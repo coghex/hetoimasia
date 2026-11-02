@@ -6,7 +6,7 @@
 -- nothing creates a Vulkan object.
 module Test.GPU.Vulkan.Native.Generations (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, yield)
+import Control.Concurrent (ThreadId, killThread, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, fromException, try)
@@ -40,6 +40,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), imageViewName
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.StandIn
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -648,20 +649,20 @@ spec = describe "Generations" $ do
         putMVar reached ()
         atomically (readTVar gate >>= check)
       finished ← newEmptyMVar
-      stepper ← forkIO (try @SomeException (stepAt rig 0 (seen 640 480)) >>= putMVar finished)
-      takeMVar reached
-      killThread stepper
-      outcome ← takeMVar finished
-      either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
-      [generation] ← viewGenerations <$> generationsOf rig
-      (viewStanding generation, viewSwapchain generation) `shouldBe` (GenerationRetiredHeld, Nothing)
-      created rig `shouldReturn` []
-      atomically $ do
-        writeTVar gate True
-        writeTVar (rigAfterAdmission rig) (\_ → pure ())
-      retireTargetGenerations (rigGenerations rig) (at 1) (rigTarget rig)
-      retireRootTarget (rigRoots rig) (rigTarget rig)
-      filter isSurfaceDestroyed <$> calls (rigStandIn rig) `shouldReturn` [DestroyedSurface 10]
+      withOwnedThreadOpening (atomically (writeTVar gate True)) (try @SomeException (stepAt rig 0 (seen 640 480)) >>= putMVar finished) $ \stepper _ → do
+        takeMVar reached
+        killThread stepper
+        outcome ← takeMVar finished
+        either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
+        [generation] ← viewGenerations <$> generationsOf rig
+        (viewStanding generation, viewSwapchain generation) `shouldBe` (GenerationRetiredHeld, Nothing)
+        created rig `shouldReturn` []
+        atomically $ do
+          writeTVar gate True
+          writeTVar (rigAfterAdmission rig) (\_ → pure ())
+        retireTargetGenerations (rigGenerations rig) (at 1) (rigTarget rig)
+        retireRootTarget (rigRoots rig) (rigTarget rig)
+        filter isSurfaceDestroyed <$> calls (rigStandIn rig) `shouldReturn` [DestroyedSurface 10]
 
     it "counts a replacement cancelled before its creation as never handing the old swapchain over, and destroys that first" $ do
       rig ← newRig
@@ -676,50 +677,50 @@ spec = describe "Generations" $ do
       resizeSurface rig 800 600
       stepAt rig 10 (seen 800 600)
       finished ← newEmptyMVar
-      stepper ← forkIO (try @SomeException (stepAt rig 26 (seen 800 600)) >>= putMVar finished)
-      takeMVar reached
-      killThread stepper
-      _ ← takeMVar finished
-      atomically $ do
-        writeTVar gate True
-        writeTVar (rigAfterAdmission rig) (\_ → pure ())
-      standings ← viewGenerations <$> generationsOf rig
-      lookup first [(viewGeneration each, (viewStanding each, viewHandedOver each)) | each ← standings]
-        `shouldBe` Just (GenerationRetiredHeld, False)
-      -- The old swapchain is still one Vulkan counts as unretired, and it is
-      -- held: nothing is created for the surface, and no attempt is spent.
-      stepAt rig 30 (seen 800 600)
-      stepAt rig 60 (seen 800 600)
-      created rig `shouldReturn` [(640, 480)]
-      recoveryAttempts rig `shouldReturn` 0
-      atomically (endGenerationUse (rigGenerations rig) use)
-      stepAt rig 80 (seen 800 600)
-      later ← swapchainCalls rig
-      [call | call ← later, isDestroyedSwapchain call || isCreated call]
-        `shouldBe` [CreatedSwapchain 100 10 (640, 480) Nothing, DestroyedSwapchain 100, CreatedSwapchain 104 10 (800, 600) Nothing]
+      withOwnedThreadOpening (atomically (writeTVar gate True)) (try @SomeException (stepAt rig 26 (seen 800 600)) >>= putMVar finished) $ \stepper _ → do
+        takeMVar reached
+        killThread stepper
+        _ ← takeMVar finished
+        atomically $ do
+          writeTVar gate True
+          writeTVar (rigAfterAdmission rig) (\_ → pure ())
+        standings ← viewGenerations <$> generationsOf rig
+        lookup first [(viewGeneration each, (viewStanding each, viewHandedOver each)) | each ← standings]
+          `shouldBe` Just (GenerationRetiredHeld, False)
+        -- The old swapchain is still one Vulkan counts as unretired, and it is
+        -- held: nothing is created for the surface, and no attempt is spent.
+        stepAt rig 30 (seen 800 600)
+        stepAt rig 60 (seen 800 600)
+        created rig `shouldReturn` [(640, 480)]
+        recoveryAttempts rig `shouldReturn` 0
+        atomically (endGenerationUse (rigGenerations rig) use)
+        stepAt rig 80 (seen 800 600)
+        later ← swapchainCalls rig
+        [call | call ← later, isDestroyedSwapchain call || isCreated call]
+          `shouldBe` [CreatedSwapchain 100 10 (640, 480) Nothing, DestroyedSwapchain 100, CreatedSwapchain 104 10 (800, 600) Nothing]
 
     it "records a swapchain whose creation a cancellation reached, and destroys it before building afresh" $ do
       rig ← newRig
       gate ← newTVarIO False
       script (rigStandIn rig) AtCreateSwapchain (HoldsUntil gate)
       finished ← newEmptyMVar
-      stepper ← forkIO (try @SomeException (stepAt rig 0 (seen 640 480)) >>= putMVar finished)
-      awaitCall (rigStandIn rig) (CreatedSwapchain 100 10 (640, 480) Nothing)
-      killer ← forkIO (killThread stepper)
-      -- The cancellation is aimed at the step while the creation holds; it is
-      -- delivered at the first point after the swapchain has been recorded.
-      awaitThrowing killer
-      atomically (writeTVar gate True)
-      outcome ← takeMVar finished
-      either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
-      length . filter isEnumerated <$> swapchainCalls rig `shouldReturn` 0
-      [generation] ← viewGenerations <$> generationsOf rig
-      (viewStanding generation, viewSwapchain generation) `shouldBe` (GenerationRetiredHeld, Just 100)
-      clearScript rig AtCreateSwapchain
-      stepAt rig 1 (seen 640 480)
-      later ← swapchainCalls rig
-      [call | call ← later, isDestroyedSwapchain call || isCreated call]
-        `shouldBe` [CreatedSwapchain 100 10 (640, 480) Nothing, DestroyedSwapchain 100, CreatedSwapchain 101 10 (640, 480) Nothing]
+      withOwnedThreadOpening (atomically (writeTVar gate True)) (try @SomeException (stepAt rig 0 (seen 640 480)) >>= putMVar finished) $ \stepper _ → do
+        awaitCall (rigStandIn rig) (CreatedSwapchain 100 10 (640, 480) Nothing)
+        withOwnedThread (killThread stepper) $ \killer _ → do
+          -- The cancellation is aimed at the step while the creation holds; it is
+          -- delivered at the first point after the swapchain has been recorded.
+          awaitThrowing killer
+          atomically (writeTVar gate True)
+          outcome ← takeMVar finished
+          either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
+          length . filter isEnumerated <$> swapchainCalls rig `shouldReturn` 0
+          [generation] ← viewGenerations <$> generationsOf rig
+          (viewStanding generation, viewSwapchain generation) `shouldBe` (GenerationRetiredHeld, Just 100)
+          clearScript rig AtCreateSwapchain
+          stepAt rig 1 (seen 640 480)
+          later ← swapchainCalls rig
+          [call | call ← later, isDestroyedSwapchain call || isCreated call]
+            `shouldBe` [CreatedSwapchain 100 10 (640, 480) Nothing, DestroyedSwapchain 100, CreatedSwapchain 101 10 (640, 480) Nothing]
 
     describe "retains a candidate whose creation a cancellation interrupted inside the call, fails the session, and destroys none of it" $ do
       let interruptedAt at' = do
@@ -727,28 +728,28 @@ spec = describe "Generations" $ do
             gate ← newTVarIO False
             script (rigStandIn rig) at' (WaitsInterruptibly gate)
             finished ← newEmptyMVar
-            stepper ← forkIO (try @SomeException (stepAt rig 0 (seen 640 480)) >>= putMVar finished)
-            awaitCall (rigStandIn rig) (CreatedSwapchain 100 10 (640, 480) Nothing)
-            case at' of
-              AtCreateView → awaitCall (rigStandIn rig) (CreatedView 101 100000)
-              _ → pure ()
-            killThread stepper
-            outcome ← takeMVar finished
-            either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
-            atomically (writeTVar gate True)
-            [generation] ← viewGenerations <$> generationsOf rig
-            viewStanding generation `shouldSatisfy` \case
-              GenerationUncertain _ → True
-              _ → False
-            model ← atomically (readRootsModel (rigRoots rig))
-            sessionState model `shouldBe` SessionFailed CleanupFailed
-            viewAdmitting <$> atomically (readRootsView (rigRoots rig)) `shouldReturn` False
-            stepAt rig 1 (seen 640 480)
-            stepAt rig 200 (seen 640 480)
-            destroyed rig `shouldReturn` []
-            length <$> created rig `shouldReturn` 1
-            retireTargetGenerations (rigGenerations rig) (at 300) (rigTarget rig) `raises` \(GenerationsRetained _ remaining) → remaining == [viewGeneration generation]
-            retireRootTarget (rigRoots rig) (rigTarget rig) `raises` \(TargetGenerationsRemain _ _) → True
+            withOwnedThreadOpening (atomically (writeTVar gate True)) (try @SomeException (stepAt rig 0 (seen 640 480)) >>= putMVar finished) $ \stepper _ → do
+              awaitCall (rigStandIn rig) (CreatedSwapchain 100 10 (640, 480) Nothing)
+              case at' of
+                AtCreateView → awaitCall (rigStandIn rig) (CreatedView 101 100000)
+                _ → pure ()
+              killThread stepper
+              outcome ← takeMVar finished
+              either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
+              atomically (writeTVar gate True)
+              [generation] ← viewGenerations <$> generationsOf rig
+              viewStanding generation `shouldSatisfy` \case
+                GenerationUncertain _ → True
+                _ → False
+              model ← atomically (readRootsModel (rigRoots rig))
+              sessionState model `shouldBe` SessionFailed CleanupFailed
+              viewAdmitting <$> atomically (readRootsView (rigRoots rig)) `shouldReturn` False
+              stepAt rig 1 (seen 640 480)
+              stepAt rig 200 (seen 640 480)
+              destroyed rig `shouldReturn` []
+              length <$> created rig `shouldReturn` 1
+              retireTargetGenerations (rigGenerations rig) (at 300) (rigTarget rig) `raises` \(GenerationsRetained _ remaining) → remaining == [viewGeneration generation]
+              retireRootTarget (rigRoots rig) (rigTarget rig) `raises` \(TargetGenerationsRemain _ _) → True
       it "in the swapchain's creation" (interruptedAt AtCreateSwapchain)
       it "in an image view's creation" (interruptedAt AtCreateView)
 
@@ -760,17 +761,17 @@ spec = describe "Generations" $ do
       resizeSurface rig 800 600
       stepAt rig 10 (seen 800 600)
       finished ← newEmptyMVar
-      stepper ← forkIO (try @SomeException (stepAt rig 26 (seen 800 600) >> stepAt rig 30 (seen 800 600)) >>= putMVar finished)
-      awaitCall (rigStandIn rig) (DestroyedSwapchain 100)
-      killThread stepper
-      _ ← takeMVar finished
-      atomically (writeTVar gate True)
-      [first, _] ← map viewGeneration . viewGenerations <$> generationsOf rig
-      standingOf rig first >>= (`shouldSatisfy` \case
-        Just (GenerationUncertain _) → True
-        _ → False)
-      stepAt rig 50 (seen 800 600)
-      length . filter isDestroyedSwapchain <$> swapchainCalls rig `shouldReturn` 1
+      withOwnedThreadOpening (atomically (writeTVar gate True)) (try @SomeException (stepAt rig 26 (seen 800 600) >> stepAt rig 30 (seen 800 600)) >>= putMVar finished) $ \stepper _ → do
+        awaitCall (rigStandIn rig) (DestroyedSwapchain 100)
+        killThread stepper
+        _ ← takeMVar finished
+        atomically (writeTVar gate True)
+        [first, _] ← map viewGeneration . viewGenerations <$> generationsOf rig
+        standingOf rig first >>= (`shouldSatisfy` \case
+          Just (GenerationUncertain _) → True
+          _ → False)
+        stepAt rig 50 (seen 800 600)
+        length . filter isDestroyedSwapchain <$> swapchainCalls rig `shouldReturn` 1
 
     it "latches device loss raised by a swapchain creation, and fails the session" $ do
       rig ← newRig

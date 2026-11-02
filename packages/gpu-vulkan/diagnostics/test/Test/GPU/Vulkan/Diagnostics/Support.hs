@@ -26,6 +26,9 @@ module Test.GPU.Vulkan.Diagnostics.Support
   , capturing
   , quiescent
 
+    -- * Threads
+  , withOwnedThreads
+
     -- * Waits
   , awaitDelivered
   , awaitInSink
@@ -77,6 +80,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   )
 import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture (Offer, offer)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 
 import Data.Time.Clock (UTCTime (UTCTime))
 import Data.Time.Calendar (fromGregorian)
@@ -219,3 +223,9 @@ awaitPhase capture phase = bounded (atomically (capturePhase capture >>= check .
 -- capture's user data.
 offerTo ∷ DiagnosticCapture → Offer → IO ()
 offerTo capture = offer (captureUserData capture)
+
+-- | Run the body beside these threads, each owned by a scope of its own nested in the previous one's: however the body ends
+-- they have all ended, and been joined, the last started first. They are started before the body and none is let go early.
+withOwnedThreads ∷ [IO ()] → IO a → IO a
+withOwnedThreads [] body = body
+withOwnedThreads (action : more) body = withOwnedThread action (\_ _ → withOwnedThreads more body)

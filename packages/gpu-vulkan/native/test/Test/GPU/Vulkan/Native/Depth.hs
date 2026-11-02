@@ -17,8 +17,6 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Depth (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Monad (when)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
@@ -27,6 +25,7 @@ import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
+import Test.GPU.Vulkan.Native.Threads (onOtherThread)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model (SessionFailureCause (CleanupFailed))
@@ -399,13 +398,11 @@ spec = describe "Depth attachments" $ do
       rig ← newRig
       kit ← newKit rig Rgba8Srgb
       kept ← newIORef Nothing
-      offThread ← newEmptyMVar
       before ← commandCount rig
       framelessRun rig $ \recorder → do
         ok (clearingPass kit recorder)
         writeIORef kept (Just recorder)
-        _ ← forkIO (clearDepthRect recorder (Rect 0 0 8 8) 0.5 >>= putMVar offThread)
-        takeMVar offThread `shouldReturn` Left RefusedNotOwner
+        onOtherThread (clearDepthRect recorder (Rect 0 0 8 8) 0.5) `shouldReturn` Left RefusedNotOwner
         ok (endRendering recorder)
       stale ← readIORef kept >>= maybe (fail "no recorder") pure
       clearDepthRect stale (Rect 0 0 8 8) 0.5 `shouldReturn` Left RefusedRecorderClosed

@@ -15,17 +15,18 @@
 -- clock but the one example that waits on a ticket's deadline.
 module Test.GPU.Vulkan.Native.Uploads (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryTakeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar, tryTakeMVar)
 import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (try)
-import Control.Monad (forM, replicateM_, when)
+import Control.Monad (forM, replicateM_, void, when)
 import qualified Data.ByteString as ByteString
 import Data.Either (isRight)
 import Data.Functor ((<&>))
 import Data.Text (Text)
 import Data.Word (Word32, Word64, Word8)
 import Numeric.Natural (Natural)
+import Test.GPU.Vulkan.Native.Threads (onOtherThread, raceOwned)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn)
 
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), durationFromNanoseconds)
@@ -84,9 +85,7 @@ spec = describe "Uploads" $ do
       stagingCount rig `shouldReturn` 1
       uploadsStagingSize <$> atomically (readUploads uploads) `shouldReturn` 1024
       uploadsSupportBC7 uploads `shouldBe` True
-      done ← newEmptyMVar
-      _ ← forkIO (progressUploads uploads >>= putMVar done . fmap (const ()))
-      takeMVar done `shouldReturn` Left RefusedNotOwner
+      onOtherThread (fmap (const ()) <$> progressUploads uploads) `shouldReturn` Left RefusedNotOwner
 
   describe "admission" $ do
     it "copies the caller's bytes into staging before it returns, and queues the upload" $ do
@@ -192,13 +191,7 @@ spec = describe "Uploads" $ do
       rig ← newUploadRig
       uploads ← made rig (config 1024 64 4)
       texture ← textureOf rig Rgba8Linear 4 4 1
-      gate ← newEmptyMVar
-      answers ← forM [1 ∷ Int, 2] $ \_ → do
-        answer ← newEmptyMVar
-        _ ← forkIO (readMVar gate >> submitUpload uploads (UploadImage texture [level 64 1]) >>= putMVar answer . fmap (const ()))
-        pure answer
-      putMVar gate ()
-      outcomes ← mapM takeMVar answers
+      outcomes ← raceOwned (replicate 2 (fmap (const ()) <$> submitUpload uploads (UploadImage texture [level 64 1])))
       length (filter isRight outcomes) `shouldBe` 1
       [refusal | Left refusal ← outcomes] `shouldBe` [UploadAlreadyTargeted]
       length . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` 1
@@ -468,9 +461,7 @@ spec = describe "Uploads" $ do
       replicateM_ 3 (turned uploads >> progress rig)
       atomically (readUploadTicket ticket) `shouldReturn` UploadUploading
       awaitUploadTicket ticket (milliseconds 1) `shouldReturn` Left RefusedOwnerWait
-      waited ← newEmptyMVar
-      _ ← forkIO (awaitUploadTicket ticket (milliseconds 5) >>= putMVar waited)
-      takeMVar waited `shouldReturn` Right UploadUploading
+      onOtherThread (awaitUploadTicket ticket (milliseconds 5)) `shouldReturn` Right UploadUploading
       completeAll' rig
       _ ← turned uploads
       atomically (readUploadTicket ticket) `shouldReturn` UploadComplete
@@ -497,17 +488,17 @@ spec = describe "Uploads" $ do
       release ← newEmptyMVar
       onceAt (rigRecordingStandIn rig) AtWriteMapped (putMVar entered () >> takeMVar release)
       answer ← newEmptyMVar
-      _ ← forkIO (submitUpload uploads (UploadImage texture [level 64 1]) >>= putMVar answer)
-      takeMVar entered
-      inModel rig (Admitted . noteDeviceLoss)
-      _ ← turned uploads
-      -- Still its caller's: the loss settles nothing it is writing into.
-      map uploadPhase . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` [PhaseAdmitting]
-      putMVar release ()
-      ticket ← takeMVar answer >>= either (fail . ("the upload was refused: " <>) . show) pure
-      _ ← turned uploads
-      atomically (readUploadTicket ticket) `shouldReturn` UploadLost
-      uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
+      withOwnedThreadOpening (void (tryPutMVar release ())) (submitUpload uploads (UploadImage texture [level 64 1]) >>= putMVar answer) $ \_ _ → do
+        takeMVar entered
+        inModel rig (Admitted . noteDeviceLoss)
+        _ ← turned uploads
+        -- Still its caller's: the loss settles nothing it is writing into.
+        map uploadPhase . uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` [PhaseAdmitting]
+        putMVar release ()
+        ticket ← takeMVar answer >>= either (fail . ("the upload was refused: " <>) . show) pure
+        _ ← turned uploads
+        atomically (readUploadTicket ticket) `shouldReturn` UploadLost
+        uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
 
     it "retires only once a caller still copying its bytes into staging has finished, which then finds admission closed" $ do
       rig ← newUploadRig
@@ -519,18 +510,21 @@ spec = describe "Uploads" $ do
       let note' event = atomically (modifyTVar' order (event :))
       onceAt (rigRecordingStandIn rig) AtWriteMapped (putMVar entered () >> takeMVar release >> note' "written")
       answer ← newEmptyMVar
-      _ ← forkIO (submitUpload uploads (UploadImage texture [level 64 1]) >>= putMVar answer . fmap (const ()))
-      takeMVar entered
-      -- The caller is let go only once retirement has closed admission.
-      _ ← forkIO $ do
-        atomically (readUploads uploads >>= check . not . uploadsAdmitting)
-        note' "released"
-        putMVar release ()
-      ok (retireUploads uploads)
-      note' "retired"
-      takeMVar answer `shouldReturn` Left UploadClosed
-      reverse <$> readTVarIO order `shouldReturn` ["released", "written", "retired" ∷ Text]
-      uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
+      withOwnedThreadOpening (void (tryPutMVar release ())) (submitUpload uploads (UploadImage texture [level 64 1]) >>= putMVar answer . fmap (const ())) $ \_ _ → do
+        takeMVar entered
+        -- The caller is let go only once retirement has closed admission.
+        withOwnedThread
+          ( do
+              atomically (readUploads uploads >>= check . not . uploadsAdmitting)
+              note' "released"
+              putMVar release ()
+          )
+          $ \_ _ → do
+          ok (retireUploads uploads)
+          note' "retired"
+          takeMVar answer `shouldReturn` Left UploadClosed
+          reverse <$> readTVarIO order `shouldReturn` ["released", "written", "retired" ∷ Text]
+          uploadsUnsettled <$> atomically (readUploads uploads) `shouldReturn` []
 
     it "cancels every upload not started when the owner's exit begins, refuses new ones, and settles started ones with their batches" $ do
       rig ← newUploadRig

@@ -6,7 +6,7 @@
 -- own state: what it admitted, copied, cut, dropped, latched and counted.
 module Test.GPU.Vulkan.Diagnostics.Capture (spec) where
 
-import Control.Concurrent (forkIO, yield)
+import Control.Concurrent (yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryTakeMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO)
 import Control.Exception (bracket, finally)
@@ -16,6 +16,7 @@ import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32, Word64)
 import Foreign.Ptr (nullPtr)
+import Test.Support.Owned (withOwnedThreadOpening)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
@@ -50,6 +51,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics.Internal.Capture
   , storageUserData
   , takeRecord
   )
+import Test.GPU.Vulkan.Diagnostics.Support (withOwnedThreads)
 import Test.Support.Bounded (bounded)
 
 -- | A storage for one example, closed and freed afterwards.
@@ -386,34 +388,34 @@ spec = describe "Capture" $ do
       storage ← createStorage (limits 4 64 2)
       hold ← newHold
       done ← newEmptyMVar
-      _ ← forkIO (offerHeld (storageUserData storage) hold SeverityError "held" >> putMVar done ())
-      bounded (untilM (holdArrived hold))
-      closeStorage storage
-      freeStorage storage
-      releaseHold hold
-      bounded (takeMVar done)
-      counterValue storage CaptureFailed `shouldReturn` 1
-      counterValue storage Admitted `shouldReturn` 0
-      latchSet storage CaptureFailureLatch `shouldReturn` True
-      latchSet storage ErrorLatch `shouldReturn` True
+      withOwnedThreadOpening (releaseHold hold) (offerHeld (storageUserData storage) hold SeverityError "held" >> putMVar done ()) $ \_ _ → do
+        bounded (untilM (holdArrived hold))
+        closeStorage storage
+        freeStorage storage
+        releaseHold hold
+        bounded (takeMVar done)
+        counterValue storage CaptureFailed `shouldReturn` 1
+        counterValue storage Admitted `shouldReturn` 0
+        latchSet storage CaptureFailureLatch `shouldReturn` True
+        latchSet storage ErrorLatch `shouldReturn` True
 
     it "makes closing wait for a producer that has announced itself" $
       withStorage (limits 4 64 2) $ \storage → do
         hold ← newHold
         producerDone ← newEmptyMVar
         closed ← newEmptyMVar
-        _ ← forkIO (offerAnnounced (storageUserData storage) hold SeverityWarning "announced" >> putMVar producerDone ())
-        bounded (untilM (holdArrived hold))
-        _ ← forkIO (closeStorage storage >> putMVar closed ())
-        -- Once the closer has set the flag it is waiting for the producer.
-        bounded (untilM (storageClosed storage))
-        tryTakeMVar closed `shouldReturn` Nothing
-        releaseHold hold
-        bounded (takeMVar producerDone)
-        bounded (takeMVar closed)
-        -- Admission closed while it waited, so it counted itself as refused.
-        counterValue storage CaptureFailed `shouldReturn` 1
-        counterValue storage Admitted `shouldReturn` 0
+        withOwnedThreadOpening (releaseHold hold) (offerAnnounced (storageUserData storage) hold SeverityWarning "announced" >> putMVar producerDone ()) $ \_ _ → do
+          bounded (untilM (holdArrived hold))
+          withOwnedThreadOpening (releaseHold hold) (closeStorage storage >> putMVar closed ()) $ \_ _ → do
+            -- Once the closer has set the flag it is waiting for the producer.
+            bounded (untilM (storageClosed storage))
+            tryTakeMVar closed `shouldReturn` Nothing
+            releaseHold hold
+            bounded (takeMVar producerDone)
+            bounded (takeMVar closed)
+            -- Admission closed while it waited, so it counted itself as refused.
+            counterValue storage CaptureFailed `shouldReturn` 1
+            counterValue storage Admitted `shouldReturn` 0
 
     it "reclaims every storage, so more lifetimes than the table has slots never run out" $
       forM_ [1 .. 3 * 64 ∷ Int] $ \_ → do
@@ -454,39 +456,42 @@ spec = describe "Capture" $ do
         let producers = 8 ∷ Int
             each = 2000 ∷ Int
         finished ← newTVarIO (0 ∷ Int)
-        forM_ [1 .. producers] $ \producer →
-          forkIO $ do
-            forM_ [1 .. each] $ \n →
-              offerInto storage (plainOffer SeverityInfo (Char8.pack (show producer <> ":" <> show n)))
-            atomically (modifyTVar' finished (+ 1))
-        -- The consumer runs beside the producers, so the queue is both full
-        -- and refilling while they race for positions. Every producer
-        -- publishes before it says it has finished, so the pass that follows
-        -- reading all of them finished sees the last record there will be.
-        --
-        -- An empty pass yields: a loop of short unsafe calls that allocates
-        -- nothing never reaches a point where the runtime can stop it, and the
-        -- other capabilities would then wait for it forever at the next
-        -- collection.
-        let consume collected = do
-              done ← (== producers) <$> readTVarIO finished
-              batch ← drainAll storage
-              if done
-                then pure (collected <> batch)
-                else do
-                  when (null batch) yield
-                  consume (collected <> batch)
-        collected ← bounded (consume [])
-        admitted ← counterValue storage Admitted
-        dropped ← counterValue storage Dropped
-        counterValue storage Offered `shouldReturn` fromIntegral (producers * each)
-        admitted + dropped `shouldBe` fromIntegral (producers * each)
-        fromIntegral (length collected) `shouldBe` admitted
-        let parsed = [parse (recordMessage record) | record ← collected]
-            byProducer = Map.fromListWith (flip (<>)) [(producer, [n]) | Just (producer, n) ← parsed]
-        length [() | Nothing ← parsed] `shouldBe` 0
-        forM_ (Map.toList byProducer) $ \(producer, sequenceNumbers) →
-          (producer, and (zipWith (<) sequenceNumbers (drop 1 sequenceNumbers))) `shouldBe` (producer, True)
+        withOwnedThreads
+          [ do
+              forM_ [1 .. each] $ \n →
+                offerInto storage (plainOffer SeverityInfo (Char8.pack (show producer <> ":" <> show n)))
+              atomically (modifyTVar' finished (+ 1))
+          | producer ← [1 .. producers]
+          ]
+          $ do
+          -- The consumer runs beside the producers, so the queue is both full
+          -- and refilling while they race for positions. Every producer
+          -- publishes before it says it has finished, so the pass that follows
+          -- reading all of them finished sees the last record there will be.
+          --
+          -- An empty pass yields: a loop of short unsafe calls that allocates
+          -- nothing never reaches a point where the runtime can stop it, and the
+          -- other capabilities would then wait for it forever at the next
+          -- collection.
+          let consume collected = do
+                done ← (== producers) <$> readTVarIO finished
+                batch ← drainAll storage
+                if done
+                  then pure (collected <> batch)
+                  else do
+                    when (null batch) yield
+                    consume (collected <> batch)
+          collected ← bounded (consume [])
+          admitted ← counterValue storage Admitted
+          dropped ← counterValue storage Dropped
+          counterValue storage Offered `shouldReturn` fromIntegral (producers * each)
+          admitted + dropped `shouldBe` fromIntegral (producers * each)
+          fromIntegral (length collected) `shouldBe` admitted
+          let parsed = [parse (recordMessage record) | record ← collected]
+              byProducer = Map.fromListWith (flip (<>)) [(producer, [n]) | Just (producer, n) ← parsed]
+          length [() | Nothing ← parsed] `shouldBe` 0
+          forM_ (Map.toList byProducer) $ \(producer, sequenceNumbers) →
+            (producer, and (zipWith (<) sequenceNumbers (drop 1 sequenceNumbers))) `shouldBe` (producer, True)
   where
     untilM condition = condition >>= \ok → if ok then pure () else yield >> untilM condition
     parse message = case Char8.split ':' message of

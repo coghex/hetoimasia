@@ -21,7 +21,7 @@
 --   adoption was deferred.
 module Test.GPU.Vulkan.GLFW.Targets (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, retry, writeTVar, modifyTVar')
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeException, catch, finally, fromException, throwIO, try)
@@ -65,6 +65,7 @@ import Hetoimasia.Runtime.GLFW
   , targetEventsOpen
   )
 import Hetoimasia.Runtime.Supervision (RuntimeControl, checkRuntime)
+import Test.Support.Owned (withOwnedThreadOpening, withOwnedThread)
 import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
 import Test.GPU.Vulkan.GLFW.StandIn
 import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldSatisfy)
@@ -725,7 +726,14 @@ testOwnerExitEndsTargets = do
   rig ← surfaceFreeRig 0
   entered ← newEmptyMVar
   proceed ← newEmptyMVar
-  (hostAfter, target, queued, holding) ← runRig rig $ \host _ → do
+  (hostAfter, target, queued, holding) ←
+    withRunHelper
+      (void (tryPutMVar proceed ()))
+      ( \host → do
+          atomically (targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host)) >>= check . not)
+          putMVar proceed ()
+      )
+      $ \supply → runRig rig $ \host _ → do
     awaitReady host
     target ← registered host
     awaitTargetStanding host target ((== Just 0) . windowAdopted)
@@ -738,9 +746,7 @@ testOwnerExitEndsTargets = do
     (_, held) ← atomically ((,) <$> publishVulkanTargetScene host target scene <*> requestVulkanRelease (vulkanController host) (VulkanAction (\_ → readTVarIO (rigSceneEvents rig))))
     queued ← either (\refusal → failWith ("refused: " <> show refusal)) pure held
     -- The owner is let go only once its exit has begun, which the host's own admission says, in a transaction.
-    void . forkIO $ do
-      atomically (targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host)) >>= check . not)
-      putMVar proceed ()
+    supply host
     pure (host, target, queued, holding)
   -- The exit ended the target: nothing can be published to it, nothing can be registered, and the request it held
   -- was refused, never run.
@@ -761,7 +767,14 @@ testExitDrainCompletesBatch ∷ IO ()
 testExitDrainCompletesBatch = do
   rig ← surfaceFreeRig 0
   submissionsComplete rig False
-  (hostAfter, target, ticket) ← runRig rig $ \host _ → do
+  (hostAfter, target, ticket) ←
+    withRunHelper
+      (pure ())
+      ( \host → do
+          atomically (targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host)) >>= check . not)
+          submissionsComplete rig True
+      )
+      $ \supply → runRig rig $ \host _ → do
     awaitReady host
     target ← registered host
     awaitTargetStanding host target ((== Just 0) . windowAdopted)
@@ -771,9 +784,7 @@ testExitDrainCompletesBatch = do
     -- The batch is pending as the body returns. Its completion is let through only once the owner's exit has begun,
     -- which the host's own admission says in a transaction: the owner's shutdown drain, not an ordinary step, is what
     -- observes it.
-    void . forkIO $ do
-      atomically (targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host)) >>= check . not)
-      submissionsComplete rig True
+    supply host
     pure (host, target, batch)
   ticketNow ticket >>= (`shouldBe` TicketComplete)
   events ← readTVarIO (rigSceneEvents rig)
@@ -792,7 +803,14 @@ testExitFailureStillSettles = do
   -- the device. What the target adopted needs no batch to end, so the exit alone must release it.
   scriptSurface rig 102 DestroyFails
   observed ← newTVarIO Nothing
-  outcome ← runRigCaught rig $ \host control → do
+  outcome ←
+    withRunHelper
+      (pure ())
+      ( \owner → do
+          atomically (readOwnerFailure owner >>= check . isJust)
+          publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+      )
+      $ \supply → runRigCaught rig $ \host control → do
     let owner = vulkanGraphicsOwner host
         windows = vulkanWindowHost host
     _ ← superviseGraphicsOwner control owner
@@ -816,9 +834,7 @@ testExitFailureStillSettles = do
     atomically (writeTVar observed (Just (host, target)))
     -- The uncertain orphan retains the instance, so the owner can produce no destruction evidence of its own: the
     -- exit finishes on independent evidence, published once the owner's retirement has failed.
-    void . forkIO $ do
-      atomically (readOwnerFailure owner >>= check . isJust)
-      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+    supply owner
     checkRuntime control
   (host, target) ← readTVarIO observed >>= maybe (failWith ("the exit example did not reach its observation: " <> either show (const "it returned") outcome)) pure
   events ← readTVarIO (rigSceneEvents rig)
@@ -868,28 +884,28 @@ testLedgerCancellation = do
   atomically (registerSceneTarget scenes (TargetAdopter identity))
   hooks ← newTVarIO ([] ∷ [String])
   entered ← newEmptyMVar
-  proceed ← newEmptyMVar
+  proceed ← newProceedGate
   let lifecycle =
         SceneLifecycle
           { sceneAdopted = \_ revision _ → do
               atomically (modifyTVar' hooks (<> ["adopted " <> show revision]))
-              putMVar entered ()
-              takeMVar proceed
+              void (tryPutMVar entered ())
+              awaitProceed proceed
           , sceneReleased = \_ revision → do
               atomically (modifyTVar' hooks (<> ["released " <> show revision]))
-              putMVar entered ()
-              takeMVar proceed
+              void (tryPutMVar entered ())
+              awaitProceed proceed
           }
       cancelDuring action = do
         finished ← newEmptyMVar
-        thread ← forkIO (try @SomeException (void action) >>= putMVar finished)
-        takeMVar entered
-        -- The cancellation is delivered once the transition ends, never in it: the thrower is blocked until then,
-        -- and only then is the hook let go.
-        cancelled ← forkIO (throwTo thread (ErrorCall "cancelled"))
-        awaitSettled cancelled
-        putMVar proceed ()
-        takeMVar finished
+        withOwnedThreadOpening (openProceed proceed) (try @SomeException (void action) >>= putMVar finished) $ \thread _ → do
+          takeMVar entered
+          -- The cancellation is delivered once the transition ends, never in it: the thrower is blocked until then,
+          -- and only then is the hook let go.
+          withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
+            awaitSettled cancelled
+            allowOne proceed
+            takeMVar finished
       standingOf = Map.lookup (KeyOffscreen identity) . sceneWindows
   -- An adoption cancelled while its hook runs.
   _ ← cancelDuring (adoptScene scenes lifecycle 100 (TargetAdopter identity) (5 ∷ Scene) 3)
@@ -899,20 +915,20 @@ testLedgerCancellation = do
   _ ← cancelDuring (adoptScene scenes lifecycle 100 (TargetAdopter identity) (6 ∷ Scene) 4)
   atomically (endSceneTarget scenes (TargetAdopter identity))
   finished ← newEmptyMVar
-  thread ← forkIO (try @SomeException (releaseScenes scenes (sceneReleased lifecycle) (\_ _ → pure False)) >>= putMVar finished)
-  takeMVar entered
-  cancelled ← forkIO (throwTo thread (ErrorCall "cancelled"))
-  awaitSettled cancelled
-  putMVar proceed ()
-  -- The second record's hook runs as well, though the first was cancelled.
-  takeMVar entered
-  putMVar proceed ()
-  _ ← takeMVar finished
-  after ← atomically (readSceneState scenes (pure []))
-  done ← readTVarIO hooks
-  fmap windowAdopted (standingOf standing) `shouldBe` Just (Just 3)
-  maybe [] windowAwaitingRelease (standingOf after) `shouldBe` []
-  done `shouldBe` ["adopted 3", "adopted 4", "released 3", "released 4"]
+  withOwnedThreadOpening (openProceed proceed) (try @SomeException (releaseScenes scenes (sceneReleased lifecycle) (\_ _ → pure False)) >>= putMVar finished) $ \thread _ → do
+    takeMVar entered
+    withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
+      awaitSettled cancelled
+      allowOne proceed
+      -- The second record's hook runs as well, though the first was cancelled.
+      takeMVar entered
+      allowOne proceed
+      _ ← takeMVar finished
+      after ← atomically (readSceneState scenes (pure []))
+      done ← readTVarIO hooks
+      fmap windowAdopted (standingOf standing) `shouldBe` Just (Just 3)
+      maybe [] windowAwaitingRelease (standingOf after) `shouldBe` []
+      done `shouldBe` ["adopted 3", "adopted 4", "released 3", "released 4"]
 
 -- | Wait until a thread that was thrown to is blocked on the delivery or has finished.
 awaitSettled ∷ ThreadId → IO ()

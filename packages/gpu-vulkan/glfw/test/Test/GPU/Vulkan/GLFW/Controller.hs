@@ -13,7 +13,7 @@
 -- the proof harness's VK-7 session, on a real loader.
 module Test.GPU.Vulkan.GLFW.Controller (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, orElse, readTVar, registerDelay, retry, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (ExceptionWithContext), SomeException, asyncExceptionFromException, asyncExceptionToException, finally, throwIO, try)
@@ -78,6 +78,7 @@ import Hetoimasia.Runtime.GLFW
   , windowGraphicsService
   )
 import Hetoimasia.Runtime.Supervision (checkRuntime)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
 import Test.GPU.Vulkan.GLFW.StandIn
 import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldSatisfy)
@@ -432,21 +433,18 @@ testCancelledHandoff = do
     -- Once the surface's creation is holding, as its native call would, a
     -- cancellation is aimed at the main thread and the creation released; the
     -- cancellation is delivered whenever the handoff next permits one.
-    void . forkIO $ do
-      atomically (creationsBegun rig >>= check . (>= 1))
-      thrower ← forkIO (throwTo main Cancelled)
-      -- Released only once the cancellation is waiting on the held call, so
-      -- it certainly arrives during this handoff and not after it.
-      awaitThrowing thrower
-      atomically (writeTVar gate True)
-    answer ← try @Cancelled (handOverVulkanTarget (vulkanController host) (vulkanWindowHost host) (vulkanGraphicsOwner host) window RequiredTarget)
-    -- Whatever the caller heard, the attachment exists and the owner was told
-    -- of it: its answer, if lost, was recovered and announced.
-    Just service ← atomically (windowGraphicsService (vulkanWindowHost host) window)
-    stage ← atomically (custodyOf (vulkanGraphicsOwner host) (graphicsAttachment service))
-    standing ← awaitStanding host service
-    roots ← atomically (readVulkanRoots (vulkanController host))
-    pure (either (const "cancelled") (const "answered") answer ∷ String, stage, standing, viewInstance roots)
+    withOwnedThread (atomically (creationsBegun rig >>= check . (>= 1)) >> throwTo main Cancelled) $ \thrower _ →
+      -- Released only once the cancellation is waiting on the held call, so it certainly arrives during this handoff and
+      -- not after it.
+      withOwnedThreadOpening (atomically (writeTVar gate True)) (awaitThrowing thrower >> atomically (writeTVar gate True)) $ \_ _ → do
+      answer ← try @Cancelled (handOverVulkanTarget (vulkanController host) (vulkanWindowHost host) (vulkanGraphicsOwner host) window RequiredTarget)
+      -- Whatever the caller heard, the attachment exists and the owner was told
+      -- of it: its answer, if lost, was recovered and announced.
+      Just service ← atomically (windowGraphicsService (vulkanWindowHost host) window)
+      stage ← atomically (custodyOf (vulkanGraphicsOwner host) (graphicsAttachment service))
+      standing ← awaitStanding host service
+      roots ← atomically (readVulkanRoots (vulkanController host))
+      pure (either (const "cancelled") (const "answered") answer ∷ String, stage, standing, viewInstance roots)
   answer `shouldSatisfy` (`elem` ["cancelled", "answered"])
   stage `shouldSatisfy` (`elem` [Just CustodyAnnounced, Just CustodyOwned])
   standing `shouldBe` TargetUsable
@@ -459,7 +457,15 @@ testRepeatedCancellation = do
   rig ← twoWindows
   gate ← newTVarIO False
   scriptNative rig AtDestroyDevice (HoldsUntil gate)
-  outcome ← runRigCaught rig $ \host _ → do
+  outcome ←
+    withRunHelper
+      (atomically (writeTVar gate True))
+      ( \main → do
+          awaitEvent rig (SurfaceDestroyed 101)
+          replicateM_ 3 (throwTo main Cancelled)
+          atomically (writeTVar gate True)
+      )
+      $ \supply → runRigCaught rig $ \host _ → do
     [first, second] ← windowsOf host
     one ← handedOver host first RequiredTarget
     TargetUsable ← awaitStanding host one
@@ -469,10 +475,7 @@ testRepeatedCancellation = do
     -- The exit reaches the device's destruction and holds there; three
     -- cancellations are then aimed at the main thread, which is awaiting the
     -- owner, before the destruction is let go.
-    void . forkIO $ do
-      awaitEvent rig (SurfaceDestroyed 101)
-      replicateM_ 3 (throwTo main Cancelled)
-      atomically (writeTVar gate True)
+    supply main
   _ ← raisedAs @Cancelled outcome
   events ← journal rig
   dropWhile (not . destruction) events
@@ -629,7 +632,14 @@ testDeferredUncertain = do
   let rig = base {rigPortCapacity = Just 1}
   scriptSurface rig 102 DestroyFails
   observed ← newTVarIO Nothing
-  outcome ← runRigCaught rig $ \host control → do
+  outcome ←
+    withRunHelper
+      (pure ())
+      ( \(owner, windows) → do
+          atomically (check . null =<< hostPendingAttachments windows)
+          publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+      )
+      $ \supply → runRigCaught rig $ \host control → do
     let owner = vulkanGraphicsOwner host
         windows = vulkanWindowHost host
     _ ← superviseGraphicsOwner control owner
@@ -644,9 +654,7 @@ testDeferredUncertain = do
       -- The uncertain surface retains the instance for good, so the owner can
       -- produce no destruction evidence; only independent evidence lets this
       -- example's exit finish.
-      void . forkIO $ do
-        atomically (check . null =<< hostPendingAttachments windows)
-        publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+      supply (owner, windows)
       checkRuntime control
   UnannouncedSurfaceUncertain attachment _ ← raisedAs @UnannouncedSurfaceUncertain outcome
   -- It names the deferred attachment, and the instance was still live.
@@ -812,7 +820,13 @@ testLossWithFailedCleanup = do
   rig ← twoWindows
   scriptSurface rig 100 DestroyFails
   observed ← newTVarIO Nothing
-  outcome ← runRigCaught rig $ \host control → do
+  outcome ←
+    withRunHelper
+      (pure ())
+      ( \supplier → do
+          supplier
+      )
+      $ \supply → runRigCaught rig $ \host control → do
     [first, second] ← windowsOf host
     let owner = vulkanGraphicsOwner host
     _ ← superviseGraphicsOwner control owner
@@ -842,7 +856,7 @@ testLossWithFailedCleanup = do
     -- The failed destruction retains the first attachment, the device and the
     -- instance for good; only independent evidence lets this example's exit
     -- finish, and it is supplied from another thread.
-    independently host one
+    independently host one >>= supply
     checkRuntime control
   loss ← raisedAs @GraphicsDeviceLost outcome
   lostDuring loss `shouldBe` "vkGetPhysicalDeviceSurfaceSupportKHR"
@@ -1091,20 +1105,21 @@ testQueuedConstructionStops = do
     _ ← superviseGraphicsOwner control owner
     one ← handedOver host first RequiredTarget
     TargetUsable ← awaitStanding host one
-    void . forkIO $ do
-      atomically (creationsBegun rig >>= check . (>= 2))
-      reportErrorNow rig "an error while a handover is under way"
-      atomically (writeTVar gate True)
-    two ← handedOver host second OptionalTarget
-    -- The owner forgets a verified rollback at once, so its rejection is read
-    -- from the controller; a target admitted instead makes its support query,
-    -- which answers too rather than being waited past.
-    settled ← atomically $
-      (Left <$> (readTargetRejection controller (graphicsAttachment two) >>= maybe retry pure))
-        `orElse` (Right () <$ (journalHas rig (SupportQueried 101) >>= check))
-    report ← atomically (readVulkanTerminal controller)
-    atomically (writeTVar observed (Just (either rejected (const False) settled, reportPrimary report)))
-    checkRuntime control
+    let worker = do
+          atomically (creationsBegun rig >>= check . (>= 2))
+          reportErrorNow rig "an error while a handover is under way"
+          atomically (writeTVar gate True)
+    withOwnedThreadOpening (atomically (writeTVar gate True)) worker $ \_ _ → do
+      two ← handedOver host second OptionalTarget
+      -- The owner forgets a verified rollback at once, so its rejection is read
+      -- from the controller; a target admitted instead makes its support query,
+      -- which answers too rather than being waited past.
+      settled ← atomically $
+        (Left <$> (readTargetRejection controller (graphicsAttachment two) >>= maybe retry pure))
+          `orElse` (Right () <$ (journalHas rig (SupportQueried 101) >>= check))
+      report ← atomically (readVulkanTerminal controller)
+      atomically (writeTVar observed (Just (either rejected (const False) settled, reportPrimary report)))
+      checkRuntime control
   failure ← raisedAs @GraphicsSessionFailed outcome
   failure `shouldBe` GraphicsSessionFailed TerminalValidationError
   -- Never admitted: its surface destroyed and its rollback verified, with no
@@ -1123,14 +1138,20 @@ testRetentionReported = do
   rig ← twoWindows
   scriptSurface rig 100 DestroyFails
   controllerOf ← newTVarIO Nothing
-  _ ← runRigCaught rig $ \host _ → do
+  _ ←
+    withRunHelper
+      (pure ())
+      ( \supplier → do
+          supplier
+      )
+      $ \supply → runRigCaught rig $ \host _ → do
     [first, _] ← windowsOf host
     atomically (writeTVar controllerOf (Just (vulkanController host)))
     one ← handedOver host first RequiredTarget
     TargetUsable ← awaitStanding host one
     -- The exit cannot destroy this surface; only independent evidence lets it
     -- finish, and it is supplied from another thread.
-    independently host one
+    independently host one >>= supply
   Just controller ← atomically (readTVar controllerOf)
   report ← atomically (readVulkanTerminal controller)
   reportPrimary report `shouldSatisfy` \case
@@ -1148,7 +1169,16 @@ testCancelledAfterLoss = do
   scriptSurface rig 100 (DestroyHolds gate)
   returned ← newTVarIO False
   controllerOf ← newTVarIO Nothing
-  outcome ← runRigCaught rig $ \host _ → do
+  outcome ←
+    withRunHelper
+      (atomically (writeTVar gate True))
+      ( \main → do
+          atomically (readTVar returned >>= check)
+          awaitBlocked main
+          replicateM_ 3 (throwTo main Cancelled)
+          atomically (writeTVar gate True)
+      )
+      $ \supply → runRigCaught rig $ \host _ → do
     [first, second] ← windowsOf host
     let owner = vulkanGraphicsOwner host
     atomically (writeTVar controllerOf (Just (vulkanController host)))
@@ -1162,11 +1192,7 @@ testCancelledAfterLoss = do
     main ← myThreadId
     -- Once the body has returned and the main thread is waiting for the
     -- owner, three cancellations are aimed at it before the drain goes on.
-    void . forkIO $ do
-      atomically (readTVar returned >>= check)
-      awaitBlocked main
-      replicateM_ 3 (throwTo main Cancelled)
-      atomically (writeTVar gate True)
+    supply main
     atomically (writeTVar returned True)
   _ ← either pure (\_ → failWith "the run returned although it was cancelled and its owner failed") outcome
   events ← journal rig
@@ -1201,7 +1227,14 @@ testLateSurfaceFails = do
   scriptSurface rig 101 (CreateHolds gate)
   scriptSurface rig 101 DestroyFails
   controllerOf ← newTVarIO Nothing
-  _ ← runRigCaught rig $ \host _ → do
+  _ ←
+    withRunHelper
+      (pure ())
+      ( \(owner, windows) → do
+          atomically (check . null =<< hostPendingAttachments windows)
+          publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+      )
+      $ \supply → runRigCaught rig $ \host _ → do
     [first, second] ← windowsOf host
     let owner = vulkanGraphicsOwner host
     atomically (writeTVar controllerOf (Just (vulkanController host)))
@@ -1212,32 +1245,31 @@ testLateSurfaceFails = do
     -- reports an error; the owner learns of it at its next round and its
     -- drain retires the first target and the device, then waits for the
     -- creation still in flight before it destroys what it left.
-    void . forkIO $ do
-      atomically (creationsBegun rig >>= check . (>= 2))
-      reportErrorNow rig "an error while a surface is being created"
-      -- A newer scene wakes the owner; one publication that lands just as
-      -- the owner settles into its wait may not, so the example publishes
-      -- again, a bounded number of times, until the failure is latched. The
-      -- short wait between publications only paces them: whether the owner
-      -- failed is read from its latch.
-      let poke remaining = do
-            _ ← atomically (publishOwnerScene (ownerHandoff owner) scene)
-            paced ← registerDelay 20000
-            failed ← atomically $
-              (readOwnerFailure owner >>= check . isJust >> pure True)
-                `orElse` (readTVar paced >>= check >> pure False)
-            if failed || remaining <= (0 ∷ Int) then pure () else poke (remaining - 1)
-      poke 500
-      awaitEvent rig DeviceDestroyed
-      atomically (writeTVar gate True)
-    -- The owner's port has closed by the time the creation returns, so the
-    -- main thread settles this attachment itself. Nothing the owner produced
-    -- lets the instance go: independent evidence of the owner's destruction
-    -- ends the exit, once no attachment is pending.
-    _ ← handOverVulkanTarget (vulkanController host) (vulkanWindowHost host) owner second RequiredTarget
-    void . forkIO $ do
-      atomically (check . null =<< hostPendingAttachments (vulkanWindowHost host))
-      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+    let worker = do
+          atomically (creationsBegun rig >>= check . (>= 2))
+          reportErrorNow rig "an error while a surface is being created"
+          -- A newer scene wakes the owner; one publication that lands just as
+          -- the owner settles into its wait may not, so the example publishes
+          -- again, a bounded number of times, until the failure is latched. The
+          -- short wait between publications only paces them: whether the owner
+          -- failed is read from its latch.
+          let poke remaining = do
+                _ ← atomically (publishOwnerScene (ownerHandoff owner) scene)
+                paced ← registerDelay 20000
+                failed ← atomically $
+                  (readOwnerFailure owner >>= check . isJust >> pure True)
+                    `orElse` (readTVar paced >>= check >> pure False)
+                if failed || remaining <= (0 ∷ Int) then pure () else poke (remaining - 1)
+          poke 500
+          awaitEvent rig DeviceDestroyed
+          atomically (writeTVar gate True)
+    withOwnedThreadOpening (atomically (writeTVar gate True)) worker $ \_ _ → do
+      -- The owner's port has closed by the time the creation returns, so the
+      -- main thread settles this attachment itself. Nothing the owner produced
+      -- lets the instance go: independent evidence of the owner's destruction
+      -- ends the exit, once no attachment is pending.
+      _ ← handOverVulkanTarget (vulkanController host) (vulkanWindowHost host) owner second RequiredTarget
+      supply (owner, vulkanWindowHost host)
   Just controller ← atomically (readTVar controllerOf)
   report ← atomically (readVulkanTerminal controller)
   reportPrimary report `shouldBe` Just TerminalValidationError
@@ -1254,7 +1286,14 @@ testSeveralDischargesFail = do
   scriptSurface rig 102 DestroyFails
   scriptSurface rig 103 DestroyFails
   controllerOf ← newTVarIO Nothing
-  _ ← runRigCaught rig $ \host _ → do
+  _ ←
+    withRunHelper
+      (pure ())
+      ( \(owner, windows) → do
+          atomically (check . null =<< hostPendingAttachments windows)
+          publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+      )
+      $ \supply → runRigCaught rig $ \host _ → do
     let owner = vulkanGraphicsOwner host
         windows = vulkanWindowHost host
     atomically (writeTVar controllerOf (Just (vulkanController host)))
@@ -1273,9 +1312,7 @@ testSeveralDischargesFail = do
     atomically (writeTVar gate True)
     -- Neither failed surface lets the instance go: independent evidence of
     -- the owner's destruction ends the exit, once no attachment is pending.
-    void . forkIO $ do
-      atomically (check . null =<< hostPendingAttachments windows)
-      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+    supply (owner, windows)
   Just controller ← atomically (readTVar controllerOf)
   report ← atomically (readVulkanTerminal controller)
   let cleanups = [reason | Just (TerminalCleanupFailed reason) ← [reportPrimary report]] <> [reason | LaterFailure (TerminalCleanupFailed reason) ← reportEvidence report]
@@ -1298,7 +1335,14 @@ testReusedHandleFails = do
   scriptSurface rig 103 (CreateReusing 102)
   scriptSurface rig 103 DestroyFails
   controllerOf ← newTVarIO Nothing
-  _ ← runRigCaught rig $ \host _ → do
+  _ ←
+    withRunHelper
+      (pure ())
+      ( \(owner, windows) → do
+          atomically (check . null =<< hostPendingAttachments windows)
+          publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+      )
+      $ \supply → runRigCaught rig $ \host _ → do
     let owner = vulkanGraphicsOwner host
         windows = vulkanWindowHost host
     atomically (writeTVar controllerOf (Just (vulkanController host)))
@@ -1317,9 +1361,7 @@ testReusedHandleFails = do
     atomically (writeTVar gate True)
     -- Neither failed surface lets the instance go: independent evidence of
     -- the owner's destruction ends the exit, once no attachment is pending.
-    void . forkIO $ do
-      atomically (check . null =<< hostPendingAttachments windows)
-      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+    supply (owner, windows)
   Just controller ← atomically (readTVar controllerOf)
   report ← atomically (readVulkanTerminal controller)
   let cleanups = [reason | Just (TerminalCleanupFailed reason) ← [reportPrimary report]] <> [reason | LaterFailure (TerminalCleanupFailed reason) ← reportEvidence report]
@@ -1333,17 +1375,17 @@ testReusedHandleFails = do
   length [() | SurfaceDestroyed 102 ← events] `shouldBe` 2
   [e | e ← events, e `elem` [MessengerDestroyed, InstanceDestroyed]] `shouldBe` []
 
--- | Publish, from another thread, the evidence the owner could not produce:
--- this attachment's facts once it is retiring, and the owner's destruction
--- once nothing else is pending. It establishes nothing about the stand-in's
--- objects, and exists only so a retaining exit can end.
-independently ∷ VulkanHost Scene → GraphicsService → IO ()
+-- | The evidence the owner could not produce, as an action for a thread the run owns ("withRunHelper": the exit it
+-- serves is still running when the body returns): this attachment's facts once it is retiring, and the owner's destruction
+-- once nothing else is pending. It establishes nothing about the stand-in's objects, and exists only so a retaining exit
+-- can end.
+independently ∷ VulkanHost Scene → GraphicsService → IO (IO ())
 independently host service = do
   let owner = vulkanGraphicsOwner host
       windows = vulkanWindowHost host
   Just publisher ← pure (hostGraphicsPublisher windows)
   Just acknowledgement ← atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-  void . forkIO $ do
+  pure $ do
     atomically (readGraphicsService service >>= check . (== SlotRetiring) . observedSlot)
     forM_ allRetirementFacts $ \fact →
       void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))

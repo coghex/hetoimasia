@@ -12,7 +12,7 @@
 -- adopted and released.
 module Test.Render.TwoD.Vulkan.Retained (spec) where
 
-import Control.Concurrent (forkIO, yield)
+import Control.Concurrent (yield)
 import Control.Monad (forM_)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import qualified Data.Map.Strict as Map
@@ -61,6 +61,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Textures (MarkPolicy (..), registeredMarks)
 import Hetoimasia.Render.TwoD.Vulkan.Window
 import Numeric.Natural (Natural)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 import Test.Render.TwoD.Vulkan.Environment
 import Test.Render.TwoD.Vulkan.StandIn
 
@@ -699,26 +700,27 @@ publishSpec = describe "publishing a snapshot that lists chunks" $ do
       done ← newTVarIO False
       failure ← newTVarIO (Nothing ∷ Maybe String)
       -- Publications run on an application thread, as they do; the release runs on the owner's.
-      _ ← forkIO $ do
-        let loop remaining = do
-              ran ← readTVarIO released
-              answer ← publish2DSnapshot (envAdapter env) 1 (windowListing [reference] [])
-              -- A publication that began after the release ran must have been refused.
-              case answer of
-                Right _ | ran → atomically (writeTVar failure (Just "a snapshot listing a released chunk was accepted after its release ran"))
-                _ → pure ()
-              if ran || remaining <= (0 ∷ Int) then atomically (writeTVar done True) else yield >> loop (remaining - 1)
-        loop 2000
-      markChunkReleased (envRetained env) reference >>= (`shouldBe` True)
-      yield
-      releaseChunkNow (builders (envRig env)) (envRetained env) reference >>= (`shouldBe` Right ())
-      atomically (writeTVar released True)
-      atomically (readTVar done >>= \finished → if finished then pure () else retry)
-      readTVarIO failure >>= (`shouldBe` Nothing)
-      -- Whatever got through before the marker, nothing lists the chunk now.
-      publish2DSnapshot (envAdapter env) 1 (windowListing [reference] []) >>= (`shouldSatisfy` either (const True) (const False))
-      view ← atomically (retainedViewSTM (envRetained env))
-      Map.member reference (viewReleased view) `shouldBe` False
+      let publisher = do
+            let loop remaining = do
+                  ran ← readTVarIO released
+                  answer ← publish2DSnapshot (envAdapter env) 1 (windowListing [reference] [])
+                  -- A publication that began after the release ran must have been refused.
+                  case answer of
+                    Right _ | ran → atomically (writeTVar failure (Just "a snapshot listing a released chunk was accepted after its release ran"))
+                    _ → pure ()
+                  if ran || remaining <= (0 ∷ Int) then atomically (writeTVar done True) else yield >> loop (remaining - 1)
+            loop 2000
+      withOwnedThread publisher $ \_ _ → do
+        markChunkReleased (envRetained env) reference >>= (`shouldBe` True)
+        yield
+        releaseChunkNow (builders (envRig env)) (envRetained env) reference >>= (`shouldBe` Right ())
+        atomically (writeTVar released True)
+        atomically (readTVar done >>= \finished → if finished then pure () else retry)
+        readTVarIO failure >>= (`shouldBe` Nothing)
+        -- Whatever got through before the marker, nothing lists the chunk now.
+        publish2DSnapshot (envAdapter env) 1 (windowListing [reference] []) >>= (`shouldSatisfy` either (const True) (const False))
+        view ← atomically (retainedViewSTM (envRetained env))
+        Map.member reference (viewReleased view) `shouldBe` False
 
   it "reads the registry as one view: a marked chunk with its flag and standing, a released one absent from all of it" $
     withChunkEnv [1] $ \env _ reference → do
