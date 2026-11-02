@@ -5,13 +5,14 @@
 -- with a gate; and a failed session is quiescent before its failure is published.
 module Test.Domains.Accounting (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId, yield)
+import Control.Concurrent (ThreadId, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
-import Control.Exception (AsyncException (ThreadKilled), SomeException, finally, fromException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), SomeException, finally, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM_, unless, void, when)
+import Data.Foldable (for_)
 import Data.ByteString (ByteString)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
 import Data.Maybe (isNothing)
 import qualified Data.Set as Set
@@ -64,7 +65,10 @@ import Hetoimasia.Scripting.Lua.Scheduled
   )
 import Hetoimasia.Scripting.Lua.Value (Schema (SInteger))
 import Test.Domains.Support
+import Test.Domains.Unowned (Ending, Scope, endings, holdUntilCancelled, hasEnded, newCleanups, ownedScope, runCleanups, runEnding, unownedScope)
 import Test.Hspec
+import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 
 evidenceOf ∷ GameSnapshot → Maybe FailureEvidence
 evidenceOf snapshot = case snapStatus snapshot of
@@ -103,6 +107,89 @@ taskEntries = [EntryPoint "task_runs" Required [] [], EntryPoint "task_fails" Re
 
 taskFunctions ∷ [Text]
 taskFunctions = ["function task_runs() fx.record('task ran') end", "function task_fails() error('task failed') end", "function task_waits() sched.wait_ticks(1000000) end"]
+
+-- | Record the thread an example's helper runs on, so the example can judge it after its scope has returned.
+noteThread ∷ IORef [ThreadId] → IO ()
+noteThread seen = myThreadId >>= \thread → atomicModifyIORef' seen (\held → (thread : held, ()))
+
+-- | Every thread the scenario noted has ended and been joined, and there was exactly this many.
+allJoined ∷ Int → IORef [ThreadId] → IO Bool
+allJoined count seen = readIORef seen >>= \threads → if length threads /= count then pure False else and <$> mapM hasEnded threads
+
+-- | The side of 'alongside', parked at a gate, with the example that owns the call ended the way the ending says.
+sideOfAlongside ∷ Ending → IO Bool
+sideOfAlongside ending = do
+  fx ← newFx
+  seen ← newIORef []
+  withReleased fx ["side"] $
+    runEnding ending $ \end → alongside (noteThread seen >> holdAt fx "side") (end (awaitEntered fx "side"))
+  allJoined 1 seen
+
+-- | The thread of 'cancelWhen' that waits for the trigger, parked at a gate, with the example ended the way the ending says.
+triggerOfCancelWhen ∷ Ending → IO Bool
+triggerOfCancelWhen ending = do
+  fx ← newFx
+  seen ← newIORef []
+  withReleased fx ["trigger"] $
+    runEnding ending $ \end → void (cancelWhen (noteThread seen >> holdAt fx "trigger") (end (awaitEntered fx "trigger")))
+  allJoined 1 seen
+
+-- | A registered thread and a spawned one, both parked, in a scope of their own that ends the way the ending says.
+childrenOfScope ∷ Ending → IO Bool
+childrenOfScope ending = do
+  fx ← newFx
+  seen ← newIORef []
+  withReleased fx ["registered", "spawned"] $
+    runEnding ending $ \end → withForks $ do
+      _ ← forkRegistered (noteThread seen >> holdAt fx "registered")
+      _ ← spawn (noteThread seen >> holdAt fx "spawned")
+      end (awaitEntered fx "registered" >> awaitEntered fx "spawned")
+  allJoined 2 seen
+
+-- | A worker started in this kind of scope and parked at a gate, with the scope ended the way the ending says: the judgement
+-- the facility makes true, and the controls' unowned start does not.
+parkedWorker ∷ Ending → Scope → IO Bool
+parkedWorker ending scope = do
+  fx ← newFx
+  seen ← newIORef []
+  -- The gate is not opened by the example: only the scope lets the worker go, which is the thing judged.
+  runEnding ending $ \end → scope (releaseGate fx "worker") (noteThread seen >> holdAt fx "worker") $ \_ _ → end (awaitEntered fx "worker")
+  allJoined 1 seen
+
+-- | A registered thread whose first step is to cancel the thread that registered it, so that the cancellation lands wherever
+-- that thread is: in the request, while it waits for the answer, or after it. The thread is registered and owned all the same.
+childCancelsItsCreator ∷ IO Bool
+childCancelsItsCreator = do
+  fx ← newFx
+  seen ← newIORef []
+  creator ← myThreadId
+  outcome ← try @AsyncException . bounded . withReleased fx ["child"] . withForks $ do
+    _ ← forkRegistered (noteThread seen >> throwTo creator UserInterrupt >> holdAt fx "child")
+    holdUntilCancelled
+  outcome `shouldBe` Left UserInterrupt
+  allJoined 1 seen
+
+-- | Two registered threads, each held in a finalizer once it is ended, and a reaper (a thread that is not registered, owned by
+-- the example) cancelled while it waits for the first of them: the other has not been reached, and is still the scope's, which
+-- ends it. Nothing is left running when the scope returns.
+reapCancelledMidway ∷ IO Bool
+reapCancelledMidway = do
+  fx ← newFx
+  seen ← newIORef []
+  let child name = noteThread seen >> holdAt fx name `finally` holdAt fx "finalizer"
+  withReleased fx ["first", "second", "finalizer"] . withForks $ do
+    _ ← forkRegistered (child "first")
+    _ ← forkRegistered (child "second")
+    awaitEntered fx "first"
+    awaitEntered fx "second"
+    withOwnedThread reapForked $ \reaper reaperEnded → do
+      -- The reaper has ended the first thread it reached, which is held in its finalizer; it is waiting for that end.
+      awaitEntered fx "finalizer"
+      killThread reaper
+      reaperEnded
+    -- The reaper was cancelled before it had ended both: let the held finalizer go, and the scope ends what is left.
+    releaseGate fx "finalizer"
+  allJoined 2 seen
 
 spec ∷ Spec
 spec = describe "the owner's accounting, and what the sample's own bookkeeping survives" $ do
@@ -313,14 +400,14 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
       withReleased fx ["child body", "child finalizer"] $ do
         _ ← forkRegistered (holdAt fx "child body" `finally` (holdAt fx "child finalizer" >> writeIORef finalized True))
         awaitEntered fx "child body"
-        -- Reaped from a thread that is not itself registered.
-        _ ← forkIO (reapForked >> putMVar reaped ())
-        awaitEntered fx "child finalizer"
-        replicateM_ 2000 yield
-        tryReadMVar reaped >>= (`shouldSatisfy` isNothing)
-        releaseGate fx "child finalizer"
-        generous (readMVar reaped)
-        readIORef finalized `shouldReturn` True
+        -- Reaped from a thread that is not itself registered, and is owned by the example (#600).
+        withOwnedThread (reapForked >> putMVar reaped ()) $ \_ _ → do
+          awaitEntered fx "child finalizer"
+          replicateM_ 2000 yield
+          tryReadMVar reaped >>= (`shouldSatisfy` isNothing)
+          releaseGate fx "child finalizer"
+          generous (readMVar reaped)
+          readIORef finalized `shouldReturn` True
     it "raise the failure of a trigger that fails, in place of a cancellation it never reached" $ do
       fx ← newFx
       raised ← try @SomeException (cancelWhen (throwIO (userError "the trigger failed")) (holdAt fx "action"))
@@ -336,6 +423,25 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
       raised `shouldSatisfy` \case Left failure → show failure == show (userError "the action failed"); Right _ → False
       releaseGate fx "trigger"
       replicateM_ 2000 yield
+
+  describe "the threads the helpers start are owned (#600)" $ do
+    for_ endings $ \(label, ending) → do
+      it ("the side of 'alongside' has ended and been joined when it returns because " <> label) $
+        sideOfAlongside ending >>= (`shouldBe` True)
+      it ("the thread that waits for the trigger of 'cancelWhen' has ended and been joined when it returns because " <> label) $
+        triggerOfCancelWhen ending >>= (`shouldBe` True)
+      it ("a registered thread and a spawned one have ended and been joined when their scope returns because " <> label) $
+        childrenOfScope ending >>= (`shouldBe` True)
+      it ("negative control: an unowned worker is left parked when its scope returns because " <> label) $ do
+        cleanups ← newCleanups
+        -- The judgement is recorded first; only then does anything independent stop and join what the control left.
+        (parkedWorker ending (unownedScope cleanups) >>= (`shouldBe` False)) `finally` runCleanups cleanups
+      it ("the same worker, started by the facility, has ended and been joined when its scope returns because " <> label) $
+        parkedWorker ending ownedScope >>= (`shouldBe` True)
+    it "a thread that cancels its creator as its first step is registered and owned wherever the cancellation lands" $
+      childCancelsItsCreator >>= (`shouldBe` True)
+    it "a cancellation that arrives while the threads are being reaped leaves the ones not yet reached owned by the scope" $
+      reapCancelledMidway >>= (`shouldBe` True)
 
   describe "a failure belongs to the tick whose accounting cutoff covers it, or to the first tick not yet committed (D-48)" $ do
     let functionsHere =

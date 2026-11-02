@@ -4,10 +4,16 @@
 -- loop) or, when no loop can be served any more, by the application's own protected exit (the example's 'exited').
 -- No example sleeps; the ones that interrupt a thread wait until the runtime reports it blocked where the
 -- interruption must land.
+--
+-- Every helper thread an example starts is owned by it (#600): the caller of the production scope, the sender that
+-- interrupts it and the writers that queue in a held sink have ended and been joined when the example's scope returns,
+-- whether it returned, failed or was cancelled. A sender supplies what its caller's wait needs, so its scope encloses the
+-- caller's. What the caller holds the production session at is opened by the scope ('withOwnedThreadOpening'), so a
+-- caller ended early does not leave the session running.
 module Test.Engine.Run.Serve (spec) where
 
-import Control.Concurrent (forkIO, myThreadId, throwTo, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (ThreadId, throwTo, yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -22,6 +28,7 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Monad (unless, void, when)
+import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import GHC.Conc (BlockReason (BlockedOnException, BlockedOnMVar, BlockedOnSTM))
@@ -32,8 +39,10 @@ import Hetoimasia.Run.Serve (Owner (..), drainAttempts, joinFailure, runOwned, s
 import Hetoimasia.Run.Session (awaitDiagnostics, newSessionLinkEndingWith)
 import Hetoimasia.Runtime.Logging (failedReportsInContext, lifetimeLogger, withLoggingLifetime)
 import Test.Engine.Run.Support (blockedFor, silentLogger)
+import Test.Engine.Unowned (Cleanups, Ending, Scope, cleanupLater, endings, hasEnded, newCleanups, ownedScope, runCleanups, runEnding, unownedScope)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 -- | What the fake owner has served.
 data Fake = Fake
@@ -84,6 +93,17 @@ failureText (ExceptionWithContext _ failure) = show failure
 run ∷ Fake → Owner → IO () → IO a → IO a
 run _ owner stopSession session =
   withLoggingLifetime silentLogger $ \lifetime → serveSpawned lifetime owner (\_ → pure ()) stopSession quiet session
+
+-- | A caller that runs the action, and a sender that interrupts it with a cancellation once it is armed, both in scopes of the
+-- given kind (#600). The sender supplies what the caller's wait needs (the blocked sending it waits for), so its scope
+-- encloses the caller's: on the way out the caller is ended first and the sender, which it may still be waiting for, after.
+-- The first action is what the caller must be let go of before it can end, run in the caller's release before it is killed.
+-- The body is given the caller and the sender.
+withInterruptedCaller ∷ Scope → IO () → MVar () → IO () → (ThreadId → ThreadId → IO ()) → IO ()
+withInterruptedCaller scope open armed caller body = do
+  callerVar ← newEmptyMVar
+  scope (pure ()) (readMVar callerVar >>= \me → takeMVar armed >> throwTo me UserInterrupt) $ \sender _ →
+    scope open caller $ \me _ → putMVar callerVar me >> body me sender
 
 spec ∷ Spec
 spec = describe "Serve" $ do
@@ -149,7 +169,6 @@ spec = describe "Serve" $ do
     stopped ← newTVarIO False
     armed ← newEmptyMVar
     result ← newEmptyMVar
-    caller ← newEmptyMVar
     thrower ← newEmptyMVar
     let stop = atomically (writeTVar stopped True)
         -- A session that ends only when it is told to stop.
@@ -163,19 +182,27 @@ spec = describe "Serve" $ do
           sender ← takeMVar thrower
           putMVar armed ()
           blockedFor BlockedOnException sender
-    _ ← forkIO $ do
-      myThreadId >>= putMVar caller
-      outcome ← tryWithContext @SomeException $ withLoggingLifetime silentLogger $ \lifetime →
-        serveSpawned lifetime (ownerWith fake Nothing quiet) queued stop quiet session
-      putMVar result outcome
-    me ← takeMVar caller
-    sender ← forkIO (takeMVar armed >> throwTo me UserInterrupt)
-    putMVar thrower sender
-    bounded (takeMVar result) >>= \case
-      Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
-      Right _ → expectationFailure "the cancellation was lost"
-    -- The session was told to stop, and has ended: nothing outlives the call.
-    readTVarIO stopped >>= (`shouldBe` True)
+        caller = do
+          outcome ← tryWithContext @SomeException $ withLoggingLifetime silentLogger $ \lifetime →
+            serveSpawned lifetime (ownerWith fake Nothing quiet) queued stop quiet session
+          putMVar result outcome
+    withInterruptedCaller ownedScope stop armed caller $ \_ sender → do
+      putMVar thrower sender
+      bounded (takeMVar result) >>= \case
+        Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+        Right _ → expectationFailure "the cancellation was lost"
+      -- The session was told to stop, and has ended: nothing outlives the call.
+      readTVarIO stopped >>= (`shouldBe` True)
+
+  describe "a caller parked in the queued callback before it is armed, with its sender, is owned (#600)" $
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined, with its sender and the production session, when the scope returns because " <> label) $ do
+        cleanups ← newCleanups
+        callerBeforeArmed ending cleanups ownedScope >>= (`shouldBe` True)
+      it ("negative control: an unowned caller and sender are left parked when the scope returns because " <> label) $ do
+        cleanups ← newCleanups
+        -- The judgement is recorded first; only then does anything independent stop the session and end what was left.
+        (callerBeforeArmed ending cleanups (unownedScope cleanups) >>= (`shouldBe` False)) `finally` runCleanups cleanups
 
   it "joins the session, keeping its failure beside the cancellation, when a cancellation is already queued as the application's failure is caught" $ do
     fake ← newFake
@@ -183,7 +210,6 @@ spec = describe "Serve" $ do
     stops ← newIORef (0 ∷ Int)
     thrower ← newEmptyMVar
     armed ← newEmptyMVar
-    caller ← newEmptyMVar
     result ← newEmptyMVar
     let stop = atomicModifyIORef' stops (\n → (n + 1, ()))
         owner = ownerWith fake (Just "the owner loop failed") (ioError (userError "the drain failed too"))
@@ -199,21 +225,20 @@ spec = describe "Serve" $ do
               blockedFor BlockedOnException sender
               atomically (writeTVar (fakeExited fake) True)
               throwIO (failure ∷ SomeException)
-    _ ← forkIO $ do
-      myThreadId >>= putMVar caller
-      outcome ← tryWithContext @SomeException (runOwned slot stop application)
-      putMVar result outcome
-    me ← takeMVar caller
-    sender ← forkIO (takeMVar armed >> throwTo me UserInterrupt)
-    putMVar thrower sender
-    bounded (takeMVar result) >>= \case
-      Left (ExceptionWithContext context failure) → do
-        (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
-        let kept = map displayCleanupFailure (cleanupFailuresInContext context)
-        kept `shouldSatisfy` any ("the owner loop failed" `isInfixOf`)
-        kept `shouldSatisfy` any ("session settled against the exit" `isInfixOf`)
-      Right _ → expectationFailure "the cancellation was lost"
-    readIORef stops >>= (`shouldSatisfy` (>= 1))
+        caller = do
+          outcome ← tryWithContext @SomeException (runOwned slot stop application)
+          putMVar result outcome
+    -- The session is ended by the application's exit, which a caller ended early never reaches: the scope makes it.
+    withInterruptedCaller ownedScope (atomically (writeTVar (fakeExited fake) True)) armed caller $ \_ sender → do
+      putMVar thrower sender
+      bounded (takeMVar result) >>= \case
+        Left (ExceptionWithContext context failure) → do
+          (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+          let kept = map displayCleanupFailure (cleanupFailuresInContext context)
+          kept `shouldSatisfy` any ("the owner loop failed" `isInfixOf`)
+          kept `shouldSatisfy` any ("session settled against the exit" `isInfixOf`)
+        Right _ → expectationFailure "the cancellation was lost"
+      readIORef stops >>= (`shouldSatisfy` (>= 1))
 
   it "records a failed diagnostic write on the lifetime, writes nothing more through that path and flushes nothing, however long the drain keeps failing" $ do
     fake ← newFake
@@ -246,52 +271,48 @@ spec = describe "Serve" $ do
     order ← newIORef ([] ∷ [String])
     started ← newEmptyMVar
     gate ← newEmptyMVar
-    caller ← newEmptyMVar
     result ← newEmptyMVar
     let note line = atomicModifyIORef' order (\l → (l <> [line], ()))
         gated = ownerWith fake (Just "the owner loop failed") (putMVar started () >> takeMVar gate)
         session = (afterRetirement fake >> ioError (userError "session cleanup failed")) `finally` note "session settled"
-    _ ← forkIO $ do
-      myThreadId >>= putMVar caller
-      outcome ← tryWithContext @SomeException (run fake gated quiet session) `finally` note "serve left"
-      putMVar result outcome
-    me ← takeMVar caller
-    takeMVar started
-    -- The drain is parked on its gate: interrupt the caller there, then let the drain go.
-    blockedFor BlockedOnMVar me
-    throwTo me UserInterrupt
-    putMVar gate ()
-    noted order 2 >>= (`shouldBe` ["session settled", "serve left"])
-    bounded (takeMVar result) >>= \case
-      Left (ExceptionWithContext context failure) → do
-        (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
-        let kept = map displayCleanupFailure (cleanupFailuresInContext context)
-        kept `shouldSatisfy` any ("the owner loop failed" `isInfixOf`)
-        kept `shouldSatisfy` any ("session cleanup failed" `isInfixOf`)
-      Right _ → expectationFailure "the cancellation was lost"
+        caller = do
+          outcome ← tryWithContext @SomeException (run fake gated quiet session) `finally` note "serve left"
+          putMVar result outcome
+    -- The drain is parked on its gate, which only the example fills; the scope fills it too, idempotently, on any other way out.
+    withOwnedThreadOpening (void (tryPutMVar gate ())) caller $ \me _ → do
+      takeMVar started
+      -- The drain is parked on its gate: interrupt the caller there, then let the drain go.
+      blockedFor BlockedOnMVar me
+      throwTo me UserInterrupt
+      putMVar gate ()
+      noted order 2 >>= (`shouldBe` ["session settled", "serve left"])
+      bounded (takeMVar result) >>= \case
+        Left (ExceptionWithContext context failure) → do
+          (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+          let kept = map displayCleanupFailure (cleanupFailuresInContext context)
+          kept `shouldSatisfy` any ("the owner loop failed" `isInfixOf`)
+          kept `shouldSatisfy` any ("session cleanup failed" `isInfixOf`)
+        Right _ → expectationFailure "the cancellation was lost"
 
   it "joins the session's diagnostics writer before the logger is released, and a cancellation meanwhile waits for it" $ do
     ended ← newTVarIO False
     link ← newSessionLinkEndingWith (readTVar ended)
     order ← newIORef ([] ∷ [String])
-    caller ← newEmptyMVar
     let note line = atomicModifyIORef' order (\l → (l <> [line], ()))
-    _ ← forkIO $ do
-      myThreadId >>= putMVar caller
-      void (tryWithContext @SomeException (awaitDiagnostics link)) `finally` note "join returned"
-    me ← takeMVar caller
-    blockedFor BlockedOnSTM me
-    throwTo me UserInterrupt
-    note "writer ended"
-    atomically (writeTVar ended True)
-    noted order 2 >>= (`shouldBe` ["writer ended", "join returned"])
+        caller = void (tryWithContext @SomeException (awaitDiagnostics link)) `finally` note "join returned"
+    -- The join waits for the writer to end, which only the example lets it; the scope lets it too on any other way out.
+    withOwnedThreadOpening (atomically (writeTVar ended True)) caller $ \me _ → do
+      blockedFor BlockedOnSTM me
+      throwTo me UserInterrupt
+      note "writer ended"
+      atomically (writeTVar ended True)
+      noted order 2 >>= (`shouldBe` ["writer ended", "join returned"])
 
   it "records a sink's refusal even when a cancellation is queued while the sink throws, so nothing is written or flushed through it afterwards" $ do
     calls ← newTVarIO (0 ∷ Int)
     flushes ← newTVarIO (0 ∷ Int)
     thrower ← newEmptyMVar
     armed ← newEmptyMVar
-    caller ← newEmptyMVar
     result ← newEmptyMVar
     let component = unsafeComponent "run.test"
         write _ = do
@@ -304,65 +325,56 @@ spec = describe "Serve" $ do
             blockedFor BlockedOnException sender
             ioError (userError "the diagnostic sink broke")
         sink = callbackSinkWith write (atomically (modifyTVar' flushes (+ 1)))
-    _ ← forkIO $ do
-      myThreadId >>= putMVar caller
-      void . tryWithContext @SomeException . withRecordingLifetime defaultLogFilter sink $ \lifetime → mask $ \restore → do
-        _ ← tryWithContext @SomeException (restore (logInfo (lifetimeLogger lifetime) component "one" []))
-        recorded ← pathFailed lifetime
-        -- Another report through the same lifetime, as an enclosing boundary would make.
-        _ ← tryWithContext @SomeException (logInfo (lifetimeLogger lifetime) component "two" [])
-        -- Take the queued cancellation here, so the lifetime ends normally and its own finalization is observed.
-        _ ← tryWithContext @SomeException (restore (pure ()))
-        putMVar result recorded
-    me ← takeMVar caller
-    sender ← forkIO (takeMVar armed >> throwTo me UserInterrupt)
-    putMVar thrower sender
-    bounded (takeMVar result) >>= (`shouldBe` True)
-    readTVarIO calls >>= (`shouldBe` 1)
-    readTVarIO flushes >>= (`shouldBe` 0)
+        caller =
+          void . tryWithContext @SomeException . withRecordingLifetime defaultLogFilter sink $ \lifetime → mask $ \restore → do
+            _ ← tryWithContext @SomeException (restore (logInfo (lifetimeLogger lifetime) component "one" []))
+            recorded ← pathFailed lifetime
+            -- Another report through the same lifetime, as an enclosing boundary would make.
+            _ ← tryWithContext @SomeException (logInfo (lifetimeLogger lifetime) component "two" [])
+            -- Take the queued cancellation here, so the lifetime ends normally and its own finalization is observed.
+            _ ← tryWithContext @SomeException (restore (pure ()))
+            putMVar result recorded
+    withInterruptedCaller ownedScope (pure ()) armed caller $ \_ sender → do
+      putMVar thrower sender
+      bounded (takeMVar result) >>= (`shouldBe` True)
+      readTVarIO calls >>= (`shouldBe` 1)
+      readTVarIO flushes >>= (`shouldBe` 0)
 
   it "hands the outcome of a job to its waiter even when a cancellation is queued as the job fails, and lets the cancellation go on" $ do
     answer ← newEmptyMVar
     thrower ← newEmptyMVar
     armed ← newEmptyMVar
-    caller ← newEmptyMVar
     result ← newEmptyMVar
     let job = mask_ $ do
           sender ← takeMVar thrower
           putMVar armed ()
           blockedFor BlockedOnException sender
           ioError (userError "the job failed") ∷ IO ()
-    _ ← forkIO $ do
-      myThreadId >>= putMVar caller
-      putMVar result =<< tryWithContext @SomeException (answering answer job)
-    me ← takeMVar caller
-    sender ← forkIO (takeMVar armed >> throwTo me UserInterrupt)
-    putMVar thrower sender
-    -- The waiter has its answer, and it is the job's own failure: it is not left waiting.
-    bounded (takeMVar answer) >>= \case
-      Left failure → show failure `shouldBe` "user error (the job failed)"
-      Right () → expectationFailure "the job's failure was lost"
-    -- And the cancellation that was queued against the runner was not swallowed.
-    bounded (takeMVar result) >>= \case
-      Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
-      Right () → expectationFailure "the cancellation was swallowed"
+        caller = putMVar result =<< tryWithContext @SomeException (answering answer job)
+    withInterruptedCaller ownedScope (pure ()) armed caller $ \_ sender → do
+      putMVar thrower sender
+      -- The waiter has its answer, and it is the job's own failure: it is not left waiting.
+      bounded (takeMVar answer) >>= \case
+        Left failure → show failure `shouldBe` "user error (the job failed)"
+        Right () → expectationFailure "the job's failure was lost"
+      -- And the cancellation that was queued against the runner was not swallowed.
+      bounded (takeMVar result) >>= \case
+        Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+        Right () → expectationFailure "the cancellation was swallowed"
 
   it "ignores a failure to write a best-effort line but lets a cancellation go on" $ do
     bestEffort (ioError (userError "the line could not be written"))
     gate ← newEmptyMVar
-    caller ← newEmptyMVar
     started ← newEmptyMVar
     result ← newEmptyMVar
-    _ ← forkIO $ do
-      myThreadId >>= putMVar caller
-      putMVar result =<< tryWithContext @SomeException (bestEffort (putMVar started () >> takeMVar gate))
-    me ← takeMVar caller
-    takeMVar started
-    blockedFor BlockedOnMVar me
-    throwTo me UserInterrupt
-    bounded (takeMVar result) >>= \case
-      Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
-      Right () → expectationFailure "the cancellation was swallowed"
+    -- Held at a take the scope's kill interrupts, so nothing has to be opened for it.
+    withOwnedThreadOpening (pure ()) (putMVar result =<< tryWithContext @SomeException (bestEffort (putMVar started () >> takeMVar gate))) $ \me _ → do
+      takeMVar started
+      blockedFor BlockedOnMVar me
+      throwTo me UserInterrupt
+      bounded (takeMVar result) >>= \case
+        Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+        Right () → expectationFailure "the cancellation was swallowed"
 
   it "refuses a writer that queued behind a failing write without touching the sink or flushing it" $ do
     calls ← newTVarIO (0 ∷ Int)
@@ -382,18 +394,55 @@ spec = describe "Serve" $ do
         sink = callbackSinkWith write (atomically (modifyTVar' flushes (+ 1)))
     recorded ← withRecordingLifetime defaultLogFilter sink $ \lifetime → do
       let say name = tryWithContext @SomeException (logInfo (lifetimeLogger lifetime) component name [])
-      writerA ← forkIO (say "a" >>= putMVar doneA)
-      takeMVar inside
-      -- A second writer arrives while the first is inside the sink: it must wait its turn, not pass the check.
-      writerB ← forkIO (say "b" >>= putMVar doneB)
-      blockedFor BlockedOnMVar writerB
-      putMVar release ()
-      void (bounded (takeMVar doneA))
-      refused ← bounded (takeMVar doneB)
-      -- It found the path failed when its turn came: refused, without a call.
-      either (const (pure ())) (const (expectationFailure "the queued writer's write was accepted")) refused
-      _ ← pure writerA
+      -- The writers are inside the lifetime and end before it is released. The first is held in the sink until the example
+      -- releases it, so the scope releases it too (idempotently) before it kills and joins; the second waits its turn behind
+      -- the first, and is ended first on the way out.
+      withOwnedThreadOpening (void (tryPutMVar release ())) (say "a" >>= putMVar doneA) $ \_ _ → do
+        takeMVar inside
+        -- A second writer arrives while the first is inside the sink: it must wait its turn, not pass the check.
+        withOwnedThreadOpening (pure ()) (say "b" >>= putMVar doneB) $ \writerB _ → do
+          blockedFor BlockedOnMVar writerB
+          putMVar release ()
+          void (bounded (takeMVar doneA))
+          refused ← bounded (takeMVar doneB)
+          -- It found the path failed when its turn came: refused, without a call.
+          either (const (pure ())) (const (expectationFailure "the queued writer's write was accepted")) refused
       pathFailed lifetime
     recorded `shouldBe` True
     readTVarIO calls >>= (`shouldBe` 1)
     readTVarIO flushes >>= (`shouldBe` 0)
+
+-- | A caller of the production scope parked in the queued callback before it is armed, with its sender, its scope ended the
+-- way the ending says (#600): whether, when the scope has returned, the caller, the sender and the production session the
+-- caller had started have all ended. Nothing is handed to the caller, so it is parked at the take that hands it its
+-- sender; the production session is the thing the caller's callback leaves running if the caller is ended there, because
+-- the loop's failure handling is never entered, so the scope stops it through its opening.
+callerBeforeArmed ∷ Ending → Cleanups → Scope → IO Bool
+callerBeforeArmed ending cleanups scope = do
+  fake ← newFake
+  stopped ← newTVarIO False
+  armed ← newEmptyMVar
+  thrower ← newEmptyMVar
+  result ← newEmptyMVar
+  sessionEnded ← newEmptyMVar
+  seen ← newIORef []
+  let stop = atomically (writeTVar stopped True)
+      session = atomically (readTVar stopped >>= check) `finally` void (tryPutMVar sessionEnded ())
+      queued _ = do
+        sender ← takeMVar thrower
+        putMVar armed ()
+        blockedFor BlockedOnException sender
+      caller = do
+        outcome ← tryWithContext @SomeException $ withLoggingLifetime silentLogger $ \lifetime →
+          serveSpawned lifetime (ownerWith fake Nothing quiet) queued stop quiet session
+        putMVar result outcome
+  -- A control that left the caller parked also leaves the session running; its end is awaited last, once it is stopped.
+  cleanupLater cleanups (bounded (readMVar sessionEnded))
+  runEnding ending $ \end →
+    withInterruptedCaller scope stop armed caller $ \me sender → do
+      writeIORef seen [me, sender]
+      end (blockedFor BlockedOnMVar me)
+  threads ← readIORef seen
+  ended ← and <$> mapM hasEnded threads
+  -- The session is a thread of the production scope, not of this example's, so its end is the production scope's to announce.
+  if ended then bounded (readMVar sessionEnded) >> pure True else pure False

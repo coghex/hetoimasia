@@ -42,6 +42,7 @@ module Test.Domains.Support
   , waitFor
   , generous
   , spawn
+  , withForks
   , forkRegistered
   , reapForked
   , awaitForkedEnded
@@ -62,9 +63,9 @@ module Test.Domains.Support
   , TriggerFailed (..)
   ) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId, throwTo)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, tryReadMVar, withMVar)
-import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, catch, evaluate, finally, fromException, mask, onException, throwIO, try)
+import Control.Concurrent (ThreadId, killThread, myThreadId, throwTo)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar, withMVar)
+import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, bracket, catch, evaluate, finally, fromException, mask, mask_, throwIO, try)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
@@ -116,6 +117,7 @@ import System.Process (getCurrentPid)
 import System.Timeout (timeout)
 import Test.Hspec (shouldBe)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 
 -- | A real supervision boundary over a real worker group. Diagnostics go to stderr, as they do
 -- in the executable.
@@ -359,13 +361,82 @@ committedTick domains = snapTick . fst <$> snapshotNow domains
 waitFor ∷ STM a → IO a
 waitFor = bounded . atomically
 
+-- | The threads an example forks with 'spawn' and 'forkRegistered' (#600).
+--
+-- State owner: 'withForks', which is the scope of one example (the suite runs every example in one). Readers/writers: the
+-- example's own threads ('spawn', 'forkRegistered', 'reapForked', 'awaitForkedEnded') and the supervisor thread, which is the
+-- only one that starts a child. Thread: the supervisor, one per scope, owned by the facility; each child is a thread that the
+-- supervisor owns in turn, through the facility, in a scope nested inside the supervisor's. Lifetime: the example's. Reset and
+-- disposal: when the scope ends, however it ends, the supervisor is killed and its nested scopes release in turn, each
+-- killing its child and joining it, uninterruptibly; 'reapForked' ends the children earlier, and a child leaves the registry
+-- only once it has ended and its failure has been looked at, so a cancellation that arrives while the children are being
+-- reaped leaves the rest registered and owned by the supervisor's scope.
+--
+-- The supervisor exists because a registered thread's scope is the whole example, not one of its calls: 'spawn' returns at
+-- once and the thread must outlive it. A child is therefore started by the supervisor inside a facility scope that stays open
+-- for as long as the supervisor loops, and the start and the registration are one step of that scope's body.
+data Forks = Forks
+  { forksRequests ∷ !(MVar ForkRequest)
+  , forksChildren ∷ !(IORef [Registered])
+  -- ^ Newest first.
+  }
+
+-- | A child to start, the look at its failure that 'reapForked' makes, and where to answer.
+data ForkRequest = ForkRequest (IO ()) (IO ()) (MVar Registered)
+
+-- | A started child: its thread, the wait for its end (every handler and finalizer inside it done, which is what makes it
+-- over, and not the delivery of the exception that ends it) and the look at its failure.
+data Registered = Registered
+  { registeredThread ∷ !ThreadId
+  , registeredEnded ∷ !(IO ())
+  , registeredUnseen ∷ !(IO ())
+  }
+
+-- | The scope in force, if any: set by 'withForks' for the length of its body.
+currentForks ∷ IORef (Maybe Forks)
+currentForks = unsafePerformIO (newIORef Nothing)
+{-# NOINLINE currentForks #-}
+
+-- | Run an example so that every thread it forks with 'spawn' or 'forkRegistered' has ended, and been joined, when it
+-- returns, however it ends: the children are cancelled and joined (handlers and finalizers done), then the failure of any
+-- that failed without being collected is raised, as 'reapForked' does, and then the scope is released. A scope inside a
+-- scope hides it for its length and restores it after.
+withForks ∷ IO a → IO a
+withForks body = do
+  requests ← newEmptyMVar
+  children ← newIORef []
+  let forks = Forks requests children
+  withOwnedThread (supervise forks) $ \_ _ →
+    bracket (atomicModifyIORef' currentForks (\previous → (Just forks, previous))) (writeIORef currentForks) $ \_ →
+      body `finally` reapIn forks
+
+-- | The supervisor's loop: take a request, start the child in a scope of the facility, register it in that scope's body and
+-- answer, then go on inside the scope, so that it stays open. The loop waits at an interruptible take, which is where the
+-- kill of the scope's release reaches it.
+supervise ∷ Forks → IO ()
+supervise forks = mask_ $ do
+  ForkRequest action unseen reply ← takeMVar (forksRequests forks)
+  withOwnedThread action $ \thread ended → do
+    let child = Registered thread ended unseen
+    atomicModifyIORef' (forksChildren forks) (\held → (child : held, ()))
+    putMVar reply child
+    supervise forks
+
+-- | Start a child in the scope in force: the answer is its registration. A cancellation that arrives while the request is
+-- being made or answered has not abandoned the child: the supervisor starts and registers it all the same.
+startChild ∷ IO () → IO () → IO Registered
+startChild action unseen = do
+  forks ← readIORef currentForks >>= maybe (throwIO (userError "a thread was forked outside withForks")) pure
+  reply ← newEmptyMVar
+  putMVar (forksRequests forks) (ForkRequest action unseen reply)
+  readMVar reply
+
 -- | Run an action on a thread of its own and answer how to collect its result, bounded: the
 -- result, or the exception it raised.
 spawn ∷ IO a → IO (IO a)
 spawn action = do
   result ← newEmptyMVar
   collected ← newIORef False
-  thread ← forkTerminating $ \unmask → try (unmask action) >>= putMVar result
   -- A thread that failed and was never collected is the example's failure, raised when it is over: nothing an example
   -- spawns can fail unseen. (Its own cancellation, when the example is over, is not a failure.)
   let unseen = do
@@ -374,52 +445,42 @@ spawn action = do
         case failed of
           Just (Left failure) | not seen, fromException failure /= Just ThreadKilled → throwIO (failure ∷ SomeException)
           _ → pure ()
-  atomicModifyIORef' forkedThreads (\held → ((thread, unseen) : held, ()))
+  _ ← startChild (try action >>= putMVar result) unseen
   pure (writeIORef collected True >> bounded (readMVar result >>= either (\failure → throwIO (failure ∷ SomeException)) pure))
-
--- | A thread, and the signal that it has terminated: every handler and finalizer inside it done, which is what makes it
--- over, and not the delivery of the exception that ends it.
-type Child = (ThreadId, MVar ())
-
--- | Fork a thread, handed the means to unmask, that signals its termination once the body, with whatever handlers and
--- finalizers it runs, has ended however it ended.
-forkTerminating ∷ ((∀ x. IO x → IO x) → IO ()) → IO Child
-forkTerminating body = do
-  done ← newEmptyMVar
-  thread ← forkIOWithUnmask $ \unmask → body unmask `finally` putMVar done ()
-  pure (thread, done)
-
--- | Cancel a child and wait for its termination: its handlers and finalizers are done when this returns, however long
--- they take, bounded by the examples' guard, which fails loudly where a finalizer never ends.
-cancelAndJoin ∷ Child → IO ()
-cancelAndJoin (thread, done) = killThread thread >> bounded (readMVar done)
-
--- | The threads an example forked and has not seen end: 'reapForked' cancels what is left of them when the example is over.
-forkedThreads ∷ IORef [(Child, IO ())]
-forkedThreads = unsafePerformIO (newIORef [])
-{-# NOINLINE forkedThreads #-}
 
 -- | Fork a thread of an example's own, registered so that however the example ends, the thread does not outlive it.
 forkRegistered ∷ IO () → IO ThreadId
-forkRegistered action = do
-  child ← forkTerminating (\unmask → unmask action)
-  atomicModifyIORef' forkedThreads (\held → ((child, pure ()) : held, ()))
-  pure (fst child)
+forkRegistered action = registeredThread <$> startChild action (pure ())
 
 -- | Wait until every thread an example forked has ended of itself: for an example whose threads are known to end.
 awaitForkedEnded ∷ IO ()
-awaitForkedEnded = do
-  threads ← readIORef forkedThreads
-  mapM_ (\((_, done), _) → bounded (readMVar done)) threads
+awaitForkedEnded = readIORef currentForks >>= maybe (pure ()) (\forks → readIORef (forksChildren forks) >>= mapM_ (bounded . registeredEnded))
 
 -- | Cancel every thread an example forked that is still running, each having terminated, handlers and finalizers done,
 -- before this returns, and raise the failure of any that failed without being collected. It runs after every example,
--- whatever the example's outcome.
+-- whatever the example's outcome, as part of 'withForks'.
+--
+-- A child leaves the registry only once it has ended and its failure has been looked at, one at a time, so a cancellation
+-- that arrives while the children are being ended leaves the ones not yet reached registered, and still owned by the
+-- scope, which ends them when it is released.
 reapForked ∷ IO ()
-reapForked = do
-  threads ← atomicModifyIORef' forkedThreads (\held → ([], held))
-  mapM_ (cancelAndJoin . fst) threads
-  mapM_ snd (reverse threads)
+reapForked = readIORef currentForks >>= maybe (pure ()) reapIn
+
+reapIn ∷ Forks → IO ()
+reapIn forks = do
+  readIORef (forksChildren forks) >>= mapM_ end
+  consult
+  where
+    end child = killThread (registeredThread child) >> bounded (registeredEnded child)
+    -- Oldest first, as the failures have always been reported. A child that has not ended yet (one forked meanwhile by
+    -- another thread) is ended first.
+    consult = do
+      oldest ← atomicModifyIORef' (forksChildren forks) $ \held → case reverse held of
+        [] → (held, Nothing)
+        child : rest → (reverse rest, Just child)
+      case oldest of
+        Nothing → pure ()
+        Just child → end child >> registeredUnseen child >> consult
 
 -- | Run a body, and open these gates however it ends, so a segment an example held never keeps
 -- the owner, and with it the session's retirement, waiting.
@@ -547,27 +608,30 @@ alongside side main = mask $ \restore → do
   me ← myThreadId
   open ← newMVar True
   sideResult ← newEmptyMVar
-  child@(_, sideDone) ← forkTerminating $ \unmask → do
-    outcome ← try @SomeException (unmask side)
-    case outcome of
-      Left failure → withMVar open (\delivering → when delivering (throwTo me (SideFailed failure))) `finally` putMVar sideResult (Left failure)
-      Right () → putMVar sideResult (Right ())
-  result ← try @SomeException (restore main)
-  -- The side may no longer interrupt this thread; one that is delivering a failure finishes first, and the delivery that
-  -- reaches this thread while it waits is the side's own failure, which is reported below.
-  let close = modifyMVar_ open (\_ → pure False) `catch` \(SideFailed _) → close
-  close
-  case result of
-    Right value → do
-      outcome ← restore (bounded (readMVar sideResult)) `onException` cancelAndJoin child
-      -- The side has ended, and its termination is waited for all the same.
-      restore (bounded (readMVar sideDone)) `onException` cancelAndJoin child
-      either (\failure → throwIO (failure ∷ SomeException)) (const (pure value)) outcome
-    Left raised → do
-      cancelAndJoin child
-      case fromException raised of
-        Just (SideFailed failure) → throwIO failure
-        Nothing → throwIO raised
+  let sideAction = do
+        outcome ← try @SomeException side
+        case outcome of
+          Left failure → withMVar open (\delivering → when delivering (throwTo me (SideFailed failure))) `finally` putMVar sideResult (Left failure)
+          Right () → putMVar sideResult (Right ())
+  -- The side is an owned thread (#600), started and registered in one masked step; the body keeps this call's mask, so the
+  -- side's failure can only reach this thread while it is running 'main' or waiting at one of the interruptible points below.
+  withOwnedThread sideAction $ \_ sideDone → do
+    result ← try @SomeException (restore main)
+    -- The side may no longer interrupt this thread; one that is delivering a failure finishes first, and the delivery that
+    -- reaches this thread while it waits is the side's own failure, which is reported below.
+    let close = modifyMVar_ open (\_ → pure False) `catch` \(SideFailed _) → close
+    close
+    case result of
+      Right value → do
+        outcome ← restore (bounded (readMVar sideResult))
+        -- The side has ended, and its termination is waited for all the same.
+        restore (bounded sideDone)
+        either (\failure → throwIO (failure ∷ SomeException)) (const (pure value)) outcome
+      Left raised ->
+        -- Leaving the scope cancels the side and joins it, handlers and finalizers done, before the failure is raised.
+        case fromException raised of
+          Just (SideFailed failure) → throwIO failure
+          Nothing → throwIO raised
 
 -- | What the side of 'alongside' raised, delivered to the other.
 newtype SideFailed = SideFailed SomeException
@@ -600,28 +664,32 @@ cancelWhen trigger action = mask $ \restore → do
   me ← myThreadId
   armed ← newMVar True
   triggerFailure ← newEmptyMVar
-  canceller ← forkTerminating $ \unmask → do
-    reached ← try @SomeException (unmask trigger)
-    case reached of
-      -- This thread's own cancellation, when the call is over, is not the trigger's failure.
-      Left failure | Just ThreadKilled ← fromException failure → pure ()
-      Left failure → void (tryPutMVar triggerFailure failure) >> withMVar armed (\on → when on (throwTo me (TriggerFailed failure)))
-      Right () → withMVar armed (\on → when on (throwTo me Cancelled))
-  outcome ← try @SomeException (restore action)
-  let disarm = modifyMVar_ armed (\_ → pure False) `catch` \raised → case fromException raised of
-        Just Cancelled → disarm
-        Nothing → case fromException raised of
-          Just (TriggerFailed _) → disarm
-          Nothing → throwIO (raised ∷ SomeException)
-  disarm
-  cancelAndJoin canceller
-  failedTrigger ← tryReadMVar triggerFailure
-  case (failedTrigger, outcome) of
-    (Just failure, _) → throwIO failure
-    (Nothing, Right result) → pure (Just result)
-    (Nothing, Left raised) → case fromException raised of
-      Just Cancelled → pure Nothing
-      Nothing → throwIO raised
+  let cancellerAction = do
+        reached ← try @SomeException trigger
+        case reached of
+          -- This thread's own cancellation, when the call is over, is not the trigger's failure.
+          Left failure | Just ThreadKilled ← fromException failure → pure ()
+          Left failure → void (tryPutMVar triggerFailure failure) >> withMVar armed (\on → when on (throwTo me (TriggerFailed failure)))
+          Right () → withMVar armed (\on → when on (throwTo me Cancelled))
+  -- The thread that waits for the trigger is an owned thread (#600): it has ended before this returns, whatever the action
+  -- raises or however this call is left.
+  withOwnedThread cancellerAction $ \canceller cancellerDone → do
+    outcome ← try @SomeException (restore action)
+    let disarm = modifyMVar_ armed (\_ → pure False) `catch` \raised → case fromException raised of
+          Just Cancelled → disarm
+          Nothing → case fromException raised of
+            Just (TriggerFailed _) → disarm
+            Nothing → throwIO (raised ∷ SomeException)
+    disarm
+    -- Ended here, and not only by the scope, because its failure is read next: the trigger's finalizers are done.
+    killThread canceller >> bounded cancellerDone
+    failedTrigger ← tryReadMVar triggerFailure
+    case (failedTrigger, outcome) of
+      (Just failure, _) → throwIO failure
+      (Nothing, Right result) → pure (Just result)
+      (Nothing, Left raised) → case fromException raised of
+        Just Cancelled → pure Nothing
+        Nothing → throwIO raised
 
 -- | One tick of the driver, on this thread, which is the application thread's, while another thread does what the example
 -- does around it, in the order it does it: the tick's outcome once both have ended, the side's exception raised if it
