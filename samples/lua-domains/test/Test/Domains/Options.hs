@@ -15,17 +15,19 @@ import Data.List (isInfixOf, isPrefixOf)
 import System.Directory (createFileLink, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, listDirectory)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Process (proc)
 import Hetoimasia.Sample.LuaDomains.InputLog (InputLog, renderLog)
 import Test.Domains.FixedLog (generateLog)
-import Test.Domains.Support (generous, withTempDirectory)
+import Test.Domains.Support (withTempDirectory)
 import Test.Hspec
+import Test.Support.Subprocess (RunBound (Within), runCaptured)
 
 -- | The executable's exit status, stdout and stderr.
 runExe ∷ [String] → IO (ExitCode, String, String)
 runExe arguments = do
   executable ← findExecutable "hetoimasia-lua-domains" >>= maybe (fail "the executable is not on this test's search path") pure
-  generous (readCreateProcessWithExitCode (proc executable arguments) "")
+  -- The two-minute bound is the one the call already had (`generous`): a hang-catcher, never an assertion.
+  runCaptured (Within 120000000) (proc executable arguments) ""
 
 -- | The lines of a report or a trace that start with this word.
 linesWith ∷ String → String → [String]

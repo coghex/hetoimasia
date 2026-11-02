@@ -36,9 +36,10 @@ module Test.Foundation.Messaging.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
-import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd), proc)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withPackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = do
@@ -102,7 +103,7 @@ payloadSpec = describe "Prepared payload opacity across the package boundary" $ 
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
           ""
       status `shouldBe` ExitSuccess
@@ -165,7 +166,7 @@ channelSpec = describe "Channel endpoint authority across the package boundary" 
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
           ""
       status `shouldBe` ExitSuccess
@@ -379,7 +380,7 @@ snapshotSpec = describe "Snapshot endpoint authority across the package boundary
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
           ""
       status `shouldBe` ExitSuccess

@@ -38,7 +38,6 @@
 module VulkanProof (spec, readByTheseExamples) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (finally)
 import Control.Monad (forM_, when)
 import Data.Char (isDigit, isHexDigit, isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
@@ -60,10 +59,10 @@ import System.Directory
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
-import System.IO (IOMode (WriteMode), withFile)
+import System.IO (IOMode (WriteMode), hClose, withFile)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (CreateProcess (..), StdStream (UseHandle), createProcess, getPid, proc, waitForProcess)
-import System.Timeout (timeout)
+import System.Process (CreateProcess (..), proc)
+import Test.Support.Subprocess (ChildSpec (..), RunBound (Within), Stream (CallerHandle, Inherited), childPid, childSpec, waitChild, withScopedChild)
 import Test.Hspec (Spec, describe, expectationFailure, it, pendingWith, shouldBe, shouldContain, shouldNotContain, shouldSatisfy)
 
 -- | The retained per-platform records, and the summary that quotes them.
@@ -1393,41 +1392,46 @@ runWithSignalsDuringCleanup ∷ RunnerFixture → Int → IO (ExitCode, String)
 runWithSignalsDuringCleanup fixture signals = do
   let root = fixtureRoot fixture
   withFile (root </> "runner.log") WriteMode $ \logHandle → do
-    (_, _, _, handle) ←
-      createProcess
-        (proc "bash" [root </> runner, "test", "hetoimasia-gpu-vulkan-native:test:native-tests"])
-          { cwd = Just root
-          , env = Just (fixtureEnvironment fixture)
-          , create_group = True
-          , std_out = UseHandle logHandle
-          , std_err = UseHandle logHandle
-          }
-    pid ← getPid handle >>= maybe (fail "the runner has no process id") pure
-    -- Through Bash, whose builtin takes a process group after `--` everywhere;
-    -- the `sh` of some platforms (dash) does not. A signal that was not delivered
-    -- fails the example rather than letting it go on without one.
-    let signalGroup = do
-          (delivered, _, errors) ← run [] root "bash" ["-c", "kill -TERM -- -\"$0\"", show pid]
-          (delivered, errors) `shouldBe` (ExitSuccess, "")
-        -- Clearing up after the example: a group that has already gone is no failure.
-        endGroup = run [] root "bash" ["-c", "kill -KILL -- -\"$0\" 2>/dev/null || true", show pid]
-    ( do
-        when (signals >= 2) $ do
-          awaitFile (root </> "suites-running")
-          signalGroup
-        awaitFile (root </> "cleanup-started")
-        -- The fingerprints the runner generated are all there when the cleanup
-        -- begins, and so is the one it found.
-        forM_ (foundFingerprint : generatedFingerprints) $ \relative →
-          doesFileExist (root </> relative) >>= (`shouldBe` True)
+    -- The runner is a scoped child of the shared subprocess facility (#588): in a process group of its own, which the facility ends and
+    -- reaps whatever happens below. Its standard input stays inherited, as it was; its output goes to the log this example opened.
+    -- The 30-minute run bound is the budget of the group that runs these examples.
+    let runnerChild =
+          ( childSpec
+              (Within (1800 * 1000000))
+              (proc "bash" [root </> runner, "test", "hetoimasia-gpu-vulkan-native:test:native-tests"])
+                { cwd = Just root
+                , env = Just (fixtureEnvironment fixture)
+                }
+          )
+            { specStdin = Inherited
+            , specStdout = CallerHandle logHandle
+            , specStderr = CallerHandle logHandle
+            }
+    withScopedChild runnerChild $ \child → do
+      -- The child has its own copy of the log. The example closes the one it opened before it reads the log back: GHC's per-process
+      -- single-writer lock on a file would refuse the read while a writer is open, and the library used to close this copy for it.
+      hClose logHandle
+      let pid = childPid child
+      -- Through Bash, whose builtin takes a process group after `--` everywhere;
+      -- the `sh` of some platforms (dash) does not. A signal that was not delivered
+      -- fails the example rather than letting it go on without one.
+      let signalGroup = do
+            (delivered, _, errors) ← run [] root "bash" ["-c", "kill -TERM -- -\"$0\"", show pid]
+            (delivered, errors) `shouldBe` (ExitSuccess, "")
+      when (signals >= 2) $ do
+        awaitFile (root </> "suites-running")
         signalGroup
-        writeFile (root </> "release") "released\n"
-        finished ← timeout (60 * 1000 * 1000) (waitForProcess handle)
-        status ← maybe (expectationFailure "the runner did not end within a minute after the cleanup was released" >> pure (ExitFailure 1)) pure finished
-        output ← readFile (root </> "runner.log")
-        length output `seq` pure (status, output)
-      )
-      `finally` endGroup
+      awaitFile (root </> "cleanup-started")
+      -- The fingerprints the runner generated are all there when the cleanup
+      -- begins, and so is the one it found.
+      forM_ (foundFingerprint : generatedFingerprints) $ \relative →
+        doesFileExist (root </> relative) >>= (`shouldBe` True)
+      signalGroup
+      writeFile (root </> "release") "released\n"
+      finished ← waitChild child (60 * 1000 * 1000)
+      status ← maybe (expectationFailure "the runner did not end within a minute after the cleanup was released" >> pure (ExitFailure 1)) pure finished
+      output ← readFile (root </> "runner.log")
+      length output `seq` pure (status, output)
 
 -- | Wait for a file a stand-in writes, a bounded number of polls.
 awaitFile ∷ FilePath → IO ()

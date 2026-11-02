@@ -3,6 +3,7 @@ module Main (main) where
 import Control.Monad (void)
 import Sandbox (git, run, sanitizedEnvironment)
 import System.Directory (createDirectory, createFileLink, getCurrentDirectory, removeFile)
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -12,6 +13,7 @@ import qualified CiImage
 import qualified DismissalStep
 import qualified Execution
 import qualified OwnedStarts
+import qualified OwnedSubprocess
 import qualified OwnedThread
 import qualified Packaging
 import qualified PlanStep
@@ -33,7 +35,12 @@ data Repository = Repository
   }
 
 main ∷ IO ()
-main = hspec $ do
+main =
+  -- The subprocess facility's outer-termination examples run this very executable as their test-owner process.
+  lookupEnv OwnedSubprocess.ownerVariable >>= maybe suite OwnedSubprocess.ownerMain
+
+suite ∷ IO ()
+suite = hspec $ do
   describe "Kanban documentation landing" $ do
     it "lands a regular AGENTS.md and a new design without unrelated staged work" $
       withRepository False $ \repo → do
@@ -94,6 +101,7 @@ main = hspec $ do
   X11Window.spec
   Packaging.spec
   OwnedThread.spec
+  OwnedSubprocess.spec
   OwnedStarts.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a

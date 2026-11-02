@@ -85,7 +85,16 @@ import System.Environment (getEnvironment, getExecutablePath)
 import System.Exit (ExitCode (..), exitWith)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
 import System.Info (arch, compilerName, fullCompilerVersion, os)
-import System.Process (CreateProcess (..), StdStream (Inherit), createProcess, proc, waitForProcess)
+import System.Process (proc, waitForProcess)
+import Test.Support.Subprocess
+  ( ChildSpec (specPlacement, specStderr, specStdin, specStdout)
+  , Placement (CallersGroup)
+  , RunBound (Unbounded)
+  , Stream (Inherited)
+  , childProcess
+  , childSpec
+  , withScopedChild
+  )
 import Test.Hspec (Spec, describe, expectationFailure, it, pendingWith)
 import Text.Read (readMaybe)
 
@@ -238,8 +247,11 @@ spec gate = describe "graphics-owner progress during window interactions" $
         executable ← getExecutablePath
         -- The child shares this terminal, so the person sees each phase's
         -- instruction when it begins.
-        (_, _, _, child) ← createProcess (proc executable [interactionProbeFlag]) {std_in = Inherit, std_out = Inherit, std_err = Inherit}
-        waitForProcess child >>= \case
+        -- Owned by the shared subprocess facility (#588), as the one human-paced child it is: it inherits the terminal, so it stays in
+        -- this process's group and only its identifier is signalled when it is ended, and its run is stated to be unbounded because a
+        -- person at the keyboard sets its pace. It is still ended and reaped if this example fails or is cancelled.
+        let probe = (childSpec Unbounded (proc executable [interactionProbeFlag])) {specStdin = Inherited, specStdout = Inherited, specStderr = Inherited, specPlacement = CallersGroup}
+        withScopedChild probe (waitForProcess . childProcess) >>= \case
           ExitSuccess → pure ()
           status → expectationFailure ("the interaction probe's process exited " <> show status)
 

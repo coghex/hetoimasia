@@ -15,8 +15,9 @@ import System.Directory (createDirectoryIfMissing)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
-import System.Process (CreateProcess (..), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (..), proc)
 import Test.Hspec (expectationFailure, shouldBe)
+import Test.Support.Subprocess (RunBound (Within), runCaptured)
 
 -- | An environment with the caller's Git and locale configuration removed, so a
 -- temporary repository behaves identically on every machine.
@@ -37,9 +38,11 @@ sanitizedEnvironment = do
       keep (name, _) = not ("GIT_" `isPrefixOf` name) && name `notElem` names
   pure (settings ++ filter keep inherited)
 
+-- | Run a command to completion through the shared subprocess facility, which owns the child: it is ended, and reaped, however the
+-- call ends. The run bound is the 30-minute budget of the group that runs these examples, a hang-catcher and not a timing assumption.
 run ∷ [(String, String)] → FilePath → String → [String] → IO (ExitCode, String, String)
-run environment path executable args = readCreateProcessWithExitCode
-  (proc executable args) {cwd = Just path, env = Just environment} ""
+run environment path executable args =
+  runCaptured (Within (1800 * 1000000)) (proc executable args) {cwd = Just path, env = Just environment} ""
 
 -- | Run Git, failing the example with its diagnostics when it does not succeed.
 git ∷ [(String, String)] → FilePath → [String] → IO String

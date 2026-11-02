@@ -8,9 +8,10 @@ module Test.LuaEngine.Texture.Client (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Process (proc)
 import Test.Hspec
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withStorePackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "composition from outside the packages" $ do
@@ -21,7 +22,7 @@ spec = describe "composition from outside the packages" $ do
         case clientStatus outcome of
           ExitSuccess → pure ()
           status → expectationFailure ("the client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
-        (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome </> "client") [tree]) ""
+        (status, out, err) ← runCaptured clientRunBound (proc (clientDirectory outcome </> "client") [tree]) ""
         (status, out, err) `shouldBe` (ExitSuccess, "(2,1)\n", "")
 
   it "keeps a texture's resource record, a texture owner's banks and the pipeline's numbers out of a client's reach" $ do

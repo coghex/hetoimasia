@@ -19,9 +19,10 @@ module Test.Asset.Image.PngDecodeClient (spec) where
 import Control.Monad (forM_)
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
-import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd), proc)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotBe)
-import Test.Support.ExternalClient (Client (..), Mode (..), withStorePackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, withStorePackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "PngDecode across the package boundary" $ do
@@ -49,7 +50,7 @@ spec = describe "PngDecode across the package boundary" $ do
           expectationFailure
             ("the supported client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess

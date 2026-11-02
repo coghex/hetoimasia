@@ -48,7 +48,8 @@ import System.FilePath ((</>))
 import System.IO (hFlush, hPutStrLn, stderr)
 import System.Info (arch, fullCompilerVersion, os)
 import System.Mem (performMajorGC)
-import System.Process (readProcess)
+import System.Process (proc)
+import Test.Support.Subprocess (RunBound (Within), runCaptured)
 
 -- | The upstream VMA the pinned Hackage package bundles (its changelog).
 bundledVma ∷ String
@@ -434,8 +435,16 @@ describeMachine = do
     ]
   where
     probe command arguments = do
-      answer ← try (readProcess command arguments "") ∷ IO (Either SomeException String)
+      answer ← try (queryMachine command arguments) ∷ IO (Either SomeException String)
       pure (either (const "") (unwords . lines) answer)
+
+-- | A machine-metadata query, run through the shared subprocess facility: the child is owned, ended and reaped however the call
+-- ends. A command that fails is no answer. The five-minute bound is a hang-catcher for a query that answers at once.
+queryMachine ∷ String → [String] → IO String
+queryMachine command arguments =
+  runCaptured (Within (300 * 1000000)) (proc command arguments) "" >>= \case
+    (ExitSuccess, out, _) → pure out
+    (status, _, err) → ioError (userError (command <> " exited " <> show status <> ": " <> err))
 
 -- ---------------------------------------------------------------------------
 -- The report

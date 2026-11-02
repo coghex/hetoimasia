@@ -12,9 +12,10 @@ import System.Directory (createDirectory)
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Process (proc)
 import Test.Hspec
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withStorePackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "composition from outside the packages" $ do
@@ -28,7 +29,7 @@ spec = describe "composition from outside the packages" $ do
         createDirectory (tree </> "root")
         ByteString.writeFile (tree </> "root" </> "hetoimasia.json") manifest
         ByteString.writeFile (tree </> "root" </> "main.lua") entry
-        (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
+        (status, out, err) ← runCaptured clientRunBound (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
         (status, out) `shouldBe` (ExitSuccess, "init presentation\nstatus starting false\nshutdown presentation stopped\nVerdictSuccess\nretired: True\nfailures: 0\n")
         -- the coordinator reports its lifecycle through the logger it was given, and nothing else is written; the note of the
         -- start was acknowledged before the session was stopped, and the last note ("session ended") may legally be left
