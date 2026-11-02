@@ -207,7 +207,8 @@ spec shared = describe "the shared fixture" $ do
       started ← newEmptyMVar
       (outcome, report) ←
         runOwned (scripted script) $ \fixture →
-          withForked (dispatch fixture $ \_ → putMVar started () >> takeMVar gate) $ \_ waited → do
+          -- The gate holds the owner's operation until the example kills the owner, so a scope that ends first opens it.
+          withForkedOpening (void (tryPutMVar gate ())) (dispatch fixture $ \_ → putMVar started () >> takeMVar gate) $ \_ waited → do
             takeMVar started
             throwTo (ownerThread fixture) OwnerKilled
             woken ← waited
@@ -229,7 +230,7 @@ spec shared = describe "the shared fixture" $ do
       never ← newEmptyMVar ∷ IO (MVar ())
       (outcome, report) ←
         runOwned (scripted script) $ \fixture →
-          withForked (dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value) $ \_ waited → do
+          withForkedOpening (void (tryPutMVar never ())) (dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value) $ \_ waited → do
             takeMVar started
             throwTo (ownerThread fixture) OwnerKilled
             woken ← waited
@@ -256,7 +257,7 @@ spec shared = describe "the shared fixture" $ do
       never ← newEmptyMVar ∷ IO (MVar ())
       (outcome, report) ←
         runOwned (scripted script) $ \fixture →
-          withForked (dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value) $ \_ waited → do
+          withForkedOpening (void (tryPutMVar never ())) (dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value) $ \_ waited → do
             takeMVar started
             throwTo (ownerThread fixture) OwnerKilled
             woken ← waited
@@ -351,10 +352,11 @@ spec shared = describe "the shared fixture" $ do
               map fromException retained `shouldBe` [Just ReleaseFailed]
 
     it "interrupts a blocked acquisition with a cancellation, answering the waiter with it" $ do
-      (script, enteredAcquire, _acquireGate) ← newScriptBlockingAcquire
+      (script, enteredAcquire, acquireGate) ← newScriptBlockingAcquire
       (outcome, report) ←
         runOwned (scripted script) $ \fixture →
-          withForked (dispatch fixture pure) $ \_ waited → do
+          -- The blocked acquisition is ended by the example's cancellation of the owner; a scope that ends first lets it go.
+          withForkedOpening (void (tryPutMVar acquireGate ())) (dispatch fixture pure) $ \_ waited → do
             readMVar enteredAcquire
             -- Delivered while the owner blocks in the acquisition: the throwTo
             -- returning proves the delivery, so the acquisition stayed
