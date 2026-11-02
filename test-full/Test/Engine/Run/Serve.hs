@@ -425,10 +425,13 @@ callerBeforeArmed ending cleanups scope = do
   thrower ← newEmptyMVar
   result ← newEmptyMVar
   sessionEnded ← newEmptyMVar
+  reached ← newEmptyMVar
   seen ← newIORef []
   let stop = atomically (writeTVar stopped True)
       session = atomically (readTVar stopped >>= check) `finally` void (tryPutMVar sessionEnded ())
       queued _ = do
+        -- The session has been started: the callback runs after it, and the caller is parked at the take below.
+        putMVar reached ()
         sender ← takeMVar thrower
         putMVar armed ()
         blockedFor BlockedOnException sender
@@ -441,7 +444,7 @@ callerBeforeArmed ending cleanups scope = do
   runEnding ending $ \end →
     withInterruptedCaller scope stop armed caller $ \me sender → do
       writeIORef seen [me, sender]
-      end (blockedFor BlockedOnMVar me)
+      end (readMVar reached >> blockedFor BlockedOnMVar me)
   threads ← readIORef seen
   ended ← and <$> mapM hasEnded threads
   -- The session is a thread of the production scope, not of this example's, so its end is the production scope's to announce.
