@@ -14,17 +14,14 @@ module Test.GLFW.Owner.Fixture.Rig
   , ownedHostBeforeBody
   , armedBody
   , armedFinally
-  , ownedHostHeldStart
   , publishAllFor
   , ownedHostCaught
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.MVar (MVar, putMVar)
 import Control.Concurrent.STM
   ( TVar
   , atomically
-  , check
   , modifyTVar'
   , newTVarIO
   , readTVar
@@ -56,7 +53,7 @@ import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import qualified Hetoimasia.Runtime.GLFW.Internal.Owner as Private
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
-import Test.GLFW.Owner.Fixture.Fake (Fake (..), ScriptedTimer, fakeOperations, newFake, newScriptedTimer, script)
+import Test.GLFW.Owner.Fixture.Fake (Fake, ScriptedTimer, fakeOperations, newFake, newScriptedTimer)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene (..), note)
 import Test.GLFW.Support (at, millis, quietLogger, windowNamed)
 
@@ -200,39 +197,6 @@ armedFinally cut arm release body = do
   mask $ \restore → do
     arm
     restore (cut 1 >> body) `finally` release
-
--- | 'ownedHost' for an example that holds the owner inside its startup until the body lets it go (#593). The startup cannot be armed
--- later than the owner's creation, so it is armed from the host's own 'beforeConsumer' hook (after the host is built, before the
--- owner exists), and the gate's release is registered in the body's first masked step: every exit of the body, and every cut the
--- example injects, opens it. The hook is called with cut 0 before it arms and the body with cut 1 once the release is registered;
--- an asynchronous cancellation between the arming and that step is the one interval test code cannot close (the owner's creation is
--- production code), and it is reported as such.
-ownedHostHeldStart
-  ∷ (Int → IO ())
-  → Rig
-  → HostConfig
-  → TVar Bool
-  → MVar ()
-  → OwnerReady
-  → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
-  → IO a
-ownedHostHeldStart cut rig config gate entered ready body =
-  ownedHostHooked
-    Private.noHostHooks
-      { Private.beforeConsumer = \_ → do
-          cut 0
-          script (fakeStart (rigFake rig)) $ \_ → do
-            putMVar entered ()
-            atomically (readTVar gate >>= check)
-            pure ready
-      }
-    quietLogger
-    (rigSeam rig)
-    config
-    (rigOwnerConfig rig)
-    $ \host owner control →
-      mask $ \restore →
-        restore (cut 1 >> body host owner control) `onException` atomically (writeTVar gate True)
 
 -- | Publish every retirement fact for one attachment from the calling thread, if the host publishes completions and the owner holds
 -- the attachment's acknowledgement, and do nothing otherwise. It blocks on nothing and raises nothing, and it is idempotent: the

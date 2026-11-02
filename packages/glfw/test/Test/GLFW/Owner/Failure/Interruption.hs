@@ -3,8 +3,8 @@
 -- point after it, and the join waits for a terminal group report.
 module Test.GLFW.Owner.Failure.Interruption (spec) where
 
-import Control.Concurrent (myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
   , check
@@ -23,11 +23,9 @@ import Control.Exception
   , getMaskingState
   , mask
   , onException
-  , throwIO
   , throwTo
   )
 import Control.Monad (forM_, unless, void, when)
-import Data.IORef (newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
@@ -39,17 +37,15 @@ import Test.GLFW.Owner.Fixture.Drive
   , awaitTerminal
   , handedOver
   , pumpUntilRetired
-  , trackedHandedOver
   , raisedBy
   , theWindow
   )
 import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled)
-import Test.GLFW.Owner.Fixture.Rig (Rig (..), armedBody, newRig, ownedHost, ownedHostCaught, ownedHostHooked, publishAllFor)
-import Test.GLFW.Support (Scope, boundedExample, caughtAsUnless, cutExamples, quietLogger, unexpected, withDeferredThread)
+import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHost, ownedHostCaught, ownedHostHooked)
+import Test.GLFW.Support (Scope, boundedExample, caughtAsUnless, cutExamples, quietLogger, unexpected)
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 import Test.GLFW.Support (withDeferredThreadOpening)
-import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = do
@@ -59,7 +55,6 @@ spec = do
     (boundedExample testOperationAnswersCommitUninterrupted)
   it "waits for a terminal group report however the join is interrupted"
     (boundedExample testJoinAwaitsTerminalReport)
-  cutExamples "the record fixture" [0, 1, 2, 3] retirementRecordScenario
   cutExamples "the join fixture" [0, 1] joinScenario
 
 -- | A target retirement that returned is recorded, whatever is delivered to
@@ -71,34 +66,15 @@ spec = do
 -- target would be neither retired nor marked, and the drain would offer the
 -- operation again, disposing a second time what the backend already disposed.
 testRetirementRecordSurvivesCancellation ∷ IO ()
-testRetirementRecordSurvivesCancellation = retirementRecordSurvives False (\_ → pure ())
-
--- | The same fixture ended at the cut (#593): before the retirement is armed, or after it and the rescue that publishes the evidence
--- its exit waits for are registered.
-retirementRecordScenario ∷ Int → Scope → IO () → IO ()
-retirementRecordScenario cutAt _ atParked = retirementRecordSurvives True (\armedNow → when (armedNow == cutAt) atParked)
-
-retirementRecordSurvives ∷ Bool → (Int → IO ()) → IO ()
-retirementRecordSurvives scenario cut = do
+testRetirementRecordSurvivesCancellation = do
   rig ← newRig
   entered ← newTVarIO False
   attempts ← newTVarIO (0 ∷ Int)
   recorded ← newTVarIO []
-  tracked ← newIORef []
-  bodyDone ← newEmptyMVar
-  -- Armed inside the body's first masked step, which also hands a supplier the host and the owner (#593). The independent evidence the
-  -- exit waits for, if the body ends before it publishes it itself, can only be recorded once the exit has begun the attachment's
-  -- retirement, so a thread publishes it then; the harassment below may leave the retirement unverified at any point.
-  let supplier (host, owner) = do
-        readMVar bodyDone
-        services ← readIORef tracked
-        forM_ services $ \service → do
-          atomically (readGraphicsService service >>= check . (== SlotRetiring) . observedSlot)
-          publishAllFor host owner (graphicsAttachment service)
-  let arm = script (fakeRetireTarget (rigFake rig)) $ \retire → do
-        atomically (modifyTVar' attempts (+ 1))
-        atomically (writeTVar entered True)
-        pure (targetRetired (Text.pack (show (retiringWindow retire))))
+  script (fakeRetireTarget (rigFake rig)) $ \retire → do
+    atomically (modifyTVar' attempts (+ 1))
+    atomically (writeTVar entered True)
+    pure (targetRetired (Text.pack (show (retiringWindow retire))))
   -- Delivered again and again from the instant the call is entered, so one of
   -- them lands wherever the owner is least protected — inside the call, on
   -- its way out, or after the record.
@@ -109,41 +85,38 @@ retirementRecordSurvives scenario cut = do
             thread : _ → pure thread
             [] → retry
         forM_ [1 ∷ Int .. 20] (\_ → throwTo ownerThread ThreadKilled)
-  -- In a scenario the harassment is left out: the example's own ending is the point, and the harassment lands on an exit whose
-  -- evidence may already have been forgotten by the attachment (UNEXERCISED together: see the pull request body).
-  withOwnedThread (unless scenario harry) $ \_ _ → withDeferredThread supplier $ \_ handOver → do
-    outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut (handOver (host, owner) >> arm) (void (tryPutMVar bodyDone ())) $ do
-      window ← theWindow host
-      service ← trackedHandedOver tracked host owner window
-      cut 2
-      awaitStanding owner service `shouldReturn` TargetUsable
-      _ ← releaseGraphicsTarget host owner service
-      cut 3
-      atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
-      -- Independent evidence, so this exit finishes whichever way the
-      -- retirement settled.
-      publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
-      acknowledgement ←
-        atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-          >>= maybe (unexpected "the attachment kept no acknowledgement") pure
-      forM_ allRetirementFacts $ \fact →
-        void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
-      pumpUntilRetired host control
-      -- Captured here rather than returned: the run itself raises the
-      -- cancellation at its exit, so the body's value never reaches the caller.
-      atomically . writeTVar recorded . Map.keys =<< atomically (readTargetTerminalsNow owner)
-    -- In a scenario the ending the example was given is the point, and propagates.
-    when scenario (either throwIO (\_ → pure ()) outcome)
-    -- However it ended, it ended by raising the cancellation rather than
-    -- swallowing it.
-    void (raisedBy outcome)
-    -- Offered exactly once, over the whole run and its drain, however many
-    -- cancellations arrived.
-    readTVarIO attempts `shouldReturn` 1
-    -- And because it returned, its record exists: a retirement the owner
-    -- performed is never one the owner then forgets, and never one the drain
-    -- performs a second time.
-    readTVarIO recorded >>= \terminals → length terminals `shouldBe` 1
+  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    window ← theWindow host
+    service ← handedOver host owner window
+    awaitStanding owner service `shouldReturn` TargetUsable
+    -- NOT CONVERTED (#593 narrowed by the owner, 2026-11-02): this harassing thread stays an unowned start, with its baseline entry. A rescue for
+    -- an early cancellation together with the harassment cannot be registered from test code (the attachment may have forgotten its
+    -- acknowledgement by then); the follow-up issue owns it.
+    void (forkIO harry)
+    _ ← releaseGraphicsTarget host owner service
+    atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+    -- Independent evidence, so this exit finishes whichever way the
+    -- retirement settled.
+    publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+    acknowledgement ←
+      atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+        >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+    forM_ allRetirementFacts $ \fact →
+      void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+    pumpUntilRetired host control
+    -- Captured here rather than returned: the run itself raises the
+    -- cancellation at its exit, so the body's value never reaches the caller.
+    atomically . writeTVar recorded . Map.keys =<< atomically (readTargetTerminalsNow owner)
+  -- However it ended, it ended by raising the cancellation rather than
+  -- swallowing it.
+  void (raisedBy outcome)
+  -- Offered exactly once, over the whole run and its drain, however many
+  -- cancellations arrived.
+  readTVarIO attempts `shouldReturn` 1
+  -- And because it returned, its record exists: a retirement the owner
+  -- performed is never one the owner then forgets, and never one the drain
+  -- performs a second time.
+  readTVarIO recorded >>= \terminals → length terminals `shouldBe` 1
 
 -- | Every injected operation's answer is committed with no interruption
 -- point between the two.

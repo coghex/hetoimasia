@@ -2,47 +2,43 @@
 -- reserved nothing, and it blocks neither the stop nor the owner's progress.
 module Test.GLFW.Owner.Port (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
+  , check
   , newTVarIO
+  , readTVar
   , writeTVar
   )
-import Control.Monad (when)
 import qualified Data.Text as Text
 import Hetoimasia.Runtime.GLFW
 import Test.GLFW.Owner.Fixture.Drive (handedOver, theWindow)
+import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled, ordered)
-import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRigWith, ownedHostHeldStart)
-import Test.GLFW.Support (Scope, boundedExample, cutExamples)
+import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRigWith, ownedHost)
+import Test.GLFW.Support (boundedExample)
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldSatisfy)
 
 spec ∷ Spec
 spec = do
   it "reports a full port as backpressure, having reserved and attached nothing"
     (boundedExample testPortFullReported)
-  cutExamples "the full-port fixtures" [0, 1] portFullReportedScenario
-  cutExamples "the full-port exit fixture" [0, 1] fullPortDoesNotBlockExitScenario
   it "prevents neither the stop, nor terminal evidence, nor owner progress when it is full"
     (boundedExample testFullPortDoesNotBlockExit)
 
 -- | A port with no room refuses the handover before anything is reserved.
 testPortFullReported ∷ IO ()
-testPortFullReported = portFullReportedFixture (\_ → pure ())
-
--- | The same fixture ended at the cut (#593): 0 in the startup hook before the owner is held in its startup, 1 once the release of that
--- hold is registered.
-portFullReportedScenario ∷ Int → Scope → IO () → IO ()
-portFullReportedScenario k _ atParked = portFullReportedFixture (\i → when (i == k) atParked)
-
-portFullReportedFixture ∷ (Int → IO ()) → IO ()
-portFullReportedFixture cut = do
+testPortFullReported = do
   rig ← newRigWith (\config → config {ownerEventCapacity = 1})
   gate ← newTVarIO False
   entered ← newEmptyMVar
   -- The owner is held inside its first startup, so it drains no event at all
   -- and the one-slot port really is full.
-  (second, pending) ← ownedHostHeldStart cut rig (rigHostConfig rig) gate entered (ownerReady (Text.pack "late")) $ \host owner _control → do
+  script (fakeStart (rigFake rig)) $ \_ → do
+    putMVar entered ()
+    atomically (readTVar gate >>= check)
+    pure (ownerReady (Text.pack "late"))
+  (second, pending) ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
     takeMVar entered
     window ← theWindow host
     _ ← handedOver host owner window
@@ -61,19 +57,15 @@ portFullReportedFixture cut = do
 -- | A full ordinary port stops neither the stop, nor the terminal evidence,
 -- nor the owner's own progress.
 testFullPortDoesNotBlockExit ∷ IO ()
-testFullPortDoesNotBlockExit = fullPortDoesNotBlockExitFixture (\_ → pure ())
-
--- | The same fixture ended at the cut (#593): 0 in the startup hook before the owner is held in its startup, 1 once the release of that
--- hold is registered.
-fullPortDoesNotBlockExitScenario ∷ Int → Scope → IO () → IO ()
-fullPortDoesNotBlockExitScenario k _ atParked = fullPortDoesNotBlockExitFixture (\i → when (i == k) atParked)
-
-fullPortDoesNotBlockExitFixture ∷ (Int → IO ()) → IO ()
-fullPortDoesNotBlockExitFixture cut = do
+testFullPortDoesNotBlockExit = do
   rig ← newRigWith (\config → config {ownerEventCapacity = 1})
   gate ← newTVarIO False
   entered ← newEmptyMVar
-  ownedHostHeldStart cut rig (rigHostConfig rig) gate entered (ownerReady (Text.pack "late")) $ \host owner _control → do
+  script (fakeStart (rigFake rig)) $ \_ → do
+    putMVar entered ()
+    atomically (readTVar gate >>= check)
+    pure (ownerReady (Text.pack "late"))
+  ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
     takeMVar entered
     window ← theWindow host
     _ ← handedOver host owner window
