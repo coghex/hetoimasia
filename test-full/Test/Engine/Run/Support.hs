@@ -26,7 +26,7 @@ module Test.Engine.Run.Support
   , blockedFor
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, yield)
+import Control.Concurrent (ThreadId, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO)
 import Control.Exception (SomeException, throwIO, try)
@@ -53,6 +53,7 @@ import System.FilePath (takeDirectory, (</>))
 import System.IO (stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 
 -- | The files of a game, by path under its folder.
 type Files = [(FilePath, ByteString)]
@@ -178,11 +179,14 @@ observeWith changes files scenario = withFolder files $ \folder → do
           , probeForced = readTVar forced
           }
   finished ← newEmptyMVar ∷ IO (MVar (Either SomeException ()))
-  _ ← forkIO (try (scenario probe) >>= putMVar finished)
-  status ← bounded (runGame setup quietFilter folder)
-  -- A scenario still waiting for a line the command never wrote fails its own bounded wait.
-  bounded (readMVar finished) >>= either throwIO pure
-  Observed status <$> readTVarIO out <*> readTVarIO err <*> readTVarIO forced <*> readTVarIO reports
+  -- The scenario runs beside the command and supplies what the command's exit needs (the signal it delivers), so its scope
+  -- encloses the command: it is ended and joined after the command has returned, however the command or the example
+  -- ended (#600). It waits only in STM on a line, which a kill interrupts, so nothing has to be opened for it.
+  withOwnedThread (try (scenario probe) >>= putMVar finished) $ \_ _ → do
+    status ← bounded (runGame setup quietFilter folder)
+    -- A scenario still waiting for a line the command never wrote fails its own bounded wait.
+    bounded (readMVar finished) >>= either throwIO pure
+    Observed status <$> readTVarIO out <*> readTVarIO err <*> readTVarIO forced <*> readTVarIO reports
   where
     awaitIn ∷ TVar [Text] → (Text → Bool) → IO ()
     awaitIn ref matches = atomically (readTVar ref >>= check . any matches)
