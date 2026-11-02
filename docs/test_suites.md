@@ -70,7 +70,16 @@ cabal test hetoimasia-tests --test-show-details=direct
   request and the optional validation's record, the composition over real temporary content with no
   graphics (roles, failures, boot refusals, stops), the built executable's usage, help and boot
   refusals, and the suite's own binary as a child under real signals. None acquires a native session, reads consent or opens a
-  window. A
+  window. Every helper thread these examples start is an owned thread (#600, `Test.Support.Owned`): the callers of
+  the production scope and the senders that interrupt them, the writers queued in a held sink, the scenario thread beside the
+  command, the 32 clients of the signal coordinator's overlap example and the runner of the console's exit path are ended and
+  joined when the example's scope returns, whether the example returned, failed or was cancelled. A thread held at a gate only
+  the example opens has the gate opened by the scope (`withOwnedThreadOpening`), and a thread that supplies what an exit needs
+  (a sender, the scenario that signals the command) is in a scope that encloses that exit. Four shapes have regressions that
+  run twice with one judgement, through the facility and through the deliberately unowned start of `Test.Engine.Unowned`
+  (the negative control, which must fail): a caller parked in the queued callback before it is armed, with its sender and the
+  production session it started; a caller held uninterruptibly by the child it asked to stop; and the 32 signal clients held
+  at their start gate. Select them with `--test-options='--match "#600"'`. A
   new runtime example belongs in `runtime-tests`, beside that component's own
   helpers; a headless GLFW example belongs in `glfw-tests`, and one that needs a
   real native session in `glfw-native-tests`; a console example belongs in root
