@@ -149,7 +149,7 @@ import System.Posix.Signals (Signal, nullSignal, sigKILL, sigTERM, signalProcess
 import System.Posix.Types (CPid (..), ProcessID)
 import System.Process
   ( CmdSpec (RawCommand, ShellCommand)
-  , CreateProcess (cmdspec, create_group, new_session, std_err, std_in, std_out)
+  , CreateProcess (cmdspec, create_group, cwd, new_session, std_err, std_in, std_out)
   , ProcessHandle
   , StdStream (Inherit, NoStream, UseHandle)
   , createProcess_
@@ -486,7 +486,8 @@ spawn spec pipes = do
     createProcess_
       "Test.Support.Subprocess"
       (specProcess spec)
-        { std_in = stream (specStdin spec) (pipesInRead pipes)
+        { cwd = rootSpelling <$> cwd (specProcess spec)
+        , std_in = stream (specStdin spec) (pipesInRead pipes)
         , std_out = stream (specStdout spec) (pipesOutWrite pipes)
         , std_err = stream (specStderr spec) (pipesErrWrite pipes)
         , create_group = specPlacement spec == OwnGroup
@@ -498,6 +499,13 @@ spawn spec pipes = do
       terminateProcess handle
       void (waitForProcess handle)
       ioError (userError ("the child " <> describeCommand (specProcess spec) <> " had been reaped before its identifier was read"))
+
+-- | The same directory spelled so that the @process@ library can start a child there. On a platform without @execvpe@ (macOS), a child
+-- that is given an environment, a process group of its own and the working directory @\"/\"@ spelled exactly so fails in the library
+-- with "chdir: does not exist" (@process-1.6.26.1@, reproduced with @readCreateProcessWithExitCode@ itself); @\"/.\"@ is the same
+-- directory and starts. Every other spelling is passed through as it is.
+rootSpelling ∷ FilePath → FilePath
+rootSpelling directory = if directory == "/" then "/." else directory
 
 -- | Release the child, then raise or answer the outcome with what the release found. Called masked.
 --

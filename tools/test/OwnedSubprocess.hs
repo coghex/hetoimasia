@@ -372,6 +372,12 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
         canonical ← canonicalizePath directory
         err `shouldBe` (canonical <> "\n")
 
+    it "starts a child in the root directory with an environment, as the display helpers' fixtures do" $ do
+      -- The process library on macOS refuses the directory spelled "/" for a child with an environment and a group of its own
+      -- ("chdir: does not exist"); the facility spells the same directory so that it starts.
+      (status, out, _) ← runCaptured hangCatcher (proc "pwd" []) {cwd = Just "/", env = Just [("PATH", "/usr/bin:/bin")]} ""
+      (status, out) `shouldBe` (ExitSuccess, "/\n")
+
     it "answers the triple the library call answered" $ do
       (status, out, err) ← runCaptured hangCatcher (shell "echo out; echo err >&2" []) ""
       (status, out, err) `shouldBe` (ExitSuccess, "out\n", "err\n")
