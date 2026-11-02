@@ -14,21 +14,23 @@
 -- already hung.
 module Test.GLFW.Session (spec) where
 
-import Control.Concurrent (isCurrentThreadBound)
+import Control.Concurrent (isCurrentThreadBound, myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Exception
-  ( ErrorCall (ErrorCall)
+  ( AsyncException (UserInterrupt)
+  , ErrorCall (ErrorCall)
   , Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , displayException
   , fromException
+  , mask_
   , throwIO
   , try
   )
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Failure
@@ -69,14 +71,19 @@ import Test.GLFW.Support
   , onBoundThread
   , onThread
   , onThreadVia
+  , endedAndJoined
   , ownedEnds
   , recordingThreads
+  , reapUnowned
+  , unownedBoundScope
   , unownedLeaks
+  , unownedScope
   , withDeferredThreadVia
   , withMainThread
   , withMainThreadVia
   )
-import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThreadOpening)
+import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
 import Data.Foldable (for_)
 
 spec ∷ Spec
@@ -144,6 +151,10 @@ spec = do
       (boundedExample testHelperRethrows)
     it "runs the main-thread helper on a bound thread designated as the process main thread, before its action, and joins it"
       (boundedExample testMainThreadHelper)
+    it "negative control rescue: registers a bound worker even when a cancellation is pending as the control starts it" $
+      boundedExample testRescueRegistersBoundWorker
+    it "negative control rescue: completes its stop-and-join when a cancellation is pending while it runs" $
+      boundedExample testRescueIsUninterruptible
     it "has ended and joined the thread of a start-and-wait helper whose caller is cancelled while it is parked"
       (boundedExample (ownedEnds WaiterCancelled startAndWaitScenario False))
     it "negative control: an unowned start leaves the start-and-wait helper's thread parked when its caller is cancelled"
@@ -675,6 +686,35 @@ testMainThreadHelper = do
     (caughtAs (entered seamForRefusal defaultSessionConfig (\_ → pure ())) >>= putMVar refused . fst)
     (\_ awaitEnd → awaitEnd)
   readMVar refused `shouldReturn` NotProcessMainThread
+
+testRescueRegistersBoundWorker ∷ Expectation
+testRescueRegistersBoundWorker = do
+  started ← newIORef []
+  recorded ← newIORef []
+  caller ← myThreadId
+  outcome ← try @AsyncException . bounded . mask_ $
+    withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+      awaitParked sender
+      recordingThreads recorded (unownedBoundScope started) (pure ()) holdForever (\_ _ → holdForever)
+  outcome `shouldBe` Left UserInterrupt
+  reapUnowned started
+  endedAndJoined recorded >>= (`shouldBe` True)
+
+testRescueIsUninterruptible ∷ Expectation
+testRescueIsUninterruptible = do
+  started ← newIORef []
+  recorded ← newIORef []
+  recordingThreads recorded (unownedScope started) (pure ()) holdForever (\_ _ → pure ())
+  caller ← myThreadId
+  rescued ← newIORef False
+  _ ← try @AsyncException . bounded . mask_ $
+    withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+      awaitParked sender
+      reapUnowned started
+      endedAndJoined recorded >>= writeIORef rescued
+  -- The scope's release ends the sender, so the cancellation need not be delivered at all; what matters is that it was pending
+  -- while the rescue ran and did not abandon it.
+  readIORef rescued >>= (`shouldBe` True)
 
 -- | The start-and-wait helper whose thread parks, with the example thread cancelled while it waits: the helper says when it is
 -- parked by calling the action it is given.

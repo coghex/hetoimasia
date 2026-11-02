@@ -42,6 +42,7 @@ import Control.Exception
 import Control.Monad (forM_, void, when, (>=>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Foldable (for_)
+import GHC.IO (unsafeUnmask)
 import Data.List (isInfixOf)
 import Data.Maybe (isJust)
 import GHC.Conc (ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
@@ -154,15 +155,17 @@ unownedBoundScope started action body = do
   body thread (readMVar done)
 
 startUnownedBound ∷ IORef [Unowned] → IO () → IO (ThreadId, MVar ())
-startUnownedBound started action = mask_ $ do
+startUnownedBound started action = uninterruptibleMask_ $ do
   done ← newEmptyMVar
-  thread ← forkOS (action `finally` putMVar done ())
+  -- @forkOS@ waits, interruptibly even under @mask_@, for the new OS thread to report itself; the start and its registration for
+  -- the rescue are uninterruptible, and the thread runs the action unmasked as a plain @forkOS@ from an unmasked caller does.
+  thread ← forkOS (unsafeUnmask action `finally` putMVar done ())
   atomicModifyIORef' started (\known → (Unowned thread done (pure ()) : known, ()))
   pure (thread, done)
 
 -- | Stop and join every thread an unowned control started, even if an assertion before it failed.
 reapUnowned ∷ IORef [Unowned] → IO ()
-reapUnowned started = do
+reapUnowned started = uninterruptibleMask_ $ do
   known ← readIORef started
   forM_ known $ \(Unowned thread done letGo) → letGo >> killThread thread >> readMVar done
 
@@ -277,6 +280,34 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
       state ← newEmptyMVar
       withOwnedBoundThread (getMaskingState >>= putMVar state) (\_ awaitEnd → awaitEnd)
       readMVar state >>= (`shouldBe` Unmasked)
+
+  describe "the negative controls' rescue (#593)" $ do
+    it "registers a bound worker for the rescue even when a cancellation is pending as the control starts it" $ do
+      started ← newIORef []
+      probe ← newProbe
+      caller ← myThreadId
+      outcome ← try @AsyncException . bounded . mask_ $
+        withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+          bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
+          unownedBoundScope started (parkedWorker probe) (\_ _ → readMVar (probeParked probe) >> holdUntilTimedOut)
+      outcome `shouldBe` Left UserInterrupt
+      reapUnowned started
+      endedAfterScope probe >>= (`shouldBe` True)
+
+    it "completes the rescue's stop-and-join when a cancellation is pending while it runs" $ do
+      started ← newIORef []
+      probe ← newProbe
+      unownedScope started (parkedWorker probe) (\_ _ → readMVar (probeParked probe))
+      caller ← myThreadId
+      rescued ← newIORef False
+      _ ← try @AsyncException . bounded . mask_ $
+        withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+          bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
+          reapUnowned started
+          endedAfterScope probe >>= writeIORef rescued
+      -- The scope's release ends the sender, so the cancellation need not be delivered at all; what matters is that it was pending
+      -- while the rescue ran and did not abandon it.
+          readIORef rescued >>= (`shouldBe` True)
 
   describe "a thread that ended on its own" $ do
     it "is joined harmlessly, the body may begin after it finished, and the wait can be repeated" $ do

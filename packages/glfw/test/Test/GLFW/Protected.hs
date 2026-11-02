@@ -154,6 +154,7 @@ import Test.GLFW.Support
   , unexpected
   , unownedLeaks
   , withMainThread
+  , withMainThreadVia
   , withMainThreadKeepingContext
   )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
@@ -214,6 +215,10 @@ spec = describe "GLFW protected host" $ do
     it "keeps a stalled attachment and its window until independent evidence arrives, reporting the stall once"
       (boundedExample testStalledThenEvidence)
     for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+      it ("has ended and joined a runner parked in its construction, whose rollback waits at a second gate, when the example body " <> label) $
+        boundedExample (ownedEnds ending parkedConstructionScenario True)
+      it ("negative control: a plain forkOS start leaves the runner parked in its construction when the example body " <> label) $
+        boundedExample (unownedLeaks ending parkedConstructionScenario True)
       it ("has ended and joined an evidence supplier waiting for an owner that never exists when the example body " <> label) $
         boundedExample (ownedEnds ending supplierScenario False)
       it ("negative control: an unowned start leaves the evidence supplier waiting for an owner that never exists when the example body " <> label) $
@@ -789,7 +794,7 @@ testCancelledAction = do
   owned ← newTVarIO Nothing
   inside ← newEmptyMVar
   never ← newEmptyMVar
-  withMainThread seam (pure ())
+  withMainThread seam (void (tryPutMVar never ()))
     ( protectedRunHere
         seam
         quietLogger
@@ -991,7 +996,7 @@ testCancelledConstruction = do
   seam ← journallingSeam journal
   constructing ← newEmptyMVar
   never ← newEmptyMVar
-  withMainThread seam (pure ())
+  withMainThread seam (void (tryPutMVar never ()))
     ( protectedRunHere
         seam
         quietLogger
@@ -1078,7 +1083,7 @@ testCancelledRollback = do
   rollingBack ← newEmptyMVar
   never ← newEmptyMVar
   neverRolls ← newEmptyMVar
-  withMainThread seam (pure ())
+  withMainThread seam (void (tryPutMVar never ()) >> void (tryPutMVar neverRolls RollbackUnsafe))
     ( protectedRunHere
         seam
         quietLogger
@@ -1107,6 +1112,38 @@ testCancelledRollback = do
       Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
       Right () → unexpected "the cancelled rollback returned"
     readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | The scenario of 'testCancelledRollback' up to the moment its runner is parked in the construction, with the example body ended
+-- the way the ending says (#593): a kill sent by the scope's release interrupts the construction, which starts a rollback that
+-- waits at a second gate, so the scope opens both gates before it kills and joins the runner.
+parkedConstructionScenario ∷ Scope → IO () → IO ()
+parkedConstructionScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  constructing ← newEmptyMVar
+  never ← newEmptyMVar
+  neverRolls ← newEmptyMVar
+  withMainThreadVia scope seam (void (tryPutMVar never ()) >> void (tryPutMVar neverRolls RollbackUnsafe))
+    ( protectedRunHere
+        seam
+        quietLogger
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            void $
+              attachOwner
+                journal
+                host
+                window
+                (ownerNamed "alpha")
+                  { scriptConstruct = putMVar constructing () >> takeMVar never
+                  , scriptRollback = takeMVar neverRolls
+                  }
+        )
+        (\_ _ → pure ())
+        (\() _ → pure ())
+    )
+    $ \runner _ → takeMVar constructing >> awaitParked runner >> atParked
 
 -- ---------------------------------------------------------------------------
 -- The drain
@@ -1530,7 +1567,7 @@ testRollbackCancelledAfterFailure = do
   seam ← journallingSeam journal
   rollingBack ← newEmptyMVar
   never ← newEmptyMVar
-  withMainThread seam (pure ())
+  withMainThread seam (void (tryPutMVar never RollbackUnsafe))
     ( protectedRunHere
         seam
         quietLogger

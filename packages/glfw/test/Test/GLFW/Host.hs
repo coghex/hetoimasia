@@ -22,8 +22,10 @@ import Control.Exception
   , ExceptionWithContext
   , SomeException
   , displayException
+  , finally
   , fromException
   , throwIO
+  , try
   , tryWithContext
   )
 import Control.Monad (forM, join, replicateM, unless, void, when)
@@ -220,6 +222,8 @@ spec = describe "GLFW window host" $ do
       (boundedExample testDegradationOnTheFinalTurn)
     it "waits for a notification still inside its post as the loop ends, and reports the degradation it leaves"
       (boundedExample testDegradationInFlightAtExit)
+    it "settles an in-flight notification at the runner's boundary when the body fails in the gap before the release (#593)"
+      (boundedExample testDegradationInFlightFailingBody)
     it "reports a degradation as a failing loop ends, keeping the loop's own failure primary"
       (boundedExample testDegradationReportedOnFailingExit)
     it "claims a degradation begun after the loop, at the application's own boundary after quiescence"
@@ -230,6 +234,10 @@ spec = describe "GLFW window host" $ do
       (boundedExample (testObligationHeldAfterCommit AdmittedCommand))
     it "waits at the runner's boundary for a demand publication paused between its commit and its wake"
       (boundedExample (testObligationHeldAfterCommit PublishedDemand))
+    it "settles a committed admission at the runner's boundary when the body fails after the commit (#593)"
+      (boundedExample (testObligationHeldFailingBody AdmittedCommand))
+    it "settles a committed publication at the runner's boundary when the body fails after the commit (#593)"
+      (boundedExample (testObligationHeldFailingBody PublishedDemand))
     it "reports a degradation when startup fails, when the action fails, and when the run is cancelled"
       (boundedExample testReportsOnEveryExit)
     it "records a reporting attempt cancelled at its sink, outside any uninterruptible release"
@@ -1020,7 +1028,28 @@ durationOf nanoseconds = case durationFromNanoseconds AllowZero nanoseconds of
 -- recorded yet; the runner's boundary, after quiescence has closed every source,
 -- waits for that obligation and reports what it left.
 testDegradationInFlightAtExit ∷ Expectation
-testDegradationInFlightAtExit = do
+testDegradationInFlightAtExit = degradationInFlightAtExit False >>= \case
+  Right (duringUpdate, admitted', warnings, seam) → do
+    -- Nothing was written while the notification was still in flight.
+    duringUpdate `shouldBe` []
+    written ← readIORef warnings
+    map (componentText . entryComponent) written `shouldBe` ["glfw.wake"]
+    takeMVar admitted' >>= (`shouldSatisfy` \case SubmitAccepted _ → True; _ → False)
+    posts seam `shouldReturn` 1
+  Left failure → unexpected ("the run failed with " <> show failure)
+
+-- | The same run with the body failing right after the worker's notification is in flight (#593): the boundary must settle that
+-- notification before it returns, so the release that lets the worker leave is guaranteed from inside the body, on every exit,
+-- and the failure is the run's.
+testDegradationInFlightFailingBody ∷ Expectation
+testDegradationInFlightFailingBody = do
+  outcome ← degradationInFlightAtExit True
+  either (`shouldBe` Broken "the update failed in flight") (\_ → unexpected "the run returned instead of failing") outcome
+
+degradationInFlightAtExit
+  ∷ Bool
+  → IO (Either Broken ([LogEntry], MVar SubmitResult, IORef [LogEntry], Seam))
+degradationInFlightAtExit failing = do
   held ← newEmptyMVar
   release ← newEmptyMVar
   firstPost ← newIORef True
@@ -1040,33 +1069,30 @@ testDegradationInFlightAtExit = do
   -- The worker is left inside its failing post and the releaser lets it leave only once the owner waits at the runner's
   -- boundary, after the body that hands them what they act on has returned: both are owned by the example (#593), and the
   -- releaser's gate is opened by the scope as well, so the worker is never joined while still held.
-  (duringUpdate, admitted') ←
+  outcome ← try @Broken $
     withDeferredThread (\(host, window) → submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= putMVar submitted) $ \_ handOverWorker →
       withDeferredThreadOpening (void (tryPutMVar release ())) (\owner → awaitBlockedOnSTM owner >> putMVar release ()) $ \_ handOverReleaser →
         hostedLogging capturing seam (settings [windowNamed "in flight"]) (\host _ → pure host) $ \host control → do
           window ← onlyWindow host
           owner ← myThreadId
-          runOwnerLoop host control $
-            LoopHooks
-              { loopLogger = capturing
-              , loopEvent = noApplicationEvents
-              , loopUpdate = \_ → do
-                  -- A worker admits during the final update and is left inside its
-                  -- failing post.
-                  handOverWorker (host, window)
-                  takeMVar held
-                  duringUpdate ← readIORef warnings
-                  -- The post is released only once the owner is waiting for it at
-                  -- the runner's own boundary, after quiescence and the drain.
-                  handOverReleaser owner
-                  pure (Finish (duringUpdate, submitted))
-              }
-  -- Nothing was written while the notification was still in flight.
-  duringUpdate `shouldBe` []
-  written ← readIORef warnings
-  map (componentText . entryComponent) written `shouldBe` ["glfw.wake"]
-  takeMVar admitted' >>= (`shouldSatisfy` \case SubmitAccepted _ → True; _ → False)
-  posts seam `shouldReturn` 1
+          -- The release is guaranteed from inside the body, on every exit, before the notification exists: the boundary settles
+          -- it before the body's outcome leaves, so a release left to the code around the host would never be reached.
+          ( runOwnerLoop host control $
+              LoopHooks
+                { loopLogger = capturing
+                , loopEvent = noApplicationEvents
+                , loopUpdate = \_ → do
+                    -- A worker admits during the final update and is left inside its
+                    -- failing post.
+                    handOverWorker (host, window)
+                    takeMVar held
+                    duringUpdate ← readIORef warnings
+                    when failing (throwIO (Broken "the update failed in flight"))
+                    pure (Finish (duringUpdate, submitted))
+                }
+            )
+            `finally` handOverReleaser owner
+  pure (fmap (\(duringUpdate, admitted') → (duringUpdate, admitted', warnings, seam)) outcome)
 
 -- | A loop that ends by raising still claims the report, and the failure it
 -- raised stays primary.
@@ -1133,6 +1159,24 @@ data HeldOperation = AdmittedCommand | PublishedDemand
 -- no warning at all.
 testObligationHeldAfterCommit ∷ HeldOperation → Expectation
 testObligationHeldAfterCommit operation = do
+  outcome ← obligationHeld operation False
+  case outcome of
+    Right (outstanding, duringAction, warnings) → do
+      outstanding `shouldBe` 1
+      duringAction `shouldBe` []
+      warningComponents warnings `shouldReturn` ["glfw.wake"]
+    Left failure → unexpected ("the run failed with " <> show failure)
+
+-- | The same run with the body failing right after the operation committed (#593): the release is guaranteed from inside the
+-- body on every exit, so the boundary, which settles the obligation before it returns, is not left waiting for a hook that
+-- nothing opens.
+testObligationHeldFailingBody ∷ HeldOperation → Expectation
+testObligationHeldFailingBody operation = do
+  outcome ← obligationHeld operation True
+  either (`shouldBe` Broken "the body failed after the commit") (\_ → unexpected "the run returned instead of failing") outcome
+
+obligationHeld ∷ HeldOperation → Bool → IO (Either Broken (Int, [LogEntry], IORef [LogEntry]))
+obligationHeld operation failing = do
   seam ← newSeam (failingPostScript "scripted wake failure")
   warnings ← newIORef ([] ∷ [LogEntry])
   committed ← newEmptyMVar
@@ -1147,7 +1191,7 @@ testObligationHeldAfterCommit operation = do
         PublishedDemand → do
           let hooks = noDemandHooks {afterPublication = putMVar committed () >> takeMVar release}
           void (publishDemandWith hooks (hostDemandPublisher host) immediateDemand)
-  (outstanding, duringAction) ←
+  outcome ← try @Broken $
     withDeferredThread worker $ \_ handOverWorker →
       withDeferredThreadOpening (void (tryPutMVar release ())) (\owner → awaitBlockedOnSTM owner >> putMVar release ()) $ \_ handOverReleaser →
         hostedLogging (recordingLogger warnings) seam (settings [windowNamed "held"]) (\host _ → pure host) $
@@ -1160,17 +1204,19 @@ testObligationHeldAfterCommit operation = do
                 , loopUpdate = \_ → pure (Finish ())
                 }
             owner ← myThreadId
-            handOverWorker (host, window)
-            takeMVar committed
-            -- Committed, so the obligation is registered; the wake has not been
-            -- made, so nothing has degraded and nothing has been written.
-            outstanding ← atomically (hostNotificationsInFlight host)
-            duringAction ← readIORef warnings
-            handOverReleaser owner
-            pure (outstanding, duringAction)
-  outstanding `shouldBe` 1
-  duringAction `shouldBe` []
-  warningComponents warnings `shouldReturn` ["glfw.wake"]
+            -- The release is guaranteed from inside the body, on every exit, before the operation exists.
+            ( do
+                handOverWorker (host, window)
+                takeMVar committed
+                when failing (throwIO (Broken "the body failed after the commit"))
+                -- Committed, so the obligation is registered; the wake has not been
+                -- made, so nothing has degraded and nothing has been written.
+                outstanding ← atomically (hostNotificationsInFlight host)
+                duringAction ← readIORef warnings
+                pure (outstanding, duringAction)
+              )
+              `finally` handOverReleaser owner
+  pure (fmap (\(outstanding, duringAction) → (outstanding, duringAction, warnings)) outcome)
 
 -- | The report is made on every exit the runner has: a startup failure, an
 -- action failure, and a cancellation, each keeping its own failure primary.

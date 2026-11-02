@@ -44,6 +44,8 @@ module Test.GLFW.Support
   , unownedLeaks
   , unownedScope
   , unownedBoundScope
+  , reapUnowned
+  , endedAndJoined
   , awaitParked
   , holdForever
 
@@ -91,6 +93,7 @@ import Control.Exception
   , finally
   , fromException
   , mask_
+  , uninterruptibleMask_
   , throwIO
   , try
   , tryWithContext
@@ -157,6 +160,7 @@ import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Reporting (DiagnosticFailure, raisedByDiagnostic)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import System.Timeout (timeout)
+import GHC.IO (unsafeUnmask)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Hspec (Expectation, expectationFailure, shouldBe)
 import Test.Support.Bounded (bounded)
@@ -444,15 +448,19 @@ unownedBoundScope started open action body = do
   body thread (readMVar done)
 
 startUnownedBound ∷ IORef [Unowned] → IO () → IO () → IO (ThreadId, MVar ())
-startUnownedBound started open action = mask_ $ do
+startUnownedBound started open action = uninterruptibleMask_ $ do
   done ← newEmptyMVar
-  thread ← forkOS (action `finally` putMVar done ())
+  -- @forkOS@ waits, interruptibly even under @mask_@, for the new OS thread to report itself, and a cancellation taken there
+  -- would leave a thread that exists unregistered for the rescue; the start and its registration are uninterruptible, and the
+  -- thread, which begins masked uninterruptibly, runs the action unmasked as a plain @forkOS@ from an unmasked caller does.
+  thread ← forkOS (unsafeUnmask action `finally` putMVar done ())
   atomicModifyIORef' started (\known → (Unowned thread done open : known, ()))
   pure (thread, done)
 
--- | Stop and join every thread an unowned control started, even if an assertion before it failed.
+-- | Stop and join every thread an unowned control started, even if an assertion before it failed. The rescue is not
+-- interruptible: a cancellation arriving during it must not abandon the join.
 reapUnowned ∷ IORef [Unowned] → IO ()
-reapUnowned started = do
+reapUnowned started = uninterruptibleMask_ $ do
   known ← readIORef started
   forM_ known $ \(Unowned thread done open) → open >> killThread thread >> readMVar done
 
