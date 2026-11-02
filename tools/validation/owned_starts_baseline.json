@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "note": "Unowned thread and process starts in the test sources that existed when the guard was introduced (#584), one count per file, classified mechanically. This is a known-debt list, not a list of proven leaks: verify a site before converting it. Entries can only shrink; an entry whose count is no longer reached fails the check. Written by `owned_starts.py bootstrap`; edited afterwards only to lower or remove an entry.",
+  "note": "Unowned thread and process starts in the test sources that existed when the guard was introduced (#584), one count per file, classified mechanically. This is a known-debt list, not a list of proven leaks: verify a site before converting it. Entries can only shrink; an entry whose count is no longer reached fails the check. Written by `owned_starts.py bootstrap`; edited afterwards only to lower or remove an entry. The two display-helper suites (tools/x11-test/Main.hs and tools/wayland-test/Main.hs) keep their entries on purpose: #588's owner decision of 2026-11-02 moved the hosted-subprocess helper they need out of that issue, to a separate one.",
   "files": {
     "packages/asset-image/test/Test/Asset/Image/PngDecodeBudget.hs": 1,
     "packages/asset-image/test/Test/Asset/Image/PngPreflightInflation.hs": 1,
@@ -149,6 +149,8 @@
     "packages/scripting-lua/test/Test/Lua/Owner/Support.hs": 1,
     "packages/scripting-lua/test/Test/Lua/Reentry.hs": 2,
     "packages/scripting-lua/test/Test/Lua/Support.hs": 3,
-    "run-native-test/Main.hs": 1
+    "run-native-test/Main.hs": 1,
+    "tools/wayland-test/Main.hs": 1,
+    "tools/x11-test/Main.hs": 1
   }
 }

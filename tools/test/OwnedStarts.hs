@@ -533,6 +533,11 @@ spec = describe "The unowned-start guard (tools/validation/owned_starts.py)" $ d
       text ← readFile (checkout </> "tools/validation/owned_starts_baseline.json")
       forM_ converted $ \path → text `shouldNotContain` path
 
+    it "keeps the two display-helper suites' baseline entries, which #588's owner decision moved to a separate issue with the hosted-subprocess helper they need" $ inCheckout $ \checkout → do
+      text ← readFile (checkout </> "tools/validation/owned_starts_baseline.json")
+      text `shouldContain` "tools/x11-test/Main.hs"
+      text `shouldContain` "tools/wayland-test/Main.hs"
+
     it "has not grown its baseline relative to the review base" $ inCheckout $ \checkout → do
       settings ← sanitizedEnvironment
       (resolved, _, _) ← run settings checkout "git" ["rev-parse", "--verify", "--quiet", "origin/master^{commit}"]
@@ -666,7 +671,5 @@ converted =
       "tools/test-support/src/Test/Support/ExternalClient.hs",
       "tools/test/RunnerIdentity.hs",
       "tools/test/Sandbox.hs",
-      "tools/test/VulkanProof.hs",
-      "tools/wayland-test/Main.hs",
-      "tools/x11-test/Main.hs"
+      "tools/test/VulkanProof.hs"
       ]
