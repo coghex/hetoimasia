@@ -19,7 +19,7 @@
 -- library call could not truthfully fail, and have none.
 module OwnedSubprocess (spec, ownerMain, ownerVariable) where
 
-import Control.Concurrent (yield)
+import Control.Concurrent (myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -67,7 +67,8 @@ import System.Process
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, pendingWith, shouldBe, shouldContain, shouldNotContain, shouldSatisfy)
 import Test.Support.Bounded (bounded)
-import Test.Support.Cancel (withCancellationAfter)
+import Test.Support.Cancel (awaitBlockedSending, withCancellationAfter)
+import Test.Support.Owned (withOwnedThread)
 import Test.Support.Parked (defaultParkBounds, parkedRelease)
 import Test.Support.Subprocess
 
@@ -614,6 +615,15 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
       outcome `shouldBe` Left Boom
       readIORef seen >>= mapM_ (\child → awaitUnreapedExit child (30 * 1000000) >> waitForProcess (childProcess child))
 
+    it "keeps the body's failure beside a cancellation that arrives while the cleanup is being reported" $ do
+      seen ← newIORef Nothing
+      outcome ← parkedRelease defaultParkBounds $ \park →
+        let seams = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing, seamDiagnostic = \_ → park}
+         in withScopedChildUsing quick {boundReap = 100000} seams (childSpec hangCatcher (shell obedientAlone [])) (\child → writeIORef seen (Just child) >> awaitReady child >> boom)
+      outcome `shouldSatisfy` cancellation
+      outcome `shouldSatisfy` retainsBodyFailure
+      readIORef seen >>= mapM_ (\child → awaitUnreapedExit child (30 * 1000000) >> waitForProcess (childProcess child))
+
     it "raises the body's own failure, not the unconfirmed cleanup, when the body failed" $ do
       let seams = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing}
       seen ← newIORef Nothing
@@ -713,6 +723,25 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
           try @AsyncException $
             withScopedChildUsing quick noSeams {seamSpawned = \_ → throwIO UserInterrupt} (childSpec hangCatcher (shell "exit 0" [])) {specStdout = CallerHandle handle} (\_ → pure ())
         outcome `shouldBe` Left UserInterrupt
+        hIsOpen handle >>= (`shouldBe` False)
+
+    it "closes the caller's handle when a cancellation queued during the acquisition lands as the body is about to begin" $
+      withTemp $ \directory → do
+        handle ← openFile (directory </> "log") WriteMode
+        spawned ← newEmptyMVar
+        helperVar ← newEmptyMVar
+        caller ← myThreadId
+        entered ← newIORef False
+        -- The cancellation is sent while the acquisition is masked and the seam does not return until its sender is blocked delivering
+        -- it, so it is delivered the moment the mask is lifted, before any of the body has run.
+        let seams = noSeams {seamSpawned = \_ → putMVar spawned () >> readMVar helperVar >>= void . awaitBlockedSending}
+        outcome ←
+          try @AsyncException . bounded $
+            withOwnedThread (readMVar spawned >> throwTo caller UserInterrupt) $ \helper _ → do
+              putMVar helperVar helper
+              withScopedChildUsing quick seams (childSpec hangCatcher (shell "exit 0" [])) {specStdout = CallerHandle handle} (\_ → writeIORef entered True)
+        outcome `shouldBe` Left UserInterrupt
+        readIORef entered >>= (`shouldBe` False)
         hIsOpen handle >>= (`shouldBe` False)
 
     it "stays the caller's: open while the body runs, and open after the call, however the body ended" $

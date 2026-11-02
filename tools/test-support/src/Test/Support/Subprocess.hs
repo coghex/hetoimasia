@@ -110,7 +110,7 @@ module Test.Support.Subprocess
   , describeBound
   ) where
 
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (threadDelay, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TMVar, TVar, atomically, check, modifyTVar', newEmptyTMVarIO, newTVarIO, orElse, putTMVar, readTMVar, readTVar, readTVarIO, writeTVar)
 import Control.Exception
@@ -121,6 +121,7 @@ import Control.Exception
   , SomeException
   , catch
   , finally
+  , interruptible
   , mask
   , onException
   , rethrowIO
@@ -131,6 +132,7 @@ import Control.Exception
   )
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (addExceptionAnnotation)
+import Control.Applicative ((<|>))
 import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -472,13 +474,21 @@ withProcess bounds seams spec entered pipes outReader errReader body = mask $ \r
     -- The parent's copies of the child's ends go, so that the readers see the end of the stream when the last holder lets go.
     mapM_ closeQuietly (concatMap (maybe [] pure) [pipesInRead pipes, pipesOutWrite pipes, pipesErrWrite pipes])
     seamSpawned seams handle
+    -- A cancellation sent during the acquisition may still sit in the scheduler's inbox or in this thread's queue: take it here, still
+    -- masked, where the facility owns everything and the release runs. Left to arrive when the mask is lifted it could land after
+    -- the body had begun, and the caller's handles would then be the caller's to close.
+    yield
+    interruptible (pure ())
   outcome ← case acquired of
     Left failure → pure (Left failure)
-    Right () → do
-      writeIORef entered True
-      tryWithContext @SomeException $ case specBound spec of
-        Unbounded → Just <$> restore (body child)
-        Within microseconds → timeout (max 0 microseconds) (restore (body child))
+    Right () →
+      -- The body is entered when it is running, not when the mask is about to be lifted: a cancellation queued during the acquisition is
+      -- delivered the moment the mask is lifted, before anything of the body ran, and the caller's handles are then still the
+      -- facility's to close. The flag is therefore set by the first step inside the restored state.
+      let entering = writeIORef entered True >> body child
+       in tryWithContext @SomeException $ case specBound spec of
+            Unbounded → Just <$> restore entering
+            Within microseconds → timeout (max 0 microseconds) (restore entering)
   conclude env outcome
 
 -- | Create the process in one step with its identifier read. The caller's handles are not closed by the library.
@@ -521,10 +531,24 @@ rootSpelling directory = if directory == "/" then "/." else directory
 -- could not be confirmed fails an otherwise passing outcome.
 conclude ∷ Env → Either (ExceptionWithContext SomeException) (Maybe a) → IO a
 conclude env outcome = do
-  (problems, interruption) ← release env
-  -- A diagnostic, written where a person reads the run; a stream that cannot take it must not replace the failure being raised.
-  forM_ problems $ \text →
-    void (try (seamDiagnostic (envSeams env) ("Test.Support.Subprocess: the cleanup was not confirmed: " <> text)) ∷ IO (Either IOException ()))
+  (problems, releaseInterruption) ← release env
+  -- A diagnostic, written where a person reads the run. It is part of the release's cancellation handling: a cancellation that arrives
+  -- while it is written is remembered and raised after, like any other, with the failure being raised retained beside it; a stream that
+  -- fails or does not take the write within the reap bound is given up on, because a diagnostic never replaces the failure being raised.
+  remaining ← newIORef problems
+  let writeAll =
+        readIORef remaining >>= \case
+          [] → pure ()
+          text : rest → do
+            void
+              ( timeout
+                  (max 0 (boundReap (envBounds env)))
+                  (try (seamDiagnostic (envSeams env) ("Test.Support.Subprocess: the cleanup was not confirmed: " <> text)) ∷ IO (Either IOException ()))
+              )
+            writeIORef remaining rest
+            writeAll
+  written ← rememberingInterruption writeAll
+  let interruption = releaseInterruption <|> written
   let command = describeCommand (specProcess (envSpec env))
       retainProblems primary = foldl (\acc text → annotate (RetainedFailure "the cleanup was not confirmed" text) acc) primary problems
   case (interruption, outcome) of
