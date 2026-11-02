@@ -102,16 +102,16 @@ handedOver host owner window =
 
 -- | 'handedOver', with the attachment it made registered in the same uninterruptible step for the rescue of an example whose exit
 -- waits for independent evidence only its body would publish (#593): an attachment never exists unregistered.
-trackedHandedOver ∷ IORef [AttachmentId] → WindowHost → GraphicsOwner Scene → WindowId → IO GraphicsService
+trackedHandedOver ∷ IORef [GraphicsService] → WindowHost → GraphicsOwner Scene → WindowId → IO GraphicsService
 trackedHandedOver tracked host owner window = uninterruptibleMask_ $ do
   service ← handedOver host owner window
-  atomicModifyIORef' tracked (\known → (graphicsAttachment service : known, ()))
+  atomicModifyIORef' tracked (\known → (service : known, ()))
   pure service
 
 -- | The rescue for the attachments 'trackedHandedOver' registered: every retirement fact published for each, from the calling
 -- thread. It blocks on nothing and raises nothing, and is idempotent.
-rescuePublishing ∷ IORef [AttachmentId] → WindowHost → GraphicsOwner Scene → IO ()
-rescuePublishing tracked host owner = readIORef tracked >>= mapM_ (publishAllFor host owner)
+rescuePublishing ∷ IORef [GraphicsService] → WindowHost → GraphicsOwner Scene → IO ()
+rescuePublishing tracked host owner = readIORef tracked >>= mapM_ (publishAllFor host owner . graphicsAttachment)
 
 sampledObservation ∷ WindowHost → WindowId → IO WindowObservation
 sampledObservation host window =

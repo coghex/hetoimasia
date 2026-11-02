@@ -4,7 +4,7 @@
 module Test.GLFW.Owner.Failure.Interruption (spec) where
 
 import Control.Concurrent (myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM
   ( atomically
   , check
@@ -27,7 +27,7 @@ import Control.Exception
   , throwTo
   )
 import Control.Monad (forM_, unless, void, when)
-import Data.IORef (newIORef)
+import Data.IORef (newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
@@ -39,15 +39,14 @@ import Test.GLFW.Owner.Fixture.Drive
   , awaitTerminal
   , handedOver
   , pumpUntilRetired
-  , rescuePublishing
   , trackedHandedOver
   , raisedBy
   , theWindow
   )
 import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled)
-import Test.GLFW.Owner.Fixture.Rig (Rig (..), armedBody, newRig, ownedHost, ownedHostCaught, ownedHostHooked)
-import Test.GLFW.Support (Scope, boundedExample, caughtAsUnless, cutExamples, quietLogger, unexpected)
+import Test.GLFW.Owner.Fixture.Rig (Rig (..), armedBody, newRig, ownedHost, ownedHostCaught, ownedHostHooked, publishAllFor)
+import Test.GLFW.Support (Scope, boundedExample, caughtAsUnless, cutExamples, quietLogger, unexpected, withDeferredThread)
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 import Test.GLFW.Support (withDeferredThreadOpening)
 import Test.Support.Owned (withOwnedThread)
@@ -86,8 +85,16 @@ retirementRecordSurvives scenario cut = do
   attempts ← newTVarIO (0 ∷ Int)
   recorded ← newTVarIO []
   tracked ← newIORef []
-  -- Armed inside the body's first masked step, which also registers the rescue that publishes the independent evidence the exit
-  -- waits for if the body ends before it publishes it itself (#593).
+  bodyDone ← newEmptyMVar
+  -- Armed inside the body's first masked step, which also hands a supplier the host and the owner (#593). The independent evidence the
+  -- exit waits for, if the body ends before it publishes it itself, can only be recorded once the exit has begun the attachment's
+  -- retirement, so a thread publishes it then; the harassment below may leave the retirement unverified at any point.
+  let supplier (host, owner) = do
+        readMVar bodyDone
+        services ← readIORef tracked
+        forM_ services $ \service → do
+          atomically (readGraphicsService service >>= check . (== SlotRetiring) . observedSlot)
+          publishAllFor host owner (graphicsAttachment service)
   let arm = script (fakeRetireTarget (rigFake rig)) $ \retire → do
         atomically (modifyTVar' attempts (+ 1))
         atomically (writeTVar entered True)
@@ -102,8 +109,10 @@ retirementRecordSurvives scenario cut = do
             thread : _ → pure thread
             [] → retry
         forM_ [1 ∷ Int .. 20] (\_ → throwTo ownerThread ThreadKilled)
-  withOwnedThread harry $ \_ _ → do
-    outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (rescuePublishing tracked host owner) $ do
+  -- In a scenario the harassment is left out: the example's own ending is the point, and the harassment lands on an exit whose
+  -- evidence may already have been forgotten by the attachment (UNEXERCISED together: see the pull request body).
+  withOwnedThread (unless scenario harry) $ \_ _ → withDeferredThread supplier $ \_ handOver → do
+    outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut (handOver (host, owner) >> arm) (void (tryPutMVar bodyDone ())) $ do
       window ← theWindow host
       service ← trackedHandedOver tracked host owner window
       cut 2
