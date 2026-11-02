@@ -16,7 +16,7 @@ module Test.Support.Cancel
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
-import Control.Exception (AsyncException (UserInterrupt))
+import Control.Exception (AsyncException (UserInterrupt), mask_)
 import Control.Monad (when)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Test.Support.Owned (withOwnedThread)
@@ -26,7 +26,7 @@ import Test.Support.Owned (withOwnedThread)
 withCancellationAfter ∷ IO () → IO () → IO a → IO a
 withCancellationAfter event afterwards body = do
   caller ← myThreadId
-  withOwnedThread (event >> throwTo caller UserInterrupt >> afterwards) (\_ _ → body)
+  withOwnedThread (event >> deliver caller afterwards) (\_ _ → body)
 
 -- | 'withCancellationAfter', but the cancellation is held back until the calling thread is blocked sending an exception of
 -- its own (an end it has asked a held thread to take): the moment the event and that blocking are both true. A calling
@@ -38,9 +38,20 @@ withCancellationWhenBlocked event afterwards body = do
     ( do
         event
         blocked ← awaitBlockedSending caller
-        when blocked (throwTo caller UserInterrupt >> afterwards)
+        when blocked (deliver caller afterwards)
     )
     (\_ _ → body)
+
+-- | Deliver the cancellation and run what follows it, as one step the scope's own release cannot split.
+--
+-- Once the exception is delivered the caller unwinds, and its release kills this helper. An unmasked helper could be killed
+-- in the gap between @throwTo@ returning and @afterwards@ running, and then what the cancellation was to be followed by (a
+-- gate opened) would not happen, on a runtime with more than one capability. Masked, the kill waits for the end of the
+-- step, and the delivery itself stays interruptible: a caller that never receives it (it is in an uninterruptible release
+-- waiting for this helper) is not waited on for ever, because the release's kill ends the delivery. @afterwards@ must not
+-- block.
+deliver ∷ ThreadId → IO () → IO ()
+deliver caller afterwards = mask_ (throwTo caller UserInterrupt >> afterwards)
 
 -- | Wait until the thread is blocked in a @throwTo@ (an end being sent that has not yet been received) and answer 'True'; or
 -- answer 'False' when the thread has ended without ever being, because it will never block again. The only wait the runtime

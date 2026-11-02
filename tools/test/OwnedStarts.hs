@@ -11,10 +11,10 @@
 module OwnedStarts (spec) where
 
 import Control.Monad (forM_, void)
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, isSuffixOf)
 import Json (Json (..), asArray, asString, entryFor, field, parseJson)
-import Sandbox (git, run, sanitizedEnvironment, writeFixtureFile)
-import System.Directory (copyFile, createDirectoryIfMissing, doesFileExist, getCurrentDirectory)
+import Sandbox (git, run, sanitizedEnvironment, workflowStepBody, writeFixtureFile)
+import System.Directory (copyFile, createDirectoryIfMissing, doesFileExist, getCurrentDirectory, listDirectory)
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -177,6 +177,32 @@ spec = describe "The unowned-start guard (tools/validation/owned_starts.py)" $ d
       (passed, errors) ← checked (tree plainConfig [] [("pkg/test/Main.hs", source body)])
       (passed, errors) `shouldBe` (True, "")
 
+    it "finds a start in a module whose whole body is indented, while its imports and export list stay ignored" $ do
+      let indented =
+            unlines
+              [ "module Main"
+              , "  ( main"
+              , "  , forkIO"
+              , "  ) where"
+              , "  import Control.Concurrent (forkIO)"
+              , "  import qualified System.Process as Proc (createProcess)"
+              , "  main :: IO ()"
+              , "  main = forkIO (pure ()) >> pure ()"
+              ]
+      (passed, errors) ← checked (tree plainConfig [] [("pkg/test/Main.hs", indented)])
+      passed `shouldBe` False
+      errors `shouldContain` "pkg/test/Main.hs: 1 unowned thread or process start(s)"
+
+    it "finds a start in an indented module body that has no header, and in one whose later declarations are indented" $ do
+      let headerless = unlines ["  import Control.Concurrent", "  main = forkIO (pure ()) >> pure ()"]
+          oneLine = unlines ["module Main where", "  import Control.Concurrent", "  helper = pure ()", "  main = forkIO helper >> pure ()"]
+      (headerlessPassed, headerlessErrors) ← checked (tree plainConfig [] [("pkg/test/Main.hs", headerless)])
+      (onePassed, oneErrors) ← checked (tree plainConfig [] [("pkg/test/Main.hs", oneLine)])
+      headerlessPassed `shouldBe` False
+      headerlessErrors `shouldContain` "1 unowned thread or process start(s)"
+      onePassed `shouldBe` False
+      oneErrors `shouldContain` "1 unowned thread or process start(s)"
+
   describe "which sources are scanned" $ do
     it "covers a test suite declared later without editing the guard's configuration" $ do
       let extra =
@@ -311,6 +337,46 @@ spec = describe "The unowned-start guard (tools/validation/owned_starts.py)" $ d
         (result, _, errors) ← guard' directory ["ratchet", "--base", base]
         result `shouldBe` ExitFailure 1
         errors `shouldContain` "pkg/test/Other.hs: a baseline entry (1) that the review base does not have"
+
+    -- The test job's checkout is shallow, so the review base is not there and the example above is pending. The planning job
+    -- holds the history, and its step is what enforces the ratchet where a pull request is checked: these run the shipped step.
+    describe "the planning job's ratchet step (.github/workflows/validation.yml)" $ do
+      let ratchetStep directory base = do
+            checkout ← getCurrentDirectory
+            body ← workflowStepBody checkout ".github/workflows/validation.yml" "Hold the owned-start baseline against the review base"
+            createDirectoryIfMissing True (directory </> "tools/validation")
+            -- The guard reads the planner's Cabal reader beside it, so the tools directory's modules go with it.
+            modules ← filter (".py" `isSuffixOf`) <$> listDirectory (checkout </> "tools/validation")
+            forM_ modules $ \name → copyFile (checkout </> "tools/validation" </> name) (directory </> "tools/validation" </> name)
+            settings ← sanitizedEnvironment
+            run (("BASE", base) : ("PYTHONDONTWRITEBYTECODE", "1") : settings) directory "bash" ["-c", body]
+
+      it "passes where the baseline did not grow" $ inCheckout $ \_ →
+        withRatchet (baseline [("pkg/test/Main.hs", 1)]) $ \directory base → do
+          (result, _, errors) ← ratchetStep directory base
+          (result, errors) `shouldBe` (ExitSuccess, "")
+
+      it "fails where the baseline grew, so a raised baseline is refused even though the check passes" $ inCheckout $ \_ →
+        withRatchet (baseline [("pkg/test/Main.hs", 1)]) $ \directory base → do
+          writeFixtureFile directory "pkg/test/Main.hs" (source ["main :: IO ()", "main = forkIO (pure ()) >> forkOS (pure ()) >> pure ()"])
+          writeFixtureFile directory "tools/validation/owned_starts_baseline.json" (baseline [("pkg/test/Main.hs", 2)])
+          (result, _, errors) ← ratchetStep directory base
+          result `shouldBe` ExitFailure 1
+          errors `shouldContain` "the baseline grew from 1 to 2; it can only shrink"
+
+      it "fails where the base cannot be resolved, rather than skipping the rule" $ inCheckout $ \_ →
+        withRatchet (baseline [("pkg/test/Main.hs", 1)]) $ \directory _ → do
+          (result, _, errors) ← ratchetStep directory (replicate 40 'a')
+          result `shouldBe` ExitFailure 2
+          errors `shouldContain` "cannot resolve the review base"
+
+      it "runs in the job that holds the history, before the plan is resolved" $ inCheckout $ \checkout → do
+        workflow ← readFile (checkout </> ".github/workflows/validation.yml")
+        let planJob = takeWhile (not . isPrefixOf "  haskell-engine:") (dropWhile (not . isPrefixOf "  plan:") (lines workflow))
+            position name = length (takeWhile (/= "      - name: " <> name) planJob)
+        planJob `shouldSatisfy` any (== "          fetch-depth: 0")
+        planJob `shouldSatisfy` elem "      - name: Hold the owned-start baseline against the review base"
+        position "Hold the owned-start baseline against the review base" `shouldSatisfy` (< position "Resolve the plan")
 
     it "allows the baseline to be established where the review base has none (the explicit bootstrap)" $
       withTree (tree plainConfig [("pkg/test/Main.hs", 1)] [("pkg/test/Main.hs", source ["main :: IO ()", "main = forkIO (pure ()) >> pure ()"])]) $ \directory → do

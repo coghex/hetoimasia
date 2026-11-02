@@ -171,17 +171,40 @@ def blank_non_code(text: str) -> str:
     return "".join(out)
 
 
-def blank_declarations(code: str) -> str:
-    """The code with import declarations and the module header's export list replaced by spaces.
+MODULE_HEADER = re.compile(r"\A\s*module\b.*?\bwhere\b", re.DOTALL)
 
-    A declaration is a column-zero line and the indented lines after it. What an import or an export list mentions is not a
-    start.
+
+def body_column(code: str) -> int:
+    """The column the top-level declarations of the module sit at: Haskell's layout rule for the module body.
+
+    That is the column of the first token after the header's ``where``, or of the first token of a file with no header.
+    It is column zero in almost every file, but a valid module may indent its whole body.
     """
+    header = MODULE_HEADER.match(code)
+    rest = code[header.end() :] if header else code
+    offset = header.end() if header else 0
+    for match in re.finditer(r"\S", rest):
+        position = offset + match.start()
+        return position - (code.rfind("\n", 0, position) + 1)
+    return 0
+
+
+def blank_declarations(code: str) -> str:
+    """The code with import declarations and the module header (with its export list) replaced by spaces.
+
+    A declaration starts at a line indented no further than the module body's column, and the more deeply indented lines
+    after it belong to it. What an import or an export list mentions is not a start.
+    """
+    header = MODULE_HEADER.match(code)
+    if header:
+        code = "".join("\n" if c == "\n" else " " for c in code[: header.end()]) + code[header.end() :]
+    column = body_column(code)
     lines = code.split("\n")
     blank = False
     for number, line in enumerate(lines):
-        if line and not line[0].isspace():
-            blank = line.startswith("import ") or line.startswith("module ")
+        if line.strip():
+            if len(line) - len(line.lstrip()) <= column:
+                blank = line.lstrip().startswith("import ")
         if blank:
             lines[number] = " " * len(line)
     return "\n".join(lines)
@@ -206,12 +229,13 @@ def primitive_pattern(primitives: list[str]) -> re.Pattern[str]:
 def find_sites(path: str, text: str, primitives: list[str]) -> list[Site]:
     """Every start primitive called in one source file, with the top-level binding it is in."""
     code = blank_declarations(blank_non_code(text))
+    column = body_column(code)
     pattern = primitive_pattern(primitives)
     sites: list[Site] = []
     binding: str | None = None
     for number, line in enumerate(code.split("\n"), start=1):
-        if line and not line[0].isspace():
-            start = BINDING_START.match(line)
+        if line.strip() and len(line) - len(line.lstrip()) <= column:
+            start = BINDING_START.match(line.lstrip())
             if start:
                 binding = None if start.group(1) in DECLARATION_KEYWORDS else start.group(1)
             else:

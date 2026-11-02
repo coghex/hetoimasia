@@ -19,7 +19,7 @@
 -- the full-product run library. The real child helper runs under the same orchestration in @run-native-test@.
 module OwnedThread (spec) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, getNumCapabilities, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -293,30 +293,20 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
         readMVar helper >>= joined >>= (`shouldBe` True)
 
     it "cancels the example once the command has begun, and then lets the command go on" $ do
-      began ← newEmptyMVar
-      gate ← newEmptyMVar
-      outcome ← try @AsyncException $
-        bounded $
-          withCancellationAfter (takeMVar began) (putMVar gate ()) $ do
-            putMVar began ()
-            takeMVar gate
-            -- Not reached: the cancellation is delivered to this thread before the gate is opened.
-            readMVar gate
-      outcome `shouldBe` Left UserInterrupt
-      tryReadMVar gate >>= (`shouldBe` Just ())
+      cancelledAfterScenario >>= (`shouldBe` (Left UserInterrupt, Just ()))
 
   describe "the cancellation helper behind the second Library.hs helper (Test.Support.Cancel.withCancellationWhenBlocked)" $ do
     it "cancels a caller blocked sending its end to a held thread, and then lets the held thread go" $ do
-      ended ← newEmptyMVar
-      gate ← newEmptyMVar
-      putMVar ended ()
-      outcome ← try @AsyncException $
-        bounded $
-          withCancellationWhenBlocked (readMVar ended) (putMVar gate ()) $
-            -- The held thread cannot receive an end until the example lets it go: the caller blocks sending one.
-            withOwnedThread (uninterruptibleMask_ (readMVar gate)) $ \held _ → killThread held
-      outcome `shouldBe` Left UserInterrupt
-      tryReadMVar gate >>= (`shouldBe` Just ())
+      cancelledWhenBlockedScenario >>= (`shouldBe` (Left UserInterrupt, Just ()))
+
+    it "still opens the gate after delivering the cancellation, however often the caller's unwinding races the helper, on more than one capability" $ do
+      -- The caller's release kills the helper as soon as the cancellation lands, so a helper that could be killed between the
+      -- delivery and the gate opening skips it on some runs: this repeats both scenarios often enough to see that happen.
+      capabilities ← getNumCapabilities
+      (capabilities >= 2) `shouldSatisfy` id
+      for_ [1 .. 1000 :: Int] $ \_ → do
+        cancelledAfterScenario >>= (`shouldBe` (Left UserInterrupt, Just ()))
+        cancelledWhenBlockedScenario >>= (`shouldBe` (Left UserInterrupt, Just ()))
 
     for_ [("returns normally", Returns), ("raises from its body", Raises)] $ \(label, ending) → do
       it ("leaves no helper running or spinning when the example " <> label <> " before it ever blocks sending") $ do
@@ -348,7 +338,8 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
     it "answers True for a thread blocked in a throwTo that its target cannot yet receive" $ do
       gate ← newEmptyMVar
       target ← newEmptyMVar
-      withOwnedThread (uninterruptibleMask_ (putMVar target () >> readMVar gate)) $ \held _ → do
+      -- The end it is sent is delivered when the region is left; it is taken here so that the thread ends quietly.
+      withOwnedThread (uninterruptibleMask_ (putMVar target () >> readMVar gate) `catch` \(_ ∷ AsyncException) → pure ()) $ \held _ → do
         readMVar target
         withOwnedThread (throwTo held UserInterrupt `catch` \(_ ∷ SomeException) → pure ()) $ \sender _ → do
           bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
@@ -538,3 +529,36 @@ unownedParkedRelease started bounds worker = do
     >>= maybe (failWith ("the helper did not finish within " <> show (boundFinish bounds `div` 1000000) <> " seconds")) pure
   where
     failWith message = throwIO (HUnitFailure Nothing (Reason message))
+
+-- | A caller cancelled once its command has begun, with the gate the cancellation is to be followed by opening: how the
+-- example ended, and whether the gate was opened by the time the scope returned.
+cancelledAfterScenario ∷ IO (Either AsyncException (), Maybe ())
+cancelledAfterScenario = do
+  began ← newEmptyMVar
+  gate ← newEmptyMVar
+  outcome ← try @AsyncException $
+    bounded $
+      withCancellationAfter (takeMVar began) (putMVar gate ()) $ do
+        putMVar began ()
+        takeMVar gate
+        -- Not reached: the cancellation is delivered to this thread before the gate is opened.
+        readMVar gate
+  opened ← tryReadMVar gate
+  pure (outcome, opened)
+
+-- | A caller cancelled while blocked sending its end to a held thread, which only the gate lets go.
+cancelledWhenBlockedScenario ∷ IO (Either AsyncException (), Maybe ())
+cancelledWhenBlockedScenario = do
+  ended ← newEmptyMVar
+  gate ← newEmptyMVar
+  holding ← newEmptyMVar
+  putMVar ended ()
+  outcome ← try @AsyncException $
+    bounded $
+      withCancellationWhenBlocked (readMVar ended) (putMVar gate ()) $
+        -- The held thread cannot receive an end until the example lets it go: the caller blocks sending one. It is sent only
+        -- once the held thread says it is inside the region that holds it, because on more than one capability a thread
+        -- killed before it got there would simply end, and the caller would never block.
+        withOwnedThread (uninterruptibleMask_ (putMVar holding () >> readMVar gate)) $ \held _ → readMVar holding >> killThread held
+  opened ← tryReadMVar gate
+  pure (outcome, opened)

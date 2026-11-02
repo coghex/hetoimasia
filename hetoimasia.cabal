@@ -200,6 +200,9 @@ test-suite workflow-tests
     import: language
     type: exitcode-stdio-1.0
     main-is: Main.hs
+    -- Two capabilities: the owned-thread examples about a cancellation racing the helper it unwinds into only see the race
+    -- when threads run at the same time.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
     hs-source-dirs: tools/test
     other-modules:
         ApprovalProvenance
