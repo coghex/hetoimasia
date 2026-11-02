@@ -11,6 +11,7 @@ module Test.GLFW.Owner.Fixture.Rig
   , ownedHost
   , ownedHostWith
   , ownedHostHooked
+  , ownedHostAt
   , ownedHostBeforeBody
   , armedBody
   , armedFinally
@@ -162,8 +163,22 @@ ownedHostHooked
   → GraphicsOwnerConfig Scene
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO a
-ownedHostHooked hooks logger seam config ownerConfig action =
-  asProcessMainThread seam (ownedHostRun hooks logger seam config ownerConfig action)
+ownedHostHooked hooks = ownedHostAt hooks (pure ())
+
+-- | 'ownedHostHooked' with an action the run's startup callback performs (#612). That callback runs after the owner has started and
+-- before the application's body, so it is where an example reaches the span between the start's return and the body's entry
+-- (supervision, the quiescence guard and the runtime checks) that no host hook is part of.
+ownedHostAt
+  ∷ Private.HostHooks
+  → IO ()
+  → Logger
+  → Seam
+  → HostConfig
+  → GraphicsOwnerConfig Scene
+  → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
+  → IO a
+ownedHostAt hooks startup logger seam config ownerConfig action =
+  asProcessMainThread seam (ownedHostRun hooks startup logger seam config ownerConfig action)
 
 -- | 'ownedHostWith' that runs an action on the main thread after the host is built and before the application's body begins (the
 -- host's own 'beforeConsumer' hook), so an example can end a run during its startup (#593).
@@ -223,18 +238,19 @@ ownedHostCaught
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO (Either SomeException a)
 ownedHostCaught seam config ownerConfig action =
-  asProcessMainThread seam (try (ownedHostRun Private.noHostHooks quietLogger seam config ownerConfig action))
+  asProcessMainThread seam (try (ownedHostRun Private.noHostHooks (pure ()) quietLogger seam config ownerConfig action))
 
 -- | The composition itself, already on the designated main thread.
 ownedHostRun
   ∷ Private.HostHooks
+  → IO ()
   → Logger
   → Seam
   → HostConfig
   → GraphicsOwnerConfig Scene
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO a
-ownedHostRun hooks logger seam config ownerConfig action =
+ownedHostRun hooks startup logger seam config ownerConfig action =
     runGraphicsOwnerApplication
       (withLoggingLifetime logger)
       (Text.pack "owner-example")
@@ -248,7 +264,7 @@ ownedHostRun hooks logger seam config ownerConfig action =
             (\host owner → use (host, owner))
       )
       fst
-      (\dependencies _ → pure dependencies)
+      (\dependencies _ → startup >> pure dependencies)
       (\(host, owner) control → action host owner control)
 
 -- | Everything an example needs to drive one owner.

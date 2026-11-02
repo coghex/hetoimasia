@@ -376,6 +376,7 @@ test-suite glfw-tests
         Test.GLFW.Owner.Failure.Evidence
         Test.GLFW.Owner.Failure.Interruption
         Test.GLFW.Owner.Failure.Reporting
+        Test.GLFW.Owner.Fixture.Cut
         Test.GLFW.Owner.Fixture.Drive
         Test.GLFW.Owner.Fixture.Fake
         Test.GLFW.Owner.Fixture.Journal

@@ -22,10 +22,19 @@ import Control.Exception
   , try
   )
 import Control.Monad (forM, forM_, void, when)
+import Data.IORef (writeIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
+import Test.GLFW.Owner.Fixture.Cut
+  ( Cutting (..)
+  , boundaryControls
+  , boundaryExamples
+  , heldBody
+  , ownedHostCut
+  , uncut
+  )
 import Test.GLFW.Owner.Fixture.Drive
   ( awaitConstructed
   , awaitRound
@@ -77,6 +86,10 @@ spec = do
     (boundedExample testVerifiedRollback)
   it "leaks no port reservation when a handover is refused, and tells the owner about an attachment whose answer was lost"
     (boundedExample testHandoverRecovery)
+  boundaryExamples "the handoff order" handoffOrder
+  boundaryControls "the handoff order" handoffOrder
+  boundaryExamples "the handover recovery" handoverRecovery
+  boundaryControls "the handover recovery" handoverRecovery
   it "leaves no attachment the owner never hears of, however a handover is cancelled"
     (boundedExample testCancelledHandover)
   it "refuses a delayed announcement of an incarnation the slot has moved past"
@@ -89,9 +102,15 @@ spec = do
 -- backend construct anything. Nothing the backend builds can precede the
 -- window's exclusive slot being reserved.
 testHandoffOrder ∷ IO ()
-testHandoffOrder = do
+testHandoffOrder = uncut >>= handoffOrder
+
+-- | The example under a 'Cutting' (#612): the gate it holds the owner at is the cutting's, and the owner is released on every way out
+-- of the body and, before the body has begun, by the exit.
+handoffOrder ∷ Cutting → IO ()
+handoffOrder cutting = do
   rig ← newRig
-  gate ← newTVarIO False
+  writeIORef (cuttingRig cutting) (Just rig)
+  let gate = cuttingGate cutting
   entered ← newEmptyMVar
   -- The owner is held inside its startup, so it can have drained no lifetime
   -- event and constructed nothing while the main thread reserves the slot.
@@ -100,7 +119,7 @@ testHandoffOrder = do
     atomically (readTVar gate >>= check)
     pure (ownerReady (Text.pack "started"))
   (pendingBeforeConstruction, notesBefore, views) ←
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    ownedHostCut cutting Private.noHostHooks quietLogger (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → heldBody cutting $ do
       takeMVar entered
       window ← theWindow host
       service ← handedOver host owner window
@@ -269,15 +288,20 @@ testVerifiedRollback = do
 -- | A refused handover spends no reservation, and an attachment whose answer
 -- was lost is still announced.
 testHandoverRecovery ∷ IO ()
-testHandoverRecovery = do
+testHandoverRecovery = uncut >>= handoverRecovery
+
+-- | The example under a 'Cutting' (#612); see 'handoffOrder'.
+handoverRecovery ∷ Cutting → IO ()
+handoverRecovery cutting = do
   -- One event of room, so a leaked reservation makes the next handover fail.
   rig ← newRigWith (\config → config {ownerEventCapacity = 1})
+  writeIORef (cuttingRig cutting) (Just rig)
   clock ← countingClock
   let config =
         (ownerSettings clock)
           { hostWindowConfigs = [windowNamed (Text.pack "closing"), windowNamed (Text.pack "open")]
           }
-  gate ← newTVarIO False
+  let gate = cuttingGate cutting
   entered ← newEmptyMVar
   -- The owner is held inside its startup, so it drains no event: the one slot
   -- has to be given back by each refusal for the last handover to fit at all.
@@ -285,7 +309,7 @@ testHandoverRecovery = do
     putMVar entered ()
     atomically (readTVar gate >>= check)
     pure (ownerReady (Text.pack "late"))
-  (refusals, announced, owned) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → do
+  (refusals, announced, owned) ← ownedHostCut cutting Private.noHostHooks quietLogger (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → heldBody cutting $ do
     takeMVar entered
     windows ← atomically (hostWindowIdentities host)
     case windows of

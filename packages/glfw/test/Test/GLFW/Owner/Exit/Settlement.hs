@@ -16,8 +16,11 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeException, throwIO, try)
+import Control.Concurrent (myThreadId, throwTo)
+import Control.Exception (AsyncException (ThreadKilled), SomeException, throwIO, try)
 import Control.Monad (forM, void, when)
+import Data.Foldable (for_)
+import Data.IORef (writeIORef)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -27,6 +30,14 @@ import Hetoimasia.GLFW.Internal.Attachment (AttachmentPhase (..), viewPhase)
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import qualified Hetoimasia.Runtime.GLFW.Internal.Owner.Handoff as Private
+import Test.GLFW.Owner.Fixture.Cut
+  ( Cutting (..)
+  , boundaryControls
+  , boundaryExamples
+  , heldBody
+  , ownedHostCut
+  , uncut
+  )
 import Test.GLFW.Owner.Fixture.Drive
   ( awaitRound
   , awaitTerminal
@@ -76,6 +87,12 @@ spec = do
     (boundedExample testWholeOwnerAfterLastTarget)
   it "reads a destruction and completion that both land inside its wait as verified, declaring nothing"
     (boundedExample testCoherentDestructionSnapshot)
+  boundaryExamples "the unannounced direct attachment" unannouncedDirectAttachSettles
+  boundaryControls "the unannounced direct attachment" unannouncedDirectAttachSettles
+  boundaryExamples "the unannounced close" unannouncedClosedSettles
+  boundaryControls "the unannounced close" unannouncedClosedSettles
+  boundaryExamples "the coherent destruction snapshot" coherentDestructionSnapshot
+  boundaryControls "the coherent destruction snapshot" coherentDestructionSnapshot
 
 -- | An ordinary public stop closes every publication, and an announcement
 -- admitted just before it is still drained.
@@ -121,9 +138,15 @@ testNormalStopClosesPublications = do
 -- answered 'ReleaseBegun' would be claiming an evidence path that does not
 -- exist, and the host drain would wait on it forever.
 testUnannouncedDirectAttachSettles ∷ IO ()
-testUnannouncedDirectAttachSettles = do
+testUnannouncedDirectAttachSettles = uncut >>= unannouncedDirectAttachSettles
+
+-- | The example under a 'Cutting' (#612): the gate it holds the owner at is the cutting's, and the owner is released on every way out
+-- of the body and, before the body has begun, by the exit.
+unannouncedDirectAttachSettles ∷ Cutting → IO ()
+unannouncedDirectAttachSettles cutting = do
   rig ← newRigWith (\config → config {ownerEventCapacity = 1})
-  gate ← newTVarIO False
+  writeIORef (cuttingRig cutting) (Just rig)
+  let gate = cuttingGate cutting
   entered ← newEmptyMVar
   script (fakeStart (rigFake rig)) $ \_ → do
     putMVar entered ()
@@ -134,7 +157,7 @@ testUnannouncedDirectAttachSettles = do
         (ownerSettings clock)
           { hostWindowConfigs = [windowNamed (Text.pack "first"), windowNamed (Text.pack "second")]
           }
-  (admitted, answer, stage, pending) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → do
+  (admitted, answer, stage, pending) ← ownedHostCut cutting Private.noHostHooks quietLogger (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → heldBody cutting $ do
     takeMVar entered
     windows ← atomically (hostWindowIdentities host)
     case windows of
@@ -180,9 +203,14 @@ describeRelease = \case
 -- which is the backstop every path that begins a retirement without a
 -- release arrives at.
 testUnannouncedClosedSettles ∷ IO ()
-testUnannouncedClosedSettles = do
+testUnannouncedClosedSettles = uncut >>= unannouncedClosedSettles
+
+-- | The example under a 'Cutting' (#612); see 'unannouncedDirectAttachSettles'.
+unannouncedClosedSettles ∷ Cutting → IO ()
+unannouncedClosedSettles cutting = do
   rig ← newRigWith (\config → config {ownerEventCapacity = 1})
-  gate ← newTVarIO False
+  writeIORef (cuttingRig cutting) (Just rig)
+  let gate = cuttingGate cutting
   entered ← newEmptyMVar
   script (fakeStart (rigFake rig)) $ \_ → do
     putMVar entered ()
@@ -193,7 +221,7 @@ testUnannouncedClosedSettles = do
         (ownerSettings clock)
           { hostWindowConfigs = [windowNamed (Text.pack "first"), windowNamed (Text.pack "second")]
           }
-  (admitted, stage, retirements) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → do
+  (admitted, stage, retirements) ← ownedHostCut cutting Private.noHostHooks quietLogger (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → heldBody cutting $ do
     takeMVar entered
     windows ← atomically (hostWindowIdentities host)
     case windows of
@@ -332,37 +360,59 @@ testWholeOwnerAfterLastTarget = do
 -- destroyed everything: one that decides from the snapshot alone only waits,
 -- and its next turn finds the evidence.
 testCoherentDestructionSnapshot ∷ IO ()
-testCoherentDestructionSnapshot = do
+testCoherentDestructionSnapshot = uncut >>= coherentDestructionSnapshot
+
+-- | The example under a 'Cutting' (#612). The destruction is held until the exit has read its first snapshot, which is the cutting's
+-- gate. The exit's hook finds the owner the body published, and leaves if there is none: the exit runs after the body has ended, so
+-- an owner that is not published by then never will be, and a hook that waited for one would hold the exit for ever. The gate is
+-- opened by the exit on every turn, whatever the run was cut in the middle of; the hook then waits for the owner's evidence only
+-- when there is an owner to wait for. Unrescued, the hook is the one the example had before: it waits for a published owner.
+coherentDestructionSnapshot ∷ Cutting → IO ()
+coherentDestructionSnapshot cutting = do
   rig ← newRig
+  writeIORef (cuttingRig cutting) (Just rig)
   trace ← newSinkTrace
   let recording = sinkFailingOn (Text.pack "never") trace
+      snapshotRead = cuttingGate cutting
   held ← newTVarIO Nothing
-  snapshotRead ← newTVarIO False
   turns ← newTVarIO (0 ∷ Int)
   releasedWhileHeld ← newTVarIO Nothing
+  hookThread ← newTVarIO Nothing
   script (fakeDestroy (rigFake rig)) $ \_ → do
     atomically (readTVar snapshotRead >>= check)
     pure (ownerDestroyed "destroyed")
+  -- What ends a run the unrescued hook is parked in, from outside it (the control's): the hook's own thread is cancelled, which the
+  -- exit absorbs, and its next turn is not the first.
+  writeIORef (cuttingRelease cutting) $
+    atomically (readTVar hookThread >>= maybe retry pure) >>= (`throwTo` ThreadKilled)
   let hooks =
         Private.noHostHooks
           { Private.afterDestructionSnapshot = do
               first ← atomically (stateTVar turns (\n → (n == 0, n + 1)))
               when first $ do
-                owner ← atomically (readTVar held >>= maybe retry pure)
-                atomically (writeTVar snapshotRead True)
-                atomically $ do
-                  terminal ← readOwnerTerminalNow owner
-                  check (isJust (ownerDestroyedEvidence terminal) && ownerRunEnded terminal)
-                notes ← journalled (rigJournal rig)
-                atomically (writeTVar releasedWhileHeld (Just (filter released notes)))
+                atomically . writeTVar hookThread . Just =<< myThreadId
+                owner ←
+                  if cuttingRescued cutting
+                    then readTVarIO held
+                    else Just <$> atomically (readTVar held >>= maybe retry pure)
+                for_ owner $ \owner' → do
+                  atomically (writeTVar snapshotRead True)
+                  atomically $ do
+                    terminal ← readOwnerTerminalNow owner'
+                    check (isJust (ownerDestroyedEvidence terminal) && ownerRunEnded terminal)
+                  notes ← journalled (rigJournal rig)
+                  atomically (writeTVar releasedWhileHeld (Just (filter released notes)))
           }
   outcome ← try @SomeException $
-    ownedHostHooked hooks recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+    ownedHostCut cutting hooks recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
       atomically (writeTVar held (Just owner))
       void (awaitRound owner 0)
   case outcome of
     Right () → pure ()
-    Left failure → unexpected ("the exit failed after a successful teardown: " <> show failure)
+    -- Raised as itself when the run was cut: that is what the cut examples judge.
+    Left failure
+      | isJust (cuttingBoundary cutting) → throwIO failure
+      | otherwise → unexpected ("the exit failed after a successful teardown: " <> show failure)
   -- The forced ordering really happened: the snapshot the hook held was read
   -- before the destruction could answer, and a later turn followed it.
   readTVarIO snapshotRead `shouldReturn` True

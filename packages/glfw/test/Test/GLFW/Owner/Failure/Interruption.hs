@@ -3,7 +3,7 @@
 -- point after it, and the join waits for a terminal group report.
 module Test.GLFW.Owner.Failure.Interruption (spec) where
 
-import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
@@ -23,34 +23,56 @@ import Control.Exception
   , getMaskingState
   , mask
   , onException
+  , throwIO
   , throwTo
   )
 import Control.Monad (forM_, unless, void, when)
+import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import Test.GLFW.Owner.Fixture.Drive
-  ( awaitRound
+  ( absorbing
+  , awaitRound
   , awaitStanding
   , awaitTerminal
   , handedOver
   , pumpUntilRetired
   , raisedBy
+  , rescuePublishing
   , theWindow
+  , trackedHandedOver
   )
 import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
-import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled)
+import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHost, ownedHostCaught, ownedHostHooked)
-import Test.GLFW.Support (Scope, boundedExample, caughtAsUnless, cutExamples, quietLogger, unexpected)
+import Test.GLFW.Support
+  ( Ending (..)
+  , Scope
+  , boundedExample
+  , caughtAsUnless
+  , cutExamples
+  , ownedEnds
+  , quietLogger
+  , unexpected
+  , unownedLeaks
+  , withDeferredThreadOpening
+  )
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
-import Test.GLFW.Support (withDeferredThreadOpening)
+import Test.Support.Owned (withOwnedThreadOpening)
+import Data.IORef (newIORef)
 
 spec ∷ Spec
 spec = do
   it "records a target retirement that returned, however it is then cancelled"
     (boundedExample testRetirementRecordSurvivesCancellation)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+    it ("ends and joins the harasser, offers the retirement once and terminates the owner when the example body " <> label <> " after the harassment started and before the body supplies the completion evidence (#612)") $
+      boundedExample (ownedEnds ending retirementRecordScenario False)
+    it ("negative control: an unowned harasser outlives the example whose body " <> label <> " after the harassment started (#612)") $
+      boundedExample (unownedLeaks ending retirementRecordScenario False)
   it "commits every injected operation's answer with no interruption point after it"
     (boundedExample testOperationAnswersCommitUninterrupted)
   it "waits for a terminal group report however the join is interrupted"
@@ -66,57 +88,109 @@ spec = do
 -- target would be neither retired nor marked, and the drain would offer the
 -- operation again, disposing a second time what the backend already disposed.
 testRetirementRecordSurvivesCancellation ∷ IO ()
-testRetirementRecordSurvivesCancellation = do
+testRetirementRecordSurvivesCancellation = retirementRecord withOwnedThreadOpening False (pure ())
+
+-- | The same fixture ended after the harassment has started and before the body supplies the completion evidence the exit waits for
+-- (#612): the harasser is held after its first cancellation until the example's own ending (or its scope) lets it go on, so it is
+-- certainly alive and certainly mid-harassment when the body fails or is cancelled. The run is not asserted to raise the injected
+-- ending here: the ending's judgement does that. What is asserted is what must hold whatever raised: the retirement was offered
+-- exactly once, the owner was destroyed after its retirement and the session ended.
+retirementRecordScenario ∷ Scope → IO () → IO ()
+retirementRecordScenario scope atParked = retirementRecord scope True atParked
+
+-- | The example. The harasser is an owned start of the first argument; with @held@ it parks after its first cancellation until the body
+-- or the scope releases it, and the second argument is where a scenario ends the body ('retirementRecord' with @held@ false never
+-- calls it).
+--
+-- = The harasser and what it may hit
+--
+-- It delivers 'ThreadKilled' to the owner's thread again and again from the instant the retirement call is entered, so one lands
+-- wherever the owner is least protected: inside the call, on its way out, or after the record. It must not outlive the target's
+-- retirement, though: a cancellation that lands in the whole-owner retirement or destruction that follows interrupts a call whose
+-- evidence the exit then waits for, correctly, for ever (the cause of the hang this example had under @-N2@, where the harasser runs
+-- beside the owner instead of ahead of it: 8 of 204 runs, each ended with @OwnerRetirement@ in the journal and no
+-- @OwnerDestruction@). So the owner's whole-owner retirement and destruction wait, absorbing what is still delivered, for the
+-- harassment to be over. Nothing else about the owner is gated, and nothing waits on time.
+retirementRecord ∷ Scope → Bool → IO () → IO ()
+retirementRecord scope held atParked = do
   rig ← newRig
   entered ← newTVarIO False
+  harassed ← newTVarIO False
+  started ← newTVarIO False
+  release ← newTVarIO (not held)
   attempts ← newTVarIO (0 ∷ Int)
   recorded ← newTVarIO []
+  absorbed ← newTVarIO (0 ∷ Int)
+  tracked ← newIORef []
   script (fakeRetireTarget (rigFake rig)) $ \retire → do
     atomically (modifyTVar' attempts (+ 1))
     atomically (writeTVar entered True)
     pure (targetRetired (Text.pack (show (retiringWindow retire))))
-  -- Delivered again and again from the instant the call is entered, so one of
-  -- them lands wherever the owner is least protected — inside the call, on
-  -- its way out, or after the record.
+  -- The owner's later calls wait for a harassment that has begun, and absorb what is still being delivered while they wait.
+  let afterHarassment = absorbing absorbed . atomically $ do
+        begun ← readTVar entered
+        when begun (readTVar harassed >>= check)
+  script (fakeRetireOwner (rigFake rig)) $ \_ → afterHarassment >> pure (ownerRetired (Text.pack "retired"))
+  script (fakeDestroy (rigFake rig)) $ \_ → afterHarassment >> pure (ownerDestroyed (Text.pack "destroyed"))
   let harry = do
         atomically (readTVar entered >>= check)
         ownerThread ← atomically $
           readTVar (fakeThreads (rigFake rig)) >>= \case
             thread : _ → pure thread
             [] → retry
-        forM_ [1 ∷ Int .. 20] (\_ → throwTo ownerThread ThreadKilled)
-  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
-    window ← theWindow host
-    service ← handedOver host owner window
-    awaitStanding owner service `shouldReturn` TargetUsable
-    -- NOT CONVERTED (#593 narrowed by the owner, 2026-11-02): this harassing thread stays an unowned start, with its baseline entry. A rescue for
-    -- an early cancellation together with the harassment cannot be registered from test code (the attachment may have forgotten its
-    -- acknowledgement by then); the follow-up issue owns it.
-    void (forkIO harry)
-    _ ← releaseGraphicsTarget host owner service
-    atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
-    -- Independent evidence, so this exit finishes whichever way the
-    -- retirement settled.
-    publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
-    acknowledgement ←
-      atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-        >>= maybe (unexpected "the attachment kept no acknowledgement") pure
-    forM_ allRetirementFacts $ \fact →
-      void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
-    pumpUntilRetired host control
-    -- Captured here rather than returned: the run itself raises the
-    -- cancellation at its exit, so the body's value never reaches the caller.
-    atomically . writeTVar recorded . Map.keys =<< atomically (readTargetTerminalsNow owner)
-  -- However it ended, it ended by raising the cancellation rather than
-  -- swallowing it.
-  void (raisedBy outcome)
-  -- Offered exactly once, over the whole run and its drain, however many
-  -- cancellations arrived.
-  readTVarIO attempts `shouldReturn` 1
-  -- And because it returned, its record exists: a retirement the owner
-  -- performed is never one the owner then forgets, and never one the drain
-  -- performs a second time.
-  readTVarIO recorded >>= \terminals → length terminals `shouldBe` 1
+        ( do
+            throwTo ownerThread ThreadKilled
+            atomically (writeTVar started True)
+            atomically (readTVar release >>= check)
+            forM_ [2 ∷ Int .. 20] (\_ → throwTo ownerThread ThreadKilled)
+          )
+          `finally` atomically (writeTVar harassed True)
+      letGo = atomically (writeTVar release True)
+  -- Owned by the example and not by the host body: the harassment ends before the owner's later calls, which wait for it, and the
+  -- scope lets it go on whatever ended the example (#612).
+  scope letGo harry $ \_ _ → do
+    outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      window ← theWindow host
+      service ← trackedHandedOver tracked host owner window
+      -- The completion evidence the exit waits for is published by the rescue as well when the body ends before it does, once the
+      -- harassment has been let go, so no ending can leave the exit waiting for it.
+      (`onException` (letGo >> rescuePublishing tracked host owner)) $ do
+        awaitStanding owner service `shouldReturn` TargetUsable
+        _ ← releaseGraphicsTarget host owner service
+        when held $ do
+          atomically (readTVar started >>= check)
+          atParked
+        atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+        -- Independent evidence, so this exit finishes whichever way the
+        -- retirement settled.
+        publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+        acknowledgement ←
+          atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+            >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+        forM_ allRetirementFacts $ \fact →
+          void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+        pumpUntilRetired host control
+        -- Captured here rather than returned: the run itself raises the
+        -- cancellation at its exit, so the body's value never reaches the caller.
+        atomically . writeTVar recorded . Map.keys =<< atomically (readTargetTerminalsNow owner)
+    -- Offered exactly once, over the whole run and its drain, however many
+    -- cancellations arrived and however the example ended.
+    readTVarIO attempts `shouldReturn` 1
+    if held
+      then do
+        -- Ended by the scenario: the owner terminated after its retirement and the session was torn down, and the ending is the
+        -- run's own, raised as itself for the ending's judgement.
+        notes ← journalled (rigJournal rig)
+        ordered notes [OwnerRetirement, OwnerDestruction, SessionEnded]
+        either throwIO (\() → unexpected "the ended run returned") outcome
+      else do
+        -- However it ended, it ended by raising the cancellation rather than
+        -- swallowing it.
+        void (raisedBy outcome)
+        -- And because it returned, its record exists: a retirement the owner
+        -- performed is never one the owner then forgets, and never one the drain
+        -- performs a second time.
+        readTVarIO recorded >>= \terminals → length terminals `shouldBe` 1
 
 -- | Every injected operation's answer is committed with no interruption
 -- point between the two.

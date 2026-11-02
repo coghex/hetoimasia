@@ -22,7 +22,7 @@ import Hetoimasia.GLFW.Internal.Attachment (AttachmentId, AttachmentPhase (Attac
 import Hetoimasia.Runtime.GLFW.Internal.Host.Attachments (hostGraphicsPublisher)
 import Hetoimasia.Runtime.GLFW.Internal.Host.Config (HostConfig (..))
 import Hetoimasia.Runtime.GLFW.Internal.Host.Seam (hostAttachmentView, hostPendingAttachments)
-import Hetoimasia.Runtime.GLFW.Internal.Host.State (WindowHost, hostConfiguration)
+import Hetoimasia.Runtime.GLFW.Internal.Host.State (OwnerBoundary (..), WindowHost, hostConfiguration)
 import Hetoimasia.Runtime.GLFW.Internal.Host.Windows (hostWindowIdentities)
 import Hetoimasia.Runtime.GLFW.Internal.Host.Wake (hostWakeNotifier)
 import Hetoimasia.Runtime.GLFW.Internal.Owner.Config (GraphicsOwnerConfig (..))
@@ -49,14 +49,22 @@ data OwnerHandleMissing = OwnerHandleMissing
 instance Exception OwnerHandleMissing
 
 -- | Build the handoff, start the worker, and answer the handle.
+--
+-- @boundary@ is the private examples' seam, 'Host.State.ownerBoundary' (#612);
+-- production passes the no-op of 'noHostHooks'. It is called at two places and nowhere
+-- else: with 'OwnerBeforePublication' at the start of the preparation step,
+-- before the handle is published to the run action's cell and to the
+-- composition that owns the owner, and with 'OwnerStarted' once the start has
+-- returned its worker, which is after the handle was published.
 startGraphicsOwner
   ∷ WorkerGroup
   → WindowHost
   → IO ()
+  → (OwnerBoundary → IO ())
   → GraphicsOwnerConfig scene
   → (GraphicsOwner scene → IO ())
   → IO (GraphicsOwner scene)
-startGraphicsOwner group host settled config publish = do
+startGraphicsOwner group host settled boundary config publish = do
   publisher ← maybe (throwIO OwnerHostUnprotected) pure (hostGraphicsPublisher host)
   handoff ←
     newOwnerHandoff
@@ -123,13 +131,16 @@ startGraphicsOwner group host settled config publish = do
   -- this owner — is what leaves no instant at which a live owner exists that
   -- the protected exit cannot see.
   let publishHandle worker = do
+        boundary OwnerBeforePublication
         let owner = partial worker
         writeIORef built (Just owner)
         publish owner
   outcome ← startWorkerWith group definition publishHandle awaitStartup
   case outcome of
     Left _ → throwIO OwnerHostUnprotected
-    Right (worker, _) → pure (partial worker)
+    Right (worker, _) → do
+      boundary OwnerStarted
+      pure (partial worker)
 
 -- | The attachments this host's model says are retiring.
 retiringAttachments ∷ WindowHost → STM [AttachmentId]

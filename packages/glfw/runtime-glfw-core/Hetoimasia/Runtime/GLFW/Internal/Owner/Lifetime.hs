@@ -176,7 +176,7 @@ withGraphicsOwnerHostAll hooks logger sessionScope config ownerConfig use = do
   -- has already drained, so its automatic join finds it settled.
   withWorkerGroup $ \group →
     withProtectedWindowHostOver hooks exit logger sessionScope config $ \host → do
-      owner ← startGraphicsOwner group host (afterOwnerOperation hooks) ownerConfig publish
+      owner ← startGraphicsOwner group host (afterOwnerOperation hooks) (ownerBoundary hooks) ownerConfig publish
       use host owner
 
 -- | 'Hetoimasia.Runtime.GLFW.runProtectedWindowApplication' over a host that
