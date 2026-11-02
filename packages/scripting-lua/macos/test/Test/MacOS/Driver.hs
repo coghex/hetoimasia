@@ -19,7 +19,8 @@ module Test.MacOS.Driver
   , Instance (..)
   , withFixture
   , helperArguments
-  , launchHelper
+  , withHelper
+  , withLaunched
   , accessesFrom
   , outcomeOf
   , mechanismOf
@@ -80,7 +81,7 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , awaitExitWithin
   , awaitStreamEnd
   , collectReports
-  , launch
+  , withLaunch
   , sendSignal
   , withEndpoint
   )
@@ -192,20 +193,24 @@ withFixture action = do
         }
 
   sweep fixture = do
-    launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "report" 0
-    observeExit launched
+    withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "report" 0 observeExit
 
--- | Run one helper, with the arguments its mode needs.
-launchHelper ∷ Fixture → Instance → Instance → Text → Int → IO Launched
-launchHelper fixture self peer mode memoryLimitMiB = do
-  result ←
-    launch
-      LaunchRequest
-        { requestExecutable = fixtureHelper fixture
-        , requestArguments = helperArguments fixture self peer mode
-        , requestMemoryLimitMiB = memoryLimitMiB
-        }
-  either (throwIO . ErrorCall . ("the helper could not be launched: " <>) . show) pure result
+-- | Run one helper for the length of the body, with the arguments its mode needs. The thread that reads its output is owned by
+-- the scope of the launch (#598): it has ended and been joined when this returns, however the body ended. The body ends the
+-- helper and observes it end, as every example does; leaving it running is the example's own concern.
+withHelper ∷ Fixture → Instance → Instance → Text → Int → (Launched → IO a) → IO a
+withHelper fixture self peer mode memoryLimitMiB =
+  withLaunched
+    LaunchRequest
+      { requestExecutable = fixtureHelper fixture
+      , requestArguments = helperArguments fixture self peer mode
+      , requestMemoryLimitMiB = memoryLimitMiB
+      }
+
+-- | 'withLaunch' for an example that needs the helper and fails when it cannot be launched.
+withLaunched ∷ LaunchRequest → (Launched → IO a) → IO a
+withLaunched request body =
+  withLaunch request (either (throwIO . ErrorCall . ("the helper could not be launched: " <>) . show) body)
 
 -- | The command line one instance is given.
 helperArguments ∷ Fixture → Instance → Instance → Text → [String]

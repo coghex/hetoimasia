@@ -15,7 +15,7 @@
 -- that was interrupted.
 module Test.Confinement.Lifetime (spec) where
 
-import Control.Concurrent (forkIO, throwTo)
+import Control.Concurrent (throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -46,6 +46,7 @@ import Test.Confinement.Support
   )
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Ledger → Controls → [FilePath] → Environment → Availability → Spec
 spec ledger available sentinels machine installed = describe "lifetime" $ do
@@ -77,45 +78,46 @@ spec ledger available sentinels machine installed = describe "lifetime" $ do
       running ← newIORef Nothing
       started ← newEmptyMVar
       finished ← newEmptyMVar
-      owner ←
-        forkIO $ do
-          outcome ←
-            try @SomeException $
-              withRoot $ \root →
-                withLaunch ledger (idle root) $ \launched → case launched of
-                  Left _ → putMVar started Nothing
-                  Right child → do
-                    _ ← awaitReady child
-                    writeIORef running (Just child)
-                    putMVar started (Just (confinedPid child))
-                    -- Parked where a supervisor would find it: the owner is
-                    -- waiting on a child that will never finish on its own.
-                    blocked ← newEmptyMVar
-                    takeMVar blocked
-          putMVar finished outcome
-      admittedPid ← bounded (takeMVar started)
-      case admittedPid of
-        Nothing →
-          expectationFailure
-            "the profile installed for the trial child but refused the cancellation case"
-        Just _ → do
-          -- Cancelling the owner is not the same as ending the child, which is
-          -- the point: the child outlives the cancellation unless the owner's
-          -- own teardown runs.
-          _ ← forkIO (throwTo owner ThreadKilled)
-          _ ← bounded (takeMVar finished)
-          child ← readIORef running
-          case child of
-            Nothing → expectationFailure "the cancelled owner recorded no child"
-            Just launched → do
-              alive ← stillRunning launched
-              alive `shouldBe` False
-              owners ← admittedOwners ledger
-              owners `shouldBe` []
-              announce
-                ( "PROVED lifetime-cancellation owner=cancelled child=reaped"
-                    <> " admitted-owners=0"
-                )
+      withOwnedThread
+        ( do
+            outcome ←
+              try @SomeException $
+                withRoot $ \root →
+                  withLaunch ledger (idle root) $ \launched → case launched of
+                    Left _ → putMVar started Nothing
+                    Right child → do
+                      _ ← awaitReady child
+                      writeIORef running (Just child)
+                      putMVar started (Just (confinedPid child))
+                      -- Parked where a supervisor would find it: the owner is
+                      -- waiting on a child that will never finish on its own.
+                      blocked ← newEmptyMVar
+                      takeMVar blocked
+            putMVar finished outcome
+        )
+        $ \owner _ → do
+          admittedPid ← bounded (takeMVar started)
+          case admittedPid of
+            Nothing →
+              expectationFailure
+                "the profile installed for the trial child but refused the cancellation case"
+            Just _ → do
+              -- Cancelling the owner is not the same as ending the child, which is
+              -- the point: the child outlives the cancellation unless the owner's
+              -- own teardown runs.
+              _ ← withOwnedThread (throwTo owner ThreadKilled) (\_ _ → bounded (takeMVar finished))
+              child ← readIORef running
+              case child of
+                Nothing → expectationFailure "the cancelled owner recorded no child"
+                Just launched → do
+                  alive ← stillRunning launched
+                  alive `shouldBe` False
+                  owners ← admittedOwners ledger
+                  owners `shouldBe` []
+                  announce
+                    ( "PROVED lifetime-cancellation owner=cancelled child=reaped"
+                        <> " admitted-owners=0"
+                    )
 
   it "ends a child that has only just started, before it has said anything" $
     whenAvailable machine installed "lifetime-immediate-force" $

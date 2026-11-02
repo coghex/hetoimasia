@@ -4,7 +4,7 @@
 -- sleeps for a duration and then assumes something happened.
 module Test.MacOS.Isolation (spec) where
 
-import Control.Exception (bracket)
+import Control.Exception (finally)
 import Test.Hspec
 
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Confine
@@ -78,14 +78,11 @@ spec = describe "two-instance isolation" $
             <> ") left the second running"
         )
  where
-  withPair fixture =
-    bracket
-      ( do
-          first ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0
-          second ← launchHelper fixture (fixtureSecond fixture) (fixtureFirst fixture) "hold" 0
-          pure (first, second)
-      )
-      (\(first, second) → mapM_ endQuietly [first, second])
+  -- Each helper is ended inside the scope of its launch, before the thread that reads its output is joined (#598).
+  withPair fixture body =
+    withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0 $ \first →
+      withHelper fixture (fixtureSecond fixture) (fixtureFirst fixture) "hold" 0 $ \second →
+        body (first, second) `finally` mapM_ endQuietly [first, second]
 
   isFootprint = \case
     Footprint _ _ → True

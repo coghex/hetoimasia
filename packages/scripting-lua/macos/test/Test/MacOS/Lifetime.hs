@@ -40,51 +40,51 @@ spec ∷ SpecWith Fixture
 spec = describe "lifetime and identity" $ do
   it "leaves no admitted owner when initialization fails after confinement" $ \fixture → do
     ledger ← newLedger
-    launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "init-fail" 0
-    admit ledger owner 64
-    ready ← awaitReady launched guardMicroseconds
-    ready `shouldBe` True
-    (reports, status) ← observeExit launched
-    releaseObserved ledger owner status
-    status `shouldBe` ExitedWith (refusalExitCode InitializationFailed)
-    [refusal | Refused refusal _ ← reports] `shouldBe` [InitializationFailed]
-    checkSettled ledger launched reports
-    announce
-      ( "proved: an initialization failure after admission exits "
-          <> show (refusalExitCode InitializationFailed)
-          <> ", releases the owner's budget only once that status was reaped, and never restarts"
-      )
+    withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "init-fail" 0 $ \launched → do
+      admit ledger owner 64
+      ready ← awaitReady launched guardMicroseconds
+      ready `shouldBe` True
+      (reports, status) ← observeExit launched
+      releaseObserved ledger owner status
+      status `shouldBe` ExitedWith (refusalExitCode InitializationFailed)
+      [refusal | Refused refusal _ ← reports] `shouldBe` [InitializationFailed]
+      checkSettled ledger launched reports
+      announce
+        ( "proved: an initialization failure after admission exits "
+            <> show (refusalExitCode InitializationFailed)
+            <> ", releases the owner's budget only once that status was reaped, and never restarts"
+        )
 
   it "leaves no admitted owner when the parent cancels a running helper" $ \fixture → do
     ledger ← newLedger
-    launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0
-    admit ledger owner 64
-    running ← awaitReport launched guardMicroseconds isFootprint
-    running `shouldSatisfy` isPresent
-    ending ← endWithEscalation launched
-    releaseObserved ledger owner (endingExit ending)
-    endingExit ending `shouldSatisfy` isSignal
-    checkSettled ledger launched (endingReports ending)
-    announce
-      ( "proved: cancelling a running helper ended it as "
-          <> show (endingExit ending)
-          <> ", and the parent released its budget from that observation"
-      )
+    withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0 $ \launched → do
+      admit ledger owner 64
+      running ← awaitReport launched guardMicroseconds isFootprint
+      running `shouldSatisfy` isPresent
+      ending ← endWithEscalation launched
+      releaseObserved ledger owner (endingExit ending)
+      endingExit ending `shouldSatisfy` isSignal
+      checkSettled ledger launched (endingReports ending)
+      announce
+        ( "proved: cancelling a running helper ended it as "
+            <> show (endingExit ending)
+            <> ", and the parent released its budget from that observation"
+        )
 
   it "leaves no admitted owner when a helper is force-killed" $ \fixture → do
     ledger ← newLedger
-    launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0
-    admit ledger owner 64
-    running ← awaitReport launched guardMicroseconds isFootprint
-    running `shouldSatisfy` isPresent
-    sent ← sendSignal launched sigKILL
-    sent `shouldBe` True
-    (reports, status) ← observeExit launched
-    releaseObserved ledger owner status
-    status `shouldBe` Signalled 9
-    checkSettled ledger launched reports
-    announce
-      "proved: a forced kill is reaped as signal 9, the budget is released from the reap and not from the send, and the helper's output up to the kill is kept"
+    withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0 $ \launched → do
+      admit ledger owner 64
+      running ← awaitReport launched guardMicroseconds isFootprint
+      running `shouldSatisfy` isPresent
+      sent ← sendSignal launched sigKILL
+      sent `shouldBe` True
+      (reports, status) ← observeExit launched
+      releaseObserved ledger owner status
+      status `shouldBe` Signalled 9
+      checkSettled ledger launched reports
+      announce
+        "proved: a forced kill is reaped as signal 9, the budget is released from the reap and not from the send, and the helper's output up to the kill is kept"
  where
   isFootprint = \case
     Footprint _ _ → True
