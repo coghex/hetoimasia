@@ -199,8 +199,7 @@ cabal test hetoimasia-tests --test-show-details=direct
   facility's test-side seams; the stream choices and the handles the caller
   opened; a child that has exited and not been reaped; where a child is placed (a
   group of its own in the caller's session, or the caller's group with only its
-  identifier signalled); a call that states no bound and is unbounded; the
-  hosts the display helper examples run their helpers on; and a test-owner
+  identifier signalled); a call that states no bound and is unbounded; and a test-owner
   process, this very executable re-run with `HETOIMASIA_SUBPROCESS_OWNER` set,
   whose process group is ended from outside while its body is parked. Each
   ownership and timeout example has a negative control that applies the same
