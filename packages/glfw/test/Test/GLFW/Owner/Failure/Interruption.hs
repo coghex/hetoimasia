@@ -60,7 +60,7 @@ spec = do
     (boundedExample testOperationAnswersCommitUninterrupted)
   it "waits for a terminal group report however the join is interrupted"
     (boundedExample testJoinAwaitsTerminalReport)
-  cutExamples "the record fixture" [0, 1, 2] retirementRecordScenario
+  cutExamples "the record fixture" [0, 1, 2, 3] retirementRecordScenario
   cutExamples "the join fixture" [0, 1] joinScenario
 
 -- | A target retirement that returned is recorded, whatever is delivered to
@@ -109,6 +109,7 @@ retirementRecordSurvives scenario cut = do
       cut 2
       awaitStanding owner service `shouldReturn` TargetUsable
       _ ← releaseGraphicsTarget host owner service
+      cut 3
       atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
       -- Independent evidence, so this exit finishes whichever way the
       -- retirement settled.

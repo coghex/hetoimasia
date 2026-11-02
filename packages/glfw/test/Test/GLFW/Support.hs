@@ -449,7 +449,8 @@ cutExamples what cuts scenario =
     cutName cutAt = case cutAt of
       0 → "before the behaviour is armed"
       1 → "after it is armed and its release registered"
-      _ → "after the first attachment exists"
+      2 → "after the first attachment exists"
+      _ → "after the first attachment's retirement was requested"
 
 -- | The negative control: the same scenario over an unowned start leaves the thread behind, and the failed judgement is recorded
 -- before anything independent stops the thread. Whatever the control left is then stopped and joined, even if the judgement
