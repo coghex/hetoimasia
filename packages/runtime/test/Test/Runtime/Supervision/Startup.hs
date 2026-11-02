@@ -16,12 +16,13 @@
 -- observation that nothing signals fail the example; it never decides what a correct run does.
 module Test.Runtime.Supervision.Startup (spec) where
 
-import Control.Concurrent (killThread)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent (ThreadId, killThread, yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, retry)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , ExceptionWithContext (ExceptionWithContext)
+  , SomeAsyncException
   , SomeException
   , finally
   , fromException
@@ -31,10 +32,12 @@ import Control.Exception
   , tryWithContext
   , uninterruptibleMask_
   )
-import Control.Monad (void, when)
+import Control.Monad (unless, void, when)
 import Control.Monad.IO.Class (liftIO)
-import Data.Foldable (for_)
+import Data.Foldable (for_, traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.Maybe (isJust)
+import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (LogEntry (..), LogLevel (..))
 import Hetoimasia.Foundation.Worker
@@ -99,6 +102,55 @@ spec = describe "A sibling's failure while a start is in progress" $ do
           judgement `shouldBe` False
         -- The rescue released the held worker, then stopped and joined the owner.
         endedAfterScope probe >>= (`shouldBe` True)
+
+  -- A fixture with a sibling that waits at a gate of its own: opening only the held worker's release would leave the cooperative
+  -- close that follows a cancelled start waiting for the sibling, so the owner's opening lets go every gate (#597).
+  describe "The owner of a start whose close waits for a sibling (withOwnedThreadOpening)" $
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined, every gate let go, when the example " <> label) $ do
+        probe ← newControlProbe
+        held ← newHeld
+        trace ← newTrace
+        siblingGate ← newGate
+        runEnding (ownedSiblingStart held siblingGate probe) (const (siblingStart trace held siblingGate probe)) probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+      it ("negative control: the previous unowned start leaves the owner held when the example " <> label) $ do
+        probe ← newControlProbe
+        held ← newHeld
+        trace ← newTrace
+        siblingGate ← newGate
+        withRescue $ \started → do
+          runEnding (unownedSiblingStart started held siblingGate probe) (const (siblingStart trace held siblingGate probe)) probe ending
+          judgement ← endedAfterScope probe
+          judgement `shouldBe` False
+        endedAfterScope probe >>= (`shouldBe` True)
+
+  -- An owner that waits for an observation which waits for a signal the cancelled start will never give: the cancellation ends the
+  -- run before it waits, and the owner's opening supplies every signal as well (#597).
+  describe "The owner of an observed start that is cancelled before the held worker is held (withOwnedThreadOpening)" $
+    for_ [(True, "ends the run first"), (False, "carries on to the observation")] $ \(rethrowFirst, how) →
+      for_ endings $ \(label, ending) → do
+        it ("has ended and been joined, the observer let go, when the example " <> label <> " and the owner " <> how) $ do
+          probe ← newControlProbe
+          held ← newHeld
+          trace ← newTrace
+          parkedAtStartup ← newGate
+          ready ← newEmptyMVar
+          runEnding (ownedObservedStart held parkedAtStartup ready probe) (const (observedStart rethrowFirst trace held parkedAtStartup ready probe)) probe ending
+          endedAfterScope probe >>= (`shouldBe` True)
+
+        it ("negative control: the previous unowned start leaves the owner parked when the example " <> label <> " and the owner " <> how) $ do
+          probe ← newControlProbe
+          held ← newHeld
+          trace ← newTrace
+          parkedAtStartup ← newGate
+          ready ← newEmptyMVar
+          withRescue $ \started → do
+            runEnding (unownedObservedStart started held parkedAtStartup ready probe) (const (observedStart rethrowFirst trace held parkedAtStartup ready probe)) probe ending
+            judgement ← endedAfterScope probe
+            judgement `shouldBe` False
+          endedAfterScope probe >>= (`shouldBe` True)
 
 -- Fixtures ----------------------------------------------------------------------
 
@@ -174,13 +226,38 @@ awaitCommitted worker =
 --
 -- The thread records its outcome and ends (it is the subject the example inspects, and a cancellation it receives is part of
 -- that record, not swallowed: the thread ends with it).
-withObserving ∷ Held → IO a → (MVar (Either SomeException a) → IO b) → IO b
-withObserving held observation body = do
+--
+-- The first argument is the scope's opening: it lets go everything any participant of the example can wait on (every sibling's
+-- gate, and every signal the observation waits for), not only the held worker's release. The observer's own end opens only the
+-- release, as it always did, so the normal path is unchanged.
+withObserving ∷ IO () → Held → IO a → (MVar (Either SomeException a) → IO b) → IO b
+withObserving everything held observation body = do
   outcome ← newEmptyMVar
   withOwnedThreadOpening
-    (openGate (heldRelease held))
+    everything
     ((try observation >>= putMVar outcome) `finally` openGate (heldRelease held))
     (\_ _ → body outcome)
+
+-- | Let go everything a fixture's participants can wait on: every gate a worker is held at and every signal an observation waits
+-- for. Idempotent and non-blocking, so it can be the opening of any scope that starts one of them.
+letGo ∷ [Gate] → IO ()
+letGo = traverse_ openGate
+
+-- | A cancellation that arrived while the start was in progress and that the example did not send is not the one under test: it
+-- ends the run now, before anything waits for a signal the cancelled start will never give. The caller has recorded it.
+rethrowUnexpectedCancellation ∷ Either (ExceptionWithContext SomeException) a → IO ()
+rethrowUnexpectedCancellation = \case
+  Left raised@(ExceptionWithContext _ failure) | isJust (fromException failure ∷ Maybe SomeAsyncException) → rethrowIO raised
+  _ → pure ()
+
+-- | Wait, without sleeping, until a thread is parked in a transaction or has ended: a thread that has gone will never park.
+awaitParkedOrEnded ∷ ThreadId → IO ()
+awaitParkedOrEnded thread =
+  threadStatus thread >>= \case
+    ThreadBlocked BlockedOnSTM → pure ()
+    ThreadFinished → pure ()
+    ThreadDied → pure ()
+    _ → yield >> awaitParkedOrEnded thread
 
 -- | The observation, after the drain: its failure is the example's.
 reported ∷ MVar (Either SomeException a) → IO a
@@ -194,11 +271,13 @@ testFatalSibling policy = do
   trace ← newTrace
   gate ← newGate
   held ← newHeld
-  -- The supervision runs on a thread the example owns, whose stop releases the held worker first (see 'runOwnedScope').
-  failure ← runOwnedScope (openGate (heldRelease held)) $ expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
+  -- Everything a participant can wait on: the held worker's release, the sibling's gate, and the signals the observation waits for.
+  let everything = letGo [heldRelease held, gate, heldEntered held, heldSeen held]
+  -- The supervision runs on a thread the example owns, whose stop lets all of it go first (see 'runOwnedScope').
+  failure ← runOwnedScope everything $ expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
     withSupervision (collectedLifetime collected) $ \control → do
       sibling ← expectStarted =<< startSupervised control policy (failingAfter trace "audio" gate (Broken "audio"))
-      withObserving held
+      withObserving everything held
         ( do
             readMVar (heldEntered held) >> openGate gate
             within "the held worker never saw a request" (heldSeen held)
@@ -208,6 +287,7 @@ testFatalSibling policy = do
         $ \observed → do
           started ← attempt (startSupervised control (required Service) (heldService trace "streaming" True held))
           record trace "start unwound"
+          rethrowUnexpectedCancellation started
           status ← reported observed
           -- Committed before the drain, which the start then waited for.
           status `shouldSatisfy` isFatalBroken "audio"
@@ -229,11 +309,12 @@ testToleratedSibling = do
   trace ← newTrace
   gate ← newGate
   held ← newHeld
-  -- The supervision runs on a thread the example owns, whose stop releases the held worker first (see 'runOwnedScope').
-  (observed, warnings, newStatus, afterwards) ← runOwnedScope (openGate (heldRelease held)) $ withCollectedLifetime ignoreWrites $ \collected →
+  let everything = letGo [heldRelease held, gate, heldEntered held]
+  -- The supervision runs on a thread the example owns, whose stop lets everything go first (see 'runOwnedScope').
+  (observed, warnings, newStatus, afterwards) ← runOwnedScope everything $ withCollectedLifetime ignoreWrites $ \collected →
     withSupervision (collectedLifetime collected) $ \control → do
       sibling ← expectStarted =<< startSupervised control (optional Service) (failingAfter trace "telemetry" gate (Broken "telemetry"))
-      withObserving held
+      withObserving everything held
         ( do
             readMVar (heldEntered held) >> openGate gate
             -- The tolerated commit is no signal of its own: it is read, and the deadline only fails the
@@ -269,18 +350,25 @@ testCancelledDuringClassification = do
   classified ← newIORef (0 ∷ Int)
   done ← newEmptyMVar
   ended ← newEmptyMVar
+  intended ← newEmptyMVar
   let policy = WorkerPolicy Service Required supervisionComponent $ \_ → do
         atomicModifyIORef' classified (\count → (count + 1, ()))
         void (tryPutMVar classifying ())
         readMVar classifyGate
         pure Unrecognized
+      -- Every gate a worker is held at (the held worker, the sibling, the classifier) and every signal the observation waits for.
+      everything = letGo [heldRelease held, gate, classifyGate, heldEntered held, classifying]
   withOwnedThreadOpening
-    (openGate (heldRelease held))
+    everything
     ( do
         outcome ← attempt $ withCollectedLifetime ignoreWrites $ \collected →
           withSupervision (collectedLifetime collected) $ \control → do
             sibling ← expectStarted =<< startSupervised control policy (failingAfter trace "audio" gate (Broken "audio"))
             started ← attempt (startSupervised control (required Service) (heldService trace "streaming" False held))
+            -- Only the cancellation the example sends is the one under test; any other ends the run, so the close below is
+            -- never a cooperative one that waits for gates nobody opens.
+            sentByTheExample ← isJust <$> tryReadMVar intended
+            unless sentByTheExample (rethrowUnexpectedCancellation started)
             record trace "start unwound"
             siblingStatus ← statusOf sibling
             count ← readIORef classified
@@ -290,10 +378,11 @@ testCancelledDuringClassification = do
         putMVar ended outcome
     )
     $ \owner _ → do
-      withObserving held
+      withObserving everything held
         ( do
             readMVar (heldEntered held) >> openGate gate
             within "the start never classified the sibling" classifying
+            putMVar intended ()
             killThread owner
         )
         $ \observed → do
@@ -327,12 +416,15 @@ testCancelledAfterTolerated = do
   done ← newEmptyMVar
   ended ← newEmptyMVar
   videoClassified ← newIORef (0 ∷ Int)
+  intended ← newEmptyMVar
   let videoPolicy = WorkerPolicy Service Required supervisionComponent $ \_ → do
         atomicModifyIORef' videoClassified (\count → (count + 1, ()))
         pure Unrecognized
       onWrite entry = when (entryLevel entry == Warning) (void (tryPutMVar warned ()))
+      -- Every gate a worker is held at (the held worker, telemetry, video) and every signal the observation waits for.
+      everything = letGo [heldRelease held, telemetryGate, videoGate, heldEntered held, warned]
   withOwnedThreadOpening
-    (openGate (heldRelease held))
+    everything
     ( do
         outcome ← attempt $ withCollectedLifetime onWrite $ \collected →
           withSupervision (collectedLifetime collected) $ \control → do
@@ -340,6 +432,8 @@ testCancelledAfterTolerated = do
             video ← expectStarted =<< startSupervised control videoPolicy (failingAfter trace "video" videoGate (Broken "video"))
             putMVar videoSlot video
             started ← attempt (startSupervised control (required Service) (heldService trace "streaming" False held))
+            sentByTheExample ← isJust <$> tryReadMVar intended
+            unless sentByTheExample (rethrowUnexpectedCancellation started)
             statuses ← (,) <$> statusOf telemetry <*> statusOf video
             count ← readIORef videoClassified
             warnings ← warningCount collected
@@ -348,12 +442,13 @@ testCancelledAfterTolerated = do
     )
     $ \owner _ → do
       video ← takeMVar videoSlot
-      withObserving held
+      withObserving everything held
         ( do
             readMVar (heldEntered held) >> openGate telemetryGate
             -- The warning is the tolerated commit's last act; the start then parks in its wait again.
             within "the start never committed the tolerated sibling" warned
-            awaitBlockedOnSTM owner
+            awaitParkedOrEnded owner
+            putMVar intended ()
             killThread owner
             openGate videoGate
             void (awaitTerminal (supervisedWorker video))
@@ -385,10 +480,69 @@ heldStart trace held probe = do
       withSupervision (collectedLifetime collected) $ \control →
         void (startSupervised control (required Service) (heldService trace "streaming" False held))
 
+-- | An owner whose body carries on after a cancelled start: it starts a sibling that returns only when the example opens its
+-- gate (and ignores stop requests until then), then the held start, records what the start did, and returns normally, so the
+-- close that follows is a cooperative one that waits for the sibling.
+siblingStart ∷ Trace → Held → Gate → ControlProbe → IO ()
+siblingStart trace held siblingGate probe = do
+  recordSelf probe
+  void . attempt $
+    withCollectedLifetime ignoreWrites $ \collected →
+      withSupervision (collectedLifetime collected) $ \control → do
+        _ ← expectStarted =<< startSupervised control (required Service) (returningAfter trace "sibling" siblingGate)
+        void (attempt (startSupervised control (required Service) (heldService trace "streaming" False held)))
+
+-- | An owner that observes its own start and reports what the observation found, while the start is parked before the held
+-- worker ever publishes that it is held: the observation waits for a signal the cancelled start never gives. With
+-- @rethrowFirst@ the cancellation ends the run before it waits for the observation.
+observedStart ∷ Bool → Trace → Held → Gate → MVar () → ControlProbe → IO ()
+observedStart rethrowFirst trace held parkedAtStartup everything probe = do
+  recordSelf probe
+  void . attempt $
+    withCollectedLifetime ignoreWrites $ \collected →
+      withSupervision (collectedLifetime collected) $ \control →
+        withObserving (void (tryPutMVar everything ()) >> letGo [heldRelease held, heldEntered held]) held (readMVar (heldEntered held)) $ \observed → do
+          let startup = workerDefinition "parked" (\_ → owned trace "parked" >> liftIO (putMVar everything () >> readMVar parkedAtStartup)) (\_ () → pure ())
+          started ← attempt (startSupervised control (required Service) startup)
+          when rethrowFirst (rethrowUnexpectedCancellation started)
+          reported observed
+
+-- | The owner of the sibling arrangement, owned with every gate the fixture holds a worker at as its opening.
+ownedSiblingStart ∷ Held → Gate → ControlProbe → Scope
+ownedSiblingStart held siblingGate probe action body =
+  withOwnedThreadOpening (letGo [heldRelease held, siblingGate]) action $ \owner _ → do
+    readMVar (heldEntered held)
+    putMVar (controlParked probe) ()
+    body owner
+
+-- | The previous start of the same owner.
+unownedSiblingStart ∷ IORef [Unowned] → Held → Gate → ControlProbe → Scope
+unownedSiblingStart started held siblingGate probe action body = do
+  owner ← startUnowned started (letGo [heldRelease held, siblingGate]) action
+  readMVar (heldEntered held)
+  putMVar (controlParked probe) ()
+  body owner
+
+-- | The observed-start owner owned with every signal the observation waits for as its opening.
+ownedObservedStart ∷ Held → Gate → MVar () → ControlProbe → Scope
+ownedObservedStart held parkedAtStartup ready probe action body =
+  withOwnedThreadOpening (letGo [heldRelease held, heldEntered held, parkedAtStartup]) action $ \owner _ → do
+    readMVar ready
+    putMVar (controlParked probe) ()
+    body owner
+
+-- | The previous start of the same owner.
+unownedObservedStart ∷ IORef [Unowned] → Held → Gate → MVar () → ControlProbe → Scope
+unownedObservedStart started held parkedAtStartup ready probe action body = do
+  owner ← startUnowned started (letGo [heldRelease held, heldEntered held, parkedAtStartup]) action
+  readMVar ready
+  putMVar (controlParked probe) ()
+  body owner
+
 -- | The owner is held once the worker has entered its hold: the signal the endings wait for.
 ownedHeldStart ∷ Held → ControlProbe → Scope
 ownedHeldStart held probe action body =
-  withOwnedThreadOpening (openGate (heldRelease held)) action $ \owner _ → do
+  withOwnedThreadOpening (letGo [heldRelease held]) action $ \owner _ → do
     readMVar (heldEntered held)
     putMVar (controlParked probe) ()
     body owner
@@ -396,7 +550,7 @@ ownedHeldStart held probe action body =
 -- | The previous start of the same owner: nothing releases the held worker when the example ends.
 unownedHeldStart ∷ IORef [Unowned] → Held → ControlProbe → Scope
 unownedHeldStart started held probe action body = do
-  owner ← startUnowned started (openGate (heldRelease held)) action
+  owner ← startUnowned started (letGo [heldRelease held]) action
   readMVar (heldEntered held)
   putMVar (controlParked probe) ()
   body owner

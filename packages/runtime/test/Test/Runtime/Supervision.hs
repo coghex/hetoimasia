@@ -659,10 +659,11 @@ newClosing ∷ IO Closing
 newClosing = Closing <$> newTrace <*> newGate <*> newGate <*> newGate <*> newEmptyMVar <*> newIORef []
 
 -- | What the body registers before it starts any worker, so that however it ends the supervision's close can finish: the
--- opener is let go (it serves the close, and waits for the signal the normal path gives last) and the release is opened itself.
+-- opener is let go (it serves the close, and waits for the signal the normal path gives last) and every gate a worker of the
+-- fixture can wait on is opened itself (the watcher's run, and its release).
 -- Idempotent and non-blocking, as an opening must be.
 rescueClosing ∷ Closing → IO ()
-rescueClosing closing = void (tryPutMVar (closingGo closing) ()) >> openGate (closingRelease closing)
+rescueClosing closing = void (tryPutMVar (closingGo closing) ()) >> openGate (closingGate closing) >> openGate (closingRelease closing)
 
 -- | The opener that serves the close: it waits to be let go, then for the application to park in the drain, then opens the
 -- release.
