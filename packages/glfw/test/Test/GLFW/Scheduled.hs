@@ -15,7 +15,6 @@
 -- the production loop's own.
 module Test.GLFW.Scheduled (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, writeTVar)
 import Control.Exception (Exception, ExceptionWithContext, SomeException, throwIO, tryWithContext)
@@ -79,6 +78,7 @@ import Test.GLFW.Support
   , caughtAs
   , diagnosticMarks
   , durationOf
+  , withDeferredThread
   , entered
   , flushed
   , hosted
@@ -367,11 +367,12 @@ testWakeWithDueWork = do
   (seam, platform) ← wakingSeam
   (clock, unread) ← scriptedClock [0, 1, millis 1, millis 2, millis 3, millis 4]
   records ←
-    scheduled seam (settings [] clock) $ \host → do
-      duringTheWait platform (void (publishDemand (hostDemandPublisher host) immediateDemand))
-      turning UpdateImmediately $ \turn → do
-        when (turnNumber (scheduledTurn turn) == 2) (stopBlocking platform)
-        pure (if turnNumber (scheduledTurn turn) == 3 then FinishWith () else ContinueWith NoUpdateDemand)
+    withDuringTheWait platform (\host → void (publishDemand (hostDemandPublisher host) immediateDemand)) $ \duringTheWait →
+      scheduled seam (settings [] clock) $ \host → do
+        duringTheWait host
+        turning UpdateImmediately $ \turn → do
+          when (turnNumber (scheduledTurn turn) == 2) (stopBlocking platform)
+          pure (if turnNumber (scheduledTurn turn) == 3 then FinishWith () else ContinueWith NoUpdateDemand)
   map scheduledPacing records
     `shouldBe` [PolledForWork, WaitedForFallback (durationOf (millis 250)), PolledForWork]
   -- The capture is the turn's own inspection, so the publication that ended the
@@ -390,12 +391,13 @@ testWakeWithoutDueWork = do
   (clock, unread) ← scriptedClock [0, 1, millis 1, millis 2, millis 3, millis 4]
   updates ← newIORef (0 ∷ Int)
   records ←
-    scheduled seam (settings [] clock) $ \host → do
-      duringTheWait platform (void (publishDemand (hostDemandPublisher host) (deadlineDemand (at (millis 10000)))))
-      turning UpdateImmediately $ \turn → do
-        modifyIORef' updates (+ 1)
-        when (turnNumber (scheduledTurn turn) == 2) (stopBlocking platform)
-        pure (if turnNumber (scheduledTurn turn) == 3 then FinishWith () else ContinueWith NoUpdateDemand)
+    withDuringTheWait platform (\host → void (publishDemand (hostDemandPublisher host) (deadlineDemand (at (millis 10000))))) $ \duringTheWait →
+      scheduled seam (settings [] clock) $ \host → do
+        duringTheWait host
+        turning UpdateImmediately $ \turn → do
+          modifyIORef' updates (+ 1)
+          when (turnNumber (scheduledTurn turn) == 2) (stopBlocking platform)
+          pure (if turnNumber (scheduledTurn turn) == 3 then FinishWith () else ContinueWith NoUpdateDemand)
   map scheduledPacing records
     `shouldBe` [ PolledForWork
                , WaitedForFallback (durationOf (millis 250))
@@ -695,12 +697,14 @@ wakingSeam = do
 stopBlocking ∷ WakePlatform → IO ()
 stopBlocking platform = atomically (writeTVar (platformBlocking platform) False)
 
--- | Run an action once the owner has entered its finite wait.
-duringTheWait ∷ WakePlatform → IO () → IO ()
-duringTheWait platform action =
-  void . forkIO $ do
-    atomically (readTVar (platformWaiting platform) >>= check)
-    action
+-- | Run an action on an owned thread once the owner has entered its finite wait (#593). The action acts on something only the
+-- running host provides, so the body is given the hand-over of it, and the thread lives until the scope around the whole run
+-- ends: the host's setup that hands it over returns long before the wait it serves.
+withDuringTheWait ∷ WakePlatform → (a → IO ()) → ((a → IO ()) → IO r) → IO r
+withDuringTheWait platform action body =
+  withDeferredThread
+    (\target → atomically (readTVar (platformWaiting platform) >>= check) >> action target)
+    (\_ handOver → body handOver)
 
 -- ---------------------------------------------------------------------------
 -- Shared scaffolding

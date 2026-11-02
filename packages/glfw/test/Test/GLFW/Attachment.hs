@@ -8,7 +8,6 @@
 -- through 'MVar's and STM, never a sleep.
 module Test.GLFW.Attachment (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Monad (foldM, forM, forM_, replicateM)
@@ -19,6 +18,7 @@ import Hetoimasia.GLFW.Internal.Window (windowSessionIdentity)
 import Hetoimasia.GLFW.Window (WindowId, hiddenTestWindowConfig, windowIdentity, withWindow)
 import Test.GLFW.Support (boundedExample, entered, unexpected)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe)
+import Test.Support.Owned (withOwnedThread)
 
 type Model = AttachmentModel String
 
@@ -248,11 +248,13 @@ spec = describe "GLFW window attachment model" $ do
       inbox ← atomically (newCompletionInbox 4) >>= either (unexpected . show) pure
       published ← newEmptyMVar
       -- A render thread publishes its two certified facts; the owner folds them.
-      _ ← forkIO $ do
-        admissions ← forM [CpuUseRetired, SubmittedWorkEnded] $ \fact →
-          atomically (offerCompletion inbox (completionNotice (registeredAttachment registered) (registeredAcknowledgement registered) fact))
-        putMVar published admissions
-      takeMVar published >>= (`shouldBe` [NoticeAdmitted, NoticeAdmitted])
+      withOwnedThread
+        ( do
+            admissions ← forM [CpuUseRetired, SubmittedWorkEnded] $ \fact →
+              atomically (offerCompletion inbox (completionNotice (registeredAttachment registered) (registeredAcknowledgement registered) fact))
+            putMVar published admissions
+        )
+        (\_ _ → takeMVar published >>= (`shouldBe` [NoticeAdmitted, NoticeAdmitted]))
       notices ← atomically (takeCompletions inbox)
       let (answers, folded) = foldCompletions owner notices retiring
       map snd answers

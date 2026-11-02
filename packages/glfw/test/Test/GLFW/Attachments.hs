@@ -16,8 +16,8 @@
 -- opens a window, needs a display, or sleeps for a concurrency outcome.
 module Test.GLFW.Attachments (spec) where
 
-import Control.Concurrent (forkIO, forkOS, killThread, myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (killThread, myThreadId)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -33,6 +33,8 @@ import Control.Concurrent.STM
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
+  , finally
+  , onException
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , fromException
@@ -41,7 +43,8 @@ import Control.Exception
   , try
   )
 import Control.Monad (forM, forM_, void, when)
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Recovery (Disposition (Required))
@@ -105,9 +108,26 @@ import Test.GLFW.Support
   , windowNamed
   )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.GLFW.Support (Ending (..), Scope, ownedEnds, rescuing, withDeferredThreadVia)
+import Test.Support.Owned (withOwnedBoundThread, withOwnedThread, withOwnedThreadOpening)
+import Data.Foldable (for_)
 
 spec ∷ Spec
 spec = describe "GLFW window attachments" $ do
+  describe "evidence suppliers when the example ends before it supplies (#593)" $
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+      it ("finishes the exit drain on the rescued evidence when the example body " <> label <> " with the owner stalled") $
+        boundedExample (ownedEnds ending stalledOwnerScenario False)
+      it ("finishes the exit drain on the rescued evidence when the example body " <> label <> " while the loop is idle") $
+        boundedExample (ownedEnds ending idleLoopScenario False)
+      it ("finishes the exit drain when the example body " <> label <> " with beta awaiting for ever and alpha stalled") $
+        boundedExample (ownedEnds ending twoOwnersScenario False)
+      for_ [0 .. 7] $ \k →
+        it ("finishes the exit drain when the example body " <> label <> " at setup step " <> show k <> " of the two-owner fixture") $
+          boundedExample (ownedEnds ending (attachmentSetupScenario k) False)
+      it ("finishes the exit drain when the example body " <> label <> " before the detached owners are finished") $
+        boundedExample (ownedEnds ending detachedOwnersScenario False)
+
   describe "attaching" $ do
     it "refuses a closing window, an ended window, an occupied window, a foreign session, and an unprotected host"
       (boundedExample testRefusals)
@@ -327,6 +347,7 @@ protocolFor ∷ TVar [Note] → WindowHost → Owner → OwnerScript → Attachm
 protocolFor journal host owner script =
   AttachmentProtocol
     { protocolConstruct = \_ acknowledgement → do
+        atomicModifyIORef' registeredOwners (\known → ((host, owner) : known, ()))
         atomically $ do
           writeTVar (ownerAcknowledgement owner) (Just acknowledgement)
           note journal (Constructed (scriptName script))
@@ -393,6 +414,145 @@ renderThrough journal host name service = atomically $ do
       usable = observedSlot observed == SlotAttached && admits
   when usable (note journal (Rendered name))
   pure usable
+
+-- | Run the example around an owned evidence supplier (#593). The supplier certifies an owner's retirement facts from a thread
+-- that is not the owner, and the protected host's exit drain waits for exactly that evidence, so the thread must outlive the
+-- body that decides to start it: the example owns it, and the body hands it the host and the owner with @supply@. However the
+-- example ends, a supplier still running has been stopped and joined before it returns.
+withSupplier ∷ TVar [Note] → ((Supplier → IO r) → IO r)
+withSupplier = withSupplierVia withOwnedThreadOpening
+
+-- | The two ways the body hands the supplier its work: 'supply' returns at once (a rescue must never wait), 'supplied' returns
+-- once the supplier has published, so the owner's turns that follow see the notices (a thread that is only queued can be
+-- preempted for longer than a fixed number of fast turns, and the example would then fail on its turn bound, not on its subject).
+data Supplier = Supplier
+  { supplyAtOnce ∷ WindowHost → Owner → [RetirementFact] → IO ()
+  , supplyAndWait ∷ WindowHost → Owner → [RetirementFact] → IO ()
+  }
+
+-- | 'withSupplier' through the given way of starting the thread, so a negative control or a scenario can run the same helper.
+withSupplierVia ∷ Scope → TVar [Note] → (Supplier → IO r) → IO r
+withSupplierVia scope journal body =
+  withDeferredThreadVia
+    scope
+    (pure ())
+    (\(host, owner, facts, done) → publishFacts journal host owner facts `finally` void (tryPutMVar done ()))
+    $ \_ handOver →
+      body
+        Supplier
+          { supplyAtOnce = \host owner facts → newEmptyMVar >>= \done → handOver (host, owner, facts, done)
+          , supplyAndWait = \host owner facts → do
+              done ← newEmptyMVar
+              handOver (host, owner, facts, done)
+              readMVar done
+          }
+
+-- | 'withSupplier' for the supplier that publishes only once the owner's loop has really entered its idle wait, so the wake the
+-- publication registers is what ends the wait rather than a fold that happened to come first.
+withWaitingSupplier ∷ TVar [Note] → ((WindowHost → Owner → IO (), WindowHost → Owner → IO ()) → IO r) → IO r
+withWaitingSupplier = withWaitingSupplierVia withOwnedThreadOpening
+
+-- | The body is given two hand-overs: the first for the example's own supply, after which the supplier waits for the idle loop,
+-- and the second for the rescue on an exceptional exit, which publishes at once because the loop is no longer running turns and
+-- the precision of waking an idle wait no longer matters (#593).
+withWaitingSupplierVia ∷ Scope → TVar [Note] → ((WindowHost → Owner → IO (), WindowHost → Owner → IO ()) → IO r) → IO r
+withWaitingSupplierVia scope journal body =
+  withDeferredThreadVia
+    scope
+    (pure ())
+    ( \(host, owner, waitForIdle) → do
+        when waitForIdle (atomically (hostActivity host >>= check . activityWaiting))
+        publishFacts journal host owner allRetirementFacts
+    )
+    $ \_ handOver → body (\host owner → handOver (host, owner, True), \host owner → handOver (host, owner, False))
+
+-- | A stalled owner whose evidence the example would supply later, with the example body ended the way the ending says before it
+-- does (#593): the protected host drains for that evidence before the scope around it could stop the supplier, so the rescue
+-- registered with the owner must hand it over on the way out of the body.
+stalledOwnerScenario ∷ Scope → IO () → IO ()
+stalledOwnerScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  withSupplierVia scope journal $ \(Supplier supply _) →
+    protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+      window ← onlyWindow host
+      (owner, _) ← attachedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+      rescuing (supply host owner allRetirementFacts) $ do
+        void (closeHostWindow host window)
+        turnsExactly host control 2
+        atParked
+
+-- | The same for the supplier that publishes only once the loop is idle in its wait, ended after the normal hand-over: the
+-- supplier is then waiting for an idle loop that the drain never provides, and the structural rescue of 'protectedRun' (which
+-- publishes directly, bypassing any wait in progress) is what finishes the drain.
+idleLoopScenario ∷ Scope → IO () → IO ()
+idleLoopScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← blockingSeam journal
+  withWaitingSupplierVia scope journal $ \(supplyOnceWaiting, _) →
+    protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
+      window ← onlyWindow host
+      (owner, _) ← attachedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+      void (closeHostWindow host window)
+      supplyOnceWaiting host owner
+      atParked
+
+-- | Two owners, alpha stalled and beta answering 'Await' for ever, with the example body ended before it updates beta's plan or
+-- supplies alpha's evidence: the drain needs both, and the structural rescue provides both for every registered owner.
+twoOwnersScenario ∷ Scope → IO () → IO ()
+twoOwnersScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  withSupplierVia scope journal $ \_ →
+    protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
+      (alpha, beta) ← twoWindows host
+      (_, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
+      (_, _) ← attachedOwner journal host beta (ownerNamed "beta") {scriptPlan = repeat Await}
+      void (closeHostWindow host alpha)
+      void (closeHostWindow host beta)
+      turnsExactly host control 1
+      atParked
+
+-- | The fixture of 'twoOwnersScenario' with the example ended at the boundary before setup step @k@ (#593): step 0 is the host's
+-- setup callback (the host exists, nothing is attached), 1 is the body's start, 2 follows the window lookup, 3 follows alpha's
+-- attachment, 4 beta's, 5 and 6 follow each window's close, 7 follows the first turn. Between any two steps a partially built
+-- fixture holds some attachments and not others, and the drain must still finish, because the rescue was acquired with the host
+-- and every owner registered with it as its construction began.
+attachmentSetupScenario ∷ Int → Scope → IO () → IO ()
+attachmentSetupScenario k scope atParked = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  let step i = when (i == k) atParked
+  withSupplierVia scope journal $ \_ →
+    protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → step 0) $ \host control → do
+      step 1
+      (alpha, beta) ← twoWindows host
+      step 2
+      (_, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
+      step 3
+      (_, _) ← attachedOwner journal host beta (ownerNamed "beta") {scriptPlan = repeat Await}
+      step 4
+      void (closeHostWindow host alpha)
+      step 5
+      void (closeHostWindow host beta)
+      step 6
+      turnsExactly host control 1
+      step 7
+
+-- | The same for owners the example detached and would finish with 'finishOwners', ended before it does.
+detachedOwnersScenario ∷ Scope → IO () → IO ()
+detachedOwnersScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  withSupplierVia scope journal $ \_ →
+    protectedRun seam config (\_ → pure ()) $ \host control → do
+      (alpha, beta) ← twoWindows host
+      _ ← detachedOwners journal host [(alpha, "alpha", [Stall]), (beta, "beta", repeat Await)]
+      pacingsOver host control 2 (\_ → pure ()) >>= \_ → atParked
 
 -- | Publish an owner's certified facts from a thread that is not the owner.
 publishFacts ∷ TVar [Note] → WindowHost → Owner → [RetirementFact] → IO ()
@@ -462,7 +622,38 @@ protectedRun
   → (WindowHost → RuntimeControl → IO a)
   → IO a
 protectedRun seam config inside action =
-  asProcessMainThread seam (protectedRunHere seam quietLogger config inside action)
+  asProcessMainThread seam $ do
+    clearRegistered
+    protectedRunHereRescued seam quietLogger config inside action `finally` clearRegistered
+
+-- | The structural rescue of every example that runs a protected host (#593). The drain that follows an exceptional exit from
+-- the body waits for every attached owner to finish its retirement, and the things that finish it (the plan updates the body
+-- would have made, the independent evidence a supplier would have published, a wake out of a finite wait) are exactly what a
+-- failed or cancelled body no longer provides. Every owner is registered as its construction starts (the registration is the
+-- construction's first step, so no owner that holds a window is missed), and an exceptional exit from the body runs this once,
+-- inside the host's lifetime and before the drain: every registered owner's plan becomes "certify every fact", and every fact is
+-- published for it directly, which also wakes a drain that is parked in a wait. It blocks on nothing, publishes nothing an owner
+-- has no acknowledgement for, and is idempotent. It is not run on a normal exit, where the example's own steps are the subject.
+rescueRegistered ∷ IO ()
+rescueRegistered = do
+  known ← readIORef registeredOwners
+  forM_ known $ \(host, owner) → do
+    atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+    acknowledgement ← readTVarIO (ownerAcknowledgement owner)
+    case (hostGraphicsPublisher host, acknowledgement) of
+      (Just publisher, Just acknowledged) →
+        forM_ allRetirementFacts $ \fact →
+          void (publishCompletion publisher (completionNotice (acknowledgedAttachment acknowledged) acknowledged fact))
+      _ → pure ()
+
+-- | The owners the current protected run has started constructing, with their hosts. One protected run is active at a time (the
+-- suite's examples run one after another), and 'protectedRun' empties the registry on both sides of the run.
+registeredOwners ∷ IORef [(WindowHost, Owner)]
+registeredOwners = unsafePerformIO (newIORef [])
+{-# NOINLINE registeredOwners #-}
+
+clearRegistered ∷ IO ()
+clearRegistered = writeIORef registeredOwners []
 
 protectedRunHere
   ∷ Seam
@@ -478,6 +669,30 @@ protectedRunHere seam logger config inside action =
     ( \_ use →
         withProtectedWindowHostIn logger (seamSession seam defaultSessionConfig) config $ \host →
           inside host >> use host
+    )
+    id
+    (\host _ → pure host)
+    action
+
+-- | 'protectedRunHere' with the rescue the first thing acquired inside the protected lifetime (#593): it wraps the host's setup
+-- callback, the startup and the body alike, so a failure or cancellation at any point after the host exists (before the first
+-- attachment, between two attachments, between the last attachment and the body, in the body) reaches 'rescueRegistered' before
+-- the host drains. Every owner is registered with it the moment its construction starts, so a partially built fixture is always
+-- fully released.
+protectedRunHereRescued
+  ∷ Seam
+  → Logger
+  → HostConfig
+  → (WindowHost → IO ())
+  → (WindowHost → RuntimeControl → IO a)
+  → IO a
+protectedRunHereRescued seam logger config inside action =
+  runProtectedWindowApplication
+    (withLoggingLifetime logger)
+    "attachment-example"
+    ( \_ use →
+        withProtectedWindowHostIn logger (seamSession seam defaultSessionConfig) config $ \host →
+          (inside host >> use host) `onException` rescueRegistered
     )
     id
     (\host _ → pure host)
@@ -721,24 +936,26 @@ testSupersededByQuiescence = do
   answered ← newIORef Nothing
   constructing ← newEmptyMVar
   closed ← newEmptyMVar
-  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
-    window ← onlyWindow host
-    owner ← newOwner (ownerNamed "alpha")
-    let script = ownerNamed "alpha"
-        blocking =
-          (protocolFor journal host owner script)
-            { protocolConstruct = \_ acknowledgement → do
-                atomically (writeTVar (ownerAcknowledgement owner) (Just acknowledgement))
-                putMVar constructing ()
-                takeMVar closed
-            }
-    -- Another thread closes the host's admission while the construction runs.
-    _ ← forkIO (takeMVar constructing >> atomically (quiesceWindowHost host) >> putMVar closed ())
-    outcome ← attachWindowGraphics host window blocking
-    writeIORef answered (Just outcome)
-    -- The facts are certified from another thread, so the exit drain can end.
-    _ ← forkIO (publishFacts journal host owner allRetirementFacts)
-    pure ()
+  withSupplier journal $ \(Supplier supply supplied) →
+    protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
+      window ← onlyWindow host
+      owner ← newOwner (ownerNamed "alpha")
+      rescuing (supply host owner allRetirementFacts) $ do
+        let script = ownerNamed "alpha"
+            blocking =
+              (protocolFor journal host owner script)
+                { protocolConstruct = \_ acknowledgement → do
+                    atomically (writeTVar (ownerAcknowledgement owner) (Just acknowledgement))
+                    putMVar constructing ()
+                    takeMVar closed
+                }
+        -- Another thread closes the host's admission while the construction runs.
+        withOwnedThread (takeMVar constructing >> atomically (quiesceWindowHost host) >> putMVar closed ()) $ \_ _ → do
+          outcome ← attachWindowGraphics host window blocking
+          writeIORef answered (Just outcome)
+          -- The facts are certified from another thread, so the exit drain can end.
+          supplied host owner allRetirementFacts
+          pure ()
   readIORef answered >>= \case
     Just (GraphicsSuperseded _) → pure ()
     other → unexpected ("the superseded construction was not answered: " <> show other)
@@ -761,45 +978,47 @@ testSupersededAtHandoff = do
   atHandoff ← newEmptyMVar
   quiesced ← newEmptyMVar
   owned ← newTVarIO Nothing
-  asProcessMainThread seam $
-    runProtectedWindowApplication
-      (withLoggingLifetime quietLogger)
-      "attachment-example"
-      ( \_ use →
-          Private.withProtectedWindowHostWith
-            Private.noHostHooks
-              { Private.beforePublication = do
-                  pending ← readTVarIO owned
-                  forM_ pending $ \_ → putMVar atHandoff () >> takeMVar quiesced
-              }
-            quietLogger
-            (seamSession seam defaultSessionConfig)
-            (settings [windowNamed "alpha"])
-            $ \host → do
-              window ← onlyWindow host
-              owner ← newOwner (ownerNamed "alpha")
-              atomically (writeTVar owned (Just owner))
-              -- Another thread closes the host's admission once the attachment
-              -- has been constructed and registered, and before it is published.
-              _ ←
-                forkIO
-                  ( takeMVar atHandoff
-                      >> atomically (quiesceWindowHost host)
-                      >> putMVar quiesced ()
-                  )
-              outcome ←
-                attachWindowGraphics host window (protocolFor journal host owner (ownerNamed "alpha"))
-              writeIORef answered (Just outcome)
-              seen ← atomically (windowGraphicsStatus host window)
-              writeIORef observedThen (Just seen)
-              -- The facts are certified from another thread, so the exit drain
-              -- can end.
-              _ ← forkIO (publishFacts journal host owner allRetirementFacts)
-              use host
-      )
-      id
-      (\host _ → pure host)
-      (\_ _ → pure ())
+  withSupplier journal $ \(Supplier supply supplied) →
+    asProcessMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "attachment-example"
+        ( \_ use →
+            Private.withProtectedWindowHostWith
+              Private.noHostHooks
+                { Private.beforePublication = do
+                    pending ← readTVarIO owned
+                    forM_ pending $ \_ → putMVar atHandoff () >> takeMVar quiesced
+                }
+              quietLogger
+              (seamSession seam defaultSessionConfig)
+              (settings [windowNamed "alpha"])
+              $ \host → do
+                window ← onlyWindow host
+                owner ← newOwner (ownerNamed "alpha")
+                rescuing (supply host owner allRetirementFacts) $ do
+                  atomically (writeTVar owned (Just owner))
+                  -- Another thread closes the host's admission once the attachment
+                  -- has been constructed and registered, and before it is published.
+                  withOwnedThread
+                    ( takeMVar atHandoff
+                        >> atomically (quiesceWindowHost host)
+                        >> putMVar quiesced ()
+                    )
+                    $ \_ _ → do
+                    outcome ←
+                      attachWindowGraphics host window (protocolFor journal host owner (ownerNamed "alpha"))
+                    writeIORef answered (Just outcome)
+                    seen ← atomically (windowGraphicsStatus host window)
+                    writeIORef observedThen (Just seen)
+                    -- The facts are certified from another thread, so the exit drain
+                    -- can end.
+                    supplied host owner allRetirementFacts
+                    use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
   readIORef answered >>= \case
     Just (GraphicsSuperseded _) → pure ()
     other → unexpected ("the handoff published a service: " <> show other)
@@ -849,28 +1068,30 @@ testRollbackUnsafeRetains = do
   seam ← pollingSeam journal
   retained ← newIORef Nothing
   refusedLater ← newIORef Nothing
-  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
-    window ← onlyWindow host
-    owner ← newOwner (ownerNamed "failing")
-    let script = ownerNamed "failing"
-        failing =
-          (protocolFor journal host owner script)
-            { protocolConstruct = \_ acknowledgement → do
-                atomically (writeTVar (ownerAcknowledgement owner) (Just acknowledgement))
-                throwIO (Scripted "construction")
-            , protocolRollback = pure RollbackUnsafe
-            }
-    outcome ← attachWindowGraphics host window failing
-    case outcome of
-      GraphicsRolledBack settled → rolledBackOutcome settled `shouldBe` RollbackUnsafe
-      other → unexpected ("the rollback was not answered: " <> show other)
-    seen ← atomically (windowGraphicsStatus host window)
-    writeIORef retained (Just seen)
-    -- The slot is not free, so no second owner may take it.
-    (_, second) ← attachScripted journal host window (ownerNamed "second")
-    writeIORef refusedLater (Just second)
-    _ ← forkIO (publishFacts journal host owner allRetirementFacts)
-    pure ()
+  withSupplier journal $ \(Supplier supply supplied) →
+    protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
+      window ← onlyWindow host
+      owner ← newOwner (ownerNamed "failing")
+      rescuing (supply host owner allRetirementFacts) $ do
+        let script = ownerNamed "failing"
+            failing =
+              (protocolFor journal host owner script)
+                { protocolConstruct = \_ acknowledgement → do
+                    atomically (writeTVar (ownerAcknowledgement owner) (Just acknowledgement))
+                    throwIO (Scripted "construction")
+                , protocolRollback = pure RollbackUnsafe
+                }
+        outcome ← attachWindowGraphics host window failing
+        case outcome of
+          GraphicsRolledBack settled → rolledBackOutcome settled `shouldBe` RollbackUnsafe
+          other → unexpected ("the rollback was not answered: " <> show other)
+        seen ← atomically (windowGraphicsStatus host window)
+        writeIORef retained (Just seen)
+        -- The slot is not free, so no second owner may take it.
+        (_, second) ← attachScripted journal host window (ownerNamed "second")
+        writeIORef refusedLater (Just second)
+        supplied host owner allRetirementFacts
+        pure ()
   readIORef retained >>= \case
     Just (GraphicsPresent observed) → do
       observedSlot observed `shouldBe` SlotRetiring
@@ -951,29 +1172,31 @@ testMetadataFailsOnTurn = do
   journal ← newTVarIO []
   seam ← pollingSeam journal
   reported ← newIORef Nothing
-  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
-    window ← onlyWindow host
-    (owner, service) ← attachedOwner journal host window (ownerNamed "alpha")
-    void (closeHostWindow host window)
-    atomically
-      ( Private.faultHostAttachmentMetadata
-          host
-          (graphicsAttachment service)
-          (throw (Scripted "declaration"))
-      )
-    turnsExactly host control 3
-    demand ← atomically (hostRetirementDemand host)
-    writeIORef reported (Just demand)
-    -- The step was never entered, and nothing the declaration failed at
-    -- authorized destroying the window.
-    atomically (readTVar (ownerSteps owner)) `shouldReturn` 0
-    destroyCalls seam `shouldReturn` []
-    slotOccupied host window `shouldReturn` True
-    -- The failure the turn contained is the attachment's own evidence, kept
-    -- exactly as a failed step's is.
-    recordedFailureOf host (graphicsAttachment service) `shouldReturn` Just (Scripted "declaration")
-    _ ← forkIO (publishFacts journal host owner allRetirementFacts)
-    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  withSupplier journal $ \(Supplier supply supplied) →
+    protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+      window ← onlyWindow host
+      (owner, service) ← attachedOwner journal host window (ownerNamed "alpha")
+      rescuing (supply host owner allRetirementFacts) $ do
+        void (closeHostWindow host window)
+        atomically
+          ( Private.faultHostAttachmentMetadata
+              host
+              (graphicsAttachment service)
+              (throw (Scripted "declaration"))
+          )
+        turnsExactly host control 3
+        demand ← atomically (hostRetirementDemand host)
+        writeIORef reported (Just demand)
+        -- The step was never entered, and nothing the declaration failed at
+        -- authorized destroying the window.
+        atomically (readTVar (ownerSteps owner)) `shouldReturn` 0
+        destroyCalls seam `shouldReturn` []
+        slotOccupied host window `shouldReturn` True
+        -- The failure the turn contained is the attachment's own evidence, kept
+        -- exactly as a failed step's is.
+        recordedFailureOf host (graphicsAttachment service) `shouldReturn` Just (Scripted "declaration")
+        supplied host owner allRetirementFacts
+        turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
   entries ← readTVarIO journal
   -- Every fact was certified independently, and all of them precede the
   -- destruction.
@@ -993,34 +1216,36 @@ testCancelledConstruction = do
   constructing ← newEmptyMVar
   never ← newEmptyMVar
   finished ← newEmptyMVar
-  runner ←
-    forkOS $ do
-      designateProcessMainThread seam
-      outcome ←
-        try . protectedRunHere seam quietLogger (settings [windowNamed "alpha"]) (\_ → pure ()) $
-          \host _ → do
-            window ← onlyWindow host
-            owner ← newOwner (ownerNamed "alpha")
-            let script = ownerNamed "alpha"
-                parking =
-                  (protocolFor journal host owner script)
-                    { protocolConstruct = \_ acknowledgement → do
-                        atomically (writeTVar (ownerAcknowledgement owner) (Just acknowledgement))
-                        putMVar constructing ()
-                        takeMVar never
-                    , protocolRollback = pure RollbackSafe
-                    }
-            void (attachWindowGraphics host window parking)
-      putMVar finished (outcome ∷ Either SomeException ())
-  takeMVar constructing
-  killThread runner
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled run returned"
-  -- Nothing was published, and the window was still destroyed on the way out.
-  entries ← readTVarIO journal
-  [name | Certified name _ ← entries] `shouldBe` []
-  entries `shouldSatisfy` (WindowGone 1 `elem`)
+  withOwnedBoundThread
+    ( do
+          designateProcessMainThread seam
+          outcome ←
+            try . protectedRunHere seam quietLogger (settings [windowNamed "alpha"]) (\_ → pure ()) $
+              \host _ → do
+                window ← onlyWindow host
+                owner ← newOwner (ownerNamed "alpha")
+                let script = ownerNamed "alpha"
+                    parking =
+                      (protocolFor journal host owner script)
+                        { protocolConstruct = \_ acknowledgement → do
+                            atomically (writeTVar (ownerAcknowledgement owner) (Just acknowledgement))
+                            putMVar constructing ()
+                            takeMVar never
+                        , protocolRollback = pure RollbackSafe
+                        }
+                void (attachWindowGraphics host window parking)
+          putMVar finished (outcome ∷ Either SomeException ())
+    )
+    $ \runner _ → do
+    takeMVar constructing
+    killThread runner
+    takeMVar finished >>= \case
+      Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      Right () → unexpected "the cancelled run returned"
+    -- Nothing was published, and the window was still destroyed on the way out.
+    entries ← readTVarIO journal
+    [name | Certified name _ ← entries] `shouldBe` []
+    entries `shouldSatisfy` (WindowGone 1 `elem`)
 
 -- | An interruption delivered in the handoff between an attachment becoming
 -- active and its caller receiving the service must not strand the exclusive
@@ -1067,25 +1292,25 @@ testCancelledAtPublication = do
           -- The owner thread is interrupted while it is inside the handoff, and
           -- catches that interruption itself.
           me ← myThreadId
-          _ ← forkIO (takeMVar atHandoff >> killThread me)
-          atomically (writeTVar armed True)
-          interrupted ←
-            try (attachWindowGraphics host window (protocolFor journal host owner (ownerNamed "alpha")))
-          atomically (writeTVar armed False)
-          case (interrupted ∷ Either SomeException GraphicsAttachment) of
-            Left failure → writeIORef caught (fromException failure ∷ Maybe AsyncException)
-            Right answered → unexpected ("the interrupted handoff answered: " <> show answered)
-          -- Already retiring, though nothing ever held a service for it.
-          seen ← atomically (windowGraphicsStatus host window)
-          writeIORef afterwards (Just seen)
-          -- Ordinary turns retire it and free the slot, and the window is then
-          -- open for a later owner with a fresh incarnation.
-          turnsUntil host control "the stranded attachment's retirement" (not <$> slotOccupied host window)
-          (later, service) ← attachedOwner journal host window (ownerNamed "later")
-          writeIORef reattached (Just (graphicsIncarnation service))
-          void (closeHostWindow host window)
-          atomically (writeTVar (ownerPlan later) (map Certify allRetirementFacts))
-          turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+          withOwnedThread (takeMVar atHandoff >> killThread me) $ \_ _ → do
+            atomically (writeTVar armed True)
+            interrupted ←
+              try (attachWindowGraphics host window (protocolFor journal host owner (ownerNamed "alpha")))
+            atomically (writeTVar armed False)
+            case (interrupted ∷ Either SomeException GraphicsAttachment) of
+              Left failure → writeIORef caught (fromException failure ∷ Maybe AsyncException)
+              Right answered → unexpected ("the interrupted handoff answered: " <> show answered)
+            -- Already retiring, though nothing ever held a service for it.
+            seen ← atomically (windowGraphicsStatus host window)
+            writeIORef afterwards (Just seen)
+            -- Ordinary turns retire it and free the slot, and the window is then
+            -- open for a later owner with a fresh incarnation.
+            turnsUntil host control "the stranded attachment's retirement" (not <$> slotOccupied host window)
+            (later, service) ← attachedOwner journal host window (ownerNamed "later")
+            writeIORef reattached (Just (graphicsIncarnation service))
+            void (closeHostWindow host window)
+            atomically (writeTVar (ownerPlan later) (map Certify allRetirementFacts))
+            turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
       )
   readIORef caught `shouldReturn` Just ThreadKilled
   readIORef afterwards >>= \case
@@ -1663,46 +1888,48 @@ testIndependentWindows ∷ Expectation
 testIndependentWindows = do
   journal ← newTVarIO []
   seam ← pollingSeam journal
-  protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
-    (alpha, beta) ← twoWindows host
-    (alphaOwner, alphaService) ← attachedOwner journal host alpha (ownerNamed "alpha")
-    (betaOwner, betaService) ← attachedOwner journal host beta (ownerNamed "beta")
-    -- Alpha's owner never makes progress of its own.
-    atomically (writeTVar (ownerPlan alphaOwner) [])
-    void (closeHostWindow host alpha)
-    -- Beta keeps executing commands while alpha's retirement is pending.
-    client ← atomically (hostWindowClient host beta) >>= maybe (unexpected "beta has no client") pure
-    ticket ←
-      submitWindowCommand (clientCommandPort client) [] (observeWindowCommand beta) >>= \case
-        SubmitAccepted ticket → pure ticket
-        other → unexpected ("beta's port refused an observation: " <> show other)
-    turnsUntil host control "beta's observation" (hasSettled <$> atomically (pollCompletion ticket))
-    -- And beta keeps rendering: its owner's slot still admits new use, turn
-    -- after turn, while alpha's owner is pending and its window is retained.
-    renders ← forM [1 .. 3 ∷ Int] $ \_ → do
-      admitted ← renderThrough journal host "beta" betaService
-      turnsExactly host control 1
-      pure admitted
-    renders `shouldBe` [True, True, True]
-    -- Alpha admits none of it, and none of beta's work advanced alpha by a
-    -- single fact.
-    renderThrough journal host "alpha" alphaService `shouldReturn` False
-    alphaSeen ← observation alphaService
-    observedSlot alphaSeen `shouldBe` SlotRetiring
-    observedMissing alphaSeen `shouldBe` allRetirementFacts
-    -- Beta's own close, retirement, and destruction then run to the end while
-    -- alpha is still pending, and beta admits no use once it has closed.
-    void (closeHostWindow host beta)
-    renderThrough journal host "beta" betaService `shouldReturn` False
-    turnsUntil host control "beta's destruction" (elem 2 <$> destroyCalls seam)
-    destroyCalls seam `shouldReturn` [2]
-    atomically (windowGraphicsStatus host alpha) >>= \case
-      GraphicsPresent seen → observedSlot seen `shouldBe` SlotRetiring
-      other → unexpected ("alpha's slot was not retiring: " <> show other)
-    -- Independent evidence finishes alpha, and its window follows.
-    _ ← forkIO (publishFacts journal host alphaOwner allRetirementFacts)
-    turnsUntil host control "alpha's destruction" (elem 1 <$> destroyCalls seam)
-    void (atomically (readTVar (ownerSteps betaOwner)))
+  withSupplier journal $ \(Supplier supply supplied) →
+    protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
+      (alpha, beta) ← twoWindows host
+      (alphaOwner, alphaService) ← attachedOwner journal host alpha (ownerNamed "alpha")
+      rescuing (supply host alphaOwner allRetirementFacts) $ do
+        (betaOwner, betaService) ← attachedOwner journal host beta (ownerNamed "beta")
+        -- Alpha's owner never makes progress of its own.
+        atomically (writeTVar (ownerPlan alphaOwner) [])
+        void (closeHostWindow host alpha)
+        -- Beta keeps executing commands while alpha's retirement is pending.
+        client ← atomically (hostWindowClient host beta) >>= maybe (unexpected "beta has no client") pure
+        ticket ←
+          submitWindowCommand (clientCommandPort client) [] (observeWindowCommand beta) >>= \case
+            SubmitAccepted ticket → pure ticket
+            other → unexpected ("beta's port refused an observation: " <> show other)
+        turnsUntil host control "beta's observation" (hasSettled <$> atomically (pollCompletion ticket))
+        -- And beta keeps rendering: its owner's slot still admits new use, turn
+        -- after turn, while alpha's owner is pending and its window is retained.
+        renders ← forM [1 .. 3 ∷ Int] $ \_ → do
+          admitted ← renderThrough journal host "beta" betaService
+          turnsExactly host control 1
+          pure admitted
+        renders `shouldBe` [True, True, True]
+        -- Alpha admits none of it, and none of beta's work advanced alpha by a
+        -- single fact.
+        renderThrough journal host "alpha" alphaService `shouldReturn` False
+        alphaSeen ← observation alphaService
+        observedSlot alphaSeen `shouldBe` SlotRetiring
+        observedMissing alphaSeen `shouldBe` allRetirementFacts
+        -- Beta's own close, retirement, and destruction then run to the end while
+        -- alpha is still pending, and beta admits no use once it has closed.
+        void (closeHostWindow host beta)
+        renderThrough journal host "beta" betaService `shouldReturn` False
+        turnsUntil host control "beta's destruction" (elem 2 <$> destroyCalls seam)
+        destroyCalls seam `shouldReturn` [2]
+        atomically (windowGraphicsStatus host alpha) >>= \case
+          GraphicsPresent seen → observedSlot seen `shouldBe` SlotRetiring
+          other → unexpected ("alpha's slot was not retiring: " <> show other)
+        -- Independent evidence finishes alpha, and its window follows.
+        supplied host alphaOwner allRetirementFacts
+        turnsUntil host control "alpha's destruction" (elem 1 <$> destroyCalls seam)
+        void (atomically (readTVar (ownerSteps betaOwner)))
   entries ← readTVarIO journal
   -- Beta rendered exactly while it was attached, and its whole retirement and
   -- destruction happened before alpha's.
@@ -1723,21 +1950,23 @@ testStalledNeighbour ∷ Expectation
 testStalledNeighbour = do
   journal ← newTVarIO []
   seam ← pollingSeam journal
-  protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
-    (alpha, beta) ← twoWindows host
-    (alphaOwner, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
-    (_, _) ← attachedOwner journal host beta (ownerNamed "beta")
-    void (closeHostWindow host alpha)
-    void (closeHostWindow host beta)
-    turnsUntil host control "beta's destruction" (elem 2 <$> destroyCalls seam)
-    destroyCalls seam `shouldReturn` [2]
-    -- The stalled owner was offered its one opportunity and withdrew; it is
-    -- never replayed.
-    steps ← atomically (readTVar (ownerSteps alphaOwner))
-    turnsExactly host control 3
-    atomically (readTVar (ownerSteps alphaOwner)) `shouldReturn` steps
-    _ ← forkIO (publishFacts journal host alphaOwner allRetirementFacts)
-    turnsUntil host control "alpha's destruction" (elem 1 <$> destroyCalls seam)
+  withSupplier journal $ \(Supplier supply supplied) →
+    protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
+      (alpha, beta) ← twoWindows host
+      (alphaOwner, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
+      rescuing (supply host alphaOwner allRetirementFacts) $ do
+        (_, _) ← attachedOwner journal host beta (ownerNamed "beta")
+        void (closeHostWindow host alpha)
+        void (closeHostWindow host beta)
+        turnsUntil host control "beta's destruction" (elem 2 <$> destroyCalls seam)
+        destroyCalls seam `shouldReturn` [2]
+        -- The stalled owner was offered its one opportunity and withdrew; it is
+        -- never replayed.
+        steps ← atomically (readTVar (ownerSteps alphaOwner))
+        turnsExactly host control 3
+        atomically (readTVar (ownerSteps alphaOwner)) `shouldReturn` steps
+        supplied host alphaOwner allRetirementFacts
+        turnsUntil host control "alpha's destruction" (elem 1 <$> destroyCalls seam)
   entries ← readTVarIO journal
   takeWhile (/= WindowGone 1) entries `shouldSatisfy` (WindowGone 2 `elem`)
 
@@ -1789,22 +2018,24 @@ testBlockingOwnerRefused = do
   journal ← newTVarIO []
   seam ← pollingSeam journal
   reported ← newIORef Nothing
-  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
-    window ← onlyWindow host
-    (owner, _) ←
-      attachedOwner journal host window (ownerNamed "blocking") {scriptCompletion = BlockingCompletion}
-    void (closeHostWindow host window)
-    -- One turn is enough: the refusal withdraws the path, so a later round has
-    -- nothing left to refuse and the demand reports it stalled instead.
-    turnsExactly host control 1
-    demand ← atomically (hostRetirementDemand host)
-    writeIORef reported (Just demand)
-    turnsExactly host control 3
-    -- The step was never entered, so it could not have blocked anything.
-    atomically (readTVar (ownerSteps owner)) `shouldReturn` 0
-    destroyCalls seam `shouldReturn` []
-    _ ← forkIO (publishFacts journal host owner allRetirementFacts)
-    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+  withSupplier journal $ \(Supplier supply supplied) →
+    protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+      window ← onlyWindow host
+      (owner, _) ←
+        attachedOwner journal host window (ownerNamed "blocking") {scriptCompletion = BlockingCompletion}
+      rescuing (supply host owner allRetirementFacts) $ do
+        void (closeHostWindow host window)
+        -- One turn is enough: the refusal withdraws the path, so a later round has
+        -- nothing left to refuse and the demand reports it stalled instead.
+        turnsExactly host control 1
+        demand ← atomically (hostRetirementDemand host)
+        writeIORef reported (Just demand)
+        turnsExactly host control 3
+        -- The step was never entered, so it could not have blocked anything.
+        atomically (readTVar (ownerSteps owner)) `shouldReturn` 0
+        destroyCalls seam `shouldReturn` []
+        supplied host owner allRetirementFacts
+        turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
   readIORef reported >>= \case
     Just demand → do
       retirementRefused demand `shouldSatisfy` (> 0)
@@ -1822,25 +2053,24 @@ testCompletionWakesTurn ∷ Expectation
 testCompletionWakesTurn = do
   journal ← newTVarIO []
   seam ← blockingSeam journal
-  protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
-    window ← onlyWindow host
-    (owner, service) ← attachedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-    void (closeHostWindow host window)
-    -- The owner withdrew its own path on its one opportunity, so no turn can
-    -- advance it and the loop goes idle. The facts are published only once the
-    -- owner has really entered that wait, so the wake is what ends it rather
-    -- than a fold that happened to come first.
-    _ ←
-      forkIO $ do
-        atomically (hostActivity host >>= check . activityWaiting)
-        publishFacts journal host owner allRetirementFacts
-    turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
-    observed ← observation service
-    observedSlot observed `shouldBe` SlotFree
-    observedMissing observed `shouldBe` []
-    -- One opportunity, which stalled and established nothing; the retirement is
-    -- entirely the published evidence's.
-    atomically (readTVar (ownerSteps owner)) `shouldReturn` 1
+  withWaitingSupplier journal $ \(supplyOnceWaiting, supplyNow) →
+    protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
+      window ← onlyWindow host
+      (owner, service) ← attachedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+      rescuing (supplyNow host owner) $ do
+        void (closeHostWindow host window)
+        -- The owner withdrew its own path on its one opportunity, so no turn can
+        -- advance it and the loop goes idle. The facts are published only once the
+        -- owner has really entered that wait, so the wake is what ends it rather
+        -- than a fold that happened to come first.
+        supplyOnceWaiting host owner
+        turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
+        observed ← observation service
+        observedSlot observed `shouldBe` SlotFree
+        observedMissing observed `shouldBe` []
+        -- One opportunity, which stalled and established nothing; the retirement is
+        -- entirely the published evidence's.
+        atomically (readTVar (ownerSteps owner)) `shouldReturn` 1
   entries ← readTVarIO journal
   filter (/= Constructed "alpha") entries `shouldBe` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
@@ -1858,22 +2088,24 @@ testUnservedCountedAsDeferred = do
   reported ← newIORef Nothing
   offered ← newIORef []
   let config = (settings [windowNamed "alpha", windowNamed "beta"]) {hostRetirementBudget = 1}
-  protectedRun seam config (\_ → pure ()) $ \host control → do
-    (alpha, beta) ← twoWindows host
-    (alphaOwner, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
-    (betaOwner, _) ← attachedOwner journal host beta (ownerNamed "beta") {scriptPlan = repeat Await}
-    void (closeHostWindow host alpha)
-    void (closeHostWindow host beta)
-    -- One turn, one opportunity, and it went to the owner that then withdrew.
-    turnsExactly host control 1
-    demand ← atomically (hostRetirementDemand host)
-    writeIORef reported (Just demand)
-    counts ← traverse (atomically . readTVar . ownerSteps) [alphaOwner, betaOwner]
-    writeIORef offered counts
-    forM_ [alphaOwner, betaOwner] $ \owner →
-      atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
-    _ ← forkIO (publishFacts journal host alphaOwner allRetirementFacts)
-    turnsUntil host control "both destructions" ((== 2) . length <$> destroyCalls seam)
+  withSupplier journal $ \(Supplier supply supplied) →
+    protectedRun seam config (\_ → pure ()) $ \host control → do
+      (alpha, beta) ← twoWindows host
+      (alphaOwner, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
+      rescuing (supply host alphaOwner allRetirementFacts) $ do
+        (betaOwner, _) ← attachedOwner journal host beta (ownerNamed "beta") {scriptPlan = repeat Await}
+        void (closeHostWindow host alpha)
+        void (closeHostWindow host beta)
+        -- One turn, one opportunity, and it went to the owner that then withdrew.
+        turnsExactly host control 1
+        demand ← atomically (hostRetirementDemand host)
+        writeIORef reported (Just demand)
+        counts ← traverse (atomically . readTVar . ownerSteps) [alphaOwner, betaOwner]
+        writeIORef offered counts
+        forM_ [alphaOwner, betaOwner] $ \owner →
+          atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+        supplied host alphaOwner allRetirementFacts
+        turnsUntil host control "both destructions" ((== 2) . length <$> destroyCalls seam)
   readIORef offered `shouldReturn` [1, 0]
   readIORef reported >>= \case
     Just demand → do
@@ -2397,15 +2629,17 @@ testStalledNeighbourThenWaits = do
   let config =
         (settings [windowNamed "alpha", windowNamed "beta"])
           {hostRetirementBudget = 1, hostClock = clock}
-  protectedRun seam config (\_ → pure ()) $ \host control → do
-    (alpha, beta) ← twoWindows host
-    owners ← detachedOwners journal host [(alpha, "alpha", [Stall]), (beta, "beta", repeat Await)]
-    pacingsOver host control 4 (\_ → pure ()) >>= writeIORef observed
-    traverse (atomically . readTVar . ownerSteps) owners >>= writeIORef offered
-    -- Alpha withdrew its own path, so only independent evidence can finish it.
-    forM_ (take 1 owners) $ \owner →
-      void (forkIO (publishFacts journal host owner allRetirementFacts))
-    finishOwners host control seam [alpha, beta] owners
+  withSupplier journal $ \(Supplier supply supplied) →
+    protectedRun seam config (\_ → pure ()) $ \host control → do
+      (alpha, beta) ← twoWindows host
+      owners ← detachedOwners journal host [(alpha, "alpha", [Stall]), (beta, "beta", repeat Await)]
+      rescuing (forM_ (take 1 owners) (\owner → supply host owner allRetirementFacts)) $ do
+        pacingsOver host control 4 (\_ → pure ()) >>= writeIORef observed
+        traverse (atomically . readTVar . ownerSteps) owners >>= writeIORef offered
+        -- Alpha withdrew its own path, so only independent evidence can finish it.
+        forM_ (take 1 owners) $ \owner →
+          supplied host owner allRetirementFacts
+        finishOwners host control seam [alpha, beta] owners
   -- Alpha stalled on its one opportunity and was never offered another; beta
   -- was offered one on every turn the budget could no longer spend on alpha.
   readIORef offered `shouldReturn` [1, 3]
@@ -2565,20 +2799,22 @@ testLatestInstantReplacesTheRetainedOne = do
   let config =
         (settings [windowNamed "alpha", windowNamed "beta"])
           {hostRetirementBudget = 1, hostClock = clock}
-  protectedRun seam config (\_ → pure ()) $ \host control → do
-    (alpha, beta) ← twoWindows host
-    owners ←
-      detachedOwners
-        journal
-        host
-        [ (alpha, "alpha", [AwaitUntil (at (millis 40)), AwaitUntil (at (millis 120)), Stall])
-        , (beta, "beta", AwaitUntil (at (millis 200)) : repeat Await)
-        ]
-    pacingsOver host control 6 (\_ → pure ()) >>= writeIORef observed
-    -- Alpha withdrew its own path, so only independent evidence finishes it.
-    forM_ (take 1 owners) $ \owner →
-      void (forkIO (publishFacts journal host owner allRetirementFacts))
-    finishOwners host control seam [alpha, beta] owners
+  withSupplier journal $ \(Supplier supply supplied) →
+    protectedRun seam config (\_ → pure ()) $ \host control → do
+      (alpha, beta) ← twoWindows host
+      owners ←
+        detachedOwners
+          journal
+          host
+          [ (alpha, "alpha", [AwaitUntil (at (millis 40)), AwaitUntil (at (millis 120)), Stall])
+          , (beta, "beta", AwaitUntil (at (millis 200)) : repeat Await)
+          ]
+      rescuing (forM_ (take 1 owners) (\owner → supply host owner allRetirementFacts)) $ do
+        pacingsOver host control 6 (\_ → pure ()) >>= writeIORef observed
+        -- Alpha withdrew its own path, so only independent evidence finishes it.
+        forM_ (take 1 owners) $ \owner →
+          supplied host owner allRetirementFacts
+        finishOwners host control seam [alpha, beta] owners
   readIORef observed >>= \case
     [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn, sixthTurn] → do
       firstTurn `shouldBe` PolledForWork

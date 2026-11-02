@@ -11,6 +11,10 @@ module Test.GLFW.Owner.Fixture.Rig
   , ownedHost
   , ownedHostWith
   , ownedHostHooked
+  , ownedHostBeforeBody
+  , armedBody
+  , armedFinally
+  , publishAllFor
   , ownedHostCaught
   ) where
 
@@ -25,7 +29,8 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeException, finally, try)
+import Control.Exception (SomeException, finally, mask, onException, try)
+import Control.Monad (forM_, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (Logger)
@@ -159,6 +164,51 @@ ownedHostHooked
   → IO a
 ownedHostHooked hooks logger seam config ownerConfig action =
   asProcessMainThread seam (ownedHostRun hooks logger seam config ownerConfig action)
+
+-- | 'ownedHostWith' that runs an action on the main thread after the host is built and before the application's body begins (the
+-- host's own 'beforeConsumer' hook), so an example can end a run during its startup (#593).
+ownedHostBeforeBody
+  ∷ IO ()
+  → Logger
+  → Seam
+  → HostConfig
+  → GraphicsOwnerConfig Scene
+  → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
+  → IO a
+ownedHostBeforeBody beforeBody = ownedHostHooked Private.noHostHooks {Private.beforeConsumer = \_ → beforeBody}
+
+-- | The body of a rig example under a rescue (#593). The example's scripted failing or gated backend behaviour (@arm@) is armed
+-- only inside this body's first masked step, in the same step that registers the release that undoes it (@release@, run only
+-- when the body ends exceptionally, before the host's drain), so no failing step, gated retirement or deferred releaser exists
+-- before the rescue that can release it. The @cut@ hook is where an example ends the body to prove that: it is called with
+-- 0 before the arming and with 1 once the arming and the release are registered; a fixture whose behaviour is reached only through an
+-- attachment calls it with 2 once the first attachment exists.
+armedBody ∷ (Int → IO ()) → IO () → IO () → IO a → IO a
+armedBody cut arm release body = do
+  cut 0
+  mask $ \restore → do
+    arm
+    restore (cut 1 >> body) `onException` release
+
+-- | 'armedBody' whose release also runs when the body returns: for a body that must leave nothing held on any exit (#593).
+armedFinally ∷ (Int → IO ()) → IO () → IO () → IO a → IO a
+armedFinally cut arm release body = do
+  cut 0
+  mask $ \restore → do
+    arm
+    restore (cut 1 >> body) `finally` release
+
+-- | Publish every retirement fact for one attachment from the calling thread, if the host publishes completions and the owner holds
+-- the attachment's acknowledgement, and do nothing otherwise. It blocks on nothing and raises nothing, and it is idempotent: the
+-- rescue of an example whose protected drain waits for independent evidence the body would have published (#593).
+publishAllFor ∷ WindowHost → GraphicsOwner Scene → AttachmentId → IO ()
+publishAllFor host owner attachment = do
+  acknowledgement ← atomically (ownerTargetAcknowledgement owner attachment)
+  case (hostGraphicsPublisher host, acknowledgement) of
+    (Just publisher, Just acknowledged) →
+      forM_ allRetirementFacts $ \fact →
+        void (publishCompletion publisher (completionNotice attachment acknowledged fact))
+    _ → pure ()
 
 -- | 'ownedHost', catching inside the seam's own bound thread.
 --

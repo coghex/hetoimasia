@@ -11,7 +11,7 @@
 -- Threads are coordinated with 'MVar's and 'threadStatus', never with a sleep.
 module Test.GLFW.Command (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, yield)
+import Control.Concurrent (ThreadId, killThread, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, retry, throwSTM)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, fromException, throwIO, try)
@@ -40,6 +40,7 @@ import Test.GLFW.Support
   , unexpected
   )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = do
@@ -110,32 +111,32 @@ testCapacityWait = withCommands defaultScript 1 $ \seam host window → do
   let port = windowCommandPort host
       command = observeOf window
   held ← submitWindowCommand port [("client", "held")] command >>= accepted
-  (cancelled, cancelledOutcome) ← forked (awaitSubmitWindowCommand port [("client", "cancelled")] command)
-  awaitBlockedOnSTM cancelled
-  beforeCancel ← statistics host
-  killThread cancelled
-  cancelledResult ← takeMVar cancelledOutcome
-  afterCancel ← statistics host
-  -- Capacity freed by the executor admits the next waiter.
-  (waiting, waitingOutcome) ← forked (awaitSubmitWindowCommand port [("client", "waited")] command)
-  awaitBlockedOnSTM waiting
-  step ← seamExecuteNext seam host [window]
-  waited ← takeMVar waitingOutcome >>= either throwIO pure >>= waitAccepted
-  -- Closure ends a wait that capacity never would.
-  (ending, endingOutcome) ← forked (awaitSubmitWindowCommand port [("client", "closed")] command)
-  awaitBlockedOnSTM ending
-  settled ← atomically (closeWindowCommands host)
-  ended ← takeMVar endingOutcome >>= either throwIO pure
-  dispositions ← atomically (mapM pollCompletion [held, waited])
-  let performed = Performed (ObservationPublished (windowIdentity window) 0)
-  beforeCancel `shouldBe` CommandStatistics 1 1 0 1
-  isCancellation cancelledResult `shouldBe` True
-  afterCancel `shouldBe` beforeCancel
-  step `shouldBe` Executed (ticketOrigin held) performed
-  submittedContext (ticketOrigin waited) `shouldBe` [("client", "waited")]
-  settled `shouldBe` 1
-  ended `shouldBe` WaitClosed
-  dispositions `shouldBe` [Just performed, Just NotExecuted]
+  withForked (awaitSubmitWindowCommand port [("client", "cancelled")] command) $ \cancelled cancelledOutcome → do
+    awaitBlockedOnSTM cancelled
+    beforeCancel ← statistics host
+    killThread cancelled
+    cancelledResult ← takeMVar cancelledOutcome
+    afterCancel ← statistics host
+    -- Capacity freed by the executor admits the next waiter.
+    withForked (awaitSubmitWindowCommand port [("client", "waited")] command) $ \waiting waitingOutcome → do
+      awaitBlockedOnSTM waiting
+      step ← seamExecuteNext seam host [window]
+      waited ← takeMVar waitingOutcome >>= either throwIO pure >>= waitAccepted
+      -- Closure ends a wait that capacity never would.
+      withForked (awaitSubmitWindowCommand port [("client", "closed")] command) $ \ending endingOutcome → do
+        awaitBlockedOnSTM ending
+        settled ← atomically (closeWindowCommands host)
+        ended ← takeMVar endingOutcome >>= either throwIO pure
+        dispositions ← atomically (mapM pollCompletion [held, waited])
+        let performed = Performed (ObservationPublished (windowIdentity window) 0)
+        beforeCancel `shouldBe` CommandStatistics 1 1 0 1
+        isCancellation cancelledResult `shouldBe` True
+        afterCancel `shouldBe` beforeCancel
+        step `shouldBe` Executed (ticketOrigin held) performed
+        submittedContext (ticketOrigin waited) `shouldBe` [("client", "waited")]
+        settled `shouldBe` 1
+        ended `shouldBe` WaitClosed
+        dispositions `shouldBe` [Just performed, Just NotExecuted]
   where
     waitAccepted (WaitAccepted ticket) = pure ticket
     waitAccepted WaitClosed = unexpected "the waiting submission was not admitted"
@@ -176,7 +177,7 @@ testOriginSurvives = withCommands defaultScript 2 $ \seam host window → do
   let port = windowCommandPort host
       command = observeOf window
       context = [("client", "inspector"), ("purpose", "refresh \"panel\"\nnow")]
-  ticket ← onThread forkIO (submitWindowCommand port context command >>= accepted)
+  ticket ← onThread (submitWindowCommand port context command >>= accepted)
   claimed ← newIORef Nothing
   step ← seamExecuteNextScripted seam host $ \origin received → do
     writeIORef claimed (Just (origin, received))
@@ -198,7 +199,7 @@ testOriginSurvives = withCommands defaultScript 2 $ \seam host window → do
 testFifoClaim ∷ Expectation
 testFifoClaim = withCommands defaultScript 4 $ \seam host window → do
   let port = windowCommandPort host
-      submitAs name = onThread forkIO (submitWindowCommand port [("client", name)] (observeOf window) >>= accepted)
+      submitAs name = onThread (submitWindowCommand port [("client", name)] (observeOf window) >>= accepted)
   first ← submitAs "first"
   second ← submitAs "second"
   claimedFirst ← claimNext seam host window
@@ -340,26 +341,26 @@ testTicketWaits ∷ Expectation
 testTicketWaits = withCommands defaultScript 2 $ \seam host window → do
   let port = windowCommandPort host
   ticket ← submitWindowCommand port [] (observeOf window) >>= accepted
-  (patient, patientOutcome) ← forked (awaitCompletion ticket)
-  (cancelled, cancelledOutcome) ← forked (awaitCompletion ticket)
-  awaitBlockedOnSTM patient
-  awaitBlockedOnSTM cancelled
-  killThread cancelled
-  cancelledResult ← takeMVar cancelledOutcome
-  unaffected ← statistics host
-  step ← seamExecuteNext seam host [window]
-  first ← takeMVar patientOutcome >>= either throwIO pure
-  second ← onThread forkIO (awaitCompletion ticket)
-  onOwner ← awaitCompletion ticket
-  polled ← atomically (pollCompletion ticket)
-  removed ← statistics host
-  let performed = Performed (ObservationPublished (windowIdentity window) 0)
-  isCancellation cancelledResult `shouldBe` True
-  unaffected `shouldBe` CommandStatistics 2 1 0 1
-  step `shouldBe` Executed (ticketOrigin ticket) performed
-  [first, second, onOwner] `shouldBe` replicate 3 performed
-  polled `shouldBe` Just performed
-  removed `shouldBe` CommandStatistics 2 0 0 0
+  withForked (awaitCompletion ticket) $ \patient patientOutcome → do
+    withForked (awaitCompletion ticket) $ \cancelled cancelledOutcome → do
+      awaitBlockedOnSTM patient
+      awaitBlockedOnSTM cancelled
+      killThread cancelled
+      cancelledResult ← takeMVar cancelledOutcome
+      unaffected ← statistics host
+      step ← seamExecuteNext seam host [window]
+      first ← takeMVar patientOutcome >>= either throwIO pure
+      second ← onThread (awaitCompletion ticket)
+      onOwner ← awaitCompletion ticket
+      polled ← atomically (pollCompletion ticket)
+      removed ← statistics host
+      let performed = Performed (ObservationPublished (windowIdentity window) 0)
+      isCancellation cancelledResult `shouldBe` True
+      unaffected `shouldBe` CommandStatistics 2 1 0 1
+      step `shouldBe` Executed (ticketOrigin ticket) performed
+      [first, second, onOwner] `shouldBe` replicate 3 performed
+      polled `shouldBe` Just performed
+      removed `shouldBe` CommandStatistics 2 0 0 0
 
 testOwnerThreadNeverWaits ∷ Expectation
 testOwnerThreadNeverWaits = withCommands defaultScript 1 $ \seam host window → do
@@ -371,7 +372,7 @@ testOwnerThreadNeverWaits = withCommands defaultScript 1 $ \seam host window →
   (submitMisuse, submitCaught) ← caughtAs (awaitSubmitWindowCommand port [] command)
   refused ← statistics host
   direct ← performWindowCommand host [window] command
-  (offOwner, _) ← onThread forkIO (caughtAs (seamExecuteNext seam host [window]))
+  (offOwner, _) ← onThread (caughtAs (seamExecuteNext seam host [window]))
   unclaimed ← statistics host
   step ← seamExecuteNext seam host [window]
   settled ← awaitCompletion ticket
@@ -394,23 +395,23 @@ testClosureBeforeClaim = withCommands defaultScript 3 $ \seam host window → do
   let port = windowCommandPort host
       command = observeOf window
   tickets ← replicateM 3 (submitWindowCommand port [] command >>= accepted)
-  (waiter, waiterOutcome) ← forked (awaitCompletion (last tickets))
-  awaitBlockedOnSTM waiter
-  callsBefore ← length <$> seamCalls seam
-  settled ← atomically (closeWindowCommands host)
-  woken ← takeMVar waiterOutcome >>= either throwIO pure
-  step ← seamExecuteNext seam host [window]
-  direct ← performWindowCommand host [window] command
-  callsAfter ← length <$> seamCalls seam
-  final ← statistics host
-  retained ← onThread forkIO (mapM awaitCompletion tickets)
-  settled `shouldBe` 3
-  woken `shouldBe` NotExecuted
-  step `shouldBe` CommandsEnded
-  direct `shouldBe` NotExecuted
-  callsAfter `shouldBe` callsBefore
-  final `shouldBe` CommandStatistics 3 0 0 0
-  retained `shouldBe` replicate 3 NotExecuted
+  withForked (awaitCompletion (last tickets)) $ \waiter waiterOutcome → do
+    awaitBlockedOnSTM waiter
+    callsBefore ← length <$> seamCalls seam
+    settled ← atomically (closeWindowCommands host)
+    woken ← takeMVar waiterOutcome >>= either throwIO pure
+    step ← seamExecuteNext seam host [window]
+    direct ← performWindowCommand host [window] command
+    callsAfter ← length <$> seamCalls seam
+    final ← statistics host
+    retained ← onThread (mapM awaitCompletion tickets)
+    settled `shouldBe` 3
+    woken `shouldBe` NotExecuted
+    step `shouldBe` CommandsEnded
+    direct `shouldBe` NotExecuted
+    callsAfter `shouldBe` callsBefore
+    final `shouldBe` CommandStatistics 3 0 0 0
+    retained `shouldBe` replicate 3 NotExecuted
 
 testClaimBeforeClosure ∷ Expectation
 testClaimBeforeClosure = withCommands defaultScript 3 $ \seam host window → do
@@ -454,39 +455,40 @@ testObservationRequests = do
       withWindow session (hiddenTestWindowConfig "second" 64 48) $ \second → do
         host ← newWindowCommandHost session 4
         let port = windowCommandPort host
-            submitFor window = onThread forkIO (submitWindowCommand port [] (observeOf window) >>= accepted)
+            submitFor window = onThread (submitWindowCommand port [] (observeOf window) >>= accepted)
         writeIORef extent (1024, 768)
         requested ← submitFor second
         -- The transaction that first sees the settlement also reads the snapshot.
-        (observer, observed) ← forked $ atomically $ do
-          disposition ← pollCompletion requested >>= maybe retry pure
-          observation ← readSnapshot (windowObservations second)
-          pure (disposition, observation)
-        awaitBlockedOnSTM observer
-        step ← seamExecuteNext seam host [first, second]
-        (disposition, observation) ← takeMVar observed >>= either throwIO pure
-        firstUnsampled ← current first
-        unserved ← submitFor second
-        callsBefore ← length <$> seamCalls seam
-        unservedStep ← seamExecuteNext seam host [first]
-        callsAfter ← length <$> seamCalls seam
-        endedTicket ← submitFor ended
-        endedStep ← seamExecuteNext seam host [ended, first, second]
-        direct ← performWindowCommand host [first, second] (observeOf first)
-        firstSampled ← current first
-        let published = preparedValue (observedValue observation)
-        disposition `shouldBe` Performed (ObservationPublished (windowIdentity second) 1)
-        step `shouldBe` Executed (ticketOrigin requested) disposition
-        cursorRevision (observedCursor observation) `shouldBe` 1
-        observedRevision published `shouldBe` 1
-        observedWindow published `shouldBe` windowIdentity second
-        observedLogicalExtent published `shouldBe` Observed (Extent 1024 768)
-        observedRevision firstUnsampled `shouldBe` 0
-        unservedStep `shouldBe` Executed (ticketOrigin unserved) (Rejected (WindowNotServed (windowIdentity second)))
-        callsAfter `shouldBe` callsBefore
-        endedStep `shouldBe` Executed (ticketOrigin endedTicket) (Rejected (WindowAlreadyEnded (windowIdentity ended)))
-        direct `shouldBe` Performed (ObservationPublished (windowIdentity first) 1)
-        observedLogicalExtent firstSampled `shouldBe` Observed (Extent 1024 768)
+        let settledWithSnapshot = atomically $ do
+              disposition ← pollCompletion requested >>= maybe retry pure
+              observation ← readSnapshot (windowObservations second)
+              pure (disposition, observation)
+        withForked settledWithSnapshot $ \observer observed → do
+          awaitBlockedOnSTM observer
+          step ← seamExecuteNext seam host [first, second]
+          (disposition, observation) ← takeMVar observed >>= either throwIO pure
+          firstUnsampled ← current first
+          unserved ← submitFor second
+          callsBefore ← length <$> seamCalls seam
+          unservedStep ← seamExecuteNext seam host [first]
+          callsAfter ← length <$> seamCalls seam
+          endedTicket ← submitFor ended
+          endedStep ← seamExecuteNext seam host [ended, first, second]
+          direct ← performWindowCommand host [first, second] (observeOf first)
+          firstSampled ← current first
+          let published = preparedValue (observedValue observation)
+          disposition `shouldBe` Performed (ObservationPublished (windowIdentity second) 1)
+          step `shouldBe` Executed (ticketOrigin requested) disposition
+          cursorRevision (observedCursor observation) `shouldBe` 1
+          observedRevision published `shouldBe` 1
+          observedWindow published `shouldBe` windowIdentity second
+          observedLogicalExtent published `shouldBe` Observed (Extent 1024 768)
+          observedRevision firstUnsampled `shouldBe` 0
+          unservedStep `shouldBe` Executed (ticketOrigin unserved) (Rejected (WindowNotServed (windowIdentity second)))
+          callsAfter `shouldBe` callsBefore
+          endedStep `shouldBe` Executed (ticketOrigin endedTicket) (Rejected (WindowAlreadyEnded (windowIdentity ended)))
+          direct `shouldBe` Performed (ObservationPublished (windowIdentity first) 1)
+          observedLogicalExtent firstSampled `shouldBe` Observed (Extent 1024 768)
 
 -- ---------------------------------------------------------------------------
 -- Support
@@ -511,12 +513,13 @@ accepted other = unexpected ("the submission was not admitted: " <> show other)
 statistics ∷ WindowCommandHost → IO CommandStatistics
 statistics host = atomically (commandStatistics host)
 
--- | Run an action on a new, unbound thread, which is never the owner.
-forked ∷ IO a → IO (ThreadId, MVar (Either SomeException a))
-forked action = do
+-- | Run an action on a new, unbound, owned thread, which is never the owner, for the length of the body (#593): the body is
+-- given the thread and the cell its outcome is put into, and waits for it itself. However the body ends, the thread has ended
+-- and been joined before this returns.
+withForked ∷ IO a → (ThreadId → MVar (Either SomeException a) → IO r) → IO r
+withForked action body = do
   outcome ← newEmptyMVar
-  thread ← forkIO (try action >>= putMVar outcome)
-  pure (thread, outcome)
+  withOwnedThread (try action >>= putMVar outcome) $ \thread _ → body thread outcome
 
 -- | Wait until @target@ is blocked in a transaction, so an example knows a wait
 -- has begun without guessing at a delay.
