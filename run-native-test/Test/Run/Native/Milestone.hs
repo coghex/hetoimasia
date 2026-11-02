@@ -48,7 +48,7 @@ import Test.Run.Native.Lifecycle (Disposal (..), awaitDisposal, disposalFollowed
 import qualified Test.Run.Native.X11 as X11
 import Test.Run.Native.Checkpoint (checkpoint)
 import Test.Run.Native.Observe
-import Test.Run.Native.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread)
 import Test.Run.Native.Peers
 
 spec ∷ Env → Spec
