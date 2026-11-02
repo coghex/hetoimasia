@@ -664,8 +664,11 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
       withTemp $ \directory → do
         let file = directory </> "holder.pid"
             script =
+              -- The real standard input is saved before the background command: a shell gives an asynchronous command /dev/null for its input
+              -- before applying any redirection of its own, so a redirection from descriptor 0 there would read /dev/null (dash does; bash does not).
               unlines
-                [ "perl -MPOSIX -e 'POSIX::setsid(); open(F, \">$ARGV[0].t\"); print F $$; close F; rename(\"$ARGV[0].t\", $ARGV[0]); sleep 300' \"$1\" <&0 >/dev/null 2>&1 &"
+                [ "exec 3<&0"
+                , "perl -MPOSIX -e 'POSIX::setsid(); open(F, \">$ARGV[0].t\"); print F $$; close F; rename(\"$ARGV[0].t\", $ARGV[0]); sleep 300' \"$1\" <&3 >/dev/null 2>&1 &"
                 , "while [ ! -e \"$1\" ]; do :; done"
                 , "echo ready"
                 , "sleep 300"
