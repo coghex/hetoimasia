@@ -44,6 +44,7 @@ import Data.Char (isDigit, isHexDigit, isSpace)
 import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, stripPrefix)
 import Data.Maybe (mapMaybe)
 import Json (Json (..), asArray, asBool, asString, field, parseJson)
+import RunnerIdentity (runnerIdentitySpec)
 import Sandbox (run)
 import System.Directory
   ( copyFile
@@ -303,6 +304,7 @@ bindingPackage = "vulkan"
 spec ∷ Spec
 spec = describe "The Vulkan project boundary" $ do
   runnerCleanupSpec
+  runnerIdentitySpec
 
   it "names the native package and the window integration package, with their local closure, in the one project file that selects them" $ do
     declared ← projectPackages "cabal.project.vulkan"
