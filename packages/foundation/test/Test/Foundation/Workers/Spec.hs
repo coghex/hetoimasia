@@ -22,7 +22,7 @@
 -- then waits for it to block in its 'throwTo' before releasing the worker.
 module Test.Foundation.Workers.Spec (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar
   ( MVar
   , newEmptyMVar
@@ -53,6 +53,7 @@ import Control.Exception
   , uninterruptibleMask_
   )
 import Control.Monad (forM, forM_, replicateM_, unless, void, when)
+import Data.Foldable (for_)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (elemIndex)
@@ -130,6 +131,17 @@ import Test.Hspec
   , shouldReturn
   , shouldSatisfy
   )
+import Test.Foundation.OwnedControl
+  ( Scope
+  , endedAfterScope
+  , endings
+  , newProbe
+  , parkedWorker
+  , runEnding
+  , unownedScope
+  , withRescue
+  )
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "Workers" $ do
@@ -200,6 +212,25 @@ spec = describe "Workers" $ do
       (boundedExample testStatusBlockedDelivery)
     it "keeps confirmed delivery for a worker that caught its cancellation and kept running"
       (boundedExample testStatusDeliveryPersists)
+
+  -- The owner helper every example above starts its owner with: however the scope that needed the owner ends, the owner
+  -- has ended and been joined before the scope returns (#597).
+  describe "The owner helper (withOwner)" $
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined when the scope " <> label) $ do
+        probe ← newProbe
+        runEnding ownedOwner parkedWorker probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+      it ("negative control: the previous unowned start leaves the owner parked when the scope " <> label) $ do
+        probe ← newProbe
+        withRescue $ \started → do
+          runEnding (unownedScope started) parkedWorker probe ending
+          -- The failed judgement is recorded before anything independent touches the owner.
+          judgement ← endedAfterScope probe
+          judgement `shouldBe` False
+        -- The rescue stopped and joined it, so nothing is left for a later example.
+        endedAfterScope probe >>= (`shouldBe` True)
 
   Opacity.spec
 
@@ -275,12 +306,32 @@ failingResource trace name =
       (record trace ("acquire " <> name))
       (\() → record trace ("release " <> name) >> throwIO (Broken ("release " <> name)))
 
--- | Run an owner on its own thread, keeping what escaped it.
-forkOwner ∷ IO a → IO (ThreadId, MVar (Either (ExceptionWithContext SomeException) a))
-forkOwner action = do
+-- | Run an owner on a thread the example owns, keeping what escaped it: the example is given the thread and the slot the
+-- outcome is written to. However the example ends (a return, a failed assertion, a timeout, a cancellation) the thread has
+-- been killed and joined before 'withOwner' returns. The owner publishes whatever it ended with, a cancellation included,
+-- and ends; the example's own wait on the slot is unchanged.
+withOwner ∷ IO a → (ThreadId → MVar (Either (ExceptionWithContext SomeException) a) → IO b) → IO b
+withOwner = withOwnerOpening (pure ())
+
+-- | 'withOwner' for an owner that runs a production scope whose exit waits for something only the example lets go (a worker
+-- held at a gate, a helper held after its delivery): the first argument opens that gate, idempotently and without blocking, in
+-- the same uninterruptible release and before the kill. Without it the join of an owner that has been cancelled would wait for
+-- ever on a scope whose exit cannot finish.
+withOwnerOpening ∷ IO () → IO a → (ThreadId → MVar (Either (ExceptionWithContext SomeException) a) → IO b) → IO b
+withOwnerOpening open action body = do
   done ← newEmptyMVar
-  thread ← forkIO (tryWithContext action >>= putMVar done)
-  pure (thread, done)
+  withOwnedThreadOpening open (tryWithContext action >>= putMVar done) (\thread _ → body thread done)
+
+-- | 'withOwner' for several owners, the first outermost.
+withOwners
+  ∷ [IO a] → ([(ThreadId, MVar (Either (ExceptionWithContext SomeException) a))] → IO b) → IO b
+withOwners [] body = body []
+withOwners (action : more) body =
+  withOwner action $ \owner done → withOwners more (\rest → body ((owner, done) : rest))
+
+-- | 'withOwner' as the scope the owner-helper examples run: the body is given the owner's thread.
+ownedOwner ∷ Scope
+ownedOwner action body = withOwner action (\owner _ → body owner)
 
 -- | Wait until a thread is blocked for a given reason.
 awaitBlocked ∷ BlockReason → ThreadId → IO ()
@@ -371,56 +422,61 @@ testCancelledDuringStartup = do
   handle ← newEmptyMVar
   entered ← newEmptyMVar
   never ← newEmptyMVar
-  _ ← forkIO $ do
-    worker ← takeMVar handle
-    takeMVar entered
-    requestCancel worker
-  started ← withWorkerGroup $ \group →
-    startWorkerWith
-      group
-      ( workerDefinition
-          "cancelled-startup"
-          (\_ → resource trace "startup buffer" >> liftIO (putMVar entered () >> takeMVar never))
-          (\_ () → record trace "run")
-      )
-      (putMVar handle)
-      awaitStartup
-  case started of
-    Right (_, NotAcknowledged completion) → do
-      kindOf completion `shouldBe` CancelledKind
-      completionExit completion `shouldBe` RunNotEntered
-      failureOf completion >>= (`shouldSatisfy` isException WorkerCancelled)
-    Right (_, Acknowledged) → expectationFailure "a cancelled startup must not be acknowledged"
-    Left rejection → expectationFailure (show rejection)
-  readIORef trace >>= (`shouldBe` ["acquire startup buffer", "release startup buffer"])
-  void (tryPutMVar never ())
+  withOwnedThread
+    ( do
+        worker ← takeMVar handle
+        takeMVar entered
+        requestCancel worker
+    )
+    $ \_ _ → do
+      started ← withWorkerGroup $ \group →
+        startWorkerWith
+          group
+          ( workerDefinition
+              "cancelled-startup"
+              (\_ → resource trace "startup buffer" >> liftIO (putMVar entered () >> takeMVar never))
+              (\_ () → record trace "run")
+          )
+          (putMVar handle)
+          awaitStartup
+      case started of
+        Right (_, NotAcknowledged completion) → do
+          kindOf completion `shouldBe` CancelledKind
+          completionExit completion `shouldBe` RunNotEntered
+          failureOf completion >>= (`shouldSatisfy` isException WorkerCancelled)
+        Right (_, Acknowledged) → expectationFailure "a cancelled startup must not be acknowledged"
+        Left rejection → expectationFailure (show rejection)
+      readIORef trace >>= (`shouldBe` ["acquire startup buffer", "release startup buffer"])
+      void (tryPutMVar never ())
 
 testCancelledStartupWait ∷ Expectation
 testCancelledStartupWait = do
   trace ← newTrace
   entered ← newEmptyMVar
   never ← newEmptyMVar
-  (owner, done) ← forkOwner $
-    withScoped (resource trace "parent" >> allocWorkerGroup) $ \group →
-      startWorker group $
-        workerDefinition
-          "slow-startup"
-          (\_ → resource trace "child" >> liftIO (putMVar entered () >> takeMVar never))
-          (\_ () → record trace "run")
-  takeMVar entered
-  awaitBlockedOnSTM owner
-  killThread owner
-  caught ← takeMVar done >>= expectFailure
-  caught `shouldSatisfy` isException ThreadKilled
-  case contextOf caught of
-    [AbandonedStart summary, GroupExit report] → do
-      kindOf summary `shouldBe` CancelledKind
-      completionExit summary `shouldBe` RunNotEntered
-      map completionWorker (reportExitedBeforeClosing report) `shouldBe` [completionWorker summary]
-      expectEmpty (reportDrained report)
-    _ → expectationFailure "expected the abandoned start and the group exit as evidence"
-  readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child", "release child", "release parent"])
-  void (tryPutMVar never ())
+  withOwner
+    ( withScoped (resource trace "parent" >> allocWorkerGroup) $ \group →
+        startWorker group $
+          workerDefinition
+            "slow-startup"
+            (\_ → resource trace "child" >> liftIO (putMVar entered () >> takeMVar never))
+            (\_ () → record trace "run")
+    )
+    $ \owner done → do
+      takeMVar entered
+      awaitBlockedOnSTM owner
+      killThread owner
+      caught ← takeMVar done >>= expectFailure
+      caught `shouldSatisfy` isException ThreadKilled
+      case contextOf caught of
+        [AbandonedStart summary, GroupExit report] → do
+          kindOf summary `shouldBe` CancelledKind
+          completionExit summary `shouldBe` RunNotEntered
+          map completionWorker (reportExitedBeforeClosing report) `shouldBe` [completionWorker summary]
+          expectEmpty (reportDrained report)
+        _ → expectationFailure "expected the abandoned start and the group exit as evidence"
+      readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child", "release child", "release parent"])
+      void (tryPutMVar never ())
 
 testComposedWaitFailure ∷ Expectation
 testComposedWaitFailure = do
@@ -428,36 +484,36 @@ testComposedWaitFailure = do
   requiredFailed ← newTVarIO False
   entered ← newEmptyMVar
   never ← newEmptyMVar
-  _ ← forkIO (takeMVar entered >> atomically (writeTVar requiredFailed True))
-  let composed worker =
-        awaitStartup worker
-          `orElse` (readTVar requiredFailed >>= check >> throwSTM (Broken "required worker failed"))
-  outcome ← try $ withWorkerGroup $ \group →
-    startWorkerWith
-      group
-      ( workerDefinition
-          "composed-wait"
-          ( \_ → do
-              liftIO (record trace "child startup")
-              resource trace "child"
-              liftIO (putMVar entered () >> takeMVar never)
-          )
-          (\_ () → record trace "run")
-      )
-      ( \worker → do
-          record trace "prepared"
-          replicateM_ 100 yield
-          acknowledged ← atomically (pollCompletion worker)
-          unless (isNothing acknowledged) $ fail "the child ran before preparation finished"
-          record trace "prepared done"
-      )
-      composed
-  case outcome of
-    Left (Broken reason) → reason `shouldBe` "required worker failed"
-    Right _ → expectationFailure "the composed wait's failure must propagate"
-  readIORef trace
-    >>= (`shouldBe` ["prepared", "prepared done", "child startup", "acquire child", "release child"])
-  void (tryPutMVar never ())
+  withOwnedThread (takeMVar entered >> atomically (writeTVar requiredFailed True)) $ \_ _ → do
+    let composed worker =
+          awaitStartup worker
+            `orElse` (readTVar requiredFailed >>= check >> throwSTM (Broken "required worker failed"))
+    outcome ← try $ withWorkerGroup $ \group →
+      startWorkerWith
+        group
+        ( workerDefinition
+            "composed-wait"
+            ( \_ → do
+                liftIO (record trace "child startup")
+                resource trace "child"
+                liftIO (putMVar entered () >> takeMVar never)
+            )
+            (\_ () → record trace "run")
+        )
+        ( \worker → do
+            record trace "prepared"
+            replicateM_ 100 yield
+            acknowledged ← atomically (pollCompletion worker)
+            unless (isNothing acknowledged) $ fail "the child ran before preparation finished"
+            record trace "prepared done"
+        )
+        composed
+    case outcome of
+      Left (Broken reason) → reason `shouldBe` "required worker failed"
+      Right _ → expectationFailure "the composed wait's failure must propagate"
+    readIORef trace
+      >>= (`shouldBe` ["prepared", "prepared done", "child startup", "acquire child", "release child"])
+    void (tryPutMVar never ())
 
 testIoWaitActsBeforeDrain ∷ Expectation
 testIoWaitActsBeforeDrain = do
@@ -576,14 +632,14 @@ testCancellableObservation =
       expectStarted
         =<< startWorker group
           (workerDefinition "observed" (\_ → pure ()) (\token () → atomically (awaitStopRequest token)))
-    (observer, observed) ← forkOwner (atomically (awaitCompletion worker))
-    awaitBlockedOnSTM observer
-    killThread observer
-    takeMVar observed >>= expectFailure >>= (`shouldSatisfy` isException ThreadKilled)
-    atomically (pollCompletion worker) >>= expectNothing
-    atomically (requestStop worker)
-    completion ← atomically (awaitCompletion worker)
-    completionExit completion `shouldBe` RunExited RunReturned StopWasRequested
+    withOwner (atomically (awaitCompletion worker)) $ \observer observed → do
+      awaitBlockedOnSTM observer
+      killThread observer
+      takeMVar observed >>= expectFailure >>= (`shouldSatisfy` isException ThreadKilled)
+      atomically (pollCompletion worker) >>= expectNothing
+      atomically (requestStop worker)
+      completion ← atomically (awaitCompletion worker)
+      completionExit completion `shouldBe` RunExited RunReturned StopWasRequested
 
 testObservedCancellation ∷ Expectation
 testObservedCancellation =
@@ -592,18 +648,21 @@ testObservedCancellation =
     worker ←
       expectStarted
         =<< startWorker group (workerDefinition "to-cancel" (\_ → pure ()) (\_ () → takeMVar never))
-    (observer, observed) ← forkOwner $ do
-      completion ← atomically (awaitCompletion worker)
-      pure (kindOf completion, completionExit completion)
-    awaitBlockedOnSTM observer
-    requestCancel worker
-    result ← takeMVar observed
-    case result of
-      Right (kind, exit) → do
-        kind `shouldBe` CancelledKind
-        exit `shouldBe` RunExited RunCancelled CancelWasRequested
-      Left _ → expectationFailure "observing a cancelled worker must not cancel the observer"
-    void (tryPutMVar never ())
+    withOwner
+      ( do
+          completion ← atomically (awaitCompletion worker)
+          pure (kindOf completion, completionExit completion)
+      )
+      $ \observer observed → do
+        awaitBlockedOnSTM observer
+        requestCancel worker
+        result ← takeMVar observed
+        case result of
+          Right (kind, exit) → do
+            kind `shouldBe` CancelledKind
+            exit `shouldBe` RunExited RunCancelled CancelWasRequested
+          Left _ → expectationFailure "observing a cancelled worker must not cancel the observer"
+        void (tryPutMVar never ())
 
 testMultipleReaders ∷ Expectation
 testMultipleReaders = do
@@ -619,19 +678,20 @@ testMultipleReaders = do
               (\_ → allocResource (record trace "acquire worker buffer") releaseBuffer)
               (\_ () → pure (42 ∷ Int))
           )
-    readers ← forM ["first", "second"] $ \name → forkOwner $ do
-      completion ← atomically (awaitCompletion worker)
-      record trace ("read by " <> name)
-      value ← expectSucceeded completion
-      pure (completionWorker completion, completionExit completion, value)
-    forM_ readers (awaitBlockedOnSTM . fst)
-    atomically (pollCompletion worker) >>= expectNothing
-    putMVar releaseGate ()
-    results ← forM readers (takeMVar . snd)
-    let expected = (workerId worker, RunExited RunReturned NothingRequested, 42)
-    forM_ results $ \case
-      Right observed → observed `shouldBe` expected
-      Left _ → expectationFailure "a reader failed"
+    let reader name = do
+          completion ← atomically (awaitCompletion worker)
+          record trace ("read by " <> name)
+          value ← expectSucceeded completion
+          pure (completionWorker completion, completionExit completion, value)
+    withOwners (map reader ["first", "second"]) $ \readers → do
+      forM_ readers (awaitBlockedOnSTM . fst)
+      atomically (pollCompletion worker) >>= expectNothing
+      putMVar releaseGate ()
+      results ← forM readers (takeMVar . snd)
+      let expected = (workerId worker, RunExited RunReturned NothingRequested, 42)
+      forM_ results $ \case
+        Right observed → observed `shouldBe` expected
+        Left _ → expectationFailure "a reader failed"
   entries ← readIORef trace
   let position entry = maybe (length entries) id (elemIndex entry entries)
   position "release worker buffer" `shouldSatisfy` (< position "read by first")
@@ -671,13 +731,15 @@ testRegistrationClosingRace =
   replicateM_ 200 $ do
     ran ← newIORef False
     (report, started) ← withWorkerGroup $ \group → do
-      (_, starting) ← forkOwner $
-        startWorker group $
-          workerDefinition "racing" (\_ → liftIO (atomicModifyIORef' ran (const (True, ())))) $
-            \token () → atomically (awaitStopRequest token)
-      report ← closeWorkerGroup group
-      started ← takeMVar starting
-      pure (report, started)
+      withOwner
+        ( startWorker group $
+            workerDefinition "racing" (\_ → liftIO (atomicModifyIORef' ran (const (True, ())))) $
+              \token () → atomically (awaitStopRequest token)
+        )
+        $ \_ starting → do
+          report ← closeWorkerGroup group
+          started ← takeMVar starting
+          pure (report, started)
     everRan ← readIORef ran
     let reported = map completionWorker (reportExitedBeforeClosing report <> reportDrained report)
     case started of
@@ -703,11 +765,11 @@ testExitBeforeStopDuringCleanup = do
           (workerDefinition "exits-on-request" (\_ → pure ()) (\token () → atomically (awaitStopRequest token)))
     takeMVar inCleanup
     atomically (pollCompletion early) >>= expectNothing
-    (closer, closed) ← forkOwner (closeWorkerGroup group)
-    awaitBlockedOnSTM closer
-    putMVar proceed ()
-    _ ← atomically (awaitCompletion requested)
-    takeMVar closed >>= either (const (fail "closing failed")) pure
+    withOwner (closeWorkerGroup group) $ \closer closed → do
+      awaitBlockedOnSTM closer
+      putMVar proceed ()
+      _ ← atomically (awaitCompletion requested)
+      takeMVar closed >>= either (const (fail "closing failed")) pure
   map completionExit (reportDrained report)
     `shouldBe` [RunExited RunReturned NothingRequested, RunExited RunReturned StopWasRequested]
   expectEmpty (reportExitedBeforeClosing report)
@@ -753,55 +815,59 @@ testFurtherCancellationDuringDrain = do
   cancelSeen ← newEmptyMVar
   release ← newEmptyMVar
   never ← newEmptyMVar
-  (owner, done) ← forkOwner $
-    withScoped (resource trace "parent" >> allocWorkerGroup) $ \group → do
-      _ ←
-        expectStarted
-          =<< startWorker group
-            ( workerDefinition "slow-to-stop" (\_ → resource trace "child") $ \_ () → do
-                interrupted ← try (takeMVar never)
-                case interrupted of
-                  Left WorkerCancelled → putMVar cancelSeen ()
-                  Right () → pure ()
-                takeMVar release
-            )
-      putMVar started ()
-      takeMVar never
-  takeMVar started
-  killThread owner
-  takeMVar cancelSeen
-  awaitBlockedOnSTM owner
-  throwTo owner UserInterrupt
-  awaitBlockedOnSTM owner
-  tryReadMVar done >>= expectNothing
-  readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child"])
-  putMVar release ()
-  caught ← takeMVar done >>= expectFailure
-  caught `shouldSatisfy` isException ThreadKilled
-  case contextOf caught of
-    [GroupExit report] → map kindOf (reportDrained report) `shouldBe` [SucceededKind]
-    _ → expectationFailure "expected the group exit as evidence"
-  readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child", "release child", "release parent"])
-  void (tryPutMVar never ())
+  withOwnerOpening (void (tryPutMVar release ()))
+    ( withScoped (resource trace "parent" >> allocWorkerGroup) $ \group → do
+        _ ←
+          expectStarted
+            =<< startWorker group
+              ( workerDefinition "slow-to-stop" (\_ → resource trace "child") $ \_ () → do
+                  interrupted ← try (takeMVar never)
+                  case interrupted of
+                    Left WorkerCancelled → putMVar cancelSeen ()
+                    Right () → pure ()
+                  takeMVar release
+              )
+        putMVar started ()
+        takeMVar never
+    )
+    $ \owner done → do
+      takeMVar started
+      killThread owner
+      takeMVar cancelSeen
+      awaitBlockedOnSTM owner
+      throwTo owner UserInterrupt
+      awaitBlockedOnSTM owner
+      tryReadMVar done >>= expectNothing
+      readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child"])
+      putMVar release ()
+      caught ← takeMVar done >>= expectFailure
+      caught `shouldSatisfy` isException ThreadKilled
+      case contextOf caught of
+        [GroupExit report] → map kindOf (reportDrained report) `shouldBe` [SucceededKind]
+        _ → expectationFailure "expected the group exit as evidence"
+      readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child", "release child", "release parent"])
+      void (tryPutMVar never ())
 
 testStuckWorker ∷ Expectation
 testStuckWorker = do
   trace ← newTrace
   bodyDone ← newEmptyMVar
   release ← newEmptyMVar
-  (owner, done) ← forkOwner $
-    withScoped (resource trace "parent" >> allocWorkerGroup) $ \group → do
-      _ ←
-        expectStarted
-          =<< startWorker group (workerDefinition "ignores-stop" (\_ → resource trace "child") (\_ () → takeMVar release))
-      putMVar bodyDone ()
-  takeMVar bodyDone
-  awaitBlockedOnSTM owner
-  tryReadMVar done >>= expectNothing
-  readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child"])
-  putMVar release ()
-  takeMVar done >>= either (const (expectationFailure "the owner failed")) pure
-  readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child", "release child", "release parent"])
+  withOwnerOpening (void (tryPutMVar release ()))
+    ( withScoped (resource trace "parent" >> allocWorkerGroup) $ \group → do
+        _ ←
+          expectStarted
+            =<< startWorker group (workerDefinition "ignores-stop" (\_ → resource trace "child") (\_ () → takeMVar release))
+        putMVar bodyDone ()
+    )
+    $ \owner done → do
+      takeMVar bodyDone
+      awaitBlockedOnSTM owner
+      tryReadMVar done >>= expectNothing
+      readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child"])
+      putMVar release ()
+      takeMVar done >>= either (const (expectationFailure "the owner failed")) pure
+      readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child", "release child", "release parent"])
 
 testBlockedCancellationDelivery ∷ Expectation
 testBlockedCancellationDelivery = do
@@ -811,35 +877,37 @@ testBlockedCancellationDelivery = do
   release ← newEmptyMVar
   delivering ← newEmptyMVar
   let probe = noProbe {probeHelperDelivering = \_ → myThreadId >>= putMVar delivering}
-  (owner, done) ← forkOwner $
-    withScoped (resource trace "parent") $ \() →
-      withWorkerGroupProbed probe $ \group → do
-        _ ←
-          expectStarted
-            =<< startWorker group
-              ( workerDefinition "uninterruptible" (\_ → resource trace "child") $ \_ () →
-                  uninterruptibleMask_ (putMVar running () >> takeMVar release)
-              )
-        takeMVar running
-        putMVar failing ()
-        throwIO (Broken "owner")
-  takeMVar failing
-  -- The drain's helper names its thread just before its 'throwTo'. Blocked in
-  -- that delivery, it is waiting on the uninterruptible worker, so releasing
-  -- the worker now cannot let it finish before the cancellation arrives.
-  takeMVar delivering >>= awaitBlocked BlockedOnException
-  awaitBlockedOnSTM owner
-  tryReadMVar done >>= expectNothing
-  readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child"])
-  putMVar release ()
-  caught ← takeMVar done >>= expectFailure
-  caught `shouldSatisfy` isException (Broken "owner")
-  case contextOf caught of
-    [GroupExit report] → do
-      map kindOf (reportDrained report) `shouldBe` [CancelledKind]
-      map completionExit (reportDrained report) `shouldBe` [RunExited RunCancelled CancelWasRequested]
-    _ → expectationFailure "expected the group exit as evidence"
-  readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child", "release child", "release parent"])
+  withOwnerOpening (void (tryPutMVar release ()))
+    ( withScoped (resource trace "parent") $ \() →
+        withWorkerGroupProbed probe $ \group → do
+          _ ←
+            expectStarted
+              =<< startWorker group
+                ( workerDefinition "uninterruptible" (\_ → resource trace "child") $ \_ () →
+                    uninterruptibleMask_ (putMVar running () >> takeMVar release)
+                )
+          takeMVar running
+          putMVar failing ()
+          throwIO (Broken "owner")
+    )
+    $ \owner done → do
+      takeMVar failing
+      -- The drain's helper names its thread just before its 'throwTo'. Blocked in
+      -- that delivery, it is waiting on the uninterruptible worker, so releasing
+      -- the worker now cannot let it finish before the cancellation arrives.
+      takeMVar delivering >>= awaitBlocked BlockedOnException
+      awaitBlockedOnSTM owner
+      tryReadMVar done >>= expectNothing
+      readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child"])
+      putMVar release ()
+      caught ← takeMVar done >>= expectFailure
+      caught `shouldSatisfy` isException (Broken "owner")
+      case contextOf caught of
+        [GroupExit report] → do
+          map kindOf (reportDrained report) `shouldBe` [CancelledKind]
+          map completionExit (reportDrained report) `shouldBe` [RunExited RunCancelled CancelWasRequested]
+        _ → expectationFailure "expected the group exit as evidence"
+      readIORef trace >>= (`shouldBe` ["acquire parent", "acquire child", "release child", "release parent"])
 
 -- Retirement -----------------------------------------------------------------
 
@@ -951,41 +1019,43 @@ drainScenario observe = do
   held ← newHeldHelpers
   published ← newEmptyMVar
   never ← newEmptyMVar
-  (owner, done) ← forkOwner $
-    withScoped (resource trace "parent") $ \() →
-      withWorkerGroupProbed (heldProbe held) $ \group → do
-        early ← expectStarted =<< startWorker group (workerDefinition "exited-early" (\_ → pure ()) (\_ () → pure ()))
-        _ ← atomically (awaitCompletion early)
-        worker ←
-          expectStarted
-            =<< startWorker group (workerDefinition "held" (\_ → failingResource trace "child socket") (\_ () → takeMVar never))
-        putMVar published (group, worker)
-        closeWorkerGroup group
-  (group, worker) ← takeMVar published
-  -- Blocked on STM only inside closeWorkerGroup's wait: closing has begun.
-  awaitBlockedOnSTM owner
-  when observe $
-    statusOf group `shouldReturn` GroupStatus GroupClosing [outstandingOf worker True StopWasRequested False AwaitingTerminal 0]
-  throwTo owner (Broken "owner")
-  takeMVar (heldArrived held)
-  _ ← atomically (awaitCompletion worker)
-  when observe $
-    statusOf group `shouldReturn` GroupStatus GroupClosing [outstandingOf worker True CancelWasRequested False AwaitingHelpers 1]
-  awaitBlockedOnSTM owner
-  tryReadMVar done >>= expectNothing
-  putMVar (heldRelease held) ()
-  caught ← takeMVar done >>= expectFailure
-  when observe $ statusOf group `shouldReturn` GroupStatus GroupClosed []
-  entries ← readIORef trace
-  pure
-    DrainRun
-      { runOwnerPrimary = isException (Broken "owner") caught
-      , runReport = case contextOf caught of
-          [GroupExit report] → Just (reportShape report)
-          _ → Nothing
-      , runCleanup = cleanupLabels caught
-      , runTrace = entries
-      }
+  withOwnerOpening (void (tryPutMVar (heldRelease held) ()))
+    ( withScoped (resource trace "parent") $ \() →
+        withWorkerGroupProbed (heldProbe held) $ \group → do
+          early ← expectStarted =<< startWorker group (workerDefinition "exited-early" (\_ → pure ()) (\_ () → pure ()))
+          _ ← atomically (awaitCompletion early)
+          worker ←
+            expectStarted
+              =<< startWorker group (workerDefinition "held" (\_ → failingResource trace "child socket") (\_ () → takeMVar never))
+          putMVar published (group, worker)
+          closeWorkerGroup group
+    )
+    $ \owner done → do
+      (group, worker) ← takeMVar published
+      -- Blocked on STM only inside closeWorkerGroup's wait: closing has begun.
+      awaitBlockedOnSTM owner
+      when observe $
+        statusOf group `shouldReturn` GroupStatus GroupClosing [outstandingOf worker True StopWasRequested False AwaitingTerminal 0]
+      throwTo owner (Broken "owner")
+      takeMVar (heldArrived held)
+      _ ← atomically (awaitCompletion worker)
+      when observe $
+        statusOf group `shouldReturn` GroupStatus GroupClosing [outstandingOf worker True CancelWasRequested False AwaitingHelpers 1]
+      awaitBlockedOnSTM owner
+      tryReadMVar done >>= expectNothing
+      putMVar (heldRelease held) ()
+      caught ← takeMVar done >>= expectFailure
+      when observe $ statusOf group `shouldReturn` GroupStatus GroupClosed []
+      entries ← readIORef trace
+      pure
+        DrainRun
+          { runOwnerPrimary = isException (Broken "owner") caught
+          , runReport = case contextOf caught of
+              [GroupExit report] → Just (reportShape report)
+              _ → Nothing
+          , runCleanup = cleanupLabels caught
+          , runTrace = entries
+          }
 
 testStatusThroughDrain ∷ Expectation
 testStatusThroughDrain = do
@@ -1011,27 +1081,29 @@ testStatusHelperPendingAtClosing = do
   published ← newEmptyMVar
   proceed ← newEmptyMVar
   never ← newEmptyMVar
-  (owner, done) ← forkOwner $
-    withWorkerGroupProbed (heldProbe held) $ \group → do
-      worker ← expectStarted =<< startWorker group (workerDefinition "cancelled-early" (\_ → pure ()) (\_ () → takeMVar never))
-      requestCancel worker
-      putMVar published (group, worker)
-      takeMVar proceed
-      closeWorkerGroup group
-  (group, worker) ← takeMVar published
-  takeMVar (heldArrived held)
-  _ ← atomically (awaitCompletion worker)
-  let pending = [outstandingOf worker True CancelWasRequested False AwaitingHelpers 1]
-  statusOf group `shouldReturn` GroupStatus GroupOpen pending
-  putMVar proceed ()
-  awaitStatus group ((== GroupClosing) . statusPhase) `shouldReturn` GroupStatus GroupClosing pending
-  awaitBlockedOnSTM owner
-  tryReadMVar done >>= expectNothing
-  putMVar (heldRelease held) ()
-  report ← takeMVar done >>= either (\_ → fail "the owner failed") pure
-  statusOf group `shouldReturn` GroupStatus GroupClosed []
-  reportShape report
-    `shouldBe` [[("cancelled-early", CancelledKind, RunExited RunCancelled CancelWasRequested, [])], [], []]
+  withOwnerOpening (void (tryPutMVar (heldRelease held) ()))
+    ( withWorkerGroupProbed (heldProbe held) $ \group → do
+        worker ← expectStarted =<< startWorker group (workerDefinition "cancelled-early" (\_ → pure ()) (\_ () → takeMVar never))
+        requestCancel worker
+        putMVar published (group, worker)
+        takeMVar proceed
+        closeWorkerGroup group
+    )
+    $ \owner done → do
+      (group, worker) ← takeMVar published
+      takeMVar (heldArrived held)
+      _ ← atomically (awaitCompletion worker)
+      let pending = [outstandingOf worker True CancelWasRequested False AwaitingHelpers 1]
+      statusOf group `shouldReturn` GroupStatus GroupOpen pending
+      putMVar proceed ()
+      awaitStatus group ((== GroupClosing) . statusPhase) `shouldReturn` GroupStatus GroupClosing pending
+      awaitBlockedOnSTM owner
+      tryReadMVar done >>= expectNothing
+      putMVar (heldRelease held) ()
+      report ← takeMVar done >>= either (\_ → fail "the owner failed") pure
+      statusOf group `shouldReturn` GroupStatus GroupClosed []
+      reportShape report
+        `shouldBe` [[("cancelled-early", CancelledKind, RunExited RunCancelled CancelWasRequested, [])], [], []]
 
 testStatusStartupAndSettled ∷ Expectation
 testStatusStartupAndSettled = do

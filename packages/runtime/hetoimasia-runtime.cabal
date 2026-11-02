@@ -69,6 +69,7 @@ test-suite runtime-tests
         Test.Runtime.LogFixture
         Test.Runtime.Messaging
         Test.Runtime.Opacity
+        Test.Runtime.OwnedControl
         Test.Runtime.Reporting
         Test.Runtime.ResourceSmoke
         Test.Runtime.Supervision

@@ -23,7 +23,7 @@
 -- still reachable, through weak references to it that the example holds.
 module Test.Foundation.Resources.OwnedCollection (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, throwTo, yield)
+import Control.Concurrent (ThreadId, killThread, throwTo, yield)
 import Control.Concurrent.MVar
   ( MVar
   , modifyMVar_
@@ -32,6 +32,7 @@ import Control.Concurrent.MVar
   , putMVar
   , readMVar
   , takeMVar
+  , tryPutMVar
   )
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -96,6 +97,7 @@ import Test.Hspec
   , shouldBe
   , shouldReturn
   )
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = do
@@ -386,13 +388,20 @@ awaitPendingThrow target = do
     ThreadDied → pure ()
     _ → yield *> awaitPendingThrow target
 
--- | Run an owner body on a thread of its own, returning that thread and a
--- slot the scope's outcome is written to.
-forkOwner ∷ IO () → IO (ThreadId, MVar (Either SomeException ()))
-forkOwner body = do
+-- | Run an owner body on a thread the example owns, and give the example that thread and the slot the scope's outcome is
+-- written to. However the example ends (a return, a failed assertion, a timeout, a cancellation) the thread has been killed
+-- and joined before 'withOwner' returns, so an owner an example gave up on does not outlive it. The owner publishes whatever
+-- it ended with, a cancellation included, and ends; the example's own wait on the slot is unchanged.
+withOwner ∷ IO () → (ThreadId → MVar (Either SomeException ()) → IO a) → IO a
+withOwner = withOwnerOpening (pure ())
+
+-- | 'withOwner' for an owner that can be held, uninterruptibly, at a gate only the example opens: the first argument opens it
+-- (idempotently, without blocking) in the same uninterruptible release and before the kill, so a join cannot wait for ever on
+-- an owner whose killer was never started.
+withOwnerOpening ∷ IO () → IO () → (ThreadId → MVar (Either SomeException ()) → IO a) → IO a
+withOwnerOpening open body continue = do
   outcome ← newEmptyMVar
-  owner ← forkIO (try body >>= putMVar outcome)
-  pure (owner, outcome)
+  withOwnedThreadOpening open (try body >>= putMVar outcome) (\owner _ → continue owner outcome)
 
 -- Admission ------------------------------------------------------------------
 
@@ -450,26 +459,28 @@ testCancelledDuringAssembly = do
   events ← newTrail
   reached ← newEmptyMVar
   blocker ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withOwned 2 $ \collection → do
-      _ ← acquireMember collection (tracked events "earlier")
-      void . acquireMember collection $ do
-        _ ← tracked events "cancelled"
-        restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
-  takeMVar reached
-  killThread owner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      -- The cancelled member was rolled back at once; the earlier member was
-      -- released at the collection's exit.
-      trail events
-        `shouldReturn` [ "acquire earlier"
-                       , "acquire cancelled"
-                       , "release cancelled"
-                       , "release earlier"
-                       ]
+  withOwner
+    ( withOwned 2 $ \collection → do
+        _ ← acquireMember collection (tracked events "earlier")
+        void . acquireMember collection $ do
+          _ ← tracked events "cancelled"
+          restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
+    )
+    $ \owner outcome → do
+      takeMVar reached
+      killThread owner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          fromException propagated `shouldBe` Just ThreadKilled
+          -- The cancelled member was rolled back at once; the earlier member was
+          -- released at the collection's exit.
+          trail events
+            `shouldReturn` [ "acquire earlier"
+                           , "acquire cancelled"
+                           , "release cancelled"
+                           , "release earlier"
+                           ]
 
 testCancellationPendingAtRegistration ∷ Expectation
 testCancellationPendingAtRegistration = do
@@ -477,69 +488,73 @@ testCancellationPendingAtRegistration = do
   acquiring ← newEmptyMVar
   killerSlot ← newEmptyMVar
   neverFilled ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withOwned 2 $ \collection → do
-      _ ← acquireMember collection (tracked events "earlier")
-      _ ←
-        acquireMember collection $
-          acquirePart
-            "pending"
-            (releaseRank 0)
-            ( uninterruptibleMask_ $ do
-                record events "acquire pending"
-                putMVar acquiring ()
-                readMVar killerSlot >>= awaitPendingThrow
-            )
-            (\_ → record events "release pending")
-      -- Not reached: the pending cancellation is delivered as soon as the
-      -- acquisition restores the caller's masking state.
-      record events "body resumed"
-      takeMVar neverFilled
-  takeMVar acquiring
-  killer ← forkIO (throwTo owner ThreadKilled)
-  putMVar killerSlot killer
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      performed ← trail events
-      -- Registered before the cancellation was delivered, so released exactly
-      -- once, by the exit, newest first.
-      performed
-        `shouldBe` [ "acquire earlier"
-                   , "acquire pending"
-                   , "release pending"
-                   , "release earlier"
-                   ]
-      occurrences "release pending" performed `shouldBe` 1
+  withOwnerOpening (void (tryPutMVar killerSlot Nothing))
+    ( withOwned 2 $ \collection → do
+        _ ← acquireMember collection (tracked events "earlier")
+        _ ←
+          acquireMember collection $
+            acquirePart
+              "pending"
+              (releaseRank 0)
+              ( uninterruptibleMask_ $ do
+                  record events "acquire pending"
+                  putMVar acquiring ()
+                  readMVar killerSlot >>= maybe (pure ()) awaitPendingThrow
+              )
+              (\_ → record events "release pending")
+        -- Not reached: the pending cancellation is delivered as soon as the
+        -- acquisition restores the caller's masking state.
+        record events "body resumed"
+        takeMVar neverFilled
+    )
+    $ \owner outcome → do
+      takeMVar acquiring
+      withOwnedThread (throwTo owner ThreadKilled) $ \killer _ → do
+        putMVar killerSlot (Just killer)
+        takeMVar outcome >>= \case
+          Right () → expectationFailure "expected the cancellation to propagate"
+          Left propagated → do
+            fromException propagated `shouldBe` Just ThreadKilled
+            performed ← trail events
+            -- Registered before the cancellation was delivered, so released exactly
+            -- once, by the exit, newest first.
+            performed
+              `shouldBe` [ "acquire earlier"
+                         , "acquire pending"
+                         , "release pending"
+                         , "release earlier"
+                         ]
+            occurrences "release pending" performed `shouldBe` 1
 
 testHandoffCancelledDuringAssembly ∷ Expectation
 testHandoffCancelledDuringAssembly = do
   events ← newTrail
   reached ← newEmptyMVar
   blocker ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withOwned 2 $ \collection → do
-      _ ← acquireMember collection (tracked events "earlier")
-      acquireMemberThen
-        collection
-        ( do
-            _ ← tracked events "cancelled"
-            restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
-        )
-        (\_ → record events "handoff")
-  takeMVar reached
-  killThread owner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      trail events
-        `shouldReturn` [ "acquire earlier"
-                       , "acquire cancelled"
-                       , "release cancelled"
-                       , "release earlier"
-                       ]
+  withOwner
+    ( withOwned 2 $ \collection → do
+        _ ← acquireMember collection (tracked events "earlier")
+        acquireMemberThen
+          collection
+          ( do
+              _ ← tracked events "cancelled"
+              restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
+          )
+          (\_ → record events "handoff")
+    )
+    $ \owner outcome → do
+      takeMVar reached
+      killThread owner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          fromException propagated `shouldBe` Just ThreadKilled
+          trail events
+            `shouldReturn` [ "acquire earlier"
+                           , "acquire cancelled"
+                           , "release cancelled"
+                           , "release earlier"
+                           ]
 
 testHandoffBeforePendingCancellation ∷ Expectation
 testHandoffBeforePendingCancellation = do
@@ -548,37 +563,39 @@ testHandoffBeforePendingCancellation = do
   killerSlot ← newEmptyMVar
   neverFilled ← newEmptyMVar
   masking ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withOwned 2 $ \collection → do
-      _ ←
-        acquireMemberThen collection (tracked events "pending") $ \member → do
-          getMaskingState >>= putMVar masking
-          record events "handoff"
-          putMVar handing ()
-          -- Waiting for the killer is itself uninterruptible; the check that its
-          -- cancellation is pending is not a blocking operation.
-          uninterruptibleMask_ (readMVar killerSlot) >>= awaitPendingThrow
-          liveMemberCount collection >>= record events . ("handoff saw " <>) . Text.pack . show
-          withMember collection member (record events . ("handoff borrowed " <>))
-      -- Not reached: the pending cancellation is delivered once the handoff
-      -- returns and the acquisition restores the caller's masking state.
-      record events "body resumed"
-      takeMVar neverFilled
-  takeMVar handing
-  killer ← forkIO (throwTo owner ThreadKilled)
-  putMVar killerSlot killer
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      takeMVar masking `shouldReturn` MaskedInterruptible
-      trail events
-        `shouldReturn` [ "acquire pending"
-                       , "handoff"
-                       , "handoff saw 1"
-                       , "handoff borrowed pending"
-                       , "release pending"
-                       ]
+  withOwnerOpening (void (tryPutMVar killerSlot Nothing))
+    ( withOwned 2 $ \collection → do
+        _ ←
+          acquireMemberThen collection (tracked events "pending") $ \member → do
+            getMaskingState >>= putMVar masking
+            record events "handoff"
+            putMVar handing ()
+            -- Waiting for the killer is itself uninterruptible; the check that its
+            -- cancellation is pending is not a blocking operation.
+            uninterruptibleMask_ (readMVar killerSlot) >>= maybe (pure ()) awaitPendingThrow
+            liveMemberCount collection >>= record events . ("handoff saw " <>) . Text.pack . show
+            withMember collection member (record events . ("handoff borrowed " <>))
+        -- Not reached: the pending cancellation is delivered once the handoff
+        -- returns and the acquisition restores the caller's masking state.
+        record events "body resumed"
+        takeMVar neverFilled
+    )
+    $ \owner outcome → do
+      takeMVar handing
+      withOwnedThread (throwTo owner ThreadKilled) $ \killer _ → do
+        putMVar killerSlot (Just killer)
+        takeMVar outcome >>= \case
+          Right () → expectationFailure "expected the cancellation to propagate"
+          Left propagated → do
+            fromException propagated `shouldBe` Just ThreadKilled
+            takeMVar masking `shouldReturn` MaskedInterruptible
+            trail events
+              `shouldReturn` [ "acquire pending"
+                             , "handoff"
+                             , "handoff saw 1"
+                             , "handoff borrowed pending"
+                             , "release pending"
+                             ]
 
 testHandoffFailure ∷ Expectation
 testHandoffFailure = do
@@ -704,22 +721,24 @@ testBorrowDroppedOnCancellation = do
   borrowing ← newEmptyMVar
   neverFilled ← newEmptyMVar
   retired ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withOwned 1 $ \collection → do
-      member ← acquireMember collection (tracked events "member")
-      cancelled ←
-        try (withMember collection member (\_ → putMVar borrowing () *> takeMVar neverFilled))
-      case cancelled of
-        Left ThreadKilled → pure ()
-        Left other → throwIO other
-        Right () → fail "the borrow was not cancelled"
-      retireMember collection member >>= putMVar retired
-  takeMVar borrowing
-  -- Returns once the cancellation has been delivered inside the callback.
-  killThread owner
-  takeMVar retired `shouldReturn` Retired
-  takeMVar outcome >>= either throwIO pure
-  trail events `shouldReturn` ["acquire member", "release member"]
+  withOwner
+    ( withOwned 1 $ \collection → do
+        member ← acquireMember collection (tracked events "member")
+        cancelled ←
+          try (withMember collection member (\_ → putMVar borrowing () *> takeMVar neverFilled))
+        case cancelled of
+          Left ThreadKilled → pure ()
+          Left other → throwIO other
+          Right () → fail "the borrow was not cancelled"
+        retireMember collection member >>= putMVar retired
+    )
+    $ \owner outcome → do
+      takeMVar borrowing
+      -- Returns once the cancellation has been delivered inside the callback.
+      killThread owner
+      takeMVar retired `shouldReturn` Retired
+      takeMVar outcome >>= either throwIO pure
+      trail events `shouldReturn` ["acquire member", "release member"]
 
 -- Misuse ---------------------------------------------------------------------
 
@@ -1028,22 +1047,24 @@ testCancelledBodyStaysPrimary = do
   events ← newTrail
   waiting ← newEmptyMVar
   neverFilled ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withOwned 2 $ \collection → do
-      _ ← acquireMember collection (tracked events "first")
-      early ← acquireMember collection (failing events "early")
-      void (expectFailure (retireMember collection early))
-      putMVar waiting ()
-      takeMVar neverFilled
-  takeMVar waiting
-  killThread owner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      labelsOf (cleanupFailures propagated) `shouldBe` ["early"]
-      trail events
-        `shouldReturn` ["acquire first", "acquire early", "release early", "release first"]
+  withOwner
+    ( withOwned 2 $ \collection → do
+        _ ← acquireMember collection (tracked events "first")
+        early ← acquireMember collection (failing events "early")
+        void (expectFailure (retireMember collection early))
+        putMVar waiting ()
+        takeMVar neverFilled
+    )
+    $ \owner outcome → do
+      takeMVar waiting
+      killThread owner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          fromException propagated `shouldBe` Just ThreadKilled
+          labelsOf (cleanupFailures propagated) `shouldBe` ["early"]
+          trail events
+            `shouldReturn` ["acquire first", "acquire early", "release early", "release first"]
 
 -- | An assembly whose only part's release throws, followed by a failing stage.
 failingRollback ∷ Trail → Assembly Text
@@ -1165,8 +1186,8 @@ refusedOperations events collection existing =
 onThread ∷ IO a → IO a
 onThread action = do
   slot ← newEmptyMVar
-  _ ← forkIO (try action >>= putMVar slot)
-  takeMVar slot >>= either (\failure → throwIO (failure ∷ SomeException)) pure
+  withOwnedThread (try action >>= putMVar slot) $ \_ _ →
+    takeMVar slot >>= either (\failure → throwIO (failure ∷ SomeException)) pure
 
 testMissingCapability ∷ Expectation
 testMissingCapability = do
@@ -1235,19 +1256,20 @@ testRevokedOnCancellation = do
   cancelled ← newEmptyMVar
   withOwned 2 $ \owned@(Owned collection capability) → do
     existing ← acquireMember owned (tracked events "existing")
-    borrower ←
-      forkIO $
-        try (lendCapability capability (\lent → putMVar kept lent *> putMVar lending () *> takeMVar neverFilled))
+    withOwnedThread
+      ( try (lendCapability capability (\lent → putMVar kept lent *> putMVar lending () *> takeMVar neverFilled))
           >>= putMVar cancelled
-    takeMVar lending
-    killThread borrower
-    takeMVar cancelled >>= \case
-      Left ThreadKilled → pure ()
-      Left other → throwIO other
-      Right () → expectationFailure "the lending was not cancelled"
-    lent ← takeMVar kept
-    refusedOperations events (Owned collection lent) existing
-      `shouldReturn` replicate 5 (Just CapabilityStale)
+      )
+      $ \borrower _ → do
+        takeMVar lending
+        killThread borrower
+        takeMVar cancelled >>= \case
+          Left ThreadKilled → pure ()
+          Left other → throwIO other
+          Right () → expectationFailure "the lending was not cancelled"
+        lent ← takeMVar kept
+        refusedOperations events (Owned collection lent) existing
+          `shouldReturn` replicate 5 (Just CapabilityStale)
 
 testLendRefusals ∷ Expectation
 testLendRefusals = do
@@ -1308,12 +1330,12 @@ refusedWhileBusy
   → IO ([Maybe OwnedCollectionError], a)
 refusedWhileBusy events collection existing inside proceed busy = do
   finished ← newEmptyMVar
-  _ ← forkIO (try busy >>= putMVar finished)
-  takeMVar inside
-  refused ← refusedOperations events collection existing
-  putMVar proceed ()
-  outcome ← takeMVar finished >>= either (\failure → throwIO (failure ∷ SomeException)) pure
-  pure (refused, outcome)
+  withOwnedThread (try busy >>= putMVar finished) $ \_ _ → do
+    takeMVar inside
+    refused ← refusedOperations events collection existing
+    putMVar proceed ()
+    outcome ← takeMVar finished >>= either (\failure → throwIO (failure ∷ SomeException)) pure
+    pure (refused, outcome)
 
 testConcurrentBorrow ∷ Expectation
 testConcurrentBorrow = do
@@ -1454,27 +1476,47 @@ data Racing a = Racing
   }
 
 -- | Enter a scope of @limit@ members on a thread of its own and prepare it with
--- @setup@. The body then starts @inflight@ on a second thread, which signals
--- through its first barrier once it is inside the collection and waits on its
--- second, and returns. This returns once the exit is waiting.
+-- @setup@. The body then hands the scope to @inflight@, which runs on a second thread and signals through its first barrier
+-- once it is inside the collection and waits on its second, and returns. The continuation runs once the exit is waiting.
+--
+-- Both threads are owned by this call. The operation in flight is what the scope's exit waits for, so its scope encloses the
+-- owner's: the owner is ended and joined before it, never the reverse. The operation is started before the owner (parked until
+-- the owner hands it the scope) because it must outlive the owner's body: an operation scoped to that body would be ended by the
+-- body's return, and it is exactly the exit waiting for it that these examples observe. Both scopes open the second barrier
+-- when they end, in the same uninterruptible release and before the kill: the owner's exit waits for the operation, which may be
+-- held at that barrier uninterruptibly (a handoff), and an example that fails before it opens the barrier itself would
+-- otherwise leave the join waiting for ever.
 racingExit
   ∷ Int
   → (Owned → MVar () → MVar () → IO a)
   → (Owned → a → MVar () → MVar () → IO ())
-  → IO (Racing a)
-racingExit limit setup inflight = do
+  → (Racing a → IO b)
+  → IO b
+racingExit limit setup inflight continue = do
   handed ← newEmptyMVar
+  handover ← newEmptyMVar
   inside ← newEmptyMVar
   proceed ← newEmptyMVar
   finished ← newEmptyMVar
-  (owner, outcome) ← forkOwner . withOwned limit $ \collection → do
-    prepared ← setup collection inside proceed
-    putMVar handed (collection, prepared)
-    _ ← forkIO (try (inflight collection prepared inside proceed) >>= putMVar finished)
-    takeMVar inside
-  (collection, prepared) ← takeMVar handed
-  awaitBlockedOnSTM owner
-  pure (Racing owner outcome collection prepared proceed finished)
+  let letGo = void (tryPutMVar proceed ())
+  withOwnedThreadOpening
+    letGo
+    ( readMVar handover >>= \(collection, prepared) →
+        try (inflight collection prepared inside proceed) >>= putMVar finished
+    )
+    $ \_ _ →
+      withOwnerOpening
+        letGo
+        ( withOwned limit $ \collection → do
+            prepared ← setup collection inside proceed
+            putMVar handed (collection, prepared)
+            putMVar handover (collection, prepared)
+            takeMVar inside
+        )
+        $ \owner outcome → do
+          (collection, prepared) ← takeMVar handed
+          awaitBlockedOnSTM owner
+          continue (Racing owner outcome collection prepared proceed finished)
 
 -- | Release the operation inside and require both threads to end without
 -- failing.
@@ -1502,64 +1544,69 @@ type Race' = (Owned, Member Text)
 testExitWaitsForBorrow ∷ Expectation
 testExitWaitsForBorrow = do
   events ← newTrail
-  race ←
-    racingExit 2 (preparedMember events) $ \collection member inside proceed →
-      withMember collection member $ \_ → do
-        record events "borrow begins"
-        putMVar inside ()
-        takeMVar proceed
-        record events "borrow ends"
-  requireExitWaiting events (racingCollection race, racingSetup race) ["acquire member", "borrow begins"]
-  finishRacing race
-  -- The borrow ended before the member was released.
-  trail events
-    `shouldReturn` ["acquire member", "borrow begins", "borrow ends", "release member"]
-  rejectedWith OwnedClosed (liveMemberCount (racingCollection race))
+  racingExit 2 (preparedMember events)
+    ( \collection member inside proceed →
+        withMember collection member $ \_ → do
+          record events "borrow begins"
+          putMVar inside ()
+          takeMVar proceed
+          record events "borrow ends"
+    )
+    $ \race → do
+      requireExitWaiting events (racingCollection race, racingSetup race) ["acquire member", "borrow begins"]
+      finishRacing race
+      -- The borrow ended before the member was released.
+      trail events
+        `shouldReturn` ["acquire member", "borrow begins", "borrow ends", "release member"]
+      rejectedWith OwnedClosed (liveMemberCount (racingCollection race))
 
 testExitWaitsForAcquisition ∷ Expectation
 testExitWaitsForAcquisition = do
   events ← newTrail
-  race ←
-    racingExit 2 (preparedMember events) $ \collection _ inside proceed →
-      void . acquireMember collection $
-        acquirePart
-          "slow"
-          (releaseRank 0)
-          (record events "acquire slow" *> putMVar inside () *> takeMVar proceed *> pure ("slow" ∷ Text))
-          (\_ → record events "release slow")
-  requireExitWaiting events (racingCollection race, racingSetup race) ["acquire member", "acquire slow"]
-  finishRacing race
-  -- The acquisition completed and registered before anything was released, so
-  -- the exit released it, newest first.
-  trail events
-    `shouldReturn` ["acquire member", "acquire slow", "release slow", "release member"]
+  racingExit 2 (preparedMember events)
+    ( \collection _ inside proceed →
+        void . acquireMember collection $
+          acquirePart
+            "slow"
+            (releaseRank 0)
+            (record events "acquire slow" *> putMVar inside () *> takeMVar proceed *> pure ("slow" ∷ Text))
+            (\_ → record events "release slow")
+    )
+    $ \race → do
+      requireExitWaiting events (racingCollection race, racingSetup race) ["acquire member", "acquire slow"]
+      finishRacing race
+      -- The acquisition completed and registered before anything was released, so
+      -- the exit released it, newest first.
+      trail events
+        `shouldReturn` ["acquire member", "acquire slow", "release slow", "release member"]
 
 testExitWaitsForHandoff ∷ Expectation
 testExitWaitsForHandoff = do
   events ← newTrail
-  race ←
-    racingExit 2 (preparedMember events) $ \collection _ inside proceed →
-      acquireMemberThen collection (tracked events "late") $ \_ → uninterruptibleMask_ $ do
-        record events "handoff begins"
-        putMVar inside ()
-        takeMVar proceed
-        record events "handoff ends"
-  requireExitWaiting events (racingCollection race, racingSetup race) ["acquire member", "acquire late", "handoff begins"]
-  finishRacing race
-  trail events
-    `shouldReturn` [ "acquire member"
-                   , "acquire late"
-                   , "handoff begins"
-                   , "handoff ends"
-                   , "release late"
-                   , "release member"
-                   ]
+  racingExit 2 (preparedMember events)
+    ( \collection _ inside proceed →
+        acquireMemberThen collection (tracked events "late") $ \_ → uninterruptibleMask_ $ do
+          record events "handoff begins"
+          putMVar inside ()
+          takeMVar proceed
+          record events "handoff ends"
+    )
+    $ \race → do
+      requireExitWaiting events (racingCollection race, racingSetup race) ["acquire member", "acquire late", "handoff begins"]
+      finishRacing race
+      trail events
+        `shouldReturn` [ "acquire member"
+                       , "acquire late"
+                       , "handoff begins"
+                       , "handoff ends"
+                       , "release late"
+                       , "release member"
+                       ]
 
 testExitWaitsForRetirement ∷ Expectation
 testExitWaitsForRetirement = do
   events ← newTrail
-  race ←
-    racingExit
+  racingExit
       2
       ( \collection inside proceed →
           acquireMember collection $
@@ -1575,54 +1622,59 @@ testExitWaitsForRetirement = do
               )
       )
       (\collection member _ _ → void (retireMember collection member))
-  -- The member is already claimed by the retirement, so the exit has nothing of
-  -- it to release.
-  refusedOperations events (racingCollection race) (racingSetup race)
-    `shouldReturn` replicate 5 (Just (OwnedReentered Closing))
-  trail events `shouldReturn` ["acquire member", "release begins"]
-  finishRacing race
-  performed ← trail events
-  performed `shouldBe` ["acquire member", "release begins", "release ends"]
-  isRetired <$> memberStatus (racingSetup race) `shouldReturn` True
+    $ \race → do
+      -- The member is already claimed by the retirement, so the exit has nothing of
+      -- it to release.
+      refusedOperations events (racingCollection race) (racingSetup race)
+        `shouldReturn` replicate 5 (Just (OwnedReentered Closing))
+      trail events `shouldReturn` ["acquire member", "release begins"]
+      finishRacing race
+      performed ← trail events
+      performed `shouldBe` ["acquire member", "release begins", "release ends"]
+      isRetired <$> memberStatus (racingSetup race) `shouldReturn` True
 
 testExitCancelledWhileWaiting ∷ Expectation
 testExitCancelledWhileWaiting = do
   events ← newTrail
-  race ←
-    racingExit 2 (preparedMember events) $ \collection member inside proceed →
-      withMember collection member $ \_ → do
-        record events "borrow begins"
-        putMVar inside ()
-        takeMVar proceed
-        record events "borrow ends"
-  killer ← forkIO (throwTo (racingOwner race) ThreadKilled)
-  awaitPendingThrow killer
-  -- The cancellation is queued against the scope, which is still waiting: the
-  -- member has not been released under the borrow.
-  trail events `shouldReturn` ["acquire member", "borrow begins"]
-  isLive <$> memberStatus (racingSetup race) `shouldReturn` True
-  putMVar (racingProceed race) ()
-  takeMVar (racingInflight race) >>= either throwIO pure
-  takeMVar (racingOutcome race) >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → fromException propagated `shouldBe` Just ThreadKilled
-  trail events
-    `shouldReturn` ["acquire member", "borrow begins", "borrow ends", "release member"]
+  racingExit 2 (preparedMember events)
+    ( \collection member inside proceed →
+        withMember collection member $ \_ → do
+          record events "borrow begins"
+          putMVar inside ()
+          takeMVar proceed
+          record events "borrow ends"
+    )
+    $ \race → do
+      withOwnedThread (throwTo (racingOwner race) ThreadKilled) $ \killer _ → do
+        awaitPendingThrow killer
+        -- The cancellation is queued against the scope, which is still waiting: the
+        -- member has not been released under the borrow.
+        trail events `shouldReturn` ["acquire member", "borrow begins"]
+        isLive <$> memberStatus (racingSetup race) `shouldReturn` True
+        putMVar (racingProceed race) ()
+        takeMVar (racingInflight race) >>= either throwIO pure
+        takeMVar (racingOutcome race) >>= \case
+          Right () → expectationFailure "expected the cancellation to propagate"
+          Left propagated → fromException propagated `shouldBe` Just ThreadKilled
+        trail events
+          `shouldReturn` ["acquire member", "borrow begins", "borrow ends", "release member"]
 
 testExitAfterFailingOperation ∷ Expectation
 testExitAfterFailingOperation = do
   events ← newTrail
-  race ←
-    racingExit 2 (preparedMember events) $ \collection member inside proceed →
-      withMember collection member $ \_ → do
-        record events "borrow begins"
-        putMVar inside ()
-        takeMVar proceed
-        throwIO (ErrorCall "borrow failed")
-  putMVar (racingProceed race) ()
-  takeMVar (racingOutcome race) >>= either throwIO pure
-  takeMVar (racingInflight race) >>= \case
-    Right () → expectationFailure "expected the borrow's failure"
-    Left failure → errorCallMessage failure `shouldBe` Just "borrow failed"
-  -- The failed operation left the collection, so the exit went on and released.
-  trail events `shouldReturn` ["acquire member", "borrow begins", "release member"]
+  racingExit 2 (preparedMember events)
+    ( \collection member inside proceed →
+        withMember collection member $ \_ → do
+          record events "borrow begins"
+          putMVar inside ()
+          takeMVar proceed
+          throwIO (ErrorCall "borrow failed")
+    )
+    $ \race → do
+      putMVar (racingProceed race) ()
+      takeMVar (racingOutcome race) >>= either throwIO pure
+      takeMVar (racingInflight race) >>= \case
+        Right () → expectationFailure "expected the borrow's failure"
+        Left failure → errorCallMessage failure `shouldBe` Just "borrow failed"
+      -- The failed operation left the collection, so the exit went on and released.
+      trail events `shouldReturn` ["acquire member", "borrow begins", "release member"]

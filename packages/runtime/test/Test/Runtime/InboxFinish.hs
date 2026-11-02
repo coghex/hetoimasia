@@ -11,9 +11,9 @@
 -- sleeps; 'boundedSupervision' only stops an example that has already hung.
 module Test.Runtime.InboxFinish (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
-import Control.Concurrent.STM (atomically, retry)
+import Control.Concurrent (ThreadId, killThread, myThreadId, throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
+import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, retry, writeTVar)
 import Control.DeepSeq (NFData (rnf))
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -26,9 +26,10 @@ import Control.Exception
 import Control.Exception.Context (getExceptionAnnotations)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
-import Data.Foldable (traverse_)
+import Data.Foldable (for_, traverse_)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
+import GHC.Conc (ThreadStatus (ThreadDied, ThreadFinished), threadStatus)
 import Hetoimasia.Foundation.Messaging.Channel (SendResult (..), send)
 import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot
@@ -82,6 +83,19 @@ import Test.Runtime.Supervision.Support
   , withCollectedLifetime
   )
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Runtime.OwnedControl
+  ( ControlProbe (..)
+  , Scope
+  , endedAfterScope
+  , endings
+  , newControlProbe
+  , recordSelf
+  , runEnding
+  , unownedScope
+  , withRescue
+  )
+import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Inbox finish" $ do
@@ -123,6 +137,51 @@ spec = describe "Inbox finish" $ do
     it "publishes each handled command's state after handling it, and keeps the final snapshot readable after finish"
       (boundedSupervision testCommandSnapshotService)
 
+  -- The opener the finish examples start (#597): a gate opener that waits for the application to park in a supervised wait.
+  describe "The gate opener (withOpenWhenWaiting)" $ do
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined when the application never parks and the scope " <> label) $ do
+        probe ← newControlProbe
+        gate ← newGate
+        application ← myThreadId
+        runEnding (ownedOpener probe gate application) (const (pure ())) probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+      it ("negative control: the previous unowned start is still polling when the application never parks and the scope " <> label) $ do
+        probe ← newControlProbe
+        gate ← newGate
+        application ← myThreadId
+        withRescue $ \started → do
+          runEnding (unownedScope started) (pollingOpener gate application) probe ending
+          -- The failed judgement is recorded before anything independent touches the opener.
+          judgement ← endedAfterScope probe
+          judgement `shouldBe` False
+        -- The rescue stopped and joined it.
+        endedAfterScope probe >>= (`shouldBe` True)
+
+    it "keeps the opener until the exit it serves has finished: it is not ended before the exit, and the exit finishes" $ do
+      relayed ← newTVarIO False
+      gate ← newGate
+      application ← myThreadId
+      aliveAtExit ← newEmptyMVar
+      -- The exit parks the application in a supervised-style wait that only the opened gate (relayed into a transaction) ends.
+      withOwnedThread (readMVar gate >> atomically (writeTVar relayed True)) $ \_ _ →
+        bounded . withOpener application gate $ \opener → do
+          ended ← hasEnded opener
+          putMVar aliveAtExit (not ended)
+          atomically (readTVar relayed >>= check)
+      readMVar aliveAtExit >>= (`shouldBe` True)
+      tryReadMVar gate >>= (`shouldBe` Just ())
+
+    it "negative control: an opener whose scope ends before the exit is already gone when the exit begins" $ do
+      gate ← newGate
+      application ← myThreadId
+      -- The mis-scoped arrangement: the opener's scope closes before the exit it serves, which is the order the supplier must
+      -- never have. Its judgement is that the opener is still there when the exit begins.
+      opener ← withOwnedThread (awaitBlockedOnSTM application >> openGate gate) (\thread _ → pure thread)
+      ended ← hasEnded opener
+      (not ended) `shouldBe` False
+
 -- Reading outcomes -------------------------------------------------------------
 
 exitText ∷ InboxExit → Text
@@ -146,9 +205,42 @@ finishText = \case
 acknowledgedText ∷ InboxService a → IO Text
 acknowledgedText started = drainText <$> atomically (inboxAcknowledgedDrain started)
 
--- | Open a gate once the thread is parked in a supervised wait.
-openWhenWaiting ∷ ThreadId → Gate → IO ()
-openWhenWaiting thread gate = void (forkIO (awaitBlockedOnSTM thread >> openGate gate))
+-- | Open a gate once the thread is parked in a supervised wait, for the length of the body.
+--
+-- The body is the exit the gate lets finish (a finish waiting for a handler that is held at the gate), so the opener's scope
+-- encloses it: the opener is ended and joined after the exit, never before it. An example that fails or is cancelled before
+-- the thread ever parks (the opener polls for a parked thread and would otherwise do so for the rest of the process) ends the
+-- opener with it, and an opener that has opened the gate has ended on its own.
+withOpenWhenWaiting ∷ ThreadId → Gate → IO a → IO a
+withOpenWhenWaiting thread gate body = withOpener thread gate (const body)
+
+-- | 'withOpenWhenWaiting', with the opener's own thread given to the body: the seam the opener's own examples judge it through.
+withOpener ∷ ThreadId → Gate → (ThreadId → IO a) → IO a
+withOpener thread gate body = withOwnedThread (awaitBlockedOnSTM thread >> openGate gate) (\opener _ → body opener)
+
+-- | Whether a thread has already ended, as the runtime reports it now.
+hasEnded ∷ ThreadId → IO Bool
+hasEnded thread =
+  threadStatus thread >>= \case
+    ThreadFinished → pure True
+    ThreadDied → pure True
+    _ → pure False
+
+-- | The opener as the scope the endings run: the helper's own thread is the one judged, and the body is the example that never
+-- parks the application in a transaction, so the opener has nothing to wait for but the end of its scope.
+ownedOpener ∷ ControlProbe → Gate → ThreadId → Scope
+ownedOpener probe gate application _ body =
+  withOpener application gate $ \opener → do
+    void (tryPutMVar (controlThread probe) opener)
+    putMVar (controlParked probe) ()
+    body opener
+
+-- | The previous start's opener: the same wait, on a thread nothing ends.
+pollingOpener ∷ Gate → ThreadId → ControlProbe → IO ()
+pollingOpener gate application probe = do
+  recordSelf probe
+  putMVar (controlParked probe) ()
+  awaitBlockedOnSTM application >> openGate gate
 
 -- In-flight and backlog work ---------------------------------------------------
 
@@ -174,21 +266,24 @@ testFinishHandlesBacklog = do
       traverse_ (offer started) [2, 3, 4]
       -- Message 1 is in flight with three queued behind it when the finish is
       -- requested. Inside the last handler the drain is not yet acknowledged.
-      _ ← forkIO $ do
-        awaitBlockedOnSTM application
-        openGate firstGate
-        takeMVar lastEntered
-        acknowledgedText started >>= putMVar duringLast
-        openGate lastGate
-      first ← finishInboxService control started
-      record trace "finished"
-      second ← finishInboxService control started
-      late ← offer started 5
-      completion ← atomically (awaitInboxCompletion started)
-      (,,,,,,) (finishText first) (finishText second) (completionExit completion) late
-        <$> acknowledgedText started
-        <*> statusOf started
-        <*> warningCount collected
+      withOwnedThread
+        ( do
+            awaitBlockedOnSTM application
+            openGate firstGate
+            takeMVar lastEntered
+            acknowledgedText started >>= putMVar duringLast
+            openGate lastGate
+        )
+        $ \_ _ → do
+          first ← finishInboxService control started
+          record trace "finished"
+          second ← finishInboxService control started
+          late ← offer started 5
+          completion ← atomically (awaitInboxCompletion started)
+          (,,,,,,) (finishText first) (finishText second) (completionExit completion) late
+            <$> acknowledgedText started
+            <*> statusOf started
+            <*> warningCount collected
   takeMVar duringLast >>= (`shouldBe` "no drain")
   first `shouldBe` "finished: discarded 0, drained after 4"
   second `shouldBe` first
@@ -218,9 +313,9 @@ testStopBeforeDrain = do
       takeMVar entered
       traverse_ (offer started) [2, 3]
       stopInboxService started
-      openWhenWaiting application gate
-      outcome ← finishInboxService control started
-      (,,) (finishText outcome) <$> acknowledgedText started <*> statusOf started
+      withOpenWhenWaiting application gate $ do
+        outcome ← finishInboxService control started
+        (,,) (finishText outcome) <$> acknowledgedText started <*> statusOf started
   -- An ordinary stop keeps its real discard count and records no drain.
   outcome `shouldBe` "unfinished: no drain; succeeded with discarded 2, no drain"
   acknowledged `shouldBe` "no drain"
@@ -267,9 +362,9 @@ testStopRacesFinalObservation = do
       -- admission closed before its handler returns, so the requested stop and
       -- the closed, empty inbox are both ready at the next decision.
       stopInboxService started
-      openWhenWaiting application gate
-      outcome ← finishInboxService control started
-      (,) (finishText outcome) <$> acknowledgedText started
+      withOpenWhenWaiting application gate $ do
+        outcome ← finishInboxService control started
+        (,) (finishText outcome) <$> acknowledgedText started
   outcome `shouldBe` "unfinished: no drain; succeeded with discarded 0, no drain"
   acknowledged `shouldBe` "no drain"
   traced trace >>= (`shouldBe` ["acquire context", "handle 1", "release context: inbox closed"])
@@ -289,10 +384,10 @@ testUnavailableDuringFinish = do
       _ ← offer started 1
       takeMVar entered
       traverse_ (offer started) [2, 3]
-      openWhenWaiting application gate
-      outcome ← finishInboxService control started
-      checkRuntime control
-      (,,,) outcome <$> acknowledgedText started <*> statusOf started <*> warningCount collected
+      withOpenWhenWaiting application gate $ do
+        outcome ← finishInboxService control started
+        checkRuntime control
+        (,,,) outcome <$> acknowledgedText started <*> statusOf started <*> warningCount collected
   case outcome of
     InboxFinishUnavailable failure → failure `shouldSatisfy` brokenIs "handler"
     _ → expectationFailure ("expected an unavailable finish, found " <> show (finishText outcome))
@@ -316,8 +411,8 @@ testFatalDuringFinish policy = do
       _ ← offer started 1
       takeMVar entered
       traverse_ (offer started) [2, 3]
-      openWhenWaiting application gate
-      finishInboxService control started
+      withOpenWhenWaiting application gate $ do
+        finishInboxService control started
   fromException raised `shouldBe` Just (Broken "handler")
   [name | Provenance name ← getExceptionAnnotations context] `shouldBe` ["handler"]
   Just started ← readIORef retained
@@ -374,18 +469,21 @@ testUnrelatedOutcomes = do
       _ ← offer started 2
       -- While the finish waits with message 1 in flight, the job completes and
       -- the optional worker fails; each is settled before the drain can happen.
-      _ ← forkIO $ do
-        awaitBlockedOnSTM application
-        openGate jobGate
-        settled counted
-        awaitBlockedOnSTM application
-        openGate failureGate
-        settled flaky
-        awaitBlockedOnSTM application
-        openGate gate
-      outcome ← finishInboxService control started
-      statuses ← atomically ((,) <$> workerStatus counted <*> workerStatus flaky)
-      (,,,) (finishText outcome) <$> acknowledgedText started <*> pure (bimap statusName statusName statuses) <*> warningCount collected
+      withOwnedThread
+        ( do
+            awaitBlockedOnSTM application
+            openGate jobGate
+            settled counted
+            awaitBlockedOnSTM application
+            openGate failureGate
+            settled flaky
+            awaitBlockedOnSTM application
+            openGate gate
+        )
+        $ \_ _ → do
+          outcome ← finishInboxService control started
+          statuses ← atomically ((,) <$> workerStatus counted <*> workerStatus flaky)
+          (,,,) (finishText outcome) <$> acknowledgedText started <*> pure (bimap statusName statusName statuses) <*> warningCount collected
   outcome `shouldBe` "finished: discarded 0, drained after 2"
   acknowledged `shouldBe` "drained after 2"
   statuses `shouldBe` ("completed", "unavailable")
@@ -428,22 +526,25 @@ testCancellationAfterDrain = do
       takeMVar entered
       -- With the finish held in the classifier, the service drains and
       -- acknowledges, and is then cancelled while it waits for its stop.
-      _ ← forkIO $ do
-        awaitBlockedOnSTM application
-        openGate failureGate
-        takeMVar classifying
-        openGate gate
-        atomically (inboxAcknowledgedDrain started >>= maybe retry (\_ → pure ()))
-        throwTo worker ThreadKilled
-        _ ← atomically (awaitInboxCompletion started)
-        openGate classifierGate
-      first ← finishInboxService control started
-      acknowledged ← acknowledgedText started
-      second ← finishInboxService control started
-      again ← acknowledgedText started
-      completion ← atomically (awaitInboxCompletion started)
-      statuses ← (,) <$> statusOf started <*> (statusName <$> atomically (workerStatus flaky))
-      (,,,,,,) first second acknowledged again completion statuses <$> warningCount collected
+      withOwnedThread
+        ( do
+            awaitBlockedOnSTM application
+            openGate failureGate
+            takeMVar classifying
+            openGate gate
+            atomically (inboxAcknowledgedDrain started >>= maybe retry (\_ → pure ()))
+            throwTo worker ThreadKilled
+            _ ← atomically (awaitInboxCompletion started)
+            openGate classifierGate
+        )
+        $ \_ _ → do
+          first ← finishInboxService control started
+          acknowledged ← acknowledgedText started
+          second ← finishInboxService control started
+          again ← acknowledgedText started
+          completion ← atomically (awaitInboxCompletion started)
+          statuses ← (,) <$> statusOf started <*> (statusName <$> atomically (workerStatus flaky))
+          (,,,,,,) first second acknowledged again completion statuses <$> warningCount collected
   -- Supervision judges the cancellation, which no owner asked for, by the
   -- service's policy; the finish reports that, never a successful finish.
   for2 first second $ \case
@@ -461,7 +562,7 @@ testCancellationAfterDrain = do
   warnings `shouldBe` 2
   traced trace >>= (`shouldBe` ["acquire context", "handle 1", "release context: inbox closed"])
   where
-    for2 a b check = check a >> check b
+    for2 a b verify = verify a >> verify b
 
 -- Owner cancellation -----------------------------------------------------------
 
@@ -484,23 +585,26 @@ testOwnerCancelledDuringFinish = do
         state ← describeLive
         record trace ("handle " <> showText value <> ": dependency " <> state)
         when (value == 1) (putMVar entered () >> readMVar gate)
-  owner ← forkIO $ do
-    outcome ← tryWithContext @SomeException $ withScoped dependency $ \() →
-      withCollectedLifetime ignoreWrites $ \collected →
-        withSupervision (collectedLifetime collected) $ \control → do
-          started ← startedWith probe =<< startInboxService control requiredInbox (inboxDefinition "inbox" 4 context handler)
-          traverse_ (offer started) [1, 2]
-          finishInboxService control started
-    putMVar done outcome
-  takeMVar entered
-  -- The owner is parked in the finish's wait with message 1 in flight.
-  awaitBlockedOnSTM owner
-  killThread owner
-  takeMVar done >>= \case
-    Left (ExceptionWithContext _ raised) → fromException raised `shouldBe` Just ThreadKilled
-    Right outcome → expectationFailure ("the cancelled owner returned " <> show (finishText outcome))
-  traced trace
-    >>= (`shouldBe` ["acquire dependency", "handle 1: dependency live", "release context: dependency live", "release dependency"])
+  withOwnedThread
+    ( do
+        outcome ← tryWithContext @SomeException $ withScoped dependency $ \() →
+          withCollectedLifetime ignoreWrites $ \collected →
+            withSupervision (collectedLifetime collected) $ \control → do
+              started ← startedWith probe =<< startInboxService control requiredInbox (inboxDefinition "inbox" 4 context handler)
+              traverse_ (offer started) [1, 2]
+              finishInboxService control started
+        putMVar done outcome
+    )
+    $ \owner _ → do
+      takeMVar entered
+      -- The owner is parked in the finish's wait with message 1 in flight.
+      awaitBlockedOnSTM owner
+      killThread owner
+      takeMVar done >>= \case
+        Left (ExceptionWithContext _ raised) → fromException raised `shouldBe` Just ThreadKilled
+        Right outcome → expectationFailure ("the cancelled owner returned " <> show (finishText outcome))
+      traced trace
+        >>= (`shouldBe` ["acquire dependency", "handle 1: dependency live", "release context: dependency live", "release dependency"])
 
 -- Combined example -------------------------------------------------------------
 

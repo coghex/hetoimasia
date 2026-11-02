@@ -16,7 +16,7 @@
 -- observation that nothing signals fail the example; it never decides what a correct run does.
 module Test.Runtime.Supervision.Startup (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, retry)
 import Control.Exception
@@ -47,6 +47,7 @@ import Hetoimasia.Foundation.Worker
 import Hetoimasia.Runtime.Supervision
 import System.Timeout (timeout)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Runtime.Supervision.Support
 
 spec ∷ Spec
@@ -128,13 +129,23 @@ awaitCommitted worker =
       WorkerLive → retry
       status → pure status
 
--- | Run the observation on a thread of its own, and release the held worker when it is over, whatever
+-- | Run the observation on a thread the scope owns, and release the held worker when it is over, whatever
 -- it found: its result, or its failure, is what the example reports after the drain.
-observing ∷ Held → IO a → IO (MVar (Either SomeException a))
-observing held observation = do
+--
+-- The observer supplies what the drain waits for (the held worker's release), so its scope encloses that drain: it is ended
+-- and joined after the exit it serves, never before it. The release is also part of the scope's stop, in the same
+-- uninterruptible step and before the kill, so an example that fails or is cancelled before the observation finishes cannot
+-- leave the drain waiting for the held worker, and the join cannot wait for an observer the drain is waiting on.
+--
+-- The thread records its outcome and ends (it is the subject the example inspects, and a cancellation it receives is part of
+-- that record, not swallowed: the thread ends with it).
+withObserving ∷ Held → IO a → (MVar (Either SomeException a) → IO b) → IO b
+withObserving held observation body = do
   outcome ← newEmptyMVar
-  void $ forkIO $ (try observation >>= putMVar outcome) `finally` openGate (heldRelease held)
-  pure outcome
+  withOwnedThreadOpening
+    (openGate (heldRelease held))
+    ((try observation >>= putMVar outcome) `finally` openGate (heldRelease held))
+    (\_ _ → body outcome)
 
 -- | The observation, after the drain: its failure is the example's.
 reported ∷ MVar (Either SomeException a) → IO a
@@ -151,19 +162,22 @@ testFatalSibling policy = do
   failure ← expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
     withSupervision (collectedLifetime collected) $ \control → do
       sibling ← expectStarted =<< startSupervised control policy (failingAfter trace "audio" gate (Broken "audio"))
-      observed ← observing held $ do
-        readMVar (heldEntered held) >> openGate gate
-        within "the held worker never saw a request" (heldSeen held)
-        -- Still held: only the example's release lets the worker go.
-        atomically (workerStatus sibling)
-      started ← attempt (startSupervised control (required Service) (heldService trace "streaming" True held))
-      record trace "start unwound"
-      status ← reported observed
-      -- Committed before the drain, which the start then waited for.
-      status `shouldSatisfy` isFatalBroken "audio"
-      case started of
-        Left raised → rethrowIO raised
-        Right _ → expectationFailure "the start returned"
+      withObserving held
+        ( do
+            readMVar (heldEntered held) >> openGate gate
+            within "the held worker never saw a request" (heldSeen held)
+            -- Still held: only the example's release lets the worker go.
+            atomically (workerStatus sibling)
+        )
+        $ \observed → do
+          started ← attempt (startSupervised control (required Service) (heldService trace "streaming" True held))
+          record trace "start unwound"
+          status ← reported observed
+          -- Committed before the drain, which the start then waited for.
+          status `shouldSatisfy` isFatalBroken "audio"
+          case started of
+            Left raised → rethrowIO raised
+            Right _ → expectationFailure "the start returned"
   failure `shouldSatisfy` brokenIs "audio"
   -- Rethrown to the starter, once and not retained beside itself; the new worker was stopped by its
   -- owner and drained before the start unwound.
@@ -182,20 +196,23 @@ testToleratedSibling = do
   (observed, warnings, newStatus, afterwards) ← withCollectedLifetime ignoreWrites $ \collected →
     withSupervision (collectedLifetime collected) $ \control → do
       sibling ← expectStarted =<< startSupervised control (optional Service) (failingAfter trace "telemetry" gate (Broken "telemetry"))
-      observed ← observing held $ do
-        readMVar (heldEntered held) >> openGate gate
-        -- The tolerated commit is no signal of its own: it is read, and the deadline only fails the
-        -- example when it never comes while the worker is held.
-        timeout deadline (awaitCommitted sibling)
-      started ← startSupervised control (required Service) (heldService trace "streaming" False held)
-      worker ← expectStarted started
-      status ← reported observed
-      stopped ← takeMVar (heldRan held)
-      checkRuntime control
-      warnings ← warningCount collected
-      newStatus ← statusOf worker
-      stopSupervised worker
-      pure (status, warnings, newStatus, stopped)
+      withObserving held
+        ( do
+            readMVar (heldEntered held) >> openGate gate
+            -- The tolerated commit is no signal of its own: it is read, and the deadline only fails the
+            -- example when it never comes while the worker is held.
+            timeout deadline (awaitCommitted sibling)
+        )
+        $ \observed → do
+          started ← startSupervised control (required Service) (heldService trace "streaming" False held)
+          worker ← expectStarted started
+          status ← reported observed
+          stopped ← takeMVar (heldRan held)
+          checkRuntime control
+          warnings ← warningCount collected
+          newStatus ← statusOf worker
+          stopSupervised worker
+          pure (status, warnings, newStatus, stopped)
   observed `shouldSatisfy` maybe False (isUnavailableBroken "telemetry")
   warnings `shouldBe` 1
   newStatus `shouldBe` "live"
@@ -220,37 +237,43 @@ testCancelledDuringClassification = do
         void (tryPutMVar classifying ())
         readMVar classifyGate
         pure Unrecognized
-  owner ← forkIO $ do
-    outcome ← attempt $ withCollectedLifetime ignoreWrites $ \collected →
-      withSupervision (collectedLifetime collected) $ \control → do
-        sibling ← expectStarted =<< startSupervised control policy (failingAfter trace "audio" gate (Broken "audio"))
-        started ← attempt (startSupervised control (required Service) (heldService trace "streaming" False held))
-        record trace "start unwound"
-        siblingStatus ← statusOf sibling
-        count ← readIORef classified
-        putMVar done (started, siblingStatus, count)
-        -- The boundary settles the sibling at closing, as it would have at a checkpoint.
-        openGate classifyGate
-    putMVar ended outcome
-  observed ← observing held $ do
-    readMVar (heldEntered held) >> openGate gate
-    within "the start never classified the sibling" classifying
-    killThread owner
-  -- The cancellation is delivered and the drain waits for the held worker, which the observation
-  -- released: what the owner saw is reported once the start has unwound.
-  reported observed
-  (started, siblingStatus, count) ← takeMVar done
-  case started of
-    Right _ → expectationFailure "the cancelled start returned"
-    Left (ExceptionWithContext context raised) → do
-      fromException raised `shouldBe` Just ThreadKilled
-      length [() | AbandonedStart _ ← workerEvidenceInContext context] `shouldBe` 1
-  siblingStatus `shouldBe` "live"
-  count `shouldBe` 1
-  closing ← takeMVar ended
-  -- At closing the sibling's failure is settled and rethrown, as ever.
-  either (brokenIs "audio") (const False) closing `shouldBe` True
-  traced trace >>= (`shouldSatisfy` elem "release streaming")
+  withOwnedThread
+    ( do
+        outcome ← attempt $ withCollectedLifetime ignoreWrites $ \collected →
+          withSupervision (collectedLifetime collected) $ \control → do
+            sibling ← expectStarted =<< startSupervised control policy (failingAfter trace "audio" gate (Broken "audio"))
+            started ← attempt (startSupervised control (required Service) (heldService trace "streaming" False held))
+            record trace "start unwound"
+            siblingStatus ← statusOf sibling
+            count ← readIORef classified
+            putMVar done (started, siblingStatus, count)
+            -- The boundary settles the sibling at closing, as it would have at a checkpoint.
+            openGate classifyGate
+        putMVar ended outcome
+    )
+    $ \owner _ → do
+      withObserving held
+        ( do
+            readMVar (heldEntered held) >> openGate gate
+            within "the start never classified the sibling" classifying
+            killThread owner
+        )
+        $ \observed → do
+          -- The cancellation is delivered and the drain waits for the held worker, which the observation
+          -- released: what the owner saw is reported once the start has unwound.
+          reported observed
+          (started, siblingStatus, count) ← takeMVar done
+          case started of
+            Right _ → expectationFailure "the cancelled start returned"
+            Left (ExceptionWithContext context raised) → do
+              fromException raised `shouldBe` Just ThreadKilled
+              length [() | AbandonedStart _ ← workerEvidenceInContext context] `shouldBe` 1
+          siblingStatus `shouldBe` "live"
+          count `shouldBe` 1
+          closing ← takeMVar ended
+          -- At closing the sibling's failure is settled and rethrown, as ever.
+          either (brokenIs "audio") (const False) closing `shouldBe` True
+          traced trace >>= (`shouldSatisfy` elem "release streaming")
 
 -- | The owner cancels the start after a tolerated sibling was committed and the start went back to
 -- waiting: the cancellation propagates as itself after the drain, a sibling failing meanwhile is
@@ -270,42 +293,48 @@ testCancelledAfterTolerated = do
         atomicModifyIORef' videoClassified (\count → (count + 1, ()))
         pure Unrecognized
       onWrite entry = when (entryLevel entry == Warning) (void (tryPutMVar warned ()))
-  owner ← forkIO $ do
-    outcome ← attempt $ withCollectedLifetime onWrite $ \collected →
-      withSupervision (collectedLifetime collected) $ \control → do
-        telemetry ← expectStarted =<< startSupervised control (optional Service) (failingAfter trace "telemetry" telemetryGate (Broken "telemetry"))
-        video ← expectStarted =<< startSupervised control videoPolicy (failingAfter trace "video" videoGate (Broken "video"))
-        putMVar videoSlot video
-        started ← attempt (startSupervised control (required Service) (heldService trace "streaming" False held))
-        statuses ← (,) <$> statusOf telemetry <*> statusOf video
-        count ← readIORef videoClassified
-        warnings ← warningCount collected
-        putMVar done (started, statuses, count, warnings)
-    putMVar ended outcome
-  video ← takeMVar videoSlot
-  observed ← observing held $ do
-    readMVar (heldEntered held) >> openGate telemetryGate
-    -- The warning is the tolerated commit's last act; the start then parks in its wait again.
-    within "the start never committed the tolerated sibling" warned
-    awaitBlockedOnSTM owner
-    killThread owner
-    openGate videoGate
-    void (awaitTerminal (supervisedWorker video))
-  reported observed
-  (started, (telemetryStatus, videoStatus), count, warnings) ← takeMVar done
-  case started of
-    Right _ → expectationFailure "the cancelled start returned"
-    Left (ExceptionWithContext context raised) → do
-      fromException raised `shouldBe` Just ThreadKilled
-      length [() | AbandonedStart _ ← workerEvidenceInContext context] `shouldBe` 1
-  telemetryStatus `shouldBe` "unavailable"
-  warnings `shouldBe` 1
-  -- Published after the cancellation: nothing classified it while the start unwound.
-  videoStatus `shouldBe` "live"
-  count `shouldBe` 0
-  closing ← takeMVar ended
-  either (brokenIs "video") (const False) closing `shouldBe` True
-  traced trace >>= (`shouldSatisfy` elem "release streaming")
+  withOwnedThread
+    ( do
+        outcome ← attempt $ withCollectedLifetime onWrite $ \collected →
+          withSupervision (collectedLifetime collected) $ \control → do
+            telemetry ← expectStarted =<< startSupervised control (optional Service) (failingAfter trace "telemetry" telemetryGate (Broken "telemetry"))
+            video ← expectStarted =<< startSupervised control videoPolicy (failingAfter trace "video" videoGate (Broken "video"))
+            putMVar videoSlot video
+            started ← attempt (startSupervised control (required Service) (heldService trace "streaming" False held))
+            statuses ← (,) <$> statusOf telemetry <*> statusOf video
+            count ← readIORef videoClassified
+            warnings ← warningCount collected
+            putMVar done (started, statuses, count, warnings)
+        putMVar ended outcome
+    )
+    $ \owner _ → do
+      video ← takeMVar videoSlot
+      withObserving held
+        ( do
+            readMVar (heldEntered held) >> openGate telemetryGate
+            -- The warning is the tolerated commit's last act; the start then parks in its wait again.
+            within "the start never committed the tolerated sibling" warned
+            awaitBlockedOnSTM owner
+            killThread owner
+            openGate videoGate
+            void (awaitTerminal (supervisedWorker video))
+        )
+        $ \observed → do
+          reported observed
+          (started, (telemetryStatus, videoStatus), count, warnings) ← takeMVar done
+          case started of
+            Right _ → expectationFailure "the cancelled start returned"
+            Left (ExceptionWithContext context raised) → do
+              fromException raised `shouldBe` Just ThreadKilled
+              length [() | AbandonedStart _ ← workerEvidenceInContext context] `shouldBe` 1
+          telemetryStatus `shouldBe` "unavailable"
+          warnings `shouldBe` 1
+          -- Published after the cancellation: nothing classified it while the start unwound.
+          videoStatus `shouldBe` "live"
+          count `shouldBe` 0
+          closing ← takeMVar ended
+          either (brokenIs "video") (const False) closing `shouldBe` True
+          traced trace >>= (`shouldSatisfy` elem "release streaming")
 
 -- Helpers ----------------------------------------------------------------------
 

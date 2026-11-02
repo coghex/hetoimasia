@@ -13,8 +13,8 @@
 -- sleep. 'boundedExample' only stops an example that has already hung.
 module Test.Foundation.Resources.Construction (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, throwTo, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent (ThreadId, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
@@ -25,6 +25,7 @@ import Control.Exception
   , annotateIO
   , evaluate
   , fromException
+  , mask_
   , someExceptionContext
   , throw
   , throwIO
@@ -35,6 +36,7 @@ import Control.Exception
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
 import Control.Monad (void)
+import Data.Foldable (for_)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
@@ -101,6 +103,20 @@ import Test.Hspec
   , shouldBe
   , shouldReturn
   )
+import Test.Foundation.OwnedControl
+  ( Probe (..)
+  , Scope
+  , Unowned
+  , endedAfterScope
+  , endings
+  , joined
+  , newProbe
+  , recordSelf
+  , runEnding
+  , startUnowned
+  , withRescue
+  )
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "Scoped component construction" $ do
@@ -144,6 +160,26 @@ spec = describe "Scoped component construction" $ do
     it "releases every part when cancellation preempts the consumer at the protected handoff"
       (boundedExample testCancelAtHandoff)
 
+  -- The runner these examples hold uninterruptibly in a rollback, and the killer blocked delivering to it, are owned (#597):
+  -- however the example that needed them ends, the stop lets the release go and both have ended and been joined.
+  describe "The masked runner and its killer (withOwnedThreadOpening)" $
+    for_ maskedCases $ \(shape, publishes) →
+      for_ endings $ \(label, ending) → do
+        it ("lets the release go and joins both when the scope " <> label <> shape) $ do
+          held ← newMaskedHold
+          runEnding (ownedMasked held publishes) (maskedRunner held) (maskedProbe held) ending
+          endedAfterMaskedScope held publishes >>= (`shouldBe` True)
+
+        it ("negative control: the previous unowned start leaves the runner held when the scope " <> label <> shape) $ do
+          held ← newMaskedHold
+          withRescue $ \started → do
+            runEnding (unownedMasked started held publishes) (maskedRunner held) (maskedProbe held) ending
+            -- The failed judgement is recorded before anything independent touches the threads.
+            judgement ← endedAfterMaskedScope held publishes
+            judgement `shouldBe` False
+          -- The rescue let the release go, then stopped and joined both.
+          endedAfterMaskedScope held publishes >>= (`shouldBe` True)
+
   describe "After selection" $ do
     it "propagates a consumer failure with cleanup evidence and no further attempt"
       testConsumerFailure
@@ -155,6 +191,69 @@ spec = describe "Scoped component construction" $ do
       testUnavailableConsumerFailure
 
 -- Fixtures -------------------------------------------------------------------
+
+-- | What the masked-runner examples watch: the runner's probe, the slot its release reads the killer from (nothing when the
+-- release is let go with no killer), the hold the release waits at after the killer is blocked, and the killer's thread.
+data MaskedHold = MaskedHold
+  { maskedProbe ∷ !Probe
+  , maskedSlot ∷ !(MVar (Maybe ThreadId))
+  , maskedHold ∷ !(MVar ())
+  , maskedKiller ∷ !(MVar ThreadId)
+  }
+
+newMaskedHold ∷ IO MaskedHold
+newMaskedHold = MaskedHold <$> newProbe <*> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar
+
+-- | The cases: the killer is started and published, so it is blocked delivering to the runner; or the scope ends before the
+-- killer is started or its identifier published, so the release waits for a publication that never comes.
+maskedCases ∷ [(String, Bool)]
+maskedCases = [(", with the killer blocked delivering to it", True), (" before the killer is started or published", False)]
+
+-- | A release held uninterruptibly: the runner says which thread it is, enters the release, waits for the killer's publication,
+-- waits for the killer to be blocked delivering to it, and waits at a hold only a let-go ends. No cancellation can reach it
+-- until it is let go.
+maskedRunner ∷ MaskedHold → Probe → IO ()
+maskedRunner held probe = do
+  recordSelf probe
+  uninterruptibleMask_ $ do
+    putMVar (probeParked probe) ()
+    readMVar (maskedSlot held) >>= maybe (pure ()) (void . awaitPendingThrow)
+    readMVar (maskedHold held)
+
+-- | What the scope's stop does to the release: let it go, with no killer and past its hold.
+letGoMasked ∷ MaskedHold → IO ()
+letGoMasked held = void (tryPutMVar (maskedSlot held) Nothing) >> void (tryPutMVar (maskedHold held) ())
+
+-- | The helpers under test, as the scope the endings run: the runner is owned with its release opening, and the killer, when
+-- there is one, is owned inside it, so it is ended first.
+ownedMasked ∷ MaskedHold → Bool → Scope
+ownedMasked held publishes action body =
+  withOwnedThreadOpening (letGoMasked held) action $ \runner _ →
+    if publishes
+      then withOwnedThread (throwTo runner ThreadKilled) $ \killer _ → do
+        putMVar (maskedKiller held) killer
+        putMVar (maskedSlot held) (Just killer)
+        body runner
+      else body runner
+
+-- | The same arrangement with the previous, unowned starts.
+unownedMasked ∷ IORef [Unowned] → MaskedHold → Bool → Scope
+unownedMasked started held publishes action body = do
+  runner ← startUnowned started (letGoMasked held) action
+  if publishes
+    then do
+      killer ← startUnowned started (pure ()) (throwTo runner ThreadKilled)
+      putMVar (maskedKiller held) killer
+      putMVar (maskedSlot held) (Just killer)
+    else pure ()
+  body runner
+
+-- | The judgement for both threads: the runner ended and been joined, and so has the killer when there was one.
+endedAfterMaskedScope ∷ MaskedHold → Bool → IO Bool
+endedAfterMaskedScope held publishes = do
+  runnerEnded ← endedAfterScope (maskedProbe held)
+  killerEnded ← if publishes then tryReadMVar (maskedKiller held) >>= maybe (pure False) joined else pure True
+  pure (runnerEnded && killerEnded)
 
 -- | The failures the small assemblies here raise.
 data Broken
@@ -646,21 +745,22 @@ testCancelDuringConstruction = do
           (annotateIO (Marker "blocked") (putMVar entered () >> takeMVar never))
           (\() → record trace "release blocked")
       policy' = policy Optional 3 (counted classified (\_ → pure (Just Retry)))
-  worker ←
-    forkIO $
-      tryWithContext (withScoped (allocComponent loadWidget policy' construction) (\_ → void (bump consumed)))
+  withOwnedThread
+    ( tryWithContext (withScoped (allocComponent loadWidget policy' construction) (\_ → void (bump consumed)))
         >>= putMVar result
-  takeMVar entered
-  killThread worker
-  outcome ← takeMVar result
-  void (tryPutMVar never ())
-  case outcome of
-    Right () → expectationFailure "expected construction to be cancelled"
-    Left (ExceptionWithContext context cancellation) → do
-      fromException cancellation `shouldBe` Just ThreadKilled
-      (getExceptionAnnotations context ∷ [Marker]) `shouldBe` [Marker "blocked"]
-      map cleanupFailureLabel (cleanupFailuresInContext context) `shouldBe` ["cache"]
-      length (recoveryHistoryInContext context) `shouldBe` 0
+    )
+    $ \worker _ → do
+      takeMVar entered
+      killThread worker
+      outcome ← takeMVar result
+      void (tryPutMVar never ())
+      case outcome of
+        Right () → expectationFailure "expected construction to be cancelled"
+        Left (ExceptionWithContext context cancellation) → do
+          fromException cancellation `shouldBe` Just ThreadKilled
+          (getExceptionAnnotations context ∷ [Marker]) `shouldBe` [Marker "blocked"]
+          map cleanupFailureLabel (cleanupFailuresInContext context) `shouldBe` ["cache"]
+          length (recoveryHistoryInContext context) `shouldBe` 0
   readIORef classified `shouldReturn` 0
   readIORef consumed `shouldReturn` 0
   -- Only the part that was acquired is released, and no attempt follows.
@@ -680,8 +780,8 @@ testCancelDuringRollback = do
         acquirePart "first" (releaseRank 0) (record trace "acquire first") $ \() → do
           record trace "first start"
           putMVar insideRelease ()
-          killer ← readMVar killerSlot
-          status ← awaitPendingThrow killer
+          -- Released with no killer when the scope ended first: the status is then not an observation, and nothing reads it.
+          status ← readMVar killerSlot >>= maybe (pure ThreadFinished) awaitPendingThrow
           putMVar killerStatus status
           record trace "first end"
           ioError (userError "first release failed")
@@ -689,27 +789,32 @@ testCancelDuringRollback = do
         restoredStep (failAttempt 1)
       alternative = Fallback cachedWidget (record trace "select" >> pure (pure ()))
       policy' = policy Optional 3 (counted classified (recognizeBroken alternative))
-  runner ←
-    forkIO $
-      tryWithContext (withScoped (allocComponent loadWidget policy' construction) (\_ → void (bump consumed)))
+  -- The runner is held uninterruptibly in the rollback until the killer is published, and the killer is blocked delivering to
+  -- it. The scope's stop lets the release go first (it publishes no killer), then ends the killer and the runner, in that
+  -- order, so a scope that ends before the killer is started or published still completes.
+  withOwnedThreadOpening
+    (void (tryPutMVar killerSlot Nothing))
+    ( tryWithContext (withScoped (allocComponent loadWidget policy' construction) (\_ → void (bump consumed)))
         >>= putMVar result
-  -- The rollback has started, so the thread is uninterruptibly masked.
-  takeMVar insideRelease
-  killer ← forkIO (throwTo runner ThreadKilled *> putMVar killerDone ())
-  putMVar killerSlot killer
-  -- The cancellation was delivered, which cannot happen before rollback ends.
-  takeMVar killerDone
-  -- While the release was still running, the sender was still waiting on it.
-  takeMVar killerStatus `shouldReturn` ThreadBlocked BlockedOnException
-  outcome ← takeMVar result
-  case outcome of
-    Right () → expectationFailure "expected construction to be cancelled"
-    Left (ExceptionWithContext context cancellation) → do
-      fromException cancellation `shouldBe` Just ThreadKilled
-      map cleanupFailureLabel (cleanupFailuresInContext context) `shouldBe` ["first"]
-      case handledFailures context of
-        [handled] → fromException handled `shouldBe` Just (Broken 1)
-        other → expectationFailure ("expected one handled failure, found " <> show other)
+    )
+    $ \runner _ → do
+      -- The rollback has started, so the thread is uninterruptibly masked.
+      takeMVar insideRelease
+      withOwnedThread (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
+        putMVar killerSlot (Just killer)
+        -- The cancellation was delivered, which cannot happen before rollback ends.
+        takeMVar killerDone
+        -- While the release was still running, the sender was still waiting on it.
+        takeMVar killerStatus `shouldReturn` ThreadBlocked BlockedOnException
+        outcome ← takeMVar result
+        case outcome of
+          Right () → expectationFailure "expected construction to be cancelled"
+          Left (ExceptionWithContext context cancellation) → do
+            fromException cancellation `shouldBe` Just ThreadKilled
+            map cleanupFailureLabel (cleanupFailuresInContext context) `shouldBe` ["first"]
+            case handledFailures context of
+              [handled] → fromException handled `shouldBe` Just (Broken 1)
+              other → expectationFailure ("expected one handled failure, found " <> show other)
   readIORef trace `shouldReturn` ["acquire first", "acquire second", "first start", "first end", "second"]
   readIORef classified `shouldReturn` 0
   readIORef consumed `shouldReturn` 0
@@ -720,6 +825,8 @@ testCancelAtHandoff = do
   classified ← newCounter
   observedStatus ← newIORef ThreadRunning
   killerDone ← newEmptyMVar
+  killerSlot ← newEmptyMVar
+  startKiller ← newEmptyMVar
   result ← newEmptyMVar
   let construction = do
         acquirePart "first" (releaseRank 0) (record trace "acquire first") $ \() → do
@@ -729,29 +836,39 @@ testCancelAtHandoff = do
           -- Leave a cancellation pending as construction completes. Masked
           -- uninterruptibly here, it cannot be delivered inside construction.
           ( uninterruptibleMask_ $ do
-              self ← myThreadId
-              killer ← forkIO (throwTo self ThreadKilled *> putMVar killerDone ())
+              -- The killer is owned by the runner's scope around the whole construction, so it outlives this acquisition
+              -- and is joined only after the runner has left it; starting it here would tie it to a scope that ends before
+              -- the pending cancellation is delivered. It is released here, inside the acquisition, so the cancellation is
+              -- aimed at the thread while it is uninterruptibly masked, as it was when the killer was started here.
+              putMVar startKiller ()
+              killer ← readMVar killerSlot
               awaitPendingThrow killer >>= writeIORef observedStatus
               record trace "acquire last"
           )
           (\() → record trace "release last")
       consumer _ = record trace "consumer"
-  _ ←
-    forkIO $
-      tryWithContext
-        ( withScoped
-            (allocComponent loadWidget (policy Optional 3 (counted classified (\_ → pure (Just Retry)))) construction)
-            consumer
-        )
-        >>= putMVar result
-  takeMVar killerDone
-  outcome ← takeMVar result
-  readIORef observedStatus `shouldReturn` ThreadBlocked BlockedOnException
-  case outcome of
-    Right () → expectationFailure "expected the handoff to be cancelled"
-    Left (ExceptionWithContext context cancellation) → do
-      fromException cancellation `shouldBe` Just ThreadKilled
-      map cleanupFailureLabel (cleanupFailuresInContext context) `shouldBe` ["first"]
+  let runner = do
+        self ← myThreadId
+        -- The delivery and the announcement that follows it are one masked step: the runner's scope ends the killer as soon as
+        -- the runner has left the construction, which can be before the killer has announced, and the example waits for
+        -- that announcement. The delivery itself stays interruptible, so a killer still blocked is ended by the scope.
+        withOwnedThread (readMVar startKiller >> mask_ (throwTo self ThreadKilled *> putMVar killerDone ())) $ \killer _ → do
+          putMVar killerSlot killer
+          tryWithContext
+            ( withScoped
+                (allocComponent loadWidget (policy Optional 3 (counted classified (\_ → pure (Just Retry)))) construction)
+                consumer
+            )
+            >>= putMVar result
+  withOwnedThread runner $ \_ _ → do
+    takeMVar killerDone
+    outcome ← takeMVar result
+    readIORef observedStatus `shouldReturn` ThreadBlocked BlockedOnException
+    case outcome of
+      Right () → expectationFailure "expected the handoff to be cancelled"
+      Left (ExceptionWithContext context cancellation) → do
+        fromException cancellation `shouldBe` Just ThreadKilled
+        map cleanupFailureLabel (cleanupFailuresInContext context) `shouldBe` ["first"]
   -- The consumer's first effect was preempted, every part was released, and
   -- no new attempt started after selection.
   readIORef trace `shouldReturn` ["acquire first", "acquire last", "release first", "release last"]

@@ -19,8 +19,8 @@
 -- STM, and 'awaitBlockedOnSTM'; nothing sleeps.
 module Test.Runtime.Composition (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent (ThreadId, killThread, myThreadId, yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -130,6 +130,7 @@ import Test.Hspec
   , shouldReturn
   , shouldSatisfy
   )
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "Application lifecycle" $ do
@@ -422,25 +423,27 @@ testCancellation = boundedSupervision $ do
   let trace = harnessTrace harness
   entered ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $
-    try
-      ( runIn harness (workshop trace (pure ())) (openFloor trace) $ \_ control → do
-          record trace "action"
-          putMVar entered ()
-          awaitSupervised control retry
-      )
-      >>= putMVar outcome
-  takeMVar entered
-  awaitBlockedOnSTM runner
-  killThread runner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "the cancelled application returned"
-    Left (failure ∷ SomeException) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-  -- The polisher drains before any dependency is disposed; nothing is reported
-  -- and nothing is flushed.
-  traced trace `shouldReturn`
-    workshopBoot <> ["startup", "acquire polisher", "action", "release polisher"] <> workshopDisposal
-  errorEntries harness `shouldReturn` []
+  withOwnedThread
+    ( try
+        ( runIn harness (workshop trace (pure ())) (openFloor trace) $ \_ control → do
+            record trace "action"
+            putMVar entered ()
+            awaitSupervised control retry
+        )
+        >>= putMVar outcome
+    )
+    $ \runner _ → do
+      takeMVar entered
+      awaitBlockedOnSTM runner
+      killThread runner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "the cancelled application returned"
+        Left (failure ∷ SomeException) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      -- The polisher drains before any dependency is disposed; nothing is reported
+      -- and nothing is flushed.
+      traced trace `shouldReturn`
+        workshopBoot <> ["startup", "acquire polisher", "action", "release polisher"] <> workshopDisposal
+      errorEntries harness `shouldReturn` []
 
 -- Truthful outcomes ------------------------------------------------------------
 
@@ -674,22 +677,24 @@ testQuiescenceOnCancellation = boundedSupervision $ do
   journal ← newTVarIO []
   entered ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $
-    try
-      ( runQuiescentIn harness (counter journal) quiesceCounter (\built _ → pure built) $ \_ control → do
-          putMVar entered ()
-          awaitSupervised control retry
-      )
-      >>= putMVar outcome
-  takeMVar entered
-  awaitBlockedOnSTM runner
-  killThread runner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "the cancelled application returned"
-    Left (failure ∷ SomeException) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-  readTVarIO journal `shouldReturn` ["acquire counter", "quiesce", "release counter"]
-  errorEntries harness `shouldReturn` []
-  flushes harness `shouldReturn` 0
+  withOwnedThread
+    ( try
+        ( runQuiescentIn harness (counter journal) quiesceCounter (\built _ → pure built) $ \_ control → do
+            putMVar entered ()
+            awaitSupervised control retry
+        )
+        >>= putMVar outcome
+    )
+    $ \runner _ → do
+      takeMVar entered
+      awaitBlockedOnSTM runner
+      killThread runner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "the cancelled application returned"
+        Left (failure ∷ SomeException) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      readTVarIO journal `shouldReturn` ["acquire counter", "quiesce", "release counter"]
+      errorEntries harness `shouldReturn` []
+      flushes harness `shouldReturn` 0
 
 testQuiescenceSkippedOnConstructionFailure ∷ Expectation
 testQuiescenceSkippedOnConstructionFailure = boundedSupervision $ do
@@ -777,22 +782,24 @@ testAbandonedStartupDrainPrecedesQuiescence = boundedSupervision $ do
               liftIO (putMVar entered () >> takeMVar never)
           )
           (\_ () → pure ())
-  runner ← forkIO $
-    try
-      ( runQuiescentIn harness (counter journal) quiesceCounter
-          (\built control → startSupervised control (required Service) stalled >>= expectStarted >> pure built)
-          (\_ _ → pure ())
-      )
-      >>= putMVar outcome
-  takeMVar entered
-  awaitBlockedOnSTM runner
-  killThread runner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "the cancelled application returned"
-    Left (failure ∷ SomeException) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-  readTVarIO journal `shouldReturn`
-    ["acquire counter", "acquire stalled", "release stalled", "quiesce", "release counter"]
-  flushes harness `shouldReturn` 0
+  withOwnedThread
+    ( try
+        ( runQuiescentIn harness (counter journal) quiesceCounter
+            (\built control → startSupervised control (required Service) stalled >>= expectStarted >> pure built)
+            (\_ _ → pure ())
+        )
+        >>= putMVar outcome
+    )
+    $ \runner _ → do
+      takeMVar entered
+      awaitBlockedOnSTM runner
+      killThread runner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "the cancelled application returned"
+        Left (failure ∷ SomeException) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      readTVarIO journal `shouldReturn`
+        ["acquire counter", "acquire stalled", "release stalled", "quiesce", "release counter"]
+      flushes harness `shouldReturn` 0
 
 -- | A quiescence action that fails. Its transaction's writes roll back with the
 -- throw, so the retained @application quiescence@ label is what shows it ran.
@@ -823,24 +830,26 @@ testQuiescenceFailureDuringCancellation = boundedSupervision $ do
   journal ← newTVarIO []
   entered ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $
-    tryWithContext
-      ( runQuiescentIn harness (counter journal) failingQuiescence (\built _ → pure built) $ \_ control → do
-          putMVar entered ()
-          awaitSupervised control retry
-      )
-      >>= putMVar outcome
-  takeMVar entered
-  awaitBlockedOnSTM runner
-  killThread runner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "the cancelled application returned"
-    Left (failure@(ExceptionWithContext _ exception) ∷ ExceptionWithContext SomeException) → do
-      (fromException exception ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-      quiescenceLabels failure `shouldBe` ["application quiescence"]
-  readTVarIO journal `shouldReturn` ["acquire counter", "release counter"]
-  errorEntries harness `shouldReturn` []
-  flushes harness `shouldReturn` 0
+  withOwnedThread
+    ( tryWithContext
+        ( runQuiescentIn harness (counter journal) failingQuiescence (\built _ → pure built) $ \_ control → do
+            putMVar entered ()
+            awaitSupervised control retry
+        )
+        >>= putMVar outcome
+    )
+    $ \runner _ → do
+      takeMVar entered
+      awaitBlockedOnSTM runner
+      killThread runner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "the cancelled application returned"
+        Left (failure@(ExceptionWithContext _ exception) ∷ ExceptionWithContext SomeException) → do
+          (fromException exception ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+          quiescenceLabels failure `shouldBe` ["application quiescence"]
+      readTVarIO journal `shouldReturn` ["acquire counter", "release counter"]
+      errorEntries harness `shouldReturn` []
+      flushes harness `shouldReturn` 0
 
 testQuiescenceFailureAfterSuccess ∷ Expectation
 testQuiescenceFailureAfterSuccess = boundedSupervision $ do
@@ -1064,11 +1073,15 @@ data Handoff
   | DuringManagedRelease
   deriving (Eq, Show)
 
--- | Ask a thread to cancel from a helper thread, and wait until the request is
--- delivered or pending behind the target's mask.
-requestCancel ∷ ThreadId → IO ()
-requestCancel target = do
-  canceller ← forkIO (killThread target)
+-- | Ask the canceller 'cancelledRun' started for the run to cancel it, and wait until the request is delivered or pending
+-- behind the target's mask.
+--
+-- The canceller is a thread the run's scope owns, parked until this request: a request that is still pending behind the
+-- target's mask when this returns stays pending, because the canceller (blocked delivering it) lives until the run's scope
+-- ends. A canceller started here and ended with this call would withdraw the very request it was asked to leave pending.
+requestCancel ∷ MVar () → ThreadId → IO ()
+requestCancel fire canceller = do
+  putMVar fire ()
   let settled =
         threadStatus canceller >>= \case
           ThreadFinished → pure ()
@@ -1076,14 +1089,21 @@ requestCancel target = do
           _ → yield >> settled
   settled
 
--- | Run on a forked thread, let the arrangement cancel it, and require the
--- failure it propagates.
-cancelledRun ∷ (ThreadId → IO ()) → IO a → IO (ExceptionWithContext SomeException)
-cancelledRun arrange run = do
+-- | Run on a thread the scope owns, let the arrangement cancel it, and require the failure it propagates. The arrangement is
+-- given the run's thread and the request it may make (once) of the run's canceller.
+--
+-- The first argument opens whatever the run is held at that only the example can open (a hub acquisition held
+-- uninterruptibly, a drain held at a gate): it is run in the runner's uninterruptible release, before the kill, however the
+-- scope ended, so a scope that ends before the arrangement opened the gate does not wait for ever on a run that cannot
+-- finish. The canceller's scope is inside the runner's, so it is ended first.
+cancelledRun ∷ IO () → (ThreadId → IO () → IO ()) → IO a → IO (ExceptionWithContext SomeException)
+cancelledRun open arrange run = do
   outcome ← newEmptyMVar
-  runner ← forkIO (tryWithContext run >>= putMVar outcome)
-  arrange runner
-  takeMVar outcome >>= either pure (\_ → throwIO (userError "the cancelled application returned"))
+  fire ← newEmptyMVar
+  withOwnedThreadOpening open (tryWithContext run >>= putMVar outcome) $ \runner _ →
+    withOwnedThread (readMVar fire >> killThread runner) $ \canceller _ → do
+      arrange runner (requestCancel fire canceller)
+      takeMVar outcome >>= either pure (\_ → throwIO (userError "the cancelled application returned"))
 
 isThreadKilled ∷ ExceptionWithContext SomeException → Bool
 isThreadKilled (ExceptionWithContext _ failure) = (fromException failure ∷ Maybe AsyncException) == Just ThreadKilled
@@ -1123,16 +1143,16 @@ testManagedCancellation handoff = boundedSupervision $ do
           DuringConsumer → signal >> awaitSupervised control retry
           DuringQuiescence → signal
           _ → pure ()
-      arrange runner = do
+      arrange runner cancel = do
         takeMVar entered
         case handoff of
           DuringConsumer → awaitBlockedOnSTM runner >> killThread runner
           DuringQuiescence → do
             awaitBlockedOnSTM runner
-            requestCancel runner
+            cancel
             atomically (writeTVar opened True)
-          _ → requestCancel runner >> openGate gate
-  propagated ← cancelledRun arrange (runManagedIn harness (managedHub hub script) quiesce startup action)
+          _ → cancel >> openGate gate
+  propagated ← cancelledRun (openGate gate) arrange (runManagedIn harness (managedHub hub script) quiesce startup action)
   propagated `shouldSatisfy` isThreadKilled
   traced trace `shouldReturn` case handoff of
     AtConsumerEntry → ["acquire parent", "acquire hub", "drain hub", "release parent"]
@@ -1168,7 +1188,7 @@ testManagedCleanupFailuresDuringCancellation = boundedSupervision $ do
   hub ← newHub trace
   entered ← newEmptyMVar
   propagated ←
-    cancelledRun (\runner → takeMVar entered >> awaitBlockedOnSTM runner >> killThread runner) $
+    cancelledRun (pure ()) (\runner _ → takeMVar entered >> awaitBlockedOnSTM runner >> killThread runner) $
       runManagedIn harness (managedHub hub plainHub {scriptDrain = throwIO (Broken "hub drain failed")}) failingQuiescence
         hubStartup
         (\h control → hubAction h >> putMVar entered () >> awaitSupervised control retry)
@@ -1252,39 +1272,42 @@ drainRun observe = do
   handed ← newEmptyMVar
   release ← newEmptyMVar
   readings ← newEmptyMVar
-  _ ← forkIO $ do
-    control ← readMVar handed
-    let observed = do
-          atomically (readTVar (hubQuiesced hub) >>= \quiesced → if quiesced then pure () else retry)
-          -- Quiescence precedes supervision's exit, so the caller's next STM
-          -- wait is the protected drain.
-          awaitBlockedOnSTM caller
-          if observe
-            then do
-              first ← atomically (workerGroupStatus control)
+  withOwnedThreadOpening (void (tryPutMVar release ()))
+    ( do
+        control ← readMVar handed
+        let observed = do
+              atomically (readTVar (hubQuiesced hub) >>= \quiesced → if quiesced then pure () else retry)
+              -- Quiescence precedes supervision's exit, so the caller's next STM
+              -- wait is the protected drain.
               awaitBlockedOnSTM caller
-              second ← atomically (workerGroupStatus control)
-              pure [first, second]
-            else pure []
-    (observed >>= putMVar readings) `finally` putMVar release ()
-  let startup h control = do
-        record trace "startup"
-        expectLive h
-        _ ←
-          startSupervised control (required Service)
-            (workerDefinition "held" (\_ → owned trace "held") (\_ () → uninterruptibleMask_ (readMVar release)))
-            >>= expectStarted
-        putMVar handed control
-        pure h
-      action h _ = hubAction h >> throwIO (Broken "action failed")
-  failure ← expectFailure (runManagedIn harness (managedHub hub plainHub) quiesceHub startup action)
-  control ← readMVar handed
-  DrainRun (brokenIs "action failed" failure)
-    <$> traced trace
-    <*> (map entryMessage <$> errorEntries harness)
-    <*> flushes harness
-    <*> takeMVar readings
-    <*> atomically (workerGroupStatus control)
+              if observe
+                then do
+                  first ← atomically (workerGroupStatus control)
+                  awaitBlockedOnSTM caller
+                  second ← atomically (workerGroupStatus control)
+                  pure [first, second]
+                else pure []
+        (observed >>= putMVar readings) `finally` void (tryPutMVar release ())
+    )
+    $ \_ _ → do
+      let startup h control = do
+            record trace "startup"
+            expectLive h
+            _ ←
+              startSupervised control (required Service)
+                (workerDefinition "held" (\_ → owned trace "held") (\_ () → uninterruptibleMask_ (readMVar release)))
+                >>= expectStarted
+            putMVar handed control
+            pure h
+          action h _ = hubAction h >> throwIO (Broken "action failed")
+      failure ← expectFailure (runManagedIn harness (managedHub hub plainHub) quiesceHub startup action)
+      control ← readMVar handed
+      DrainRun (brokenIs "action failed" failure)
+        <$> traced trace
+        <*> (map entryMessage <$> errorEntries harness)
+        <*> flushes harness
+        <*> takeMVar readings
+        <*> atomically (workerGroupStatus control)
 
 testStatusDuringManagedDrain ∷ Expectation
 testStatusDuringManagedDrain = boundedSupervision $ do

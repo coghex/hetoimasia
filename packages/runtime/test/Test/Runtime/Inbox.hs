@@ -12,7 +12,7 @@
 -- stops an example that has already hung.
 module Test.Runtime.Inbox (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
+import Control.Concurrent (killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception
@@ -59,6 +59,7 @@ import Test.Runtime.Supervision.Support
   , withCollectedLifetime
   )
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Inbox services" $ do
@@ -167,18 +168,21 @@ testCancelledConstruction = do
           4
           (\_ → probedContext trace probe >> liftIO (putMVar entered () >> takeMVar held))
           (handling trace ignore)
-  owner ← forkIO $ do
-    outcome ← tryWithContext @SomeException $ withCollectedLifetime ignoreWrites $ \collected →
-      withSupervision (collectedLifetime collected) $ \control → do
-        _ ← startedWith probe =<< startInboxService control requiredInbox slow
-        pure ()
-    putMVar done outcome
-  takeMVar entered
-  killThread owner
-  takeMVar done >>= \case
-    Left (ExceptionWithContext _ raised) → fromException raised `shouldBe` Just ThreadKilled
-    Right () → expectationFailure "the cancelled owner returned"
-  traced trace >>= (`shouldBe` ["acquire context", "release context: inbox no endpoint"])
+  withOwnedThread
+    ( do
+        outcome ← tryWithContext @SomeException $ withCollectedLifetime ignoreWrites $ \collected →
+          withSupervision (collectedLifetime collected) $ \control → do
+            _ ← startedWith probe =<< startInboxService control requiredInbox slow
+            pure ()
+        putMVar done outcome
+    )
+    $ \owner _ → do
+      takeMVar entered
+      killThread owner
+      takeMVar done >>= \case
+        Left (ExceptionWithContext _ raised) → fromException raised `shouldBe` Just ThreadKilled
+        Right () → expectationFailure "the cancelled owner returned"
+      traced trace >>= (`shouldBe` ["acquire context", "release context: inbox no endpoint"])
 
 -- Handoff and immediate exit ---------------------------------------------------
 
@@ -244,16 +248,20 @@ testGroupTriggeredStop = do
   entered ← newEmptyMVar
   gate ← newGate
   application ← myThreadId
-  started ← withCollectedLifetime ignoreWrites $ \collected →
-    withSupervision (collectedLifetime collected) $ \control → do
-      started ← startedWith probe =<< startInboxService control requiredInbox (inbox trace probe 3 (holdingFirst entered gate))
-      _ ← offer started 1
-      takeMVar entered
-      traverse_ (offer started) [2, 3, 4]
-      -- The handler is released only once closing has asked for the stop and
-      -- the application is waiting in the drain.
-      _ ← forkIO (awaitBlockedOnSTM application >> openGate gate)
-      pure started
+  -- The opener serves the exit of the supervision (the close waits for the handler the gate holds), so it is started outside it,
+  -- parked, and let go at the point the example reached the fork before; it is ended and joined after the close, never before.
+  go ← newEmptyMVar
+  started ← withOwnedThread (readMVar go >> awaitBlockedOnSTM application >> openGate gate) $ \_ _ →
+    withCollectedLifetime ignoreWrites $ \collected →
+      withSupervision (collectedLifetime collected) $ \control → do
+        started ← startedWith probe =<< startInboxService control requiredInbox (inbox trace probe 3 (holdingFirst entered gate))
+        _ ← offer started 1
+        takeMVar entered
+        traverse_ (offer started) [2, 3, 4]
+        -- The handler is released only once closing has asked for the stop and
+        -- the application is waiting in the drain.
+        putMVar go ()
+        pure started
   first ← atomically (inboxCompletion started)
   second ← atomically (inboxCompletion started)
   (exitOf <$> first) `shouldBe` Just (Just 3)

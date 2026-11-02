@@ -14,7 +14,7 @@
 -- 'boundedSupervision' only stops an example that has already hung.
 module Test.Runtime.Supervision (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
+import Control.Concurrent (killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically, check, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception
@@ -59,6 +59,7 @@ import Hetoimasia.Runtime.Supervision
 import Test.Runtime.Supervision.Support
 import qualified Test.Runtime.Supervision.Startup as Startup
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Supervision" $ do
@@ -215,9 +216,9 @@ testWakesSupervisedWait = do
   failure ← expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
     withSupervision (collectedLifetime collected) $ \control → do
       _ ← expectStarted =<< startSupervised control (required Service) (failingAfter trace "renderer" gate (Broken "renderer"))
-      _ ← forkIO (awaitBlockedOnSTM application >> openGate gate)
-      waiting ← never
-      awaitSupervised control waiting
+      withOwnedThread (awaitBlockedOnSTM application >> openGate gate) $ \_ _ → do
+        waiting ← never
+        awaitSupervised control waiting
   failure `shouldSatisfy` brokenIs "renderer"
   traced trace >>= (`shouldBe` ["acquire renderer", "release renderer"])
 
@@ -231,15 +232,15 @@ testWakesStartupWait = do
   failure ← expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
     withSupervision (collectedLifetime collected) $ \control → do
       _ ← expectStarted =<< startSupervised control (required Service) (failingAfter trace "audio" gate (Broken "audio"))
-      _ ← forkIO (readMVar entered >> awaitBlockedOnSTM application >> openGate gate)
-      let slow =
-            workerDefinition
-              "streaming"
-              (\_ → owned trace "streaming" >> liftIO (putMVar entered () >> takeMVar held))
-              (\_ () → pure ())
-      started ← attempt (startSupervised control (required Service) slow)
-      record trace "start unwound"
-      either (\(ExceptionWithContext _ raised) → throwIO raised) (\_ → fail "the start returned") started
+      withOwnedThread (readMVar entered >> awaitBlockedOnSTM application >> openGate gate) $ \_ _ → do
+        let slow =
+              workerDefinition
+                "streaming"
+                (\_ → owned trace "streaming" >> liftIO (putMVar entered () >> takeMVar held))
+                (\_ () → pure ())
+        started ← attempt (startSupervised control (required Service) slow)
+        record trace "start unwound"
+        either (\(ExceptionWithContext _ raised) → throwIO raised) (\_ → fail "the start returned") started
   failure `shouldSatisfy` brokenIs "audio"
   -- The new worker was drained, its startup resource released, before the start
   -- operation unwound.
@@ -579,27 +580,30 @@ testCancelledClassification = do
   done ← newEmptyMVar
   let blocking = WorkerPolicy Service Optional supervisionComponent $ \_ →
         putMVar entered () >> takeMVar held >> pure Recognized
-  owner ← forkIO $ do
-    outcome ← attempt $ withCollectedLifetime ignoreWrites $ \collected →
-      withSupervision (collectedLifetime collected) $ \control → do
-        _ ← expectStarted =<< startSupervised control (required Service) (serviceUntilStopped trace "stream")
-        worker ← expectStarted =<< startSupervised control blocking (failingAfter trace "flaky" gate (Broken "flaky"))
-        openGate gate
-        _ ← awaitTerminal (supervisedWorker worker)
-        checkRuntime control
-    putMVar done outcome
-  takeMVar entered
-  killThread owner
-  outcome ← takeMVar done
-  case outcome of
-    Right () → expectationFailure "the cancelled owner returned"
-    Left (ExceptionWithContext context raised) → do
-      fromException raised `shouldBe` Just ThreadKilled
-      -- The group drained first and left its report as raw evidence.
-      length [() | GroupExit _ ← workerEvidenceInContext context] `shouldBe` 1
-  entries ← traced trace
-  entries `shouldSatisfy` elem "release stream"
-  entries `shouldSatisfy` elem "release flaky"
+  withOwnedThread
+    ( do
+        outcome ← attempt $ withCollectedLifetime ignoreWrites $ \collected →
+          withSupervision (collectedLifetime collected) $ \control → do
+            _ ← expectStarted =<< startSupervised control (required Service) (serviceUntilStopped trace "stream")
+            worker ← expectStarted =<< startSupervised control blocking (failingAfter trace "flaky" gate (Broken "flaky"))
+            openGate gate
+            _ ← awaitTerminal (supervisedWorker worker)
+            checkRuntime control
+        putMVar done outcome
+    )
+    $ \owner _ → do
+      takeMVar entered
+      killThread owner
+      outcome ← takeMVar done
+      case outcome of
+        Right () → expectationFailure "the cancelled owner returned"
+        Left (ExceptionWithContext context raised) → do
+          fromException raised `shouldBe` Just ThreadKilled
+          -- The group drained first and left its report as raw evidence.
+          length [() | GroupExit _ ← workerEvidenceInContext context] `shouldBe` 1
+      entries ← traced trace
+      entries `shouldSatisfy` elem "release stream"
+      entries `shouldSatisfy` elem "release flaky"
 
 -- Closing ----------------------------------------------------------------------
 
@@ -611,22 +615,26 @@ testExitBeforeStopSurvivesClosing = do
   releaseGate ← newGate
   handles ← newIORef []
   application ← myThreadId
-  failure@(ExceptionWithContext _ raised) ← expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
-    withSupervision (collectedLifetime collected) $ \control → do
-      let watcher =
-            workerDefinition
-              "watcher"
-              (\_ → allocResource (pure ()) (\() → openGate inRelease >> readMVar releaseGate >> record trace "release watcher"))
-              (\_ () → readMVar gate)
-      watching ← expectStarted =<< startSupervised control (required Service) watcher
-      listening ← expectStarted =<< startSupervised control (required Service) (serviceUntilStopped trace "listener")
-      writeIORef handles [watching, listening]
-      openGate gate
-      -- The run action has exited and its cleanup is still running when the
-      -- body returns and closing requests every stop.
-      readMVar inRelease
-      _ ← forkIO (awaitBlockedOnSTM application >> openGate releaseGate)
-      pure ()
+  -- The opener serves the exit of the supervision (the close waits for the release the gate holds), so it is started outside it,
+  -- parked, and let go at the point the example reached the fork before; it is ended and joined after the close, never before.
+  go ← newEmptyMVar
+  failure@(ExceptionWithContext _ raised) ← withOwnedThread (readMVar go >> awaitBlockedOnSTM application >> openGate releaseGate) $ \_ _ →
+    expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
+      withSupervision (collectedLifetime collected) $ \control → do
+        let watcher =
+              workerDefinition
+                "watcher"
+                (\_ → allocResource (pure ()) (\() → openGate inRelease >> readMVar releaseGate >> record trace "release watcher"))
+                (\_ () → readMVar gate)
+        watching ← expectStarted =<< startSupervised control (required Service) watcher
+        listening ← expectStarted =<< startSupervised control (required Service) (serviceUntilStopped trace "listener")
+        writeIORef handles [watching, listening]
+        openGate gate
+        -- The run action has exited and its cleanup is still running when the
+        -- body returns and closing requests every stop.
+        readMVar inRelease
+        putMVar go ()
+        pure ()
   case fromException raised of
     Just (UnexpectedServiceExit summary) → do
       completionLabel summary `shouldBe` "watcher"

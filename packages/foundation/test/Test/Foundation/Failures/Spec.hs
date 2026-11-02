@@ -10,7 +10,7 @@
 -- 'boundedExample' only stops an example that has already hung.
 module Test.Foundation.Failures.Spec (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (STM, atomically, catchSTM, newTVarIO, readTVarIO, throwSTM, writeTVar)
 import Control.Exception
@@ -78,6 +78,7 @@ import Test.Hspec
   , shouldBe
   , shouldSatisfy
   )
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Failures" $ do
@@ -422,25 +423,28 @@ testCancellationUnannotated = do
   entered ← newEmptyMVar
   never ← newEmptyMVar
   result ← newEmptyMVar
-  worker ← forkIO $ do
-    outcome ←
-      tryWithContext @SomeException $
-        withOperationContext widgets loadWidget [] $
-          annotateIO (Marker "inside the operation") $ do
-            putMVar entered ()
-            takeMVar never
-    putMVar result outcome
-  takeMVar entered
-  killThread worker
-  outcome ← takeMVar result
-  -- Keeps the blocking slot reachable until the cancellation was observed.
-  void (tryPutMVar never ())
-  case outcome of
-    Left (ExceptionWithContext context cancellation) → do
-      fromException cancellation `shouldBe` Just ThreadKilled
-      failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
-      (getExceptionAnnotations context ∷ [Marker]) `shouldBe` [Marker "inside the operation"]
-    Right () → expectationFailure "expected the operation to be cancelled"
+  withOwnedThread
+    ( do
+        outcome ←
+          tryWithContext @SomeException $
+            withOperationContext widgets loadWidget [] $
+              annotateIO (Marker "inside the operation") $ do
+                putMVar entered ()
+                takeMVar never
+        putMVar result outcome
+    )
+    $ \worker _ → do
+      takeMVar entered
+      killThread worker
+      outcome ← takeMVar result
+      -- Keeps the blocking slot reachable until the cancellation was observed.
+      void (tryPutMVar never ())
+      case outcome of
+        Left (ExceptionWithContext context cancellation) → do
+          fromException cancellation `shouldBe` Just ThreadKilled
+          failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
+          (getExceptionAnnotations context ∷ [Marker]) `shouldBe` [Marker "inside the operation"]
+        Right () → expectationFailure "expected the operation to be cancelled"
 
 testSynchronousAsyncUnannotated ∷ Expectation
 testSynchronousAsyncUnannotated = do
