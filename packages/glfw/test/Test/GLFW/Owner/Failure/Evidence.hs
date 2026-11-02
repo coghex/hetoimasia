@@ -14,7 +14,7 @@ import Control.Concurrent.STM
   , readTVarIO
   , writeTVar
   )
-import Control.Exception (finally, mask, throwIO, uninterruptibleMask_)
+import Control.Exception (finally, mask, mask_, throwIO, uninterruptibleMask_)
 import Control.Monad (forM_, void, when)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
@@ -55,6 +55,7 @@ import Test.GLFW.Owner.Fixture.Rig
   , countingClock
   , newRig
   , newRigWith
+  , ownedHostBeforeBody
   , ownedHost
   , ownedHostWith
   , ownerSettings
@@ -89,6 +90,9 @@ spec = do
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
     it ("finishes the exit on the supplier's evidence when the example body " <> label <> " right after the supplier was handed its host (#593)") $
       boundedExample (ownedEnds ending completionEndedEarlyScenario False)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    it ("finishes the exit when the example body " <> label <> " during the run's startup, before the rescue is registered (#593)") $
+      boundedExample (ownedEnds ending completionStartupScenario False)
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
     for_ [0 .. 2] $ \k →
       it ("finishes the exit on the supplier's evidence when the example body " <> label <> " at setup step " <> show k <> " of the completion fixture (#593)") $
@@ -194,22 +198,28 @@ testEarlyFatalWhileRetiring = do
 -- | An owner that ended without retirement evidence retains its dependencies,
 -- and its completion is never permission to dispose them.
 testCompletionWithoutEvidence ∷ IO ()
-testCompletionWithoutEvidence = completionWithoutEvidence withOwnedThreadOpening Nothing
+testCompletionWithoutEvidence = completionWithoutEvidence withOwnedThreadOpening (pure ()) Nothing
 
 -- | The scenario of 'testCompletionWithoutEvidence' for an example that fails or is cancelled right after the supplier has been
 -- handed what it publishes with (#593): the body ends the way the ending says, and the exit's drain must still finish on the
 -- evidence the supplier publishes, which the exit waits for before the scope around the host could stop the supplier.
 completionEndedEarlyScenario ∷ Scope → IO () → IO ()
-completionEndedEarlyScenario scope atParked = completionWithoutEvidence scope (Just (\i → when (i == 2) atParked))
+completionEndedEarlyScenario scope atParked = completionWithoutEvidence scope (pure ()) (Just (\i → when (i == 2) atParked))
+
+-- | The same fixture ended during the run's startup (#593): after the host is built and before the body's first statement, the
+-- interval in which the rescue is not yet registered. Nothing the backend is asked for fails until the body arms it, so the exit
+-- has nothing to wait for.
+completionStartupScenario ∷ Scope → IO () → IO ()
+completionStartupScenario scope atParked = completionWithoutEvidence scope atParked (Just (\_ → pure ()))
 
 -- | The same fixture ended at the boundary before setup step @k@ (#593): 0 is the body's start (the host exists), 1 follows the
 -- window lookup, 2 follows the target handover and the supplier's hand-over, which are one uninterruptible step (an attachment
 -- never exists without the supplier holding what it publishes with). Between any two steps the fixture is partially built.
 completionSetupScenario ∷ Int → Scope → IO () → IO ()
-completionSetupScenario k scope atParked = completionWithoutEvidence scope (Just (\i → when (i == k) atParked))
+completionSetupScenario k scope atParked = completionWithoutEvidence scope (pure ()) (Just (\i → when (i == k) atParked))
 
-completionWithoutEvidence ∷ Scope → Maybe (Int → IO ()) → IO ()
-completionWithoutEvidence scope endEarly = do
+completionWithoutEvidence ∷ Scope → IO () → Maybe (Int → IO ()) → IO ()
+completionWithoutEvidence scope beforeBody endEarly = do
   rig ← newRig
   trace ← newSinkTrace
   let recording = sinkFailingOn (Text.pack "never") trace
@@ -217,11 +227,16 @@ completionWithoutEvidence scope endEarly = do
   -- owner ends with no record for it and no destruction evidence of its own.
   -- The step fails only after the target exists, so the handover below is the
   -- ordinary one rather than a race with the owner's own admission closing.
-  script (fakeStep (rigFake rig)) $ \step →
-    if null (stepTargets step) then pure noStepWork else throwIO (Scripted (Text.pack "step"))
-  script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
-  script (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
-  script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
+  --
+  -- The failing behaviour is armed only inside the body's first masked step, after the rescue has been registered (the supplier
+  -- handed what it needs, the end of the body announced) (#593): until then the backend behaves, so a cancellation before the
+  -- body begins leaves an exit with nothing to wait for.
+  let arm = do
+        script (fakeStep (rigFake rig)) $ \step →
+          if null (stepTargets step) then pure noStepWork else throwIO (Scripted (Text.pack "step"))
+        script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
+        script (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
+        script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
   -- The thread supplies the independent evidence that lets the exit finish, so it is owned by the example and outlives the host
   -- body (#593). The fixture's destroy always fails, so even an exit with no attachment waits for the owner's destruction
   -- evidence: the supplier is handed the host and the owner as the very first step of the body, in the same masked step that
@@ -254,10 +269,11 @@ completionWithoutEvidence scope endEarly = do
         uninterruptibleMask_ (handedOver host owner window >>= \target → target <$ putMVar serviceCell target)
       guarded handOver host owner body = mask $ \restore → do
         handOver (host, owner)
+        arm
         restore body `finally` void (tryPutMVar bodyDone ())
   withDeferredThreadVia scope (pure ()) supplier $ \_ handOver → case endEarly of
    Just step →
-    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
+    ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
       guarded handOver host owner $ do
         step 0
         window ← theWindow host
@@ -266,7 +282,7 @@ completionWithoutEvidence scope endEarly = do
         step 2
    Nothing → do
     (unverified, _) ← caughtAs @OwnerDestructionUnverified $
-      ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
+      ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
        guarded handOver host owner $ do
         window ← theWindow host
         service ← establish host owner window
@@ -399,7 +415,8 @@ testUnverifiedDestructionRetains = do
   rig ← newRig
   trace ← newSinkTrace
   let recording = sinkFailingOn (Text.pack "never") trace
-  script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
+  -- Armed in the body's first masked step, after the supplier has been handed the owner (#593).
+  let arm = script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
   releasedWhileRetained ← newTVarIO Nothing
   -- From another thread: wait until the exit has said, once, what it is retaining and why — which it does before it settles
   -- into the wait — then record what has been released, and only then supply the independent evidence that lets the boundary
@@ -414,7 +431,7 @@ testUnverifiedDestructionRetains = do
   withDeferredThread supplier $ \_ handOver → do
     (unverified, _) ← caughtAs @OwnerDestructionUnverified $
       ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
-        handOver owner
+        mask_ (handOver owner >> arm)
         _ ← awaitRound owner 0
         pure ()
     unverifiedRetired unverified `shouldBe` True

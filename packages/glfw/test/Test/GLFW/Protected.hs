@@ -223,6 +223,8 @@ spec = describe "GLFW protected host" $ do
         boundedExample (ownedEnds ending repeatedCancellationEndedEarlyScenario True)
       it ("negative control: a plain forkOS start leaves the runner parked in the drain's wait when the example body " <> label) $
         boundedExample (unownedLeaks ending repeatedCancellationEndedEarlyScenario True)
+      it ("has ended and joined a runner parked between its first attachment and the publication of its handles when the example body " <> label) $
+        boundedExample (ownedEnds ending runnerPartialScenario True)
       for_ [0 .. 5] $ \k →
         it ("finishes the exit when the example body " <> label <> " at setup step " <> show k <> " of the two-chain fixture (#593)") $
           boundedExample (ownedEnds ending (protectedSetupScenario k) False)
@@ -750,7 +752,12 @@ protectedHost seam logger config body = do
 rescueRegistered ∷ IO ()
 rescueRegistered = do
   isArmed ← readIORef rescueArmed
-  known ← if isArmed then readIORef registeredOwners else pure []
+  when isArmed rescueNow
+
+-- | 'rescueRegistered' without the arming: the runner scopes call it from their opening, which runs only when the scope ends.
+rescueNow ∷ IO ()
+rescueNow = do
+  known ← readIORef registeredOwners
   forM_ known $ \(host, owner) → do
     atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
     acknowledgement ← readTVarIO (ownerAcknowledgement owner)
@@ -1223,6 +1230,42 @@ protectedSetupScenario k scope atParked = do
         (\host _ → pure host)
         (\_ _ → pure ())
 
+-- | The fixture of the main-thread runners that publish their handles after attaching (#593, 'testRepeatedCancellation',
+-- 'testInterruptedStepWithdrawn', 'testOnlyNewEvidenceRevives'), ended while the runner is parked between its first attachment and
+-- the publication of its handles. The owner still has its scripted 'Await' steps to take and nothing left to publish for it, so
+-- the runner's drain would wait for ever: the scope's opening must release what the registered owner owes without the handles.
+runnerPartialScenario ∷ Scope → IO () → IO ()
+runnerPartialScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  attached ← newEmptyMVar
+  resume ← newEmptyMVar
+  withMainThreadVia scope seam (supplyIfHeld journal hostHeld owned allRetirementFacts)
+    ( runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+              window ← onlyWindow host
+              owner ←
+                establishedOwner
+                  journal
+                  host
+                  window
+                  (ownerNamed "alpha") {scriptPlan = [Await, Await] <> map Certify allRetirementFacts}
+              -- Parked between the attachment and the publication of the handles.
+              putMVar attached () >> takeMVar resume
+              atomically (writeTVar owned (Just owner) >> writeTVar hostHeld (Just host))
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+    )
+    $ \_ _ → takeMVar attached >> atParked
+
 -- | The scenario of 'testCancelledRollback' up to the moment its runner is parked in the construction, with the example body ended
 -- the way the ending says (#593): a kill sent by the scope's release interrupts the construction, which starts a rollback that
 -- waits at a second gate, so the scope opens both gates before it kills and joins the runner.
@@ -1517,25 +1560,13 @@ supplyEvidenceAfterFault journal hostHeld owned = do
   atomically (afterDeclarationFailed host owner)
   publishFacts journal host owner allRetirementFacts
 
--- | Publish the facts if the host and the owner exist and the owner has been acknowledged, and do nothing otherwise; it never
--- blocks and never raises. It is the opening of a scope that runs a protected application whose drain waits for evidence only
--- the example supplies: were the example to fail before supplying it, the drain would hold the scope's join for ever (a drain
--- defers a cancellation by design), so the scope supplies what it can before it joins. It adds nothing once the run has
--- finished: the boundary has closed publication, and a refused notice establishes nothing.
+-- | The opening of a main-thread runner's scope (#593): release everything the registered owners still owe, from the moment each
+-- owner was created, whether or not the example has published any handle yet. The arguments are the cells the example would
+-- publish; they are no longer consulted, because a cancellation that lands after an attachment exists and before they are filled
+-- would otherwise leave this with nothing to release while the runner's drain waits for it. It never blocks and never raises, and
+-- it adds nothing once the run has finished: the boundary has closed publication, and a refused notice establishes nothing.
 supplyIfHeld ∷ TVar [Flag] → TVar (Maybe WindowHost) → TVar (Maybe Owner) → [RetirementFact] → IO ()
-supplyIfHeld _journal hostHeld owned facts = do
-  held ← atomically ((,) <$> readTVar hostHeld <*> readTVar owned)
-  case held of
-    (Just host, Just owner) → do
-      -- Whatever steps the owner still has to take are released too: it certifies every fact the next time it is asked.
-      atomically (writeTVar (ownerPlan owner) (map Certify facts))
-      acknowledgement ← readTVarIO (ownerAcknowledgement owner)
-      case (hostGraphicsPublisher host, acknowledgement) of
-        (Just publisher, Just acknowledged) →
-          forM_ facts $ \fact →
-            void (publishCompletion publisher (completionNotice (acknowledgedAttachment acknowledged) acknowledged fact))
-        _ → pure ()
-    _ → pure ()
+supplyIfHeld _ _ _ _ = rescueNow
 
 afterDeclarationFailed ∷ WindowHost → Owner → STM ()
 afterDeclarationFailed host owner = do

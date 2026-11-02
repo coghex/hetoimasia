@@ -13,7 +13,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (AsyncException (ThreadKilled), throwTo)
+import Control.Exception (AsyncException (ThreadKilled), mask_, throwTo)
 import Control.Monad (forM_, void)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
@@ -29,7 +29,7 @@ import Test.GLFW.Owner.Fixture.Drive
   )
 import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled, ordered)
-import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHost, ownedHostWith)
+import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHost, ownedHostBeforeBody)
 import Test.GLFW.Support
   ( boundedExample
   , caughtAs
@@ -55,6 +55,9 @@ spec = do
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
     it ("finishes the exit on the interrupter's evidence when the example body " <> label <> " right after the interrupter was handed the owner (#593)") $
       boundedExample (ownedEnds ending escapedDestructionEndedEarlyScenario False)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    it ("finishes the exit when the example body " <> label <> " during the run's startup, before the rescue is registered (#593)") $
+      boundedExample (ownedEnds ending escapedDestructionStartupScenario False)
 
 -- | Cancellation is honoured inside each backend call in turn, and releases
 -- nothing early in any of them.
@@ -252,25 +255,31 @@ testEscapedRetirementCancellation = do
 -- its windows, its session and every parent stay retained until independent
 -- evidence arrives — and nothing is released early on the way there.
 testEscapedDestructionCancellation ∷ IO ()
-testEscapedDestructionCancellation = escapedDestruction withOwnedThreadOpening Nothing
+testEscapedDestructionCancellation = escapedDestruction withOwnedThreadOpening (pure ()) Nothing
 
 -- | The scenario of 'testEscapedDestructionCancellation' for an example that fails or is cancelled right after the interrupter has
 -- been handed the owner (#593): the exit's drain must still finish on the evidence the interrupter publishes, which the exit
 -- waits for before the scope around the host could stop it.
 escapedDestructionEndedEarlyScenario ∷ Scope → IO () → IO ()
-escapedDestructionEndedEarlyScenario scope atParked = escapedDestruction scope (Just atParked)
+escapedDestructionEndedEarlyScenario scope atParked = escapedDestruction scope (pure ()) (Just atParked)
 
-escapedDestruction ∷ Scope → Maybe (IO ()) → IO ()
-escapedDestruction scope endEarly = do
+-- | The same fixture ended during the run's startup (#593), after the host is built and before the body's first statement.
+escapedDestructionStartupScenario ∷ Scope → IO () → IO ()
+escapedDestructionStartupScenario scope atParked = escapedDestruction scope atParked (Just (pure ()))
+
+escapedDestruction ∷ Scope → IO () → Maybe (IO ()) → IO ()
+escapedDestruction scope beforeBody endEarly = do
   rig ← newRig
   inside ← newTVarIO False
   never ← newTVarIO False
   trace ← newSinkTrace
   let recording = sinkFailingOn (Text.pack "never") trace
-  script (fakeDestroy (rigFake rig)) $ \_ → do
-    atomically (writeTVar inside True)
-    atomically (readTVar never >>= check)
-    unexpected "the interrupted destruction returned"
+  -- Armed in the body's first masked step, after the interrupter has been handed the owner (#593): until then the destruction
+  -- behaves, so a cancellation before the body begins leaves an exit with nothing to wait for.
+  let arm = script (fakeDestroy (rigFake rig)) $ \_ → do
+        atomically (writeTVar inside True)
+        atomically (readTVar never >>= check)
+        unexpected "the interrupted destruction returned"
   releasedEarly ← newTVarIO Nothing
   -- The destruction is only ever entered during the exit, when the main thread is no longer in the body, so both the
   -- interruption and the independent evidence come from a thread of the example's own. The evidence is what ends the exit's
@@ -286,16 +295,16 @@ escapedDestruction scope endEarly = do
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
   withDeferredThreadVia scope (pure ()) interrupter $ \_ handOver → case endEarly of
    Just atParked →
-    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _ → do
-      handOver owner
+    ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _ → do
+      mask_ (handOver owner >> arm)
       atParked
    Nothing → do
     (unverified, _) ← caughtAs @OwnerDestructionUnverified $
-      ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
         -- Handed over at once: the interrupter waits for the destruction to be entered, which happens only during the exit, so it
         -- acts at the same moment as before, and an example that fails or is cancelled before the run ends can never leave the
         -- exit waiting for the evidence it supplies.
-        handOver owner
+        mask_ (handOver owner >> arm)
         window ← theWindow host
         service ← handedOver host owner window
         awaitStanding owner service `shouldReturn` TargetUsable

@@ -11,6 +11,7 @@ module Test.GLFW.Owner.Fixture.Rig
   , ownedHost
   , ownedHostWith
   , ownedHostHooked
+  , ownedHostBeforeBody
   , ownedHostCaught
   ) where
 
@@ -159,6 +160,18 @@ ownedHostHooked
   → IO a
 ownedHostHooked hooks logger seam config ownerConfig action =
   asProcessMainThread seam (ownedHostRun hooks logger seam config ownerConfig action)
+
+-- | 'ownedHostWith' that runs an action on the main thread after the host is built and before the application's body begins (the
+-- host's own 'beforeConsumer' hook), so an example can end a run during its startup (#593).
+ownedHostBeforeBody
+  ∷ IO ()
+  → Logger
+  → Seam
+  → HostConfig
+  → GraphicsOwnerConfig Scene
+  → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
+  → IO a
+ownedHostBeforeBody beforeBody = ownedHostHooked Private.noHostHooks {Private.beforeConsumer = \_ → beforeBody}
 
 -- | 'ownedHost', catching inside the seam's own bound thread.
 --
