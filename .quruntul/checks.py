@@ -301,6 +301,51 @@ class AdapterChecks(unittest.TestCase):
         self.assertEqual(self.suites["macos-confinement-probe"].platforms, ["Darwin"])
         self.assertEqual(self.suites["linux-confinement-probe"].platforms, ["Linux"])
 
+    def test_the_repeated_run_probe_is_its_own_darwin_suite_and_never_selected_by_inputs(self):
+        # #586: the repeated-run probe runs the complete run-native-tests profile, and must not be folded into that
+        # suite by the adapter (suites are keyed by component), nor reached by any selection but an explicit request.
+        probe = self.suites["run-native-repeat-probe"]
+        native = self.suites["run-native-tests"]
+        self.assertEqual((probe.kind, probe.platforms, probe.data["group"]), ("probe", ["Darwin"], "test.run-native-repeat"))
+        self.assertEqual(probe.data["component"], "hetoimasia:test:run-native-repeat-probe")
+        self.assertEqual((native.kind, native.data["component"]), ("ci", "hetoimasia:test:run-native-tests"))
+        self.assertNotEqual(probe.identity, native.identity)
+        self.assertEqual([g["id"] for g in CATALOG["groups"] if "run-native-repeat-probe" in g.get("component", "")], ["test.run-native-repeat"])
+        # The planner on the real catalog, over the committed head, as a Darwin runner would plan it (on any other runner the
+        # Darwin-only group is `platform-inapplicable`, which is also not a selection, but is not the reason this asserts): a change inside the probe's own inputs and a change
+        # to a path no group claims (which widens non-optional selection to everything) leave it unselected.
+        revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
+        with tempfile.TemporaryDirectory() as scratch:
+            clone = Path(scratch) / "checkout"
+            subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(clone)],
+                           check=True, capture_output=True)
+            git = ["git", "-c", "user.name=check", "-c", "user.email=check@example.invalid"]
+            subprocess.run([*git, "checkout", "--quiet", revision], cwd=clone, check=True, capture_output=True)
+
+            def planned(path: str, text: str) -> dict:
+                subprocess.run([*git, "checkout", "--quiet", revision], cwd=clone, check=True, capture_output=True)
+                target = clone / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("a") as handle:
+                    handle.write(text)
+                subprocess.run([*git, "add", path], cwd=clone, check=True, capture_output=True)
+                subprocess.run([*git, "commit", "--quiet", "-m", "change"], cwd=clone, check=True, capture_output=True)
+                done = subprocess.run(
+                    [sys.executable, "-B", "tools/validation/plan.py", "--base", revision, "--head", "HEAD", "--runner-os", "Darwin", "--json"],
+                    cwd=clone, check=True, capture_output=True, text=True)
+                return json.loads(done.stdout)
+
+            own = planned("run-native-repeat/Main.hs", "-- a change inside the probe's own inputs\n")
+            entry = next(g for g in own["groups"] if g["id"] == "test.run-native-repeat")
+            self.assertEqual((entry["selected"], entry["reason"], entry["inputs_changed"]), (False, "optional-unrequested", True))
+            self.assertNotIn("test.run-native-repeat", [g["id"] if isinstance(g, dict) else g for g in own["selected"]])
+            unknown = planned("unclaimed-by-any-group.txt", "a path no group consumes\n")
+            self.assertEqual(unknown["unknown_inputs"], ["unclaimed-by-any-group.txt"])
+            entry = next(g for g in unknown["groups"] if g["id"] == "test.run-native-repeat")
+            self.assertEqual((entry["selected"], entry["reason"]), (False, "optional-unrequested"))
+            self.assertNotIn("test.run-native-repeat", [g["id"] if isinstance(g, dict) else g for g in unknown["selected"]])
+            self.assertTrue(unknown["selected"], "an unknown input widens the non-optional selection")
+
     def test_identities_are_stable_and_distinct(self):
         again = {s.id: s.identity for s in self.module.adapter().suites(Context())}
         self.assertEqual(again, {k: s.identity for k, s in self.suites.items()})

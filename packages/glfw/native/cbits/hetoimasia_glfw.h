@@ -15,6 +15,12 @@
  * main function. It reads the thread's identity and nothing else. */
 int hetoimasia_glfw_is_process_main_thread(void);
 
+/* glfwInit, with the platform's preparation around it: on Cocoa, a
+ * re-initialization in a process whose launch already finished cannot wait for
+ * that launch again (#586, docs/glfw.md Entry); elsewhere it is glfwInit. It
+ * answers what glfwInit answers, and runs on the process main thread. */
+int hetoimasia_glfw_init(void);
+
 /* glfwGetMonitors, glfwGetMonitorName, glfwGetVideoMode, and glfwGetVideoModes,
  * returning the pointer types the Haskell imports' generated wrappers declare.
  * GLFW owns what they point to, and the binding only reads and copies it

@@ -1,3 +1,5 @@
+{-# LANGUAGE CApiFFI #-}
+
 -- | Session lifecycles no shared session can host.
 --
 -- GLFW allows one session per process, and the shared fixture holds that one
@@ -57,7 +59,9 @@ import qualified Control.Concurrent.STM as STM
 import Control.Exception (ErrorCall (ErrorCall), SomeException, displayException, fromException, throw, try)
 import Control.Monad (forever, unless, void, when, (>=>))
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Foreign.C.Types (CInt (CInt))
 import Foreign.Ptr (nullFunPtr)
+import System.Info (os)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Failure
   ( FailureCause (..)
@@ -107,7 +111,7 @@ import Test.GLFW.Native.Child (ChildEnd (..), Launched (..), launchCommand, term
 import Test.GLFW.Native.Consent (Consent, Refusal, refusalMessage)
 import Test.GLFW.Native.Support (Gate, admit, consentBackend, consentSessionConfig, hostBackend)
 import qualified Test.GLFW.Native.WaylandScenarios as WaylandScenarios
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, it, pendingWith, shouldBe, shouldContain, shouldSatisfy)
 
 -- | The argument that makes this executable a private-session child.
 privateSessionFlag ∷ String
@@ -132,6 +136,11 @@ spec gate = describe "private sessions in a child process" $ do
 
   it "keeps a second real window live, resizable, and observing while the first's owner retires, and creates or destroys no native window across a detach and reattach" $
     privateScenarioReporting gate "public-attachments"
+
+  it "re-initializes on Cocoa in twenty sessions while LaunchServices answers that the launch has not finished" $
+    if os == "darwin"
+      then privateScenarioReporting gate "cocoa-reinitialization"
+      else pendingWith "Cocoa only: the redundant launch wait is a Cocoa initialization (docs/glfw.md, Initialization on Cocoa)"
 
   it "fails a child that outlives its deadline, terminating and reaping it, however much success it printed first" $ do
     _ ← admit gate
@@ -256,6 +265,11 @@ scenarios consent =
       , ("enters a session after the failed initialization rolled back", enterAndLeave consent)
       ]
     )
+  , ( "cocoa-reinitialization"
+    , [ ("a first session enters and leaves, so the process's launch is real and finished", enterAndLeave consent)
+      , ("twenty later sessions complete while the launch is reported unfinished, each under a five-second deadline", forcedReinitializations consent)
+      ]
+    )
   , ( deadlineScenario
     , [("prints this scenario's success line and then never exits, as a hung child would", neverExits)]
     )
@@ -325,6 +339,32 @@ enterAndLeave consent = do
   unless (backend == consentBackend consent) $
     failCheck ("the session selected " <> show backend <> ", not " <> show (consentBackend consent))
   pure ("backend " <> show backend <> ", asynchronous reports " <> show reports)
+
+-- | Twenty sessions in sequence over the production table, after the override of the launch flag, each with the
+-- deadline the command arms (here five seconds, so a regression ends the child with the documented status and the
+-- diagnostic below rather than after the case's two minutes). GLFW's @[NSApp run]@ for a launch that already
+-- finished never returns, so every one of them blocks unless the shim's prevention stops it.
+forcedReinitializations ∷ Consent → IO String
+forcedReinitializations consent = do
+  forced ← c_forceUnfinishedLaunch
+  when (forced /= 1) $ failCheck "the launch flag could not be overridden on this platform"
+  let config =
+        (consentSessionConfig consent)
+          { initializationDeadline =
+              Just
+                InitializationDeadline
+                  { deadlineBoundMicroseconds = 5_000_000
+                  , deadlineReport = \expiry →
+                      hPutStrLn stderr ("glfw-native-tests: initialization of backend " <> Text.unpack (expiryBackend expiry) <> " exceeded its bound of " <> show (expiryBoundMicroseconds expiry) <> " microseconds")
+                  }
+          }
+  backends ← mapM (const (withSession config (pure . sessionBackend))) [1 ∷ Int .. 20]
+  unless (all (== consentBackend consent) backends) $
+    failCheck ("a session selected " <> show (filter (/= consentBackend consent) backends))
+  pure (show (length backends) <> " sessions completed")
+
+foreign import capi unsafe "hetoimasia_glfw_test_cocoa.h hetoimasia_glfw_test_force_unfinished_launch"
+  c_forceUnfinishedLaunch ∷ IO CInt
 
 -- | A production table whose size callback copies a payload that raises, so the
 -- fault is raised inside the model's trampoline while GLFW is calling it.

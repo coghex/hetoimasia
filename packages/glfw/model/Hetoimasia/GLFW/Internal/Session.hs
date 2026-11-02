@@ -42,7 +42,9 @@
 -- It takes an opaque 'SessionIntegration' — made by the Vulkan interop
 -- component from the loader entry point the Vulkan binding dispatches through,
 -- or scripted by the test seam — separately from 'SessionConfig', which stays a
--- pure window configuration that carries no action. The capability is admitted
+-- pure configuration: the one action it carries is the application's
+-- 'InitializationDeadline' report, injected policy rather than a capability
+-- over GLFW's state. The capability is admitted
 -- right after the guard is claimed, before any native call: a stale, foreign, or
 -- already-used capability is refused there. It is applied after the
 -- initialization hints and before @glfwInit@, and its release restores GLFW's
@@ -227,6 +229,10 @@ module Hetoimasia.GLFW.Internal.Session
   , backendText
   , SessionConfig (..)
   , defaultSessionConfig
+  , InitializationDeadline (..)
+  , InitializationExpiry (..)
+  , initializationTimeoutStatus
+  , reportGrace
 
     -- * The native operations a session performs
   , Native (..)
@@ -370,6 +376,13 @@ import Hetoimasia.GLFW.Internal.Connection
   , ConnectionStatus (..)
   , EventBoundary
   )
+import Hetoimasia.GLFW.Internal.Deadline
+  ( InitializationDeadline (..)
+  , InitializationExpiry (..)
+  , guardInitialization
+  , initializationTimeoutStatus
+  , reportGrace
+  )
 import Hetoimasia.GLFW.Internal.Control
   ( WindowCapabilities
   , WindowOperation (..)
@@ -432,12 +445,19 @@ backendText Wayland = "wayland"
 data SessionConfig = SessionConfig
   { requestedBackend ∷ !(Maybe Backend)
     -- ^ 'Nothing' selects the backend this platform supports.
+  , initializationDeadline ∷ !(Maybe InitializationDeadline)
+    -- ^ The application's process-level deadline on native initialization, or
+    -- 'Nothing' for none. It is policy the application owns (vision V-3): the
+    -- bound, and the report it injects over its own logger. When the bound
+    -- passes before @glfwInit@ returns, the report runs for at most
+    -- 'reportGrace' and the process ends with 'initializationTimeoutStatus',
+    -- without unwinding. See "Hetoimasia.GLFW.Internal.Deadline".
   }
   deriving (Eq, Show)
 
--- | The platform's own backend.
+-- | The platform's own backend, and no deadline.
 defaultSessionConfig ∷ SessionConfig
-defaultSessionConfig = SessionConfig {requestedBackend = Nothing}
+defaultSessionConfig = SessionConfig {requestedBackend = Nothing, initializationDeadline = Nothing}
 
 -- | GLFW's opaque window object. A pointer to it never leaves this package.
 data NativeWindow
@@ -517,6 +537,12 @@ data Native = Native
   , nativeSetInitHints ∷ Backend → IO ()
     -- ^ Select the platform, and keep the working directory unchanged.
   , nativeInitialize ∷ IO Bool
+    -- ^ Initialize GLFW. On the process main thread, and it may block there
+    -- without returning; 'initializationDeadline' is what bounds it.
+  , nativeExitProcess ∷ Int → IO ()
+    -- ^ End the process with this status at once, without unwinding, running
+    -- an exit handler, or waiting for any thread. It does not return in
+    -- production; the test seam records the status and returns.
   , nativeCurrentBackend ∷ IO (Maybe Backend)
   , nativeConnectionProbe ∷ IO (Either Text ConnectionProbe)
     -- ^ Resolve the private connection-status probe of the initialized
@@ -1086,7 +1112,7 @@ assembleSession native config integration = do
     acquirePart
       "glfw terminate"
       (releaseRank 3)
-      (initialize native capture teardown backend integration)
+      (initialize native config capture teardown backend integration)
       (\_ → terminate native capture owner teardown live backend)
   restoredStep $ do
     raiseReported initializeOperation (backendIdentifiers backend) NativeCallReturned initialized
@@ -1206,14 +1232,19 @@ attachCallback native capture teardown = do
   nativeAttachErrorCallback native storage `onException` atomicWriteIORef teardown False
   pure storage
 
-initialize ∷ Native → Capture → IORef Bool → Backend → Maybe SessionIntegration → IO Reports
-initialize native capture teardown backend integration = do
+initialize ∷ Native → SessionConfig → Capture → IORef Bool → Backend → Maybe SessionIntegration → IO Reports
+initialize native config capture teardown backend integration = do
   settleStrayOwnerReports capture
   nativeSetInitHints native backend
   mapM_ installLoader integration
   -- An initialization that raises leaves GLFW's state unknown; nothing is
   -- registered to terminate it, so the guard is poisoned instead.
-  initialized ← nativeInitialize native `onException` atomicWriteIORef teardown False
+  -- The deadline brackets the one call that can block the main thread for good,
+  -- and nothing else: it is retired, and its thread joined, however the call
+  -- ends.
+  initialized ←
+    guardInitialization (nativeExitProcess native) (backendText backend) (initializationDeadline config) (nativeInitialize native)
+      `onException` atomicWriteIORef teardown False
   reports ← takeOwnerReports capture
   unless initialized $
     throwFailure

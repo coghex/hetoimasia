@@ -40,6 +40,9 @@ module Hetoimasia.Run.Graphics
   , Observation (..)
   , noObservation
   , hostConfiguration
+  , initializationBoundMicroseconds
+  , productionInitializationDeadline
+  , withInitializationDeadline
   , reportResolution
   , validationFields
   , droppedItems
@@ -51,7 +54,9 @@ import Control.Monad (join, unless)
 import Data.List (partition)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Log (Component, logInfo, logWarning, unsafeComponent)
+import System.Info (os)
+import Hetoimasia.Foundation.Log (Component, Logger, flushLogger, logError, logInfo, logWarning, unsafeComponent)
+import Hetoimasia.GLFW.Session (InitializationDeadline (..), InitializationExpiry (..), SessionConfig (..))
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureConfig (..)
@@ -118,6 +123,7 @@ import Hetoimasia.Run.Session
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
   , UpdateSchedule (NoUpdateDemand)
+  , HostConfig (..)
   , defaultHostConfig
   , defaultScheduledHooks
   , runGraphicsOwnerApplication
@@ -161,7 +167,7 @@ runNativeWith ∷ Observation → Environment → ValidationChoice → LoggingLi
 runNativeWith observation environment choice lifetime stop link prepared = do
   textureConfiguration ← either (\refused → ioError (userError ("the profile cannot be mapped to the native graphics: " <> show refused))) pure (configurationFor (preparedProfile prepared))
   scenes ← newSceneSession
-  let config = hostConfiguration observation choice textureConfiguration scenes
+  let config = withInitializationDeadline logger (hostConfiguration observation choice textureConfiguration scenes)
   verdictCell ← newIORef Nothing
   slot ← newIORef Nothing
   -- The application, the capture of whatever ends it, the stop of the session and its join are one masked sequence
@@ -240,6 +246,47 @@ hostConfiguration observation choice textureConfiguration scenes =
   where
     capture = defaultCaptureConfig {captureTextBudget = 16384}
     base = vulkanHostConfig (defaultHostConfig []) capture (configurationBudgets textureConfiguration) (scenesInitial scenes)
+
+-- | The command's policy on native initialization (#586): the process is ended if @glfwInit@ has not returned within
+-- 'initializationBoundMicroseconds'. The policy is the application's (vision V-3): the package supplies the guard and the
+-- exit, and this injects the bound and the diagnostic over the command's own logger. Applied to the host's session
+-- configuration, so it covers the first initialization of the process and every later one. It is armed on macOS only
+-- (the Cocoa initialization is the one known to block); Linux's initialization is unchanged by it.
+withInitializationDeadline ∷ Logger → VulkanHostConfig scene → VulkanHostConfig scene
+withInitializationDeadline logger config
+  | os /= "darwin" = config
+  | otherwise = config {vulkanHost = host {hostSessionConfig = session {initializationDeadline = Just (productionInitializationDeadline logger)}}}
+  where
+    host = vulkanHost config
+    session = hostSessionConfig host
+
+-- | The bound: ten seconds. The slowest healthy @glfwInit@ measured on the pinned macOS profile (a first initialization,
+-- which waits for the real launch notification, or a later one, among about 7,400 measured, some under concurrent
+-- application launches) took 0.094 s, so the bound is more than a hundred times it: a slow but healthy start is not
+-- killed. It stays well inside the 30-second budget of the complete native profile. docs/glfw.md, Entry step 6.
+initializationBoundMicroseconds ∷ Int
+initializationBoundMicroseconds = 10_000_000
+
+-- | What is said when the bound passes: an error record over the command's logger, then a best-effort flush of it. It
+-- states the observed condition, that initialization had not returned within the bound, and not a cause; the guard
+-- waits for this for at most its grace period and ends the process whether or not it returns, throws or blocks.
+productionInitializationDeadline ∷ Logger → InitializationDeadline
+productionInitializationDeadline logger =
+  InitializationDeadline
+    { deadlineBoundMicroseconds = initializationBoundMicroseconds
+    , deadlineReport = \expiry → do
+        logError
+          logger
+          component
+          "native initialization exceeded its bound; ending the process"
+          [ ("backend", expiryBackend expiry)
+          , ("bound_microseconds", Text.pack (show (expiryBoundMicroseconds expiry)))
+          , ("exit_status", Text.pack (show (expiryStatus expiry)))
+          , ("observed", "glfwInit had not returned")
+          , ("see", "docs/glfw.md#entry")
+          ]
+        flushLogger logger
+    }
 
 -- | The window provider's stop and fatal endpoints, through the link: a genuine native close is the session's
 -- idempotent normal stop, a failure of retirement a @cleanup_failure@ and any other fatal fault a
