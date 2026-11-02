@@ -60,7 +60,7 @@ import Test.Run.Native.Command (executableVariable)
 import qualified Test.Run.Native.Command as Command
 import Test.Run.Native.Consent (Consent (..), describeConsent, readConsent, refusalMessage)
 import Test.Run.Native.Env (Env (..), Hold (..))
-import Test.Run.Native.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread)
 import Test.Run.Native.X11 (defaultX11)
 import qualified Test.Run.Native.Library as Library
 import qualified Test.Run.Native.Milestone as Milestone

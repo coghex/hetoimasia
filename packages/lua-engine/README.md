@@ -1392,7 +1392,7 @@ A role whose release failed stays `stopping`: retirement is unproven, the failur
 | `latchTerminalFailure` | the whole session stops; it is the guard's, not an ordinary role failure |
 | `requestStop` | the whole session stops; nothing is a failure |
 
-An eventual stop cannot erase an earlier failure: the outcome ranks **failure over interruption over a normal quit over success**, whatever order they arrive in, and the quit and interruption flags are kept beside it. A required request's failure latches at its eligible position whether or not Lua ever polled the request (the host's rule); the coordinator is told as the failing instance's ending begins and acts then, whatever a provider is slow to retire.
+An eventual stop cannot erase an earlier failure: the outcome ranks **failure over interruption over a normal quit over success**, whatever order they arrive in, and the quit and interruption flags are kept beside it. A required request's failure latches at its eligible position whether or not Lua ever polled the request (the host's rule), and it is the instance's primary failure over an uncaught script error that a running invocation raised on it, in whichever order the two arrived (the script's error is a secondary of the settled record, accounted once beside it); the coordinator is told as the failing instance's ending begins and acts then, whatever a provider is slow to retire.
 
 ### The failure record and the engine report
 

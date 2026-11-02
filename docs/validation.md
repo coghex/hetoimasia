@@ -690,7 +690,8 @@ calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
   header are not code, so they are not sites; qualified calls are.
 - **A per-file count ratchet.** `tools/validation/owned_starts_baseline.json`
   records, per file, how many unowned starts it had when the guard was introduced
-  (552 in 192 files, written by `owned_starts.py bootstrap`). Each file's count
+  (555 in 193 files, written by `owned_starts.py bootstrap`: the 552 found when the
+  guard was introduced plus the three starts `tools/test/RunnerIdentity.hs` brought). Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven
@@ -698,7 +699,17 @@ calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
   an individual site, so a new unowned start that replaces another in the same
   file is a review responsibility. `owned_starts.py ratchet --base REV` fails a
   baseline that adds an entry or raises a count relative to the review base; a
-  base without a baseline is the explicit bootstrap.
+  base without a baseline is the explicit bootstrap. The planning job
+  runs that command against its comparison base, because it holds the history
+  (the test job's shallow checkout cannot resolve the base, so the example there
+  is pending); a base that cannot be resolved fails.
+- **What the scanner reads.** It works on text. Layout (the module body at any
+  indentation), semicolons after imports, nested block comments, string and
+  character literals, qualified and aliased calls, backticks, sections and CPP
+  lines are read. A module body in explicit braces, a multi-line string, a
+  source of a kind it does not read (`.lhs`, `.hsc`, ...), a package that
+  enables Template Haskell or quasi-quotes, and a file that enables them and
+  names a start primitive are rejected with an error instead of being passed.
 - **Exemptions are by binding and exact.** An already-owned helper is exempted
   in `owned_starts.json` by file and top-level binding with the number of starts
   it holds and its reason; a new raw start elsewhere in the same file is counted

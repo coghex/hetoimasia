@@ -115,6 +115,18 @@ jobs:
           # is a tested tool rather than shell arithmetic here.
           python3 tools/validation/range.py "${arguments[@]}" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Hold the owned-start baseline against the review base
+        env:
+          # Through the environment, as the steps the examples extract take it.
+          BASE: ${{ steps.range.outputs.base }}
+        run: |
+          set -euo pipefail
+          # This job holds the history both commits live in (fetch-depth 0
+          # above), which the test job's default-depth checkout does not, so
+          # the baseline's no-growth rule is enforced here rather than skipped
+          # where the base is absent. A base that cannot be resolved fails.
+          python3 tools/validation/owned_starts.py ratchet --base "$BASE"
+
       - name: Capture the validation request
         env:
           # The body reaches the file through the environment and never through

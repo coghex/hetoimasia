@@ -16,8 +16,8 @@
 -- callback latches it and the session stops in order: exit 0.
 module Test.Run.Native.Library (spec, shippedContent, copyTree) where
 
-import Control.Concurrent (ThreadId, forkIO, forkIOWithUnmask, killThread, myThreadId, throwTo, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryReadMVar)
+import Control.Concurrent (forkIOWithUnmask, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM
   ( TVar
   , atomically
@@ -40,7 +40,7 @@ import Data.Foldable (traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, isPrefixOf)
 import Data.Maybe (fromMaybe, isJust)
-import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), threadStatus)
+import GHC.Conc (ThreadStatus (ThreadBlocked), threadStatus)
 import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -79,6 +79,7 @@ import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldSatisfy)
 import Test.Run.Native.Env (Env (..), evidence)
+import Test.Support.Cancel (withCancellationAfter, withCancellationWhenBlocked)
 
 -- | The shipped content's folder, from the repository root the runner starts the suite in.
 shippedContent ∷ FilePath
@@ -221,10 +222,11 @@ spec env = describe "the command's production composition" $ do
         ended <- newEmptyMVar
         began <- newEmptyMVar
         gate <- newEmptyMVar
-        caller <- myThreadId
-        -- Cancel the example once the command has begun but before it publishes its endpoint, then let it go on.
-        _ <- forkIO (takeMVar began >> throwTo caller UserInterrupt >> putMVar gate ())
-        outcome <- try @SomeException (runWithEnding env folder ended (putMVar began () >> takeMVar gate) (\_ _ _ → pure ()))
+        -- Cancel the example once the command has begun but before it publishes its endpoint, then let it go on. The
+        -- helper is owned by this scope (#584): an example that ends before the command has begun does not leave it
+        -- waiting. The helper never waits at the gate, it only opens it, so it needs nothing opened for it to end.
+        outcome <- withCancellationAfter (takeMVar began) (openGate gate) $
+          try @SomeException (runWithEnding env folder ended (putMVar began () >> takeMVar gate) (\_ _ _ → pure ()))
         either (\failure → show failure) (const "no failure") outcome `shouldBe` "user interrupt"
         -- The command had ended when the example returned: nothing outlives it.
         tryReadMVar ended >>= (`shouldBe` Just ())
@@ -263,19 +265,16 @@ spec env = describe "the command's production composition" $ do
         ended <- newEmptyMVar
         gate <- newEmptyMVar
         order <- newIORef ([] :: [String])
-        caller <- myThreadId
         let note line = atomicModifyIORef' order (\l -> (l <> [line], ()))
-        -- After the command has ended, and once the caller is blocked sending its end to the held scenario, cancel it.
-        _ <- forkIO $ do
-          readMVar ended
-          blockedSending caller
-          throwTo caller UserInterrupt
-          putMVar gate ()
-        outcome <- try @SomeException $ runWithEnding env folder ended (pure ()) $ \watch host _ -> do
-          _ <- awaitWindow host
-          atomically (writeTVar (watchFail watch) True)
-          -- Held where an end cannot reach it until the example lets it go.
-          uninterruptibleMask_ (takeMVar gate) `finally` note "scenario ended"
+        -- After the command has ended, and once the caller is blocked sending its end to the held scenario, cancel it. The
+        -- helper is owned by this scope (#584): an example that fails before it ever blocks sending (the window never
+        -- appears) leaves nothing running or spinning.
+        outcome <- withCancellationWhenBlocked (readMVar ended) (openGate gate) $
+          try @SomeException $ runWithEnding env folder ended (pure ()) $ \watch host _ -> do
+            _ <- awaitWindow host
+            atomically (writeTVar (watchFail watch) True)
+            -- Held where an end cannot reach it until the example lets it go.
+            uninterruptibleMask_ (takeMVar gate) `finally` note "scenario ended"
         note "runWith left"
         either (\failure -> show failure) (const "no failure") outcome `shouldSatisfy` isPrefixOf "user interrupt"
         readIORef order >>= (`shouldBe` ["scenario ended", "runWith left"])
@@ -561,10 +560,9 @@ capacityScript =
     , "}"
     ]
 
--- | Wait until the thread is blocked in a @throwTo@ (an end being sent that has not yet been received).
-blockedSending :: ThreadId -> IO ()
-blockedSending thread = threadStatus thread >>= \status ->
-  if status == ThreadBlocked BlockedOnException then pure () else yield >> blockedSending thread
+-- | Open a gate a held thread waits at, at most once: the idempotent release a scope runs on every way out.
+openGate :: MVar () -> IO ()
+openGate = void . flip tryPutMVar ()
 
 -- | A logger that writes nothing: the run's diagnostics are not what these examples observe.
 silentLogger :: Logger

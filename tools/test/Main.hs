@@ -11,6 +11,8 @@ import qualified ApprovalProvenance
 import qualified CiImage
 import qualified DismissalStep
 import qualified Execution
+import qualified OwnedStarts
+import qualified OwnedThread
 import qualified Packaging
 import qualified PlanStep
 import qualified QuruntulAdapter
@@ -91,6 +93,8 @@ main = hspec $ do
   VulkanProof.spec
   X11Window.spec
   Packaging.spec
+  OwnedThread.spec
+  OwnedStarts.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a
 withRepository alias action = do
