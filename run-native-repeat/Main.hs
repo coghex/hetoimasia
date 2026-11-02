@@ -25,6 +25,8 @@
 -- * @HETOIMASIA_REPEAT_OUTPUT@, where each run's output, samples and the report are kept (default a new directory in
 --   the temporary directory, printed).
 -- * @HETOIMASIA_REPEAT_BOUND_SECONDS@, one run's bound (default 45; a healthy run takes 8 to 13 seconds).
+-- * @HETOIMASIA_REPEAT_EXAMPLES@, how many examples the whole profile has (default 59, its size when this was written; a run
+--   with fewer is not a pass). Set it when the profile grows.
 module Main (main) where
 
 import Control.Monad (unless, when)
@@ -221,6 +223,7 @@ realBatch = do
   runs ← maybe 59 id . (>>= readMaybe) <$> lookupEnv "HETOIMASIA_REPEAT_RUNS"
   untilHang ← (== Just "1") <$> lookupEnv "HETOIMASIA_REPEAT_UNTIL_HANG"
   bound ← maybe 45 id . (>>= readMaybe) <$> lookupEnv "HETOIMASIA_REPEAT_BOUND_SECONDS"
+  examples ← maybe 59 id . (>>= readMaybe) <$> lookupEnv "HETOIMASIA_REPEAT_EXAMPLES"
   checkout ← lookupEnv "HETOIMASIA_REPEAT_CHECKOUT" >>= maybe getCurrentDirectory pure
   output ← lookupEnv "HETOIMASIA_REPEAT_OUTPUT" >>= maybe fresh pure
   createDirectoryIfMissing True output
@@ -242,7 +245,7 @@ realBatch = do
           , trialDirectory = checkout
           , trialBoundSeconds = bound
           , trialSample = \pid file → ["sample", show pid, "5", "-file", file]
-          , trialExpectedExamples = 54
+          , trialExpectedExamples = examples
           , trialSampleBoundSeconds = 30
           , trialStopGraceSeconds = 10
           }
