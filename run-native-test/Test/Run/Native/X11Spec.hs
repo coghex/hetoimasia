@@ -4,7 +4,7 @@
 -- reaped the helper process before it returns, so a capture can never race a helper that is still running. A call that
 -- times out leaves through the same release ('Test.Run.Native.Child.withChild'), so this one example covers both.
 --
--- The call runs on an owned worker ('Test.Run.Native.Owned.withOwnedThread'): however the example ends (the helper never
+-- The call runs on an owned worker ('Test.Support.Owned.withOwnedThread'): however the example ends (the helper never
 -- publishing its pid, an assertion, a timeout of the example), the worker is stopped and joined, and with it the helper
 -- process it owns is reaped, before the temporary directory goes.
 module Test.Run.Native.X11Spec (spec) where
@@ -19,7 +19,7 @@ import System.Posix.Signals (nullSignal, signalProcess)
 import System.Posix.Types (CPid (..))
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, it, shouldSatisfy)
-import Test.Run.Native.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread)
 import Test.Run.Native.X11 (X11 (..), runBounded)
 
 spec ∷ Spec

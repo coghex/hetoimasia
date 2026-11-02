@@ -40,6 +40,9 @@ consumed =
   , ("tools/ci-image/compositor.pin", "provision.sh sources it")
   , ("tools/ci-image/toolchain.pin", "provision.sh sources it")
   , ("tools/validation/plan.py", "Validation.hs, Execution.hs, Reuse.hs, TimingStep.hs, CiImage.hs, and PlanStep.hs run it")
+  , ("tools/validation/owned_starts.py", "OwnedStarts.hs runs it against fixture trees and, in a checkout, against the repository")
+  , ("tools/validation/owned_starts.json", "owned_starts.py reads the scan's primitives, exclusions and exemptions from it")
+  , ("tools/validation/owned_starts_baseline.json", "owned_starts.py reads the recorded debt from it")
   , ("tools/validation/plan_repository.py", "plan.py, run.py, range.py, and aggregate.py load it")
   , ("tools/validation/plan_cabal.py", "plan.py and run.py load it")
   , ("tools/validation/plan_catalog.py", "plan.py and run.py load it")
@@ -94,7 +97,8 @@ checkoutOnly ∷ [(FilePath, String)]
 checkoutOnly =
   [ (".quruntul/adapter.py", "QuruntulAdapter.hs checks it through .quruntul/checks.py, against the checkout's Git history")
   , (".quruntul/checks.py", "QuruntulAdapter.hs runs it; it reads the checkout's Git history")
-  , ("cabal.project", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
+  , ("tools/test-support/src/Test/Support/Owned.hs", "OwnedThread.hs reads its imports to hold the facility to base alone, as a sibling package's source")
+  , ("cabal.project", "VulkanProof.hs resolves the packages it names to keep the binding off the floor; OwnedStarts.hs scans every package it lists")
   , ("cabal.project.cpu", "VulkanProof.hs resolves the packages it names to keep the binding off the floor")
   , ( "packages/gpu-vulkan/native/hetoimasia-gpu-vulkan-native.cabal"
     , "VulkanProof.hs reads the native package's dependencies beside the ordinary projects, as a sibling package"

@@ -154,7 +154,7 @@ import Hetoimasia.LuaEngine.Texture (specIoWorkers, textureSpec, withTexturePipe
 import Hetoimasia.Run.Boot (Prepared (..), withPrepared)
 import Hetoimasia.Run.Serve (Owner (..), serveSpawned, runOwned)
 import Hetoimasia.Run.Settle (answering, combine, isAsynchronous)
-import Test.Run.Native.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread)
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
   , UpdateSchedule (NoUpdateDemand)
