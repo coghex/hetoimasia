@@ -1,38 +1,38 @@
 # Guide cursor
 
-Resume after: `b7f3b56e03887d6020e5a04891ce02bdf728a55c` · [2026-10-21T140406Z-b7f3b56](2026-10-21T140406Z-b7f3b56.md) · 2026-10-21T14:17:51+00:00
+Resume after: `ef1b9adfda4f5e125a86c625a01ffc1e38af9b89` · [2026-11-01T234207Z-ef1b9ad](2026-11-01T234207Z-ef1b9ad.md) · 2026-11-02T00:13:49Z
 Covered beyond the boundary: none
 
 ## Next
 
-Trusted milestone delivered and owner-accepted. Reconcile #145 and the design's delivered-state notes, then choose a named consumer (recommended) or renewed Q-5 feasibility for the next scoped design discussion. This review does not start that work.
+Finish the already-requested startup/helper/executable-freshness follow-ups and reconcile completed-arc records. Then choose a named gameplay-state consumer for a narrow design discussion; no successor feature slice is approved by this review.
 
 ## Open findings
 
-None from this run. Previous 2026-10-20T150446Z-4e70eff/GUIDE-1 was filed as #505 and repaired by #506; #508 repairs related assertion swallowing. Historical report unchanged.
+None newly established. Prior GUIDE-1 was filed as #505 and repaired by #506/#508; historical reports remain unchanged.
 
 ## Pending handoff
 
-- All fourteen pending PRs/specs and #504/#506/#508/#502/#509 are assessed at this pin; four earlier PRs remain inherited. No requested item remains pending.
-- D-23 qualification is fixed-build/platform/configuration/input. D-48's independent post-cutoff failures are not trace-equality qualified; future consumers must not infer that guarantee.
-- #145 has seven merged children still unchecked (#492/#493/#494/#498/#503/#499/#500) and a stale fifteen-slice count. Design lacks LUA-31's delivered entry, places #499 under LUA-29, and retains stale readiness/handoff text; exact notes in report. Report only: neither edited.
-- Q-5 is inconclusive on both platforms; LUA-9–13/16/17 stay gated. Full Lua epic remains incomplete.
-- #446 stays deferred until a named render-to-texture consumer and Q-10; text remains an alternative for a named consumer. Historical #360/#362 apparatus coverage remains incomplete.
-- End recheck found nothing moved: master at pin, no issue/specification, PR or published vision changes. Conclusions remain snapshot-scoped.
-- No probes, builds, suites or GHCi ran in this review. Linux exact-tree CI and published macOS receipts were reused. Owner docs-push rule supersedes V-11's older one-PR docs sentence. No step-8 walk or tracker changes.
+- M1 #514 is delivered: all 28 children merged. Qualification is scoped, not a whole-project reliability claim; macOS glfwInit hung in 4/14 recorded full attempts. Three owner-requested drafters own startup, unowned helpers and stale executable checks; do not duplicate.
+- M1 design header/count/processing prose and LFE-25 pending confirmations need reconciliation/archive; native coverage has a stale pending-merge heading. M-6 summary lacks command PID/window identity/actual metrics: recover existing logs or label absent, no rerun ordered.
+- Earlier #145 checklist/count/LUA-31/LUA-30 gaps are resolved by the revised trusted closure. Remaining historical successor/closure wording and archive disposition are report-only notes. Confinement stays outside the active roadmap.
+- M1 has no state/RNG/replay or whole-session determinism guarantee. D-23/D-48 remain the lua-domains sample's limited qualification; native zero-area framebuffer remains unexercised on both receipts' platforms.
+- #446 stays deferred on its named consumer/Q-10; historical #360/#362 apparatus coverage remains incomplete. Existing report-processing work remains separate.
+- End recheck 2026-11-02T00:13:49Z: no remote head, issue/specification, PR or published vision movement; three concurrent drafts await signoff and their recorded owner choices.
+- No probes, builds, tests or desktop operations ran; static analysis and identified retained receipts only. No tracker changes or step-8 walk.
 
 ## Alignment
 
 | Principle | Reading | Since | Note |
 |---|---|---|---|
-| V-1 | aligned | 2026-10-21T140406Z-b7f3b56 | Application-owned world and commit policy; narrow engine services. |
-| V-2 | aligned | 2026-10-21T140406Z-b7f3b56 | Concrete accounting prerequisite delivered; next consumer is a design choice. |
-| V-3 | aligned | 2026-10-21T140406Z-b7f3b56 | Owner acknowledgement, engine leases and provider retirement preserve completion. |
-| V-4 | aligned | 2026-10-21T140406Z-b7f3b56 | Last-good-state failure and explicit host/cleanup authority. |
-| V-5 | aligned | 2026-10-21T140406Z-b7f3b56 | Bounded reservations and logical placement compose through the sample. |
-| V-6 | aligned | 2026-10-16T165532Z-edefc39 | Not exercised here; prior GPU ownership reading retained. |
-| V-7 | aligned | 2026-10-21T140406Z-b7f3b56 | Protected coroutine foreign boundary; no new performance guarantee. |
-| V-8 | aligned | 2026-10-21T140406Z-b7f3b56 | Exact-tree Linux CI, identified macOS receipts; confinement unqualified. |
-| V-9 | aligned | 2026-10-21T140406Z-b7f3b56 | Trusted milestone delivered within D-23/D-48; mod branch remains gated. |
-| V-10 | aligned | 2026-10-21T140406Z-b7f3b56 | Was drifting; #506/#508 repair gate unwind and swallowed assertions. |
-| V-11 | aligned | 2026-10-21T140406Z-b7f3b56 | Pinned inputs, proven evidence reuse and owner-authorized docs lane. |
+| V-1 | aligned | 2026-11-01T234207Z-ef1b9ad | Generic launcher and Lua-authored quad; CPU engine/content independent of graphics. State store remains explicitly unavailable. |
+| V-2 | aligned | 2026-11-01T234207Z-ef1b9ad | Concrete M1 consumer drove bounded services; missing offscreen/validation seams were escalated as #576/#579. |
+| V-3 | aligned | 2026-11-01T234207Z-ef1b9ad | Atomic admissions, protected stop/join and separate texture interest, submission and presentation retirement. |
+| V-4 | aligned | 2026-11-01T234207Z-ef1b9ad | Ordinary pre-action refusal, optional vs latched required failure and primary/cleanup evidence remain distinct. |
+| V-5 | aligned | 2026-11-01T234207Z-ef1b9ad | Two-worker content service, assigned logical result positions and copied UI scenes; bounded visibility follow-up. |
+| V-6 | aligned | 2026-11-01T234207Z-ef1b9ad | Surface-free targets share scene identities/barrier/ledger; actual device readiness and completion govern release. |
+| V-7 | aligned | 2026-11-01T234207Z-ef1b9ad | Native boundaries reused; diagnostic writer has explicit lifetime and refusal serialization. No performance inference. |
+| V-8 | aligned | 2026-11-01T234207Z-ef1b9ad | Linux X11 captures and local macOS confirmations are separate; known init hang and missing M-6 traceability limit confidence. |
+| V-9 | aligned | 2026-11-01T234207Z-ef1b9ad | Trusted filtered game/mod direction published; M1 lacks state/replay/RNG or whole-session determinism. |
+| V-10 | aligned | 2026-11-01T234207Z-ef1b9ad | Real interpreter and causal-gate assertions plus independent pixels; late review audits improved evidence. No probes in this guide. |
+| V-11 | aligned | 2026-11-01T234207Z-ef1b9ad | Pinned evidence reuse verified where cited; exact approved-head owner gate retained. Owner docs-push agreement supersedes older V-11 docs sentence. |
