@@ -9,7 +9,6 @@
 -- GLFW or finds a Vulkan loader.
 module Test.GLFW.Interop (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
@@ -240,7 +239,7 @@ testExtensionsOwnerOnly = do
   (fromWorker, afterEnd) ← asProcessMainThread seam $ do
     (worker, retained) ←
       integrated seam integration $ \session → do
-        worker ← onThread forkIO (caughtAs (requiredInstanceExtensions session))
+        worker ← onThread (caughtAs (requiredInstanceExtensions session))
         pure (worker, session)
     ended ← caughtAs (requiredInstanceExtensions retained)
     pure (fst worker, fst ended)

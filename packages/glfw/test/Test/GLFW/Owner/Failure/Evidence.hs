@@ -4,8 +4,7 @@
 -- destruction is retained rather than disposed of.
 module Test.GLFW.Owner.Failure.Evidence (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM
   ( stateTVar
   , atomically
@@ -13,10 +12,12 @@ import Control.Concurrent.STM
   , newTVarIO
   , readTVar
   , readTVarIO
+  , throwSTM
   , writeTVar
   )
-import Control.Exception (finally, throwIO)
+import Control.Exception (finally, mask, mask_, throwIO, try, uninterruptibleMask_)
 import Control.Monad (forM_, void, when)
+import Data.IORef (newIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as Text
@@ -44,18 +45,23 @@ import Test.GLFW.Owner.Fixture.Drive
   , describeStart
   , awaitConstructed
   , handedOver
+  , rescuePublishing
+  , trackedHandedOver
   , observed
   , pumpUntilRetired
   , sampledObservation
   , theWindow
   )
-import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
+import Test.GLFW.Owner.Fixture.Fake (Fake (..), script, scriptAll, scriptSTM)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene (..), Scripted (..), journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig
   ( Rig (..)
   , countingClock
   , newRig
   , newRigWith
+  , armedBody
+  , armedFinally
+  , ownedHostBeforeBody
   , ownedHost
   , ownedHostWith
   , ownerSettings
@@ -63,6 +69,7 @@ import Test.GLFW.Owner.Fixture.Rig
 import Test.GLFW.Support
   ( boundedExample
   , caughtAs
+  , caughtAsUnless
   , newSinkTrace
   , sinkFailingOn
   , traced
@@ -70,6 +77,9 @@ import Test.GLFW.Support
   , windowNamed
   )
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
+import Test.GLFW.Support (Ending (..), Scope, cutExamples, ownedEnds, withDeferredThread, withDeferredThreadVia)
+import Data.Foldable (for_)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = do
@@ -81,6 +91,23 @@ spec = do
     (boundedExample testEarlyFatalWhileRetiring)
   it "retains an unexpected completion without retirement evidence, and disposes nothing on it"
     (boundedExample testCompletionWithoutEvidence)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    it ("finishes the exit on the supplier's evidence when the example body " <> label <> " right after the supplier was handed its host (#593)") $
+      boundedExample (ownedEnds ending completionEndedEarlyScenario False)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    it ("finishes the exit when the example body " <> label <> " during the run's startup, before the rescue is registered (#593)") $
+      boundedExample (ownedEnds ending completionStartupScenario False)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    for_ [-1 .. 2] $ \k →
+      it ("finishes the exit on the supplier's evidence when the example body " <> label <> " at setup step " <> show k <> " of the completion fixture (#593)") $
+        boundedExample (ownedEnds ending (completionSetupScenario k) False)
+  it "publishes a fixture's failure and its gate in one transaction, so a running owner never sees one without the other (#593)"
+    (boundedExample testScriptAllIsAtomic)
+  cutExamples "the early fatal failure fixture" [0, 1] earlyFatalScenario
+  cutExamples "the required failure fixture" [0, 1] requiredFailureEndedEarlyScenario
+  cutExamples "the quiescence fixture" [0, 1] quiescenceScenario
+  cutExamples "the failing retirement fixture" [0, 1, 2] retirementFailsOnceScenario
+  cutExamples "the every-failure fixture" [0, 1, 2] everyFailureScenario
   it "retains terminal facts the completion publisher refused, and transports them at the next opportunity"
     (boundedExample testRefusedNoticeRetained)
   it "closes the owner's admission and begins its retirement as soon as a required failure is latched"
@@ -141,7 +168,14 @@ testFailureBeforeSupervision = do
 -- | A fatal owner failure reaches an application checkpoint while the owner is
 -- still retiring.
 testEarlyFatalWhileRetiring ∷ IO ()
-testEarlyFatalWhileRetiring = do
+testEarlyFatalWhileRetiring = earlyFatalWhileRetiring False (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the gated retirement is armed, or after it and the release of its gate are registered.
+earlyFatalScenario ∷ Int → Scope → IO () → IO ()
+earlyFatalScenario cutAt _ atParked = earlyFatalWhileRetiring True (\armedNow → when (armedNow == cutAt) atParked)
+
+earlyFatalWhileRetiring ∷ Bool → (Int → IO ()) → IO ()
+earlyFatalWhileRetiring scenario cut = do
   rig ← newRig
   release ← newTVarIO False
   failing ← newTVarIO False
@@ -151,17 +185,18 @@ testEarlyFatalWhileRetiring = do
   script (fakeStep (rigFake rig)) $ \_ →
     readTVarIO failing >>= \doomed →
       if doomed then throwIO (Scripted (Text.pack "fatal step")) else pure noStepWork
-  -- Its whole-owner retirement is held open across the checkpoint below.
-  script (fakeRetireOwner (rigFake rig)) $ \_ → do
-    putMVar retiring ()
-    atomically (readTVar release >>= check)
-    pure (ownerRetired (Text.pack "retired after the checkpoint"))
+  -- Its whole-owner retirement is held open across the checkpoint below; held only from the body's first masked step, after the
+  -- release of its gate is registered (#593).
+  let arm = script (fakeRetireOwner (rigFake rig)) $ \_ → do
+        putMVar retiring ()
+        atomically (readTVar release >>= check)
+        pure (ownerRetired (Text.pack "retired after the checkpoint"))
   observedPhase ← newTVarIO OwnerStarting
-  (raised, _) ← caughtAs @Scripted $
+  (raised, _) ← caughtAsUnless scenario $
     ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner control →
       -- However this body leaves, the held retirement is released, so a path
       -- the example did not intend fails it rather than hanging it.
-      flip finally (atomically (writeTVar release True)) $ do
+      armedFinally cut arm (atomically (writeTVar release True)) $ do
         started ← superviseGraphicsOwner control owner
         case started of
           WorkerStarted _ → pure ()
@@ -179,10 +214,50 @@ testEarlyFatalWhileRetiring = do
   raised `shouldBe` Scripted (Text.pack "fatal step")
   readTVarIO observedPhase `shouldReturn` OwnerRetiring
 
+-- | 'scriptAll' publishes every operation it is given in one transaction (#593).
+--
+-- A fixture that arms a failing step together with the gate it leads to, while the owner is already running, must never be seen
+-- half armed: an owner that met the failure before the gate would retire with the old callback and nothing would fill the gate's
+-- signal. The proof is by rollback, which needs no interleaving: the second step of the group raises inside the transaction, and
+-- the first step's write must have been rolled back with it. (Publishing the steps with separate transactions, as two 'script'
+-- calls do, leaves the first write behind and fails this example.)
+testScriptAllIsAtomic ∷ IO ()
+testScriptAllIsAtomic = do
+  first ← newTVarIO (0 ∷ Int)
+  second ← newTVarIO (0 ∷ Int)
+  outcome ← try (scriptAll [scriptSTM first 1, throwSTM (Scripted (Text.pack "mid-group")), scriptSTM second 1])
+  outcome `shouldBe` Left (Scripted (Text.pack "mid-group"))
+  (,) <$> readTVarIO first <*> readTVarIO second `shouldReturn` (0, 0)
+  scriptAll [scriptSTM first 1, scriptSTM second 1]
+  (,) <$> readTVarIO first <*> readTVarIO second `shouldReturn` (1, 1)
+
 -- | An owner that ended without retirement evidence retains its dependencies,
 -- and its completion is never permission to dispose them.
 testCompletionWithoutEvidence ∷ IO ()
-testCompletionWithoutEvidence = do
+testCompletionWithoutEvidence = completionWithoutEvidence withOwnedThreadOpening (pure ()) Nothing
+
+-- | The scenario of 'testCompletionWithoutEvidence' for an example that fails or is cancelled right after the supplier has been
+-- handed what it publishes with (#593): the body ends the way the ending says, and the exit's drain must still finish on the
+-- evidence the supplier publishes, which the exit waits for before the scope around the host could stop the supplier.
+completionEndedEarlyScenario ∷ Scope → IO () → IO ()
+completionEndedEarlyScenario scope atParked = completionWithoutEvidence scope (pure ()) (Just (\i → when (i == 2) atParked))
+
+-- | The same fixture ended during the run's startup (#593): after the host is built and before the body's first statement, the
+-- interval in which the rescue is not yet registered. Nothing the backend is asked for fails until the body arms it, so the exit
+-- has nothing to wait for.
+completionStartupScenario ∷ Scope → IO () → IO ()
+completionStartupScenario scope atParked = completionWithoutEvidence scope atParked (Just (\_ → pure ()))
+
+-- | The same fixture ended at the boundary before setup step @k@ (#593): -1 is the body's first statement, with the owner created
+-- and the rescue not yet registered (the backend's failing behaviour is armed only by the registration step, so there is nothing
+-- for the exit to wait for), 0 is the first statement after the registration (the host exists), 1 follows the
+-- window lookup, 2 follows the target handover and the supplier's hand-over, which are one uninterruptible step (an attachment
+-- never exists without the supplier holding what it publishes with). Between any two steps the fixture is partially built.
+completionSetupScenario ∷ Int → Scope → IO () → IO ()
+completionSetupScenario k scope atParked = completionWithoutEvidence scope (pure ()) (Just (\i → when (i == k) atParked))
+
+completionWithoutEvidence ∷ Scope → IO () → Maybe (Int → IO ()) → IO ()
+completionWithoutEvidence scope beforeBody endEarly = do
   rig ← newRig
   trace ← newSinkTrace
   let recording = sinkFailingOn (Text.pack "never") trace
@@ -190,54 +265,90 @@ testCompletionWithoutEvidence = do
   -- owner ends with no record for it and no destruction evidence of its own.
   -- The step fails only after the target exists, so the handover below is the
   -- ordinary one rather than a race with the owner's own admission closing.
-  script (fakeStep (rigFake rig)) $ \step →
-    if null (stepTargets step) then pure noStepWork else throwIO (Scripted (Text.pack "step"))
-  script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
-  script (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
-  script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
-  (unverified, _) ← caughtAs @OwnerDestructionUnverified $
-    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
-      window ← theWindow host
-      service ← handedOver host owner window
-      -- The owner's run has ended and it established nothing.
-      atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
-      records ← atomically (readTargetTerminalsNow owner)
-      Map.keys records `shouldBe` []
-      held ← atomically (readOwnerTargets owner)
-      length held `shouldBe` 1
-      -- The window's slot is still occupied and every fact is still owed: the
-      -- worker's completion changed none of that.
-      observation ← atomically (readGraphicsService service)
-      observedMissing observation `shouldBe` allRetirementFacts
-      pending ← atomically (hostPendingAttachments host)
-      length pending `shouldBe` 1
-      -- Independent evidence, from a thread that is not the main one, is the
-      -- only thing that can retire any of this — the attachment's facts, and
-      -- then the owner's own destruction. Without both, the boundary retains
-      -- the window, the session and every parent for good, which is the whole
-      -- point; with them, this example's exit can finish.
-      publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
-      acknowledgement ←
-        atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-          >>= maybe (unexpected "the attachment kept no acknowledgement") pure
-      void . forkIO $ do
-        -- The attachment is still the main thread's and is only retiring once
-        -- the exit's quiescence has begun it, so the facts are published into
-        -- a model that can record them rather than refuse them.
-        atomically (readGraphicsService service >>= check . (== SlotRetiring) . observedSlot)
-        forM_ allRetirementFacts $ \fact →
-          void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+  --
+  -- The failing behaviour is armed only inside the body's first masked step, after the rescue has been registered (the supplier
+  -- handed what it needs, the end of the body announced) (#593): until then the backend behaves, so a cancellation before the
+  -- body begins leaves an exit with nothing to wait for.
+  let arm = scriptAll
+        [ scriptSTM (fakeStep (rigFake rig)) $ \step →
+            if null (stepTargets step) then pure noStepWork else throwIO (Scripted (Text.pack "step"))
+        , scriptSTM (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
+        , scriptSTM (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
+        , scriptSTM (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
+        ]
+  -- The thread supplies the independent evidence that lets the exit finish, so it is owned by the example and outlives the host
+  -- body (#593). The fixture's destroy always fails, so even an exit with no attachment waits for the owner's destruction
+  -- evidence: the supplier is handed the host and the owner as the very first step of the body, in the same masked step that
+  -- arranges for the end of the body to be announced, and learns of the attachment's service through a cell the setup fills in
+  -- the same uninterruptible step that creates it. Whatever way the body ends, the supplier therefore knows what exists.
+  serviceCell ← newEmptyMVar
+  bodyDone ← newEmptyMVar
+  let supplier (host, owner) = do
+        -- The exit begins once the body is over, however it ended.
+        readMVar bodyDone
+        tryReadMVar serviceCell >>= mapM_ (\service → do
+          publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+          acknowledgement ←
+            atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+              >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+          -- The attachment is still the main thread's and is only retiring once
+          -- the exit's quiescence has begun it, so the facts are published into
+          -- a model that can record them rather than refuse them.
+          atomically (readGraphicsService service >>= check . (== SlotRetiring) . observedSlot)
+          forM_ allRetirementFacts $ \fact →
+            void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact)))
         -- Then the owner's own destruction, once the boundary is demonstrably
         -- retaining everything for the want of it: the attachment drain has
         -- finished and the exit has said, once, what it is retaining.
         atomically (check . null =<< hostPendingAttachments host)
         awaitDiagnostic trace
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
-  unverifiedRetired unverified `shouldBe` False
-  unverifiedTargets unverified `shouldBe` 1
-  -- Said exactly once, whatever the wait then had to do.
-  components ← traced trace
-  length (filter (== Text.pack "glfw.graphics-owner") components) `shouldBe` 1
+      -- The target handover and the cell that tells the supplier of it are one uninterruptible step.
+      establish host owner window =
+        uninterruptibleMask_ (handedOver host owner window >>= \target → target <$ putMVar serviceCell target)
+      guarded handOver host owner body = mask $ \restore → do
+        handOver (host, owner)
+        arm
+        restore body `finally` void (tryPutMVar bodyDone ())
+  withDeferredThreadVia scope (pure ()) supplier $ \_ handOver → case endEarly of
+   Just step →
+    ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      -- Step -1: the owner exists and the body has begun, but the rescue is not yet registered and nothing fails yet.
+      step (-1)
+      guarded handOver host owner $ do
+        step 0
+        window ← theWindow host
+        step 1
+        _ ← establish host owner window
+        step 2
+   Nothing → do
+    (unverified, _) ← caughtAs @OwnerDestructionUnverified $
+      ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
+       guarded handOver host owner $ do
+        window ← theWindow host
+        service ← establish host owner window
+        -- The owner's run has ended and it established nothing.
+        atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+        records ← atomically (readTargetTerminalsNow owner)
+        Map.keys records `shouldBe` []
+        held ← atomically (readOwnerTargets owner)
+        length held `shouldBe` 1
+        -- The window's slot is still occupied and every fact is still owed: the
+        -- worker's completion changed none of that.
+        observation ← atomically (readGraphicsService service)
+        observedMissing observation `shouldBe` allRetirementFacts
+        pending ← atomically (hostPendingAttachments host)
+        length pending `shouldBe` 1
+        -- Independent evidence, from a thread that is not the main one, is the
+        -- only thing that can retire any of this — the attachment's facts, and
+        -- then the owner's own destruction. Without both, the boundary retains
+        -- the window, the session and every parent for good, which is the whole
+        -- point; with them, this example's exit can finish.
+    unverifiedRetired unverified `shouldBe` False
+    unverifiedTargets unverified `shouldBe` 1
+    -- Said exactly once, whatever the wait then had to do.
+    components ← traced trace
+    length (filter (== Text.pack "glfw.graphics-owner") components) `shouldBe` 1
 
 -- | A terminal fact the completion publisher could not carry stays owed, and
 -- nothing loses it.
@@ -288,31 +399,50 @@ testRefusedNoticeRetained = do
 -- | A required failure closes the owner's admission and takes it into its
 -- retirement at once, rather than waiting for the exit.
 testRequiredFailureClosesAdmission ∷ IO ()
-testRequiredFailureClosesAdmission = do
+testRequiredFailureClosesAdmission = requiredFailureClosesAdmission False (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the failing step and the gated retirement are armed, or after they and the
+-- release of the gate are registered.
+requiredFailureEndedEarlyScenario ∷ Int → Scope → IO () → IO ()
+requiredFailureEndedEarlyScenario cutAt _ atParked = requiredFailureClosesAdmission True (\armedNow → when (armedNow == cutAt) atParked)
+
+requiredFailureClosesAdmission ∷ Bool → (Int → IO ()) → IO ()
+requiredFailureClosesAdmission scenario cut = do
   rig ← newRig
   release ← newTVarIO False
   retiring ← newEmptyMVar
-  script (fakeStep (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "fatal step")))
-  script (fakeRetireOwner (rigFake rig)) $ \_ → do
-    putMVar retiring ()
-    atomically (readTVar release >>= check)
-    pure (ownerRetired (Text.pack "retired"))
   observedRefusal ← newTVarIO Nothing
   observedPhase ← newTVarIO OwnerStarting
-  (raised, _) ← caughtAs @Scripted $
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
-      window ← theWindow host
-      takeMVar retiring
-      -- The owner is already retiring and its admission is already closed, so
-      -- a handover now leaves nothing attached at all.
-      answer ← handOverGraphicsTarget host owner window
-      pending ← atomically (hostPendingAttachments host)
-      length pending `shouldBe` 0
-      status ← atomically (readOwnerStatusNow owner)
-      atomically $ do
-        writeTVar observedRefusal (Just (describeHandover answer))
-        writeTVar observedPhase (statusPhase status)
-      void (forkIO (atomically (writeTVar release True)))
+  -- Armed only inside the body's first masked step, in the same step that registers the release of the gate the retiring owner is
+  -- held at (#593): nothing fails and nothing is held before the release that undoes it exists, and the release runs whether or
+  -- not the body's assertions held, so a failed assertion is reported rather than leaving the exit waiting at the gate. The
+  -- owner is woken into the step that now fails.
+  let arm owner = do
+        -- ONE transaction: the failing step and the gate it leads to are visible to a running owner together.
+        scriptAll
+          [ scriptSTM (fakeRetireOwner (rigFake rig)) $ \_ → do
+              putMVar retiring ()
+              atomically (readTVar release >>= check)
+              pure (ownerRetired (Text.pack "retired"))
+          , scriptSTM (fakeStep (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "fatal step")))
+          ]
+        demand ← prepare (OwnerDemand True Nothing)
+        void (atomically (publishOwnerDemand (ownerHandoff owner) demand))
+      run =
+        ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
+          armedFinally cut (arm owner) (atomically (writeTVar release True)) $ do
+            window ← theWindow host
+            takeMVar retiring
+            -- The owner is already retiring and its admission is already closed, so
+            -- a handover now leaves nothing attached at all.
+            answer ← handOverGraphicsTarget host owner window
+            pending ← atomically (hostPendingAttachments host)
+            length pending `shouldBe` 0
+            status ← atomically (readOwnerStatusNow owner)
+            atomically $ do
+              writeTVar observedRefusal (Just (describeHandover answer))
+              writeTVar observedPhase (statusPhase status)
+  (raised, _) ← caughtAsUnless scenario run
   raised `shouldBe` Scripted (Text.pack "fatal step")
   readTVarIO observedRefusal `shouldReturn` Just "owner closed"
   readTVarIO observedPhase `shouldReturn` OwnerRetiring
@@ -324,28 +454,32 @@ testUnverifiedDestructionRetains = do
   rig ← newRig
   trace ← newSinkTrace
   let recording = sinkFailingOn (Text.pack "never") trace
-  script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
+  -- Armed in the body's first masked step, after the supplier has been handed the owner (#593).
+  let arm = script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
   releasedWhileRetained ← newTVarIO Nothing
-  (unverified, _) ← caughtAs @OwnerDestructionUnverified $
-    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
-      _ ← awaitRound owner 0
-      -- From another thread: wait until the exit has said, once, what it is
-      -- retaining and why — which it does before it settles into the wait —
-      -- then record what has been released, and only then supply the
-      -- independent evidence that lets the boundary finish.
-      void . forkIO $ do
+  -- From another thread: wait until the exit has said, once, what it is retaining and why — which it does before it settles
+  -- into the wait — then record what has been released, and only then supply the independent evidence that lets the boundary
+  -- finish. That evidence is what ends the exit's wait, so the thread is owned by the example and outlives the host body that
+  -- hands it the owner (#593).
+  let supplier owner = do
         atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
         awaitDiagnostic trace
         notes ← journalled (rigJournal rig)
         atomically (writeTVar releasedWhileRetained (Just (filter released notes)))
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
-  unverifiedRetired unverified `shouldBe` True
-  unverifiedTargets unverified `shouldBe` 0
-  -- Nothing of the host's was released while the evidence was missing.
-  readTVarIO releasedWhileRetained `shouldReturn` Just []
-  -- And it was released in the end, after the evidence existed.
-  notes ← journalled (rigJournal rig)
-  notes `shouldContain` [SessionEnded]
+  withDeferredThread supplier $ \_ handOver → do
+    (unverified, _) ← caughtAs @OwnerDestructionUnverified $
+      ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+        mask_ (handOver owner >> arm)
+        _ ← awaitRound owner 0
+        pure ()
+    unverifiedRetired unverified `shouldBe` True
+    unverifiedTargets unverified `shouldBe` 0
+    -- Nothing of the host's was released while the evidence was missing.
+    readTVarIO releasedWhileRetained `shouldReturn` Just []
+    -- And it was released in the end, after the evidence existed.
+    notes ← journalled (rigJournal rig)
+    notes `shouldContain` [SessionEnded]
   where
     released = \case
       WindowGone _ → True
@@ -384,7 +518,15 @@ testPublicationsClosedAtExit = do
 -- it let the owner go, and the exit then accounts for the queued ownership,
 -- retires each target, destroys the owner and joins it, in D-33's order.
 testPublicationsClosedAtQuiescence ∷ IO ()
-testPublicationsClosedAtQuiescence = do
+testPublicationsClosedAtQuiescence = publicationsClosedAtQuiescence (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the owner is told to hold in its next step, or after it is told and the release
+-- of the hold is registered.
+quiescenceScenario ∷ Int → Scope → IO () → IO ()
+quiescenceScenario cutAt _ atParked = publicationsClosedAtQuiescence (\armedNow → when (armedNow == cutAt) atParked)
+
+publicationsClosedAtQuiescence ∷ (Int → IO ()) → IO ()
+publicationsClosedAtQuiescence cut = do
   rig ← newRigWith id
   clock ← countingClock
   let config =
@@ -403,6 +545,7 @@ testPublicationsClosedAtQuiescence = do
     stepped step
   evidence ← newEmptyMVar
   escaped ← newEmptyMVar
+  -- However the body ends, the exit's release is what ends the hold; a scenario's own ending propagates.
   ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → do
     windows ← atomically (hostWindowIdentities host)
     (first, second) ← case windows of
@@ -417,37 +560,38 @@ testPublicationsClosedAtQuiescence = do
     seen ← sampledObservation host first
     observed owner service 1 seen `shouldReturn` ObservationAccepted 1
     -- Hold the owner inside its next step: a scene publication asks for one.
-    atomically (writeTVar holding True)
-    _ ← atomically . publishOwnerScene (ownerHandoff owner) =<< prepare (Scene 1)
-    atomically (readTVar held >>= check)
-    -- The second target's ownership is queued, and the held owner cannot take
-    -- it.
-    _ ← handedOver host owner second
-    putMVar escaped owner
-    let watcher =
-          workerDefinition
-            (Text.pack "quiescence watcher")
-            (\_ → pure ())
-            ( \token () → do
-                atomically (awaitStopRequest token)
-                let handoff = ownerHandoff owner
-                demand ← prepare (OwnerDemand True Nothing)
-                scene ← prepare (Scene 2)
-                demanded ← atomically (publishOwnerDemand handoff demand)
-                published ← atomically (publishOwnerScene handoff scene)
-                slot ← observed owner service 2 seen
-                open ← atomically (targetEventsOpen handoff)
-                -- What the owner had done by the time every refusal was read:
-                -- still held in the step, never stopped or joined, and the
-                -- queued ownership untaken.
-                stillHeld ← not <$> readTVarIO released
-                running ← isNothing <$> atomically (Worker.pollCompletion (graphicsOwnerWorker owner))
-                notes ← journalled (rigJournal rig)
-                putMVar evidence (demanded, published, slot, open, stillHeld, running, notes)
-                atomically (writeTVar released True)
-            )
-    _ ← startSupervised control (WorkerPolicy Service Required ownerExampleComponent (\_ → pure Unrecognized)) watcher
-    pure ()
+    -- The hold is armed only inside a masked step that also registers its release (#593).
+    armedBody cut (atomically (writeTVar holding True)) (atomically (writeTVar released True)) $ do
+      _ ← atomically . publishOwnerScene (ownerHandoff owner) =<< prepare (Scene 1)
+      atomically (readTVar held >>= check)
+      -- The second target's ownership is queued, and the held owner cannot take
+      -- it.
+      _ ← handedOver host owner second
+      putMVar escaped owner
+      let watcher =
+            workerDefinition
+              (Text.pack "quiescence watcher")
+              (\_ → pure ())
+              ( \token () → do
+                  atomically (awaitStopRequest token)
+                  let handoff = ownerHandoff owner
+                  demand ← prepare (OwnerDemand True Nothing)
+                  scene ← prepare (Scene 2)
+                  demanded ← atomically (publishOwnerDemand handoff demand)
+                  published ← atomically (publishOwnerScene handoff scene)
+                  slot ← observed owner service 2 seen
+                  open ← atomically (targetEventsOpen handoff)
+                  -- What the owner had done by the time every refusal was read:
+                  -- still held in the step, never stopped or joined, and the
+                  -- queued ownership untaken.
+                  stillHeld ← not <$> readTVarIO released
+                  running ← isNothing <$> atomically (Worker.pollCompletion (graphicsOwnerWorker owner))
+                  notes ← journalled (rigJournal rig)
+                  putMVar evidence (demanded, published, slot, open, stillHeld, running, notes)
+                  atomically (writeTVar released True)
+              )
+      _ ← startSupervised control (WorkerPolicy Service Required ownerExampleComponent (\_ → pure Unrecognized)) watcher
+      pure ()
   (demanded, published, slot, open, stillHeld, running, notesAtQuiescence) ← takeMVar evidence
   demanded `shouldBe` PublicationClosed
   published `shouldBe` ScenePublication PublicationClosed
@@ -526,22 +670,33 @@ testDrainFailureSurfaces = do
 -- | A failed target retirement is retained, marked unverified, and never
 -- offered again — not by a later round, and not by the drain.
 testRetirementFailsOnce ∷ IO ()
-testRetirementFailsOnce = do
+testRetirementFailsOnce = retirementFailsOnce False (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the failing retirement is armed, or after it and the rescue that publishes the
+-- evidence its exit waits for are registered.
+retirementFailsOnceScenario ∷ Int → Scope → IO () → IO ()
+retirementFailsOnceScenario cutAt _ atParked = retirementFailsOnce True (\armedNow → when (armedNow == cutAt) atParked)
+
+retirementFailsOnce ∷ Bool → (Int → IO ()) → IO ()
+retirementFailsOnce scenario cut = do
   rig ← newRig
   attempts ← newTVarIO (0 ∷ Int)
+  tracked ← newIORef []
   -- Fails the first time and would succeed on any replay, so a replay is
-  -- visible as a target that retired after all.
-  script (fakeRetireTarget (rigFake rig)) $ \retire → do
-    seen ← atomically (stateTVar attempts (\n → (n, n + 1)))
-    if seen == 0
-      then throwIO (Scripted (Text.pack "retire target"))
-      else pure (targetRetired (Text.pack (show (retiringWindow retire))))
+  -- visible as a target that retired after all. Armed only inside the body's first masked step, which also registers the
+  -- rescue that publishes the independent evidence this example's exit waits for (#593).
+  let arm = script (fakeRetireTarget (rigFake rig)) $ \retire → do
+        seen ← atomically (stateTVar attempts (\n → (n, n + 1)))
+        if seen == 0
+          then throwIO (Scripted (Text.pack "retire target"))
+          else pure (targetRetired (Text.pack (show (retiringWindow retire))))
   observedFailures ← newTVarIO 0
   observedTargets ← newTVarIO []
-  (raised, _) ← caughtAs @Scripted $
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+  (raised, _) ← caughtAsUnless scenario $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (rescuePublishing tracked host owner) $ do
       window ← theWindow host
-      service ← handedOver host owner window
+      service ← trackedHandedOver tracked host owner window
+      cut 2
       awaitStanding owner service `shouldReturn` TargetUsable
       _ ← releaseGraphicsTarget host owner service
       -- The failure is latched and retained; the target stays, unverified.
@@ -578,17 +733,26 @@ testRetirementFailsOnce = do
 -- arbitrary cap would keep, and each failure is evidence the contract says
 -- stays readable.
 testEveryRetirementFailureRetained ∷ IO ()
-testEveryRetirementFailureRetained = do
+testEveryRetirementFailureRetained = everyRetirementFailureRetained False (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the failing retirement is armed, or after it and the rescue are registered.
+everyFailureScenario ∷ Int → Scope → IO () → IO ()
+everyFailureScenario cutAt _ atParked = everyRetirementFailureRetained True (\armedNow → when (armedNow == cutAt) atParked)
+
+everyRetirementFailureRetained ∷ Bool → (Int → IO ()) → IO ()
+everyRetirementFailureRetained scenario cut = do
   rig ← newRig
+  tracked ← newIORef []
   clock ← countingClock
   let windows = [windowNamed (Text.pack ("window " <> show n)) | n ← [1 ∷ Int .. 12]]
       config = (ownerSettings clock) {hostWindowConfigs = windows, hostWindowLimit = 12}
-  script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
+  let arm = script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
   keptCount ← newTVarIO 0
-  (raised, _) ← caughtAs @Scripted $
-    ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → do
+  (raised, _) ← caughtAsUnless scenario $
+    ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (rescuePublishing tracked host owner) $ do
       identities ← atomically (hostWindowIdentities host)
-      services ← mapM (handedOver host owner) identities
+      services ← mapM (trackedHandedOver tracked host owner) identities
+      cut 2
       forM_ services (awaitStanding owner)
       forM_ services (releaseGraphicsTarget host owner)
       -- Every one of them fails its retirement, and every failure is kept.

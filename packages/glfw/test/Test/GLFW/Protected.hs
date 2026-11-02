@@ -22,7 +22,7 @@
 module Test.GLFW.Protected (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -40,7 +40,10 @@ import Control.Exception
   , Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
+  , finally
   , fromException
+  , catch
+  , mask_
   , throw
   , throwIO
   , try
@@ -48,8 +51,9 @@ import Control.Exception
   , uninterruptibleMask_
   )
 import Data.Unique (newUnique)
-import Control.Monad (forM, forM_, void, when)
-import Data.IORef (IORef, atomicWriteIORef, newIORef, readIORef, writeIORef)
+import Control.Monad (forM, forM_, unless, void, when)
+import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef, writeIORef)
+import System.IO.Unsafe (unsafePerformIO)
 import GHC.Conc (BlockReason (BlockedOnMVar, BlockedOnException, BlockedOnSTM), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
 import Data.List (sort)
@@ -97,8 +101,8 @@ import Hetoimasia.GLFW.Internal.Seam
   , Seam
   , SeamScript (..)
   , asProcessMainThread
-  , defaultScript
   , designateProcessMainThread
+  , defaultScript
   , newSeam
   , reportError
   , seamCalls
@@ -134,14 +138,19 @@ import Hetoimasia.Runtime.Supervision
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Test.GLFW.Support
-  ( SinkFailed (..)
+  ( Ending (..)
+  , Scope
+  , SinkFailed (..)
   , SinkMark (..)
+  , awaitParked
   , boundedExample
   , caughtAs
   , diagnosticMarks
   , failingSink
   , flushed
   , newSinkTrace
+  , exitFinishes
+  , ownedEnds
   , raisedWith
   , retainedAs
   , retainedDiagnostics
@@ -149,11 +158,16 @@ import Test.GLFW.Support
   , sinkMarks
   , traced
   , unexpected
+  , unownedLeaks
+  , withMainThread
+  , withMainThreadVia
   )
-import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Hspec (Expectation, Spec, before_, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
+import Data.Foldable (for_)
 
 spec ∷ Spec
-spec = describe "GLFW protected host" $ do
+spec = before_ clearRegistered $ describe "GLFW protected host" $ do
   describe "exit paths" $ do
     it "retires its attachment, then destroys the window and ends the session, on a normal return"
       (boundedExample (testExitPath ReturnsNormally))
@@ -205,6 +219,39 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testIndependentChains)
     it "keeps a stalled attachment and its window until independent evidence arrives, reporting the stall once"
       (boundedExample testStalledThenEvidence)
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+      it ("has ended and joined a runner parked in the drain's first wait, which absorbs the cleanup's one kill, when the example body " <> label) $
+        boundedExample (ownedEnds ending repeatedCancellationEndedEarlyScenario True)
+      it ("negative control: a plain forkOS start leaves the runner parked in the drain's wait when the example body " <> label) $
+        boundedExample (unownedLeaks ending repeatedCancellationEndedEarlyScenario True)
+      it ("has ended and joined a runner parked between its first attachment and the publication of its handles when the example body " <> label) $
+        boundedExample (ownedEnds ending runnerPartialScenario True)
+      for_ [0 .. 5] $ \k →
+        it ("finishes the exit when the example body " <> label <> " at setup step " <> show k <> " of the two-chain fixture (#593)") $
+          boundedExample (ownedEnds ending (protectedSetupScenario k) False)
+      it ("has ended and joined a runner parked in its construction, whose rollback waits at a second gate, when the example body " <> label) $
+        boundedExample (ownedEnds ending parkedConstructionScenario True)
+      it ("negative control: a plain forkOS start leaves the runner parked in its construction when the example body " <> label) $
+        boundedExample (unownedLeaks ending parkedConstructionScenario True)
+      it ("finishes the exit when the example body " <> label <> " before the runner has registered its owner, which then registers and attaches after the cleanup began, one that may be absorbed (#593)") $
+        boundedExample (ownedEnds ending runnerBeforeRegistrationScenario True)
+      it ("finishes the exit when the example body " <> label <> " while the runner's owner is registered and under construction, and attached after the cleanup began (#593)") $
+        boundedExample (ownedEnds ending runnerDuringConstructionScenario True)
+      for_ [0 .. 5] $ \k →
+        it ("finishes the exit when the example body " <> label <> " at step " <> show k <> " of the inbox fixture (#593)") $
+          boundedExample (exitFinishes ending (inboxSetupScenario k))
+      it ("has ended and joined an evidence supplier waiting for an owner that never exists when the example body " <> label) $
+        boundedExample (ownedEnds ending supplierScenario False)
+      it ("negative control: an unowned start leaves the evidence supplier waiting for an owner that never exists when the example body " <> label) $
+        boundedExample (unownedLeaks ending supplierScenario False)
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+      for_ [("after its first owner attached", True), ("while the runner is parked before its host", False)] $ \(where', after) →
+        it ("finishes the exit when the example body " <> label <> " " <> where' <> ", before the explicit rescue (#593)") $
+          boundedExample (ownedEnds ending (stickyBeforeRescueScenario after) True)
+    it "releases an owner the runner registers after the cleanup began, before it built its host (#593)"
+      (boundedExample (stickyRegistration False))
+    it "releases an owner the runner registers after the cleanup began, after the snapshot that cleanup took (#593)"
+      (boundedExample (stickyRegistration True))
     it "contains a declaration that fails after acquisition, retiring on independent evidence before it settles"
       (boundedExample testMetadataFailsInDrain)
     it "retains a stalled diagnostic's own failure without unwinding anything it is holding"
@@ -268,9 +315,13 @@ spec = describe "GLFW protected host" $ do
     it "refuses a window limit below one, below its configured windows, or above the bound its counts derive from"
       (boundedExample testWindowLimitBounds)
 
-  describe "closing an attached window during the run" $
+  describe "closing an attached window during the run" $ do
     it "begins retirement without destroying it, and destroys it only once every fact is certified"
       (boundedExample testEarlyClose)
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+      for_ [0 .. 3] $ \k →
+        it ("finishes the exit when the example body " <> label <> " at step " <> show k <> " of the early-close fixture (#593)") $
+          boundedExample (exitFinishes ending (earlyCloseScenario k))
 
 -- ---------------------------------------------------------------------------
 -- The journal
@@ -368,15 +419,21 @@ instance Exception Scripted
 -- | Attach one scripted owner to a window of a protected host.
 attachOwner ∷ TVar [Flag] → WindowHost → WindowId → OwnerScript → IO (Owner, AttachmentOutcome)
 attachOwner journal host window script = do
-  owner ←
-    Owner (scriptName script)
-      <$> newTVarIO Nothing
-      <*> newTVarIO (scriptPlan script)
-      <*> newTVarIO 0
-      <*> newTVarIO 0
-      <*> newTVarIO 0
-      <*> newTVarIO []
-  outcome ← attachHostWindow host window (protocolFor journal host owner script)
+  -- Created and registered with the rescue in one masked step, before the attachment exists.
+  owner ← mask_ $ do
+    created ←
+      Owner (scriptName script)
+        <$> newTVarIO Nothing
+        <*> newTVarIO (scriptPlan script)
+        <*> newTVarIO 0
+        <*> newTVarIO 0
+        <*> newTVarIO 0
+        <*> newTVarIO []
+    registerOwner host created
+    pure created
+  -- Whenever the attachment ends, an owner registered after the cleanup began (or attached while it began) is released by this
+  -- code itself, now that its attachment can take the notices.
+  outcome ← attachHostWindow host window (protocolFor journal host owner script) `finally` releaseIfBegun host owner
   pure (owner, outcome)
 
 -- | The one scripted owner established, or why it was not.
@@ -510,7 +567,7 @@ waylandProtectedRunAs seam config inside action =
             quietLogger
             (seamSession seam defaultSessionConfig {requestedBackend = Just Wayland})
             config
-            (\host → inside host >> use host)
+            (\host → (inside host >> use host) `rescuedUnlessDesigned` ())
       )
       id
       (\host _ → pure host)
@@ -583,31 +640,34 @@ testLossSuppliesNoFacts = do
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
   seen ← newTVarIO Nothing
-  helper ← forkIO $ do
-    owner ← awaitHeld owned
-    host ← awaitHeld hostHeld
-    view ← atomically $ do
-      afterStall owner
-      held ← readTVar (ownerAcknowledgement owner) >>= maybe retry pure
-      hostAttachmentView host (acknowledgedAttachment held) >>= maybe retry pure
-    atomically (writeTVar seen (Just view))
-    publishFacts journal host owner allRetirementFacts
-  (primary, _) ←
-    waylandProtectedRun
-        seam
-        (settings [windowNamed "alpha"])
-        ( \host → do
-            window ← onlyWindow host
-            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-            atomically (writeTVar owned (Just owner) >> writeTVar hostHeld (Just host))
-        )
-        (losingTurns status)
-  void (pure helper)
-  connectionCause primary `shouldBe` TransportClosed (Just 32)
-  stalled ← readTVarIO seen >>= maybe (unexpected "the helper saw no stalled attachment") pure
-  viewRecorded stalled `shouldBe` Map.empty
-  sort (viewMissing stalled) `shouldBe` sort allRetirementFacts
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  withEvidenceThread
+    ( do
+        owner ← awaitHeld owned
+        host ← awaitHeld hostHeld
+        view ← atomically $ do
+          afterStall owner
+          held ← readTVar (ownerAcknowledgement owner) >>= maybe retry pure
+          hostAttachmentView host (acknowledgedAttachment held) >>= maybe retry pure
+        atomically (writeTVar seen (Just view))
+        publishFacts journal host owner allRetirementFacts
+    )
+    $ \helper _ → do
+    (primary, _) ←
+      waylandProtectedRun
+          seam
+          (settings [windowNamed "alpha"])
+          ( \host → do
+              window ← onlyWindow host
+              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+              atomically (writeTVar owned (Just owner) >> writeTVar hostHeld (Just host))
+          )
+          (losingTurns status)
+    void (pure helper)
+    connectionCause primary `shouldBe` TransportClosed (Just 32)
+    stalled ← readTVarIO seen >>= maybe (unexpected "the helper saw no stalled attachment") pure
+    viewRecorded stalled `shouldBe` Map.empty
+    sort (viewMissing stalled) `shouldBe` sort allRetirementFacts
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | The connection failures a failure retained under one cleanup label.
 retainedAs' ∷ Text → SomeException → [Maybe ConnectionFailed]
@@ -699,8 +759,97 @@ protectedRunHere seam logger config inside startup action =
     action
 
 protectedHost ∷ Seam → Logger → HostConfig → (WindowHost → IO r) → IO r
-protectedHost seam logger config =
-  withProtectedWindowHostIn logger (seamSession seam defaultSessionConfig) config
+protectedHost seam logger config body = do
+  withProtectedWindowHostIn logger (seamSession seam defaultSessionConfig) config $ \host →
+    -- The rescue is the first thing acquired inside the protected lifetime (#593): it wraps the whole callback, the setup and
+    -- everything the example does with the host, so a failure or cancellation at any point after the host exists reaches it
+    -- before the host drains, and every owner is registered with it as it is created.
+    body host `rescuedUnlessDesigned` ()
+
+-- | The structural rescue of the protected examples (#593): every owner registered since the host was built gets its remaining plan
+-- released ("certify every fact") and every fact published for it directly, which also wakes a drain parked in a wait. It
+-- blocks on nothing, raises nothing, adds nothing an owner has no acknowledgement for, and is idempotent. It runs only on an
+-- exceptional exit, where the suppliers the examples start up front may be waiting for cells a half-built fixture never filled.
+rescueRegistered ∷ IO ()
+rescueRegistered = do
+  isArmed ← readIORef rescueArmed
+  when isArmed rescueNow
+
+-- | 'rescueRegistered' without the arming: the runner scopes call it from their opening, which runs only when the scope ends.
+rescueNow ∷ IO ()
+rescueNow = do
+  -- Sticky (#593): the cleanup is marked begun and the owners are read in one atomic step, before anything is released, so an
+  -- owner registered after this step finds the mark and releases itself, and one registered before it is in the snapshot.
+  known ← atomicModifyIORef' registeredOwners (\registry → (registry {registryBegun = True}, registryOwners registry))
+  forM_ known (uncurry releaseOwner)
+
+-- | Release one owner: its remaining plan becomes "certify every fact", and every fact is published for it directly if it holds
+-- an acknowledgement. It blocks on nothing, raises nothing and is idempotent.
+releaseOwner ∷ WindowHost → Owner → IO ()
+releaseOwner host owner = do
+  atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+  acknowledgement ← readTVarIO (ownerAcknowledgement owner)
+  case (hostGraphicsPublisher host, acknowledgement) of
+    (Just publisher, Just acknowledged) →
+      forM_ allRetirementFacts $ \fact →
+        void (publishCompletion publisher (completionNotice (acknowledgedAttachment acknowledged) acknowledged fact))
+    _ → pure ()
+
+-- | Register an owner with the rescue as it is created. If the cleanup has begun already, the registering code releases the owner
+-- itself, at once: nothing is left for a later pass to find.
+registerOwner ∷ WindowHost → Owner → IO ()
+registerOwner host owner = do
+  begun ← atomicModifyIORef' registeredOwners (\registry → (registry {registryOwners = (host, owner) : registryOwners registry}, registryBegun registry))
+  when begun (releaseOwner host owner)
+
+-- | After an attachment ended (or failed): release the owner again if the cleanup has begun, since its notices could not have been
+-- accepted before the attachment was established.
+releaseIfBegun ∷ WindowHost → Owner → IO ()
+releaseIfBegun host owner = do
+  registry ← readIORef registeredOwners
+  when (registryBegun registry) (releaseOwner host owner)
+
+-- | The failures an example raises on purpose as its subject (the scripted failure of a step, a startup or an action): the drain's own
+-- behaviour on them is what the example asserts, so the rescue leaves them alone and acts only on what nobody scripted, a
+-- cancellation or a failed assertion.
+rescuedUnlessDesigned ∷ IO a → () → IO a
+rescuedUnlessDesigned act () =
+  act `catch` \(thrown ∷ SomeException) → do
+    unless (isDesignedFailure thrown) rescueRegistered
+    throwIO thrown
+
+isDesignedFailure ∷ SomeException → Bool
+isDesignedFailure thrown = case (fromException thrown, fromException thrown) of
+  (Just (Scripted _), _) → True
+  (_, Just (_ ∷ ConnectionFailed)) → True
+  _ → False
+
+-- | The rescue is armed only by the examples whose drain depends on evidence an up-front supplier would publish: in every other
+-- example the drain's own behaviour on an exceptional exit is the subject, and an early rescue would change it.
+rescueArmed ∷ IORef Bool
+rescueArmed = unsafePerformIO (newIORef False)
+{-# NOINLINE rescueArmed #-}
+
+-- | Start an evidence supplier for the length of the body with the structural rescue armed (#593).
+withEvidenceThread ∷ IO () → (ThreadId → IO () → IO a) → IO a
+withEvidenceThread action body = armed (withOwnedThread action body)
+
+armed ∷ IO a → IO a
+armed act = (atomicWriteIORef rescueArmed True >> act) `finally` atomicWriteIORef rescueArmed False
+
+-- | The owners created since the current example began, with their hosts. One example is active at a time (the suite's examples
+-- run one after another), and the spec empties the registry before each.
+registeredOwners ∷ IORef Registry
+registeredOwners = unsafePerformIO (newIORef (Registry False []))
+{-# NOINLINE registeredOwners #-}
+
+-- | Whether the cleanup has begun (sticky until the next example), and the owners registered.
+data Registry = Registry {registryBegun ∷ Bool, registryOwners ∷ [(WindowHost, Owner)]}
+
+-- | Reset between examples (the spec runs @before_@ every one), never inside a lifetime: a cleanup that begins before the runner
+-- reaches its host must stay begun.
+clearRegistered ∷ IO ()
+clearRegistered = writeIORef registeredOwners (Registry False [])
 
 -- ---------------------------------------------------------------------------
 -- Exit paths
@@ -773,9 +922,8 @@ testCancelledAction = do
   owned ← newTVarIO Nothing
   inside ← newEmptyMVar
   never ← newEmptyMVar
-  (runner, finished) ←
-    onMainThread seam $
-      protectedRunHere
+  withMainThread seam (void (tryPutMVar never ()))
+    ( protectedRunHere
         seam
         quietLogger
         (settings [windowNamed "alpha"])
@@ -785,12 +933,14 @@ testCancelledAction = do
             void (startSupervised control workerPolicy (admissionWatcher journal host owner) >>= started)
         )
         (\() _ → putMVar inside () >> takeMVar never)
-  takeMVar inside
-  killThread runner
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled run returned"
-  readTVarIO journal `shouldReturn` ([AdmissionClosed] <> retiring "alpha" <> [WindowGone 1, SessionEnded])
+    )
+    $ \runner finished → do
+    takeMVar inside
+    killThread runner
+    takeMVar finished >>= \case
+      Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      Right () → unexpected "the cancelled run returned"
+    readTVarIO journal `shouldReturn` ([AdmissionClosed] <> retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | A dependent construction that fails after the host is built never enters
 -- supervision, so no quiescence hook exists and no worker is drained. The
@@ -974,9 +1124,8 @@ testCancelledConstruction = do
   seam ← journallingSeam journal
   constructing ← newEmptyMVar
   never ← newEmptyMVar
-  (runner, finished) ←
-    onMainThread seam $
-      protectedRunHere
+  withMainThread seam (void (tryPutMVar never ()))
+    ( protectedRunHere
         seam
         quietLogger
         (settings [windowNamed "alpha"])
@@ -994,12 +1143,14 @@ testCancelledConstruction = do
         )
         (\_ _ → pure ())
         (\() _ → pure ())
-  takeMVar constructing
-  killThread runner
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled construction returned"
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+    )
+    $ \runner finished → do
+    takeMVar constructing
+    killThread runner
+    takeMVar finished >>= \case
+      Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      Right () → unexpected "the cancelled construction returned"
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | A rollback is trusted but not infallible. One that raises establishes no
 -- safety, so the attachment is retained owing every fact — never left pending,
@@ -1060,9 +1211,8 @@ testCancelledRollback = do
   rollingBack ← newEmptyMVar
   never ← newEmptyMVar
   neverRolls ← newEmptyMVar
-  (runner, finished) ←
-    onMainThread seam $
-      protectedRunHere
+  withMainThread seam (void (tryPutMVar never ()) >> void (tryPutMVar neverRolls RollbackUnsafe))
+    ( protectedRunHere
         seam
         quietLogger
         (settings [windowNamed "alpha"])
@@ -1080,14 +1230,220 @@ testCancelledRollback = do
         )
         (\_ _ → pure ())
         (\() _ → pure ())
-  takeMVar constructing
-  killThread runner
-  takeMVar rollingBack
-  killThread runner
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled rollback returned"
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+    )
+    $ \runner finished → do
+    takeMVar constructing
+    killThread runner
+    takeMVar rollingBack
+    killThread runner
+    takeMVar finished >>= \case
+      Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      Right () → unexpected "the cancelled rollback returned"
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+
+-- | The fixture of 'testIndependentChains' (two windows, alpha stalled, a supplier started up front that waits for cells the
+-- fixture fills last) ended at the boundary before setup step @k@ (#593): 0 is the setup callback (the host exists, nothing is
+-- attached), 1 follows the window lookup, 2 follows alpha's attachment, 3 follows beta's, 4 and 5 follow each published cell. At
+-- 2 to 4 alpha is already retained and the supplier still waits for cells, so the drain would wait for ever without the rescue
+-- that was acquired with the host and told of each owner as it was created.
+protectedSetupScenario ∷ Int → Scope → IO () → IO ()
+protectedSetupScenario k scope atParked = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  let step i = when (i == k) atParked
+  withEvidenceSupplier scope journal hostHeld owned $ \_ →
+    asProcessMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+              step 0
+              (alpha, beta) ← twoWindows host
+              step 1
+              alphaOwner ← establishedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
+              step 2
+              void (establishedOwner journal host beta (ownerNamed "beta"))
+              step 3
+              atomically (writeTVar owned (Just alphaOwner))
+              step 4
+              atomically (writeTVar hostHeld (Just host))
+              step 5
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+
+-- | The fixture of the main-thread runners that publish their handles after attaching (#593, 'testRepeatedCancellation',
+-- 'testInterruptedStepWithdrawn', 'testOnlyNewEvidenceRevives'), ended while the runner is parked between its first attachment and
+-- the publication of its handles. The owner still has its scripted 'Await' steps to take and nothing left to publish for it, so
+-- the runner's drain would wait for ever: the scope's opening must release what the registered owner owes without the handles.
+runnerPartialScenario ∷ Scope → IO () → IO ()
+runnerPartialScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  attached ← newEmptyMVar
+  resume ← newEmptyMVar
+  withMainThreadVia scope seam (supplyIfHeld journal hostHeld owned allRetirementFacts)
+    ( runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+              window ← onlyWindow host
+              owner ←
+                establishedOwner
+                  journal
+                  host
+                  window
+                  (ownerNamed "alpha") {scriptPlan = [Await, Await] <> map Certify allRetirementFacts}
+              -- Parked between the attachment and the publication of the handles.
+              putMVar attached () >> takeMVar resume
+              atomically (writeTVar owned (Just owner) >> writeTVar hostHeld (Just host))
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+    )
+    $ \_ _ → takeMVar attached >> atParked
+
+-- | The sticky rescue, without a cancellation (#593): the cleanup begins while the runner has not yet registered the owner that
+-- decides how the drain ends, and the runner then registers and attaches it. Nothing is killed; the only thing that can finish the
+-- drain is the registering code releasing the owner itself, because the cleanup's one pass has already been made. With @after@ false
+-- the cleanup begins before the runner builds its host (the registry must not be reset by the host); with it true, after the
+-- runner attached a first owner and before it attaches a second, so the second is not in the snapshot the cleanup took.
+stickyRegistration ∷ Bool → Expectation
+stickyRegistration after = stickyRegistrationFixture after withOwnedBoundThreadOpening (pure ())
+
+-- | The same fixture ended before its own explicit @rescueNow@ (#593): the example body fails or is cancelled while the runner has
+-- attached its first owner (or, with @after@ false, while it is parked before its host), so the cleanup that follows is the owning
+-- scope's own, whose opening calls @rescueNow@ before the kill.
+stickyBeforeRescueScenario ∷ Bool → Scope → IO () → IO ()
+stickyBeforeRescueScenario after scope atParked = stickyRegistrationFixture after scope atParked
+
+stickyRegistrationFixture ∷ Bool → Scope → IO () → Expectation
+stickyRegistrationFixture after scope beforeRescue = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  attached ← newEmptyMVar
+  go ← newEmptyMVar
+  let pending name = (ownerNamed name) {scriptPlan = [Await, Await] <> map Certify allRetirementFacts}
+      callback host
+        | after = do
+            (alpha, beta) ← twoWindows host
+            void (establishedOwner journal host alpha (pending "alpha"))
+            putMVar attached () >> takeMVar go
+            void (establishedOwner journal host beta (pending "beta"))
+        | otherwise = do
+            window ← onlyWindow host
+            void (establishedOwner journal host window (pending "alpha"))
+      windows = if after then ["alpha", "beta"] else ["alpha"]
+  -- The scope's opening begins the cleanup before it kills the runner, and lets go of the runner's gate, however the example ended.
+  withMainThreadVia scope seam (rescueNow >> void (tryPutMVar go ()))
+    ( do
+        unless after (takeMVar go)
+        protectedRunHere seam quietLogger (settings (map windowNamed windows)) callback (\_ _ → pure ()) (\() _ → pure ())
+    )
+    $ \_ finished → do
+    when after (takeMVar attached)
+    beforeRescue
+    rescueNow
+    putMVar go ()
+    takeMVar finished >>= either throwIO pure
+
+-- | The runner of 'testRepeatedCancellation' held before it has registered its owner (#593), with the example body ended the way the
+-- ending says: the scope's opening begins the cleanup while the runner has registered nothing, then lets it go on, so the owner is
+-- registered and attached after the cleanup began. Nothing in the snapshot covers it; the registering code must release it itself,
+-- or the drain waits for ever on an owner whose plan awaits and whose facts nobody publishes.
+runnerBeforeRegistrationScenario ∷ Scope → IO () → IO ()
+runnerBeforeRegistrationScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  reached ← newEmptyMVar
+  proceed ← newEmptyMVar
+  withMainThreadVia scope seam (rescueNow >> void (tryPutMVar proceed ()))
+    ( protectedRunHere
+        seam
+        quietLogger
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            putMVar reached () >> takeMVar proceed
+            void (establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Await, Await] <> map Certify allRetirementFacts})
+        )
+        (\_ _ → pure ())
+        (\() _ → pure ())
+    )
+    $ \runner _ → takeMVar reached >> awaitParked runner >> atParked
+
+-- | The same runner held inside its owner's construction (#593): the owner is registered and holds its acknowledgement, but its
+-- attachment is not established, so a notice published for it by the cleanup's snapshot may be refused. The attachment is established
+-- after the cleanup began, and the registering code releases the owner again then.
+runnerDuringConstructionScenario ∷ Scope → IO () → IO ()
+runnerDuringConstructionScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  constructing ← newEmptyMVar
+  proceed ← newEmptyMVar
+  withMainThreadVia scope seam (rescueNow >> void (tryPutMVar proceed ()))
+    ( protectedRunHere
+        seam
+        quietLogger
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            void $
+              establishedOwner
+                journal
+                host
+                window
+                (ownerNamed "alpha")
+                  { scriptPlan = [Await, Await] <> map Certify allRetirementFacts
+                  , scriptConstruct = putMVar constructing () >> takeMVar proceed
+                  }
+        )
+        (\_ _ → pure ())
+        (\() _ → pure ())
+    )
+    $ \runner _ → takeMVar constructing >> awaitParked runner >> atParked
+
+-- | The scenario of 'testCancelledRollback' up to the moment its runner is parked in the construction, with the example body ended
+-- the way the ending says (#593): a kill sent by the scope's release interrupts the construction, which starts a rollback that
+-- waits at a second gate, so the scope opens both gates before it kills and joins the runner.
+parkedConstructionScenario ∷ Scope → IO () → IO ()
+parkedConstructionScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  constructing ← newEmptyMVar
+  never ← newEmptyMVar
+  neverRolls ← newEmptyMVar
+  withMainThreadVia scope seam (void (tryPutMVar never ()) >> void (tryPutMVar neverRolls RollbackUnsafe))
+    ( protectedRunHere
+        seam
+        quietLogger
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            void $
+              attachOwner
+                journal
+                host
+                window
+                (ownerNamed "alpha")
+                  { scriptConstruct = putMVar constructing () >> takeMVar never
+                  , scriptRollback = takeMVar neverRolls
+                  }
+        )
+        (\_ _ → pure ())
+        (\() _ → pure ())
+    )
+    $ \runner _ → takeMVar constructing >> awaitParked runner >> atParked
 
 -- ---------------------------------------------------------------------------
 -- The drain
@@ -1096,13 +1452,26 @@ testCancelledRollback = do
 -- pending attachment, establishes no fact, releases nothing, and is re-raised
 -- only once the last fact has been certified.
 testRepeatedCancellation ∷ Expectation
-testRepeatedCancellation = do
+testRepeatedCancellation = repeatedCancellation withMainThread Nothing
+
+-- | The scenario of 'testRepeatedCancellation' up to the moment its runner is parked in the drain's first finite wait, with the
+-- example body ended the way the ending says before its first planned cancellation (#593): the drain absorbs the one kill of the
+-- scope's cleanup, advances to its second wait, and would block there with nothing to wake it, so the cleanup must release every
+-- remaining wait (the owner's plan, and a notice to wake the wait).
+repeatedCancellationEndedEarlyScenario ∷ Scope → IO () → IO ()
+repeatedCancellationEndedEarlyScenario scope atParked = repeatedCancellation (withMainThreadVia scope) (Just atParked)
+
+repeatedCancellation
+  ∷ (Seam → IO () → IO () → (ThreadId → MVar (Either SomeException ()) → IO ()) → IO ())
+  → Maybe (IO ())
+  → Expectation
+repeatedCancellation start endEarly = do
   journal ← newTVarIO []
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
-  (runner, finished) ←
-    onMainThread seam $
-      protectedRunHere
+  hostHeld ← newTVarIO Nothing
+  start seam (supplyIfHeld journal hostHeld owned allRetirementFacts)
+    ( protectedRunHere
         seam
         quietLogger
         (settings [windowNamed "alpha"])
@@ -1114,26 +1483,31 @@ testRepeatedCancellation = do
                 host
                 window
                 (ownerNamed "alpha") {scriptPlan = [Await, Await] <> map Certify allRetirementFacts}
-            atomically (writeTVar owned (Just owner))
+            atomically (writeTVar owned (Just owner) >> writeTVar hostHeld (Just host))
         )
         (\_ _ → pure ())
         (\() _ → pure ())
-  owner ← awaitHeld owned
-  -- Each cancellation is delivered while the drain is inside a finite wait it
-  -- has no progress to skip, which is where the deferral must hold.
-  forM_ [1 .. 2 ∷ Int] $ \round' → do
-    atomically (readTVar (ownerAwaits owner) >>= check . (>= round'))
-    killThread runner
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled drain returned"
-  seen ← readTVarIO (ownerViews owner)
-  map viewPhase (take 1 seen) `shouldBe` [AttachmentRetiring]
-  map (evidenceCancellations . viewEvidence) (take 1 seen) `shouldSatisfy` \case
-    [counted] → counted >= 2
-    _ → False
-  map viewMissing (take 1 seen) `shouldBe` [allRetirementFacts]
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+    )
+    $ \runner finished → do
+    owner ← awaitHeld owned
+    case endEarly of
+     Just atParked → atomically (readTVar (ownerAwaits owner) >>= check . (>= 1)) >> atParked
+     Nothing → do
+      -- Each cancellation is delivered while the drain is inside a finite wait it
+      -- has no progress to skip, which is where the deferral must hold.
+      forM_ [1 .. 2 ∷ Int] $ \round' → do
+        atomically (readTVar (ownerAwaits owner) >>= check . (>= round'))
+        killThread runner
+      takeMVar finished >>= \case
+        Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+        Right () → unexpected "the cancelled drain returned"
+      seen ← readTVarIO (ownerViews owner)
+      map viewPhase (take 1 seen) `shouldBe` [AttachmentRetiring]
+      map (evidenceCancellations . viewEvidence) (take 1 seen) `shouldSatisfy` \case
+        [counted] → counted >= 2
+        _ → False
+      map viewMissing (take 1 seen) `shouldBe` [allRetirementFacts]
+      readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 exceptionOf ∷ Evidence → SomeException
 exceptionOf (ExceptionWithContext _ failure) = failure
@@ -1156,36 +1530,36 @@ testIndependentChains = do
   -- Beta's independent evidence arrives only once alpha's chain is already
   -- safe and its own window destroyed, so the order below is the order the
   -- boundary produced and not one the example imposed.
-  helper ← forkIO (supplyEvidence journal hostHeld betaHeld (afterAlphaDestroyed journal) allRetirementFacts)
-  asProcessMainThread seam $
-    runProtectedWindowApplication
-      (withLoggingLifetime quietLogger)
-      "protected-host-example"
-      ( \_ use →
-          withScoped (scriptedParent journal "parent") $ \() →
-            protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
-              (alpha, beta) ← twoWindows host
-              void (establishedOwner journal host alpha (ownerNamed "alpha"))
-              betaOwner ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = [Stall]}
-              atomically (writeTVar betaHeld (Just betaOwner))
-              atomically (writeTVar hostHeld (Just host))
-              use host
-      )
-      id
-      (\host _ → pure host)
-      ( \host _ → do
-          -- The chain that can retire is closed during the run, so its own
-          -- window is destroyed as soon as it is safe, and not before.
-          (alpha, _) ← twoWindows host
-          closeHostWindow host alpha `shouldReturn` CloseStarted
-      )
-  void (pure helper)
-  readTVarIO journal
-    `shouldReturn` ( retiring "alpha"
-                   <> [WindowGone 1]
-                   <> retiring "beta"
-                   <> [WindowGone 2, SessionEnded, ParentReleased "parent"]
-               )
+  withEvidenceThread (supplyEvidence journal hostHeld betaHeld (afterAlphaDestroyed journal) allRetirementFacts) $ \helper _ → do
+    asProcessMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "protected-host-example"
+        ( \_ use →
+            withScoped (scriptedParent journal "parent") $ \() →
+              protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+                (alpha, beta) ← twoWindows host
+                void (establishedOwner journal host alpha (ownerNamed "alpha"))
+                betaOwner ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = [Stall]}
+                atomically (writeTVar betaHeld (Just betaOwner))
+                atomically (writeTVar hostHeld (Just host))
+                use host
+        )
+        id
+        (\host _ → pure host)
+        ( \host _ → do
+            -- The chain that can retire is closed during the run, so its own
+            -- window is destroyed as soon as it is safe, and not before.
+            (alpha, _) ← twoWindows host
+            closeHostWindow host alpha `shouldReturn` CloseStarted
+        )
+    void (pure helper)
+    readTVarIO journal
+      `shouldReturn` ( retiring "alpha"
+                     <> [WindowGone 1]
+                     <> retiring "beta"
+                     <> [WindowGone 2, SessionEnded, ParentReleased "parent"]
+                 )
 
 -- | Once the owner has declared its stall, publish its certified facts from
 -- another thread. Each notice wakes the owner out of its finite wait.
@@ -1225,26 +1599,48 @@ testStalledThenEvidence = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
-  let logger = recordingLogger entries
-  asProcessMainThread seam $
-    runProtectedWindowApplication
-      (withLoggingLifetime logger)
-      "protected-host-example"
-      ( \_ use →
-          protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
-            window ← onlyWindow host
-            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-            atomically (writeTVar owned (Just owner))
-            atomically (writeTVar hostHeld (Just host))
-            use host
-      )
-      id
-      (\host _ → pure host)
-      (\_ _ → pure ())
-  void (pure helper)
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
-  stallReports entries `shouldReturn` 1
+  withEvidenceSupplier withOwnedThreadOpening journal hostHeld owned $ \helper → do
+    let logger = recordingLogger entries
+    asProcessMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime logger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
+              window ← onlyWindow host
+              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+              atomically (writeTVar owned (Just owner))
+              atomically (writeTVar hostHeld (Just host))
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+    void (pure helper)
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+    stallReports entries `shouldReturn` 1
+
+-- | The evidence supplier of the stalled-owner examples, started through the given scope (#593): the example, or the negative
+-- control that starts it without ownership. It waits for the owner and the host the example's run publishes, so an example that
+-- fails before the run publishes them leaves it parked for ever unless the scope stops it.
+withEvidenceSupplier
+  ∷ Scope
+  → TVar [Flag]
+  → TVar (Maybe WindowHost)
+  → TVar (Maybe Owner)
+  → (ThreadId → IO r)
+  → IO r
+withEvidenceSupplier scope journal hostHeld owned body =
+  armed $ scope (pure ()) (supplyEvidence journal hostHeld owned afterStall allRetirementFacts) (\helper _ → body helper)
+
+-- | The scenario of 'testStalledThenEvidence' for an example that fails before the run ever publishes the owner the supplier
+-- waits for: the supplier is parked, waiting for an owner that never exists, and the example body ends the way the ending says.
+supplierScenario ∷ Scope → IO () → IO ()
+supplierScenario scope atParked = do
+  journal ← newTVarIO []
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  withEvidenceSupplier scope journal hostHeld owned $ \helper → awaitParked helper >> atParked
 
 -- | A declaration of the protocol that raises while the drain demands it is
 -- contained, exactly as a failed step is.
@@ -1263,39 +1659,39 @@ testMetadataFailsInDrain = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  helper ← forkIO (supplyEvidenceAfterFault journal hostHeld owned)
-  (failure, _) ←
-    caughtAs . asProcessMainThread seam $
-      runProtectedWindowApplication
-        (withLoggingLifetime quietLogger)
-        "protected-host-example"
-        ( \_ use →
-            protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
-              window ← onlyWindow host
-              owner ← establishedOwner journal host window (ownerNamed "alpha")
-              acknowledgement ← awaitAcknowledgement owner
-              atomically
-                ( faultHostAttachmentMetadata
-                    host
-                    (acknowledgedAttachment acknowledgement)
-                    (throw (Scripted "declaration"))
-                )
-              atomically (writeTVar owned (Just owner))
-              atomically (writeTVar hostHeld (Just host))
-              use host
-        )
-        id
-        (\host _ → pure host)
-        (\_ _ → pure ())
-  void (pure helper)
-  owner ← awaitHeld owned
-  -- The step was never entered: the declaration is demanded before it.
-  readTVarIO (ownerSteps owner) `shouldReturn` 0
-  -- Every fact was certified independently, and the window and the session were
-  -- released only afterwards.
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
-  -- It is the drain's own retained evidence, settled after retirement was safe.
-  failure `shouldBe` Scripted "declaration"
+  withEvidenceThread (supplyEvidenceAfterFault journal hostHeld owned) $ \helper _ → do
+    (failure, _) ←
+      caughtAs . asProcessMainThread seam $
+        runProtectedWindowApplication
+          (withLoggingLifetime quietLogger)
+          "protected-host-example"
+          ( \_ use →
+              protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+                window ← onlyWindow host
+                owner ← establishedOwner journal host window (ownerNamed "alpha")
+                acknowledgement ← awaitAcknowledgement owner
+                atomically
+                  ( faultHostAttachmentMetadata
+                      host
+                      (acknowledgedAttachment acknowledgement)
+                      (throw (Scripted "declaration"))
+                  )
+                atomically (writeTVar owned (Just owner))
+                atomically (writeTVar hostHeld (Just host))
+                use host
+          )
+          id
+          (\host _ → pure host)
+          (\_ _ → pure ())
+    void (pure helper)
+    owner ← awaitHeld owned
+    -- The step was never entered: the declaration is demanded before it.
+    readTVarIO (ownerSteps owner) `shouldReturn` 0
+    -- Every fact was certified independently, and the window and the session were
+    -- released only afterwards.
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+    -- It is the drain's own retained evidence, settled after retirement was safe.
+    failure `shouldBe` Scripted "declaration"
 
 -- | The owner's completion authority, once its construction has stored it.
 awaitAcknowledgement ∷ Owner → IO Acknowledgement
@@ -1310,6 +1706,14 @@ supplyEvidenceAfterFault journal hostHeld owned = do
   host ← awaitHeld hostHeld
   atomically (afterDeclarationFailed host owner)
   publishFacts journal host owner allRetirementFacts
+
+-- | The opening of a main-thread runner's scope (#593): release everything the registered owners still owe, from the moment each
+-- owner was created, whether or not the example has published any handle yet. The arguments are the cells the example would
+-- publish; they are no longer consulted, because a cancellation that lands after an attachment exists and before they are filled
+-- would otherwise leave this with nothing to release while the runner's drain waits for it. It never blocks and never raises, and
+-- it adds nothing once the run has finished: the boundary has closed publication, and a refused notice establishes nothing.
+supplyIfHeld ∷ TVar [Flag] → TVar (Maybe WindowHost) → TVar (Maybe Owner) → [RetirementFact] → IO ()
+supplyIfHeld _ _ _ _ = rescueNow
 
 afterDeclarationFailed ∷ WindowHost → Owner → STM ()
 afterDeclarationFailed host owner = do
@@ -1328,27 +1732,27 @@ testStallDiagnosticFails = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
-  let logger = failingLogger "glfw.retirement"
-  (failure, _) ←
-    caughtAs . asProcessMainThread seam $
-      runProtectedWindowApplication
-        (withLoggingLifetime logger)
-        "protected-host-example"
-        ( \_ use →
-            protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
-              window ← onlyWindow host
-              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-              atomically (writeTVar owned (Just owner))
-              atomically (writeTVar hostHeld (Just host))
-              use host
-        )
-        id
-        (\host _ → pure host)
-        (\_ _ → pure ())
-  void (pure helper)
-  failure `shouldBe` Scripted "sink"
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  withEvidenceThread (supplyEvidence journal hostHeld owned afterStall allRetirementFacts) $ \helper _ → do
+    let logger = failingLogger "glfw.retirement"
+    (failure, _) ←
+      caughtAs . asProcessMainThread seam $
+        runProtectedWindowApplication
+          (withLoggingLifetime logger)
+          "protected-host-example"
+          ( \_ use →
+              protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
+                window ← onlyWindow host
+                owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+                atomically (writeTVar owned (Just owner))
+                atomically (writeTVar hostHeld (Just host))
+                use host
+          )
+          id
+          (\host _ → pure host)
+          (\_ _ → pure ())
+    void (pure helper)
+    failure `shouldBe` Scripted "sink"
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | A chain that became safe before the drain, and whose destruction was
 -- deferred while it was not, must not stay tied to a chain that stalls: the
@@ -1364,49 +1768,59 @@ testDeferredWindowRetired = do
   betaHeld ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
   duringRun ← newIORef Nothing
-  helper ← forkIO (supplyEvidence journal hostHeld betaHeld afterStall allRetirementFacts)
-  asProcessMainThread seam $
-    runProtectedWindowApplication
-      (withLoggingLifetime quietLogger)
-      "protected-host-example"
-      ( \_ use →
-          protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
-            (alpha, beta) ← twoWindows host
-            alphaOwner ← establishedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = []}
-            betaOwner ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = [Stall]}
-            atomically (writeTVar betaHeld (Just betaOwner))
-            atomically (writeTVar hostHeld (Just host))
-            alphaAcknowledgement ←
-              atomically (readTVar (ownerAcknowledgement alphaOwner) >>= maybe retry pure)
-            -- Closing alpha's window begins its attachment's retirement and
-            -- destroys nothing: its own veto defers that.
-            closeHostWindow host alpha `shouldReturn` CloseStarted
-            -- Alpha then becomes safe on the owner thread, before anything
-            -- drains. Nothing retries its deferred destruction during the run,
-            -- because the application runs no owner turn.
-            forM_ allRetirementFacts $ \fact → do
-              atomically (note journal (flagOf "alpha" fact))
-              void (reportHostRetirementFact host alphaAcknowledgement fact)
-            atomically (hostPendingAttachments host) >>= \pending → length pending `shouldBe` 1
-            use host
-      )
-      id
-      (\host _ → pure host)
-      (\_ _ → destroyedWindows seam >>= writeIORef duringRun . Just)
-  void (pure helper)
-  readIORef duringRun `shouldReturn` Just []
-  readTVarIO journal
-    `shouldReturn` ( retiring "alpha"
-                       <> [WindowGone 1]
-                       <> retiring "beta"
-                       <> [WindowGone 2, SessionEnded]
-                   )
+  withEvidenceThread (supplyEvidence journal hostHeld betaHeld afterStall allRetirementFacts) $ \helper _ → do
+    asProcessMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime quietLogger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+              (alpha, beta) ← twoWindows host
+              alphaOwner ← establishedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = []}
+              betaOwner ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = [Stall]}
+              atomically (writeTVar betaHeld (Just betaOwner))
+              atomically (writeTVar hostHeld (Just host))
+              alphaAcknowledgement ←
+                atomically (readTVar (ownerAcknowledgement alphaOwner) >>= maybe retry pure)
+              -- Closing alpha's window begins its attachment's retirement and
+              -- destroys nothing: its own veto defers that.
+              closeHostWindow host alpha `shouldReturn` CloseStarted
+              -- Alpha then becomes safe on the owner thread, before anything
+              -- drains. Nothing retries its deferred destruction during the run,
+              -- because the application runs no owner turn.
+              forM_ allRetirementFacts $ \fact → do
+                atomically (note journal (flagOf "alpha" fact))
+                void (reportHostRetirementFact host alphaAcknowledgement fact)
+              atomically (hostPendingAttachments host) >>= \pending → length pending `shouldBe` 1
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → destroyedWindows seam >>= writeIORef duringRun . Just)
+    void (pure helper)
+    readIORef duringRun `shouldReturn` Just []
+    readTVarIO journal
+      `shouldReturn` ( retiring "alpha"
+                         <> [WindowGone 1]
+                         <> retiring "beta"
+                         <> [WindowGone 2, SessionEnded]
+                     )
 
 -- | The completion inbox holds one notice per retirement fact per window the
 -- host may hold, so an integration can publish every obligation it has ended
 -- without being refused.
 testInboxHoldsEveryFact ∷ Expectation
-testInboxHoldsEveryFact = do
+testInboxHoldsEveryFact = inboxFixture (\_ → pure ())
+
+-- | The fixture ended at the boundary before step @k@ (#593): 0 is the setup callback (nothing attached), 1 follows the window
+-- lookup, 2 alpha's attachment, 3 beta's, 4 is the action before the publishers, 5 follows alpha's producer starting (before beta's
+-- publication). Both plans are empty, so only published notices retire either chain, and the rescue registered with the host, which
+-- certifies every fact for every owner registered so far, must be what finishes the exit from any of these.
+inboxSetupScenario ∷ Int → Scope → IO () → IO ()
+inboxSetupScenario k _ atParked = inboxFixture (\i → when (i == k) atParked)
+
+inboxFixture ∷ (Int → IO ()) → Expectation
+inboxFixture step = armed $ do
   journal ← newTVarIO []
   seam ← journallingSeam journal
   asProcessMainThread seam $
@@ -1415,19 +1829,25 @@ testInboxHoldsEveryFact = do
       "protected-host-example"
       ( \_ use →
           protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+            step 0
             (alpha, beta) ← twoWindows host
+            step 1
             alphaOwner ← establishedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = []}
+            step 2
             betaOwner ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = []}
+            step 3
             use (host, alphaOwner, betaOwner)
       )
       (\(host, _, _) → host)
       (\dependencies _ → pure dependencies)
       ( \(host, alphaOwner, betaOwner) _ → do
+          step 4
           -- Every fact of every window at once: none may be refused, and the
           -- plans are empty, so only these notices can retire either chain.
-          published ← forkPublisher (publishFacts journal host alphaOwner allRetirementFacts)
-          publishFacts journal host betaOwner allRetirementFacts
-          takeMVar published
+          withPublisher (publishFacts journal host alphaOwner allRetirementFacts) $ \published → do
+            step 5
+            publishFacts journal host betaOwner allRetirementFacts
+            takeMVar published
       )
   entries ← readTVarIO journal
   -- Both chains retired from notices alone, whichever order the two publishers
@@ -1439,11 +1859,21 @@ testInboxHoldsEveryFact = do
       WindowGone _ → True
       _ → False
 
-forkPublisher ∷ IO () → IO (MVar ())
-forkPublisher work = do
+-- | 'onMainThread' keeping the context of whatever the run raised, for the same
+-- reason.
+onMainThreadKeepingContext
+  ∷ ∀ a. Seam → IO a → IO (ThreadId, MVar (Either (ExceptionWithContext SomeException) a))
+onMainThreadKeepingContext seam action = do
+  finished ← newEmptyMVar
+  runner ← forkOS (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
+  pure (runner, finished)
+
+-- | Run the work on an owned thread (#593) for the length of the body, which is given the cell the thread fills when the work
+-- is done and waits for it itself. However the body ends, the thread has been stopped and joined before this returns.
+withPublisher ∷ IO () → (MVar () → IO r) → IO r
+withPublisher work body = do
   done ← newEmptyMVar
-  _ ← forkIO (work >> putMVar done ())
-  pure done
+  withOwnedThread (work >> putMVar done ()) $ \_ _ → body done
 
 -- | The window limit is refused below one, below the configured windows, and
 -- above the bound every count a host derives from it stays exact within.
@@ -1469,9 +1899,8 @@ testRollbackCancelledAfterFailure = do
   seam ← journallingSeam journal
   rollingBack ← newEmptyMVar
   never ← newEmptyMVar
-  (runner, finished) ←
-    onMainThread seam $
-      protectedRunHere
+  withMainThread seam (void (tryPutMVar never RollbackUnsafe))
+    ( protectedRunHere
         seam
         quietLogger
         (settings [windowNamed "alpha"])
@@ -1489,12 +1918,14 @@ testRollbackCancelledAfterFailure = do
         )
         (\_ _ → pure ())
         (\() _ → pure ())
-  takeMVar rollingBack
-  killThread runner
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled rollback returned"
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+    )
+    $ \runner finished → do
+    takeMVar rollingBack
+    killThread runner
+    takeMVar finished >>= \case
+      Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      Right () → unexpected "the cancelled rollback returned"
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | A cancellation queued in the handoff out of the scope's own construction.
 --
@@ -1516,9 +1947,8 @@ testCancelledAtHandoff = do
           { afterRegistration = putMVar registered () >> uninterruptibleMask_ (takeMVar proceed)
           , beforeConsumer = \_ → writeIORef reached True
           }
-  (runner, finished) ←
-    onMainThread seam $
-      runProtectedWindowApplication
+  withMainThread seam (void (tryPutMVar proceed ()))
+    ( runProtectedWindowApplication
         (withLoggingLifetime quietLogger)
         "protected-host-example"
         ( \_ use →
@@ -1527,19 +1957,21 @@ testCancelledAtHandoff = do
         id
         (\host _ → writeIORef entered True >> pure host)
         (\_ _ → pure ())
-  takeMVar registered
-  awaitBlockedOn BlockedOnMVar runner
-  killer ← forkIO (killThread runner)
-  awaitBlockedOn BlockedOnException killer
-  putMVar proceed ()
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled handoff returned"
-  -- Delivered in the handoff itself: neither the protected consumer path nor
-  -- the application's own startup began.
-  readIORef reached `shouldReturn` False
-  readIORef entered `shouldReturn` False
-  readTVarIO journal `shouldReturn` [WindowGone 1, SessionEnded]
+    )
+    $ \runner finished → do
+    takeMVar registered
+    awaitBlockedOn BlockedOnMVar runner
+    withOwnedThread (killThread runner) $ \killer _ → do
+      awaitBlockedOn BlockedOnException killer
+      putMVar proceed ()
+      takeMVar finished >>= \case
+        Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+        Right () → unexpected "the cancelled handoff returned"
+      -- Delivered in the handoff itself: neither the protected consumer path nor
+      -- the application's own startup began.
+      readIORef reached `shouldReturn` False
+      readIORef entered `shouldReturn` False
+      readTVarIO journal `shouldReturn` [WindowGone 1, SessionEnded]
 
 -- | Whether the boundary has closed completion publication, asked with a notice
 -- of its own that names nothing the model can accept.
@@ -1589,10 +2021,13 @@ testPublicationCloses = do
             quietLogger
             (seamSession seam defaultSessionConfig)
             (settings [windowNamed "alpha"])
-            ( \host → do
-                window ← onlyWindow host
-                void (establishedOwner journal host window (ownerNamed "alpha"))
-                use host
+            ( \host →
+                ( do
+                    window ← onlyWindow host
+                    void (establishedOwner journal host window (ownerNamed "alpha"))
+                    use host
+                )
+                  `rescuedUnlessDesigned` ()
             )
       )
       id
@@ -1620,9 +2055,8 @@ testInterruptedStepWithdrawn = do
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
   let logger = recordingLogger entries
-  (runner, finished) ←
-    onMainThread seam $
-      runProtectedWindowApplication
+  withMainThread seam (supplyIfHeld journal hostHeld owned allRetirementFacts)
+    ( runProtectedWindowApplication
         (withLoggingLifetime logger)
         "protected-host-example"
         ( \_ use →
@@ -1636,22 +2070,24 @@ testInterruptedStepWithdrawn = do
         id
         (\host _ → pure host)
         (\_ _ → pure ())
-  owner ← awaitHeld owned
-  host ← awaitHeld hostHeld
-  -- The step has begun disposing and cannot return.
-  atomically (readTVar (ownerSteps owner) >>= check . (>= 1))
-  awaitBlockedOn BlockedOnSTM runner
-  killThread runner
-  -- With the path withdrawn, and no other, the boundary owes its one stall
-  -- diagnostic; the step is never offered again until evidence arrives.
-  atomically (afterStallReported entries)
-  readTVarIO (ownerSteps owner) `shouldReturn` 1
-  publishFacts journal host owner allRetirementFacts
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled drain returned"
-  stallReports entries `shouldReturn` 1
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+    )
+    $ \runner finished → do
+    owner ← awaitHeld owned
+    host ← awaitHeld hostHeld
+    -- The step has begun disposing and cannot return.
+    atomically (readTVar (ownerSteps owner) >>= check . (>= 1))
+    awaitBlockedOn BlockedOnSTM runner
+    killThread runner
+    -- With the path withdrawn, and no other, the boundary owes its one stall
+    -- diagnostic; the step is never offered again until evidence arrives.
+    atomically (afterStallReported entries)
+    readTVarIO (ownerSteps owner) `shouldReturn` 1
+    publishFacts journal host owner allRetirementFacts
+    takeMVar finished >>= \case
+      Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      Right () → unexpected "the cancelled drain returned"
+    stallReports entries `shouldReturn` 1
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | A refused notice and a duplicate fact establish nothing, so neither may
 -- revive a withdrawn path and make a failed disposal run again.
@@ -1663,9 +2099,8 @@ testOnlyNewEvidenceRevives = do
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
   let logger = recordingLogger entries
-  (runner, finished) ←
-    onMainThread seam $
-      runProtectedWindowApplication
+  withMainThread seam (supplyIfHeld journal hostHeld owned allRetirementFacts)
+    ( runProtectedWindowApplication
         (withLoggingLifetime logger)
         "protected-host-example"
         ( \_ use →
@@ -1684,34 +2119,36 @@ testOnlyNewEvidenceRevives = do
         id
         (\host _ → pure host)
         (\_ _ → pure ())
-  owner ← awaitHeld owned
-  host ← awaitHeld hostHeld
-  publisher ← maybe (unexpected "the host publishes no completions") pure (hostCompletionPublisher host)
-  acknowledgement ← atomically (readTVar (ownerAcknowledgement owner) >>= maybe retry pure)
-  -- The first fact was certified and the second step failed, so nothing has a
-  -- path left and the stall is owed.
-  atomically (afterStallReported entries)
-  awaitBlockedOn BlockedOnSTM runner
-  stepsBefore ← readTVarIO (ownerSteps owner)
-  -- A duplicate of the fact already recorded, and a notice for another host's
-  -- attachment entirely. Both are folded and both establish nothing.
-  (stray, strayAcknowledgement) ← strayAttachment
-  let target = acknowledgedAttachment acknowledgement
-  void (publishCompletion publisher (completionNotice target acknowledgement CpuUseRetired))
-  void (publishCompletion publisher (completionNotice stray strayAcknowledgement CpuUseRetired))
-  -- The round that folded them has finished and parked again.
-  awaitBlockedOn BlockedOnSTM runner
-  readTVarIO (ownerSteps owner) `shouldReturn` stepsBefore
-  -- Real evidence does revive it, and the run then finishes.
-  publishFacts journal host owner (filter (/= CpuUseRetired) allRetirementFacts)
-  takeMVar finished >>= \case
-    Right () → unexpected "the required step's failure did not fail the run"
-    Left caught → (fromException caught ∷ Maybe Scripted) `shouldBe` Just (Scripted "disposal")
-  stallReports entries `shouldReturn` 1
-  -- The first flag is the step's own certification; the rest are the published
-  -- facts. The duplicate and the refused notice are offered directly, so they
-  -- journal nothing and, having established nothing, change nothing.
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+    )
+    $ \runner finished → do
+    owner ← awaitHeld owned
+    host ← awaitHeld hostHeld
+    publisher ← maybe (unexpected "the host publishes no completions") pure (hostCompletionPublisher host)
+    acknowledgement ← atomically (readTVar (ownerAcknowledgement owner) >>= maybe retry pure)
+    -- The first fact was certified and the second step failed, so nothing has a
+    -- path left and the stall is owed.
+    atomically (afterStallReported entries)
+    awaitBlockedOn BlockedOnSTM runner
+    stepsBefore ← readTVarIO (ownerSteps owner)
+    -- A duplicate of the fact already recorded, and a notice for another host's
+    -- attachment entirely. Both are folded and both establish nothing.
+    (stray, strayAcknowledgement) ← strayAttachment
+    let target = acknowledgedAttachment acknowledgement
+    void (publishCompletion publisher (completionNotice target acknowledgement CpuUseRetired))
+    void (publishCompletion publisher (completionNotice stray strayAcknowledgement CpuUseRetired))
+    -- The round that folded them has finished and parked again.
+    awaitBlockedOn BlockedOnSTM runner
+    readTVarIO (ownerSteps owner) `shouldReturn` stepsBefore
+    -- Real evidence does revive it, and the run then finishes.
+    publishFacts journal host owner (filter (/= CpuUseRetired) allRetirementFacts)
+    takeMVar finished >>= \case
+      Right () → unexpected "the required step's failure did not fail the run"
+      Left caught → (fromException caught ∷ Maybe Scripted) `shouldBe` Just (Scripted "disposal")
+    stallReports entries `shouldReturn` 1
+    -- The first flag is the step's own certification; the rest are the published
+    -- facts. The duplicate and the refused notice are offered directly, so they
+    -- journal nothing and, having established nothing, change nothing.
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | A cancellation queued as the last fact is certified, while the window's own
 -- destruction is under way, is deferred: the destruction completes once, the
@@ -1723,9 +2160,8 @@ testCancelledIntoDisposal = do
   destroying ← newEmptyMVar
   proceed ← newEmptyMVar
   seam ← destroyGatedSeam journal destroying proceed
-  (runner, finished) ←
-    onMainThread seam $
-      runProtectedWindowApplication
+  withMainThread seam (void (tryPutMVar proceed ()))
+    ( runProtectedWindowApplication
         (withLoggingLifetime quietLogger)
         "protected-host-example"
         ( \_ use →
@@ -1741,19 +2177,21 @@ testCancelledIntoDisposal = do
             window ← onlyWindow host
             closeHostWindow host window `shouldReturn` CloseStarted
         )
-  -- The drain certified the last fact and is inside the window's destruction,
-  -- which runs uninterruptibly.
-  takeMVar destroying
-  killer ← forkIO (killThread runner)
-  awaitBlockedOn BlockedOnException killer
-  putMVar proceed ()
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled disposal returned"
-  -- Destroyed exactly once, and the session and the parent released only after
-  -- it, whatever was queued during it.
-  readTVarIO journal
-    `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded, ParentReleased "parent"])
+    )
+    $ \runner finished → do
+    -- The drain certified the last fact and is inside the window's destruction,
+    -- which runs uninterruptibly.
+    takeMVar destroying
+    withOwnedThread (killThread runner) $ \killer _ → do
+      awaitBlockedOn BlockedOnException killer
+      putMVar proceed ()
+      takeMVar finished >>= \case
+        Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+        Right () → unexpected "the cancelled disposal returned"
+      -- Destroyed exactly once, and the session and the parent released only after
+      -- it, whatever was queued during it.
+      readTVarIO journal
+        `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded, ParentReleased "parent"])
 
 -- | 'journallingSeam' whose destroy hook parks until the example releases it,
 -- so a cancellation can be queued while the destruction is in flight.
@@ -1790,49 +2228,49 @@ testFailedStep disposition = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  helper ← forkIO (supplyEvidence journal hostHeld owned afterFailedStep [CpuUseRetired])
-  outcome ←
-    try . asProcessMainThread seam $
-      runProtectedWindowApplication
-        (withLoggingLifetime quietLogger)
-        "protected-host-example"
-        ( \_ use →
-            protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
-              window ← onlyWindow host
-              owner ←
-                establishedOwner
-                  journal
-                  host
-                  window
-                  (ownerNamed "alpha")
-                    { scriptPlan = FailWith "disposal" : map Certify allRetirementFacts
-                    , scriptDisposition = disposition
-                    , scriptRecognizes = disposition == Optional
-                    }
-              atomically (writeTVar owned (Just owner))
-              atomically (writeTVar hostHeld (Just host))
-              use host
-        )
-        id
-        (\host _ → pure host)
-        (\_ _ → pure ())
-  void (pure helper)
-  owner ← awaitHeld owned
-  seen ← readTVarIO (ownerViews owner)
-  -- The step ran once, its evidence is the attachment's, and the only fact it
-  -- no longer owed by the next opportunity is the one the notice certified.
-  map (disposalEvidence . viewEvidence) (take 1 seen) `shouldBe` [True]
-  map viewMissing (take 1 seen) `shouldBe` [filter (/= CpuUseRetired) allRetirementFacts]
-  readTVarIO (ownerPlan owner) `shouldReturn` []
-  -- The notice certifies CPU-use retirement; the revived plan then certifies
-  -- every fact, the first of which the model has already recorded.
-  readTVarIO journal
-    `shouldReturn` ([CpuUsesEnded "alpha"] <> retiring "alpha" <> [WindowGone 1, SessionEnded])
-  case (disposition, outcome ∷ Either SomeException ()) of
-    (Required, Left caught) → (fromException caught ∷ Maybe Scripted) `shouldBe` Just (Scripted "disposal")
-    (Required, Right ()) → unexpected "the required failure did not fail the run"
-    (Optional, Right ()) → pure ()
-    (Optional, Left caught) → unexpected ("the optional failure failed the run: " <> show caught)
+  withEvidenceThread (supplyEvidence journal hostHeld owned afterFailedStep [CpuUseRetired]) $ \helper _ → do
+    outcome ←
+      try . asProcessMainThread seam $
+        runProtectedWindowApplication
+          (withLoggingLifetime quietLogger)
+          "protected-host-example"
+          ( \_ use →
+              protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+                window ← onlyWindow host
+                owner ←
+                  establishedOwner
+                    journal
+                    host
+                    window
+                    (ownerNamed "alpha")
+                      { scriptPlan = FailWith "disposal" : map Certify allRetirementFacts
+                      , scriptDisposition = disposition
+                      , scriptRecognizes = disposition == Optional
+                      }
+                atomically (writeTVar owned (Just owner))
+                atomically (writeTVar hostHeld (Just host))
+                use host
+          )
+          id
+          (\host _ → pure host)
+          (\_ _ → pure ())
+    void (pure helper)
+    owner ← awaitHeld owned
+    seen ← readTVarIO (ownerViews owner)
+    -- The step ran once, its evidence is the attachment's, and the only fact it
+    -- no longer owed by the next opportunity is the one the notice certified.
+    map (disposalEvidence . viewEvidence) (take 1 seen) `shouldBe` [True]
+    map viewMissing (take 1 seen) `shouldBe` [filter (/= CpuUseRetired) allRetirementFacts]
+    readTVarIO (ownerPlan owner) `shouldReturn` []
+    -- The notice certifies CPU-use retirement; the revived plan then certifies
+    -- every fact, the first of which the model has already recorded.
+    readTVarIO journal
+      `shouldReturn` ([CpuUsesEnded "alpha"] <> retiring "alpha" <> [WindowGone 1, SessionEnded])
+    case (disposition, outcome ∷ Either SomeException ()) of
+      (Required, Left caught) → (fromException caught ∷ Maybe Scripted) `shouldBe` Just (Scripted "disposal")
+      (Required, Right ()) → unexpected "the required failure did not fail the run"
+      (Optional, Right ()) → pure ()
+      (Optional, Left caught) → unexpected ("the optional failure failed the run: " <> show caught)
 
 -- | The independent safe evidence that revives a withdrawn progress path: one
 -- certified fact, published from a thread that is not the owner, once the step
@@ -1879,12 +2317,12 @@ testHandoffAttachmentDrained failing = do
       (failure, _) ← caughtAs (asProcessMainThread seam run)
       failure `shouldBe` Scripted "handoff"
     ByCancellation → do
-      (runner, finished) ← onMainThread seam run
-      takeMVar reaching
-      killThread runner
-      takeMVar finished >>= \case
-        Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-        Right () → unexpected "the cancelled handoff returned"
+      withMainThread seam (pure ()) run $ \runner finished → do
+        takeMVar reaching
+        killThread runner
+        takeMVar finished >>= \case
+          Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+          Right () → unexpected "the cancelled handoff returned"
   readIORef entered `shouldReturn` False
   readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
@@ -1908,36 +2346,39 @@ testLateAdmissionRefused = do
   hostHeld ← newTVarIO Nothing
   refusals ← newEmptyMVar
   let logger = recordingLogger entries
-  helper ← forkIO $ do
-    owner ← awaitHeld owned
-    host ← awaitHeld hostHeld
-    -- The drain has begun and has nothing it can do.
-    atomically (afterStallReported entries)
-    submitted ← submitWindowCommand (hostCommandPort host) [] (createWindowCommand (windowNamed "late"))
-    published ← publishDemand (hostDemandPublisher host) immediateDemand
-    putMVar refusals (submitted, published)
-    publishFacts journal host owner allRetirementFacts
-  asProcessMainThread seam $
-    runManagedApplication
-      (withLoggingLifetime logger)
-      "protected-host-example"
-      ( \use →
-          protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
-            window ← onlyWindow host
-            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-            atomically (writeTVar owned (Just owner))
-            atomically (writeTVar hostHeld (Just host))
-            use host
-      )
-      -- No quiescence: the protected exit is the only close.
-      (\_ → pure ())
-      (\host _ → pure host)
-      (\_ _ → pure ())
-  void (pure helper)
-  (submitted, published) ← takeMVar refusals
-  submitted `shouldBe` SubmitClosed
-  published `shouldBe` DemandSlotClosed
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  withEvidenceThread
+    ( do
+        owner ← awaitHeld owned
+        host ← awaitHeld hostHeld
+        -- The drain has begun and has nothing it can do.
+        atomically (afterStallReported entries)
+        submitted ← submitWindowCommand (hostCommandPort host) [] (createWindowCommand (windowNamed "late"))
+        published ← publishDemand (hostDemandPublisher host) immediateDemand
+        putMVar refusals (submitted, published)
+        publishFacts journal host owner allRetirementFacts
+    )
+    $ \helper _ → do
+    asProcessMainThread seam $
+      runManagedApplication
+        (withLoggingLifetime logger)
+        "protected-host-example"
+        ( \use →
+            protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
+              window ← onlyWindow host
+              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+              atomically (writeTVar owned (Just owner))
+              atomically (writeTVar hostHeld (Just host))
+              use host
+        )
+        -- No quiescence: the protected exit is the only close.
+        (\_ → pure ())
+        (\host _ → pure host)
+        (\_ _ → pure ())
+    void (pure helper)
+    (submitted, published) ← takeMVar refusals
+    submitted `shouldBe` SubmitClosed
+    published `shouldBe` DemandSlotClosed
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | A chain with no safe path is retaining its window, the session, and its
 -- parents from that round on, and a chain beside it that only ever awaits must
@@ -1951,42 +2392,45 @@ testStallReportedBesideAwaiting = do
   awaitingHeld ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
   let logger = recordingLogger entries
-  helper ← forkIO $ do
-    stalled ← awaitHeld stalledHeld
-    awaiting ← awaitHeld awaitingHeld
-    host ← awaitHeld hostHeld
-    -- The diagnostic is owed although the other chain keeps answering that it
-    -- may yet progress.
-    atomically (afterStallReported entries)
-    publishFacts journal host stalled allRetirementFacts
-    publishFacts journal host awaiting allRetirementFacts
-  asProcessMainThread seam $
-    runProtectedWindowApplication
-      (withLoggingLifetime logger)
-      "protected-host-example"
-      ( \_ use →
-          protectedHost seam logger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
-            (alpha, beta) ← twoWindows host
-            stalled ← establishedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
-            -- Never runs out: every opportunity answers that progress may still
-            -- become possible, so this chain never loses its own path.
-            awaiting ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = replicate 200 Await}
-            atomically (writeTVar stalledHeld (Just stalled))
-            atomically (writeTVar awaitingHeld (Just awaiting))
-            atomically (writeTVar hostHeld (Just host))
-            use host
-      )
-      id
-      (\host _ → pure host)
-      (\_ _ → pure ())
-  void (pure helper)
-  stallReports entries `shouldReturn` 1
-  stallCounts entries `shouldReturn` [Just ("1", "2")]
-  readTVarIO journal
-    `shouldReturn` ( retiring "alpha"
-                       <> retiring "beta"
-                       <> [WindowGone 2, WindowGone 1, SessionEnded]
-                   )
+  withEvidenceThread
+    ( do
+        stalled ← awaitHeld stalledHeld
+        awaiting ← awaitHeld awaitingHeld
+        host ← awaitHeld hostHeld
+        -- The diagnostic is owed although the other chain keeps answering that it
+        -- may yet progress.
+        atomically (afterStallReported entries)
+        publishFacts journal host stalled allRetirementFacts
+        publishFacts journal host awaiting allRetirementFacts
+    )
+    $ \helper _ → do
+    asProcessMainThread seam $
+      runProtectedWindowApplication
+        (withLoggingLifetime logger)
+        "protected-host-example"
+        ( \_ use →
+            protectedHost seam logger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+              (alpha, beta) ← twoWindows host
+              stalled ← establishedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
+              -- Never runs out: every opportunity answers that progress may still
+              -- become possible, so this chain never loses its own path.
+              awaiting ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = replicate 200 Await}
+              atomically (writeTVar stalledHeld (Just stalled))
+              atomically (writeTVar awaitingHeld (Just awaiting))
+              atomically (writeTVar hostHeld (Just host))
+              use host
+        )
+        id
+        (\host _ → pure host)
+        (\_ _ → pure ())
+    void (pure helper)
+    stallReports entries `shouldReturn` 1
+    stallCounts entries `shouldReturn` [Just ("1", "2")]
+    readTVarIO journal
+      `shouldReturn` ( retiring "alpha"
+                         <> retiring "beta"
+                         <> [WindowGone 2, WindowGone 1, SessionEnded]
+                     )
 
 -- | How many of the attachments still pending each stall diagnostic named as
 -- stalled, and how many were pending at all.
@@ -2005,37 +2449,37 @@ testBodyFailureStaysPrimary = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  helper ← forkIO (supplyEvidence journal hostHeld owned afterFailedStep [CpuUseRetired])
-  (primary, caught) ←
-    asProcessMainThread seam . caughtAs $
-      runProtectedWindowApplication
-        (withLoggingLifetime quietLogger)
-        "protected-host-example"
-        ( \_ use →
-            protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
-              window ← onlyWindow host
-              owner ←
-                establishedOwner
-                  journal
-                  host
-                  window
-                  (ownerNamed "alpha") {scriptPlan = FailWith "disposal" : map Certify allRetirementFacts}
-              atomically (writeTVar owned (Just owner))
-              atomically (writeTVar hostHeld (Just host))
-              use host
-        )
-        id
-        (\host _ → pure host)
-        (\_ _ → throwIO (Scripted "action"))
-  void (pure helper)
-  -- The action's own failure, unchanged.
-  primary `shouldBe` Scripted "action"
-  -- The drain's failure beside it, under this boundary's label.
-  retainedUnder "glfw protected retirement" caught `shouldBe` [Just (Scripted "disposal")]
-  -- The notice certifies CPU-use retirement, then the revived plan certifies
-  -- every fact, the first of which the model already holds.
-  readTVarIO journal
-    `shouldReturn` ([CpuUsesEnded "alpha"] <> retiring "alpha" <> [WindowGone 1, SessionEnded])
+  withEvidenceThread (supplyEvidence journal hostHeld owned afterFailedStep [CpuUseRetired]) $ \helper _ → do
+    (primary, caught) ←
+      asProcessMainThread seam . caughtAs $
+        runProtectedWindowApplication
+          (withLoggingLifetime quietLogger)
+          "protected-host-example"
+          ( \_ use →
+              protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+                window ← onlyWindow host
+                owner ←
+                  establishedOwner
+                    journal
+                    host
+                    window
+                    (ownerNamed "alpha") {scriptPlan = FailWith "disposal" : map Certify allRetirementFacts}
+                atomically (writeTVar owned (Just owner))
+                atomically (writeTVar hostHeld (Just host))
+                use host
+          )
+          id
+          (\host _ → pure host)
+          (\_ _ → throwIO (Scripted "action"))
+    void (pure helper)
+    -- The action's own failure, unchanged.
+    primary `shouldBe` Scripted "action"
+    -- The drain's failure beside it, under this boundary's label.
+    retainedUnder "glfw protected retirement" caught `shouldBe` [Just (Scripted "disposal")]
+    -- The notice certifies CPU-use retirement, then the revived plan certifies
+    -- every fact, the first of which the model already holds.
+    readTVarIO journal
+      `shouldReturn` ([CpuUsesEnded "alpha"] <> retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | The exceptions a failure retained under one cleanup label, in the order
 -- inspection reports them.
@@ -2098,28 +2542,28 @@ testLazyStallDiagnosticFails = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
-  let logger = lazilyFailingLogger "glfw.retirement"
-  (failure, _) ←
-    asProcessMainThread seam . caughtAs $
-      runProtectedWindowApplication
-        (withLoggingLifetime logger)
-        "protected-host-example"
-        ( \_ use →
-            protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
-              window ← onlyWindow host
-              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-              atomically (writeTVar owned (Just owner))
-              atomically (writeTVar hostHeld (Just host))
-              use host
-        )
-        id
-        (\host _ → pure host)
-        (\_ _ → pure ())
-  void (pure helper)
-  failure `shouldBe` Scripted "lazy sink"
-  -- Retained, not raised through the scope: the window outlived the stall.
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  withEvidenceThread (supplyEvidence journal hostHeld owned afterStall allRetirementFacts) $ \helper _ → do
+    let logger = lazilyFailingLogger "glfw.retirement"
+    (failure, _) ←
+      asProcessMainThread seam . caughtAs $
+        runProtectedWindowApplication
+          (withLoggingLifetime logger)
+          "protected-host-example"
+          ( \_ use →
+              protectedHost seam logger (settings [windowNamed "alpha"]) $ \host → do
+                window ← onlyWindow host
+                owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+                atomically (writeTVar owned (Just owner))
+                atomically (writeTVar hostHeld (Just host))
+                use host
+          )
+          id
+          (\host _ → pure host)
+          (\_ _ → pure ())
+    void (pure helper)
+    failure `shouldBe` Scripted "lazy sink"
+    -- Retained, not raised through the scope: the window outlived the stall.
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | A logger whose sink returns, for one component, a unit that raises when it
 -- is demanded rather than raising as it is run.
@@ -2138,38 +2582,41 @@ testRetainedEvidenceOrder = do
   firstHeld ← newTVarIO Nothing
   secondHeld ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  helper ← forkIO $ do
-    alpha ← awaitHeld firstHeld
-    beta ← awaitHeld secondHeld
-    host ← awaitHeld hostHeld
-    atomically (afterFailedStep alpha >> afterFailedStep beta)
-    publishFacts journal host alpha [CpuUseRetired]
-    publishFacts journal host beta [CpuUseRetired]
-  (primary, caught) ←
-    asProcessMainThread seam . caughtAs $
-      runProtectedWindowApplication
-        (withLoggingLifetime quietLogger)
-        "protected-host-example"
-        ( \_ use →
-            protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
-              (alpha, beta) ← twoWindows host
-              -- Stepped in registration order, so the failures happen in this
-              -- order too.
-              first ← establishedOwner journal host alpha (failingOwner "alpha" "first")
-              second ← establishedOwner journal host beta (failingOwner "beta" "second")
-              atomically (writeTVar firstHeld (Just first))
-              atomically (writeTVar secondHeld (Just second))
-              atomically (writeTVar hostHeld (Just host))
-              use host
-        )
-        id
-        (\host _ → pure host)
-        (\_ _ → throwIO (Scripted "action"))
-  void (pure helper)
-  primary `shouldBe` Scripted "action"
-  retainedUnder "glfw protected retirement" caught
-    `shouldBe` [Just (Scripted "first"), Just (Scripted "second")]
-  destructions journal `shouldReturn` [WindowGone 2, WindowGone 1]
+  withEvidenceThread
+    ( do
+        alpha ← awaitHeld firstHeld
+        beta ← awaitHeld secondHeld
+        host ← awaitHeld hostHeld
+        atomically (afterFailedStep alpha >> afterFailedStep beta)
+        publishFacts journal host alpha [CpuUseRetired]
+        publishFacts journal host beta [CpuUseRetired]
+    )
+    $ \helper _ → do
+    (primary, caught) ←
+      asProcessMainThread seam . caughtAs $
+        runProtectedWindowApplication
+          (withLoggingLifetime quietLogger)
+          "protected-host-example"
+          ( \_ use →
+              protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+                (alpha, beta) ← twoWindows host
+                -- Stepped in registration order, so the failures happen in this
+                -- order too.
+                first ← establishedOwner journal host alpha (failingOwner "alpha" "first")
+                second ← establishedOwner journal host beta (failingOwner "beta" "second")
+                atomically (writeTVar firstHeld (Just first))
+                atomically (writeTVar secondHeld (Just second))
+                atomically (writeTVar hostHeld (Just host))
+                use host
+          )
+          id
+          (\host _ → pure host)
+          (\_ _ → throwIO (Scripted "action"))
+    void (pure helper)
+    primary `shouldBe` Scripted "action"
+    retainedUnder "glfw protected retirement" caught
+      `shouldBe` [Just (Scripted "first"), Just (Scripted "second")]
+    destructions journal `shouldReturn` [WindowGone 2, WindowGone 1]
 
 -- | An owner whose first opportunity fails and whose later ones certify.
 failingOwner ∷ Text → Text → OwnerScript
@@ -2190,7 +2637,16 @@ destructions journal = filter isWindowGone <$> readTVarIO journal
 -- window stays alive — with its close acknowledged — until every one of its
 -- attachment's facts is certified, and a later owner turn then destroys it.
 testEarlyClose ∷ Expectation
-testEarlyClose = do
+testEarlyClose = earlyCloseFixture (\_ → pure ())
+
+-- | The fixture ended at the boundary before step @k@ (#593): 0 is the setup callback (nothing attached), 1 follows the attachment (the
+-- owner's plan is empty, so only the facts the action's loop reports can retire it), 2 is the action's start, 3 is the loop's first
+-- turn. The rescue registered with the host certifies every fact for every owner registered so far.
+earlyCloseScenario ∷ Int → Scope → IO () → IO ()
+earlyCloseScenario k _ atParked = earlyCloseFixture (\i → when (i == k) atParked)
+
+earlyCloseFixture ∷ (Int → IO ()) → Expectation
+earlyCloseFixture step = armed $ do
   journal ← newTVarIO []
   seam ← pollingSeam journal
   owned ← newTVarIO Nothing
@@ -2202,14 +2658,17 @@ testEarlyClose = do
       "protected-host-example"
       ( \_ use →
           protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+            step 0
             window ← onlyWindow host
             owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = []}
+            step 1
             atomically (writeTVar owned (Just owner))
             use host
       )
       id
       (\host _ → pure host)
       ( \host control → do
+          step 2
           window ← onlyWindow host
           owner ← heldOwner owned
           acknowledgement ← atomically (readTVar (ownerAcknowledgement owner) >>= maybe retry pure)
@@ -2218,7 +2677,7 @@ testEarlyClose = do
               { loopLogger = quietLogger
               , loopEvent = noApplicationEvents
               , loopUpdate = \turn → case turnNumber turn of
-                  1 → Continue <$ (closeHostWindow host window `shouldReturn` CloseStarted)
+                  1 → Continue <$ (step 3 >> (closeHostWindow host window `shouldReturn` CloseStarted))
                   2 → do
                     -- The close is acknowledged and the attachment is retiring,
                     -- but the window is not destroyed: its attachment vetoes it.
@@ -2261,58 +2720,61 @@ testStallWarningSurvivesAFullBudget = do
   hostHeld ← newTVarIO Nothing
   trace ← newSinkTrace
   declared ← newEmptyMVar
-  helper ← forkIO $ do
-    owners ← awaitHeld established
-    host ← awaitHeld hostHeld
-    -- The diagnostic has reached its sink, so every step in that round has
-    -- already failed and the budget is full. Independent evidence then finishes
-    -- the retirement the failed steps withdrew.
-    takeMVar declared
-    forM_ owners (\owner → publishFacts journal host owner allRetirementFacts)
-  let logger =
-        failingSink defaultLogFilter "glfw.retirement" (\_ → putMVar declared ()) trace
-      faulty = [windowNamed ("faulty " <> Text.pack (show n)) | n ← [1 .. failingChains]]
-  (failure, context) ←
-    raisedWith
-      =<< protectedFailure seam logger (settings faulty)
-        ( \host → do
-            identities ← atomically (hostWindowIdentities host)
-            owners ← forM (zip [1 ..] identities) $ \(n ∷ Int, window) →
-              establishedOwner journal host window $
-                (ownerNamed ("faulty " <> Text.pack (show n)))
-                  {scriptPlan = FailWith "step" : map Certify allRetirementFacts}
-            atomically (writeTVar established (Just owners))
-            atomically (writeTVar hostHeld (Just host))
-        )
-        (\host _ → pure host)
-        (\_ _ → pure ())
-  void (pure helper)
-  -- The body returned, so the drain's first failure is the run's own: a failed
-  -- step, not the diagnostic.
-  failure `shouldBe` Scripted "step"
-  diagnosticMarks context `shouldBe` []
-  -- One attempt through the sink, and no terminal report after it.
-  traced trace `shouldReturn` ["glfw.retirement"]
-  flushed trace `shouldReturn` 0
-  -- The bound really was full: exactly its own number of step failures were
-  -- retained beside the primary, though ten failed, so one did not fit.
-  [step | (Just step, _) ← retainedAs "glfw protected retirement" context]
-    `shouldBe` replicate retainedFailureLimit (Scripted "step")
-  -- Those, the count of the one the bound elided, and the diagnostic kept past
-  -- the bound, and nothing else.
-  let retained = retainedDiagnostics context
-  length retained `shouldBe` retainedFailureLimit + 2
-  -- Exactly one of them was raised by a diagnostic, and it is the sink's own
-  -- exception with the context it raised it with.
-  filter snd retained `shouldBe` [("glfw protected retirement", True)]
-  [kept | kept@(Just _, _) ← retainedAs "glfw protected retirement" context]
-    `shouldBe` [(Just (SinkFailed "glfw.retirement"), [SinkMark])]
-  -- Which is what the lifetime was told, so nothing was written or flushed.
-  length (Logging.failedReportsInContext context) `shouldBe` 1
-  -- Every window went and the session after them. Which chain's window goes
-  -- first is the ordering examples' claim, not this one's.
-  (sort <$> destroyedWindows seam) `shouldReturn` [1 .. failingChains]
-  (last <$> readTVarIO journal) `shouldReturn` SessionEnded
+  withEvidenceThread
+    ( do
+        owners ← awaitHeld established
+        host ← awaitHeld hostHeld
+        -- The diagnostic has reached its sink, so every step in that round has
+        -- already failed and the budget is full. Independent evidence then finishes
+        -- the retirement the failed steps withdrew.
+        takeMVar declared
+        forM_ owners (\owner → publishFacts journal host owner allRetirementFacts)
+    )
+    $ \helper _ → do
+    let logger =
+          failingSink defaultLogFilter "glfw.retirement" (\_ → putMVar declared ()) trace
+        faulty = [windowNamed ("faulty " <> Text.pack (show n)) | n ← [1 .. failingChains]]
+    (failure, context) ←
+      raisedWith
+        =<< protectedFailure seam logger (settings faulty)
+          ( \host → do
+              identities ← atomically (hostWindowIdentities host)
+              owners ← forM (zip [1 ..] identities) $ \(n ∷ Int, window) →
+                establishedOwner journal host window $
+                  (ownerNamed ("faulty " <> Text.pack (show n)))
+                    {scriptPlan = FailWith "step" : map Certify allRetirementFacts}
+              atomically (writeTVar established (Just owners))
+              atomically (writeTVar hostHeld (Just host))
+          )
+          (\host _ → pure host)
+          (\_ _ → pure ())
+    void (pure helper)
+    -- The body returned, so the drain's first failure is the run's own: a failed
+    -- step, not the diagnostic.
+    failure `shouldBe` Scripted "step"
+    diagnosticMarks context `shouldBe` []
+    -- One attempt through the sink, and no terminal report after it.
+    traced trace `shouldReturn` ["glfw.retirement"]
+    flushed trace `shouldReturn` 0
+    -- The bound really was full: exactly its own number of step failures were
+    -- retained beside the primary, though ten failed, so one did not fit.
+    [step | (Just step, _) ← retainedAs "glfw protected retirement" context]
+      `shouldBe` replicate retainedFailureLimit (Scripted "step")
+    -- Those, the count of the one the bound elided, and the diagnostic kept past
+    -- the bound, and nothing else.
+    let retained = retainedDiagnostics context
+    length retained `shouldBe` retainedFailureLimit + 2
+    -- Exactly one of them was raised by a diagnostic, and it is the sink's own
+    -- exception with the context it raised it with.
+    filter snd retained `shouldBe` [("glfw protected retirement", True)]
+    [kept | kept@(Just _, _) ← retainedAs "glfw protected retirement" context]
+      `shouldBe` [(Just (SinkFailed "glfw.retirement"), [SinkMark])]
+    -- Which is what the lifetime was told, so nothing was written or flushed.
+    length (Logging.failedReportsInContext context) `shouldBe` 1
+    -- Every window went and the session after them. Which chain's window goes
+    -- first is the ordering examples' claim, not this one's.
+    (sort <$> destroyedWindows seam) `shouldReturn` [1 .. failingChains]
+    (last <$> readTVarIO journal) `shouldReturn` SessionEnded
 
 -- | Enough failing chains to fill the retained bound and overflow it before the
 -- stall diagnostic is claimed: one becomes primary, 'retainedFailureLimit' are
@@ -2340,15 +2802,6 @@ protectedFailure seam logger config inside startup action = do
     asProcessMainThread seam . tryWithContext $
       protectedRunHere seam logger config inside startup action
   either pure (\_ → unexpected "the run returned instead of failing") outcome
-
--- | 'onMainThread' keeping the context of whatever the run raised, for the same
--- reason.
-onMainThreadKeepingContext
-  ∷ ∀ a. Seam → IO a → IO (ThreadId, MVar (Either (ExceptionWithContext SomeException) a))
-onMainThreadKeepingContext seam action = do
-  finished ← newEmptyMVar
-  runner ← forkOS (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
-  pure (runner, finished)
 
 -- | The wake path's own warning fails at the protected exit's boundary, which
 -- claims it after the drain has retired every attachment.
@@ -2441,31 +2894,31 @@ testStallWarningFailsIsDiagnostic = do
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
   trace ← newSinkTrace
-  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
-  let logger = sinkFailingOn "glfw.retirement" trace
-  (failure, context) ←
-    raisedWith
-      =<< protectedFailure seam logger (settings [windowNamed "alpha"])
-        ( \host → do
-            window ← onlyWindow host
-            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-            atomically (writeTVar owned (Just owner))
-            atomically (writeTVar hostHeld (Just host))
-        )
-        (\host _ → pure host)
-        (\_ _ → pure ())
-  void (pure helper)
-  failure `shouldBe` SinkFailed "glfw.retirement"
-  -- One attempt through the sink and nothing after it: no second write.
-  traced trace `shouldReturn` ["glfw.retirement"]
-  flushed trace `shouldReturn` 0
-  diagnosticMarks context `shouldBe` [DiagnosticFailure]
-  -- The exception the sink raised, with the context it raised it with.
-  sinkMarks context `shouldBe` [SinkMark]
-  length (Logging.failedReportsInContext context) `shouldBe` 1
-  -- Nothing the stall was retaining was unwound early: the window and the
-  -- session went only once independent evidence made the attachment safe.
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  withEvidenceThread (supplyEvidence journal hostHeld owned afterStall allRetirementFacts) $ \helper _ → do
+    let logger = sinkFailingOn "glfw.retirement" trace
+    (failure, context) ←
+      raisedWith
+        =<< protectedFailure seam logger (settings [windowNamed "alpha"])
+          ( \host → do
+              window ← onlyWindow host
+              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+              atomically (writeTVar owned (Just owner))
+              atomically (writeTVar hostHeld (Just host))
+          )
+          (\host _ → pure host)
+          (\_ _ → pure ())
+    void (pure helper)
+    failure `shouldBe` SinkFailed "glfw.retirement"
+    -- One attempt through the sink and nothing after it: no second write.
+    traced trace `shouldReturn` ["glfw.retirement"]
+    flushed trace `shouldReturn` 0
+    diagnosticMarks context `shouldBe` [DiagnosticFailure]
+    -- The exception the sink raised, with the context it raised it with.
+    sinkMarks context `shouldBe` [SinkMark]
+    length (Logging.failedReportsInContext context) `shouldBe` 1
+    -- Nothing the stall was retaining was unwound early: the window and the
+    -- session went only once independent evidence made the attachment safe.
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- | The same warning fails while the action's failure is already primary.
 --
@@ -2480,31 +2933,34 @@ testStallWarningFailsBesideAPrimary = do
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
   trace ← newSinkTrace
-  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
-  let logger = sinkFailingOn "glfw.retirement" trace
-  (failure, context) ←
-    raisedWith
-      =<< protectedFailure seam logger (settings [windowNamed "alpha"])
-        ( \host → do
-            window ← onlyWindow host
-            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-            atomically (writeTVar owned (Just owner))
-            atomically (writeTVar hostHeld (Just host))
-        )
-        (\host _ → pure host)
-        (\_ _ → throwIO (Scripted "action"))
-  void (pure helper)
-  failure `shouldBe` Scripted "action"
-  traced trace `shouldReturn` ["glfw.retirement"]
-  flushed trace `shouldReturn` 0
-  diagnosticMarks context `shouldBe` []
-  retainedDiagnostics context `shouldBe` [("glfw protected retirement", True)]
-  -- Retained as the sink raised it: the diagnostic's own exception, not a copy.
-  retainedAs "glfw protected retirement" context
-    `shouldBe` [(Just (SinkFailed "glfw.retirement"), [SinkMark])]
-  length (Logging.failedReportsInContext context) `shouldBe` 1
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  withEvidenceThread (supplyEvidence journal hostHeld owned afterStall allRetirementFacts) $ \helper _ → do
+    let logger = sinkFailingOn "glfw.retirement" trace
+    (failure, context) ←
+      raisedWith
+        =<< protectedFailure seam logger (settings [windowNamed "alpha"])
+          ( \host → do
+              window ← onlyWindow host
+              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+              atomically (writeTVar owned (Just owner))
+              atomically (writeTVar hostHeld (Just host))
+          )
+          (\host _ → pure host)
+          (\_ _ → throwIO (Scripted "action"))
+    void (pure helper)
+    failure `shouldBe` Scripted "action"
+    traced trace `shouldReturn` ["glfw.retirement"]
+    flushed trace `shouldReturn` 0
+    diagnosticMarks context `shouldBe` []
+    retainedDiagnostics context `shouldBe` [("glfw protected retirement", True)]
+    -- Retained as the sink raised it: the diagnostic's own exception, not a copy.
+    retainedAs "glfw protected retirement" context
+      `shouldBe` [(Just (SinkFailed "glfw.retirement"), [SinkMark])]
+    length (Logging.failedReportsInContext context) `shouldBe` 1
+    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
+-- NOT CONVERTED (#593 narrowed by the owner a third time, 2026-11-02; moved to #612): the cleanup kill of this example can land before any rescue of
+-- the protected drain exists, so the drain enters the stall diagnostic's sink and a scope's join waits for ever. It stays as it is on master, with
+-- its baseline entry, until #612's seam around the protected runner's lifetime lets it be rescued.
 -- | A cancellation delivered while the stall diagnostic's sink is running is
 -- never turned into a synchronous logging failure.
 --
@@ -2608,14 +3064,6 @@ awaitBlockedOn reason target =
     ThreadFinished → unexpected "the thread finished instead of parking"
     ThreadDied → unexpected "the thread died instead of parking"
     _ → yield >> awaitBlockedOn reason target
-
--- | Run an action on a new bound thread designated as the process main thread,
--- so an example can cancel it.
-onMainThread ∷ ∀ a. Seam → IO a → IO (ThreadId, MVar (Either SomeException a))
-onMainThread seam action = do
-  finished ← newEmptyMVar
-  runner ← forkOS (designateProcessMainThread seam >> (try action ∷ IO (Either SomeException a)) >>= putMVar finished)
-  pure (runner, finished)
 
 workerPolicy ∷ WorkerPolicy
 workerPolicy = WorkerPolicy Job Supervision.Required testComponent (\_ → pure Unrecognized)

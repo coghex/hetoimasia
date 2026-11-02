@@ -11,6 +11,8 @@ module Test.GLFW.Owner.Fixture.Fake
   , newFake
   , fakeOperations
   , script
+  , scriptSTM
+  , scriptAll
   , ScriptedTimer (..)
   , newScriptedTimer
   , fireTimer
@@ -18,7 +20,8 @@ module Test.GLFW.Owner.Fixture.Fake
 
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM
-  ( TVar
+  ( STM
+  , TVar
   , atomically
   , modifyTVar'
   , newTVarIO
@@ -132,6 +135,16 @@ fakeOperations fake =
 -- | Replace one operation for the rest of the run.
 script ∷ TVar a → a → IO ()
 script cell = atomically . writeTVar cell
+
+-- | 'script' as a transaction step, for 'scriptAll'.
+scriptSTM ∷ TVar a → a → STM ()
+scriptSTM = writeTVar
+
+-- | Replace several operations in ONE transaction (#593). A fixture that arms a failing behaviour together with the gate or the
+-- release it needs must publish them atomically: with separate transactions an owner that is already running can meet the failure
+-- before the gate exists.
+scriptAll ∷ [STM ()] → IO ()
+scriptAll = atomically . sequence_
 
 -- ---------------------------------------------------------------------------
 -- The timer

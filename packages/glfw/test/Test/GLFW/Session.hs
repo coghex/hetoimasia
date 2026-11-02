@@ -14,21 +14,24 @@
 -- already hung.
 module Test.GLFW.Session (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, forkOS, isCurrentThreadBound)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (isCurrentThreadBound, myThreadId, throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Exception
-  ( ErrorCall (ErrorCall)
+  ( AsyncException (UserInterrupt)
+  , ErrorCall (ErrorCall)
   , Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , displayException
+  , finally
   , fromException
+  , mask_
   , throwIO
   , try
   )
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
-import Data.IORef (atomicModifyIORef', newIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Failure
@@ -60,6 +63,29 @@ import Test.Hspec
   , shouldNotBe
   , shouldReturn
   )
+import Test.GLFW.Support
+  ( Boom (..)
+  , Ending (..)
+  , Scope
+  , awaitParked
+  , holdForever
+  , onBoundThread
+  , onThread
+  , onThreadVia
+  , endedAndJoined
+  , ownedEnds
+  , recordingThreads
+  , reapUnowned
+  , unownedBoundScope
+  , unownedLeaks
+  , unownedScope
+  , withDeferredThreadVia
+  , withMainThread
+  , withMainThreadVia
+  )
+import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
+import Data.Foldable (for_)
 
 spec ∷ Spec
 spec = do
@@ -119,6 +145,31 @@ spec = do
     it "rejects use from another thread and after the session ended, before any native call"
       (boundedExample testOwnerOnlyOperations)
 
+  describe "GLFW suite thread helpers (#593)" $ do
+    it "runs an owned start-and-wait helper on an unbound thread, and an owned bound one on a bound thread"
+      (boundedExample testHelperBoundness)
+    it "rethrows what the action raised on the helper's thread, which has ended and been joined"
+      (boundedExample testHelperRethrows)
+    it "runs the main-thread helper on a bound thread designated as the process main thread, before its action, and joins it"
+      (boundedExample testMainThreadHelper)
+    it "negative control rescue: registers a bound worker even when a cancellation is pending as the control starts it" $
+      boundedExample testRescueRegistersBoundWorker
+    it "negative control rescue: completes its stop-and-join when a cancellation is pending while it runs" $
+      boundedExample testRescueIsUninterruptible
+    it "has ended and joined the thread of a start-and-wait helper whose caller is cancelled while it is parked"
+      (boundedExample (ownedEnds WaiterCancelled startAndWaitScenario False))
+    it "negative control: an unowned start leaves the start-and-wait helper's thread parked when its caller is cancelled"
+      (boundedExample (unownedLeaks WaiterCancelled startAndWaitScenario False))
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+      it ("has ended and joined the bound main-thread helper's thread, parked in a session, when the example body " <> label) $
+        boundedExample (ownedEnds ending mainThreadScenario True)
+      it ("negative control: a plain forkOS start leaves the bound thread parked in a session when the example body " <> label) $
+        boundedExample (unownedLeaks ending mainThreadScenario True)
+      it ("has ended and joined a deferred thread nothing was ever handed to when the example body " <> label) $
+        boundedExample (ownedEnds ending deferredScenario False)
+      it ("negative control: an unowned start leaves the deferred thread waiting for its work when the example body " <> label) $
+        boundedExample (unownedLeaks ending deferredScenario False)
+
 -- ---------------------------------------------------------------------------
 -- Entry
 
@@ -136,7 +187,7 @@ testEnterTwice = do
 testBoundWorkerRejected ∷ Expectation
 testBoundWorkerRejected = do
   seam ← newSeam defaultScript
-  (bound, (misuse, caught)) ← onThread forkOS $ do
+  (bound, (misuse, caught)) ← onBoundThread $ do
     bound ← isCurrentThreadBound
     rejected ← caughtAs (entered seam defaultSessionConfig (\_ → pure ()))
     pure (bound, rejected)
@@ -148,7 +199,7 @@ testBoundWorkerRejected = do
 testUnboundThreadRejected ∷ Expectation
 testUnboundThreadRejected = do
   seam ← newSeam defaultScript
-  (bound, (misuse, _)) ← onThread forkIO $ do
+  (bound, (misuse, _)) ← onThread $ do
     designateProcessMainThread seam
     bound ← isCurrentThreadBound
     rejected ← caughtAs (entered seam defaultSessionConfig (\_ → pure ()))
@@ -169,7 +220,7 @@ testConcurrentEntryRejected ∷ Expectation
 testConcurrentEntryRejected = do
   seam ← newSeam defaultScript
   misuse ← asProcessMainThread seam $ entered seam defaultSessionConfig $ \_ →
-    onThread forkOS $ do
+    onBoundThread $ do
       designateProcessMainThread seam
       fst <$> caughtAs (entered seam defaultSessionConfig (\_ → pure ()))
   misuse `shouldBe` SessionAlreadyActive
@@ -585,8 +636,8 @@ testOwnerOnlyOperations = do
   let config = hiddenTestWindowConfig "elsewhere" 64 48
   (reportsElsewhere, windowElsewhere, afterEnd) ← asProcessMainThread seam $ do
     (reportsElsewhere, windowElsewhere, session) ← entered seam defaultSessionConfig $ \session → do
-      reportsElsewhere ← onThread forkOS (fst <$> caughtAs (takeAsynchronousReports session))
-      windowElsewhere ← onThread forkOS (fst <$> caughtAs (withWindow session config (\_ → pure ())))
+      reportsElsewhere ← onBoundThread (fst <$> caughtAs (takeAsynchronousReports session))
+      windowElsewhere ← onBoundThread (fst <$> caughtAs (withWindow session config (\_ → pure ())))
       pure (reportsElsewhere, windowElsewhere, session)
     -- Deliberate misuse: the session escaped its scope to prove it is refused.
     (afterEnd, _) ← caughtAs (takeAsynchronousReports session)
@@ -595,6 +646,101 @@ testOwnerOnlyOperations = do
   windowElsewhere `shouldBe` NotSessionOwner
   afterEnd `shouldBe` SessionEnded
   seamCalls seam `shouldReturn` entryCalls <> exitCalls
+
+-- ---------------------------------------------------------------------------
+-- The suite's thread helpers (#593)
+
+testHelperBoundness ∷ Expectation
+testHelperBoundness = do
+  onThread isCurrentThreadBound `shouldReturn` False
+  onBoundThread isCurrentThreadBound `shouldReturn` True
+
+testHelperRethrows ∷ Expectation
+testHelperRethrows = do
+  recorded ← newIORef []
+  outcome ← try @Boom (onThreadVia (recordingThreads recorded withOwnedThreadOpening) (throwIO Boom ∷ IO ()))
+  outcome `shouldBe` Left Boom
+  -- The thread ended on its own failure, and the scope joined it.
+  threads ← readIORef recorded
+  length threads `shouldBe` 1
+
+testMainThreadHelper ∷ Expectation
+testMainThreadHelper = do
+  seam ← newSeam defaultScript
+  seen ← newEmptyMVar
+  -- On the helper's thread: it is bound, and a session is entered on it, which only the designated process main thread may do.
+  withMainThread
+    seam
+    (pure ())
+    ( do
+        bound ← isCurrentThreadBound
+        backend ← entered seam defaultSessionConfig (pure . sessionBackend)
+        putMVar seen (bound, backend)
+    )
+    $ \_ finished → takeMVar finished >>= either throwIO pure
+  readMVar seen `shouldReturn` (True, X11)
+  -- The same thread, undesignated, is refused: the designation is the helper's and not the bound start's.
+  refused ← newEmptyMVar
+  seamForRefusal ← newSeam defaultScript
+  withOwnedBoundThreadOpening
+    (pure ())
+    (caughtAs (entered seamForRefusal defaultSessionConfig (\_ → pure ())) >>= putMVar refused . fst)
+    (\_ awaitEnd → awaitEnd)
+  readMVar refused `shouldReturn` NotProcessMainThread
+
+testRescueRegistersBoundWorker ∷ Expectation
+testRescueRegistersBoundWorker = do
+  started ← newIORef []
+  recorded ← newIORef []
+  caller ← myThreadId
+  -- The example's own rescue is independent of the rescue under test and runs on every way out of the example.
+  ( do
+      outcome ← try @AsyncException . bounded . mask_ $
+        withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+          awaitParked sender
+          recordingThreads recorded (unownedBoundScope started) (pure ()) holdForever (\_ _ → holdForever)
+      outcome `shouldBe` Left UserInterrupt
+      reapUnowned started
+      endedAndJoined recorded >>= (`shouldBe` True)
+    )
+    `finally` reapUnowned started
+
+testRescueIsUninterruptible ∷ Expectation
+testRescueIsUninterruptible = do
+  started ← newIORef []
+  recorded ← newIORef []
+  caller ← myThreadId
+  rescued ← newIORef False
+  ( do
+      recordingThreads recorded (unownedScope started) (pure ()) holdForever (\_ _ → pure ())
+      _ ← try @AsyncException . bounded . mask_ $
+        withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+          awaitParked sender
+          reapUnowned started
+          endedAndJoined recorded >>= writeIORef rescued
+      -- The scope's release ends the sender, so the cancellation need not be delivered at all; what matters is that it was
+      -- pending while the rescue ran and did not abandon it.
+      readIORef rescued >>= (`shouldBe` True)
+    )
+    `finally` reapUnowned started
+
+-- | The start-and-wait helper whose thread parks, with the example thread cancelled while it waits: the helper says when it is
+-- parked by calling the action it is given.
+startAndWaitScenario ∷ Scope → IO () → IO ()
+startAndWaitScenario scope atParked = onThreadVia scope atParked
+
+-- | The main-thread helper whose bound thread is parked inside a session, with the example body ended the way the ending says.
+mainThreadScenario ∷ Scope → IO () → IO ()
+mainThreadScenario scope atParked = do
+  seam ← newSeam defaultScript
+  withMainThreadVia scope seam (pure ()) (entered seam defaultSessionConfig (\_ → holdForever)) $ \runner _ →
+    awaitParked runner >> atParked
+
+-- | A deferred thread that is started and waits for work nothing ever hands it, with the example body ended the way the ending
+-- says: the thread is parked in its wait for the hand-over.
+deferredScenario ∷ Scope → IO () → IO ()
+deferredScenario scope atParked =
+  withDeferredThreadVia scope (pure ()) (\() → pure ()) $ \thread _ → awaitParked thread >> atParked
 
 -- ---------------------------------------------------------------------------
 -- Support
@@ -651,14 +797,6 @@ firstTimeOnly ∷ IO (IO Bool)
 firstTimeOnly = do
   flag ← newIORef True
   pure (atomicModifyIORef' flag (\first → (False, first)))
-
--- | Run an action on a new thread and wait for its outcome.
-onThread ∷ (IO () → IO ThreadId) → IO a → IO a
-onThread fork action = do
-  finished ← newEmptyMVar
-  _ ← fork (try action >>= putMVar finished)
-  outcome ← takeMVar finished
-  either (throwIO ∷ SomeException → IO a) pure outcome
 
 -- | The typed failure an action raised, beside the exception as caught.
 caughtAs ∷ Exception e ⇒ IO a → IO (e, SomeException)

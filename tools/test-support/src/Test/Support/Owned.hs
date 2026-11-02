@@ -14,6 +14,18 @@
 -- @finally@ is installed, and the release waits without an interrupt for the thread's end, so a gate left closed would hang
 -- the join. The opening is idempotent ('Control.Concurrent.MVar.tryPutMVar') and does not block.
 --
+-- /Bound threads (#593)./ A test that asserts boundness (a seam that rejects entry from a bound worker and from an unbound one,
+-- a thread designated as the process main thread) needs an OS-bound thread, and 'withOwnedBoundThread' starts one with the same
+-- ownership properties: the thread is bound ('Control.Concurrent.isCurrentThreadBound' is true on it) and there is no unowned
+-- start to reach for. The one difference from 'withOwnedThread' is the acquisition. @forkOS@ blocks its caller until the new OS
+-- thread has reported its 'ThreadId', and that wait is interruptible even under @mask@, so a cancellation delivered inside it
+-- would abandon a thread that already exists. The start is therefore made in an uninterruptible step: the wait is for the
+-- operating system to run a thread that waits for nothing the example controls, so it is short and cannot depend on the
+-- example. The thread itself starts with exceptions masked and unmasks only inside the announcing @finally@, exactly as the
+-- unbound start does, so a kill can never find it unprotected. The start is generic: it designates nothing and knows nothing of
+-- any native library; a test that must also designate the thread (GLFW's process main thread) does so as the first step of the
+-- action it passes.
+--
 -- /Pinned to a capability (#610)./ 'withOwnedThreadOn' and 'withOwnedThreadOpeningOn' are the same ownership for a thread that
 -- is pinned to one capability ('Control.Concurrent.forkOn'). An example whose point is that a cancellation is /pending/ against
 -- a thread before that thread's next effect starts both its target and the cancellation's sender this way, on the same
@@ -29,11 +41,13 @@
 module Test.Support.Owned
   ( withOwnedThread
   , withOwnedThreadOpening
+  , withOwnedBoundThread
+  , withOwnedBoundThreadOpening
   , withOwnedThreadOn
   , withOwnedThreadOpeningOn
   ) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, forkOn, killThread)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, forkOS, forkOn, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Exception (finally, mask, uninterruptibleMask_)
 import GHC.IO (unsafeUnmask)
@@ -50,6 +64,19 @@ withOwnedThreadOpening ∷ IO () → IO () → (ThreadId → IO () → IO a) →
 withOwnedThreadOpening open action body = mask $ \restore → do
   done ← newEmptyMVar
   thread ← forkIOWithUnmask $ \unmask → unmask action `finally` putMVar done ()
+  restore (body thread (readMVar done)) `finally` uninterruptibleMask_ (open >> killThread thread >> readMVar done)
+
+-- | 'withOwnedThread' for an OS-bound thread: the action runs on a thread for which @isCurrentThreadBound@ holds, and the scope
+-- stops and joins it on every way out, a cancellation delivered while the thread is starting included.
+withOwnedBoundThread ∷ IO () → (ThreadId → IO () → IO a) → IO a
+withOwnedBoundThread = withOwnedBoundThreadOpening (pure ())
+
+-- | 'withOwnedThreadOpening' for an OS-bound thread; see the module header for why the start is uninterruptible.
+withOwnedBoundThreadOpening ∷ IO () → IO () → (ThreadId → IO () → IO a) → IO a
+withOwnedBoundThreadOpening open action body = mask $ \restore → do
+  done ← newEmptyMVar
+  -- The same unmasking as 'forkIOWithUnmask' gives: the thread inherits the start's uninterruptible state and unmasks only the action.
+  thread ← uninterruptibleMask_ (forkOS (unsafeUnmask action `finally` putMVar done ()))
   restore (body thread (readMVar done)) `finally` uninterruptibleMask_ (open >> killThread thread >> readMVar done)
 
 -- | 'withOwnedThread' for a thread pinned to the given capability (see "Test.Support.Owned" for why an example pins).

@@ -19,7 +19,7 @@
 -- the full-product run library. The real child helper runs under the same orchestration in @run-native-test@.
 module OwnedThread (spec) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, getNumCapabilities, killThread, myThreadId, threadCapability, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, forkOS, getNumCapabilities, isCurrentThreadBound, killThread, myThreadId, threadCapability, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Exception
   ( AsyncException (ThreadKilled, UserInterrupt)
@@ -40,8 +40,9 @@ import Control.Exception
   , uninterruptibleMask_
   )
 import Control.Monad (forM, forM_, void, when, (>=>))
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Foldable (for_)
+import GHC.IO (unsafeUnmask)
 import Data.List (isInfixOf)
 import Data.Maybe (isJust)
 import GHC.Conc (ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
@@ -51,7 +52,7 @@ import Test.Hspec (Spec, describe, it, pendingWith, shouldBe, shouldSatisfy)
 import Test.HUnit.Lang (HUnitFailure (HUnitFailure), FailureReason (Reason))
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (awaitBlockedSending, withCancellationAfter, withCancellationWhenBlocked)
-import Test.Support.Owned (withOwnedThread, withOwnedThreadOn, withOwnedThreadOpening, withOwnedThreadOpeningOn)
+import Test.Support.Owned (withOwnedBoundThread, withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOn, withOwnedThreadOpening, withOwnedThreadOpeningOn)
 import Test.Support.Parked (ParkBounds (..), defaultParkBounds, parkedRelease)
 
 -- | The failure an example raises from a body, told apart from every other.
@@ -85,14 +86,18 @@ data Probe = Probe
   , probeThread ∷ !(MVar ThreadId)
   -- ^ The worker's own thread, filled by the worker as its first step: the example judges that thread, never the worker's
   -- say-so, so a worker killed before it ran anything is still judged.
+  , probeBound ∷ !(MVar Bool)
+  -- ^ Whether the worker's thread was an OS-bound thread, filled with 'probeThread'.
   }
 
 newProbe ∷ IO Probe
-newProbe = Probe <$> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar
+newProbe = Probe <$> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar
 
--- | The worker's first step: say which thread it is.
+-- | The worker's first step: say which thread it is, and whether it is bound.
 recordSelf ∷ Probe → IO ()
-recordSelf probe = myThreadId >>= void . tryPutMVar (probeThread probe)
+recordSelf probe = do
+  myThreadId >>= void . tryPutMVar (probeThread probe)
+  isCurrentThreadBound >>= void . tryPutMVar (probeBound probe)
 
 -- | The worker: say which thread it is, say it is parked, wait at the gate.
 parkedWorker ∷ Probe → IO ()
@@ -142,9 +147,25 @@ startUnowned started letGo action = mask_ $ do
   atomicModifyIORef' started (\known → (Unowned thread done letGo : known, ()))
   pure (thread, done)
 
+-- | 'unownedScope' for an OS-bound thread: the control for the bound start is the plain @forkOS@ the suites used before the
+-- facility offered one. Its start is, like 'startUnowned', announced and masked so that the cleanup can always join it.
+unownedBoundScope ∷ IORef [Unowned] → Scope
+unownedBoundScope started action body = do
+  (thread, done) ← startUnownedBound started action
+  body thread (readMVar done)
+
+startUnownedBound ∷ IORef [Unowned] → IO () → IO (ThreadId, MVar ())
+startUnownedBound started action = uninterruptibleMask_ $ do
+  done ← newEmptyMVar
+  -- @forkOS@ waits, interruptibly even under @mask_@, for the new OS thread to report itself; the start and its registration for
+  -- the rescue are uninterruptible, and the thread runs the action unmasked as a plain @forkOS@ from an unmasked caller does.
+  thread ← forkOS (unsafeUnmask action `finally` putMVar done ())
+  atomicModifyIORef' started (\known → (Unowned thread done (pure ()) : known, ()))
+  pure (thread, done)
+
 -- | Stop and join every thread an unowned control started, even if an assertion before it failed.
 reapUnowned ∷ IORef [Unowned] → IO ()
-reapUnowned started = do
+reapUnowned started = uninterruptibleMask_ $ do
   known ← readIORef started
   forM_ known $ \(Unowned thread done letGo) → letGo >> killThread thread >> readMVar done
 
@@ -230,6 +251,99 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
         -- handler of the body exists, still finds the gate opened.
         runEnding (withOwnedThreadOpening (void (tryPutMVar (probeGate probe) ()))) stubbornWorker probe ending
         endedAfterScope probe >>= (`shouldBe` True)
+
+  describe "an OS-bound thread parked at a gate, whichever way its scope ends (#593)" $
+    for_ endings $ \(label, ending) → do
+      it ("is bound, has ended and been joined when the scope " <> label) $ do
+        probe ← newProbe
+        runEnding withOwnedBoundThread parkedWorker probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+        tryReadMVar (probeBound probe) >>= (`shouldBe` Just True)
+
+      it ("negative control: a plain forkOS start leaves the bound thread parked when the scope " <> label) $ do
+        started ← newIORef []
+        probe ← newProbe
+        (do
+            runEnding (unownedBoundScope started) parkedWorker probe ending
+            judgement ← endedAfterScope probe
+            judgement `shouldBe` False)
+          `finally` (reapUnowned started >> void (tryPutMVar (probeGate probe) ()))
+        endedAfterScope probe >>= (`shouldBe` True)
+
+  describe "an OS-bound thread held at a gate that it keeps waiting at after a kill (#593)" $
+    for_ endings $ \(label, ending) →
+      it ("has ended and been joined when the scope " <> label <> ", because the scope opens the gate itself before it joins") $ do
+        probe ← newProbe
+        runEnding (withOwnedBoundThreadOpening (void (tryPutMVar (probeGate probe) ()))) stubbornWorker probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+  describe "the boundness of the two starts (#593)" $ do
+    it "an owned unbound start is not bound, and an owned bound start is" $ do
+      unbound ← newEmptyMVar
+      bound ← newEmptyMVar
+      withOwnedThread (isCurrentThreadBound >>= putMVar unbound) (\_ awaitEnd → awaitEnd)
+      withOwnedBoundThread (isCurrentThreadBound >>= putMVar bound) (\_ awaitEnd → awaitEnd)
+      (,) <$> readMVar unbound <*> readMVar bound >>= (`shouldBe` (False, True))
+
+    it "a cancellation already pending when the bound start returns from its acquisition ends the scope with the worker joined" $ do
+      -- The cancellation is sent while the caller is masked and received only at the body's first interruptible wait, so it is
+      -- pending across the whole acquisition: a start whose own wait for the new OS thread were interruptible could take it
+      -- there and abandon a thread that exists. The sender is known to be blocked in its throwTo before the start begins.
+      probe ← newProbe
+      caller ← myThreadId
+      outcome ← try @AsyncException . bounded . mask_ $
+        withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+          bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
+          withOwnedBoundThread (parkedWorker probe) (\_ _ → readMVar (probeParked probe) >> holdUntilTimedOut)
+      outcome `shouldBe` Left UserInterrupt
+      endedAfterScope probe >>= (`shouldBe` True)
+
+    it "a bound start's body runs with the interruptibility of the caller restored" $ do
+      let stateInBody = withOwnedBoundThread (pure ()) (\_ _ → getMaskingState)
+      unmasked ← stateInBody
+      masked ← mask_ stateInBody
+      uninterruptible ← uninterruptibleMask_ stateInBody
+      (unmasked, masked, uninterruptible) `shouldBe` (Unmasked, MaskedInterruptible, MaskedUninterruptible)
+
+    it "the thread a bound start runs the action on is unmasked" $ do
+      state ← newEmptyMVar
+      withOwnedBoundThread (getMaskingState >>= putMVar state) (\_ awaitEnd → awaitEnd)
+      readMVar state >>= (`shouldBe` Unmasked)
+
+  describe "the negative controls' rescue (#593)" $ do
+    it "registers a bound worker for the rescue even when a cancellation is pending as the control starts it" $ do
+      started ← newIORef []
+      probe ← newProbe
+      caller ← myThreadId
+      -- The example's own rescue is independent of the rescue under test and runs on every way out of the example.
+      ( do
+          outcome ← try @AsyncException . bounded . mask_ $
+            withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+              bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
+              unownedBoundScope started (parkedWorker probe) (\_ _ → readMVar (probeParked probe) >> holdUntilTimedOut)
+          outcome `shouldBe` Left UserInterrupt
+          reapUnowned started
+          endedAfterScope probe >>= (`shouldBe` True)
+        )
+        `finally` (reapUnowned started >> void (tryPutMVar (probeGate probe) ()))
+
+    it "completes the rescue's stop-and-join when a cancellation is pending while it runs" $ do
+      started ← newIORef []
+      probe ← newProbe
+      caller ← myThreadId
+      rescued ← newIORef False
+      ( do
+          unownedScope started (parkedWorker probe) (\_ _ → readMVar (probeParked probe))
+          _ ← try @AsyncException . bounded . mask_ $
+            withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+              bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
+              reapUnowned started
+              endedAfterScope probe >>= writeIORef rescued
+          -- The scope's release ends the sender, so the cancellation need not be delivered at all; what matters is that it was
+          -- pending while the rescue ran and did not abandon it.
+          readIORef rescued >>= (`shouldBe` True)
+        )
+        `finally` (reapUnowned started >> void (tryPutMVar (probeGate probe) ()))
 
   describe "a thread that ended on its own" $ do
     it "is joined harmlessly, the body may begin after it finished, and the wait can be repeated" $ do
@@ -333,8 +447,8 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
         else do
           source ← readFile path
           let imports = [line | line ← lines source, startsWith "import " line]
-          -- @GHC.IO@ is @base@'s: the pinned start unmasks its action with 'unsafeUnmask', as 'forkIOWithUnmask' does.
-          imports `shouldSatisfy` all (\line → startsWith "import Control." line || startsWith "import GHC.IO " line)
+          -- base alone: the Control modules, and the one GHC.IO import the bound start unmasks its action with (#593)
+          imports `shouldSatisfy` all (\line → startsWith "import Control." line || line == "import GHC.IO (unsafeUnmask)")
           source `shouldSatisfy` (not . ("threadDelay" `isInfixOf`))
 
   describe "the cancellation helper behind the first Library.hs helper (Test.Support.Cancel.withCancellationAfter)" $ do
