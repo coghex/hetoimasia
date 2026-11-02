@@ -221,7 +221,13 @@ cabal test hetoimasia-tests --test-show-details=direct
   process, this very executable re-run with `HETOIMASIA_SUBPROCESS_OWNER` set,
   whose process group is ended from outside while its body is parked. Each
   ownership and timeout example has a negative control that applies the same
-  judgement to the library call the converted sites used and must fail) and
+  judgement to the library call the converted sites used and must fail),
+  `the hosted subprocess` (`OwnedHost`, #608: every cell of the host's state-by-operation
+  table and every row of its cause table, each example named after its cell; the three
+  abandonment races for a request's handles; a cancellation delivered into each cleanup
+  the host adds; the limit of a body that is not cancellable; and a captured run, the
+  shape the display-helper suites use; none sleeps, and a run bound passes when the
+  example says so) and
   `The unowned-start guard` (`OwnedStarts`: fixture trees for a new unowned
   start, an owned start, a baselined start, a stale or shrunken baseline entry, a
   count raised with its baseline, a new start in a file that has an exempt helper,
@@ -233,7 +239,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   (group `test.vulkan-run-native`, selected with `--match 'the child helper'`).
   A test that starts a thread starts it through `Test.Support.Owned`, and one that
   starts a subprocess through `Test.Support.Subprocess` (#588 converted the
-  subprocess sites the baseline listed). `glfw-tests` was converted in #593, narrowed by
+  subprocess sites the baseline listed; #608 converted the two display-helper suites,
+  which run the helper on a host of `Test.Support.Subprocess.Host` so that its
+  process group outlives the call, and whose probe calls are one-shot owned calls). `glfw-tests` was converted in #593, narrowed by
   the owner (2026-11-02): every thread it starts is owned (`Test.GLFW.Support`'s
   `onThread`, `onBoundThread`, `withDeferredThread`, `withMainThread` and the
   scoped helpers beside the specs that use them) except three references that keep

@@ -681,7 +681,11 @@ capability, #610) and
 `Test.Support.Subprocess` in the same library for a subprocess (#588:
 `runToCompletion` and `runCaptured` for a command run to completion,
 `withScopedChild` for a child lent to a body; the child is ended and reaped, its
-process group with it, on every exit); the guard fails a test source that
+process group with it, on every exit) and `Test.Support.Subprocess.Host` for the
+one child whose group must outlive the call that ran it (#608: `withHost` and
+`hostedCaptured`, a state machine whose table is in
+[the library's README](../tools/test-support/README.md); every hosted child is ended
+and reaped, latest first, when the host's scope ends); the guard fails a test source that
 calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
 `createProcess`, `createProcess_`, `withCreateProcess`, `spawnProcess`,
 `spawnCommand`, `callProcess`, `callCommand`, `readProcess`,
@@ -699,7 +703,7 @@ any other way, and its message names the facility that fits the kind of start.
   header are not code, so they are not sites; qualified calls are.
 - **A per-file count ratchet.** `tools/validation/owned_starts_baseline.json`
   records, per file, how many unowned starts it had when the guard was introduced
-  (204 in 59 files: the 552 found when the guard was introduced plus the three
+  (202 in 57 files: the 552 found when the guard was introduced plus the three
   starts `tools/test/RunnerIdentity.hs` brought, written by
   `owned_starts.py bootstrap`, less the 24 thread starts of the
   root run and console suites and the `lua-domains` sample that #600 converted (the `Run`
@@ -712,7 +716,10 @@ any other way, and its message names the facility that fits the kind of start.
   four thread starts that existed only to serve them. #588 left two files in the
   baseline on purpose: the display-helper suites, `tools/x11-test/Main.hs` and
   `tools/wayland-test/Main.hs`, whose subprocess starts need a hosted-subprocess helper
-  that its owner decision of 2026-11-02 moved to a separate issue). #595 then removed the 105
+  that its owner decision of 2026-11-02 moved to a separate issue; #608 built that host
+  and converted both suites onto it (the helper runs are hosted requests, the probe
+  calls are one-shot owned calls), which took their one entry each out of the baseline).
+  #595 then removed the 105
   thread starts of the headless Vulkan suites it converted (`diagnostics-tests`, `native-tests`,
   `integration-tests`, `render-2d-vulkan-tests` and the `allocator-parity-probe`), and the three
   starts of the integration suite's example bound, `Bound.hs`, left the baseline as audited
