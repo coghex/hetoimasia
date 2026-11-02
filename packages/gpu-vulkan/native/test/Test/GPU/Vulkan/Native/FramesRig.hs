@@ -69,7 +69,8 @@ module Test.GPU.Vulkan.Native.FramesRig
   , at
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
+import Control.Concurrent (ThreadId, killThread, myThreadId, yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, fromException, try)
 import Control.Monad (unless, void, when)
@@ -81,6 +82,7 @@ import Data.Text (Text)
 import Data.Word (Word64)
 import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
 import Numeric.Natural (Natural)
+import Test.Support.Owned (withOwnedThread)
 import Test.Hspec (Expectation, expectationFailure, shouldBe, shouldReturn)
 
 import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, durationFromNanoseconds, scriptedInstant)
@@ -292,16 +294,18 @@ cancelled ∷ Show a ⇒ Rig → (FrameCall → Bool) → IO a → IO ()
 cancelled rig selected action = do
   owner ← myThreadId
   armed ← newIORef True
-  duringFrameCall (rigStandIn rig) $ \call → when (selected call) $ do
-    first ← atomicModifyIORef' armed (\armed' → (False, armed'))
-    when first $ do
-      killer ← forkIO (killThread owner)
-      awaitThrowing killer
-  outcome ← try @SomeException action
-  duringFrameCall (rigStandIn rig) (\_ → pure ())
-  case outcome of
-    Left failure → fromException failure `shouldBe` Just ThreadKilled
-    Right value → expectationFailure ("the cancellation was not delivered: " <> show value)
+  fire ← newEmptyMVar
+  withOwnedThread (takeMVar fire >> killThread owner) $ \killer _ → do
+    duringFrameCall (rigStandIn rig) $ \call → when (selected call) $ do
+      first ← atomicModifyIORef' armed (\armed' → (False, armed'))
+      when first $ do
+        putMVar fire ()
+        awaitThrowing killer
+    outcome ← try @SomeException action
+    duringFrameCall (rigStandIn rig) (\_ → pure ())
+    case outcome of
+      Left failure → fromException failure `shouldBe` Just ThreadKilled
+      Right value → expectationFailure ("the cancellation was not delivered: " <> show value)
 
 awaitThrowing ∷ ThreadId → IO ()
 awaitThrowing thread =

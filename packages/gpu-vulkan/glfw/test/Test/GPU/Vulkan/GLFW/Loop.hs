@@ -12,7 +12,6 @@
 -- something /not/ to happen is labelled where it is made.
 module Test.GPU.Vulkan.GLFW.Loop (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
 import Control.Exception (Exception (..), SomeException, throwIO, toException, try)
 import Control.Monad (forM, forM_, unless, void, when)
@@ -68,6 +67,7 @@ import Hetoimasia.Runtime.GLFW
   , superviseGraphicsOwner
   )
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
 import Test.GPU.Vulkan.GLFW.StandIn
 import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldReturn, shouldSatisfy)
@@ -449,7 +449,15 @@ testDrainWakeAcrossArming = do
   presentationsRetire rig False
   moved ← newTVarIO Nothing
   paced ← newTVarIO False
-  runRig rig $ \host control → do
+  withRunHelper
+    (pure ())
+    ( \() → do
+        armings ← atomically (readTVar moved >>= maybe retry pure)
+        atomically (readTVar (rigArmings rig) >>= check . (> armings) . length)
+        atomically (writeTVar paced True)
+        letExitFinish rig
+    )
+    $ \supply → runRig rig $ \host control → do
     [window] ← windowsOf host
     _ ← firstFrame rig host control window
     let owner = vulkanGraphicsOwner host
@@ -463,11 +471,7 @@ testDrainWakeAcrossArming = do
           armings ← length <$> readTVarIO (rigArmings rig)
           atomically (writeTVar moved (Just armings))
           pure True
-    _ ← forkIO $ do
-      armings ← atomically (readTVar moved >>= maybe retry pure)
-      atomically (readTVar (rigArmings rig) >>= check . (> armings) . length)
-      atomically (writeTVar paced True)
-      letExitFinish rig
+    supply ()
     pure ()
   readTVarIO paced `shouldReturn` True
 
@@ -525,28 +529,28 @@ testSuspendedTarget = do
     service ← firstFrame rig host control window
     let owner = vulkanGraphicsOwner host
     hidden ← newTVarIO False
-    _ ← forkIO (setVisible rig host window False >> atomically (writeTVar hidden True))
-    composedUntil rig host control "the hidden window's suspension" (\_ → pure ()) $ do
-      done ← readTVarIO hidden
-      model ← atomically (readVulkanModel (vulkanController host))
-      targets ← atomically (readVulkanTargets (vulkanController host))
-      let suspended = [() | (attachment, view) ← targets, attachment == graphicsAttachment service, Just held ← [targetView (targetViewIdentity view) model], viewTargetPhase held == TargetSuspended]
-      pure (done && not (null suspended))
-    -- The presentation is still pending, so the suspended target keeps a
-    -- finite deadline.
-    due ← awaitDeadline rig host
-    settled ← atomically (readOwnerStatusNow owner)
-    -- The one bounded wait for something not to happen: with the clock still,
-    -- a spinning owner would take round after round in this time.
-    expired ← registerDelay 50000
-    spun ← atomically $ (True <$ (readOwnerStatusNow owner >>= check . (> statusRounds settled + 2) . statusRounds)) `orElse` (False <$ (readTVar expired >>= check))
-    queried ← fenceQueries rig
-    setClock rig due
-    atomically $ do
-      queries ← length . filter isQuery . map snd <$> readTVar (rigJournal rig)
-      check (queries > queried)
-    letExitFinish rig
-    pure (due, spun, True)
+    withOwnedThread (setVisible rig host window False >> atomically (writeTVar hidden True)) $ \_ _ → do
+      composedUntil rig host control "the hidden window's suspension" (\_ → pure ()) $ do
+        done ← readTVarIO hidden
+        model ← atomically (readVulkanModel (vulkanController host))
+        targets ← atomically (readVulkanTargets (vulkanController host))
+        let suspended = [() | (attachment, view) ← targets, attachment == graphicsAttachment service, Just held ← [targetView (targetViewIdentity view) model], viewTargetPhase held == TargetSuspended]
+        pure (done && not (null suspended))
+      -- The presentation is still pending, so the suspended target keeps a
+      -- finite deadline.
+      due ← awaitDeadline rig host
+      settled ← atomically (readOwnerStatusNow owner)
+      -- The one bounded wait for something not to happen: with the clock still,
+      -- a spinning owner would take round after round in this time.
+      expired ← registerDelay 50000
+      spun ← atomically $ (True <$ (readOwnerStatusNow owner >>= check . (> statusRounds settled + 2) . statusRounds)) `orElse` (False <$ (readTVar expired >>= check))
+      queried ← fenceQueries rig
+      setClock rig due
+      atomically $ do
+        queries ← length . filter isQuery . map snd <$> readTVar (rigJournal rig)
+        check (queries > queried)
+      letExitFinish rig
+      pure (due, spun, True)
   deadline `shouldSatisfy` (> scriptedInstant zeroDuration)
   spun `shouldBe` False
   polledLater `shouldBe` True
@@ -640,62 +644,64 @@ testHideWhilePresenting = do
     -- The test's own thread: once the owner is inside its presentation to
     -- the first window, it asks for the hide, which the main thread takes on
     -- its next turn.
-    _ ← forkIO $ do
-      atomically (presenting >>= check)
-      awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (hideWindowCommand first) >>= \case
-        WaitAccepted ticket → do
-          -- The one bounded wait for something not to happen: a hide that did
-          -- not wait for the presentation would make its native call well
-          -- within this time.
-          expired ← registerDelay 50000
-          made ← atomically ((True <$ (hiddenYet >>= check)) `orElse` (False <$ (readTVar expired >>= check)))
-          atomically (writeTVar early (Just made))
-          atomically (writeTVar gate True)
-          _ ← awaitCompletion ticket
-          atomically (writeTVar hideSettled True)
-        WaitClosed → pure ()
-    demandFrame host first
-    composedUntil rig host control "the hide's settlement" (\_ → pure ()) (readTVarIO hideSettled)
-    firstAt ← presentsOf rig a
-    secondAt ← presentsOf rig b
-    -- Both windows are asked for frames; only the second is shown.
-    asked ← newTVarIO secondAt
-    composedUntil
-      rig
-      host
-      control
-      "three frames on the second target while the first is hidden"
-      ( \_ → do
-          demandFrame host first
-          presented ← presentsOf rig b
-          wanted ← readTVarIO asked
-          when (presented >= wanted) $ do
-            demandFrame host second
-            atomically (writeTVar asked (presented + 1))
-      )
-      ((>= secondAt + 3) <$> presentsOf rig b)
-    hidden ← subtract firstAt <$> presentsOf rig a
-    showSettled ← newTVarIO False
-    _ ← forkIO $
-      awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (showWindowCommand first) >>= \case
-        WaitAccepted ticket → awaitCompletion ticket >> atomically (writeTVar showSettled True)
-        WaitClosed → pure ()
-    composedUntil rig host control "a frame on the first target once shown" (\_ → demandFrame host first) $
-      (&&) <$> readTVarIO showSettled <*> ((> firstAt + hidden) <$> presentsOf rig a)
-    resumedCount ← subtract (firstAt + hidden) <$> presentsOf rig a
-    kept ← not <$> atomically (journalHas rig (SwapchainDestroyed old))
-    events ← journal rig
-    let sinceHide = drop 1 (dropWhile (not . isHidden) events)
-        onOld = length [() | ImagePresented swapchain _ ← sinceHide, swapchain == old]
-        handedOld = length [() | SwapchainCreated _ _ (Just handed) ← sinceHide, handed == old]
-    -- Let its presentations retire: a replaced swapchain then goes, on the
-    -- owner's own polls. One nothing replaced would stay, and the assertions
-    -- below say so rather than this wait.
-    keepPresentationsOf rig old False
-    when (handedOld > 0) $
-      composedUntil rig host control "the old swapchain's destruction" (\_ → pure ()) (atomically (journalHas rig (SwapchainDestroyed old)))
-    held ← readTVarIO early
-    pure (held, hidden, kept, (onOld, handedOld), resumedCount)
+    let hider = do
+          atomically (presenting >>= check)
+          awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (hideWindowCommand first) >>= \case
+            WaitAccepted ticket → do
+              -- The one bounded wait for something not to happen: a hide that did
+              -- not wait for the presentation would make its native call well
+              -- within this time.
+              expired ← registerDelay 50000
+              made ← atomically ((True <$ (hiddenYet >>= check)) `orElse` (False <$ (readTVar expired >>= check)))
+              atomically (writeTVar early (Just made))
+              atomically (writeTVar gate True)
+              _ ← awaitCompletion ticket
+              atomically (writeTVar hideSettled True)
+            WaitClosed → pure ()
+    withOwnedThreadOpening (atomically (writeTVar gate True)) hider $ \_ _ → do
+      demandFrame host first
+      composedUntil rig host control "the hide's settlement" (\_ → pure ()) (readTVarIO hideSettled)
+      firstAt ← presentsOf rig a
+      secondAt ← presentsOf rig b
+      -- Both windows are asked for frames; only the second is shown.
+      asked ← newTVarIO secondAt
+      composedUntil
+        rig
+        host
+        control
+        "three frames on the second target while the first is hidden"
+        ( \_ → do
+            demandFrame host first
+            presented ← presentsOf rig b
+            wanted ← readTVarIO asked
+            when (presented >= wanted) $ do
+              demandFrame host second
+              atomically (writeTVar asked (presented + 1))
+        )
+        ((>= secondAt + 3) <$> presentsOf rig b)
+      hidden ← subtract firstAt <$> presentsOf rig a
+      showSettled ← newTVarIO False
+      let shower = 
+            awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (showWindowCommand first) >>= \case
+              WaitAccepted ticket → awaitCompletion ticket >> atomically (writeTVar showSettled True)
+              WaitClosed → pure ()
+      withOwnedThread shower $ \_ _ → do
+        composedUntil rig host control "a frame on the first target once shown" (\_ → demandFrame host first) $
+          (&&) <$> readTVarIO showSettled <*> ((> firstAt + hidden) <$> presentsOf rig a)
+        resumedCount ← subtract (firstAt + hidden) <$> presentsOf rig a
+        kept ← not <$> atomically (journalHas rig (SwapchainDestroyed old))
+        events ← journal rig
+        let sinceHide = drop 1 (dropWhile (not . isHidden) events)
+            onOld = length [() | ImagePresented swapchain _ ← sinceHide, swapchain == old]
+            handedOld = length [() | SwapchainCreated _ _ (Just handed) ← sinceHide, handed == old]
+        -- Let its presentations retire: a replaced swapchain then goes, on the
+        -- owner's own polls. One nothing replaced would stay, and the assertions
+        -- below say so rather than this wait.
+        keepPresentationsOf rig old False
+        when (handedOld > 0) $
+          composedUntil rig host control "the old swapchain's destruction" (\_ → pure ()) (atomically (journalHas rig (SwapchainDestroyed old)))
+        held ← readTVarIO early
+        pure (held, hidden, kept, (onOld, handedOld), resumedCount)
   heldHide `shouldBe` Just False
   hiddenPresents `shouldBe` 0
   keptWhileUnretired `shouldBe` True
@@ -723,28 +729,30 @@ testHideSuspendedWhileOtherPresents = do
     one ← firstFrame rig host control first
     _ ← firstFrame rig host control second
     hidden ← newTVarIO False
-    _ ← forkIO (commandSettled host (hideWindowCommand first) >> atomically (writeTVar hidden True))
-    composedUntil rig host control "the hidden window's suspension" (\_ → pure ()) $
-      (&&) <$> readTVarIO hidden <*> targetSuspended host one
-    gate ← newTVarIO False
-    presenting ← holdPresentations rig gate
-    result ← newTVarIO Nothing
-    before ← length . filter isHidden <$> journal rig
-    _ ← forkIO $ do
-      atomically (presenting >>= check)
-      _ ← forkIO (commandSettled host (hideWindowCommand first))
-      -- The bound only ends a regression's deadlock: a hide that waits for no
-      -- step makes its native call at once, and the example passes as soon as
-      -- it does.
-      expired ← registerDelay 10000000
-      made ← atomically $
-        (True <$ (length . filter (isHidden . snd) <$> readTVar (rigJournal rig) >>= check . (> before)))
-          `orElse` (False <$ (readTVar expired >>= check))
-      atomically (writeTVar result (Just made))
-      atomically (writeTVar gate True)
-    demandFrame host second
-    composedUntil rig host control "the second hide's native call" (\_ → pure ()) (isJust <$> readTVarIO result)
-    readTVarIO result
+    withOwnedThread (void (commandSettled host (hideWindowCommand first)) >> atomically (writeTVar hidden True)) $ \_ _ → do
+      composedUntil rig host control "the hidden window's suspension" (\_ → pure ()) $
+        (&&) <$> readTVarIO hidden <*> targetSuspended host one
+      gate ← newTVarIO False
+      presenting ← holdPresentations rig gate
+      result ← newTVarIO Nothing
+      before ← length . filter isHidden <$> journal rig
+      let hider = atomically (presenting >>= check) >> void (commandSettled host (hideWindowCommand first))
+          watcher = do
+            atomically (presenting >>= check)
+            -- The bound only ends a regression's deadlock: a hide that waits for no
+            -- step makes its native call at once, and the example passes as soon as
+            -- it does.
+            expired ← registerDelay 10000000
+            made ← atomically $
+              (True <$ (length . filter (isHidden . snd) <$> readTVar (rigJournal rig) >>= check . (> before)))
+                `orElse` (False <$ (readTVar expired >>= check))
+            atomically (writeTVar result (Just made))
+            atomically (writeTVar gate True)
+      withOwnedThreadOpening (atomically (writeTVar gate True)) hider $ \_ _ →
+        withOwnedThreadOpening (atomically (writeTVar gate True)) watcher $ \_ _ → do
+        demandFrame host second
+        composedUntil rig host control "the second hide's native call" (\_ → pure ()) (isJust <$> readTVarIO result)
+        readTVarIO result
   settledWhileHeld `shouldBe` Just True
   where
     isHidden = \case
@@ -788,64 +796,65 @@ testDirectHideWhilePresenting = do
     -- The test's own thread: once the main thread is about to hide, it gives
     -- the hide's native call the one bounded wait for something not to
     -- happen, then lets the presentation return.
-    _ ← forkIO $ do
-      atomically (readTVar asked >>= check)
-      expired ← registerDelay 50000
-      made ← atomically ((True <$ (hiddenYet >>= check)) `orElse` (False <$ (readTVar expired >>= check)))
-      atomically (writeTVar early (Just made))
-      atomically (writeTVar gate True)
-    demandFrame host first
-    -- The main thread: once the owner is inside its presentation to the first
-    -- window, it hides that window directly, from its update opportunity.
-    composedUntil
-      rig
-      host
-      control
-      "the direct hide"
-      ( \_ → do
-          ready ← atomically ((&&) <$> presenting <*> (not <$> readTVar asked))
-          when ready $ do
-            atomically (writeTVar asked True)
-            directCommand rig host first (hideWindowCommand first) >>= atomically . writeTVar hidden
-      )
-      (readTVarIO hidden)
-    firstAt ← presentsOf rig a
-    secondAt ← presentsOf rig b
-    wanted ← newTVarIO secondAt
-    composedUntil
-      rig
-      host
-      control
-      "three frames on the second target while the first is hidden"
-      ( \_ → do
-          demandFrame host first
-          presented ← presentsOf rig b
-          due ← readTVarIO wanted
-          when (presented >= due) $ do
-            demandFrame host second
-            atomically (writeTVar wanted (presented + 1))
-      )
-      ((>= secondAt + 3) <$> presentsOf rig b)
-    hiddenCount ← subtract firstAt <$> presentsOf rig a
-    shown ← newTVarIO False
-    composedUntil
-      rig
-      host
-      control
-      "a frame on the first target once shown directly"
-      ( \_ → do
-          done ← readTVarIO shown
-          unless done (directCommand rig host first (showWindowCommand first) >>= atomically . writeTVar shown)
-          demandFrame host first
-      )
-      ((&&) <$> readTVarIO shown <*> ((> firstAt + hiddenCount) <$> presentsOf rig a))
-    resumedCount ← subtract (firstAt + hiddenCount) <$> presentsOf rig a
-    events ← journal rig
-    let sinceHide = drop 1 (dropWhile (not . isHidden) events)
-        onOld = length [() | ImagePresented swapchain _ ← sinceHide, swapchain == old]
-        handedOld = length [() | SwapchainCreated _ _ (Just handed) ← sinceHide, handed == old]
-    held ← readTVarIO early
-    pure (held, hiddenCount, (onOld, handedOld), resumedCount)
+    let releaser = do
+          atomically (readTVar asked >>= check)
+          expired ← registerDelay 50000
+          made ← atomically ((True <$ (hiddenYet >>= check)) `orElse` (False <$ (readTVar expired >>= check)))
+          atomically (writeTVar early (Just made))
+          atomically (writeTVar gate True)
+    withOwnedThreadOpening (atomically (writeTVar gate True)) releaser $ \_ _ → do
+      demandFrame host first
+      -- The main thread: once the owner is inside its presentation to the first
+      -- window, it hides that window directly, from its update opportunity.
+      composedUntil
+        rig
+        host
+        control
+        "the direct hide"
+        ( \_ → do
+            ready ← atomically ((&&) <$> presenting <*> (not <$> readTVar asked))
+            when ready $ do
+              atomically (writeTVar asked True)
+              directCommand rig host first (hideWindowCommand first) >>= atomically . writeTVar hidden
+        )
+        (readTVarIO hidden)
+      firstAt ← presentsOf rig a
+      secondAt ← presentsOf rig b
+      wanted ← newTVarIO secondAt
+      composedUntil
+        rig
+        host
+        control
+        "three frames on the second target while the first is hidden"
+        ( \_ → do
+            demandFrame host first
+            presented ← presentsOf rig b
+            due ← readTVarIO wanted
+            when (presented >= due) $ do
+              demandFrame host second
+              atomically (writeTVar wanted (presented + 1))
+        )
+        ((>= secondAt + 3) <$> presentsOf rig b)
+      hiddenCount ← subtract firstAt <$> presentsOf rig a
+      shown ← newTVarIO False
+      composedUntil
+        rig
+        host
+        control
+        "a frame on the first target once shown directly"
+        ( \_ → do
+            done ← readTVarIO shown
+            unless done (directCommand rig host first (showWindowCommand first) >>= atomically . writeTVar shown)
+            demandFrame host first
+        )
+        ((&&) <$> readTVarIO shown <*> ((> firstAt + hiddenCount) <$> presentsOf rig a))
+      resumedCount ← subtract (firstAt + hiddenCount) <$> presentsOf rig a
+      events ← journal rig
+      let sinceHide = drop 1 (dropWhile (not . isHidden) events)
+          onOld = length [() | ImagePresented swapchain _ ← sinceHide, swapchain == old]
+          handedOld = length [() | SwapchainCreated _ _ (Just handed) ← sinceHide, handed == old]
+      held ← readTVarIO early
+      pure (held, hiddenCount, (onOld, handedOld), resumedCount)
   heldHide `shouldBe` Just False
   hiddenPresents `shouldBe` 0
   afterHide `shouldBe` (0, 1)
@@ -939,33 +948,43 @@ testStalledMainThread = do
     served ← newTVarIO False
     rendered ← newTVarIO 0
     servedWhileHeld ← newTVarIO Nothing
+    -- The command thread starts on the publishing thread's say-so, a latch that stays set, and says in turn, by another
+    -- that stays set, that the command was admitted: the publishing thread publishes only after that, so the command is
+    -- admitted while the pump is held whatever the threads' scheduling, as it was when the publishing thread forked the
+    -- command thread after it had seen the hold. The pump itself is a flag that the publishing thread clears.
+    commanderGo ← newTVarIO False
+    admitted ← newTVarIO False
     -- The test's own thread: once the main thread is held inside its native
     -- event call, it publishes scenes — which is what an application thread
     -- other than the main one does — and submits a window command.
-    _ ← forkIO $ do
-      atomically (pumpHeld rig >>= check)
-      before ← presentsOf rig (graphicsAttachment service)
-      _ ← forkIO $
-        -- Admitted at once, and executed only by the main thread's pump.
-        awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (setWindowSizeCommand window (Extent 80 60)) >>= \case
-          WaitAccepted ticket → awaitCompletion ticket >> atomically (writeTVar served True)
-          WaitClosed → pure ()
-      forM_ [1 .. 3 ∷ Int] $ \count → do
-        scene ← prepare 0
-        _ ← publishVulkanScene host scene
-        atomically $ do
-          -- Each scene is presented while the pump stays held.
-          held ← pumpHeld rig
-          unless held retry
-        awaitPresents rig (graphicsAttachment service) (before + count)
-      now ← presentsOf rig (graphicsAttachment service)
-      atomically (writeTVar rendered (now - before))
-      servedNow ← readTVarIO served
-      atomically (writeTVar servedWhileHeld (Just servedNow))
-      holdPump rig False
-    holdPump rig True
-    composedUntil rig host control "the command's service after the stall" (\_ → pure ()) (readTVarIO served)
-    (,,) <$> readTVarIO rendered <*> readTVarIO servedWhileHeld <*> readTVarIO served
+    let commander = do
+          atomically (readTVar commanderGo >>= check)
+          -- Admitted at once, and executed only by the main thread's pump.
+          awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (setWindowSizeCommand window (Extent 80 60)) >>= \case
+            WaitAccepted ticket → atomically (writeTVar admitted True) >> awaitCompletion ticket >> atomically (writeTVar served True)
+            WaitClosed → atomically (writeTVar admitted True)
+        primary = do
+          atomically (pumpHeld rig >>= check)
+          atomically (writeTVar commanderGo True)
+          atomically (readTVar admitted >>= check)
+          before ← presentsOf rig (graphicsAttachment service)
+          forM_ [1 .. 3 ∷ Int] $ \count → do
+            scene ← prepare 0
+            _ ← publishVulkanScene host scene
+            atomically $ do
+              -- Each scene is presented while the pump stays held.
+              held ← pumpHeld rig
+              unless held retry
+            awaitPresents rig (graphicsAttachment service) (before + count)
+          now ← presentsOf rig (graphicsAttachment service)
+          atomically (writeTVar rendered (now - before))
+          servedNow ← readTVarIO served
+          atomically (writeTVar servedWhileHeld (Just servedNow))
+          holdPump rig False
+    withOwnedThread commander $ \_ _ → withOwnedThread primary $ \_ _ → do
+      holdPump rig True
+      composedUntil rig host control "the command's service after the stall" (\_ → pure ()) (readTVarIO served)
+      (,,) <$> readTVarIO rendered <*> readTVarIO servedWhileHeld <*> readTVarIO served
   duringStall `shouldSatisfy` (>= 3)
   servedDuringStall `shouldBe` Just False
   servedAfter `shouldBe` True
@@ -990,34 +1009,35 @@ testStalledLiveResize = do
     suboptimalWhileStale rig
     let attachment = graphicsAttachment service
     result ← newTVarIO Nothing
-    _ ← forkIO $ do
-      atomically (pumpHeld rig >>= check)
-      intervals ← forM [1 .. 12 ∷ Word32] $ \step → do
-        presentedBefore ← presentsOf rig attachment
-        builtBefore ← length <$> swapchainsBuilt rig
-        offerExtent rig (Just (SurfaceExtent (640 + step * 4) 480))
-        scene ← prepare 0
-        _ ← publishVulkanScene host scene
-        awaitPresents rig attachment (presentedBefore + 1)
-        presentedIn ← maybe 0 (+ 1) . lastMaybe <$> presentRounds rig
-        awaitOwnerSettled rig host presentedIn
-        -- A deadline the move reaches leaves the settled status behind the
-        -- clock until the round that meets it; one it does not reach wakes
-        -- nothing.
-        rounds ← statusRounds <$> atomically (readOwnerStatusNow (vulkanGraphicsOwner host))
-        advanceClock rig 8
-        awaitOwnerSettled rig host rounds
-        presentedAfter ← presentsOf rig attachment
-        built ← map snd . drop builtBefore <$> swapchainsBuilt rig
-        pure (presentedAfter - presentedBefore, built)
-      fromActive ← presentedFromNewest <$> journal rig
-      atomically (writeTVar result (Just (intervals, fromActive)))
-      holdPump rig False
-    holdPump rig True
-    composedUntil rig host control "the end of the live resize" (\_ → pure ()) (isJust <$> readTVarIO result)
-    measured ← readTVarIO result >>= maybe (throwIO (StandInFailure (Text.pack "the live resize reported nothing"))) pure
-    letExitFinish rig
-    pure measured
+    let resizer = do
+          atomically (pumpHeld rig >>= check)
+          intervals ← forM [1 .. 12 ∷ Word32] $ \step → do
+            presentedBefore ← presentsOf rig attachment
+            builtBefore ← length <$> swapchainsBuilt rig
+            offerExtent rig (Just (SurfaceExtent (640 + step * 4) 480))
+            scene ← prepare 0
+            _ ← publishVulkanScene host scene
+            awaitPresents rig attachment (presentedBefore + 1)
+            presentedIn ← maybe 0 (+ 1) . lastMaybe <$> presentRounds rig
+            awaitOwnerSettled rig host presentedIn
+            -- A deadline the move reaches leaves the settled status behind the
+            -- clock until the round that meets it; one it does not reach wakes
+            -- nothing.
+            rounds ← statusRounds <$> atomically (readOwnerStatusNow (vulkanGraphicsOwner host))
+            advanceClock rig 8
+            awaitOwnerSettled rig host rounds
+            presentedAfter ← presentsOf rig attachment
+            built ← map snd . drop builtBefore <$> swapchainsBuilt rig
+            pure (presentedAfter - presentedBefore, built)
+          fromActive ← presentedFromNewest <$> journal rig
+          atomically (writeTVar result (Just (intervals, fromActive)))
+          holdPump rig False
+    withOwnedThread resizer $ \_ _ → do
+      holdPump rig True
+      composedUntil rig host control "the end of the live resize" (\_ → pure ()) (isJust <$> readTVarIO result)
+      measured ← readTVarIO result >>= maybe (throwIO (StandInFailure (Text.pack "the live resize reported nothing"))) pure
+      letExitFinish rig
+      pure measured
   -- A move is first seen by the suboptimal presentation of an odd interval's
   -- scene and settles 16 ms later, at the end of the next interval: that
   -- interval builds one replacement from the extent it offered, the newest,
@@ -1055,25 +1075,35 @@ testExitWithOwedPresentations = do
   ended ← newTVarIO False
   answered ← newTVarIO Nothing
   retiring ← newTVarIO False
-  runRig rig $ \host control → do
-    [window] ← windowsOf host
-    _ ← firstFrame rig host control window
-    let owner = vulkanGraphicsOwner host
-    -- A worker that submits a window command once the loop has ended.
-    _ ← forkIO $ do
-      atomically (readTVar ended >>= check)
-      answer ← awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (setWindowSizeCommand window (Extent 90 70))
-      atomically (writeTVar answered (Just (accepted answer)))
-    -- The presentations retire only once the owner is retiring, so the exit
-    -- drain has to wait for them.
-    _ ← forkIO $ do
-      atomically (readOwnerStatusNow owner >>= check . (== OwnerRetiring) . statusPhase)
-      atomically (writeTVar retiring True)
-      presentationsRetire rig True
-    atomically (writeTVar ended True)
-  -- The worker was answered, not left waiting on the ended loop.
-  worker ← timeout (10 * 1000 * 1000) (atomically (readTVar answered >>= maybe retry pure))
-  worker `shouldSatisfy` isJust
+  withRunHelper
+    (pure ())
+    ( \(host, window) → do
+        atomically (readTVar ended >>= check)
+        answer ← awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (setWindowSizeCommand window (Extent 90 70))
+        atomically (writeTVar answered (Just (accepted answer)))
+    )
+    $ \supplyWorker →
+      withRunHelper
+        (pure ())
+        ( \owner → do
+            atomically (readOwnerStatusNow owner >>= check . (== OwnerRetiring) . statusPhase)
+            atomically (writeTVar retiring True)
+            presentationsRetire rig True
+        )
+        $ \supplyRetirement → do
+          runRig rig $ \host control → do
+            [window] ← windowsOf host
+            _ ← firstFrame rig host control window
+            let owner = vulkanGraphicsOwner host
+            -- A worker that submits a window command once the loop has ended.
+            supplyWorker (host, window)
+            -- The presentations retire only once the owner is retiring, so the exit
+            -- drain has to wait for them.
+            supplyRetirement owner
+            atomically (writeTVar ended True)
+          -- The worker was answered, not left waiting on the ended loop.
+          worker ← timeout (10 * 1000 * 1000) (atomically (readTVar answered >>= maybe retry pure))
+          worker `shouldSatisfy` isJust
   readTVarIO retiring >>= (`shouldBe` True)
   events ← journal rig
   events
@@ -1108,7 +1138,20 @@ testDrainPastDemand = do
   rig ← scriptedRigOf 1
   presentationsRetire rig False
   paced ← newTVarIO False
-  runRig rig $ \host control → do
+  withRunHelper
+    (pure ())
+    ( \owner → do
+        atomically (readOwnerStatusNow owner >>= check . (== OwnerRetiring) . statusPhase)
+        -- Past the demand deadline and well beyond, a tenth of a second at a
+        -- time: the drain arms its timer again after every move.
+        forM_ [1 .. 6 ∷ Int] $ \_ → do
+          armed ← length <$> readTVarIO (rigArmings rig)
+          advanceClock rig 100
+          atomically (readTVar (rigArmings rig) >>= check . (> armed) . length)
+        atomically (writeTVar paced True)
+        letExitFinish rig
+    )
+    $ \supply → runRig rig $ \host control → do
     [window] ← windowsOf host
     _ ← firstFrame rig host control window
     let owner = vulkanGraphicsOwner host
@@ -1125,16 +1168,7 @@ testDrainPastDemand = do
       "the owner taking the demand deadline"
       (\_ → atomically (modifyTVar' turns (+ 1)))
       (atomically ((&&) . (>= 2) <$> readTVar turns <*> readOwnerDemandTaken owner))
-    _ ← forkIO $ do
-      atomically (readOwnerStatusNow owner >>= check . (== OwnerRetiring) . statusPhase)
-      -- Past the demand deadline and well beyond, a tenth of a second at a
-      -- time: the drain arms its timer again after every move.
-      forM_ [1 .. 6 ∷ Int] $ \_ → do
-        armed ← length <$> readTVarIO (rigArmings rig)
-        advanceClock rig 100
-        atomically (readTVar (rigArmings rig) >>= check . (> armed) . length)
-      atomically (writeTVar paced True)
-      letExitFinish rig
+    supply owner
     pure ()
   readTVarIO paced `shouldReturn` True
 
@@ -1148,7 +1182,18 @@ testDrainPastSettling = do
   rig ← scriptedRigOf 1
   presentationsRetire rig False
   paced ← newTVarIO False
-  runRig rig $ \host control → do
+  withRunHelper
+    (pure ())
+    ( \owner → do
+        atomically (readOwnerStatusNow owner >>= check . (== OwnerRetiring) . statusPhase)
+        forM_ [1 .. 6 ∷ Int] $ \_ → do
+          armed ← length <$> readTVarIO (rigArmings rig)
+          advanceClock rig 100
+          atomically (readTVar (rigArmings rig) >>= check . (> armed) . length)
+        atomically (writeTVar paced True)
+        letExitFinish rig
+    )
+    $ \supply → runRig rig $ \host control → do
     [window] ← windowsOf host
     service ← firstFrame rig host control window
     let owner = vulkanGraphicsOwner host
@@ -1158,14 +1203,7 @@ testDrainPastSettling = do
       pure $ case viewCondition <$> view of
         Just (Settling _) → True
         _ → False
-    _ ← forkIO $ do
-      atomically (readOwnerStatusNow owner >>= check . (== OwnerRetiring) . statusPhase)
-      forM_ [1 .. 6 ∷ Int] $ \_ → do
-        armed ← length <$> readTVarIO (rigArmings rig)
-        advanceClock rig 100
-        atomically (readTVar (rigArmings rig) >>= check . (> armed) . length)
-      atomically (writeTVar paced True)
-      letExitFinish rig
+    supply owner
     pure ()
   readTVarIO paced `shouldReturn` True
 

@@ -8,7 +8,7 @@
 -- journal and from the threads involved, never from timing.
 module Test.GPU.Vulkan.GLFW.Rescue (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
+import Control.Concurrent (ThreadId, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, stateTVar, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, displayException, fromException, throwIO, try, uninterruptibleMask_)
@@ -33,6 +33,7 @@ import Hetoimasia.Runtime.GLFW
   , readOwnerStatusNow
   )
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.GPU.Vulkan.GLFW.Bound (BoundSettings (..), boundOf, boundedIt, currentBound, runBounded, withBoundThread)
 import Test.GPU.Vulkan.GLFW.StandIn
 import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldReturn, shouldSatisfy)
@@ -58,25 +59,26 @@ testExpiryBeforeRelease = do
   rigCell ← newTVarIO Nothing
   blocking ← newTVarIO False
   never ← newTVarIO False
-  void . forkIO $ do
-    atomically (readTVar blocking >>= check)
-    expire controls
-  outcome ← try . runBounded settings "a blocked example" $ do
-    rig ← scriptedRigOf 1
-    atomically (writeTVar rigCell (Just rig))
-    presentationsRetire rig False
-    runRig rig $ \host control → do
-      presentOne rig host control
-      atomically (writeTVar blocking True)
-      atomically (readTVar never >>= check)
-  failedWith "the example did not finish within its bound" outcome
-  rig ← readTVarIO rigCell >>= maybe (failWith "the example made no rig") pure
-  destroyedEverything rig
-  readTVarIO (controlTerminated controls) `shouldReturn` Nothing
-  settled rig controls
-  -- Kept reachable to the end, so the body's wait was never one the runtime
-  -- could see was hopeless.
-  atomically (writeTVar never True)
+  let supplier = do
+        atomically (readTVar blocking >>= check)
+        expire controls
+  withOwnedThread supplier $ \_ _ → do
+    outcome ← try . runBounded settings "a blocked example" $ do
+      rig ← scriptedRigOf 1
+      atomically (writeTVar rigCell (Just rig))
+      presentationsRetire rig False
+      runRig rig $ \host control → do
+        presentOne rig host control
+        atomically (writeTVar blocking True)
+        atomically (readTVar never >>= check)
+    failedWith "the example did not finish within its bound" outcome
+    rig ← readTVarIO rigCell >>= maybe (failWith "the example made no rig") pure
+    destroyedEverything rig
+    readTVarIO (controlTerminated controls) `shouldReturn` Nothing
+    settled rig controls
+    -- Kept reachable to the end, so the body's wait was never one the runtime
+    -- could see was hopeless.
+    atomically (writeTVar never True)
 
 -- | An example that fails before it releases the rig's gates — a presentation
 -- unretired, the clock stopped — reports its own failure, after the owner's
@@ -110,27 +112,28 @@ testEnteredHoldRescued = do
   never ← newTVarIO False
   -- The handover itself waits on the held construction, so it is not the body
   -- that sees the hold entered.
-  void . forkIO $ do
-    rig ← atomically (readTVar rigCell >>= maybe retry pure)
-    awaitHeld rig AtCreateDevice
-    expire controls
-  outcome ← try . runBounded settings "a held example" $ do
-    rig ← newRig
-    scriptNative rig AtCreateDevice (HoldsUntil gate)
-    atomically (writeTVar rigCell (Just rig))
-    runRig rig $ \host _ → do
-      [window] ← windowsOf host
-      _ ← handedOver host window RequiredTarget
-      atomically (readTVar never >>= check)
-  failedWith "the example did not finish within its bound" outcome
-  rig ← readTVarIO rigCell >>= maybe (failWith "the example made no rig") pure
-  events ← journal rig
-  -- The held creation completed, and what it made was destroyed.
-  events `shouldSatisfy` isSubsequenceOf [DeviceCreated, DeviceDestroyed]
-  destroyedEverything rig
-  readTVarIO gate `shouldReturn` False
-  settled rig controls
-  atomically (writeTVar never True)
+  let supplier = do
+        rig ← atomically (readTVar rigCell >>= maybe retry pure)
+        awaitHeld rig AtCreateDevice
+        expire controls
+  withOwnedThread supplier $ \_ _ → do
+    outcome ← try . runBounded settings "a held example" $ do
+      rig ← newRig
+      scriptNative rig AtCreateDevice (HoldsUntil gate)
+      atomically (writeTVar rigCell (Just rig))
+      runRig rig $ \host _ → do
+        [window] ← windowsOf host
+        _ ← handedOver host window RequiredTarget
+        atomically (readTVar never >>= check)
+    failedWith "the example did not finish within its bound" outcome
+    rig ← readTVarIO rigCell >>= maybe (failWith "the example made no rig") pure
+    events ← journal rig
+    -- The held creation completed, and what it made was destroyed.
+    events `shouldSatisfy` isSubsequenceOf [DeviceCreated, DeviceDestroyed]
+    destroyedEverything rig
+    readTVarIO gate `shouldReturn` False
+    settled rig controls
+    atomically (writeTVar never True)
 
 -- | An example whose thread cannot be cancelled — it waits uninterruptibly on
 -- something no rig withholds — is still running when the grace expires. The
@@ -142,21 +145,22 @@ testLastResort = do
   (controls, settings) ← scriptedBound
   entered ← newTVarIO False
   stuck ← newTVarIO False
-  void . forkIO $ do
-    atomically (readTVar entered >>= check)
-    atomically (writeTVar (controlGrace controls) True)
-    expire controls
-    atomically (readTVar (controlTerminated controls) >>= maybe retry (const (pure ())))
-    atomically (writeTVar stuck True)
-  outcome ← try . runBounded settings "a stuck example" $ do
-    atomically (writeTVar entered True)
-    uninterruptibleMask_ (atomically (readTVar stuck >>= check))
-  failedWith "the example did not finish within its bound" outcome
-  readTVarIO (controlTerminated controls) `shouldReturn` Just "a stuck example"
-  started ← readTVarIO (controlThreads controls)
-  mapM_ awaitEnded started
-  -- The example's thread, the watchdog and the one cancellation.
-  length (nub started) `shouldBe` 3
+  let supplier = do
+        atomically (readTVar entered >>= check)
+        atomically (writeTVar (controlGrace controls) True)
+        expire controls
+        atomically (readTVar (controlTerminated controls) >>= maybe retry (const (pure ())))
+        atomically (writeTVar stuck True)
+  withOwnedThreadOpening (atomically (writeTVar stuck True)) supplier $ \_ _ → do
+    outcome ← try . runBounded settings "a stuck example" $ do
+      atomically (writeTVar entered True)
+      uninterruptibleMask_ (atomically (readTVar stuck >>= check))
+    failedWith "the example did not finish within its bound" outcome
+    readTVarIO (controlTerminated controls) `shouldReturn` Just "a stuck example"
+    started ← readTVarIO (controlThreads controls)
+    mapM_ awaitEnded started
+    -- The example's thread, the watchdog and the one cancellation.
+    length (nub started) `shouldBe` 3
 
 -- | The example's own thread ends as soon as it is cancelled, but a rig run it
 -- started on a thread of its own is inside an uninterruptible call, so that
@@ -173,31 +177,37 @@ testRunOutlivesExample = do
   -- The grace expires only once the example's own thread has ended, so a
   -- bound that took that end for settlement would already have disarmed its
   -- last resort.
-  void . forkIO $ do
-    atomically (readTVar enlisted >>= check)
-    expire controls
-    worker ← atomically (readTVar (controlThreads controls) >>= \case
-      first : _ → pure first
-      [] → retry)
-    awaitEnded worker
-    atomically (writeTVar (controlGrace controls) True)
-    atomically (readTVar (controlTerminated controls) >>= maybe retry (const (pure ())))
-    atomically (writeTVar stuck True)
-  outcome ← try . runBounded settings "an example with a run of its own" $ do
-    bound ← currentBound
-    thread ← forkIO $ do
-      self ← myThreadId
-      void . try @SomeException . withBoundThread bound self $ do
-        atomically (writeTVar enlisted True)
-        uninterruptibleMask_ (atomically (readTVar stuck >>= check))
-    atomically (writeTVar helper (Just thread))
-    atomically (readTVar never >>= check)
-  failedWith "the example did not finish within its bound" outcome
-  readTVarIO (controlTerminated controls) `shouldReturn` Just "an example with a run of its own"
-  started ← readTVarIO (controlThreads controls)
-  run ← readTVarIO helper
-  mapM_ awaitEnded (maybe id (:) run started)
-  atomically (writeTVar never True)
+  let supplier = do
+        atomically (readTVar enlisted >>= check)
+        expire controls
+        worker ← atomically (readTVar (controlThreads controls) >>= \case
+          first : _ → pure first
+          [] → retry)
+        awaitEnded worker
+        atomically (writeTVar (controlGrace controls) True)
+        atomically (readTVar (controlTerminated controls) >>= maybe retry (const (pure ())))
+        atomically (writeTVar stuck True)
+  withOwnedThreadOpening (atomically (writeTVar stuck True)) supplier $ \_ _ → do
+    withRunHelper
+      (atomically (writeTVar stuck True))
+      ( \bound → do
+          self ← myThreadId
+          atomically (writeTVar helper (Just self))
+          void . try @SomeException . withBoundThread bound self $ do
+            atomically (writeTVar enlisted True)
+            uninterruptibleMask_ (atomically (readTVar stuck >>= check))
+      )
+      $ \supply → do
+      outcome ← try . runBounded settings "an example with a run of its own" $ do
+        bound ← currentBound
+        supply bound
+        atomically (readTVar never >>= check)
+      failedWith "the example did not finish within its bound" outcome
+      readTVarIO (controlTerminated controls) `shouldReturn` Just "an example with a run of its own"
+      started ← readTVarIO (controlThreads controls)
+      run ← readTVarIO helper
+      mapM_ awaitEnded (maybe id (:) run started)
+      atomically (writeTVar never True)
 
 -- | A hook installed while an earlier one is running inside an arming stays
 -- installed when the earlier one answers, and runs at a later arming.
@@ -240,15 +250,14 @@ testCancelledWhileStarting = do
                 atomically (writeTVar starting True)
                 atomically (readTVar release >>= check)
           }
-  coordinator ← forkIO $
-    try (runBounded settings "an example cancelled while its bound starts" (atomically (readTVar never >>= check))) >>= putMVar done
-  atomically (readTVar starting >>= check)
-  killThread coordinator
-  outcome ← takeMVar done
-  either (\caught → fromException caught `shouldBe` Just ThreadKilled) (\() → failWith "the cancelled bound returned") outcome
-  readTVarIO (controlTerminated controls) `shouldReturn` Nothing
-  readTVarIO (controlThreads controls) >>= mapM_ awaitEnded
-  atomically (writeTVar never True >> writeTVar release True)
+  withOwnedThread (try (runBounded settings "an example cancelled while its bound starts" (atomically (readTVar never >>= check))) >>= putMVar done) $ \coordinator _ → do
+    atomically (readTVar starting >>= check)
+    killThread coordinator
+    outcome ← takeMVar done
+    either (\caught → fromException caught `shouldBe` Just ThreadKilled) (\() → failWith "the cancelled bound returned") outcome
+    readTVarIO (controlTerminated controls) `shouldReturn` Nothing
+    readTVarIO (controlThreads controls) >>= mapM_ awaitEnded
+    atomically (writeTVar never True >> writeTVar release True)
 
 -- | The example fails while a rig run it started on a thread of its own is
 -- still under way. That run is rescued, cancelled and settled before the
@@ -259,22 +268,27 @@ testFailureWithRunOutstanding = do
   helper ← newTVarIO Nothing
   enlisted ← newTVarIO False
   never ← newTVarIO False
-  outcome ← try . runBounded settings "an example failing with a run of its own" $ do
-    bound ← currentBound
-    thread ← forkIO $ do
-      self ← myThreadId
-      void . try @SomeException . withBoundThread bound self $ do
-        atomically (writeTVar enlisted True)
-        atomically (readTVar never >>= check)
-    atomically (writeTVar helper (Just thread))
-    atomically (readTVar enlisted >>= check)
-    expectationFailure "the example's own failure"
-  failedWith "the example's own failure" outcome
-  readTVarIO (controlTerminated controls) `shouldReturn` Nothing
-  started ← readTVarIO (controlThreads controls)
-  run ← readTVarIO helper
-  mapM_ awaitEnded (maybe id (:) run started)
-  atomically (writeTVar never True)
+  withRunHelper
+    (pure ())
+    ( \bound → do
+        self ← myThreadId
+        atomically (writeTVar helper (Just self))
+        void . try @SomeException . withBoundThread bound self $ do
+          atomically (writeTVar enlisted True)
+          atomically (readTVar never >>= check)
+    )
+    $ \supply → do
+    outcome ← try . runBounded settings "an example failing with a run of its own" $ do
+      bound ← currentBound
+      supply bound
+      atomically (readTVar enlisted >>= check)
+      expectationFailure "the example's own failure"
+    failedWith "the example's own failure" outcome
+    readTVarIO (controlTerminated controls) `shouldReturn` Nothing
+    started ← readTVarIO (controlThreads controls)
+    run ← readTVarIO helper
+    mapM_ awaitEnded (maybe id (:) run started)
+    atomically (writeTVar never True)
 
 -- ---------------------------------------------------------------------------
 -- Helpers

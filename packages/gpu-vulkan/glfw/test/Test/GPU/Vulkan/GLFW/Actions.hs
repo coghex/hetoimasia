@@ -11,8 +11,7 @@
 -- meanwhile reads the order it was journalled in.
 module Test.GPU.Vulkan.GLFW.Actions (spec) where
 
-import Control.Concurrent (forkIO, myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, throwIO, toException, try)
 import Control.Monad (void, when)
@@ -421,7 +420,17 @@ testExitRefusal = do
   rig ← surfaceFreeRig 0
   answers ← newTVarIO Nothing
   (gate, running, holding) ← holdingAction
-  outcomes ← runRig rig $ \host _ → do
+  outcomes ←
+    withRunHelper
+      (atomically (writeTVar gate True))
+      ( \(host, behind) → do
+          refused ← atomically (awaitVulkanAction behind)
+          late ← atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
+          atomically $ do
+            writeTVar answers (Just (outcomeText refused, refusalOf late))
+            writeTVar gate True
+      )
+      $ \supply → runRig rig $ \host _ → do
     awaitReady host
     held ← admitted =<< atomically (submitVulkanAction (vulkanController host) holding)
     atomically (readTVar running >>= check)
@@ -429,12 +438,7 @@ testExitRefusal = do
     -- Once the exit has begun, the one queued behind the running action is
     -- refused without waiting for the owner, a new one is refused at
     -- admission, and only then does the running one finish.
-    _ ← forkIO $ do
-      refused ← atomically (awaitVulkanAction behind)
-      late ← atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
-      atomically $ do
-        writeTVar answers (Just (outcomeText refused, refusalOf late))
-        writeTVar gate True
+    supply (host, behind)
     pure (host, held)
   let (host, held) = outcomes
   readTVarIO answers `shouldReturnValue` Just (outcomeText (ActionRefused @() ActionOwnerClosed), Just ActionOwnerClosed)
@@ -609,8 +613,7 @@ testUploads = do
       texture ← constructImage construction (ImageDescription TextureImage Rgba8Linear 64 64 2) >>= either (failWith . show) pure
       vertices ← constructBuffer construction (BufferDescription VertexBuffer 4096) >>= either (failWith . show) pure
       pure (texture, vertices)))
-    answers ← newEmptyMVar
-    _ ← forkIO $ do
+    answer ← onOtherThread $ do
       admitted' ←
         mapM
           (submitVulkanUpload (vulkanController host))
@@ -618,11 +621,11 @@ testUploads = do
           , UploadBuffer vertices (ByteString.replicate 4096 3)
           ]
       case sequence admitted' of
-        Left refusal → putMVar answers (Left refusal)
+        Left refusal → pure (Left refusal)
         Right tickets → do
           early ← mapM (\ticket → awaitUploadTicket ticket (millisecondsOf 20)) tickets
-          putMVar answers (Right (tickets, early))
-    (tickets, early) ← takeMVar answers >>= either (failWith . ("the upload was refused: " <>) . show) pure
+          pure (Right (tickets, early))
+    (tickets, early) ← either (failWith . ("the upload was refused: " <>) . show) pure answer
     submissionsComplete rig True
     late ← mapM (\ticket → awaitUploadTicket ticket (millisecondsOf 30000)) tickets
     owner' ← returned =<< act host (VulkanAction (\_ → mapM (\ticket → awaitUploadTicket ticket (millisecondsOf 1)) tickets))
@@ -645,7 +648,14 @@ testSwapAtRetirement = do
   rig ← withUploads (either (error . show) id (validateUploadConfig (1024 * 1024) 65536 4)) <$> surfaceFreeRig 0
   submissionsComplete rig False
   held ← newTVarIO Nothing
-  _ ← runRigCaught rig $ \host _ → do
+  _ ←
+    withRunHelper
+      (pure ())
+      ( \(owner, ticket, bound) → do
+          atomically ((readSwapTicket ticket >>= check . (== SwapFailed)) `orElse` (readTVar bound >>= check))
+          publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+      )
+      $ \supply → runRigCaught rig $ \host _ → do
     awaitReady host
     (handle, replacement) ← returned =<< act host (VulkanAction (\construction → do
       constructTextureTable construction (either (error . show) id (validateTableConfig 16 4 2)) >>= either (failWith . show) pure
@@ -662,9 +672,7 @@ testSwapAtRetirement = do
     -- fails the example rather than hanging it.
     let owner = vulkanGraphicsOwner host
     bound ← registerDelay 15000000
-    void . forkIO $ do
-      atomically ((readSwapTicket ticket >>= check . (== SwapFailed)) `orElse` (readTVar bound >>= check))
-      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+    supply (owner, ticket, bound)
   ticket ← readTVarIO held >>= maybe (failWith "the swap was not accepted") pure
   atomically (readSwapTicket ticket) >>= (`shouldBe` SwapFailed)
 
@@ -680,7 +688,15 @@ testSwapAtOrphanFailure = do
   scriptSurface rig 102 DestroyFails
   submissionsComplete rig False
   held ← newTVarIO Nothing
-  _ ← runRigCaught rig $ \host _ → do
+  _ ←
+    withRunHelper
+      (pure ())
+      ( \(owner, windows, ticket, bound) → do
+          atomically ((readSwapTicket ticket >>= check . (== SwapFailed)) `orElse` (readTVar bound >>= check))
+          atomically (check . null =<< hostPendingAttachments windows)
+          publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+      )
+      $ \supply → runRigCaught rig $ \host _ → do
     let owner = vulkanGraphicsOwner host
         windows = vulkanWindowHost host
     -- The owner holds inside the first construction while the second
@@ -710,10 +726,7 @@ testSwapAtOrphanFailure = do
     -- swap has failed — or after a bound, so a ticket left pending fails the
     -- example rather than hanging it.
     bound ← registerDelay 15000000
-    void . forkIO $ do
-      atomically ((readSwapTicket ticket >>= check . (== SwapFailed)) `orElse` (readTVar bound >>= check))
-      atomically (check . null =<< hostPendingAttachments windows)
-      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+    supply (owner, windows, ticket, bound)
   ticket ← readTVarIO held >>= maybe (failWith "the swap was not accepted") pure
   atomically (readSwapTicket ticket) >>= (`shouldBe` SwapFailed)
 
@@ -730,7 +743,14 @@ testSwapAtTerminal ∷ IO ()
 testSwapAtTerminal = do
   rig ← withUploads (either (error . show) id (validateUploadConfig (1024 * 1024) 65536 4)) <$> surfaceFreeRig 0
   observed ← newTVarIO Nothing
-  _ ← runRigCaught rig $ \host _ → do
+  _ ←
+    withRunHelper
+      (pure ())
+      ( \host → do
+          atomically (check . null =<< hostPendingAttachments (vulkanWindowHost host))
+          publishOwnerDestruction (vulkanGraphicsOwner host) (ownerDestroyed "published independently by the example")
+      )
+      $ \supply → runRigCaught rig $ \host _ → do
     awaitReady host
     (handle, replacement) ← returned =<< act host (VulkanAction (\construction → do
       constructTextureTable construction (either (error . show) id (validateTableConfig 16 4 2)) >>= either (failWith . show) pure
@@ -752,9 +772,7 @@ testSwapAtTerminal = do
     -- The failed session retains its uploads' batch: independent evidence of
     -- the owner's destruction ends the exit.
     submissionsComplete rig True
-    void . forkIO $ do
-      atomically (check . null =<< hostPendingAttachments (vulkanWindowHost host))
-      publishOwnerDestruction (vulkanGraphicsOwner host) (ownerDestroyed "published independently by the example")
+    supply host
   -- The construction was refused, the failure latched, and the ticket failed
   -- while the action still held the owner's thread.
   readTVarIO observed >>= (`shouldBe` Just (True, Just SwapFailed))
