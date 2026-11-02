@@ -664,6 +664,7 @@ converted =
       "samples/lua-domains/test/Test/Domains/Process.hs",
       "test/Test/Engine/Console/Support.hs",
       "tools/test-support/src/Test/Support/ExternalClient.hs",
+      "tools/test/RunnerIdentity.hs",
       "tools/test/Sandbox.hs",
       "tools/test/VulkanProof.hs",
       "tools/wayland-test/Main.hs",

@@ -157,7 +157,6 @@
     "test-full/Test/Engine/Run/Serve.hs": 13,
     "test-full/Test/Engine/Run/Support.hs": 1,
     "test/Test/Engine/Console/Lua/Signals.hs": 1,
-    "test/Test/Engine/Console/Spec.hs": 1,
-    "tools/test/RunnerIdentity.hs": 3
+    "test/Test/Engine/Console/Spec.hs": 1
   }
 }
