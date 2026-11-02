@@ -17,7 +17,8 @@ import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (CreateProcess (cwd, env), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd, env), proc)
+import Test.Support.Subprocess (Host, RunBound (Within), hostedCaptured, runCaptured, withHost)
 import Test.Hspec
   ( Spec, describe, expectationFailure, it, shouldBe, shouldContain
   , shouldNotContain, shouldReturn
@@ -31,6 +32,9 @@ data Display = Display
   { directory ∷ FilePath
   , toolbox ∷ FilePath
   , script ∷ FilePath
+  , host ∷ Host
+  -- ^ Where the helper runs: its process group stays unended after it returns, so an example can look at what the helper left, and
+  -- the host ends whatever the example left when the example's display ends (#588).
   }
 
 x11Spec ∷ Spec
@@ -625,7 +629,9 @@ helper display arguments = do
       removed = "HETOIMASIA_NATIVE_SESSION" : map fst overrides
       settings = overrides ++ filter ((`notElem` removed) . fst) inherited
   bash ← findExecutable "bash" >>= maybe (fail "bash is not on PATH") pure
-  run settings (directory display) bash (script display : arguments)
+  -- The 10-minute run bound is the budget of the group that runs these probes; a helper that waits out its real 30-second startup
+  -- deadlines is far inside it.
+  hostedCaptured (host display) (Within (600 * 1000000)) (proc bash (script display : arguments)) {cwd = Just (directory display), env = Just settings} ""
 
 -- | Whether a process has stopped existing. The helper waits for what it
 -- stops, so by the time it returns this is already settled.
@@ -676,7 +682,7 @@ withHelper relative action = do
       findExecutable name >>= \case
         Just found → createFileLink found (box </> name)
         Nothing → expectationFailure (name ++ " is not on PATH, so the helper's toolbox cannot be assembled")
-    action (Display scratch box (checkout </> relative))
+    withHost $ \hosting → action (Display scratch box (checkout </> relative) hosting)
 
 -- | The ordinary utilities the helpers and these examples' commands use. The
 -- display programs themselves are deliberately absent unless stubbed.
@@ -697,5 +703,5 @@ pidIn display name = takeWhile (/= '\n') <$> readFile (directory display </> nam
 -- display environment and cannot inherit native-session consent.
 run ∷ [(String, String)] → FilePath → String → [String] → IO (ExitCode, String, String)
 run environment path executable arguments =
-  readCreateProcessWithExitCode
-    (proc executable arguments) {cwd = Just path, env = Just environment} ""
+  -- The 10-minute run bound is the budget of the group that runs these probes.
+  runCaptured (Within (600 * 1000000)) (proc executable arguments) {cwd = Just path, env = Just environment} ""

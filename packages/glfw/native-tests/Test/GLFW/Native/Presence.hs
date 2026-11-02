@@ -1,5 +1,3 @@
-{-# LANGUAGE CApiFFI #-}
-
 -- | Whether a process is still running, read from outside it.
 --
 -- Signal 0 cannot answer that: a process that has exited but has not been
@@ -28,16 +26,23 @@ module Test.GLFW.Native.Presence
   , withZombie
   ) where
 
-import Control.Exception (IOException, displayException, finally, try)
-import Control.Monad (unless)
+import Control.Exception (IOException, displayException, try)
 import Data.Char (isSpace)
-import Foreign.C.Error (Errno (..), errnoToIOError)
-import Foreign.C.Types (CInt (..))
 import System.Exit (ExitCode (..))
 import System.Info (os)
-import System.Posix.Types (CPid (..), ProcessID)
-import System.Process (createProcess, getPid, proc, waitForProcess)
+import System.Posix.Types (ProcessID)
+import System.Process (proc)
 import Test.GLFW.Native.Child (ChildEnd (..), Launched (..), launchCommand)
+import Test.Support.Subprocess
+  ( ChildState (ExitedUnreaped)
+  , RunBound (Within)
+  , Stream (Inherited)
+  , ChildSpec (specStderr, specStdin, specStdout)
+  , awaitUnreapedExit
+  , childPid
+  , childSpec
+  , withScopedChild
+  )
 
 -- | What @ps@ reported about a process.
 data Presence
@@ -105,19 +110,15 @@ inspectPresenceUsing command pid = do
 
 -- | Run an action with the identifier of a child of this process that has
 -- exited and has not been reaped, and reap it afterwards. The zombie is
--- observed, not waited for with a timer: 'awaitUnreapedExit' returns once the
--- kernel reports the exit, and leaves the child waitable.
+-- observed, not waited for with a timer: the shared subprocess facility's
+-- 'awaitUnreapedExit' returns once the kernel reports the exit, and leaves the
+-- child waitable; the facility's release, which owns the child from its
+-- start, then reaps it on every way out (#588). The child keeps the standard
+-- streams it always had. The 30-minute run bound is the budget of the group
+-- that runs this suite, and the wait for the exit has its own, shorter one.
 withZombie ∷ (ProcessID → IO a) → IO a
-withZombie action = do
-  (_, _, _, handle) ← createProcess (proc "true" [])
-  pid ← getPid handle >>= maybe (ioError (userError "true was reaped before its identifier was read")) pure
-  (awaitUnreapedExit pid >> action pid) `finally` waitForProcess handle
-
-awaitUnreapedExit ∷ ProcessID → IO ()
-awaitUnreapedExit pid = do
-  errno ← c_awaitUnreapedExit pid
-  unless (errno == 0) $
-    ioError (errnoToIOError ("waitid for process " <> show pid) (Errno errno) Nothing Nothing)
-
-foreign import capi safe "hetoimasia_glfw_test_process.h hetoimasia_glfw_test_await_unreaped_exit"
-  c_awaitUnreapedExit ∷ CPid → IO CInt
+withZombie action =
+  withScopedChild ((childSpec (Within (1800 * 1000000)) (proc "true" [])) {specStdin = Inherited, specStdout = Inherited, specStderr = Inherited}) $ \child →
+    awaitUnreapedExit child (30 * 1000000) >>= \case
+      Just ExitedUnreaped → action (childPid child)
+      other → ioError (userError ("true was expected to have exited and not been reaped, found " <> show other))

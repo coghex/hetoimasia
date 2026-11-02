@@ -11,26 +11,20 @@ module Test.Engine.Console.Spec (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (throwIO, try)
+import Control.Exception (finally, throwIO, try)
 import Control.Monad (forM_)
 import Data.List (isPrefixOf, tails)
 import Data.Maybe (mapMaybe)
 import Hetoimasia.Console.Exit (cancellationExitCode, exitOnFailure, failureExitCode, usageExitCode)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess), exitWith)
 import System.IO (hClose)
-import System.Process
-  ( CreateProcess (env, std_err)
-  , StdStream (UseHandle)
-  , createPipe
-  , proc
-  , waitForProcess
-  , withCreateProcess
-  )
+import System.Process (CreateProcess (env), createPipe, proc, waitForProcess)
 import qualified Test.Engine.Console.Lua.Options as LuaOptions
 import qualified Test.Engine.Console.Lua.Process as LuaProcess
 import qualified Test.Engine.Console.Lua.Signals as LuaSignals
 import qualified Test.Engine.Console.Lua.Status as LuaStatus
 import Test.Engine.Console.Support (consoleExecutable, consoleVariableNames, controlledEnvironment, runConsole)
+import qualified Test.Support.Subprocess as Facility
 import Test.Hspec
   ( Spec
   , describe
@@ -77,10 +71,16 @@ runConsoleWithBrokenStderr arguments = do
   controlled ← controlledEnvironment []
   (reading, writing) ← createPipe
   hClose reading
-  -- The process library closes the writing end in this process once the
-  -- child has it.
-  withCreateProcess (proc executable arguments) { env = Just controlled, std_err = UseHandle writing } $
-    \_ _ _ child → waitForProcess child
+  -- The writing end is a handle this example opened, so the example closes its own copy once the child is done: the facility
+  -- leaves a handle it was lent open after a successful start (it closes it only when the start fails or the call is cancelled
+  -- before the body is entered). Standard input and output stay inherited, as they were.
+  let child =
+        (Facility.childSpec (Facility.Within (1800 * 1000000)) (proc executable arguments) {env = Just controlled})
+          { Facility.specStdin = Facility.Inherited
+          , Facility.specStdout = Facility.Inherited
+          , Facility.specStderr = Facility.CallerHandle writing
+          }
+  Facility.withScopedChild child (waitForProcess . Facility.childProcess) `finally` hClose writing
 
 -- | The component of each rendered record, which is its third segment. A line
 -- that is not a record is kept whole so a failure shows it.

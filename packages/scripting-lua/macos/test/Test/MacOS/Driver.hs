@@ -52,9 +52,10 @@ import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withTempDirectory)
 import System.Posix.Process (getProcessID)
-import System.Process (readProcessWithExitCode)
+import System.Process (proc)
 
 import Test.Support.Bounded (boundMicroseconds)
+import Test.Support.Subprocess (RunBound (Within), runCaptured)
 
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Confine
   ( Attempt (..)
@@ -275,7 +276,8 @@ buildNativeModule root = do
   writeFile
     source
     "int hetoimasia_probe_module_symbol(void) { return 42; }\n"
-  (code, out, err) ← readProcessWithExitCode "cc" ["-dynamiclib", "-o", target, source] ""
+  -- The bound is the 30-minute budget of the group that runs this probe: a hang-catcher, never a timing assumption.
+  (code, out, err) ← runCaptured (Within (1800 * 1000000)) (proc "cc" ["-dynamiclib", "-o", target, source]) ""
   unless (code == ExitSuccess) $
     throwIO (ErrorCall ("cannot build the native probe module: " <> out <> err))
   pure target

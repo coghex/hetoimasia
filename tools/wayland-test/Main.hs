@@ -19,7 +19,8 @@ import System.Directory
   , setPermissions
   )
 import System.Environment (getEnvironment)
-import System.Process (CreateProcess (cwd, env), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd, env), proc)
+import Test.Support.Subprocess (Host, RunBound (Within), hostedCaptured, runCaptured, withHost)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -42,6 +43,9 @@ data Display = Display
   { directory ∷ FilePath
   , toolbox ∷ FilePath
   , script ∷ FilePath
+  , host ∷ Host
+  -- ^ Where the helper runs: its process group stays unended after it returns, so an example can look at what the helper left, and
+  -- the host ends whatever the example left when the example's session ends (#588).
   }
 
 main ∷ IO ()
@@ -75,7 +79,7 @@ withHelper relative action = do
       findExecutable name >>= \case
         Just found → createFileLink found (box </> name)
         Nothing → expectationFailure (name ++ " is not on PATH, so the helper's toolbox cannot be assembled")
-    action (Display scratch box (checkout </> relative))
+    withHost $ \hosting → action (Display scratch box (checkout </> relative) hosting)
 
 -- | The ordinary utilities the helpers and these examples' commands use. The
 -- display programs themselves are deliberately absent unless stubbed.
@@ -354,12 +358,19 @@ helperRun defaultSignals session arguments = do
   if defaultSignals
     then do
       perl ← findExecutable "perl" >>= maybe (fail "perl is not on PATH") pure
-      run
+      hostedRun
+        session
         settings
-        (directory session)
         perl
         (["-e", "$SIG{HUP} = 'DEFAULT'; $SIG{INT} = 'DEFAULT'; exec @ARGV", bash, script session] ++ arguments)
-    else run settings (directory session) bash (script session : arguments)
+    else hostedRun session settings bash (script session : arguments)
+
+-- | Run the helper on the session's host, so that its process group is still there when this returns, for the example to look at. The
+-- 10-minute run bound is the budget of the group that runs these probes; examples that want the 30-second watchdog add it themselves
+-- ('watched').
+hostedRun ∷ Display → [(String, String)] → String → [String] → IO (ExitCode, String, String)
+hostedRun session environment executable arguments =
+  hostedCaptured (host session) (Within (600 * 1000000)) (proc executable arguments) {cwd = Just (directory session), env = Just environment} ""
 
 -- | A shell command that records the Wayland environment the helper gave it.
 -- The socket the helper named is not predictable, so what is asserted is the
@@ -553,5 +564,5 @@ refusedSession session reason = do
 -- Each shell fixture supplies its private display environment.
 run ∷ [(String, String)] → FilePath → String → [String] → IO (ExitCode, String, String)
 run environment path executable arguments =
-  readCreateProcessWithExitCode
-    (proc executable arguments) {cwd = Just path, env = Just environment} ""
+  -- The 10-minute run bound is the budget of the group that runs these probes.
+  runCaptured (Within (600 * 1000000)) (proc executable arguments) {cwd = Just path, env = Just environment} ""

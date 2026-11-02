@@ -7,6 +7,7 @@
     "forkIOWithUnmask",
     "forkFinally",
     "createProcess",
+    "createProcess_",
     "withCreateProcess",
     "spawnProcess",
     "spawnCommand",
@@ -45,10 +46,34 @@
       "reason": "the shared facility itself: the one place a test thread is started, with its stop-and-join registered in the same masked step"
     },
     {
+      "file": "tools/test-support/src/Test/Support/Subprocess.hs",
+      "binding": "spawn",
+      "sites": 1,
+      "reason": "the shared subprocess facility itself: the one place a test child is started, in the same masked step as its pipes and its release (the readers are owned threads started before it), audited in #588"
+    },
+    {
       "file": "tools/test/OwnedThread.hs",
       "binding": "startUnowned",
       "sites": 1,
       "reason": "the negative controls' deliberately unowned start, which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
+      "file": "tools/test/OwnedSubprocess.hs",
+      "binding": "libraryRun",
+      "sites": 1,
+      "reason": "the subprocess facility's negative controls' library call, the one-shot call the converted sites used to make, which exists to be judged as a leak; the control that made it stops and reaps what it left independently"
+    },
+    {
+      "file": "tools/test/OwnedSubprocess.hs",
+      "binding": "libraryScope",
+      "sites": 1,
+      "reason": "the subprocess facility's negative controls' library call, the scoped call the converted sites used to make, which exists to be judged as a leak; the control that made it stops and reaps what it left independently"
+    },
+    {
+      "file": "tools/test/OwnedSubprocess.hs",
+      "binding": "unownedStart",
+      "sites": 1,
+      "reason": "the subprocess facility's negative controls' deliberately unowned start, which exists to be judged as a leak and is stopped and reaped independently by the control that made it"
     },
     {
       "file": "run-native-test/Test/Run/Native/Child.hs",

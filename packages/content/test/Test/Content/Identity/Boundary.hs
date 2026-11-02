@@ -22,9 +22,10 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Process (proc)
 import Test.Hspec
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withStorePackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "Identity package boundary" $ do
@@ -80,7 +81,7 @@ spec = describe "Identity package boundary" $ do
         status →
           expectationFailure
             ("the supported client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
-      (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome </> "client") []) ""
+      (status, out, err) ← runCaptured clientRunBound (proc (clientDirectory outcome </> "client") []) ""
       (status, out, err)
         `shouldBe` ( ExitSuccess
                    , unlines

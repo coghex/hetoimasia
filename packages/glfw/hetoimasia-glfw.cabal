@@ -453,11 +453,11 @@ test-suite glfw-native-tests
         Test.GLFW.Native.WaylandSync
         Test.GLFW.Native.Window
     -- The Wayland synchronization the native examples need and the production
-    -- shim may not perform (D-13), and the unreaped-exit wait the descendant
-    -- check's own examples need: test-only, and compiled into this suite alone.
+    -- shim may not perform (D-13): test-only, and compiled into this suite
+    -- alone. The unreaped-exit wait the descendant check's own examples need is
+    -- the shared subprocess facility's (#588).
     c-sources:
         native-tests/cbits/hetoimasia_glfw_test.c
-        native-tests/cbits/hetoimasia_glfw_test_process.c
     include-dirs: native-tests/cbits
     ghc-options: -threaded
     build-depends:
@@ -474,6 +474,7 @@ test-suite glfw-native-tests
         unix >=2.8 && <2.9,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0,
         hetoimasia-glfw,
         hetoimasia-glfw:model,
         hetoimasia-glfw:native,

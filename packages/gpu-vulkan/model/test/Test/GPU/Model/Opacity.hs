@@ -50,9 +50,10 @@ module Test.GPU.Model.Opacity (spec) where
 import Control.Monad (forM_)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
-import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd), proc)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withPackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = do
@@ -96,7 +97,7 @@ budgetSpec = describe "budget opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
           ""
       status `shouldBe` ExitSuccess

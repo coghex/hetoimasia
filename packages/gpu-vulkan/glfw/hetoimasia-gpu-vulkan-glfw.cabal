@@ -243,6 +243,7 @@ test-suite vulkan-native-tests
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,

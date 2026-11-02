@@ -393,4 +393,5 @@ test-suite allocator-parity-probe
         vector >=0.13 && <0.14,
         vulkan >=3.27 && <3.28,
         VulkanMemoryAllocator ==0.11.1.0,
-        hetoimasia-gpu-vulkan-model:placement-reference
+        hetoimasia-gpu-vulkan-model:placement-reference,
+        hetoimasia-test-support ==0.1.0.0

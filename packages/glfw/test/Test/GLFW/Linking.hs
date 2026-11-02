@@ -21,13 +21,15 @@ import Data.List (isPrefixOf, stripPrefix)
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
 import System.Info (os)
-import System.Process (readProcessWithExitCode)
+import System.Process (proc)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain)
+import Test.Support.Subprocess (RunBound (Within), runCaptured)
 
 spec ∷ Spec
 spec = describe "GLFW link declarations" $ do
   it "declare exactly the platform link requirements the native manifest records" $ do
-    (status, out, err) ← readProcessWithExitCode "pkg-config" ["--variable=prefix", "glfw3"] ""
+    -- The bound is the 30-minute budget of the group that runs this suite: a hang-catcher, never a timing assumption.
+    (status, out, err) ← runCaptured (Within (1800 * 1000000)) (proc "pkg-config" ["--variable=prefix", "glfw3"]) ""
     case status of
       ExitSuccess → do
         let prefix = trim out
