@@ -22,7 +22,7 @@ module Test.MacOS.Ownership (spec) where
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (readTVarIO)
-import Control.Exception (AsyncException (UserInterrupt), Exception, allowInterrupt, finally, mask_, throwIO, try)
+import Control.Exception (AsyncException (UserInterrupt), Exception, finally, throwIO, try)
 import Control.Monad (void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
@@ -38,7 +38,7 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , withEndpointSeamed
   )
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Report (Report (..))
-import Test.MacOS.Driver (Fixture (..), endQuietly, endWithEscalation, guardMicroseconds, withHelper, withHelperPair)
+import Test.MacOS.Driver (Fixture (..), endQuietly, endWithEscalation, guardMicroseconds, withHelper, withHelperPairSeamed)
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (withCancellationAfter)
 import Test.Support.Owned (withOwnedThread)
@@ -192,13 +192,18 @@ spec = describe "the threads the probe library owns itself (#598)" $ do
     it "ends and reaps both helpers of a pair when a cancellation is already pending as its body begins" $ \fixture → do
       kept ← newIORef Nothing
       caller ← myThreadId
-      -- The example is masked and a cancellation is queued against it, blocked in throwTo: the first point the pair's body
-      -- can take it is `allowInterrupt`, which is after the cleanup is installed (review round 2 of #598).
+      go ← newEmptyMVar
+      -- A cancellation is queued against the example exactly at the handoff of the second launch to the pair's body: a thrower
+      -- waits for the seam, and the seam waits until the thrower is blocked in throwTo against the (masked) example. It is
+      -- taken at the first point the example is interruptible, which must be after the cleanup is installed (review round 2 of
+      -- #598): before it, the helpers would be left running.
       outcome ←
-        try @AsyncException . bounded . mask_ $
-          withOwnedThread (throwTo caller UserInterrupt) $ \thrower _ → do
-            awaitBlockedThrower thrower
-            withHelperPair fixture $ \pair → writeIORef kept (Just pair) >> allowInterrupt
+        try @AsyncException . bounded $
+          withOwnedThread (readMVar go >> throwTo caller UserInterrupt) $ \thrower _ →
+            withHelperPairSeamed
+              (\_ → putMVar go () >> awaitBlockedThrower thrower)
+              fixture
+              (\pair → writeIORef kept (Just pair) >> holdUntilEnded)
       outcome `shouldBe` Left UserInterrupt
       readIORef kept >>= \case
         Nothing → expectationFailure "the pair's body never began"
@@ -212,7 +217,7 @@ spec = describe "the threads the probe library owns itself (#598)" $ do
   awaitBlockedThrower thrower =
     threadStatus thrower >>= \case
       ThreadBlocked BlockedOnException → pure ()
-      ThreadFinished → expectationFailure "the cancellation was delivered before the body began"
+      ThreadFinished → expectationFailure "the cancellation was delivered before the handoff"
       ThreadDied → expectationFailure "the thrower died"
       _ → yield >> awaitBlockedThrower thrower
   isFootprint = \case

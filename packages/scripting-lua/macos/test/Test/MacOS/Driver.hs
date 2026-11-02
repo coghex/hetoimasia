@@ -22,6 +22,7 @@ module Test.MacOS.Driver
   , withHelper
   , withLaunched
   , withHelperPair
+  , withHelperPairSeamed
   , accessesFrom
   , outcomeOf
   , mechanismOf
@@ -37,6 +38,7 @@ module Test.MacOS.Driver
   , enforceExecutionBudget
   ) where
 
+import Control.Concurrent (ThreadId)
 import Control.Exception (ErrorCall (ErrorCall), IOException, bracket_, finally, mask, throwIO, try)
 import Control.Monad (forM, unless, void)
 import Data.List (find)
@@ -82,7 +84,7 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , awaitExitWithin
   , awaitStreamEnd
   , collectReports
-  , withLaunch
+  , withLaunchSeamed
   , sendSignal
   , withEndpoint
   )
@@ -200,8 +202,13 @@ withFixture action = do
 -- the scope of the launch (#598): it has ended and been joined when this returns, however the body ended. The body ends the
 -- helper and observes it end, as every example does; leaving it running is the example's own concern.
 withHelper ∷ Fixture → Instance → Instance → Text → Int → (Launched → IO a) → IO a
-withHelper fixture self peer mode memoryLimitMiB =
-  withLaunched
+withHelper = withHelperSeamed (\_ → pure ())
+
+-- | 'withHelper' with the launch's test-side seam ('withLaunchSeamed').
+withHelperSeamed ∷ (ThreadId → IO ()) → Fixture → Instance → Instance → Text → Int → (Launched → IO a) → IO a
+withHelperSeamed seam fixture self peer mode memoryLimitMiB =
+  withLaunchedSeamed
+    seam
     LaunchRequest
       { requestExecutable = fixtureHelper fixture
       , requestArguments = helperArguments fixture self peer mode
@@ -213,15 +220,22 @@ withHelper fixture self peer mode memoryLimitMiB =
 -- @finally@ that ends the helpers run masked, and the body alone is restored to the caller's interruptibility after the
 -- cleanup is installed, so a cancellation pending as the body begins still ends and reaps both helpers.
 withHelperPair ∷ Fixture → ((Launched, Launched) → IO a) → IO a
-withHelperPair fixture body = mask $ \restore →
+withHelperPair = withHelperPairSeamed (\_ → pure ())
+
+-- | 'withHelperPair' whose seam is told the second helper's reader, at the handoff of the second launch to the body.
+withHelperPairSeamed ∷ (ThreadId → IO ()) → Fixture → ((Launched, Launched) → IO a) → IO a
+withHelperPairSeamed seam fixture body = mask $ \restore →
   withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0 $ \first →
-    withHelper fixture (fixtureSecond fixture) (fixtureFirst fixture) "hold" 0 $ \second →
+    withHelperSeamed seam fixture (fixtureSecond fixture) (fixtureFirst fixture) "hold" 0 $ \second →
       restore (body (first, second)) `finally` mapM_ endQuietly [first, second]
 
 -- | 'withLaunch' for an example that needs the helper and fails when it cannot be launched.
 withLaunched ∷ LaunchRequest → (Launched → IO a) → IO a
-withLaunched request body =
-  withLaunch request (either (throwIO . ErrorCall . ("the helper could not be launched: " <>) . show) body)
+withLaunched = withLaunchedSeamed (\_ → pure ())
+
+withLaunchedSeamed ∷ (ThreadId → IO ()) → LaunchRequest → (Launched → IO a) → IO a
+withLaunchedSeamed seam request body =
+  withLaunchSeamed seam request (either (throwIO . ErrorCall . ("the helper could not be launched: " <>) . show) body)
 
 -- | The command line one instance is given.
 helperArguments ∷ Fixture → Instance → Instance → Text → [String]

@@ -24,6 +24,7 @@ module Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , jetsamAvailable
   , jetsamFlags
   , withLaunch
+  , withLaunchSeamed
 
     -- * Watching
   , awaitReport
@@ -199,7 +200,13 @@ jetsamFlags = fromIntegral <$> c_jetsam_flags
 -- State owner: the reader owns the pipe end and the reports it appends; the launcher owns the helper process. Thread: one
 -- reader per helper, started and joined by this scope. Lifetime: the action's. Disposal: the release.
 withLaunch ∷ LaunchRequest → (Either LaunchFailure Launched → IO a) → IO a
-withLaunch request body
+withLaunch = withLaunchSeamed (\_ → pure ())
+
+-- | 'withLaunch' with a test-side seam (#598): told the reader's thread once it is started, in the masked step that starts it
+-- and before the body is let go of the mask, so an example can queue a cancellation against the caller exactly at the
+-- handoff. The production launch passes none.
+withLaunchSeamed ∷ (ThreadId → IO ()) → LaunchRequest → (Either LaunchFailure Launched → IO a) → IO a
+withLaunchSeamed seam request body
   | requestMemoryLimitMiB request > 0 = do
       available ← jetsamAvailable
       if available then spawnIt else body (Left MemoryLimitUnavailable)
@@ -242,8 +249,11 @@ withLaunch request body
                   `finally` (atomically (writeTVar finished True) >> void (try @IOException (hClose handle)) >> putMVar done ())
             )
             `onException` hClose handle
+        seam reader `onException` stopReader reader done
         restore (body (Right (Launched pid reports finished reader)))
-          `finally` uninterruptibleMask_ (killThread reader >> readMVar done)
+          `finally` stopReader reader done
+
+  stopReader reader done = uninterruptibleMask_ (killThread reader >> readMVar done)
 
   -- One reader thread owns the pipe end for the helper's whole life. It stops
   -- at end of file or at the first read failure; the finally around it (in the
