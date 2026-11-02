@@ -382,7 +382,8 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
         else do
           source ← readFile path
           let imports = [line | line ← lines source, startsWith "import " line]
-          imports `shouldSatisfy` all (startsWith "import Control.")
+          -- base alone: the Control modules, and the one GHC.IO import the bound start unmasks its action with (#593)
+          imports `shouldSatisfy` all (\line → startsWith "import Control." line || line == "import GHC.IO (unsafeUnmask)")
           source `shouldSatisfy` (not . ("threadDelay" `isInfixOf`))
 
   describe "the cancellation helper behind the first Library.hs helper (Test.Support.Cancel.withCancellationAfter)" $ do

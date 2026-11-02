@@ -34,9 +34,10 @@ module Test.Support.Owned
   , withOwnedBoundThreadOpening
   ) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, forkOSWithUnmask, killThread)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, forkOS, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Exception (finally, mask, uninterruptibleMask_)
+import GHC.IO (unsafeUnmask)
 
 -- | Run the action on a thread of its own for the length of the body, which is given the thread and a wait for its end.
 -- The wait may be repeated, and may be made after the thread has ended on its own.
@@ -61,5 +62,6 @@ withOwnedBoundThread = withOwnedBoundThreadOpening (pure ())
 withOwnedBoundThreadOpening ∷ IO () → IO () → (ThreadId → IO () → IO a) → IO a
 withOwnedBoundThreadOpening open action body = mask $ \restore → do
   done ← newEmptyMVar
-  thread ← uninterruptibleMask_ (forkOSWithUnmask $ \unmask → unmask action `finally` putMVar done ())
+  -- The same unmasking as 'forkIOWithUnmask' gives: the thread inherits the start's uninterruptible state and unmasks only the action.
+  thread ← uninterruptibleMask_ (forkOS (unsafeUnmask action `finally` putMVar done ()))
   restore (body thread (readMVar done)) `finally` uninterruptibleMask_ (open >> killThread thread >> readMVar done)
