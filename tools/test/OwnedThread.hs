@@ -40,7 +40,7 @@ import Control.Exception
   , uninterruptibleMask_
   )
 import Control.Monad (forM_, void, when, (>=>))
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Foldable (for_)
 import GHC.IO (unsafeUnmask)
 import Data.List (isInfixOf)
@@ -307,7 +307,7 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
           endedAfterScope probe >>= writeIORef rescued
       -- The scope's release ends the sender, so the cancellation need not be delivered at all; what matters is that it was pending
       -- while the rescue ran and did not abandon it.
-          readIORef rescued >>= (`shouldBe` True)
+      readIORef rescued >>= (`shouldBe` True)
 
   describe "a thread that ended on its own" $ do
     it "is joined harmlessly, the body may begin after it finished, and the wait can be repeated" $ do
