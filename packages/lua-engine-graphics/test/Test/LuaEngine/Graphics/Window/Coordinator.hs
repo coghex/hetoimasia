@@ -11,7 +11,7 @@ module Test.LuaEngine.Graphics.Window.Coordinator (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (SomeException, finally, throwIO, try)
+import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString

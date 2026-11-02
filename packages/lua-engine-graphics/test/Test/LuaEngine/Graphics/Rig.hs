@@ -52,7 +52,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Concurrent (ThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Exception (SomeException, finally, throwIO, try)
 import Data.List (findIndex)
 import Data.IORef (newIORef, readIORef, writeIORef)

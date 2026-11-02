@@ -68,7 +68,7 @@ import Control.Concurrent.STM
   , throwSTM
   , writeTVar
   )
-import Control.Exception (SomeException, finally, throwIO, try)
+import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as ByteString
 import Data.Map.Strict (Map)
