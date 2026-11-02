@@ -701,7 +701,10 @@ any other way, and its message names the facility that fits the kind of start.
   starts `tools/test/RunnerIdentity.hs` brought, written by
   `owned_starts.py bootstrap`, less the 64 that #588 removed: its 57 subprocess
   starts, the three of `RunnerIdentity.hs`, which have the same shape, and the four
-  thread starts that existed only to serve them). Each file's count
+  thread starts that existed only to serve them), and less the 24 thread starts of the
+  root run and console suites and the `lua-domains` sample that #600 converted (the `Run`
+  examples of `test-full/`, the console's signal and exit examples, and the sample's
+  `Test.Domains.Support` helpers and `Accounting` reaper). Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven
@@ -724,7 +727,10 @@ any other way, and its message names the facility that fits the kind of start.
   in `owned_starts.json` by file and top-level binding with the number of starts
   it holds and its reason; a new raw start elsewhere in the same file is counted
   as any other, and a helper that gains or loses a start fails until the entry is
-  reviewed. The initial exemptions are those #540 audited, narrowed: sites found
+  reviewed. The negative controls of #600 start their one deliberately unowned thread in
+  `startUnowned` of `test/Test/Engine/Unowned.hs` and of the sample's
+  `Test.Domains.Unowned`, exempted by binding like `tools/test/OwnedThread.hs`; the control
+  records its failed judgement and then stops and joins what it left. The initial exemptions are those #540 audited, narrowed: sites found
   not to be provably owned (`Test.Content.Support.spawn`, which `withRootVia`
   calls outside `withChild`; the `forkOS` runner of `run-native-test/Main.hs`;
   `Compositor.hs`, whose `stopProcess` could time out unconfirmed) remained in the
