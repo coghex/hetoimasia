@@ -244,6 +244,29 @@ cabal test hetoimasia-tests --test-show-details=direct
   same standing approval, as `glfw-native-tests`; on Linux its runner starts an
   isolated X11 display, and `test.vulkan-wayland` runs it on the isolated
   headless Wayland compositor. See [gpu_backend.md](gpu_backend.md#the-native-suite).
+  Every helper thread `diagnostics-tests`, `native-tests`, `integration-tests`,
+  `render-2d-vulkan-tests` and the `allocator-parity-probe` start is an owned start
+  through `Test.Support.Owned` (#595): however the scope that needed it ends (a return, a
+  failed assertion, a timeout of the example, a cancellation) it has ended and been
+  joined before the scope returns. A thread held where only the scope can reach it (a
+  hold, a gate, a scene transition's hook) is let go by the same release, before the kill,
+  and an evidence supplier, the helper that publishes what a run's exit needs in order to
+  finish, is in a scope that encloses that exit (`withRunHelper` of
+  `Test.GPU.Vulkan.GLFW.StandIn`). The shared helpers are `onOtherThread` and
+  `withOtherThread` (`Test.GPU.Vulkan.Native.Threads`), `withOwnedThreads` (the
+  diagnostics `Support`), `onOtherThread`, `withRunHelper` and the `ProceedGate` of the
+  integration `StandIn`; the integration suite's example bound, `Bound.hs`, is not
+  converted and is recorded as three audited helpers (see
+  [validation.md](validation.md#the-owned-start-guard)). Five shapes have regressions
+  that run twice with one judgement, through the facility and through the deliberately
+  unowned start of each suite's `Unowned` module (the negative control, which must fail):
+  the start-and-wait helper, the stepper parked at a held creation with the killer aimed at
+  it, a producer held after announcing itself with the lifetime closing around it, an
+  evidence supplier (also judged alive when the exit it serves begins), and the thread
+  parked in a scene transition with the thrower aimed at it. Select them with
+  `--test-options='--match "#595"'` on `native-tests` and `diagnostics-tests`, and on
+  `integration-tests` with `--match "#595"`, `--match "owns the thread parked"` and
+  `--match "negative control"`.
   The generic run command's real-device suite `run-native-tests` (the root package, `run-native-test/`,
   full-product build only, group `test.vulkan-run-native`) takes the same desktop consent as the other
   window-opening native suites, under the same standing approval, and the runner starts an isolated X11
