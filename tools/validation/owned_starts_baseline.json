@@ -190,6 +190,7 @@
     "test/Test/Engine/Console/Spec.hs": 2,
     "test/Test/Engine/Console/Support.hs": 4,
     "tools/test-support/src/Test/Support/ExternalClient.hs": 3,
+    "tools/test/RunnerIdentity.hs": 3,
     "tools/test/Sandbox.hs": 1,
     "tools/test/VulkanProof.hs": 1,
     "tools/wayland-test/Main.hs": 1,
