@@ -15,6 +15,7 @@ import qualified Test.LuaRuntime.Independence
 import qualified Test.LuaRuntime.Instance.Spec
 import qualified Test.LuaRuntime.Lifecycle.Spec
 import qualified Test.LuaRuntime.Loading
+import qualified Test.LuaRuntime.Ownership
 import qualified Test.LuaRuntime.Readiness
 import qualified Test.LuaRuntime.Recoverable
 import qualified Test.LuaRuntime.Request.Spec
@@ -38,6 +39,7 @@ spec = describe "the Lua runtime adapter" $ do
   Test.LuaRuntime.HostFailures.spec
   Test.LuaRuntime.Stop.spec
   Test.LuaRuntime.Gates.spec
+  Test.LuaRuntime.Ownership.spec
   Test.LuaRuntime.Expected.spec
   Test.LuaRuntime.Independence.spec
   Test.LuaRuntime.Callbacks.spec

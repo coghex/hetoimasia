@@ -20,11 +20,13 @@ module Test.LuaRuntime.Support
   , tryExpected
   , failExample
   , alongsideOpening
+  , alongsideOpeningObserving
   , withProducers
   , withProducer
   , expectFatalOpening
   , bounded
   , boundedAfter
+  , boundedAfterObserving
   , BoundExpired (..)
   , boundExpiredMessage
   , expectObserved
@@ -263,7 +265,13 @@ expectFatalOpening openers body =
 -- opening would end; and the helper's failure, not what the other action made of it,
 -- is what the example fails with.
 alongsideOpening ∷ [IO ()] → IO () → IO a → IO a
-alongsideOpening openers helper main' = do
+alongsideOpening = alongsideOpeningObserving (\_ → pure ())
+
+-- | 'alongsideOpening' that tells an observer which thread the helper is on, once it is started and before the other action
+-- runs: for the examples that judge that the helper has ended and been joined when this returns (#598). The observer runs
+-- masked and must not block.
+alongsideOpeningObserving ∷ (ThreadId → IO ()) → [IO ()] → IO () → IO a → IO a
+alongsideOpeningObserving observe openers helper main' = do
   example ← myThreadId
   failed ← newEmptyMVar
   -- The helper is owned (#598): when the other action is over, however it ended, the helper is stopped and joined before this
@@ -271,7 +279,7 @@ alongsideOpening openers helper main' = do
   -- cannot land outside it; a helper still delivering one when the other action is over is ended by the release's kill, which
   -- reaches a thread blocked in 'throwTo'.
   outcome ← mask $ \restore →
-    withOwnedThread (helperAction example failed) $ \_ _ → try @SomeException (restore main')
+    withOwnedThread (helperAction example failed) $ \thread _ → observe thread >> try @SomeException (restore main')
   tryTakeMVar failed >>= \case
     Just failure → throwIO failure
     Nothing → either throwIO pure outcome
@@ -333,7 +341,13 @@ bounded = boundedAfter exampleBound exampleBound
 -- interrupted at, so that the examples of the helper itself can have the gates opened first
 -- or last.
 boundedAfter ∷ Int → Int → Expectation → Expectation
-boundedAfter openAfter limit action = do
+boundedAfter = boundedAfterObserving (\_ _ → pure ())
+
+-- | 'boundedAfter' that tells an observer which threads are the bound's watchdog and its interrupter, once both are started and
+-- before the example runs: for the examples that judge that both have ended and been joined when this returns (#598). The
+-- observer runs masked and must not block.
+boundedAfterObserving ∷ (ThreadId → ThreadId → IO ()) → Int → Int → Expectation → Expectation
+boundedAfterObserving observe openAfter limit action = do
   example ← myThreadId
   finished ← newEmptyMVar
   expired ← newIORef False
@@ -342,8 +356,9 @@ boundedAfter openAfter limit action = do
   -- kill reaches a thread blocked delivering an interruption to a thread that is masked now (the example, in the release).
   -- The two schedules stay independent: gates may be opened before or after the first interruption.
   outcome ← mask $ \restore →
-    withOwnedThread (watchdog example finished expired) $ \_ _ →
-      withOwnedThread (interruptUntil finished expired example limit regrace) $ \_ _ → do
+    withOwnedThread (watchdog example finished expired) $ \watching _ →
+      withOwnedThread (interruptUntil finished expired example limit regrace) $ \interrupting _ → do
+        observe watching interrupting
         result ← try @SomeException (restore action)
         -- Whatever the interrupting thread is doing, it ends before the example does.
         putMVar finished ()

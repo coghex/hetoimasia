@@ -483,6 +483,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Lifecycle.Spec
         Test.LuaRuntime.Lifecycle.Support
         Test.LuaRuntime.Loading
+        Test.LuaRuntime.Ownership
         Test.LuaRuntime.Readiness
         Test.LuaRuntime.Recoverable
         Test.LuaRuntime.Request.Admission
