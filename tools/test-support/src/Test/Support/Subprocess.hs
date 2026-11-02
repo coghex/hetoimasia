@@ -81,6 +81,7 @@ module Test.Support.Subprocess
   , Host
   , withHost
   , hosted
+  , hostedUsing
   , hostedCaptured
     -- * A scoped child
   , Stream (..)
@@ -111,7 +112,7 @@ module Test.Support.Subprocess
   ) where
 
 import Control.Concurrent (threadDelay, yield)
-import Control.Concurrent.STM (TMVar, TVar, atomically, check, modifyTVar', newEmptyTMVarIO, newTVarIO, orElse, putTMVar, readTMVar, readTVar, readTVarIO, takeTMVar, tryPutTMVar, writeTVar)
+import Control.Concurrent.STM (TMVar, TVar, atomically, check, modifyTVar', newEmptyTMVarIO, newTVarIO, orElse, putTMVar, readTMVar, readTVar, readTVarIO, takeTMVar, tryPutTMVar, tryReadTMVar, writeTVar)
 import Control.Exception
   ( Exception (displayException, fromException)
   , ExceptionWithContext (ExceptionWithContext)
@@ -967,40 +968,84 @@ withHost use = do
           Nothing → pure ()
           Just (Job run) → run serve
       stopServing = atomically (writeTVar stopping True)
-      worker = tryWithContext @SomeException serve >>= atomically . void . tryPutTMVar ended . either Just (const Nothing)
+      -- However the worker ends, the host is stopped in the same step that announces it, so a later submission is refused at once.
+      worker = tryWithContext @SomeException serve >>= \r → atomically (writeTVar stopping True >> void (tryPutTMVar ended (either Just (const Nothing) r)))
   ( withOwnedThreadOpening stopServing worker $ \_ awaitEnd → do
       result ← use host
       stopServing
       awaitEnd
       atomically (readTMVar ended) >>= maybe (pure result) rethrowIO
     )
-    `finally` atomically (void (tryPutTMVar ended Nothing))
+    `finally` atomically (writeTVar stopping True >> void (tryPutTMVar ended Nothing))
 
 -- | Run a scoped child on the host and answer what the body answered. The child is alive after this returns unless the body ended it;
 -- the host ends it, with the others, when it ends. The spec's run bound limits the body, not the time the host keeps the child.
 hosted ∷ Host → ChildSpec → (Child → IO a) → IO a
-hosted host spec body = do
+hosted = hostedUsing defaultBounds noSeams
+
+-- | 'hosted' with the given bounds and seams (the facility's own examples).
+--
+-- The spec's run bound limits the whole call from the moment it is made: the wait for the request slot and for the worker, then the
+-- body. A call whose bound passes first is abandoned (a request still queued is skipped by the worker, one running is cut at its own
+-- bound) and fails naming the command and the bound.
+hostedUsing ∷ Bounds → Seams → Host → ChildSpec → (Child → IO a) → IO a
+hostedUsing bounds seams host spec body = do
   reply ← newEmptyTMVarIO
-  let limited child = case specBound spec of
+  abandoned ← newTVarIO False
+  let expiry = SubprocessFailure (describeCommand (specProcess spec) <> " did not finish within its run bound of " <> describeBound (specBound spec))
+      limited child = case specBound spec of
         Unbounded → body child
-        Within microseconds →
-          timeout (max 0 microseconds) (body child)
-            >>= maybe (throwIO (SubprocessFailure (describeCommand (specProcess spec) <> " did not finish within its run bound of " <> describeBound (specBound spec)))) pure
-      job = Job $ \rest →
-        withScopedChild spec {specBound = Unbounded} $ \child → do
-          result ← tryWithContext @SomeException (limited child)
-          atomically (putTMVar reply result)
-          case result of
-            -- A cancellation of the worker (the release's kill) reaches the body here: the caller is answered, and service ends.
-            Left cancelled@(ExceptionWithContext _ failure) | isJust (fromException failure ∷ Maybe SomeAsyncException) → rethrowIO cancelled
-            _ → rest
+        Within microseconds → timeout (max 0 microseconds) (body child) >>= maybe (throwIO expiry) pure
+      job = Job $ \rest → do
+        skip ← readTVarIO abandoned
+        if skip
+          then rest
+          else do
+            began ← newIORef False
+            outcome ←
+              tryWithContext @SomeException . withScopedChildUsing bounds seams spec {specBound = Unbounded} $ \child → do
+                writeIORef began True
+                result ← tryWithContext @SomeException (limited child)
+                atomically (putTMVar reply result)
+                case result of
+                  -- A cancellation of the worker (the release's kill) reaches the body here: the caller is answered, and service ends.
+                  Left cancelled@(ExceptionWithContext _ failure) | isJust (fromException failure ∷ Maybe SomeAsyncException) → rethrowIO cancelled
+                  _ → rest
+            case outcome of
+              Right () → pure ()
+              Left failure@(ExceptionWithContext _ cause) → do
+                wasRunning ← readIORef began
+                if wasRunning
+                  then -- The scope ended with a failure after its body ran (its cleanup, or a later scope's): that ends service, and is raised.
+                    rethrowIO failure
+                  else do
+                    -- The child could not be started (or the worker was cancelled while it started): its own caller is told, and the host,
+                    -- which has lost nothing, goes on serving unless the failure was a cancellation.
+                    atomically (void (tryPutTMVar reply (Left failure)))
+                    if isJust (fromException cause ∷ Maybe SomeAsyncException) then rethrowIO failure else rest
       stopped = SubprocessFailure "the host of the scoped child had ended before it answered"
-  accepted ← atomically $ ((readTVar (hostStopping host) >>= check) >> pure False) `orElse` (putTMVar (hostRequests host) job >> pure True)
-  unless accepted $ throwIO stopped
-  atomically ((Left <$> readTMVar reply) `orElse` (Right <$> readTMVar (hostEnded host))) >>= \case
-    Left (Right answer) → pure answer
-    Left (Left failure) → rethrowIO failure
-    Right _ → throwIO stopped
+      submit = do
+        -- Refused at once when the host is stopping or its worker has ended; otherwise queued, waiting for the slot while neither happens.
+        accepted ←
+          atomically $
+            ( do
+                stoppingNow ← readTVar (hostStopping host)
+                endedNow ← isJust <$> tryReadTMVar (hostEnded host)
+                check (stoppingNow || endedNow)
+                pure False
+            )
+              `orElse` (putTMVar (hostRequests host) job >> pure True)
+        unless accepted $ throwIO stopped
+        atomically ((Left <$> readTMVar reply) `orElse` (Right <$> readTMVar (hostEnded host))) >>= \case
+          Left (Right answer) → pure answer
+          Left (Left failure) → rethrowIO failure
+          Right _ → throwIO stopped
+      abandon = atomically (writeTVar abandoned True)
+  ( case specBound spec of
+      Unbounded → submit
+      Within microseconds → timeout (max 0 microseconds) submit >>= maybe (abandon >> throwIO expiry) pure
+    )
+    `onException` abandon
 
 -- | 'runCaptured' on a host: the child's group stays unended, as 'hosted' explains, until the host ends.
 hostedCaptured ∷ Host → RunBound → CreateProcess → String → IO (ExitCode, String, String)

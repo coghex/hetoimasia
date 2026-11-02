@@ -925,6 +925,123 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
             mapM goneAndReaped pids >>= (`shouldBe` [True]))
           `finally` (readIORef known >>= rescue)
 
+    it "ends a host that never served anything" $
+      withHost (\_ → pure ())
+
+    it "serves a request queued behind a running one once the running body returns, and reaps both children" $ do
+      known ← newIORef []
+      running ← newEmptyMVar
+      gate ← newEmptyMVar
+      let note child = atomicModifyIORef' known (\old → (childPid child : old, ()))
+          quiet = childSpec hangCatcher (shell obedientAlone [])
+      (do
+          answer ← bounded . withHost $ \host →
+            withOwnedThread (void (hosted host quiet (\child → note child >> awaitReady child >> putMVar running () >> readMVar gate))) $ \_ awaitFirst → do
+              readMVar running
+              withOwnedThread (hosted host quiet (\child → note child >> awaitReady child >> pure (7 ∷ Int)) >>= \value → putMVar gate () >> void (pure value)) $ \second _ → do
+                awaitBlockedOnSTM second
+                -- The first body returns; the queued request is then served.
+                putMVar gate ()
+                awaitFirst
+                hosted host quiet (\child → note child >> awaitReady child >> pure (9 ∷ Int))
+          answer `shouldBe` 9
+          pids ← readIORef known
+          length pids `shouldBe` 3
+          mapM goneAndReaped pids >>= (`shouldBe` [True, True, True]))
+        `finally` (readIORef known >>= rescue)
+
+    it "fails a call whose run bound passes while it waits for the request slot, at its bound, and never starts it" $ do
+      known ← newIORef []
+      running ← newEmptyMVar
+      gate ← newEmptyMVar
+      let note child = atomicModifyIORef' known (\old → (childPid child : old, ()))
+          quiet = childSpec hangCatcher (shell obedientAlone [])
+      (do
+          outcome ← try @SubprocessFailure . bounded . withHost $ \host →
+            withOwnedThread (void (hosted host quiet (\child → note child >> awaitReady child >> putMVar running () >> readMVar gate))) $ \_ _ → do
+              readMVar running
+              withOwnedThread (void (try @SomeException (hosted host quiet (\child → note child >> awaitReady child)))) $ \second _ → do
+                awaitBlockedOnSTM second
+                -- The slot is taken by the request behind the running body, so this call waits for the slot, and its bound passes.
+                hosted host (childSpec (Within 200000) (shell obedientAlone [])) (\child → note child)
+          case outcome of
+            Left (SubprocessFailure message) → message `shouldContain` "run bound of 200 ms"
+            Right () → expectationFailure "a call whose bound passed while it waited for the slot was served"
+          pids ← readIORef known
+          -- Only the running body's child ever started; neither the queued request nor the expired call did.
+          length pids `shouldBe` 1
+          mapM goneAndReaped pids >>= (`shouldBe` [True]))
+        `finally` (readIORef known >>= rescue)
+
+    it "skips a request whose caller gave up on it at its bound, and serves the next" $ do
+      known ← newIORef []
+      running ← newEmptyMVar
+      gate ← newEmptyMVar
+      let note child = atomicModifyIORef' known (\old → (childPid child : old, ()))
+          quiet = childSpec hangCatcher (shell obedientAlone [])
+      (do
+          answer ← bounded . withHost $ \host →
+            withOwnedThread (void (hosted host quiet (\child → note child >> awaitReady child >> putMVar running () >> readMVar gate))) $ \_ awaitFirst → do
+              readMVar running
+              expired ← try @SubprocessFailure (hosted host (childSpec (Within 100000) (shell obedientAlone [])) (\child → note child))
+              expired `shouldSatisfy` either (const True) (const False)
+              putMVar gate ()
+              awaitFirst
+              hosted host quiet (\child → note child >> awaitReady child >> pure (3 ∷ Int))
+          answer `shouldBe` 3
+          pids ← readIORef known
+          -- The first and the last children started; the abandoned request's did not.
+          length pids `shouldBe` 2
+          mapM goneAndReaped pids >>= (`shouldBe` [True, True]))
+        `finally` (readIORef known >>= rescue)
+
+    it "refuses every later submission at once after its worker ended on a cancellation" $ do
+      known ← newIORef []
+      (do
+          let quiet = childSpec hangCatcher (shell obedientAlone [])
+          -- The worker ended on the cancellation, which the host raises when its scope ends, after the body below has run.
+          ended ← try @AsyncException . bounded . withHost $ \host → do
+            first ← try @AsyncException (hosted host quiet (\child → atomicModifyIORef' known (\old → (childPid child : old, ())) >> awaitReady child >> (throwIO UserInterrupt ∷ IO ())))
+            first `shouldBe` Left UserInterrupt
+            forM_ [Unbounded, Within 100000] $ \limit → do
+              later ← try @SubprocessFailure (hosted host (childSpec limit (shell obedientAlone [])) (\_ → pure ()))
+              case later of
+                Left (SubprocessFailure message) → message `shouldContain` "had ended"
+                Right () → expectationFailure "a submission to a host whose worker ended was served"
+          ended `shouldBe` Left UserInterrupt
+          readIORef known >>= mapM goneAndReaped >>= (`shouldBe` [True]))
+        `finally` (readIORef known >>= rescue)
+
+    it "keeps serving after a child could not be started, and tells each caller its own failure" $ do
+      let missing limit = childSpec limit (proc "/nonexistent/hetoimasia-command" [])
+      bounded . withHost $ \host → do
+        forM_ [hangCatcher, hangCatcher, Within 100000] $ \limit → do
+          outcome ← try @IOException (hosted host (missing limit) (\_ → pure ()))
+          outcome `shouldSatisfy` either (const True) (const False)
+        hosted host (childSpec hangCatcher (shell "exit 0" [])) (\child → waitChild child (30 * 1000000)) >>= (`shouldBe` Just ExitSuccess)
+
+    it "refuses a submission to a host whose scope has ended" $ do
+      host ← withHost pure
+      outcome ← try @SubprocessFailure (bounded (hosted host (childSpec (Within 100000) (shell "exit 0" [])) (\_ → pure ())))
+      case outcome of
+        Left (SubprocessFailure message) → message `shouldContain` "had ended"
+        Right () → expectationFailure "a submission to an ended host was served"
+
+    it "raises, when the host ends, a cleanup a hosted child could not confirm, and still ends the others" $ do
+      seen ← newIORef []
+      let seams = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing}
+      outcome ← try @SubprocessFailure . withHost $ \host → do
+        hosted host (childSpec hangCatcher (shell obedientAlone [])) (\child → atomicModifyIORef' seen (\old → (child : old, ())) >> awaitReady child)
+        hostedUsing quick {boundReap = 100000} seams host (childSpec hangCatcher (shell obedientAlone [])) (\child → atomicModifyIORef' seen (\old → (child : old, ())) >> awaitReady child)
+      case outcome of
+        Left (SubprocessFailure message) → message `shouldContain` "not reaped"
+        Right () → expectationFailure "a cleanup that was not confirmed passed"
+      children ← readIORef seen
+      length children `shouldBe` 2
+      -- The one whose reap was not confirmed is the last started: it is still a zombie, observed without reaping, and then reaped here.
+      forM_ (take 1 children) $ \child → awaitUnreapedExit child (30 * 1000000) >> waitForProcess (childProcess child)
+      mapM (goneAndReaped . childPid) children >>= (`shouldBe` [True, True])
+
     it "fails a hosted call that passes its run bound, naming the command and the bound" $ do
       known ← newIORef []
       (do
