@@ -3150,14 +3150,29 @@ the failure attributed to the request): it is latched when the failure becomes e
 ever read the request, and applied at the owner's next safe boundary, before any more of the instance's ordinary work
 (see [Atomic request admission](#atomic-request-admission)).
 
+**Which failure is primary when a script raises over a latched required request.** The primary failure is the first one
+recorded and a later one never replaces it, with one exception owed to this rule: when an invocation that is running (an
+`update`, a `run` or a callback) raises an uncaught script error (Lua's own `error`, as `ScriptFailed CallFailed`) and a
+required *request's* expected failure of that instance has already been latched, the latched failure is the instance's
+primary (`ErrorRequest`, at the `request` stage, attributed to the endpoint) and the script's error is kept as a
+secondary, with its own stage and traceback intact, once. The latch settles with the request, whether the owner reaches
+the instance's dispatch boundary first or a script that was already running takes the refused result and raises it, so the
+instance fails with the same attributed failure in either order, and the earlier notice, the settled record and a session's
+first failure all name it. An uncaught script error recorded before the failure was latched stays primary. Nothing else
+changes: the primary of a failure of `init`, of `shutdown`, of a release or of a delivery, of a fault that is not an uncaught
+script error (a refused value, a memory limit, a wait the scheduler refused), of a cancellation that won, and of a failure
+latched from a required *module's* lookup is as before, and an optional request's failure is a result to read, not an
+instance failure.
+
 **The earlier notice.** An instance's ending is *parked* when a provider has yet to retire something the instance released,
 and it settles, and `instanceEscalate` is told, only when every such retirement has completed, so a failure whose own provider
 is slow to retire is not told for as long. An application whose policy must act on a failure at once (close its admission, stop
 granting ticks, ask its owner to stop) is told earlier, through `instanceOnFailing` of the instance configuration (default:
 nothing): on the owner's thread, once, as the ending *begins* with a failure (an `init`, `update`, callback or `run` that failed, a
 wait the scheduler refused, a required request's failure, a construction refusal), before the `shutdown` hook runs and before the
-release and the retirements. The record is the primary failure alone, `failureSecondary` empty, since nothing else has failed yet;
-`instanceEscalate` is still told, with the settled record, which carries what else failed as the instance ended. A failure that
+release and the retirements. The record is the primary failure alone, `failureSecondary` empty by contract (even when an uncaught script error was
+displaced as the primary by a latched required request's failure, as above); `instanceEscalate` is still told, with the
+settled record, which carries what else failed, that error included. A failure that
 arises only in settling (a `shutdown` that raises after a stop, a release that fails) is told to `instanceEscalate` alone. What the
 notice raises is a failure of the host, as for `instanceOnSegment`. The Lua-first engine's session coordinator is the application
 that uses it ([the session coordinator](../lua-engine/README.md#the-session-coordinator-lfe-13)).
