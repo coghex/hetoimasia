@@ -17,7 +17,7 @@
 module Test.GLFW.Attachments (spec) where
 
 import Control.Concurrent (killThread, myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -122,6 +122,9 @@ spec = describe "GLFW window attachments" $ do
         boundedExample (ownedEnds ending idleLoopScenario False)
       it ("finishes the exit drain when the example body " <> label <> " with beta awaiting for ever and alpha stalled") $
         boundedExample (ownedEnds ending twoOwnersScenario False)
+      for_ [0 .. 7] $ \k →
+        it ("finishes the exit drain when the example body " <> label <> " at setup step " <> show k <> " of the two-owner fixture") $
+          boundedExample (ownedEnds ending (attachmentSetupScenario k) False)
       it ("finishes the exit drain when the example body " <> label <> " before the detached owners are finished") $
         boundedExample (ownedEnds ending detachedOwnersScenario False)
 
@@ -416,14 +419,33 @@ renderThrough journal host name service = atomically $ do
 -- that is not the owner, and the protected host's exit drain waits for exactly that evidence, so the thread must outlive the
 -- body that decides to start it: the example owns it, and the body hands it the host and the owner with @supply@. However the
 -- example ends, a supplier still running has been stopped and joined before it returns.
-withSupplier ∷ TVar [Note] → ((WindowHost → Owner → [RetirementFact] → IO ()) → IO r) → IO r
+withSupplier ∷ TVar [Note] → ((Supplier → IO r) → IO r)
 withSupplier = withSupplierVia withOwnedThreadOpening
 
+-- | The two ways the body hands the supplier its work: 'supply' returns at once (a rescue must never wait), 'supplied' returns
+-- once the supplier has published, so the owner's turns that follow see the notices (a thread that is only queued can be
+-- preempted for longer than a fixed number of fast turns, and the example would then fail on its turn bound, not on its subject).
+data Supplier = Supplier
+  { supplyAtOnce ∷ WindowHost → Owner → [RetirementFact] → IO ()
+  , supplyAndWait ∷ WindowHost → Owner → [RetirementFact] → IO ()
+  }
+
 -- | 'withSupplier' through the given way of starting the thread, so a negative control or a scenario can run the same helper.
-withSupplierVia ∷ Scope → TVar [Note] → ((WindowHost → Owner → [RetirementFact] → IO ()) → IO r) → IO r
+withSupplierVia ∷ Scope → TVar [Note] → (Supplier → IO r) → IO r
 withSupplierVia scope journal body =
-  withDeferredThreadVia scope (pure ()) (\(host, owner, facts) → publishFacts journal host owner facts) $ \_ handOver →
-    body (\host owner facts → handOver (host, owner, facts))
+  withDeferredThreadVia
+    scope
+    (pure ())
+    (\(host, owner, facts, done) → publishFacts journal host owner facts `finally` void (tryPutMVar done ()))
+    $ \_ handOver →
+      body
+        Supplier
+          { supplyAtOnce = \host owner facts → newEmptyMVar >>= \done → handOver (host, owner, facts, done)
+          , supplyAndWait = \host owner facts → do
+              done ← newEmptyMVar
+              handOver (host, owner, facts, done)
+              readMVar done
+          }
 
 -- | 'withSupplier' for the supplier that publishes only once the owner's loop has really entered its idle wait, so the wake the
 -- publication registers is what ends the wait rather than a fold that happened to come first.
@@ -451,7 +473,7 @@ stalledOwnerScenario ∷ Scope → IO () → IO ()
 stalledOwnerScenario scope atParked = do
   journal ← newTVarIO []
   seam ← pollingSeam journal
-  withSupplierVia scope journal $ \supply →
+  withSupplierVia scope journal $ \(Supplier supply _) →
     protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
       window ← onlyWindow host
       (owner, _) ← attachedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
@@ -490,6 +512,32 @@ twoOwnersScenario scope atParked = do
       void (closeHostWindow host beta)
       turnsExactly host control 1
       atParked
+
+-- | The fixture of 'twoOwnersScenario' with the example ended at the boundary before setup step @k@ (#593): step 0 is the host's
+-- setup callback (the host exists, nothing is attached), 1 is the body's start, 2 follows the window lookup, 3 follows alpha's
+-- attachment, 4 beta's, 5 and 6 follow each window's close, 7 follows the first turn. Between any two steps a partially built
+-- fixture holds some attachments and not others, and the drain must still finish, because the rescue was acquired with the host
+-- and every owner registered with it as its construction began.
+attachmentSetupScenario ∷ Int → Scope → IO () → IO ()
+attachmentSetupScenario k scope atParked = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  let step i = when (i == k) atParked
+  withSupplierVia scope journal $ \_ →
+    protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → step 0) $ \host control → do
+      step 1
+      (alpha, beta) ← twoWindows host
+      step 2
+      (_, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
+      step 3
+      (_, _) ← attachedOwner journal host beta (ownerNamed "beta") {scriptPlan = repeat Await}
+      step 4
+      void (closeHostWindow host alpha)
+      step 5
+      void (closeHostWindow host beta)
+      step 6
+      turnsExactly host control 1
+      step 7
 
 -- | The same for owners the example detached and would finish with 'finishOwners', ended before it does.
 detachedOwnersScenario ∷ Scope → IO () → IO ()
@@ -576,8 +624,7 @@ protectedRun
 protectedRun seam config inside action =
   asProcessMainThread seam $ do
     clearRegistered
-    protectedRunHere seam quietLogger config inside (\host control → action host control `onException` rescueRegistered)
-      `finally` clearRegistered
+    protectedRunHereRescued seam quietLogger config inside action `finally` clearRegistered
 
 -- | The structural rescue of every example that runs a protected host (#593). The drain that follows an exceptional exit from
 -- the body waits for every attached owner to finish its retirement, and the things that finish it (the plan updates the body
@@ -622,6 +669,30 @@ protectedRunHere seam logger config inside action =
     ( \_ use →
         withProtectedWindowHostIn logger (seamSession seam defaultSessionConfig) config $ \host →
           inside host >> use host
+    )
+    id
+    (\host _ → pure host)
+    action
+
+-- | 'protectedRunHere' with the rescue the first thing acquired inside the protected lifetime (#593): it wraps the host's setup
+-- callback, the startup and the body alike, so a failure or cancellation at any point after the host exists (before the first
+-- attachment, between two attachments, between the last attachment and the body, in the body) reaches 'rescueRegistered' before
+-- the host drains. Every owner is registered with it the moment its construction starts, so a partially built fixture is always
+-- fully released.
+protectedRunHereRescued
+  ∷ Seam
+  → Logger
+  → HostConfig
+  → (WindowHost → IO ())
+  → (WindowHost → RuntimeControl → IO a)
+  → IO a
+protectedRunHereRescued seam logger config inside action =
+  runProtectedWindowApplication
+    (withLoggingLifetime logger)
+    "attachment-example"
+    ( \_ use →
+        withProtectedWindowHostIn logger (seamSession seam defaultSessionConfig) config $ \host →
+          (inside host >> use host) `onException` rescueRegistered
     )
     id
     (\host _ → pure host)
@@ -865,7 +936,7 @@ testSupersededByQuiescence = do
   answered ← newIORef Nothing
   constructing ← newEmptyMVar
   closed ← newEmptyMVar
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
       window ← onlyWindow host
       owner ← newOwner (ownerNamed "alpha")
@@ -883,7 +954,7 @@ testSupersededByQuiescence = do
           outcome ← attachWindowGraphics host window blocking
           writeIORef answered (Just outcome)
           -- The facts are certified from another thread, so the exit drain can end.
-          supply host owner allRetirementFacts
+          supplied host owner allRetirementFacts
           pure ()
   readIORef answered >>= \case
     Just (GraphicsSuperseded _) → pure ()
@@ -907,7 +978,7 @@ testSupersededAtHandoff = do
   atHandoff ← newEmptyMVar
   quiesced ← newEmptyMVar
   owned ← newTVarIO Nothing
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     asProcessMainThread seam $
       runProtectedWindowApplication
         (withLoggingLifetime quietLogger)
@@ -942,7 +1013,7 @@ testSupersededAtHandoff = do
                     writeIORef observedThen (Just seen)
                     -- The facts are certified from another thread, so the exit drain
                     -- can end.
-                    supply host owner allRetirementFacts
+                    supplied host owner allRetirementFacts
                     use host
         )
         id
@@ -997,7 +1068,7 @@ testRollbackUnsafeRetains = do
   seam ← pollingSeam journal
   retained ← newIORef Nothing
   refusedLater ← newIORef Nothing
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
       window ← onlyWindow host
       owner ← newOwner (ownerNamed "failing")
@@ -1019,7 +1090,7 @@ testRollbackUnsafeRetains = do
         -- The slot is not free, so no second owner may take it.
         (_, second) ← attachScripted journal host window (ownerNamed "second")
         writeIORef refusedLater (Just second)
-        supply host owner allRetirementFacts
+        supplied host owner allRetirementFacts
         pure ()
   readIORef retained >>= \case
     Just (GraphicsPresent observed) → do
@@ -1101,7 +1172,7 @@ testMetadataFailsOnTurn = do
   journal ← newTVarIO []
   seam ← pollingSeam journal
   reported ← newIORef Nothing
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
       window ← onlyWindow host
       (owner, service) ← attachedOwner journal host window (ownerNamed "alpha")
@@ -1124,7 +1195,7 @@ testMetadataFailsOnTurn = do
         -- The failure the turn contained is the attachment's own evidence, kept
         -- exactly as a failed step's is.
         recordedFailureOf host (graphicsAttachment service) `shouldReturn` Just (Scripted "declaration")
-        supply host owner allRetirementFacts
+        supplied host owner allRetirementFacts
         turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
   entries ← readTVarIO journal
   -- Every fact was certified independently, and all of them precede the
@@ -1817,7 +1888,7 @@ testIndependentWindows ∷ Expectation
 testIndependentWindows = do
   journal ← newTVarIO []
   seam ← pollingSeam journal
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
       (alpha, beta) ← twoWindows host
       (alphaOwner, alphaService) ← attachedOwner journal host alpha (ownerNamed "alpha")
@@ -1856,7 +1927,7 @@ testIndependentWindows = do
           GraphicsPresent seen → observedSlot seen `shouldBe` SlotRetiring
           other → unexpected ("alpha's slot was not retiring: " <> show other)
         -- Independent evidence finishes alpha, and its window follows.
-        supply host alphaOwner allRetirementFacts
+        supplied host alphaOwner allRetirementFacts
         turnsUntil host control "alpha's destruction" (elem 1 <$> destroyCalls seam)
         void (atomically (readTVar (ownerSteps betaOwner)))
   entries ← readTVarIO journal
@@ -1879,7 +1950,7 @@ testStalledNeighbour ∷ Expectation
 testStalledNeighbour = do
   journal ← newTVarIO []
   seam ← pollingSeam journal
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
       (alpha, beta) ← twoWindows host
       (alphaOwner, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
@@ -1894,7 +1965,7 @@ testStalledNeighbour = do
         steps ← atomically (readTVar (ownerSteps alphaOwner))
         turnsExactly host control 3
         atomically (readTVar (ownerSteps alphaOwner)) `shouldReturn` steps
-        supply host alphaOwner allRetirementFacts
+        supplied host alphaOwner allRetirementFacts
         turnsUntil host control "alpha's destruction" (elem 1 <$> destroyCalls seam)
   entries ← readTVarIO journal
   takeWhile (/= WindowGone 1) entries `shouldSatisfy` (WindowGone 2 `elem`)
@@ -1947,7 +2018,7 @@ testBlockingOwnerRefused = do
   journal ← newTVarIO []
   seam ← pollingSeam journal
   reported ← newIORef Nothing
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host control → do
       window ← onlyWindow host
       (owner, _) ←
@@ -1963,7 +2034,7 @@ testBlockingOwnerRefused = do
         -- The step was never entered, so it could not have blocked anything.
         atomically (readTVar (ownerSteps owner)) `shouldReturn` 0
         destroyCalls seam `shouldReturn` []
-        supply host owner allRetirementFacts
+        supplied host owner allRetirementFacts
         turnsUntil host control "the window's destruction" (not . null <$> destroyCalls seam)
   readIORef reported >>= \case
     Just demand → do
@@ -2017,7 +2088,7 @@ testUnservedCountedAsDeferred = do
   reported ← newIORef Nothing
   offered ← newIORef []
   let config = (settings [windowNamed "alpha", windowNamed "beta"]) {hostRetirementBudget = 1}
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     protectedRun seam config (\_ → pure ()) $ \host control → do
       (alpha, beta) ← twoWindows host
       (alphaOwner, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
@@ -2033,7 +2104,7 @@ testUnservedCountedAsDeferred = do
         writeIORef offered counts
         forM_ [alphaOwner, betaOwner] $ \owner →
           atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
-        supply host alphaOwner allRetirementFacts
+        supplied host alphaOwner allRetirementFacts
         turnsUntil host control "both destructions" ((== 2) . length <$> destroyCalls seam)
   readIORef offered `shouldReturn` [1, 0]
   readIORef reported >>= \case
@@ -2558,7 +2629,7 @@ testStalledNeighbourThenWaits = do
   let config =
         (settings [windowNamed "alpha", windowNamed "beta"])
           {hostRetirementBudget = 1, hostClock = clock}
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     protectedRun seam config (\_ → pure ()) $ \host control → do
       (alpha, beta) ← twoWindows host
       owners ← detachedOwners journal host [(alpha, "alpha", [Stall]), (beta, "beta", repeat Await)]
@@ -2567,7 +2638,7 @@ testStalledNeighbourThenWaits = do
         traverse (atomically . readTVar . ownerSteps) owners >>= writeIORef offered
         -- Alpha withdrew its own path, so only independent evidence can finish it.
         forM_ (take 1 owners) $ \owner →
-          supply host owner allRetirementFacts
+          supplied host owner allRetirementFacts
         finishOwners host control seam [alpha, beta] owners
   -- Alpha stalled on its one opportunity and was never offered another; beta
   -- was offered one on every turn the budget could no longer spend on alpha.
@@ -2728,7 +2799,7 @@ testLatestInstantReplacesTheRetainedOne = do
   let config =
         (settings [windowNamed "alpha", windowNamed "beta"])
           {hostRetirementBudget = 1, hostClock = clock}
-  withSupplier journal $ \supply →
+  withSupplier journal $ \(Supplier supply supplied) →
     protectedRun seam config (\_ → pure ()) $ \host control → do
       (alpha, beta) ← twoWindows host
       owners ←
@@ -2742,7 +2813,7 @@ testLatestInstantReplacesTheRetainedOne = do
         pacingsOver host control 6 (\_ → pure ()) >>= writeIORef observed
         -- Alpha withdrew its own path, so only independent evidence finishes it.
         forM_ (take 1 owners) $ \owner →
-          supply host owner allRetirementFacts
+          supplied host owner allRetirementFacts
         finishOwners host control seam [alpha, beta] owners
   readIORef observed >>= \case
     [firstTurn, secondTurn, thirdTurn, fourthTurn, fifthTurn, sixthTurn] → do

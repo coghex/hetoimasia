@@ -4,7 +4,7 @@
 -- destruction is retained rather than disposed of.
 module Test.GLFW.Owner.Failure.Evidence (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM
   ( stateTVar
   , atomically
@@ -14,7 +14,7 @@ import Control.Concurrent.STM
   , readTVarIO
   , writeTVar
   )
-import Control.Exception (finally, throwIO)
+import Control.Exception (finally, mask, throwIO, uninterruptibleMask_)
 import Control.Monad (forM_, void, when)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
@@ -89,6 +89,10 @@ spec = do
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
     it ("finishes the exit on the supplier's evidence when the example body " <> label <> " right after the supplier was handed its host (#593)") $
       boundedExample (ownedEnds ending completionEndedEarlyScenario False)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    for_ [0 .. 2] $ \k →
+      it ("finishes the exit on the supplier's evidence when the example body " <> label <> " at setup step " <> show k <> " of the completion fixture (#593)") $
+        boundedExample (ownedEnds ending (completionSetupScenario k) False)
   it "retains terminal facts the completion publisher refused, and transports them at the next opportunity"
     (boundedExample testRefusedNoticeRetained)
   it "closes the owner's admission and begins its retirement as soon as a required failure is latched"
@@ -196,9 +200,15 @@ testCompletionWithoutEvidence = completionWithoutEvidence withOwnedThreadOpening
 -- handed what it publishes with (#593): the body ends the way the ending says, and the exit's drain must still finish on the
 -- evidence the supplier publishes, which the exit waits for before the scope around the host could stop the supplier.
 completionEndedEarlyScenario ∷ Scope → IO () → IO ()
-completionEndedEarlyScenario scope atParked = completionWithoutEvidence scope (Just atParked)
+completionEndedEarlyScenario scope atParked = completionWithoutEvidence scope (Just (\i → when (i == 2) atParked))
 
-completionWithoutEvidence ∷ Scope → Maybe (IO ()) → IO ()
+-- | The same fixture ended at the boundary before setup step @k@ (#593): 0 is the body's start (the host exists), 1 follows the
+-- window lookup, 2 follows the target handover and the supplier's hand-over, which are one uninterruptible step (an attachment
+-- never exists without the supplier holding what it publishes with). Between any two steps the fixture is partially built.
+completionSetupScenario ∷ Int → Scope → IO () → IO ()
+completionSetupScenario k scope atParked = completionWithoutEvidence scope (Just (\i → when (i == k) atParked))
+
+completionWithoutEvidence ∷ Scope → Maybe (Int → IO ()) → IO ()
 completionWithoutEvidence scope endEarly = do
   rig ← newRig
   trace ← newSinkTrace
@@ -213,39 +223,53 @@ completionWithoutEvidence scope endEarly = do
   script (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
   script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
   -- The thread supplies the independent evidence that lets the exit finish, so it is owned by the example and outlives the host
-  -- body that hands it what it publishes with (#593).
-  let supplier (host, owner, service) = do
-        publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
-        acknowledgement ←
-          atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-            >>= maybe (unexpected "the attachment kept no acknowledgement") pure
-        -- The attachment is still the main thread's and is only retiring once
-        -- the exit's quiescence has begun it, so the facts are published into
-        -- a model that can record them rather than refuse them.
-        atomically (readGraphicsService service >>= check . (== SlotRetiring) . observedSlot)
-        forM_ allRetirementFacts $ \fact →
-          void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+  -- body (#593). The fixture's destroy always fails, so even an exit with no attachment waits for the owner's destruction
+  -- evidence: the supplier is handed the host and the owner as the very first step of the body, in the same masked step that
+  -- arranges for the end of the body to be announced, and learns of the attachment's service through a cell the setup fills in
+  -- the same uninterruptible step that creates it. Whatever way the body ends, the supplier therefore knows what exists.
+  serviceCell ← newEmptyMVar
+  bodyDone ← newEmptyMVar
+  let supplier (host, owner) = do
+        -- The exit begins once the body is over, however it ended.
+        readMVar bodyDone
+        tryReadMVar serviceCell >>= mapM_ (\service → do
+          publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+          acknowledgement ←
+            atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+              >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+          -- The attachment is still the main thread's and is only retiring once
+          -- the exit's quiescence has begun it, so the facts are published into
+          -- a model that can record them rather than refuse them.
+          atomically (readGraphicsService service >>= check . (== SlotRetiring) . observedSlot)
+          forM_ allRetirementFacts $ \fact →
+            void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact)))
         -- Then the owner's own destruction, once the boundary is demonstrably
         -- retaining everything for the want of it: the attachment drain has
         -- finished and the exit has said, once, what it is retaining.
         atomically (check . null =<< hostPendingAttachments host)
         awaitDiagnostic trace
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
+      -- The target handover and the cell that tells the supplier of it are one uninterruptible step.
+      establish host owner window =
+        uninterruptibleMask_ (handedOver host owner window >>= \target → target <$ putMVar serviceCell target)
+      guarded handOver host owner body = mask $ \restore → do
+        handOver (host, owner)
+        restore body `finally` void (tryPutMVar bodyDone ())
   withDeferredThreadVia scope (pure ()) supplier $ \_ handOver → case endEarly of
-   Just atParked →
-    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
-      window ← theWindow host
-      service ← handedOver host owner window
-      handOver (host, owner, service)
-      atParked
+   Just step →
+    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
+      guarded handOver host owner $ do
+        step 0
+        window ← theWindow host
+        step 1
+        _ ← establish host owner window
+        step 2
    Nothing → do
     (unverified, _) ← caughtAs @OwnerDestructionUnverified $
-      ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
+       guarded handOver host owner $ do
         window ← theWindow host
-        service ← handedOver host owner window
-        -- Handed over at once: the supplier waits for the exit's own quiescence, so it acts at the same moment as before, and an
-        -- example that fails or is cancelled before here can never leave the exit's drain waiting for evidence nobody supplies.
-        handOver (host, owner, service)
+        service ← establish host owner window
         -- The owner's run has ended and it established nothing.
         atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
         records ← atomically (readTargetTerminalsNow owner)
