@@ -31,6 +31,7 @@ spec = describe "Quruntul adapter" $
     , "test_display_helpers_follow_ci"
     , "test_build_routes_follow_the_project_files"
     , "test_platform_bound_probes"
+    , "test_the_repeated_run_probe_is_its_own_darwin_suite_and_never_selected_by_inputs"
     , "test_identities_are_stable_and_distinct"
     , "test_each_execution_policy_change_changes_the_affected_identities"
     , "test_a_policy_change_invalidates_every_suite_of_a_multi_component_group"

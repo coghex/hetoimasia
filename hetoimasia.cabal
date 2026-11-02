@@ -279,6 +279,7 @@ test-suite hetoimasia-tests
             Test.Engine.Run.Abort
             Test.Engine.Run.Child
             Test.Engine.Run.Compose
+            Test.Engine.Run.Initialization
             Test.Engine.Run.Integrated
             Test.Engine.Run.Options
             Test.Engine.Run.Process
@@ -292,6 +293,8 @@ test-suite hetoimasia-tests
             containers >=0.8 && <0.9,
             hetoimasia:run,
             hetoimasia-content ==0.1.0.0,
+            hetoimasia-glfw ==0.1.0.0,
+            hetoimasia-glfw:runtime-glfw ==0.1.0.0,
             hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
             hetoimasia-lua-engine ==0.1.0.0,
             hetoimasia-lua-engine:facade,
@@ -340,6 +343,32 @@ test-suite lua-forced-exit-probe
         unix >=2.8 && <2.9,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0
+
+-- The repeated-run probe of the macOS glfwInit hang (#586): an optional local probe, macOS only, never selected by
+-- affected inputs and routed to no CI group. It runs the complete `run-native-tests` profile N times, one at a time,
+-- and reports how many runs passed, hung and failed (run-native-repeat/Main.hs). It starts the profile as a child
+-- through `tools/vulkan/run.sh native`, so it builds nothing and links no GLFW or Vulkan itself; its device-free
+-- examples exercise the machinery with /bin/sh children.
+test-suite run-native-repeat-probe
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: run-native-repeat
+    other-modules:
+        Test.Run.Repeat.Batch
+    ghc-options: -threaded -rtsopts
+    if os(darwin)
+        build-depends:
+            base >=4.22 && <4.23,
+            directory >=1.3 && <1.4,
+            filepath >=1.5 && <1.6,
+            hspec >=2.11 && <3,
+            process >=1.6 && <1.7,
+            temporary >=1.3 && <1.4,
+            text >=2.1 && <2.2,
+            unix >=2.8 && <2.9
+    else
+        buildable: False
 
 -- The generic run command on a real device, in the group `test.vulkan-run-native`: the command's production
 -- composition (real providers, real windows, finite temporary Lua fixtures and an unchanged copy of the shipped

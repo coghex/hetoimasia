@@ -32,6 +32,7 @@ import qualified Test.GLFW.Attachment as Attachment
 import qualified Test.GLFW.Attachments as Attachments
 import qualified Test.GLFW.Command as Command
 import qualified Test.GLFW.Control as Control
+import qualified Test.GLFW.Deadline as Deadline
 import qualified Test.GLFW.Dynamic as Dynamic
 import qualified Test.GLFW.Host as Host
 import qualified Test.GLFW.Input as Input
@@ -57,6 +58,7 @@ import Test.Hspec (Spec, describe)
 spec ∷ Spec
 spec = describe "GLFW" $ do
   Session.spec
+  Deadline.spec
   Interop.spec
   Wake.spec
   Connection.spec

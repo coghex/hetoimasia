@@ -10,10 +10,19 @@
 -- succeeding. The command line is still read on top of this default, so
 -- @--no-fail-on=empty@ restores the runner's own behaviour for a caller that
 -- wants it.
+--
+-- One example ends a real process: "Test.GLFW.Deadline" runs this executable
+-- again as a child whose main thread is blocked in a safe foreign call, with
+-- 'childVariable' naming the scenario. A child declares no example; it runs the
+-- scenario and ends.
 module Main (main) where
 
+import System.Environment (lookupEnv)
+import Test.GLFW.Deadline (childVariable, runChild)
 import qualified Test.GLFW.Spec as GLFW
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 main ∷ IO ()
-main = hspecWith defaultConfig { configFailOnEmpty = True } GLFW.spec
+main = lookupEnv childVariable >>= \case
+  Just scenario → runChild scenario
+  Nothing → hspecWith defaultConfig { configFailOnEmpty = True } GLFW.spec

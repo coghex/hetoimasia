@@ -67,6 +67,7 @@ library model
         Hetoimasia.GLFW.Internal.Capture
         Hetoimasia.GLFW.Internal.Connection
         Hetoimasia.GLFW.Internal.Control
+        Hetoimasia.GLFW.Internal.Deadline
         Hetoimasia.GLFW.Internal.Demand
         Hetoimasia.GLFW.Internal.Input
         Hetoimasia.GLFW.Internal.Interop
@@ -355,6 +356,7 @@ test-suite glfw-tests
         Test.GLFW.Command
         Test.GLFW.Connection
         Test.GLFW.Control
+        Test.GLFW.Deadline
         Test.GLFW.Dynamic
         Test.GLFW.Host
         Test.GLFW.Input
@@ -454,9 +456,12 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Window
     -- The Wayland synchronization the native examples need and the production
     -- shim may not perform (D-13), and the unreaped-exit wait the descendant
-    -- check's own examples need: test-only, and compiled into this suite alone.
+    -- check's own examples need, and the Cocoa launch-flag override the
+    -- re-initialization example forces (#586): test-only, compiled into this
+    -- suite alone.
     c-sources:
         native-tests/cbits/hetoimasia_glfw_test.c
+        native-tests/cbits/hetoimasia_glfw_test_cocoa.c
         native-tests/cbits/hetoimasia_glfw_test_process.c
     include-dirs: native-tests/cbits
     ghc-options: -threaded
