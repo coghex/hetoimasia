@@ -5574,7 +5574,17 @@ own on Linux, or the desktop opt-in on a real desktop.
   `test.glfw` validation group on the CPU worker.
 
   A new example that needs no native session — a model, seam, host, or boundary
-  contract — belongs in `glfw-tests`, beside the component spec that owns it. An
+  contract — belongs in `glfw-tests`, beside the component spec that owns it. A
+  helper thread an example needs is started through `Test.Support.Owned` (#593),
+  and in `glfw-tests` through the helpers `Test.GLFW.Support` offers over it:
+  `onThread` and `onBoundThread` run an action on an owned thread and wait for its
+  outcome; `withMainThread` runs one on an owned bound thread designated as the
+  process main thread; `withDeferredThread` starts a thread that waits to be handed
+  the host, window or owner it acts on, so that an evidence supplier or an injector
+  started from a callback outlives the callback and is stopped and joined when the
+  example ends. An example that holds a thread at a gate only it can open registers
+  the gate's opening with the thread, so the join never waits for a gate the
+  failed example left closed. An
   example that must initialize GLFW, open a real window, or observe the platform
   belongs in `glfw-native-tests` and its shared fixture.
 - **The session wake examples** (`--match "GLFW session wake"`) use only the
