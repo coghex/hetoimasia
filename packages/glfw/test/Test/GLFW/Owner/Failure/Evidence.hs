@@ -84,6 +84,9 @@ spec = do
   it "retains an unexpected completion without retirement evidence, and disposes nothing on it"
     (boundedExample testCompletionWithoutEvidence)
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    it ("opens the retiring owner's gate when the example body " <> label <> " before it has waited for the owner to retire (#593)") $
+      boundedExample (ownedEnds ending requiredFailureEndedEarlyScenario False)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
     it ("finishes the exit on the supplier's evidence when the example body " <> label <> " right after the supplier was handed its host (#593)") $
       boundedExample (ownedEnds ending completionEndedEarlyScenario False)
   it "retains terminal facts the completion publisher refused, and transports them at the next opportunity"
@@ -315,7 +318,16 @@ testRefusedNoticeRetained = do
 -- | A required failure closes the owner's admission and takes it into its
 -- retirement at once, rather than waiting for the exit.
 testRequiredFailureClosesAdmission ∷ IO ()
-testRequiredFailureClosesAdmission = do
+testRequiredFailureClosesAdmission = requiredFailureClosesAdmission withOwnedThreadOpening Nothing
+
+-- | The scenario of 'testRequiredFailureClosesAdmission' for an example that fails or is cancelled at the very start of the body,
+-- before it has waited for the owner to retire (#593): the gate the retiring owner is held at must still be opened on the way
+-- out of the body, before the exit waits for that owner.
+requiredFailureEndedEarlyScenario ∷ Scope → IO () → IO ()
+requiredFailureEndedEarlyScenario scope atParked = requiredFailureClosesAdmission scope (Just atParked)
+
+requiredFailureClosesAdmission ∷ Scope → Maybe (IO ()) → IO ()
+requiredFailureClosesAdmission scope endEarly = do
   rig ← newRig
   release ← newTVarIO False
   retiring ← newEmptyMVar
@@ -329,26 +341,32 @@ testRequiredFailureClosesAdmission = do
   -- The helper opens the gate the retiring owner is held at once the body has made its observations, so the exit can finish.
   -- It is owned by the example (#593), and the body hands it the go-ahead whether or not its assertions held, so a failed
   -- assertion is reported rather than leaving the exit waiting at the gate.
-  withDeferredThread (\() → atomically (writeTVar release True)) $ \_ handOver → do
-    (raised, _) ← caughtAs @Scripted $
-      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
-        window ← theWindow host
-        takeMVar retiring
-        ( do
-            -- The owner is already retiring and its admission is already closed, so
-            -- a handover now leaves nothing attached at all.
-            answer ← handOverGraphicsTarget host owner window
-            pending ← atomically (hostPendingAttachments host)
-            length pending `shouldBe` 0
-            status ← atomically (readOwnerStatusNow owner)
-            atomically $ do
-              writeTVar observedRefusal (Just (describeHandover answer))
-              writeTVar observedPhase (statusPhase status)
-          )
-          `finally` handOver ()
-    raised `shouldBe` Scripted (Text.pack "fatal step")
-    readTVarIO observedRefusal `shouldReturn` Just "owner closed"
-    readTVarIO observedPhase `shouldReturn` OwnerRetiring
+  withDeferredThreadVia scope (pure ()) (\() → atomically (writeTVar release True)) $ \_ handOver → do
+    let run =
+          ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
+            -- The go-ahead is guaranteed from the first statement of the body, before anything that can block or fail.
+            ( do
+                maybe (pure ()) id endEarly
+                window ← theWindow host
+                takeMVar retiring
+                -- The owner is already retiring and its admission is already closed, so
+                -- a handover now leaves nothing attached at all.
+                answer ← handOverGraphicsTarget host owner window
+                pending ← atomically (hostPendingAttachments host)
+                length pending `shouldBe` 0
+                status ← atomically (readOwnerStatusNow owner)
+                atomically $ do
+                  writeTVar observedRefusal (Just (describeHandover answer))
+                  writeTVar observedPhase (statusPhase status)
+              )
+              `finally` handOver ()
+    case endEarly of
+      Just _ → run
+      Nothing → do
+        (raised, _) ← caughtAs @Scripted run
+        raised `shouldBe` Scripted (Text.pack "fatal step")
+        readTVarIO observedRefusal `shouldReturn` Just "owner closed"
+        readTVarIO observedPhase `shouldReturn` OwnerRetiring
 
 -- | Whole-owner destruction that produced no evidence retains everything the
 -- owner borrowed, with no target involved at all.

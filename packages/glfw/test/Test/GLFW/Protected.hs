@@ -215,6 +215,10 @@ spec = describe "GLFW protected host" $ do
     it "keeps a stalled attachment and its window until independent evidence arrives, reporting the stall once"
       (boundedExample testStalledThenEvidence)
     for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+      it ("has ended and joined a runner parked in the drain's first wait, which absorbs the cleanup's one kill, when the example body " <> label) $
+        boundedExample (ownedEnds ending repeatedCancellationEndedEarlyScenario True)
+      it ("negative control: a plain forkOS start leaves the runner parked in the drain's wait when the example body " <> label) $
+        boundedExample (unownedLeaks ending repeatedCancellationEndedEarlyScenario True)
       it ("has ended and joined a runner parked in its construction, whose rollback waits at a second gate, when the example body " <> label) $
         boundedExample (ownedEnds ending parkedConstructionScenario True)
       it ("negative control: a plain forkOS start leaves the runner parked in its construction when the example body " <> label) $
@@ -1152,11 +1156,25 @@ parkedConstructionScenario scope atParked = do
 -- pending attachment, establishes no fact, releases nothing, and is re-raised
 -- only once the last fact has been certified.
 testRepeatedCancellation ∷ Expectation
-testRepeatedCancellation = do
+testRepeatedCancellation = repeatedCancellation withMainThread Nothing
+
+-- | The scenario of 'testRepeatedCancellation' up to the moment its runner is parked in the drain's first finite wait, with the
+-- example body ended the way the ending says before its first planned cancellation (#593): the drain absorbs the one kill of the
+-- scope's cleanup, advances to its second wait, and would block there with nothing to wake it, so the cleanup must release every
+-- remaining wait (the owner's plan, and a notice to wake the wait).
+repeatedCancellationEndedEarlyScenario ∷ Scope → IO () → IO ()
+repeatedCancellationEndedEarlyScenario scope atParked = repeatedCancellation (withMainThreadVia scope) (Just atParked)
+
+repeatedCancellation
+  ∷ (Seam → IO () → IO () → (ThreadId → MVar (Either SomeException ()) → IO ()) → IO ())
+  → Maybe (IO ())
+  → Expectation
+repeatedCancellation start endEarly = do
   journal ← newTVarIO []
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
-  withMainThread seam (pure ())
+  hostHeld ← newTVarIO Nothing
+  start seam (supplyIfHeld journal hostHeld owned allRetirementFacts)
     ( protectedRunHere
         seam
         quietLogger
@@ -1169,28 +1187,31 @@ testRepeatedCancellation = do
                 host
                 window
                 (ownerNamed "alpha") {scriptPlan = [Await, Await] <> map Certify allRetirementFacts}
-            atomically (writeTVar owned (Just owner))
+            atomically (writeTVar owned (Just owner) >> writeTVar hostHeld (Just host))
         )
         (\_ _ → pure ())
         (\() _ → pure ())
     )
     $ \runner finished → do
     owner ← awaitHeld owned
-    -- Each cancellation is delivered while the drain is inside a finite wait it
-    -- has no progress to skip, which is where the deferral must hold.
-    forM_ [1 .. 2 ∷ Int] $ \round' → do
-      atomically (readTVar (ownerAwaits owner) >>= check . (>= round'))
-      killThread runner
-    takeMVar finished >>= \case
-      Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-      Right () → unexpected "the cancelled drain returned"
-    seen ← readTVarIO (ownerViews owner)
-    map viewPhase (take 1 seen) `shouldBe` [AttachmentRetiring]
-    map (evidenceCancellations . viewEvidence) (take 1 seen) `shouldSatisfy` \case
-      [counted] → counted >= 2
-      _ → False
-    map viewMissing (take 1 seen) `shouldBe` [allRetirementFacts]
-    readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+    case endEarly of
+     Just atParked → atomically (readTVar (ownerAwaits owner) >>= check . (>= 1)) >> atParked
+     Nothing → do
+      -- Each cancellation is delivered while the drain is inside a finite wait it
+      -- has no progress to skip, which is where the deferral must hold.
+      forM_ [1 .. 2 ∷ Int] $ \round' → do
+        atomically (readTVar (ownerAwaits owner) >>= check . (>= round'))
+        killThread runner
+      takeMVar finished >>= \case
+        Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+        Right () → unexpected "the cancelled drain returned"
+      seen ← readTVarIO (ownerViews owner)
+      map viewPhase (take 1 seen) `shouldBe` [AttachmentRetiring]
+      map (evidenceCancellations . viewEvidence) (take 1 seen) `shouldSatisfy` \case
+        [counted] → counted >= 2
+        _ → False
+      map viewMissing (take 1 seen) `shouldBe` [allRetirementFacts]
+      readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 exceptionOf ∷ Evidence → SomeException
 exceptionOf (ExceptionWithContext _ failure) = failure
@@ -1400,6 +1421,8 @@ supplyIfHeld _journal hostHeld owned facts = do
   held ← atomically ((,) <$> readTVar hostHeld <*> readTVar owned)
   case held of
     (Just host, Just owner) → do
+      -- Whatever steps the owner still has to take are released too: it certifies every fact the next time it is asked.
+      atomically (writeTVar (ownerPlan owner) (map Certify facts))
       acknowledgement ← readTVarIO (ownerAcknowledgement owner)
       case (hostGraphicsPublisher host, acknowledgement) of
         (Just publisher, Just acknowledged) →

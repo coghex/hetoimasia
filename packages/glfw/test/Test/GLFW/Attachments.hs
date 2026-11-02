@@ -33,6 +33,8 @@ import Control.Concurrent.STM
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
+  , finally
+  , onException
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , fromException
@@ -41,7 +43,8 @@ import Control.Exception
   , try
   )
 import Control.Monad (forM, forM_, void, when)
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (Component, Logger, unsafeComponent)
 import Hetoimasia.Foundation.Recovery (Disposition (Required))
@@ -117,6 +120,10 @@ spec = describe "GLFW window attachments" $ do
         boundedExample (ownedEnds ending stalledOwnerScenario False)
       it ("finishes the exit drain on the rescued evidence when the example body " <> label <> " while the loop is idle") $
         boundedExample (ownedEnds ending idleLoopScenario False)
+      it ("finishes the exit drain when the example body " <> label <> " with beta awaiting for ever and alpha stalled") $
+        boundedExample (ownedEnds ending twoOwnersScenario False)
+      it ("finishes the exit drain when the example body " <> label <> " before the detached owners are finished") $
+        boundedExample (ownedEnds ending detachedOwnersScenario False)
 
   describe "attaching" $ do
     it "refuses a closing window, an ended window, an occupied window, a foreign session, and an unprotected host"
@@ -337,6 +344,7 @@ protocolFor ∷ TVar [Note] → WindowHost → Owner → OwnerScript → Attachm
 protocolFor journal host owner script =
   AttachmentProtocol
     { protocolConstruct = \_ acknowledgement → do
+        atomicModifyIORef' registeredOwners (\known → ((host, owner) : known, ()))
         atomically $ do
           writeTVar (ownerAcknowledgement owner) (Just acknowledgement)
           note journal (Constructed (scriptName script))
@@ -452,18 +460,51 @@ stalledOwnerScenario scope atParked = do
         turnsExactly host control 2
         atParked
 
--- | The same for the supplier that publishes only once the loop is idle in its wait.
+-- | The same for the supplier that publishes only once the loop is idle in its wait, ended after the normal hand-over: the
+-- supplier is then waiting for an idle loop that the drain never provides, and the structural rescue of 'protectedRun' (which
+-- publishes directly, bypassing any wait in progress) is what finishes the drain.
 idleLoopScenario ∷ Scope → IO () → IO ()
 idleLoopScenario scope atParked = do
   journal ← newTVarIO []
   seam ← blockingSeam journal
-  withWaitingSupplierVia scope journal $ \(_, supplyNow) →
+  withWaitingSupplierVia scope journal $ \(supplyOnceWaiting, _) →
     protectedRun seam (settings [windowNamed "alpha"]) (\_ → pure ()) $ \host _ → do
       window ← onlyWindow host
       (owner, _) ← attachedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-      rescuing (supplyNow host owner) $ do
-        void (closeHostWindow host window)
-        atParked
+      void (closeHostWindow host window)
+      supplyOnceWaiting host owner
+      atParked
+
+-- | Two owners, alpha stalled and beta answering 'Await' for ever, with the example body ended before it updates beta's plan or
+-- supplies alpha's evidence: the drain needs both, and the structural rescue provides both for every registered owner.
+twoOwnersScenario ∷ Scope → IO () → IO ()
+twoOwnersScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  withSupplierVia scope journal $ \_ →
+    protectedRun seam (settings [windowNamed "alpha", windowNamed "beta"]) (\_ → pure ()) $ \host control → do
+      (alpha, beta) ← twoWindows host
+      (_, _) ← attachedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = [Stall]}
+      (_, _) ← attachedOwner journal host beta (ownerNamed "beta") {scriptPlan = repeat Await}
+      void (closeHostWindow host alpha)
+      void (closeHostWindow host beta)
+      turnsExactly host control 1
+      atParked
+
+-- | The same for owners the example detached and would finish with 'finishOwners', ended before it does.
+detachedOwnersScenario ∷ Scope → IO () → IO ()
+detachedOwnersScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← pollingSeam journal
+  clock ← heldClock
+  let config =
+        (settings [windowNamed "alpha", windowNamed "beta"])
+          {hostRetirementBudget = 1, hostClock = clock}
+  withSupplierVia scope journal $ \_ →
+    protectedRun seam config (\_ → pure ()) $ \host control → do
+      (alpha, beta) ← twoWindows host
+      _ ← detachedOwners journal host [(alpha, "alpha", [Stall]), (beta, "beta", repeat Await)]
+      pacingsOver host control 2 (\_ → pure ()) >>= \_ → atParked
 
 -- | Publish an owner's certified facts from a thread that is not the owner.
 publishFacts ∷ TVar [Note] → WindowHost → Owner → [RetirementFact] → IO ()
@@ -533,7 +574,39 @@ protectedRun
   → (WindowHost → RuntimeControl → IO a)
   → IO a
 protectedRun seam config inside action =
-  asProcessMainThread seam (protectedRunHere seam quietLogger config inside action)
+  asProcessMainThread seam $ do
+    clearRegistered
+    protectedRunHere seam quietLogger config inside (\host control → action host control `onException` rescueRegistered)
+      `finally` clearRegistered
+
+-- | The structural rescue of every example that runs a protected host (#593). The drain that follows an exceptional exit from
+-- the body waits for every attached owner to finish its retirement, and the things that finish it (the plan updates the body
+-- would have made, the independent evidence a supplier would have published, a wake out of a finite wait) are exactly what a
+-- failed or cancelled body no longer provides. Every owner is registered as its construction starts (the registration is the
+-- construction's first step, so no owner that holds a window is missed), and an exceptional exit from the body runs this once,
+-- inside the host's lifetime and before the drain: every registered owner's plan becomes "certify every fact", and every fact is
+-- published for it directly, which also wakes a drain that is parked in a wait. It blocks on nothing, publishes nothing an owner
+-- has no acknowledgement for, and is idempotent. It is not run on a normal exit, where the example's own steps are the subject.
+rescueRegistered ∷ IO ()
+rescueRegistered = do
+  known ← readIORef registeredOwners
+  forM_ known $ \(host, owner) → do
+    atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+    acknowledgement ← readTVarIO (ownerAcknowledgement owner)
+    case (hostGraphicsPublisher host, acknowledgement) of
+      (Just publisher, Just acknowledged) →
+        forM_ allRetirementFacts $ \fact →
+          void (publishCompletion publisher (completionNotice (acknowledgedAttachment acknowledged) acknowledged fact))
+      _ → pure ()
+
+-- | The owners the current protected run has started constructing, with their hosts. One protected run is active at a time (the
+-- suite's examples run one after another), and 'protectedRun' empties the registry on both sides of the run.
+registeredOwners ∷ IORef [(WindowHost, Owner)]
+registeredOwners = unsafePerformIO (newIORef [])
+{-# NOINLINE registeredOwners #-}
+
+clearRegistered ∷ IO ()
+clearRegistered = writeIORef registeredOwners []
 
 protectedRunHere
   ∷ Seam
