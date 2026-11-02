@@ -1,7 +1,7 @@
 # hetoimasia-lua-engine
 
 The Lua-first engine's **configuration boundary and role policy** (LFE-3, LFE-6 and LFE-8 of
-[the design](../../docs/designs/lua_first_engine_design.md)): a strict parser for
+[the design](../../docs/archive/designs/lua_first_engine_design.md)): a strict parser for
 the format-1 launch manifest `hetoimasia.json`, from supplied bytes to a
 resolved role, entry and tick configuration, the **fixed M1 profile** of
 limits with validated, smaller test profiles, the **M1 behavior selection**: which
@@ -1310,7 +1310,7 @@ admits the roots, runs the roots' `init`s and the clocks over the Lua host's own
 down through one protected protocol that ends in actual retirement. It adds no scheduling, no world, no progress channel and no event API; it installs no signal handler,
 exits no process and writes nothing to a standard stream. The Lua status, quit and unavailable-state bindings are [LFE-26's](#the-session-controls-lfe-26), which
 consume the endpoints below (`sessionEndpoints` hands a facade exactly three of them); the launcher that opens the content root, makes the checkpoint and maps an outcome to an exit status is LFE-22's.
-[D-82](../../docs/designs/lua_first_engine_design.md) (the teardown protocol), D-83 (the first two host seams), D-84 (the third), D-85 (the fourth), D-86 (the fifth) and D-87 (diagnostics go through a session-owned writer that the session abandons, without waiting for it, once every role has retired) are normative for this section.
+[D-82](../../docs/archive/designs/lua_first_engine_design.md) (the teardown protocol), D-83 (the first two host seams), D-84 (the third), D-85 (the fourth), D-86 (the fifth) and D-87 (diagnostics go through a session-owned writer that the session abandons, without waiting for it, once every role has retired) are normative for this section.
 
 ```haskell
 runSession           ∷ SessionSpec → (Session → IO ()) → IO SessionOutcome   -- on the thread that owns the supervision control

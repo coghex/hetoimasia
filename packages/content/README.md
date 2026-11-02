@@ -1,7 +1,7 @@
 # hetoimasia-content
 
 Anchored, no-follow reading of one launcher-selected content folder (LFE-4 of
-[the Lua-first design](../../docs/designs/lua_first_engine_design.md), decisions
+[the Lua-first design](../../docs/archive/designs/lua_first_engine_design.md), decisions
 D-11, D-63 and D-64).
 
 `withContentRoot` resolves a launch path **once**, opens the directory it

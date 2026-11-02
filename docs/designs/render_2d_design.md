@@ -490,7 +490,7 @@ registers the texture with `render-2d`.
 Owner decision 2026-10-05; resolves Q-11. This arc exposes Haskell
 interfaces that are easy to bind and exposes nothing to Lua itself; the Lua
 arc, which owns VM ownership and the registration layer
-([Lua design](../lua_runtime_design.md)), owns the bindings.
+([Lua design](../archive/designs/lua_runtime_design.md)), owns the bindings.
 
 ### D-21. The design's proposals are accepted
 

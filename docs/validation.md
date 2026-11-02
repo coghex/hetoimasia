@@ -524,7 +524,8 @@ the floor, and is the one group with a [preparation](#preparation-and-the-watchd
 The preparation compiles the suite, and the triangle, sprites, image2d and scene3d samples'
 executables beside it so a sample that no longer builds against the host fails
 the group; nothing runs either executable. The command builds nothing — it asks Cabal
-for the built executable and refuses one that was not prepared. `--complete`
+for the built executable and refuses one that was not prepared, or whose recorded build identity is missing
+or no longer describes it ([the build identity](#a-native-runs-build-identity)). `--complete`
 makes the receipt speak for the whole profile: the suite runs every example
 through Hspec's own primitives with the configuration-reading step left out, so
 no `HSPEC_*`, `.hspec` file or selector can narrow it, and fails unless its
@@ -602,8 +603,8 @@ implements a port of (`packages/lua-engine/`, `packages/scripting-lua/`,
 backend, so a change to any of them selects it. `--complete` runs the whole
 profile with no configuration reading, as the window integration's suite does,
 and the run writes its evidence record, `lua-engine-graphics-native.md` — exact
-revision, the source digest `run.sh` computes (whose roots include the adapter and
-its CPU closure), the command, the platform and driver manifest, the validation
+revision and the source digest `run.sh build` recorded for the executable the run starts (the digest's roots
+include the adapter and its CPU closure), the command, the platform and driver manifest, the validation
 outcome and the native accounting each example measured — into the group's evidence
 directory. The CPU Lua-engine, content and codec packages stay free of Vulkan and
 GLFW dependencies: the group, like the headless group's
@@ -623,8 +624,9 @@ GLFW dependencies: the group, like the headless group's
 
 The preparation builds the suite and the full-product executable it launches (`build-tool-depends: hetoimasia:hetoimasia`); the timed
 execution builds nothing. `tools/vulkan/run.sh native` names that executable, from the same project and build directory, in
-`HETOIMASIA_RUN_EXECUTABLE` for this component, and refuses to run if it was not built, so a `hetoimasia` of another profile on `PATH` can never be the
-one launched. The suite follows the native-suite rules (consent read once, GLFW on the process main thread with Hspec on another, a
+`HETOIMASIA_RUN_EXECUTABLE` for this component, and refuses to run if it was not built, or if the build identity recorded for it and for the
+suite is missing, stale or not the same pair ([the build identity](#a-native-runs-build-identity)), so a `hetoimasia` of another profile on `PATH`
+can never be the one launched and `run-native.md` records one revision and digest that both executables carry. The suite follows the native-suite rules (consent read once, GLFW on the process main thread with Hspec on another, a
 nonzero selected count) and reimplements the consent check in its own source directory. The production `run` command itself neither reads nor requires
 `HETOIMASIA_NATIVE_SESSION`: consent gates native test suites, never the user's command. On Linux the runner starts an isolated X11 display;
 on macOS the desktop opt-in is on the run's own command, under the owner's standing approval.
@@ -663,6 +665,56 @@ record, such as a platform's evidence for the very candidate it describes, does
 not move that candidate's identity: its Vulkan boundary examples are what hold
 those packages out of the ordinary projects, read their dependencies, and hold
 the two Vulkan groups to their commands and routing.
+
+### The owned-start guard
+
+`test.workflow` also runs the guard against new unowned thread and process
+starts in test sources (#584), `tools/validation/owned_starts.py`, through the
+Hspec examples in `tools/test/OwnedStarts.hs`. A test that starts a thread or a
+subprocess must own it: acquire it under mask, register its stop-and-join in the
+same step, and stop and join it on every exit. The shared facility is
+`Test.Support.Owned` in `tools/test-support`; the guard fails a test source that
+calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
+`createProcess`, `withCreateProcess`, `spawnProcess`, `spawnCommand`,
+`callProcess`, `callCommand`, `readProcess`, `readProcessWithExitCode`,
+`readCreateProcess` or `readCreateProcessWithExitCode` any other way.
+
+- **Scope is derived.** It scans the source directories of every `test-suite` in
+  the package descriptions `cabal.project` and `cabal.project.vulkan` list, read
+  by the planner's own Cabal reader so conditional and platform-specific source
+  directories count whichever platform runs it, and of every other component built
+  for tests (named for tests, or listed in `tools/validation/owned_starts.json`).
+  A new suite is covered without editing the guard. The helper executables the
+  suites launch as child processes are excluded by name, with the reason, in the
+  same file. Comments, string literals, character literals, imports and the module
+  header are not code, so they are not sites; qualified calls are.
+- **A per-file count ratchet.** `tools/validation/owned_starts_baseline.json`
+  records, per file, how many unowned starts it had when the guard was introduced
+  (552 in 192 files, written by `owned_starts.py bootstrap`). Each file's count
+  must equal its baseline: a count above it is a new unowned start; a count below
+  it is a stale entry, so the baseline stays honest and can only shrink. The
+  baseline is a known-debt list classified mechanically, not a list of proven
+  leaks: verify a site before converting it. Being a count, it does not identify
+  an individual site, so a new unowned start that replaces another in the same
+  file is a review responsibility. `owned_starts.py ratchet --base REV` fails a
+  baseline that adds an entry or raises a count relative to the review base; a
+  base without a baseline is the explicit bootstrap.
+- **Exemptions are by binding and exact.** An already-owned helper is exempted
+  in `owned_starts.json` by file and top-level binding with the number of starts
+  it holds and its reason; a new raw start elsewhere in the same file is counted
+  as any other, and a helper that gains or loses a start fails until the entry is
+  reviewed. The initial exemptions are those #540 audited, narrowed: sites found
+  not to be provably owned (`Test.Content.Support.spawn`, which `withRootVia`
+  calls outside `withChild`; the `forkOS` runner of `run-native-test/Main.hs`;
+  `Compositor.hs`, whose `stopProcess` can time out unconfirmed) remain in the
+  baseline.
+- **Selection.** The guard's inputs are every scanned source directory and every
+  package description, listed as inputs of `test.workflow` in the catalog, beside
+  `tools/validation/` (the script, its configuration and its baseline). An
+  example fails when a scanned directory is not one of those inputs, so a suite
+  added later cannot be scanned without selecting the group that scans it.
+- **What it prints.** The failure names the file, the count against the baseline
+  and the facility to use.
 
 `test.x11-helper` and `test.wayland-helper` own those headless display-helper
 probes in `tools/x11-test/` and `tools/wayland-test/`. They use stub programs and
@@ -2731,6 +2783,37 @@ approval — the pull request says local macOS verification is pending, never
 passed. A change to anything either group consumes invalidates
 the evidence under the ordinary rules and needs a new run before merge; a
 documentation-only change may reuse it.
+
+#### A native run's build identity
+
+`tools/vulkan/run.sh native` runs an executable that an earlier `run.sh build` compiled and builds nothing, so the provenance it prints
+(`vulkan: repository revision …`, `vulkan: source digest …`) and exports for the executable to record (`HETOIMASIA_VULKAN_REVISION`,
+`HETOIMASIA_VULKAN_SOURCE_DIGEST`, which the three native evidence records copy) must describe that executable and not the tree it
+happens to run in. [#585](https://github.com/coghex/hetoimasia/issues/585) closed the gap that
+[the #535 diagnosis](evidence/lfe20-native-retention-diagnosis.md) found: a mutated executable run under a clean header.
+
+- **Recording.** `run.sh build` records, for every named target that resolves to exactly one executable, the identity of the tree the
+  build started from: the source digest over the same roots and files as before, and the repository revision (` (dirty)` when tracked
+  files differ). Building `hetoimasia:test:run-native-tests`, however it is spelled and even alone, also records
+  `hetoimasia:exe:hetoimasia`, which it launches. A library or a whole package builds as before and records nothing. A build that fails,
+  is interrupted, or sees the tree change while it compiles records nothing; one that compiled but could not record exits 1 naming the
+  component. The record lives in `native-identity/` inside the build directory (`dist-vulkan/`, or `dist-vulkan-vma-safe/` for the
+  `safe` variant, so the variants never touch each other's), a declared generated path that Git ignores; it is not one of the digest's
+  inputs.
+- **Binding.** The record carries the executable's content hash and path. An executable replaced by another build that left no record of
+  its own (`run.sh test` relinking `hetoimasia`, for example), a record copied from another build or component, and a record that is
+  incomplete or malformed are all refused as if there were none.
+- **Presenting.** `native` prints and exports the revision and digest the executable's own build recorded, never the tree's now, and runs
+  it when the recorded digest is the current tree's, even if `HEAD` has moved. It refuses with status 2, before starting the executable
+  or the Linux isolated display, naming the component and the exact command that prepares it (with
+  `HETOIMASIA_VMA_FOREIGN_CALLS=safe` when that variant is active): when the record is missing or unusable, when its digest differs from
+  the current tree's (any change under the digest's roots, which include `tools/vulkan` and `tools/native`, needs the component built
+  again), or when a caller-set `HETOIMASIA_VULKAN_REVISION` disagrees with the recorded revision.
+- **The launcher.** `hetoimasia:test:run-native-tests` runs only if it and the `hetoimasia` executable it starts each satisfy the above
+  and carry the same revision and digest; otherwise the refusal names `bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia
+  hetoimasia:test:run-native-tests`. The header and `run-native.md` are therefore one truthful pair.
+
+The validation groups' preparation stages build the component they run, so they leave the records their timed execution reads.
 
 #### The macOS confinement probe's receipt
 

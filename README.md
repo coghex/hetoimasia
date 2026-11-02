@@ -35,7 +35,7 @@ in [docs/gpu_backend.md](docs/gpu_backend.md). The independent
 [two-window triangle consumer](samples/triangle/README.md) (#233) is delivered;
 the [milestone verdict](docs/archive/vulkan_milestone_verdict.md) links the final
 required native-profile evidence on macOS and Linux. The
-[Lua design](docs/lua_runtime_design.md) (#145) has returned to exploring: both platform confinement verdicts are inconclusive, so
+[Lua design](docs/archive/designs/lua_runtime_design.md) (#145) has returned to exploring: both platform confinement verdicts are inconclusive, so
 production mod-process work needs the deployment decision required by D-11.
 
 ## Start here

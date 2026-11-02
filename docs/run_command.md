@@ -3,7 +3,7 @@
 `hetoimasia run [--vulkan-validation] GAME_ROOT` is the Lua-first engine's launcher (LFE-22, [#537](https://github.com/coghex/hetoimasia/issues/537);
 the option is LFE-28, [#579](https://github.com/coghex/hetoimasia/issues/579)).
 It knows how to assemble the engine's services, not what game or scene to run: everything a game is lives in the folder
-it is given. The design is [the Lua-first engine design](designs/lua_first_engine_design.md) (P-71, P-73, P-74, D-74 to D-77
+it is given. The design is [the Lua-first engine design](archive/designs/lua_first_engine_design.md) (P-71, P-73, P-74, D-74 to D-77
 and D-80); this document is what the command does today.
 
 ## Two builds of one executable
@@ -68,11 +68,14 @@ option is a value of the parse; no environment variable, manifest field, build f
    (the device starts *without a surface*, so a texture can be GPU-ready before any window exists), the texture adapter and, inside the
    session, the window provider. The owner's startup resolves the validation request against the loader's offer and creates the
    instance; the record of what it resolved is logged once, as soon as that startup has finished or failed and before the session,
-   so before any window ([Validation](#validation)).
+   so before any window ([Validation](#validation)). Native initialization (`glfwInit`) is bounded: if it has not returned within
+   ten seconds the process ends without unwinding, with status 75 ([Exit status](#exit-status),
+   [GLFW session entry](glfw.md#entry)).
 6. **Run one session** (`Hetoimasia.Run.Session`) on a thread of its own: two read workers, one decode worker and two texture
    lanes, made once; each selected role's VM evaluates its entry (a common entry runs separately in each); both selected behaviors
    validate before either `init`; the `init`s are dispatched concurrently; the logical clock opens through the joint start gate.
-7. Map the outcome to an exit status after every scope has unwound.
+7. Map the outcome to an exit status after every scope has unwound. The one status not chosen this way is 75, described below: it
+   is chosen while a scope is still blocked, and nothing unwinds.
 
 Evaluating the selected entries and validating the behaviors can themselves execute Lua and fail; those failures are exit 1 and start
 neither `init`. Path-level validation (root, manifest, inventory, declared entry paths) completes before any authored evaluation.
@@ -91,6 +94,16 @@ public spawn call.
 | 1 | a root, manifest, content, entry or boot failure; a script, required-request, host, provider, output or cleanup failure; a session whose roles did not all retire; a caught call of `state(...)`; an unclean diagnostic capture |
 | 2 | invalid command syntax |
 | 130 | an orderly SIGINT or SIGTERM stop that failed nothing |
+| 75 | native initialization (`glfwInit`) did not return within its bound, so the process was ended where it stood (see below) |
+
+Status 75 is the exception to "chosen after the scopes have unwound". `glfwInit` runs on the process main thread, and a thread blocked
+inside it cannot be unwound or interrupted from Haskell, so there is nothing to wait for. The application's initialization deadline
+(ten seconds, with a two-second allowance for its report; [GLFW session entry](glfw.md#entry), step 6) logs one error record named
+`native initialization exceeded its bound; ending the process` with fields `backend`, `bound_microseconds`, `exit_status` and
+`observed`, makes a best-effort flush of the logger, and ends the process with `_exit(75)` whether or not the report returned. No scope
+unwinds, no cleanup or hook runs, nothing waits for GLFW, and the operating system reclaims the process. The record states the observed
+condition (initialization did not return in time), not a cause. Status 75 is distinct from 0, 1, 2 and 130, and from the native test
+suite's 3 for a refused consent. The deadline is armed on macOS only; Linux's initialization is unchanged and has none.
 
 A failure outranks an interruption, which outranks a normal quit, in every order they arrive; an error after a quit, a sink failure or
 a cleanup failure overrides a normal or signal stop. An ordinary logical failure after the start with a healthy UI leaves that UI
@@ -259,7 +272,9 @@ the texture pipeline 16 accepted-work records. No M1 ceiling is changed by this 
 
 Engine, boot and failure diagnostics go to stderr through the logger, independently of the UI. Authored `print` is plain stdout and
 `warn` the attributed stderr line, both through the session's ordered output sinks with the accepted caps and visible truncation.
-Output and flush failure is fatal. The launcher adds at most one bounded, escaped reason line for a boot or host failure.
+Output and flush failure is fatal. The launcher adds at most one bounded, escaped reason line for a boot or host failure. The
+initialization deadline's record is a diagnostic of the same kind: an error through the logger, flushed once, best effort, before the process
+ends with status 75.
 
 ## Tests
 

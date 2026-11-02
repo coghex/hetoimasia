@@ -48,7 +48,7 @@ that window is recorded below with the owning slices' evidence and reported to t
 ## Acceptance map
 
 Each row names the example, what it runs, what it injects, what it observes and the contract it answers. "Prerequisite
-contract" cites the accepted design (`docs/designs/lua_first_engine_design.md`).
+contract" cites the accepted design (`docs/archive/designs/lua_first_engine_design.md`).
 
 | Scenario | Example | Injected boundary | Observable assertions | Prerequisite contract |
 | --- | --- | --- | --- | --- |

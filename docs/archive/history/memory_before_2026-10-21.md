@@ -55,7 +55,7 @@ Guide is advisory and does not replace Kanban approval or project-review records
   - First-party game scripts are trusted and run in-process in the UI and
     gameplay VM owners with direct bindings. Mods keep the confined-process
     pipeline, and both share one registration layer
-    ([Lua D-12](../../lua_runtime_design.md#d-12-run-first-party-scripts-trusted-and-in-process)).
+    ([Lua D-12](../designs/lua_runtime_design.md#d-12-run-first-party-scripts-trusted-and-in-process)).
     Owner decisions D-13/D-14 on 2026-09-24 resolve Q-8: trusted slices may
     proceed independently of Q-5 after renewed readiness, with explicit binding
     eligibility and no mod exposure by default. The reconciled local design
@@ -363,7 +363,7 @@ Guide is advisory and does not replace Kanban approval or project-review records
   (#220) retired its harness and runs its cases, with VK-5–VK-7's, in the
   window integration's native suite, the required group `test.vulkan-native`,
   with synchronization validation enabled on every validation-enabled instance.
-- [Lua](../../lua_runtime_design.md) has returned to `exploring` under D-11.
+- [Lua](../designs/lua_runtime_design.md) has returned to `exploring` under D-11.
   Independent UI/gameplay execution domains; stop unsafe authoritative gameplay
   while keeping UI available. Untrusted mods require separate processes per mod/domain,
   explicit capabilities, and enforced whole-process resource/execution limits.

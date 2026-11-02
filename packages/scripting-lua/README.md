@@ -53,7 +53,7 @@ share. See [The script runner](#the-script-runner). **Ordered import chains** (L
 suspends on a dependency's verified source and resumes on its VM's owner, one chain at a time, in the order the coordinator
 admitted the roots. See [Ordered import chains](#ordered-import-chains-the-module-loader). Any
 concrete game namespace and the confined path are later slices of
-[the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
+[the Lua runtime design](../../docs/archive/designs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
 
 ## What the boundary exposes
@@ -305,7 +305,7 @@ because a call is in progress. The check is by thread identity, so re-entry
 through a thread the callback starts, or through another VM whose callback
 calls back into this one, is not detected. Both remain forbidden by the
 callback contract; nested execution on one VM is outside it (`P-4` in
-[the runtime design](../../docs/lua_runtime_design.md)), and a synchronous call
+[the runtime design](../../docs/archive/designs/lua_runtime_design.md)), and a synchronous call
 into another VM's owner is `D-13`'s to forbid.
 
 A globals table can carry `__index` and `__newindex` metamethods, so reading or
@@ -3678,13 +3678,13 @@ hide on one platform, so CI, which runs them on Linux, is the evidence for them 
 `Hetoimasia.Scripting.Lua.Provider` and `Hetoimasia.Scripting.Lua.Request` (LUA-7, in `runtime-lua`) let a script ask
 for something an engine operation will answer later (pathfinding, an asset load, a query) without blocking its owner
 and without a provider's thread ever entering Lua. They follow P-7 of [the Lua runtime
-design](../../docs/lua_runtime_design.md): a component-local protocol, not an engine RPC bus. A bounded
+design](../../docs/archive/designs/lua_runtime_design.md): a component-local protocol, not an engine RPC bus. A bounded
 single-assignment result slot is reserved before a request is accepted; a response fills it without waiting on a
 shared queue; the session, domain, request identity and generation are carried; every admitted request settles
 exactly once, with a result, a failure or a cancellation; and a duplicate, late or stale reply cannot overwrite it.
 Cancelling revokes interest and is not proof that native work ended, so what the provider borrowed stays owned until
 it proves the work over. The mechanics are proven with fake providers. Subscriptions and provider events are
-[LUA-26](../../docs/lua_runtime_design.md#lua-26-deliver-provider-events-through-owned-lua-subscriptions)'s, which
+[LUA-26](../../docs/archive/designs/lua_runtime_design.md#lua-26-deliver-provider-events-through-owned-lua-subscriptions)'s, which
 reuses this section's granted service, guard and epoch operation unchanged.
 
 ### Granting the service
@@ -4060,7 +4060,7 @@ one platform, so CI, which runs them on Linux, is the evidence for them and a lo
 
 `Hetoimasia.Scripting.Lua.Provider` (LUA-26, in `runtime-lua`) lets an instance subscribe a function to the events
 a provider delivers, without a provider's thread ever entering Lua. It follows P-7 of [the Lua runtime
-design](../../docs/lua_runtime_design.md): a subscription is an owned record with bounded delivery, unsubscribe and
+design](../../docs/archive/designs/lua_runtime_design.md): a subscription is an owned record with bounded delivery, unsubscribe and
 invalidation; a producer never invokes a Lua closure on its own thread, and the owner looks up the still-live callback
 when it services an event; overload is stated per endpoint, and there is no universal lossy stream. It is built on the
 granted provider service, the one guard and the epoch operation of [Asynchronous requests](#asynchronous-requests),
@@ -4244,7 +4244,7 @@ named VM, on the elapsed clock or on logical ticks it grants at a real-time rate
 layer under the `lua` subcommand (LUA-19) and under a windowed application alike. It publishes an event when an instance starts and when
 it ends, to the scripts that subscribe. It parses no arguments, installs no signal handler, never calls `exit`, opens no window and imports nothing of the
 console, GLFW, Vulkan or a game: what the outside world does is injected. Its behavior is [D-40 and D-42 of the Lua runtime
-design](../../docs/lua_runtime_design.md#d-40-the-headless-runners-clock-ending-event-source-and-exit-statuses), over the
+design](../../docs/archive/designs/lua_runtime_design.md#d-40-the-headless-runners-clock-ending-event-source-and-exit-statuses), over the
 instance contract (D-26, D-27), and it reopens none of the contracts it is built on.
 
 ```haskell
@@ -4886,7 +4886,7 @@ None of it is an engine facility. No production library, executable, or public
 API depends on it, and it admits no untrusted source through any public path —
 the only Lua it loads is the fixture its own parent wrote into the private
 directory it was given. It exists to answer
-[Q-5](../../docs/lua_runtime_design.md#q-5-verified-platform-confinement-and-resource-enforcement-profile)'s
+[Q-5](../../docs/archive/designs/lua_runtime_design.md#q-5-verified-platform-confinement-and-resource-enforcement-profile)'s
 macOS row with observations.
 
 The answer is `inconclusive` — with one row of evidence explicitly identified as
