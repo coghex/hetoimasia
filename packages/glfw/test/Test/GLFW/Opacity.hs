@@ -90,9 +90,10 @@ import Data.Foldable (for_)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.Info (os)
-import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd), proc)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withPackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "GLFW session opacity across the package boundary" $ do
@@ -501,7 +502,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess
@@ -561,7 +562,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess
@@ -601,7 +602,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess
@@ -627,7 +628,7 @@ spec = describe "GLFW session opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess

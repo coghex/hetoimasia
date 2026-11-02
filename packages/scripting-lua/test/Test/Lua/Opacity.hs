@@ -49,7 +49,7 @@ import System.Directory (getPermissions, setPermissions, writable)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd), proc)
 import Test.Hspec
   ( Spec
   , describe
@@ -63,10 +63,12 @@ import Test.Hspec
 import Test.Support.ExternalClient
   ( Client (clientDirectory, clientOutput, clientStatus)
   , Mode (Link, Typecheck)
+  , clientRunBound
   , rejectedBecause
   , storeDatabases
   , withStorePackageClient
   )
+import Test.Support.Subprocess (runCaptured)
 
 -- The main library is named by its local unit id: its sublibraries share its
 -- package name. The dependency store is exposed as well, because the private
@@ -175,7 +177,7 @@ spec = describe "opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess
@@ -312,7 +314,7 @@ spec = describe "opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess
@@ -345,7 +347,7 @@ spec = describe "opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess
@@ -378,7 +380,7 @@ spec = describe "opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess
@@ -411,7 +413,7 @@ spec = describe "opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess
@@ -455,7 +457,7 @@ spec = describe "opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess

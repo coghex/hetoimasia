@@ -24,7 +24,7 @@
 module RunnerIdentity (runnerIdentitySpec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (bracket, onException)
+import Control.Exception (onException)
 import Control.Monad (forM, forM_, void, when)
 import Data.Char (isHexDigit)
 import Data.List (isInfixOf, isPrefixOf, isSuffixOf, sort)
@@ -47,9 +47,9 @@ import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO (Handle, IOMode (WriteMode), withFile)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (CreateProcess (..), StdStream (UseHandle), createProcess, getPid, proc, readCreateProcessWithExitCode, waitForProcess)
-import System.Timeout (timeout)
+import System.Process (CreateProcess (..), proc)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotBe, shouldSatisfy)
+import Test.Support.Subprocess (ChildSpec (specStderr, specStdout), RunBound (Within), Stream (CallerHandle), childPid, childSpec, runCaptured, waitChild, withScopedChild)
 
 -- ---------------------------------------------------------------------------
 -- The components the fixture knows, spelled as the callers spell them
@@ -289,8 +289,10 @@ runScript = "tools/vulkan/run.sh"
 -- | Run the real runner to its end.
 invoke ∷ Native → [(String, String)] → [String] → IO Outcome
 invoke native settings arguments = do
+  -- Through the shared subprocess facility (#588). The 30-minute run bound is the budget of the group that runs these examples.
   (status, out, err) ←
-    readCreateProcessWithExitCode
+    runCaptured
+      (Within (1800 * 1000000))
       (proc "bash" ((nativeRoot native </> runScript) : arguments))
         { cwd = Just (nativeRoot native)
         , env = Just (withSettings native settings)
@@ -317,7 +319,8 @@ built native settings targets = do
 cabalBuild ∷ Native → [(String, String)] → FilePath → [String] → IO ()
 cabalBuild native settings buildDirectory targets = do
   (status, _, err) ←
-    readCreateProcessWithExitCode
+    runCaptured
+      (Within (1800 * 1000000))
       (proc (nativeRoot native </> "bin/cabal") (["build", "--builddir=" ++ nativeRoot native </> buildDirectory] ++ targets))
         { cwd = Just (nativeRoot native)
         , env = Just (withSettings native settings)
@@ -735,30 +738,28 @@ interruptedBuild native targets = do
 
 interruptedBuildWith ∷ Native → [String] → Handle → IO ()
 interruptedBuildWith native targets logHandle =
-  -- Started under mask with its cleanup registered in the same step: whatever happens to the
-  -- example, the runner's whole process group is killed and the runner waited for.
-  bracket
-    ( createProcess
-        (proc "bash" ((root </> runScript) : "build" : targets))
-          { cwd = Just root
-          , env = Just (withSettings native [("FIXTURE_BUILD", "block")])
-          , create_group = True
-          , std_out = UseHandle logHandle
-          , std_err = UseHandle logHandle
-          }
+  -- A scoped child of the shared subprocess facility (#588): started under mask with its cleanup registered in the same step, in a
+  -- process group of its own, so whatever happens to the example the runner's whole group is ended and the runner reaped. The log is
+  -- a handle this example opened; the child has its own copy, which is all the example reads back through the caller's file.
+  withScopedChild
+    ( ( childSpec
+          (Within (1800 * 1000000))
+          (proc "bash" ((root </> runScript) : "build" : targets))
+            { cwd = Just root
+            , env = Just (withSettings native [("FIXTURE_BUILD", "block")])
+            }
+      )
+        { specStdout = CallerHandle logHandle
+        , specStderr = CallerHandle logHandle
+        }
     )
-    ( \(_, _, _, handle) → do
-        pid ← getPid handle
-        forM_ pid $ \started → void (run [] root "bash" ["-c", "kill -KILL -- -\"$0\" 2>/dev/null || true", show started])
-        void (waitForProcess handle)
-    )
-    ( \(_, _, _, handle) → do
-        pid ← getPid handle >>= maybe (fail "the runner has no process id") pure
+    ( \child → do
+        let pid = childPid child
         awaitFile (root </> "build-started")
         -- As the validation runner signals every member of a stage's session at its expiry.
         (delivered, _, errors) ← run [] root "bash" ["-c", "kill -TERM -- -\"$0\"", show pid]
         (delivered, errors) `shouldBe` (ExitSuccess, "")
-        finished ← timeout (60 * 1000 * 1000) (waitForProcess handle)
+        finished ← waitChild child (60 * 1000 * 1000)
         when (finished == Nothing) $ expectationFailure "the signalled build did not end within a minute"
     )
   where

@@ -10,9 +10,10 @@ import System.Directory (createDirectory)
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Process (proc)
 import Test.Hspec
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withStorePackageClient)
+import Test.Support.Subprocess (runCaptured)
 import qualified Data.ByteString.Char8 as BC
 
 spec ∷ Spec
@@ -27,7 +28,7 @@ spec = describe "the coordinator from outside the package" $ do
         createDirectory (tree </> "root")
         forM_ [("main.lua", "local dep = import('dep.lua') return { id = 'main', dep = dep }"), ("dep.lua", "return { id = 'dep' }")] $ \(name, body) →
           BC.writeFile (tree </> "root" </> name) body
-        (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
+        (status, out, err) ← runCaptured clientRunBound (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
         (status, out, err) `shouldBe` (ExitSuccess, "boot: BootReady\nlookup: ready\nlookup other: not_ready\njobs: 2 ready: 2\nslots: 4 held, drained: True\n", "")
 
   it "does not let a client reach a private module of the coordinator" $

@@ -3,8 +3,9 @@
 
 A test that starts a thread or a subprocess must own it: acquire it under mask, register its stop-and-join in the same
 step, and stop *and join* it on every exit (a normal return, an exception, a timeout of the example, a cancellation). The
-one shared facility is ``Test.Support.Owned`` in ``tools/test-support`` (``withOwnedThread``, ``withOwnedThreadOpening``).
-This tool finds every call to a start primitive in the repository's test sources and fails when one is neither made
+one shared facility for a thread is ``Test.Support.Owned`` in ``tools/test-support`` (``withOwnedThread``,
+``withOwnedThreadOpening``), and the one for a subprocess is ``Test.Support.Subprocess`` in the same library
+(``runToCompletion``, ``runCaptured``, ``withScopedChild``; #588). This tool finds every call to a start primitive in the repository's test sources and fails when one is neither made
 through that facility nor accounted for.
 
 What it checks, and what each check cannot do:
@@ -52,6 +53,8 @@ CONFIG_PATH = "tools/validation/owned_starts.json"
 BASELINE_PATH = "tools/validation/owned_starts_baseline.json"
 FACILITY_PATH = "tools/test-support/src/Test/Support/Owned.hs"
 FACILITY = "Test.Support.Owned.withOwnedThread"
+SUBPROCESS_FACILITY_PATH = "tools/test-support/src/Test/Support/Subprocess.hs"
+SUBPROCESS_FACILITY = "Test.Support.Subprocess"
 
 SCHEMA_VERSION = 1
 
@@ -520,6 +523,26 @@ def describe(sites: list[Site]) -> str:
     return ", ".join(f"{site.primitive}@{site.line}" for site in sites[:6]) + (" ..." if len(sites) > 6 else "")
 
 
+def is_thread_primitive(name: str) -> bool:
+    """A thread start is a ``fork`` primitive; every other primitive starts a subprocess."""
+    return name.startswith("fork")
+
+
+def advice(sites: list[Site]) -> str:
+    """Which facility to use, named for the kind of start the file makes."""
+    threads = any(is_thread_primitive(site.primitive) for site in sites)
+    processes = any(not is_thread_primitive(site.primitive) for site in sites)
+    parts: list[str] = []
+    if threads or not sites:
+        parts.append(f"Start helper threads through {FACILITY} ({FACILITY_PATH})")
+    if processes:
+        parts.append(
+            f"Start subprocesses through {SUBPROCESS_FACILITY} ({SUBPROCESS_FACILITY_PATH}): runCaptured or runToCompletion "
+            "for a command run to completion, withScopedChild for a child lent to a body"
+        )
+    return "; ".join(parts)
+
+
 def check(root: str) -> list[str]:
     """Every problem with the tree's test starts; empty when the guard passes."""
     result = scan(root)
@@ -531,8 +554,8 @@ def check(root: str) -> list[str]:
         if observed > allowed:
             problems.append(
                 f"{path}: {observed} unowned thread or process start(s) where the baseline allows {allowed} "
-                f"({describe(result.sites.get(path, []))}). Start helper threads through {FACILITY} "
-                f"({FACILITY_PATH}); only an already-owned helper may be exempted, in {CONFIG_PATH}, with its reason."
+                f"({describe(result.sites.get(path, []))}). {advice(result.sites.get(path, []))}; "
+                f"only an already-owned helper may be exempted, in {CONFIG_PATH}, with its reason."
             )
         elif observed < allowed:
             reason = (
