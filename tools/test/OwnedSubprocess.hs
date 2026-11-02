@@ -589,6 +589,31 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
           readIORef held >>= mapM goneAndReaped >>= (`shouldBe` [False]))
         `finally` (readIORef held >>= rescue)
 
+    it "never signals the group again once it was observed gone, whatever the identifier is later given to" $ do
+      -- The probe answers that the group is gone and then, as if the identifier had been given to an unrelated group, that a member
+      -- remains: the release has already seen the group end, so it sends nothing.
+      answers ← newIORef [False, True, True, False]
+      sent ← newIORef []
+      let reuse _ = atomicModifyIORef' answers (\known → case known of next : rest → (rest, next); [] → ([], False))
+          seams = noSeams {seamGroupRemains = reuse, seamSignalled = \target signal → atomicModifyIORef' sent (\old → (old <> [(target, signal)], ()))}
+      withScopedChildUsing quick seams (childSpec hangCatcher (shell "exit 0" [])) $ \child →
+        waitChild child (30 * 1000000) >>= (`shouldBe` Just ExitSuccess)
+      readIORef sent >>= (`shouldBe` [])
+      -- The first probe consumed the "gone" answer and no later one was asked.
+      readIORef answers >>= (`shouldBe` [True, True, False])
+
+    it "keeps a closed or broken diagnostic stream from replacing the body's own failure" $ do
+      let seams =
+            noSeams
+              { seamPoll = \_ → pure Nothing
+              , seamWait = \_ _ → pure Nothing
+              , seamDiagnostic = \_ → ioError (userError "the diagnostic stream is closed")
+              }
+      seen ← newIORef Nothing
+      outcome ← try @Boom (withScopedChildUsing quick {boundReap = 100000} seams (childSpec hangCatcher (shell obedientAlone [])) (\child → writeIORef seen (Just child) >> awaitReady child >> boom))
+      outcome `shouldBe` Left Boom
+      readIORef seen >>= mapM_ (\child → awaitUnreapedExit child (30 * 1000000) >> waitForProcess (childProcess child))
+
     it "raises the body's own failure, not the unconfirmed cleanup, when the body failed" $ do
       let seams = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing}
       seen ← newIORef Nothing

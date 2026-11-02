@@ -203,6 +203,9 @@ data Seams = Seams
   , seamGroupRemains ∷ ProcessID → IO Bool
   -- ^ Whether any process of the group remains ('probeGroup'). An example that makes it answer 'True' injects a descendant whose end
   -- is not observed.
+  , seamDiagnostic ∷ String → IO ()
+  -- ^ Where the release writes the cleanup it could not confirm, beside annotating the raised failure with it. A failure of the write
+  -- itself is ignored: a diagnostic never replaces the failure being raised.
   , seamSignalled ∷ SignalTarget → Signal → IO ()
   -- ^ Run just before the release sends a signal: what an example reads to say which signals were sent and to what, so that a child
   -- that obeys SIGTERM is shown not to have been sent SIGKILL, and a child that stays in the caller's group is shown to have been
@@ -221,6 +224,7 @@ noSeams =
     , seamPoll = getProcessExitCode
     , seamWait = \handle bound → timeout (max 0 bound) (waitForProcess handle)
     , seamGroupRemains = probeGroup
+    , seamDiagnostic = hPutStrLn stderr
     , seamSignalled = \_ _ → pure ()
     }
 
@@ -443,6 +447,9 @@ data Env = Env
   , envTermSent ∷ !(IORef Bool)
   , envKillSent ∷ !(IORef Bool)
   , envLeaderReaped ∷ !(IORef Bool)
+  , envGroupGone ∷ !(IORef Bool)
+  -- ^ Set once a probe, made after the leader was reaped, found no member: the identifier may belong to another group from then on, so
+  -- nothing is signalled to it again, however often the release is retried.
   , envProblems ∷ !(IORef [String])
   }
 
@@ -460,7 +467,7 @@ withProcess bounds seams spec entered pipes outReader errReader body = mask $ \r
           , childDrainBound = boundDrain bounds
           , childDrainAccounted = accounted
           }
-  env ← Env bounds seams spec child <$> newIORef False <*> newIORef False <*> newIORef False <*> newIORef []
+  env ← Env bounds seams spec child <$> newIORef False <*> newIORef False <*> newIORef False <*> newIORef False <*> newIORef []
   acquired ← tryWithContext @SomeException $ do
     -- The parent's copies of the child's ends go, so that the readers see the end of the stream when the last holder lets go.
     mapM_ closeQuietly (concatMap (maybe [] pure) [pipesInRead pipes, pipesOutWrite pipes, pipesErrWrite pipes])
@@ -515,7 +522,9 @@ rootSpelling directory = if directory == "/" then "/." else directory
 conclude ∷ Env → Either (ExceptionWithContext SomeException) (Maybe a) → IO a
 conclude env outcome = do
   (problems, interruption) ← release env
-  forM_ problems $ \text → hPutStrLn stderr ("Test.Support.Subprocess: the cleanup was not confirmed: " <> text)
+  -- A diagnostic, written where a person reads the run; a stream that cannot take it must not replace the failure being raised.
+  forM_ problems $ \text →
+    void (try (seamDiagnostic (envSeams env) ("Test.Support.Subprocess: the cleanup was not confirmed: " <> text)) ∷ IO (Either IOException ()))
   let command = describeCommand (specProcess (envSpec env))
       retainProblems primary = foldl (\acc text → annotate (RetainedFailure "the cleanup was not confirmed" text) acc) primary problems
   case (interruption, outcome) of
@@ -627,7 +636,7 @@ endGroup ∷ Env → IO ()
 endGroup env = do
   let pid = childPid (envChild env)
       bounds = envBounds env
-      remains = seamGroupRemains (envSeams env)
+      remains = probeFor env
   leaderReaped ← pollLeader env
   -- While the leader is unreaped its identifier cannot belong to another group, so the group may be signalled. Once it is reaped the
   -- group is signalled only while a member is known to remain; a null signal that finds none sends nothing.
@@ -644,15 +653,30 @@ endGroup env = do
     stillThere ← remains pid
     when stillThere $ do
       killed ← readIORef (envKillSent env)
-      -- Members that obey SIGTERM are given the rest of the grace; ones that outlast it (or that outlived a kill already sent) are
-      -- killed and then waited for.
+      -- Members that obey SIGTERM are given the rest of the grace; ones that outlast it are killed, once, and then waited for. A group
+      -- that has already been sent SIGKILL (the leader outlasted the grace) is only waited for: its members are zombies awaiting their
+      -- adopter, and a second signal would add nothing.
       gone ← if killed then pure False else groupGone remains pid (boundGrace bounds)
       unless gone $ do
-        -- A member is known to remain (the probe just said so), so the identifier is still reserved.
-        sendTo env ToGroup sigKILL
+        unless killed $
+          -- A member is known to remain (the probe just said so), so the identifier is still reserved.
+          once (envKillSent env) (sendTo env ToGroup sigKILL)
         vanished ← groupGone remains pid (boundReap bounds)
         unless vanished $
           noteProblem env ("processes of the child's process group still remained " <> describeBound (Within (boundReap bounds)) <> " after SIGKILL (a zombie awaiting its parent counts as remaining)")
+
+-- | The probe the release signals on, made only once the leader is reaped: whether a member remains. The first answer of "none" is
+-- terminal. The identifier of a group with no member can be given to an unrelated one, so from then on this answers "none" without
+-- asking again, and the release sends the group nothing.
+probeFor ∷ Env → ProcessID → IO Bool
+probeFor env pgid = do
+  already ← readIORef (envGroupGone env)
+  if already
+    then pure False
+    else do
+      present ← seamGroupRemains (envSeams env) pgid
+      unless present $ writeIORef (envGroupGone env) True
+      pure present
 
 -- | Whether a null signal to the group finds a member. A member that exists but may not be signalled counts as remaining, as does a
 -- zombie.
