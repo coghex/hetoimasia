@@ -311,7 +311,8 @@ class AdapterChecks(unittest.TestCase):
         self.assertEqual((native.kind, native.data["component"]), ("ci", "hetoimasia:test:run-native-tests"))
         self.assertNotEqual(probe.identity, native.identity)
         self.assertEqual([g["id"] for g in CATALOG["groups"] if "run-native-repeat-probe" in g.get("component", "")], ["test.run-native-repeat"])
-        # The planner on the real catalog, over the committed head: a change inside the probe's own inputs and a change
+        # The planner on the real catalog, over the committed head, as a Darwin runner would plan it (on any other runner the
+        # Darwin-only group is `platform-inapplicable`, which is also not a selection, but is not the reason this asserts): a change inside the probe's own inputs and a change
         # to a path no group claims (which widens non-optional selection to everything) leave it unselected.
         revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
         with tempfile.TemporaryDirectory() as scratch:
@@ -330,7 +331,7 @@ class AdapterChecks(unittest.TestCase):
                 subprocess.run([*git, "add", path], cwd=clone, check=True, capture_output=True)
                 subprocess.run([*git, "commit", "--quiet", "-m", "change"], cwd=clone, check=True, capture_output=True)
                 done = subprocess.run(
-                    [sys.executable, "-B", "tools/validation/plan.py", "--base", revision, "--head", "HEAD", "--json"],
+                    [sys.executable, "-B", "tools/validation/plan.py", "--base", revision, "--head", "HEAD", "--runner-os", "Darwin", "--json"],
                     cwd=clone, check=True, capture_output=True, text=True)
                 return json.loads(done.stdout)
 
