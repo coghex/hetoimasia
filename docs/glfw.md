@@ -690,7 +690,7 @@ sends a later `glfwInit` into a `[NSApp run]` that nothing can stop: the main
 thread waits in `nextEventMatchingMask:untilDate:inMode:dequeue:` for ever.
 
 Established, with a scratch probe that links the pinned static GLFW and sets the
-same two init hints as the session, creating no window (evidence on the issue):
+same two init hints as the session, creating no window (evidence: [docs/evidence/issue-586-glfwinit-diagnosis.md](evidence/issue-586-glfwinit-diagnosis.md)):
 
 - A bare second `[NSApp run]` after `glfwInit; glfwTerminate` blocks every time.
   The flag after a first initialization is `true` and stays so.

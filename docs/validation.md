@@ -524,7 +524,8 @@ the floor, and is the one group with a [preparation](#preparation-and-the-watchd
 The preparation compiles the suite, and the triangle, sprites, image2d and scene3d samples'
 executables beside it so a sample that no longer builds against the host fails
 the group; nothing runs either executable. The command builds nothing — it asks Cabal
-for the built executable and refuses one that was not prepared. `--complete`
+for the built executable and refuses one that was not prepared, or whose recorded build identity is missing
+or no longer describes it ([the build identity](#a-native-runs-build-identity)). `--complete`
 makes the receipt speak for the whole profile: the suite runs every example
 through Hspec's own primitives with the configuration-reading step left out, so
 no `HSPEC_*`, `.hspec` file or selector can narrow it, and fails unless its
@@ -602,8 +603,8 @@ implements a port of (`packages/lua-engine/`, `packages/scripting-lua/`,
 backend, so a change to any of them selects it. `--complete` runs the whole
 profile with no configuration reading, as the window integration's suite does,
 and the run writes its evidence record, `lua-engine-graphics-native.md` — exact
-revision, the source digest `run.sh` computes (whose roots include the adapter and
-its CPU closure), the command, the platform and driver manifest, the validation
+revision and the source digest `run.sh build` recorded for the executable the run starts (the digest's roots
+include the adapter and its CPU closure), the command, the platform and driver manifest, the validation
 outcome and the native accounting each example measured — into the group's evidence
 directory. The CPU Lua-engine, content and codec packages stay free of Vulkan and
 GLFW dependencies: the group, like the headless group's
@@ -623,8 +624,9 @@ GLFW dependencies: the group, like the headless group's
 
 The preparation builds the suite and the full-product executable it launches (`build-tool-depends: hetoimasia:hetoimasia`); the timed
 execution builds nothing. `tools/vulkan/run.sh native` names that executable, from the same project and build directory, in
-`HETOIMASIA_RUN_EXECUTABLE` for this component, and refuses to run if it was not built, so a `hetoimasia` of another profile on `PATH` can never be the
-one launched. The suite follows the native-suite rules (consent read once, GLFW on the process main thread with Hspec on another, a
+`HETOIMASIA_RUN_EXECUTABLE` for this component, and refuses to run if it was not built, or if the build identity recorded for it and for the
+suite is missing, stale or not the same pair ([the build identity](#a-native-runs-build-identity)), so a `hetoimasia` of another profile on `PATH`
+can never be the one launched and `run-native.md` records one revision and digest that both executables carry. The suite follows the native-suite rules (consent read once, GLFW on the process main thread with Hspec on another, a
 nonzero selected count) and reimplements the consent check in its own source directory. The production `run` command itself neither reads nor requires
 `HETOIMASIA_NATIVE_SESSION`: consent gates native test suites, never the user's command. On Linux the runner starts an isolated X11 display;
 on macOS the desktop opt-in is on the run's own command, under the owner's standing approval.
@@ -2781,6 +2783,37 @@ approval — the pull request says local macOS verification is pending, never
 passed. A change to anything either group consumes invalidates
 the evidence under the ordinary rules and needs a new run before merge; a
 documentation-only change may reuse it.
+
+#### A native run's build identity
+
+`tools/vulkan/run.sh native` runs an executable that an earlier `run.sh build` compiled and builds nothing, so the provenance it prints
+(`vulkan: repository revision …`, `vulkan: source digest …`) and exports for the executable to record (`HETOIMASIA_VULKAN_REVISION`,
+`HETOIMASIA_VULKAN_SOURCE_DIGEST`, which the three native evidence records copy) must describe that executable and not the tree it
+happens to run in. [#585](https://github.com/coghex/hetoimasia/issues/585) closed the gap that
+[the #535 diagnosis](evidence/lfe20-native-retention-diagnosis.md) found: a mutated executable run under a clean header.
+
+- **Recording.** `run.sh build` records, for every named target that resolves to exactly one executable, the identity of the tree the
+  build started from: the source digest over the same roots and files as before, and the repository revision (` (dirty)` when tracked
+  files differ). Building `hetoimasia:test:run-native-tests`, however it is spelled and even alone, also records
+  `hetoimasia:exe:hetoimasia`, which it launches. A library or a whole package builds as before and records nothing. `build` takes component names only: an option such as `--dry-run`, which Cabal answers without compiling, is refused with status 2 before anything runs, since a record made after it would describe an executable that was not built. A build that fails,
+  is interrupted, or sees the tree change while it compiles records nothing; one that compiled but could not record exits 1 naming the
+  component. The record lives in `native-identity/` inside the build directory (`dist-vulkan/`, or `dist-vulkan-vma-safe/` for the
+  `safe` variant, so the variants never touch each other's), a declared generated path that Git ignores; it is not one of the digest's
+  inputs.
+- **Binding.** The record carries the executable's content hash and path. An executable replaced by another build that left no record of
+  its own (`run.sh test` relinking `hetoimasia`, for example), a record copied from another build or component, and a record that is
+  incomplete or malformed are all refused as if there were none.
+- **Presenting.** `native` prints and exports the revision and digest the executable's own build recorded, never the tree's now, and runs
+  it when the recorded digest is the current tree's, even if `HEAD` has moved. It refuses with status 2, before starting the executable
+  or the Linux isolated display, naming the component and the exact command that prepares it (with
+  `HETOIMASIA_VMA_FOREIGN_CALLS=safe` when that variant is active): when the record is missing or unusable, when its digest differs from
+  the current tree's (any change under the digest's roots, which include `tools/vulkan` and `tools/native`, needs the component built
+  again), or when a caller-set `HETOIMASIA_VULKAN_REVISION` disagrees with the recorded revision.
+- **The launcher.** `hetoimasia:test:run-native-tests` runs only if it and the `hetoimasia` executable it starts each satisfy the above
+  and carry the same revision and digest; otherwise the refusal names `bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia
+  hetoimasia:test:run-native-tests`. The header and `run-native.md` are therefore one truthful pair.
+
+The validation groups' preparation stages build the component they run, so they leave the records their timed execution reads.
 
 #### The macOS confinement probe's receipt
 
