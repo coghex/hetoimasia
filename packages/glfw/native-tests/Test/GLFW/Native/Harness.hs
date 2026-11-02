@@ -317,7 +317,9 @@ spec shared = describe "the shared fixture" $ do
           -- is while the owner is masked, so its throw stays pending.
           acquire thrower = do
             putMVar acquiring ()
-            uninterruptibleMask_ (awaitThrowing thrower)
+            -- The thrower may run on another capability, where its throw is only a message in this one's inbox until the
+            -- scheduler next runs; yielding processes it, so the cancellation is pending before the acquisition returns.
+            uninterruptibleMask_ (awaitThrowing thrower >> yield)
             note script "acquired"
             pure (7 ∷ Int)
           release _ = do
