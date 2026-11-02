@@ -311,9 +311,13 @@ spec = before_ clearRegistered $ describe "GLFW protected host" $ do
     it "refuses a window limit below one, below its configured windows, or above the bound its counts derive from"
       (boundedExample testWindowLimitBounds)
 
-  describe "closing an attached window during the run" $
+  describe "closing an attached window during the run" $ do
     it "begins retirement without destroying it, and destroys it only once every fact is certified"
       (boundedExample testEarlyClose)
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+      for_ [0 .. 3] $ \k →
+        it ("finishes the exit when the example body " <> label <> " at step " <> show k <> " of the early-close fixture (#593)") $
+          boundedExample (exitFinishes ending (earlyCloseScenario k))
 
 -- ---------------------------------------------------------------------------
 -- The journal
@@ -2609,7 +2613,16 @@ destructions journal = filter isWindowGone <$> readTVarIO journal
 -- window stays alive — with its close acknowledged — until every one of its
 -- attachment's facts is certified, and a later owner turn then destroys it.
 testEarlyClose ∷ Expectation
-testEarlyClose = do
+testEarlyClose = earlyCloseFixture (\_ → pure ())
+
+-- | The fixture ended at the boundary before step @k@ (#593): 0 is the setup callback (nothing attached), 1 follows the attachment (the
+-- owner's plan is empty, so only the facts the action's loop reports can retire it), 2 is the action's start, 3 is the loop's first
+-- turn. The rescue registered with the host certifies every fact for every owner registered so far.
+earlyCloseScenario ∷ Int → Scope → IO () → IO ()
+earlyCloseScenario k _ atParked = earlyCloseFixture (\i → when (i == k) atParked)
+
+earlyCloseFixture ∷ (Int → IO ()) → Expectation
+earlyCloseFixture step = armed $ do
   journal ← newTVarIO []
   seam ← pollingSeam journal
   owned ← newTVarIO Nothing
@@ -2621,14 +2634,17 @@ testEarlyClose = do
       "protected-host-example"
       ( \_ use →
           protectedHost seam quietLogger (settings [windowNamed "alpha"]) $ \host → do
+            step 0
             window ← onlyWindow host
             owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = []}
+            step 1
             atomically (writeTVar owned (Just owner))
             use host
       )
       id
       (\host _ → pure host)
       ( \host control → do
+          step 2
           window ← onlyWindow host
           owner ← heldOwner owned
           acknowledgement ← atomically (readTVar (ownerAcknowledgement owner) >>= maybe retry pure)
@@ -2637,7 +2653,7 @@ testEarlyClose = do
               { loopLogger = quietLogger
               , loopEvent = noApplicationEvents
               , loopUpdate = \turn → case turnNumber turn of
-                  1 → Continue <$ (closeHostWindow host window `shouldReturn` CloseStarted)
+                  1 → Continue <$ (step 3 >> (closeHostWindow host window `shouldReturn` CloseStarted))
                   2 → do
                     -- The close is acknowledged and the attachment is retiring,
                     -- but the window is not destroyed: its attachment vetoes it.
