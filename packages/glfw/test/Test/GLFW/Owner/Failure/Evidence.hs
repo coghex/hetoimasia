@@ -9,13 +9,14 @@ import Control.Concurrent.STM
   ( stateTVar
   , atomically
   , check
+  , modifyTVar'
   , newTVarIO
   , readTVar
   , readTVarIO
   , writeTVar
   )
 import Control.Exception (finally, mask, mask_, throwIO, uninterruptibleMask_)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, forever, void, when)
 import Data.IORef (newIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
@@ -51,7 +52,7 @@ import Test.GLFW.Owner.Fixture.Drive
   , sampledObservation
   , theWindow
   )
-import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
+import Test.GLFW.Owner.Fixture.Fake (Fake (..), script, scriptAll, scriptSTM)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene (..), Scripted (..), journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig
   ( Rig (..)
@@ -78,7 +79,7 @@ import Test.GLFW.Support
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 import Test.GLFW.Support (Ending (..), Scope, cutExamples, ownedEnds, withDeferredThread, withDeferredThreadVia)
 import Data.Foldable (for_)
-import Test.Support.Owned (withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = do
@@ -100,6 +101,8 @@ spec = do
     for_ [-1 .. 2] $ \k →
       it ("finishes the exit on the supplier's evidence when the example body " <> label <> " at setup step " <> show k <> " of the completion fixture (#593)") $
         boundedExample (ownedEnds ending (completionSetupScenario k) False)
+  it "publishes a fixture's failure and its gate in one transaction, so a running owner never sees one without the other (#593)"
+    (boundedExample testScriptAllIsAtomic)
   cutExamples "the early fatal failure fixture" [0, 1] earlyFatalScenario
   cutExamples "the required failure fixture" [0, 1] requiredFailureEndedEarlyScenario
   cutExamples "the quiescence fixture" [0, 1] quiescenceScenario
@@ -211,6 +214,29 @@ earlyFatalWhileRetiring scenario cut = do
   raised `shouldBe` Scripted (Text.pack "fatal step")
   readTVarIO observedPhase `shouldReturn` OwnerRetiring
 
+-- | 'scriptAll' publishes every operation it is given in one transaction (#593).
+--
+-- A fixture that arms a failing step together with the gate it leads to, while the owner is already running, must never be seen
+-- half armed: an owner that met the failure before the gate would retire with the old callback and nothing would fill the gate's
+-- signal. An observer reads both operations in one transaction while the fixture re-arms them thousands of times; it never sees
+-- one new and the other old. (Publishing them with two 'script' calls fails this example.)
+testScriptAllIsAtomic ∷ IO ()
+testScriptAllIsAtomic = do
+  first ← newTVarIO (0 ∷ Int)
+  second ← newTVarIO (0 ∷ Int)
+  mixed ← newTVarIO (0 ∷ Int)
+  looks ← newTVarIO (0 ∷ Int)
+  let observe = forever $ atomically $ do
+        a ← readTVar first
+        b ← readTVar second
+        when (a /= b) (modifyTVar' mixed (+ 1))
+        modifyTVar' looks (+ 1)
+  withOwnedThread observe $ \_ _ → do
+    forM_ [1 .. 20000] $ \n →
+      scriptAll [scriptSTM first n, scriptSTM second n]
+    atomically (readTVar looks >>= check . (> 0))
+  readTVarIO mixed `shouldReturn` 0
+
 -- | An owner that ended without retirement evidence retains its dependencies,
 -- and its completion is never permission to dispose them.
 testCompletionWithoutEvidence ∷ IO ()
@@ -249,12 +275,13 @@ completionWithoutEvidence scope beforeBody endEarly = do
   -- The failing behaviour is armed only inside the body's first masked step, after the rescue has been registered (the supplier
   -- handed what it needs, the end of the body announced) (#593): until then the backend behaves, so a cancellation before the
   -- body begins leaves an exit with nothing to wait for.
-  let arm = do
-        script (fakeStep (rigFake rig)) $ \step →
-          if null (stepTargets step) then pure noStepWork else throwIO (Scripted (Text.pack "step"))
-        script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
-        script (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
-        script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
+  let arm = scriptAll
+        [ scriptSTM (fakeStep (rigFake rig)) $ \step →
+            if null (stepTargets step) then pure noStepWork else throwIO (Scripted (Text.pack "step"))
+        , scriptSTM (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
+        , scriptSTM (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
+        , scriptSTM (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
+        ]
   -- The thread supplies the independent evidence that lets the exit finish, so it is owned by the example and outlives the host
   -- body (#593). The fixture's destroy always fails, so even an exit with no attachment waits for the owner's destruction
   -- evidence: the supplier is handed the host and the owner as the very first step of the body, in the same masked step that
@@ -397,11 +424,14 @@ requiredFailureClosesAdmission scenario cut = do
   -- not the body's assertions held, so a failed assertion is reported rather than leaving the exit waiting at the gate. The
   -- owner is woken into the step that now fails.
   let arm owner = do
-        script (fakeStep (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "fatal step")))
-        script (fakeRetireOwner (rigFake rig)) $ \_ → do
-          putMVar retiring ()
-          atomically (readTVar release >>= check)
-          pure (ownerRetired (Text.pack "retired"))
+        -- ONE transaction: the failing step and the gate it leads to are visible to a running owner together.
+        scriptAll
+          [ scriptSTM (fakeRetireOwner (rigFake rig)) $ \_ → do
+              putMVar retiring ()
+              atomically (readTVar release >>= check)
+              pure (ownerRetired (Text.pack "retired"))
+          , scriptSTM (fakeStep (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "fatal step")))
+          ]
         demand ← prepare (OwnerDemand True Nothing)
         void (atomically (publishOwnerDemand (ownerHandoff owner) demand))
       run =

@@ -39,7 +39,7 @@ import Test.GLFW.Owner.Fixture.Drive
   , sampledObservation
   , theWindow
   )
-import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
+import Test.GLFW.Owner.Fixture.Fake (Fake (..), script, scriptAll, scriptSTM)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scripted (..), journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig
   ( Rig (..)
@@ -213,11 +213,12 @@ cancelledConstruction scenario cut = do
   -- a required failure takes the owner into its drain at once and the drain
   -- retires the target it kept.
   gate ← newTVarIO False
-  let arm = do
-        script (fakeConstruct (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "transfer")))
-        script (fakeRetireTarget (rigFake rig)) $ \retire → do
-          atomically (readTVar gate >>= check)
-          pure (targetRetired (Text.pack (show (retiringWindow retire))))
+  let arm = scriptAll
+        [ scriptSTM (fakeConstruct (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "transfer")))
+        , scriptSTM (fakeRetireTarget (rigFake rig)) $ \retire → do
+            atomically (readTVar gate >>= check)
+            pure (targetRetired (Text.pack (show (retiringWindow retire))))
+        ]
   -- The owner's disposition is required, so the failure it kept is terminal
   -- and the whole run reports it. What the example asserts is what the owner
   -- did with the target /before/ that: it kept it, and it retired it.

@@ -18,7 +18,7 @@ import qualified Data.Text as Text
 import Hetoimasia.Foundation.Worker (requestCancel)
 import Hetoimasia.Runtime.GLFW
 import Test.GLFW.Owner.Fixture.Drive (absorbing, handedOver, theWindow)
-import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
+import Test.GLFW.Owner.Fixture.Fake (Fake (..), scriptAll, scriptSTM)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig (Rig (..), armedBody, newRig, ownedHost)
 import Test.GLFW.Support (Scope, boundedExample, cutExamples)
@@ -54,18 +54,19 @@ repeatedCancellationFixture cut = do
   -- The owner is held inside a step, so the first cancellation is delivered at
   -- a wait rather than wherever it happens to land. Both holds are armed only inside the body's first masked step, after the
   -- release of their gate is registered (#593).
-  let arm = do
-        script (fakeStep (rigFake rig)) $ \_ → do
-          putMVar stepping ()
-          atomically (readTVar release >>= check)
-          pure noStepWork
-        -- Its whole-owner retirement absorbs every cancellation delivered to it and
-        -- finishes, which is the shape a real one has: a cancellation is not
-        -- permission to abandon retirement.
-        script (fakeRetireOwner (rigFake rig)) $ \_ → do
-          putMVar retiring ()
-          absorbing cancellations (atomically (readTVar release >>= check))
-          pure (ownerRetired (Text.pack "retired under cancellation"))
+  let arm = scriptAll
+        [ scriptSTM (fakeStep (rigFake rig)) $ \_ → do
+            putMVar stepping ()
+            atomically (readTVar release >>= check)
+            pure noStepWork
+        , -- Its whole-owner retirement absorbs every cancellation delivered to it and
+          -- finishes, which is the shape a real one has: a cancellation is not
+          -- permission to abandon retirement.
+          scriptSTM (fakeRetireOwner (rigFake rig)) $ \_ → do
+            putMVar retiring ()
+            absorbing cancellations (atomically (readTVar release >>= check))
+            pure (ownerRetired (Text.pack "retired under cancellation"))
+        ]
   terminal ← ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → armedBody cut arm (atomically (writeTVar release True)) $ do
     window ← theWindow host
     _ ← handedOver host owner window

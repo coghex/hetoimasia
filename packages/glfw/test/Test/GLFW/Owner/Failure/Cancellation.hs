@@ -27,7 +27,7 @@ import Test.GLFW.Owner.Fixture.Drive
   , pumpUntilRetired
   , theWindow
   )
-import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
+import Test.GLFW.Owner.Fixture.Fake (Fake (..), script, scriptAll, scriptSTM)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig (Rig (..), armedBody, newRig, ownedHost, ownedHostBeforeBody, publishAllFor)
 import Test.GLFW.Support
@@ -201,14 +201,15 @@ escapedConstruction scenario cut = do
   -- retires — and so forgets — the very target the standing is about.
   gate ← newTVarIO False
   -- Both behaviours are armed inside the body's first masked step, after the release of the gate is registered (#593).
-  let arm = do
-        script (fakeConstruct (rigFake rig)) $ \_ → do
-          atomically (writeTVar inside True)
-          atomically (readTVar never >>= check)
-          unexpected "the interrupted construction returned"
-        script (fakeRetireTarget (rigFake rig)) $ \retire → do
-          atomically (readTVar gate >>= check)
-          pure (targetRetired (Text.pack (show (retiringWindow retire))))
+  let arm = scriptAll
+        [ scriptSTM (fakeConstruct (rigFake rig)) $ \_ → do
+            atomically (writeTVar inside True)
+            atomically (readTVar never >>= check)
+            unexpected "the interrupted construction returned"
+        , scriptSTM (fakeRetireTarget (rigFake rig)) $ \retire → do
+            atomically (readTVar gate >>= check)
+            pure (targetRetired (Text.pack (show (retiringWindow retire))))
+        ]
   withOwnedThread (killInside rig inside) $ \_ _ → do
     (raised, _) ← caughtUnlessScenario scenario $
       ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (atomically (writeTVar gate True)) $ do
