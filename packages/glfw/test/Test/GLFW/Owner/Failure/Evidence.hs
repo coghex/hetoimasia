@@ -9,14 +9,14 @@ import Control.Concurrent.STM
   ( stateTVar
   , atomically
   , check
-  , modifyTVar'
   , newTVarIO
   , readTVar
   , readTVarIO
+  , throwSTM
   , writeTVar
   )
-import Control.Exception (finally, mask, mask_, throwIO, uninterruptibleMask_)
-import Control.Monad (forM_, forever, void, when)
+import Control.Exception (finally, mask, mask_, throwIO, try, uninterruptibleMask_)
+import Control.Monad (forM_, void, when)
 import Data.IORef (newIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
@@ -79,7 +79,7 @@ import Test.GLFW.Support
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 import Test.GLFW.Support (Ending (..), Scope, cutExamples, ownedEnds, withDeferredThread, withDeferredThreadVia)
 import Data.Foldable (for_)
-import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = do
@@ -218,24 +218,18 @@ earlyFatalWhileRetiring scenario cut = do
 --
 -- A fixture that arms a failing step together with the gate it leads to, while the owner is already running, must never be seen
 -- half armed: an owner that met the failure before the gate would retire with the old callback and nothing would fill the gate's
--- signal. An observer reads both operations in one transaction while the fixture re-arms them thousands of times; it never sees
--- one new and the other old. (Publishing them with two 'script' calls fails this example.)
+-- signal. The proof is by rollback, which needs no interleaving: the second step of the group raises inside the transaction, and
+-- the first step's write must have been rolled back with it. (Publishing the steps with separate transactions, as two 'script'
+-- calls do, leaves the first write behind and fails this example.)
 testScriptAllIsAtomic ∷ IO ()
 testScriptAllIsAtomic = do
   first ← newTVarIO (0 ∷ Int)
   second ← newTVarIO (0 ∷ Int)
-  mixed ← newTVarIO (0 ∷ Int)
-  looks ← newTVarIO (0 ∷ Int)
-  let observe = forever $ atomically $ do
-        a ← readTVar first
-        b ← readTVar second
-        when (a /= b) (modifyTVar' mixed (+ 1))
-        modifyTVar' looks (+ 1)
-  withOwnedThread observe $ \_ _ → do
-    forM_ [1 .. 20000] $ \n →
-      scriptAll [scriptSTM first n, scriptSTM second n]
-    atomically (readTVar looks >>= check . (> 0))
-  readTVarIO mixed `shouldReturn` 0
+  outcome ← try (scriptAll [scriptSTM first 1, throwSTM (Scripted (Text.pack "mid-group")), scriptSTM second 1])
+  outcome `shouldBe` Left (Scripted (Text.pack "mid-group"))
+  (,) <$> readTVarIO first <*> readTVarIO second `shouldReturn` (0, 0)
+  scriptAll [scriptSTM first 1, scriptSTM second 1]
+  (,) <$> readTVarIO first <*> readTVarIO second `shouldReturn` (1, 1)
 
 -- | An owner that ended without retirement evidence retains its dependencies,
 -- and its completion is never permission to dispose them.
