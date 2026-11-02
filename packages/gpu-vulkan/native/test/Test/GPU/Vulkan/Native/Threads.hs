@@ -7,6 +7,7 @@
 -- still waiting and joins it without being interruptible. Nothing here sleeps.
 module Test.GPU.Vulkan.Native.Threads
   ( onOtherThread
+  , withOtherThread
   , raceOwned
   ) where
 
@@ -17,9 +18,14 @@ import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 -- | Run the action on a thread of its own, wait for its answer, and answer it. The thread has ended, and been joined, when
 -- this returns, whether the answer was awaited to the end or the wait for it was cancelled or failed.
 onOtherThread ∷ IO a → IO a
-onOtherThread action = do
+onOtherThread action = withOtherThread action id
+
+-- | 'onOtherThread' with the wait handed to a body, which may do other things first, fail, or be cancelled before it waits:
+-- the thread has ended, and been joined, when this returns however the body ended.
+withOtherThread ∷ IO a → (IO a → IO b) → IO b
+withOtherThread action body = do
   answer ← newEmptyMVar
-  withOwnedThread (action >>= putMVar answer) (\_ _ → takeMVar answer)
+  withOwnedThread (action >>= putMVar answer) (\_ _ → body (takeMVar answer))
 
 -- | Start each action on a thread of its own, every one held at a gate until all are started, open the gate, and answer what
 -- each answered, in order. The threads are nested scopes, so each has ended, and been joined, when this returns however it

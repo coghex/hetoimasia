@@ -9,7 +9,7 @@ module Test.GPU.Vulkan.Native.Generations (spec) where
 import Control.Concurrent (ThreadId, killThread, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, fromException, try)
+import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, finally, fromException, try)
 import Control.Monad (forM_, void)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
@@ -19,6 +19,7 @@ import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked),
 import Numeric.Natural (Natural)
 import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), Instant, durationFromNanoseconds, maximumDuration, scriptedInstant)
 import Data.Foldable (for_)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Hetoimasia.GPU.Model
   ( Escalation (..)
   , NextTurn (..)
@@ -40,6 +41,7 @@ import Hetoimasia.GPU.Vulkan.Native.Naming (NativeObjectKind (..), imageViewName
 import Hetoimasia.GPU.Vulkan.Native.Presentation
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.StandIn
+import Test.GPU.Vulkan.Native.Unowned
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
@@ -721,6 +723,15 @@ spec = describe "Generations" $ do
           later ← swapchainCalls rig
           [call | call ← later, isDestroyedSwapchain call || isCreated call]
             `shouldBe` [CreatedSwapchain 100 10 (640, 480) Nothing, DestroyedSwapchain 100, CreatedSwapchain 101 10 (640, 480) Nothing]
+
+    describe "the stepper parked in a held creation and the killer aimed at it are owned (#595)" $
+      for_ endings $ \(label, ending) → do
+        it ("have ended and been joined when the scope returns because " <> label) $
+          steppedAndKilled ending ownedScope >>= (`shouldBe` True)
+        it ("negative control: unowned starts leave both when the scope returns because " <> label) $ do
+          cleanups ← newCleanups
+          -- The judgement is recorded first; only then is the hold released and the stepper and killer stopped and joined.
+          (steppedAndKilled ending (unownedScope cleanups) >>= (`shouldBe` False)) `finally` runCleanups cleanups
 
     describe "retains a candidate whose creation a cancellation interrupted inside the call, fails the session, and destroys none of it" $ do
       let interruptedAt at' = do
@@ -1480,3 +1491,26 @@ awaitThrowing thread =
   threadStatus thread >>= \case
     ThreadBlocked BlockedOnException → pure ()
     _ → yield >> awaitThrowing thread
+
+-- | The arrangement of the two examples that cancel a step parked in a held swapchain creation, ended the way the ending says
+-- in place of their own steps: the stepper (started in this kind of scope, with the hold's release as the scope's opening) is
+-- held inside the creation, the killer aimed at it is blocked sending the cancellation to a thread that cannot take it, and the
+-- scope ends there. The answer is whether, when the scope has returned, both have ended and been joined.
+steppedAndKilled ∷ Ending → Scope → IO Bool
+steppedAndKilled ending scope = do
+  rig ← newRig
+  gate ← newTVarIO False
+  script (rigStandIn rig) AtCreateSwapchain (HoldsUntil gate)
+  finished ← newEmptyMVar
+  seenThreads ← newIORef []
+  runEnding ending $ \end →
+    scope (atomically (writeTVar gate True)) (try @SomeException (stepAt rig 0 (seen 640 480)) >>= putMVar finished) $ \stepper _ → do
+      awaitCall (rigStandIn rig) (CreatedSwapchain 100 10 (640, 480) Nothing)
+      scope (pure ()) (killThread stepper) $ \killer _ → do
+        awaitThrowing killer
+        writeIORef seenThreads [stepper, killer]
+        end (pure ())
+  readIORef seenThreads >>= \threads → case threads of
+    [] → pure False
+    _ → and <$> mapM hasEnded threads
+

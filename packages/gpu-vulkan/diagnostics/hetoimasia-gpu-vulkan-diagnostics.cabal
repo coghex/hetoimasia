@@ -99,6 +99,7 @@ test-suite diagnostics-tests
         Test.GPU.Vulkan.Diagnostics.Outcome
         Test.GPU.Vulkan.Diagnostics.Spec
         Test.GPU.Vulkan.Diagnostics.Support
+        Test.GPU.Vulkan.Diagnostics.Unowned
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,

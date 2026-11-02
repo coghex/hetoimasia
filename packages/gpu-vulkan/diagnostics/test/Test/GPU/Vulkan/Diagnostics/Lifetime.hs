@@ -28,10 +28,12 @@ import Control.Exception
   , try
   )
 import Control.Exception.Context (getExceptionAnnotations)
+import Data.Foldable (for_)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import qualified Data.Text as Text
+import Test.GPU.Vulkan.Diagnostics.Unowned
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Hspec
   ( Spec
@@ -724,6 +726,15 @@ spec = describe "Lifetime" $ do
               -- saw it.
               verdictIssues verdict `shouldBe` [CaptureFailureLatched, CaptureFailures 1]
 
+    describe "the producer held after announcing itself, and the lifetime closing around it, are owned (#595)" $
+      for_ endings $ \(label, ending) → do
+        it ("have ended and been joined when the scope returns because " <> label) $
+          producerInHold ending ownedScope >>= (`shouldBe` True)
+        it ("negative control: unowned starts leave both when the scope returns because " <> label) $ do
+          cleanups ← newCleanups
+          -- The judgement is recorded first; only then is the hold released and the producer and the lifetime stopped and joined.
+          (producerInHold ending (unownedScope cleanups) >>= (`shouldBe` False)) `finally` runCleanups cleanups
+
     it "counts a report not yet begun when the lifetime ends, in memory that is still live" $ do
       (logger, _) ← recordingLogger everythingFilter
       hold ← newHold
@@ -864,3 +875,41 @@ spec = describe "Lifetime" $ do
       ( fromException failure
       , fmap (consumerName . verdictConsumer) (diagnosticVerdict failure)
       )
+
+-- | The arrangement of "includes in its verdict a producer that had announced itself when the body returned", ended the way
+-- the ending says in place of its own steps: the producer (started in this kind of scope, with the hold's release as the scope's
+-- opening) is held after announcing itself, the lifetime around it has begun closing and waits for it, and the scope ends there.
+-- The answer is whether, when the scope has returned, both have ended and been joined.
+producerInHold ∷ Ending → Scope → IO Bool
+producerInHold ending scope = do
+  (logger, _) ← recordingLogger everythingFilter
+  hold ← newHold
+  done ← newEmptyMVar
+  lifetime ← newEmptyMVar
+  handle ← newEmptyMVar
+  capCell ← newEmptyMVar
+  seenThreads ← newIORef []
+  let producer = do
+        capture ← readMVar capCell
+        offerAnnounced (captureUserData capture) hold SeverityWarning "announced" >> putMVar done ()
+      worker = do
+        result ←
+          try @SomeException $
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
+              putMVar capCell capture
+              bounded (waitUntil (holdArrived hold))
+              putMVar handle capture
+        putMVar lifetime result
+  runEnding ending $ \end →
+    scope (releaseHold hold) producer $ \announced _ →
+      scope (releaseHold hold) worker $ \closing _ → do
+        capture ← readMVar handle
+        bounded (waitUntil ((== Just True) <$> slotClosed (captureUserData capture)))
+        writeIORef seenThreads [announced, closing]
+        end (pure ())
+  readIORef seenThreads >>= \threads → case threads of
+    [] → pure False
+    _ → and <$> mapM hasEnded threads
+  where
+    waitUntil condition = condition >>= \ok → if ok then pure () else yield >> waitUntil condition
+

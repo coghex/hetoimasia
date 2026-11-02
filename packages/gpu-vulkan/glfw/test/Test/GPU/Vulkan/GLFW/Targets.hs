@@ -27,6 +27,7 @@ import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarI
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeException, catch, finally, fromException, throwIO, try)
 import Control.Monad (replicateM_, void)
 import Data.Foldable (for_)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
@@ -68,6 +69,7 @@ import Hetoimasia.Runtime.Supervision (RuntimeControl, checkRuntime)
 import Test.Support.Owned (withOwnedThreadOpening, withOwnedThread)
 import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
 import Test.GPU.Vulkan.GLFW.StandIn
+import Test.GPU.Vulkan.GLFW.Unowned
 import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldSatisfy)
 
 spec ∷ Spec
@@ -98,6 +100,13 @@ spec = describe "Offscreen scene targets (LFE-27)" $ do
     itBounded "releases what a target adopted when the owner's retirement failed at its first step, before it settled anything" testExitFailureStillSettles
     itBounded "discards a batch whose recording the owner's cancellation interrupted before its ticket reached the caller, and releases the revision it read" testCancelledRecording
     itBounded "completes an adoption's record, notification and watermark, and a release's removal and notifications, for an offscreen target whatever cancels the thread meanwhile" testLedgerCancellation
+    for_ endings $ \(label, ending) → do
+      itBounded ("owns the thread parked in an adoption's hook and the thrower aimed at it: both have ended and been joined when the scope returns because " <> label) $
+        adoptionCancelled ending ownedScope >>= (`shouldBe` True)
+      itBounded ("negative control: unowned starts leave both parked when the scope returns because " <> label) $ do
+        cleanups ← newCleanups
+        -- The judgement is recorded first; only then is the hook let go and the thread and its thrower stopped and joined.
+        (adoptionCancelled ending (unownedScope cleanups) >>= (`shouldBe` False)) `finally` runCleanups cleanups
 
   describe "a host with windows and targets" $ do
     itBounded "leaves a window's barrier entry, adoption and release order as they were with a target registered beside it, and names both in one request" testMixedHost
@@ -997,3 +1006,32 @@ composedUntil host control what done =
           if turnNumber (scheduledTurn turn) > 20000
             then failWith ("the loop never reached " <> what)
             else pure (ContinueWith NoUpdateDemand)
+
+-- | The arrangement of 'testLedgerCancellation''s first step, ended the way the ending says in place of its own steps: the
+-- adoption (started in this kind of scope, with the hook's gate as the scope's opening) is parked in its hook, which a scene
+-- transition holds where nothing can interrupt it, the thrower aimed at it is blocked until the transition ends, and the scope
+-- ends there. The answer is whether, when the scope has returned, both have ended and been joined.
+adoptionCancelled ∷ Ending → Scope → IO Bool
+adoptionCancelled ending scope = do
+  identity ← OffscreenTargetId <$> newUnique <*> pure 0
+  scenes ← newScenes False
+  atomically (registerSceneTarget scenes (TargetAdopter identity))
+  entered ← newEmptyMVar
+  proceed ← newProceedGate
+  seenThreads ← newIORef []
+  let lifecycle =
+        SceneLifecycle
+          { sceneAdopted = \_ _ _ → void (tryPutMVar entered ()) >> awaitProceed proceed
+          , sceneReleased = \_ _ → pure ()
+          }
+  runEnding ending $ \end →
+    scope (openProceed proceed) (void (try @SomeException (adoptScene scenes lifecycle 100 (TargetAdopter identity) (5 ∷ Scene) 3))) $ \adopting _ → do
+      takeMVar entered
+      scope (pure ()) (throwTo adopting (ErrorCall "cancelled")) $ \thrower _ → do
+        awaitSettled thrower
+        writeIORef seenThreads [adopting, thrower]
+        end (pure ())
+  readIORef seenThreads >>= \threads → case threads of
+    [] → pure False
+    _ → and <$> mapM hasEnded threads
+
