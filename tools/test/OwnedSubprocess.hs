@@ -34,6 +34,7 @@ import Control.Exception
   , getMaskingState
   , throwIO
   , try
+  , tryWithContext
   )
 import Control.Exception.Context (getExceptionAnnotations)
 import Control.Monad (forM_, void, when)
@@ -329,6 +330,11 @@ unownedStart process use = do
 
 type ProcessHandleOf = ProcessHandle
 
+-- | Does the raised exception retain the unconfirmed-reap diagnostic beside it?
+retainsUnconfirmedReap ∷ ExceptionWithContext e → Bool
+retainsUnconfirmedReap (ExceptionWithContext context _) =
+  any (\(RetainedFailure label text) → "cleanup was not confirmed" `isInfixOf` label && "not reaped" `isInfixOf` text) (getExceptionAnnotations context)
+
 retainsBodyFailure ∷ Either (ExceptionWithContext SomeException) () → Bool
 retainsBodyFailure = \case
   Left (ExceptionWithContext context _) →
@@ -622,6 +628,35 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
          in withScopedChildUsing quick {boundReap = 100000} seams (childSpec hangCatcher (shell obedientAlone [])) (\child → writeIORef seen (Just child) >> awaitReady child >> boom)
       outcome `shouldSatisfy` cancellation
       outcome `shouldSatisfy` retainsBodyFailure
+      -- The unconfirmed reap is retained beside the cancellation too.
+      outcome `shouldSatisfy` either retainsUnconfirmedReap (const False)
+      readIORef seen >>= mapM_ (\child → awaitUnreapedExit child (30 * 1000000) >> waitForProcess (childProcess child))
+
+    it "retains the unconfirmed reap beside the body's own failure, which is still raised as itself" $ do
+      seen ← newIORef Nothing
+      let seams = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing}
+      outcome ← tryWithContext @Boom (withScopedChildUsing quick {boundReap = 100000} seams (childSpec hangCatcher (shell obedientAlone [])) (\child → writeIORef seen (Just child) >> awaitReady child >> boom))
+      case outcome of
+        Left raised@(ExceptionWithContext _ Boom) → raised `shouldSatisfy` retainsUnconfirmedReap
+        Right () → expectationFailure "the body's failure was not raised"
+      readIORef seen >>= mapM_ (\child → awaitUnreapedExit child (30 * 1000000) >> waitForProcess (childProcess child))
+
+    it "retains the unconfirmed reap beside a failure of the acquisition after the child exists" $ do
+      seen ← newIORef Nothing
+      let seams = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing, seamSpawned = \handle → writeIORef seen (Just handle) >> boom}
+      outcome ← tryWithContext @Boom (withScopedChildUsing quick {boundReap = 100000} seams (childSpec hangCatcher (shell obedientAlone [])) (\_ → pure ()))
+      case outcome of
+        Left raised@(ExceptionWithContext _ Boom) → raised `shouldSatisfy` retainsUnconfirmedReap
+        Right () → expectationFailure "the acquisition's failure was not raised"
+      readIORef seen >>= mapM_ (\handle → void (waitForProcess handle))
+
+    it "names the unconfirmed reap in the failure of a run bound that passed" $ do
+      seen ← newIORef Nothing
+      let seams = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing}
+      outcome ← try @SubprocessFailure (withScopedChildUsing quick {boundReap = 100000} seams (childSpec (Within 1000000) (shell obedientAlone [])) (\child → writeIORef seen (Just child) >> awaitReady child >> holdUntilEnded))
+      case outcome of
+        Left (SubprocessFailure message) → (message `shouldContain` "run bound of 1 s") >> (message `shouldContain` "not reaped")
+        Right () → expectationFailure "a run bound that passed with an unconfirmed reap passed"
       readIORef seen >>= mapM_ (\child → awaitUnreapedExit child (30 * 1000000) >> waitForProcess (childProcess child))
 
     it "raises the body's own failure, not the unconfirmed cleanup, when the body failed" $ do
