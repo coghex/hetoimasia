@@ -19,7 +19,7 @@
 -- library call could not truthfully fail, and have none.
 module OwnedSubprocess (spec, ownerMain, ownerVariable) where
 
-import Control.Concurrent (myThreadId, throwTo, yield)
+import Control.Concurrent (myThreadId, threadDelay, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -37,7 +37,7 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Exception.Context (getExceptionAnnotations)
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, forever, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
@@ -942,7 +942,13 @@ outerTermination mode = do
       Line text | ("child" : pid : _) ← words text → pure (CPid (read pid))
       other → expectationFailure ("the owner did not say what its child was: " <> show other) >> pure 0
     -- The owner leads the group it was started in. Ended from outside, it cannot run the facility's release.
-    signalProcessGroup sigKILL (childPid ownerChild)
+    killed ← try @IOException (signalProcessGroup sigKILL (childPid ownerChild))
+    case killed of
+      Left failure → do
+        status ← waitChild ownerChild (30 * 1000000)
+        said ← restOfOutput ownerChild Stderr (30 * 1000000)
+        expectationFailure ("the test-owner process had already ended before it was ended from outside (" <> show failure <> "; status " <> show status <> "; it said " <> show said <> ")")
+      Right () → pure ()
     void (waitChild ownerChild (30 * 1000000))
     pure (child, childPid ownerChild)
 
@@ -987,5 +993,6 @@ ownerMain mode = do
     awaitReady child
     putStrLn ("child " <> show (childPid child))
     hFlush stdout
-    -- Parked until ended from outside; the owner never gets to run the facility's release.
-    void getLine
+    -- Parked until ended from outside; the owner never gets to run the facility's release. It waits on nothing but the clock, so nothing
+    -- about its standard input (an end of file, a closed pipe) can end it before the example does.
+    forever (threadDelay 1000000)
