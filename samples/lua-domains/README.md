@@ -732,3 +732,14 @@ refused requests (`Replay`); D-23's qualification, its negative controls and the
 executable's options, their exit statuses and the distinctions of the final digest (`Options`); and the files of the record and replay options, with exclusive creation, symbolic links, a competing creation and an interrupted write (`Files`). The helpers the suite and the
 probe share (the boundary, the fake UI clock, the test-only namespace, the generated log and the disturbances) are the private
 library `lua-domains-fixtures`, so neither imports the other's sources.
+
+Every thread an example or a helper starts is an owned thread (#600, `Test.Support.Owned`): it has ended and been joined when the
+scope that needed it returns, however that scope ends. `alongside` and `cancelWhen` run their side and their trigger in owned
+scopes. `spawn` and `forkRegistered` start their threads inside the scope `withForks`, which the suite wraps around every
+example (`around_`): a supervisor thread, itself owned, starts each child in a facility scope of its own that stays open until the
+example's scope ends, so the child is registered in the step that starts it, a cancellation that arrives while it starts or while
+`reapForked` ends the children leaves every child owned, and a child leaves the registry only once it has ended and its
+uncollected failure has been looked at. The examples are in `Accounting` (`--match '#600'`): each helper's thread ended and joined
+whether the example fails or is cancelled, a thread that cancels its creator as its first step, a reap cancelled midway, the
+failure kept across it, and a negative control that applies the same judgement to an unowned start and must fail
+(`Test.Domains.Unowned`).

@@ -64,6 +64,10 @@ module Hetoimasia.GLFW.Session
   , SessionConfig (..)
   , defaultSessionConfig
   , Backend (..)
+  , InitializationDeadline (..)
+  , InitializationExpiry (..)
+  , initializationTimeoutStatus
+  , reportGrace
 
     -- * Native error evidence
   , Reports (..)
@@ -110,6 +114,8 @@ import Hetoimasia.GLFW.Internal.Session
   , IntegrationRefused (..)
   , IntegrationStillInstalled (..)
   , IntegrationUse (..)
+  , InitializationDeadline (..)
+  , InitializationExpiry (..)
   , Session
   , SessionConfig (..)
   , SessionIntegration
@@ -121,7 +127,9 @@ import Hetoimasia.GLFW.Internal.Session
   , defaultSessionConfig
   , errorDescriptionLimit
   , errorEvidenceCapacity
+  , reportGrace
   , glfwComponent
+  , initializationTimeoutStatus
   , readIntegrationUse
   , sessionAssembly
   , sessionAssemblyWith
@@ -153,7 +161,8 @@ withSession config = withScoped (allocSession config)
 -- refused there with 'IntegrationRefused' — handed to GLFW between the
 -- initialization hints and @glfwInit@, and GLFW's default loader search is
 -- restored after termination or a failed initialization, before the guard is
--- settled. 'SessionConfig' is unchanged and carries no part of it; a
+-- settled. 'SessionConfig' carries no part of it (its only action is the
+-- application's initialization-deadline report); a
 -- window-only session makes no loader call at all. See
 -- "Hetoimasia.GLFW.Internal.Session"'s /Loader-aware sessions/ section and
 -- @docs/glfw.md@.

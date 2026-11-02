@@ -247,6 +247,9 @@ data NativeCall
   | FreeErrorCallback
   | SetInitHints Backend
   | Initialize
+  | ExitProcess Int
+    -- ^ The initialization deadline expired and the process was asked to end
+    -- with this status. The seam records it and returns; production does not.
   | QueryPlatform
   | ResolveConnectionProbe
     -- ^ A Wayland session resolved its connection-status probe at entry.
@@ -963,6 +966,7 @@ seamNative seam =
     , nativeInitialize = do
         record Initialize
         scriptInitialize script reporter
+    , nativeExitProcess = record . ExitProcess
     , nativeCurrentBackend = do
         record QueryPlatform
         scriptReportedPlatform script <$> readIORef (seamHinted seam)

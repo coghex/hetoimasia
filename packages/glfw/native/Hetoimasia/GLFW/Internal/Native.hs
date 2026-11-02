@@ -138,7 +138,8 @@ productionNative =
     , nativeSetInitHints = \backend → do
         c_glfwInitHint glfwPlatformHint (platformCode backend)
         c_glfwInitHint glfwCocoaChdirResources glfwFalse
-    , nativeInitialize = (== glfwTrue) <$> c_glfwInit
+    , nativeInitialize = (== glfwTrue) <$> c_hetoimasiaGlfwInit
+    , nativeExitProcess = exitProcessNow
     , nativeCurrentBackend = platformBackend <$> c_glfwGetPlatform
     , nativeConnectionProbe = resolveConnectionProbe
     , nativeTerminate = c_glfwTerminate
@@ -660,8 +661,19 @@ foreign import ccall "wrapper"
 foreign import capi safe "hetoimasia_glfw.h glfwInitHint"
   c_glfwInitHint ∷ CInt → CInt → IO ()
 
-foreign import capi safe "hetoimasia_glfw.h glfwInit"
-  c_glfwInit ∷ IO CInt
+-- The initializer is a safe call: the process main thread stays inside it for
+-- as long as GLFW does, and the initialization deadline's timer thread must
+-- keep running meanwhile.
+foreign import capi safe "hetoimasia_glfw.h hetoimasia_glfw_init"
+  c_hetoimasiaGlfwInit ∷ IO CInt
+
+-- | @_exit@: ends the process at once, without unwinding, running an exit
+-- handler or flushing a buffer, and without a thread's cooperation.
+foreign import ccall unsafe "_exit"
+  c_exit ∷ CInt → IO ()
+
+exitProcessNow ∷ Int → IO ()
+exitProcessNow status = c_exit (fromIntegral status)
 
 foreign import capi safe "hetoimasia_glfw.h glfwGetPlatform"
   c_glfwGetPlatform ∷ IO CInt
