@@ -39,7 +39,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct`
   runs LUA-15's confinement probe. It is local evidence, not a routine check:
   its validation group `test.macos-confinement` is optional, no CI runs it, and
-  its components are not built off Darwin. A pull-request request block must
+  its components are not built off Darwin. The library owns its two threads (an endpoint's
+  backlog thread and a launched helper's output reader) with `base` alone, and
+  `Test.MacOS.Ownership` (`--test-options='--match "#598"'`) judges both. A pull-request request block must
   name neither it nor `all-hspec`. Read
   [its verdict](archive/macos_confinement_verdict.md) before building on it — the
   answer is `inconclusive`.
@@ -98,9 +100,19 @@ cabal test hetoimasia-tests --test-show-details=direct
   that report the suite's whole construction record. Run one component with
   `--test-options='--match <Component>'` on the suite that owns it; a selector
   that matches no example fails the suite rather than reporting a silent pass.
+  Every thread this suite starts is owned (#598): started through
+  `Test.Support.Owned`, with the gates an example alone opens let go by the registered stop,
+  except the `detached` runner and the two starts of the `Reentry` examples, which run inside
+  an owner that may be trapped in a `safe` foreign call and stay in the guard's baseline with
+  their reason recorded at the start. The regression examples for the helpers that start
+  threads, with a negative control each, are `Test.Lua.Ownership`
+  (`--test-options='--match "#598"'`).
   `lua-runtime-tests` (`packages/scripting-lua/runtime-lua-test/`, composed by
   `Test.LuaRuntime.Spec`, group `test.scripting-lua-runtime`) owns the runtime
-  adapter's examples: readiness, identity, submission and its bounds,
+  adapter's examples (every thread the suite starts is owned, #598: the example bound
+  `Test.LuaRuntime.Support.boundedAfter` ends and joins its watchdog and interrupter before it
+  returns, and the regression examples with their negative controls are
+  `Test.LuaRuntime.Ownership`, `--test-options='--match "#598"'`): readiness, identity, submission and its bounds,
   settlement, host failures, stop, independent owners, and the refused reply
   wait from a Lua callback, with real VMs under a real `withSupervision`, the module loader hosted on a scheduled
   owner (`Test.LuaRuntime.Loading`, `--match 'module loader on a scheduled owner'`, LFE-9; its `placed roots` examples are
