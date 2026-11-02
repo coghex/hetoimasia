@@ -62,7 +62,7 @@ module Test.GLFW.Support
   , retainedAs
   ) where
 
-import Control.Concurrent (ThreadId)
+import Control.Concurrent (ThreadId, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception
@@ -201,7 +201,10 @@ withMainThreadKeepingContext seam open action body = do
 -- and gives the body the thread and the handing-over. For an injector whose target is known only inside a callback (a hook
 -- that runs masked on the owner): started from the callback, its scope would end, and kill it, while it was still waiting to
 -- deliver to a target that stays masked; started here, around the whole run, it lives until its exception has been delivered
--- and is stopped and joined when the scope ends, delivered or not. The handing-over never blocks.
+-- and is stopped and joined when the scope ends, delivered or not. The handing-over never blocks. It yields once after handing
+-- over: a thread forked in the middle of an example is scheduled soon (the runtime asks for a context switch when it forks),
+-- but one that is woken from a wait is only queued, and an example that goes on to loop without blocking on one capability
+-- would otherwise never let the thread run before its own bound ran out.
 withDeferredThread ∷ (a → IO ()) → (ThreadId → (a → IO ()) → IO r) → IO r
 withDeferredThread = withDeferredThreadOpening (pure ())
 
@@ -211,7 +214,7 @@ withDeferredThread = withDeferredThreadOpening (pure ())
 withDeferredThreadOpening ∷ IO () → (a → IO ()) → (ThreadId → (a → IO ()) → IO r) → IO r
 withDeferredThreadOpening open work body = do
   handed ← newEmptyMVar
-  withOwnedThreadOpening open (takeMVar handed >>= work) $ \thread _ → body thread (void . tryPutMVar handed)
+  withOwnedThreadOpening open (takeMVar handed >>= work) $ \thread _ → body thread (\target → void (tryPutMVar handed target) >> yield)
 
 -- | The typed failure an action raised, beside the exception as caught.
 caughtAs ∷ Exception e ⇒ IO a → IO (e, SomeException)
