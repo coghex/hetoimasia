@@ -9,7 +9,7 @@
 -- own copy.
 module Test.Engine.Console.Spec (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (finally, throwIO, try)
 import Control.Monad (forM_)
@@ -35,6 +35,7 @@ import Test.Hspec
   , shouldNotContain
   , shouldStartWith
   )
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Console" $ do
@@ -254,13 +255,15 @@ testExitCancellation = do
   entered ← newEmptyMVar
   held ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ try (exitOnFailure (putMVar entered () >> takeMVar held)) >>= putMVar outcome
-  takeMVar entered
-  killThread runner
-  takeMVar outcome >>= (`shouldBe` Left cancellationExitCode)
-  -- Keeps the path's MVar reachable, so its block is a cancellation point
-  -- rather than a deadlock the runtime could resolve on its own.
-  putMVar held ()
+  -- The path runs on a thread this example owns (#600): it is ended and joined with the example however the example ends.
+  -- It waits at an interruptible take, so the kill the scope delivers ends it without anything being opened.
+  withOwnedThread (try (exitOnFailure (putMVar entered () >> takeMVar held)) >>= putMVar outcome) $ \runner _ → do
+    takeMVar entered
+    killThread runner
+    takeMVar outcome >>= (`shouldBe` Left cancellationExitCode)
+    -- Keeps the path's MVar reachable, so its block is a cancellation point
+    -- rather than a deadlock the runtime could resolve on its own.
+    putMVar held ()
 
 -- | A usage or configuration @die@ keeps its own status.
 testExitPassthrough ∷ IO ()

@@ -6,7 +6,7 @@
 -- would print, and the line is absent. Nothing sleeps.
 module Test.Engine.Run.Compose (spec) where
 
-import Control.Concurrent (forkIO, myThreadId, threadDelay, throwTo)
+import Control.Concurrent (threadDelay, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forever, void, when)
 import qualified Data.ByteString as ByteString
@@ -38,6 +38,7 @@ import System.Posix.Files (createSymbolicLink)
 import Test.Engine.Run.Support
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain, shouldSatisfy)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 -- | Every one of these lines was printed, in any order: the roles' inits are dispatched together.
 shouldInclude ∷ [Text] → [Text] → Expectation
@@ -399,7 +400,6 @@ stops = describe "stops and signals" $ do
     ended ← newTVarIO False
     started ← newEmptyMVar
     result ← newEmptyMVar
-    caller ← newEmptyMVar
     let held = newSessionLinkEndingWith (readTVar ended)
         launching =
           withResource (pure ()) (\_ → ioError (userError "launch cleanup failed")) $ \_ → do
@@ -415,22 +415,23 @@ stops = describe "stops and signals" $ do
             , setupReport = \_ → pure ()
             , setupLaunch = \_ _ _ _ → launching
             }
-    _ ← forkIO $ do
-      myThreadId >>= putMVar caller
-      outcome ← withFolder [("hetoimasia.json", commonManifest), ("main.lua", lua (entry logic))] $ \folder →
-        tryWithContext @SomeException (runGame setup quietFilter folder)
-      putMVar result outcome
-    me ← takeMVar caller
-    takeMVar started
-    -- The launch failed, and the command is now joining the writer, which is held: interrupt it there.
-    blockedFor BlockedOnSTM me
-    throwTo me UserInterrupt
-    atomically (writeTVar ended True)
-    bounded (takeMVar result) >>= \case
-      Left (ExceptionWithContext context failure) → do
-        (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
-        concatMap displayCleanupFailure (cleanupFailuresInContext context) `shouldSatisfy` isInfixOf "launch"
-      Right _ → expectationFailure "the cancellation was lost"
+        caller = do
+          outcome ← withFolder [("hetoimasia.json", commonManifest), ("main.lua", lua (entry logic))] $ \folder →
+            tryWithContext @SomeException (runGame setup quietFilter folder)
+          putMVar result outcome
+    -- The command runs on a thread this example owns (#600). Its diagnostics writer is held at 'ended', which only the example
+    -- opens, so the scope opens it (idempotently) before it kills and joins the caller on every way out.
+    withOwnedThreadOpening (atomically (writeTVar ended True)) caller $ \me _ → do
+      takeMVar started
+      -- The launch failed, and the command is now joining the writer, which is held: interrupt it there.
+      blockedFor BlockedOnSTM me
+      throwTo me UserInterrupt
+      atomically (writeTVar ended True)
+      bounded (takeMVar result) >>= \case
+        Left (ExceptionWithContext context failure) → do
+          (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+          concatMap displayCleanupFailure (cleanupFailuresInContext context) `shouldSatisfy` isInfixOf "launch"
+        Right _ → expectationFailure "the cancellation was lost"
 
   it "abandons the boot work on a signal, runs nothing authored, and is 130" $ do
     gate ← newEmptyMVar

@@ -70,7 +70,16 @@ cabal test hetoimasia-tests --test-show-details=direct
   request and the optional validation's record, the composition over real temporary content with no
   graphics (roles, failures, boot refusals, stops), the built executable's usage, help and boot
   refusals, and the suite's own binary as a child under real signals. None acquires a native session, reads consent or opens a
-  window. A
+  window. Every helper thread these examples start is an owned thread (#600, `Test.Support.Owned`): the callers of
+  the production scope and the senders that interrupt them, the writers queued in a held sink, the scenario thread beside the
+  command, the 32 clients of the signal coordinator's overlap example and the runner of the console's exit path are ended and
+  joined when the example's scope returns, whether the example returned, failed or was cancelled. A thread held at a gate only
+  the example opens has the gate opened by the scope (`withOwnedThreadOpening`), and a thread that supplies what an exit needs
+  (a sender, the scenario that signals the command) is in a scope that encloses that exit. Four shapes have regressions that
+  run twice with one judgement, through the facility and through the deliberately unowned start of `Test.Engine.Unowned`
+  (the negative control, which must fail): a caller parked in the queued callback before it is armed, with its sender and the
+  production session it started; a caller held uninterruptibly by the child it asked to stop; and the 32 signal clients held
+  at their start gate. Select them with `--test-options='--match "#600"'`. A
   new runtime example belongs in `runtime-tests`, beside that component's own
   helpers; a headless GLFW example belongs in `glfw-tests`, and one that needs a
   real native session in `glfw-native-tests`; a console example belongs in root
@@ -139,6 +148,24 @@ cabal test hetoimasia-tests --test-show-details=direct
   or `--match 'Logging lifetime'` select runtime subgroups as they did at root,
   and on `glfw-tests` the GLFW group names, such as `--match 'GLFW session'`,
   select what they selected at root or in the removed window-examples executable.
+- Every helper thread the `foundation-tests`, `runtime-tests` and `asset-image-tests`
+  suites start is an owned start through `Test.Support.Owned` (#597): however the scope
+  that needed it ends (a return, a failed assertion, a timeout of the example, a
+  cancellation) the thread has ended and been joined before the scope returns, and a
+  thread held at a gate only the example can open (an uninterruptible release, a
+  worker parked behind a hook) is let go by the same release, before the kill. A gate
+  opener or observer that supplies what a surrounding exit needs in order to finish
+  encloses that exit. Each suite's helpers are scoped (`withOwner`, `withWaiter`,
+  `withChild`, `withObserving`, `withOpenWhenWaiting`, ...), and each family has an
+  example that ends the scope by a failing body and by a cancellation and judges the
+  thread, with a negative control that applies the same judgement to the previous
+  unowned start and must fail. They are selected, on `foundation-tests`, by
+  `--match 'The owner helper'`, `--match 'The runner of a production scope'`,
+  `--match 'The masked runner'` and `--match 'The waiter helper'`, and on
+  `runtime-tests` by `--match 'The gate opener'`. The controls keep their one raw start
+  in `Test.Foundation.OwnedControl` and `Test.Runtime.OwnedControl`, exempt by binding
+  (see [validation.md](validation.md#the-owned-start-guard)). A new thread in these
+  suites is started through the facility, as the guard requires.
 - `workflow-tests` (`tools/test/`, group `test.workflow`) owns the contracts of
   the workflow tooling and, since #584 and #588, the shared owned-thread and
   owned-subprocess facilities and the guard that keeps test sources using them.

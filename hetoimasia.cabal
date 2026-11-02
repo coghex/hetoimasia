@@ -286,6 +286,7 @@ test-suite hetoimasia-tests
         Test.Engine.Console.Lua.Process
         Test.Engine.Console.Lua.Signals
         Test.Engine.Console.Lua.Status
+        Test.Engine.Unowned
     ghc-options: -threaded -rtsopts
     build-tool-depends: hetoimasia:hetoimasia
     if flag(full-product)
