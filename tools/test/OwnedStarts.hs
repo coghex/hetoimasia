@@ -203,6 +203,64 @@ spec = describe "The unowned-start guard (tools/validation/owned_starts.py)" $ d
       onePassed `shouldBe` False
       oneErrors `shouldContain` "1 unowned thread or process start(s)"
 
+  -- One row of the scanner's audit against Haskell's syntax (the table in the pull request): either the scanner reads the
+  -- construct correctly, with a fixture, or it rejects the file with a clear error. Nothing in the table is passed silently.
+  describe "the scanner against Haskell's syntax" $ do
+    let found (n ∷ Int) = (False, show n <> " unowned thread or process start(s)")
+        clean = (True, "")
+        rejected reason = (False, reason)
+        rows ∷ [(String, [String], (Bool, String))]
+        rows =
+          [ ("layout: a semicolon after an import does not hide the declaration that follows it", ["module Main where", "  import Control.Concurrent; main = forkIO (pure ()) >> pure ()"], found 1)
+          , ("layout: semicolon-separated imports, one spanning lines, then a declaration on the same line", ["module Main where", "  import A (a,", "    b); import B; main = forkIO (pure ())"], found 1)
+          , ("layout: an import list that mentions a primitive is not a start, with or without a semicolon", ["module Main where", "  import Control.Concurrent (forkIO); import System.Process (createProcess)", "  main :: IO ()", "  main = pure ()"], clean)
+          , ("explicit braces: a module body in braces is rejected", ["module Main where {", "  import Control.Concurrent; main = forkIO (pure ()) }"], rejected "explicit braces")
+          , ("nested block comments: a primitive inside nested comments is not a start", ["main :: IO ()", "main = pure () {- outer {- forkIO -} still comment forkOS -}"], clean)
+          , ("nested block comments: code after the comments closes is read", ["main :: IO ()", "main = pure () {- a {- b -} c -} >> forkIO (pure ()) >> pure ()"], found 1)
+          , ("string literals: escapes and string gaps hide nothing and show nothing", ["s :: String", "s = \"a \\\" forkIO \\\\\" ++ \"x\\", "  \\y forkOS\"", "main :: IO ()", "main = forkIO (pure ()) >> pure ()"], found 1)
+          , ("character literals: a quote character does not open a string", ["c :: Char", "c = '\"'", "main :: IO ()", "main = forkIO (pure ()) >> pure ()"], found 1)
+          , ("character literals: a primed name and an escaped quote are not literals", ["f' :: Int", "f' = 1", "q :: Char", "q = '\\''", "main :: IO ()", "main = forkIO (pure ()) >> pure ()"], found 1)
+          , ("multi-line strings: rejected", ["s :: String", "s = \"\"\"", "forkIO", "\"\"\"", "main :: IO ()", "main = pure ()"], rejected "multi-line string")
+          , ("CPP: both branches of a conditional and a macro that names a primitive are counted", ["#if FLAG", "main = forkIO (pure ())", "#else", "main = forkOS (pure ())", "#endif", "#define STARTER forkIO"], found 3)
+          , ("Template Haskell: a file that enables it and names no primitive is accepted", ["{-# LANGUAGE TemplateHaskell #-}", "main :: IO ()", "main = pure ()"], clean)
+          , ("Template Haskell: a file that enables it and names a primitive is rejected", ["{-# LANGUAGE TemplateHaskell #-}", "main :: IO ()", "main = forkIO (pure ())"], rejected "TemplateHaskell is on and the source names forkIO")
+          , ("quasi-quotes: a file that enables them and names a primitive, even in a comment, is rejected", ["{-# LANGUAGE QuasiQuotes #-}", "-- forkIO", "main :: IO ()", "main = pure ()"], rejected "QuasiQuotes is on and the source names forkIO")
+          , ("qualified and aliased imports: a call through the alias is a start", ["import qualified Control.Concurrent as C", "main :: IO ()", "main = C.forkIO (pure ()) >> pure ()"], found 1)
+          , ("qualified imports: the full module path is a start too", ["main :: IO ()", "main = Control.Concurrent.forkOS (pure ()) >> pure ()"], found 1)
+          , ("backticks: an infix use is a start", ["main :: IO ()", "main = pure () `forkIO` pure ()"], found 1)
+          , ("operator sections: a section and a bare reference are starts", ["main :: IO ()", "main = mapM_ (forkIO $) [] >> mapM_ (`forkOS` undefined) []"], found 2)
+          , ("operators and longer names: not starts", ["forkIOLater :: Int", "forkIOLater = 1", "(-->) :: Int -> Int -> Int", "a --> b = a + b", "main :: IO ()", "main = pure ()"], clean)
+          ]
+    forM_ rows $ \(label, body, expected) →
+      it label $ do
+        (passed, errors) ← checked (tree plainConfig [] [("pkg/test/Main.hs", unlines body)])
+        passed `shouldBe` fst expected
+        errors `shouldContain` snd expected
+
+    it "rejects a source of a kind it does not read, in a scanned directory" $ do
+      (passed, errors) ← checked (tree plainConfig [] [("pkg/test/Main.hs", source ["main :: IO ()", "main = pure ()"]), ("pkg/test/Lit.lhs", "> main = forkIO (pure ())\n")])
+      passed `shouldBe` False
+      errors `shouldContain` "pkg/test/Lit.lhs: a source of a kind the scanner does not read"
+
+    it "rejects a package description that turns on Template Haskell for components it scans" $ do
+      let extra = [("pkg/pkg.cabal", packageDescription <> "    default-extensions: TemplateHaskell\n")]
+      (passed, errors) ← checked (replacing (tree plainConfig [] [("pkg/test/Main.hs", source ["main :: IO ()", "main = pure ()"])]) extra)
+      passed `shouldBe` False
+      errors `shouldContain` "TemplateHaskell is not supported by the scanner"
+
+    it "writes no bytecode beside its sibling modules when run in isolated mode, as the tests and the runner run it" $ do
+      checkout ← getCurrentDirectory
+      withSystemTempDirectory "hetoimasia-owned-bytecode" $ \copy → do
+        modules ← filter (".py" `isSuffixOf`) <$> listDirectory (checkout </> "tools/validation")
+        createDirectoryIfMissing True (copy </> "tools/validation")
+        forM_ modules $ \name → copyFile (checkout </> "tools/validation" </> name) (copy </> "tools/validation" </> name)
+        withTree (tree plainConfig [] [("pkg/test/Main.hs", source ["main :: IO ()", "main = pure ()"])]) $ \fixture → do
+          settings ← sanitizedEnvironment
+          -- No PYTHONDONTWRITEBYTECODE: the guard has to switch it off itself, since -I ignores the variable anyway.
+          (result, _, errors) ← run settings copy "python3" ["-I", "-W", "error", copy </> "tools/validation/owned_starts.py", "--root", fixture, "check"]
+          (result, errors) `shouldBe` (ExitSuccess, "")
+          listDirectory (copy </> "tools/validation") >>= (`shouldNotContain` ["__pycache__"])
+
   describe "which sources are scanned" $ do
     it "covers a test suite declared later without editing the guard's configuration" $ do
       let extra =
@@ -475,7 +533,7 @@ spec = describe "The unowned-start guard (tools/validation/owned_starts.py)" $ d
 
     it "selects the workflow group for an ordinary test-source change outside it, a source-directory declaration and the baseline" $ inCheckout $ \checkout → do
       settings ← sanitizedEnvironment
-      files ← lines <$> git settings checkout ["ls-files", "*.cabal", "cabal.project*", "tools/validation/catalog.json"]
+      files ← lines <$> git settings checkout ["-c", "safe.directory=*", "ls-files", "*.cabal", "cabal.project*", "tools/validation/catalog.json"]
       let changedPaths =
             [ "packages/foundation/test/Test/Foundation/Time/Spec.hs"
             , "packages/scripting-lua/hazard-test/Main.hs"

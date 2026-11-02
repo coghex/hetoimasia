@@ -39,6 +39,10 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
+# A one-shot tool must not write into the checkout it is validating (this directory is a policy root, and the runner refuses
+# a checkout that has gained a file in it). `python3 -I` ignores PYTHONDONTWRITEBYTECODE, so the switch is made here, before
+# the imports that would leave a `__pycache__` beside the sibling modules.
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from plan_cabal import load_packages  # noqa: E402
@@ -85,20 +89,27 @@ class GuardError(Exception):
     """A configuration or tree the guard cannot read; never a finding."""
 
 
+class Unsupported(Exception):
+    """Syntax the scanner cannot read with the certainty a guard needs. It is reported as a problem and fails the check:
+    the guard rejects what it cannot see rather than passing it."""
+
+
 # --------------------------------------------------------------------------
 # Reading Haskell: what is code
 
 
-def blank_non_code(text: str) -> str:
+def blank_non_code(text: str, pragmas: list[str] | None = None) -> str:
     """The source with comments, string literals and character literals replaced by spaces.
 
     Newlines and columns are kept, so a line number and an indentation in the result are the source's. Block comments nest.
-    A line comment starts at a run of two or more dashes that is not part of a longer operator.
+    A line comment starts at a run of two or more dashes that is not part of a longer operator. The text of every pragma
+    (a block comment that opens with ``{-#``) is appended to ``pragmas`` when it is given.
     """
     out: list[str] = []
     index = 0
     length = len(text)
     depth = 0
+    pragma_start = -1
     while index < length:
         char = text[index]
         pair = text[index : index + 2]
@@ -111,12 +122,17 @@ def blank_non_code(text: str) -> str:
                 depth -= 1
                 out.append("  ")
                 index += 2
+                if depth == 0 and pragma_start >= 0:
+                    if pragmas is not None:
+                        pragmas.append(text[pragma_start:index])
+                    pragma_start = -1
             else:
                 out.append("\n" if char == "\n" else " ")
                 index += 1
             continue
         if pair == "{-":
             depth = 1
+            pragma_start = index if text[index : index + 3] == "{-#" else -1
             out.append("  ")
             index += 2
             continue
@@ -133,6 +149,8 @@ def blank_non_code(text: str) -> str:
                 index = end
                 continue
         if char == '"':
+            if text[index : index + 3] == '"""':
+                raise Unsupported("a multi-line string literal (three double quotes) is not supported by the scanner")
             end = index + 1
             while end < length:
                 current = text[end]
@@ -174,17 +192,23 @@ def blank_non_code(text: str) -> str:
 MODULE_HEADER = re.compile(r"\A\s*module\b.*?\bwhere\b", re.DOTALL)
 
 
+IMPORT_KEYWORD = re.compile(r"import(?![A-Za-z0-9_'])")
+
+
 def body_column(code: str) -> int:
     """The column the top-level declarations of the module sit at: Haskell's layout rule for the module body.
 
     That is the column of the first token after the header's ``where``, or of the first token of a file with no header.
-    It is column zero in almost every file, but a valid module may indent its whole body.
+    It is column zero in almost every file, but a valid module may indent its whole body. A body in explicit braces has no
+    such column, and the scanner does not read it: it is rejected.
     """
     header = MODULE_HEADER.match(code)
     rest = code[header.end() :] if header else code
     offset = header.end() if header else 0
     for match in re.finditer(r"\S", rest):
         position = offset + match.start()
+        if code[position] == "{":
+            raise Unsupported("a module body in explicit braces is not supported by the scanner; use the layout rule")
         return position - (code.rfind("\n", 0, position) + 1)
     return 0
 
@@ -193,20 +217,51 @@ def blank_declarations(code: str) -> str:
     """The code with import declarations and the module header (with its export list) replaced by spaces.
 
     A declaration starts at a line indented no further than the module body's column, and the more deeply indented lines
-    after it belong to it. What an import or an export list mentions is not a start.
+    after it belong to it. An import ends at the next declaration or at a semicolon outside its parentheses, and what follows
+    that semicolon on the line is code again: ``import M; main = forkIO x`` has a start. What an import or an export list
+    mentions is not a start.
     """
     header = MODULE_HEADER.match(code)
     if header:
         code = "".join("\n" if c == "\n" else " " for c in code[: header.end()]) + code[header.end() :]
     column = body_column(code)
     lines = code.split("\n")
-    blank = False
+    importing = False
+    depth = 0
     for number, line in enumerate(lines):
-        if line.strip():
-            if len(line) - len(line.lstrip()) <= column:
-                blank = line.lstrip().startswith("import ")
-        if blank:
-            lines[number] = " " * len(line)
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        position = 0
+        if indent <= column:
+            importing = False
+            position = indent
+        characters = list(line)
+        while True:
+            if not importing:
+                if IMPORT_KEYWORD.match(line, position) and (indent <= column or position > indent):
+                    importing = True
+                    depth = 0
+                else:
+                    break
+            ended = False
+            while position < len(line):
+                character = line[position]
+                characters[position] = " "
+                position += 1
+                if character == "(":
+                    depth += 1
+                elif character == ")":
+                    depth -= 1
+                elif character == ";" and depth <= 0:
+                    ended = True
+                    break
+            if not ended:
+                break
+            importing = False
+            while position < len(line) and line[position].isspace():
+                position += 1
+        lines[number] = "".join(characters)
     return "\n".join(lines)
 
 
@@ -226,10 +281,37 @@ def primitive_pattern(primitives: list[str]) -> re.Pattern[str]:
     return re.compile(r"(?<![A-Za-z0-9_'])(?:[A-Z][A-Za-z0-9_']*\.)*(" + names + r")(?![A-Za-z0-9_'])")
 
 
+UNREADABLE_EXTENSIONS = ("TemplateHaskell", "QuasiQuotes")
+SOURCE_KINDS_NOT_READ = (".lhs", ".hsc", ".chs", ".hs-boot", ".cpphs", ".gc", ".x", ".y", ".ly")
+
+
+def enables_unreadable_extension(pragmas: list[str]) -> str | None:
+    """The first of Template Haskell and quasi-quotation that a pragma of the source turns on, if any."""
+    for pragma in pragmas:
+        for name in UNREADABLE_EXTENSIONS:
+            if re.search(r"(?<![A-Za-z0-9_])" + name + r"(?![A-Za-z0-9_])", pragma):
+                return name
+    return None
+
+
 def find_sites(path: str, text: str, primitives: list[str]) -> list[Site]:
     """Every start primitive called in one source file, with the top-level binding it is in."""
-    code = blank_declarations(blank_non_code(text))
-    column = body_column(code)
+    pragmas: list[str] = []
+    readable = blank_non_code(text, pragmas)
+    extension = enables_unreadable_extension(pragmas)
+    if extension is not None:
+        # A splice builds code from an expression and a quasi-quote is text of any shape between its bars, so neither can be
+        # read the way ordinary code is. Such a file is accepted only when it names no start primitive anywhere, comments and
+        # strings included; one that does is rejected. A splice that assembles a primitive's name from pieces is not seen.
+        named = primitive_pattern(primitives).search(text)
+        if named:
+            raise Unsupported(
+                f"{extension} is on and the source names {named.group(1)}: the scanner cannot tell code from quoted text there; "
+                "move the start out of the file (or out of the splice's reach)"
+            )
+        return []
+    column = body_column(readable)
+    code = blank_declarations(readable)
     pattern = primitive_pattern(primitives)
     sites: list[Site] = []
     binding: str | None = None
@@ -342,6 +424,37 @@ def scanned_files(root: str, directories: dict[str, str]) -> dict[str, str]:
     return found
 
 
+def unreadable_scope_problems(root: str, directories: dict[str, str]) -> list[str]:
+    """What the scanned directories hold that the scanner cannot read: source kinds other than plain Haskell, and a package
+    description that turns on Template Haskell or quasi-quotation for its components."""
+    tree = WorkTree(root)
+    problems: list[str] = []
+    for path in sorted(tree.files()):
+        if not path.endswith(SOURCE_KINDS_NOT_READ):
+            continue
+        if any(path.startswith(directory + "/" if directory else "") for directory in directories):
+            problems.append(f"{path}: a source of a kind the scanner does not read (only plain .hs files are)")
+    try:
+        packages = load_packages(tree, required=True)
+    except PlannerError as error:
+        raise GuardError(str(error)) from error
+    for package in packages.values():
+        prefix = package.directory.rstrip("/") + "/" if package.directory not in ("", ".") else ""
+        if not any(directory.startswith(prefix) for directory in directories):
+            continue
+        if not tree.exists(package.cabal_path):
+            continue
+        for number, line in enumerate(tree.read(package.cabal_path).splitlines(), start=1):
+            if line.lstrip().startswith("--"):
+                continue
+            for name in UNREADABLE_EXTENSIONS:
+                if re.search(r"(?<![A-Za-z0-9_])" + name + r"(?![A-Za-z0-9_])", line):
+                    problems.append(
+                        f"{package.cabal_path}:{number}: {name} is not supported by the scanner, and this package has scanned components"
+                    )
+    return problems
+
+
 # --------------------------------------------------------------------------
 # The scan
 
@@ -359,6 +472,7 @@ def scan(root: str) -> Scan:
     config = load_config(root)
     directories, problems = scanned_directories(root, config)
     files = scanned_files(root, directories)
+    problems.extend(unreadable_scope_problems(root, directories))
     exempt = {(entry["file"], entry["binding"]): entry for entry in config["exempt"]}
     seen: dict[tuple[str, str], int] = {}
     counts: dict[str, int] = {}
@@ -367,7 +481,12 @@ def scan(root: str) -> Scan:
         with open(os.path.join(root, path), encoding="utf-8") as handle:
             text = handle.read()
         remaining: list[Site] = []
-        for site in find_sites(path, text, config["primitives"]):
+        try:
+            found_sites = find_sites(path, text, config["primitives"])
+        except Unsupported as error:
+            problems.append(f"{path}: {error}")
+            continue
+        for site in found_sites:
             key = (path, site.binding or "")
             if site.binding is not None and key in exempt:
                 seen[key] = seen.get(key, 0) + 1
