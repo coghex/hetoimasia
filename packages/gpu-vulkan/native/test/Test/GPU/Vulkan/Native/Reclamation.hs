@@ -11,7 +11,7 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Reclamation (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Concurrent (killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, throwIO, toException, try)
@@ -22,6 +22,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model
@@ -137,10 +138,10 @@ spec = describe "Allocation recovery" $ do
       -- The construction runs on the owner's thread, this one; the
       -- cancellation comes from another once the retry is under way.
       owner ← myThreadId
-      _ ← forkIO (takeMVar started >> killThread owner >> putMVar never ())
-      atRetry ← retryRaising rig recording (putMVar started () >> takeMVar never)
-      raisedBy (createReadback (rigRecording rig) readbackBytes) `shouldReturn` ThreadKilled
-      atRetry >>= givenBack rig before
+      withOwnedThread (takeMVar started >> killThread owner >> putMVar never ()) $ \_ _ → do
+        atRetry ← retryRaising rig recording (putMVar started () >> takeMVar never)
+        raisedBy (createReadback (rigRecording rig) readbackBytes) `shouldReturn` ThreadKilled
+        atRetry >>= givenBack rig before
 
     it "gives the reservation back when the reclamation pass is cancelled, which it re-raises" $ do
       (rig, recording) ← rigWithRecording 1
@@ -151,13 +152,13 @@ spec = describe "Allocation recovery" $ do
       Roots.script (rigRootsStandIn rig) Roots.AtDestroySwapchain (Roots.WaitsInterruptibly gate)
       allocatorOutOfMemory recording 1
       owner ← myThreadId
-      _ ← forkIO (Roots.awaitCall (rigRootsStandIn rig) (Roots.DestroyedSwapchain oldSwapchain) >> killThread owner >> atomically (writeTVar gate True))
-      raisedBy (createReadback (rigRecording rig) readbackBytes) `shouldReturn` ThreadKilled
-      readbacks recording `shouldReturn` 1
-      -- The pass released nothing: its one destruction never returned.
-      after ← usage <$> modelOf rig
-      usageAllocations after `shouldBe` usageAllocations before
-      (usageBytes after, usageObjects after) `shouldBe` (usageBytes before, usageObjects before)
+      withOwnedThreadOpening (atomically (writeTVar gate True)) (Roots.awaitCall (rigRootsStandIn rig) (Roots.DestroyedSwapchain oldSwapchain) >> killThread owner >> atomically (writeTVar gate True)) $ \_ _ → do
+        raisedBy (createReadback (rigRecording rig) readbackBytes) `shouldReturn` ThreadKilled
+        readbacks recording `shouldReturn` 1
+        -- The pass released nothing: its one destruction never returned.
+        after ← usage <$> modelOf rig
+        usageAllocations after `shouldBe` usageAllocations before
+        (usageBytes after, usageObjects after) `shouldBe` (usageBytes before, usageObjects before)
 
     it "escalates a disposal that failed and permits no retry, however much else the pass reclaimed" $ do
       (rig, recording) ← rigWithRecording 2

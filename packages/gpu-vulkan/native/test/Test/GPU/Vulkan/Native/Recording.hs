@@ -10,7 +10,7 @@
 module Test.GPU.Vulkan.Native.Recording (spec) where
 
 import Control.Arrow ((&&&))
-import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Concurrent (killThread, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, throwIO, try)
@@ -126,6 +126,8 @@ import Test.GPU.Vulkan.Native.StandIn
   , standardRequest
   , surfaceNumbered
   )
+import Test.GPU.Vulkan.Native.Threads (onOtherThread)
+import Test.Support.Owned (withOwnedThread)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -246,9 +248,7 @@ spec = describe "Recording" $ do
       discardBatch (rigRecording rig) batch `shouldReturn` Left (RefusedMisuse (AlreadyConsumed BatchIdentity))
       nativeCount rig `shouldReturn` resets
       resets `shouldBe` before + 1
-      answer ← newEmptyMVar
-      _ ← forkIO (discardBatch (rigRecording rig) batch >>= putMVar answer)
-      takeMVar answer `shouldReturn` Left RefusedNotOwner
+      onOtherThread (discardBatch (rigRecording rig) batch) `shouldReturn` Left RefusedNotOwner
 
     it "refuses a recorder kept past its consumer's scope, and runs the consumer exactly once" $ do
       rig ← newRig
@@ -366,19 +366,19 @@ spec = describe "Recording" $ do
       -- comes from another, which also keeps the consumer's MVar reachable so
       -- the runtime cannot mistake the wait for a deadlock.
       owner ← myThreadId
-      _ ← forkIO (takeMVar started >> killThread owner >> putMVar never ())
-      outcome ← try @SomeException $ recorded rig frame $ \recorder → do
-        enterRendering recorder
-        ok (bindPipeline recorder (kitPipelineHandle kit))
-        putMVar started ()
-        takeMVar never
-      fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
-      [view] ← atomically (readBatches (rigRecording rig))
-      viewBatchStanding view `shouldSatisfy` \case
-        BatchPartial reason → "a cancellation ended the consumer" `Text.isPrefixOf` reason
-        _ → False
-      model ← modelOf rig
-      recordedOf model (kitPipeline kit) `shouldBe` [viewBatch view]
+      withOwnedThread (takeMVar started >> killThread owner >> putMVar never ()) $ \_ _ → do
+        outcome ← try @SomeException $ recorded rig frame $ \recorder → do
+          enterRendering recorder
+          ok (bindPipeline recorder (kitPipelineHandle kit))
+          putMVar started ()
+          takeMVar never
+        fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
+        [view] ← atomically (readBatches (rigRecording rig))
+        viewBatchStanding view `shouldSatisfy` \case
+          BatchPartial reason → "a cancellation ended the consumer" `Text.isPrefixOf` reason
+          _ → False
+        model ← modelOf rig
+        recordedOf model (kitPipeline kit) `shouldBe` [viewBatch view]
 
     it "leaves a batch whose consumer left rendering open partial, unsealed and owned" $ do
       rig ← newRig
@@ -900,18 +900,18 @@ spec = describe "Recording" $ do
       started ← newEmptyMVar
       never ← newEmptyMVar
       owner ← myThreadId
-      _ ← forkIO (takeMVar started >> killThread owner >> putMVar never ())
-      outcome ← try @SomeException $ recorded rig frame $ \recorder → do
-        enterRendering recorder
-        ok (bindPipeline recorder (kitPipelineHandle kit))
-        putMVar started ()
-        takeMVar never
-      fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
-      [view] ← atomically (readBatches (rigRecording rig))
-      viewBatchStanding view `shouldSatisfy` \case
-        BatchPartial reason → "a cancellation ended the consumer" `Text.isPrefixOf` reason
-        _ → False
-      nativeOf rig `shouldReturn'` \calls → labelBalance calls `shouldBe` 0
+      withOwnedThread (takeMVar started >> killThread owner >> putMVar never ()) $ \_ _ → do
+        outcome ← try @SomeException $ recorded rig frame $ \recorder → do
+          enterRendering recorder
+          ok (bindPipeline recorder (kitPipelineHandle kit))
+          putMVar started ()
+          takeMVar never
+        fmap (const ()) outcome `shouldSatisfy` either (const True) (const False)
+        [view] ← atomically (readBatches (rigRecording rig))
+        viewBatchStanding view `shouldSatisfy` \case
+          BatchPartial reason → "a cancellation ended the consumer" `Text.isPrefixOf` reason
+          _ → False
+        nativeOf rig `shouldReturn'` \calls → labelBalance calls `shouldBe` 0
 
     it "closes every open label when a command failed and the consumer returned, and still refuses to seal" $ do
       rig ← newNamingRig
@@ -1176,9 +1176,7 @@ spec = describe "Recording" $ do
       exhaust rig
       createBuffer (rigRecording rig) (BufferDescription StagingBuffer 64) `shouldReturn` Left (RefusedBackpressure ObjectBudget)
       createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1) `shouldReturn` Left (RefusedBackpressure ObjectBudget)
-      answer ← newEmptyMVar
-      _ ← forkIO (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1) >>= putMVar answer)
-      takeMVar answer `shouldReturn` Left RefusedNotOwner
+      onOtherThread (createImage (rigRecording rig) (ImageDescription TextureImage Rgba8Srgb 16 16 1)) `shouldReturn` Left RefusedNotOwner
       allocatorCalls (allocatorOf rig) `shouldReturn` []
       nativeOf rig `shouldReturn'` \calls → [() | call ← calls, not (isQuery call)] `shouldBe` []
 
@@ -1421,12 +1419,10 @@ spec = describe "Recording" $ do
       live ← created (createBuffer (rigRecording rig) (BufferDescription VertexBuffer 64))
       frame ← acquired rig
       before ← nativeCount rig
-      stranger ← newEmptyMVar
       (_, (foreignAnswer, releasedAnswer, kept)) ← recorded rig frame $ \recorder → do
         foreignAnswer ← transitionResource recorder foreign' (FromUse GeometryRead) TransferWrite
         releasedAnswer ← transitionResource recorder released (FromUse GeometryRead) TransferWrite
-        _ ← forkIO (transitionResource recorder released (FromUse GeometryRead) GeometryRead >>= putMVar stranger)
-        strangerAnswer ← takeMVar stranger
+        strangerAnswer ← onOtherThread (transitionResource recorder released (FromUse GeometryRead) GeometryRead)
         strangerAnswer `shouldBe` Left RefusedNotOwner
         pure (foreignAnswer, releasedAnswer, recorder)
       (foreignAnswer, releasedAnswer) `shouldBe` (Left (RefusedMisuse (ForeignIdentity ResourceIdentity)), Left (RefusedMisuse (WrongPhase ResourceIdentity)))

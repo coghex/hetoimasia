@@ -18,8 +18,8 @@
 -- device is lost natively and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Terminal (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId, threadDelay)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (killThread, myThreadId, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, throwSTM, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), Exception, SomeException, fromException, mask, throwIO, toException, try)
 import Control.Monad (forM_, join, void, when)
@@ -28,6 +28,8 @@ import Data.List (nub)
 import Data.Maybe (fromMaybe, isJust)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text (Text)
+import Test.GPU.Vulkan.Native.Threads (onOtherThread)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotReturn, shouldReturn, shouldSatisfy, shouldThrow)
 import Test.Support.Bounded (bounded)
 
@@ -175,12 +177,13 @@ spec = describe "Terminal failure" $ do
       seen ← newEmptyMVar
       holdNextClaim capture $ do
         reportValidationError capture
-        answered ← newEmptyMVar
-        _ ← forkIO $ do
-          answer ← checkpointRoots (rigRoots rig)
-          latched ← reportPrimary <$> atomically (readRootsTerminal (rigRoots rig))
-          putMVar answered (answer, latched)
-        takeMVar answered >>= putMVar seen
+        onOtherThread
+          ( do
+              answer ← checkpointRoots (rigRoots rig)
+              latched ← reportPrimary <$> atomically (readRootsTerminal (rigRoots rig))
+              pure (answer, latched)
+          )
+          >>= putMVar seen
       loseFrameStep (rigStandIn rig) AtQueryFence
       progress rig `raises` \loss → lostDuring loss == "vkGetFenceStatus"
       -- That checkpoint latched nothing and refused.
@@ -214,14 +217,14 @@ spec = describe "Terminal failure" $ do
       release ← newEmptyMVar
       -- The claimant rolls its transaction back and carries on, never reaching
       -- another checkpoint of its own.
-      _ ← forkIO (abandonClaim rig >> putMVar abandoned () >> takeMVar release)
-      bounded (takeMVar abandoned)
-      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointClear
-      reportValidationError capture
-      checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed TerminalValidationError
-      evidenceOf rig `shouldReturn` []
-      putMVar release ()
-      clean rig
+      withOwnedThreadOpening (void (tryPutMVar release ())) (abandonClaim rig >> putMVar abandoned () >> takeMVar release) $ \_ _ → do
+        bounded (takeMVar abandoned)
+        checkpointRoots (rigRoots rig) `shouldReturn` CheckpointClear
+        reportValidationError capture
+        checkpointRoots (rigRoots rig) `shouldReturn` CheckpointFailed TerminalValidationError
+        evidenceOf rig `shouldReturn` []
+        putMVar release ()
+        clean rig
 
     it "keeps a sink failure that arrived behind an abandoned claim pending until it publishes, and orders a later failure of the owner's own behind it" $ do
       rig ← newRig
@@ -315,45 +318,47 @@ spec = describe "Terminal failure" $ do
       -- The sink's worker has claimed first place and not yet published why.
       -- The presentation's record finds that out inside its transaction, and a
       -- cancellation is then aimed at the owner and held there, waiting.
-      looks ← newIORef (0 ∷ Int)
-      let published = do
-            look ← atomicModifyIORef' looks (\count → (count + 1, count))
-            if look == 0
-              then do
-                owner ← myThreadId
-                killer ← forkIO (killThread owner)
-                awaitThrowing killer
-                pure Nothing
-              else pure (Just "the sink is gone")
-      atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure (SinkFirst published))))
-      -- The presentation runs on the owner's thread, which the cancellation is
-      -- aimed at; one still pending when it returns is delivered, and caught,
-      -- just after.
-      (presented, after) ← mask $ \restore → do
-        presented ← try @SomeException (restore (presentFrame (rigFrames rig) (ownedFrame frame)))
-        after ← try @SomeException (restore (pure ()))
-        pure (presented, after)
-      [failure | Left failure ← [void presented, after]] `shouldSatisfy` \case
-        [cancellation] → fromException cancellation == Just ThreadKilled
-        [effect, cancellation] → isJust (fromException @FrameEffectUncertain effect) && fromException cancellation == Just ThreadKilled
-        _ → False
-      -- The record is whole: the frame and its synchronization are uncertain,
-      -- admission is closed, the sink failure is the primary and the owner's
-      -- uncertain effect is kept beside it.
-      standingOf rig (ownedFrame frame) `shouldReturn'` (`shouldSatisfy` maybe False uncertainStage)
-      [PoolView _ number pool] ← atomically (readPool (rigFrames rig))
-      poolFenceState pool `shouldSatisfy` \case
-        FenceUncertain _ → True
-        _ → False
-      poolRenderedState pool `shouldSatisfy` \case
-        SemaphoreUncertain _ → True
-        _ → False
-      primaryIs rig (== TerminalSinkFailed "the sink is gone")
-      evidenceOf rig `shouldReturn'` (`shouldSatisfy` any (\case LaterFailure (TerminalUncertainEffect _) → True; _ → False))
-      refusedPrimary rig `shouldReturn` Just (TerminalSinkFailed "the sink is gone")
-      settleAll rig
-      retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames' _ _ pools) → frames' == [ownedFrame frame] && pools == [number]
-      clean rig
+      owner ← myThreadId
+      armed ← newEmptyMVar
+      withOwnedThread (takeMVar armed >> killThread owner) $ \killer _ → do
+        looks ← newIORef (0 ∷ Int)
+        let published = do
+              look ← atomicModifyIORef' looks (\count → (count + 1, count))
+              if look == 0
+                then do
+                  putMVar armed ()
+                  awaitThrowing killer
+                  pure Nothing
+                else pure (Just "the sink is gone")
+        atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure (SinkFirst published))))
+        -- The presentation runs on the owner's thread, which the cancellation is
+        -- aimed at; one still pending when it returns is delivered, and caught,
+        -- just after.
+        (presented, after) ← mask $ \restore → do
+          presented ← try @SomeException (restore (presentFrame (rigFrames rig) (ownedFrame frame)))
+          after ← try @SomeException (restore (pure ()))
+          pure (presented, after)
+        [failure | Left failure ← [void presented, after]] `shouldSatisfy` \case
+          [cancellation] → fromException cancellation == Just ThreadKilled
+          [effect, cancellation] → isJust (fromException @FrameEffectUncertain effect) && fromException cancellation == Just ThreadKilled
+          _ → False
+        -- The record is whole: the frame and its synchronization are uncertain,
+        -- admission is closed, the sink failure is the primary and the owner's
+        -- uncertain effect is kept beside it.
+        standingOf rig (ownedFrame frame) `shouldReturn'` (`shouldSatisfy` maybe False uncertainStage)
+        [PoolView _ number pool] ← atomically (readPool (rigFrames rig))
+        poolFenceState pool `shouldSatisfy` \case
+          FenceUncertain _ → True
+          _ → False
+        poolRenderedState pool `shouldSatisfy` \case
+          SemaphoreUncertain _ → True
+          _ → False
+        primaryIs rig (== TerminalSinkFailed "the sink is gone")
+        evidenceOf rig `shouldReturn'` (`shouldSatisfy` any (\case LaterFailure (TerminalUncertainEffect _) → True; _ → False))
+        refusedPrimary rig `shouldReturn` Just (TerminalSinkFailed "the sink is gone")
+        settleAll rig
+        retireTargetFrames (rigFrames rig) (rigTarget rig) `raises` \(FramesRetained _ frames' _ _ pools) → frames' == [ownedFrame frame] && pools == [number]
+        clean rig
 
     it "keeps a validation error reported during a call as the primary when that call then returns the device's loss" $ do
       rig ← newRig
@@ -559,15 +564,18 @@ spec = describe "Terminal failure" $ do
       -- The sink claimed first place, and its worker is delayed before it
       -- publishes why; no checkpoint could have read it.
       published ← newTVarIO Nothing
-      _ ← forkIO $ do
-        threadDelay 50000
-        atomically (writeTVar published (Just "the sink is gone"))
-      exhaustRecoveryAfter rig required $
-        atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure (SinkFirst (readTVarIO published)))))
-      primaryIs rig (== TerminalSinkFailed "the sink is gone")
-      evidenceOf rig `shouldReturn` []
-      viewCondition <$> generationsOn rig required `shouldNotReturn` RecoverySpent
-      clean rig
+      withOwnedThread
+        ( do
+            threadDelay 50000
+            atomically (writeTVar published (Just "the sink is gone"))
+        )
+        $ \_ _ → do
+        exhaustRecoveryAfter rig required $
+          atomically (watchRootsDiagnosticsOrdered (rigRoots rig) (DiagnosticWatch (pure []) (pure (SinkFirst (readTVarIO published)))))
+        primaryIs rig (== TerminalSinkFailed "the sink is gone")
+        evidenceOf rig `shouldReturn` []
+        viewCondition <$> generationsOn rig required `shouldNotReturn` RecoverySpent
+        clean rig
 
     it "orders a validation error that claimed first place ahead of the exhaustion it preceded, though no checkpoint could read it yet" $ do
       rig ← newRigClassed [RequiredTarget, OptionalTarget] defaultBudgetRequest

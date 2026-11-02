@@ -6,7 +6,7 @@
 -- answered, never a time. Nothing here creates a Vulkan object.
 module Test.GPU.Vulkan.Native.Roots (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically, newTVarIO, writeTVar)
 import Control.Exception (AsyncException, Exception, SomeException, fromException, try)
@@ -41,6 +41,7 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.StandIn
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -115,16 +116,16 @@ spec = describe "Roots" $ do
       gate ← newTVarIO False
       script standIn AtCreateMessenger (HoldsUntil gate)
       finished ← newEmptyMVar
-      starter ← forkIO (try @SomeException (startRoots roots standardRequest) >>= putMVar finished)
-      awaitCall standIn CreatedMessenger
-      _ ← forkIO (killThread starter)
-      atomically (writeTVar gate True)
-      _ ← takeMVar finished
-      view ← atomically (readRootsView roots)
-      viewMessenger view `shouldBe` RootLive
-      _ ← retireRoots roots
-      _ ← destroyRoots roots
-      reverse . take 2 . reverse <$> calls standIn `shouldReturn` [DestroyedMessenger, DestroyedInstance]
+      withOwnedThreadOpening (atomically (writeTVar gate True)) (try @SomeException (startRoots roots standardRequest) >>= putMVar finished) $ \starter _ → do
+        awaitCall standIn CreatedMessenger
+        withOwnedThread (killThread starter) $ \_ _ → do
+          atomically (writeTVar gate True)
+          _ ← takeMVar finished
+          view ← atomically (readRootsView roots)
+          viewMessenger view `shouldBe` RootLive
+          _ ← retireRoots roots
+          _ ← destroyRoots roots
+          reverse . take 2 . reverse <$> calls standIn `shouldReturn` [DestroyedMessenger, DestroyedInstance]
 
   describe "optional validation (LFE-28)" $ do
     let khronos = "VK_LAYER_KHRONOS_validation"
@@ -373,16 +374,16 @@ spec = describe "Roots" $ do
       gate ← newTVarIO False
       target ← admitted roots RequiredTarget (surfaceWaiting standIn 10 gate)
       finished ← newEmptyMVar
-      retiring ← forkIO (try @SomeException (retireRootTarget roots target) >>= putMVar finished)
-      awaitCall standIn (DestroyedSurface 10)
-      killThread retiring
-      outcome ← takeMVar finished
-      outcome `shouldSatisfy` either (isJust . fromException @AsyncException) (const False)
-      targets ← atomically (readRootTargets roots)
-      map targetViewUncertain targets `shouldSatisfy` all isJust
-      atomically (writeTVar gate True)
-      raised @SurfaceDestructionFailed (retireRootTarget roots target) `shouldReturn` True
-      surfacesDestroyed standIn `shouldReturn` [10]
+      withOwnedThreadOpening (atomically (writeTVar gate True)) (try @SomeException (retireRootTarget roots target) >>= putMVar finished) $ \retiring _ → do
+        awaitCall standIn (DestroyedSurface 10)
+        killThread retiring
+        outcome ← takeMVar finished
+        outcome `shouldSatisfy` either (isJust . fromException @AsyncException) (const False)
+        targets ← atomically (readRootTargets roots)
+        map targetViewUncertain targets `shouldSatisfy` all isJust
+        atomically (writeTVar gate True)
+        raised @SurfaceDestructionFailed (retireRootTarget roots target) `shouldReturn` True
+        surfacesDestroyed standIn `shouldReturn` [10]
 
     it "retains the messenger and the instance behind a device whose destruction failed, and never retries it" $ do
       (standIn, roots) ← started

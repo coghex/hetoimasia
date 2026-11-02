@@ -697,7 +697,7 @@ any other way, and its message names the facility that fits the kind of start.
   header are not code, so they are not sites; qualified calls are.
 - **A per-file count ratchet.** `tools/validation/owned_starts_baseline.json`
   records, per file, how many unowned starts it had when the guard was introduced
-  (382 in 124 files: the 552 found when the guard was introduced plus the three
+  (266 in 95 files: the 552 found when the guard was introduced plus the three
   starts `tools/test/RunnerIdentity.hs` brought, written by
   `owned_starts.py bootstrap`, less the 24 thread starts of the
   root run and console suites and the `lua-domains` sample that #600 converted (the `Run`
@@ -714,7 +714,12 @@ any other way, and its message names the facility that fits the kind of start.
   thread starts of the headless Vulkan suites it converted (`diagnostics-tests`, `native-tests`,
   `integration-tests`, `render-2d-vulkan-tests` and the `allocator-parity-probe`), and the three
   starts of the integration suite's example bound, `Bound.hs`, left the baseline as audited
-  helpers (below). Each file's count
+  helpers (below). #598 then removed the 68 thread starts of the `lua-host-tests` and
+  `lua-runtime-tests` suites and the Linux confinement probe's two it converted, and the two
+  starts of the macOS probe library left as audited helpers (below); the three it deferred
+  (`Test.Lua.Support.detached` and the two starts of `Test.Lua.Reentry`, which run inside an
+  owner that may be trapped in a `safe` foreign call, so joining them would hang the example
+  whose bound exists to fail) stay, their reason recorded at each start. Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven
@@ -766,6 +771,16 @@ any other way, and its message names the facility that fits the kind of start.
   joins uninterruptibly) and `terminateProcess` (writes one line, waited for a second at
   most, after which its caller ends the whole process with `_Exit`, so it is not joined by
   design). A new raw start in `Bound.hs` is counted as any other.
+  The probe library `macos-probe` may not depend on the test-support facility (only test
+  suites do), so its two thread starts are owned with `base` alone and exempt by binding,
+  one start each (#598): `withEndpointSeamed` (an endpoint's backlog thread, started in the
+  masked step that registers its stop-and-join, waiting through the runtime on a non-blocking
+  socket so that the kill ends the wait, and joined, not interruptibly, before the descriptor
+  it waits on is closed) and `withLaunch` (a launched helper's output reader, started in the
+  masked step that registers its stop-and-join and joined, not interruptibly, before the
+  launch's scope returns). Their regression examples are `Test.MacOS.Ownership`, in
+  `macos-confinement-probe`, which runs where the library builds. A new raw start in
+  `Launch.hs` is counted as any other.
 - **Selection.** The guard's inputs are every scanned source directory and every
   package description, listed as inputs of `test.workflow` in the catalog, beside
   `tools/validation/` (the script, its configuration and its baseline). An

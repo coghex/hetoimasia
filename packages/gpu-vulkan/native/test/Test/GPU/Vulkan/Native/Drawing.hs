@@ -12,8 +12,6 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Drawing (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), throwIO, try)
 import Control.Monad (when)
@@ -22,6 +20,7 @@ import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
+import Test.GPU.Vulkan.Native.Threads (onOtherThread)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model (HoldKind (..), HoldView (..), holdView)
@@ -529,7 +528,6 @@ spec = describe "Drawing from buffers" $ do
       kit ← newKit rig
       ringed rig 256
       kept ← newIORef Nothing
-      offThread ← newEmptyMVar
       before ← readsOf rig
       framelessOnce rig $ \recorder → do
         vertices ← claimed recorder 32
@@ -541,8 +539,7 @@ spec = describe "Drawing from buffers" $ do
           ok (bindVertexBuffer recorder 0 (FromClaim vertices 0))
           ok (bindVertexBuffer recorder 1 (FromClaim instances 0))
           ok (bindIndexBuffer recorder (FromClaim indices 0) Index16)
-          _ ← forkIO (drawIndexed recorder 6 1 >>= putMVar offThread)
-          takeMVar offThread `shouldReturn` Left RefusedNotOwner
+          onOtherThread (drawIndexed recorder 6 1) `shouldReturn` Left RefusedNotOwner
       stale ← readIORef kept >>= maybe (fail "no recorder") pure
       drawIndexed stale 6 1 `shouldReturn` Left RefusedRecorderClosed
       readsOf rig `shouldReturn` before

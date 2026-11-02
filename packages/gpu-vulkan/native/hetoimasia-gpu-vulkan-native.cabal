@@ -305,6 +305,7 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.Generations
         Test.GPU.Vulkan.Native.GenerationsVisibility
         Test.GPU.Vulkan.Native.Offscreen
+        Test.GPU.Vulkan.Native.OwnedThreads
         Test.GPU.Vulkan.Native.Presentation
         Test.GPU.Vulkan.Native.Profile
         Test.GPU.Vulkan.Native.Reclamation
@@ -315,6 +316,8 @@ test-suite native-tests
         Test.GPU.Vulkan.Native.StandIn
         Test.GPU.Vulkan.Native.Terminal
         Test.GPU.Vulkan.Native.Table
+        Test.GPU.Vulkan.Native.Threads
+        Test.GPU.Vulkan.Native.Unowned
         Test.GPU.Vulkan.Native.Uploads
         Test.GPU.Vulkan.Native.WindowDepth
     ghc-options: -threaded -rtsopts
@@ -393,4 +396,5 @@ test-suite allocator-parity-probe
         vector >=0.13 && <0.14,
         vulkan >=3.27 && <3.28,
         VulkanMemoryAllocator ==0.11.1.0,
-        hetoimasia-gpu-vulkan-model:placement-reference
+        hetoimasia-gpu-vulkan-model:placement-reference,
+        hetoimasia-test-support ==0.1.0.0

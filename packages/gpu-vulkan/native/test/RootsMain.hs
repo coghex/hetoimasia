@@ -22,6 +22,7 @@ import qualified Test.GPU.Vulkan.Native.FramesVisibility as FramesVisibility
 import qualified Test.GPU.Vulkan.Native.Generations as Generations
 import qualified Test.GPU.Vulkan.Native.GenerationsVisibility as GenerationsVisibility
 import qualified Test.GPU.Vulkan.Native.Offscreen as Offscreen
+import qualified Test.GPU.Vulkan.Native.OwnedThreads as OwnedThreads
 import qualified Test.GPU.Vulkan.Native.Presentation as Presentation
 import qualified Test.GPU.Vulkan.Native.Profile as Profile
 import qualified Test.GPU.Vulkan.Native.Reclamation as Reclamation
@@ -62,3 +63,4 @@ main =
       Terminal.spec
       Uploads.spec
       Table.spec
+      OwnedThreads.spec
