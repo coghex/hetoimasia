@@ -1,7 +1,7 @@
 -- | Examples for scoped context, breadcrumbs, and source attribution.
 module Test.Foundation.Logging.Context (spec) where
 
-import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (void)
 import Data.Char (isDigit)
@@ -20,6 +20,7 @@ import GHC.Stack
 import Hetoimasia.Foundation.Log
 import Test.Foundation.Logging.Support (fixedMetadata, newCollector, testComponent)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldNotBe, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = do
@@ -64,29 +65,30 @@ testConcurrentContext = do
   startTwo ← newEmptyMVar
   doneOne ← newEmptyMVar
   doneTwo ← newEmptyMVar
-  let worker name start done = void . forkIO $ do
+  let worker name start done = do
         takeMVar start
         identity ← myThreadId
         logInfo (withFields [("worker", name)] root) testComponent "tick" []
         -- The same numeric identity 'systemMetadata' reports, derived here
         -- independently of the logger.
         putMVar done (Text.dropWhile (not . isDigit) (Text.pack (show identity)))
-  worker "one" startOne (doneOne ∷ MVar Text)
-  worker "two" startTwo (doneTwo ∷ MVar Text)
-  putMVar startOne ()
-  putMVar startTwo ()
-  threadOne ← takeMVar doneOne
-  threadTwo ← takeMVar doneTwo
-  threadOne `shouldNotBe` threadTwo
-  entries ← collected
-  map entryMessage entries `shouldBe` ["tick", "tick"]
-  let observed name = [(entryFields entry, entryThread entry)
-                      | entry ← entries
-                      , Map.lookup "worker" (entryFields entry) == Just name]
-  observed "one" `shouldBe`
-    [(Map.fromList [("service", "engine"), ("worker", "one")], threadOne)]
-  observed "two" `shouldBe`
-    [(Map.fromList [("service", "engine"), ("worker", "two")], threadTwo)]
+  -- Both workers are owned by the example, and wait at their start gates until the example opens them (an interruptible wait).
+  withOwnedThread (worker "one" startOne (doneOne ∷ MVar Text)) $ \_ _ →
+    withOwnedThread (worker "two" startTwo (doneTwo ∷ MVar Text)) $ \_ _ → do
+      putMVar startOne ()
+      putMVar startTwo ()
+      threadOne ← takeMVar doneOne
+      threadTwo ← takeMVar doneTwo
+      threadOne `shouldNotBe` threadTwo
+      entries ← collected
+      map entryMessage entries `shouldBe` ["tick", "tick"]
+      let observed name = [(entryFields entry, entryThread entry)
+                          | entry ← entries
+                          , Map.lookup "worker" (entryFields entry) == Just name]
+      observed "one" `shouldBe`
+        [(Map.fromList [("service", "engine"), ("worker", "one")], threadOne)]
+      observed "two" `shouldBe`
+        [(Map.fromList [("service", "engine"), ("worker", "two")], threadTwo)]
 
 -- | A wrapper declaring the call-stack constraint. The entry it emits must be
 -- attributed to this function's own caller, which it returns for comparison.

@@ -10,7 +10,7 @@
 -- has already hung.
 module Test.Runtime.AsyncLog (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
+import Control.Concurrent (ThreadId, killThread, myThreadId)
 import Control.Concurrent.MVar
   ( MVar
   , modifyMVar_
@@ -19,6 +19,7 @@ import Control.Concurrent.MVar
   , putMVar
   , readMVar
   , takeMVar
+  , tryPutMVar
   , tryTakeMVar
   )
 import Control.Concurrent.STM (atomically, check)
@@ -97,6 +98,7 @@ import Test.Hspec
   )
 import Test.Runtime.LogFixture (fixedMetadata)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "Asynchronous logging adapter" $ do
@@ -283,6 +285,12 @@ expectFailure action = try action >>= either pure (\_ → fail "expected a failu
 cancelled ∷ SomeException → Expectation
 cancelled failure = (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
 
+-- | Run each action on a thread the scope owns, the first outermost, for the length of the body. However the body ends (a
+-- return, a failed assertion, a timeout, a cancellation) every thread has been killed and joined before this returns.
+withOwnedThreads ∷ [IO ()] → IO a → IO a
+withOwnedThreads [] body = body
+withOwnedThreads (action : more) body = withOwnedThread action (\_ _ → withOwnedThreads more body)
+
 -- Admission ------------------------------------------------------------------------
 
 testConcurrentAdmission ∷ IO ()
@@ -292,17 +300,18 @@ testConcurrentAdmission = do
   (_, probe, status) ← runAdapter defaultAsyncLogConfig quiet $ \_ adapter → do
     let root = mkLogger defaultLogFilter { filterSource = False } (adapterSink adapter)
     gate ← newEmptyMVar
-    dones ← forM producers $ \name → do
-      done ← newEmptyMVar
-      void . forkIO $ do
-        readMVar gate
-        let producer = withBreadcrumb "worker" (withFields [("producer", name)] root)
-        forM_ [1 .. perProducer] $ \index →
-          logInfo producer testComponent "tick" [("seq", Text.pack (show index))]
-        putMVar done ()
-      pure (done ∷ MVar ())
-    putMVar gate ()
-    forM_ dones takeMVar
+    dones ← forM producers $ \_ → newEmptyMVar ∷ IO (MVar ())
+    let produce name done = do
+          readMVar gate
+          let producer = withBreadcrumb "worker" (withFields [("producer", name)] root)
+          forM_ [1 .. perProducer] $ \index →
+            logInfo producer testComponent "tick" [("seq", Text.pack (show index))]
+          putMVar done ()
+    -- The producers are owned by the example: each waits at the gate (an interruptible wait) until the example opens it, and
+    -- is killed and joined with the example however it ends.
+    withOwnedThreads (zipWith produce producers dones) $ do
+      putMVar gate ()
+      forM_ dones takeMVar
     flushAdapter adapter `shouldReturn` FlushCompleted
   entries ← probeEntries probe
   length entries `shouldBe` length producers * perProducer
@@ -543,12 +552,12 @@ testFlushOrdering = do
     offer adapter (sample "second")
     -- The barrier is taken here: it covers the two records already admitted.
     flushed ← newEmptyMVar
-    void (forkIO (flushAdapter adapter >>= putMVar flushed))
-    awaitPending adapter 1
-    -- Admitted after the request, so it must not extend the barrier.
-    offer adapter (sample "third")
-    putMVar hold ()
-    takeMVar flushed
+    withOwnedThread (flushAdapter adapter >>= putMVar flushed) $ \_ _ → do
+      awaitPending adapter 1
+      -- Admitted after the request, so it must not extend the barrier.
+      offer adapter (sample "third")
+      putMVar hold ()
+      takeMVar flushed
   outcome `shouldBe` FlushCompleted
   trace ← probeTrace probe
   trace `shouldBe` ["write first", "write second", "flush", "write third"]
@@ -611,11 +620,11 @@ testWriterFailureWakesWaiter = do
     offer adapter (sample "doomed")
     takeMVar entered
     flushed ← newEmptyMVar
-    void (forkIO (flushAdapter adapter >>= putMVar flushed))
-    awaitPending adapter 1
-    -- The waiter is registered and the barrier can never complete.
-    putMVar hold ()
-    takeMVar flushed
+    withOwnedThread (flushAdapter adapter >>= putMVar flushed) $ \_ _ → do
+      awaitPending adapter 1
+      -- The waiter is registered and the barrier can never complete.
+      putMVar hold ()
+      takeMVar flushed
   case outcome of
     FlushWriterFailed reason → reason `shouldSatisfy` Text.isInfixOf "sink unavailable"
     other → expectationFailure ("expected the writer's failure, got " <> show other)
@@ -639,16 +648,14 @@ testControlBound = do
   (rejected, _, _) ← runAdapter config hooks $ \_ adapter → do
     offer adapter (sample "held")
     takeMVar entered
-    waiters ← forM [1 .. 2 ∷ Int] $ \_ → do
-      slot ← newEmptyMVar
-      void (forkIO (flushAdapter adapter >>= putMVar slot))
-      pure slot
-    awaitPending adapter 2
-    -- The third request neither waits for record-queue space nor blocks.
-    outcome ← flushAdapter adapter
-    putMVar hold ()
-    forM_ waiters (\slot → takeMVar slot `shouldReturn` FlushCompleted)
-    pure outcome
+    waiters ← forM [1 .. 2 ∷ Int] $ \_ → newEmptyMVar
+    withOwnedThreads [flushAdapter adapter >>= putMVar slot | slot ← waiters] $ do
+      awaitPending adapter 2
+      -- The third request neither waits for record-queue space nor blocks.
+      outcome ← flushAdapter adapter
+      putMVar hold ()
+      forM_ waiters (\slot → takeMVar slot `shouldReturn` FlushCompleted)
+      pure outcome
   rejected `shouldBe` FlushRejected
 
 testControlCancellationChurn ∷ IO ()
@@ -671,16 +678,16 @@ testControlCancellationChurn = do
     -- registering and installing the release that undoes it, and how often a
     -- cancellation lands inside it is the platform's business.
     replicateM_ 100000 $ do
-      waiter ← forkIO (void (flushAdapter adapter))
-      awaitPending adapter 1
-      killThread waiter
-      awaitPending adapter 0
+      withOwnedThread (void (flushAdapter adapter)) $ \waiter _ → do
+        awaitPending adapter 1
+        killThread waiter
+        awaitPending adapter 0
     -- The slot is usable again after all that churn.
     slot ← newEmptyMVar
-    void (forkIO (flushAdapter adapter >>= putMVar slot))
-    awaitPending adapter 1
-    putMVar hold ()
-    takeMVar slot `shouldReturn` FlushCompleted
+    withOwnedThread (flushAdapter adapter >>= putMVar slot) $ \_ _ → do
+      awaitPending adapter 1
+      putMVar hold ()
+      takeMVar slot `shouldReturn` FlushCompleted
   pure ()
 
 testControlBoundCoversInFlight ∷ IO ()
@@ -691,16 +698,16 @@ testControlBoundCoversInFlight = do
       config = defaultAsyncLogConfig { asyncControlCapacity = 1 }
   (rejected, _, _) ← runAdapter config hooks $ \_ adapter → do
     first ← newEmptyMVar
-    void (forkIO (flushAdapter adapter >>= putMVar first))
-    -- The writer has taken the request and is inside the borrowed flush. It is
-    -- still retained, so the single slot is still occupied.
-    takeMVar entered
-    awaitPending adapter 1
-    outcome ← flushAdapter adapter
-    putMVar held ()
-    takeMVar first `shouldReturn` FlushCompleted
-    awaitPending adapter 0
-    pure outcome
+    withOwnedThread (flushAdapter adapter >>= putMVar first) $ \_ _ → do
+      -- The writer has taken the request and is inside the borrowed flush. It is
+      -- still retained, so the single slot is still occupied.
+      takeMVar entered
+      awaitPending adapter 1
+      outcome ← flushAdapter adapter
+      putMVar held ()
+      takeMVar first `shouldReturn` FlushCompleted
+      awaitPending adapter 0
+      pure outcome
   rejected `shouldBe` FlushRejected
 
 -- Accounting ------------------------------------------------------------------------------
@@ -746,79 +753,99 @@ testInterruptedFlushAccounting = do
   probe ← newProbe hooks
   handle ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    result ← try . withAsyncLogAdapter defaultAsyncLogConfig (probeSink probe) $ \adapter → do
-      putMVar handle adapter
-      offer adapter (sample "written")
-      void (forkIO (flushAdapter adapter >>= putMVar flushed))
-      -- Never filled: the owner waits here to be cancelled, so the writer is
-      -- interrupted inside the borrowed flush rather than inside a write.
-      takeMVar parked
-    putMVar outcome result
-  takeMVar entered
-  adapter ← readMVar handle
-  killThread runner
-  result ← bounded (takeMVar outcome)
-  either cancelled (\_ → expectationFailure "the cancelled lifetime returned") result
-  bounded (takeMVar flushed) `shouldReturn` FlushWriterStopped
-  status ← adapterStatus adapter
-  -- The interrupted flush fails its barrier and terminates the writer. It
-  -- invents no in-flight record and reclassifies no completed write.
-  statusWritten status `shouldBe` 1
-  statusFailedWrites status `shouldBe` 0
-  statusInterruptedWrites status `shouldBe` 0
-  statusAbandoned status `shouldBe` 0
-  statusWriterTerminated status `shouldBe` True
-  statusWriterFailure status `shouldBe` Nothing
-  messages probe `shouldReturn` ["written"]
-  probeTrace probe `shouldReturn` ["write written", "flush"]
+  requested ← newEmptyMVar
+  -- The waiter's barrier outlives the lifetime it waits on: it is what observes the writer stopped, after the owner has been
+  -- cancelled, so it is owned by the example and not by the owner's body (which the cancellation unwinds). It is started
+  -- parked and let go, with the adapter, once the record is offered, which is where the owner's body used to start it.
+  withOwnedThread (readMVar requested >>= \adapter → flushAdapter adapter >>= putMVar flushed) $ \_ _ →
+    withOwnedThread
+      ( do
+          result ← try . withAsyncLogAdapter defaultAsyncLogConfig (probeSink probe) $ \adapter → do
+            putMVar handle adapter
+            offer adapter (sample "written")
+            putMVar requested adapter
+            -- Never filled: the owner waits here to be cancelled, so the writer is
+            -- interrupted inside the borrowed flush rather than inside a write.
+            takeMVar parked
+          putMVar outcome result
+      )
+      $ \runner _ → do
+        takeMVar entered
+        adapter ← readMVar handle
+        killThread runner
+        result ← bounded (takeMVar outcome)
+        either cancelled (\_ → expectationFailure "the cancelled lifetime returned") result
+        bounded (takeMVar flushed) `shouldReturn` FlushWriterStopped
+        status ← adapterStatus adapter
+        -- The interrupted flush fails its barrier and terminates the writer. It
+        -- invents no in-flight record and reclassifies no completed write.
+        statusWritten status `shouldBe` 1
+        statusFailedWrites status `shouldBe` 0
+        statusInterruptedWrites status `shouldBe` 0
+        statusAbandoned status `shouldBe` 0
+        statusWriterTerminated status `shouldBe` True
+        statusWriterFailure status `shouldBe` Nothing
+        messages probe `shouldReturn` ["written"]
+        probeTrace probe `shouldReturn` ["write written", "flush"]
 
 -- Cancellation ---------------------------------------------------------------------------
 
--- | Run a lifetime on its own thread, hand back its adapter handle, and return
+-- | Run a lifetime on a thread the scope owns, hand back its adapter handle, and return
 -- the outcome once the example has cancelled it.
-cancellableAdapter
-  ∷ Hooks
+--
+-- The first argument opens whatever the example holds the lifetime at (a write no cancellation can shorten, held at a gate only
+-- the example opens): it is run in the same uninterruptible release as the kill, before it and however the scope ended, so a
+-- scope that ends before the example opened the gate does not wait for ever on a lifetime that cannot finish.
+withCancellableAdapter
+  ∷ IO ()
+  → Hooks
   → (AsyncLogAdapter → IO ())
-  → IO (Probe, MVar AsyncLogAdapter, MVar (Either SomeException ()), ThreadId)
-cancellableAdapter hooks body = do
+  → ((Probe, MVar AsyncLogAdapter, MVar (Either SomeException ()), ThreadId) → IO b)
+  → IO b
+withCancellableAdapter open hooks body continue = do
   probe ← newProbe hooks
   handle ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    result ← try . withAsyncLogAdapter defaultAsyncLogConfig (probeSink probe) $ \adapter → do
-      putMVar handle adapter
-      body adapter
-    putMVar outcome result
-  pure (probe, handle, outcome, runner)
+  withOwnedThreadOpening
+    open
+    ( do
+        result ← try . withAsyncLogAdapter defaultAsyncLogConfig (probeSink probe) $ \adapter → do
+          putMVar handle adapter
+          body adapter
+        putMVar outcome result
+    )
+    (\runner _ → continue (probe, handle, outcome, runner))
 
 testCancelInterruptibleBarrier ∷ IO ()
 testCancelInterruptibleBarrier = do
   entered ← newEmptyMVar
   hold ← newEmptyMVar
   let hooks = quiet { hookWrite = \_ → putMVar entered () >> takeMVar hold }
-  (probe, handle, outcome, runner) ← cancellableAdapter hooks $ \adapter → do
-    offer adapter (sample "in flight")
-    void (flushAdapter adapter)
-  takeMVar entered
-  adapter ← readMVar handle
-  -- The owner is parked on the barrier and the writer is inside the borrowed
-  -- write, which is an interruptible wait.
-  awaitPending adapter 1
-  killThread runner
-  result ← bounded (takeMVar outcome)
-  either cancelled (\_ → expectationFailure "the cancelled lifetime returned") result
-  status ← adapterStatus adapter
-  -- The interrupted record is neither replayed nor called undelivered.
-  statusInterruptedWrites status `shouldBe` 1
-  statusWritten status `shouldBe` 0
-  statusFailedWrites status `shouldBe` 0
-  statusAbandoned status `shouldBe` 0
-  statusWriterTerminated status `shouldBe` True
-  statusWriterFailure status `shouldBe` Nothing
-  -- The writer was joined, and the borrowed sink never accepted the record.
-  messages probe `shouldReturn` []
-  probeTrace probe `shouldReturn` ["write in flight"]
+  withCancellableAdapter (pure ()) hooks
+    ( \adapter → do
+      offer adapter (sample "in flight")
+      void (flushAdapter adapter)
+    )
+    $ \(probe, handle, outcome, runner) → do
+      takeMVar entered
+      adapter ← readMVar handle
+      -- The owner is parked on the barrier and the writer is inside the borrowed
+      -- write, which is an interruptible wait.
+      awaitPending adapter 1
+      killThread runner
+      result ← bounded (takeMVar outcome)
+      either cancelled (\_ → expectationFailure "the cancelled lifetime returned") result
+      status ← adapterStatus adapter
+      -- The interrupted record is neither replayed nor called undelivered.
+      statusInterruptedWrites status `shouldBe` 1
+      statusWritten status `shouldBe` 0
+      statusFailedWrites status `shouldBe` 0
+      statusAbandoned status `shouldBe` 0
+      statusWriterTerminated status `shouldBe` True
+      statusWriterFailure status `shouldBe` Nothing
+      -- The writer was joined, and the borrowed sink never accepted the record.
+      messages probe `shouldReturn` []
+      probeTrace probe `shouldReturn` ["write in flight"]
 
 testCancelUncancellableBarrier ∷ IO ()
 testCancelUncancellableBarrier = do
@@ -833,39 +860,42 @@ testCancelUncancellableBarrier = do
             takeMVar gate
             modifyMVar_ completed (pure . (+ 1))
         }
-  (probe, handle, outcome, runner) ← cancellableAdapter hooks $ \adapter → do
-    offer adapter (sample "uncancellable")
-    void (flushAdapter adapter)
-  takeMVar entered
-  adapter ← readMVar handle
-  awaitPending adapter 1
-  -- The writer is inside the borrowed write and the owner is on the barrier.
-  probeTrace probe `shouldReturn` ["write uncancellable"]
-  -- Two cancellations while that write is held: neither ends the drain, and
-  -- neither releases the borrow early.
-  killThread runner
-  killThread runner
-  held ← tryTakeMVar outcome
-  case held of
-    Nothing → pure ()
-    Just _ → expectationFailure "the lifetime returned while its writer held the sink"
-  readMVar completed `shouldReturn` 0
-  -- Releasing this example's own gate is the only thing that lets it finish.
-  putMVar gate ()
-  result ← bounded (takeMVar outcome)
-  either cancelled (\_ → expectationFailure "the cancelled lifetime returned") result
-  -- The borrowed write ran to completion with the sink still live, and the
-  -- writer was joined rather than detached.
-  readMVar completed `shouldReturn` 1
-  status ← adapterStatus adapter
-  statusWriterTerminated status `shouldBe` True
-  statusFailedWrites status `shouldBe` 0
-  statusAbandoned status `shouldBe` 0
-  -- The record is accounted exactly once. Whether the cancellation caught the
-  -- writer inside that write or just after it is the sink's timing, not a
-  -- promise the adapter makes: either way it is never counted twice and never
-  -- claimed delivered.
-  statusWritten status + statusInterruptedWrites status `shouldBe` 1
+  withCancellableAdapter (void (tryPutMVar gate ())) hooks
+    ( \adapter → do
+      offer adapter (sample "uncancellable")
+      void (flushAdapter adapter)
+    )
+    $ \(probe, handle, outcome, runner) → do
+      takeMVar entered
+      adapter ← readMVar handle
+      awaitPending adapter 1
+      -- The writer is inside the borrowed write and the owner is on the barrier.
+      probeTrace probe `shouldReturn` ["write uncancellable"]
+      -- Two cancellations while that write is held: neither ends the drain, and
+      -- neither releases the borrow early.
+      killThread runner
+      killThread runner
+      held ← tryTakeMVar outcome
+      case held of
+        Nothing → pure ()
+        Just _ → expectationFailure "the lifetime returned while its writer held the sink"
+      readMVar completed `shouldReturn` 0
+      -- Releasing this example's own gate is the only thing that lets it finish.
+      putMVar gate ()
+      result ← bounded (takeMVar outcome)
+      either cancelled (\_ → expectationFailure "the cancelled lifetime returned") result
+      -- The borrowed write ran to completion with the sink still live, and the
+      -- writer was joined rather than detached.
+      readMVar completed `shouldReturn` 1
+      status ← adapterStatus adapter
+      statusWriterTerminated status `shouldBe` True
+      statusFailedWrites status `shouldBe` 0
+      statusAbandoned status `shouldBe` 0
+      -- The record is accounted exactly once. Whether the cancellation caught the
+      -- writer inside that write or just after it is the sink's timing, not a
+      -- promise the adapter makes: either way it is never counted twice and never
+      -- claimed delivered.
+      statusWritten status + statusInterruptedWrites status `shouldBe` 1
 
 -- Lifetime composition ----------------------------------------------------------------------
 

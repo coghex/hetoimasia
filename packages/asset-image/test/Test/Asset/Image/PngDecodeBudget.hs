@@ -14,14 +14,15 @@
 -- never saw shows.
 module Test.Asset.Image.PngDecodeBudget (spec) where
 
-import Control.Concurrent (ThreadId, forkFinally, killThread, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (ThreadId, killThread, yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , ErrorCall (ErrorCall)
   , SomeAsyncException
   , SomeException
   , fromException
+  , mask
   , mask_
   , throwIO
   , throwTo
@@ -50,6 +51,7 @@ import Test.Asset.Image.PngBuilder
 import Test.Asset.Image.Support (fixtureBytes)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "PngDecodeBudget" $ do
@@ -333,11 +335,11 @@ cancellationSpec = describe "asynchronous cancellation" $ do
       waiting ← newEmptyMVar
       never ← newEmptyMVar
       let gate s _ = when (s == stage) (putMVar waiting () >> takeMVar never)
-      (child, childDone) ← forkChild (decodeBounded (beforeReserve gate (ledgerAccount ledger)) preflighted)
-      bounded (takeMVar waiting)
-      killThread child
-      outcome ← bounded (takeMVar childDone)
-      cancelled outcome
+      withChild (decodeBounded (beforeReserve gate (ledgerAccount ledger)) preflighted) $ \child childOutcome → do
+        bounded (takeMVar waiting)
+        killThread child
+        outcome ← bounded childOutcome
+        cancelled outcome
       liveBytes ledger >>= (`shouldBe` ByteString.length bytes)
       balanced ledger
 
@@ -352,14 +354,17 @@ cancellationSpec = describe "asynchronous cancellation" $ do
       -- request is queued behind its mask, so the request is delivered at
       -- the decoder's own first cancellable step and not before.
       let gate s _ = when (s == stage) (uninterruptibleMask_ (putMVar reached () >> takeMVar proceed))
-      (child, childDone) ← forkChild (mask_ (decodeBounded (beforeReserve gate (ledgerAccount ledger)) preflighted))
-      bounded (takeMVar reached)
-      (thrower, throwerDone) ← forkChild (throwTo child ThreadKilled)
-      bounded (awaitBlockedThrowing thrower)
-      putMVar proceed ()
-      outcome ← bounded (takeMVar childDone)
-      void (bounded (takeMVar throwerDone))
-      cancelled outcome
+      -- The decoder is held uninterruptibly at the gate, so the scope opens the gate itself before it kills and joins
+      -- the decoder: an example that fails before it opens the gate cannot leave the join waiting for ever.
+      withChildOpening (void (tryPutMVar proceed ())) (mask_ (decodeBounded (beforeReserve gate (ledgerAccount ledger)) preflighted)) $ \child childOutcome → do
+        bounded (takeMVar reached)
+        outcome ← withChild (throwTo child ThreadKilled) $ \thrower throwerOutcome → do
+          bounded (awaitBlockedThrowing thrower)
+          putMVar proceed ()
+          decoded ← bounded childOutcome
+          void (bounded throwerOutcome)
+          pure decoded
+        cancelled outcome
       liveBytes ledger >>= (`shouldBe` ByteString.length bytes)
       balanced ledger
       grants ← grantedEvents ledger
@@ -374,13 +379,14 @@ cancellationSpec = describe "asynchronous cancellation" $ do
     let gate s _ = when (s == StageWorking) (uninterruptibleMask_ (putMVar reached () >> takeMVar proceed))
         failing s _ = when (s == StageScratch) (throwIO (ErrorCall "the release failed"))
         account = beforeRelease failing (beforeReserve gate (ledgerAccount ledger))
-    (child, childDone) ← forkChild (mask_ (decodeBounded account preflighted))
-    bounded (takeMVar reached)
-    (thrower, throwerDone) ← forkChild (throwTo child ThreadKilled)
-    bounded (awaitBlockedThrowing thrower)
-    putMVar proceed ()
-    outcome ← bounded (takeMVar childDone)
-    void (bounded (takeMVar throwerDone))
+    outcome ← withChildOpening (void (tryPutMVar proceed ())) (mask_ (decodeBounded account preflighted)) $ \child childOutcome → do
+      bounded (takeMVar reached)
+      withChild (throwTo child ThreadKilled) $ \thrower throwerOutcome → do
+        bounded (awaitBlockedThrowing thrower)
+        putMVar proceed ()
+        decoded ← bounded childOutcome
+        void (bounded throwerOutcome)
+        pure decoded
     case outcome of
       Left failure → do
         (fromException failure ∷ Maybe SomeAsyncException) `shouldSatisfy` isJust
@@ -398,12 +404,23 @@ cancellationSpec = describe "asynchronous cancellation" $ do
       Left failure → fromException failure `shouldBe` Just ThreadKilled
       Right _ → expectationFailure "a cancelled decode returned"
 
--- | A fork whose result and termination the example waits for.
-forkChild ∷ IO a → IO (ThreadId, MVar (Either SomeException a))
-forkChild action = do
-  done ← newEmptyMVar
-  child ← forkFinally action (putMVar done)
-  pure (child, done)
+-- | A thread the scope owns, whose outcome the example waits for: the body is given the thread and the wait for its outcome.
+-- However the scope ends (a return, a failed assertion, a timeout, a cancellation) the thread has been killed and joined
+-- before the scope returns, so a thread an example gave up on does not outlive it.
+withChild ∷ IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
+withChild = withChildOpening (pure ())
+
+-- | 'withChild' for a thread held at a gate that a kill does not end (an uninterruptible mask): the first argument is run,
+-- idempotently and without blocking, in the same uninterruptible release and before the kill.
+--
+-- The thread publishes what it ended with, whatever that was, and then ends: it is the subject the example cancels, so it
+-- records the cancellation it received (as @forkFinally@ did) and does not swallow it. The wait is the example's own: it
+-- returns once the outcome is there, and an example that reaches it with the thread gone and nothing published fails.
+withChildOpening ∷ IO () → IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
+withChildOpening open action body = do
+  slot ← newEmptyMVar
+  withOwnedThreadOpening open (mask $ \restore → try (restore action) >>= putMVar slot) $ \child ended →
+    body child (ended >> tryReadMVar slot >>= maybe (throwIO (ErrorCall "the thread ended without publishing an outcome")) pure)
 
 -- | Wait, without sleeping, until the thread is blocked delivering an
 -- exception: it has been queued behind the target's mask.
