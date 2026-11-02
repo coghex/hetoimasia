@@ -1,10 +1,11 @@
 # Lua-first M1 (epic #514): coverage of the completion conditions and the 28 delivery slices
 
-Written for LFE-25 ([#540](https://github.com/coghex/hetoimasia/issues/540)), the last slice, and retained with [its evidence](README.md). This document **does not declare
-the epic complete**. It says what each completion condition rests on, which slices delivered it, what kind of proof each
-slice has (headless, offscreen or native), which prerequisites are merged and which part is this slice's own pending
-pull request, and what is still owed. Tracker closure belongs to the authorized manager and owner. A filed issue, a merged
-slice or an all-green headless run is not evidence of a displayed quad: only the native rows below are.
+Written for LFE-25 ([#540](https://github.com/coghex/hetoimasia/issues/540)), the last slice, and retained with [its evidence](README.md).
+LFE-25 merged as pull request [#582](https://github.com/coghex/hetoimasia/pull/582) (`4f5c3b40`), all 28 slices are merged, and epic
+[#514](https://github.com/coghex/hetoimasia/issues/514) is closed as completed (2026-11-01T23:29:53Z). This document says what each
+completion condition rests on, which slices delivered it, what kind of proof each slice has (headless, offscreen or native), what LFE-25
+added, and what limits remain. A filed issue, a merged slice or an all-green headless run is not evidence of a displayed quad: only the
+native rows below are.
 
 Three kinds of proof are kept apart throughout:
 
@@ -19,7 +20,7 @@ Three kinds of proof are kept apart throughout:
 ## The 28 delivery slices
 
 The design's processing checklist lists LFE-1 to LFE-28 (LFE-26 was inserted after LFE-13, LFE-27 before LFE-24 and LFE-28
-before LFE-25). Merged prerequisites are separate from this pull request.
+before LFE-25). All 28 are merged.
 
 | Slice | Title | Issue | Merged as | Proof class |
 | --- | --- | --- | --- | --- |
@@ -65,7 +66,7 @@ before LFE-25). Merged prerequisites are separate from this pull request.
 | 7 | Status, output and quit (0, 1, 2, 130) | LFE-13, LFE-22, LFE-26 | headless; native: Lua quit exits 0, a genuine native close exits 0, an orderly SIGTERM exits 130 (LFE-22), a native close of either harness window is one session quit (LFE-25) |
 | 8 | Concrete accounting (the fixed profile) | LFE-3, LFE-7, LFE-14 to LFE-16, LFE-19 | headless; the native cases run under the fixed profile unchanged |
 
-## What LFE-25 adds (this pull request, pending merge)
+## What LFE-25 added (pull request #582, merged as `4f5c3b40`)
 
 * A named, nonempty `Lua native milestone` subgroup in `run-native-tests`, selected by `--match 'Lua native milestone'` and part of the
   catalog group's `--complete` profile (`test.vulkan-run-native`), with a test-only isolated-X11 window helper
@@ -82,14 +83,16 @@ before LFE-25). Merged prerequisites are separate from this pull request.
   absence of lost-records warnings.
 * View adaptation with an unchanged published scene (smaller, larger, minimize, restore) with the metrics actually reported.
 
-## Still owed, and limits
+## Limits
 
 * **macOS owner visual confirmations** (the quad in both windows, resize clipping, peer survival, the actual command's quad and
   close) are **confirmed** (all six, once, at the approved head `f7ffd77a`, run by the manager with the owner present). The pull request
   carried [the pending entries](macos-owner-confirmations.md); [the confirmation record](macos-owner-confirmations-record.md) supersedes them.
+  That record also states that the M-6 run's owning PID, window identity and window metrics were not captured (the plain command logs none).
 * The **native zero-area framebuffer row is unexercised** on both receipts' platforms (a minimized window's framebuffer was not reported with zero area); the controlled zero-metrics coverage belongs to LFE-18, LFE-20 and the host's suspended-target cases and is not
   claimed here as native.
 * A restored window once stayed undrawn on macOS until something sampled it again ([#581](https://github.com/coghex/hetoimasia/issues/581), fixed in `bb163cfa`); the restore case is now its regression check.
+* An intermittent macOS hang in `glfwInit` is tracked as [#586](https://github.com/coghex/hetoimasia/issues/586).
 * The exit status of a session that meets a *real* window-creation failure is the owning slices' (a labelled injected clean refusal is
   used here); device loss and out-of-memory are not induced.
 * No new Wayland, hardware-support or performance claim.

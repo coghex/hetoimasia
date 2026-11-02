@@ -20,11 +20,32 @@ does.
   every package by name.
 - `Test.Support.Bounded` bounds a call that must return, so a stuck example
   fails instead of hanging the run.
+- `Test.Support.Owned` is the one way a test starts a helper thread:
+  `withOwnedThread action body` forks the thread and registers its
+  stop-and-join in one masked step, runs the body with the caller's
+  interruptibility restored, and on every way out (a return, an exception, a
+  timeout of the example, a cancellation, including one delivered while the
+  thread is starting) kills the thread, which does nothing to one that already
+  ended, and waits for its end without being interruptible. The end is announced
+  however it happened, by the step that started the thread. A thread that waits
+  at a gate it keeps waiting at after a kill is started with
+  `withOwnedThreadOpening open`, whose idempotent, non-blocking `open` the same
+  release runs first; a `finally` inside the body is too late for a cancellation
+  delivered as the body begins. It sleeps nowhere and needs `base` alone.
+  `Test.Support.Cancel` builds on it the cancellation delivered to the example at
+  a chosen moment (`withCancellationAfter`, `withCancellationWhenBlocked`), and
+  `Test.Support.Parked` the parked-release orchestration of the native suite's
+  child helper examples. `tools/validation/owned_starts.py` fails a test source
+  that starts a thread or subprocess any other way, except for the debt recorded
+  in its checked-in baseline and the helpers it exempts by name; see
+  [validation.md](../../docs/validation.md#the-owned-start-guard).
 
 ## What belongs here
 
 A utility belongs here only when it is already used by examples that will be
-owned by different suites, and it is neutral: it registers no Hspec examples,
+owned by different suites, or is the one definition of a rule every suite that
+starts a thread must follow (the owned thread: several suites had written their
+own), and it is neutral: it registers no Hspec examples,
 depends on no `hetoimasia-*` package, initializes nothing native, holds no
 mutable global fixture, and offers no production service API. Keep sources in
 `src/` alone; no other component may list this directory in `hs-source-dirs`.

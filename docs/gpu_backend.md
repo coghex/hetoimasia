@@ -7084,6 +7084,11 @@ bash tools/vulkan/run.sh build hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tes
 bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --dry-run
 ```
 
+The second command builds nothing. It prints, and hands the suite to record, the revision and source digest that the first command
+recorded for the executable, and refuses, naming the build command, an executable that was built from another tree or has no record. After
+any change under the digest's roots, which include `tools/vulkan` and `tools/native`, run the first command again
+([the build identity](validation.md#a-native-runs-build-identity)).
+
 On Linux the native mode starts an isolated X11 display for the run and needs
 no approval. `test.vulkan-wayland` runs the same profile on the isolated
 headless compositor instead, which needs no approval either:

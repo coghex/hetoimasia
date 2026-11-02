@@ -158,7 +158,7 @@ VK-4 onward remain unprocessed. The original #158 merge gate is satisfied;
 processing a later issue must account for its actual dependencies and these
 review findings, rather than preserving an obsolete merge wait or treating
 merged code as defect-free. Lua's independent platform verdicts are
-inconclusive, so [its design](../lua_runtime_design.md) returns to exploring under
+inconclusive, so [its design](designs/lua_runtime_design.md) returns to exploring under
 D-11 without making Lua a prerequisite of Vulkan.
 
 ## Historical handoff at `e0c752e` — 2026-09-17
@@ -204,7 +204,7 @@ multiple-window ownership and capability boundaries; do not reimplement the
 runtime, messaging, window binding, or fixture from historical inventory text.
 Linux remote CI and local Cocoa verification remain fixed owner decisions.
 
-The owner plans to process the canonical [Lua design](../lua_runtime_design.md)
+The owner plans to process the canonical [Lua design](designs/lua_runtime_design.md)
 in parallel with this design work. Its binding and confinement proof gates
 remain intact. Neither backend imports the other: application-owned services
 connect scripting to eventual rendering consumers. Coordinate shared clock,

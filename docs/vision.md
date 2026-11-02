@@ -209,7 +209,7 @@ unavailable state service ends the session. The Lua-first startup gate and
 one-role rules define the cases where no healthy UI can continue. Callback
 threads remain runtime machinery, not cancellation endpoints.
 
-Owner decision 2026-10-17 ([Lua D-23](lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)):
+Owner decision 2026-10-17 ([Lua D-23](archive/designs/lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)):
 deterministic authoritative simulation is a design requirement. The initial
 qualification target is identical gameplay results for identical initial state,
 content, seed, tick-assigned inputs and scheduling configuration on the same
@@ -232,7 +232,7 @@ determinism. The existing lua-domains sample retains its own D-23/D-48
 qualification, including the limit on late independent failures. Its state
 transactions, replay and seeded streams are not M1 services.
 
-Owner decision 2026-10-17 ([Lua D-27](lua_runtime_design.md#d-27-engine-owned-cleanup-independent-of-script-correctness)):
+Owner decision 2026-10-17 ([Lua D-27](archive/designs/lua_runtime_design.md#d-27-engine-owned-cleanup-independent-of-script-correctness)):
 script authors must not be responsible for remembering which engine resources
 exist or making shutdown succeed to avoid leaks. Lua-exposed acquisitions have
 protected engine-owned scope/lease records; failed initialization, lost handles

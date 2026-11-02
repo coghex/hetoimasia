@@ -139,6 +139,28 @@ cabal test hetoimasia-tests --test-show-details=direct
   or `--match 'Logging lifetime'` select runtime subgroups as they did at root,
   and on `glfw-tests` the GLFW group names, such as `--match 'GLFW session'`,
   select what they selected at root or in the removed window-examples executable.
+- `workflow-tests` (`tools/test/`, group `test.workflow`) owns the contracts of
+  the workflow tooling and, since #584, the shared owned-thread facility and the
+  guard that keeps test sources using it. Select them with
+  `--test-options='--match <name>'`: `the shared owned-thread facility`
+  (`OwnedThread`: every way a scope can end with a thread parked at a gate, each
+  with a negative control that applies the same judgement to a deliberately
+  unowned start and must fail; the thread that ended on its own; the
+  uninterruptible release; the interruptibility the body runs with; the
+  cancellation helpers behind the two `Library.hs` helpers and the parked-release
+  orchestration behind `ChildSpec`, with their former unowned forms as controls)
+  and `The unowned-start guard` (`OwnedStarts`: fixture trees for a new unowned
+  start, an owned start, a baselined start, a stale or shrunken baseline entry, a
+  count raised with its baseline, a new start in a file that has an exempt helper,
+  and the three sites the issue named; then this repository: the guard passes,
+  the baseline has not grown, and every directory it scans is an input of the
+  group). The facility's own sources live in `tools/test-support`, which both
+  `workflow-tests` and `run-native-tests` depend on; the real child helper runs
+  under the same parked-release orchestration in `Test.Run.Native.ChildSpec`
+  (group `test.vulkan-run-native`, selected with `--match 'the child helper'`).
+  A test that starts a thread or subprocess starts it through
+  `Test.Support.Owned`; the sites that existed when the guard was introduced are a
+  known-debt baseline to be removed by follow-up changes, not to be extended.
 
 ## Vulkan suites
 
@@ -171,8 +193,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   `failures=0 verdict=VerdictInterrupted`. The suite's child helper (`Test.Run.Native.Child`) has its own harness examples first
   (`Test.Run.Native.ChildSpec`: a failure part-way through acquisition, a cancellation during the release, a child that
   cannot be confirmed reaped or drained, the body's failure preserved), run against `/bin/sh` children with no native session. It is built, with the executable it launches, in the group's preparation stage
-  (`bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests`) and run,
-  unbuilt, by `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`. It
+  (`bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests`) and run by
+  `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`, which builds nothing and presents the
+  build identity the preparation recorded (see [validation.md](validation.md#a-native-runs-build-identity)). It
   captures no pixel and reads no window back in its smoke cases. See [run_command.md](run_command.md).
   Its `Lua native milestone` subgroup (LFE-25, [#540](https://github.com/coghex/hetoimasia/issues/540), selectable alone with
   `--match 'Lua native milestone'` and part of `--complete`) is the final qualification of native windows: a two-instance harness composed through
@@ -202,8 +225,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   desktop consent as `vulkan-native-tests`, under the same standing approval (on
   macOS `HETOIMASIA_NATIVE_SESSION=desktop` on the one command; on Linux the
   runner starts its own X11 display), and is built in the group's preparation
-  stage and run, unbuilt, by
-  `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete`;
+  stage and run by
+  `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete`, which builds
+  nothing and refuses an executable whose recorded build identity is missing or stale;
   the subgroup alone by the same command with `-- --match 'window provider'`. Its
   headless counterpart is the `window provider` group of `lua-engine-graphics-tests`
   (group `test.vulkan-headless`), a gated fake port inside the real request

@@ -6,8 +6,18 @@ Keep Lua central to authoring a game while Haskell owns execution, transport,
 failure evidence, and lifetime. This is the canonical continuation of
 `lua_runtime_architecture_notes.md` and the design conversation of 2026-09-16.
 
-Design state: `trusted milestone delivered`; confinement is deferred outside
-the completed trusted scope by the owner's 2026-10-22 reconciliation.
+Design state: `delivered and archived` (2026-11-02). The trusted milestone is delivered: epic
+[#145](https://github.com/coghex/hetoimasia/issues/145) is closed as completed (2026-10-22T05:32:13Z) at its owner-confirmed reduced trusted scope, and its named
+successor, the [Lua-first design](lua_first_engine_design.md)'s epic [#514](https://github.com/coghex/hetoimasia/issues/514), is closed as completed
+(2026-11-01T23:29:53Z) with all 28 deliveries merged. Confinement is deferred outside the completed trusted scope by the owner's
+2026-10-22 reconciliation.
+
+**Deferred decisions, still readable here:** hostile-code confinement, that is the platform feasibility evidence in
+[Q-5](#q-5-verified-platform-confinement-and-resource-enforcement-profile) (both verdicts inconclusive; see also its [follow-up](#q-5-feasibility-follow-up-2026-09-16)) and the seven deferred
+slices [LUA-9](#lua-9-add-bounded-child-process-transport-and-owned-process-lifetime), [LUA-10](#lua-10-establish-linux-mod-process-confinement), [LUA-11](#lua-11-establish-macos-mod-process-confinement), [LUA-12](#lua-12-enforce-parent-owned-execution-and-resource-budgets), [LUA-13](#lua-13-broker-scoped-mod-capabilities-in-the-parent), [LUA-16](#lua-16-integrate-confined-mod-owners-with-the-runtime), [LUA-17](#lua-17-prove-confined-execution-and-adversarial-isolation-headlessly). The generic state store, deliberate hot swap and mods with their activation are open questions of the
+[Lua-first design](lua_first_engine_design.md) (its [Q-5](lua_first_engine_design.md#q-5-what-generic-engine-state-does-lua-define-and-mutate),
+[Q-10](lua_first_engine_design.md#q-10-investigate-deliberate-script-hot-swapping) and
+[Q-4](lua_first_engine_design.md#q-4-how-are-mods-discovered-ordered-and-combined)).
 
 **Current scope precedence (2026-10-22):** the trusted milestone is delivered
 and owner-accepted at `b7f3b56e` on 2026-10-21. The owner's later trust decision
@@ -15,9 +25,10 @@ treats game and mod Lua alike as trusted. LUA-9–LUA-13, LUA-16 and LUA-17 are
 deferred outside this completed trusted milestone; they are not implemented
 or qualified. Q-5 remains unresolved technical evidence for any future
 hostile-code arc, not a prerequisite for Lua-first M1 or later trusted-mod
-activation. The [Lua-first design](designs/lua_first_engine_design.md), D-79/
+activation. The [Lua-first design](lua_first_engine_design.md), D-79/
 P-75, records the confirmed reconciliation and the named consumer's M1 profile.
-The manager owns #145's corresponding revised-scope closure.
+History: the manager owned #145's corresponding revised-scope closure; [#145](https://github.com/coghex/hetoimasia/issues/145) is closed as completed
+and the Lua-first epic [#514](https://github.com/coghex/hetoimasia/issues/514) is closed as completed.
 
 Older dated decisions, quotations, readiness notes and process-branch specs
 below retain their historical meaning. Their requirements that confinement
@@ -68,10 +79,10 @@ LUA-9 through LUA-13 and their dependent integration slices remain blocked;
 closing the proof issues did not prove supported confinement. D-13 now permits
 trusted delivery independently of Q-5 after renewed readiness; the process
 branch still requires Q-5's successful verdicts. The
-[review ledger](project_review/ledger.md) also records implementation
+[review ledger](../../project_review/ledger.md) also records implementation
 follow-ups; processing completion is not a clean implementation verdict. The
-[binding review](project_review/173.md) records stale source comments, and the
-[protocol review](project_review/179.md) recorded failure-settlement and bounded
+[binding review](../../project_review/173.md) records stale source comments, and the
+[protocol review](../../project_review/179.md) recorded failure-settlement and bounded
 failure-detail defects. Those repairs (#193/#194) are closed at the 2026-09-22
 review baseline. PR #241 subsequently corrected the binding comments. Neither
 those repairs nor closed proof issues clear Q-5's confinement gate.
@@ -104,7 +115,7 @@ This is not approval of the whole program, and no other gate changes.
 
 Narrow readiness renewal, 2026-10-16: the owner, via the assistant (request
 `user-het-lua5-readiness-20261016-1740`), accepted priority 1 of guide report
-[2026-10-16T165532Z-edefc39](guide/2026-10-16T165532Z-edefc39.md) and approved
+[2026-10-16T165532Z-edefc39](../../guide/2026-10-16T165532Z-edefc39.md) and approved
 the narrow LUA-5 readiness renewal. LUA-5 is reconciled with the delivered
 owner, module and protocol APIs at `master@21c2add5`
 ([LUA-5](#lua-5-integrate-trusted-vm-owners-with-runtime-supervision)) and its
@@ -126,7 +137,7 @@ contract/organization under D-25; it does not revoke prior approvals or renew
 the other trusted slices or the confined branch.
 Q-9 through Q-17 below preserve the resolved design questions. D-16 through
 D-28 record lifecycle, identity, scheduling, determinism, delivery, automatic
-cleanup requirements. The [instance contract](lua_instance_contract.md) is
+cleanup requirements. The [instance contract](../../lua_instance_contract.md) is
 accepted by D-26 and strengthened by D-27. LUA-6's design-readiness check is
 complete and readiness is renewed by D-28. The owner requests manager-led issue
 processing and canonical issue approval. Do not request the same behavioral or
@@ -194,7 +205,7 @@ concrete precondition
 
 ## Processing status
 
-- [x] EPIC. Establish trusted UI and gameplay Lua execution — [#145]; owner-confirmed revised scope, tracker reconciliation owned by the manager
+- [x] EPIC. Establish trusted UI and gameplay Lua execution — [#145](https://github.com/coghex/hetoimasia/issues/145); owner-confirmed revised scope; closed as completed 2026-10-22 (history: tracker reconciliation was owned by the manager)
 - [x] LUA-1. Establish the Lua binding and foreign-call boundary — [#146]
 - [x] LUA-14. Prove Linux confinement and resource-limit feasibility — [#147]
 - [x] LUA-15. Prove macOS confinement and resource-limit feasibility — [#148]
@@ -385,7 +396,7 @@ LUA-18 builds on:
 - **The clock.** The monotonic time and deadline boundary that LUA-6 and
   LUA-12 need (Q-4) has shipped: TIME-1/#133, merged by PR #152, and
   `Foundation.Time` with its `Types` and `Arithmetic` modules (the latest split
-  is `16933652`). [Runtime scheduling](archive/runtime_scheduling_design.md) owns
+  is `16933652`). [Runtime scheduling](../runtime_scheduling_design.md) owns
   monotonic time and native wake, not Lua tasks.
 - **A graphics consumer now exists.** The 2D renderer (epic #413, closed
   2026-10-14) publishes per-window scenes in the window host (#423, PR #435,
@@ -393,13 +404,13 @@ LUA-18 builds on:
   #441, `1728868b`). These are the presentation consumers P-2 anticipated.
   The trusted milestone LUA-8 stays headless, with fake capability and
   presentation consumers and no Vulkan or GLFW dependency.
-- [Window/graphics lifetime](archive/window_graphics_lifetime_design.md) owns graphics
-  retirement. [Test architecture](archive/test_architecture_design.md) specifies
+- [Window/graphics lifetime](../window_graphics_lifetime_design.md) owns graphics
+  retirement. [Test architecture](../test_architecture_design.md) specifies
   package-owned suites, so new Lua suites start in this package.
 - **Tracker.** The open items at inspection are #145 (this epic) and #446
   (deferred render-to-texture, unrelated). No other issue or pull request
   overlaps the Lua arc. The original foundation plan's FND-5 overlapped host
-  construction. Its [current boundary overview](engine_foundation_design.md)
+  construction. Its [current boundary overview](../../engine_foundation_design.md)
   delegates scripting to this arc; do not resurrect the historical slice or
   create a second host epic.
 
@@ -780,7 +791,7 @@ Owner direction, 2026-10-17: a paused instance must not process callbacks. The
 owner prefers callbacks to queue and execute in order on resume; "probably
 silent failure" was tentative, not approval to silently lose accepted work.
 The concrete bounded retention and overflow recommendation is in the
-[instance contract](lua_instance_contract.md), subsequently approved by D-26.
+[instance contract](../../lua_instance_contract.md), subsequently approved by D-26.
 
 If initialization fails, fail that instance, run none of its later hooks/loop,
 and warn the user with how the script failed. Isolate failure from other
@@ -805,7 +816,7 @@ approve new behavior, file tracker items, or renew readiness for these slices.
 ### D-26. Accept the instance contract
 
 Owner approval, 2026-10-17: "i approve this" in response to the complete
-[instance contract](lua_instance_contract.md) and its presented defaults.
+[instance contract](../../lua_instance_contract.md) and its presented defaults.
 Accept bounded FIFO paused-event retention with explicit overflow, safe-boundary
 cancellation, shutdown once after successful init, finite non-suspending
 init/shutdown, the specified cadence/pause baselines and bounded control results.
@@ -1562,7 +1573,7 @@ flowchart TD
 ```
 
 LUA-1 selected `lua-2.3.4`, its bundled Lua 5.4.8, and the private C/Haskell
-bridge documented in the [package contract](../packages/scripting-lua/README.md).
+bridge documented in the [package contract](../../../packages/scripting-lua/README.md).
 Use that qualified boundary and the binding settings in `cabal.project.common`;
 `lua` is the HsLua project's raw binding layer; its higher-level `hslua-core`
 layer was evaluated and not selected. Binding selection is complete. Q-3 records
@@ -1600,7 +1611,7 @@ the GLFW process main thread owns platform events and windows. This does not
 make rendering a dependency of the headless Lua milestone: fake capability and
 presentation consumers establish the same boundary there. Simulation and the
 commit policy remain application-owned. This follows the accepted
-[V-5 ownership boundary](vision.md#v-5-bounded-communication-and-responsive-ownership).
+[V-5 ownership boundary](../../vision.md#v-5-bounded-communication-and-responsive-ownership).
 
 The trusted owners use direct application-registered bindings under D-12/D-14;
 this does not allow a callback to access another owner's mutable state or call
@@ -2011,7 +2022,7 @@ No macOS remote CI is introduced.
 
 All first-arc acceptance is headless and needs no desktop interaction. If a later
 integration test opens windows or changes focus/display state, ask for the human
-user's explicit approval before that local session (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md)). No Vulkan API or graphics
+user's explicit approval before that local session (superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../../../AGENTS.md)). No Vulkan API or graphics
 completion token belongs in these Lua tests.
 
 ### P-13. Untrusted processes, permissions, and enforced limits
@@ -2114,7 +2125,7 @@ probes. A future sandbox relaxation or native-mod API needs a new design review.
 
 ### P-14. Script-instance lifecycle contract
 
-[Lua instance contract](lua_instance_contract.md) is accepted by D-26 and
+[Lua instance contract](../../lua_instance_contract.md) is accepted by D-26 and
 strengthened by D-27. It fixes initialization, pause/resume, ordered event
 retention, stop/shutdown, engine-owned resource cleanup, cadence and control
 results. Behavioral signoff is complete; implementation evidence and slice
@@ -2145,7 +2156,7 @@ normal supervision semantics.
 
 Resolved by LUA-1/#146, merged in PR #173, on the shared #157 toolchain:
 `lua-2.3.4` with bundled Lua 5.4.8 and the project's private C/Haskell bridge.
-The [package contract](../packages/scripting-lua/README.md) records safe FFI
+The [package contract](../../../packages/scripting-lua/README.md) records safe FFI
 paths, registry/stack ownership, callback transport, close/finalizer behavior,
 and the selected flags. `hslua-core` was evaluated and not selected.
 
@@ -2159,7 +2170,7 @@ cancellation or confinement guarantees from the binding proof.
 ### Q-4. Clock prerequisite and delivery coordination
 
 LUA-6 and LUA-12 require TIME-1/#133, which is merged. Use the existing
-[foundation monotonic time boundary](time.md) and link that prerequisite when
+[foundation monotonic time boundary](../../time.md) and link that prerequisite when
 drafting either slice. Do not absorb TIME-1 into this epic or make Vulkan,
 GLFW scheduling, or a completed game loop artificial prerequisites.
 
@@ -2168,17 +2179,17 @@ GLFW scheduling, or a completed game loop artificial prerequisites.
 **Result reconciled 2026-09-23:** both preliminary proofs are merged and
 `inconclusive`; no production deployment profile is selected.
 
-- [Linux verdict](archive/lua_linux_confinement_verdict.md), LUA-14/#147, PR #177:
+- [Linux verdict](../lua_linux_confinement_verdict.md), LUA-14/#147, PR #177:
   the candidate enforces the tested boundary where unprivileged user
   namespaces are usable. Stock Ubuntu 24.04 restrictions and the current CI
   container prevent that setup. The successful reference experiment required
   an administrative restriction change; this is not an approved deployment
-  requirement. [Retained runs](archive/lua_linux_confinement_evidence.md) distinguish
+  requirement. [Retained runs](../lua_linux_confinement_evidence.md) distinguish
   all three environments/outcomes.
-- [macOS verdict](archive/macos_confinement_verdict.md), LUA-15/#148, PR #176:
+- [macOS verdict](../macos_confinement_verdict.md), LUA-15/#148, PR #176:
   the candidate uses unsupported confinement and memory-limit interfaces.
   Its named residual limits and missing Lua-side network-denial evidence
-  remain part of the result. The [#176 review](project_review/176.md) also
+  remain part of the result. The [#176 review](../../project_review/176.md) also
   identified an optimization defect in the intended native-buffer growth.
   #228/PR #243 repaired it and refreshed the retained evidence on 2026-09-22;
   the corrected workload checks distinct native buffers after a major
@@ -2581,7 +2592,7 @@ shutdown and cleanup. Slice readiness remains to be renewed.
 ### Q-17. Accept the concrete instance contract
 
 **Resolved by D-26/D-27.** The owner approved
-[the instance contract](lua_instance_contract.md) and clarified mandatory
+[the instance contract](../../lua_instance_contract.md) and clarified mandatory
 engine-owned cleanup. The accepted behavioral groups are:
 
 1. Bounded FIFO retention while paused, explicit refusal/reporting on overflow,
@@ -3391,7 +3402,7 @@ unchanged; Lua-first M1 is a separate consumer plan.
   reload.
 - **Open questions:** None; D-40 and D-42 fix its behavior.
 - **As delivered (#492):** the choices the slice left to its solver, recorded so a later slice does not reopen
-  them. The package contract is [`packages/scripting-lua/README.md`](../packages/scripting-lua/README.md#the-script-runner).
+  them. The package contract is [`packages/scripting-lua/README.md`](../../../packages/scripting-lua/README.md#the-script-runner).
   Sinks (the owner's amendment on #492, `owner-decision:lua27-runner-sinks`): the tables go to the *output* sink as
   `print` does, the source-did-not-load report and every instance failure report to the *error* sink as `warn`
   does; which process streams they are is LUA-19's. Hooks: the owner reads which optional hooks a module defines
@@ -3447,7 +3458,7 @@ unchanged; Lua-first M1 is a separate consumer plan.
   message bus, replay.
 - **Open questions:** None; D-40 and D-42 fix its behavior.
 - **As delivered (#493):** the choices the slice left to its solver, recorded so a later slice does not reopen
-  them. The package contract is [`packages/scripting-lua/README.md`](../packages/scripting-lua/README.md#the-script-runner).
+  them. The package contract is [`packages/scripting-lua/README.md`](../../../packages/scripting-lua/README.md#the-script-runner).
   *Coordination (requirement 6)* is met with the engine as delivered, changing none of LUA-18's dispatch, LUA-23's
   control admission or LUA-26's subscriptions: the runner installs the owner's segment observer as a *gate* it can hold
   (the owner parks before its next segment, readable in STM), admits each script with the gate held, produces the
@@ -3498,7 +3509,7 @@ unchanged; Lua-first M1 is a separate consumer plan.
 - **Open questions:** None; D-40 settles the runner's product choices and D-41
   renews readiness.
 - **As delivered (#494):** the choices the slice left to its solver, recorded so a later slice does not reopen
-  them. The package contract is [`packages/scripting-lua/README.md`](../packages/scripting-lua/README.md#the-command-line).
+  them. The package contract is [`packages/scripting-lua/README.md`](../../../packages/scripting-lua/README.md#the-command-line).
   The command line is a pure parser (`Hetoimasia.Console.Lua.Options`) in the root package's private `console`
   library, with the status mapping (`...Lua.Status`), the one signal coordinator (`...Lua.Signals`) and the wiring
   (`Hetoimasia.Console.Lua`) beside it; `app/Main.hs` only routes. A value that is absent, empty or itself begins with
@@ -3916,10 +3927,12 @@ does not authorize conflicting edits or duplicate platform infrastructure.
 Q-8's historical D-13/D-14 answer is qualified by the later trust decision.
 The trusted branch is delivered through LUA-8 (2026-10-21); do not recreate
 this host/runtime or #146–#149. The named successor is
-[Lua-first M1](designs/lua_first_engine_design.md): a separate consumer epic
+[Lua-first M1](lua_first_engine_design.md): a separate consumer epic
 after its own readiness, with a rendered Lua quad, real logical stub and no
-state store/mod activation. The manager reconciles #145's title/body and closes
-its explicitly reduced trusted scope; that is not original-scope completion.
+state store/mod activation. It was delivered as epic [#514](https://github.com/coghex/hetoimasia/issues/514), closed as completed on
+2026-11-01T23:29:53Z with all 28 slices merged. The manager reconciled #145's title/body and closed
+its explicitly reduced trusted scope ([#145](https://github.com/coghex/hetoimasia/issues/145), closed as completed on 2026-10-22T05:32:13Z); that was not
+original-scope completion.
 
 Q-5's deployment obstacles and inconclusive platform verdicts remain recorded.
 Any future hostile-code arc first needs owner scope/readiness authorization
@@ -3948,7 +3961,7 @@ boundaries has restrictions. Protected calls report errors rather than rolling
 back mutations. These facts motivate the proposed ownership and failure rules;
 recheck them against LUA-1's selected version.
 
-The [qualified GHC toolchain](toolchain.md) and its
+The [qualified GHC toolchain](../../toolchain.md) and its
 [FFI guide](https://downloads.haskell.org/ghc/9.14.1/docs/users_guide/exts/ffi.html#multi-threading-and-the-ffi)
 describe threaded-RTS concurrency, safe versus unsafe foreign calls, callback
 behavior, and bound-thread affinity. Long unsafe calls can impede progress and

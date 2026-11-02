@@ -632,6 +632,24 @@ is the wake path's degradation warning, under `glfw.wake`.
    backends do not agree on the code, so the description is part of the
    evidence; the session carries both through unaltered rather than folding
    them into one generic failure.
+
+   `glfwInit` is the one call of entry that can fail to return. On Cocoa the
+   process main thread can block inside it for good, and a blocked main thread
+   cannot be unwound from Haskell. Two things bound that, and neither alters
+   the contract above for a call that returns (see
+   [Initialization on Cocoa](#initialization-on-cocoa)):
+
+   - **Prevention.** Before `glfwInit`, a re-initialization in a process whose
+     launch already finished arms a stop for the launch wait GLFW would
+     otherwise enter and never leave. The first initialization of a process is
+     untouched, and the arming has no visible effect.
+   - **Deadline.** The application may put a process-level deadline on the call
+     (`SessionConfig.initializationDeadline`). When it passes, the application's
+     report runs for at most two seconds and the process ends with status 75,
+     without unwinding. The `run` command arms it on macOS with a bound of **ten
+     seconds**; nothing is armed by default, and Linux initialization is
+     unchanged. The deadline names an observed condition, that `glfwInit` had not
+     returned within the bound, and never a cause.
 7. **Verification.** Reports from a successful initialization are raised only
    now, after termination has been registered, and `glfwGetPlatform` must name
    the selected backend, or entry is `BackendNotSelected`. A Wayland hint that
@@ -655,6 +673,117 @@ rejected before native mutation. A failure at any later step releases exactly
 what the earlier steps acquired, with the triggering failure primary and every
 cleanup failure retained, as [composite construction](resources.md#composite-construction)
 guarantees. Sequential sessions work after a complete, safe teardown.
+
+### Initialization on Cocoa
+
+#### The cause (issue #586)
+
+On the pinned macOS profile (GLFW 3.4, Cocoa) `glfwInit` intermittently never
+returned. GLFW 3.4's `_glfwInitCocoa` calls `[NSApp run]` whenever
+`-[NSRunningApplication isFinishedLaunching]` answers `NO`
+(`src/cocoa_init.m:633-635`). That run returns only when its delegate's
+`applicationDidFinishLaunching:` stops it (`:439-443`), and `NSApplication` sends
+that notification once per process, at its first launch. `isFinishedLaunching`
+is LaunchServices' view of the process, read once, at that instant. So in a
+process that has already initialized GLFW once, a *transiently false* answer
+sends a later `glfwInit` into a `[NSApp run]` that nothing can stop: the main
+thread waits in `nextEventMatchingMask:untilDate:inMode:dequeue:` for ever.
+
+Established, with a scratch probe that links the pinned static GLFW and sets the
+same two init hints as the session, creating no window (evidence on the issue):
+
+- A bare second `[NSApp run]` after `glfwInit; glfwTerminate` blocks every time.
+  The flag after a first initialization is `true` and stays so.
+- In a quiet process the flag was `true` before all 2,999 later initializations
+  of a 3,000-cycle loop.
+- With three other processes repeatedly launching and ending a GLFW application,
+  the flag read `false` at a later initialization in 4 of 649 cycles in one run
+  and 3 of 231 in another, and `glfwInit` then never returned (cycle 649, cycle
+  231). A `sample` of the hung probe has the stack the issue recorded:
+  `glfwInit` → `_glfwInitCocoa` → `-[NSApplication run]` →
+  `nextEventMatchingMask:untilDate:inMode:dequeue:` → `mach_msg2_trap`.
+
+Not established: that the flag read `false` inside `run-native-tests` itself (the
+runner strips `DYLD_INSERT_LIBRARIES`, so the real suite cannot be instrumented
+without changing it; the match is by stack, by the repeated in-process
+initializations, and by the churn the suite's windowed product children
+produce), and why LaunchServices answers `false` at those instants. The first
+initialization of a process is not affected by this cause: its launch is real
+and its notification arrives.
+
+#### Prevention
+
+The native shim wraps `glfwInit` (`hetoimasia_glfw_init`). From the second
+initialization of a process on (an earlier one returned `GLFW_TRUE`), before
+`glfwInit` it queues a block on the main dispatch queue and closes it again when
+`glfwInit` returns. If `glfwInit` enters the redundant `[NSApp run]`, the run loop
+services the main queue and the block, still open for that call, stops the run
+and posts the application-defined event that wakes it, exactly what GLFW's own
+delegate does at a real launch. If `glfwInit` does not enter it, the main queue is
+not serviced during the call; a block that runs later finds its generation
+closed and does nothing. Verified against a flag forced to `NO` on every
+re-initialization: 499 of 499 completed, where the same loop without the stop
+blocks at the second.
+
+Visible effects: **none**. The activation policy, the menu bar and the Dock icon
+are GLFW's own, as before (`GLFW_COCOA_MENUBAR` stays at its default); no hint is
+added; the pinned prefix and GLFW are unchanged; the first initialization takes
+the same path. A re-initialization whose flag is `true` (the ordinary case)
+enters nothing and runs the same code as before. Linux and Wayland initialization
+are unchanged: the wrapper is `glfwInit` itself there.
+
+#### The deadline
+
+A prevention can be wrong, and a blocked main thread can only be answered by
+ending the process. The mechanism is the package's; the policy is the
+application's (vision V-3: engine packages gain no deadline policy, and the
+application chooses the deadline, what is reported and the flush).
+`SessionConfig.initializationDeadline` carries an `InitializationDeadline`: a
+bound in microseconds and a report action over the application's own logger, so
+the session stays logger-free and writes to no handle. The guard
+(`Hetoimasia.GLFW.Internal.Deadline`) brackets exactly one call, `glfwInit`
+(including the shim's arming above), and nothing else.
+
+| Phase of one guarded call | Entered by | Left by |
+| --- | --- | --- |
+| Pending | the guard, before the call | the call ending, or the bound passing |
+| Retired | the call returning, raising or being cancelled | never; its timer thread ends and is joined before the guard leaves |
+| Expired | the timer thread, once the bound has passed with the call Pending | never; the process ends |
+
+One transaction decides each call exactly once, so a call that returns just as
+the bound passes is either retired or expired, never both. A retired timer
+cannot end a later session: its thread has been joined, and a later call has a
+cell and a timer thread of its own, so each initialization of a process is
+protected. The timer thread is started under mask with its join registered in the
+same step, and is stopped and joined on a normal return, a `False` return, an
+exception and cancellation; it leaves no thread or timer behind.
+
+On expiry the timer thread runs the application's report on a thread of its own
+and waits for it for at most **two seconds**, then ends the process with
+`_exit(75)` through the session's `nativeExitProcess` (`EX_TEMPFAIL`, distinct
+from every status [the run command](run_command.md#exit-status) documents). It
+does not wait for GLFW, termination, cleanup or the main thread, and a report
+that blocks, throws or never returns cannot delay the exit: the total from the
+start of the call is the bound plus two seconds, at most **twelve seconds** in
+the `run` command. Nothing unwinds, no exit handler runs, and the operating
+system reclaims the process.
+
+**The bound.** The `run` command's is ten seconds, armed on macOS only. The
+slowest healthy `glfwInit` measured on this profile, among about 7,400
+initializations (3,000 in a quiet process, 648 and 230 under concurrent
+application launches, 500 and 3,000 with the prevention armed), took 0.094 s; a
+typical later initialization takes 0.4 ms and a first one about 60 ms. Ten
+seconds is more than a hundred times the slowest, so a slow but healthy start is
+not ended, and it sits well inside the 30-second budget of the complete native
+profile, whose healthy run takes 8 to 13 seconds.
+
+**The diagnostic.** One `Error` record of the command's logger, component
+`run.graphics`, message `native initialization exceeded its bound; ending the
+process`, fields `backend`, `bound_microseconds`, `exit_status` (75), `observed`
+(`glfwInit had not returned`) and `see` (this section), then a best-effort flush
+of the logger. It says what was observed and does not assert that the cause
+above explains it: a timeout is evidence that Cocoa initialization exceeded its
+bound, nothing more.
 
 ## Owner, thread, and lifetime
 

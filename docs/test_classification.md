@@ -89,7 +89,7 @@ an ordinary example hanging during protected cleanup.
 
 ## Local probe inventory
 
-All seven catalog groups below have `optional: true`, `category: probe`, and no
+All eight catalog groups below have `optional: true`, `category: probe`, and no
 CI worker assignment. They remain in the catalog so their commands, ownership,
 inputs, and platform constraints have one authority. They must not be named in
 a PR `validation-request` block; a hosted plan cannot route them. `all-hspec`
@@ -104,6 +104,7 @@ also includes them and must not be used in a PR request.
 | `probe:lua-domains-profile` / `test.lua-domains-profile` | `cabal test hetoimasia-sample-lua-domains:lua-domains-profile --test-show-details=direct` | Eight examples, a few seconds; bounded workloads of the two-domain sample print one record each and assert no number (P-11): the UI's update cadence while gameplay is idle, held and CPU-bound, gameplay's throughput with the UI idle and busy, the scheduler's counters, the RTS statistics (`-T`), and requirement 5's qualification runs repeated fifty times each with how many matched the baseline's digest trace |
 | `probe:lua-confinement-linux` / `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | Linux only; confinement, limits, isolation, and lifetime feasibility; missing prerequisites can leave evidence unproven |
 | `probe:lua-confinement-macos` / `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | Darwin only; confinement and resource-limit feasibility using unsupported interfaces |
+| `probe:run-native-repeat` / `test.run-native-repeat` | `HETOIMASIA_NATIVE_SESSION=desktop cabal test hetoimasia:run-native-repeat-probe --test-show-details=direct` | Darwin only; the complete `run-native-tests` profile (`test.vulkan-run-native`) run N times (default 59), one at a time, windows on the desktop for the whole batch, about 12 s a run (an hour at most); a run that exceeds its 45-second bound is sampled once and stopped by pid with everything it started and counts as a hang, as does a run the initialization deadline ended; reports N, the detection confidence (1 - 0.95^N, 95.15% at 59, detection power and not proof), and how many runs passed, hung and failed, keeping every run's output and samples (#586). Eleven device-free examples with `/bin/sh` children cover the machinery. `HETOIMASIA_REPEAT_UNTIL_HANG=1` runs an unfixed revision until its first hang; the probe first builds the suite and the product executable of the checkout it runs (`HETOIMASIA_REPEAT_CHECKOUT`) and keeps that output, so a stale binary is never measured as the revision |
 
 Use `--project-file cabal.project.cpu` with the `cabal test` commands when the GLFW SDK
 is unavailable. The catalog command deadlines include compilation overhead;

@@ -37,7 +37,7 @@ which was "yes" each time.
 | M-3 | Checkpoint `resize-smaller`: clipped, not stretched or re-centred | CONFIRMED | 23:24:04.390Z | WindowId 1, 320x240 logical / 640x480 framebuffer; clipped, not stretched or re-centred |
 | M-4 | Checkpoint `resize-larger` | CONFIRMED | 23:24:17.851Z | WindowId 1, 800x600 logical / 1600x1200 framebuffer |
 | M-5 | Checkpoint `restore` | CONFIRMED | 23:24:32.079Z | WindowId 1 at revision 236, visible=True, iconified=False, with no explicit sample |
-| M-6 | Actual command: the quad, then the owner closes the window; exit 0 | CONFIRMED | n/a (the second run) | exit 0; see below |
+| M-6 | Actual command: the quad, then the owner closes the window; exit 0 | CONFIRMED | n/a (the second run) | exit 0. Owning PID: not captured by this run (the plain command logs none); unavailable. Window identity: not captured by this run (the plain command logs none); unavailable. Window metrics: not captured by this run (the plain command logs none); unavailable. See "M-6 traceability" below |
 
 The M-5 reading is the [#581](https://github.com/coghex/hetoimasia/issues/581) behaviour: the restored window reported
 itself drawable by itself, with no further sample (the earlier explicit-sample readings, revision 8 `visible=False` and
@@ -50,6 +50,20 @@ revision 9 `visible=True`, are history).
 * The session stopped with `interrupt=false quit=true` (the owner's close of the window, a quit, not an interrupt) and ended
   with `failures=0 verdict=VerdictSuccess`.
 * The command exited 0. The owner saw the quad and closed the window ("looked good").
+
+## M-6 traceability
+
+[#540](https://github.com/coghex/hetoimasia/issues/540) requirement 2 and
+[owner amendment item 2](https://github.com/coghex/hetoimasia/issues/540#issuecomment-6558502797) ask for the owning PID, window
+identity and window metrics of each run. The M-6 run, the plain actual command (item 2 above), reports none of the three:
+
+* Owning PID: not captured by this run (the plain command logs none); unavailable
+* Window identity: not captured by this run (the plain command logs none); unavailable
+* Window metrics: not captured by this run (the plain command logs none); unavailable
+
+The PID recorded above (57617) belongs to the separate supervised run (item 1), not to M-6. The M-6 summary therefore does not
+satisfy every traceability field of #540 requirement 2 and amendment item 2. This does not change the owner's observed quad and
+clean close of the window, and no rerun was ordered.
 
 ## Limits
 
