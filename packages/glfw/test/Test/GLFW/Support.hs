@@ -42,6 +42,7 @@ module Test.GLFW.Support
   , recordingThreads
   , runEnding
   , ownedEnds
+  , exitFinishes
   , unownedLeaks
   , unownedScope
   , unownedBoundScope
@@ -418,6 +419,12 @@ ownedEnds ending scenario bound = do
   recorded ← newIORef []
   runEnding ending (scenario (recordingThreads recorded (if bound then withOwnedBoundThreadOpening else withOwnedThreadOpening)))
   endedAndJoined recorded >>= (`shouldBe` True)
+
+-- | The judgement for a scenario that starts its own threads inside the fixture (so none is recorded): the example, ended the way
+-- the ending says, finishes: its exit does not wait for ever. A fixture that would hang does so here, and the hard bound of the
+-- caller ends it.
+exitFinishes ∷ Ending → (Scope → IO () → IO ()) → Expectation
+exitFinishes ending scenario = runEnding ending (scenario withOwnedThreadOpening)
 
 -- | The negative control: the same scenario over an unowned start leaves the thread behind, and the failed judgement is recorded
 -- before anything independent stops the thread. Whatever the control left is then stopped and joined, even if the judgement

@@ -13,8 +13,8 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (AsyncException (ThreadKilled), mask_, throwTo)
-import Control.Monad (forM_, unless, void, when)
+import Control.Exception (AsyncException (ThreadKilled), SomeException, mask_, throwTo, uninterruptibleMask_)
+import Control.Monad (forM_, join, unless, void, when)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Hetoimasia.Runtime.GLFW
@@ -29,7 +29,7 @@ import Test.GLFW.Owner.Fixture.Drive
   )
 import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled, ordered)
-import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHost, ownedHostBeforeBody)
+import Test.GLFW.Owner.Fixture.Rig (Rig (..), armedBody, newRig, ownedHost, ownedHostBeforeBody, publishAllFor)
 import Test.GLFW.Support
   ( boundedExample
   , caughtAs
@@ -38,9 +38,10 @@ import Test.GLFW.Support
   , unexpected
   )
 import Test.Hspec (Spec, it, shouldBe, shouldReturn, shouldSatisfy)
-import Test.GLFW.Support (Ending (..), Scope, ownedEnds, withDeferredThreadVia)
+import Test.GLFW.Support (Ending (..), Scope, exitFinishes, ownedEnds, withDeferredThreadVia)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Data.Foldable (for_)
+import Data.IORef (newIORef, readIORef, writeIORef)
 
 spec ∷ Spec
 spec = do
@@ -52,6 +53,14 @@ spec = do
     (boundedExample testEscapedRetirementCancellation)
   it "retains everything until independent evidence when the cancellation escaped the destruction"
     (boundedExample testEscapedDestructionCancellation)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    for_ [("before the scripted backend behaviour is armed", False), ("after it is armed and its release registered", True)] $ \(where', cutAt) → do
+      it ("finishes the exit when the example body " <> label <> " " <> where' <> ", at each backend call (#593)") $
+        boundedExample (exitFinishes ending (backendCallScenario cutAt))
+      it ("finishes the exit when the example body " <> label <> " " <> where' <> ", in the escaped construction (#593)") $
+        boundedExample (exitFinishes ending (escapedConstructionScenario cutAt))
+      it ("finishes the exit when the example body " <> label <> " " <> where' <> ", in the escaped retirement (#593)") $
+        boundedExample (exitFinishes ending (escapedRetirementScenario cutAt))
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
     it ("finishes the exit on the interrupter's evidence when the example body " <> label <> " right after the interrupter was handed the owner (#593)") $
       boundedExample (ownedEnds ending escapedDestructionEndedEarlyScenario False)
@@ -69,7 +78,15 @@ spec = do
 -- has been entered and then waits, and the example throws to the owner's own
 -- thread while it is there.
 testCancellationAtEachBackendCall ∷ IO ()
-testCancellationAtEachBackendCall =
+testCancellationAtEachBackendCall = cancellationAtEachBackendCall (\_ → pure ())
+
+-- | The same fixture with the example ended at the cut (#593): before the scripted backend behaviour is armed, or after it and its
+-- release are registered.
+backendCallScenario ∷ Bool → Scope → IO () → IO ()
+backendCallScenario cutAt _ atParked = cancellationAtEachBackendCall (\armedNow → when (armedNow == cutAt) atParked)
+
+cancellationAtEachBackendCall ∷ (Bool → IO ()) → IO ()
+cancellationAtEachBackendCall cut =
   forM_ [BackendConstruct, BackendRetireTarget, BackendDestroy] $ \at' → do
     rig ← newRig
     inside ← newTVarIO False
@@ -85,15 +102,16 @@ testCancellationAtEachBackendCall =
             atomically (writeTVar inside True)
             atomically (readTVar release >>= check)
           answer
-    case at' of
-      BackendConstruct →
-        script (fakeConstruct (rigFake rig)) $ \start →
-          gated (pure (TargetConstructed (targetEvidence (Text.pack (show (startingWindow start))))))
-      BackendRetireTarget →
-        script (fakeRetireTarget (rigFake rig)) $ \retire →
-          gated (pure (targetRetired (Text.pack (show (retiringWindow retire)))))
-      BackendDestroy →
-        script (fakeDestroy (rigFake rig)) $ \_ → gated (pure (ownerDestroyed (Text.pack "destroyed")))
+    -- Armed inside the body's first masked step, after the release that undoes it is registered (#593).
+    let arm = case at' of
+          BackendConstruct →
+            script (fakeConstruct (rigFake rig)) $ \start →
+              gated (pure (TargetConstructed (targetEvidence (Text.pack (show (startingWindow start))))))
+          BackendRetireTarget →
+            script (fakeRetireTarget (rigFake rig)) $ \retire →
+              gated (pure (targetRetired (Text.pack (show (retiringWindow retire)))))
+          BackendDestroy →
+            script (fakeDestroy (rigFake rig)) $ \_ → gated (pure (ownerDestroyed (Text.pack "destroyed")))
     -- The destruction is only ever entered during the exit, when the main
     -- thread is no longer in the body, so every case delivers from a helper
     -- rather than from the body itself.
@@ -117,7 +135,7 @@ testCancellationAtEachBackendCall =
     -- The helper drives the owner through the gate it is held at and opens that gate itself, so it is owned by the example and
     -- outlives the host body (#593); the scope opens the gate as well, whatever ended it.
     withOwnedThreadOpening (atomically (writeTVar release True)) deliver $ \_ _ → do
-      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (atomically (writeTVar release True)) $ do
         window ← theWindow host
         service ← handedOver host owner window
         -- The body must not return before a call that happens during the run
@@ -163,25 +181,34 @@ data BackendCall
 -- | A construction the cancellation escaped is settled unverified, and the
 -- owner retires what it must therefore assume it owns, in dependency order.
 testEscapedConstructionCancellation ∷ IO ()
-testEscapedConstructionCancellation = do
+testEscapedConstructionCancellation = escapedConstruction False (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the gated retirement is armed, or after it and its release are registered.
+escapedConstructionScenario ∷ Bool → Scope → IO () → IO ()
+escapedConstructionScenario cutAt _ atParked = escapedConstruction True (\armedNow → when (armedNow == cutAt) atParked)
+
+escapedConstruction ∷ Bool → (Bool → IO ()) → IO ()
+escapedConstruction scenario cut = do
   rig ← newRig
   inside ← newTVarIO False
   never ← newTVarIO False
   observedStanding ← newTVarIO Nothing
-  script (fakeConstruct (rigFake rig)) $ \_ → do
-    atomically (writeTVar inside True)
-    atomically (readTVar never >>= check)
-    unexpected "the interrupted construction returned"
   -- The retirement is held until the example has read the standing: the
   -- cancellation takes the owner into its drain at once, and the drain
   -- retires — and so forgets — the very target the standing is about.
   gate ← newTVarIO False
-  script (fakeRetireTarget (rigFake rig)) $ \retire → do
-    atomically (readTVar gate >>= check)
-    pure (targetRetired (Text.pack (show (retiringWindow retire))))
+  -- Both behaviours are armed inside the body's first masked step, after the release of the gate is registered (#593).
+  let arm = do
+        script (fakeConstruct (rigFake rig)) $ \_ → do
+          atomically (writeTVar inside True)
+          atomically (readTVar never >>= check)
+          unexpected "the interrupted construction returned"
+        script (fakeRetireTarget (rigFake rig)) $ \retire → do
+          atomically (readTVar gate >>= check)
+          pure (targetRetired (Text.pack (show (retiringWindow retire))))
   withOwnedThread (killInside rig inside) $ \_ _ → do
-    (raised, _) ← caughtAs @AsyncException $
-      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    (raised, _) ← caughtUnlessScenario scenario $
+      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (atomically (writeTVar gate True)) $ do
         window ← theWindow host
         service ← handedOver host owner window
         -- Neither accepted nor verifiably rolled back: the owner records what
@@ -214,21 +241,30 @@ testEscapedConstructionCancellation = do
 -- on which kind of exception ended the call: the operation was entered, what
 -- it did is unknown, and asking again could dispose something twice.
 testEscapedRetirementCancellation ∷ IO ()
-testEscapedRetirementCancellation = do
+testEscapedRetirementCancellation = escapedRetirement False (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the blocking retirement is armed, or after it and the rescue are registered.
+escapedRetirementScenario ∷ Bool → Scope → IO () → IO ()
+escapedRetirementScenario cutAt _ atParked = escapedRetirement True (\armedNow → when (armedNow == cutAt) atParked)
+
+escapedRetirement ∷ Bool → (Bool → IO ()) → IO ()
+escapedRetirement scenario cut = do
   rig ← newRig
   inside ← newTVarIO False
   never ← newTVarIO False
-  script (fakeRetireTarget (rigFake rig)) $ \_ → do
-    atomically (writeTVar inside True)
-    atomically (readTVar never >>= check)
-    unexpected "the interrupted target retirement returned"
+  rescueRef ← newIORef (pure ())
+  let arm = script (fakeRetireTarget (rigFake rig)) $ \_ → do
+        atomically (writeTVar inside True)
+        atomically (readTVar never >>= check)
+        unexpected "the interrupted target retirement returned"
   observedTargets ← newTVarIO []
   observedRecords ← newTVarIO []
   withOwnedThread (killInside rig inside) $ \_ _ → do
-    (raised, _) ← caughtAs @AsyncException $
-      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    (raised, _) ← caughtUnlessScenario scenario $
+      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (join (readIORef rescueRef)) $ do
         window ← theWindow host
-        service ← handedOver host owner window
+        -- The independent evidence the drain will need is registered with the rescue in the step that creates the attachment.
+        service ← uninterruptibleMask_ (handedOver host owner window >>= \target → target <$ writeIORef rescueRef (publishAllFor host owner (graphicsAttachment target)))
         awaitStanding owner service `shouldReturn` TargetUsable
         _ ← releaseGraphicsTarget host owner service
         -- The run has ended and its drain has finished, so nothing is still to
@@ -337,6 +373,11 @@ escapedDestruction scope beforeBody endEarly = do
       WindowGone _ → True
       SessionEnded → True
       _ → False
+
+-- | In a scenario the run's own failure is the point and propagates; otherwise it is caught as the cancellation it must be.
+caughtUnlessScenario ∷ Bool → IO a → IO (AsyncException, SomeException)
+caughtUnlessScenario True run = run >> ioError (userError "the scenario's run returned")
+caughtUnlessScenario False run = caughtAs @AsyncException run
 
 -- | Wait until an injected call has been entered, then cancel the thread it
 -- is running on — which is the owner's, because the owner is the only thread

@@ -12,6 +12,8 @@ module Test.GLFW.Owner.Fixture.Rig
   , ownedHostWith
   , ownedHostHooked
   , ownedHostBeforeBody
+  , armedBody
+  , publishAllFor
   , ownedHostCaught
   ) where
 
@@ -26,7 +28,8 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeException, finally, try)
+import Control.Exception (SomeException, finally, mask, onException, try)
+import Control.Monad (forM_, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (Logger)
@@ -172,6 +175,30 @@ ownedHostBeforeBody
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO a
 ownedHostBeforeBody beforeBody = ownedHostHooked Private.noHostHooks {Private.beforeConsumer = \_ → beforeBody}
+
+-- | The body of a rig example under a rescue (#593). The example's scripted failing or gated backend behaviour (@arm@) is armed
+-- only inside this body's first masked step, in the same step that registers the release that undoes it (@release@, run only
+-- when the body ends exceptionally, before the host's drain), so no failing step, gated retirement or deferred releaser exists
+-- before the rescue that can release it. The @cut@ hook is where an example ends the body to prove that: it is called with
+-- 'False' before the arming and with 'True' once the arming and the release are registered.
+armedBody ∷ (Bool → IO ()) → IO () → IO () → IO a → IO a
+armedBody cut arm release body = do
+  cut False
+  mask $ \restore → do
+    arm
+    restore (cut True >> body) `onException` release
+
+-- | Publish every retirement fact for one attachment from the calling thread, if the host publishes completions and the owner holds
+-- the attachment's acknowledgement, and do nothing otherwise. It blocks on nothing and raises nothing, and it is idempotent: the
+-- rescue of an example whose protected drain waits for independent evidence the body would have published (#593).
+publishAllFor ∷ WindowHost → GraphicsOwner Scene → AttachmentId → IO ()
+publishAllFor host owner attachment = do
+  acknowledgement ← atomically (ownerTargetAcknowledgement owner attachment)
+  case (hostGraphicsPublisher host, acknowledgement) of
+    (Just publisher, Just acknowledged) →
+      forM_ allRetirementFacts $ \fact →
+        void (publishCompletion publisher (completionNotice attachment acknowledged fact))
+    _ → pure ()
 
 -- | 'ownedHost', catching inside the seam's own bound thread.
 --
