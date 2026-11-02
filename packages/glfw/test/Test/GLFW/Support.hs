@@ -29,6 +29,7 @@ module Test.GLFW.Support
   , withMainThreadVia
   , withMainThreadKeepingContext
   , caughtAs
+  , caughtAsUnless
   , unexpected
   , originOf
   , operationOf
@@ -43,6 +44,7 @@ module Test.GLFW.Support
   , runEnding
   , ownedEnds
   , exitFinishes
+  , cutExamples
   , unownedLeaks
   , unownedScope
   , unownedBoundScope
@@ -164,7 +166,8 @@ import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import System.Timeout (timeout)
 import GHC.IO (unsafeUnmask)
 import System.IO.Unsafe (unsafePerformIO)
-import Test.Hspec (Expectation, expectationFailure, shouldBe)
+import Data.Foldable (for_)
+import Test.Hspec (Expectation, Spec, expectationFailure, it, shouldBe)
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (withCancellationAfter)
 import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThreadOpening)
@@ -279,6 +282,12 @@ caughtAs action = do
     Left caught → case fromException caught of
       Just typed → pure (typed, caught)
       Nothing → unexpected ("the action failed with " <> displayException caught)
+
+-- | 'caughtAs', except in a scenario (#593): there the run's own ending is the point, so whatever it raises propagates to the ending's
+-- judgement rather than being matched against the exception the full example expects.
+caughtAsUnless ∷ Exception e ⇒ Bool → IO a → IO (e, SomeException)
+caughtAsUnless True run = run >> unexpected "the scenario's run returned instead of failing"
+caughtAsUnless False run = caughtAs run
 
 unexpected ∷ String → IO a
 unexpected message = expectationFailure message >> ioError (userError message)
@@ -425,6 +434,17 @@ ownedEnds ending scenario bound = do
 -- caller ends it.
 exitFinishes ∷ Ending → (Scope → IO () → IO ()) → Expectation
 exitFinishes ending scenario = runEnding ending (scenario withOwnedThreadOpening)
+
+-- | The examples that end a rig fixture at each of its cuts, for both endings (#593): before its failing or gated backend behaviour
+-- is armed, and after it is armed with the release that undoes it registered (the arming and the registration are one masked
+-- step, so a cancellation cannot land between them: it is delivered at one cut or the other). Each judges only that the exit
+-- finishes; the bound of the example ends a fixture that would wait for ever.
+cutExamples ∷ String → (Bool → Scope → IO () → IO ()) → Spec
+cutExamples what scenario =
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    for_ [("before the behaviour is armed", False), ("after it is armed and its release registered", True)] $ \(cut, cutAt) →
+      it ("finishes the exit when the example body " <> label <> " " <> cut <> ", in " <> what <> " (#593)") $
+        boundedExample (exitFinishes ending (scenario cutAt))
 
 -- | The negative control: the same scenario over an unowned start leaves the thread behind, and the failed judgement is recorded
 -- before anything independent stops the thread. Whatever the control left is then stopped and joined, even if the judgement

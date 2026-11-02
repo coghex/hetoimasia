@@ -148,6 +148,7 @@ import Test.GLFW.Support
   , failingSink
   , flushed
   , newSinkTrace
+  , exitFinishes
   , ownedEnds
   , raisedWith
   , retainedAs
@@ -161,12 +162,12 @@ import Test.GLFW.Support
   , withMainThreadVia
   , withMainThreadKeepingContext
   )
-import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Hspec (Expectation, Spec, before_, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Data.Foldable (for_)
 
 spec ∷ Spec
-spec = describe "GLFW protected host" $ do
+spec = before_ clearRegistered $ describe "GLFW protected host" $ do
   describe "exit paths" $ do
     it "retires its attachment, then destroys the window and ends the session, on a normal return"
       (boundedExample (testExitPath ReturnsNormally))
@@ -232,6 +233,13 @@ spec = describe "GLFW protected host" $ do
         boundedExample (ownedEnds ending parkedConstructionScenario True)
       it ("negative control: a plain forkOS start leaves the runner parked in its construction when the example body " <> label) $
         boundedExample (unownedLeaks ending parkedConstructionScenario True)
+      it ("finishes the exit when the example body " <> label <> " before the runner has registered its owner, which then registers and attaches after the cleanup began (#593)") $
+        boundedExample (ownedEnds ending runnerBeforeRegistrationScenario True)
+      it ("finishes the exit when the example body " <> label <> " while the runner's owner is registered and under construction, and attached after the cleanup began (#593)") $
+        boundedExample (ownedEnds ending runnerDuringConstructionScenario True)
+      for_ [0 .. 5] $ \k →
+        it ("finishes the exit when the example body " <> label <> " at step " <> show k <> " of the inbox fixture (#593)") $
+          boundedExample (exitFinishes ending (inboxSetupScenario k))
       it ("has ended and joined an evidence supplier waiting for an owner that never exists when the example body " <> label) $
         boundedExample (ownedEnds ending supplierScenario False)
       it ("negative control: an unowned start leaves the evidence supplier waiting for an owner that never exists when the example body " <> label) $
@@ -409,9 +417,11 @@ attachOwner journal host window script = do
         <*> newTVarIO 0
         <*> newTVarIO 0
         <*> newTVarIO []
-    atomicModifyIORef' registeredOwners (\known → ((host, created) : known, ()))
+    registerOwner host created
     pure created
-  outcome ← attachHostWindow host window (protocolFor journal host owner script)
+  -- Whenever the attachment ends, an owner registered after the cleanup began (or attached while it began) is released by this
+  -- code itself, now that its attachment can take the notices.
+  outcome ← attachHostWindow host window (protocolFor journal host owner script) `finally` releaseIfBegun host owner
   pure (owner, outcome)
 
 -- | The one scripted owner established, or why it was not.
@@ -738,7 +748,6 @@ protectedRunHere seam logger config inside startup action =
 
 protectedHost ∷ Seam → Logger → HostConfig → (WindowHost → IO r) → IO r
 protectedHost seam logger config body = do
-  clearRegistered
   withProtectedWindowHostIn logger (seamSession seam defaultSessionConfig) config $ \host →
     -- The rescue is the first thing acquired inside the protected lifetime (#593): it wraps the whole callback, the setup and
     -- everything the example does with the host, so a failure or cancellation at any point after the host exists reaches it
@@ -757,15 +766,36 @@ rescueRegistered = do
 -- | 'rescueRegistered' without the arming: the runner scopes call it from their opening, which runs only when the scope ends.
 rescueNow ∷ IO ()
 rescueNow = do
-  known ← readIORef registeredOwners
-  forM_ known $ \(host, owner) → do
-    atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
-    acknowledgement ← readTVarIO (ownerAcknowledgement owner)
-    case (hostGraphicsPublisher host, acknowledgement) of
-      (Just publisher, Just acknowledged) →
-        forM_ allRetirementFacts $ \fact →
-          void (publishCompletion publisher (completionNotice (acknowledgedAttachment acknowledged) acknowledged fact))
-      _ → pure ()
+  -- Sticky (#593): the cleanup is marked begun and the owners are read in one atomic step, before anything is released, so an
+  -- owner registered after this step finds the mark and releases itself, and one registered before it is in the snapshot.
+  known ← atomicModifyIORef' registeredOwners (\registry → (registry {registryBegun = True}, registryOwners registry))
+  forM_ known (uncurry releaseOwner)
+
+-- | Release one owner: its remaining plan becomes "certify every fact", and every fact is published for it directly if it holds
+-- an acknowledgement. It blocks on nothing, raises nothing and is idempotent.
+releaseOwner ∷ WindowHost → Owner → IO ()
+releaseOwner host owner = do
+  atomically (writeTVar (ownerPlan owner) (map Certify allRetirementFacts))
+  acknowledgement ← readTVarIO (ownerAcknowledgement owner)
+  case (hostGraphicsPublisher host, acknowledgement) of
+    (Just publisher, Just acknowledged) →
+      forM_ allRetirementFacts $ \fact →
+        void (publishCompletion publisher (completionNotice (acknowledgedAttachment acknowledged) acknowledged fact))
+    _ → pure ()
+
+-- | Register an owner with the rescue as it is created. If the cleanup has begun already, the registering code releases the owner
+-- itself, at once: nothing is left for a later pass to find.
+registerOwner ∷ WindowHost → Owner → IO ()
+registerOwner host owner = do
+  begun ← atomicModifyIORef' registeredOwners (\registry → (registry {registryOwners = (host, owner) : registryOwners registry}, registryBegun registry))
+  when begun (releaseOwner host owner)
+
+-- | After an attachment ended (or failed): release the owner again if the cleanup has begun, since its notices could not have been
+-- accepted before the attachment was established.
+releaseIfBegun ∷ WindowHost → Owner → IO ()
+releaseIfBegun host owner = do
+  registry ← readIORef registeredOwners
+  when (registryBegun registry) (releaseOwner host owner)
 
 -- | The failures an example raises on purpose as its subject (the scripted failure of a step, a startup or an action): the drain's own
 -- behaviour on them is what the example asserts, so the rescue leaves them alone and acts only on what nobody scripted, a
@@ -795,14 +825,19 @@ withEvidenceThread action body = armed (withOwnedThread action body)
 armed ∷ IO a → IO a
 armed act = (atomicWriteIORef rescueArmed True >> act) `finally` atomicWriteIORef rescueArmed False
 
--- | The owners created since the current protected lifetime began, with their hosts. One lifetime is active at a time (the
--- suite's examples run one after another), and 'protectedHost' empties the registry as it begins.
-registeredOwners ∷ IORef [(WindowHost, Owner)]
-registeredOwners = unsafePerformIO (newIORef [])
+-- | The owners created since the current example began, with their hosts. One example is active at a time (the suite's examples
+-- run one after another), and the spec empties the registry before each.
+registeredOwners ∷ IORef Registry
+registeredOwners = unsafePerformIO (newIORef (Registry False []))
 {-# NOINLINE registeredOwners #-}
 
+-- | Whether the cleanup has begun (sticky until the next example), and the owners registered.
+data Registry = Registry {registryBegun ∷ Bool, registryOwners ∷ [(WindowHost, Owner)]}
+
+-- | Reset between examples (the spec runs @before_@ every one), never inside a lifetime: a cleanup that begins before the runner
+-- reaches its host must stay begun.
 clearRegistered ∷ IO ()
-clearRegistered = writeIORef registeredOwners []
+clearRegistered = writeIORef registeredOwners (Registry False [])
 
 -- ---------------------------------------------------------------------------
 -- Exit paths
@@ -1266,6 +1301,62 @@ runnerPartialScenario scope atParked = do
     )
     $ \_ _ → takeMVar attached >> atParked
 
+-- | The runner of 'testRepeatedCancellation' held before it has registered its owner (#593), with the example body ended the way the
+-- ending says: the scope's opening begins the cleanup while the runner has registered nothing, then lets it go on, so the owner is
+-- registered and attached after the cleanup began. Nothing in the snapshot covers it; the registering code must release it itself,
+-- or the drain waits for ever on an owner whose plan awaits and whose facts nobody publishes.
+runnerBeforeRegistrationScenario ∷ Scope → IO () → IO ()
+runnerBeforeRegistrationScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  reached ← newEmptyMVar
+  proceed ← newEmptyMVar
+  withMainThreadVia scope seam (rescueNow >> void (tryPutMVar proceed ()))
+    ( protectedRunHere
+        seam
+        quietLogger
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            putMVar reached () >> takeMVar proceed
+            void (establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Await, Await] <> map Certify allRetirementFacts})
+        )
+        (\_ _ → pure ())
+        (\() _ → pure ())
+    )
+    $ \runner _ → takeMVar reached >> awaitParked runner >> atParked
+
+-- | The same runner held inside its owner's construction (#593): the owner is registered and holds its acknowledgement, but its
+-- attachment is not established, so a notice published for it by the cleanup's snapshot may be refused. The attachment is established
+-- after the cleanup began, and the registering code releases the owner again then.
+runnerDuringConstructionScenario ∷ Scope → IO () → IO ()
+runnerDuringConstructionScenario scope atParked = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  constructing ← newEmptyMVar
+  proceed ← newEmptyMVar
+  withMainThreadVia scope seam (rescueNow >> void (tryPutMVar proceed ()))
+    ( protectedRunHere
+        seam
+        quietLogger
+        (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            void $
+              establishedOwner
+                journal
+                host
+                window
+                (ownerNamed "alpha")
+                  { scriptPlan = [Await, Await] <> map Certify allRetirementFacts
+                  , scriptConstruct = putMVar constructing () >> takeMVar proceed
+                  }
+        )
+        (\_ _ → pure ())
+        (\() _ → pure ())
+    )
+    $ \runner _ → takeMVar constructing >> awaitParked runner >> atParked
+
 -- | The scenario of 'testCancelledRollback' up to the moment its runner is parked in the construction, with the example body ended
 -- the way the ending says (#593): a kill sent by the scope's release interrupts the construction, which starts a rollback that
 -- waits at a second gate, so the scope opens both gates before it kills and joins the runner.
@@ -1663,7 +1754,17 @@ testDeferredWindowRetired = do
 -- host may hold, so an integration can publish every obligation it has ended
 -- without being refused.
 testInboxHoldsEveryFact ∷ Expectation
-testInboxHoldsEveryFact = do
+testInboxHoldsEveryFact = inboxFixture (\_ → pure ())
+
+-- | The fixture ended at the boundary before step @k@ (#593): 0 is the setup callback (nothing attached), 1 follows the window
+-- lookup, 2 alpha's attachment, 3 beta's, 4 is the action before the publishers, 5 follows alpha's producer starting (before beta's
+-- publication). Both plans are empty, so only published notices retire either chain, and the rescue registered with the host, which
+-- certifies every fact for every owner registered so far, must be what finishes the exit from any of these.
+inboxSetupScenario ∷ Int → Scope → IO () → IO ()
+inboxSetupScenario k _ atParked = inboxFixture (\i → when (i == k) atParked)
+
+inboxFixture ∷ (Int → IO ()) → Expectation
+inboxFixture step = armed $ do
   journal ← newTVarIO []
   seam ← journallingSeam journal
   asProcessMainThread seam $
@@ -1672,17 +1773,23 @@ testInboxHoldsEveryFact = do
       "protected-host-example"
       ( \_ use →
           protectedHost seam quietLogger (settings [windowNamed "alpha", windowNamed "beta"]) $ \host → do
+            step 0
             (alpha, beta) ← twoWindows host
+            step 1
             alphaOwner ← establishedOwner journal host alpha (ownerNamed "alpha") {scriptPlan = []}
+            step 2
             betaOwner ← establishedOwner journal host beta (ownerNamed "beta") {scriptPlan = []}
+            step 3
             use (host, alphaOwner, betaOwner)
       )
       (\(host, _, _) → host)
       (\dependencies _ → pure dependencies)
       ( \(host, alphaOwner, betaOwner) _ → do
+          step 4
           -- Every fact of every window at once: none may be refused, and the
           -- plans are empty, so only these notices can retire either chain.
           withPublisher (publishFacts journal host alphaOwner allRetirementFacts) $ \published → do
+            step 5
             publishFacts journal host betaOwner allRetirementFacts
             takeMVar published
       )

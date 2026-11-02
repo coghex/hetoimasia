@@ -13,6 +13,7 @@ module Test.GLFW.Owner.Fixture.Rig
   , ownedHostHooked
   , ownedHostBeforeBody
   , armedBody
+  , armedFinally
   , publishAllFor
   , ownedHostCaught
   ) where
@@ -187,6 +188,14 @@ armedBody cut arm release body = do
   mask $ \restore → do
     arm
     restore (cut True >> body) `onException` release
+
+-- | 'armedBody' whose release also runs when the body returns: for a body that must leave nothing held on any exit (#593).
+armedFinally ∷ (Bool → IO ()) → IO () → IO () → IO a → IO a
+armedFinally cut arm release body = do
+  cut False
+  mask $ \restore → do
+    arm
+    restore (cut True >> body) `finally` release
 
 -- | Publish every retirement fact for one attachment from the calling thread, if the host publishes completions and the owner holds
 -- the attachment's acknowledgement, and do nothing otherwise. It blocks on nothing and raises nothing, and it is idempotent: the

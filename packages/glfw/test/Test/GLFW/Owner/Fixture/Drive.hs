@@ -10,6 +10,8 @@ module Test.GLFW.Owner.Fixture.Drive
   , pumpUntilRetired
   , theWindow
   , handedOver
+  , trackedHandedOver
+  , rescuePublishing
   , sampledObservation
   , observed
   , awaitTerminal
@@ -34,7 +36,8 @@ import Control.Concurrent.STM
   , retry
   )
 import Control.Exception
-  ( SomeAsyncException
+  ( uninterruptibleMask_
+  , SomeAsyncException
   , SomeException
   , fromException
   , throwIO
@@ -50,7 +53,8 @@ import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Supervision (RuntimeControl, SupervisedStart (..))
 import Numeric.Natural (Natural)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene)
-import Test.GLFW.Owner.Fixture.Rig (Rig (..))
+import Test.GLFW.Owner.Fixture.Rig (Rig (..), publishAllFor)
+import Data.IORef (IORef, atomicModifyIORef', readIORef)
 import Test.GLFW.Support (SinkTrace, current, quietLogger, traced, unexpected)
 
 -- | Run owner turns on the main thread until the condition holds.
@@ -95,6 +99,19 @@ handedOver host owner window =
   handOverGraphicsTarget host owner window >>= \case
     TargetHandedOver service → pure service
     other → unexpected ("the target was not handed over: " <> show other)
+
+-- | 'handedOver', with the attachment it made registered in the same uninterruptible step for the rescue of an example whose exit
+-- waits for independent evidence only its body would publish (#593): an attachment never exists unregistered.
+trackedHandedOver ∷ IORef [AttachmentId] → WindowHost → GraphicsOwner Scene → WindowId → IO GraphicsService
+trackedHandedOver tracked host owner window = uninterruptibleMask_ $ do
+  service ← handedOver host owner window
+  atomicModifyIORef' tracked (\known → (graphicsAttachment service : known, ()))
+  pure service
+
+-- | The rescue for the attachments 'trackedHandedOver' registered: every retirement fact published for each, from the calling
+-- thread. It blocks on nothing and raises nothing, and is idempotent.
+rescuePublishing ∷ IORef [AttachmentId] → WindowHost → GraphicsOwner Scene → IO ()
+rescuePublishing tracked host owner = readIORef tracked >>= mapM_ (publishAllFor host owner)
 
 sampledObservation ∷ WindowHost → WindowId → IO WindowObservation
 sampledObservation host window =
