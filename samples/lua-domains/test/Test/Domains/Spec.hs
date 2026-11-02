@@ -31,11 +31,11 @@ import qualified Test.Domains.Stop
 import qualified Test.Domains.UiFailure
 import qualified Test.Domains.View
 import qualified Test.Domains.World
-import Test.Domains.Support (reapForked)
-import Test.Hspec (Spec, after_, describe)
+import Test.Domains.Support (withForks)
+import Test.Hspec (Spec, around_, describe)
 
 spec ∷ Spec
-spec = after_ reapForked . describe "the two-domain Lua sample" $ do
+spec = around_ withForks . describe "the two-domain Lua sample" $ do
   Test.Domains.Dependencies.spec
   Test.Domains.World.spec
   Test.Domains.Queue.spec

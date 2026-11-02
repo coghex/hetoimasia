@@ -69,6 +69,18 @@
       "reason": "the negative controls' deliberately unowned start, which exists to be judged as a leak and is stopped and joined independently by the control that made it"
     },
     {
+      "file": "test/Test/Engine/Unowned.hs",
+      "binding": "startUnowned",
+      "sites": 1,
+      "reason": "the root suite's ownership regressions' negative controls' deliberately unowned start (#600), which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
+      "file": "samples/lua-domains/test/Test/Domains/Unowned.hs",
+      "binding": "startUnowned",
+      "sites": 1,
+      "reason": "the sample's ownership regressions' negative controls' deliberately unowned start (#600), which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
       "file": "run-native-test/Test/Run/Native/Child.hs",
       "binding": "start",
       "sites": 1,

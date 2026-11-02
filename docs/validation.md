@@ -704,7 +704,10 @@ any other way, and its message names the facility that fits the kind of start.
   thread starts that existed only to serve them), and less the 24 thread starts of the
   root run and console suites and the `lua-domains` sample that #600 converted (the `Run`
   examples of `test-full/`, the console's signal and exit examples, and the sample's
-  `Test.Domains.Support` helpers and `Accounting` reaper). Each file's count
+  `Test.Domains.Support` helpers and `Accounting` reaper), and less the 87 thread
+  starts of the foundation, runtime and asset-image suites that #597 converted (those
+  suites keep baseline entries only for the subprocess starts of their `*Opacity.hs`
+  and `*Client.hs` sources, which are #588's). Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven
@@ -736,6 +739,12 @@ any other way, and its message names the facility that fits the kind of start.
   `Compositor.hs`, whose `stopProcess` could time out unconfirmed) remained in the
   baseline until #588 moved those subprocess starts onto the shared subprocess
   facility, which ends and reaps them.
+  The negative controls of the foundation and runtime suites (#597) keep one
+  deliberately unowned start each, in the one binding `startUnowned` of
+  `Test.Foundation.OwnedControl` and `Test.Runtime.OwnedControl`: the thread is
+  recorded in the control's rescue list in the same masked step that starts it, and
+  a rescue registered before the control exposes any thread lets it go, stops it and
+  joins it on every way out. A converted helper is never exempt.
 - **Selection.** The guard's inputs are every scanned source directory and every
   package description, listed as inputs of `test.workflow` in the catalog, beside
   `tools/validation/` (the script, its configuration and its baseline). An
