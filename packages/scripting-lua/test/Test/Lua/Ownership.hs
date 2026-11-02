@@ -43,11 +43,13 @@ data Probe = Probe
 newProbe ∷ IO Probe
 newProbe = Probe <$> newIORef [] <*> newEmptyMVar <*> newEmptyMVar
 
-recordSelf ∷ Probe → IO ()
-recordSelf probe = myThreadId >>= \thread → atomicModifyIORef' (probeThreads probe) (\held → (held <> [thread], ()))
+-- | The scope records the thread it started: a thread killed before it ran anything must still be judged, so no thread records
+-- itself.
+recordThread ∷ Probe → ThreadId → IO ()
+recordThread probe thread = atomicModifyIORef' (probeThreads probe) (\held → (held <> [thread], ()))
 
 parkedWorker ∷ Probe → IO ()
-parkedWorker probe = recordSelf probe >> putMVar (probeParked probe) () >> readMVar (probeGate probe)
+parkedWorker probe = putMVar (probeParked probe) () >> readMVar (probeGate probe)
 
 -- | Wait where only the example's own end can reach it.
 holdUntilEnded ∷ IO ()
@@ -104,7 +106,8 @@ runEnding scope parked = \case
 -- after the outer scope has returned.
 leakedAfterScope ∷ Probe → IO Bool
 leakedAfterScope probe =
-  withOwnedThread (parkedWorker probe) $ \_ _ → do
+  withOwnedThread (parkedWorker probe) $ \thread _ → do
+    recordThread probe thread
     readMVar (probeParked probe)
     -- The scope under test returns here, leaving the worker parked.
     endedAfter probe
@@ -116,13 +119,13 @@ spec = describe "the threads this suite's own helpers start (#598)" $ do
       probe ← newProbe
       outcome ←
         try @AsyncException . bounded $
-          withCancellationAfter (readMVar (probeParked probe)) (pure ()) (inThread (parkedWorker probe))
+          withCancellationAfter (readMVar (probeParked probe)) (pure ()) (inThread (myThreadId >>= recordThread probe >> parkedWorker probe))
       outcome `shouldBe` Left UserInterrupt
       judged probe 1
       endedAfter probe `shouldReturn` True
     it "ends and joins its thread when the thread fails, raising the failure here" $ bounded $ do
       probe ← newProbe
-      outcome ← try @Boom (inThread (recordSelf probe >> throwIO Boom ∷ IO ()))
+      outcome ← try @Boom (inThread (myThreadId >>= recordThread probe >> throwIO Boom ∷ IO ()))
       outcome `shouldBe` Left Boom
       judged probe 1
       endedAfter probe `shouldReturn` True
@@ -142,9 +145,11 @@ spec = describe "the threads this suite's own helpers start (#598)" $ do
           installCallback vm "linger" (putMVar entered () >> readMVar release >> pure NoResult) (pure ())
           evalChunk vm (chunkName "finalizer") "guard = setmetatable({}, {__gc = function() linger() end})"
           let letGo = void (tryPutMVar release ())
-          withOwnedThreadOpening letGo (recordSelf probe >> closeVm vm) $ \_ _ → do
+          withOwnedThreadOpening letGo (closeVm vm) $ \first _ → do
+            recordThread probe first
             takeMVar entered
-            withOwnedThreadOpening letGo (recordSelf probe >> closeVm vm) $ \_ _ → do
+            withOwnedThreadOpening letGo (closeVm vm) $ \second _ → do
+              recordThread probe second
               putMVar (probeParked probe) ()
               body
     forM_ endings $ \(label, ending) →

@@ -44,9 +44,10 @@ newProbe = Probe <$> newIORef [] <*> newEmptyMVar <*> newEmptyMVar
 recordThread ∷ Probe → ThreadId → IO ()
 recordThread probe thread = atomicModifyIORef' (probeThreads probe) (\held → (held <> [thread], ()))
 
--- | A worker: say which thread it is, say it is parked, wait at the gate.
+-- | A worker: say it is parked, wait at the gate. The scope records the thread it started (a worker killed before it ran
+-- anything must still be judged, so the worker does not record itself).
 parkedWorker ∷ Probe → IO ()
-parkedWorker probe = myThreadId >>= recordThread probe >> putMVar (probeParked probe) () >> readMVar (probeGate probe)
+parkedWorker probe = putMVar (probeParked probe) () >> readMVar (probeGate probe)
 
 -- | Wait where only the example's own end can reach it. The bound or the cancellation ends it.
 holdUntilEnded ∷ IO ()
@@ -107,7 +108,8 @@ runEnding scope parked = \case
 -- after the outer scope has returned.
 leakedAfterScope ∷ Probe → IO Bool
 leakedAfterScope probe =
-  withOwnedThread (parkedWorker probe) $ \_ _ → do
+  withOwnedThread (parkedWorker probe) $ \thread _ → do
+    recordThread probe thread
     readMVar (probeParked probe)
     -- The scope under test returns here, leaving the worker parked.
     endedAfter probe
@@ -145,9 +147,9 @@ spec = describe "the threads this suite's own helpers start (#598)" $ do
           (alongsideOpeningObserving (recordThread probe) [] (parkedWorker probe))
           (readMVar (probeParked probe))
           ending
-        -- the seam reported the helper, and the helper recorded itself: two entries, one thread
+        -- the seam reported the helper, which ran its first step before the body ended
         endedAfter probe `shouldReturn` True
-        judged probe 2
+        judged probe 1
     it "opens the gates and fails the example with its own failure when the helper fails, and has ended by then" $ bounded $ do
       probe ← newProbe
       opened ← newEmptyMVar
@@ -173,8 +175,9 @@ spec = describe "the threads this suite's own helpers start (#598)" $ do
           gate ← newEmptyMVar
           withOwnedThreadOpening
             (void (tryPutMVar gate ()))
-            (myThreadId >>= recordThread probe >> uninterruptibleMask_ (putMVar entered () >> readMVar gate))
+            (uninterruptibleMask_ (putMVar entered () >> readMVar gate))
             $ \held _ → do
+              recordThread probe held
               readMVar entered
               withOwnedThread (throwTo held ThreadKilled) $ \thrower _ → do
                 recordThread probe thrower
@@ -198,8 +201,8 @@ spec = describe "the threads this suite's own helpers start (#598)" $ do
         try @Boom $
           withOwnedThreadOpening
             (void (tryPutMVar gate ()))
-            (myThreadId >>= recordThread probe >> uninterruptibleMask_ (putMVar entered () >> readMVar gate))
-            (\_ _ → throwIO Boom ∷ IO ())
+            (uninterruptibleMask_ (putMVar entered () >> readMVar gate))
+            (\held _ → recordThread probe held >> throwIO Boom ∷ IO ())
       outcome `shouldBe` Left Boom
       judged probe 1
       endedAfter probe `shouldReturn` True
