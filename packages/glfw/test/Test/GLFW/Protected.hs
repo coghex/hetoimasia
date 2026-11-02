@@ -21,7 +21,7 @@
 -- waits and a completion published from another thread really ends that wait.
 module Test.GLFW.Protected (spec) where
 
-import Control.Concurrent (ThreadId, killThread, yield)
+import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM
   ( STM
@@ -101,6 +101,7 @@ import Hetoimasia.GLFW.Internal.Seam
   , Seam
   , SeamScript (..)
   , asProcessMainThread
+  , designateProcessMainThread
   , defaultScript
   , newSeam
   , reportError
@@ -160,7 +161,6 @@ import Test.GLFW.Support
   , unownedLeaks
   , withMainThread
   , withMainThreadVia
-  , withMainThreadKeepingContext
   )
 import Test.Hspec (Expectation, Spec, before_, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
@@ -1859,6 +1859,15 @@ inboxFixture step = armed $ do
       WindowGone _ → True
       _ → False
 
+-- | 'onMainThread' keeping the context of whatever the run raised, for the same
+-- reason.
+onMainThreadKeepingContext
+  ∷ ∀ a. Seam → IO a → IO (ThreadId, MVar (Either (ExceptionWithContext SomeException) a))
+onMainThreadKeepingContext seam action = do
+  finished ← newEmptyMVar
+  runner ← forkOS (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
+  pure (runner, finished)
+
 -- | Run the work on an owned thread (#593) for the length of the body, which is given the cell the thread fills when the work
 -- is done and waits for it itself. However the body ends, the thread has been stopped and joined before this returns.
 withPublisher ∷ IO () → (MVar () → IO r) → IO r
@@ -2949,6 +2958,9 @@ testStallWarningFailsBesideAPrimary = do
     length (Logging.failedReportsInContext context) `shouldBe` 1
     readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
+-- NOT CONVERTED (#593 narrowed by the owner a third time, 2026-11-02; moved to #612): the cleanup kill of this example can land before any rescue of
+-- the protected drain exists, so the drain enters the stall diagnostic's sink and a scope's join waits for ever. It stays as it is on master, with
+-- its baseline entry, until #612's seam around the protected runner's lifetime lets it be rescued.
 -- | A cancellation delivered while the stall diagnostic's sink is running is
 -- never turned into a synchronous logging failure.
 --
@@ -2964,35 +2976,34 @@ testStallWarningCancelledAtItsSink = do
   trace ← newSinkTrace
   reached ← newEmptyMVar
   never ← newEmptyMVar
-  withEvidenceThread (supplyEvidence journal hostHeld owned afterStall allRetirementFacts) $ \helper _ → do
-    let logger =
-          failingSink defaultLogFilter "glfw.retirement" (\_ → putMVar reached () >> takeMVar never) trace
-    withMainThreadKeepingContext seam (pure ())
-      ( protectedRunHere seam logger (settings [windowNamed "alpha"])
-          ( \host → do
-              window ← onlyWindow host
-              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-              atomically (writeTVar owned (Just owner))
-              atomically (writeTVar hostHeld (Just host))
-          )
-          (\host _ → pure host)
-          (\_ _ → pure ())
-      )
-      $ \runner finished → do
-      -- The drain has declared the stall and is inside the diagnostic's sink.
-      takeMVar reached
-      killThread runner
-      void (pure helper)
-      (failure, context) ←
-        takeMVar finished >>= either raisedWith (\_ → unexpected "the cancelled run returned")
-      failure `shouldBe` ThreadKilled
-      diagnosticMarks context `shouldBe` []
-      null (Logging.failedReportsInContext context) `shouldBe` True
-      -- The attempt was spent and never retried, and nothing was flushed.
-      traced trace `shouldReturn` ["glfw.retirement"]
-      flushed trace `shouldReturn` 0
-      -- The cancellation was re-raised only after retirement was safe.
-      readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
+  let logger =
+        failingSink defaultLogFilter "glfw.retirement" (\_ → putMVar reached () >> takeMVar never) trace
+  (runner, finished) ←
+    onMainThreadKeepingContext seam $
+      protectedRunHere seam logger (settings [windowNamed "alpha"])
+        ( \host → do
+            window ← onlyWindow host
+            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
+            atomically (writeTVar owned (Just owner))
+            atomically (writeTVar hostHeld (Just host))
+        )
+        (\host _ → pure host)
+        (\_ _ → pure ())
+  -- The drain has declared the stall and is inside the diagnostic's sink.
+  takeMVar reached
+  killThread runner
+  void (pure helper)
+  (failure, context) ←
+    takeMVar finished >>= either raisedWith (\_ → unexpected "the cancelled run returned")
+  failure `shouldBe` ThreadKilled
+  diagnosticMarks context `shouldBe` []
+  null (Logging.failedReportsInContext context) `shouldBe` True
+  -- The attempt was spent and never retried, and nothing was flushed.
+  traced trace `shouldReturn` ["glfw.retirement"]
+  flushed trace `shouldReturn` 0
+  -- The cancellation was re-raised only after retirement was safe.
+  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
 -- ---------------------------------------------------------------------------
 -- Support

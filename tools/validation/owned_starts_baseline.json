@@ -25,6 +25,7 @@
     "packages/glfw/test/Test/GLFW/Linking.hs": 1,
     "packages/glfw/test/Test/GLFW/Opacity.hs": 4,
     "packages/glfw/test/Test/GLFW/Owner/Failure/Interruption.hs": 1,
+    "packages/glfw/test/Test/GLFW/Protected.hs": 2,
     "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/ChildSpec.hs": 1,
     "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Compositor.hs": 2,
     "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Fixture.hs": 1,
