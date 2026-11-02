@@ -160,7 +160,7 @@
     },
     {
       "file": "packages/scripting-lua/macos/lib/Hetoimasia/Scripting/Lua/Internal/MacOS/Launch.hs",
-      "binding": "withLaunch",
+      "binding": "withLaunchSeamed",
       "sites": 1,
       "reason": "the launched helper's pipe reader: started in the masked step that registers its stop-and-join and joined (not interruptibly) before the launch's scope returns, on a return, an exception and a cancellation, with base alone because this is the probe library and not a test suite (#598)"
     },
