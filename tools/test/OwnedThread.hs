@@ -19,10 +19,10 @@
 -- the full-product run library. The real child helper runs under the same orchestration in @run-native-test@.
 module OwnedThread (spec) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, getNumCapabilities, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, getNumCapabilities, killThread, myThreadId, threadCapability, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Exception
-  ( AsyncException (UserInterrupt)
+  ( AsyncException (ThreadKilled, UserInterrupt)
   , Exception
   , ExceptionWithContext (ExceptionWithContext)
   , MaskingState (MaskedInterruptible, MaskedUninterruptible, Unmasked)
@@ -39,7 +39,7 @@ import Control.Exception
   , tryWithContext
   , uninterruptibleMask_
   )
-import Control.Monad (forM_, void, when, (>=>))
+import Control.Monad (forM, forM_, void, when, (>=>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Foldable (for_)
 import Data.List (isInfixOf)
@@ -51,7 +51,7 @@ import Test.Hspec (Spec, describe, it, pendingWith, shouldBe, shouldSatisfy)
 import Test.HUnit.Lang (HUnitFailure (HUnitFailure), FailureReason (Reason))
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (awaitBlockedSending, withCancellationAfter, withCancellationWhenBlocked)
-import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOn, withOwnedThreadOpening, withOwnedThreadOpeningOn)
 import Test.Support.Parked (ParkBounds (..), defaultParkBounds, parkedRelease)
 
 -- | The failure an example raises from a body, told apart from every other.
@@ -172,6 +172,35 @@ runEnding scope worker probe ending = case ending of
 holdUntilTimedOut ∷ IO ()
 holdUntilTimedOut = newEmptyMVar >>= \hold → readMVar hold `finally` void (tryPutMVar hold ())
 
+-- | One cancellation aimed at a running target (#610): the target waits, inside an uninterruptible step, until its sender is
+-- seen blocked delivering, leaves the step, and does an effect. Answers whether the effect ran, that is whether the
+-- cancellation was /not/ yet raised in the target when it left the step. The target then waits for the cancellation, which
+-- always arrives, so the scenario ends the same way whatever the answer; the sender is started only once the target is inside
+-- its step. Both starts are the one the caller gives: a pinned
+-- pair, or the unpinned facility the control compares it with.
+effectBeforeCancellation ∷ Scope → IO Bool
+effectBeforeCancellation start = do
+  senderSlot ← newEmptyMVar
+  entered ← newEmptyMVar
+  effect ← newEmptyMVar
+  ended ← newEmptyMVar
+  let spinUntilCancelled ∷ IO ()
+      spinUntilCancelled = yield >> spinUntilCancelled
+      target = do
+        outcome ← try @AsyncException $ do
+          uninterruptibleMask_ (putMVar entered () >> readMVar senderSlot >>= void . awaitBlockedSending)
+          putMVar effect ()
+          spinUntilCancelled
+        putMVar ended outcome
+  start target $ \targetThread _ → do
+    -- The sender is started once the target is inside its step: a cancellation that reached it before could not be told from
+    -- one that arrived late.
+    takeMVar entered
+    start (throwTo targetThread ThreadKilled) $ \sender _ → do
+      putMVar senderSlot sender
+      takeMVar ended >>= (`shouldBe` Left ThreadKilled)
+  isJust <$> tryReadMVar effect
+
 spec ∷ Spec
 spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
   describe "a thread parked at a gate, whichever way its scope ends" $
@@ -217,6 +246,42 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
       -- The kill may arrive before the thread ran anything; the scope has joined it either way.
       withOwnedThread (recordSelf probe) (\thread _ → void (tryPutMVar (probeThread probe) thread))
       endedAfterScope probe >>= (`shouldBe` True)
+
+  describe "a thread pinned to a capability (withOwnedThreadOn, withOwnedThreadOpeningOn)" $ do
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined when the scope " <> label) $ do
+        probe ← newProbe
+        runEnding (withOwnedThreadOn 0) parkedWorker probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+      it ("has ended and been joined when the scope " <> label <> ", because the scope opens the gate itself before it joins") $ do
+        probe ← newProbe
+        runEnding (withOwnedThreadOpeningOn 0 (void (tryPutMVar (probeGate probe) ()))) stubbornWorker probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+    it "runs the thread on the capability asked for, pinned there, and with the caller's interruptibility not inherited" $ do
+      capabilities ← getNumCapabilities
+      for_ [0 .. capabilities - 1] $ \capability → do
+        placed ← newEmptyMVar
+        withOwnedThreadOn capability (myThreadId >>= threadCapability >>= \place → getMaskingState >>= putMVar placed . (,) place) $ \_ awaitEnd →
+          awaitEnd
+        readMVar placed >>= (`shouldBe` ((capability, True), Unmasked))
+
+    it "has a cancellation pending against a masked target on the same capability as soon as its sender is seen blocked, on more than one capability" $ do
+      -- The property the pin exists for (#610): the sender and the target share a capability, so the target's queue holds the
+      -- exception before the sender is recorded as blocked, and a target that leaves its uninterruptible step after seeing
+      -- the sender blocked has the exception raised in it before its next effect, every time.
+      capabilities ← getNumCapabilities
+      (capabilities >= 2) `shouldSatisfy` id
+      ran ← forM [1 .. 1000 :: Int] $ \_ → bounded (effectBeforeCancellation (withOwnedThreadOn 0))
+      length (filter id ran) `shouldBe` 0
+
+    it "negative control: unpinned starts let the target run its next effect before the cancellation is raised, on more than one capability" $ do
+      capabilities ← getNumCapabilities
+      (capabilities >= 2) `shouldSatisfy` id
+      ran ← forM [1 .. 1000 :: Int] $ \_ → bounded (effectBeforeCancellation withOwnedThread)
+      -- The sender is seen blocked once it has sent its exception to the target's capability, which takes it in later.
+      (length (filter id ran) > 0) `shouldBe` True
 
   describe "the release" $ do
     it "is not interruptible: a cancellation that arrives while it waits for the thread does not abandon the join" $ do
@@ -268,7 +333,8 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
         else do
           source ← readFile path
           let imports = [line | line ← lines source, startsWith "import " line]
-          imports `shouldSatisfy` all (startsWith "import Control.")
+          -- @GHC.IO@ is @base@'s: the pinned start unmasks its action with 'unsafeUnmask', as 'forkIOWithUnmask' does.
+          imports `shouldSatisfy` all (\line → startsWith "import Control." line || startsWith "import GHC.IO " line)
           source `shouldSatisfy` (not . ("threadDelay" `isInfixOf`))
 
   describe "the cancellation helper behind the first Library.hs helper (Test.Support.Cancel.withCancellationAfter)" $ do
