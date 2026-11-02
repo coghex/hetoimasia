@@ -73,7 +73,9 @@ import Test.GLFW.Native.Support
   , sharedSessionOwner
   , threadChecks
   )
-import Test.GLFW.Native.Threads (Boundness (Unbound), startOwned)
+import Test.GLFW.Native.Ownership (withLauncher)
+import qualified Test.GLFW.Native.Ownership as Ownership
+import Test.GLFW.Native.Threads (Boundness (Unbound), ownedScope, startOwned)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 import Test.Hspec.Core.Formatters.V2 (formatterToFormat, silent)
 import Test.Hspec.Runner
@@ -89,6 +91,8 @@ import Test.Hspec.Runner
 
 spec ∷ Spec
 spec = describe "the native opt-in" $ do
+  Ownership.spec
+
   describe "read from the environment" $ do
     it "finds no consent in an empty environment, a bare DISPLAY, or CI" $ do
       consentFrom "linux" [] `shouldBe` Left NoConsent
@@ -393,12 +397,10 @@ spec = describe "the native opt-in" $ do
         try (signalProcess nullSignal escaped) >>= (`shouldSatisfy` either (\(_ ∷ IOException) → False) (const True))
 
     it "owns no reader or pipe handle when an interruption reaches the launch, and propagates the interruption" $ do
-      acquired ← newEmptyMVar
-      result ← newEmptyMVar
-      -- The launcher thread is owned (#594): however the example ends, it has been stopped and joined, and the launch
-      -- it was running has ended its child and reclaimed its readers and handles on the way out, before this returns.
-      startOwned Unbound (try (Child.launchCommandObserved (putMVar acquired) Child.terminationGrace Nothing 300 "sh" ["-c", "sleep 300"]) >>= putMVar result) $ \launcher _ → do
-        owned ← takeMVar acquired
+      -- The launcher thread is owned (#594, "Test.GLFW.Native.Ownership"): however the example ends, it has been stopped and
+      -- joined, and the launch it was running has ended its child and reclaimed its readers and handles on the way out,
+      -- before this returns.
+      withLauncher ownedScope $ \owned launcher result →
         -- Whatever the child does next, it is ended with its group on the way out.
         ( do
             throwTo launcher (ErrorCall "the launch was interrupted")

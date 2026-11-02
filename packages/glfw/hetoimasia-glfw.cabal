@@ -446,12 +446,14 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Interaction
         Test.GLFW.Native.Mode
         Test.GLFW.Native.Monitor
+        Test.GLFW.Native.Ownership
         Test.GLFW.Native.Presence
         Test.GLFW.Native.Private
         Test.GLFW.Native.Session
         Test.GLFW.Native.Spec
         Test.GLFW.Native.Support
         Test.GLFW.Native.Threads
+        Test.GLFW.Native.Unowned
         Test.GLFW.Native.Wake
         Test.GLFW.Native.Wayland
         Test.GLFW.Native.WaylandScenarios
