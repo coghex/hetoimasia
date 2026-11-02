@@ -111,8 +111,7 @@ module Test.Support.Subprocess
   ) where
 
 import Control.Concurrent (threadDelay, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (TMVar, TVar, atomically, check, modifyTVar', newEmptyTMVarIO, newTVarIO, orElse, putTMVar, readTMVar, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TMVar, TVar, atomically, check, modifyTVar', newEmptyTMVarIO, newTVarIO, orElse, putTMVar, readTMVar, readTVar, readTVarIO, takeTMVar, tryPutTMVar, writeTVar)
 import Control.Exception
   ( Exception (displayException, fromException)
   , ExceptionWithContext (ExceptionWithContext)
@@ -936,8 +935,13 @@ runCapturedUsing bounds seams bound process input = do
 -- in reverse order of their start when the host ends. Lifetime: the host's scope. Disposal: the worker's release, however the scope
 -- ended, with every child ended and reaped before 'withHost' returns or raises.
 data Host = Host
-  { hostRequests ∷ !(MVar (Maybe Job))
+  { hostRequests ∷ !(TMVar Job)
+  -- ^ The one waiting request; a caller whose request finds it taken waits for it to empty, or for the host to stop.
+  , hostStopping ∷ !(TVar Bool)
+  -- ^ Set, once and for good, when the host is to stop serving. It is recorded apart from the request slot, so a full slot can never
+  -- drop it, and the worker looks at it before it looks at a request: a request still waiting is not served after the stop.
   , hostEnded ∷ !(TMVar (Maybe (ExceptionWithContext SomeException)))
+  -- ^ Filled exactly once, when the worker has ended: with the failure its scopes ended with, if any. Every waiter also waits on it.
   }
 
 -- | One scope to run: given the rest of the worker's work, which it runs inside its own scope.
@@ -945,21 +949,32 @@ newtype Job = Job (IO () → IO ())
 
 -- | Run the use with a host. On a normal end the children's scopes unwind and a failure of their cleanup is raised; on any other the
 -- worker is stopped and joined, and its scopes end first.
+--
+-- /How stop is recorded and what ends the worker./ Stop is the 'hostStopping' flag, written by one non-blocking, idempotent STM step
+-- that the owned release runs first (and the normal end runs too). The worker serves by waiting for the flag or a request, the flag
+-- first, so it ends the moment the flag is set whatever the request slot holds. A hosted body that is cancelled (the release's kill
+-- reaches it) answers its caller and then ends the worker's service: a cancellation is never turned into "carry on". The ended
+-- flag is filled by the final step of 'withHost' itself, after the worker has been joined, so a thread that was killed before it
+-- ran anything still releases every waiter.
 withHost ∷ (Host → IO a) → IO a
 withHost use = do
-  requests ← newEmptyMVar
+  requests ← newEmptyTMVarIO
+  stopping ← newTVarIO False
   ended ← newEmptyTMVarIO
-  let serve =
-        takeMVar requests >>= \case
+  let host = Host requests stopping ended
+      serve =
+        atomically ((Nothing <$ (readTVar stopping >>= check)) `orElse` (Just <$> takeTMVar requests)) >>= \case
           Nothing → pure ()
           Just (Job run) → run serve
-      stopServing = void (tryPutMVar requests Nothing)
-      worker = tryWithContext @SomeException serve >>= atomically . putTMVar ended . either Just (const Nothing)
-  withOwnedThreadOpening stopServing worker $ \_ awaitEnd → do
-    result ← use (Host requests ended)
-    stopServing
-    awaitEnd
-    atomically (readTMVar ended) >>= maybe (pure result) rethrowIO
+      stopServing = atomically (writeTVar stopping True)
+      worker = tryWithContext @SomeException serve >>= atomically . void . tryPutTMVar ended . either Just (const Nothing)
+  ( withOwnedThreadOpening stopServing worker $ \_ awaitEnd → do
+      result ← use host
+      stopServing
+      awaitEnd
+      atomically (readTMVar ended) >>= maybe (pure result) rethrowIO
+    )
+    `finally` atomically (void (tryPutTMVar ended Nothing))
 
 -- | Run a scoped child on the host and answer what the body answered. The child is alive after this returns unless the body ended it;
 -- the host ends it, with the others, when it ends. The spec's run bound limits the body, not the time the host keeps the child.
@@ -972,13 +987,20 @@ hosted host spec body = do
           timeout (max 0 microseconds) (body child)
             >>= maybe (throwIO (SubprocessFailure (describeCommand (specProcess spec) <> " did not finish within its run bound of " <> describeBound (specBound spec)))) pure
       job = Job $ \rest →
-        withScopedChild spec {specBound = Unbounded} $ \child →
-          tryWithContext @SomeException (limited child) >>= atomically . putTMVar reply >> rest
-  putMVar (hostRequests host) (Just job)
+        withScopedChild spec {specBound = Unbounded} $ \child → do
+          result ← tryWithContext @SomeException (limited child)
+          atomically (putTMVar reply result)
+          case result of
+            -- A cancellation of the worker (the release's kill) reaches the body here: the caller is answered, and service ends.
+            Left cancelled@(ExceptionWithContext _ failure) | isJust (fromException failure ∷ Maybe SomeAsyncException) → rethrowIO cancelled
+            _ → rest
+      stopped = SubprocessFailure "the host of the scoped child had ended before it answered"
+  accepted ← atomically $ ((readTVar (hostStopping host) >>= check) >> pure False) `orElse` (putTMVar (hostRequests host) job >> pure True)
+  unless accepted $ throwIO stopped
   atomically ((Left <$> readTMVar reply) `orElse` (Right <$> readTMVar (hostEnded host))) >>= \case
     Left (Right answer) → pure answer
     Left (Left failure) → rethrowIO failure
-    Right _ → throwIO (SubprocessFailure "the host of the scoped child had ended before it answered")
+    Right _ → throwIO stopped
 
 -- | 'runCaptured' on a host: the child's group stays unended, as 'hosted' explains, until the host ends.
 hostedCaptured ∷ Host → RunBound → CreateProcess → String → IO (ExitCode, String, String)

@@ -19,7 +19,8 @@
 -- library call could not truthfully fail, and have none.
 module OwnedSubprocess (spec, ownerMain, ownerVariable) where
 
-import Control.Concurrent (myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
+import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -210,6 +211,15 @@ awaitReady child =
 -- | The identifier the descendant wrote to the file, once the leader has said it is ready.
 descendantPid ∷ FilePath → IO ProcessID
 descendantPid file = CPid . read <$> readFile file
+
+-- | Wait, without sleeping, until a thread is blocked in an STM wait (a hosted call waiting for its reply).
+awaitBlockedOnSTM ∷ ThreadId → IO ()
+awaitBlockedOnSTM thread =
+  threadStatus thread >>= \case
+    ThreadBlocked BlockedOnSTM → pure ()
+    ThreadFinished → expectationFailure "the thread ended before it blocked waiting for its reply"
+    ThreadDied → expectationFailure "the thread died before it blocked waiting for its reply"
+    _ → yield >> awaitBlockedOnSTM thread
 
 -- | Wait where only the example's own end can reach it. The wait is bounded by the caller's timeout or 'bounded'.
 holdUntilEnded ∷ IO ()
@@ -890,6 +900,30 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
             second `shouldBe` 7
           readIORef known >>= mapM goneAndReaped >>= (`shouldBe` [True, True]))
         `finally` (readIORef known >>= rescue)
+
+    for_ [("fails", False), ("is cancelled", True)] $ \(label, cancelled) →
+      it ("ends a host whose scope " <> label <> " while a request is queued behind a running one, with the running child reaped and the queued one never started") $ do
+        known ← newIORef []
+        running ← newEmptyMVar
+        queued ← newEmptyMVar
+        let note child = atomicModifyIORef' known (\old → (childPid child : old, ()))
+            quiet = childSpec hangCatcher (shell obedientAlone [])
+            scope = withHost $ \host →
+              withOwnedThread (void (try @SomeException (hosted host quiet (\child → note child >> awaitReady child >> putMVar running () >> holdUntilEnded)))) $ \_ _ → do
+                readMVar running
+                withOwnedThread (void (try @SomeException (hosted host quiet (\child → note child >> awaitReady child)))) $ \second _ → do
+                  -- Waiting for its reply, so its request is in the slot behind the one that is running.
+                  awaitBlockedOnSTM second
+                  putMVar queued ()
+                  if cancelled then holdUntilEnded else boom
+        (do
+            outcome ← try @SomeException . bounded $ if cancelled then withCancellationAfter (readMVar queued) (pure ()) scope else scope
+            (fromException =<< either Just (const Nothing) outcome) `shouldBe` (if cancelled then Just UserInterrupt else Nothing)
+            (fromException =<< either Just (const Nothing) outcome) `shouldBe` (if cancelled then Nothing else Just Boom)
+            pids ← readIORef known
+            length pids `shouldBe` 1
+            mapM goneAndReaped pids >>= (`shouldBe` [True]))
+          `finally` (readIORef known >>= rescue)
 
     it "fails a hosted call that passes its run bound, naming the command and the bound" $ do
       known ← newIORef []
