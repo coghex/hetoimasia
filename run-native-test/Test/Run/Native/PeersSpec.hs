@@ -22,7 +22,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , DiagnosticVerdict (..)
   )
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
-import Test.Run.Native.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread)
 import Test.Run.Native.Peers (judgeCancellation, judgeTeardown, withOwnedLoop)
 
 clean ∷ DiagnosticVerdict

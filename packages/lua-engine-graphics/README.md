@@ -324,7 +324,11 @@ the invocation that is running when the request settles, whether the script read
 invocation can still take the result: the example holds one invocation at a gate of its own (`fx.block`), lets the provider
 settle a clean refusal meanwhile, then resumes, finds the request ready and takes the exact record
 (`{status = "failure", error = {code = "window_error", message ≤ 2 KiB}}`, no root or path), and the instance then fails,
-attributed to the `window` endpoint. M1 offers no optional window to Lua.
+attributed to the `window` endpoint. When such a script raises the message uncaught, as the shipped content's `collect`
+does, the refusal is still the instance's primary failure (`window_error`, the `request` stage), whichever order the
+settlement and the invocation reach the instance in, and the script's error is its secondary, accounted once in the
+engine report ([the failure precedence](../scripting-lua/README.md#failure-and-escalation)).
+M1 offers no optional window to Lua.
 
 ### Failed effects and exit
 

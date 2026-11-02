@@ -185,6 +185,35 @@ spec = describe "graphics facade" $ do
     map rfCode (outFailures outcome) `shouldBe` [RequiredRequest]
     map rfStage (outFailures outcome) `shouldBe` [OnRequest]
 
+  it "keeps the window refusal as the role's and the engine report's primary when the update that was running took it and raised it uncaught, and accounts that script error once as a secondary" $ do
+    outcome ←
+      runFacade
+        ( (defaultShape raisedOpen)
+            { shapeBoth = False
+            , shapeParkOutput = True
+            , shapeWindow = WF.defaultFakeConfig {WF.fcHolds = [WF.HoldCreate]}
+            , shapeCreateScript = [CreateRefusedClean "the display refused the window"]
+            }
+        )
+        $ \fs → do
+          -- The update is parked inside its authored output, so its invocation is running: its line is recorded before
+          -- it parks. Only then does the refusal settle, while that invocation runs, and the segment resume.
+          awaitLine fs "parked"
+          WF.awaitEvent (fsWindows fs) "issue create"
+          WF.release (fsWindows fs) WF.HoldCreate
+          atomically (providerReading (fsProvider fs) >>= \found → unless (readingAcquisitions found == 0) retry)
+          void (tryPutMVar (fsGate fs) ())
+          atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
+    outVerdict outcome `shouldBe` VerdictFailure
+    map rfCode (outFailures outcome) `shouldBe` [RequiredRequest]
+    map rfStage (outFailures outcome) `shouldBe` [OnRequest]
+    fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just RequiredRequest
+    fmap eeStage (erPrimary (outEngine outcome)) `shouldBe` Just OnRequest
+    -- The script's own error is the one secondary of the engine report, once, and none is omitted.
+    map eeCode (erSecondary (outEngine outcome)) `shouldBe` [LuaError]
+    map (Text.isInfixOf "the display refused the window" . eeMessage) (erSecondary (outEngine outcome)) `shouldBe` [True]
+    erOmitted (outEngine outcome) `shouldBe` 0
+
   it "routes a genuine native close with the startup gate closed to the session's stop, which Lua cannot veto" $ do
     outcome ← runFacade ((defaultShape parkedOpen) {shapeBoth = False, shapeParkOutput = True}) $ \fs → do
       -- The role's init is parked in its authored output, so the startup gate is closed; its window is pending.
@@ -624,6 +653,23 @@ caughtOpen =
     , "      print('caught', ok, result.error.code, result.error.root == nil, result.error.path == nil, result.error.message)"
     , "    end,"
     , "    update=function(self, dt) end"
+    ]
+
+-- | A window whose failure the update takes and raises uncaught, the shape of the shipped content's own @collect@. The
+-- update parks in its authored output first, so that the refusal settles while the invocation runs.
+raisedOpen ∷ ByteString
+raisedOpen =
+  presentationOnly
+    [ "    init=function(self, api) self.request = api.window.open({title=\"t\", width=640, height=480}) end,"
+    , "    update=function(self, dt)"
+    , "      if self.raised then return end"
+    , "      self.raised = true"
+    , "      local api = self.api"
+    , "      print(\"parked\")"
+    , "      assert(api.request.ready(self.request), 'the refusal had settled')"
+    , "      local result = api.request.take(self.request)"
+    , "      error(result.error.message)"
+    , "    end"
     ]
 
 -- | A window requested in init, which then parks in its authored output: the startup gate stays closed.

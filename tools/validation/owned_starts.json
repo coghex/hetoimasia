@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "primitives": [
+    "forkIO",
+    "forkOS",
+    "forkOn",
+    "forkIOWithUnmask",
+    "forkFinally",
+    "createProcess",
+    "withCreateProcess",
+    "spawnProcess",
+    "spawnCommand",
+    "callProcess",
+    "callCommand",
+    "readProcess",
+    "readProcessWithExitCode",
+    "readCreateProcess",
+    "readCreateProcessWithExitCode"
+  ],
+  "test_only_components": [
+    {
+      "component": "hetoimasia-gpu-vulkan-model:lib:placement-reference",
+      "reason": "the pure placement kept as a test reference only (owner decision 2026-09-30); built for the model suite and for no production consumer"
+    }
+  ],
+  "excluded_components": [
+    {
+      "component": "hetoimasia-scripting-lua:exe:lua-hazard",
+      "reason": "a helper executable the lua-host suite launches as a child process; its threads run inside a child the owning suite reaps"
+    },
+    {
+      "component": "hetoimasia-scripting-lua:exe:lua-confine-child",
+      "reason": "a helper executable the Linux confinement probe launches as a child process; its threads run inside a child the owning suite reaps"
+    },
+    {
+      "component": "hetoimasia-scripting-lua:exe:macos-confinement-helper",
+      "reason": "a helper executable the macOS confinement probe launches as a child process; its threads run inside a child the owning suite reaps"
+    }
+  ],
+  "exempt": [
+    {
+      "file": "tools/test-support/src/Test/Support/Owned.hs",
+      "binding": "withOwnedThreadOpening",
+      "sites": 1,
+      "reason": "the shared facility itself: the one place a test thread is started, with its stop-and-join registered in the same masked step"
+    },
+    {
+      "file": "tools/test/OwnedThread.hs",
+      "binding": "startUnowned",
+      "sites": 1,
+      "reason": "the negative controls' deliberately unowned start, which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
+      "file": "run-native-test/Test/Run/Native/Child.hs",
+      "binding": "start",
+      "sites": 1,
+      "reason": "the child helper's acquisition: the process is created in one masked step and released by conclude (kill, reap, bounded drain), audited in #540"
+    },
+    {
+      "file": "run-native-test/Test/Run/Native/Child.hs",
+      "binding": "reader",
+      "sites": 1,
+      "reason": "the child helper's pipe reader: started in the masked acquisition, its end is announced however it ended and awaited by the release, audited in #540"
+    },
+    {
+      "file": "run-native-test/Test/Run/Native/Library.hs",
+      "binding": "runWithEnding",
+      "sites": 1,
+      "reason": "the scenario thread: forked under mask and stopped and joined on every way out by the same function, audited in #540"
+    },
+    {
+      "file": "packages/glfw/native-tests/Test/GLFW/Native/Child.hs",
+      "binding": "assembly",
+      "sites": 1,
+      "reason": "the child reaper, acquired as a registered part of the composite (withComposite) and released by it"
+    },
+    {
+      "file": "packages/glfw/native-tests/Test/GLFW/Native/Child.hs",
+      "binding": "start",
+      "sites": 1,
+      "reason": "the child process, acquired as a registered part of the composite (withComposite): its group is killed and reaped on release"
+    },
+    {
+      "file": "packages/glfw/native-tests/Test/GLFW/Native/Child.hs",
+      "binding": "startReader",
+      "sites": 1,
+      "reason": "a pipe reader, acquired as a registered part of the composite (withComposite) and stopped by stopReader on release"
+    },
+    {
+      "file": "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Child.hs",
+      "binding": "assembly",
+      "sites": 1,
+      "reason": "the child reaper, acquired as a registered part of the composite (withComposite) and released by it"
+    },
+    {
+      "file": "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Child.hs",
+      "binding": "start",
+      "sites": 1,
+      "reason": "the child process, acquired as a registered part of the composite (withComposite): its group is killed and reaped on release"
+    },
+    {
+      "file": "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Child.hs",
+      "binding": "startReader",
+      "sites": 1,
+      "reason": "a pipe reader, acquired as a registered part of the composite (withComposite) and stopped by stopReader on release"
+    },
+    {
+      "file": "packages/scripting-lua/runtime-lua-test/Test/LuaRuntime/Runner/Scripts.hs",
+      "binding": "withWorkers",
+      "sites": 1,
+      "reason": "workers forked under mask; the gate they wait at is opened and every worker joined uninterruptibly on every path"
+    },
+    {
+      "file": "tools/test/Execution.hs",
+      "binding": "withOutsider",
+      "sites": 1,
+      "reason": "a control process acquired and released by bracket: terminated and reaped whether or not the example held"
+    }
+  ]
+}

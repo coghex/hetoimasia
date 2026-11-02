@@ -487,7 +487,7 @@ latchRunningFailure instances endpoint reason = do
       if isStopped state || isTerminal (isPhase state) || isJust (isRequestFailure state)
         then pure False
         else do
-          writeTVar (icState cell) state {isRequestFailure = Just (endpoint, reason), isDispatchQueued = True}
+          writeTVar (icState cell) state {isRequestFailure = Just (LatchedModule, endpoint, reason), isDispatchQueued = True}
           unless (isDispatchQueued state) $
             modifyTVar' (insInbox instances) (|> JobDispatch (icId cell))
           pure True

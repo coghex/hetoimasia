@@ -4,12 +4,11 @@
 -- these cases exist to catch.
 module Test.Run.Native.ChildSpec (spec) where
 
-import Control.Concurrent (forkIO, throwTo)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
-import Control.Concurrent.STM (TMVar, atomically, newEmptyTMVarIO, orElse, putTMVar, readTMVar, tryPutTMVar)
-import Control.Exception (AsyncException (UserInterrupt), Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, tryWithContext)
+import Control.Concurrent (myThreadId, throwTo)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
+import Control.Exception (AsyncException (UserInterrupt), Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
 import Control.Monad (void)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
 import System.Environment (getEnvironment)
@@ -17,8 +16,12 @@ import System.Exit (ExitCode (ExitFailure))
 import System.Posix.Signals (sigKILL)
 import System.Process (ProcessHandle, getProcessExitCode, waitForProcess)
 import System.Timeout (timeout)
+import Test.HUnit.Lang (FailureReason (Reason), HUnitFailure (HUnitFailure))
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldSatisfy, shouldThrow)
 import Test.Run.Native.Child (Bounds (..), Child (..), Hooks (..), defaultBounds, noHooks, withChildUsing)
+import Test.Support.Bounded (bounded)
+import Test.Support.Cancel (withCancellationAfter)
+import qualified Test.Support.Parked as Parked
 
 -- | The failure of what the example runs, told apart from every other.
 data BodyFailed = BodyFailed
@@ -76,20 +79,20 @@ spec = describe "the child helper" $ do
 
     it "reaps the process even when its release is cancelled, and raises the cancellation after it" $ do
       seen ← newIORef Nothing
-      outcome ← parkedRelease (\parked gate → noHooks {hookSpawned = \process → writeIORef seen (Just process) >> throwIO AcquisitionFailed, hookReleasing = park parked gate}) (\_ → pure ())
+      outcome ← parkedRelease (\park → noHooks {hookSpawned = \process → writeIORef seen (Just process) >> throwIO AcquisitionFailed, hookReleasing = park}) (\_ → pure ())
       outcome `shouldSatisfy` cancellation
       reapedAfter seen
 
   describe "a cancellation during the release" $ do
     it "is remembered across the whole release, which still reaps the child, and raised after it" $ do
       seen ← newIORef Nothing
-      outcome ← parkedRelease (\parked gate → noHooks {hookReleasing = park parked gate}) (\child → writeIORef seen (Just (childProcess child)))
+      outcome ← parkedRelease (\park → noHooks {hookReleasing = park}) (\child → writeIORef seen (Just (childProcess child)))
       outcome `shouldSatisfy` cancellation
       reapedAfter seen
 
     it "is raised with the failure of what was being run retained beside it" $ do
       seen ← newIORef Nothing
-      outcome ← parkedRelease (\parked gate → noHooks {hookReleasing = park parked gate}) (\child → writeIORef seen (Just (childProcess child)) >> throwIO BodyFailed)
+      outcome ← parkedRelease (\park → noHooks {hookReleasing = park}) (\child → writeIORef seen (Just (childProcess child)) >> throwIO BodyFailed)
       outcome `shouldSatisfy` cancellation
       -- The body's failure is not lost: it is retained as cleanup evidence in the raised exception's context.
       case outcome of
@@ -97,34 +100,88 @@ spec = describe "the child helper" $ do
         Right () → expectationFailure "the cancellation was not raised"
       reapedAfter seen
 
+  describe "an example that ends while the helper is live" $ do
+    -- The helper under test is the example's own scaffolding (#584): however the example ends, the helper it started has
+    -- ended and been joined, and so has the child the helper owns, before the example sees the failure.
+    it "stops and joins the helper and reaps its child when the example is cancelled while the helper is in its body" $ do
+      seen <- newIORef Nothing
+      started <- newEmptyMVar
+      hold <- newEmptyMVar
+      outcome <- try @AsyncException $
+        bounded $
+          withCancellationAfter (readMVar started) (pure ()) $
+            parkedRelease (\park -> noHooks {hookReleasing = park}) (\child -> writeIORef seen (Just (childProcess child)) >> putMVar started () >> readMVar hold)
+      outcome `shouldSatisfy` either (== UserInterrupt) (const False)
+      reapedAfter seen
+      void (tryPut hold)
+
+    it "stops and joins the helper and reaps its child when the example is cancelled while the helper's release is parked, the gate still closed" $ do
+      -- The helper cancels the example at its first park, before it has said it parked, so the example is cancelled while it
+      -- waits for the park and the gate is closed. The release remembers the kill and retries its park, so a gate left
+      -- closed would hold the join for ever: the scope opens it before it joins.
+      seen <- newIORef Nothing
+      caller <- myThreadId
+      once <- newIORef True
+      let first = atomicModifyIORef' once (\fresh -> (False, fresh)) >>= \fresh -> if fresh then throwTo caller UserInterrupt else pure ()
+      outcome <- try @AsyncException $
+        bounded $
+          parkedRelease (\park -> noHooks {hookReleasing = first >> park}) (\child -> writeIORef seen (Just (childProcess child)))
+      outcome `shouldSatisfy` either (== UserInterrupt) (const False)
+      reapedAfter seen
+
+    it "raises the failure of a helper that ended without reaching its release, with its child reaped" $ do
+      seen <- newIORef Nothing
+      outcome <- try @HUnitFailure (parkedRelease (\_ -> noHooks) (\child -> writeIORef seen (Just (childProcess child))))
+      outcome `shouldSatisfy` failedWith "ended without reaching its release"
+      reapedAfter seen
+
+    it "raises the failure of a wait that expired, with the helper stopped and joined and its child reaped" $ do
+      -- A zero bound expires at once, whatever the helper has reached: when it had started its child the child is reaped,
+      -- and when the scope stopped it before that there is nothing to reap.
+      seen <- newIORef Nothing
+      hold <- newEmptyMVar
+      outcome <- try @HUnitFailure (parkedReleaseWithin (Parked.ParkBounds 0 (30 * 1000000)) (\park -> noHooks {hookReleasing = park}) (\child -> writeIORef seen (Just (childProcess child)) >> readMVar hold))
+      outcome `shouldSatisfy` failedWith "did not reach its release"
+      reapedIfStarted seen
+      void (tryPut hold)
+
+    it "raises the failure of a helper that did not finish in its bound, with the helper stopped and joined and its child reaped" $ do
+      seen <- newIORef Nothing
+      outcome <- try @HUnitFailure (parkedReleaseWithin (Parked.ParkBounds (30 * 1000000) 0) (\park -> noHooks {hookReleasing = park}) (\child -> writeIORef seen (Just (childProcess child))))
+      outcome `shouldSatisfy` failedWith "did not finish within"
+      reapedAfter seen
+
+
 -- | A child that stays until it is killed.
 run ∷ Bounds → Hooks → (Child → IO a) → IO a
 run bounds hooks body = do
   environment ← getEnvironment
   withChildUsing bounds hooks "/bin/sh" ["-c", "exec sleep 1000"] environment body
 
--- | Run the helper on a thread of its own, park its release at the hook, deliver a cancellation to it there, let the release
--- go on, and answer how the helper ended. Explicit synchronization throughout, every wait bounded: the hook says it is
--- parked, the example then throws, then opens the gate. A helper that never reaches its release (or never ends) fails the
--- example instead of hanging it.
-parkedRelease ∷ (TMVar () → MVar () → Hooks) → (Child → IO ()) → IO (Either (ExceptionWithContext SomeException) ())
-parkedRelease hooks body = do
-  parked ← newEmptyTMVarIO
-  gate ← newEmptyMVar
-  finished ← newEmptyTMVarIO
-  worker ← forkIO (tryWithContext @SomeException (run defaultBounds (hooks parked gate) body) >>= atomically . putTMVar finished)
-  reached ← timeout (30 * 1000000) (atomically ((Left <$> readTMVar parked) `orElse` (Right <$> readTMVar finished)))
-  case reached of
-    Just (Left ()) → pure ()
-    Just (Right _) → expectationFailure "the helper ended without reaching its release"
-    Nothing → expectationFailure "the helper did not reach its release within 30 seconds"
-  throwTo worker UserInterrupt
-  putMVar gate ()
-  timeout (30 * 1000000) (atomically (readTMVar finished)) >>= maybe (expectationFailure "the helper did not finish within 30 seconds" >> throwIO BodyFailed) pure
+-- | Run the helper on an owned thread, park its release at the hook, deliver a cancellation to it there, let the release go on,
+-- and answer how the helper ended: the shared orchestration ("Test.Support.Parked"), with the child helper as the worker. The
+-- hooks are given the park to run where the release is to wait. A helper that never reaches its release (or never ends) fails
+-- the example instead of hanging it, and in every case the helper, and with it the child it owns, has ended and been reaped
+-- before the example sees the failure (#584).
+parkedRelease ∷ (IO () → Hooks) → (Child → IO ()) → IO (Either (ExceptionWithContext SomeException) ())
+parkedRelease = parkedReleaseWithin Parked.defaultParkBounds
 
--- | The hook that parks the release: say so once, then wait for the gate.
-park ∷ TMVar () → MVar () → IO ()
-park parked gate = atomically (void (tryPutTMVar parked ())) >> readMVar gate
+-- | 'parkedRelease' with the orchestration's bounds stated, so an example can make a wait expire without waiting (a bound of
+-- zero expires at once). The bounds are the example's alone; no production default changes.
+parkedReleaseWithin ∷ Parked.ParkBounds → (IO () → Hooks) → (Child → IO ()) → IO (Either (ExceptionWithContext SomeException) ())
+parkedReleaseWithin bounds hooks body = Parked.parkedRelease bounds (\park → run defaultBounds (hooks park) body)
+
+tryPut ∷ MVar () → IO Bool
+tryPut = flip tryPutMVar ()
+
+failedWith ∷ String → Either HUnitFailure a → Bool
+failedWith needle = \case
+  Left (HUnitFailure _ (Reason message)) → needle `isInfixOf` message
+  _ → False
+
+-- | The process, if the helper had started it, was left reaped; a helper stopped before it started its child left nothing.
+reapedIfStarted ∷ IORef (Maybe ProcessHandle) → IO ()
+reapedIfStarted seen = readIORef seen >>= maybe (pure ()) (\_ → reapedAfter seen)
 
 cancellation ∷ Either (ExceptionWithContext SomeException) () → Bool
 cancellation = either (\(ExceptionWithContext _ failure) → fromException failure == Just UserInterrupt) (const False)
