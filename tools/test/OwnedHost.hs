@@ -72,7 +72,7 @@ import Test.Support.Subprocess
   , Output (Stdout)
   , RetainedFailure (RetainedFailure)
   , RunBound (Unbounded, Within)
-  , Seams (seamReleasing, seamSignalled, seamSpawned, seamWait)
+  , Seams (seamDiagnostic, seamReleasing, seamSignalled, seamSpawned, seamWait)
   , SignalTarget (ToGroup)
   , Stream (CallerHandle)
   , SubprocessFailure (SubprocessFailure)
@@ -915,6 +915,19 @@ servingQueuedSpec = describe "Serving a request, one queued" $ do
           answered a >>= (`shouldSatisfy` namesBound "5 s")
           answered b >>= void . pidOf
 
+  it "Serving, one queued × Submitter cancelled, for the running request: it sees its own cancellation, its body is not cancelled by this, and the queued request is then served" $ do
+    held <- newHeld
+    withHost $ \host ->
+      withSubmission host (readyChild (Within 60000000) "a" nowhere) (heldBody held) $ \a -> do
+        _ <- awaitHeld held
+        withSubmission host (readyChild Unbounded "b" nowhere) pidBody $ \b -> do
+          bounded (awaitQueued host True)
+          cancelSubmitter a
+          answered a >>= (`shouldSatisfy` isCancellation)
+          readIORef (heldCancelled held) `shouldReturn` False
+          releaseHeld held
+          answered b >>= void . pidOf
+
   it "Serving, one queued × Stop: the running body is cancelled, the queued request is never started, answered 'host stopped' with its handles closed, though the slot is full" $ do
     held <- newHeld
     firstHost <- newEmptyTMVarIO
@@ -1079,7 +1092,7 @@ stoppingSpec = describe "Stopping (the stop is recorded, the worker not finished
     -- The reap of the first child is not observed (an injected wait that answers nothing); its group is killed all the same.
     target <- newIORef Nothing
     handles <- newIORef []
-    let facility = noSeams {seamWait = \handle bound -> do
+    let facility = noSeams {seamDiagnostic = \_ -> pure (), seamWait = \handle bound -> do
                               mine <- getPid handle
                               wanted <- readIORef target
                               if mine == wanted then modifyIORef' handles (handle :) >> pure Nothing else seamWait noSeams handle bound}
@@ -1211,7 +1224,7 @@ causeSpec = describe "Cause: how a host, or a request inside it, comes to an end
     target <- newIORef Nothing
     handles <- newIORef []
     pids <- newIORef []
-    let facility = noSeams {seamWait = \handle bound -> do
+    let facility = noSeams {seamDiagnostic = \_ -> pure (), seamWait = \handle bound -> do
                               mine <- getPid handle
                               wanted <- readIORef target
                               if mine == wanted then modifyIORef' handles (handle :) >> pure Nothing else seamWait noSeams handle bound}
@@ -1269,7 +1282,7 @@ causeSpec = describe "Cause: how a host, or a request inside it, comes to an end
   it "Cause: the owner's body fails or is cancelled, and every child is ended and reaped with the cleanup failure retained beside the owner's failure" $ do
     target <- newIORef Nothing
     handles <- newIORef []
-    let facility = noSeams {seamWait = \handle bound -> do
+    let facility = noSeams {seamDiagnostic = \_ -> pure (), seamWait = \handle bound -> do
                               mine <- getPid handle
                               wanted <- readIORef target
                               if mine == wanted then modifyIORef' handles (handle :) >> pure Nothing else seamWait noSeams handle bound}
