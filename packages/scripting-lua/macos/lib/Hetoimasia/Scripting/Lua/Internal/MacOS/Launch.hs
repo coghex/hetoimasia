@@ -202,10 +202,10 @@ jetsamFlags = fromIntegral <$> c_jetsam_flags
 withLaunch ∷ LaunchRequest → (Either LaunchFailure Launched → IO a) → IO a
 withLaunch = withLaunchSeamed (\_ → pure ())
 
--- | 'withLaunch' with a test-side seam (#598): told the reader's thread once it is started, in the masked step that starts it
+-- | 'withLaunch' with a test-side seam (#598): told the launched helper (and so its reader's thread) once the reader is started, in the masked step that starts it
 -- and before the body is let go of the mask, so an example can queue a cancellation against the caller exactly at the
 -- handoff. The production launch passes none.
-withLaunchSeamed ∷ (ThreadId → IO ()) → LaunchRequest → (Either LaunchFailure Launched → IO a) → IO a
+withLaunchSeamed ∷ (Launched → IO ()) → LaunchRequest → (Either LaunchFailure Launched → IO a) → IO a
 withLaunchSeamed seam request body
   | requestMemoryLimitMiB request > 0 = do
       available ← jetsamAvailable
@@ -249,8 +249,9 @@ withLaunchSeamed seam request body
                   `finally` (atomically (writeTVar finished True) >> void (try @IOException (hClose handle)) >> putMVar done ())
             )
             `onException` hClose handle
-        seam reader `onException` stopReader reader done
-        restore (body (Right (Launched pid reports finished reader)))
+        let launched = Launched pid reports finished reader
+        seam launched `onException` stopReader reader done
+        restore (body (Right launched))
           `finally` stopReader reader done
 
   stopReader reader done = uninterruptibleMask_ (killThread reader >> readMVar done)

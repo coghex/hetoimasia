@@ -201,12 +201,12 @@ spec = describe "the threads the probe library owns itself (#598)" $ do
         try @AsyncException . bounded $
           withOwnedThread (readMVar go >> throwTo caller UserInterrupt) $ \thrower _ →
             withHelperPairSeamed
-              (\_ → putMVar go () >> awaitBlockedThrower thrower)
+              (\pair → writeIORef kept (Just pair) >> putMVar go () >> awaitBlockedThrower thrower)
               fixture
-              (\pair → writeIORef kept (Just pair) >> holdUntilEnded)
+              (\_ → holdUntilEnded)
       outcome `shouldBe` Left UserInterrupt
       readIORef kept >>= \case
-        Nothing → expectationFailure "the pair's body never began"
+        Nothing → expectationFailure "the pair never reached its handoff"
         Just (first, second) → do
           mapM_ (\launched → processGone (launchedPid launched) `shouldReturn` True) [first, second]
           mapM_ (\launched → joined (launchedReader launched) `shouldReturn` True) [first, second]

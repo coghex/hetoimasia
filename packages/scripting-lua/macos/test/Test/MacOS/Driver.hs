@@ -38,7 +38,6 @@ module Test.MacOS.Driver
   , enforceExecutionBudget
   ) where
 
-import Control.Concurrent (ThreadId)
 import Control.Exception (ErrorCall (ErrorCall), IOException, bracket_, finally, mask, throwIO, try)
 import Control.Monad (forM, unless, void)
 import Data.List (find)
@@ -205,7 +204,7 @@ withHelper ∷ Fixture → Instance → Instance → Text → Int → (Launched 
 withHelper = withHelperSeamed (\_ → pure ())
 
 -- | 'withHelper' with the launch's test-side seam ('withLaunchSeamed').
-withHelperSeamed ∷ (ThreadId → IO ()) → Fixture → Instance → Instance → Text → Int → (Launched → IO a) → IO a
+withHelperSeamed ∷ (Launched → IO ()) → Fixture → Instance → Instance → Text → Int → (Launched → IO a) → IO a
 withHelperSeamed seam fixture self peer mode memoryLimitMiB =
   withLaunchedSeamed
     seam
@@ -222,18 +221,18 @@ withHelperSeamed seam fixture self peer mode memoryLimitMiB =
 withHelperPair ∷ Fixture → ((Launched, Launched) → IO a) → IO a
 withHelperPair = withHelperPairSeamed (\_ → pure ())
 
--- | 'withHelperPair' whose seam is told the second helper's reader, at the handoff of the second launch to the body.
-withHelperPairSeamed ∷ (ThreadId → IO ()) → Fixture → ((Launched, Launched) → IO a) → IO a
+-- | 'withHelperPair' whose seam is told both helpers, at the handoff of the second launch to the body.
+withHelperPairSeamed ∷ ((Launched, Launched) → IO ()) → Fixture → ((Launched, Launched) → IO a) → IO a
 withHelperPairSeamed seam fixture body = mask $ \restore →
   withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0 $ \first →
-    withHelperSeamed seam fixture (fixtureSecond fixture) (fixtureFirst fixture) "hold" 0 $ \second →
+    withHelperSeamed (\second → seam (first, second)) fixture (fixtureSecond fixture) (fixtureFirst fixture) "hold" 0 $ \second →
       restore (body (first, second)) `finally` mapM_ endQuietly [first, second]
 
 -- | 'withLaunch' for an example that needs the helper and fails when it cannot be launched.
 withLaunched ∷ LaunchRequest → (Launched → IO a) → IO a
 withLaunched = withLaunchedSeamed (\_ → pure ())
 
-withLaunchedSeamed ∷ (ThreadId → IO ()) → LaunchRequest → (Launched → IO a) → IO a
+withLaunchedSeamed ∷ (Launched → IO ()) → LaunchRequest → (Launched → IO a) → IO a
 withLaunchedSeamed seam request body =
   withLaunchSeamed seam request (either (throwIO . ErrorCall . ("the helper could not be launched: " <>) . show) body)
 
