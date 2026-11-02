@@ -210,6 +210,7 @@ test-suite workflow-tests
         Reuse
         ReviewGate
         ReviewReplay
+        RunnerIdentity
         Sandbox
         Timings
         TimingStep

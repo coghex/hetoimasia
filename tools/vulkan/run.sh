@@ -14,10 +14,19 @@
 # groups `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`,
 # `test.vulkan-lua-engine-native` and `test.vulkan-run-native` run through it.
 #
-# `build` compiles the named components, and nothing else. `test.vulkan-native`
-# and `test.vulkan-wayland` run it as their preparation stage, so the
-# compilation is recorded apart from the native execution it prepares and
-# never counted in it.
+# `build` compiles the named components, and nothing else, then records the
+# build identity of each executable they resolve to: the source digest and the
+# revision of the tree the build started from, in the form `native` prints, in
+# `native-identity/` inside the build directory (tools/vulkan/build_identity.py).
+# The record is bound to the executable by its content, path and variant, and is
+# not among the digest's inputs. Building `run-native-tests` also records the
+# full-product `hetoimasia` executable it launches, even when only the suite is
+# named. A target that is not one executable (a library, a whole package) builds
+# as before and records nothing. A build that fails, is interrupted, or sees the
+# source change while it compiles records nothing; one that compiles but cannot
+# record exits 1 naming the component. `test.vulkan-native` and
+# `test.vulkan-wayland` run it as their preparation stage, so the compilation is
+# recorded apart from the native execution it prepares and never counted in it.
 #
 # `test` builds and runs the named test suites. `test.vulkan-headless` runs the
 # native backend's `native-tests` and `shader-tests`, the window integration's
@@ -30,7 +39,16 @@
 #
 # `native` runs one component already built — the native suite — as the
 # timed execution. It builds nothing, and refuses a component that was not
-# prepared. On Linux, a run given no consent of its own is started inside the
+# prepared. What it prints as the run's provenance (`repository revision`,
+# `source digest`) and exports for the executable to record is the identity the
+# executable's own build recorded, never the tree as it is now: it refuses, with
+# status 2 and the command that prepares the component, an executable whose
+# record is missing, malformed, made for another executable or variant, or built
+# from a tree whose digest is not the current one, and a caller-set
+# `HETOIMASIA_VULKAN_REVISION` that disagrees with the record. For
+# `run-native-tests` the `hetoimasia` executable it launches must satisfy the same
+# and carry the same revision and digest, so the header and the suite's record
+# are one truthful pair. On Linux, a run given no consent of its own is started inside the
 # isolated X11 display `tools/display/x11.sh` starts for it, which supplies the
 # consent for that display alone and needs no approval; the display's startup
 # and teardown are part of the run. A run that already carries consent — the
@@ -86,7 +104,8 @@
 # probe checks against the binding's behaviour.
 #
 # Exit status: the build's, the suites', or the executable's own; 2 for a
-# configuration diagnostic.
+# configuration diagnostic (including a refused build identity); 1 for a build
+# identity that could not be recorded.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -268,31 +287,12 @@ prepare_x11_helper() {
   echo "vulkan: X11 evidence helper ready"
 }
 
-case "$mode" in
-  build)
-    generate_fingerprint
-    cabal build "${cabal_flags[@]}" "${components[@]}"
-    for component in "${components[@]}"; do
-      case "$component" in
-        *run-native-tests) prepare_x11_helper ;;
-      esac
-    done
-    ;;
-  test)
-    generate_fingerprint
-    options=()
-    for argument in ${arguments[@]+"${arguments[@]}"}; do
-      options+=("--test-option=$argument")
-    done
-    cabal test "${cabal_flags[@]}" --test-show-details=direct "${components[@]}" ${options[@]+"${options[@]}"}
-    ;;
-  native)
-    # The exact identity of the sources under test, computed from their
-    # content, which the VK-2 case's record carries. A revision is a
-    # convenience and can be inexact — a working tree can be dirty — so a
-    # record is pinned by this instead, and a reader can recompute it.
-    HETOIMASIA_VULKAN_SOURCE_DIGEST="$(
-      python3 - "$root" <<'DIGEST'
+# The exact identity of the sources under test, computed from their content,
+# which the VK-2 case's record carries. A revision is a convenience and can be
+# inexact — a working tree can be dirty — so a record is pinned by this instead,
+# and a reader can recompute it.
+source_digest() {
+  python3 - "$root" <<'DIGEST'
 import hashlib, os, sys
 
 root = sys.argv[1]
@@ -344,18 +344,134 @@ for path in sorted(paths):
     overall.update(path.encode("utf-8") + b"\0" + content.encode("ascii") + b"\n")
 print(overall.hexdigest())
 DIGEST
-    )"
-    export HETOIMASIA_VULKAN_SOURCE_DIGEST
-    if [ -z "${HETOIMASIA_VULKAN_REVISION:-}" ]; then
-      if revision="$(git -C "$root" rev-parse HEAD 2>/dev/null)"; then
-        git -C "$root" diff --quiet HEAD -- . 2>/dev/null || revision="$revision (dirty)"
+}
+
+# The repository revision of the tree as it is now, with ` (dirty)` when tracked
+# files differ from it. `build` records it; `native` never computes it.
+source_revision() {
+  local revision
+  if revision="$(git -C "$root" rev-parse HEAD 2>/dev/null)"; then
+    git -C "$root" diff --quiet HEAD -- . 2>/dev/null || revision="$revision (dirty)"
+  else
+    revision="unknown"
+  fi
+  printf '%s\n' "$revision"
+}
+
+# The build identity of each executable `build` produces, recorded where
+# `native` reads it back (tools/vulkan/build_identity.py). It lives in the build
+# directory — `dist-vulkan/` is a declared generated path and is ignored by Git,
+# so the validation runner and `git status` see nothing new — and it is not
+# among the source digest's inputs.
+identity_directory="$build_directory/native-identity"
+identity_tool="$root/tools/vulkan/build_identity.py"
+
+# The command that prepares a component, for a refusal to name: with the
+# variant's choice when it is not the default.
+prepare_prefix=""
+[ "$vma_calls" = "unsafe" ] || prepare_prefix="HETOIMASIA_VMA_FOREIGN_CALLS=$vma_calls "
+
+# Whether Cabal resolves a target to exactly one executable that exists, and which.
+# A library, or a package naming several components, names no single executable:
+# such a target builds as it always did and is not stamped.
+built_executable() {
+  local path
+  path="$(cabal list-bin -v0 "${cabal_flags[@]}" "$1" 2>/dev/null)" || return 1
+  [ -f "$path" ] && [ -x "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
+# Record, for each executable the named targets built, the identity of the tree
+# the build started from. Called only after the build and its checks succeeded,
+# so a failed or interrupted build records nothing. If the source changed while
+# it compiled, the executable may not match either tree, and nothing is
+# recorded; a stamp that cannot be recorded fails the build, naming the target.
+stamp_build() {
+  local started_revision="$1" started_digest="$2"
+  shift 2
+  local labels=() paths=() target path label index seen suite_path status=0 recorded
+  suite_path="$(built_executable hetoimasia:test:run-native-tests || true)"
+  for target in "$@"; do
+    path="$(built_executable "$target" || true)"
+    [ -n "$path" ] || continue
+    labels+=("$target")
+    paths+=("$path")
+    # The suite launches the full-product command as a child, and the two are
+    # one pair: building the suite, however it was spelled, stamps both.
+    if [ -n "$suite_path" ] && [ "$path" = "$suite_path" ]; then
+      path="$(built_executable hetoimasia:exe:hetoimasia || true)"
+      if [ -z "$path" ]; then
+        echo "vulkan: cannot record the build identity of hetoimasia:exe:hetoimasia, which $target launches: it was not built" >&2
+        status=1
       else
-        revision="unknown"
+        labels+=("hetoimasia:exe:hetoimasia")
+        paths+=("$path")
       fi
-      export HETOIMASIA_VULKAN_REVISION="$revision"
     fi
-    echo "vulkan: repository revision $HETOIMASIA_VULKAN_REVISION"
-    echo "vulkan: source digest $HETOIMASIA_VULKAN_SOURCE_DIGEST"
+  done
+  [ "${#paths[@]}" -gt 0 ] || return "$status"
+  if [ "$(source_digest)" != "$started_digest" ]; then
+    for label in "${labels[@]}"; do
+      echo "vulkan: cannot record the build identity of $label: the source tree changed while it was being built" >&2
+    done
+    return 1
+  fi
+  seen=" "
+  index=0
+  for path in "${paths[@]}"; do
+    label="${labels[$index]}"
+    index=$((index + 1))
+    case "$seen" in *" $path "*) continue ;; esac
+    seen="$seen$path "
+    if ! recorded="$(python3 -I "$identity_tool" record --directory "$identity_directory" --executable "$path" \
+      --variant "$vma_calls" --revision "$started_revision" --digest "$started_digest")"; then
+      echo "vulkan: cannot record the build identity of $label: $recorded" >&2
+      status=1
+    fi
+  done
+  return "$status"
+}
+
+# The identity recorded for an executable, or the refusal. Sets
+# `recorded_revision` and `recorded_digest` to what the executable's build
+# stamped, once it is the executable that stamp was made for and was built from
+# the tree as it is now.
+read_identity() {
+  local label="$1" path="$2" prepare="$3" verified status=0
+  verified="$(python3 -I "$identity_tool" verify --directory "$identity_directory" --executable "$path" --variant "$vma_calls")" || status=$?
+  [ "$status" -eq 0 ] \
+    || refuse "$label cannot be run: ${verified:-its recorded build identity could not be read}; prepare it with: $prepare"
+  recorded_revision="${verified%%$'\n'*}"
+  recorded_digest="${verified#*$'\n'}"
+  [ "$recorded_digest" = "$current_digest" ] \
+    || refuse "$label was built from source digest $recorded_digest (revision $recorded_revision), but the tree's is $current_digest; prepare it with: $prepare"
+}
+
+case "$mode" in
+  build)
+    generate_fingerprint
+    # The identity of the tree the build starts from, taken before anything
+    # compiles.
+    started_digest="$(source_digest)"
+    started_revision="$(source_revision)"
+    cabal build "${cabal_flags[@]}" "${components[@]}"
+    for component in "${components[@]}"; do
+      case "$component" in
+        *run-native-tests) prepare_x11_helper ;;
+      esac
+    done
+    stamp_build "$started_revision" "$started_digest" "${components[@]}"
+    ;;
+  test)
+    generate_fingerprint
+    options=()
+    for argument in ${arguments[@]+"${arguments[@]}"}; do
+      options+=("--test-option=$argument")
+    done
+    cabal test "${cabal_flags[@]}" --test-show-details=direct "${components[@]}" ${options[@]+"${options[@]}"}
+    ;;
+  native)
+    current_digest="$(source_digest)"
 
     executable="$(cabal list-bin -v0 "${cabal_flags[@]}" "${components[0]}")" \
       || refuse "Cabal could not name the executable of ${components[0]}"
@@ -371,11 +487,47 @@ DIGEST
     # and no stale environment can reach it.
     unset HETOIMASIA_RUN_EXECUTABLE
     run_native_suite="$(cabal list-bin -v0 "${cabal_flags[@]}" hetoimasia:test:run-native-tests 2>/dev/null || true)"
+    suite_launches=""
     if [ -n "$run_native_suite" ] && [ "$executable" = "$run_native_suite" ]; then
+      suite_launches="yes"
+    fi
+
+    # What the run reports as provenance is what each executable's own build
+    # recorded, never the tree as it is now: the executable was built earlier and
+    # this command builds nothing. An executable with no valid record, or built
+    # from a different tree than the one here, is refused before anything starts.
+    if [ -n "$suite_launches" ]; then
+      prepare_command="${prepare_prefix}bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests"
+    else
+      prepare_command="${prepare_prefix}bash tools/vulkan/run.sh build ${components[0]}"
+    fi
+    read_identity "${components[0]}" "$executable" "$prepare_command"
+    identity_revision="$recorded_revision"
+    identity_digest="$recorded_digest"
+
+    if [ -n "$suite_launches" ]; then
       run_executable="$(cabal list-bin -v0 "${cabal_flags[@]}" hetoimasia:exe:hetoimasia)" \
         || refuse "Cabal could not name the full-product hetoimasia executable"
       [ -x "$run_executable" ] \
         || refuse "the full-product hetoimasia executable has not been built; prepare it with: bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests"
+      read_identity "hetoimasia:exe:hetoimasia" "$run_executable" "$prepare_command"
+      # One truthful pair for the header and the suite's record: the suite and the
+      # command it launches must have been built from the same revision and tree.
+      if [ "$recorded_revision" != "$identity_revision" ] || [ "$recorded_digest" != "$identity_digest" ]; then
+        refuse "${components[0]} and the hetoimasia executable it launches were built at different identities (${components[0]}: revision $identity_revision, source digest $identity_digest; hetoimasia:exe:hetoimasia: revision $recorded_revision, source digest $recorded_digest); build both together with: $prepare_command"
+      fi
+    fi
+
+    # A caller-set revision may agree with the recorded one and may not stand in for it.
+    if [ -n "${HETOIMASIA_VULKAN_REVISION:-}" ] && [ "$HETOIMASIA_VULKAN_REVISION" != "$identity_revision" ]; then
+      refuse "HETOIMASIA_VULKAN_REVISION is set to '$HETOIMASIA_VULKAN_REVISION', but ${components[0]} was built at revision $identity_revision; unset it, or prepare the component with: $prepare_command"
+    fi
+    export HETOIMASIA_VULKAN_SOURCE_DIGEST="$identity_digest"
+    export HETOIMASIA_VULKAN_REVISION="$identity_revision"
+    echo "vulkan: repository revision $HETOIMASIA_VULKAN_REVISION"
+    echo "vulkan: source digest $HETOIMASIA_VULKAN_SOURCE_DIGEST"
+
+    if [ -n "$suite_launches" ]; then
       export HETOIMASIA_RUN_EXECUTABLE="$run_executable"
       echo "vulkan: launched executable $HETOIMASIA_RUN_EXECUTABLE"
       prepare_x11_helper

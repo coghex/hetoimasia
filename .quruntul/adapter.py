@@ -290,11 +290,14 @@ class Hetoimasia:
             environment["PATH"] = os.pathsep.join([str(Path(t).parent) for t in tools] + [path])
         if suite.data["launch"] == "vulkan-native":
             # As test.vulkan-native runs it: run.sh native sets the source digest
-            # and revision the native suite's provenance checks require, starts
-            # the executable from the repository root, and on Linux starts its
-            # own isolated X11 display. As test.vulkan-wayland runs it, the
-            # isolated compositor is started around run.sh instead, whose
-            # consent run.sh then uses rather than starting a display.
+            # and revision the native suite's provenance checks require, taking
+            # them from the build identity run.sh build recorded for the
+            # executable (the preparation above) and refusing one that does not
+            # match the current tree, starts the executable from the repository
+            # root, and on Linux starts its own isolated X11 display. As
+            # test.vulkan-wayland runs it, the isolated compositor is started
+            # around run.sh instead, whose consent run.sh then uses rather than
+            # starting a display.
             runner = ["bash", str(checkout / "tools" / "vulkan" / "run.sh"), "native", component, "--"]
             compositor = (["bash", str(checkout / "tools" / "display" / "wayland.sh"), "--"]
                           if suite.data["display"] == "wayland" else [])
