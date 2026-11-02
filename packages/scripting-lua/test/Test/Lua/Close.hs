@@ -13,7 +13,7 @@
 -- this slice has not established; LUA-2 owns the protected owner that will.
 module Test.Lua.Close (spec) where
 
-import Control.Concurrent (forkIO, throwTo)
+import Control.Concurrent (throwTo)
 import Control.Concurrent.MVar (modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -41,6 +41,10 @@ import Hetoimasia.Scripting.Lua.Internal.Vm (Phase (Closed), vmPhase)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain)
 import Test.Lua.Support (ScopeFailure (BodyFailed, CloseFailed), acquireVm, closeCauses, runScoped)
 import Test.Support.Bounded (bounded)
+import Control.Concurrent.MVar (tryPutMVar)
+import Control.Exception (catchJust)
+import Control.Monad (void)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 newtype BodyBroke = BodyBroke String
   deriving (Eq, Show)
@@ -129,17 +133,25 @@ spec = describe "close" $ do
     installCallback vm "used" (pure NoResult) (modifyMVar_ releases (pure . succ))
     evalChunk vm (chunkName "use") "used()"
     finished ← newEmptyMVar
-    -- Forked under a mask, so the child is masked from its first instruction:
-    -- a cancellation that landed before the close began would prove nothing
-    -- about a close being interrupted.
-    closer ← mask_ (forkIO (try @SomeException (closeVm vm) >>= putMVar finished))
-    -- Repeated cancellation of the closing thread. The close is masked, so none
-    -- of these can land inside it.
-    mapM_ (\_ → throwTo closer UserInterrupt) [1 .. 5 ∷ Int]
-    outcome ← bounded (takeMVar finished)
-    case outcome of
-      Left thrown → expectationFailure ("the close failed: " <> show thrown)
-      Right () → pure ()
+    begun ← newEmptyMVar
+    -- The closer is masked before it announces that it has begun, and the example cancels it only then: a cancellation that
+    -- landed before the close began would prove nothing about a close being interrupted. The thread is owned (#598): a pending
+    -- cancellation it never takes is dropped with it, and it is joined however the example ends.
+    withOwnedThread
+      ( catchJust
+          (\raised → if raised == UserInterrupt then Just () else Nothing)
+          (mask_ (putMVar begun () >> try @SomeException (closeVm vm) >>= putMVar finished))
+          pure
+      )
+      $ \closer _ → do
+        takeMVar begun
+        -- Repeated cancellation of the closing thread. The close is masked, so none
+        -- of these can land inside it.
+        mapM_ (\_ → throwTo closer UserInterrupt) [1 .. 5 ∷ Int]
+        outcome ← bounded (takeMVar finished)
+        case outcome of
+          Left thrown → expectationFailure ("the close failed: " <> show thrown)
+          Right () → pure ()
     vmPhase vm >>= (`shouldBe` Closed)
     readMVar releases >>= (`shouldBe` 1)
     -- Closing again releases nothing further: the close was complete, not
@@ -160,25 +172,28 @@ spec = describe "close" $ do
       (pure ())
     -- Publishing a global now runs Haskell, and that Haskell can be paused.
     evalChunk vm (chunkName "trap") "setmetatable(_G, {__newindex = function(t, k, v) hold() end})"
-    installer ←
-      forkIO $ do
-        outcome ←
-          try @SomeException
-            ( installCallback
-                vm
-                "later"
-                (pure NoResult)
-                (modifyMVar_ releases (pure . succ))
-            )
-        putMVar raised outcome
-    bounded (takeMVar entered)
-    _ ← forkIO (throwTo installer UserInterrupt)
-    putMVar released ()
-    _ ← bounded (takeMVar raised)
-    -- However that install ended, its borrowed dependency was retained before
-    -- anything was published, so the close still frees it exactly once.
-    closeVm vm
-    readMVar releases >>= (`shouldBe` 1)
+    withOwnedThreadOpening
+      (void (tryPutMVar released ()))
+      ( do
+          outcome ←
+            try @SomeException
+              ( installCallback
+                  vm
+                  "later"
+                  (pure NoResult)
+                  (modifyMVar_ releases (pure . succ))
+              )
+          putMVar raised outcome
+      )
+      $ \installer _ → do
+        bounded (takeMVar entered)
+        withOwnedThread (throwTo installer UserInterrupt) $ \_ _ → do
+          putMVar released ()
+          void (bounded (takeMVar raised))
+        -- However that install ended, its borrowed dependency was retained before
+        -- anything was published, so the close still frees it exactly once.
+        closeVm vm
+        readMVar releases >>= (`shouldBe` 1)
 
   it "reports a Haskell finalizer that failed while the interpreter closed" $ do
     vm ← acquireVm [LibraryBase]
@@ -229,17 +244,20 @@ spec = describe "close" $ do
       (putMVar finalizing () >> takeMVar release >> note "finalizer-left" >> pure NoResult)
       (pure ())
     evalChunk vm (chunkName "finalizer") "guard = setmetatable({}, {__gc = function() linger() end})"
-    _ ← forkIO (closeVm vm >> note "first-close" >> putMVar firstDone ())
-    bounded (takeMVar finalizing)
-    _ ← forkIO (closeVm vm >> note "second-close" >> putMVar secondDone ())
-    putMVar release ()
-    bounded (takeMVar firstDone)
-    bounded (takeMVar secondDone)
-    -- The second caller cannot report a finished close while the interpreter is
-    -- still running a finalizer that calls back into Haskell.
-    entries ← readMVar order
-    take 1 entries `shouldBe` ["finalizer-left"]
-    entries `shouldContain` ["second-close"]
+    -- Both closers are owned (#598), and the stop lets the finalizer go: the first is parked in it and the second waits for the
+    -- teardown it is running, so neither could be joined while the finalizer is held.
+    let letGo = void (tryPutMVar release ())
+    withOwnedThreadOpening letGo (closeVm vm >> note "first-close" >> putMVar firstDone ()) $ \_ _ → do
+      bounded (takeMVar finalizing)
+      withOwnedThreadOpening letGo (closeVm vm >> note "second-close" >> putMVar secondDone ()) $ \_ _ → do
+        putMVar release ()
+        bounded (takeMVar firstDone)
+        bounded (takeMVar secondDone)
+        -- The second caller cannot report a finished close while the interpreter is
+        -- still running a finalizer that calls back into Haskell.
+        entries ← readMVar order
+        take 1 entries `shouldBe` ["finalizer-left"]
+        entries `shouldContain` ["second-close"]
 
   it "leaves a VM closed even when the chunk that ran last failed" $ do
     vm ← acquireVm [LibraryBase] ∷ IO Vm

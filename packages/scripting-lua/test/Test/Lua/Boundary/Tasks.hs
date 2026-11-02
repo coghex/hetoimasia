@@ -10,7 +10,6 @@
 -- are fixtures, and name nothing of a game.
 module Test.Lua.Boundary.Tasks (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -41,8 +40,10 @@ import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
-import Test.Lua.Support (Settled (settledOperation), awaitSettled, cancelling, observedCancellation, settling)
+import Test.Lua.Support (Settled (settledOperation), awaitSettled, cancelling, observedCancellation)
 import Test.Support.Bounded (bounded)
+import Control.Concurrent.MVar (tryPutMVar)
+import Test.Lua.Support (withProducer, withSettling)
 
 -- | What the fixture's bindings did, oldest first, and the pair of signals a
 -- binding that holds its owner uses.
@@ -1122,48 +1123,54 @@ teardownSpec = describe "a VM closed with suspended tasks" $ do
     probe ← newProbe
     withWorker probe $ \owned handle → do
       (task, _) ← begin owned handle "yield_once" []
-      answers ← newEmptyMVar
-      _ ← forkIO $ do
-        started ← try @VmNotOwned (startTask owned handle "yield_once" [])
-        resumed ← try @VmNotOwned (resumeTask owned task)
-        closed ← try @VmNotOwned (closeTask owned task)
-        putMVar answers (either (const True) (const False) started, either (const True) (const False) resumed, either (const True) (const False) closed)
-      bounded (takeMVar answers) >>= (`shouldBe` (True, True, True))
+      withProducer
+        ( do
+            started ← try @VmNotOwned (startTask owned handle "yield_once" [])
+            resumed ← try @VmNotOwned (resumeTask owned task)
+            closed ← try @VmNotOwned (closeTask owned task)
+            pure (either (const True) (const False) started, either (const True) (const False) resumed, either (const True) (const False) closed)
+        )
+        (bounded . takeMVar)
+        >>= (`shouldBe` (True, True, True))
       resumeTask owned task >>= (`shouldBe` Completed [VInteger 1])
 
 cancellationSpec ∷ Spec
 cancellationSpec = describe "cancellation" $ do
   it "lands after a resumed segment, closing every suspended task and keeping the failure as evidence" $ do
     probe ← newProbe
-    runner ←
-      settling $
-        withWorker probe $ \owned handle → do
-          void (begin owned handle "with_guard" [VText "a"])
-          void (begin owned handle "with_failing_guard" [VText "x"])
-          (holding, _) ← begin owned handle "holder" []
-          void (resumeTask owned holding)
-    bounded (takeMVar (probeEntered probe))
-    cancelling runner UserInterrupt (putMVar (probeRelease probe) ())
-    settled ← awaitSettled runner
-    observedCancellation settled `shouldBe` Just UserInterrupt
-    logged probe >>= (`shouldBe` ["note_gc closed a"])
-    case settledOperation settled of
-      Right _ → expectationFailure "the cancellation was lost"
-      Left raised → map cleanupFailureLabel (cleanupFailures raised) `shouldBe` ["lua coroutine close"]
+    withSettling
+      (void (tryPutMVar (probeRelease probe) ()))
+      (         withWorker probe $ \owned handle → do
+        void (begin owned handle "with_guard" [VText "a"])
+        void (begin owned handle "with_failing_guard" [VText "x"])
+        (holding, _) ← begin owned handle "holder" []
+        void (resumeTask owned holding)
+      )
+      $ \runner → do
+        bounded (takeMVar (probeEntered probe))
+        cancelling runner UserInterrupt (putMVar (probeRelease probe) ())
+        settled ← awaitSettled runner
+        observedCancellation settled `shouldBe` Just UserInterrupt
+        logged probe >>= (`shouldBe` ["note_gc closed a"])
+        case settledOperation settled of
+          Right _ → expectationFailure "the cancellation was lost"
+          Left raised → map cleanupFailureLabel (cleanupFailures raised) `shouldBe` ["lua coroutine close"]
 
   it "leaves the VM closed when the cancelled owner had tasks suspended" $ do
     probe ← newProbe
-    runner ←
-      settling $
-        withWorker probe $ \owned handle → do
-          void (begin owned handle "with_guard" [VText "kept"])
-          (holding, _) ← begin owned handle "holder" []
-          void (resumeTask owned holding)
-    bounded (takeMVar (probeEntered probe))
-    cancelling runner UserInterrupt (putMVar (probeRelease probe) ())
-    settled ← awaitSettled runner
-    observedCancellation settled `shouldBe` Just UserInterrupt
-    logged probe >>= (`shouldBe` ["note_gc closed kept"])
+    withSettling
+      (void (tryPutMVar (probeRelease probe) ()))
+      (         withWorker probe $ \owned handle → do
+        void (begin owned handle "with_guard" [VText "kept"])
+        (holding, _) ← begin owned handle "holder" []
+        void (resumeTask owned holding)
+      )
+      $ \runner → do
+        bounded (takeMVar (probeEntered probe))
+        cancelling runner UserInterrupt (putMVar (probeRelease probe) ())
+        settled ← awaitSettled runner
+        observedCancellation settled `shouldBe` Just UserInterrupt
+        logged probe >>= (`shouldBe` ["note_gc closed kept"])
 
 interleavingSpec ∷ Spec
 interleavingSpec = describe "two tasks on one VM" $ do

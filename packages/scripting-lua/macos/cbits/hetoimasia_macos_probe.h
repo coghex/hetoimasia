@@ -67,9 +67,9 @@ void hetoimasia_macos_errno_text(int code, char *message, size_t message_len);
  * answered by a real endpoint rather than by its absence. fd, or -errno. */
 int hetoimasia_macos_listen_unix(const char *path);
 
-/* Take one pending connection off an endpoint's backlog and drop it. 0 when one
- * was taken, -1 when the endpoint is gone. A backlog that is never drained
- * starts refusing, and a refusal is not a denial. */
+/* Take one pending connection off an endpoint's backlog and drop it. The endpoint is non-blocking: 0 when one was taken, 1
+ * when none was waiting, -1 when the endpoint is gone. A backlog that is never drained starts refusing, and a refusal is not
+ * a denial. */
 int hetoimasia_macos_accept_and_close(int fd);
 void hetoimasia_macos_shutdown_fd(int fd);
 void hetoimasia_macos_close_fd(int fd);

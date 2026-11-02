@@ -4,8 +4,7 @@
 -- cannot be placed.
 module Test.LuaRuntime.Lifecycle.Logical (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Monad (forM, forM_, replicateM, replicateM_, void)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
@@ -20,7 +19,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitScheduledTerminal)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, failExample, Gated (..), withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), withBoundary, withBoundaryOpening, withProducers)
 
 takenAs ∷ Int → Text
 takenAs number = "{accepted=true,receipt=" <> Text.pack (show number) <> "}"
@@ -269,12 +268,12 @@ spec = describe "logical admission" $ do
       _ ← admit targetFx owner "a" (moduleNamed "echoer")
       awaitPhase targetFx owner "a" Active
       a ← idOf targetFx "a"
-      done ← newEmptyMVar
-      forM_ [0 .. 7] $ \order → forkIO $ do
-        answer ← requestInstanceControlAt (scheduledEndpoint owner) a InstancePause (ControlSlot 1 order)
-        putMVar done answer
-      grantOne control owner
-      answers ← forM [0 .. 7 ∷ Int] (const (takeMVar done))
+      answers ←
+        withProducers
+          [requestInstanceControlAt (scheduledEndpoint owner) a InstancePause (ControlSlot 1 order) | order ← [0 .. 7]]
+          $ \dones → do
+            grantOne control owner
+            mapM takeMVar dones
       forM_ answers $ \case
         InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldSatisfy` \result → result `elem` [ControlApplied, ControlAlreadyInState])
         InstanceControlLate → pure ()

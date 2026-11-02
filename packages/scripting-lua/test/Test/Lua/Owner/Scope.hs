@@ -10,8 +10,8 @@
 -- one the finalizer policy refuses.
 module Test.Lua.Owner.Scope (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Exception (finally, throwIO)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -35,6 +35,7 @@ import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Registration (namespace, registration, stateOperation)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Lua.Owner.Support
+import Test.Lua.Support (withProducer)
 
 -- | A scope that notes entering and leaving, keeps the site it was given, and
 -- records the thread it ran on.
@@ -96,9 +97,7 @@ spec = describe "the scope around each callback" $ do
     let record label answer = readIORef verdicts >>= writeIORef verdicts . (<> [(label ∷ Text, answer ∷ Bool)])
         askingScope = CallbackScope $ \site action → do
           record "inside" =<< siteIsCallback site
-          child ← newEmptyMVar
-          _ ← forkIO (siteIsCallback site >>= record "child" >> putMVar child ())
-          takeMVar child
+          withProducer (siteIsCallback site >>= record "child") takeMVar
           writeIORef kept (Just site)
           action
     withVmOwnerScoped askingScope (publicConfig log' [("init", "probe.mark()")]) $ \_ → do

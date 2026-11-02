@@ -8,7 +8,7 @@
 -- cannot leave a creator waiting.
 module Test.LuaRuntime.Readiness (spec) where
 
-import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwTo, try)
@@ -22,6 +22,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
 import Test.HUnit.Lang (HUnitFailure)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Support
+import Test.Support.Owned (withOwnedThreadOpening)
 
 -- | A module whose load records that it loaded and then waits on a gate.
 loader ∷ ModuleSource
@@ -140,9 +141,9 @@ spec = describe "readiness" $ do
     outcome ← newEmptyMVar
     withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       example ← myThreadId
-      creator ←
-        forkIO $
-          try @SomeException
+      withOwnedThreadOpening
+        (openAllGates fixture)
+        ( try @SomeException
             ( startOwner runtime $
                 withChunks
                   [gcInitChunk "closed", (chunkName "slow", Text.encodeUtf8 "app.block('init')")]
@@ -153,17 +154,19 @@ spec = describe "readiness" $ do
               -- and is not the exception the example throws to the creator.
               Left failure | Just (assertion ∷ HUnitFailure) ← fromException failure → throwTo example assertion
               ended → putMVar outcome (either Just (const Nothing) ended)
-      awaitEntered fixture "init"
-      -- The startup was acknowledged, so a creator parked in an STM wait is
-      -- parked in the readiness wait.
-      awaitBlockedOnSTM creator
-      throwTo creator ThreadKilled
-      takeMVar outcome >>= (`shouldSatisfy` maybe False ((== Just ThreadKilled) . fromException))
-      releaseGate fixture "init"
-      -- The adapter asked the owner to stop, so with its initialization done it
-      -- stops and closes its VM, which its finalizer says, while the boundary
-      -- is still open.
-      awaitEntered fixture "closed"
+        )
+        $ \creator _ → do
+          awaitEntered fixture "init"
+          -- The startup was acknowledged, so a creator parked in an STM wait is
+          -- parked in the readiness wait.
+          awaitBlockedOnSTM creator
+          throwTo creator ThreadKilled
+          takeMVar outcome >>= (`shouldSatisfy` maybe False ((== Just ThreadKilled) . fromException))
+          releaseGate fixture "init"
+          -- The adapter asked the owner to stop, so with its initialization done it
+          -- stops and closes its VM, which its finalizer says, while the boundary
+          -- is still open.
+          awaitEntered fixture "closed"
     -- The boundary then returned without a failure: the worker was drained.
     noted fixture >>= (`shouldBe` ["gc closed"])
   where

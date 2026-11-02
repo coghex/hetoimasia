@@ -10,12 +10,11 @@
 -- outcomes. Nothing sleeps.
 module Test.LuaRuntime.Loading (spec) where
 
-import Control.Concurrent (forkIO, yield)
+import Control.Concurrent (yield)
 import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (try)
-import Control.Monad (void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -31,7 +30,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, awaitScheduledTerminal, defaultSchedulerBounds, releaseGate)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (Gated (openAllGates), bounded, failExample, requiredPolicy, withBoundaryOpening)
+import Test.LuaRuntime.Support (Gated (openAllGates), bounded, failExample, requiredPolicy, withBoundaryOpening, withProducer)
 
 -- | What the supplier and the resolver observe and answer.
 data Rig = Rig
@@ -149,11 +148,10 @@ spec = describe "the module loader on a scheduled owner" $ do
       before `shouldSatisfy` any ("tick" `Text.isPrefixOf`)
       loaderOutcome endpoint (ident "main") >>= (`shouldBe` Just OutcomeAdmitted)
       -- Another thread finds the source, tells the owner, and cannot do more.
-      found ← newEmptyMVar
-      void . forkIO $ do
-        answered ← notifySource endpoint (ident "dep") (SourceVerified (Text.encodeUtf8 "fx.record('dep:run') return { name = 'dep' }"))
-        putMVar found answered
-      takeMVar found >>= (`shouldBe` NotifyAccepted)
+      withProducer
+        (notifySource endpoint (ident "dep") (SourceVerified (Text.encodeUtf8 "fx.record('dep:run') return { name = 'dep' }")))
+        takeMVar
+        >>= (`shouldBe` NotifyAccepted)
       outcome ← awaitOutcome control endpoint "main"
       outcome `shouldSatisfy` \case OutcomeSettled (ModuleReady _) → True; _ → False
       dep ← loaderOutcome endpoint (ident "dep")

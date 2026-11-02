@@ -5,7 +5,7 @@
 -- a stopped task's continuation on the owner's thread.
 module Test.LuaRuntime.Scheduler.Control (spec) where
 
-import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), MaskingState (Unmasked), SomeException, displayException, fromException, getMaskingState, toException, try)
@@ -17,6 +17,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
 import Test.LuaRuntime.Support (failExample)
+import Test.Support.Owned (withOwnedThread)
 
 -- | Make a request and require that it was accepted.
 request ∷ Rig → TaskId → ControlRequest → IO ControlTicket
@@ -319,12 +320,12 @@ spec = describe "safe-boundary control" $ do
       task ← admit rig "task" OrdinaryClass Looped
       loop rig "task"
       requested ← newEmptyMVar
-      asker ← forkIO (request rig task RequestStop >>= putMVar requested)
-      _ ← takeMVar requested
-      driver ← myThreadId
-      _ ← turn rig
-      closedTasks rig >>= \closed → map snd closed `shouldBe` [driver]
-      asker `shouldSatisfy` (/= driver)
+      withOwnedThread (request rig task RequestStop >>= putMVar requested) $ \asker _ → do
+        _ ← takeMVar requested
+        driver ← myThreadId
+        _ ← turn rig
+        closedTasks rig >>= \closed → map snd closed `shouldBe` [driver]
+        asker `shouldSatisfy` (/= driver)
 
   describe "a task woken by a grant" $ do
     it "frees the grant's slot when it is stopped before it runs, and never runs" $ do

@@ -3,11 +3,11 @@
 -- not fit, and every accepted instance settling exactly once.
 module Test.LuaRuntime.Instance.Capacity (spec) where
 
-import Control.Concurrent (forkIO, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (yield)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
-import Control.Monad (forM, forM_, replicateM, void)
+import Control.Monad (forM_, replicateM, void)
 import Data.List.NonEmpty (toList)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
@@ -19,7 +19,7 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SList, SRe
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (defaultSchedulerBounds, scheduled, startScheduled)
-import Test.LuaRuntime.Support (bounded, failExample, requiredPolicy, tryExpected, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, requiredPolicy, tryExpected, withBoundary, withProducers)
 
 -- | What admitting answered, as something an example compares.
 full ∷ InstanceAdmission → Bool
@@ -160,15 +160,17 @@ spec = describe "capacity" $ do
       owner ← startInstances fixture runtime "racing" [echoer] (testConfig instanceBounds') requiredPolicy
       let request = InstanceRequest (moduleNamed "echoer") EventOnly Nothing OrdinaryClass ["tick"]
           endpoint = scheduledEndpoint owner
-      tickets ← forM [1 .. 4 ∷ Int] $ \_ → do
-        finished ← newEmptyMVar
-        _ ← forkIO $ do
-          answers ← replicateM 20 (admitInstance endpoint request <* yield)
-          putMVar finished [ticket | InstanceAccepted _ ticket ← answers]
-        pure finished
-      yield
-      retireScheduled owner
-      accepted ← concat <$> forM tickets takeMVar
+      accepted ←
+        withProducers
+          [ do
+              answers ← replicateM 20 (admitInstance endpoint request <* yield)
+              pure [ticket | InstanceAccepted _ ticket ← answers]
+          | _ ← [1 .. 4 ∷ Int]
+          ]
+          $ \tickets → do
+            yield
+            retireScheduled owner
+            concat <$> mapM takeMVar tickets
       -- Whatever was accepted settles, once: a second read answers the same result.
       forM_ accepted $ \ticket → do
         first ← waitInstance ticket

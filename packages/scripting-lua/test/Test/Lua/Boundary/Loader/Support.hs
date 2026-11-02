@@ -49,8 +49,8 @@ module Test.Lua.Boundary.Loader.Support
   , balanced
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
@@ -73,6 +73,7 @@ import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Value
 import Test.HUnit.Lang (HUnitFailure)
 import Test.Hspec (expectationFailure)
+import Test.Lua.Support (withProducer)
 
 -- | What the rig's seams observe and answer.
 data Rig = Rig
@@ -430,9 +431,7 @@ balanced found =
 -- thread it was made on.
 inThread ∷ IO a → IO a
 inThread action = do
-  done ← newEmptyMVar
-  _ ← forkIO (try action >>= putMVar done)
-  outcome ← takeMVar done
+  outcome ← withProducer (try action) takeMVar
   case outcome of
     Left failure → throwIO (failure ∷ SomeException)
     Right result → pure result

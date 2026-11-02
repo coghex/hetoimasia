@@ -342,6 +342,7 @@ test-suite lua-host-tests
         Test.Lua.Independence
         Test.Lua.Libraries
         Test.Lua.Opacity
+        Test.Lua.Ownership
         Test.Lua.Owner.Cancellation
         Test.Lua.Owner.Construction
         Test.Lua.Owner.Independence
@@ -483,6 +484,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Lifecycle.Spec
         Test.LuaRuntime.Lifecycle.Support
         Test.LuaRuntime.Loading
+        Test.LuaRuntime.Ownership
         Test.LuaRuntime.Readiness
         Test.LuaRuntime.Recoverable
         Test.LuaRuntime.Request.Admission
@@ -555,7 +557,8 @@ test-suite lua-runtime-tests
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:bridge,
         hetoimasia-scripting-lua:model,
-        hetoimasia-scripting-lua:runtime-lua
+        hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-test-support ==0.1.0.0
 
 -- Deliberate nontermination is optional evidence, separate from lua-host-tests.
 test-suite lua-hazard-probes
@@ -639,6 +642,7 @@ test-suite macos-confinement-probe
         Test.MacOS.Isolation
         Test.MacOS.Lifetime
         Test.MacOS.Limits
+        Test.MacOS.Ownership
         Test.MacOS.Spec
     -- -N2 rather than -N: the two-instance example needs the parent to watch
     -- one helper while another is running, on every machine that runs it.

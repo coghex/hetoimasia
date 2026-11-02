@@ -15,7 +15,7 @@ module Test.Lua.Owner.Independence (spec) where
 import Control.Concurrent (ThreadId, throwTo)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (AsyncException (UserInterrupt), annotateIO, throwIO)
-import Control.Monad (forM, forM_)
+import Control.Monad (forM_)
 import Data.ByteString (ByteString)
 import Data.List (nub)
 import qualified Data.Set as Set
@@ -32,6 +32,8 @@ import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 import Test.Lua.Owner.Support
 import Test.Lua.Support (Recorder, newRecorder, recorded, recordingCallback)
 import Test.Support.Bounded (bounded)
+import Control.Concurrent.MVar (tryPutMVar)
+import Control.Monad (void)
 
 -- | How an owner is made to end.
 data Role
@@ -108,20 +110,32 @@ configFor index checks =
              ]
     }
 
-startMember ∷ Int → IO Member
-startMember index = do
+withMember ∷ Int → (Member → IO a) → IO a
+withMember index continue = do
   checks ← newRecorder
   ready ← newEmptyMVar
   go ← newEmptyMVar
-  (thread, outcome) ← ownerThread (configFor index checks) $ \owned → do
-    evalOwned owned (chunkName "before") "check()"
-    putMVar ready ()
-    takeMVar go
-    evalOwned owned (chunkName "after") "check()"
-    case roleOf index of
-      Fails → throwIO (BodyBroke ("owner " <> show index))
-      _ → pure ()
-  pure (Member (roleOf index) checks ready go thread outcome)
+  -- The owner is owned (#598): it waits at `go` until its example ends it, so the stop lets it go before it is joined.
+  withOwnerThread
+    (void (tryPutMVar go ()))
+    (configFor index checks)
+    ( \owned → do
+        evalOwned owned (chunkName "before") "check()"
+        putMVar ready ()
+        takeMVar go
+        evalOwned owned (chunkName "after") "check()"
+        case roleOf index of
+          Fails → throwIO (BodyBroke ("owner " <> show index))
+          _ → pure ()
+    )
+    $ \(thread, outcome) → continue (Member (roleOf index) checks ready go thread outcome)
+
+-- | Every member, started in the order given, for the length of the continuation.
+withMembers ∷ [Int] → ([Member] → IO a) → IO a
+withMembers indexes continue = go indexes []
+  where
+    go [] started = continue (reverse started)
+    go (index : rest) started = withMember index (\member → go rest (member : started))
 
 -- | End one owner the way its role says, and wait for it to finish.
 end ∷ Member → IO (Outcome ())
@@ -134,30 +148,30 @@ end member = do
 spec ∷ Spec
 spec = describe "any number of independent owners" $
   it "keeps every owner's state and evidence unchanged while the others close, fail, are cancelled or close with a failing finalizer" $ do
-    members ← forM [0 .. owners - 1] startMember
-    -- All ten are live at once, on ten threads, each having checked its own VM.
-    forM_ members (bounded . takeMVar . memberReady)
-    length (nub (map memberThread members)) `shouldBe` owners
-    forM_ endingOrder $ \index → do
-      let member = members !! index
-      outcome ← end member
-      checked ← recorded (memberChecks member)
-      case (memberRole member, outcome) of
-        (Normal, Right ()) → checked `shouldBe` ["ok", "ok"]
-        (Normal, Left failure) → expectationFailure ("owner " <> show index <> " failed: " <> show (causeOf failure ∷ Maybe BodyBroke))
-        (Fails, Left failure) → do
-          causeOf failure `shouldBe` Just (BodyBroke "owner 0")
-          evidenceLabels failure `shouldBe` []
-          checked `shouldBe` ["ok", "ok"]
-        (Cancelled, Left failure) → do
-          causeOf failure `shouldBe` Just UserInterrupt
-          asyncCancellation failure `shouldBe` True
-          evidenceLabels failure `shouldBe` []
-          -- It never left its first check.
-          checked `shouldBe` ["ok"]
-        (FailingFinalizer, Left failure) → do
-          causeOf failure `shouldBe` Just (CloseBroke "owner 2")
-          evidenceLabels failure `shouldBe` ["lua finalizer"]
-          evidenceMarkers failure `shouldBe` [["2"]]
-          checked `shouldBe` ["ok", "ok"]
-        (role, Right ()) → expectationFailure ("owner " <> show index <> " (" <> show role <> ") ended without its failure")
+    withMembers [0 .. owners - 1] $ \members → do
+      -- All ten are live at once, on ten threads, each having checked its own VM.
+      forM_ members (bounded . takeMVar . memberReady)
+      length (nub (map memberThread members)) `shouldBe` owners
+      forM_ endingOrder $ \index → do
+        let member = members !! index
+        outcome ← end member
+        checked ← recorded (memberChecks member)
+        case (memberRole member, outcome) of
+          (Normal, Right ()) → checked `shouldBe` ["ok", "ok"]
+          (Normal, Left failure) → expectationFailure ("owner " <> show index <> " failed: " <> show (causeOf failure ∷ Maybe BodyBroke))
+          (Fails, Left failure) → do
+            causeOf failure `shouldBe` Just (BodyBroke "owner 0")
+            evidenceLabels failure `shouldBe` []
+            checked `shouldBe` ["ok", "ok"]
+          (Cancelled, Left failure) → do
+            causeOf failure `shouldBe` Just UserInterrupt
+            asyncCancellation failure `shouldBe` True
+            evidenceLabels failure `shouldBe` []
+            -- It never left its first check.
+            checked `shouldBe` ["ok"]
+          (FailingFinalizer, Left failure) → do
+            causeOf failure `shouldBe` Just (CloseBroke "owner 2")
+            evidenceLabels failure `shouldBe` ["lua finalizer"]
+            evidenceMarkers failure `shouldBe` [["2"]]
+            checked `shouldBe` ["ok", "ok"]
+          (role, Right ()) → expectationFailure ("owner " <> show index <> " (" <> show role <> ") ended without its failure")

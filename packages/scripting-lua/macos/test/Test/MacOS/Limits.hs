@@ -24,7 +24,7 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , collectReports
   , jetsamAvailable
   , jetsamFlags
-  , launch
+  , withLaunch
   , processGone
   , sendSignal
   )
@@ -48,16 +48,15 @@ spec = describe "enforced limits" $ do
     available ← jetsamAvailable
     available `shouldBe` True
     flags ← jetsamFlags
-    refused ←
-      launch
-        LaunchRequest
-          { requestExecutable = fixtureHelper fixture <> "-does-not-exist"
-          , requestArguments = []
-          , requestMemoryLimitMiB = admittedMiB
-          }
-    case refused of
-      Left (LaunchRejected _) → pure ()
-      other → expectationFailure ("a launch that cannot happen must refuse, got " <> show (void other))
+    withLaunch
+      LaunchRequest
+        { requestExecutable = fixtureHelper fixture <> "-does-not-exist"
+        , requestArguments = []
+        , requestMemoryLimitMiB = admittedMiB
+        }
+      $ \refused → case refused of
+        Left (LaunchRejected _) → pure ()
+        other → expectationFailure ("a launch that cannot happen must refuse, got " <> show (void other))
     putStrLn
       ( "      proved: the spawn-time memory limit is installable here (flags 0x"
           <> showHex flags
@@ -65,96 +64,96 @@ spec = describe "enforced limits" $ do
       )
 
   it "reaches its own ceiling with no limit installed, so the workload really does exceed the cap" $ \fixture → do
-    launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "grow" 0
-    ready ← awaitReady launched guardMicroseconds
-    ready `shouldBe` True
-    status ← awaitExitWithin launched memoryGuardMicroseconds
-    case status of
-      Nothing → do
-        void (sendSignal launched sigKILL)
-        void (awaitExit launched)
-        expectationFailure "the unlimited control never finished"
-      Just observed → do
-        reports ← completeReports launched
-        observed `shouldBe` ExitedWith 0
-        payloads reports `shouldBe` expectedPayloads
-        ceilings reports `shouldBe` [(expectedLuaBytes, expectedNativeBytes, expectedTotalBytes)]
-        putStrLn
-          ( "      proved: unlimited, the same workload retained "
-              <> showPayload expectedLuaBytes
-              <> " of Lua payload and "
-              <> showPayload expectedNativeBytes
-              <> " of native payload ("
-              <> showPayload expectedTotalBytes
-              <> " total) and reached its own ceiling, which is above the "
-              <> show admittedMiB
-              <> " MiB cap the later example installs"
-          )
+    withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "grow" 0 $ \launched → do
+      ready ← awaitReady launched guardMicroseconds
+      ready `shouldBe` True
+      status ← awaitExitWithin launched memoryGuardMicroseconds
+      case status of
+        Nothing → do
+          void (sendSignal launched sigKILL)
+          void (awaitExit launched)
+          expectationFailure "the unlimited control never finished"
+        Just observed → do
+          reports ← completeReports launched
+          observed `shouldBe` ExitedWith 0
+          payloads reports `shouldBe` expectedPayloads
+          ceilings reports `shouldBe` [(expectedLuaBytes, expectedNativeBytes, expectedTotalBytes)]
+          putStrLn
+            ( "      proved: unlimited, the same workload retained "
+                <> showPayload expectedLuaBytes
+                <> " of Lua payload and "
+                <> showPayload expectedNativeBytes
+                <> " of native payload ("
+                <> showPayload expectedTotalBytes
+                <> " total) and reached its own ceiling, which is above the "
+                <> show admittedMiB
+                <> " MiB cap the later example installs"
+            )
 
   it "retains every completed step's native buffer, still live and distinct, at the ceiling" $ \fixture → do
-    launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "grow" 0
-    ready ← awaitReady launched guardMicroseconds
-    ready `shouldBe` True
-    status ← awaitExitWithin launched memoryGuardMicroseconds
-    case status of
-      Nothing → do
-        void (sendSignal launched sigKILL)
-        void (awaitExit launched)
-        expectationFailure "the retention workload never finished"
-      Just observed → do
-        reports ← completeReports launched
-        observed `shouldBe` ExitedWith 0
-        -- One reading, taken after a major collection, of every native buffer
-        -- still live. The expected bytes are the workload's own step pattern,
-        -- not a total read off the held counter.
-        [(count, each, fills, sums) | Retained count each fills sums ← reports]
-          `shouldBe` [(stepCount, nativeStepBytes, expectedFills, expectedSums)]
-        putStrLn
-          ( "      proved: after a major collection, one ceiling reading found "
-              <> show stepCount
-              <> " simultaneously live native buffers, oldest step first, each "
-              <> show nativeStepBytes
-              <> " materialized bytes and each a distinct fill, including the earliest step. This is not the held counter."
-          )
+    withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "grow" 0 $ \launched → do
+      ready ← awaitReady launched guardMicroseconds
+      ready `shouldBe` True
+      status ← awaitExitWithin launched memoryGuardMicroseconds
+      case status of
+        Nothing → do
+          void (sendSignal launched sigKILL)
+          void (awaitExit launched)
+          expectationFailure "the retention workload never finished"
+        Just observed → do
+          reports ← completeReports launched
+          observed `shouldBe` ExitedWith 0
+          -- One reading, taken after a major collection, of every native buffer
+          -- still live. The expected bytes are the workload's own step pattern,
+          -- not a total read off the held counter.
+          [(count, each, fills, sums) | Retained count each fills sums ← reports]
+            `shouldBe` [(stepCount, nativeStepBytes, expectedFills, expectedSums)]
+          putStrLn
+            ( "      proved: after a major collection, one ceiling reading found "
+                <> show stepCount
+                <> " simultaneously live native buffers, oldest step first, each "
+                <> show nativeStepBytes
+                <> " materialized bytes and each a distinct fill, including the earliest step. This is not the held counter."
+            )
 
   it "terminates the helper when its whole-process footprint crosses the installed cap" $ \fixture → do
-    launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "grow" admittedMiB
-    ready ← awaitReady launched guardMicroseconds
-    ready `shouldBe` True
-    guarded ← awaitExitWithin launched memoryGuardMicroseconds
-    case guarded of
-      Nothing → do
-        void (sendSignal launched sigKILL)
-        void (awaitExit launched)
-        expectationFailure
-          "the external guard fired: guard-triggered termination is not evidence that the cap worked"
-      Just observed → do
-        reports ← completeReports launched
-        -- The cap is fatal, so the violation is a kill the parent observes; it
-        -- is never reported to the child as a failed allocation it could catch.
-        observed `shouldBe` Signalled 9
-        [() | Ceiling _ _ _ ← reports] `shouldBe` []
-        gone ← processGone (launchedPid launched)
-        gone `shouldBe` True
-        let (lua, native, total) = lastPayload reports
-            (footprint, virtualSize) = lastFootprint reports
-        putStrLn
-          ( "      proved: with a "
-              <> show admittedMiB
-              <> " MiB cap the helper was killed by signal 9. The last complete report, before termination, was "
-              <> showPayload lua
-              <> " of Lua payload and "
-              <> showPayload native
-              <> " of native payload ("
-              <> showPayload total
-              <> " total). That is a pre-termination observation, not a measurement at the kill. It was before the workload's own "
-              <> show ceilingMiB
-              <> " MiB ceiling and before the external guard. The ledger is the physical footprint ("
-              <> showMiB footprint
-              <> " MiB last reported), not address space ("
-              <> showMiB virtualSize
-              <> " MiB reserved by the threaded RTS) and not the payload counter."
-          )
+    withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "grow" admittedMiB $ \launched → do
+      ready ← awaitReady launched guardMicroseconds
+      ready `shouldBe` True
+      guarded ← awaitExitWithin launched memoryGuardMicroseconds
+      case guarded of
+        Nothing → do
+          void (sendSignal launched sigKILL)
+          void (awaitExit launched)
+          expectationFailure
+            "the external guard fired: guard-triggered termination is not evidence that the cap worked"
+        Just observed → do
+          reports ← completeReports launched
+          -- The cap is fatal, so the violation is a kill the parent observes; it
+          -- is never reported to the child as a failed allocation it could catch.
+          observed `shouldBe` Signalled 9
+          [() | Ceiling _ _ _ ← reports] `shouldBe` []
+          gone ← processGone (launchedPid launched)
+          gone `shouldBe` True
+          let (lua, native, total) = lastPayload reports
+              (footprint, virtualSize) = lastFootprint reports
+          putStrLn
+            ( "      proved: with a "
+                <> show admittedMiB
+                <> " MiB cap the helper was killed by signal 9. The last complete report, before termination, was "
+                <> showPayload lua
+                <> " of Lua payload and "
+                <> showPayload native
+                <> " of native payload ("
+                <> showPayload total
+                <> " total). That is a pre-termination observation, not a measurement at the kill. It was before the workload's own "
+                <> show ceilingMiB
+                <> " MiB ceiling and before the external guard. The ledger is the physical footprint ("
+                <> showMiB footprint
+                <> " MiB last reported), not address space ("
+                <> showMiB virtualSize
+                <> " MiB reserved by the threaded RTS) and not the payload counter."
+            )
 
   it "records that no public address-space limit could have been installed instead" $ \fixture →
     case [(bytes, code) | RlimitFloor bytes code ← fixtureSweep fixture] of
@@ -175,37 +174,37 @@ spec = describe "enforced limits" $ do
           )
 
   it "enforces a granted execution budget on a helper that never yields, within its total bound" $ \fixture → do
-    launched ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0
-    running ← awaitReport launched guardMicroseconds isFootprint
-    running `shouldSatisfy` isJust'
-    -- The budget really runs out: the parent waits out the granted time, finds
-    -- the helper still running, and only then escalates. A helper that had
-    -- stopped on its own would be reported as completed and fail this example.
-    enforcement ← enforceExecutionBudget launched
-    enforcementReason enforcement `shouldBe` "execution-budget-exceeded"
-    [() | Done ← enforcementReports enforcement] `shouldBe` []
-    gone ← processGone (launchedPid launched)
-    gone `shouldBe` True
-    let ceilingMicros =
-          executionBudgetMicroseconds + escalationGraceMicroseconds + hardStopMicroseconds
-    enforcementElapsedMicros enforcement `shouldSatisfy` (< ceilingMicros)
-    case enforcementExit enforcement of
-      Signalled signal →
-        putStrLn
-          ( "      proved: a helper spinning inside Lua outlived its granted "
-              <> show (executionBudgetMicroseconds `div` 1000)
-              <> " ms, so the parent recorded enforcement reason "
-              <> show (enforcementReason enforcement)
-              <> " and ended it by signal "
-              <> show signal
-              <> (if enforcementEscalated enforcement then " after escalation from SIGTERM" else " at the first signal")
-              <> "; the status was reaped "
-              <> show (enforcementElapsedMicros enforcement `div` 1000)
-              <> " ms in, inside the "
-              <> show (ceilingMicros `div` 1000)
-              <> " ms total bound, and its output was read to end of file"
-          )
-      other → expectationFailure ("a helper inside Lua should end by signal, got " <> show other)
+    withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0 $ \launched → do
+      running ← awaitReport launched guardMicroseconds isFootprint
+      running `shouldSatisfy` isJust'
+      -- The budget really runs out: the parent waits out the granted time, finds
+      -- the helper still running, and only then escalates. A helper that had
+      -- stopped on its own would be reported as completed and fail this example.
+      enforcement ← enforceExecutionBudget launched
+      enforcementReason enforcement `shouldBe` "execution-budget-exceeded"
+      [() | Done ← enforcementReports enforcement] `shouldBe` []
+      gone ← processGone (launchedPid launched)
+      gone `shouldBe` True
+      let ceilingMicros =
+            executionBudgetMicroseconds + escalationGraceMicroseconds + hardStopMicroseconds
+      enforcementElapsedMicros enforcement `shouldSatisfy` (< ceilingMicros)
+      case enforcementExit enforcement of
+        Signalled signal →
+          putStrLn
+            ( "      proved: a helper spinning inside Lua outlived its granted "
+                <> show (executionBudgetMicroseconds `div` 1000)
+                <> " ms, so the parent recorded enforcement reason "
+                <> show (enforcementReason enforcement)
+                <> " and ended it by signal "
+                <> show signal
+                <> (if enforcementEscalated enforcement then " after escalation from SIGTERM" else " at the first signal")
+                <> "; the status was reaped "
+                <> show (enforcementElapsedMicros enforcement `div` 1000)
+                <> " ms in, inside the "
+                <> show (ceilingMicros `div` 1000)
+                <> " ms total bound, and its output was read to end of file"
+            )
+        other → expectationFailure ("a helper inside Lua should end by signal, got " <> show other)
  where
   ceilingMiB = 256 ∷ Int
 
