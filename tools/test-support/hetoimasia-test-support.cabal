@@ -33,6 +33,7 @@ library
         Test.Support.Owned
         Test.Support.Parked
         Test.Support.Subprocess
+        Test.Support.Subprocess.Host
     hs-source-dirs: src
     c-sources: cbits/hetoimasia_test_support_process.c
     include-dirs: cbits
