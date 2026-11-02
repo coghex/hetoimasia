@@ -697,17 +697,20 @@ any other way, and its message names the facility that fits the kind of start.
   header are not code, so they are not sites; qualified calls are.
 - **A per-file count ratchet.** `tools/validation/owned_starts_baseline.json`
   records, per file, how many unowned starts it had when the guard was introduced
-  (491 in 156 files: the 552 found when the guard was introduced plus the three
+  (469 in 150 files: the 552 found when the guard was introduced plus the three
   starts `tools/test/RunnerIdentity.hs` brought, written by
-  `owned_starts.py bootstrap`, less the 64 that #588 removed: its 57 subprocess
-  starts, the three of `RunnerIdentity.hs`, which have the same shape, and the four
-  thread starts that existed only to serve them), and less the 24 thread starts of the
+  `owned_starts.py bootstrap`, less the 24 thread starts of the
   root run and console suites and the `lua-domains` sample that #600 converted (the `Run`
   examples of `test-full/`, the console's signal and exit examples, and the sample's
   `Test.Domains.Support` helpers and `Accounting` reaper), and less the 87 thread
   starts of the foundation, runtime and asset-image suites that #597 converted (those
   suites keep baseline entries only for the subprocess starts of their `*Opacity.hs`
-  and `*Client.hs` sources, which are #588's). Each file's count
+  and `*Client.hs` sources, which are #588's), and less the 62 that #588 removed: its
+  subprocess starts, the three of `RunnerIdentity.hs`, which have the same shape, and the
+  four thread starts that existed only to serve them. #588 left two files in the
+  baseline on purpose: the display-helper suites, `tools/x11-test/Main.hs` and
+  `tools/wayland-test/Main.hs`, whose subprocess starts need a hosted-subprocess helper
+  that its owner decision of 2026-11-02 moved to a separate issue). Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven
