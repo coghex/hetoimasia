@@ -697,7 +697,7 @@ any other way, and its message names the facility that fits the kind of start.
   header are not code, so they are not sites; qualified calls are.
 - **A per-file count ratchet.** `tools/validation/owned_starts_baseline.json`
   records, per file, how many unowned starts it had when the guard was introduced
-  (266 in 95 files: the 552 found when the guard was introduced plus the three
+  (204 in 59 files: the 552 found when the guard was introduced plus the three
   starts `tools/test/RunnerIdentity.hs` brought, written by
   `owned_starts.py bootstrap`, less the 24 thread starts of the
   root run and console suites and the `lua-domains` sample that #600 converted (the `Run`
