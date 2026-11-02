@@ -139,6 +139,28 @@ cabal test hetoimasia-tests --test-show-details=direct
   or `--match 'Logging lifetime'` select runtime subgroups as they did at root,
   and on `glfw-tests` the GLFW group names, such as `--match 'GLFW session'`,
   select what they selected at root or in the removed window-examples executable.
+- `workflow-tests` (`tools/test/`, group `test.workflow`) owns the contracts of
+  the workflow tooling and, since #584, the shared owned-thread facility and the
+  guard that keeps test sources using it. Select them with
+  `--test-options='--match <name>'`: `the shared owned-thread facility`
+  (`OwnedThread`: every way a scope can end with a thread parked at a gate, each
+  with a negative control that applies the same judgement to a deliberately
+  unowned start and must fail; the thread that ended on its own; the
+  uninterruptible release; the interruptibility the body runs with; the
+  cancellation helpers behind the two `Library.hs` helpers and the parked-release
+  orchestration behind `ChildSpec`, with their former unowned forms as controls)
+  and `The unowned-start guard` (`OwnedStarts`: fixture trees for a new unowned
+  start, an owned start, a baselined start, a stale or shrunken baseline entry, a
+  count raised with its baseline, a new start in a file that has an exempt helper,
+  and the three sites the issue named; then this repository: the guard passes,
+  the baseline has not grown, and every directory it scans is an input of the
+  group). The facility's own sources live in `tools/test-support`, which both
+  `workflow-tests` and `run-native-tests` depend on; the real child helper runs
+  under the same parked-release orchestration in `Test.Run.Native.ChildSpec`
+  (group `test.vulkan-run-native`, selected with `--match 'the child helper'`).
+  A test that starts a thread or subprocess starts it through
+  `Test.Support.Owned`; the sites that existed when the guard was introduced are a
+  known-debt baseline to be removed by follow-up changes, not to be extended.
 
 ## Vulkan suites
 

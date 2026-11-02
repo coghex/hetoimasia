@@ -6,7 +6,24 @@ quad in a rendered window, with a real logical runtime running stub content;
 mod-aware foundations without mod activation; no ECS/gameplay store.**
 This document carries request `user-het-luafirst-20261021-1435`.
 
-Design state: `exploring`
+Design state: `delivered and archived` (2026-11-02). Epic [#514](https://github.com/coghex/hetoimasia/issues/514) is **closed as completed**
+(2026-11-01T23:29:53Z) with **all 28 deliveries (LFE-1 to LFE-28) merged**. [The coverage document](../../evidence/lua_first_native/coverage.md)
+is the implementation and evidence map: what each completion condition rests on, which slices delivered it, and whether each
+slice's proof is headless, offscreen or native. [Processing status](#processing-status) maps every slice to its issue, pull request
+and merge commit. The trusted runtime epic [#145](https://github.com/coghex/hetoimasia/issues/145) that this design builds on is closed as well
+([runtime design](lua_runtime_design.md), also archived).
+
+**Deferred decisions, still readable here:** the generic state store
+([Q-5](#q-5-what-generic-engine-state-does-lua-define-and-mutate); the next design arc starts from that agenda), deliberate script hot swap
+([Q-10](#q-10-investigate-deliberate-script-hot-swapping)), mods and their activation
+([Q-4](#q-4-how-are-mods-discovered-ordered-and-combined)), and hostile-code confinement
+(the [runtime design](lua_runtime_design.md)'s
+[Q-5](lua_runtime_design.md#q-5-verified-platform-confinement-and-resource-enforcement-profile) and its deferred slices
+[LUA-9](lua_runtime_design.md#lua-9-add-bounded-child-process-transport-and-owned-process-lifetime) to
+[LUA-17](lua_runtime_design.md#lua-17-prove-confined-execution-and-adversarial-isolation-headlessly), all linked from the top of that document).
+
+Everything below this block is the design as it stood while it was open. Its present-tense statements about processing still to
+come, the `exploring` state and the slice count of the plan at an earlier decision are history and are kept as written.
 
 **2026-10-24 amendment:** D-82 specifies the owner-requested LFE-13 teardown
 protocol for #527 / PR #567. D-83 resolves Q-17 by approving both public host
@@ -96,10 +113,46 @@ concrete precondition
 - [x] LFE-28. Select optional Vulkan validation for `hetoimasia run` and record what actually loaded — [#579]
 - [x] LFE-25. Qualify native windows, independent retirement and quit — [#540]
 
-The twenty-six LFE slices below have manager process signoff under D-80;
-they are not approved issues or implementation authorization. Q-8 is confirmed
-by D-79; the manager owns the #145 tracker mutation. Ledger revision D-80
-inserts new LFE-26 after LFE-13, preserving LFE-14–LFE-25 IDs and their order.
+Epic #514 closed as completed on 2026-11-01T23:29:53Z with all 28 deliveries merged. The ledger order above is the
+delivery order. Each row below is the issue, pull request and merge commit of that slice; it agrees with the table in
+[the coverage document](../../evidence/lua_first_native/coverage.md), which is the implementation and evidence map (and gives each
+slice's proof class). The per-slice "As delivered" notes in the Delivery plan hold what each delivery contains.
+
+| Slice | Issue | Pull request | Merge commit |
+| --- | --- | --- | --- |
+| LFE-1 | #515 | #541 | `16f6d63f` |
+| LFE-2 | #516 | #542 | `4b8dbc38` |
+| LFE-3 | #517 | #543 | `e61d657e` |
+| LFE-4 | #518 | #544 | `f0146060` |
+| LFE-5 | #519 | #546 | `91baf8a3` |
+| LFE-6 | #520 | #550 | `849581e9` |
+| LFE-7 | #521 | #548 | `a737fa85` |
+| LFE-8 | #522 | #547 | `bf9cbd84` |
+| LFE-9 | #523 | #551 | `4bde0c9b` |
+| LFE-10 | #524 | #553 | `ad173c17` |
+| LFE-11 | #525 | #561 | `61db59dc` |
+| LFE-12 | #526 | #566 | `965140ba` |
+| LFE-13 | #527 | #567 | `976d5356` |
+| LFE-26 | #528 | #571 | `8a3b187c` |
+| LFE-14 | #529 | #545 | `8c6b19cf` |
+| LFE-15 | #530 | #549 | `ad559cf7` |
+| LFE-16 | #531 | #560 | `a4b8b911` |
+| LFE-17 | #532 | #565 | `8339d4b7` |
+| LFE-18 | #533 | #570 | `5b45863b` |
+| LFE-19 | #534 | #564 | `ec5660f3` |
+| LFE-20 | #535 | #572 | `13d2a133` |
+| LFE-21 | #536 | #573 | `f9ef4038` |
+| LFE-22 | #537 | #574 | `868d82e1` |
+| LFE-23 | #538 | #575 | `342e11ac` |
+| LFE-27 | #576 | #577 | `941f0e88` |
+| LFE-24 | #539 | #578 | `b7822bbd` |
+| LFE-28 | #579 | #580 | `7597eb5f` |
+| LFE-25 | #540 | #582 | `4f5c3b40` |
+
+*History (the ledger as signed off before delivery):* the twenty-six LFE slices then listed had manager process signoff under D-80;
+they were not approved issues or implementation authorization. Q-8 was confirmed
+by D-79; the manager owned the #145 tracker mutation. Ledger revision D-80
+inserted new LFE-26 after LFE-13, preserving LFE-14–LFE-25 IDs and their order.
 LFE-27 (#576) was added on 2026-11-01 as a prerequisite of LFE-24 (see its entry);
 the next free number after LFE-26 was used, and it sits before LFE-24 in the list
 because LFE-24 depends on it. LFE-28 (#579) was added on 2026-11-01 as a prerequisite of
@@ -127,7 +180,7 @@ sits before LFE-25 in the list because LFE-25 depends on it. LFE-14–LFE-27 IDs
 Inspection baseline: `master@5162e98f6176e07d25b80e88e76cf05f514b79c4`.
 No build, probe or desktop session ran for this draft.
 
-- The [Lua host](../../packages/scripting-lua/README.md) exposes explicit
+- The [Lua host](../../../packages/scripting-lua/README.md) exposes explicit
   library selection, opaque protected owners, registered bindings and bounded
   copied values. Each owner receives its own binding policy. Host-supplied
   modules are text-only, have distinct environments and explicit identities,
@@ -148,28 +201,28 @@ No build, probe or desktop session ran for this draft.
   callbacks and optional `shutdown`. Engine-held leases protect acquisitions
   even when init or shutdown fails or Lua loses the handle. These are reusable
   mechanisms, not a settled new boot contract.
-- [The two-domain sample](../../samples/lua-domains/README.md) directly
+- [The two-domain sample](../../../samples/lua-domains/README.md) directly
   composes independent UI and gameplay owners. Its Haskell-owned world and
   commit policy are sample-specific. Gameplay stages effects; the driver
   accounts for a tick before an atomic commit of state and publication.
   A failed session retains its last good world. This is evidence to reuse,
   not an already delivered generic engine state store.
-- [Lua D-23](../lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)
+- [Lua D-23](lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)
   qualifies the same build/platform, initial state, content, seed, tick-assigned
   inputs and scheduling configuration. D-47 supplies the accounting wait;
   D-48 attributes late independent failures by the first uncommitted tick when
   recorded. Such unassigned failures do not carry a trace-equality guarantee.
-  The [latest guide report](../guide/2026-10-21T140406Z-b7f3b56.md) preserves
+  The [latest guide report](../../guide/2026-10-21T140406Z-b7f3b56.md) preserves
   this limit and reports the trusted milestone delivered at `b7f3b56e`.
-- The [2D design](render_2d_design.md), especially D-12/D-20, separates pure
+- The [2D design](../../designs/render_2d_design.md), especially D-12/D-20, separates pure
   scenes from Vulkan recording and assigns Lua bindings to the Lua arc.
-  [Asset decoding](../archive/designs/asset_design.md) consumes bytes; file loading is the caller's
+  [Asset decoding](asset_design.md) consumes bytes; file loading is the caller's
   responsibility. Mod-supplied content was deferred by that older design.
-  [The image2d sample](../../samples/README.md) already composes decoded PNG
+  [The image2d sample](../../../samples/README.md) already composes decoded PNG
   and KTX2 images, texture registration and per-window 2D scenes in Haskell.
-- [GPU services](../archive/designs/gpu_resource_services_design.md),
-  [window/graphics lifetime](../archive/window_graphics_lifetime_design.md) and
-  [GLFW integration](../archive/glfw_integration_design.md) retain native ownership:
+- [GPU services](gpu_resource_services_design.md),
+  [window/graphics lifetime](../window_graphics_lifetime_design.md) and
+  [GLFW integration](../glfw_integration_design.md) retain native ownership:
   GLFW on the main thread, graphics under its protected owner, resources held
   until actual GPU and presentation retirement. Lua bindings must preserve
   these boundaries.
@@ -2490,8 +2543,8 @@ The manager approved coverage/dependency order with two explicit changes:
    and session stop**, and new **LFE-26: Expose UI status, quit and the
    unavailable-state guard**. LFE-26 depends on LFE-12 and LFE-13; LFE-21 and
    LFE-22 also depend on LFE-26. Insert LFE-26 immediately after LFE-13 in both
-   ledger and delivery plan without renumbering the other slices. There are
-   twenty-six slices. The manager cites #499/#502's thirteen review rounds as
+   ledger and delivery plan without renumbering the other slices. There were
+   then twenty-six slices (history: LFE-27 and LFE-28 were added on 2026-11-01, making twenty-eight). The manager cites #499/#502's thirteen review rounds as
    the reason for a smaller startup/failure/stop boundary.
 2. Lifecycle-heavy issues require a PR-body invariant table covering every
    reservation, settlement/publication site and cancellation window, including
@@ -5249,11 +5302,11 @@ A is recommended because it exercises the ownership, cancellation and readiness
 boundary needed by the reusable Lua integration. Its cost is real pending-window
 machinery and testing stop/failure races, beyond the small visible quad.
 
-Evidence: [instance leases](../../packages/scripting-lua/README.md#instance-leases)
+Evidence: [instance leases](../../../packages/scripting-lua/README.md#instance-leases)
 already refuse use/release through another instance and retain cleanup without
-Lua cooperation. [Window lifetime](../archive/window_graphics_lifetime_design.md)
+Lua cooperation. [Window lifetime](../window_graphics_lifetime_design.md)
 requires main-thread native handling and verified graphics retirement. The
-[image2d sample](../../samples/image2d/README.md#the-windowed-mode) composes window
+[image2d sample](../../../samples/image2d/README.md#the-windowed-mode) composes window
 adoption and scene publication in Haskell. These are mechanisms to reuse;
 the asynchronous Lua window binding proposed here is not already delivered.
 
@@ -5311,10 +5364,10 @@ later need retained content or smaller update surfaces. M1 must qualify rejected
 publication preserving the prior scene, table mutation after publication,
 coalescing, and replacement/ending while GPU work still references a texture.
 
-Evidence: the [2D host adapter](../../packages/render-2d-vulkan/README.md)
+Evidence: the [2D host adapter](../../../packages/render-2d-vulkan/README.md)
 validates `publish2DSnapshot`, serializes publication with texture release, and
 holds objects by adopted window/revision until released. The
-[per-window host](../gpu_backend.md#a-scene-for-each-window) uses latest-value
+[per-window host](../../gpu_backend.md#a-scene-for-each-window) uses latest-value
 publication without waiting for adoption. The new Lua conversion and ready-lease
 validation are proposed integration work, not existing bindings.
 
@@ -5361,8 +5414,8 @@ GPU readiness; Lua cannot retain a decoded image separately or choose its
 upload time. Exact format/options, request syntax, caching/sharing and explicit
 release APIs remain subsequent M1 contracts, not silently selected here.
 
-Evidence: [asset-image](../../packages/asset-image/README.md) decodes bytes;
-the [GPU upload and texture-table contracts](../gpu_backend.md) distinguish
+Evidence: [asset-image](../../../packages/asset-image/README.md) decodes bytes;
+the [GPU upload and texture-table contracts](../../gpu_backend.md) distinguish
 completed upload from mere admission and from descriptor/lookup publication.
 Registration of an already completed texture refreshes the table before
 returning. The image2d sample composes upload completion and registration in
@@ -5421,10 +5474,10 @@ holds. This question covers textures only; public window-close controls,
 module-import cancellation/cache semantics and the common request API remain
 separate details. It does not add mod activation or texture-sharing features.
 
-Evidence: [instance leases and requests](../../packages/scripting-lua/README.md)
+Evidence: [instance leases and requests](../../../packages/scripting-lua/README.md)
 already distinguish revoked leases from retained retirement and implement
 first-settlement-wins for elapsed requests. The
-[2D adapter](../../packages/render-2d-vulkan/README.md) keeps a released texture
+[2D adapter](../../../packages/render-2d-vulkan/README.md) keeps a released texture
 rendering while an adopted scene holds it and releases it behind the native
 barrier. New bindings must preserve those mechanisms and test both orders of
 cancel/completion, repeated release, and scene-held retirement.
@@ -5475,7 +5528,7 @@ two-instance test should request the same path, then cancel/end/release one
 owner and prove the peer's work/lease remains usable, subject to role-level
 failure escalation.
 
-Evidence: [instance leases](../../packages/scripting-lua/README.md#instance-leases)
+Evidence: [instance leases](../../../packages/scripting-lua/README.md#instance-leases)
 already support both owned and shared acquisitions, with different lifetime
 meanings. Neither that mechanism nor a shared module export supplies a content-
 keyed texture cache. This proposal selects the M1 provider policy; the native
@@ -5533,10 +5586,10 @@ add those capabilities through further design. Qualification needs more than
 the one-quad demo: two overlapping sprites for order, an empty scene for
 clearing/retirement, and resize/content-scale behavior without scene mutation.
 
-Evidence: [render-2d snapshots and mapping](../../packages/render-2d/README.md)
+Evidence: [render-2d snapshots and mapping](../../../packages/render-2d/README.md)
 already define UI layers in logical pixels, per-frame target metrics, nearest
 default sampling and painter order for equal depth keys. The
-[image2d sample](../../samples/image2d/README.md) demonstrates UI content scaling.
+[image2d sample](../../../samples/image2d/README.md) demonstrates UI content scaling.
 The proposed Lua schema and its automatic full-window view adaptation remain
 M1 integration work, not delivered bindings.
 
@@ -5590,7 +5643,7 @@ window-management work may extend that surface. Qualification covers duplicate
 admission, cancellation/completion order, close during startup, teardown that
 does not synthesize a peer's quit, and retained retirement before slot reuse.
 
-Evidence: the [GLFW host](../glfw.md) already has bounded multi-window ownership
+Evidence: the [GLFW host](../../glfw.md) already has bounded multi-window ownership
 and surfaces native close requests to application policy; a native close
 callback neither destroys a window nor exits the process by itself. The new
 composition must implement the policy above while preserving the delivered
@@ -5650,7 +5703,7 @@ settles; an unobserved required failure can stop the role/session. Qualification
 must cover failure with no waiter or result read, optional failure, both cancel/
 failure orders, and early logical failure held until its assigned tick.
 
-Evidence: the [host request service](../../packages/scripting-lua/README.md)
+Evidence: the [host request service](../../../packages/scripting-lua/README.md)
 already returns provider failure as result data and distinguishes arrival from
 assigned-tick settlement. It does not itself establish this launcher's required-
 content policy. Required-failure latching/supervision is additional M1 integration
@@ -5707,7 +5760,7 @@ narrow host interface if necessary. Qualification covers full capacity with
 zero provider calls, no partial reservation, eventual reuse after real
 retirement, and unchanged required-failure escalation after admission.
 
-Evidence: [host request admission and lease capacity](../../packages/scripting-lua/README.md)
+Evidence: [host request admission and lease capacity](../../../packages/scripting-lua/README.md)
 currently refuse full capacity as invocation faults, including a caught lease
 capacity error. They already retain slots through settlement consumption and
 provider retirement. The proposed non-fatal busy path is new M1 work, not a
@@ -5772,7 +5825,7 @@ capacity held after consumption while a provider retires, and request ownership
 across two real instances. Module-import/cache behavior remains a separate
 contract; this does not turn shared module exports into one-shot values.
 
-Evidence: [host requests](../../packages/scripting-lua/README.md#what-a-script-sees)
+Evidence: [host requests](../../../packages/scripting-lua/README.md#what-a-script-sees)
 and `Hetoimasia.Scripting.Lua.Request.requestBindings` implement these four
 operations, including pending takes and terminal handle retirement. D-52/D-53's
 required-failure and busy-admission policies still require new integration work;
@@ -5825,7 +5878,7 @@ requests repeat I/O/copying. Qualification covers byte-for-byte results with
 NUL/non-UTF-8 content, empty files, exact/over-limit sizes, changed content,
 required/optional failures and provider cleanup on cancellation.
 
-Evidence: the [Lua value boundary](../../packages/scripting-lua/README.md)
+Evidence: the [Lua value boundary](../../../packages/scripting-lua/README.md)
 already distinguishes byte-string and UTF-8-text schemas over Lua's string
 type and bounds copied values. The scoped filesystem provider and result-size
 accounting are new M1 integration work; no existing ambient Lua I/O is reused.
@@ -5891,7 +5944,7 @@ imports, cancellation when callers go away, exact limits and the module API
 need subsequent concrete contracts whichever route is chosen; those are not
 silently decided by selecting this dependency mechanism.
 
-Evidence: the [current Lua host](../../packages/scripting-lua/README.md#modules-and-entry-points)
+Evidence: the [current Lua host](../../../packages/scripting-lua/README.md#modules-and-entry-points)
 loads application-supplied text into distinct module environments and exposes
 declared entry points, not this Lua-to-Lua export-table/import protocol. Its
 callback boundary refuses VM re-entry. The new loader must extend a narrow
@@ -5965,7 +6018,7 @@ Qualification covers joining one evaluation from two instances, ending one or
 all waiters, cached success/failure afterwards, assigned-position execution with
 no waiters, cycle detection and shutdown while dependency reads are outstanding.
 
-Evidence: the [host request service](../../packages/scripting-lua/README.md)
+Evidence: the [host request service](../../../packages/scripting-lua/README.md)
 distinguishes cancellation of interest from provider retirement, but it does
 not supply this shared module-job owner. D-7 and D-56 require new per-VM loader
 state; the subscription-versus-job accounting proposed here must be implemented
@@ -6034,7 +6087,7 @@ of a later queued dependency without duplicate execution, separate ticket
 visibility/failure timing, cycle paths, cancellation of all external waiters,
 UI hook progress during source waits and VM stop. The existing host's FIFO
 ready ordinals govern scheduling (see the
-[host scheduler](../../packages/scripting-lua/README.md#policies)); they do not
+[host scheduler](../../../packages/scripting-lua/README.md#policies)); they do not
 already provide this module queue or dependency-promotion protocol.
 
 ### P-56. Refuse permanent module limits without waiting for cache space
@@ -6483,8 +6536,8 @@ Qualification covers nontrivial opaque/transparent PNG output, top-row
 orientation, non-8-bit/palette conversion through existing decoder tests,
 invalid and animation-marked inputs, oversized declarations/decoded work,
 optional versus required failures, readiness and cancellation ownership. The
-existing [image codec contract](../../packages/asset-image/README.md) and
-[image2d sample](../../samples/image2d/README.md) establish decoder behaviour
+existing [image codec contract](../../../packages/asset-image/README.md) and
+[image2d sample](../../../samples/image2d/README.md) establish decoder behaviour
 and composed rendering evidence. The new signature dispatch, animation refusal,
 provider bounds and Lua lifecycle still need their own integration evidence;
 this design turn ran no decoder, GPU or native tests.
@@ -6615,7 +6668,7 @@ Qualification covers default/explicit offsets from init and updates, held early
 success/failure, late required/optional results, unique sequence ordering,
 invalid offsets, both cancellation orders, UI-option refusal and joining a
 later queued module with an earlier target without duplicate evaluation. The
-[host request contract](../../packages/scripting-lua/README.md#settling-on-arrival-and-at-an-assigned-tick)
+[host request contract](../../../packages/scripting-lua/README.md#settling-on-arrival-and-at-an-assigned-tick)
 already has application-assigned `DueSlot` and defaults to the next tick.
 Its current assignment callback receives `RequestInfo`, not the request's Lua
 arguments. The new binding must carry validated assignment metadata through a
@@ -6683,7 +6736,7 @@ package. This does not add a cross-VM clock/data bus or deterministic UI replay.
 Qualification uses injected clocks and explicit scheduler gates for init zero,
 shared origin, stable within-segment reads, refreshed reads after resume,
 held logical ticks, early timer wakes, late resumes, role/phase refusal and
-shutdown. The [host scheduler contract](../../packages/scripting-lua/README.md)
+shutdown. The [host scheduler contract](../../../packages/scripting-lua/README.md)
 already provides logical/elapsed waits and owner-thread observation; its public
 wait operation takes integer ticks or nanoseconds. Seconds conversion, sampled
 Lua clock reads and M1 eligibility checks are new integration work over those
@@ -6739,7 +6792,7 @@ make trusted Lua deterministic or contain a hostile script.
 Qualification checks removal before entry/dependency evaluation in both roles,
 normal math availability, ordinary error classification and continued module
 and instance isolation; no world digest/replay acceptance is added. Evidence:
-the [two-domain sample](../../samples/lua-domains/README.md) owns a SplitMix64
+the [two-domain sample](../../../samples/lua-domains/README.md) owns a SplitMix64
 stream in its committed/candidate world, strips the gameplay math RNG and leaves
 the UI math library's RNG available. That is sample-specific implementation,
 not an existing standalone generic service to wire into the no-store M1.
@@ -6809,10 +6862,10 @@ startup gates, sticky failure during unfinished retirement, independent UI
 continuation, forbidden-role/phase errors and teardown without acknowledgement.
 
 Evidence: P-14/P-15/P-38 record the accepted launcher policies. The
-[two-domain sample](../../samples/lua-domains/README.md) already separates
+[two-domain sample](../../../samples/lua-domains/README.md) already separates
 supervision's failure/stop latch from task completion, but its world/status
 publication is not a ready-made no-store M1 API. The
-[Lua host](../../packages/scripting-lua/README.md) reports scheduled segment
+[Lua host](../../../packages/scripting-lua/README.md) reports scheduled segment
 observations on the owner thread (`scheduledObserve`); exposing this new
 bounded launcher status still requires explicit supervisor publication and
 binding integration.
@@ -6888,9 +6941,9 @@ engine-owned warning attribution including shared-module calls, conversion
 failure before emission, invalid bytes/control escaping and the final byte
 bound, concurrent complete-call serialization, sink failures and output during
 shutdown. Tests use injected sinks rather than timing sleeps. Evidence:
-[Lua runner output and stream rules](../../packages/scripting-lua/README.md#output-and-the-stream-rules)
+[Lua runner output and stream rules](../../../packages/scripting-lua/README.md#output-and-the-stream-rules)
 already rebind print/warn, cap each call at 4096 bytes and serialize writes;
-[the logger](../logging.md) has synchronous injected sinks and propagates sink
+[the logger](../../logging.md) has synchronous injected sinks and propagates sink
 exceptions. M1 warning context and launcher-wide coordination are integration
 work, not a claim that the current runner already implements this proposal.
 
@@ -6964,7 +7017,7 @@ code executing after the call, cancellation/required-failure races, failure
 precedence and actual retirement. Injected barriers coordinate simultaneous
 owners and stop; no hanging-script or desktop probe is required to establish
 these state transitions. Evidence: the
-[Lua host's control and runner rules](../../packages/scripting-lua/README.md)
+[Lua host's control and runner rules](../../../packages/scripting-lua/README.md)
 already apply controls at safe boundaries, stop future grants, retire pending
 requests and distinguish stop from cleanup completion. The no-store launcher
 must wire a narrow whole-session binding and admission gate; this proposal
@@ -7015,7 +7068,7 @@ binding and platform/resize qualification.
 The existing M1 evidence still checks automatic viewport adaptation, content
 scale, zero-size suspension and restoration without mutating the Lua scene.
 No test may infer current size from the requested initial size. Evidence:
-[GLFW observations](../glfw.md#observations) publish sampled logical extent,
+[GLFW observations](../../glfw.md#observations) publish sampled logical extent,
 framebuffer extent and content scale with explicit unavailable values;
 P-47/D-50 preserve the renderer's distinct coordinate mapping. These native
 facilities remain available to the engine whichever Lua boundary is chosen.
@@ -7156,7 +7209,7 @@ format. The owner may revise any of the five parts before signoff.
 
 **Evidence and qualification.** The current console dependency list does not
 already provide this JSON manifest loader. Its existing
-[`parseSeconds`](../../console/Hetoimasia/Console/Lua/Options.hs) validates
+[`parseSeconds`](../../../console/Hetoimasia/Console/Lua/Options.hs) validates
 positive decimal text to exact nanoseconds, and foundation `Duration` uses
 Word64 nanoseconds; reuse the pure contract through an appropriate dependency
 boundary rather than importing console internals into an engine library.
@@ -7364,7 +7417,7 @@ known failed imports are fatal rather than a probing API; and new VM-side
 export retention beyond the current copied-value provider interface. The
 owner may revise any part, including names, before approval.
 
-**Evidence/qualification.** The [Lua host](../../packages/scripting-lua/README.md)
+**Evidence/qualification.** The [Lua host](../../../packages/scripting-lua/README.md)
 already has private module environments, fresh self, per-instance request
 ownership and ready/take/wait/cancel, but does not already expose this return-
 table loader or facade/result schema. Tests must distinguish fresh envelopes
@@ -7650,8 +7703,8 @@ does not use pcall to undo required failure. Additional qualification fixtures
 must cover explicit quit, waits, failed loads and independent instances.
 
 **Recommendation/costs and evidence.** These functions directly expose the
-selected M1 services through the existing [Lua host](../../packages/scripting-lua/README.md),
-[window host](../glfw.md) and [renderer](../../packages/render-2d/README.md)
+selected M1 services through the existing [Lua host](../../../packages/scripting-lua/README.md),
+[window host](../../glfw.md) and [renderer](../../../packages/render-2d/README.md)
 contracts without claiming the new bindings already exist. Cost: strict
 record shapes and explicit asynchronous steps; floating Lua seconds versus
 exact engine duration; separate failure/retirement facts in status; and the
@@ -7846,11 +7899,11 @@ drains. Prove one instance's cleanup preserves the other's resources and that
 released displayed textures remain charged. Use small injected limits plus
 real codec/offscreen/native paths; fake providers alone cannot qualify the arc.
 
-Evidence: the [Lua value boundary](../../packages/scripting-lua/README.md)
+Evidence: the [Lua value boundary](../../../packages/scripting-lua/README.md)
 supports crossings up to 16 MiB/depth 64/1,048,576 elements; an 8 MiB data
 result leaves envelope space inside its existing byte ceiling. Its module
 baseline is 256 identities/1 MiB source. Current
-[PNG checks](../../packages/asset-image/README.md) establish structural safety,
+[PNG checks](../../../packages/asset-image/README.md) establish structural safety,
 not this allocation/inflation budget. The GPU budget model and scene ledger
 already derive bounded frame/generation/adoption state; image2d selects a
 2 GiB byte budget. These are starting points, not proof that M1 reservations
@@ -8191,9 +8244,10 @@ outside this document. Final readiness remains a separately recorded checkpoint.
 
 ### P-76. Deliver M1 through bounded implementation slices
 
-**Accepted by D-80 through Q-9 under D-78's process grant.** The Processing
-status and Delivery plan contain the same twenty-six stable IDs in dependency-
-valid order. The initial twenty-five-slice draft is revised by inserting
+**Accepted by D-80 through Q-9 under D-78's process grant.** At D-80 (history: the plan was
+later extended to twenty-eight slices) the Processing
+status and Delivery plan contained the same twenty-six stable IDs in dependency-
+valid order. The initial twenty-five-slice draft was revised by inserting
 LFE-26 after LFE-13; later IDs stay stable. These implement approved behavior
 only, not twenty-six filed issues or a time estimate.
 
@@ -9288,8 +9342,8 @@ replace boundary tests, prove performance or establish confinement.
   frame or GPU completion is inferred from a CPU function returning.
 - **Owner/tests:** headless GPU/scene tests and focused native retention checks;
   preserve the six-revision policy and no unbounded publication FIFO.
-- **As delivered ([#535](https://github.com/coghex/hetoimasia/issues/535)):**
-  `packages/lua-engine-graphics`, [Scene publication](../../packages/lua-engine-graphics/README.md#scene-publication-lfe-20):
+- **As delivered (issue [#535](https://github.com/coghex/hetoimasia/issues/535), PR [#572](https://github.com/coghex/hetoimasia/pull/572), merged as `13d2a133`):**
+  `packages/lua-engine-graphics`, [Scene publication](../../../packages/lua-engine-graphics/README.md#scene-publication-lfe-20):
   a per-window scene and a hold ledger counting adoptions, a publication boundary
   that pins the window and every texture lease until the host holds the scene, a
   table release gated on the ledger and retained (not failed) while held, and a
@@ -9350,8 +9404,8 @@ replace boundary tests, prove performance or establish confinement.
 - **Owner/tests:** package/root composition Hspec tests with explicit gates
   and production loader/VM paths; fake native edges isolate races, while the
   following two slices establish pixels and desktop resource use.
-- **As delivered ([#538](https://github.com/coghex/hetoimasia/issues/538)):**
-  [the evidence record](../evidence/lfe23-integrated-qualification.md) maps every scenario to its example, its real services, its
+- **As delivered (issue [#538](https://github.com/coghex/hetoimasia/issues/538), PR [#575](https://github.com/coghex/hetoimasia/pull/575), merged as `342e11ac`):**
+  [the evidence record](../../evidence/lfe23-integrated-qualification.md) maps every scenario to its example, its real services, its
   injected boundary, its assertions and its contract. `Test.LuaEngine.Integrated.*` in `lua-engine-tests` (CPU),
   `Test.LuaEngine.Graphics.Integrated` in `lua-engine-graphics-tests` and `Test.Engine.Run.Integrated` in the root full-product
   `hetoimasia-tests`, all headless; the second instance of a role is the session harness's second slot or `declareInstance` and
@@ -9383,22 +9437,22 @@ replace boundary tests, prove performance or establish confinement.
   Lua-visible setting, no second ownership policy, no test-only hook.
 - **Decisions relied on:** D-46; LFE-20 as delivered; LFE-24's boundary
   ("not ... ownership"); D-80 (invariant table and same-shape sweep);
-  [render_2d_design.md](render_2d_design.md) D-18 and D-28 (worded for windows;
+  [render_2d_design.md](../../designs/render_2d_design.md) D-18 and D-28 (worded for windows;
   extended to the target by the owner decision above); the archived
-  [GPU resource services design](../archive/designs/gpu_resource_services_design.md)
+  [GPU resource services design](gpu_resource_services_design.md)
   D-28, D-12 and D-6 (history, cited for the decisions only).
 - **Acceptance:** see [#576](https://github.com/coghex/hetoimasia/issues/576).
 - **Owner/tests:** `gpu-vulkan/glfw` (the host's scene state) and
   `lua-engine-graphics` (the ledger instantiation), headless Hspec plus one
   real-Vulkan native case that opens no rendered window.
-- **As delivered ([#576](https://github.com/coghex/hetoimasia/issues/576), PR [#577](https://github.com/coghex/hetoimasia/pull/577)):**
+- **As delivered (issue [#576](https://github.com/coghex/hetoimasia/issues/576), PR [#577](https://github.com/coghex/hetoimasia/pull/577), merged as `941f0e88`):**
   one scene-target key, `SceneTargetKey` (`KeyWindow WindowId | KeyOffscreen OffscreenTargetId`), keys the host's release barrier,
   scene lifecycle and observation and lua-engine-graphics' hold ledger; `WindowId` is neither widened nor minted. A surface-free
   target registers with the running host (`registerVulkanSceneTarget`, STM, typed refusals, finite `vulkanTargetCapacity`),
   publishes a latest value with a host-held rising revision (`publishVulkanTargetScene`, STM), is adopted by the owner's step
   through the window's ledger, and its adopted revisions are released only on the own tickets of the batches recorded with them
   through `recordVulkanTargetBatch` (complete or discarded; pending and lost keep them). The contract is
-  [gpu_backend.md](../gpu_backend.md#offscreen-scene-targets); the headless examples are
+  [gpu_backend.md](../../gpu_backend.md#offscreen-scene-targets); the headless examples are
   `Test.GPU.Vulkan.GLFW.Targets` and the native case is `an offscreen scene target on a real device (LFE-27)`. The adapter's
   suites cannot compose the production release lane over a stand-in host (its host is private), so over the real hold
   ledger that lane is proved by the native case. One additive export of the native package, `recordFramelessInWith`, binds a
@@ -9418,7 +9472,7 @@ replace boundary tests, prove performance or establish confinement.
   exact source/command/profile and explicitly labeled technical assets.
 - **Owner/tests:** graphics acceptance suite through the Vulkan headless runner.
   This establishes pixel semantics, not native window behavior or performance.
-- **As delivered ([#539](https://github.com/coghex/hetoimasia/issues/539)):** the
+- **As delivered (issue [#539](https://github.com/coghex/hetoimasia/issues/539), PR [#578](https://github.com/coghex/hetoimasia/pull/578), merged as `b7822bbd`):** the
   `Lua offscreen pixels` group of the graphics adapter's native suite
   (`lua-engine-graphics-native-tests`, catalog group `test.vulkan-lua-engine-native`) and its
   device-free counterpart, the `Lua offscreen pixels comparator` group of
@@ -9430,7 +9484,7 @@ replace boundary tests, prove performance or establish confinement.
   reading the managed RGBA8 sRGB target back after the batch's own ticket completed. Ten cases are
   judged by the render-2d oracle over every pixel and by independently hand-stated colours; the
   committed technical fixtures, their provenance and the retained PNGs and records are in
-  [the evidence](../evidence/lfe24-offscreen-pixels/README.md). The routing differs from this
+  [the evidence](../../evidence/lfe24-offscreen-pixels/README.md). The routing differs from this
   entry's wording: the "Vulkan headless runner" lane creates no device by contract, so the real
   pixels are in the native lane, which opens no window for this group. No production code, Lua API
   or capture API was added; no performance or new platform-support claim is made.
@@ -9457,7 +9511,7 @@ replace boundary tests, prove performance or establish confinement.
 - **Acceptance:** see [#579](https://github.com/coghex/hetoimasia/issues/579).
 - **Owner/tests:** `run` (grammar, composition), `gpu-vulkan/native` (the pure resolution) and `gpu-vulkan/glfw`; headless Hspec plus
   one native case of the actual command per platform route in `run-native-tests`.
-- **As delivered ([#580](https://github.com/coghex/hetoimasia/pull/580)):** `hetoimasia run [--vulkan-validation] [--] GAME_ROOT`;
+- **As delivered (issue [#579](https://github.com/coghex/hetoimasia/issues/579), PR [#580](https://github.com/coghex/hetoimasia/pull/580), merged as `7597eb5f`):** `hetoimasia run [--vulkan-validation] [--] GAME_ROOT`;
   the choice is a plain `ValidationChoice` (`ValidationOff` by default) that reaches `VulkanHostConfig.vulkanOptionalValidation`
   through `production`, `runNative` and `runNativeWith`. `Profile.resolveValidation` is the pure, device-free decision; the owner's
   startup (`Roots.startRootsResolving`) takes it where the offer is known, publishes the typed record before the plan is checked,
@@ -9465,7 +9519,7 @@ replace boundary tests, prove performance or establish confinement.
   The strict `InstanceRequest` path is unchanged. The two native cases start the built command (not requested; requested), wait for
   the resolved root, the record and `start gate opened`, and the validated one also requires the Khronos layer's own
   `Khronos Validation Layer Active` announcement (visible under `HETOIMASIA_DEBUG=gpu.vulkan.diagnostics`), which attests that the
-  layer was loaded and ran and had synchronization validation enabled. See [the run command](../run_command.md#validation).
+  layer was loaded and ran and had synchronization validation enabled. See [the run command](../../run_command.md#validation).
 
 #### LFE-25. Qualify native windows, independent retirement and quit
 
@@ -9484,7 +9538,7 @@ replace boundary tests, prove performance or establish confinement.
   suites, narrowly routed by the validation catalog. Final arc accounting
   links all required receipts and deferrals; completion needs the actual quad
   and independent-instance evidence, not only green headless tests.
-- **As delivered ([#540](https://github.com/coghex/hetoimasia/issues/540), PR [#582](https://github.com/coghex/hetoimasia/pull/582)):**
+- **As delivered (issue [#540](https://github.com/coghex/hetoimasia/issues/540), PR [#582](https://github.com/coghex/hetoimasia/pull/582), merged as `4f5c3b40`):**
   the named `Lua native milestone` subgroup of the root `run-native-tests` suite (catalog group `test.vulkan-run-native`, selectable with
   `--match 'Lua native milestone'` and part of `--complete`). A two-instance harness is composed through the public Haskell interfaces over a
   host the suite composes with the validation layer and synchronization validation (one UI VM, two engine-owned instances of the shipped
@@ -9498,10 +9552,13 @@ replace boundary tests, prove performance or establish confinement.
   genuine `WM_DELETE_WINDOW` to its exact window ends it with exit 0, an ordinary logical failure leaves the UI on the exact red clear until a close
   (exit 1), and a Lua quit exits 0. The Linux windows are captured through the test-only helper `tools/x11-window/x11_window.py` and judged against
   landmarks written from the fixture; the captures, records and checksums are in
-  [the evidence](../evidence/lua_first_native/README.md), and what each slice and completion condition rests on is in
-  [the coverage document](../evidence/lua_first_native/coverage.md). macOS has no OS capture: the owner's visual confirmations are recorded as
-  pending in the pull request and supersede by a record landed after the merge. The native zero-area framebuffer row is unexercised on both
-  platforms. No product code, Lua API or capture API was added.
+  [the evidence](../../evidence/lua_first_native/README.md), and what each slice and completion condition rests on is in
+  [the coverage document](../../evidence/lua_first_native/coverage.md). macOS has no OS capture: the owner's visual confirmations are in
+  [the confirmation record](../../evidence/lua_first_native/macos-owner-confirmations-record.md) (landed in `ef1b9adf`): all six entries are
+  CONFIRMED at head `f7ffd77a` (PR #582 merged as `4f5c3b40`). The restore behaviour they confirm is
+  [#581](https://github.com/coghex/hetoimasia/issues/581)'s. Limits kept: the native zero-area framebuffer row was unexercised on both platforms; the window-creation failure is an
+  injected, labelled clean refusal; and an intermittent macOS hang in `glfwInit` is tracked as [#586](https://github.com/coghex/hetoimasia/issues/586). No product code, Lua API or
+  capture API was added.
 
 ### Coverage and handoff checks
 

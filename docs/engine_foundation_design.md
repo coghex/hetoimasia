@@ -56,7 +56,7 @@ to these focused contracts and work queues:
 | FND-2, Vulkan initialization and disposal | [Vulkan backend design](archive/vulkan_backend_design.md), epic #155; native proof #158 delivered; production instance, device and target ownership delivered by #219 ([contract](gpu_backend.md)) |
 | FND-3, minimal depth-tested 3D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-3; needs focused refinement |
 | FND-4, independent textured 2D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-4; needs focused refinement |
-| FND-5, Lua hosting and application bindings | [Lua runtime design](lua_runtime_design.md), epic #145; binding and protocol model delivered, confinement inconclusive and further processing paused |
+| FND-5, Lua hosting and application bindings | [Lua runtime design](archive/designs/lua_runtime_design.md), epic #145; binding and protocol model delivered, confinement inconclusive and further processing paused |
 
 ## Component boundaries
 
@@ -165,7 +165,7 @@ runs an issue or pull request needs; approved isolated Linux displays need
 none.
 
 Game saves and game-specific determinism remain application-owned.
-[Lua D-23](lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)
+[Lua D-23](archive/designs/lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)
 makes deterministic authoritative simulation a requirement: initially qualify
 identical results on the same build/platform for identical initial state,
 content, seed, tick-assigned inputs and scheduling configuration. Engine timing

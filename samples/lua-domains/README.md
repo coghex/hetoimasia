@@ -1,7 +1,7 @@
 # Lua domains sample
 
 LUA-29's consumer (owner decision D-44 of
-[`docs/lua_runtime_design.md`](../../docs/lua_runtime_design.md)): a small, headless,
+[`docs/archive/designs/lua_runtime_design.md`](../../docs/archive/designs/lua_runtime_design.md)): a small, headless,
 application-owned program that runs a **UI** Lua VM owner and a **gameplay** Lua VM owner side
 by side, so that the UI keeps making progress and reads a coherent, completed view while gameplay
 is busy, and so that what the UI asks of gameplay reaches it exactly once.

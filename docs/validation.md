@@ -664,6 +664,56 @@ not move that candidate's identity: its Vulkan boundary examples are what hold
 those packages out of the ordinary projects, read their dependencies, and hold
 the two Vulkan groups to their commands and routing.
 
+### The owned-start guard
+
+`test.workflow` also runs the guard against new unowned thread and process
+starts in test sources (#584), `tools/validation/owned_starts.py`, through the
+Hspec examples in `tools/test/OwnedStarts.hs`. A test that starts a thread or a
+subprocess must own it: acquire it under mask, register its stop-and-join in the
+same step, and stop and join it on every exit. The shared facility is
+`Test.Support.Owned` in `tools/test-support`; the guard fails a test source that
+calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
+`createProcess`, `withCreateProcess`, `spawnProcess`, `spawnCommand`,
+`callProcess`, `callCommand`, `readProcess`, `readProcessWithExitCode`,
+`readCreateProcess` or `readCreateProcessWithExitCode` any other way.
+
+- **Scope is derived.** It scans the source directories of every `test-suite` in
+  the package descriptions `cabal.project` and `cabal.project.vulkan` list, read
+  by the planner's own Cabal reader so conditional and platform-specific source
+  directories count whichever platform runs it, and of every other component built
+  for tests (named for tests, or listed in `tools/validation/owned_starts.json`).
+  A new suite is covered without editing the guard. The helper executables the
+  suites launch as child processes are excluded by name, with the reason, in the
+  same file. Comments, string literals, character literals, imports and the module
+  header are not code, so they are not sites; qualified calls are.
+- **A per-file count ratchet.** `tools/validation/owned_starts_baseline.json`
+  records, per file, how many unowned starts it had when the guard was introduced
+  (552 in 192 files, written by `owned_starts.py bootstrap`). Each file's count
+  must equal its baseline: a count above it is a new unowned start; a count below
+  it is a stale entry, so the baseline stays honest and can only shrink. The
+  baseline is a known-debt list classified mechanically, not a list of proven
+  leaks: verify a site before converting it. Being a count, it does not identify
+  an individual site, so a new unowned start that replaces another in the same
+  file is a review responsibility. `owned_starts.py ratchet --base REV` fails a
+  baseline that adds an entry or raises a count relative to the review base; a
+  base without a baseline is the explicit bootstrap.
+- **Exemptions are by binding and exact.** An already-owned helper is exempted
+  in `owned_starts.json` by file and top-level binding with the number of starts
+  it holds and its reason; a new raw start elsewhere in the same file is counted
+  as any other, and a helper that gains or loses a start fails until the entry is
+  reviewed. The initial exemptions are those #540 audited, narrowed: sites found
+  not to be provably owned (`Test.Content.Support.spawn`, which `withRootVia`
+  calls outside `withChild`; the `forkOS` runner of `run-native-test/Main.hs`;
+  `Compositor.hs`, whose `stopProcess` can time out unconfirmed) remain in the
+  baseline.
+- **Selection.** The guard's inputs are every scanned source directory and every
+  package description, listed as inputs of `test.workflow` in the catalog, beside
+  `tools/validation/` (the script, its configuration and its baseline). An
+  example fails when a scanned directory is not one of those inputs, so a suite
+  added later cannot be scanned without selecting the group that scans it.
+- **What it prints.** The failure names the file, the count against the baseline
+  and the facility to use.
+
 `test.x11-helper` and `test.wayland-helper` own those headless display-helper
 probes in `tools/x11-test/` and `tools/wayland-test/`. They use stub programs and
 need no desktop consent. Real readiness deadlines make them occasional local
