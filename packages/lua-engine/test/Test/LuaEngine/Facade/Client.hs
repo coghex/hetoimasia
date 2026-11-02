@@ -8,9 +8,10 @@
 module Test.LuaEngine.Facade.Client (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Process (proc)
 import Test.Hspec
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withStorePackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "composition from outside the packages" $ do
@@ -20,7 +21,7 @@ spec = describe "composition from outside the packages" $ do
       case clientStatus outcome of
         ExitSuccess → pure ()
         status → expectationFailure ("the client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
-      (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome <> "/client") []) ""
+      (status, out, err) ← runCaptured clientRunBound (proc (clientDirectory outcome <> "/client") []) ""
       (status, out, err) `shouldBe` (ExitSuccess, "stdout: [\"a\\tb\"]\nstderr: []\nroot ok: True, bad: False\nresolved: mod-b lua/x.lua\nrefused: root \"other\" is not enabled\nafter the scope: refused\n", "")
 
   it "keeps a facade's construction out of a client's reach: it can be made only by the function that checks it" $

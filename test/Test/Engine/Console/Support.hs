@@ -1,10 +1,11 @@
 -- | What the console examples share: the built executable, the controlled environment it is run in,
 -- and the child process handling the signal examples need.
 --
--- A child is always run under 'withChild', which on every way out kills what is still running with
--- @SIGKILL@, independently of any signal an example sends, and reaps it, bounded. A cooperative signal
--- is not a cleanup: @SIGTERM@ requests an orderly stop in the @lua@ subcommand, and a script whose
--- shutdown never returns can hold that stop indefinitely.
+-- A child is always run under 'withChild', which is the shared subprocess facility's scoped child
+-- ("Test.Support.Subprocess", #588): on every way out it sends the child's process group @SIGTERM@, @SIGKILL@
+-- after a grace, independently of any signal an example sends, and reaps it with the wait confirmed. A
+-- cooperative signal is not a cleanup: @SIGTERM@ requests an orderly stop in the @lua@ subcommand, and a
+-- script whose shutdown never returns can hold that stop, which the grace and the kill then end.
 module Test.Engine.Console.Support
   ( -- * The executable
     consoleVariables
@@ -27,31 +28,17 @@ module Test.Engine.Console.Support
   , withLuaFiles
   ) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
-import Control.Exception (SomeException, bracket, try)
-import Control.Monad (void)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (LogVariables (..), variableComponentLevels, variableDebug, variableGlobalLevel)
 import System.Directory (findExecutable)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode)
 import System.FilePath ((</>))
-import System.IO (Handle, hClose, hGetContents', hGetLine, hSetEncoding, utf8)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Posix.Signals (Signal, sigKILL, signalProcess)
-import System.Process
-  ( CreateProcess (env, std_err, std_in, std_out)
-  , ProcessHandle
-  , StdStream (CreatePipe, NoStream)
-  , createProcess
-  , getPid
-  , proc
-  , readCreateProcessWithExitCode
-  , waitForProcess
-  )
-import System.Timeout (timeout)
-import Test.Support.Bounded (bounded)
+import System.Posix.Signals (Signal)
+import System.Process (CreateProcess (env), proc)
+import Test.Support.Bounded (boundMicroseconds)
+import qualified Test.Support.Subprocess as Facility
 
 -- | The variable names the console application chooses.
 consoleVariables ∷ LogVariables
@@ -88,74 +75,59 @@ runConsole ∷ [(String, String)] → [String] → IO (ExitCode, String, String)
 runConsole variables arguments = do
   executable ← consoleExecutable
   controlled ← controlledEnvironment variables
-  readCreateProcessWithExitCode (proc executable arguments) {env = Just controlled} ""
+  -- The 30-minute budget of the group that runs these examples: a hang-catcher, never a timing assumption.
+  Facility.runCaptured (Facility.Within (1800 * 1000000)) (proc executable arguments) {env = Just controlled} ""
 
--- | A running child of the executable.
-data Child = Child
-  { childProcess ∷ ProcessHandle
-  , childOut ∷ Handle
-  , childErrors ∷ MVar String
-    -- ^ Everything the child wrote to stderr, once it has closed it.
-  , childExit ∷ MVar ExitCode
-  }
+-- | A running child of the executable: the shared subprocess facility's child, which the facility owns (#588).
+newtype Child = Child Facility.Child
 
--- | Run the executable as a child with its stdout and stderr on pipes, and always, on every way out,
--- kill it with @SIGKILL@ if it is still running and reap it.
+-- | Run the executable as a child with its stdout and stderr on pipes and no standard input, and on every way out end it and reap
+-- it: SIGTERM to its process group, SIGKILL after the grace, the reap confirmed, independently of any signal an example sends.
 withChild ∷ [(String, String)] → [String] → (Child → IO a) → IO a
 withChild = withChildOf consoleExecutable
 
 -- | 'withChild' of the executable this action names: the suite's own binary, for the examples that run the
 -- command's composition as a child of their own.
 withChildOf ∷ IO FilePath → [(String, String)] → [String] → (Child → IO a) → IO a
-withChildOf locate variables arguments = bracket start finish
-  where
-    start = do
-      executable ← locate
-      controlled ← controlledEnvironment variables
-      (_, out, errors, process) ←
-        createProcess (proc executable arguments) {env = Just controlled, std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe}
-      case (out, errors) of
-        (Just output, Just diagnostics) → do
-          hSetEncoding output utf8
-          hSetEncoding diagnostics utf8
-          errorsBox ← newEmptyMVar
-          void (forkIO (hGetContents' diagnostics >>= putMVar errorsBox))
-          exitBox ← newEmptyMVar
-          void (forkIO (waitForProcess process >>= putMVar exitBox))
-          pure (Child process output errorsBox exitBox)
-        _ → fail "the child's pipes were not created"
-    finish child = do
-      -- Independently of any signal under test. A process that has already been reaped has no pid.
-      _ ← try (getPid (childProcess child) >>= mapM_ (signalProcess sigKILL)) ∷ IO (Either SomeException ())
-      void (timeout 10000000 (readMVar (childExit child)))
-      _ ← try (hClose (childOut child)) ∷ IO (Either SomeException ())
-      pure ()
+withChildOf locate variables arguments body = do
+  executable ← locate
+  controlled ← controlledEnvironment variables
+  -- No standard input stream, as before: the facility's default for the input is absent. The run bound is the 30-minute budget of
+  -- the group that runs these examples; every wait in them has its own, shorter bound.
+  Facility.withScopedChild (Facility.childSpec (Facility.Within (1800 * 1000000)) (proc executable arguments) {env = Just controlled}) (body . Child)
 
 -- | Read stdout lines until one is exactly this marker, answering the lines read, marker last. Every
 -- read is bounded.
 awaitMarker ∷ Child → String → IO [String]
-awaitMarker child marker = go []
+awaitMarker (Child child) marker = go []
   where
     go seen = do
-      line ← bounded (hGetLine (childOut child))
-      if line == marker then pure (reverse (line : seen)) else go (line : seen)
+      line ← Facility.nextLine child Facility.Stdout boundMicroseconds
+      case line of
+        Facility.Line text
+          | text == marker → pure (reverse (text : seen))
+          | otherwise → go (text : seen)
+        Facility.EndOfStream → fail ("the child's output ended before the marker " <> show marker <> "; read " <> show (reverse seen))
+        Facility.TimedOut → fail ("a bounded test call never returned: waiting for the marker " <> show marker)
 
 -- | Send the child a signal.
 sendSignal ∷ Signal → Child → IO ()
-sendSignal signal child =
-  getPid (childProcess child) >>= maybe (fail "the child is no longer running") (signalProcess signal)
+sendSignal signal (Child child) = Facility.signalChild child signal
 
 -- | The child's exit status, waited for with a bound.
 awaitExit ∷ Child → IO ExitCode
-awaitExit child = bounded (readMVar (childExit child))
+awaitExit (Child child) =
+  Facility.waitChild child boundMicroseconds >>= maybe (fail "a bounded test call never returned: waiting for the child to exit") pure
 
 -- | The rest of the child's stdout, to its end, bounded.
 readRest ∷ Child → IO String
-readRest child = bounded (hGetContents' (childOut child))
+readRest (Child child) =
+  Facility.restOfOutput child Facility.Stdout boundMicroseconds >>= maybe (fail "a bounded test call never returned: reading the rest of the output") pure
 
 -- | Everything the child wrote to stderr, once it has exited, bounded.
 readErrors ∷ Child → IO String
-readErrors child = bounded (readMVar (childErrors child))
+readErrors (Child child) =
+  Facility.restOfOutput child Facility.Stderr boundMicroseconds >>= maybe (fail "a bounded test call never returned: reading the errors") pure
 
 -- | What a child that ran to its end did.
 data Outcome = Outcome

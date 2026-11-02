@@ -17,7 +17,7 @@ module Test.Foundation.Workers.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
-import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd), proc)
 import Test.Hspec
   ( Spec
   , describe
@@ -27,7 +27,8 @@ import Test.Hspec
   , shouldContain
   , shouldNotContain
   )
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withPackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "Probe opacity across the package boundary" $ do
@@ -60,7 +61,7 @@ spec = describe "Probe opacity across the package boundary" $ do
           expectationFailure
             ("the status client did not build (" <> show status <> "):\n" <> clientOutput outcome)
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
           ""
       status `shouldBe` ExitSuccess

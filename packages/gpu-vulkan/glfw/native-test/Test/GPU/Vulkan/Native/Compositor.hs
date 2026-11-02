@@ -25,26 +25,27 @@ module Test.GPU.Vulkan.Native.Compositor
   , endCompositor
   ) where
 
-import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.STM (atomically, check, newTVarIO, orElse, readTVar, registerDelay, retry, writeTVar)
+import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, bracket, try)
 import Control.Monad (forM_)
 import System.Directory (getTemporaryDirectory, removeDirectoryRecursive)
 import System.Environment (getEnvironment, setEnv, unsetEnv)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.IO (IOMode (WriteMode), openFile)
+import System.IO (IOMode (WriteMode), hClose, withFile)
 import System.Posix.Process (getProcessID)
 import System.Posix.Temp (mkdtemp)
-import System.Process
-  ( CreateProcess (env, std_err, std_in, std_out)
-  , ProcessHandle
-  , StdStream (NoStream, UseHandle)
-  , createProcess
-  , getProcessExitCode
-  , proc
-  , terminateProcess
-  , waitForProcess
+import System.Process (CreateProcess (env), ProcessHandle, getProcessExitCode, proc, terminateProcess)
+import Test.Support.Subprocess
+  ( Child
+  , ChildSpec (specPlacement, specStderr, specStdin, specStdout)
+  , Placement (CallersGroup)
+  , RunBound (Within)
+  , Stream (Absent, CallerHandle)
+  , childProcess
+  , childSpec
+  , waitChild
+  , withScopedChild
   )
 
 import Test.GPU.Vulkan.Native.Child (ChildEnd (..), Launched (..), launchCommandIn)
@@ -55,7 +56,8 @@ data Compositor = Compositor
     -- ^ Its private runtime directory, mode 0700.
   , compositorSocket ∷ !String
     -- ^ The socket's name inside that directory.
-  , compositorProcess ∷ !ProcessHandle
+  , compositorChild ∷ !Child
+    -- ^ The compositor as the shared subprocess facility owns it (#588).
   , compositorVersion ∷ !String
     -- ^ What @weston --version@ answered.
   }
@@ -74,29 +76,32 @@ withPrivateCompositor body =
       launchCommandIn (Just environment) readinessDeadline "weston" ["--version"] >>= \case
         Launched (ChildExited ExitSuccess) out _ _ → pure (takeWhile (/= '\n') out)
         Launched end _ err _ → failCase ("weston --version ended " <> show end <> ": " <> err)
-    bracket
-      ( do
-          out ← openFile (directory </> "compositor.out") WriteMode
-          err ← openFile (directory </> "compositor.err") WriteMode
-          (_, _, _, handle) ←
-            createProcess
-              ( proc
-                  "weston"
-                  ["--backend=headless", "--socket=" <> socket, "--width=1280", "--height=1024", "--no-config", "--idle-time=0"]
-              )
-                { env = Just environment
-                , std_in = NoStream
-                , std_out = UseHandle out
-                , std_err = UseHandle err
-                }
-          pure handle
-      )
-      (\handle → getProcessExitCode handle >>= maybe (() <$ stopProcess handle) (\_ → pure ()))
-      ( \handle → do
-          let compositor = Compositor directory socket handle version
-          awaitServed compositor environment readinessAttempts
-          body compositor
-      )
+    -- The compositor is a scoped child of the shared subprocess facility (#588). It stays in this process's group, signalled by
+    -- identifier only, so that the outer launcher's deadline, which ends that group, ends it too if this process hangs; it is ended
+    -- and reaped on every exit path: SIGTERM, a grace, SIGKILL, so one that ignores SIGTERM is no longer left running. The logs are
+    -- files this function opens before the start; the facility closes them if the start fails, and they are closed here once the
+    -- compositor has its own copies, so that 'compositorLog' can read what it wrote. The 30-minute run bound is the budget of the
+    -- group that runs this suite; the readiness waits keep their own.
+    withFile (directory </> "compositor.out") WriteMode $ \out →
+      withFile (directory </> "compositor.err") WriteMode $ \err →
+        withScopedChild
+          ( ( childSpec
+                (Within (1800 * 1000000))
+                ( proc
+                    "weston"
+                    ["--backend=headless", "--socket=" <> socket, "--width=1280", "--height=1024", "--no-config", "--idle-time=0"]
+                )
+                  {env = Just environment}
+            )
+              {specStdin = Absent, specStdout = CallerHandle out, specStderr = CallerHandle err, specPlacement = CallersGroup}
+          )
+          ( \child → do
+              hClose out
+              hClose err
+              let compositor = Compositor directory socket child version
+              awaitServed compositor environment readinessAttempts
+              body compositor
+          )
   where
     awaitServed compositor environment remaining = do
       exited ← getProcessExitCode (compositorProcess compositor)
@@ -140,19 +145,16 @@ enterPrivate compositor = do
   setEnv "XDG_RUNTIME_DIR" (compositorDirectory compositor)
   setEnv "WAYLAND_DISPLAY" (compositorDirectory compositor </> compositorSocket compositor)
 
--- | End the compositor: @SIGTERM@, then its exit, within a bound.
-endCompositor ∷ Compositor → IO ExitCode
-endCompositor = stopProcess . compositorProcess
+-- | The compositor's process.
+compositorProcess ∷ Compositor → ProcessHandle
+compositorProcess = childProcess . compositorChild
 
--- | Terminate a process this child started and wait for its exit, failing the
--- case if it does not exit within 'readinessDeadline'.
-stopProcess ∷ ProcessHandle → IO ExitCode
-stopProcess handle = do
-  terminateProcess handle
-  exited ← newTVarIO Nothing
-  _ ← forkIO (waitForProcess handle >>= atomically . writeTVar exited . Just)
-  timer ← registerDelay (round (readinessDeadline * 1000000))
-  atomically ((Just <$> (readTVar exited >>= maybe retry pure)) `orElse` (Nothing <$ (readTVar timer >>= check)))
+-- | End the compositor: @SIGTERM@, then its exit, within a bound. The facility that owns it reaps it with the wait it makes here,
+-- and finds it reaped when the compositor's scope ends.
+endCompositor ∷ Compositor → IO ExitCode
+endCompositor compositor = do
+  terminateProcess (compositorProcess compositor)
+  waitChild (compositorChild compositor) (round (readinessDeadline * 1000000))
     >>= maybe (failCase "the private compositor did not exit after SIGTERM") pure
 
 compositorLog ∷ Compositor → IO String

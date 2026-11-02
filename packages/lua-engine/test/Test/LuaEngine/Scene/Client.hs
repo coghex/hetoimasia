@@ -7,9 +7,10 @@
 module Test.LuaEngine.Scene.Client (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Process (proc)
 import Test.Hspec
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withStorePackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "composition from outside the packages" $ do
@@ -19,7 +20,7 @@ spec = describe "composition from outside the packages" $ do
       case clientStatus outcome of
         ExitSuccess → pure ()
         status → expectationFailure ("the client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
-      (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome <> "/client") []) ""
+      (status, out, err) ← runCaptured clientRunBound (proc (clientDirectory outcome <> "/client") []) ""
       (status, out, err) `shouldBe` (ExitSuccess, "prepared 0 sprites\nframe valid: True\nrefused: scene.clear.g: a colour channel is a whole number\n", "")
 
   it "keeps a prepared scene's construction and the limits' record out of a client's reach where they would let it skip a check" $ do

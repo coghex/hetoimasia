@@ -25,9 +25,10 @@ module Test.Runtime.Opacity (spec) where
 
 import System.Exit (ExitCode (ExitSuccess))
 import System.FilePath ((</>))
-import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd), proc)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain)
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withPackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = do
@@ -61,7 +62,7 @@ supervisedSpec = describe "Supervised worker opacity across the package boundary
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
           ""
       status `shouldBe` ExitSuccess
@@ -270,7 +271,7 @@ inboxSpec = describe "Inbox service opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
           ""
       status `shouldBe` ExitSuccess
@@ -290,7 +291,7 @@ inboxSpec = describe "Inbox service opacity across the package boundary" $ do
                 <> clientOutput outcome
             )
       (status, out, err) ←
-        readCreateProcessWithExitCode
+        runCaptured clientRunBound
           (proc (clientDirectory outcome </> "client") []) { cwd = Just (clientDirectory outcome) }
           ""
       status `shouldBe` ExitSuccess

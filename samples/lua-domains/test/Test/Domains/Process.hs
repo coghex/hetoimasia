@@ -9,14 +9,15 @@ import Data.List (isPrefixOf)
 import qualified Data.Text as Text
 import System.Directory (findExecutable)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
-import System.Process (proc, readCreateProcessWithExitCode)
-import Test.Domains.Support (generous)
+import System.Process (proc)
 import Test.Hspec
+import Test.Support.Subprocess (RunBound (Within), runCaptured)
 
 run ∷ [String] → IO (ExitCode, String, String)
 run arguments = do
   executable ← findExecutable "hetoimasia-lua-domains" >>= maybe (fail "the executable is not on this test's search path") pure
-  generous (readCreateProcessWithExitCode (proc executable arguments) "")
+  -- The two-minute bound is the one the call already had (`generous`): a hang-catcher, never an assertion.
+  runCaptured (Within 120000000) (proc executable arguments) ""
 
 -- | The report of a scenario: its lines, which the report keeps to eleven.
 reportOf ∷ [String] → IO (ExitCode, [String])
