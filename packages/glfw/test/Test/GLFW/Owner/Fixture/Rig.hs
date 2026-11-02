@@ -181,21 +181,22 @@ ownedHostBeforeBody beforeBody = ownedHostHooked Private.noHostHooks {Private.be
 -- only inside this body's first masked step, in the same step that registers the release that undoes it (@release@, run only
 -- when the body ends exceptionally, before the host's drain), so no failing step, gated retirement or deferred releaser exists
 -- before the rescue that can release it. The @cut@ hook is where an example ends the body to prove that: it is called with
--- 'False' before the arming and with 'True' once the arming and the release are registered.
-armedBody ∷ (Bool → IO ()) → IO () → IO () → IO a → IO a
+-- 0 before the arming and with 1 once the arming and the release are registered; a fixture whose behaviour is reached only through an
+-- attachment calls it with 2 once the first attachment exists.
+armedBody ∷ (Int → IO ()) → IO () → IO () → IO a → IO a
 armedBody cut arm release body = do
-  cut False
+  cut 0
   mask $ \restore → do
     arm
-    restore (cut True >> body) `onException` release
+    restore (cut 1 >> body) `onException` release
 
 -- | 'armedBody' whose release also runs when the body returns: for a body that must leave nothing held on any exit (#593).
-armedFinally ∷ (Bool → IO ()) → IO () → IO () → IO a → IO a
+armedFinally ∷ (Int → IO ()) → IO () → IO () → IO a → IO a
 armedFinally cut arm release body = do
-  cut False
+  cut 0
   mask $ \restore → do
     arm
-    restore (cut True >> body) `finally` release
+    restore (cut 1 >> body) `finally` release
 
 -- | Publish every retirement fact for one attachment from the calling thread, if the host publishes completions and the owner holds
 -- the attachment's acknowledgement, and do nothing otherwise. It blocks on nothing and raises nothing, and it is idempotent: the

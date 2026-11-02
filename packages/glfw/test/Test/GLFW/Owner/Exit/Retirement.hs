@@ -64,7 +64,7 @@ spec = do
     (boundedExample testIndividualRelease)
   it "asks again on a later round for a released target whose retirement is owed, certifying nothing meanwhile"
     (boundedExample testOwedRetirementRetried)
-  cutExamples "the owed retirement fixture" owedRetiredScenario
+  cutExamples "the owed retirement fixture" [0, 1, 2] owedRetiredScenario
   it "waits in its exit drain for a retirement still owed, and retires the target before the owner"
     (boundedExample testOwedRetirementDrained)
   it "hands its exit drain's timer the backend's deadline, or its fallback interval after the drain's own reading"
@@ -144,10 +144,10 @@ testOwedRetirementRetried = owedRetirementRetried (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the retirement is held owed, or after it is and the release that makes it ready is
 -- registered.
-owedRetiredScenario ∷ Bool → Scope → IO () → IO ()
+owedRetiredScenario ∷ Int → Scope → IO () → IO ()
 owedRetiredScenario cutAt _ atParked = owedRetirementRetried (\armedNow → when (armedNow == cutAt) atParked)
 
-owedRetirementRetried ∷ (Bool → IO ()) → IO ()
+owedRetirementRetried ∷ (Int → IO ()) → IO ()
 owedRetirementRetried cut = do
   rig ← newRig
   asked ← newTVarIO (0 ∷ Int)
@@ -162,6 +162,7 @@ owedRetirementRetried cut = do
     ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → armedBody cut arm (atomically (writeTVar ready True)) $ do
       window ← theWindow host
       service ← handedOver host owner window
+      cut 2
       awaitConstructed rig (Text.pack (show window))
       _ ← releaseGraphicsTarget host owner service
       atomically (readTVar asked >>= check . (>= 1))

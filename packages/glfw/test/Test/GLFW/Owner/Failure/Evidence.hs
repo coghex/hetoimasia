@@ -100,11 +100,11 @@ spec = do
     for_ [-1 .. 2] $ \k →
       it ("finishes the exit on the supplier's evidence when the example body " <> label <> " at setup step " <> show k <> " of the completion fixture (#593)") $
         boundedExample (ownedEnds ending (completionSetupScenario k) False)
-  cutExamples "the early fatal failure fixture" earlyFatalScenario
-  cutExamples "the required failure fixture" requiredFailureEndedEarlyScenario
-  cutExamples "the quiescence fixture" quiescenceScenario
-  cutExamples "the failing retirement fixture" retirementFailsOnceScenario
-  cutExamples "the every-failure fixture" everyFailureScenario
+  cutExamples "the early fatal failure fixture" [0, 1] earlyFatalScenario
+  cutExamples "the required failure fixture" [0, 1] requiredFailureEndedEarlyScenario
+  cutExamples "the quiescence fixture" [0, 1] quiescenceScenario
+  cutExamples "the failing retirement fixture" [0, 1, 2] retirementFailsOnceScenario
+  cutExamples "the every-failure fixture" [0, 1, 2] everyFailureScenario
   it "retains terminal facts the completion publisher refused, and transports them at the next opportunity"
     (boundedExample testRefusedNoticeRetained)
   it "closes the owner's admission and begins its retirement as soon as a required failure is latched"
@@ -168,10 +168,10 @@ testEarlyFatalWhileRetiring ∷ IO ()
 testEarlyFatalWhileRetiring = earlyFatalWhileRetiring False (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the gated retirement is armed, or after it and the release of its gate are registered.
-earlyFatalScenario ∷ Bool → Scope → IO () → IO ()
+earlyFatalScenario ∷ Int → Scope → IO () → IO ()
 earlyFatalScenario cutAt _ atParked = earlyFatalWhileRetiring True (\armedNow → when (armedNow == cutAt) atParked)
 
-earlyFatalWhileRetiring ∷ Bool → (Bool → IO ()) → IO ()
+earlyFatalWhileRetiring ∷ Bool → (Int → IO ()) → IO ()
 earlyFatalWhileRetiring scenario cut = do
   rig ← newRig
   release ← newTVarIO False
@@ -382,10 +382,10 @@ testRequiredFailureClosesAdmission = requiredFailureClosesAdmission False (\_ �
 
 -- | The same fixture ended at the cut (#593): before the failing step and the gated retirement are armed, or after they and the
 -- release of the gate are registered.
-requiredFailureEndedEarlyScenario ∷ Bool → Scope → IO () → IO ()
+requiredFailureEndedEarlyScenario ∷ Int → Scope → IO () → IO ()
 requiredFailureEndedEarlyScenario cutAt _ atParked = requiredFailureClosesAdmission True (\armedNow → when (armedNow == cutAt) atParked)
 
-requiredFailureClosesAdmission ∷ Bool → (Bool → IO ()) → IO ()
+requiredFailureClosesAdmission ∷ Bool → (Int → IO ()) → IO ()
 requiredFailureClosesAdmission scenario cut = do
   rig ← newRig
   release ← newTVarIO False
@@ -498,10 +498,10 @@ testPublicationsClosedAtQuiescence = publicationsClosedAtQuiescence (\_ → pure
 
 -- | The same fixture ended at the cut (#593): before the owner is told to hold in its next step, or after it is told and the release
 -- of the hold is registered.
-quiescenceScenario ∷ Bool → Scope → IO () → IO ()
+quiescenceScenario ∷ Int → Scope → IO () → IO ()
 quiescenceScenario cutAt _ atParked = publicationsClosedAtQuiescence (\armedNow → when (armedNow == cutAt) atParked)
 
-publicationsClosedAtQuiescence ∷ (Bool → IO ()) → IO ()
+publicationsClosedAtQuiescence ∷ (Int → IO ()) → IO ()
 publicationsClosedAtQuiescence cut = do
   rig ← newRigWith id
   clock ← countingClock
@@ -650,10 +650,10 @@ testRetirementFailsOnce = retirementFailsOnce False (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the failing retirement is armed, or after it and the rescue that publishes the
 -- evidence its exit waits for are registered.
-retirementFailsOnceScenario ∷ Bool → Scope → IO () → IO ()
+retirementFailsOnceScenario ∷ Int → Scope → IO () → IO ()
 retirementFailsOnceScenario cutAt _ atParked = retirementFailsOnce True (\armedNow → when (armedNow == cutAt) atParked)
 
-retirementFailsOnce ∷ Bool → (Bool → IO ()) → IO ()
+retirementFailsOnce ∷ Bool → (Int → IO ()) → IO ()
 retirementFailsOnce scenario cut = do
   rig ← newRig
   attempts ← newTVarIO (0 ∷ Int)
@@ -672,6 +672,7 @@ retirementFailsOnce scenario cut = do
     ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (rescuePublishing tracked host owner) $ do
       window ← theWindow host
       service ← trackedHandedOver tracked host owner window
+      cut 2
       awaitStanding owner service `shouldReturn` TargetUsable
       _ ← releaseGraphicsTarget host owner service
       -- The failure is latched and retained; the target stays, unverified.
@@ -711,10 +712,10 @@ testEveryRetirementFailureRetained ∷ IO ()
 testEveryRetirementFailureRetained = everyRetirementFailureRetained False (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the failing retirement is armed, or after it and the rescue are registered.
-everyFailureScenario ∷ Bool → Scope → IO () → IO ()
+everyFailureScenario ∷ Int → Scope → IO () → IO ()
 everyFailureScenario cutAt _ atParked = everyRetirementFailureRetained True (\armedNow → when (armedNow == cutAt) atParked)
 
-everyRetirementFailureRetained ∷ Bool → (Bool → IO ()) → IO ()
+everyRetirementFailureRetained ∷ Bool → (Int → IO ()) → IO ()
 everyRetirementFailureRetained scenario cut = do
   rig ← newRig
   tracked ← newIORef []
@@ -727,6 +728,7 @@ everyRetirementFailureRetained scenario cut = do
     ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (rescuePublishing tracked host owner) $ do
       identities ← atomically (hostWindowIdentities host)
       services ← mapM (trackedHandedOver tracked host owner) identities
+      cut 2
       forM_ services (awaitStanding owner)
       forM_ services (releaseGraphicsTarget host owner)
       -- Every one of them fails its retirement, and every failure is kept.

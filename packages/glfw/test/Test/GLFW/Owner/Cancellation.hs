@@ -28,7 +28,7 @@ spec ∷ Spec
 spec = do
   it "honours it at each wait in dependency order, and repeated cancellation releases nothing early"
     (boundedExample testRepeatedCancellation)
-  cutExamples "the repeated cancellation fixture" repeatedCancellationScenario
+  cutExamples "the repeated cancellation fixture" [0, 1] repeatedCancellationScenario
 
 -- | Cancellation is honoured at the owner's waits and absorbed by its drain.
 --
@@ -41,10 +41,10 @@ testRepeatedCancellation = repeatedCancellationFixture (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the owner is held in a step and its retirement held at the gate, or after they and
 -- the release of the gate are registered.
-repeatedCancellationScenario ∷ Bool → Scope → IO () → IO ()
+repeatedCancellationScenario ∷ Int → Scope → IO () → IO ()
 repeatedCancellationScenario cutAt _ atParked = repeatedCancellationFixture (\armedNow → when (armedNow == cutAt) atParked)
 
-repeatedCancellationFixture ∷ (Bool → IO ()) → IO ()
+repeatedCancellationFixture ∷ (Int → IO ()) → IO ()
 repeatedCancellationFixture cut = do
   rig ← newRig
   cancellations ← newTVarIO (0 ∷ Int)

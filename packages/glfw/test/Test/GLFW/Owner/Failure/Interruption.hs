@@ -60,8 +60,8 @@ spec = do
     (boundedExample testOperationAnswersCommitUninterrupted)
   it "waits for a terminal group report however the join is interrupted"
     (boundedExample testJoinAwaitsTerminalReport)
-  cutExamples "the record fixture" retirementRecordScenario
-  cutExamples "the join fixture" joinScenario
+  cutExamples "the record fixture" [0, 1, 2] retirementRecordScenario
+  cutExamples "the join fixture" [0, 1] joinScenario
 
 -- | A target retirement that returned is recorded, whatever is delivered to
 -- the owner as it returns — so it is never offered a second time.
@@ -76,10 +76,10 @@ testRetirementRecordSurvivesCancellation = retirementRecordSurvives False (\_ �
 
 -- | The same fixture ended at the cut (#593): before the retirement is armed, or after it and the rescue that publishes the evidence
 -- its exit waits for are registered.
-retirementRecordScenario ∷ Bool → Scope → IO () → IO ()
+retirementRecordScenario ∷ Int → Scope → IO () → IO ()
 retirementRecordScenario cutAt _ atParked = retirementRecordSurvives True (\armedNow → when (armedNow == cutAt) atParked)
 
-retirementRecordSurvives ∷ Bool → (Bool → IO ()) → IO ()
+retirementRecordSurvives ∷ Bool → (Int → IO ()) → IO ()
 retirementRecordSurvives scenario cut = do
   rig ← newRig
   entered ← newTVarIO False
@@ -106,6 +106,7 @@ retirementRecordSurvives scenario cut = do
     outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (rescuePublishing tracked host owner) $ do
       window ← theWindow host
       service ← trackedHandedOver tracked host owner window
+      cut 2
       awaitStanding owner service `shouldReturn` TargetUsable
       _ ← releaseGraphicsTarget host owner service
       atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
@@ -184,10 +185,10 @@ testJoinAwaitsTerminalReport = joinAwaitsTerminalReport False (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the destruction is held and the helper handed the owner, or after both, in one
 -- masked step.
-joinScenario ∷ Bool → Scope → IO () → IO ()
+joinScenario ∷ Int → Scope → IO () → IO ()
 joinScenario cutAt _ atParked = joinAwaitsTerminalReport True (\armedNow → when (armedNow == cutAt) atParked)
 
-joinAwaitsTerminalReport ∷ Bool → (Bool → IO ()) → IO ()
+joinAwaitsTerminalReport ∷ Bool → (Int → IO ()) → IO ()
 joinAwaitsTerminalReport scenario cut = do
   rig ← newRig
   release ← newTVarIO False
@@ -221,11 +222,11 @@ joinAwaitsTerminalReport scenario cut = do
     (raised, _) ← caughtAsUnless @IOException scenario $
       ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
         main ← myThreadId
-        cut False
+        cut 0
         mask $ \restore → do
           handOver (owner, main)
           arm
-          restore (cut True >> void (awaitRound owner 0)) `onException` atomically (writeTVar release True)
+          restore (cut 1 >> void (awaitRound owner 0)) `onException` atomically (writeTVar release True)
     show raised `shouldContain` "delivered during the join"
     readTVarIO released `shouldReturn` Just []
     notes ← journalled (rigJournal rig)

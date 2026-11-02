@@ -54,7 +54,7 @@ spec = do
   it "retains everything until independent evidence when the cancellation escaped the destruction"
     (boundedExample testEscapedDestructionCancellation)
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
-    for_ [("before the scripted backend behaviour is armed", False), ("after it is armed and its release registered", True)] $ \(where', cutAt) → do
+    for_ [("before the scripted backend behaviour is armed", 0 ∷ Int), ("after it is armed and its release registered", 1), ("after the first attachment exists", 2)] $ \(where', cutAt) → do
       it ("finishes the exit when the example body " <> label <> " " <> where' <> ", at each backend call (#593)") $
         boundedExample (exitFinishes ending (backendCallScenario cutAt))
       it ("finishes the exit when the example body " <> label <> " " <> where' <> ", in the escaped construction (#593)") $
@@ -82,10 +82,10 @@ testCancellationAtEachBackendCall = cancellationAtEachBackendCall (\_ → pure (
 
 -- | The same fixture with the example ended at the cut (#593): before the scripted backend behaviour is armed, or after it and its
 -- release are registered.
-backendCallScenario ∷ Bool → Scope → IO () → IO ()
+backendCallScenario ∷ Int → Scope → IO () → IO ()
 backendCallScenario cutAt _ atParked = cancellationAtEachBackendCall (\armedNow → when (armedNow == cutAt) atParked)
 
-cancellationAtEachBackendCall ∷ (Bool → IO ()) → IO ()
+cancellationAtEachBackendCall ∷ (Int → IO ()) → IO ()
 cancellationAtEachBackendCall cut =
   forM_ [BackendConstruct, BackendRetireTarget, BackendDestroy] $ \at' → do
     rig ← newRig
@@ -138,6 +138,7 @@ cancellationAtEachBackendCall cut =
       ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (atomically (writeTVar release True)) $ do
         window ← theWindow host
         service ← handedOver host owner window
+        cut 2
         -- The body must not return before a call that happens during the run
         -- has been entered and interrupted, or the exit would stop the owner
         -- first and the gate would never be reached at all. The destruction is
@@ -184,10 +185,10 @@ testEscapedConstructionCancellation ∷ IO ()
 testEscapedConstructionCancellation = escapedConstruction False (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the gated retirement is armed, or after it and its release are registered.
-escapedConstructionScenario ∷ Bool → Scope → IO () → IO ()
+escapedConstructionScenario ∷ Int → Scope → IO () → IO ()
 escapedConstructionScenario cutAt _ atParked = escapedConstruction True (\armedNow → when (armedNow == cutAt) atParked)
 
-escapedConstruction ∷ Bool → (Bool → IO ()) → IO ()
+escapedConstruction ∷ Bool → (Int → IO ()) → IO ()
 escapedConstruction scenario cut = do
   rig ← newRig
   inside ← newTVarIO False
@@ -211,6 +212,7 @@ escapedConstruction scenario cut = do
       ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (atomically (writeTVar gate True)) $ do
         window ← theWindow host
         service ← handedOver host owner window
+        cut 2
         -- Neither accepted nor verifiably rolled back: the owner records what
         -- it knows, which is that it may own whatever the call had built.
         standing ← awaitStanding owner service
@@ -244,10 +246,10 @@ testEscapedRetirementCancellation ∷ IO ()
 testEscapedRetirementCancellation = escapedRetirement False (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the blocking retirement is armed, or after it and the rescue are registered.
-escapedRetirementScenario ∷ Bool → Scope → IO () → IO ()
+escapedRetirementScenario ∷ Int → Scope → IO () → IO ()
 escapedRetirementScenario cutAt _ atParked = escapedRetirement True (\armedNow → when (armedNow == cutAt) atParked)
 
-escapedRetirement ∷ Bool → (Bool → IO ()) → IO ()
+escapedRetirement ∷ Bool → (Int → IO ()) → IO ()
 escapedRetirement scenario cut = do
   rig ← newRig
   inside ← newTVarIO False
@@ -265,6 +267,7 @@ escapedRetirement scenario cut = do
         window ← theWindow host
         -- The independent evidence the drain will need is registered with the rescue in the step that creates the attachment.
         service ← uninterruptibleMask_ (handedOver host owner window >>= \target → target <$ writeIORef rescueRef (publishAllFor host owner (graphicsAttachment target)))
+        cut 2
         awaitStanding owner service `shouldReturn` TargetUsable
         _ ← releaseGraphicsTarget host owner service
         -- The run has ended and its drain has finished, so nothing is still to

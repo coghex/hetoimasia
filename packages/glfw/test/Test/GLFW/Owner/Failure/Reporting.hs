@@ -57,8 +57,8 @@ spec = do
     (boundedExample testSupervisedFailureReportedOnce)
   it "reports a supervised failure it survived once as well"
     (boundedExample testSupervisedRetainedFailureReportedOnce)
-  cutExamples "the retained failure fixture" retainedFailureScenario
-  cutExamples "the supervised retained failure fixture" supervisedRetainedScenario
+  cutExamples "the retained failure fixture" [0, 1, 2] retainedFailureScenario
+  cutExamples "the supervised retained failure fixture" [0, 1, 2] supervisedRetainedScenario
   it "suppresses nothing for a sentinel that was cancelled before it delivered"
     (boundedExample testUndeliveredSentinelSuppressesNothing)
   describe "when the owner's final wake raises" $ do
@@ -92,10 +92,10 @@ testRetainedFailureReportedOnce = retainedFailureReportedOnce False (\_ → pure
 
 -- | The same fixture ended at the cut (#593): before the failing retirement is armed, or after it and the rescue that publishes the
 -- evidence its exit waits for are registered.
-retainedFailureScenario ∷ Bool → Scope → IO () → IO ()
+retainedFailureScenario ∷ Int → Scope → IO () → IO ()
 retainedFailureScenario cutAt _ atParked = retainedFailureReportedOnce True (\armedNow → when (armedNow == cutAt) atParked)
 
-retainedFailureReportedOnce ∷ Bool → (Bool → IO ()) → IO ()
+retainedFailureReportedOnce ∷ Bool → (Int → IO ()) → IO ()
 retainedFailureReportedOnce scenario cut = do
   rig ← newRig
   tracked ← newIORef []
@@ -103,6 +103,7 @@ retainedFailureReportedOnce scenario cut = do
   outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (rescuePublishing tracked host owner) $ do
     window ← theWindow host
     service ← trackedHandedOver tracked host owner window
+    cut 2
     awaitStanding owner service `shouldReturn` TargetUsable
     _ ← releaseGraphicsTarget host owner service
     -- Latched and retained together, which is the pair this example is about.
@@ -190,10 +191,10 @@ testSupervisedRetainedFailureReportedOnce ∷ IO ()
 testSupervisedRetainedFailureReportedOnce = supervisedRetainedFailure False (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the failing retirement is armed, or after it and the rescue are registered.
-supervisedRetainedScenario ∷ Bool → Scope → IO () → IO ()
+supervisedRetainedScenario ∷ Int → Scope → IO () → IO ()
 supervisedRetainedScenario cutAt _ atParked = supervisedRetainedFailure True (\armedNow → when (armedNow == cutAt) atParked)
 
-supervisedRetainedFailure ∷ Bool → (Bool → IO ()) → IO ()
+supervisedRetainedFailure ∷ Bool → (Int → IO ()) → IO ()
 supervisedRetainedFailure scenario cut = do
   rig ← newRig
   tracked ← newIORef []
@@ -205,6 +206,7 @@ supervisedRetainedFailure scenario cut = do
       other → unexpected ("the sentinel did not start: " <> describeStart other)
     window ← theWindow host
     service ← trackedHandedOver tracked host owner window
+    cut 2
     awaitStanding owner service `shouldReturn` TargetUsable
     _ ← releaseGraphicsTarget host owner service
     atomically (readOwnerFailure owner >>= check . isJust)

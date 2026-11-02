@@ -72,7 +72,7 @@ spec = do
     (boundedExample testPartialConstruction)
   it "keeps a construction that was interrupted as unverified, and retires that too"
     (boundedExample testCancelledConstruction)
-  cutExamples "the cancelled construction fixture" cancelledConstructionScenario
+  cutExamples "the cancelled construction fixture" [0, 1, 2] cancelledConstructionScenario
   it "certifies a verified rollback's facts without a retirement of its own"
     (boundedExample testVerifiedRollback)
   it "leaks no port reservation when a handover is refused, and tells the owner about an attachment whose answer was lost"
@@ -201,10 +201,10 @@ testCancelledConstruction = cancelledConstruction False (\_ → pure ())
 
 -- | The same fixture ended at the cut (#593): before the failing construction and the gated retirement are armed, or after they and the
 -- release of the gate are registered.
-cancelledConstructionScenario ∷ Bool → Scope → IO () → IO ()
+cancelledConstructionScenario ∷ Int → Scope → IO () → IO ()
 cancelledConstructionScenario cutAt _ atParked = cancelledConstruction True (\armedNow → when (armedNow == cutAt) atParked)
 
-cancelledConstruction ∷ Bool → (Bool → IO ()) → IO ()
+cancelledConstruction ∷ Bool → (Int → IO ()) → IO ()
 cancelledConstruction scenario cut = do
   rig ← newRig
   observedStanding ← newTVarIO Nothing
@@ -225,6 +225,7 @@ cancelledConstruction scenario cut = do
     ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → armedBody cut arm (atomically (writeTVar gate True)) $ do
       window ← theWindow host
       service ← handedOver host owner window
+      cut 2
       standing ← awaitStanding owner service
       atomically (writeTVar observedStanding (Just standing))
       atomically (writeTVar gate True)

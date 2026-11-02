@@ -439,12 +439,17 @@ exitFinishes ending scenario = runEnding ending (scenario withOwnedThreadOpening
 -- is armed, and after it is armed with the release that undoes it registered (the arming and the registration are one masked
 -- step, so a cancellation cannot land between them: it is delivered at one cut or the other). Each judges only that the exit
 -- finishes; the bound of the example ends a fixture that would wait for ever.
-cutExamples ∷ String → (Bool → Scope → IO () → IO ()) → Spec
-cutExamples what scenario =
+cutExamples ∷ String → [Int] → (Int → Scope → IO () → IO ()) → Spec
+cutExamples what cuts scenario =
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
-    for_ [("before the behaviour is armed", False), ("after it is armed and its release registered", True)] $ \(cut, cutAt) →
-      it ("finishes the exit when the example body " <> label <> " " <> cut <> ", in " <> what <> " (#593)") $
+    for_ cuts $ \cutAt →
+      it ("finishes the exit when the example body " <> label <> " " <> cutName cutAt <> ", in " <> what <> " (#593)") $
         boundedExample (exitFinishes ending (scenario cutAt))
+  where
+    cutName cutAt = case cutAt of
+      0 → "before the behaviour is armed"
+      1 → "after it is armed and its release registered"
+      _ → "after the first attachment exists"
 
 -- | The negative control: the same scenario over an unowned start leaves the thread behind, and the failed judgement is recorded
 -- before anything independent stops the thread. Whatever the control left is then stopped and joined, even if the judgement
