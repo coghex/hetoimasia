@@ -62,6 +62,9 @@ extra-source-files:
     tools/native/vulkan.py
     tools/native/patches/0001-wayland-fix-segfault-when-there-is-no-seat.patch
     tools/validation/ci_image.py
+    tools/validation/owned_starts.py
+    tools/validation/owned_starts.json
+    tools/validation/owned_starts_baseline.json
     tools/validation/plan.py
     tools/validation/plan_repository.py
     tools/validation/plan_cabal.py
@@ -204,6 +207,7 @@ test-suite workflow-tests
         DismissalStep
         Execution
         Json
+        OwnedStarts
         OwnedThread
         Packaging
         PlanStep

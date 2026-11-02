@@ -45,8 +45,9 @@ import Data.Foldable (for_)
 import Data.List (isInfixOf)
 import Data.Maybe (isJust)
 import GHC.Conc (ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
+import System.Directory (doesFileExist)
 import System.Timeout (timeout)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Spec, describe, it, pendingWith, shouldBe, shouldSatisfy)
 import Test.HUnit.Lang (HUnitFailure (HUnitFailure), FailureReason (Reason))
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (awaitBlockedSending, withCancellationAfter, withCancellationWhenBlocked)
@@ -259,11 +260,16 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
 
   describe "its definition" $
     it "uses no timed wait and depends on base alone" $ do
-      source ← readFile "tools/test-support/src/Test/Support/Owned.hs"
-      let imports = [line | line ← lines source, "import " `isPrefixOfLine` line]
-          isPrefixOfLine prefix line = take (length prefix) line == prefix
-      imports `shouldSatisfy` all (\line → "import Control." `isPrefixOfLine` line)
-      source `shouldSatisfy` (not . ("threadDelay" `isInfixOf`))
+      let path = "tools/test-support/src/Test/Support/Owned.hs"
+          startsWith prefix line = take (length prefix) line == prefix
+      present ← doesFileExist path
+      if not present
+        then pendingWith "the facility's source is another package's, which a source distribution does not carry"
+        else do
+          source ← readFile path
+          let imports = [line | line ← lines source, startsWith "import " line]
+          imports `shouldSatisfy` all (startsWith "import Control.")
+          source `shouldSatisfy` (not . ("threadDelay" `isInfixOf`))
 
   describe "the cancellation helper behind the first Library.hs helper (Test.Support.Cancel.withCancellationAfter)" $ do
     for_ [("returns normally", Returns), ("raises from its body", Raises)] $ \(label, ending) → do
