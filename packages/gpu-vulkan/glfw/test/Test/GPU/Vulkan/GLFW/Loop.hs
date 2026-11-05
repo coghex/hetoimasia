@@ -545,19 +545,12 @@ testSuspendedTarget = do
       expired ← registerDelay 50000
       spun ← atomically $ (True <$ (readOwnerStatusNow owner >>= check . (> statusRounds settled + 2) . statusRounds)) `orElse` (False <$ (readTVar expired >>= check))
       queried ← fenceQueries rig
-      setClock rig due
-      atomically $ do
-        queries ← length . filter isQuery . map snd <$> readTVar (rigJournal rig)
-        check (queries > queried)
+      reached ← pollAtDeadline rig host queried due
       letExitFinish rig
-      pure (due, spun, True)
+      pure (reached, spun, True)
   deadline `shouldSatisfy` (> scriptedInstant zeroDuration)
   spun `shouldBe` False
   polledLater `shouldBe` True
-  where
-    isQuery = \case
-      FenceQueried _ → True
-      _ → False
 
 testBusyTargetFairness ∷ IO ()
 testBusyTargetFairness = do
@@ -1636,6 +1629,36 @@ presentedFromNewest = go Nothing
       SwapchainCreated handle _ _ : rest → go (Just handle) rest
       ImagePresented swapchain _ : rest → newest == Just swapchain && go newest rest
       _ : rest → go newest rest
+
+-- | Move the scripted clock to the owner's deadline, and wait for the poll it
+-- is owed there, answering the deadline the clock reached when the owner
+-- polled.
+--
+-- A deadline read earlier is not the owner's last: every round it takes moves
+-- the model's backoff on once, so one that ran after the read re-published a
+-- later deadline, and a clock moved only to the earlier one wakes nothing. The
+-- wait therefore ends on the poll or on the owner publishing another deadline,
+-- in which case the clock goes on to that one. Both are events the owner
+-- publishes; nothing here waits for a time to pass.
+pollAtDeadline ∷ Rig → VulkanHost Scene → Int → Instant → IO Instant
+pollAtDeadline rig host queried = go
+  where
+    go held = do
+      setClock rig held
+      outcome ← atomically $ (Right () <$ polled) `orElse` (Left <$> republished held)
+      case outcome of
+        Right () → pure held
+        Left later → go later
+    polled = do
+      queries ← length . filter isQuery . map snd <$> readTVar (rigJournal rig)
+      check (queries > queried)
+    republished held =
+      readOwnerStatusNow (vulkanGraphicsOwner host) >>= \status → case statusNextDeadline status of
+        Just due | due /= held → pure due
+        _ → retry
+    isQuery = \case
+      FenceQueried _ → True
+      _ → False
 
 -- | The owner's published deadline, once it is later than this instant.
 awaitDeadlineAfter ∷ VulkanHost Scene → Instant → IO Instant
