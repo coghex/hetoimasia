@@ -39,6 +39,7 @@ module Test.GLFW.Owner.Fixture.Cut
   , boundaryExamples
   , boundaryControls
   , stalledSnapshots
+  , pendingProtocolExample
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
@@ -65,10 +66,10 @@ import Control.Exception
   , try
   , uninterruptibleMask_
   )
-import Control.Monad (forM_, join, unless, void, when)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Control.Monad (forM_, join, replicateM_, unless, void, when)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing)
-import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadCapability, threadStatus)
+import GHC.Conc (BlockReason (BlockedOnException, BlockedOnMVar), ThreadStatus (..), threadCapability, threadStatus)
 import GHC.IO (unsafeUnmask)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Runtime.GLFW
@@ -184,21 +185,30 @@ withCutting recorded state boundary rescued body = do
 -- as it is unprotected, inside their scope.
 --
 -- The whole is under an uninterruptible mask, so the target is protected before anything else is started. The sender is started on the
--- capability the target is on; while the target is blocked, it checks that the target is still on that capability and throws: a
--- thread blocked on a capability stays there, so the throw is made on the target's own capability, where it is settled where it is
--- made, and the sender is then blocked delivering with the exception queued against the target. The target is not woken by the sender
--- (a bound thread woken by the thread that then throws can move to another capability before the throw is made) but by a second thread
--- on the same capability, which waits for the sender to be blocked delivering and only then hands the target the confirmation. The
--- target lifts the mask for the instant it takes to receive the cancellation, inside the scope, which stops and joins both threads
--- (recorded for the caller's judgement). A sender that found the target elsewhere reports it and the whole is tried again.
+-- capability the target is on and does three things in this order: it waits until the target is __observed parked__ on the protected
+-- hand-over (a runnable thread proves nothing: it may be preempted, and the scheduler can move a runnable bound thread to another
+-- capability between any check and the throw); it then checks that the parked target is on its own capability, which a blocked thread
+-- stays on; and it throws, on the target's own capability, where the throw is settled where it is made, so that the sender is blocked
+-- delivering with the exception queued against the target. The target is not woken by the sender (a bound thread woken by the thread
+-- that then throws can move to another capability before the throw is made) but by a second thread on the same capability, which waits
+-- for the sender to be blocked delivering and only then hands the target the confirmation. The target lifts the mask for the instant
+-- it takes to receive the cancellation, inside the scope, which stops and joins both threads (recorded for the caller's judgement). A
+-- sender that found the parked target elsewhere reports it and the whole is tried again.
 pending ∷ IORef [ThreadId] → IO ()
-pending recorded = do
+pending recorded = newIORef Nothing >>= pendingWith (pure ()) recorded
+
+-- | 'pending' with an action the target performs, masked, before it parks (the cut where it is preempted before it parks), and the
+-- status the sender saw the target in when it threw.
+pendingWith ∷ IO () → IORef [ThreadId] → IORef (Maybe ThreadStatus) → IO ()
+pendingWith beforePark recorded sawAtThrow = do
   settled ← uninterruptibleMask_ $ do
     me ← myThreadId
     (capability, _) ← threadCapability me
     there ← newEmptyMVar
     let sender = do
+          awaitParked me
           (now, _) ← threadCapability me
+          threadStatus me >>= writeIORef sawAtThrow . Just
           if now == capability then throwTo me UserInterrupt else void (tryPutMVar there False)
         waker thread = do
           awaitSettled thread
@@ -206,13 +216,39 @@ pending recorded = do
     withOwnedThreadOn capability sender $ \sendingThread _ →
       withOwnedThreadOn capability (waker sendingThread) $ \wakingThread _ → do
         atomicModifyIORef' recorded (\known → (sendingThread : wakingThread : known, ()))
+        beforePark
         same ← takeMVar there
         when same $ do
           -- Pending, confirmed: the sender is blocked delivering on the target's own capability.
           unsafeUnmask (pure ())
         pure same
-  -- Raised above when it was made. Reached only when the sender found the caller elsewhere: again, from where it is now.
-  unless settled (pending recorded)
+  -- Raised above when it was made. Reached only when the sender found the target elsewhere: again, from where it is now.
+  unless settled (pendingWith beforePark recorded sawAtThrow)
+
+-- | Wait, by yielding, until the thread is blocked on an @MVar@: observed, not assumed.
+awaitParked ∷ ThreadId → IO ()
+awaitParked thread =
+  threadStatus thread >>= \case
+    ThreadBlocked BlockedOnMVar → pure ()
+    _ → yield >> awaitParked thread
+
+-- | The pending protocol's own regression: the target is preempted before it parks (it keeps yielding the capability, runnable, while
+-- the sender is ready), and the sender must still throw only once it observes the target parked. The cancellation is raised, both
+-- threads are ended and joined, and the status the sender saw when it threw was the parked one.
+pendingProtocolExample ∷ Spec
+pendingProtocolExample =
+  it "makes a cancellation pending only against a target it has observed parked, however long the target is preempted first (#612)" $
+    boundedExample $ do
+      recorded ← newIORef []
+      saw ← newIORef Nothing
+      finished ← newEmptyMVar
+      withOwnedThreadOpening (pure ()) (try (pendingWith (replicateM_ 500 yield) recorded saw) >>= putMVar finished) $ \_ _ → do
+        outcome ← readMVar finished
+        case outcome of
+          Left caught → caught `shouldSatisfy` (\failure → fromException failure == Just UserInterrupt)
+          Right () → unexpected "the cancellation was never raised"
+        readIORef saw >>= (`shouldBe` Just (ThreadBlocked BlockedOnMVar))
+        endedAndJoined recorded >>= (`shouldBe` True)
 
 -- | Wait, by yielding, until the thread is blocked delivering its exception or has ended.
 awaitSettled ∷ ThreadId → IO ()
@@ -285,7 +321,7 @@ boundaryExamples what fixture =
 boundaryControls ∷ String → (Cutting → IO ()) → Spec
 boundaryControls what fixture =
   forM_ [boundary | boundary ← allBoundaries, boundary /= BeforePublication] $ \boundary →
-    forM_ [state | state ← allStates, state /= CutPending] $ \state →
+    forM_ allStates $ \state →
       it ("negative control: " <> describeCut what boundary state <> ", unrescued (#612)") $
         boundedExample (cutStrands state boundary fixture)
 

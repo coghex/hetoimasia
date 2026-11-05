@@ -34,6 +34,7 @@ import Test.GLFW.Owner.Fixture.Cut
   , boundaryExamples
   , heldBody
   , ownedHostCut
+  , pendingProtocolExample
   , uncut
   )
 import Test.GLFW.Owner.Fixture.Drive
@@ -89,6 +90,7 @@ spec = do
     (boundedExample testHandoverRecovery)
   it "calls the owner-boundary hook at the start's two boundaries, once each and in order, and nowhere else (#612)"
     (boundedExample testOwnerBoundariesCalledOnce)
+  pendingProtocolExample
   boundaryExamples "the handoff order" handoffOrder
   boundaryControls "the handoff order" handoffOrder
   boundaryExamples "the handover recovery" handoverRecovery
