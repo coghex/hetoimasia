@@ -177,6 +177,33 @@ runSession complete backend features configuration examples = do
           , vulkanObserver = const (observer recorded)
           }
   done ← newEmptyMVar
+  let -- The profile is the session thread's, as in the shipped launcher (@Hetoimasia.Run.Serve@): it owns the texture adapter's scope
+      -- and every scope the examples use, and ends them itself, so the main thread owns only the native owner and its loop and can
+      -- always give the owner back to the host's own teardown while the profile is still unwinding. The adapter's drain waits for
+      -- the textures live windows hold, which retire only as the main thread serves the owner loop (or, once it has stopped
+      -- serving, as the host's teardown destroys them); the result is published after that scope has ended.
+      -- The complete profile is run with Hspec's configuration reading left out, so no argument, @~/.hspec@, @./.hspec@ or
+      -- @HSPEC_*@ can narrow what the catalog group's receipt speaks for.
+      profile (vulkan, control, jobs, serve) = do
+        result ←
+          try @SomeException $
+            withTextureGraphics scenes configuration config vulkan $ \graphics → do
+              progressNote "the adapter is composed; waiting for the table to bind"
+              -- The adapter is composed; wait for the table to bind, so the baseline is the session at rest.
+              atomically $ do
+                reading ← graphicsReading graphics
+                unless (readingBound reading) retry
+              progressNote "the table is bound; running the examples"
+              now ← usage <$> atomically (readVulkanModel (vulkanController vulkan))
+              rest ← newIORef Nothing
+              let env = Env vulkan config scenes graphics control now rest evidence jobs serve windowCount frames mainThread
+              if complete
+                then do
+                  (cfg, forest) ← evalSpec defaultConfig {configFailOnEmpty = True} (examples env)
+                  specResultSuccess <$> runSpecForest forest cfg
+                else isSuccess <$> hspecWithResult defaultConfig {configFailOnEmpty = True} (examples env)
+        putMVar done result
+        wakeGraphicsHost (vulkanGraphicsOwner vulkan)
   outcome ←
     try @SomeException $
       -- The bound OS thread that runs the complete profile is owned by the call (#599), started by the facility's bound start
@@ -185,7 +212,7 @@ runSession complete backend features configuration examples = do
       -- services its commands. The host's own teardown is what retires whatever the profile still holds when the loop is left
       -- abnormally (even for a failure that makes serving the loop again impossible), so the thread is killed and joined after the
       -- host's scope has ended, never inside it ('Test.LuaEngine.Graphics.Served').
-      withProfileBeyond (profile done) $ \hand running →
+      withProfileBeyond profile $ \hand running →
         withLoaderIntegration $ \integration →
           runGraphicsOwnerApplication
             (withLoggingLifetime quietLogger)
@@ -197,7 +224,7 @@ runSession complete backend features configuration examples = do
             )
             vulkanWindowHost
             (\vulkan _ → pure vulkan)
-            (\vulkan control → body done hand running mainThread scenes vulkan control config evidence passedCell windowCount deviceCell frames)
+            (\vulkan control → body done hand running vulkan control passedCell deviceCell)
   calls ← reverse <$> readIORef recorded
   verdict ← readIORef verdictCell
   passed ← readIORef passedCell
@@ -215,19 +242,7 @@ runSession complete backend features configuration examples = do
       , factsDevice = device
       }
   where
-    -- The complete profile is run with Hspec's configuration reading left out, so no argument, @~/.hspec@, @./.hspec@ or
-    -- @HSPEC_*@ can narrow what the catalog group's receipt speaks for.
-    profile done env = do
-      result ←
-        try @SomeException $
-          if complete
-            then do
-              (cfg, forest) ← evalSpec defaultConfig {configFailOnEmpty = True} (examples env)
-              specResultSuccess <$> runSpecForest forest cfg
-            else isSuccess <$> hspecWithResult defaultConfig {configFailOnEmpty = True} (examples env)
-      putMVar done result
-      wakeGraphicsHost (vulkanGraphicsOwner (envHost env))
-    body done hand running mainThread scenes vulkan control config evidence passedCell windowCount deviceCell frames = do
+    body done hand running vulkan control passedCell deviceCell = do
       progressNote "the owner is starting"
       readiness ← atomically $
         readReadiness (vulkanController vulkan) >>= \case
@@ -238,43 +253,32 @@ runSession complete backend features configuration examples = do
         _ → pure ()
       atomically (readVulkanRoots (vulkanController vulkan)) >>= writeIORef deviceCell . viewDeviceName
       progressNote "the owner is ready; composing the adapter"
-      withTextureGraphics scenes configuration config vulkan $ \graphics → do
-        progressNote "the adapter is composed; waiting for the table to bind"
-        -- The adapter is composed; wait for the table to bind, so the baseline is the session at rest.
-        atomically $ do
-          reading ← graphicsReading graphics
-          unless (readingBound reading) retry
-        progressNote "the table is bound; running the examples"
-        now ← usage <$> atomically (readVulkanModel (vulkanController vulkan))
-        rest ← newIORef Nothing
-        jobs ← newTVarIO []
-        serve ← newIORef (pure ())
-        let env = Env vulkan config scenes graphics control now rest evidence jobs serve windowCount frames mainThread
-        -- The profile starts now that its environment exists (the thread was started beyond the host's scope and waits for it).
-        -- The process main thread serves the owner loop until the examples are done: window creation, surfaces and native
-        -- events belong to it. A turn runs the jobs the examples handed it and the action they installed, then asks to finish
-        -- once Hspec has. The loop is woken for each, so none waits on the idle bound. This scope is the texture backend's,
-        -- whose drain waits for the textures live windows hold, and those windows retire only as this thread serves the loop:
-        -- if the loop is left abnormally it is served again, with the profile thread killed, until the thread has ended, before
-        -- this scope's drain begins ('Test.LuaEngine.Graphics.Served').
-        let update stopWhen _ = do
-              pending ← atomically (swapTVar jobs [])
-              sequence_ pending
-              join (readIORef serve)
-              finished ← stopWhen
-              pure (if finished then FinishWith () else ContinueWith NoUpdateDemand)
-        let hooks stopWhen = defaultScheduledHooks quietLogger (update stopWhen)
-        serveProfile
-          running
-          (hand env)
-          (\stopWhen → runVulkanOwnerLoop vulkan control (hooks stopWhen))
-          -- the settling run makes its own supervision, as the shipped owner drain does: the application's may have latched the
-          -- very failure that ended the first run, and its checkpoints would end this one before it served anything
-          (\stopWhen → withLoggingLifetime quietLogger $ \lifetime → withSupervision lifetime $ \fresh → runVulkanOwnerLoop vulkan fresh (hooks stopWhen))
-          (isJust <$> tryReadMVar done)
-        takeMVar done >>= \case
-          Left failure → throwIO failure
-          Right success → writeIORef passedCell success
+      jobs ← newTVarIO []
+      serve ← newIORef (pure ())
+      -- The process main thread serves the owner loop until the examples are done: window creation, surfaces and native events
+      -- belong to it. A turn runs the jobs the examples handed it and the action they installed, then asks to finish once the
+      -- profile has published its result. The loop is woken for each, so none waits on the idle bound. If the loop is left
+      -- abnormally the profile thread is killed and the loop is served again, a bounded number of attempts each under a fresh
+      -- supervision, until the thread has ended; if it has not ended after that, the failure is raised at once and the host's own
+      -- teardown does what the loop could not ('Test.LuaEngine.Graphics.Served').
+      let update stopWhen _ = do
+            pending ← atomically (swapTVar jobs [])
+            sequence_ pending
+            join (readIORef serve)
+            finished ← stopWhen
+            pure (if finished then FinishWith () else ContinueWith NoUpdateDemand)
+          hooks stopWhen = defaultScheduledHooks quietLogger (update stopWhen)
+      serveProfile
+        running
+        (hand (vulkan, control, jobs, serve))
+        (\stopWhen → runVulkanOwnerLoop vulkan control (hooks stopWhen))
+        -- each settling attempt makes its own supervision, as the shipped owner drain does: the application's may have latched the
+        -- very failure that ended the first run, and its checkpoints would end this one before it served anything
+        (\stopWhen → withLoggingLifetime quietLogger $ \lifetime → withSupervision lifetime $ \fresh → runVulkanOwnerLoop vulkan fresh (hooks stopWhen))
+        (isJust <$> tryReadMVar done)
+      takeMVar done >>= \case
+        Left failure → throwIO failure
+        Right success → writeIORef passedCell success
 
 -- | A line on stderr as the session reaches each stage, so a run that stops says where.
 progressNote ∷ String → IO ()
