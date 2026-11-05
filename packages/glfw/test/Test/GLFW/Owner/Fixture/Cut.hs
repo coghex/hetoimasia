@@ -210,8 +210,8 @@ withCutting recorded state boundary rescued body = do
           -- The sender and the target share a capability (#610's pinned start). On one capability a throw to a masked thread is settled
           -- where it is made: the exception is on the target's queue before the sender is recorded as blocked delivering. Across
           -- capabilities the throw is a message the target's capability takes in when it next looks at its inbox, so no wait on the
-          -- sender's status establishes receipt, and the cancellation could arrive anywhere later, inside the startup wait that #613
-          -- leaves stranded. The run's main thread is a bound thread and can change capability whenever it yields, so the throw is made
+          -- sender's status establishes receipt, and the cancellation could arrive anywhere later, away from the boundary it
+          -- was made pending at. The run's main thread is a bound thread and can change capability whenever it yields, so the throw is made
           -- while it is blocked on the sender's own hand-over: the sender is started on the capability the target is on, says it is
           -- there, and throws in the same turn, with the target woken on that capability and masked uninterruptibly. The cancellation is
           -- received as that mask ends, inside the scope, which then stops and joins the sender.
@@ -416,7 +416,7 @@ cutRuns state boundary fixture = do
   withCutting recorded state boundary True $ \cutting → do
     -- Run unmasked, as an application's main thread is. The run's bound thread inherits the state of its caller, and an example's own
     -- thread may be masked; a cancellation that is pending is then received at whatever interruptible point comes first instead of at
-    -- the boundary, which can be the startup wait that #613 leaves stranded.
+    -- the boundary, which can be the startup wait.
     outcome ← try (unsafeUnmask (fixture cutting))
     case outcome of
       Right () → unexpected "the cut run returned instead of raising what was injected"
