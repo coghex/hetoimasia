@@ -34,7 +34,7 @@
 -- teardown reports after its compositor is gone is recorded, not asserted.
 module Test.GLFW.Native.WaylandScenarios (scenarios) where
 
-import Control.Concurrent (forkIO, threadDelay, yield)
+import Control.Concurrent (threadDelay, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (Exception (..), ExceptionWithContext (ExceptionWithContext), SomeException, bracket, finally, throwIO, try)
@@ -108,6 +108,7 @@ import Test.Support.Subprocess
   )
 import Test.GLFW.Native.Child (ChildEnd (..), Launched (..), launchCommandIn)
 import Test.GLFW.Native.Consent (Consent)
+import Test.GLFW.Native.Threads (Boundness (Unbound), ownedScope, startIn)
 import Test.GLFW.Native.Control (showAndRelease)
 import Test.GLFW.Native.Support (consentBackend, consentSessionConfig)
 import qualified Test.GLFW.Native.Wake as Wake
@@ -495,29 +496,31 @@ lossInsideWait =
           (floor', _) ← takeLastWaitForCheck
           ownerDone ← newTVarIO False
           worker ← newEmptyMVar
-          _ ← forkIO (try (endWhenBlocked ownerDone floor' compositor) >>= putMVar worker)
-          started ← getMonotonicTime
-          outcome ← try (processWindowEvents session (AwaitEventsFor lossWaitBound)) `finally` atomically (writeTVar ownerDone True)
-          seconds ← subtract started <$> getMonotonicTime
-          ended ←
-            takeMVar worker >>= \case
-              Left thrown → failCheck ("the worker failed: " <> displayException (thrown ∷ SomeException))
-              Right Nothing → failCheck "the worker never observed the owner blocked inside GLFW's wait"
-              Right (Just (blocked, status)) → pure (blocked, status)
-          failure ← case outcome of
-            Left thrown → maybe (failCheck ("unexpected failure: " <> displayException (thrown ∷ SomeException))) pure (fromException thrown)
-            Right () → failCheck "the wait returned with the connection lost and nothing confirmed it"
-          requireLoss failure AfterEvents
-          when (seconds >= lossWaitBound) $
-            failCheck ("the wait ran to its bound of " <> show lossWaitBound <> " seconds rather than returning on the loss")
-          -- GLFW's disconnect path issues a close request to every window; it
-          -- is recorded, and rejected as the application rejects every one,
-          -- but it is not what confirmed the loss.
-          closing ← observedCloseRequest <$> synchronized window
-          mapM_ (rejectCloseRequest window) closing
-          terminal ← latched session statuses pumps failure
-          seen ← readIORef statuses
-          pure (ended, seconds, failure, isJust closing, seen, terminal)
+          -- The worker ends the compositor and is owned (#594): it is stopped and joined however the scope ends, and the
+          -- flag that lets it give up is raised by the scope's own opening as well as after the owner's wait.
+          startIn ownedScope Unbound (atomically (writeTVar ownerDone True)) (try (endWhenBlocked ownerDone floor' compositor) >>= putMVar worker) $ \_ _ → do
+            started ← getMonotonicTime
+            outcome ← try (processWindowEvents session (AwaitEventsFor lossWaitBound)) `finally` atomically (writeTVar ownerDone True)
+            seconds ← subtract started <$> getMonotonicTime
+            ended ←
+              takeMVar worker >>= \case
+                Left thrown → failCheck ("the worker failed: " <> displayException (thrown ∷ SomeException))
+                Right Nothing → failCheck "the worker never observed the owner blocked inside GLFW's wait"
+                Right (Just (blocked, status)) → pure (blocked, status)
+            failure ← case outcome of
+              Left thrown → maybe (failCheck ("unexpected failure: " <> displayException (thrown ∷ SomeException))) pure (fromException thrown)
+              Right () → failCheck "the wait returned with the connection lost and nothing confirmed it"
+            requireLoss failure AfterEvents
+            when (seconds >= lossWaitBound) $
+              failCheck ("the wait ran to its bound of " <> show lossWaitBound <> " seconds rather than returning on the loss")
+            -- GLFW's disconnect path issues a close request to every window; it
+            -- is recorded, and rejected as the application rejects every one,
+            -- but it is not what confirmed the loss.
+            closing ← observedCloseRequest <$> synchronized window
+            mapM_ (rejectCloseRequest window) closing
+            terminal ← latched session statuses pumps failure
+            seen ← readIORef statuses
+            pure (ended, seconds, failure, isJust closing, seen, terminal)
     let ((blocked, ended), seconds, failure, closing, seen, terminal) = evidence
     pure
       ( "compositor "
@@ -751,42 +754,47 @@ againstPausedCompositor settleWith =
       (floor', _) ← takeLastWaitForCheck
       ownerDone ← newTVarIO False
       worker ← newEmptyMVar
-      (seconds, returned, woken, noted, counts) ←
-        ( do
-            signalProcess sigSTOP process
-            _ ← forkIO (try (resumeWhenBlocked ownerDone floor' process) >>= putMVar worker)
-            before ← wakeCountsForCheck
-            settleWith session
-            settled ← wakeCountsForCheck
-            started ← getMonotonicTime
-            processWindowEvents session (AwaitEventsFor settleWaitBound)
-            seconds ← subtract started <$> getMonotonicTime
-            (returned, woken) ← takeLastWaitForCheck
-            noted ← takeWaitNotedForCheck
-            after ← wakeCountsForCheck
-            pure (seconds, returned, woken, noted, [before, settled, after])
-        )
-          `finally` (atomically (writeTVar ownerDone True) >> signalProcess sigCONT process)
-      resumedAt ←
-        takeMVar worker >>= \case
-          Left thrown → failCheck ("the worker failed: " <> displayException (thrown ∷ SomeException))
-          Right Nothing → failCheck "the worker never observed the owner blocked, so the compositor was never resumed"
-          Right (Just place) → pure place
-      unless (and (zipWith (==) counts (drop 1 counts))) $
-        failCheck ("the production wake counts changed: " <> show counts)
-      unless (returned > floor') $
-        failCheck ("no production wait was recorded after wait " <> show floor')
-      when woken $ failCheck ("wait " <> show returned <> " was woken, and nothing in this check wakes it")
-      when noted $ failCheck ("wait " <> show returned <> " carried a progress note")
-      pure
-        Paused
-          { pausedVersion = compositorVersion compositor
-          , pausedResumed = resumedAt
-          , pausedFloor = floor'
-          , pausedReturned = returned
-          , pausedSeconds = seconds
-          , pausedCounts = counts
-          }
+      -- The worker resumes the compositor and is owned (#594). It supplies what the owner's wait needs to end, so its
+      -- scope encloses the wait and the compositor is continued on every exit by the @finally@ below, before the join: a
+      -- worker killed by the scope has nothing left to resume, and one that ended on its own already did. The flag that
+      -- lets it give up is raised by the scope's opening too, so a cancellation before that @finally@ cannot leave it
+      -- spinning. It starts before the stop signal; it acts only on an observed blocked wait, which comes after.
+      startIn ownedScope Unbound (atomically (writeTVar ownerDone True)) (try (resumeWhenBlocked ownerDone floor' process) >>= putMVar worker) $ \_ _ → do
+        (seconds, returned, woken, noted, counts) ←
+          ( do
+              signalProcess sigSTOP process
+              before ← wakeCountsForCheck
+              settleWith session
+              settled ← wakeCountsForCheck
+              started ← getMonotonicTime
+              processWindowEvents session (AwaitEventsFor settleWaitBound)
+              seconds ← subtract started <$> getMonotonicTime
+              (returned, woken) ← takeLastWaitForCheck
+              noted ← takeWaitNotedForCheck
+              after ← wakeCountsForCheck
+              pure (seconds, returned, woken, noted, [before, settled, after])
+          )
+            `finally` (atomically (writeTVar ownerDone True) >> signalProcess sigCONT process)
+        resumedAt ←
+          takeMVar worker >>= \case
+            Left thrown → failCheck ("the worker failed: " <> displayException (thrown ∷ SomeException))
+            Right Nothing → failCheck "the worker never observed the owner blocked, so the compositor was never resumed"
+            Right (Just place) → pure place
+        unless (and (zipWith (==) counts (drop 1 counts))) $
+          failCheck ("the production wake counts changed: " <> show counts)
+        unless (returned > floor') $
+          failCheck ("no production wait was recorded after wait " <> show floor')
+        when woken $ failCheck ("wait " <> show returned <> " was woken, and nothing in this check wakes it")
+        when noted $ failCheck ("wait " <> show returned <> " carried a progress note")
+        pure
+          Paused
+            { pausedVersion = compositorVersion compositor
+            , pausedResumed = resumedAt
+            , pausedFloor = floor'
+            , pausedReturned = returned
+            , pausedSeconds = seconds
+            , pausedCounts = counts
+            }
 
 describePaused ∷ Paused → String
 describePaused paused =

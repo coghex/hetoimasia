@@ -15,9 +15,9 @@
 -- wake's latency; a wait that returned without reaching it returned on an
 -- event, and one that reached it fails the example rather than passing. Each
 -- example prints one evidence line.
-module Test.GLFW.Native.Wake (spec, settle) where
+module Test.GLFW.Native.Wake (spec, settle, Waits (..), wokenWaitIn) where
 
-import Control.Concurrent (ThreadId, forkIO, forkOS, yield)
+import Control.Concurrent (yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (SomeException, displayException, finally, try)
@@ -40,6 +40,7 @@ import Hetoimasia.GLFW.Window (hiddenTestWindowConfig)
 import Numeric.Natural (Natural)
 import System.IO (hFlush, stdout)
 import Test.GLFW.Native.Support (Shared, failed, owned)
+import Test.GLFW.Native.Threads (Boundness (..), Scope, ownedScope, startIn)
 import Test.GLFW.Native.WaylandSync (awaitCompositor)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 
@@ -48,7 +49,7 @@ spec shared = describe "session wake" $ do
   it "ends a wait the owner thread entered and was blocked inside, with a worker's production wake" $ do
     evidence ← owned shared $ \session → do
       settle session
-      wokenWait forkIO session (sessionWake session) 1 0
+      wokenWait Unbound session (sessionWake session) 1 0
     evidenceLine "worker wake" evidence
     waitOutcomes evidence `shouldBe` [WakePosted]
     waitReturned evidence `shouldBe` Just (waitBlocked evidence)
@@ -59,8 +60,8 @@ spec shared = describe "session wake" $ do
     (repeated, next) ← owned shared $ \session → do
       let wake = sessionWake session
       settle session
-      repeated ← wokenWait forkOS session wake 3 0
-      next ← wokenWait forkIO session wake 1 (waitBlocked repeated)
+      repeated ← wokenWait Bound session wake 3 0
+      next ← wokenWait Unbound session wake 1 (waitBlocked repeated)
       pure (repeated, next)
     evidenceLine "repeated wakes" repeated
     evidenceLine "next wait" next
@@ -79,7 +80,7 @@ spec shared = describe "session wake" $ do
       host ← newWindowCommandHost session 4
       let port = windowCommandPort host
           command = createWindowCommand (hiddenTestWindowConfig "native admission wake" 64 48)
-      evidence ← wokenWaitBy forkIO session 0 (submitWindowCommand port [] command)
+      evidence ← wokenWaitBy Unbound session 0 (submitWindowCommand port [] command)
       -- Nothing executed it, so no window was created in the shared session:
       -- closure settles the command the wake announced.
       settled ← atomically (closeWindowCommands host)
@@ -99,7 +100,7 @@ spec shared = describe "session wake" $ do
       let wake = sessionWake session
       (floor', _) ← takeLastWaitForCheck
       spurious ← replicateM 3 (wakeSession wake)
-      evidence ← wokenWait forkOS session wake 1 floor'
+      evidence ← wokenWait Bound session wake 1 floor'
       pure (spurious, evidence)
     evidenceLine "spurious wakes" evidence
     spurious `shouldBe` replicate 3 WakePosted
@@ -120,51 +121,80 @@ data WaitEvidence a = WaitEvidence
     -- ^ How long the woken wait's owner operation took, against 'waitBound'.
   }
 
--- | Wait on the owner thread until a worker started by @fork@, having observed a
+-- | Wait on the owner thread until an owned worker of the given boundness, having observed a
 -- wait later than @after@ blocked inside GLFW, wakes it @wakes@ times. Waits
 -- that return unwoken first are counted as spurious, up to 'spuriousLimit'.
-wokenWait ∷ (IO () → IO ThreadId) → Session → SessionWake → Int → Natural → IO (WaitEvidence [WakeOutcome])
-wokenWait fork session wake wakes after = wokenWaitBy fork session after (replicateM wakes (wakeSession wake))
+wokenWait ∷ Boundness → Session → SessionWake → Int → Natural → IO (WaitEvidence [WakeOutcome])
+wokenWait boundness session wake wakes after = wokenWaitBy boundness session after (replicateM wakes (wakeSession wake))
 
 -- | 'wokenWait' over any action the worker runs once it has observed a wait
 -- later than @after@ blocked inside GLFW — a wake, or an admission that owes
 -- one.
-wokenWaitBy ∷ (IO () → IO ThreadId) → Session → Natural → IO a → IO (WaitEvidence a)
-wokenWaitBy fork session after act = do
+wokenWaitBy ∷ Boundness → Session → Natural → IO a → IO (WaitEvidence a)
+wokenWaitBy boundness session = wokenWaitIn ownedScope (productionWaits session) boundness
+
+-- | What the owner's side and the worker's observation read: the production wait on the session and the shim's record of it
+-- ('productionWaits'), or the ownership regressions' stand-ins, which need no session and no display.
+data Waits = Waits
+  { waitsAwait ∷ IO ()
+    -- ^ The owner's finite wait: returns when it ends, for whatever reason.
+  , waitsLast ∷ IO (Natural, Bool)
+    -- ^ The sequence number of the wait that last returned, and whether a production wake was posted while it ran.
+  , waitsObserve ∷ IO (Maybe Natural)
+    -- ^ The sequence number of a wait the worker finds blocked, if one is.
+  }
+
+productionWaits ∷ Session → Waits
+productionWaits session =
+  Waits
+    { waitsAwait = processWindowEvents session (AwaitEventsFor waitBound)
+    , waitsLast = takeLastWaitForCheck
+    , waitsObserve = blockedWaitForCheck
+    }
+
+-- | 'wokenWaitBy' over the given reads and in a chosen kind of scope.
+--
+-- /Ownership (#594)./ The worker is owned: it ends and is joined however this returns, and the flag that tells it the owner is
+-- done is raised by the scope's own opening as well as by the @finally@ that follows the owner's wait, so a cancellation
+-- delivered between the worker's start and that @finally@ cannot leave a worker spinning on @yield@ for ever. The worker's
+-- result is read once the owner's wait has ended and the flag is up, exactly as before.
+wokenWaitIn ∷ Scope → Waits → Boundness → Natural → IO a → IO (WaitEvidence a)
+wokenWaitIn scope waits boundness after act = do
   ownerDone ← newTVarIO False
   worker ← newEmptyMVar
-  _ ← fork (try (observeAndWake ownerDone) >>= putMVar worker)
-  let loop spurious = do
-        started ← getMonotonicTime
-        processWindowEvents session (AwaitEventsFor waitBound)
-        seconds ← subtract started <$> getMonotonicTime
-        (returned, woken) ← takeLastWaitForCheck
-        when (seconds >= waitBound) $
-          failed ("wait " <> show returned <> " reached its bound of " <> show waitBound <> " seconds instead of returning on a wake")
-        if woken || spurious >= spuriousLimit
-          then pure (returned, woken, spurious, seconds)
-          else loop (spurious + 1)
-  (returned, woken, spurious, seconds) ← loop 0 `finally` atomically (writeTVar ownerDone True)
-  takeMVar worker >>= \case
-    Left failure → failed ("the waking worker failed: " <> displayException (failure ∷ SomeException))
-    Right Nothing → failed "the worker never observed a wait blocked inside GLFW"
-    Right (Just (blocked, outcomes)) →
-      pure
-        WaitEvidence
-          { waitBlocked = blocked
-          , waitOutcomes = outcomes
-          , waitReturned = if woken then Just returned else Nothing
-          , waitWoken = woken
-          , waitSpurious = spurious
-          , waitSeconds = seconds
-          }
+  let ownerFinished = atomically (writeTVar ownerDone True)
+  startIn scope boundness ownerFinished (try (observeAndWake ownerDone) >>= putMVar worker) $ \_ _ → do
+    let loop spurious = do
+          started ← getMonotonicTime
+          waitsAwait waits
+          seconds ← subtract started <$> getMonotonicTime
+          (returned, woken) ← waitsLast waits
+          when (seconds >= waitBound) $
+            failed ("wait " <> show returned <> " reached its bound of " <> show waitBound <> " seconds instead of returning on a wake")
+          if woken || spurious >= spuriousLimit
+            then pure (returned, woken, spurious, seconds)
+            else loop (spurious + 1)
+    (returned, woken, spurious, seconds) ← loop 0 `finally` ownerFinished
+    takeMVar worker >>= \case
+      Left failure → failed ("the waking worker failed: " <> displayException (failure ∷ SomeException))
+      Right Nothing → failed "the worker never observed a wait blocked inside GLFW"
+      Right (Just (blocked, outcomes)) →
+        pure
+          WaitEvidence
+            { waitBlocked = blocked
+            , waitOutcomes = outcomes
+            , waitReturned = if woken then Just returned else Nothing
+            , waitWoken = woken
+            , waitSpurious = spurious
+            , waitSeconds = seconds
+            }
   where
     observeAndWake ownerDone = do
       done ← readTVarIO ownerDone
       if done
         then pure Nothing
         else
-          blockedWaitForCheck >>= \case
+          waitsObserve waits >>= \case
             Just blocked | blocked > after → do
               outcomes ← act
               pure (Just (blocked, outcomes))
