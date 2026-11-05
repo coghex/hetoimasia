@@ -86,7 +86,7 @@ import Test.Support.Subprocess.Host
   ( Deadline (DeadlineAt, NoDeadline)
   , Host
   , HostFailure (HostEnded, HostStopped)
-  , HostSeams (hostAbandoning, hostBeforeServing, hostClosing, hostEntering, hostLimit, hostOpen, hostTaking)
+  , HostSeams (hostAbandoning, hostBeforeServing, hostClosing, hostEntering, hostLimit, hostOpen, hostStarting, hostTaking)
   , HostState (..)
   , Site (AtBody, AtSubmission)
   , awaitHostState
@@ -468,6 +468,7 @@ spec = describe "the hosted subprocess (Test.Support.Subprocess.Host)" $ do
   causeSpec
   racesSpec
   cleanupSpec
+  lifecycleSpec
   cancellabilitySpec
   capturedSpec
 
@@ -1490,6 +1491,100 @@ cleanupSpec = describe "A cancellation delivered into a cleanup of the host" $ d
         Just (SubprocessFailure message) -> message `shouldSatisfy` (\text -> "cleanup was not confirmed" `isInfixOf` text && "could not be flushed" `isInfixOf` text)
         Nothing -> expectationFailure ("the owner's scope raised " <> show failure)
       Right () -> expectationFailure "the unconfirmed close was lost: the owner's scope returned"
+
+-- | The lifecycle of a request's handles, transition by transition (the audit of round 2), each with a cancellation delivered at its
+-- boundary, and the places a cleanup diagnostic is produced.
+lifecycleSpec :: Spec
+lifecycleSpec = describe "The lifecycle of a request's handles" $ do
+  let reap = quick {boundReap = 300000}
+      cancelWorkerAt gate workerVar = do
+        awaitReached gate
+        worker <- bounded (atomically (readTMVar workerVar))
+        throwTo worker ThreadKilled
+
+  it "Lifecycle Placed → Claimed: a worker cancelled right after it claimed the request closes the handles it took over, and the submitter is answered 'host ended'" $ do
+    taking <- newGate
+    workerVar <- newEmptyTMVarIO
+    ran <- newIORef False
+    withSupplied $ \handle ->
+      withHostEx noSeams noHostSeams {hostBeforeServing = myThreadId >>= atomically . putTMVar workerVar, hostTaking = park taking, hostOpen = openGate taking} $ \host ->
+        withSubmission host (supplying handle (readyChild Unbounded "a" nowhere)) (flagged ran) $ \a -> do
+          cancelWorkerAt taking workerVar
+          answered a >>= (`shouldSatisfy` isEnded)
+          closed handle `shouldReturn` True
+          readIORef ran `shouldReturn` False
+          bounded (awaitHostState host (== Ended))
+
+  it "Lifecycle Claimed → the child's acquisition: a worker cancelled while the child is acquired closes the handles, and the submitter is answered 'host ended'" $ do
+    spawned <- newGate
+    workerVar <- newEmptyTMVarIO
+    ran <- newIORef False
+    withSupplied $ \handle ->
+      withHostEx noSeams {seamSpawned = \_ -> park spawned} noHostSeams {hostBeforeServing = myThreadId >>= atomically . putTMVar workerVar, hostOpen = openGate spawned} $ \host ->
+        withSubmission host (supplying handle (readyChild Unbounded "a" nowhere)) (flagged ran) $ \a -> do
+          cancelWorkerAt spawned workerVar
+          answered a >>= (`shouldSatisfy` isEnded)
+          closed handle `shouldReturn` True
+          readIORef ran `shouldReturn` False
+          bounded (awaitHostState host (== Ended))
+
+  it "Lifecycle Claimed → Entered: a worker cancelled between the entry and the start of the body closes the handles, which the body never received, and the submitter is answered 'host ended'" $ do
+    starting <- newGate
+    workerVar <- newEmptyTMVarIO
+    ran <- newIORef False
+    withSupplied $ \handle ->
+      withHostEx noSeams noHostSeams {hostBeforeServing = myThreadId >>= atomically . putTMVar workerVar, hostStarting = park starting, hostOpen = openGate starting} $ \host ->
+        withSubmission host (supplying handle (readyChild Unbounded "a" nowhere)) (flagged ran) $ \a -> do
+          cancelWorkerAt starting workerVar
+          answered a >>= (`shouldSatisfy` isEnded)
+          closed handle `shouldReturn` True
+          readIORef ran `shouldReturn` False
+          bounded (awaitHostState host (== Ended))
+
+  it "Lifecycle Entered → the body started: a cancellation of the worker after the body started leaves the handles the caller's" $ do
+    held <- newHeld
+    hostVar <- newEmptyTMVarIO
+    withSupplied $ \handle ->
+      withLateSubmission hostVar (supplying handle (readyChild Unbounded "a" nowhere)) (heldBody held) $ \a -> do
+        withHost $ \host -> do
+          atomically (putTMVar hostVar host)
+          void (awaitHeld held)
+        answered a >>= (`shouldSatisfy` isStopped)
+        readIORef (heldCancelled held) `shouldReturn` True
+        hIsOpen handle `shouldReturn` True
+
+  -- A failed start, the submitter gone (cancelled where the worker has claimed the request), and a handle whose flush cannot
+  -- complete: the facility's own close times out, annotates the start failure and closes the handle, so the worker's second close finds
+  -- nothing; the diagnostic is kept at the host's scope, not only on a reply nobody reads.
+  let abandonedStart :: Maybe Boom -> IO (Answer ())
+      abandonedStart ending = do
+        taking <- newGate
+        (reading, writing) <- blockedPipe
+        (tryWithContext @SomeException $
+            withHostUsing reap noSeams noHostSeams {hostTaking = park taking, hostOpen = openGate taking} $ \host -> do
+              withSubmission host ((missingChild (Within 60000000)) {specStdout = CallerHandle writing}) (\_ -> pure ()) $ \a -> do
+                awaitReached taking
+                cancelSubmitter a
+                answered a >>= (`shouldSatisfy` isCancellation)
+                openGate taking
+                bounded (awaitHostState host (== Idle))
+                hIsOpen writing `shouldReturn` False
+              maybe (pure ()) throwIO ending)
+          `finally` hClose reading
+
+  it "Diagnostics: the facility's cleanup annotation on a failed start whose submitter has gone is raised by the owner's scope, with no second cancellation injected" $
+    abandonedStart Nothing >>= \case
+      Left (ExceptionWithContext _ failure) -> case fromException failure of
+        Just (SubprocessFailure message) -> message `shouldSatisfy` (\text -> "cleanup was not confirmed" `isInfixOf` text && "could not be flushed" `isInfixOf` text)
+        Nothing -> expectationFailure ("the owner's scope raised " <> show failure)
+      Right () -> expectationFailure "the facility's annotation was lost: the owner's scope returned"
+
+  it "Diagnostics: the same, beside the owner's own failure, which is raised as itself and keeps the diagnostic" $
+    abandonedStart (Just Boom) >>= \case
+      Left failure@(ExceptionWithContext _ cause) -> do
+        fromException cause `shouldBe` Just Boom
+        retained failure `shouldSatisfy` any ("could not be flushed" `isInfixOf`)
+      Right () -> expectationFailure "the owner's failure was not raised"
 
 -- | Rule F: the limit of a body that is not cancellable.
 cancellabilitySpec :: Spec

@@ -118,7 +118,7 @@ import Control.Applicative ((<|>))
 import Control.Exception.Context (addExceptionAnnotation, getExceptionAnnotations)
 import Control.Monad (forM_, unless, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (intercalate)
+import Data.List (intercalate, isInfixOf)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTimeNSec)
@@ -199,6 +199,9 @@ data HostSeams = HostSeams
   , hostEntering ∷ IO ()
   -- ^ Run by the worker inside the child's scope, before the entry of the body is decided: where an example holds the race of an
   -- abandonment with the entry of the body.
+  , hostStarting ∷ IO ()
+  -- ^ Run in the masked entry of a request's body, after the entry is decided and inside the cleanup that closes the handles, before
+  -- the timed body starts: where an example delivers a cancellation to the worker between the entry and the start of the body.
   , hostAbandoning ∷ String → IO ()
   -- ^ Run by a submitter that was not answered, given its command, in its cleanup and before it withdraws its request, where a
   -- cancellation that lands is remembered and the hold run again: where an example holds a request in the slot while the host is
@@ -221,6 +224,7 @@ noHostSeams =
     { hostBeforeServing = pure ()
     , hostTaking = pure ()
     , hostEntering = pure ()
+    , hostStarting = pure ()
     , hostAbandoning = \_ → pure ()
     , hostClosing = pure ()
     , hostLimit = realLimit
@@ -445,6 +449,7 @@ serve host =
                 else do
                   -- The child could not be started, or the worker was cancelled before the body: its own submitter is told, its
                   -- handles are closed, and the host, which has lost nothing, goes on unless the failure was a cancellation.
+                  atomically (noteOrphans host (carriedProblems failure))
                   interruption ← releaseClaimed host pending failure
                   case interruption of
                     Just interrupted → rethrowIO interrupted
@@ -460,25 +465,13 @@ serve host =
 stopRecorded ∷ Phase → Bool
 stopRecorded phase = phase == PhaseStopping || phase == PhaseEnded
 
--- | The body of a request's scope: decide the entry, run the body, answer, and go on serving inside the scope.
+-- | The body of a request's scope: enter, run the body, answer, and go on serving inside the scope. The entry itself (deciding it,
+-- the handles' change of owner and the cleanup that closes them) is one masked step inside 'pendExecute'; what comes before it leaves
+-- the request 'Claimed', which 'serve' releases.
 runBody ∷ Host → Pending → Child → IO ()
 runBody host pending child = do
   hostEntering (hostHooks host)
-  entered ← atomically $ do
-    gaveUp ← readTVar (pendAbandoned pending)
-    writeTVar (pendLife pending) (if gaveUp then Withdrawn else Entered)
-    pure (not gaveUp)
-  if entered
-    then
-      pendExecute pending child >>= \case
-        Just cancellation → rethrowIO cancellation
-        Nothing → serve host
-    else do
-      -- The submitter gave up before the entry: the body is not entered, the handles are closed, and the child, which exists, stays
-      -- hosted with the others.
-      failure ← captureFailure (SubprocessFailure (pendCommand pending <> " was abandoned before its body was entered"))
-      interruption ← releaseClaimed host pending failure
-      maybe (serve host) rethrowIO interruption
+  pendExecute pending child >>= maybe (serve host) rethrowIO
 
 -- | A claimed request that will not enter its body: close the handles, remembering a cancellation that lands, and answer its
 -- submitter, with the failure itself or, when that was a cancellation, with the fact that the host stopped or ended. Answers the
@@ -492,10 +485,21 @@ releaseClaimed host pending failure = do
       then stoppedOrEnded host (pendCommand pending) >>= captureFailure
       else pure failure
   atomically $ do
-    unless (null problems) (modifyTVar' (hostOrphans host) (<> problems))
+    noteOrphans host problems
     pendFail pending (retainProblems problems told)
     writeTVar (hostRunning host) False
   pure (retainProblems problems . retain "the failure of what was being run" failure <$> interruption)
+
+-- | Keep cleanup the worker could not confirm at the host's scope, each once, in the step that answers (or fails to answer) a
+-- request: the submitter may be gone, and an answer nobody reads must not hide it.
+noteOrphans ∷ Host → [String] → STM ()
+noteOrphans host problems =
+  unless (null problems) (modifyTVar' (hostOrphans host) (\known → known <> [text | text ← problems, text `notElem` known]))
+
+-- | The cleanup diagnostics a failure already carries (the facility's, on a failed start): they are kept at the host's scope too.
+carriedProblems ∷ ExceptionWithContext SomeException → [String]
+carriedProblems (ExceptionWithContext context _) =
+  [text | RetainedFailure label text ← getExceptionAnnotations context, "cleanup was not confirmed" `isInfixOf` label]
 
 -- | Why a request that will not be answered by a child is told so: the stop was recorded, or the worker ended without it.
 stoppedOrEnded ∷ Host → String → IO HostFailure
@@ -534,31 +538,47 @@ hosted host spec body = mask $ \restore → do
       answer ∷ Either (ExceptionWithContext SomeException) a → STM ()
       answer result = void (tryPutTMVar reply result) >> writeTVar (hostRunning host) False
       expiry = SubprocessFailure (command <> " did not finish within its run bound of " <> describeBound (specBound spec))
-      execute child = do
-        -- The handles are the caller's from the moment the body starts. A bound that passed before it did, or a cancellation, leaves
-        -- them the host's to close, and the host closes them before it answers.
-        started ← newTVarIO False
-        result ← tryWithContext @SomeException (hostLimit hooks AtBody deadline (atomically (writeTVar started True) >> body child))
-        ran ← readTVarIO started
-        (problems, closeInterruption) ←
-          if ran then pure ([], Nothing) else closeRemembering (hostBounds host) (hostClosing hooks) (pendHandles pending)
-        let kept = retainProblems problems
-            -- A cancellation that landed in the close is raised, with the failure being handled retained beside it.
-            raising failure = (\interrupted → kept (retain "the failure of what was being run" failure interrupted)) <$> closeInterruption
-            answerWith told = atomically (unless (null problems) (modifyTVar' (hostOrphans host) (<> problems)) >> answer (Left (kept told)))
-        case result of
-          Right (Just value) → atomically (answer (Right value)) >> pure Nothing
-          Right Nothing → do
-            failure ← captureFailure expiry
-            answerWith failure
-            pure (raising failure)
-          Left failure
-            | isAsync failure → do
-                -- A cancellation of the body is the host's stop, or the worker's own: the submitter is told which, and service ends.
-                told ← stoppedOrEnded host command >>= captureFailure
-                answerWith told
-                pure (Just (fromMaybe (kept failure) (raising failure)))
-            | otherwise → answerWith failure >> pure (raising failure)
+      -- One masked step from the entry to the answer. The entry is decided and the handles' owner changes in the same step that
+      -- registers the cleanup that closes them: the handles are the host's until the timed body starts, so a cancellation that lands
+      -- anywhere before it (the seam, the allocation, the unmask itself, a bound that has already passed) closes them, and
+      -- interruptibility is restored only around the body.
+      execute child = mask $ \restoreBody → do
+        entered ← atomically $ do
+          gaveUp ← readTVar abandoned
+          writeTVar life (if gaveUp then Withdrawn else Entered)
+          pure (not gaveUp)
+        if not entered
+          then do
+            -- The submitter gave up before the entry: the body is not entered, the handles are closed, and the child, which exists,
+            -- stays hosted with the others.
+            failure ← captureFailure (SubprocessFailure (command <> " was abandoned before its body was entered"))
+            releaseClaimed host pending failure
+          else do
+            started ← newTVarIO False
+            result ← tryWithContext @SomeException $ do
+              hostStarting hooks
+              restoreBody (hostLimit hooks AtBody deadline (atomically (writeTVar started True) >> body child))
+            ran ← readTVarIO started
+            (problems, closeInterruption) ←
+              if ran then pure ([], Nothing) else closeRemembering (hostBounds host) (hostClosing hooks) (pendHandles pending)
+            let kept = retainProblems problems
+                -- A cancellation that landed in the close is raised, with the failure being handled retained beside it.
+                raising failure = (\interrupted → kept (retain "the failure of what was being run" failure interrupted)) <$> closeInterruption
+                answerWith told = atomically (noteOrphans host problems >> answer (Left (kept told)))
+            case result of
+              Right (Just value) → atomically (answer (Right value)) >> pure Nothing
+              Right Nothing → do
+                failure ← captureFailure expiry
+                answerWith failure
+                pure (raising failure)
+              Left failure
+                | isAsync failure → do
+                    -- A cancellation of the body is the host's stop, or the worker's own: the submitter is told which, and service
+                    -- ends.
+                    told ← stoppedOrEnded host command >>= captureFailure
+                    answerWith told
+                    pure (Just (fromMaybe (kept failure) (raising failure)))
+                | otherwise → answerWith failure >> pure (raising failure)
       pending =
         Pending
           { pendSpec = spec {specBound = Unbounded}
