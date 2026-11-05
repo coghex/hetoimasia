@@ -675,9 +675,7 @@ subprocess must own it: acquire it under mask, register its stop-and-join in the
 same step, and stop and join it on every exit. The shared facility is
 `Test.Support.Owned` in `tools/test-support` for a thread (`withOwnedThread` for an
 unbound one, `withOwnedBoundThread` for an OS-bound one, #593, each with an
-`Opening` variant for a thread held at a gate only the scope can open, and
-`withOwnedThreadOn` / `withOwnedThreadOpeningOn` for a thread pinned to one
-capability, #610) and
+`Opening` variant for a thread held at a gate only the scope can open) and
 `Test.Support.Subprocess` in the same library for a subprocess (#588:
 `runToCompletion` and `runCaptured` for a command run to completion,
 `withScopedChild` for a child lent to a body; the child is ended and reaped, its

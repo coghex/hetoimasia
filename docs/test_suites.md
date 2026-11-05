@@ -197,13 +197,7 @@ cabal test hetoimasia-tests --test-show-details=direct
   (`OwnedThread`: every way a scope can end with a thread parked at a gate, each
   with a negative control that applies the same judgement to a deliberately
   unowned start and must fail; the thread that ended on its own; the
-  uninterruptible release; the interruptibility the body runs with; since #610 the
-  capability-pinned starts (`withOwnedThreadOn`, `withOwnedThreadOpeningOn`: every
-  ending again, the thread placed and pinned on the capability asked for, and a
-  cancellation pending against a masked target from the moment its sender, on the
-  same capability, is seen blocked, with the unpinned start as the negative control
-  that must let the target's next effect run first, on more than one capability);
-  since #593 the
+  uninterruptible release; the interruptibility the body runs with; since #593 the
   owned bound start (`withOwnedBoundThread`: every ending again, with a plain
   `forkOS` start as the negative control; the thread is bound and the unbound
   start is not; the gate the scope opens for a thread that keeps waiting after a
