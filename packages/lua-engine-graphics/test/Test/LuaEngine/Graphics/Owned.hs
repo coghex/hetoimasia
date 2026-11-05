@@ -169,20 +169,27 @@ raceDrain ∷ IORef [ThreadId] → Ending → IO Bool
 raceDrain seen ending = do
   fake ← newFake defaultFakeConfig
   start ← newEmptyMVar
+  armed ← newEmptyMVar
   withFakeOwner fake $ do
-    let scope = noteThread seen >> readMVar start >> drainScope fake
-    runEnding ending $ \end → withForkedScope (openEveryHold fake >> void (tryPutMVar start ())) scope $ \_ → end (waitNoted seen)
+    -- The worker installs its holds only once the stop has let everything go, and does it without being interruptible, so the kill
+    -- the stop sends next can arrive only after they are installed: the drain it is then left in waits for them. The example
+    -- ends only once the worker is parked there, so the stop is certain to reach it at that point.
+    let scope = noteThread seen >> drainScopeAfter (void (tryPutMVar armed ()) >> readMVar start) fake
+    runEnding ending $ \end → withForkedScope (openEveryHold fake >> void (tryPutMVar start ())) scope $ \_ → end (bounded (readMVar armed))
     allJoined seen
 
 -- | A backend scope that installs the holds a drain then waits on.
 drainScope ∷ Fake → IO ()
-drainScope fake =
+drainScope = drainScopeAfter (pure ())
+
+-- | The same, installing the holds uninterruptibly once the given wait has returned.
+drainScopeAfter ∷ IO () → Fake → IO ()
+drainScopeAfter wait fake =
   withBackendOnRaw fake $ \rig → do
     probe ← newProbe
     _ ← submit rig probe 2 2 255
     _ ← awaitTerminal probe
-    hold fake HoldReclaim
-    setVersionHolders fake 1
+    uninterruptibleMask_ (wait >> hold fake HoldReclaim >> setVersionHolders fake 1)
 
 -- | The failure the first run of the loop raises.
 data Boom = Boom
