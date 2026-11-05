@@ -89,7 +89,7 @@ import Test.GLFW.Support
   , withDeferredThreadVia
   )
 import Test.Hspec (Expectation, Spec, it, shouldBe, shouldSatisfy)
-import Test.Support.Owned (withOwnedThreadOn, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThreadOn, withOwnedThreadOpening)
 
 -- | Where a run is cut.
 data Boundary
@@ -223,7 +223,8 @@ pendingWith beforePark recorded sawAtThrow = do
           unsafeUnmask (pure ())
         pure same
   -- Raised above when it was made. Reached only when the sender found the target elsewhere: again, from where it is now.
-  unless settled (pendingWith beforePark recorded sawAtThrow)
+  -- The preemption is the first attempt's alone: a target that is made to yield again moves again, for ever.
+  unless settled (pendingWith (pure ()) recorded sawAtThrow)
 
 -- | Wait, by yielding, until the thread is blocked on an @MVar@: observed, not assumed.
 awaitParked ∷ ThreadId → IO ()
@@ -242,7 +243,9 @@ pendingProtocolExample =
       recorded ← newIORef []
       saw ← newIORef Nothing
       finished ← newEmptyMVar
-      withOwnedThreadOpening (pure ()) (try (pendingWith (replicateM_ 500 yield) recorded saw) >>= putMVar finished) $ \_ _ → do
+      -- A bound thread, as the run's main thread is: an unbound one is moved between capabilities while it yields, and the sender's
+      -- check would keep finding it elsewhere.
+      withOwnedBoundThreadOpening (pure ()) (try (pendingWith (replicateM_ 500 yield) recorded saw) >>= putMVar finished) $ \_ _ → do
         outcome ← readMVar finished
         case outcome of
           Left caught → caught `shouldSatisfy` (\failure → fromException failure == Just UserInterrupt)
