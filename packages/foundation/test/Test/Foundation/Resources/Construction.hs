@@ -24,6 +24,7 @@ import Control.Exception
   , WhileHandling (WhileHandling)
   , annotateIO
   , evaluate
+  , finally
   , fromException
   , mask_
   , someExceptionContext
@@ -116,7 +117,7 @@ import Test.Foundation.OwnedControl
   , startUnowned
   , withRescue
   )
-import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOn, withOwnedThreadOpening, withOwnedThreadOpeningOn)
 
 spec ∷ Spec
 spec = describe "Scoped component construction" $ do
@@ -388,15 +389,28 @@ boundedExample action = do
     Just () → pure ()
     Nothing → expectationFailure "the example did not finish within its bound"
 
--- | Wait until a thread is blocked delivering an exception, or has finished.
+-- | Wait until @sender@ is blocked delivering an exception (or has ended, because it will never block again). The target and
+-- the sender of every cancellation this waits on are pinned to 'sharedCapability' ('withOwnedThreadOn'), so the exception is
+-- already pending against the target when the sender is seen blocked and is raised the moment the target restores its masking
+-- state; the examples that assert the cancellation preempts the target's next effect rely on that (#610). Pinned, the target
+-- must give up its capability for the sender to run, which the 'yield' of the poll does.
+-- The status it settled on is returned, so an example can assert that the cancellation really was still undelivered.
 awaitPendingThrow ∷ ThreadId → IO ThreadStatus
-awaitPendingThrow target = do
-  status ← threadStatus target
+awaitPendingThrow sender = do
+  status ← threadStatus sender
   case status of
     ThreadBlocked BlockedOnException → pure status
     ThreadFinished → pure status
     ThreadDied → pure status
-    _ → yield *> awaitPendingThrow target
+    _ → yield *> awaitPendingThrow sender
+
+-- | The one capability the examples that wait for a cancellation to be pending run their target and its sender on (#610). On one
+-- capability @throwTo@ to a masked thread queues the exception before the sender is recorded as blocked, so a sender seen in
+-- 'BlockedOnException' has an exception pending against its target; across capabilities it is a message the target's capability
+-- takes in later (GHC 9.14.1 @rts/Schedule.c@, @scheduleProcessInbox@ returns at once when the capability's lock is busy), and no
+-- wait on the sender's status, a yield after it included, establishes receipt. See "Test.Support.Owned".
+sharedCapability ∷ Int
+sharedCapability = 0
 
 -- Component convention -------------------------------------------------------
 
@@ -808,7 +822,8 @@ testCancelDuringRollback = do
   -- The runner is held uninterruptibly in the rollback until the killer is published, and the killer is blocked delivering to
   -- it. The scope's stop lets the release go first (it publishes no killer), then ends the killer and the runner, in that
   -- order, so a scope that ends before the killer is started or published still completes.
-  withOwnedThreadOpening
+  withOwnedThreadOpeningOn
+    sharedCapability
     (void (tryPutMVar killerSlot Nothing))
     ( tryWithContext (withScoped (allocComponent loadWidget policy' construction) (\_ → void (bump consumed)))
         >>= putMVar result
@@ -816,7 +831,7 @@ testCancelDuringRollback = do
     $ \runner _ → do
       -- The rollback has started, so the thread is uninterruptibly masked.
       takeMVar insideRelease
-      withOwnedThread (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
+      withOwnedThreadOn sharedCapability (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
         putMVar killerSlot (Just killer)
         -- The cancellation was delivered, which cannot happen before rollback ends.
         takeMVar killerDone
@@ -867,8 +882,10 @@ testCancelAtHandoff = do
         self ← myThreadId
         -- The delivery and the announcement that follows it are one masked step: the runner's scope ends the killer as soon as
         -- the runner has left the construction, which can be before the killer has announced, and the example waits for
-        -- that announcement. The delivery itself stays interruptible, so a killer still blocked is ended by the scope.
-        withOwnedThread (readMVar startKiller >> mask_ (throwTo self ThreadKilled *> putMVar killerDone ())) $ \killer _ → do
+        -- that announcement. The delivery itself stays interruptible, so a killer still blocked is ended by the scope; the
+        -- announcement is made however the delivery ends (@finally@), so a delivery the scope cut short is a failed
+        -- assertion about the outcome below and not an example waiting for ever on a signal nothing will give.
+        withOwnedThreadOn sharedCapability (readMVar startKiller >> mask_ (throwTo self ThreadKilled `finally` putMVar killerDone ())) $ \killer _ → do
           putMVar killerSlot killer
           tryWithContext
             ( withScoped
@@ -876,7 +893,7 @@ testCancelAtHandoff = do
                 consumer
             )
             >>= putMVar result
-  withOwnedThread runner $ \_ _ → do
+  withOwnedThreadOn sharedCapability runner $ \_ _ → do
     takeMVar killerDone
     outcome ← takeMVar result
     readIORef observedStatus `shouldReturn` ThreadBlocked BlockedOnException

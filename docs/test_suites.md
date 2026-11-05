@@ -197,7 +197,14 @@ cabal test hetoimasia-tests --test-show-details=direct
   (`OwnedThread`: every way a scope can end with a thread parked at a gate, each
   with a negative control that applies the same judgement to a deliberately
   unowned start and must fail; the thread that ended on its own; the
-  uninterruptible release; the interruptibility the body runs with; since #593 the
+  uninterruptible release; the interruptibility the body runs with; since #610 the
+  capability-pinned starts (`withOwnedThreadOn`, `withOwnedThreadOpeningOn`: every
+  ending again, the thread placed and pinned on the capability asked for, a
+  cancellation pending against a masked target from the moment its sender, on the
+  same capability, is seen blocked, a deterministic negative control (a sender
+  blocked delivering to a decoy leaves nothing pending, and the target's effect
+  runs), and a scope cancelled after the target entered its step and before its
+  sender was published that still joins); since #593 the
   owned bound start (`withOwnedBoundThread`: every ending again, with a plain
   `forkOS` start as the negative control; the thread is bound and the unbound
   start is not; the gate the scope opens for a thread that keeps waiting after a
@@ -246,31 +253,32 @@ cabal test hetoimasia-tests --test-show-details=direct
   starts a subprocess through `Test.Support.Subprocess` (#588 converted the
   subprocess sites the baseline listed; #608 converted the two display-helper suites,
   which run the helper on a host of `Test.Support.Subprocess.Host` so that its
-  process group outlives the call, and whose probe calls are one-shot owned calls). `glfw-tests` was converted in #593, narrowed by
-  the owner (2026-11-02): every thread it starts is owned (`Test.GLFW.Support`'s
-  `onThread`, `onBoundThread`, `withDeferredThread`, `withMainThread` and the
-  scoped helpers beside the specs that use them) except three references that keep
-  their baseline entries: the evidence supplier (`forkIO`) and the dedicated bound
-  runner (`onMainThreadKeepingContext`, `forkOS`) of `Protected.hs`
-  `testStallWarningCancelledAtItsSink` (that file's entry went from 21 to 2), and
-  the harassing `forkIO` of `testRetirementRecordSurvivesCancellation` in
-  `Owner/Failure/Interruption.hs` (from 2 to 1). That removes 130 of the 133
-  references the suite had. Nine examples are left as before #593 and belong to
-  follow-ups, because an early cancellation can leave a protected drain waiting
-  for ever and test code cannot rescue it: those two;
-  `testStallWarningCancelledAtItsSink`, whose cleanup kill can land before any
-  rescue of the protected drain exists, so the drain enters the stall diagnostic's
-  sink and blocks there (the only caller of its dedicated runner helper; the
-  exception covers no other main-thread runner); `Owner/Exit/Settlement.hs`
-  `testCoherentDestructionSnapshot` (no raw thread start and no baseline entry;
-  its destruction hook waits for an owner handle that only the consumer callback
-  publishes, which an early cancellation can prevent; scenario and assertions
-  unchanged); and the six that hold the graphics owner inside its startup
-  (`Owner/Port.hs` `testPortFullReported` and `testFullPortDoesNotBlockExit`,
-  `Owner/Exit/Settlement.hs` `testUnannouncedDirectAttachSettles` and
-  `testUnannouncedClosedSettles`, `Owner/Handover.hs` `testHandoffOrder` and
-  `testHandoverRecovery`; these start no thread and carry no baseline entry, but
-  their startup gate cannot be armed later than the owner's creation). The examples that hold the
+  process group outlives the call, and whose probe calls are one-shot owned calls). `glfw-tests` was converted in #593 and #612: every thread it starts is owned
+  (`Test.GLFW.Support`'s `onThread`, `onBoundThread`, `withDeferredThread`, `withMainThread`,
+  `withMainThreadKeepingContextVia` and the scoped helpers beside the specs that use them), and no
+  baseline entry is left for it. #593 was narrowed by the owner (2026-11-02) and left nine examples
+  to #612, which converted or rescued them: `Owner/Port.hs` `testPortFullReported` and
+  `testFullPortDoesNotBlockExit`, `Owner/Exit/Settlement.hs` `testUnannouncedDirectAttachSettles`,
+  `testUnannouncedClosedSettles` and `testCoherentDestructionSnapshot`, `Owner/Handover.hs`
+  `testHandoffOrder` and `testHandoverRecovery`, `Owner/Failure/Interruption.hs`
+  `testRetirementRecordSurvivesCancellation` (its harasser is an owned start that stops at the
+  target's record; under `-N2` the old stream of cancellations outlasted the target's retirement and
+  reached the owner's destruction, which production rightly leaves unverified), and `Protected.hs`
+  `testStallWarningCancelledAtItsSink` (its supplier and runner are owned; the scope that owns the
+  runner releases the registered owners and the sink's hold before it kills the runner).
+  The seven that hold the owner's startup or its destruction are cut at every boundary of the
+  owner's start by `Test.GLFW.Owner.Fixture.Cut` (`boundaryExamples`, and `boundaryControls` where
+  the fixture without its rescue strands): the private host hook `ownerBoundary` (called with
+  `OwnerBeforePublication` before the owner's handle is published and `OwnerStarted` after the start
+  has published it), the rig's startup callback, and the body's entry, each ending the run by a
+  failure, a cancellation pending when the boundary is reached, or a cancellation delivered while the
+  run is parked there. The rescue is the exit's own: the wait for the owner's destruction opens the
+  fixture's gate on its first snapshot (`afterDestructionSnapshot`), and the body opens it on every
+  way out (`heldBody`). **Known production gap (#613).** Two boundaries of the start are not cut:
+  after the owner's handle is published inside the preparation step, and the abandoned-start path of
+  the startup wait. There the worker start drains an owner that never entered its run, destruction
+  evidence is recorded only inside that run's drain, and the protected exit waits for it for ever, so
+  no fixture can close them; #613 fixes it in production and adds those two cuts. The examples that hold the
   conversion to account run in `glfw-tests` (`--match '#593'`), each as an owned
   example and a negative control: the start-and-wait helper, the bound
   main-thread helper and the bound start in a session, a deferred thread, a
@@ -278,7 +286,17 @@ cabal test hetoimasia-tests --test-show-details=direct
   demand hook with its gate closed (`GLFW admission helper threads`), an injector
   and the helper it never reaches, a runner parked in its construction whose
   rollback waits at a second gate, and an evidence supplier waiting for an owner
-  that never exists (`GLFW protected host`, `the drain`). The thread sites that
+  that never exists (`GLFW protected host`, `the drain`). `glfw-native-tests` was
+  converted in #594: its `onThread`, `runOwned`'s borrower, the harness's
+  `withForked`, the launch-interruption example's launcher, `wokenWait` and
+  `wokenWaitBy`, the private-session rounds' wakers and the two Wayland scenario
+  workers start their threads through `Test.GLFW.Native.Threads`, which takes the
+  boundness (`Unbound` or `Bound`) in place of a fork primitive, and all 17 of its
+  baseline references (14 sites) left the baseline; `WaylandScenarios.hs:938` was
+  #588's. Its regressions run with no consent in `--match "owns the threads its
+  helpers start"` (under `the native opt-in`), each as an owned example and a
+  negative control through the deliberately unowned start of
+  `Test.GLFW.Native.Unowned`. The thread sites that
   remain in other suites are a known-debt baseline to be removed by follow-up
   changes, not to be extended.
 

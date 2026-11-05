@@ -60,7 +60,7 @@ There is no default close policy or rendering operation.
 | `hetoimasia-glfw:model` | private | The session, monitor inventory, and window models over a table of native operations, bounded error capture, window controls with their validation and capability descriptions, the window command protocol, including execution and settlement, the notification policy over the session's wake capability and the bounded demand slots, the input feed model with its private producer, warning, resumption, and closure, bounded input staging at the window callbacks, and the backend-neutral window attachment model. The window model is `Hetoimasia.GLFW.Internal.Window`, a composition module over its private parts beneath it: `.Identity`, `.Config` and `.Observation`, a window's identity, configuration and observations; `.State`, the one window handle; `.Sample` and `.Callbacks`, attribute sampling and the contained callbacks; `.Reconcile` and `.Boundary`, the reconciliation protocol and the owner boundaries built on it; `.Controls`, `.ModeAttempt` and `.ModeTransition`, the native interpreters of the pure control rules and mode planner; and `.Construction`, the staged assembly and release. The input feed names a window through `.Identity`, so the graph has no boot file. Binds nothing. |
 | `hetoimasia-glfw:native` | private | The foreign imports, `native/cbits`, and the production native table. Native handles and ABI declarations stay here. |
 | `hetoimasia-glfw:runtime-glfw` | public | `Hetoimasia.Runtime.GLFW`: the window host with its dynamically created and independently closed windows, its supervised owner loop and fair command dispatch, the CPU-only render demand helper that composes the runtime's simulation demand with each window's, and the host's quiescence action. The one library that depends on `hetoimasia-runtime`. |
-| `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`, the window host's composition module, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration, over its private parts beneath `Hetoimasia.Runtime.GLFW.Internal.Host`: `.Config`, what a host is built from; `.State` and `.Progress`, the one host handle and the retirement demand and graphics cells it publishes; `.Windows`, `.Commands`, `.Construction`, `.Wake` and `.Demand`, window registration and closing, command dispatch, construction and quiescence, the wake report and the demand slots; `.Turn`, `.Loop` and `.Pacing`, the one shared owner turn, both owner loops and the scheduled loop's pure pacing decisions; `.Application` and `.Lifetime`, the ordinary runner and the protected lifetime; and `.Seam` and `.Attachments`, the private attachment seam and the public attachment contract; `Hetoimasia.Runtime.GLFW.Internal.RenderDemand`, the pure render demand helper; `Hetoimasia.Runtime.GLFW.Internal.Owner`, the supervised graphics owner's composition module, over its private parts: `.Evidence`, `.Operations` and `.Config`, the injected backend contract; `.Handoff`, the cross-thread state it runs over; `.State`, `.Custody`, `.Observation` and `.Wake`, the one owner handle, its custody ledger, its read-only views and its authorized wake; `.Worker`, `.Targets`, `.Terminal`, `.Latch` and `.Drain`, worker progress on the owner thread; `.Handover`, `.Release`, `.Protocol`, `.Stranded` and `.Reservation`, the main thread's attachment path; and `.Start`, `.Lifetime` and `.Exit`, the owner's start, its protected-host composition and D-33's exit; and `Hetoimasia.Runtime.GLFW.Internal.Surface`, the Vulkan-free surface bridge over the protected attachment |
+| `hetoimasia-glfw:runtime-glfw-core` | private | `Hetoimasia.Runtime.GLFW.Internal`, the window host's composition module, with the test-only host hooks the dynamic window examples use to deliver a cancellation after a window's registration (and `ownerBoundary`, which the graphics-owner examples use to end a run at the boundaries of the owner's start), over its private parts beneath `Hetoimasia.Runtime.GLFW.Internal.Host`: `.Config`, what a host is built from; `.State` and `.Progress`, the one host handle and the retirement demand and graphics cells it publishes; `.Windows`, `.Commands`, `.Construction`, `.Wake` and `.Demand`, window registration and closing, command dispatch, construction and quiescence, the wake report and the demand slots; `.Turn`, `.Loop` and `.Pacing`, the one shared owner turn, both owner loops and the scheduled loop's pure pacing decisions; `.Application` and `.Lifetime`, the ordinary runner and the protected lifetime; and `.Seam` and `.Attachments`, the private attachment seam and the public attachment contract; `Hetoimasia.Runtime.GLFW.Internal.RenderDemand`, the pure render demand helper; `Hetoimasia.Runtime.GLFW.Internal.Owner`, the supervised graphics owner's composition module, over its private parts: `.Evidence`, `.Operations` and `.Config`, the injected backend contract; `.Handoff`, the cross-thread state it runs over; `.State`, `.Custody`, `.Observation` and `.Wake`, the one owner handle, its custody ledger, its read-only views and its authorized wake; `.Worker`, `.Targets`, `.Terminal`, `.Latch` and `.Drain`, worker progress on the owner thread; `.Handover`, `.Release`, `.Protocol`, `.Stranded` and `.Reservation`, the main thread's attachment path; and `.Start`, `.Lifetime` and `.Exit`, the owner's start, its protected-host composition and D-33's exit; and `Hetoimasia.Runtime.GLFW.Internal.Surface`, the Vulkan-free surface bridge over the protected attachment |
 | `hetoimasia-glfw:vulkan-interop` | public, flag-gated | `Hetoimasia.GLFW.Vulkan` and `Hetoimasia.GLFW.Vulkan.Provenance`: the loader integration capability made from the Vulkan binding's own loader entry point, the instance-extension query, and the surface bridge's production operations, over `vulkan-interop/cbits`, the one translation unit in the package that includes the Vulkan headers. Built only with the manual `vulkan-interop` flag, which only `cabal.project.vulkan` sets; see [Vulkan interop](#vulkan-interop). |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
@@ -5576,7 +5576,7 @@ own on Linux, or the desktop opt-in on a real desktop.
   A new example that needs no native session — a model, seam, host, or boundary
   contract — belongs in `glfw-tests`, beside the component spec that owns it. A
   helper thread an example needs is started through `Test.Support.Owned` (#593),
-  and in `glfw-tests` through the helpers `Test.GLFW.Support` offers over it:
+  and in `glfw-native-tests` through `Test.GLFW.Native.Threads` (#594, below), and in `glfw-tests` through the helpers `Test.GLFW.Support` offers over it:
   `onThread` and `onBoundThread` run an action on an owned thread and wait for its
   outcome; `withMainThread` runs one on an owned bound thread designated as the
   process main thread; `withDeferredThread` starts a thread that waits to be handed
@@ -5588,15 +5588,18 @@ own on Linux, or the desktop opt-in on a real desktop.
   backend arms it inside the body's first masked step, after the release that
   undoes it is registered (`Rig.armedBody`, `armedFinally`), and the protected
   fixtures' rescue is sticky once a cleanup has begun; both are exercised at each
-  cut by `Test.GLFW.Support.cutExamples`. Nine examples were left out of that
-  conversion (see `docs/test_suites.md`): the six that hold the graphics owner
-  inside its startup, `testCoherentDestructionSnapshot`, whose destruction hook
-  waits for an owner handle only the consumer callback publishes,
-  `testStallWarningCancelledAtItsSink`, whose cleanup kill can land before any
-  rescue of the protected drain exists (so the drain blocks in the stall
-  diagnostic's sink), and `testRetirementRecordSurvivesCancellation`; three
-  thread references remain unowned with baseline entries (two in
-  `Protected.hs`, one in `Owner/Failure/Interruption.hs`). An
+  cut by `Test.GLFW.Support.cutExamples`. The nine #593 left out are converted
+  or rescued by #612 (see `docs/test_suites.md`), and no baseline entry is left in `glfw-tests`.
+  The graphics owner's start offers the examples one more private hook, `HostHooks.ownerBoundary`,
+  called with `OwnerBeforePublication` at the start of the preparation step (the worker is
+  registered and forked, its handle not yet published) and with `OwnerStarted` once the start has
+  published the handle and is about to return it; production passes `noHostHooks`, whose hook does
+  nothing. `Test.GLFW.Owner.Fixture.Cut` ends a rig run at each boundary of the start through it,
+  through the rig's startup callback (`ownedHostAt`) and through the body's entry. Two further
+  boundaries (the handle's publication inside the preparation step, and the startup wait's
+  abandoned-start path) strand the protected exit in production, because the owner's destruction
+  evidence is recorded only inside a run that never started; no fixture can cut them, and #613
+  tracks the fix. An
   example that must initialize GLFW, open a real window, or observe the platform
   belongs in `glfw-native-tests` and its shared fixture.
 - **The session wake examples** (`--match "GLFW session wake"`) use only the
@@ -5792,6 +5795,41 @@ it, through a recorded launcher; and that a directly invoked child refuses
 before its scenario is looked up, keeping the unknown-scenario exit for an
 approved one. Each refusal message names the variable, the desktop opt-in, the
 owner's standing approval, and the isolated alternative.
+
+Every thread the native suite starts is owned (#594): started through
+`Test.Support.Owned` in the one masked step that registers its stop-and-join,
+and stopped and joined on every way out of the scope that needed it, a
+cancellation delivered while it starts included. The helpers no longer take a
+fork primitive; a thread's boundness is a value (`Test.GLFW.Native.Threads`,
+`Unbound` or `Bound`, the latter on the facility's owned bound start of #593),
+so the four starts that were `forkOS` (the bound wakers of the private-session
+rounds and of the wake examples, and the session examples' bound worker) are
+still OS-bound and no example's thread identity changed. `onThread` is an owned
+start; `wokenWait` and `wokenWaitBy` own the worker that wakes the owner's wait,
+whose "owner is done" flag the scope also raises, so a cancellation before the
+owner's own `finally` cannot leave it spinning; the harness's `withForked` owns
+the threads its examples start, and `withForkedOpening` opens a gate only the
+scope can open before it joins; the launch-interruption example's launcher is
+owned, and with it the child, its readers and its handles. A worker that acts
+during a release, after the borrower returned, has a scope that encloses the
+whole run. `runOwned`'s borrower is owned too: its settlement is unchanged (it
+lets the borrower finish, absorbs a further cancellation in that wait, and holds
+the resource until the borrower has) and the scope closes the one interval it
+did not cover, a cancellation after the borrower started and before the
+settlement was installed. The private-session rounds' wakers outlive the session
+until their capability answers `WakeTerminal`, so their scopes enclose the
+session's, and the capability reaches them through a cell. The ownership
+regressions are `owns the threads its helpers start (#594)` under `the native
+opt-in`, so they run with no consent, session or display
+(`--match "owns the threads its helpers start"`): each ends the scope while the
+thread is parked, by a failing body and by a cancellation, and judges that it has
+ended and been joined, and each has a negative control through the deliberately
+unowned start of `Test.GLFW.Native.Unowned`, which must fail. A control's own
+registered stop-and-join is uninterruptible, and `the controls' own cleanup` holds
+that with a cancellation delivered while the kill blocks, and its own negative
+control (an interruptible cleanup is abandoned and leaves the worker). The helpers that
+need a session (`Private.hs`, the Wayland scenarios, the wake examples) are
+covered by their own examples in the display groups.
 
 The native examples cover:
 
