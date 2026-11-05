@@ -42,11 +42,6 @@ does.
   capabilities it is a message the target's capability takes in later (GHC 9.14.1
   `rts/Schedule.c`, `scheduleProcessInbox` returns at once when the capability's
   lock is busy), and no wait on the sender's status establishes receipt.
-  The pinned start is also how a worker and its cancellation's killer are started when the killer has to outlive the call that
-  arms it: the killer is started with the worker and parked at a gate only the arm opens, so its scope encloses the worker's whole
-  run and the cancellation stays pending until the worker has received it (#596,
-  `Test.Vulkan.Proof.PendingCancellation` in `vulkan-native-tests`). The start's examples, with a plain `forkOn` as the negative
-  control and a placement check over every capability of a run with at least two, are in `tools/test/OwnedThread.hs`.
   A test that asserts boundness (a seam that rejects entry from a bound worker and
   from an unbound thread, a thread designated as the process main thread) starts
   its thread with `withOwnedBoundThread action body`, or
