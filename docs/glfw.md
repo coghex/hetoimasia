@@ -5821,7 +5821,10 @@ opt-in`, so they run with no consent, session or display
 (`--match "owns the threads its helpers start"`): each ends the scope while the
 thread is parked, by a failing body and by a cancellation, and judges that it has
 ended and been joined, and each has a negative control through the deliberately
-unowned start of `Test.GLFW.Native.Unowned`, which must fail. The helpers that
+unowned start of `Test.GLFW.Native.Unowned`, which must fail. A control's own
+registered stop-and-join is uninterruptible, and `the controls' own cleanup` holds
+that with a cancellation delivered while the kill blocks, and its own negative
+control (an interruptible cleanup is abandoned and leaves the worker). The helpers that
 need a session (`Private.hs`, the Wayland scenarios, the wake examples) are
 covered by their own examples in the display groups.
 
