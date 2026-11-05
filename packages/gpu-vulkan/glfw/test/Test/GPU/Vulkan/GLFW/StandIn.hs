@@ -48,6 +48,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , StandInSurfaceLost (..)
   , injectedMessageId
   , reportErrorNow
+  , onSceneEvent
   , reportWarningNow
   , awaitSinkRecorded
   , claimSinkFirst
@@ -1234,6 +1235,13 @@ raiseOnCreate rig kind failure = atomically (modifyTVar' (renderingCreations (ri
 renderWith ∷ Rig → VulkanRenderer Scene → IO ()
 renderWith rig renderer = atomically (writeTVar (rigRenderer rig) (Just renderer))
 
+-- | Run this on the owner's thread with every later scene event, inside the
+-- lifecycle report that made it and after it is logged. The scene lifecycle's
+-- hooks run in the owner's step, so what this does must never wait for the
+-- owner (an admission to the owner's action queue never does).
+onSceneEvent ∷ Rig → (SceneEvent → IO ()) → IO ()
+onSceneEvent rig = atomically . writeTVar (rigSceneHook rig)
+
 -- | Run this on the owner's thread with every later frame event, as a frame
 -- observer does, after the event is logged.
 onFrameEvent ∷ Rig → (FrameEvent → IO ()) → IO ()
@@ -1616,6 +1624,10 @@ data Rig = Rig
   , rigSceneRounds ∷ !(TVar [Natural])
     -- ^ For each of them, the owner's completed rounds when it was reported:
     -- the round that reported it is the next one.
+  , rigSceneHook ∷ !(TVar (SceneEvent → IO ()))
+    -- ^ What runs on the owner's thread, inside the adoption or release that
+    -- reported an event, after the event is logged; nothing until an example
+    -- installs one ('onSceneEvent').
   , rigTargetCapacity ∷ !Natural
     -- ^ How many offscreen scene targets the host accounts for at once.
   , rigValidation ∷ !ValidationChoice
@@ -1910,6 +1922,7 @@ newRigClocked visible windows clock = do
   native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty <*> newTVarIO imageUsageColorAttachment <*> newTVarIO False <*> newTVarIO Set.empty <*> newTVarIO ([], []) <*> newTVarIO []
   renderer ← newTVarIO Nothing
   frameHook ← newTVarIO (\_ → pure ())
+  sceneHook ← newTVarIO (\_ → pure ())
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
   verdict ← newTVarIO Nothing
   refusalHook ← newTVarIO (\_ → pure ())
@@ -1967,6 +1980,7 @@ newRigClocked visible windows clock = do
       , rigSceneMode = SharedScene
       , rigSceneEvents = sceneLog
       , rigSceneRounds = sceneRoundLog
+      , rigSceneHook = sceneHook
       , rigValidation = ValidationOff
       }
 
@@ -2027,11 +2041,13 @@ runRigOwned rig body = myThreadId >>= \self → withBoundThread (rigBound rig) s
                   _ → pure ()
               readTVarIO (rigFrameHook rig) >>= ($ event)
           }
-      reportScene event = atomically $ do
-        modifyTVar' (rigSceneEvents rig) (<> [event])
-        owner <- readTVar (rigOwner rig)
-        rounds <- maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) owner
-        modifyTVar' (rigSceneRounds rig) (<> [rounds])
+      reportScene event = do
+        atomically $ do
+          modifyTVar' (rigSceneEvents rig) (<> [event])
+          owner <- readTVar (rigOwner rig)
+          rounds <- maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) owner
+          modifyTVar' (rigSceneRounds rig) (<> [rounds])
+        readTVarIO (rigSceneHook rig) >>= ($ event)
       timed owner = case rigClock rig of
         Nothing → owner
         Just cell →
