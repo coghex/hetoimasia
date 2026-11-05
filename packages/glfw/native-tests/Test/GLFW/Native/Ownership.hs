@@ -17,7 +17,7 @@
 module Test.GLFW.Native.Ownership (spec, withLauncher) where
 
 import Control.Concurrent (ThreadId, isCurrentThreadBound, myThreadId, throwTo, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (UserInterrupt), IOException, SomeException, finally, throwIO, try, uninterruptibleMask_)
 import Control.Monad (void, when)
@@ -248,11 +248,24 @@ cleanupCancelled protect = do
         blockedKill ← awaitBlockedSending runner
         blockedKill `shouldBe` True
         startIn ownedScope Unbound (pure ()) (throwTo runner UserInterrupt) $ \canceller _ → do
-          -- Deferred (the thrower blocks) when the cleanup cannot be interrupted; taken at once (the thrower ends) when it can.
+          -- Deferred (the thrower stays blocked) when the cleanup cannot be interrupted; taken (the thrower ends and the
+          -- cleanup is abandoned) when it can. A thrower handing its exception to an interruptible target is blocked for an
+          -- instant too, so the worker is let go only once the cleanup has either ended or kept holding for a count of
+          -- scheduler yields (never a duration, as in 'hasEnded'): the cleanup that cannot be interrupted never ends here.
           void (awaitBlockedSending canceller)
+          cleanupSettles result
           putMVar gate ()
+          -- Whether the cancellation reached the runner before it finished is not the property: a throw still in transit when a
+          -- cleanup that cannot be interrupted ends is dropped. The property is the worker.
           runnerEnded
-          readMVar result >>= (`shouldBe` True) . endedAs Cancelled
         hasEnded worker
     )
     `finally` void (tryPutMVar never ())
+
+-- | Wait for the answer of the cleanup's runner, or give up after a count of yields: the runner of a cleanup that cannot be
+-- interrupted answers only after the worker has been let go.
+cleanupSettles ∷ MVar a → IO ()
+cleanupSettles result = go (100000 ∷ Int)
+  where
+    go 0 = pure ()
+    go remaining = tryReadMVar result >>= maybe (yield >> go (remaining - 1)) (const (pure ()))
