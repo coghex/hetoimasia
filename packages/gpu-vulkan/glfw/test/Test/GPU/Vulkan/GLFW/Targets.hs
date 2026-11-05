@@ -426,8 +426,9 @@ testBatchFixedAtStepBegin = do
         (_, Left refusal) → failWith ("the action admitted during the adoption was refused: " <> show refusal)
     ranIn ← awaitRan ticket
     pure (admittedIn, ranIn)
-  -- It was admitted in the round that adopted revision 1, and ran in a later one.
-  ranIn `shouldSatisfy` (> admittedIn)
+  -- It was admitted in the round that adopted revision 1, and ran in the very next one: not in that round, and
+  -- not later than its admission's own wake asks for.
+  ranIn `shouldBe` admittedIn + 1
 
 -- | A release request queued before the step began is in its batch whatever
 -- its barrier says then: the barrier is judged when the request is reached,
