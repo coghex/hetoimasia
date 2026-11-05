@@ -50,6 +50,7 @@ import Control.Concurrent.STM
   , check
   , modifyTVar'
   , newTVarIO
+  , orElse
   , readTVar
   , readTVarIO
   , writeTVar
@@ -68,6 +69,7 @@ import Control.Monad (forM_, join, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isNothing)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
+import GHC.IO (unsafeUnmask)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
@@ -127,6 +129,8 @@ data Cutting = Cutting
     -- ^ The fixture's rig, recorded by the fixture, so the harness can read its journal.
   , cuttingSnapshots ∷ !(TVar Int)
     -- ^ How many turns of the exit's wait for the owner's destruction have taken their snapshot.
+  , cuttingFinished ∷ !(TVar Bool)
+    -- ^ Set by a control when the unrescued fixture's run ended, so the control never waits for a strand that did not happen.
   , cuttingCrossed ∷ !(IORef [Boundary])
     -- ^ Every boundary the run crossed, oldest first, recorded as it was reached and before the cut was performed there: the observed
     -- boundary of a cell, and the proof that a failure meant for a pre-callback boundary was not raised after the body began.
@@ -143,7 +147,8 @@ uncut = do
   snapshots ← newTVarIO 0
   release ← newIORef (pure ())
   crossed ← newIORef []
-  pure (Cutting Nothing (pure ()) True gate rigs snapshots crossed release)
+  finished ← newTVarIO False
+  pure (Cutting Nothing (pure ()) True gate rigs snapshots finished crossed release)
 
 -- | Build a cutting for one cell and run the body with it, inside the scope of the thread that delivers the cancellation.
 -- The thread is owned: however the body ends it has been stopped and joined before this returns, and the thread is recorded so the
@@ -163,8 +168,12 @@ withCutting recorded state boundary rescued body = do
           CutDelivered → myThreadId >>= handOver >> holdForever
           -- Masked so the cancellation cannot be received before the boundary has been left: the thread that delivers it is blocked
           -- in its throw, which is the one state a cancellation can be pending in.
-          CutPending → uninterruptibleMask_ (myThreadId >>= handOver >> awaitThrowing helper)
-    body (Cutting (Just boundary) cut rescued gate rigs snapshots crossed release)
+          -- The yield afterwards is not decoration. A throw to a thread running on another capability is a message that capability
+          -- processes when its scheduler next runs, so without it the cancellation is received at some later point of the run, which
+          -- can be inside the startup wait (#613) and is not the boundary this state names.
+          CutPending → uninterruptibleMask_ (myThreadId >>= handOver >> awaitThrowing helper >> yield)
+    finished ← newTVarIO False
+    body (Cutting (Just boundary) cut rescued gate rigs snapshots finished crossed release)
 
 -- | Wait, by yielding, until the thread is blocked delivering its exception.
 awaitThrowing ∷ ThreadId → IO ()
@@ -237,7 +246,7 @@ boundaryExamples what fixture =
 boundaryControls ∷ String → (Cutting → IO ()) → Spec
 boundaryControls what fixture =
   forM_ [boundary | boundary ← allBoundaries, boundary /= BeforePublication] $ \boundary →
-    forM_ allStates $ \state →
+    forM_ [state | state ← allStates, state /= CutPending] $ \state →
       it ("negative control: " <> describeCut what boundary state <> ", unrescued (#612)") $
         boundedExample (cutStrands state boundary fixture)
 
@@ -264,10 +273,15 @@ cutRuns ∷ CutState → Boundary → (Cutting → IO ()) → Expectation
 cutRuns state boundary fixture = do
   recorded ← newIORef []
   withCutting recorded state boundary True $ \cutting → do
-    outcome ← try (fixture cutting)
+    -- Run unmasked, as an application's main thread is. The run's bound thread inherits the state of its caller, and an example's own
+    -- thread may be masked; a cancellation that is pending is then received at whatever interruptible point comes first instead of at
+    -- the boundary, which can be the startup wait that #613 leaves stranded.
+    outcome ← try (unsafeUnmask (fixture cutting))
     case outcome of
       Right () → unexpected "the cut run returned instead of raising what was injected"
       Left caught → caught `shouldSatisfy` raisedAsInjected state
+    -- The run reached the boundary it was cut at, having crossed every earlier one in order and none after it: a failure meant for a
+    -- boundary before the body never became one raised by the body.
     -- The run reached the boundary it was cut at, having crossed every earlier one in order and none after it: a failure meant for a
     -- boundary before the body never became one raised by the body.
     readIORef (cuttingCrossed cutting) >>= (`shouldBe` [reached | reached ← allBoundaries, reached <= boundary])
@@ -280,11 +294,11 @@ judgeFinished boundary cutting = do
   rig ← readIORef (cuttingRig cutting) >>= maybe (unexpected "the fixture recorded no rig") pure
   notes ← journalled (rigJournal rig)
   notes `shouldSatisfy` elem SessionEnded
-  case boundary of
-    BeforePublication → notes `shouldSatisfy` notElem OwnerStartup
-    _ → do
-      notes `shouldSatisfy` elem OwnerDestruction
-      readTVarIO (cuttingGate cutting) >>= (`shouldBe` True)
+  let started = OwnerStartup `elem` notes
+  when (boundary == BeforePublication) (started `shouldBe` False)
+  when (boundary /= BeforePublication) $ do
+    notes `shouldSatisfy` elem OwnerDestruction
+    readTVarIO (cuttingGate cutting) >>= (`shouldBe` True)
 
 cutStrands ∷ CutState → Boundary → (Cutting → IO ()) → Expectation
 cutStrands state boundary fixture = do
@@ -292,11 +306,11 @@ cutStrands state boundary fixture = do
   done ← newEmptyMVar @(Either SomeException ())
   withCutting recorded state boundary False $ \cutting → do
     let open = atomically (writeTVar (cuttingGate cutting) True)
-    withOwnedThreadOpening open (try (fixture cutting) >>= putMVar done) $ \_ _ →
+    withOwnedThreadOpening open (try (fixture cutting) >>= \ended → atomically (writeTVar (cuttingFinished cutting) True) >> putMVar done ended) $ \_ _ →
       ( do
           -- The exit is waiting for a destruction that cannot come: it has taken its first snapshot of the owner's terminal record, which
           -- holds no evidence, and its owner is held at its gate, so nothing can end the wait but the release below.
-          atomically (stalledSnapshots cutting 1)
+          atomically (stalledSnapshots cutting 1 `orElse` (readTVar (cuttingFinished cutting) >>= check))
           stranded ← isNothing <$> tryReadMVar done
           rig ← readIORef (cuttingRig cutting) >>= maybe (unexpected "the fixture recorded no rig") pure
           notes ← journalled (rigJournal rig)
