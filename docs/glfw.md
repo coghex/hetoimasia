@@ -4529,15 +4529,20 @@ happens inside the action's own protected retirement — and the evidence that
 retirement records can never come. The starter therefore *withdraws* the owner
 from the protected exit: in one transaction it reads that the worker's
 completion is published and that `ownerEntered` is unset, and empties the
-cell the exit reads the owner from, closing the owner's publications if the
-host's quiescence has already committed. Quiescence that commits first closes
-the published owner itself, so no order of the three leaves a withdrawn owner
-admitting. The exit then finds no owner and settles exactly as it does for a
-host whose owner never started: it quiesces, drains, unwinds the windows and
-the session in the order above, and the start's failure or cancellation is
-raised as itself, with the abandoned-start evidence and the cleanup failures
-retained beside it. The same holds for a worker that ends before it
-acknowledges while the start's wait returns normally.
+cell the exit reads the owner from and closes the owner's publications, whether
+or not the host's quiescence has committed: quiescence that committed first
+had closed the published owner itself, and one that commits later cannot find
+a withdrawn owner, so the withdrawal closes it. The exit then finds no owner
+and settles exactly as it does for a host whose owner never started: it
+quiesces, drains, unwinds the windows and the session in the order above, and
+the start's failure or cancellation is raised as itself, with the
+abandoned-start evidence and the cleanup failures retained beside it. The same
+holds for a worker that ends before it acknowledges while the start's wait
+returns normally, with one difference: that start returns the owner to the
+application, so the wait observes the terminal worker and withdraws it in the
+one transaction that answers (no cancellation can fall between the two), and
+the owner it returns refuses every publication and handover instead of
+announcing a target to a worker that can never retire it.
 
 This does not relax the rule above. The exit's wait is unchanged, it has no
 new way to return, and nothing is ever published as destruction evidence:

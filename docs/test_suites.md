@@ -291,7 +291,8 @@ cabal test hetoimasia-tests --test-show-details=direct
   for when the start is abandoned afterwards (and the exit retains everything until independent
   evidence ends the wait), an owner withdrawn from an exit whose quiescence committed before or while
   it was published has its publications closed, and a worker that ends before it acknowledges while
-  the start's wait returns is withdrawn too. The examples that hold the
+  the start's wait returns is withdrawn too (the owner it returns refuses every publication and handover, and a failure or
+  cancellation right after the start returns it finishes the exit; `afterUnacknowledgedExamples`). The examples that hold the
   conversion to account run in `glfw-tests` (`--match '#593'`), each as an owned
   example and a negative control: the start-and-wait helper, the bound
   main-thread helper and the bound start in a session, a deferred thread, a
