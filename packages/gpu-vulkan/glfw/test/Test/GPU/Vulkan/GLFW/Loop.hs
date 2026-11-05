@@ -970,40 +970,52 @@ testDirectHideShowBetweenSteps = do
       WindowHidden _ → True
       _ → False
 
--- | Wait until the owner is idle at the scripted clock's standing instant, its
--- latest demand taken by a round that has ended.
+-- | Wait until the owner is idle at the scripted clock's standing instant, the
+-- round that took its latest demand having ended.
 --
 -- That the latest demand is taken says only that a round has read it: the
 -- flag flips when the round's step begins, and the owner's status describes
--- the round before, which ends later. So the demand is followed by an empty
--- one, published once the first is taken. The round that takes the second
--- begins after the round that took the first has ended, rounds being one at a
--- time, and the status then describes that round or a later one: its last
--- step owed no further work at once, and its next deadline, if it has one, is
--- not yet due. Nothing then wakes the owner until the clock moves or something
--- is published to it. The empty demand asks no frame of any target and resets
--- nothing, as the pacing example that publishes one shows.
+-- the round before, which ends later. So an empty demand is published once the
+-- latest is taken, and the round that begins a step carrying it is waited
+-- for: rounds being one at a time, every round before it has ended once it
+-- has, and the status then describes it or a later one — its last step owed
+-- no further work at once, and its next deadline, if it has one, is not yet
+-- due. Nothing then wakes the owner until the clock moves or something is
+-- published to it. The empty demand asks no frame of any target and resets
+-- nothing, as the pacing example that publishes one shows. The demand before
+-- it must be a real one: a step carries the owner's latest demand, and the
+-- empty one is told from it by its content.
 awaitOwnerIdle ∷ Rig → VulkanHost Scene → IO ()
 awaitOwnerIdle rig host = ownerIdleBarrier rig host >>= \idle → atomically (idle >>= check)
 
--- | Wait until the owner has taken its latest demand, publish an empty one
+-- | Wait until the owner has taken its latest demand and publish an empty one
 -- after it, and answer the transaction that says whether the owner is idle
--- once a round has taken that one too ('awaitOwnerIdle' waits on it).
+-- once the round that took the empty one has ended ('awaitOwnerIdle' waits on
+-- it).
 ownerIdleBarrier ∷ Rig → VulkanHost Scene → IO (STM Bool)
 ownerIdleBarrier rig host = do
   let owner = vulkanGraphicsOwner host
+      empty = OwnerDemand False Nothing
   atomically (readOwnerDemandTaken owner >>= check)
-  nothing ← prepare (OwnerDemand False Nothing)
-  _ ← atomically (publishOwnerDemand (ownerHandoff owner) nothing)
+  nothing ← prepare empty
+  -- The steps begun before the publication either read the demand before it
+  -- or carry the one it follows, never the empty one.
+  begun ← atomically $ do
+    steps ← length <$> readTVar (rigStepEntries rig)
+    _ ← publishOwnerDemand (ownerHandoff owner) nothing
+    pure steps
   pure $ do
-    taken ← readOwnerDemandTaken owner
-    status ← readOwnerStatusNow owner
-    -- A rig on the real clock has no standing instant to compare a deadline
-    -- with, and its owner serves a due deadline by itself.
-    due ← case rigClock rig of
-      Nothing → pure False
-      Just clock → (\now → maybe False (deadlineReached now) (statusNextDeadline status)) <$> readTVar clock
-    pure (taken && not (statusImmediate status) && not due)
+    entries ← drop begun <$> readTVar (rigStepEntries rig)
+    case [at | (demand, at) ← entries, demand == empty] of
+      [] → pure False
+      rounds : _ → do
+        status ← readOwnerStatusNow owner
+        -- A rig on the real clock has no standing instant to compare a
+        -- deadline with, and its owner serves a due deadline by itself.
+        due ← case rigClock rig of
+          Nothing → pure False
+          Just clock → (\now → maybe False (deadlineReached now) (statusNextDeadline status)) <$> readTVar clock
+        pure (statusRounds status > rounds && not (statusImmediate status) && not due)
 
 -- | Submit a command through the host's port and wait for its settlement,
 -- from a thread that is not the main one.
