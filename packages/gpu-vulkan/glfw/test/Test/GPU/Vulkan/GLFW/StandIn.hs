@@ -64,6 +64,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
     -- * The rendering layers
   , Rendering
   , submissionsComplete
+  , submissionsCompleteWhen
   , millisecondsOf
   , presentationsRetire
   , scriptPresentStatus
@@ -188,7 +189,7 @@ import Data.Foldable (for_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -983,6 +984,10 @@ data Rendering = Rendering
     -- ^ How many the canceller has delivered.
   , renderingCanceller ∷ !(TVar (Maybe ThreadId))
     -- ^ The thread of the run now under way that throws them, owned by the run.
+  , renderingSubmissionGate ∷ !(TVar (Maybe (STM Bool)))
+    -- ^ When set, a transaction that lets a submission fence answer signalled while it holds, beside
+    -- 'renderingSubmissions': the fence query reads it in its own transaction, so the completion and what the gate
+    -- observes are one atomic fact ('submissionsCompleteWhen').
   }
 
 -- | Where a rig cancels the graphics owner.
@@ -1133,10 +1138,20 @@ newRendering =
     <*> newTVarIO 0
     <*> newTVarIO 0
     <*> newTVarIO Nothing
+    <*> newTVarIO Nothing
 
 -- | Whether a submission's fence answers signalled when it is next asked.
 submissionsComplete ∷ Rig → Bool → IO ()
 submissionsComplete rig = atomically . writeTVar (renderingSubmissions (rigRendering rig))
+
+-- | Let every submission fence answer signalled, from the fence query on which this transaction holds, and not before.
+--
+-- The condition is read in the fence query's own transaction, so the completion and the fact it waits for are one
+-- observation: whichever thread asks first after the condition holds finds the submission complete, on whatever
+-- capability it runs, with no supplier thread to be scheduled in between. It adds to 'submissionsComplete' and
+-- 'completeNextSubmissions' and replaces neither; given a rig that never calls it, a query is as it was.
+submissionsCompleteWhen ∷ Rig → STM Bool → IO ()
+submissionsCompleteWhen rig = atomically . writeTVar (renderingSubmissionGate (rigRendering rig)) . Just
 
 -- | Whether a present fence answers signalled when it is next asked.
 presentationsRetire ∷ Rig → Bool → IO ()
@@ -1405,7 +1420,8 @@ renderingLayers rescued events rendering clock =
             kindBefore ← Map.lookup handle <$> readTVarIO (renderingFences rendering)
             answer ← atomically $ do
               kind ← Map.lookup handle <$> readTVar (renderingFences rendering)
-              submissions ← readTVar (renderingSubmissions rendering)
+              gated ← readTVar (renderingSubmissionGate rendering) >>= fromMaybe (pure False)
+              submissions ← (|| gated) <$> readTVar (renderingSubmissions rendering)
               presentations ← readTVar (renderingPresentations rendering)
               counted ← readTVar (renderingRetireCount rendering)
               submissionsLeft ← readTVar (renderingSubmissionCount rendering)
