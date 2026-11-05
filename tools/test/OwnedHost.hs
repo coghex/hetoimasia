@@ -1553,6 +1553,31 @@ lifecycleSpec = describe "The lifecycle of a request's handles" $ do
         readIORef (heldCancelled held) `shouldReturn` True
         hIsOpen handle `shouldReturn` True
 
+  it "Diagnostics: a close that cannot be confirmed when the body never started is kept beside the bound failure and raised by the owner's scope" $ do
+    wires <- newWires
+    ran <- newIORef False
+    -- The bound has passed before the body can start, and the reap bound is zero: the close cannot be confirmed.
+    let hooks =
+          (withWires wires)
+            { hostLimit = \site deadline action -> case (site, deadline) of
+                (AtBody, DeadlineAt _) -> pure Nothing
+                _ -> limitBy wires site deadline action
+            }
+    outcome <-
+      tryWithContext @SomeException . withSupplied $ \handle ->
+        withHostUsing quick {boundReap = 0} noSeams hooks $ \host ->
+          withSubmission host (supplying handle (readyChild (Within 60000000) "a" nowhere)) (flagged ran) $ \a -> do
+            answer <- answered a
+            answer `shouldSatisfy` namesBound "60 s"
+            either retained (const []) answer `shouldSatisfy` any ("could not be flushed" `isInfixOf`)
+            readIORef ran `shouldReturn` False
+            bounded (awaitHostState host (== Idle))
+    case outcome of
+      Left (ExceptionWithContext _ failure) -> case fromException failure of
+        Just (SubprocessFailure message) -> message `shouldSatisfy` (\text -> "cleanup was not confirmed" `isInfixOf` text && "could not be flushed" `isInfixOf` text)
+        Nothing -> expectationFailure ("the owner's scope raised " <> show failure)
+      Right () -> expectationFailure "the unconfirmed close was lost: the owner's scope returned"
+
   -- A failed start, the submitter gone (cancelled where the worker has claimed the request), and a handle whose flush cannot
   -- complete: the facility's own close times out, annotates the start failure and closes the handle, so the worker's second close finds
   -- nothing; the diagnostic is kept at the host's scope, not only on a reply nobody reads.
