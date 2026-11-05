@@ -25,7 +25,7 @@ import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, retry, writeTVar, modifyTVar')
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeException, catch, finally, fromException, throwIO, try)
-import Control.Monad (replicateM_, void)
+import Control.Monad (replicateM_, void, when)
 import Data.Foldable (for_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
@@ -84,6 +84,10 @@ spec = describe "Offscreen scene targets (LFE-27)" $ do
     itBounded "runs a held release request when the target is unregistered, without the revision ever being adopted, and releases what the target had adopted" testBarrierEndsWithUnregistration
     itBounded "leaves a target at revision 0 out of the barrier when the host declares its initial scene holds nothing, and names it otherwise" testInitialSceneExemption
     itBounded "settles a held release request as refused, never run, when the session fails, and when the owner's exit begins" testHeldRequestRefused
+    itBounded "runs a release request queued before the owner's step, whose barrier only that step's own adoption meets, in that same round" testReleaseRunsInStepOfItsAdoption
+
+  describe "the owner step's batch" $ do
+    itBounded "leaves an action admitted during the step's scene adoption to the next round, though the step has not yet served its queue" testBatchFixedAtStepBegin
 
   describe "adoption and release" $ do
     itBounded "releases a superseded revision only when its batch's own ticket is complete, once, in adoption order, and announces nothing while the completion is withheld" testReleaseOnTicketCompletion
@@ -294,9 +298,11 @@ testRegistrationRefusals = do
     _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
     awaitReady host
     target ← registered host
-    reportErrorNow rig "an error while a target is registered"
-    -- The round that takes the error: a publication asks the owner for one, as an application does.
-    _ ← publishNow host target 1
+    -- The error arrives as a validation error does in production, inside a call the owner made: an owner-thread
+    -- action reports it, and the action's own checkpoint latches it. Reported from this thread, it would wait for
+    -- a round that began after it, and a publication does not make one when the round in flight takes it
+    -- ("Reporting an error wakes no one", docs/gpu_backend.md).
+    act host (VulkanAction (\_ → reportErrorNow rig "an error while a target is registered")) >>= returned
     atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
     afterFailure ← atomically (registerVulkanSceneTarget host)
     published ← publishNow host target 2
@@ -381,6 +387,80 @@ testBarrierWaitsForAdoption = do
   -- It ran only after the target had adopted revision 1.
   adoptedOf ranAt target `shouldBe` [(0, 0), (1, 71)]
   fmap windowAdopted afterRun `shouldBe` Just (Just 1)
+
+-- ---------------------------------------------------------------------------
+-- The owner step's batch
+
+-- | The owner's step fixes its batch of owner-thread actions when it begins
+-- (docs/gpu_backend.md, "after its checkpoint, runs the actions queued when
+-- the step began"). An action admitted from inside the step's own scene
+-- adoption, which runs on the owner's thread before the step serves its queue,
+-- is not in it: it runs in the next round.
+--
+-- The admission is made by the scene lifecycle's hook, so it happens at one
+-- known point of one known step, with nothing to schedule; the rounds are
+-- the owner's own count, read in the admission and in the action.
+testBatchFixedAtStepBegin ∷ IO ()
+testBatchFixedAtStepBegin = do
+  rig ← surfaceFreeRig 0
+  admission ← newTVarIO (Nothing ∷ Maybe (Natural, Either ActionRefusal (ActionTicket Natural)))
+  (admittedIn, ranIn) ← runRig rig $ \host _ → do
+    awaitReady host
+    target ← registered host
+    awaitTargetStanding host target ((== Just 0) . windowAdopted)
+    let roundsNow = statusRounds <$> readOwnerStatusNow (vulkanGraphicsOwner host)
+    onSceneEvent rig $ \case
+      TargetAdopted at 1 _ | at == target →
+        atomically $ do
+          already ← isJust <$> readTVar admission
+          when (not already) $ do
+            rounds ← roundsNow
+            submitted ← submitVulkanAction (vulkanController host) (VulkanAction (\_ → atomically roundsNow))
+            writeTVar admission (Just (rounds, submitted))
+      _ → pure ()
+    published ← publishNow host target 1
+    published `shouldBe` TargetScenePublished target 1
+    (admittedIn, ticket) ←
+      atomically (readTVar admission >>= maybe retry pure) >>= \case
+        (rounds, Right ticket) → pure (rounds, ticket)
+        (_, Left refusal) → failWith ("the action admitted during the adoption was refused: " <> show refusal)
+    ranIn ← awaitRan ticket
+    pure (admittedIn, ranIn)
+  -- It was admitted in the round that adopted revision 1, and ran in the very next one: not in that round, and
+  -- not later than its admission's own wake asks for.
+  ranIn `shouldBe` admittedIn + 1
+
+-- | A release request queued before the step began is in its batch whatever
+-- its barrier says then: the barrier is judged when the request is reached,
+-- after the step's adoption, so a revision only that adoption brings in lets it
+-- run in that same round (docs/gpu_backend.md, "The step adopts before it
+-- services the queue"). Both the request's action and the adoption's report
+-- read the owner's own round count.
+testReleaseRunsInStepOfItsAdoption ∷ IO ()
+testReleaseRunsInStepOfItsAdoption = do
+  rig ← surfaceFreeRig 0
+  (adoptedIn, ranIn) ← runRig rig $ \host _ → do
+    awaitReady host
+    target ← registered host
+    awaitTargetStanding host target ((== Just 0) . windowAdopted)
+    let roundsNow = statusRounds <$> readOwnerStatusNow (vulkanGraphicsOwner host)
+    ticket ← holdingOwner host $ \release → do
+      scene ← prepare 91
+      -- Accepted, and the request made, in one transaction, while the owner is inside the holding action: the
+      -- request waits for revision 1, which the owner adopts only in a step that begins after this transaction.
+      (published, queued) ← atomically ((,) <$> publishVulkanTargetScene host target scene <*> requestVulkanRelease (vulkanController host) (VulkanAction (\_ → atomically roundsNow)))
+      published `shouldBe` TargetScenePublished target 1
+      held ← either (\refusal → failWith ("refused: " <> show refusal)) pure queued
+      release
+      pure held
+    ranIn ← awaitRan ticket
+    events ← sceneEvents rig
+    rounds ← sceneRounds rig
+    adoptedIn ← case [round' | (TargetAdopted at 1 _, round') ← zip events rounds, at == target] of
+      [only] → pure only
+      other → failWith ("expected one adoption of revision 1, saw rounds " <> show other)
+    pure (adoptedIn, ranIn)
+  ranIn `shouldBe` adoptedIn
 
 testBarrierEndsWithUnregistration ∷ IO ()
 testBarrierEndsWithUnregistration = do

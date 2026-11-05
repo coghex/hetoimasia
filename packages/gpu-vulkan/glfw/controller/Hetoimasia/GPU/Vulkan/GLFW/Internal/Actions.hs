@@ -56,6 +56,19 @@
 -- step. A queue holding nothing but blocked release requests is not work: it
 -- does not wake an idle owner.
 --
+-- = A step's batch
+--
+-- An owner step serves the entries that were queued when it began, and no
+-- other: it fixes its 'Batch' ('beginBatch') before anything else it does, and
+-- 'startAction' takes only entries admitted before that. An entry admitted
+-- later — while the step checks the session, adopts scenes, or runs an earlier
+-- entry of its batch — waits for the next step, which its admission already
+-- asks for. Which entries are in the batch is a fact of when each was
+-- admitted, not a count: a release request in it is still judged when it is
+-- taken, by its barrier then, so one the step's own adoption satisfies still
+-- starts in that same step, and an entry admitted later can never take the
+-- place of a batch entry that is blocked.
+--
 -- = State
 --
 -- +------------------+--------------+------------------------------------+--------+--------------------------+------------------------------+
@@ -85,6 +98,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , pendingBarriers
   , actionsWaiting
   , actionsCount
+  , Batch
+  , beginBatch
   , Started (..)
   , startAction
   , refuseRemaining
@@ -192,13 +207,16 @@ awaitActionTicket ticket = readActionTicket ticket >>= maybe retry pure
 -- revision or a later one, unless the host no longer holds it.
 type Barrier = Map SceneTargetKey Natural
 
--- | One queued action, with its ticket's standing and, for a release request,
--- the barrier it waits for.
-data Entry = ∀ r. Entry !(TVar (Standing r)) !(VulkanAction r) !(Maybe Barrier)
+-- | One queued action, with the place it was admitted in, its ticket's standing
+-- and, for a release request, the barrier it waits for. The places count up from
+-- the queue's first admission, so the queue is always in their order.
+data Entry = ∀ r. Entry !Natural !(TVar (Standing r)) !(VulkanAction r) !(Maybe Barrier)
 
 -- | The session's queue of admitted actions.
 data Actions = Actions
   { actionsQueue ∷ !(TVar (Seq Entry))
+  , actionsAdmitted ∷ !(TVar Natural)
+    -- ^ How many entries have ever been admitted: the place the next one takes.
   , actionsCapacity ∷ !Natural
     -- ^ How many actions with no barrier the queue may hold.
   , actionsReleaseCapacity ∷ !Natural
@@ -214,7 +232,10 @@ data Actions = Actions
 -- release requests, gated by this, whose release requests wait on barriers that
 -- are met when this says so.
 newActions ∷ Natural → Natural → STM (Maybe ActionRefusal) → (Barrier → STM Bool) → IO Actions
-newActions capacity releaseCapacity gate met = (\queue → Actions queue capacity releaseCapacity gate met) <$> newTVarIO Seq.empty
+newActions capacity releaseCapacity gate met = do
+  queue ← newTVarIO Seq.empty
+  admitted ← newTVarIO 0
+  pure (Actions queue admitted capacity releaseCapacity gate met)
 
 -- | Admit one action, given whether the session's device exists, or refuse it
 -- at once. It never waits.
@@ -241,13 +262,15 @@ admitWith actions device barrier action =
           let (capacity, refusal) = case barrier of
                 Nothing → (actionsCapacity actions, ActionQueueFull)
                 Just _ → (actionsReleaseCapacity actions, ReleaseQueueFull)
-              sameClass (Entry _ _ held) = isJust held == isJust barrier
+              sameClass (Entry _ _ _ held) = isJust held == isJust barrier
           if fromIntegral (length (filter sameClass (toList queue))) >= capacity
             then pure (Left refusal)
             else do
               held ← traverse id barrier
               standing ← newTVar Queued
-              writeTVar (actionsQueue actions) (queue |> Entry standing action held)
+              place ← readTVar (actionsAdmitted actions)
+              writeTVar (actionsAdmitted actions) (place + 1)
+              writeTVar (actionsQueue actions) (queue |> Entry place standing action held)
               pure (Right (ActionTicket standing (actionsGate actions)))
 
 -- | The barriers of the release requests still queued, in the order they were
@@ -257,7 +280,7 @@ pendingBarriers actions = do
   queue ← readTVar (actionsQueue actions)
   fmap concat . traverse pending $ toList queue
   where
-    pending (Entry standing _ barrier) =
+    pending (Entry _ standing _ barrier) =
       readTVar standing <&> \case
         Queued → maybe [] pure barrier
         _ → []
@@ -270,13 +293,14 @@ actionsWaiting ∷ Actions → STM Bool
 actionsWaiting actions = (> 0) <$> actionsCount actions
 
 -- | How many entries the queue holds that the owner may start in sequence now,
--- for a step to bound the actions it takes to those waiting when it began.
--- Entries their readers already settled are counted: the owner drops them.
+-- which is whether it has work for an idle owner ('actionsWaiting'). Entries
+-- their readers already settled are counted: the owner drops them. A step does
+-- not bound its work by this: it takes the entries of its 'Batch'.
 actionsCount ∷ Actions → STM Int
 actionsCount actions = readTVar (actionsQueue actions) >>= go 0 False . toList
   where
     go count _ [] = pure count
-    go count blocked (Entry standing _ barrier : rest) =
+    go count blocked (Entry _ standing _ barrier : rest) =
       readTVar standing >>= \case
         Queued → case barrier of
           Nothing → go (count + 1) blocked rest
@@ -288,33 +312,46 @@ actionsCount actions = readTVar (actionsQueue actions) >>= go 0 False . toList
                   False → go count True rest
         _ → go (count + 1) blocked rest
 
+-- | The entries an owner step serves: those admitted before it began.
+newtype Batch = Batch Natural
+
+-- | Fix the batch of the step that begins now: every entry admitted so far,
+-- and none admitted after this transaction.
+beginBatch ∷ Actions → STM Batch
+beginBatch actions = Batch <$> readTVar (actionsAdmitted actions)
+
 -- | An action the owner has started, with what settles it.
 data Started = ∀ r. Started !(VulkanAction r) !(ActionOutcome r → STM ())
 
--- | Take the next action the owner may start, marking it running, in one
--- transaction. An entry its reader already settled is dropped. While the gate
--- refuses, every queued one is settled as refused and dropped, and nothing is
--- started. A release request is taken only when its barrier is met and no
--- earlier release request remains queued.
-startAction ∷ Actions → STM (Maybe Started)
-startAction actions = readTVar (actionsQueue actions) >>= scan Seq.empty False
+-- | Take the next action of this batch the owner may start, marking it
+-- running, in one transaction. An entry its reader already settled is dropped.
+-- While the gate refuses, every queued entry of the batch is settled as
+-- refused and dropped, and nothing is started. A release request is taken only
+-- when its barrier is met and no earlier release request remains queued. An
+-- entry admitted after the batch began is never taken, and stays queued.
+startAction ∷ Actions → Batch → STM (Maybe Started)
+startAction actions (Batch limit) = readTVar (actionsQueue actions) >>= scan Seq.empty False
   where
     scan kept blocked remaining = case viewl remaining of
       EmptyL → Nothing <$ writeTVar (actionsQueue actions) kept
-      entry@(Entry standing action barrier) :< rest →
-        readTVar standing >>= \case
-          Queued →
-            actionsGate actions >>= \case
-              Just refusal → writeTVar standing (Settled (ActionRefused refusal)) >> scan kept blocked rest
-              Nothing → case barrier of
-                Nothing → start standing action kept rest
-                Just wanted
-                  | blocked → scan (kept |> entry) blocked rest
-                  | otherwise →
-                      actionsMet actions wanted >>= \case
-                        True → start standing action kept rest
-                        False → scan (kept |> entry) True rest
-          _ → scan kept blocked rest
+      entry@(Entry place standing action barrier) :< rest
+        -- The queue is in the order of admission: nothing after this is in the
+        -- batch either.
+        | place >= limit → Nothing <$ writeTVar (actionsQueue actions) (kept <> remaining)
+        | otherwise →
+            readTVar standing >>= \case
+              Queued →
+                actionsGate actions >>= \case
+                  Just refusal → writeTVar standing (Settled (ActionRefused refusal)) >> scan kept blocked rest
+                  Nothing → case barrier of
+                    Nothing → start standing action kept rest
+                    Just wanted
+                      | blocked → scan (kept |> entry) blocked rest
+                      | otherwise →
+                          actionsMet actions wanted >>= \case
+                            True → start standing action kept rest
+                            False → scan (kept |> entry) True rest
+              _ → scan kept blocked rest
     start ∷ TVar (Standing r) → VulkanAction r → Seq Entry → Seq Entry → STM (Maybe Started)
     start standing action kept rest = do
       writeTVar (actionsQueue actions) (kept <> rest)
@@ -329,7 +366,7 @@ refuseRemaining actions fallback = do
   refusal ← maybe fallback id <$> actionsGate actions
   queue ← readTVar (actionsQueue actions)
   writeTVar (actionsQueue actions) Seq.empty
-  for_ queue $ \(Entry standing _ _) →
+  for_ queue $ \(Entry _ standing _ _) →
     readTVar standing >>= \case
       Queued → writeTVar standing (Settled (ActionRefused refusal))
       _ → pure ()
