@@ -4264,6 +4264,20 @@ Nothing else asks. A target nobody asked a frame of is never rendered to,
 however its generations change, so a host whose application publishes neither
 demand nor a scene presents nothing, exactly as before VK-16.
 
+Eligibility alone asks a target that has never presented for nothing: the
+"eligible again after a suspension" case above is only for a target that
+presented before. A target that has never presented is asked for its first
+frame by a fresh demand publication, a scene publication or a capture request,
+and only by one, and each of those supersedes a retry pending for it. A retry
+already scheduled for it stands unless such a request supersedes it. So when
+the owner takes the first demand of a target before it has folded the window's
+observation that makes the target eligible, the frame offered is refused
+(`AcquisitionSuspended`, see [Rendering a frame](#rendering-a-frame)), becoming
+eligible asks nothing, and the first frame waits for that retry, one backoff
+interval after the step's own instant. The interval (5 ms by default) is
+measured on the owner's clock from that instant, so it is not a guaranteed
+wall-clock delay: the owner's clock decides when the retry comes due.
+
 ### A scene for each window
 
 R2D-14 ([#423](https://github.com/coghex/hetoimasia/issues/423); D-18, D-28 and
@@ -4644,9 +4658,18 @@ is attempted once the device exists, and each target's frame storages — one pe
 frame slot of the model's budget — the first time that target is.
 
 - An acquisition the swapchain cannot answer yet — not ready, out of date, no
-  generation, backpressure — is retried at the first interval of the model's
-  backoff schedule (5 ms by default), anchored at the step's own instant, so
-  work the step did counts against it and nothing sleeps after it.
+  generation, backpressure — or that is refused because the target has no
+  usable extent now (`AcquisitionSuspended`) is retried at the first interval of
+  the model's backoff schedule (5 ms by default), anchored at the step's own
+  instant, so work the step did counts against it and nothing sleeps after it.
+  The interval is therefore not a guaranteed wall-clock delay. A target the
+  step offers a frame can still be refused as suspended: the step plans its
+  frames, from the targets whose render demand is admitted, before the
+  generations' step runs, and that step then suspends a target whose geometry
+  is not yet usable — one whose window observation the owner has not folded
+  has none — so the acquisition after it answers `AcquisitionSuspended`. The
+  refusal is silent and the retry stands until a fresh request for the target
+  supersedes it.
 - A frame the renderer refused, whose recording was refused, or whose
   submission had no effect is skipped (`skipFrame`); one whose presentation
   enqueued nothing is closed unpresented (`closeUnpresentedFrame`). Each is
