@@ -19,10 +19,10 @@
 -- the full-product run library. The real child helper runs under the same orchestration in @run-native-test@.
 module OwnedThread (spec) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, forkOS, getNumCapabilities, isCurrentThreadBound, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, forkOS, getNumCapabilities, isCurrentThreadBound, killThread, myThreadId, threadCapability, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Exception
-  ( AsyncException (UserInterrupt)
+  ( AsyncException (ThreadKilled, UserInterrupt)
   , Exception
   , ExceptionWithContext (ExceptionWithContext)
   , MaskingState (MaskedInterruptible, MaskedUninterruptible, Unmasked)
@@ -39,7 +39,7 @@ import Control.Exception
   , tryWithContext
   , uninterruptibleMask_
   )
-import Control.Monad (forM_, void, when, (>=>))
+import Control.Monad (forM, forM_, void, when, (>=>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Foldable (for_)
 import GHC.IO (unsafeUnmask)
@@ -52,7 +52,7 @@ import Test.Hspec (Spec, describe, it, pendingWith, shouldBe, shouldSatisfy)
 import Test.HUnit.Lang (HUnitFailure (HUnitFailure), FailureReason (Reason))
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (awaitBlockedSending, withCancellationAfter, withCancellationWhenBlocked)
-import Test.Support.Owned (withOwnedBoundThread, withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedBoundThread, withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOn, withOwnedThreadOpening, withOwnedThreadOpeningOn)
 import Test.Support.Parked (ParkBounds (..), defaultParkBounds, parkedRelease)
 
 -- | The failure an example raises from a body, told apart from every other.
@@ -193,6 +193,49 @@ runEnding scope worker probe ending = case ending of
 holdUntilTimedOut ∷ IO ()
 holdUntilTimedOut = newEmptyMVar >>= \hold → readMVar hold `finally` void (tryPutMVar hold ())
 
+-- | The target of the cancellation examples (#610): inside an uninterruptible step it announces itself, waits for the sender to
+-- be published (@Nothing@ when the scope ended before there was one, so nothing is waited for) and for that sender to be seen
+-- blocked delivering, leaves the step, and does an effect. Then it waits for a cancellation, which always arrives (the sender's,
+-- or the scope's kill), so every scenario ends the same way whatever happened before.
+steppedTarget ∷ MVar (Maybe ThreadId) → MVar () → MVar () → MVar (Either AsyncException ()) → IO ()
+steppedTarget senderSlot entered effect ended = do
+  let spinUntilCancelled ∷ IO ()
+      spinUntilCancelled = yield >> spinUntilCancelled
+  outcome ← try @AsyncException $ do
+    uninterruptibleMask_ (putMVar entered () >> readMVar senderSlot >>= maybe (pure ()) (void . awaitBlockedSending))
+    putMVar effect ()
+    spinUntilCancelled
+  putMVar ended outcome
+
+-- | One cancellation aimed at a running target (#610), the target and its sender both pinned to one capability. Answers whether
+-- the target's effect ran, that is whether the cancellation was /not/ yet raised in it when it left its step. The sender is
+-- started once the target is inside its step, so a cancellation that reached it earlier could not be told from one that
+-- arrived late. The target's scope opens @senderSlot@ with @Nothing@ in its release (an idempotent, non-blocking opening), so
+-- a scope that ends before the sender is published still joins the target.
+--
+-- With @decoyed@ the sender is aimed at a decoy thread (held uninterruptibly at a gate its scope opens) instead of the target:
+-- the sender is then seen blocked delivering although nothing is pending against the target. This is the negative control, and
+-- it is deterministic: it shows that the answer /can/ be @True@, so a pinned run answering @False@ is not vacuous.
+effectBeforeCancellation ∷ Bool → IO Bool
+effectBeforeCancellation decoyed = do
+  senderSlot ← newEmptyMVar
+  entered ← newEmptyMVar
+  effect ← newEmptyMVar
+  ended ← newEmptyMVar
+  decoyEntered ← newEmptyMVar
+  decoyGate ← newEmptyMVar
+  let decoy = uninterruptibleMask_ (putMVar decoyEntered () >> readMVar decoyGate)
+  withOwnedThreadOpeningOn 0 (void (tryPutMVar senderSlot Nothing)) (steppedTarget senderSlot entered effect ended) $ \targetThread _ → do
+    takeMVar entered
+    withOwnedThreadOpeningOn 0 (void (tryPutMVar decoyGate ())) decoy $ \decoyThread _ → do
+      takeMVar decoyEntered
+      withOwnedThreadOn 0 (throwTo (if decoyed then decoyThread else targetThread) ThreadKilled) $ \sender _ → do
+        putMVar senderSlot (Just sender)
+        -- Aimed at the decoy nothing cancels the target; the example does, once the effect has run.
+        when decoyed (readMVar effect >> killThread targetThread)
+        takeMVar ended >>= (`shouldBe` Left ThreadKilled)
+  isJust <$> tryReadMVar effect
+
 spec ∷ Spec
 spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
   describe "a thread parked at a gate, whichever way its scope ends" $
@@ -331,6 +374,55 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
       -- The kill may arrive before the thread ran anything; the scope has joined it either way.
       withOwnedThread (recordSelf probe) (\thread _ → void (tryPutMVar (probeThread probe) thread))
       endedAfterScope probe >>= (`shouldBe` True)
+
+  describe "a thread pinned to a capability (withOwnedThreadOn, withOwnedThreadOpeningOn)" $ do
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined when the scope " <> label) $ do
+        probe ← newProbe
+        runEnding (withOwnedThreadOn 0) parkedWorker probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+      it ("has ended and been joined when the scope " <> label <> ", because the scope opens the gate itself before it joins") $ do
+        probe ← newProbe
+        runEnding (withOwnedThreadOpeningOn 0 (void (tryPutMVar (probeGate probe) ()))) stubbornWorker probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+    it "runs the thread on the capability asked for, pinned there, and with the caller's interruptibility not inherited" $ do
+      capabilities ← getNumCapabilities
+      for_ [0 .. capabilities - 1] $ \capability → do
+        placed ← newEmptyMVar
+        withOwnedThreadOn capability (myThreadId >>= threadCapability >>= \place → getMaskingState >>= putMVar placed . (,) place) $ \_ awaitEnd →
+          awaitEnd
+        readMVar placed >>= (`shouldBe` ((capability, True), Unmasked))
+
+    it "has a cancellation pending against a masked target on the same capability as soon as its sender is seen blocked, on more than one capability" $ do
+      -- The property the pin exists for (#610): the sender and the target share a capability, so the target's queue holds the
+      -- exception before the sender is recorded as blocked, and a target that leaves its uninterruptible step after seeing
+      -- the sender blocked has the exception raised in it before its next effect, every time.
+      capabilities ← getNumCapabilities
+      (capabilities >= 2) `shouldSatisfy` id
+      ran ← forM [1 .. 1000 :: Int] $ \_ → bounded (effectBeforeCancellation False)
+      length (filter id ran) `shouldBe` 0
+
+    it "negative control: a sender seen blocked delivering to something else leaves nothing pending against the target, which runs its next effect" $
+      -- Deterministic: the judgement above is not vacuous, because the same scenario answers True when the sender's exception is
+      -- not aimed at the target. (That an unpinned pair can also answer True is a race, kept as stress evidence in the PR, not
+      -- asserted here.)
+      bounded (effectBeforeCancellation True) >>= (`shouldBe` True)
+
+    it "joins the target when the scope is cancelled after the target entered its step and before the sender is published" $ do
+      senderSlot ← newEmptyMVar
+      entered ← newEmptyMVar
+      effect ← newEmptyMVar
+      ended ← newEmptyMVar
+      -- The target waits for a sender that never comes; the scope's release publishes @Nothing@ for it before it kills and joins.
+      outcome ← try @AsyncException $
+        bounded $
+          withOwnedThreadOpeningOn 0 (void (tryPutMVar senderSlot Nothing)) (steppedTarget senderSlot entered effect ended) $ \_ _ → do
+            takeMVar entered
+            myThreadId >>= \caller → throwTo caller UserInterrupt
+      outcome `shouldBe` Left UserInterrupt
+      tryReadMVar ended >>= (`shouldBe` Just (Left ThreadKilled))
 
   describe "the release" $ do
     it "is not interruptible: a cancellation that arrives while it waits for the thread does not abandon the join" $ do

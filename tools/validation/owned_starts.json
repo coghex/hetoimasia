@@ -46,6 +46,12 @@
       "reason": "the shared facility itself: the one place a test thread is started, with its stop-and-join registered in the same masked step"
     },
     {
+      "file": "tools/test-support/src/Test/Support/Owned.hs",
+      "binding": "withOwnedThreadOpeningOn",
+      "sites": 1,
+      "reason": "the shared facility's capability-pinned start (#610): the same acquisition, registration and release as withOwnedThreadOpening, pinned with forkOn so a cancellation's sender and its target can share a capability"
+    },
+    {
       "file": "tools/test-support/src/Test/Support/Subprocess.hs",
       "binding": "spawn",
       "sites": 1,

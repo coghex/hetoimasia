@@ -120,7 +120,7 @@ import Test.Foundation.OwnedControl
   , unownedScope
   , withRescue
   )
-import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOn, withOwnedThreadOpeningOn)
 
 spec ∷ Spec
 spec = describe "Resources" $ do
@@ -432,18 +432,28 @@ boundedExample action = do
 exampleBoundMicroseconds ∷ Int
 exampleBoundMicroseconds = 30 * 1000 * 1000
 
--- | Wait until @target@ has stopped making progress towards its 'throwTo',
--- so an example knows a cancellation is pending without guessing at a delay.
--- The status it settled on is returned, so an example can assert that the
--- cancellation really was still undelivered.
+-- | Wait until @sender@ is blocked delivering an exception (or has ended, because it will never block again). The target and
+-- the sender of every cancellation this waits on are pinned to 'sharedCapability' ('withOwnedThreadOn'), so the exception is
+-- already pending against the target when the sender is seen blocked and is raised the moment the target restores its masking
+-- state; the examples that assert the cancellation preempts the target's next effect rely on that (#610). Pinned, the target
+-- must give up its capability for the sender to run, which the 'yield' of the poll does.
+-- The status it settled on is returned, so an example can assert that the cancellation really was still undelivered.
 awaitPendingThrow ∷ ThreadId → IO ThreadStatus
-awaitPendingThrow target = do
-  status ← threadStatus target
+awaitPendingThrow sender = do
+  status ← threadStatus sender
   case status of
     ThreadBlocked BlockedOnException → pure status
     ThreadFinished → pure status
     ThreadDied → pure status
-    _ → yield *> awaitPendingThrow target
+    _ → yield *> awaitPendingThrow sender
+
+-- | The one capability the examples that wait for a cancellation to be pending run their target and its sender on (#610). On one
+-- capability @throwTo@ to a masked thread queues the exception before the sender is recorded as blocked, so a sender seen in
+-- 'BlockedOnException' has an exception pending against its target; across capabilities it is a message the target's capability
+-- takes in later (GHC 9.14.1 @rts/Schedule.c@, @scheduleProcessInbox@ returns at once when the capability's lock is busy), and no
+-- wait on the sender's status, a yield after it included, establishes receipt. See "Test.Support.Owned".
+sharedCapability ∷ Int
+sharedCapability = 0
 
 -- Outcomes -------------------------------------------------------------------
 
@@ -724,7 +734,7 @@ testDeferredDeliveryDuringRelease = do
   killerSlot ← newEmptyMVar
   killerStatus ← newEmptyMVar
   killerDone ← newEmptyMVar
-  withOwnedThreadOpening (void (tryPutMVar killerSlot Nothing))
+  withOwnedThreadOpeningOn sharedCapability (void (tryPutMVar killerSlot Nothing))
     ( void . try @SomeException $
         withResourceLabelled "outer" (pure ()) (\_ → do
           record releases "outer start"
@@ -742,7 +752,7 @@ testDeferredDeliveryDuringRelease = do
     $ \runner _ → do
       -- The inner release has started, so the thread is uninterruptibly masked.
       takeMVar insideRelease
-      withOwnedThread (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
+      withOwnedThreadOn sharedCapability (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
         putMVar killerSlot (Just killer)
         -- The cancellation was delivered, which cannot happen before cleanup ends.
         takeMVar killerDone
@@ -1476,7 +1486,7 @@ testCancellationDeferredDuringRollback = do
   killerSlot ← newEmptyMVar
   killerStatus ← newEmptyMVar
   killerDone ← newEmptyMVar
-  withOwnedThreadOpening (void (tryPutMVar killerSlot Nothing))
+  withOwnedThreadOpeningOn sharedCapability (void (tryPutMVar killerSlot Nothing))
     ( void . try @SomeException $
         withComposite
           ( do
@@ -1499,7 +1509,7 @@ testCancellationDeferredDuringRollback = do
     $ \runner _ → do
       -- The rollback has started, so the thread is uninterruptibly masked.
       takeMVar insideRelease
-      withOwnedThread (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
+      withOwnedThreadOn sharedCapability (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
         putMVar killerSlot (Just killer)
         takeMVar killerDone
         observed ← takeMVar killerStatus
@@ -1608,7 +1618,7 @@ testCancellationPendingWhenAcquisitionReturns = do
   killerDone ← newEmptyMVar
   neverFilled ← newEmptyMVar
   outcome ← newEmptyMVar
-  withOwnedThreadOpening (void (tryPutMVar killerSlot Nothing))
+  withOwnedThreadOpeningOn sharedCapability (void (tryPutMVar killerSlot Nothing))
     ( do
         captured ←
           try $
@@ -1636,7 +1646,7 @@ testCancellationPendingWhenAcquisitionReturns = do
     )
     $ \runner _ → do
       takeMVar acquiring
-      withOwnedThread (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
+      withOwnedThreadOn sharedCapability (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
         putMVar killerSlot (Just killer)
         -- The cancellation was delivered, so the construction has unwound.
         takeMVar killerDone
