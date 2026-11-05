@@ -48,6 +48,7 @@ module Test.GPU.Vulkan.Native.Fixture
   , Request
   , Session
   , Seams (..)
+  , afterFailureBound
   , runSharedWith
   , fixtureConsent
   , onMain
@@ -106,6 +107,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Encoding
 import Data.Word (Word64)
+import System.Timeout (timeout)
 
 import Hetoimasia.Foundation.Log
   ( DebugSelection (DebugAll)
@@ -239,7 +241,18 @@ data Seams = Seams
   , seamBorrow ∷ ∀ b. IO () → IO () → (ThreadId → IO () → IO b) → IO b
     -- ^ How the borrower is started for the length of the dispatch: what must be let go before it can end (idempotent,
     -- non-blocking), its action, and the body that serves it. Production: 'withOwnedThreadOpening'.
+  , seamFailureBound ∷ Int
+    -- ^ How long, in microseconds, the dispatch waits for the borrower to finish on its own once the session has failed and
+    -- been reported (see 'runSharedWith'). Production: 'afterFailureBound'. A test that wants the expiry states zero, which
+    -- expires at once and needs no timing.
   }
+
+-- | The bound on the wait for the borrower after a session failure: fifteen minutes, an order of magnitude beyond what the whole
+-- profile takes on the slowest runner, so it only ever turns a borrower that nothing will finish into a failure, never a slow
+-- run into one. It is a failure bound and not a coordination: the wait ends earlier, on the borrower's result, in every run
+-- that is not stuck.
+afterFailureBound ∷ Int
+afterFailureBound = 15 * 60 * 1000000
 
 -- | Run the borrower — the Hspec run — on a thread of its own, and serve its
 -- operations on this one, which must be the process main thread.
@@ -249,13 +262,18 @@ data Seams = Seams
 -- this returns or raises. Its start and its stop-and-join are one masked step, and the release first fills the cell that
 -- ends every wait on the session (an idempotent, non-blocking opening), so a borrower held at the session's end is let
 -- go before it is killed. The wait for the borrower's result stays: it is what lets the Hspec run finish and report after a
--- session that could not be served, and ownership adds only that no exit leaves the borrower behind.
+-- session that could not be served, and ownership adds only that no exit leaves the borrower behind. That wait is the one place
+-- a session failure that was caught and reported could keep the scope from reaching its release, when the borrower is parked
+-- where nothing now ends it, so it is bounded ('seamFailureBound'): a borrower still running when the bound expires is stopped
+-- and joined by the scope's release, and the dispatch raises, naming the failure that was reported. Every other path already
+-- holds the borrower's result when it gets here (the serving loop ends only when the borrower has), so the wait there takes it
+-- at once.
 --
 -- State owner: this function owns the borrower's thread, and the request queue, the cells and the counters the borrower
 -- shares with the serving thread. Readers/writers: the borrower (requests, its result, its done flag) and the serving thread
 -- (the replies). Thread: the borrower's, one per call. Lifetime: the call. Disposal: the scope's release.
 runShared ∷ Gate → (Fixture → IO a) → IO (a, SharedReport)
-runShared = runSharedWith Seams {seamSession = nativeSession, seamBorrow = withOwnedThreadOpening}
+runShared = runSharedWith Seams {seamSession = nativeSession, seamBorrow = withOwnedThreadOpening, seamFailureBound = afterFailureBound}
 
 -- | 'runShared' with its seams given (see 'Seams'); a test-side entry only.
 runSharedWith ∷ Seams → Gate → (Fixture → IO a) → IO (a, SharedReport)
@@ -283,7 +301,13 @@ runSharedWith seams gate borrower = do
     -- has gone.
     void (atomically (tryPutTMVar ended (maybe (toException Finished) id failure)))
     declineQueued fixture
-    outcome ← atomically (takeTMVar result)
+    outcome ← case failure of
+      Nothing → atomically (takeTMVar result)
+      Just reported →
+        timeout (seamFailureBound seams) (atomically (takeTMVar result))
+          >>= maybe
+            (throwIO (userError ("the borrower had not finished when the bound on waiting for it after the session failed expired; the session failed: " <> displayException reported)))
+            pure
     report ←
       SharedReport
         <$> readIORef acquisitions

@@ -17,16 +17,18 @@ module Test.GPU.Vulkan.Native.FixtureSpec (spec) where
 
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar, tryReadMVar)
-import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), SomeException, finally, fromException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), IOException, SomeException, finally, fromException, throwIO, try)
 import Control.Monad (void)
 import GHC.Conc (BlockReason (BlockedOnSTM))
-import Test.Hspec (Spec, describe, it, shouldBe)
+import Data.List (isInfixOf)
+import System.IO.Error (ioeGetErrorString)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (withCancellationAfter)
 import Test.Support.Owned (withOwnedThreadOpening)
 
 import Test.GPU.Vulkan.Native.Consent (Consent (Desktop))
-import Test.GPU.Vulkan.Native.Fixture (Fixture, Seams (..), Session, SharedReport (..), onMain, runSharedWith)
+import Test.GPU.Vulkan.Native.Fixture (Fixture, Seams (..), Session, SharedReport (..), afterFailureBound, onMain, runSharedWith)
 import Test.GPU.Vulkan.Native.Gate (Gate, newGate)
 import Test.GPU.Vulkan.Native.Unowned (Boom (..), awaitBlocked, hasEnded, newCleanups, runCleanups, unownedScope)
 
@@ -91,7 +93,7 @@ unreachedSession ∷ Session
 unreachedSession _ _ _ = throwIO (userError "the stand-in session was entered, though no operation was requested")
 
 ownedSeams ∷ Session → Seams
-ownedSeams session = Seams {seamSession = session, seamBorrow = withOwnedThreadOpening}
+ownedSeams session = Seams {seamSession = session, seamBorrow = withOwnedThreadOpening, seamFailureBound = afterFailureBound}
 
 spec ∷ Spec
 spec = describe "the shared fixture's borrower is owned (#596)" $ do
@@ -119,6 +121,7 @@ spec = describe "the shared fixture's borrower is owned (#596)" $ do
   scenario "serving is cancelled while the dispatch is idle and the borrower is parked" idleCancelled
   scenario "serving is cancelled while the session is being served and the borrower waits for it" servingCancelled
   scenario "serving is cancelled while the dispatch waits for a borrower parked after the session failed" failureCancelled
+  scenario "the session failed, was reported, and the borrower is parked where nothing ends it (no cancellation follows)" failureBounded
   scenario "a cancellation escapes the session, which is not a failure of the session, while the borrower waits for it" escapesTheSession
 
 -- | One way the dispatch can end with the borrower parked. It runs the dispatch, with the seams built from the session it
@@ -141,7 +144,7 @@ scenario label run = do
     -- The judgement is recorded first, about what the dispatch left; only then does anything independent stop and join the
     -- borrower, even if an assertion before it failed. The unowned start registers its own stop-and-join with the control.
     ( do
-        run rig (\session → Seams {seamSession = session, seamBorrow = unownedScope cleanups})
+        run rig (\session → Seams {seamSession = session, seamBorrow = unownedScope cleanups, seamFailureBound = afterFailureBound})
         judge rig False
       )
       `finally` runCleanups cleanups
@@ -186,6 +189,17 @@ failureCancelled rig seamsFor = do
   caller ← myThreadId
   endsCancelled . withCancellationAfter (readMVar (rigParked rig) >> awaitBlocked (== BlockedOnSTM) caller) (keepReachable rig) $
     runSharedWith (seamsFor failingSession) gate (parkingBorrower rig)
+
+-- | The session failed in the way the dispatch catches and reports, the borrower parked, and nothing cancels the example: the
+-- bound on the wait for the borrower expires (stated as zero, which needs no timing), the dispatch raises, and the borrower has
+-- been stopped and joined by the scope's release without any second cancellation.
+failureBounded ∷ Scenario
+failureBounded rig seamsFor = do
+  gate ← newOpenGate
+  outcome ← try @IOException (void (bounded (runSharedWith (seamsFor failingSession) {seamFailureBound = 0} gate (parkingBorrower rig))))
+  case outcome of
+    Left failure → ioeGetErrorString failure `shouldSatisfy` isInfixOf "the session failed: Boom"
+    Right () → expectationFailure "the dispatch returned though its borrower was still parked after the session failed"
 
 -- | The serving thread is cancelled inside the session: the cancellation is not a failure of the session, so it ends the
 -- dispatch as itself instead of being reported and followed by a wait for a borrower nothing now ends.
