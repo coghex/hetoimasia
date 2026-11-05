@@ -180,25 +180,33 @@ withCutting recorded state boundary rescued body = do
     finished ← newTVarIO False
     body (Cutting (Just boundary) cut rescued gate rigs snapshots finished crossed release)
 
--- | Make a cancellation pending against the calling thread, which is masked until the cancellation is received as the mask ends.
--- The sender is started on the capability the caller is on and, while the caller is blocked on the sender's hand-over, checks that the
--- caller is still on it before it throws: a caller blocked on a capability stays there, so the throw is made on the caller's own
--- capability, where it is settled at once, or not made at all and the whole is tried again. The cancellation is raised as the caller's
--- mask ends, inside the sender's scope, which then stops and joins the sender (recorded for the caller's judgement).
+-- | Make a cancellation pending against the calling thread, which is protected before the sender exists and receives the cancellation
+-- as it is unprotected, inside the sender's scope.
+--
+-- The whole is under an uninterruptible mask, so the target is protected before the sender is started (the scope restores its body to
+-- the caller's state, which is that mask). The sender is started on the capability the target is on and, once the target is blocked on
+-- its hand-over, checks that the target is still on that capability before it throws: a thread blocked on a capability stays there,
+-- so the throw is made on the target's own capability, where it is settled where it is made, or it is not made and the whole is tried
+-- again. The target then confirms that the sender is blocked delivering, which on one capability means the exception is queued
+-- against it, and only then lifts the mask: the cancellation is raised there, inside the scope, which stops and joins the sender
+-- (recorded for the caller's judgement).
 pending ∷ IORef [ThreadId] → IO ()
 pending recorded = do
-  me ← myThreadId
-  (capability, _) ← threadCapability me
-  there ← newEmptyMVar
-  let sender = do
-        (now, _) ← threadCapability me
-        putMVar there (now == capability)
-        when (now == capability) (throwTo me UserInterrupt)
-  settled ← withOwnedThreadOn capability sender $ \thread _ → do
-    atomicModifyIORef' recorded (\known → (thread : known, ()))
-    uninterruptibleMask_ $ do
+  settled ← uninterruptibleMask_ $ do
+    me ← myThreadId
+    (capability, _) ← threadCapability me
+    there ← newEmptyMVar
+    let sender = do
+          (now, _) ← threadCapability me
+          putMVar there (now == capability)
+          when (now == capability) (throwTo me UserInterrupt)
+    withOwnedThreadOn capability sender $ \thread _ → do
+      atomicModifyIORef' recorded (\known → (thread : known, ()))
       same ← takeMVar there
-      when same (awaitThrowing thread)
+      when same $ do
+        awaitThrowing thread
+        -- Pending, confirmed. The mask is lifted for the instant it takes to receive it, in the scope.
+        unsafeUnmask (pure ())
       pure same
   -- Raised above when it was made. Reached only when the caller had moved: again, from where it is now.
   unless settled (pending recorded)
