@@ -36,7 +36,7 @@
 module Test.LuaEngine.Graphics.Native.Pixels (spec) where
 
 import Control.Concurrent (killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryPutMVar, tryReadMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, displayException, finally, fromException, mask, toException, try)
 import Control.Monad (forM_, unless, void, when)

@@ -17,7 +17,7 @@ module Test.LuaEngine.Graphics.Native.Facade (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Exception (SomeException, finally, throwIO, try)
+import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (newIORef, readIORef, writeIORef)
