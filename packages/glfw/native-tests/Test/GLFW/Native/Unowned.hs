@@ -37,7 +37,7 @@ import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVa
 import Control.Exception (AsyncException (UserInterrupt), Exception, SomeException, finally, fromException, mask_, throwIO, toException, try, uninterruptibleMask_)
 import Control.Monad (void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
-import GHC.Conc (ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnBlackHole), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import GHC.IO (unsafeUnmask)
 import Test.GLFW.Native.Threads (Boundness (..), Scope (..))
 import Test.Support.Cancel (withCancellationAfter)
@@ -131,15 +131,17 @@ holdUntilCancelled ∷ IO ()
 holdUntilCancelled = newEmptyMVar >>= \hold → readMVar hold `finally` void (tryPutMVar hold ())
 
 -- | The judgement the facility makes true: the thread has ended, and been joined, when the scope returns. A thread that is
--- blocked has not ended; one that ended is finished, or is running its last steps after announcing its end, which the poll
--- yields to (a count of yields, never a duration, so a thread that never ends gives up the same way on any machine).
+-- blocked on something has not ended; one that ended is finished, or is running its last steps after announcing its end (or
+-- waiting on a blackhole for a value another thread is finishing), which the poll yields to (a count of yields, never a
+-- duration, so a thread that never ends gives up the same way on any machine).
 hasEnded ∷ ThreadId → IO Bool
-hasEnded thread = go (100000 ∷ Int)
+hasEnded thread = go (2000000 ∷ Int)
   where
     go 0 = pure False
     go remaining =
       threadStatus thread >>= \case
         ThreadFinished → pure True
         ThreadDied → pure True
+        ThreadBlocked BlockedOnBlackHole → yield >> go (remaining - 1)
         ThreadBlocked _ → pure False
         _ → yield >> go (remaining - 1)
