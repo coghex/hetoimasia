@@ -133,6 +133,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , setVisible
   , resizeFramebuffer
   , publishObservation
+  , awaitObservationsFolded
   , setWindowMetrics
   , nudgeOwner
   , offerExtent
@@ -307,6 +308,7 @@ import Hetoimasia.Runtime.GLFW
   , TargetStanding (..)
   , OwnerStatus (..)
   , readOwnerStatusNow
+  , readOwnerGeometry
   , TerminalRecord
   , Turn (..)
   , TurnStep (..)
@@ -1748,6 +1750,23 @@ publishObservation host service window = do
   -- The attachment's revisions start after the slot's initial zero, and rise
   -- with the window's own.
   void (publishGraphicsObservation (vulkanGraphicsOwner host) service (observedRevision observation + 1) observation (windowRenderEligibility observation) Nothing)
+
+-- | Wait until the owner has folded the observation 'publishObservation'
+-- published for each of these targets.
+--
+-- A round folds the observations at its start and reads the render demand
+-- when it offers its step, so an application that publishes an observation
+-- and then a demand from another thread may find a round between the two
+-- that has the demand but not the observation. Its target is then not
+-- eligible, its first frame is refused, and the retry is paced on the owner's
+-- clock, which a scripted one never moves on its own. The owner folds an
+-- observation into the target's eligibility and its geometry cell in one
+-- transaction, and the cell holds nothing for a target before that, so the
+-- cell is the event to wait for before the demand is published.
+awaitObservationsFolded ∷ VulkanHost Scene → [GraphicsService] → IO ()
+awaitObservationsFolded host services = atomically $ do
+  geometry ← readOwnerGeometry (vulkanGraphicsOwner host)
+  check (all ((`Map.member` geometry) . graphicsAttachment) services)
 
 -- | Republish the window's unchanged observation at a revision above every
 -- one published so far, which takes the owner a round. A result reported
