@@ -121,12 +121,14 @@ retirementRecord scope held atParked = do
   abandoned ← newTVarIO False
   started ← newTVarIO False
   release ← newTVarIO (not held)
-  attempts ← newTVarIO (0 ∷ Int)
   recorded ← newTVarIO []
+  retained ← newTVarIO (0 ∷ Int)
   absorbed ← newTVarIO (0 ∷ Int)
   tracked ← newIORef []
+  -- How often the backend was asked to retire the target, counted by the fake at the call's entry, before anything a cancellation
+  -- could interrupt in the call itself.
+  let offers = length <$> readTVarIO (fakeRetirements (rigFake rig))
   script (fakeRetireTarget (rigFake rig)) $ \retire → do
-    atomically (modifyTVar' attempts (+ 1))
     atomically (writeTVar entered True)
     pure (targetRetired (Text.pack (show (retiringWindow retire))))
   -- The owner's later calls wait for a harassment that has begun, and absorb what is still being delivered while they wait.
@@ -187,9 +189,10 @@ retirementRecord scope held atParked = do
         -- Captured here rather than returned: the run itself raises the
         -- cancellation at its exit, so the body's value never reaches the caller.
         atomically . writeTVar recorded . Map.keys =<< atomically (readTargetTerminalsNow owner)
+        atomically . writeTVar retained . length =<< atomically (readOwnerTargets owner)
     -- Offered exactly once, over the whole run and its drain, however many
     -- cancellations arrived and however the example ended.
-    readTVarIO attempts `shouldReturn` 1
+    offers `shouldReturn` 1
     if held
       then do
         -- Ended by the scenario: the owner terminated after its retirement and the session was torn down, and the ending is the
@@ -201,10 +204,12 @@ retirementRecord scope held atParked = do
         -- However it ended, it ended by raising the cancellation rather than
         -- swallowing it.
         void (raisedBy outcome)
-        -- And because it returned, its record exists: a retirement the owner
-        -- performed is never one the owner then forgets, and never one the drain
-        -- performs a second time.
-        readTVarIO recorded >>= \terminals → length terminals `shouldBe` 1
+        -- And the target is accounted for exactly once: a retirement that returned has its record, and is never forgotten or performed a
+        -- second time; one a cancellation interrupted inside the call (which stays interruptible) did not return, so it is explicitly
+        -- retained as unverified instead and has no record. Which of the two a run meets depends on where the cancellation lands.
+        terminals ← readTVarIO recorded
+        kept ← readTVarIO retained
+        length terminals + kept `shouldBe` 1
 
 -- | Every injected operation's answer is committed with no interruption
 -- point between the two.
