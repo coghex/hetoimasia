@@ -35,6 +35,19 @@
 --   retained cleanup evidence. This is the protected-drain policy of
 --   "Hetoimasia.Foundation.Worker" applied to the fixture's one borrower.
 --
+-- = Ownership of the borrower (#594)
+--
+-- The borrower's thread is started through "Test.Support.Owned" ('Test.GLFW.Native.Threads'), in one masked step with the
+-- registration of its stop-and-join, and the whole of the serving and the settlement above runs inside that scope. However
+-- the scope ends the borrower has ended and been joined before 'runOwned' returns, which closes the one interval the cooperative
+-- settlement did not cover: a cancellation delivered after the borrower was started and before the settlement was installed.
+-- The settlement itself is unchanged and stays what ends the borrower on every path that reaches it: it lets the borrower
+-- finish (never kills it), keeps its wait interruptible and absorbs a further cancellation there, and holds the resource
+-- until the borrower has finished. The scope's release is the backstop for the paths that do not reach it, and it is
+-- uninterruptible, whereas the settlement wait is not: the two are different phases and neither stands in for the other.
+-- When the release has to kill a borrower the settlement never reached, no resource was acquired yet, because the first
+-- operation acquires it inside the settlement's protection.
+--
 -- = State
 --
 -- The request queue, the acquisition count, and the ended signal are written by
@@ -47,6 +60,7 @@ module Test.GLFW.Native.Fixture
     Owner (..)
   , OwnerReport (..)
   , runOwned
+  , runOwnedIn
 
     -- * Borrowing
   , Fixture
@@ -60,7 +74,7 @@ module Test.GLFW.Native.Fixture
   , awaitQueued
   ) where
 
-import Control.Concurrent (ThreadId, forkFinally, myThreadId)
+import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.STM
   ( STM
   , TMVar
@@ -101,6 +115,7 @@ import Control.Exception
 import Control.Monad (unless, void, when)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Resource (Scoped, withScoped)
+import Test.GLFW.Native.Threads (Boundness (Unbound), Scope, ownedScope, startIn)
 
 -- | What an owner holds and how it ends its borrowers' use of it.
 data Owner r = Owner
@@ -196,133 +211,147 @@ dispatch fixture action = do
 
 data Next r = BorrowerFinished | Serve (Request r)
 
--- | Make the calling thread the owner, fork the borrower, serve it until it
+-- | Make the calling thread the owner, start the borrower, serve it until it
 -- finishes, and release the resource. The borrower's own outcome is returned
 -- beside the owner's report; neither is thrown.
 runOwned ∷ Owner r → (Fixture r → IO a) → IO (Either SomeException a, OwnerReport)
-runOwned owner borrower = do
+runOwned = runOwnedIn ownedScope (pure ())
+
+-- | 'runOwned' in a chosen kind of scope, with a step the owner takes between
+-- the borrower's start and the installation of the settlement. Both exist for
+-- the ownership regressions ("Test.GLFW.Native.Ownership"): the step is where
+-- a cancellation lands in the interval the scope closes, and the scope is the
+-- unowned start the borrower had before it was owned, for the negative control.
+-- Nothing else passes either; the step runs on the owner thread and is
+-- interruptible like the serving that follows it.
+runOwnedIn ∷ Scope → IO () → Owner r → (Fixture r → IO a) → IO (Either SomeException a, OwnerReport)
+runOwnedIn scope afterStart owner borrower = do
   me ← myThreadId
   fixture ← Fixture <$> newTQueueIO <*> newTVarIO 0 <*> newEmptyTMVarIO <*> newTVarIO 0 <*> pure me
   finished ← newEmptyTMVarIO
   served ← newIORef (0 ∷ Int)
   declined ← newIORef (0 ∷ Int)
   reported ← newIORef Nothing
-  _ ← forkFinally (borrower fixture) (atomically . void . tryPutTMVar finished)
-  let next =
-        atomically
-          ( (BorrowerFinished <$ readTMVar finished)
-              `orElse` (Serve <$> readTQueue (fixtureRequests fixture))
-          )
-      decline reason request = do
-        atomically (requestDecline request reason)
-        modifyIORef' declined (+ 1)
-      drain = atomically (flushTQueue (fixtureRequests fixture)) >>= mapM_ (decline (toException NotExecuted))
-      perform resource request = do
-        gone ← readTVarIO (requestAbandoned request)
-        if gone
-          then decline (toException NotExecuted) request
-          else requestPerform request resource >> modifyIORef' served (+ 1)
-      -- Stop serving: wake every waiter with the reason, let the borrower
-      -- finish, and settle what it left queued. Idempotent, so a caller that
-      -- absorbs an interruption delivered during its wait can retry it.
-      stopServing reason = do
-        atomically (void (tryPutTMVar (fixtureEnded fixture) reason))
-        void (atomically (readTMVar finished))
-        drain
-      -- Run a settlement step to the end of the wait. The wait stays
-      -- interruptible, but an interruption delivered during it — a further
-      -- cancellation aimed at the owner — is absorbed and the step retried,
-      -- so it neither ends the settlement nor escapes its caller.
-      absorbing step = do
-        outcome ← try step
-        case outcome of
-          Right () → pure ()
-          Left (_ ∷ SomeException) → absorbing step
-      held resource first = perform resource first >> loop
-        where
-          loop =
-            next >>= \case
-              BorrowerFinished → drain >> ownerSettled owner
-              Serve request → perform resource request >> loop
-      -- Once serving fails or is cancelled, settlement still runs with the
-      -- resource held: the borrower finishes first, and the failure that
-      -- began the settlement is the one rethrown.
-      settle failure = absorbing (stopServing failure) >> rethrow failure
-      refusing failure =
-        next >>= \case
-          BorrowerFinished → drain
-          Serve request → decline failure request >> refusing failure
-      -- A failure is returned rather than rethrown, so the report carries
-      -- exactly the exception the scope produced, with any cleanup evidence
-      -- it retained.
-      acquireFor request = do
-        atomically (modifyTVar' (fixtureAcquisitions fixture) (+ 1))
-        entered ← newIORef False
-        -- The scope's orchestration runs masked, so a cancellation deferred
-        -- through the uninterruptible release cannot replace the scope's
-        -- failure in flight: the failure the scope produced, with the cleanup
-        -- evidence the release retained, unwinds to the 'try' below under a
-        -- mask the deferred delivery cannot cross without a blocking point,
-        -- and is recorded before unmasked code gives that delivery one. The
-        -- scope's own masking keeps its acquisition and the settlement wait
-        -- interruptible, the served operations run with the caller's masking
-        -- state restored, and the release stays the only uninterruptible
-        -- blocking step.
-        outcome ←
-          mask $ \restore → do
-            caught ←
-              try . withScoped (ownerAcquire owner) $ \resource → do
-                -- Entered is recorded and the settlement handler installed
-                -- while still masked, so a cancellation already pending when
-                -- the acquisition returns is delivered only inside the
-                -- handler — never in an unprotected gap where its unwind
-                -- would release the resource before the borrower finishes.
-                writeIORef entered True
-                restore (held resource request) `catch` settle
-            -- Record the scope's failure — the initiating failure, with the
-            -- cleanup evidence its release retained — while still masked: a
-            -- cancellation deferred through the release is delivered as soon
-            -- as unmasked code resumes, and would take the report over that
-            -- primary failure if it were recorded any later.
-            case caught of
-              Right () → pure ()
-              Left failure → do
-                inside ← readIORef entered
-                when inside (writeIORef reported (Just failure))
-            pure caught
-        case outcome of
-          Right () → pure Nothing
-          Left failure → do
-            inside ← readIORef entered
-            unless inside $ do
-              decline failure request
-              refusing failure
-            pure (Just failure)
-      idle =
-        next >>= \case
-          BorrowerFinished → drain >> pure Nothing
-          Serve request → do
-            gone ← readTVarIO (requestAbandoned request)
-            if gone
-              then decline (toException NotExecuted) request >> idle
-              else acquireFor request
-  outcome ← try idle
-  -- A cancellation deferred through the release is delivered after it and is
-  -- what 'try' catches here; the failure the scope recorded, if there is one,
-  -- stays the report's primary.
-  recorded ← readIORef reported
-  let failure = case recorded of
-        Just primary → Just primary
-        Nothing → either Just id outcome
-  absorbing (stopServing (maybe (toException OwnerFinished) id failure))
-  borrowed ← atomically (readTMVar finished)
-  report ←
-    OwnerReport
-      <$> readTVarIO (fixtureAcquisitions fixture)
-      <*> readIORef served
-      <*> readIORef declined
-      <*> pure failure
-  pure (borrowed, report)
+  -- The borrower's outcome is published by the thread itself, as @forkFinally@ did: a kill that arrives before the
+  -- borrower first runs is delivered inside the 'try' and published, so the wait below always finds an outcome.
+  let borrowing = mask $ \restore → try (restore (borrower fixture)) >>= atomically . void . tryPutTMVar finished
+  startIn scope Unbound (pure ()) borrowing $ \_ _ → do
+    afterStart
+    let next =
+          atomically
+            ( (BorrowerFinished <$ readTMVar finished)
+                `orElse` (Serve <$> readTQueue (fixtureRequests fixture))
+            )
+        decline reason request = do
+          atomically (requestDecline request reason)
+          modifyIORef' declined (+ 1)
+        drain = atomically (flushTQueue (fixtureRequests fixture)) >>= mapM_ (decline (toException NotExecuted))
+        perform resource request = do
+          gone ← readTVarIO (requestAbandoned request)
+          if gone
+            then decline (toException NotExecuted) request
+            else requestPerform request resource >> modifyIORef' served (+ 1)
+        -- Stop serving: wake every waiter with the reason, let the borrower
+        -- finish, and settle what it left queued. Idempotent, so a caller that
+        -- absorbs an interruption delivered during its wait can retry it.
+        stopServing reason = do
+          atomically (void (tryPutTMVar (fixtureEnded fixture) reason))
+          void (atomically (readTMVar finished))
+          drain
+        -- Run a settlement step to the end of the wait. The wait stays
+        -- interruptible, but an interruption delivered during it — a further
+        -- cancellation aimed at the owner — is absorbed and the step retried,
+        -- so it neither ends the settlement nor escapes its caller.
+        absorbing step = do
+          outcome ← try step
+          case outcome of
+            Right () → pure ()
+            Left (_ ∷ SomeException) → absorbing step
+        held resource first = perform resource first >> loop
+          where
+            loop =
+              next >>= \case
+                BorrowerFinished → drain >> ownerSettled owner
+                Serve request → perform resource request >> loop
+        -- Once serving fails or is cancelled, settlement still runs with the
+        -- resource held: the borrower finishes first, and the failure that
+        -- began the settlement is the one rethrown.
+        settle failure = absorbing (stopServing failure) >> rethrow failure
+        refusing failure =
+          next >>= \case
+            BorrowerFinished → drain
+            Serve request → decline failure request >> refusing failure
+        -- A failure is returned rather than rethrown, so the report carries
+        -- exactly the exception the scope produced, with any cleanup evidence
+        -- it retained.
+        acquireFor request = do
+          atomically (modifyTVar' (fixtureAcquisitions fixture) (+ 1))
+          entered ← newIORef False
+          -- The scope's orchestration runs masked, so a cancellation deferred
+          -- through the uninterruptible release cannot replace the scope's
+          -- failure in flight: the failure the scope produced, with the cleanup
+          -- evidence the release retained, unwinds to the 'try' below under a
+          -- mask the deferred delivery cannot cross without a blocking point,
+          -- and is recorded before unmasked code gives that delivery one. The
+          -- scope's own masking keeps its acquisition and the settlement wait
+          -- interruptible, the served operations run with the caller's masking
+          -- state restored, and the release stays the only uninterruptible
+          -- blocking step.
+          outcome ←
+            mask $ \restore → do
+              caught ←
+                try . withScoped (ownerAcquire owner) $ \resource → do
+                  -- Entered is recorded and the settlement handler installed
+                  -- while still masked, so a cancellation already pending when
+                  -- the acquisition returns is delivered only inside the
+                  -- handler — never in an unprotected gap where its unwind
+                  -- would release the resource before the borrower finishes.
+                  writeIORef entered True
+                  restore (held resource request) `catch` settle
+              -- Record the scope's failure — the initiating failure, with the
+              -- cleanup evidence its release retained — while still masked: a
+              -- cancellation deferred through the release is delivered as soon
+              -- as unmasked code resumes, and would take the report over that
+              -- primary failure if it were recorded any later.
+              case caught of
+                Right () → pure ()
+                Left failure → do
+                  inside ← readIORef entered
+                  when inside (writeIORef reported (Just failure))
+              pure caught
+          case outcome of
+            Right () → pure Nothing
+            Left failure → do
+              inside ← readIORef entered
+              unless inside $ do
+                decline failure request
+                refusing failure
+              pure (Just failure)
+        idle =
+          next >>= \case
+            BorrowerFinished → drain >> pure Nothing
+            Serve request → do
+              gone ← readTVarIO (requestAbandoned request)
+              if gone
+                then decline (toException NotExecuted) request >> idle
+                else acquireFor request
+    outcome ← try idle
+    -- A cancellation deferred through the release is delivered after it and is
+    -- what 'try' catches here; the failure the scope recorded, if there is one,
+    -- stays the report's primary.
+    recorded ← readIORef reported
+    let failure = case recorded of
+          Just primary → Just primary
+          Nothing → either Just id outcome
+    absorbing (stopServing (maybe (toException OwnerFinished) id failure))
+    borrowed ← atomically (readTMVar finished)
+    report ←
+      OwnerReport
+        <$> readTVarIO (fixtureAcquisitions fixture)
+        <*> readIORef served
+        <*> readIORef declined
+        <*> pure failure
+    pure (borrowed, report)
 
 -- | Rethrow a failure caught on one side on the other, keeping the context it
 -- was raised with rather than starting a fresh one, so failure evidence and
