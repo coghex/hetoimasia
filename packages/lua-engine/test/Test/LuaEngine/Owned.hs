@@ -25,7 +25,7 @@ module Test.LuaEngine.Owned (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (MVar, isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), ErrorCall (ErrorCall), SomeException, finally, mask, onException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), ErrorCall (ErrorCall), SomeException, finally, mask, onException, throwIO, try, uninterruptibleMask_)
 import Control.Monad (void)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
@@ -34,6 +34,7 @@ import Test.Hspec
 import Test.LuaEngine.Session.Support
 import Test.LuaEngine.Unowned
 import Test.Support.Bounded (bounded)
+import Test.Support.Cancel (withCancellationAfter)
 import Test.Support.Owned (withOwnedThread)
 
 -- The runners -------------------------------------------------------------------------------------------------------------
@@ -42,25 +43,28 @@ import Test.Support.Owned (withOwnedThread)
 -- by a cleanup registered with 'onException' after the start returned. It is the previous unowned start the negative controls
 -- judge: it leaves the thread when the example is cancelled between its start and that cleanup, and when it is cancelled once
 -- the session has ended. It differs from 'runScenarioSeamed' in nothing else.
-previousRunScenario ∷ RunnerSeams → SessionEnv → Harness → (Session → IO ()) → IO SessionOutcome
-previousRunScenario seams env harness scenario = do
+previousRunScenario ∷ IORef [ThreadId] → RunnerSeams → SessionEnv → Harness → (Session → IO ()) → IO SessionOutcome
+previousRunScenario seen seams env harness scenario = do
   handleVar ← newEmptyMVar
   resultVar ← newEmptyMVar
   terminated ← newEmptyMVar
+  -- the control's own cleanup learns the thread in the step that starts it
   thread ← mask $ \restore →
-    forkIO $
-      ( do
-          session ← readMVar handleVar
-          result ← try (restore (scenario session))
-          case result of
-            Left (failure ∷ SomeException) → do
-              hPutStrLn stderr ("scenario failed with " <> show failure)
-              requestStop session StopQuit
-              putMVar resultVar (Left failure)
-            Right () → putMVar resultVar (Right ())
-          letScenarioGo env
-      )
-        `finally` putMVar terminated ()
+    ( forkIO $
+        ( do
+            session ← readMVar handleVar
+            result ← try (restore (scenario session))
+            case result of
+              Left (failure ∷ SomeException) → do
+                hPutStrLn stderr ("scenario failed with " <> show failure)
+                requestStop session StopQuit
+                putMVar resultVar (Left failure)
+              Right () → putMVar resultVar (Right ())
+            letScenarioGo env
+        )
+          `finally` putMVar terminated ()
+    )
+      >>= \started → atomicModifyIORef' seen (\held → (started : held, ())) >> pure started
   -- the gap: the thread exists, and the cleanup below is not registered yet
   seamStarted seams thread
   outcome ← runSession (scenarioSpec env harness) (putMVar handleVar) `onException` (killThread thread >> takeMVar terminated)
@@ -84,9 +88,21 @@ recording seen ended = RunnerSeams {seamStarted = \thread → atomicModifyIORef'
 
 -- | End and join what a control left, newest first, each even if an earlier one failed.
 stopNoted ∷ IORef [ThreadId] → IO ()
-stopNoted seen = do
-  threads ← readIORef seen
-  for_ threads $ \thread → killThread thread `finally` void (hasEnded thread)
+stopNoted seen =
+  uninterruptibleMask_ $ do
+    threads ← readIORef seen
+    for_ threads $ \thread → killThread thread `finally` void (hasEnded thread)
+
+-- | Nothing the helper or control started is alive.
+noneAlive ∷ IORef [ThreadId] → IO Bool
+noneAlive seen = readIORef seen >>= fmap and . mapM hasEnded
+
+-- | Run the helper or control cancelled at once; whatever it started is not alive once it has returned or raised.
+cancelledAtOnce ∷ (IORef [ThreadId] → IO ()) → IO Bool
+cancelledAtOnce control = do
+  seen ← newIORef []
+  void (try @AsyncException (bounded (withCancellationAfter (pure ()) (pure ()) (control seen))))
+  noneAlive seen
 
 -- | The session's run is cancelled before the scenario started: the scenario's thread exists, is parked waiting for the
 -- session's handle, and the cancellation lands where the runner has not yet registered anything of its own. Whether the thread
@@ -117,9 +133,8 @@ cancelledOnceTheSessionEnded runner seen hold =
 
 -- | A canceller that waits for a point the session reaches, which the example never lets it reach, in a scope that ends the way
 -- the ending says: whether the thread has ended and been joined when the scope returned.
-cancellerNeverReached ∷ Ending → Scope → IO Bool
-cancellerNeverReached ending scope = do
-  seen ← newIORef []
+cancellerNeverReached ∷ IORef [ThreadId] → Ending → Scope → IO Bool
+cancellerNeverReached seen ending scope = do
   point ← newEmptyMVar ∷ IO (MVar ())
   started ← newEmptyMVar
   driver ← myThreadId
@@ -134,27 +149,28 @@ cancellerNeverReached ending scope = do
 -- | A writer parked in a held sink of the output the example owns, in a scope that ends the way the ending says. The gate it is
 -- held at is not opened by the example: only the scope lets it go, which is the thing judged. A control stops what it left
 -- before the output's own scope ends, because that waits for the call inside the sink; the judgement is made first.
-parkedWriter ∷ Ending → Scope → IO () → IO Bool
-parkedWriter ending scope afterwards = do
-  seen ← newIORef []
+parkedWriter ∷ IORef [ThreadId] → Ending → Scope → IO () → IO Bool
+parkedWriter seen ending scope afterwards = do
   entered ← newEmptyMVar
   gate ← newEmptyMVar
   let sink = OutputSink {sinkLine = \_ → putMVar entered () >> takeMVar gate, sinkFlush = pure ()}
       letGo = void (tryPutMVar gate ())
-  withOutput sink sink $ \output → do
-    runEnding ending $ \end → scope letGo (noteThread seen >> writeAuthored output Stdout ["held"]) $ \_ _ → end (bounded (takeMVar entered))
-    joined ← allJoined seen
-    afterwards
-    pure joined
+  withOutput sink sink $ \output →
+    -- the control's cleanup is a finalizer around the scenario and its judgement, inside the output's scope and registered before the
+    -- writer starts: the output's own exit waits for the call inside the sink, so it must never be reached with the writer parked
+    ( do
+        runEnding ending $ \end → scope letGo (noteThread seen >> writeAuthored output Stdout ["held"]) $ \_ _ → end (bounded (takeMVar entered))
+        allJoined seen
+    )
+      `finally` afterwards
 
 -- | Whether the supplier is still running when the exit it serves runs. @Enclosing@ is the shape of the converted sites: the
 -- supplier's scope encloses the exit, which ends it afterwards. @Preceding@ is the shape they had: the supplier is ended and
 -- joined by its own scope, and the exit runs after it.
 data Nesting = Enclosing | Preceding
 
-supplierAtExit ∷ Nesting → IO Bool
-supplierAtExit nesting = do
-  seen ← newIORef []
+supplierAtExit ∷ IORef [ThreadId] → Nesting → IO Bool
+supplierAtExit seen nesting = do
   started ← newEmptyMVar
   hold ← newEmptyMVar
   running ← newEmptyMVar
@@ -193,26 +209,53 @@ spec = describe "the threads the helpers start are owned (#599)" $ do
     it "negative control: the previous runner leaves the scenario's thread when the cancellation lands between its start and the cleanup it registered" $ do
       seen ← newIORef []
       -- The judgement is recorded first; only then is the thread the control left stopped and joined.
-      (cancelledBeforeScenario previousRunScenario seen >>= (`shouldBe` False)) `finally` stopNoted seen
+      (cancelledBeforeScenario (previousRunScenario seen) seen >>= (`shouldBe` False)) `finally` stopNoted seen
     it "negative control: the previous runner leaves the scenario's thread when the example is cancelled once the session has ended" $ do
       seen ← newIORef []
       hold ← newEmptyMVar
-      (cancelledOnceTheSessionEnded previousRunScenario seen hold >>= (`shouldBe` False)) `finally` (void (tryPutMVar hold ()) >> stopNoted seen)
+      (cancelledOnceTheSessionEnded (previousRunScenario seen) seen hold >>= (`shouldBe` False)) `finally` (void (tryPutMVar hold ()) >> stopNoted seen)
   for_ endings $ \(label, ending) → do
     describe ("a canceller that waits for a point the session reaches, when " <> label) $ do
-      it "has ended and been joined when its scope returns, though the point was never reached" $
-        cancellerNeverReached ending ownedScope >>= (`shouldBe` True)
+      it "has ended and been joined when its scope returns, though the point was never reached" $ do
+        seen ← newIORef []
+        cancellerNeverReached seen ending ownedScope >>= (`shouldBe` True)
       it "negative control: an unowned canceller is left waiting for the point" $ do
         cleanups ← newCleanups
-        (cancellerNeverReached ending (unownedScope cleanups) >>= (`shouldBe` False)) `finally` runCleanups cleanups
+        seen ← newIORef []
+        (cancellerNeverReached seen ending (unownedScope cleanups) >>= (`shouldBe` False)) `finally` runCleanups cleanups
     describe ("a writer parked in a held sink, when " <> label) $ do
-      it "is let go by the stop, and has ended and been joined when its scope returns" $
-        parkedWriter ending ownedScope (pure ()) >>= (`shouldBe` True)
+      it "is let go by the stop, and has ended and been joined when its scope returns" $ do
+        seen ← newIORef []
+        parkedWriter seen ending ownedScope (pure ()) >>= (`shouldBe` True)
       it "negative control: an unowned writer is left parked in the sink" $ do
         cleanups ← newCleanups
-        parkedWriter ending (unownedScope cleanups) (runCleanups cleanups) >>= (`shouldBe` False)
+        seen ← newIORef []
+        parkedWriter seen ending (unownedScope cleanups) (runCleanups cleanups) >>= (`shouldBe` False)
   describe "a supplier whose exit is still running" $ do
-    it "is not ended before the exit it serves: its scope encloses the exit" $
-      supplierAtExit Enclosing >>= (`shouldBe` True)
-    it "negative control: a supplier ended and joined by its own scope is gone when the exit runs" $
-      supplierAtExit Preceding >>= (`shouldBe` False)
+    it "is not ended before the exit it serves: its scope encloses the exit" $ do
+      seen ← newIORef []
+      supplierAtExit seen Enclosing >>= (`shouldBe` True)
+    it "negative control: a supplier ended and joined by its own scope is gone when the exit runs" $ do
+      seen ← newIORef []
+      supplierAtExit seen Preceding >>= (`shouldBe` False)
+    it "leaves nothing alive when it is cancelled at once" $
+      cancelledAtOnce (\seen → void (supplierAtExit seen Enclosing)) >>= (`shouldBe` True)
+  describe "cancelled at once" $ do
+    it "a scenario runner leaves nothing alive" $ do
+      hold ← newEmptyMVar
+      joined ← cancelledAtOnce (\seen → void (cancelledOnceTheSessionEnded runScenarioSeamed seen hold))
+      void (tryPutMVar hold ())
+      joined `shouldBe` True
+    it "the previous runner's control leaves nothing alive" $ do
+      hold ← newEmptyMVar
+      joined ← cancelledAtOnce (\seen → void (cancelledOnceTheSessionEnded (previousRunScenario seen) seen hold) `finally` (void (tryPutMVar hold ()) >> stopNoted seen))
+      joined `shouldBe` True
+    for_ endings $ \(label, ending) → do
+      it ("a canceller and its control leave nothing alive, when " <> label) $ do
+        cleanups ← newCleanups
+        joined ← cancelledAtOnce (\seen → void (cancellerNeverReached seen ending (unownedScope cleanups)) `finally` runCleanups cleanups)
+        joined `shouldBe` True
+      it ("a writer parked in a held sink and its control leave nothing alive, when " <> label) $ do
+        cleanups ← newCleanups
+        joined ← cancelledAtOnce (\seen → void (parkedWriter seen ending (unownedScope cleanups) (runCleanups cleanups)))
+        joined `shouldBe` True

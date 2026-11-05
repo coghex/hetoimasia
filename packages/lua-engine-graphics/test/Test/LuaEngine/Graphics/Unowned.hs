@@ -36,7 +36,7 @@ module Test.LuaEngine.Graphics.Unowned
 
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
-import Control.Exception (AsyncException (UserInterrupt), Exception, finally, mask_, throwIO, try)
+import Control.Exception (AsyncException (UserInterrupt), Exception, finally, mask_, throwIO, try, uninterruptibleMask_)
 import Control.Monad (void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Foreign.StablePtr (freeStablePtr, newStablePtr)
@@ -65,9 +65,10 @@ newCleanups = Cleanups <$> newIORef []
 cleanupLater ∷ Cleanups → IO () → IO ()
 cleanupLater (Cleanups ref) cleanup = atomicModifyIORef' ref (\held → (cleanup : held, ()))
 
--- | Run every registered cleanup, the newest first, each even if an earlier one failed.
+-- | Run every registered cleanup, the newest first, each even if an earlier one failed, and not interruptibly: a cancellation
+-- that arrives while a control is stopping what it left must not leave the rest of it behind.
 runCleanups ∷ Cleanups → IO ()
-runCleanups (Cleanups ref) = readIORef ref >>= foldr (\cleanup rest → cleanup `finally` rest) (pure ())
+runCleanups (Cleanups ref) = uninterruptibleMask_ (readIORef ref >>= foldr (\cleanup rest → cleanup `finally` rest) (pure ()))
 
 -- | A deliberately unowned start, the controls' only one: the thread is started and its end announced however it ended, and
 -- nothing stops or joins it when the scope ends. Its independent stop-and-join is registered with the control in the same

@@ -47,7 +47,7 @@ import Hetoimasia.GPU.Model (Usage, usage)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig)
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootsView (..))
 import Test.LuaEngine.Graphics.FrameLog (FrameLog, emptyFrameLog, recordEvent)
-import Test.Support.Owned (withOwnedBoundThread)
+import Test.LuaEngine.Graphics.Served (withServedBoundThread)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
   , NativeObserver (..)
@@ -240,8 +240,11 @@ runSession complete backend features configuration examples = do
               wakeGraphicsHost (vulkanGraphicsOwner vulkan)
         -- The bound OS thread that runs the complete profile is owned by the call (#599), started by the facility's bound
         -- start (#593): window creation, surfaces and native events belong to the process main thread, which serves the
-        -- owner loop below, and the thread is ended and joined before this loop's scope returns however it ended.
-        withOwnedBoundThread profile $ \_ _ → do
+        -- owner loop below. The loop is a supplier of the profile's own teardown (an example's window scope closes and drains
+        -- only as the loop services its commands), so when the loop is left abnormally it is served again until the profile
+        -- thread has ended, and the thread is ended and joined before this scope returns however it ended
+        -- ('Test.LuaEngine.Graphics.Served').
+        withServedBoundThread profile (isJust <$> tryReadMVar done) $ \stopServing → do
           -- The process main thread serves the owner loop until the examples are done: window creation, surfaces
           -- and native events belong to it. A turn runs the jobs the examples handed it and the action they
           -- installed, then asks to finish once Hspec has. The loop is woken for each, so none waits on the idle bound.
@@ -249,12 +252,12 @@ runSession complete backend features configuration examples = do
                 pending ← atomically (swapTVar jobs [])
                 sequence_ pending
                 join (readIORef serve)
-                finished ← tryReadMVar done
-                pure (if isJust finished then FinishWith () else ContinueWith NoUpdateDemand)
+                finished ← stopServing
+                pure (if finished then FinishWith () else ContinueWith NoUpdateDemand)
           runVulkanOwnerLoop vulkan control (defaultScheduledHooks quietLogger update)
-          takeMVar done >>= \case
-            Left failure → throwIO failure
-            Right success → writeIORef passedCell success
+        takeMVar done >>= \case
+          Left failure → throwIO failure
+          Right success → writeIORef passedCell success
 
 -- | A line on stderr as the session reaches each stage, so a run that stops says where.
 progressNote ∷ String → IO ()

@@ -21,6 +21,7 @@ module Test.LuaEngine.Graphics.Fake
   , setBarrier
   , withFakeOwner
   , withFakeOwnerAs
+  , latchHolds
   , ownerLoop
 
     -- * Holds
@@ -189,6 +190,10 @@ data Fake = Fake
   , fLedger ∷ !(SceneLedger Int)
     -- ^ The production ledger of what adopted scene revisions hold, which the fake's release is gated on exactly as
     -- the production port's is. The examples that adopt scenes drive its lifecycle hooks.
+  , fLatched ∷ !(TVar Bool)
+    -- ^ Set once the example's scope is stopping ('latchHolds'): from then on 'hold', 'holdTicket' and 'setVersionHolders'
+    -- install nothing, so a worker that is cancelled before it installs its holds cannot reinstall them after the stop let go
+    -- of every one (#599).
   }
 
 newFake ∷ FakeConfig → IO Fake
@@ -215,6 +220,7 @@ newFake cfg =
     <*> newTVarIO (pure (pure True))
     <*> newTVarIO Set.empty
     <*> newSceneLedger
+    <*> newTVarIO False
 
 -- | Install what a release request captures at its admission: a transaction that reads the scene host's state and
 -- answers the gate the owner waits on. The scene host model (the lifecycle suite's stand-in for the host's
@@ -229,7 +235,7 @@ fakeLedger = fLedger
 -- Holds and injections ---------------------------------------------------------------------------------------
 
 hold ∷ Fake → Hold → IO ()
-hold fake which = atomically (modifyTVar' (fHolds fake) (Set.insert which))
+hold fake which = atomically (unlessLatched fake (modifyTVar' (fHolds fake) (Set.insert which)))
 
 release ∷ Fake → Hold → IO ()
 release fake which = atomically (modifyTVar' (fHolds fake) (Set.delete which) >> bump fake)
@@ -237,7 +243,7 @@ release fake which = atomically (modifyTVar' (fHolds fake) (Set.delete which) >>
 -- | Hold the completion of one upload (by the ticket its start event names) while the others complete: how an example
 -- completes two open uploads in the reverse of the order they started.
 holdTicket ∷ Fake → Int → IO ()
-holdTicket fake ticket = atomically (modifyTVar' (fTicketHolds fake) (Set.insert ticket))
+holdTicket fake ticket = atomically (unlessLatched fake (modifyTVar' (fTicketHolds fake) (Set.insert ticket)))
 
 -- | Let one held upload complete.
 releaseTicket ∷ Fake → Int → IO ()
@@ -288,7 +294,16 @@ grantOwner ∷ Fake → Int → IO ()
 grantOwner fake count = atomically (modifyTVar' (fGrants fake) (+ count))
 
 setVersionHolders ∷ Fake → Int → IO ()
-setVersionHolders fake count = atomically (writeTVar (fHolders fake) count >> bump fake)
+setVersionHolders fake count = atomically (readTVar (fLatched fake) >>= \latched → writeTVar (fHolders fake) (if latched then 0 else count) >> bump fake)
+
+-- | From now on no hold is installed: the stop of a scope calls this before it lets every hold go, in the same step, so a worker
+-- the stop reaches before the worker has installed its holds does not install them afterwards and wait on them in a drain the
+-- stop's kill cannot end. Idempotent; it never blocks.
+latchHolds ∷ Fake → IO ()
+latchHolds fake = atomically (writeTVar (fLatched fake) True >> bump fake)
+
+unlessLatched ∷ Fake → STM () → STM ()
+unlessLatched fake action = readTVar (fLatched fake) >>= \latched → unless latched action
 
 bump ∷ Fake → STM ()
 bump fake = modifyTVar' (fEpoch fake) (+ 1)

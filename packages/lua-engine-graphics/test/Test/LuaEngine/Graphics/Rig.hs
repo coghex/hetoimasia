@@ -129,7 +129,7 @@ withBackendOnRaw fake body =
   withBackend (fakePort fake) $ \backend → body (Rig fake backend (textureBackend backend))
 
 openEveryHold ∷ Fake → IO ()
-openEveryHold fake = forM_ [minBound .. maxBound] (release fake) >> releaseAllTickets fake >> setVersionHolders fake 0
+openEveryHold fake = latchHolds fake >> forM_ [minBound .. maxBound] (release fake) >> releaseAllTickets fake >> setVersionHolders fake 0
 
 -- | What a finished example must not have left.
 leaked ∷ Fake → STM [Text]
