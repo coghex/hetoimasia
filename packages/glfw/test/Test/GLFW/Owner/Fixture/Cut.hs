@@ -46,6 +46,7 @@ module Test.GLFW.Owner.Fixture.Cut
   , heldBody
   , boundaryExamples
   , boundaryControls
+  , afterUnacknowledgedExamples
   , stalledSnapshots
   , pendingProtocolExample
   ) where
@@ -86,13 +87,14 @@ import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import Hetoimasia.GLFW.Internal.Seam (Seam)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene, journalled, ordered)
-import Test.GLFW.Owner.Fixture.Rig (Observer (..), Rig (..), ownedHostObserved)
+import Test.GLFW.Owner.Fixture.Rig (Observer (..), Rig (..), newRig, ownedHostObserved)
 import Test.GLFW.Support
   ( Boom (..)
   , Scope
   , boundedExample
   , endedAndJoined
   , holdForever
+  , quietLogger
   , recordingThreads
   , unexpected
   , withDeferredThreadVia
@@ -387,6 +389,42 @@ boundaryControls what fixture =
     forM_ allStates $ \state →
       it ("negative control: " <> describeCut what boundary state <> ", unrescued (#612)") $
         boundedExample (cutStrands state boundary fixture)
+
+-- | The coordinated cancellation for a worker that ends before it acknowledges while the start's wait returns normally (#613): the
+-- start has already observed it terminal and withdrawn the owner in the one transaction that answered, so the first instant a run can
+-- be cut after is the start's return, 'AfterStart'. Cut there in each way, the run raises what was injected, the exit finishes
+-- without a destruction snapshot, and the backend was asked for nothing.
+afterUnacknowledgedExamples ∷ Spec
+afterUnacknowledgedExamples =
+  forM_ allStates $ \state →
+    it ("finishes the exit when the run " <> describeCutState state <> " after the start returned an owner whose worker ended before it acknowledged (#613)") $
+      boundedExample $ do
+        recorded ← newIORef []
+        withCutting recorded state AfterStart True $ \cutting → do
+          rig ← newRig
+          writeIORef (cuttingRig cutting) (Just rig)
+          let hooks =
+                Private.noHostHooks
+                  { Private.ownerWorkerBoundary = \case
+                      Private.OwnerWorkerStarting → throwIO Boom
+                      Private.OwnerWorkerEntering → pure ()
+                  }
+          outcome ← try (unsafeUnmask (ownedHostCut cutting hooks quietLogger (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) (\_ _ _ → pure ())))
+          case outcome of
+            Right () → unexpected "the cut run returned instead of raising what was injected"
+            Left caught → caught `shouldSatisfy` raisedAsInjected state
+          readIORef (cuttingCrossed cutting) >>= (`shouldBe` [BeforePublication, AfterPublication, AwaitingStartup, AfterStart])
+          notes ← journalled (rigJournal rig)
+          notes `shouldSatisfy` elem SessionEnded
+          filter (\entry → entry `elem` [OwnerStartup, OwnerRetirement, OwnerDestruction]) notes `shouldBe` []
+          readTVarIO (cuttingSnapshots cutting) >>= (`shouldBe` 0)
+        endedAndJoined recorded >>= (`shouldBe` True)
+
+describeCutState ∷ CutState → String
+describeCutState = \case
+  CutFails → "fails"
+  CutPending → "is cancelled, the cancellation pending,"
+  CutDelivered → "is cancelled while parked"
 
 describeCut ∷ String → Boundary → CutState → String
 describeCut what boundary state =

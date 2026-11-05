@@ -16,7 +16,7 @@ import Control.Concurrent.STM (STM, atomically, newTVarIO, readTVar)
 import Control.Exception (Exception, onException, throwIO)
 import Control.Monad.IO.Class (liftIO)
 import Data.Foldable (for_)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Hetoimasia.Foundation.Worker (Startup (..), WorkerGroup, awaitStartup, pollCompletion, startWorkerWithIO, workerDefinition)
@@ -84,7 +84,10 @@ instance Exception OwnerHandleMissing
 -- destruction was established.
 --
 -- The same holds for a worker that ends before it acknowledges while the wait
--- itself returned normally ('NotAcknowledged').
+-- itself returns normally ('NotAcknowledged'): the wait observes it and
+-- withdraws it in the one transaction that answers, so no cancellation can
+-- fall between the two, and the owner the start then returns is no longer
+-- published and refuses everything offered to it.
 --
 -- @withdraw@ is the composition's: it must be safe to run on an owner the
 -- composition never published, and it runs inside a transaction together with
@@ -178,40 +181,43 @@ startGraphicsOwner group host settled boundary workerBoundary config publish wit
         writeIORef built (Just owner)
         publish owner
         boundary OwnerPublished
+      -- A worker that ends before it acknowledges is observed and withdrawn in the one transaction that returns the wait's answer,
+      -- so there is no instant between the two at which a cancellation could leave a terminal, never-entered owner published. A
+      -- cancellation after the transaction is the start's own failure path, which withdraws the same way.
       awaitStarted worker = do
         boundary OwnerAwaitingStartup
-        atomically (awaitStartup worker)
+        filled ← readIORef built
+        atomically $ do
+          startup ← awaitStartup worker
+          case startup of
+            NotAcknowledged _ → withdrawNeverEntered withdraw filled
+            Acknowledged → pure ()
+          pure startup
   outcome ←
     startWorkerWithIO group definition publishHandle awaitStarted
       -- Handler masked by 'onException', and the only thing it does is one
       -- transaction, which cannot be interrupted: the abandoned worker is
       -- already terminal when the failure reaches here, so no cancellation can
       -- fall between that and the withdrawal.
-      `onException` withdrawIfNeverEntered withdraw built
+      `onException` (readIORef built >>= atomically . withdrawNeverEntered withdraw)
   case outcome of
     Left _ → throwIO OwnerHostUnprotected
-    Right (worker, startup) → do
-      case startup of
-        Acknowledged → pure ()
-        -- Terminal before it acknowledged: its run action can never begin.
-        NotAcknowledged _ → withdrawIfNeverEntered withdraw built
+    Right (worker, _) → do
       boundary OwnerStarted
       pure (partial worker)
 
--- | Withdraw the owner whose handle the start filled in, if its worker is
--- terminal and its run action never began; do nothing otherwise.
+-- | Withdraw the owner whose handle the start filled in, if its worker is terminal and its run action never began; do nothing
+-- otherwise.
 --
--- One transaction reads the worker's completion and the owner's entered flag
--- and withdraws, so the decision and the withdrawal cannot come apart. A worker
--- with no completion yet is not terminal and is left alone, and so is an owner
--- that entered its run, whatever its worker's record says: those are the
--- owners whose own drain records the evidence the exit waits for.
-withdrawIfNeverEntered
+-- One transaction reads the worker's completion and the owner's entered flag and withdraws, so the decision and the withdrawal
+-- cannot come apart. A worker with no completion yet is not terminal and is left alone, and so is an owner that entered its run,
+-- whatever its worker's record says: those are the owners whose own drain records the evidence the exit waits for.
+withdrawNeverEntered
   ∷ (GraphicsOwner scene → STM ())
-  → IORef (Maybe (GraphicsOwner scene))
-  → IO ()
-withdrawIfNeverEntered withdraw built =
-  readIORef built >>= \filled → for_ filled $ \owner → atomically $ do
+  → Maybe (GraphicsOwner scene)
+  → STM ()
+withdrawNeverEntered withdraw filled =
+  for_ filled $ \owner → do
     settled ← pollCompletion (ownerWorkerHandle owner)
     entered ← readTVar (ownerEntered owner)
     for_ settled (\_ → if entered then pure () else withdraw owner)

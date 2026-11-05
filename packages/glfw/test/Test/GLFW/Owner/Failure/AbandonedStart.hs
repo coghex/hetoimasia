@@ -22,7 +22,8 @@ import Hetoimasia.Foundation.Messaging.Snapshot (Publication (..))
 import Hetoimasia.Foundation.Worker (Completion (..), Result (..), RunExit (..), WorkerEvidence (..), pollCompletion, workerEvidence)
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
-import Test.GLFW.Owner.Fixture.Drive (awaitDiagnostic)
+import Test.GLFW.Owner.Fixture.Cut (afterUnacknowledgedExamples)
+import Test.GLFW.Owner.Fixture.Drive (awaitDiagnostic, theWindow)
 import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene (..), Scripted (..), journalled)
 import Test.GLFW.Owner.Fixture.Rig (Observer (..), Rig (..), newRig, ownedHostObserved)
@@ -47,8 +48,9 @@ spec = do
     boundedExample (testWithdrawnAfterQuiescence QuiescedBeforeStart)
   it "closes the publications of an owner withdrawn from an exit whose quiescence committed while the owner was published (#613)" $
     boundedExample (testWithdrawnAfterQuiescence QuiescedWhilePublished)
-  it "withdraws an owner whose worker ended before it acknowledged although the start's wait returned (#613)" $
+  it "withdraws an owner whose worker ended before it acknowledged although the start's wait returned, and the owner it returns refuses every publication and handover (#613)" $
     boundedExample testWorkerEndedBeforeAcknowledging
+  afterUnacknowledgedExamples
 
 -- | What a run of the rig left for the example to judge.
 data Ran = Ran
@@ -59,8 +61,8 @@ data Ran = Ran
   }
 
 -- | Run the rig under these hooks and a body that must not be entered, and report what was observed.
-observedRun ∷ Rig → Private.HostHooks → IO Ran
-observedRun rig hooks = do
+observedRun ∷ Rig → Private.HostHooks → (WindowHost → GraphicsOwner Scene → IO ()) → IO Ran
+observedRun rig hooks body = do
   failure ← newIORef Nothing
   owner ← newIORef Nothing
   _ ←
@@ -73,7 +75,7 @@ observedRun rig hooks = do
         (rigSeam rig)
         (rigHostConfig rig)
         (rigOwnerConfig rig)
-        (\_ _ _ → pure ())
+        (\host started _ → body host started)
   Ran <$> readIORef failure <*> readIORef owner
 
 -- | The one abandoned start a failure carries evidence of, with the run exit of the worker that was drained.
@@ -185,7 +187,7 @@ testWithdrawnAfterQuiescence quiescence = do
               Private.OwnerWorkerStarting → holdForever
               Private.OwnerWorkerEntering → pure ()
           }
-  ran ← observedRun rig hooks
+  ran ← observedRun rig hooks (\_ _ → unexpected "the body was entered")
   failure ← maybe (unexpected "the run did not fail") pure (ranFailure ran)
   fromException failure `shouldBe` Just Boom
   abandonedExit failure >>= (`shouldBe` RunNotEntered)
@@ -207,14 +209,23 @@ testWithdrawnAfterQuiescence quiescence = do
 testWorkerEndedBeforeAcknowledging ∷ IO ()
 testWorkerEndedBeforeAcknowledging = do
   rig ← newRig
+  offered ← newIORef Nothing
   let hooks =
         Private.noHostHooks
           { Private.ownerWorkerBoundary = \case
               Private.OwnerWorkerStarting → throwIO Boom
               Private.OwnerWorkerEntering → pure ()
           }
-  ran ← observedRun rig hooks
+      -- The application got the owner back, so it can offer it things. Both are refused: nothing will ever run it.
+      body host owner = do
+        scene ← prepare (Scene 1)
+        published ← atomically (publishOwnerScene (ownerHandoff owner) scene)
+        window ← theWindow host
+        handover ← handOverGraphicsTarget host owner window
+        writeIORef offered (Just (published, describeHandover handover))
+  ran ← observedRun rig hooks body
   owner ← maybe (unexpected "the owner was never published") pure (ranOwner ran)
+  readIORef offered >>= (`shouldBe` Just (ScenePublication PublicationClosed, "owner closed"))
   -- The worker ended without acknowledging, with the failure it was given, and never entered its run.
   completion ← atomically (pollCompletion (graphicsOwnerWorker owner)) >>= maybe (unexpected "the worker never ended") pure
   completionExit completion `shouldBe` RunNotEntered
@@ -226,3 +237,12 @@ testWorkerEndedBeforeAcknowledging = do
   notes ← journalled (rigJournal rig)
   notes `shouldSatisfy` elem SessionEnded
   filter backendNote notes `shouldBe` []
+  where
+    describeHandover ∷ GraphicsHandover → String
+    describeHandover = \case
+      HandoverOwnerClosed → "owner closed"
+      HandoverPortFull → "port full"
+      HandoverRefused _ → "refused"
+      HandoverSuperseded _ → "superseded"
+      HandoverRolledBack _ → "rolled back"
+      TargetHandedOver _ → "handed over"

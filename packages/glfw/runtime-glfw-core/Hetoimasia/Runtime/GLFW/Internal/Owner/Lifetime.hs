@@ -200,16 +200,14 @@ withGraphicsOwnerHostAll hooks observe logger sessionScope config ownerConfig us
       -- records it never ran. Mechanism A of the owner's decision: nothing is
       -- published as evidence, and the exit's wait is not changed.
       --
-      -- Idempotent, and a no-op for an owner that was never published. If the
-      -- host's quiescence committed while the owner was published, it closed
-      -- the owner's publications then; if it committed before, 'publish' did;
-      -- either way the withdrawn owner admits nothing from here on. Run in the
-      -- transaction that observed the worker terminal, so no quiescence or
-      -- exit step falls between the two.
+      -- Idempotent, and a no-op for an owner that was never published. The owner's publications are closed in the same transaction,
+      -- whether or not the host's quiescence has committed: a worker that ended before it acknowledged is still returned to the
+      -- application by the start, and an owner nothing will ever run must refuse everything the application offers it, or a
+      -- handover would be announced to a worker that cannot retire it. If quiescence committed while the owner was published it
+      -- had closed them already; this only makes the closure independent of that order.
       withdraw owner = do
         writeTVar pending Nothing
-        closed ← readTVar quiesced
-        when closed (closeOwnerPublications (ownerHandoff' owner))
+        closeOwnerPublications (ownerHandoff' owner)
   -- The group's own scope sits outside the protected host lifetime
   -- deliberately: D-33 forbids an automatic join that could run before the
   -- main thread has serviced retirement, and the exit's own
