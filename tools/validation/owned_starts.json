@@ -112,6 +112,12 @@
       "reason": "the scenario thread: forked under mask and stopped and joined on every way out by the same function, audited in #540"
     },
     {
+      "file": "packages/glfw/native-tests/Test/GLFW/Native/Unowned.hs",
+      "binding": "startUnowned",
+      "sites": 2,
+      "reason": "the native suite's ownership regressions' negative controls' deliberately unowned start, of either boundness (#594), which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
       "file": "packages/glfw/native-tests/Test/GLFW/Native/Child.hs",
       "binding": "assembly",
       "sites": 1,
