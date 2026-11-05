@@ -32,6 +32,16 @@ does.
   `withOwnedThreadOpening open`, whose idempotent, non-blocking `open` the same
   release runs first; a `finally` inside the body is too late for a cancellation
   delivered as the body begins. It sleeps nowhere and needs `base` alone.
+  An example whose point is that a cancellation is *pending* against a thread
+  before the thread's next effect starts the target and the cancellation's sender
+  with `withOwnedThreadOn capability action body` (or
+  `withOwnedThreadOpeningOn capability open action body`): the same ownership, on a
+  thread pinned to one capability (#610). On one capability `throwTo` to a masked
+  thread queues the exception before the sender is recorded as blocked, so a sender
+  seen blocked delivering has an exception pending against its target; across
+  capabilities it is a message the target's capability takes in later (GHC 9.14.1
+  `rts/Schedule.c`, `scheduleProcessInbox` returns at once when the capability's
+  lock is busy), and no wait on the sender's status establishes receipt.
   A test that asserts boundness (a seam that rejects entry from a bound worker and
   from an unbound thread, a thread designated as the process main thread) starts
   its thread with `withOwnedBoundThread action body`, or
