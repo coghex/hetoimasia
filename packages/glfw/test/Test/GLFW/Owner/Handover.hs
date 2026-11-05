@@ -9,6 +9,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
   , check
+  , modifyTVar'
   , newTVarIO
   , readTVar
   , readTVarIO
@@ -22,10 +23,20 @@ import Control.Exception
   , try
   )
 import Control.Monad (forM, forM_, void, when)
+import Data.IORef (writeIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
+import Test.GLFW.Owner.Fixture.Cut
+  ( Cutting (..)
+  , boundaryControls
+  , boundaryExamples
+  , heldBody
+  , ownedHostCut
+  , pendingProtocolExample
+  , uncut
+  )
 import Test.GLFW.Owner.Fixture.Drive
   ( awaitConstructed
   , awaitRound
@@ -77,6 +88,13 @@ spec = do
     (boundedExample testVerifiedRollback)
   it "leaks no port reservation when a handover is refused, and tells the owner about an attachment whose answer was lost"
     (boundedExample testHandoverRecovery)
+  it "calls the owner-boundary hook at the start's two boundaries, once each and in order, and nowhere else (#612)"
+    (boundedExample testOwnerBoundariesCalledOnce)
+  pendingProtocolExample
+  boundaryExamples "the handoff order" handoffOrder
+  boundaryControls "the handoff order" handoffOrder
+  boundaryExamples "the handover recovery" handoverRecovery
+  boundaryControls "the handover recovery" handoverRecovery
   it "leaves no attachment the owner never hears of, however a handover is cancelled"
     (boundedExample testCancelledHandover)
   it "refuses a delayed announcement of an incarnation the slot has moved past"
@@ -89,9 +107,15 @@ spec = do
 -- backend construct anything. Nothing the backend builds can precede the
 -- window's exclusive slot being reserved.
 testHandoffOrder ∷ IO ()
-testHandoffOrder = do
+testHandoffOrder = uncut >>= handoffOrder
+
+-- | The example under a 'Cutting' (#612): the gate it holds the owner at is the cutting's, and the owner is released on every way out
+-- of the body and, before the body has begun, by the exit.
+handoffOrder ∷ Cutting → IO ()
+handoffOrder cutting = do
   rig ← newRig
-  gate ← newTVarIO False
+  writeIORef (cuttingRig cutting) (Just rig)
+  let gate = cuttingGate cutting
   entered ← newEmptyMVar
   -- The owner is held inside its startup, so it can have drained no lifetime
   -- event and constructed nothing while the main thread reserves the slot.
@@ -100,7 +124,7 @@ testHandoffOrder = do
     atomically (readTVar gate >>= check)
     pure (ownerReady (Text.pack "started"))
   (pendingBeforeConstruction, notesBefore, views) ←
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    ownedHostCut cutting Private.noHostHooks quietLogger (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → heldBody cutting $ do
       takeMVar entered
       window ← theWindow host
       service ← handedOver host owner window
@@ -124,6 +148,18 @@ testHandoffOrder = do
     isConstruction = \case
       Constructed _ → True
       _ → False
+
+-- | The private hook the cut examples use is called exactly where the graphics owner's start documents it, once each and in order,
+-- and a run without it is the production run: every other example of the suite passes 'Private.noHostHooks' through the same call
+-- sites (#612).
+testOwnerBoundariesCalledOnce ∷ IO ()
+testOwnerBoundariesCalledOnce = do
+  rig ← newRig
+  reached ← newTVarIO []
+  let hooks = Private.noHostHooks {Private.ownerBoundary = \boundary → atomically (modifyTVar' reached (<> [boundary]))}
+  ownedHostHooked hooks quietLogger (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control →
+    void (awaitRound owner 0)
+  readTVarIO reached `shouldReturn` [Private.OwnerBeforePublication, Private.OwnerStarted]
 
 -- | A target's observations carry their own monotonic revision, and the slot
 -- is keyed by the exact attachment.
@@ -269,15 +305,20 @@ testVerifiedRollback = do
 -- | A refused handover spends no reservation, and an attachment whose answer
 -- was lost is still announced.
 testHandoverRecovery ∷ IO ()
-testHandoverRecovery = do
+testHandoverRecovery = uncut >>= handoverRecovery
+
+-- | The example under a 'Cutting' (#612); see 'handoffOrder'.
+handoverRecovery ∷ Cutting → IO ()
+handoverRecovery cutting = do
   -- One event of room, so a leaked reservation makes the next handover fail.
   rig ← newRigWith (\config → config {ownerEventCapacity = 1})
+  writeIORef (cuttingRig cutting) (Just rig)
   clock ← countingClock
   let config =
         (ownerSettings clock)
           { hostWindowConfigs = [windowNamed (Text.pack "closing"), windowNamed (Text.pack "open")]
           }
-  gate ← newTVarIO False
+  let gate = cuttingGate cutting
   entered ← newEmptyMVar
   -- The owner is held inside its startup, so it drains no event: the one slot
   -- has to be given back by each refusal for the last handover to fit at all.
@@ -285,7 +326,7 @@ testHandoverRecovery = do
     putMVar entered ()
     atomically (readTVar gate >>= check)
     pure (ownerReady (Text.pack "late"))
-  (refusals, announced, owned) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → do
+  (refusals, announced, owned) ← ownedHostCut cutting Private.noHostHooks quietLogger (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → heldBody cutting $ do
     takeMVar entered
     windows ← atomically (hostWindowIdentities host)
     case windows of

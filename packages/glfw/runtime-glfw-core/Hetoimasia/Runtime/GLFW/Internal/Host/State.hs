@@ -28,6 +28,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Host.State
 
     -- * Where the private examples interrupt a host
   , HostHooks (..)
+  , OwnerBoundary (..)
   , noHostHooks
 
     -- * The registry
@@ -140,10 +141,34 @@ data HostHooks = HostHooks
     -- whatever this attaches, and however it then fails, is drained exactly as
     -- the consumer's own attachments are. It never runs for a host built as an
     -- ordinary 'Scoped' value, which can hold no attachment.
+  , ownerBoundary ∷ OwnerBoundary → IO ()
+    -- ^ Runs on the main thread, inside the graphics owner's start, at each
+    -- 'OwnerBoundary' the start crosses (#612): the instants between the
+    -- owner's worker being registered and forked and the application's body
+    -- being entered, which no other hook reaches. It runs with the masking
+    -- state its caller has, so an example may fail, park or be cancelled
+    -- there; whatever it does, the owner is drained exactly as the consumer's
+    -- own failure would drain it. It never runs for a host that starts no
+    -- owner.
   }
 
+-- | The instants inside the graphics owner's start that a private example may
+-- end a run at, passed to 'ownerBoundary' (#612). The start's other two
+-- boundaries, the owner handle's publication inside the preparation step and
+-- the wait for its startup, are not named here: ending a run there strands the
+-- protected exit in production (#613), so no example reaches them.
+data OwnerBoundary
+  = OwnerBeforePublication
+    -- ^ The owner's worker is registered and forked and its handle is not yet
+    -- published, at the start of the preparation step: the protected exit has
+    -- no owner to settle.
+  | OwnerStarted
+    -- ^ The owner has started and its handle is published, and the start has
+    -- not yet returned it to the application.
+  deriving (Eq, Show)
+
 noHostHooks ∷ HostHooks
-noHostHooks = HostHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (\_ → pure ())
+noHostHooks = HostHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (\_ → pure ()) (\_ → pure ())
 
 -- | One registered window: its collection member, its own command host, its
 -- input feed, the capabilities handed to clients, and whether its close protocol
