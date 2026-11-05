@@ -11,7 +11,7 @@
 -- private seam.
 module Test.LuaEngine.Boot (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, throwIO, try)
 import Control.Monad (forM_, void)
@@ -40,6 +40,7 @@ import System.Exit (ExitCode (ExitSuccess))
 import System.Process (proc)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, withStorePackageClient)
 import Test.Support.Subprocess (runCaptured)
 
@@ -315,10 +316,12 @@ spec = describe "the boot checkpoint" $ do
               putMVar reached ()
               takeMVar hold
               pure result
-        thread ← forkIO (try (bootCheckpoint fixedM1Profile inventory gated) >>= putMVar finished)
-        bounded (takeMVar reached)
-        killThread thread
-        outcome ← bounded (takeMVar finished) ∷ IO (Either SomeException (Either BootRefusal Checkpoint))
+        -- the checkpoint is owned by the example (#599); the example cancels it itself while it holds the manifest read
+        outcome ←
+          withOwnedThread (try (bootCheckpoint fixedM1Profile inventory gated) >>= putMVar finished) $ \thread _ → do
+            bounded (takeMVar reached)
+            killThread thread
+            bounded (takeMVar finished) ∷ IO (Either SomeException (Either BootRefusal Checkpoint))
         either (\exception → fromException exception `shouldBe` Just ThreadKilled) (const (expectationFailure "the cancelled checkpoint returned")) outcome
         -- no usable partial result: a fresh checkpoint over the same inventory is whole
         again ← checkpointOf root inventory

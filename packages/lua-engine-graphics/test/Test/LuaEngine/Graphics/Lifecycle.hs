@@ -25,25 +25,27 @@ spec = describe "close, bootstrap and the owner's end, at every seam" $ do
     gateReady probe
     rigs ← newEmptyMVar
     withFakeOwner fake . bounded $ do
-      forked ← forkScope $ do
-        withBackendOnRaw fake $ \rig → do
-          putMVar rigs rig
-          _ ← submit rig probe 2 2 255
-          -- The body returns while 'sinkReady' is still inside the pipeline.
-          _ ← delivered probe
-          pure ()
-        noteEvent fake "scope returned"
-      rig ← takeMVar rigs
-      -- The close has marked the offer; the drain cannot end while the pipeline holds it.
-      awaitBackend rig (elem "offered-released" . readingTextureStages)
-      noteEvent fake "offer answered"
-      openReady probe
-      forkedJoin forked >>= either (\failure → expectationFailure (show failure)) pure
-      assertBefore fake "offer answered" "scope returned"
-      -- The taken texture was engine-owned and unconsumed: released once, and nothing is left.
-      eventCount fake "release attempted" `shouldReturn` 1
-      problems ← atomically (leaked fake)
-      problems `shouldBe` []
+      let scope = do
+            withBackendOnRaw fake $ \rig → do
+              putMVar rigs rig
+              _ ← submit rig probe 2 2 255
+              -- The body returns while 'sinkReady' is still inside the pipeline.
+              _ ← delivered probe
+              pure ()
+            noteEvent fake "scope returned"
+      -- the forked scope is owned by the example (#599); what it may be held at is let go first however the example ends
+      withForkedScope (openReady probe >> openEveryHold fake) scope $ \forked → do
+        rig ← takeMVar rigs
+        -- The close has marked the offer; the drain cannot end while the pipeline holds it.
+        awaitBackend rig (elem "offered-released" . readingTextureStages)
+        noteEvent fake "offer answered"
+        openReady probe
+        forkedJoin forked >>= either (\failure → expectationFailure (show failure)) pure
+        assertBefore fake "offer answered" "scope returned"
+        -- The taken texture was engine-owned and unconsumed: released once, and nothing is left.
+        eventCount fake "release attempted" `shouldReturn` 1
+        problems ← atomically (leaked fake)
+        problems `shouldBe` []
 
   it "ends assembly with the owner's end, not with a bound table, and stops scheduling bootstrap reads" $ do
     fake ← newFake defaultFakeConfig {fcInitialHolds = [HoldBind]}
@@ -169,29 +171,31 @@ spec = describe "close, bootstrap and the owner's end, at every seam" $ do
   it "drains a texture the version of a batch still holds even when the body raised, and raises the body's failure" $ do
     fake ← newFake defaultFakeConfig
     withFakeOwner fake . bounded $ do
-      forked ← forkScope $
-        ( withBackendOnRaw fake $ \rig → do
-            probe ← newProbe
-            _ ← submit rig probe 2 2 255
-            _ ← awaitTerminal probe
-            hold fake HoldReclaim
-            setVersionHolders fake 1
-            throwIO (userError "the body failed")
-        )
-          `finally` noteEvent fake "scope left"
-      awaitEvent fake "released"
-      noteEvent fake "evidence supplied"
-      setVersionHolders fake 0
-      release fake HoldReclaim
-      forkedJoin forked >>= \case
-        Left failure
-          | "the body failed" `Text.isInfixOf` Text.pack (show failure) → pure ()
-          | otherwise → expectationFailure ("expected the body's failure, found " <> show failure)
-        Right () → expectationFailure "the scope returned normally although its body raised"
-      -- The body's failure left the scope through the drain: the evidence was in before it did, the texture retired.
-      assertBefore fake "evidence supplied" "scope left"
-      problems ← atomically (leaked fake)
-      problems `shouldBe` []
+      let scope =
+            ( withBackendOnRaw fake $ \rig → do
+                probe ← newProbe
+                _ ← submit rig probe 2 2 255
+                _ ← awaitTerminal probe
+                hold fake HoldReclaim
+                setVersionHolders fake 1
+                throwIO (userError "the body failed")
+            )
+              `finally` noteEvent fake "scope left"
+      -- the forked scope is owned by the example (#599); what it may be held at is let go first however the example ends
+      withForkedScope (openEveryHold fake) scope $ \forked → do
+        awaitEvent fake "released"
+        noteEvent fake "evidence supplied"
+        setVersionHolders fake 0
+        release fake HoldReclaim
+        forkedJoin forked >>= \case
+          Left failure
+            | "the body failed" `Text.isInfixOf` Text.pack (show failure) → pure ()
+            | otherwise → expectationFailure ("expected the body's failure, found " <> show failure)
+          Right () → expectationFailure "the scope returned normally although its body raised"
+        -- The body's failure left the scope through the drain: the evidence was in before it did, the texture retired.
+        assertBefore fake "evidence supplied" "scope left"
+        problems ← atomically (leaked fake)
+        problems `shouldBe` []
 
   it "still releases and drains when marking a texture released raises at the close, and latches it" $ do
     fake ← newFake defaultFakeConfig

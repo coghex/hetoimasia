@@ -35,10 +35,10 @@
 -- render-2d oracle over the published window-pass scene with the managed target's own 'TargetSpec', every pixel.
 module Test.LuaEngine.Graphics.Native.Pixels (spec) where
 
-import Control.Concurrent (forkFinally, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent (killThread)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Exception (AsyncException (ThreadKilled), displayException, finally, fromException)
+import Control.Exception (AsyncException (ThreadKilled), SomeException, displayException, finally, fromException, mask, toException, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -90,6 +90,7 @@ import Test.LuaEngine.Graphics.Native.Scenes (evidence, within)
 import Test.LuaEngine.Graphics.Native.Session (Env (..), serveMain)
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Pixels
+import Test.Support.Owned (withOwnedThreadOpening)
 
 -- The subgroup ----------------------------------------------------------------------------------------------------------
 
@@ -556,22 +557,23 @@ withLiveSession env name files held scenario = do
         withOutput outSink errSink $ \output → do
           handle ← newEmptyMVar
           result ← newEmptyMVar
-          scenarioThread ←
-            forkFinally
-              -- The whole of the scenario's thread is bounded, its startup waits included (the session's handle, the
-              -- display's target), and names what the roles said when the bound is not met.
-              ( timeout (60 * 1000000) (readMVar handle >>= \found → writeIORef sessionRef (Just found) >> atomically (displayTargets display >>= \case [one] → pure one; _ → retry) >>= \target → scenario (Live name composition target warns env)) >>= \case
-                  Just () → pure ()
-                  Nothing → do
-                    said ← readTVarIO warns
-                    assertFailure ("the scenario did not finish within 60 seconds; the roles warned " <> show said)
-              )
-              ( \outcome →
-                  -- Masked by 'forkFinally': however the scenario ended, every read it held is let go and the session
-                  -- stops normally, and the outcome reaches the example that started it.
-                  (releaseAllReads composition >> (readIORef sessionRef >>= mapM_ (\found → requestStop found StopQuit)))
-                    `finally` putMVar result outcome
-              )
+          -- The scenario's thread, owned by the call (#599). Its body, the capture of its failure and the stop it must still make
+          -- run as 'forkFinally' ran them: the body unmasked, the capture and the stop masked. The reads it holds are let go
+          -- first however the call ends.
+          let scenarioAction = mask $ \restore → do
+                outcome ←
+                  try @SomeException . restore $
+                    -- The whole of the scenario's thread is bounded, its startup waits included (the session's handle, the
+                    -- display's target), and names what the roles said when the bound is not met.
+                    timeout (60 * 1000000) (readMVar handle >>= \found → writeIORef sessionRef (Just found) >> atomically (displayTargets display >>= \case [one] → pure one; _ → retry) >>= \target → scenario (Live name composition target warns env)) >>= \case
+                      Just () → pure ()
+                      Nothing → do
+                        said ← readTVarIO warns
+                        assertFailure ("the scenario did not finish within 60 seconds; the roles warned " <> show said)
+                -- Masked: however the scenario ended, every read it held is let go and the session stops normally, and the
+                -- outcome reaches the example that started it.
+                (releaseAllReads composition >> (readIORef sessionRef >>= mapM_ (\found → requestStop found StopQuit)))
+                  `finally` putMVar result outcome
           let sessionSpec =
                 SessionSpec
                   { sxProfile = compositionProfile
@@ -588,20 +590,22 @@ withLiveSession env name files held scenario = do
                   , sxGraphics = Just injection
                   }
           -- However the session ends (normally, with the roles' failure returned before any window existed, or by an
-          -- exception), the scenario's thread has ended and been joined before this scope does: it is told to end
-          -- unconditionally and its masked handler's outcome is waited for.
-          outcome ← runSession sessionSpec (putMVar handle) `finally` (killThread scenarioThread >> void (readMVar result))
-          scenarioOutcome ← readMVar result
-          case scenarioOutcome of
-            Right () → pure ()
-            Left raised
-              | Just ThreadKilled ← fromException raised →
-                  assertFailure ("the session ended before the scenario finished; the verdict was " <> show (outVerdict outcome) <> "; the roles failed: " <> show (outFailures outcome))
-              | otherwise →
-                  assertFailure (displayException raised <> "; the verdict was " <> show (outVerdict outcome) <> "; the roles failed: " <> show (outFailures outcome))
-          outVerdict outcome `shouldBe` VerdictSuccess
-          outFailures outcome `shouldBe` []
-          outRetired outcome `shouldBe` True
+          -- exception), the scenario's thread has ended and been joined before this scope does: the scope's release ends it,
+          -- and, once the session has ended, it is told to end unconditionally and its masked handler's outcome is waited for.
+          withOwnedThreadOpening (releaseAllReads composition) scenarioAction $ \scenarioThread joined → do
+            outcome ← runSession sessionSpec (putMVar handle) `finally` (killThread scenarioThread >> joined)
+            -- A thread killed before its handler could run never delivers an outcome: it is the scenario that did not finish.
+            scenarioOutcome ← tryReadMVar result >>= maybe (pure (Left (toException ThreadKilled))) pure
+            case scenarioOutcome of
+              Right () → pure ()
+              Left raised
+                | Just ThreadKilled ← fromException raised →
+                    assertFailure ("the session ended before the scenario finished; the verdict was " <> show (outVerdict outcome) <> "; the roles failed: " <> show (outFailures outcome))
+                | otherwise →
+                    assertFailure (displayException raised <> "; the verdict was " <> show (outVerdict outcome) <> "; the roles failed: " <> show (outFailures outcome))
+            outVerdict outcome `shouldBe` VerdictSuccess
+            outFailures outcome `shouldBe` []
+            outRetired outcome `shouldBe` True
   awaitGone env
 
 -- | Everything a session made is gone: its target is unregistered and its record released, its textures retired.

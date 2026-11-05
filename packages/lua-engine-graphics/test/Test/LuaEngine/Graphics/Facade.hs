@@ -13,7 +13,6 @@
 -- terminates before the example returns, a failed assertion in it included.
 module Test.LuaEngine.Graphics.Facade (spec) where
 
-import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Exception (SomeException, finally, fromException, throwIO, try)
@@ -55,6 +54,7 @@ import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Rig (Rig (..), bounded, withRig)
 import Test.LuaEngine.Graphics.SceneHost
 import qualified Test.LuaEngine.Graphics.Window.Fake as WF
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 -- | Everything a scenario drives.
 data FS = FS
@@ -540,34 +540,31 @@ runCore rig shape scenario = do
           withOutput outSink errSink $ \output → do
             handle ← newEmptyMVar
             result ← newEmptyMVar
-            terminated ← newEmptyMVar
-            mainLoop ← forkIO (forever (mainStep provider))
-            _ ← forkIO $
-              ( do
-                  found ← readMVar handle
-                  writeIORef sessionRef (Just found)
-                  forM_ (shapeSession shape) (\ref → writeIORef ref (Just found))
-                  let fs = FS found rig windows model provider outLines gate
-                  attempted ←
-                    try @SomeException $
-                      timeout 8000000 (scenario fs) >>= \case
-                        Just () → pure ()
-                        Nothing → do
-                          status ← atomically (sessionStatus found)
-                          seen ← Fake.events (rigFake rig)
-                          windowEvents ← WF.events windows
-                          printed ← readTVarIO outLines
-                          warned ← readTVarIO errLines
-                          assertFailure ("the scenario did not finish: " <> show status <> "\ntexture: " <> show seen <> "\nwindows: " <> show windowEvents <> "\nout: " <> show printed <> "\nerr: " <> show warned)
-                  case attempted of
-                    Left _ → requestStop found StopQuit
-                    Right () → pure ()
-                  -- Every adoption the host model holds is released, so that the texture an adopted scene retained can
-                  -- retire and the roles with it: the host's ledger is the model's.
-                  dissolve model
-                  putMVar result attempted
-              )
-                `finally` putMVar terminated ()
+            let scenarioAction =
+                  ( do
+                      found ← readMVar handle
+                      writeIORef sessionRef (Just found)
+                      forM_ (shapeSession shape) (\ref → writeIORef ref (Just found))
+                      let fs = FS found rig windows model provider outLines gate
+                      attempted ←
+                        try @SomeException $
+                          timeout 8000000 (scenario fs) >>= \case
+                            Just () → pure ()
+                            Nothing → do
+                              status ← atomically (sessionStatus found)
+                              seen ← Fake.events (rigFake rig)
+                              windowEvents ← WF.events windows
+                              printed ← readTVarIO outLines
+                              warned ← readTVarIO errLines
+                              assertFailure ("the scenario did not finish: " <> show status <> "\ntexture: " <> show seen <> "\nwindows: " <> show windowEvents <> "\nout: " <> show printed <> "\nerr: " <> show warned)
+                      case attempted of
+                        Left _ → requestStop found StopQuit
+                        Right () → pure ()
+                      -- Every adoption the host model holds is released, so that the texture an adopted scene retained can
+                      -- retire and the roles with it: the host's ledger is the model's.
+                      dissolve model
+                      putMVar result attempted
+                  )
             let sessionSpec =
                   SessionSpec
                     { sxProfile = shapeProfile shape
@@ -583,11 +580,15 @@ runCore rig shape scenario = do
                     , sxHarness = noHarness
                     , sxGraphics = Just injection
                     }
-            outcome ←
-              runSession sessionSpec (putMVar handle)
-                `finally` (void (tryPutMVar gate ()) >> WF.releaseAll windows >> killThread mainLoop)
-            takeMVar terminated
-            takeMVar result >>= either throwIO (const (pure outcome))
+            -- Both threads are owned by the call (#599). The main-step loop supplies what the session's exit needs (the windows'
+            -- steps), so its scope encloses the session's run and is ended and joined after it; the scenario's thread is let
+            -- go of what it may be held at (the output gate, the fake windows) first however the call ends.
+            let letGo = void (tryPutMVar gate ()) >> WF.releaseAll windows
+            withOwnedThread (forever (mainStep provider)) $ \_ _ →
+              withOwnedThreadOpening letGo scenarioAction $ \_ terminated → do
+                outcome ← runSession sessionSpec (putMVar handle) `finally` letGo
+                terminated
+                takeMVar result >>= either throwIO (const (pure outcome))
       )
         `finally` (WF.releaseAll windows >> dissolve model >> endWindows provider)
 

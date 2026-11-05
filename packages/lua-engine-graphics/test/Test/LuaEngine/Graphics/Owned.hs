@@ -1,0 +1,397 @@
+-- | The threads the graphics adapter's helpers start are owned (#599): however the scope that needed a thread ends, the thread
+-- has ended and been joined before the scope returns.
+--
+-- Each shape has an example that ends the scope while the thread is parked, and judges that the thread has ended and been joined,
+-- and a negative control that applies the same judgement to the start the helper made before it was converted and must fail:
+--
+-- * 'withFakeOwner' and 'mainLoop': the body is cancelled between the fork and the first step of the body, which is where the
+--   previous helpers (the thread forked, then the stop-and-join installed after) left the thread. The seam that places the
+--   cancellation there exists in the helper test-side only ('withFakeOwnerAs', 'mainLoopAs'); no example passes anything else.
+-- * 'withForkedScope': a scope held at a gate it waits at uninterruptibly ends with the example, and its thread has ended and
+--   been joined, whether the example fails or is cancelled while it is held; and the real drain a scope waits in, which the
+--   stop lets go of and latches, so a worker cancelled before it installs its holds cannot reinstall them afterwards.
+-- * 'withServedBoundThread': the loop that serves a bound profile thread is served again when it is left abnormally, until the
+--   thread has ended.
+--
+-- A control's own cleanup is registered in the same masked step that starts what it leaves, before anything can cancel it, and
+-- runs not interruptibly on every exit, after the judgement is recorded: it lets go of every gate, kills and joins. Each row also
+-- has a coordinated cancellation example: the helper or the control is cancelled at once, and nothing it started is alive once
+-- it has returned or raised.
+--
+-- State owner: each example owns the cells it passes its helper and its 'Cleanups'. Thread: the helper's. Lifetime: the example's.
+-- Nothing here sleeps: every wait is an @MVar@, a hold or the runtime's report of a thread, and a bound exists only to keep a
+-- stuck example from hanging the run.
+module Test.LuaEngine.Graphics.Owned (spec) where
+
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
+import Control.Exception (AsyncException (UserInterrupt), Exception, ExceptionWithContext (ExceptionWithContext), SomeException, bracket_, finally, fromException, mask_, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Monad (forever, unless, void, when)
+import Data.Foldable (for_)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Maybe (isJust)
+import Hetoimasia.Foundation.Log (unsafeComponent)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
+import Hetoimasia.Foundation.Worker (awaitCompletion, workerDefinition)
+import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), WindowProvider, noProviderHooks, windowMainReady, windowMainStep, withWindowProviderWith)
+import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import qualified Hetoimasia.Runtime.Supervision as Supervision
+import Test.Hspec
+import Test.LuaEngine.Graphics.Fake
+import Test.LuaEngine.Graphics.PeersRig (mainLoopAs, quietLogger, retarget)
+import Test.LuaEngine.Graphics.Rig
+import Test.LuaEngine.Graphics.Served (Profile (..), serveProfile, settleAttempts, withProfileBeyond)
+import Test.LuaEngine.Graphics.Unowned
+import qualified Test.LuaEngine.Graphics.Window.Fake as WF
+import Test.Support.Cancel (withCancellationAfter)
+
+-- | Record a thread: in the same masked step that starts it, for a control, so what it leaves is known before anything can cancel it.
+note ∷ IORef [ThreadId] → ThreadId → IO ()
+note seen thread = atomicModifyIORef' seen (\held → (thread : held, ()))
+
+-- | The fake owner as the helper had it before #599: the thread forked, and its stop-and-join installed after the fork
+-- returned, so a cancellation delivered in between (the seam) leaves the thread. The thread is recorded for the control's own
+-- cleanup in the step that starts it. Nothing else differs from 'withFakeOwnerAs'.
+previousWithFakeOwner ∷ IORef [ThreadId] → (ThreadId → IO ()) → Fake → IO a → IO a
+previousWithFakeOwner seen seam fake body = do
+  done ← newEmptyMVar
+  thread ← mask_ (forkIO (ownerLoop fake `finally` putMVar done ()) >>= \started → note seen started >> pure started)
+  seam thread
+  body `finally` (killThread thread >> takeMVar done)
+
+-- | The main-step loop as the helper had it before #599, cut and recorded in the same way.
+previousMainLoop ∷ IORef [ThreadId] → (ThreadId → IO ()) → WindowProvider Int → IO a → IO a
+previousMainLoop seen seam provider action = do
+  ended ← newEmptyMVar
+  thread ←
+    mask_
+      ( forkIO (forever (atomically (windowMainReady provider >>= \ready → unless ready retry) >> windowMainStep provider) `finally` putMVar ended ())
+          >>= \started → note seen started >> pure started
+      )
+  seam thread
+  action `finally` (killThread thread >> takeMVar ended)
+
+-- | The scope-on-a-thread helper as it was before #599: the thread forked, its outcome and end kept in cells the caller must
+-- take, and nothing stopping or joining it when the caller ends. The control's own cleanup (let the gate go, kill, wait for the
+-- end) is registered in the step that starts the thread. The negative control judges it.
+previousForkScope ∷ Cleanups → IO () → IO a → (Forked a → IO b) → IO b
+previousForkScope cleanups open scope body = do
+  result ← newEmptyMVar
+  done ← newEmptyMVar
+  thread ←
+    mask_
+      ( do
+          started ← forkIO ((try @SomeException scope >>= putMVar result) `finally` putMVar done ())
+          cleanupLater cleanups (open >> killThread started >> readMVar done)
+          pure started
+      )
+  body Forked {forkedThread = thread, forkedJoin = takeMVar result <* takeMVar done}
+
+-- | Record a thread, and cancel the example right there.
+cancelHere ∷ IORef [ThreadId] → ThreadId → IO ()
+cancelHere seen thread = note seen thread >> throwIO UserInterrupt
+
+-- | End and join what a control left, not interruptibly, each even if an earlier one failed.
+stopNoted ∷ IORef [ThreadId] → IO ()
+stopNoted seen =
+  uninterruptibleMask_ $ do
+    threads ← readIORef seen
+    for_ threads $ \thread → killThread thread `finally` void (hasEnded thread)
+
+-- | Nothing the control or helper started is alive.
+noneAlive ∷ IORef [ThreadId] → IO Bool
+noneAlive seen = readIORef seen >>= fmap and . mapM hasEnded
+
+-- | Wait until a thread has recorded itself.
+waitNoted ∷ IORef [ThreadId] → IO ()
+waitNoted seen = bounded go
+  where
+    go = readIORef seen >>= \held → if null held then yield >> go else pure ()
+
+-- | A fake owner started by this helper whose example is cancelled between the fork and the first step of its body: whether the
+-- thread has ended and been joined once the call raised.
+fakeOwnerCancelledAtStart ∷ ((ThreadId → IO ()) → Fake → IO () → IO ()) → IORef [ThreadId] → IO Bool
+fakeOwnerCancelledAtStart start seen = do
+  fake ← newFake defaultFakeConfig
+  outcome ← try @AsyncException (bounded (start (cancelHere seen) fake (pure ())))
+  either (`shouldBe` UserInterrupt) (const (expectationFailure "the cancellation was lost")) outcome
+  joined ← allJoined seen
+  -- the fake stays reachable until the judgement is made, so the runtime does not end the parked thread as deadlocked
+  void (events fake)
+  pure joined
+
+-- | The same for the main-step loop, over a window provider of the suite's fake windows.
+mainLoopCancelledAtStart ∷ ((ThreadId → IO ()) → WindowProvider Int → IO () → IO ()) → IORef [ThreadId] → IO Bool
+mainLoopCancelledAtStart start seen = do
+  windows ← WF.newFake WF.defaultFakeConfig
+  let config = WindowConfig 2 (pure ()) (\_ → pure ())
+  withWindowProviderWith noProviderHooks config (retarget (WF.fakePort windows)) $ \provider → do
+    outcome ← try @AsyncException (bounded (start (cancelHere seen) provider (pure ())))
+    either (`shouldBe` UserInterrupt) (const (expectationFailure "the cancellation was lost")) outcome
+    joined ← allJoined seen
+    -- the provider stays reachable until the judgement is made, so the runtime does not end the parked thread as deadlocked
+    void (atomically (windowMainReady provider))
+    pure joined
+
+-- | A scope on a thread of its own, held at a gate it waits at uninterruptibly (as a drain waits for evidence only the example
+-- supplies, so the kill alone cannot end it), with the example ended the way the ending says: whether the thread has ended and
+-- been joined when the call returned. The gate is not let go by the example: only the stop does, which is the thing judged. A
+-- control's own cleanup, registered by its start before anything can cancel it, lets the gate go and joins on every exit, after
+-- the judgement is made. The gate is referenced by the example until then, so the runtime does not end the parked thread as
+-- deadlocked.
+gatedScope ∷ IORef [ThreadId] → Ending → (Cleanups → IO () → IO () → (Forked () → IO ()) → IO ()) → IO Bool
+gatedScope seen ending start = do
+  cleanups ← newCleanups
+  gate ← newEmptyMVar
+  let letGo = void (tryPutMVar gate ())
+      scope = noteThread seen >> uninterruptibleMask_ (readMVar gate)
+  ( do
+      runEnding ending $ \end → start cleanups letGo scope $ \_ → end (waitNoted seen)
+      joined ← allJoined seen
+      -- the gate stays reachable until the judgement is made
+      void (isEmptyMVar gate)
+      pure joined
+    )
+    `finally` runCleanups cleanups
+
+-- | A backend scope on a thread of its own, held in its drain by evidence only the example supplies, with the example ended the
+-- way the ending says: whether the thread has ended and been joined when the call returned. Owned only: it is the real drain
+-- that 'Test.LuaEngine.Graphics.Teardown' and 'Test.LuaEngine.Graphics.Lifecycle' hold, and a leaked one cannot be stopped
+-- without the fake owner it needs, so no control leaves one.
+heldDrain ∷ IORef [ThreadId] → Ending → IO Bool
+heldDrain seen ending = do
+  fake ← newFake defaultFakeConfig
+  withFakeOwner fake $ do
+    let scope = noteThread seen >> drainScope fake
+    runEnding ending $ \end → withForkedScope (openEveryHold fake) scope $ \_ → end (bounded (awaitEvent fake "released"))
+    allJoined seen
+
+-- | The same drain, with the worker cancelled before it has installed its holds: it waits to start until the stop has let
+-- everything go (the stop's opening is what starts it), and only then installs them. The stop latched the fake before it let
+-- anything go, so the holds the worker installs afterwards hold nothing, and the drain the kill leaves it in can finish. Without
+-- the latch the worker waits in a drain for evidence nobody supplies any more and the join never ends.
+raceDrain ∷ IORef [ThreadId] → Ending → IO Bool
+raceDrain seen ending = do
+  fake ← newFake defaultFakeConfig
+  start ← newEmptyMVar
+  armed ← newEmptyMVar
+  withFakeOwner fake $ do
+    -- The worker installs its holds only once the stop has let everything go, and does it without being interruptible, so the kill
+    -- the stop sends next can arrive only after they are installed: the drain it is then left in waits for them. The example
+    -- ends only once the worker is parked there, so the stop is certain to reach it at that point.
+    let scope = noteThread seen >> drainScopeAfter (void (tryPutMVar armed ()) >> readMVar start) fake
+    runEnding ending $ \end → withForkedScope (openEveryHold fake >> void (tryPutMVar start ())) scope $ \_ → end (bounded (readMVar armed))
+    allJoined seen
+
+-- | A backend scope that installs the holds a drain then waits on.
+drainScope ∷ Fake → IO ()
+drainScope = drainScopeAfter (pure ())
+
+-- | The same, installing the holds uninterruptibly once the given wait has returned.
+drainScopeAfter ∷ IO () → Fake → IO ()
+drainScopeAfter wait fake =
+  withBackendOnRaw fake $ \rig → do
+    probe ← newProbe
+    _ ← submit rig probe 2 2 255
+    _ ← awaitTerminal probe
+    uninterruptibleMask_ (wait >> hold fake HoldReclaim >> setVersionHolders fake 1)
+
+-- | The failure the main thread raises after serving (an assertion), the one the host's teardown raises as well, the one a required
+-- supervised worker raises to latch the application's supervision, and the one a settling attempt raises.
+data Boom = Boom | TeardownBoom | Latching | SettleBoom
+  deriving (Eq, Show)
+
+instance Exception Boom
+
+-- | How the native session ends. @ExitLatched@ is the cancelled exit with the application's supervision latched by a required
+-- worker's fatal failure before the loop is served: the loop checks its supervision before it serves anything, so it raises that
+-- failure at once, and serving it again under the same supervision could never serve the window's retirement. The @ExitSettle@
+-- exits fail the settling run itself: its first attempt fails (@Retry@), every attempt fails (@Fails@), or a cancellation is
+-- delivered to it (@Cancelled@).
+data Exit = ExitNormal | ExitAssertion | ExitCancelled | ExitLatched | ExitSettleRetry | ExitSettleFails | ExitSettleCancelled
+  deriving (Eq, Show)
+
+exits ∷ [(String, Exit)]
+exits =
+  [ ("the profile ends and the run returns", ExitNormal)
+  , ("the profile ends and the main thread's assertion then fails", ExitAssertion)
+  , ("the main thread is cancelled while a window is live", ExitCancelled)
+  , ("the owner loop is left by a latched supervision failure while a window is live", ExitLatched)
+  , ("the first settling attempt fails", ExitSettleRetry)
+  , ("every settling attempt fails", ExitSettleFails)
+  , ("a cancellation is delivered during the settling", ExitSettleCancelled)
+  ]
+
+-- | Latch a fatal failure of a required supervised worker on the control, and wait until it is published.
+latch ∷ Supervision.RuntimeControl → IO ()
+latch control = do
+  gate ← newEmptyMVar
+  started ←
+    Supervision.startSupervised
+      control
+      (Supervision.WorkerPolicy Supervision.Service Supervision.Required (unsafeComponent "test.luaengine.graphics.owned.latch") (\_ → pure Supervision.Unrecognized))
+      (workerDefinition "test.luaengine.graphics.owned.latch" (\_ → pure ()) (\_ () → (readMVar gate >> throwIO Latching ∷ IO ())))
+  handle ← case started of
+    Supervision.WorkerStarted found → pure found
+    _ → expectationFailure "the latching worker did not start" >> fail "unreachable"
+  putMVar gate ()
+  void (atomically (awaitCompletion (Supervision.supervisedWorker handle)))
+
+-- | The native session's shutdown, with the dependencies of 'Test.LuaEngine.Graphics.Served' modelled and nothing else: the profile
+-- (session) thread owns a window it closes in its own cleanup, which retires only while the loop is being served or once the host's
+-- teardown has destroyed it, and the texture adapter's scope, whose exit drains (waits for that window to retire, not
+-- interruptibly) and after which the result is published; the main thread serves the owner loop, which checks its supervision, a real
+-- one, on every turn before it serves; the host's teardown runs after the main thread's scope has been left. The cancelled exits
+-- leave the first run while the profile's window is live; each settling attempt is made under a fresh supervision as the shipped
+-- drain makes it. Whether the call returned (no cycle: each wait's server was running when the wait began) with the profile thread
+-- ended and joined, the exception the exit should have raised and what was retained beside it, and, for the settling exits, whether
+-- the profile thread had ended at the moment the exception left the settling.
+shutdownModel ∷ IORef [ThreadId] → Exit → Bool → Bool → IO Bool
+shutdownModel seen exit hostFails judgeExit = do
+  answer ← newIORef Nothing
+  -- the application's supervision raises a latched failure at its own exit: that is part of the exit, and the answer is kept aside
+  void . try @SomeException . withLoggingLifetime quietLogger $ \lifetime → Supervision.withSupervision lifetime $ \control → do
+    serving ← newTVarIO False
+    hostDown ← newTVarIO False
+    windowRetired ← newEmptyMVar
+    result ← newEmptyMVar
+    runs ← newIORef (0 ∷ Int)
+    attemptsMade ← newIORef (0 ∷ Int)
+    parked ← newEmptyMVar
+    endedAtRaise ← newIORef Nothing
+    when (exit == ExitLatched) (latch control)
+    let closeWindow = uninterruptibleMask_ (atomically ((||) <$> readTVar serving <*> readTVar hostDown >>= \served → unless served retry) >> void (tryPutMVar windowRetired ()))
+        drain = uninterruptibleMask_ (readMVar windowRetired)
+        profile () = do
+          noteThread seen
+          case exit of
+            ExitNormal → bracket_ (pure ()) drain closeWindow >> putMVar result ()
+            ExitAssertion → bracket_ (pure ()) drain closeWindow >> putMVar result ()
+            _ → bracket_ (pure ()) drain ((putMVar parked () >> (newEmptyMVar >>= readMVar)) `finally` closeWindow)
+        -- one run of the loop: the control's check, then a turn, until the predicate holds
+        loop supervision stopWhen =
+          bracket_ (atomically (writeTVar serving True)) (atomically (writeTVar serving False)) $ do
+            let go = do
+                  Supervision.checkRuntime supervision
+                  over ← stopWhen
+                  unless over (yield >> go)
+            go
+        serve stopWhen = do
+          run ← atomicModifyIORef' runs (\count → (count + 1, count))
+          case exit of
+            _ | run == 0, exit == ExitCancelled → readMVar parked >> throwIO UserInterrupt
+            _ | run == 0, exit == ExitSettleCancelled → readMVar parked >> throwIO Boom
+            _ | run == 0, exit `elem` [ExitSettleRetry, ExitSettleFails] → readMVar parked >> throwIO UserInterrupt
+            _ | run == 0, exit == ExitLatched → readMVar parked >> bounded (loop control stopWhen)
+            _ → bounded (loop control stopWhen)
+        serveFresh stopWhen = do
+          n ← atomicModifyIORef' attemptsMade (\count → (count + 1, count))
+          case exit of
+            ExitSettleRetry | n == 0 → throwIO SettleBoom
+            ExitSettleFails → throwIO SettleBoom
+            ExitSettleCancelled | n == 0 → myThreadId >>= \me → throwTo me UserInterrupt
+            _ → Supervision.withSupervision lifetime $ \fresh → bounded (loop fresh stopWhen)
+        finished = isJust <$> tryReadMVar result
+        teardown = atomically (writeTVar hostDown True) >> when hostFails (throwIO TeardownBoom)
+    outcome ←
+      tryWithContext @SomeException $
+        withProfileBeyond profile $ \hand running →
+          (serveProfile running (hand ()) serve serveFresh finished >> when (exit == ExitAssertion) (throwIO Boom))
+            `finally` (profileEnded running >>= writeIORef endedAtRaise . Just >> teardown)
+    joined ← allJoined seen
+    raisedEnded ← readIORef endedAtRaise
+    writeIORef answer (Just (outcome, joined, raisedEnded))
+  readIORef answer >>= \case
+    -- a cancellation that lands before the answer is recorded is the at-once row's own, which judges only that nothing is alive
+    Nothing → if judgeExit then expectationFailure "the model did not finish" >> pure False else pure True
+    Just (outcome, joined, raisedEnded) → do
+      -- the exit raised what it should have, with what was retained beside it
+      let retained = either (\(ExceptionWithContext carried _) → length (cleanupFailuresInContext carried)) (const 0) outcome
+          raised = either (\(ExceptionWithContext _ failure) → Just failure) (const Nothing) outcome
+      when judgeExit $ case (exit, hostFails) of
+        (_, True) → maybe (expectationFailure "the host's failure was lost") (\failure → fromException failure `shouldBe` Just TeardownBoom) raised
+        (ExitNormal, _) → maybe (pure ()) (expectationFailure . show) raised
+        (ExitAssertion, _) → maybe (expectationFailure "the assertion was lost") (\failure → fromException failure `shouldBe` Just Boom) raised
+        (ExitCancelled, _) → maybe (expectationFailure "the cancellation was lost") (\failure → fromException failure `shouldBe` Just UserInterrupt) raised
+        (ExitLatched, _) → maybe (expectationFailure "the latched failure was lost") (const (pure ())) raised
+        (ExitSettleRetry, _) → do
+          maybe (expectationFailure "the cancellation was lost") (\failure → fromException failure `shouldBe` Just UserInterrupt) raised
+          -- the failed attempt is retained beside it, not swallowed, and the next attempt settled the thread before the raise
+          retained `shouldBe` 1
+          raisedEnded `shouldBe` Just True
+        (ExitSettleFails, _) → do
+          maybe (expectationFailure "the cancellation was lost") (\failure → fromException failure `shouldBe` Just UserInterrupt) raised
+          -- every attempt's failure is retained, and the thread had not ended when the failure was raised: the host's teardown ended it
+          retained `shouldBe` settleAttempts
+          raisedEnded `shouldBe` Just False
+        (ExitSettleCancelled, _) → do
+          -- the cancellation delivered during the settling is raised after it, with the loop's own failure beside it
+          maybe (expectationFailure "the cancellation was lost") (\failure → fromException failure `shouldBe` Just UserInterrupt) raised
+          retained `shouldBe` 1
+          raisedEnded `shouldBe` Just True
+      pure joined
+
+-- | Run the helper or control cancelled at once; whatever it started is not alive once it has returned or raised.
+cancelledAtOnce ∷ (IORef [ThreadId] → IO ()) → IO Bool
+cancelledAtOnce control = do
+  seen ← newIORef []
+  void (try @AsyncException (bounded (withCancellationAfter (pure ()) (pure ()) (control seen))))
+  noneAlive seen
+
+spec ∷ Spec
+spec = describe "the threads the helpers start are owned (#599)" $ do
+  describe "the fake graphics owner" $ do
+    it "has ended and been joined when the body is cancelled between the fork and its first step" $ do
+      seen ← newIORef []
+      fakeOwnerCancelledAtStart withFakeOwnerAs seen >>= (`shouldBe` True)
+    it "negative control: the previous helper leaves the thread when the body is cancelled between the fork and its first step" $ do
+      seen ← newIORef []
+      -- The judgement is recorded first; only then is the thread the control left stopped and joined.
+      (fakeOwnerCancelledAtStart (previousWithFakeOwner seen) seen >>= (`shouldBe` False)) `finally` stopNoted seen
+    it "leaves nothing alive when it is cancelled at once" $
+      cancelledAtOnce (void . fakeOwnerCancelledAtStart withFakeOwnerAs) >>= (`shouldBe` True)
+    it "leaves nothing alive when the control is cancelled at once" $
+      cancelledAtOnce (\seen → void (fakeOwnerCancelledAtStart (previousWithFakeOwner seen) seen) `finally` stopNoted seen) >>= (`shouldBe` True)
+  describe "the main-step loop" $ do
+    it "has ended and been joined when the body is cancelled between the fork and its first step" $ do
+      seen ← newIORef []
+      mainLoopCancelledAtStart mainLoopAs seen >>= (`shouldBe` True)
+    it "negative control: the previous helper leaves the thread when the body is cancelled between the fork and its first step" $ do
+      seen ← newIORef []
+      (mainLoopCancelledAtStart (previousMainLoop seen) seen >>= (`shouldBe` False)) `finally` stopNoted seen
+    it "leaves nothing alive when it is cancelled at once" $
+      cancelledAtOnce (void . mainLoopCancelledAtStart mainLoopAs) >>= (`shouldBe` True)
+    it "leaves nothing alive when the control is cancelled at once" $
+      cancelledAtOnce (\seen → void (mainLoopCancelledAtStart (previousMainLoop seen) seen) `finally` stopNoted seen) >>= (`shouldBe` True)
+  for_ endings $ \(label, ending) →
+    describe ("a scope on a thread of its own, held in its drain, when " <> label) $ do
+      it "has ended and been joined when the call returns: the real drain's hold is let go by the stop" $ do
+        seen ← newIORef []
+        heldDrain seen ending >>= (`shouldBe` True)
+      it "has ended and been joined when the worker had not installed its holds when the stop let everything go" $ do
+        seen ← newIORef []
+        raceDrain seen ending >>= (`shouldBe` True)
+      it "has ended and been joined when the call returns: the gate it waits at uninterruptibly is let go by the stop" $ do
+        seen ← newIORef []
+        gatedScope seen ending (const withForkedScope) >>= (`shouldBe` True)
+      it "negative control: the previous helper leaves the thread held at its gate" $ do
+        seen ← newIORef []
+        gatedScope seen ending previousForkScope >>= (`shouldBe` False)
+  describe "the forked scope, cancelled at once" $ do
+    it "leaves nothing alive" $
+      cancelledAtOnce (\seen → void (gatedScope seen Cancelled (const withForkedScope))) >>= (`shouldBe` True)
+    it "leaves nothing alive when the real drain is held" $
+      cancelledAtOnce (\seen → void (heldDrain seen Cancelled)) >>= (`shouldBe` True)
+    it "leaves nothing alive when the control is cancelled at once" $
+      cancelledAtOnce (\seen → void (gatedScope seen Cancelled previousForkScope)) >>= (`shouldBe` True)
+  describe "the native session's shutdown has no dependency cycle" $ do
+    for_ exits $ \(label, exit) → do
+      it ("ends the profile thread and returns when " <> label) $ do
+        seen ← newIORef []
+        shutdownModel seen exit False True >>= (`shouldBe` True)
+      it ("does the same when the host's teardown fails as well, when " <> label) $ do
+        seen ← newIORef []
+        shutdownModel seen exit True True >>= (`shouldBe` True)
+      it ("leaves nothing alive when it is cancelled at once, when " <> label) $
+        cancelledAtOnce (\seen → void (shutdownModel seen exit False False)) >>= (`shouldBe` True)
