@@ -13,7 +13,7 @@
 -- the texture retires only once the window has closed and the frames that used it completed. A second example raises in the
 -- logical update after startup and shows the UI's failure status and its empty red-clear scene published and adopted
 -- through the same bindings. Both end through the session's quit path.
-module Test.LuaEngine.Graphics.Native.Facade (spec, cancelProbe) where
+module Test.LuaEngine.Graphics.Native.Facade (spec, cancelProbe, latchProbe) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
@@ -26,7 +26,10 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (UTCTime), secondsToDiffTime)
-import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, defaultLogFilter, mkLoggerWith)
+import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, defaultLogFilter, mkLoggerWith, unsafeComponent)
+import Hetoimasia.Foundation.Worker (awaitCompletion, workerDefinition)
+import Hetoimasia.Runtime.Supervision (Recognition (Unrecognized), SupervisedStart (WorkerStarted), WorkerPolicy (..), startSupervised, supervisedWorker)
+import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.GLFW.Window (WindowId)
 import qualified Data.Map.Strict as Map
@@ -123,6 +126,33 @@ cancelProbe env = describe "cancelling the owner loop while a window holds a tex
       expectHeld env
       evidence env "cancellation probe: the main thread is cancelled while the quad example's window is live and its texture held"
       throwTo (envMain env) UserInterrupt
+      -- the profile thread is killed by the settling run of the loop; this wait only keeps the scenario here until it is
+      newEmptyMVar >>= takeMVar
+
+-- | The same probe with the failure a latched supervision gives (#599), run by @--probe-latch-loop@: a required supervised worker
+-- fails while the quad example's window is live and its texture held, so the application's supervision latches a fatal
+-- failure and the owner loop, which checks its supervision before it serves anything, is left by it. Serving it again under the
+-- same supervision would end at once and the window could never retire; the settling run makes a fresh supervision, as the
+-- shipped owner drain does, and the run must end by itself.
+latchProbe ∷ Env → Spec
+latchProbe env = describe "leaving the owner loop by a latched supervision failure while a window holds a texture" $
+  it "latches the supervision with the quad example's window live and its texture held" $
+    within 180 . withFacadeSession env quadExample (\_ → pure ()) $ \_ _ window → do
+      awaitAdopted env window 1
+      awaitHeld env
+      expectHeld env
+      evidence env "latch probe: a required supervised worker fails while the quad example's window is live and its texture held"
+      gate ← newEmptyMVar
+      started ←
+        startSupervised
+          (envControl env)
+          (WorkerPolicy Supervision.Service Supervision.Required (unsafeComponent "test.luaengine.graphics.native.latch") (\_ → pure Unrecognized))
+          (workerDefinition "test.luaengine.graphics.native.latch" (\_ → pure ()) (\_ () → (readMVar gate >> ioError (userError "LatchingProbe") ∷ IO ())))
+      handle ← case started of
+        WorkerStarted found → pure found
+        _ → assertFailure "the latching worker did not start"
+      putMVar gate ()
+      void (atomically (awaitCompletion (supervisedWorker handle)))
       -- the profile thread is killed by the settling run of the loop; this wait only keeps the scenario here until it is
       newEmptyMVar >>= takeMVar
 

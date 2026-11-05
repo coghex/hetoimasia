@@ -53,8 +53,8 @@ main = do
   started ← getCurrentTime
   environment ← establishEnvironment
   arguments ← getArgs
-  when ((completeFlag `elem` arguments || probeFlag `elem` arguments) && length arguments /= 1) $ do
-    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile and " <> probeFlag <> " the cancellation probe, each alone")
+  when (any (`elem` arguments) [completeFlag, probeFlag, latchFlag] && length arguments /= 1) $ do
+    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile, " <> probeFlag <> " the cancellation probe and " <> latchFlag <> " the latched-supervision probe, each alone")
     exitWith (ExitFailure 2)
   forM_ environment (Text.putStrLn . ("lua-engine-graphics-native-tests: " <>))
   consent ← readConsent >>= either refuse pure
@@ -62,13 +62,15 @@ main = do
   loader ← checkLoader >>= either (\why → stop ("the qualified loader: " <> why)) pure
   Text.putStrLn ("lua-engine-graphics-native-tests: the binding's loader is the recorded loader " <> Text.pack loader)
   configuration ← either (\refused → stop ("the profile could not be mapped: " <> Text.pack (show refused))) pure (configurationFor fixedM1Profile)
-  let probing = arguments == [probeFlag]
+  let probing = arguments == [probeFlag] || arguments == [latchFlag]
+      expectedFailure = if arguments == [latchFlag] then "LatchingProbe" else "user interrupt"
   facts ← runSession (arguments == [completeFlag] || probing) (consentBackend consent) validationFeatures configuration $
-    if probing
-      then Facade.cancelProbe
-      else \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> Facade.spec env
+    case arguments of
+      [flag] | flag == probeFlag → Facade.cancelProbe
+      [flag] | flag == latchFlag → Facade.latchProbe
+      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> Facade.spec env
   finished ← getCurrentTime
-  let problems = if probing then probeChecks facts else checks facts
+  let problems = if probing then probeChecks expectedFailure facts else checks facts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double
   record ← evidenceRecord consent loader configuration facts problems seconds
   Text.putStrLn record
@@ -92,14 +94,20 @@ completeFlag = "--complete"
 probeFlag ∷ String
 probeFlag = "--probe-cancel-loop"
 
+-- | The same probe with a latched supervision failure instead of a cancellation: a required supervised worker fails while the
+-- window is live and holds its texture, so the owner loop is left by the latched failure and must be served again under a fresh
+-- supervision before the texture backend's drain.
+latchFlag ∷ String
+latchFlag = "--probe-latch-loop"
+
 -- | What the probe must have shown: the run ended by itself (it returned), its only failure is the cancellation it made, a window
 -- existed and was destroyed, and everything else a run must show about the native calls (the destruction order, none raised)
 -- holds. The host gives its diagnostic verdict only on a normal exit, so a cancelled host gives none, and that absence is the one
 -- check of a normal run the probe does not make.
-probeChecks ∷ Facts → [Text]
-probeChecks facts =
-  [ "the session did not end with the probe's cancellation: " <> Text.pack (show (factsFailure facts)) | not (maybe False ("user interrupt" `Text.isInfixOf`) (factsFailure facts)) ]
-    <> [ problem | problem ← checks facts, problem /= "an example failed", problem /= "the session gave no diagnostic verdict", not ("the session ended with a failure: user interrupt" `Text.isPrefixOf` problem) ]
+probeChecks ∷ Text → Facts → [Text]
+probeChecks expected facts =
+  [ "the session did not end with the probe's failure: " <> Text.pack (show (factsFailure facts)) | not (maybe False (expected `Text.isInfixOf`) (factsFailure facts)) ]
+    <> [ problem | problem ← checks facts, problem /= "an example failed", problem /= "the session gave no diagnostic verdict", not (("the session ended with a failure: " <> expected) `Text.isPrefixOf` problem) ]
     <> [ "the probe made no window" | factsWindows facts == 0 ]
 
 -- | What a run must have shown whatever Hspec reported.
