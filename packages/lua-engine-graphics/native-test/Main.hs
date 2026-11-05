@@ -107,7 +107,7 @@ latchFlag = "--probe-latch-loop"
 probeChecks ∷ Text → Facts → [Text]
 probeChecks expected facts =
   [ "the session did not end with the probe's failure: " <> Text.pack (show (factsFailure facts)) | not (maybe False (expected `Text.isInfixOf`) (factsFailure facts)) ]
-    <> [ problem | problem ← checks facts, problem /= "an example failed", problem /= "the session gave no diagnostic verdict", not (("the session ended with a failure: " <> expected) `Text.isPrefixOf` problem) ]
+    <> [ problem | problem ← checks facts, problem /= "an example failed", problem /= "the session gave no diagnostic verdict", not (("the session ended with a failure: " `Text.isPrefixOf` problem) && (expected `Text.isInfixOf` problem)) ]
     <> [ "the probe made no window" | factsWindows facts == 0 ]
 
 -- | What a run must have shown whatever Hspec reported.
