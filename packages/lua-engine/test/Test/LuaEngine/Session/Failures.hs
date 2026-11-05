@@ -29,7 +29,7 @@ import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Test.Hspec
 import Test.LuaEngine.Modules.Support (closeGate, injectedDefect, openGate)
 import Test.LuaEngine.Session.Support
-import Test.Support.Owned (withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "failures" $ do
@@ -688,9 +688,9 @@ hostFailures = describe "of the host" $ do
       holdAt recorder (Resumed (InstanceKey Presentation 0))
       self ← myThreadId
       handle ← newEmptyMVar
-      -- the canceller is owned by the example (#599), and the hold it waits at is let go first however the example ends
-      withOwnedThreadOpening
-        (releaseHold recorder (Resumed (InstanceKey Presentation 0)))
+      -- the canceller is owned by the example (#599). The hold it waits at is not let go by the stop: the example never lets it
+      -- go, and the session is cancelled while its driver is held there
+      withOwnedThread
         ( do
             session ← readMVar handle
             awaitPoint recorder (Resumed (InstanceKey Presentation 0))

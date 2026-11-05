@@ -26,7 +26,7 @@ import Hetoimasia.Foundation.Time (readInstant, scriptedSource)
 import Test.Hspec
 import Test.LuaEngine.Session.Support
 import Test.Support.Bounded (bounded)
-import Test.Support.Owned (withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "the one commit" $ do
@@ -325,9 +325,10 @@ facts = describe "the facts a commit carries" $ do
       holdAt recorder (Resumed (InstanceKey Presentation 0))
       self ← myThreadId
       handle ← newEmptyMVar
-      -- the canceller is owned by the example (#599): the hold it waits at is let go first however the example ends
-      withOwnedThreadOpening
-        (releaseHold recorder (Resumed (InstanceKey Presentation 0)))
+      -- the canceller is owned by the example (#599). The hold it waits at is not let go by the stop: the session is cancelled
+      -- while its driver is held there, and the example never lets that hold go, so releasing it afterwards would run the
+      -- orphaned driver against the clock this example has broken
+      withOwnedThread
         ( do
             session ← readMVar handle
             awaitPoint recorder (Resumed (InstanceKey Presentation 0))
