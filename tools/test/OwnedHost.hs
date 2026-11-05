@@ -1591,6 +1591,9 @@ lifecycleSpec = describe "The lifecycle of a request's handles" $ do
               let findSender = atomically (tryReadTMVar senderVar) >>= maybe (yield >> findSender) pure
               sender <- findSender
               void (awaitBlockedSending sender)
+              -- The send is blocked on a message the owner's capability has yet to process: yielding runs its scheduler, which queues the
+              -- exception on the masked owner, so it is pending, not merely on its way, when the hold returns.
+              yield >> yield
             owner = tryWithContext @SomeException (withHostUsing quick noSeams (withHold hold) (\_ -> ioError (userError "owner-marker")))
         withOwnedThread (owner >>= atomically . putTMVar result) $ \ownerThread _ -> do
           bounded (atomically (readTMVar reached))
