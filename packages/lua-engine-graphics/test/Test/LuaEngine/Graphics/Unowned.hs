@@ -39,8 +39,10 @@ import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVa
 import Control.Exception (AsyncException (UserInterrupt), Exception, finally, mask_, throwIO, try, uninterruptibleMask_)
 import Control.Monad (void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.Maybe (fromMaybe)
+import System.Timeout (timeout)
 import Foreign.StablePtr (freeStablePtr, newStablePtr)
-import GHC.Conc (BlockReason, ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnBlackHole), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Test.Hspec (shouldBe)
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (withCancellationAfter)
@@ -130,18 +132,21 @@ holdUntilCancelled = do
   readMVar hold `finally` (void (tryPutMVar hold ()) >> freeStablePtr anchor)
 
 -- | The judgement the facility makes true: the thread has ended, and been joined, when the scope returns. A thread that is
--- blocked has not ended; one that ended is finished, or is running its last steps after announcing its end, which the poll
--- yields to (a count of yields, never a duration, so a thread that never ends gives up the same way on any machine).
+-- blocked has not ended; one that ended is finished, or is still finishing after announcing its end, which the poll yields to,
+-- for a bound of a few seconds that only keeps a thread that never stops from hanging the run. A thread finishing can be seen
+-- running on another capability, or blocked on a black hole (a thunk another thread is evaluating, as the handler of a killed
+-- thread can share one): neither is a wait for anything the example controls, so both are waited out; every other block is a
+-- thread that has not ended.
 hasEnded ∷ ThreadId → IO Bool
-hasEnded thread = go (100000 ∷ Int)
+hasEnded thread = fromMaybe False <$> timeout 5000000 go
   where
-    go 0 = pure False
-    go remaining =
+    go =
       threadStatus thread >>= \case
         ThreadFinished → pure True
         ThreadDied → pure True
+        ThreadBlocked BlockedOnBlackHole → yield >> go
         ThreadBlocked _ → pure False
-        _ → yield >> go (remaining - 1)
+        _ → yield >> go
 
 -- | Wait until a thread is blocked for this reason, by asking the runtime: coordination on what the thread is doing, not a
 -- wait for time to pass.
