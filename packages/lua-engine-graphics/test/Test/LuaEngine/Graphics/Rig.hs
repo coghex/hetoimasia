@@ -26,7 +26,7 @@ module Test.LuaEngine.Graphics.Rig
   , terminals
   , sinkEvents
   , Forked (..)
-  , forkScope
+  , withForkedScope
   , assertBefore
   , gateReady
   , raiseFromReady
@@ -51,8 +51,8 @@ import Control.Concurrent.STM
   , swapTVar
   , writeTVar
   )
-import Control.Concurrent (ThreadId, forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (ThreadId)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Exception (SomeException, finally, throwIO, try)
 import Data.List (findIndex)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -69,6 +69,7 @@ import System.Timeout (timeout)
 import Text.Read (readMaybe)
 import Test.HUnit.Lang (assertFailure)
 import Test.LuaEngine.Graphics.Fake
+import Test.Support.Owned (withOwnedThreadOpening)
 
 -- | A backend over a fake owner, with the pipeline's port it hands out.
 data Rig = Rig
@@ -128,7 +129,7 @@ withBackendOnRaw fake body =
   withBackend (fakePort fake) $ \backend → body (Rig fake backend (textureBackend backend))
 
 openEveryHold ∷ Fake → IO ()
-openEveryHold fake = forM_ [minBound .. maxBound] (release fake) >> releaseAllTickets fake >> setVersionHolders fake 0
+openEveryHold fake = latchHolds fake >> forM_ [minBound .. maxBound] (release fake) >> releaseAllTickets fake >> setVersionHolders fake 0
 
 -- | What a finished example must not have left.
 leaked ∷ Fake → STM [Text]
@@ -198,15 +199,20 @@ probeSink fake probe =
 data Forked a = Forked
   { forkedThread ∷ !ThreadId
   , forkedJoin ∷ IO (Either SomeException a)
-    -- ^ Waits for the scope's outcome, and then for the thread to have ended.
+    -- ^ Waits for the scope's outcome, and then for the thread to have ended. It may be made again: the outcome is read, not
+    -- taken, so the scope's own release, which joins the thread as well, never waits on a signal this consumed.
   }
 
-forkScope ∷ IO a → IO (Forked a)
-forkScope scope = do
+-- | Run the scope on a thread of its own for the length of the body, which is given the thread and the join. The thread is owned
+-- by the call (#599): started and registered for its stop-and-join in one masked step, and ended and joined however the body
+-- ended. The first argument is what the scope may be held at, which only the example can let go (a hold of the fake, a gate of a
+-- sink): it is run first in the uninterruptible release, because a scope inside an uninterruptible drain cannot be ended by
+-- the kill alone. It must not block and must be safe to run when everything is already let go.
+withForkedScope ∷ IO () → IO a → (Forked a → IO b) → IO b
+withForkedScope open scope body = do
   result ← newEmptyMVar
-  done ← newEmptyMVar
-  thread ← forkIO ((try @SomeException scope >>= putMVar result) `finally` putMVar done ())
-  pure Forked {forkedThread = thread, forkedJoin = takeMVar result <* takeMVar done}
+  withOwnedThreadOpening open (try @SomeException scope >>= putMVar result) $ \thread joined →
+    body Forked {forkedThread = thread, forkedJoin = readMVar result <* joined}
 
 -- | The first event of the fake's log with this prefix came before the first with that one: an order the log
 -- records, not an instant a thread happened to be observed at.

@@ -14,7 +14,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, writeTVar)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (..))
-import Control.Concurrent (forkIO, myThreadId, throwTo)
+import Control.Concurrent (myThreadId, throwTo)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, throwIO, toException, try, tryWithContext)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure)
 import Control.Monad (forM_, void, when)
@@ -29,6 +29,7 @@ import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Test.Hspec
 import Test.LuaEngine.Modules.Support (closeGate, injectedDefect, openGate)
 import Test.LuaEngine.Session.Support
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "failures" $ do
@@ -574,22 +575,28 @@ hostFailures = describe "of the host" $ do
         holdAt recorder (GrantIntent 2)
         self ← myThreadId
         handle ← newEmptyMVar
-        _ ← forkIO $ do
-          session ← readMVar handle
-          awaitPhase session Gameplay Running
-          awaitRegistration world 1000
-          passTime world 1000000 (elem "suspended" <$> outLines world)
-          nudgeArmed world 1000 1000000
-          awaitPoint recorder (GrantIntent 2)
-          throwTo self ThreadKilled
-          void (awaitStatus session statusStopping)
-          releaseHold recorder (GrantIntent 2)
-        result ← tryWithContext @SomeException (runSession (scenarioSpec env (recordingHarness recorder noHarness)) (putMVar handle))
-        case result of
-          Left (ExceptionWithContext attached raised) → do
-            fromException raised `shouldBe` Just ThreadKilled
-            map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any ("close failed" `isInfixOf`)
-          Right _ → expectationFailure "the cancellation was lost"
+        -- the canceller supplies the hold the unwinding needs to end, so it outlives the call; owned by the example (#599), and
+        -- the hold is let go first however the example ends
+        withOwnedThreadOpening
+          (releaseHold recorder (GrantIntent 2))
+          ( do
+              session ← readMVar handle
+              awaitPhase session Gameplay Running
+              awaitRegistration world 1000
+              passTime world 1000000 (elem "suspended" <$> outLines world)
+              nudgeArmed world 1000 1000000
+              awaitPoint recorder (GrantIntent 2)
+              throwTo self ThreadKilled
+              void (awaitStatus session statusStopping)
+              releaseHold recorder (GrantIntent 2)
+          )
+          $ \_ _ → do
+            result ← tryWithContext @SomeException (runSession (scenarioSpec env (recordingHarness recorder noHarness)) (putMVar handle))
+            case result of
+              Left (ExceptionWithContext attached raised) → do
+                fromException raised `shouldBe` Just ThreadKilled
+                map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any ("close failed" `isInfixOf`)
+              Right _ → expectationFailure "the cancellation was lost"
     pure ()
 
   mapM_
@@ -604,24 +611,29 @@ hostFailures = describe "of the host" $ do
               holdAt recorder (GrantIntent 2)
               self ← myThreadId
               handle ← newEmptyMVar
-              _ ← forkIO $ do
-                session ← readMVar handle
-                awaitPhase session Gameplay Running
-                awaitRegistration world 1000
-                passTime world 1000000 (elem "suspended" <$> outLines world)
-                nudgeArmed world 1000 1000000
-                awaitPoint recorder (GrantIntent 2)
-                atomically (writeTVar armed True)
-                throwTo self ThreadKilled
-                void (awaitStatus session statusStopping)
-                releaseHold recorder (GrantIntent 2)
-              result ← tryWithContext @SomeException (runSession (scenarioSpec env' (recordingHarness recorder noHarness)) (putMVar handle))
-              case result of
-                Left (ExceptionWithContext attached raised) → do
-                  -- the cancellation is what is raised, with the owner's retained cleanup beside it
-                  fromException raised `shouldBe` Just ThreadKilled
-                  map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any ("close failed" `isInfixOf`)
-                Right _ → expectationFailure "the cancellation was lost"
+              -- the canceller supplies the hold the unwinding needs to end, so it outlives the call; owned by the example (#599)
+              withOwnedThreadOpening
+                (releaseHold recorder (GrantIntent 2))
+                ( do
+                    session ← readMVar handle
+                    awaitPhase session Gameplay Running
+                    awaitRegistration world 1000
+                    passTime world 1000000 (elem "suspended" <$> outLines world)
+                    nudgeArmed world 1000 1000000
+                    awaitPoint recorder (GrantIntent 2)
+                    atomically (writeTVar armed True)
+                    throwTo self ThreadKilled
+                    void (awaitStatus session statusStopping)
+                    releaseHold recorder (GrantIntent 2)
+                )
+                $ \_ _ → do
+                  result ← tryWithContext @SomeException (runSession (scenarioSpec env' (recordingHarness recorder noHarness)) (putMVar handle))
+                  case result of
+                    Left (ExceptionWithContext attached raised) → do
+                      -- the cancellation is what is raised, with the owner's retained cleanup beside it
+                      fromException raised `shouldBe` Just ThreadKilled
+                      map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any ("close failed" `isInfixOf`)
+                    Right _ → expectationFailure "the cancellation was lost"
               -- the drain was reached and the role retired, whatever the sink did
               points ← recorded recorder
               points `shouldSatisfy` elem (Draining Gameplay)
@@ -676,17 +688,22 @@ hostFailures = describe "of the host" $ do
       holdAt recorder (Resumed (InstanceKey Presentation 0))
       self ← myThreadId
       handle ← newEmptyMVar
-      _ ← forkIO $ do
-        session ← readMVar handle
-        awaitPoint recorder (Resumed (InstanceKey Presentation 0))
-        pumpUntil world (elem "init presentation" <$> outLines world)
-        awaitRegistration world 1000000
-        passTime world 1000000000 (maybe False roleFailed . presentationOf <$> statusNow session)
-        throwTo self ThreadKilled
-      result ← try (runSession (scenarioSpec env (recordingHarness recorder noHarness)) (putMVar handle))
-      case result of
-        Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
-        Right _ → expectationFailure "the cancellation was lost"
+      -- the canceller is owned by the example (#599). The hold it waits at is not let go by the stop: the example never lets it
+      -- go, and the session is cancelled while its driver is held there
+      withOwnedThread
+        ( do
+            session ← readMVar handle
+            awaitPoint recorder (Resumed (InstanceKey Presentation 0))
+            pumpUntil world (elem "init presentation" <$> outLines world)
+            awaitRegistration world 1000000
+            passTime world 1000000000 (maybe False roleFailed . presentationOf <$> statusNow session)
+            throwTo self ThreadKilled
+        )
+        $ \_ _ → do
+          result ← try (runSession (scenarioSpec env (recordingHarness recorder noHarness)) (putMVar handle))
+          case result of
+            Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
+            Right _ → expectationFailure "the cancellation was lost"
       session ← readMVar handle
       status ← statusNow session
       fmap roleInitialized (presentationOf status) `shouldBe` Just True

@@ -380,6 +380,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Modules.Spec
         Test.LuaEngine.Modules.Stages
         Test.LuaEngine.Modules.Support
+        Test.LuaEngine.Owned
         Test.LuaEngine.Profile
         Test.LuaEngine.Request.Contract
         Test.LuaEngine.Request.Failure
@@ -427,6 +428,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Texture.Teardown
         Test.LuaEngine.Texture.Support
         Test.LuaEngine.Texture.Workers
+        Test.LuaEngine.Unowned
     build-depends:
         base >=4.22 && <4.23,
         array >=0.5 && <0.6,

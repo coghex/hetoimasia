@@ -37,44 +37,48 @@ spec = describe "the backend's scope ends in dependency order" $ do
   it "waits for the table's evidence when it closes, and returns the moment the evidence is in" $ do
     fake ← newFake defaultFakeConfig
     withFakeOwner fake . bounded $ do
-      forked ← forkScope $ do
-        withBackendOnRaw fake $ \rig → do
-          probe ← newProbe
-          _ ← submit rig probe 2 2 255
-          _ ← awaitTerminal probe
-          hold fake HoldReclaim
-          setVersionHolders fake 1
-        noteEvent fake "scope returned"
-      -- The scope has closed and released the texture; a batch still maps its slot.
-      awaitEvent fake "released"
-      noteEvent fake "evidence supplied"
-      setVersionHolders fake 0
-      release fake HoldReclaim
-      forkedJoin forked >>= either (\failure → expectationFailure (show failure)) pure
-      assertBefore fake "evidence supplied" "scope returned"
+      let scope = do
+            withBackendOnRaw fake $ \rig → do
+              probe ← newProbe
+              _ ← submit rig probe 2 2 255
+              _ ← awaitTerminal probe
+              hold fake HoldReclaim
+              setVersionHolders fake 1
+            noteEvent fake "scope returned"
+      -- the forked scope is owned by the example (#599); what it may be held at is let go first however the example ends
+      withForkedScope (openEveryHold fake) scope $ \forked → do
+        -- The scope has closed and released the texture; a batch still maps its slot.
+        awaitEvent fake "released"
+        noteEvent fake "evidence supplied"
+        setVersionHolders fake 0
+        release fake HoldReclaim
+        forkedJoin forked >>= either (\failure → expectationFailure (show failure)) pure
+        assertBefore fake "evidence supplied" "scope returned"
 
   it "remembers a cancellation delivered while it waits, finishes the drain, and raises it after" $ do
     fake ← newFake defaultFakeConfig
     withFakeOwner fake . bounded $ do
-      forked ← forkScope $ do
-        withBackendOnRaw fake $ \rig → do
-          probe ← newProbe
-          _ ← submit rig probe 2 2 255
-          _ ← awaitTerminal probe
-          hold fake HoldReclaim
-          setVersionHolders fake 1
-        noteEvent fake "scope returned"
-      awaitEvent fake "released"
-      throwTo (forkedThread forked) UserInterrupt
-      noteEvent fake "evidence supplied"
-      setVersionHolders fake 0
-      release fake HoldReclaim
-      forkedJoin forked >>= \case
-        Left _ → pure ()
-        Right () → expectationFailure "the cancellation was lost"
-      -- The drain ran to its end first: the evidence was in before the scope left, and nothing native is left.
-      problems ← atomically (leaked fake)
-      problems `shouldBe` []
+      let scope = do
+            withBackendOnRaw fake $ \rig → do
+              probe ← newProbe
+              _ ← submit rig probe 2 2 255
+              _ ← awaitTerminal probe
+              hold fake HoldReclaim
+              setVersionHolders fake 1
+            noteEvent fake "scope returned"
+      -- the forked scope is owned by the example (#599); what it may be held at is let go first however the example ends
+      withForkedScope (openEveryHold fake) scope $ \forked → do
+        awaitEvent fake "released"
+        throwTo (forkedThread forked) UserInterrupt
+        noteEvent fake "evidence supplied"
+        setVersionHolders fake 0
+        release fake HoldReclaim
+        forkedJoin forked >>= \case
+          Left _ → pure ()
+          Right () → expectationFailure "the cancellation was lost"
+        -- The drain ran to its end first: the evidence was in before the scope left, and nothing native is left.
+        problems ← atomically (leaked fake)
+        problems `shouldBe` []
 
   it "leaves a peer's texture to its own release when another is released" $ do
     fake ← newFake defaultFakeConfig

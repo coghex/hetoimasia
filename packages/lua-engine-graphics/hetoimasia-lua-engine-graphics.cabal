@@ -98,6 +98,7 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Faults
         Test.LuaEngine.Graphics.Integrated
         Test.LuaEngine.Graphics.Lifecycle
+        Test.LuaEngine.Graphics.Owned
         Test.LuaEngine.Graphics.Peers
         Test.LuaEngine.Graphics.PeersRig
         Test.LuaEngine.Graphics.PixelComparator
@@ -111,9 +112,11 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.SceneFrames
         Test.LuaEngine.Graphics.SceneHost
         Test.LuaEngine.Graphics.Scenes
+        Test.LuaEngine.Graphics.Served
         Test.LuaEngine.Graphics.Spec
         Test.LuaEngine.Graphics.Stages
         Test.LuaEngine.Graphics.Teardown
+        Test.LuaEngine.Graphics.Unowned
         Test.LuaEngine.Graphics.Window.Coordinator
         Test.LuaEngine.Graphics.Window.Fake
         Test.LuaEngine.Graphics.Window.Request
@@ -161,7 +164,8 @@ test-suite lua-engine-graphics-tests
         hetoimasia-render-api ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
-        hetoimasia-scripting-lua:runtime-lua
+        hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-test-support ==0.1.0.0
 
 -- The adapter's real-device suite, in the group `test.vulkan-lua-engine-native`: a window-free session of the
 -- production host, started without a surface, in which a texture request finishes through verified reading,
@@ -197,6 +201,7 @@ test-suite lua-engine-graphics-native-tests
         Test.LuaEngine.Graphics.Pixels
         Test.LuaEngine.Graphics.Png
         Test.LuaEngine.Graphics.SceneComp
+        Test.LuaEngine.Graphics.Served
         Test.LuaEngine.Graphics.Windows
     c-sources: native-test/cbits/hetoimasia_lua_engine_graphics_native.c
     include-dirs: native-test/cbits
@@ -245,4 +250,5 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-render-api ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
-        hetoimasia-scripting-lua:runtime-lua
+        hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-test-support ==0.1.0.0

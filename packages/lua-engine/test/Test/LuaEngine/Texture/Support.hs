@@ -124,7 +124,7 @@ module Test.LuaEngine.Texture.Support
   , Necessity (..)
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, yield)
+import Control.Concurrent (yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM
   ( TVar
@@ -211,6 +211,7 @@ import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 import Test.HUnit.Lang (HUnitFailure, assertFailure)
+import Test.Support.Owned (withOwnedThread)
 
 -- The session --------------------------------------------------------------------------------------
 
@@ -383,19 +384,30 @@ withNested session body onClosed = do
   atomically (modifyTVar' (ssFakes session) (fake :))
   spec ← either (\refused → assertFailure ("texture spec refused: " <> show refused)) pure (textureSpec (ssProfile session) (cfgJobs (ssConfig session)))
   done ← newEmptyMVar
-  value ←
-    -- The janitor is armed only once the helper has finished, however it finished, so a helper that
-    -- fails cannot leave the backend holding what the scope waits for.
-    -- "nested scope returned" is recorded however the scope ended, the moment it did: whatever the helper has
-    -- recorded by then, it recorded before the scope could end.
-    (`finally` note session "nested scope returned") . withTexturePipelineWith (cfgHooks (ssConfig session)) spec (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
-      let nested = session {ssPipeline = pipeline, ssFake = fake}
-      _ ← forkIO $ do
-        atomically (pipelineOpen pipeline >>= \open → when open retry)
-        tryWithContext @SomeException (onClosed nested `finally` releaseEverything session) >>= putMVar done
-      body nested
-  readMVar done >>= either rethrowIO pure
-  pure value
+  made ← newEmptyMVar
+  -- The helper supplies what the nested scope's exit waits for (the backend finishing), so its own scope encloses that exit
+  -- (#599): it is ended and joined after the nested scope has returned or raised, never before, and the nested pipeline is
+  -- handed to it once the scope has made it. A scope that never made one leaves it waiting for that, and the release ends it.
+  withOwnedThread
+      ( do
+          nested ← readMVar made
+          atomically (pipelineOpen (ssPipeline nested) >>= \open → when open retry)
+          tryWithContext @SomeException (onClosed nested `finally` releaseEverything session) >>= putMVar done
+      )
+      $ \_ _ → do
+        value ←
+          -- The janitor is armed only once the helper has finished, however it finished, so a helper that
+          -- fails cannot leave the backend holding what the scope waits for.
+          -- "nested scope returned" is recorded however the scope ended, the moment it did: whatever the helper has
+          -- recorded by then, it recorded before the scope could end.
+          (`finally` note session "nested scope returned") . withTexturePipelineWith (cfgHooks (ssConfig session)) spec (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
+            let nested = session {ssPipeline = pipeline, ssFake = fake}
+            putMVar made nested
+            body nested
+        -- The helper's own failure is raised after the scope; it is waited for here, inside its own scope, so the release never
+        -- ends a helper that is still finishing.
+        readMVar done >>= either rethrowIO pure
+        pure value
 
 -- | An example whose owner is expected to end in a failure of the application's own, which
 -- supervision raises at the boundary: answers the failure with its context. A failed assertion or
@@ -759,13 +771,11 @@ flushFake ∷ Fake → IO ()
 flushFake fake = atomically (writeTVar (fkFlush fake) True >> writeTVar (fkAuto fake) True >> writeTVar (fkHold fake) False)
 
 withJanitor ∷ TVar [Fake] → IO a → IO a
-withJanitor fakesVar action = do
-  done ← newEmptyMVar
-  thread ← forkIO (janitor `finally` putMVar done ())
-  action `finally` stop thread done
+withJanitor fakesVar action =
+  -- Owned by the example (#599): it supplies what the pipeline's drain waits for, so its scope encloses the example's, and it
+  -- is ended and joined however the example ended.
+  withOwnedThread janitor (\_ _ → action)
   where
-    stop ∷ ThreadId → MVar () → IO ()
-    stop thread done = killThread thread >> readMVar done
     janitor = do
       work ← atomically $ do
         fakes ← readTVar fakesVar

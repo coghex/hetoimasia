@@ -27,6 +27,11 @@ module Test.LuaEngine.Session.Support
     -- * Running
   , runScenario
   , runScenarioWith
+  , RunnerSeams (..)
+  , noRunnerSeams
+  , runScenarioSeamed
+  , letScenarioGo
+  , withOwnedThreadsOpening
   , runCaught
   , Caught
   , historyNow
@@ -83,12 +88,12 @@ module Test.LuaEngine.Session.Support
   , module Hetoimasia.LuaEngine.Session.Failure
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
+import Control.Concurrent (ThreadId, killThread, myThreadId, yield)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Exception.Context (emptyExceptionContext)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, finally, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, mask, rethrowIO, throwIO, try, tryWithContext)
 import Test.HUnit.Lang (HUnitFailure)
 import Control.Monad (unless, void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -111,6 +116,7 @@ import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Test.LuaEngine.Facade.Support hiding (Session (..))
 import Test.LuaEngine.Modules.Support (Probe, ReaderOf, openEverything, realReader, ssInventory, ssLogger, ssPool, ssProbe, startedPaths)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 -- Setting up ---------------------------------------------------------------------------------------
 
@@ -246,41 +252,74 @@ runScenario env = runScenarioWith env (sxHarness (seSpec env))
 
 -- | The same, over this harness.
 runScenarioWith ∷ SessionEnv → Harness → (Session → IO ()) → IO SessionOutcome
-runScenarioWith env harness scenario = do
+runScenarioWith = runScenarioSeamed noRunnerSeams
+
+-- | The runner's test-side seams (#599), which place a cancellation of the example exactly, as a timing-free example cannot do
+-- from outside: what runs on the calling thread once the scenario's thread exists and is known, and what runs once the session
+-- has ended and before the scenario is waited for. The ownership regressions raise there; no example of the suite passes
+-- anything else.
+data RunnerSeams = RunnerSeams
+  { seamStarted ∷ ThreadId → IO ()
+  , seamEnded ∷ IO ()
+  }
+
+noRunnerSeams ∷ RunnerSeams
+noRunnerSeams = RunnerSeams {seamStarted = \_ → pure (), seamEnded = pure ()}
+
+-- | 'runScenarioWith' over its seams.
+--
+-- State owner: the runner owns the scenario thread, the handle and the result cell. Thread: the scenario's, started by
+-- 'withOwnedThreadOpening' (#599), so that however the runner ends (a return, an exception, a timeout of the example, a
+-- cancellation delivered at any point, including before the scenario started or once the session has ended) the scenario
+-- thread has ended and been joined before the runner returns, and the held sink and the pool reader's gates are let go first,
+-- so a scenario parked at one cannot hold the join. Lifetime: the call's. Disposal: the facility's release.
+runScenarioSeamed ∷ RunnerSeams → SessionEnv → Harness → (Session → IO ()) → IO SessionOutcome
+runScenarioSeamed seams env harness scenario = do
   handleVar ← newEmptyMVar
   resultVar ← newEmptyMVar
-  terminated ← newEmptyMVar
-  thread ← mask $ \restore →
-    forkIO $
-      ( do
-          session ← readMVar handleVar
-          result ← try (restore (scenario session))
-          case result of
-            Left (failure ∷ SomeException) → do
-              -- what the session looked like when the scenario gave up, for whoever reads the log
-              status ← statusNow session
-              out ← outLines (seWorld env)
-              err ← errLines (seWorld env)
-              hPutStrLn stderr ("scenario failed with " <> show failure <> "\n  status: " <> show status <> "\n  stdout: " <> show out <> "\n  stderr: " <> show err)
-              requestStop session StopQuit
-              putMVar resultVar (Left failure)
-            Right () → putMVar resultVar (Right ())
-          releaseSink (seWorld env)
-          openEverything (wSession (seWorld env))
-      )
-        `finally` putMVar terminated ()
-  -- A session that ends by itself (a failure) leaves the scenario to see that and finish; one whose run is
-  -- itself interrupted or raises takes the scenario down with it.
-  outcome ← runSession (scenarioSpec env harness) (putMVar handleVar) `onException` (killThread thread >> takeMVar terminated)
-  finished ← try (bounded (readMVar resultVar))
-  case finished of
-    Left (ErrorCall why) → do
-      killThread thread
-      takeMVar terminated
-      throwIO (ErrorCall ("the scenario did not finish after the session ended: " <> why))
-    Right result → do
-      takeMVar terminated
-      either throwIO (const (pure outcome)) result
+  withOwnedThreadOpening (letScenarioGo env) (scenarioThread handleVar resultVar) $ \thread terminated → do
+    seamStarted seams thread
+    -- A session that ends by itself (a failure) leaves the scenario to see that and finish; one whose run is itself
+    -- interrupted or raises takes the scenario down with it, through the scope's release.
+    outcome ← runSession (scenarioSpec env harness) (putMVar handleVar)
+    seamEnded seams
+    finished ← try (bounded (readMVar resultVar))
+    case finished of
+      Left (ErrorCall why) → do
+        killThread thread
+        terminated
+        throwIO (ErrorCall ("the scenario did not finish after the session ended: " <> why))
+      Right result → do
+        terminated
+        either throwIO (const (pure outcome)) result
+  where
+    scenarioThread handleVar resultVar = mask $ \restore → do
+      session ← readMVar handleVar
+      result ← try (restore (scenario session))
+      case result of
+        Left (failure ∷ SomeException) → do
+          -- what the session looked like when the scenario gave up, for whoever reads the log
+          status ← statusNow session
+          out ← outLines (seWorld env)
+          err ← errLines (seWorld env)
+          hPutStrLn stderr ("scenario failed with " <> show failure <> "\n  status: " <> show status <> "\n  stdout: " <> show out <> "\n  stderr: " <> show err)
+          requestStop session StopQuit
+          putMVar resultVar (Left failure)
+        Right () → putMVar resultVar (Right ())
+      letScenarioGo env
+
+-- | Several owned threads, started in nested scopes in order and ended and joined in the reverse order, each released with the
+-- same opening first. The body is given their identities.
+withOwnedThreadsOpening ∷ IO () → [IO ()] → ([ThreadId] → IO a) → IO a
+withOwnedThreadsOpening open = go []
+  where
+    go started [] body = body (reverse started)
+    go started (action : more) body = withOwnedThreadOpening open action (\thread _ → go (thread : started) more body)
+
+-- | Let go what a scenario can be held at: the sink it held, and every gate of the pool's reader. Idempotent and never blocks,
+-- so it is safe to run again from a release, and when the scenario never ran.
+letScenarioGo ∷ SessionEnv → IO ()
+letScenarioGo env = releaseSink (seWorld env) >> openEverything (wSession (seWorld env))
 
 -- | An exception with the context it was raised with.
 type Caught = ExceptionWithContext SomeException
@@ -294,36 +333,34 @@ runCaught env harness scenario = do
   driver ← myThreadId
   handleVar ← newEmptyMVar
   resultVar ← newEmptyMVar
-  terminated ← newEmptyMVar
-  thread ← mask $ \restore →
-    forkIO $
-      ( do
-          session ← readMVar handleVar
-          result ← try (restore (scenario driver session))
-          case result of
-            Left (failure ∷ SomeException) → do
-              status ← statusNow session
-              out ← outLines (seWorld env)
-              hPutStrLn stderr ("scenario failed with " <> show failure <> "\n  status: " <> show status <> "\n  stdout: " <> show out)
-              requestStop session StopQuit
-              putMVar resultVar (Left failure)
-            Right () → putMVar resultVar (Right ())
-          releaseSink (seWorld env)
-          openEverything (wSession (seWorld env))
-      )
-        `finally` putMVar terminated ()
-  ended ← tryWithContext @SomeException (runSession (scenarioSpec env harness) (putMVar handleVar))
-  finished ← try (bounded (readMVar resultVar))
-  case finished of
-    Left (ErrorCall why) → do
-      killThread thread
-      takeMVar terminated
-      throwIO (ErrorCall ("the scenario did not finish after the session ended: " <> why))
-    Right result → do
-      takeMVar terminated
-      either throwIO (const (pure ())) result
+  -- Owned by the call (#599): ended and joined however the call ends, with the held sink and the reader's gates let go first.
+  ended ← withOwnedThreadOpening (letScenarioGo env) (scenarioThread driver handleVar resultVar) $ \thread terminated → do
+    ended ← tryWithContext @SomeException (runSession (scenarioSpec env harness) (putMVar handleVar))
+    finished ← try (bounded (readMVar resultVar))
+    case finished of
+      Left (ErrorCall why) → do
+        killThread thread
+        terminated
+        throwIO (ErrorCall ("the scenario did not finish after the session ended: " <> why))
+      Right result → do
+        terminated
+        either throwIO (const (pure ())) result
+    pure ended
   session ← readMVar handleVar
   pure (ended, session)
+  where
+    scenarioThread driver handleVar resultVar = mask $ \restore → do
+      session ← readMVar handleVar
+      result ← try (restore (scenario driver session))
+      case result of
+        Left (failure ∷ SomeException) → do
+          status ← statusNow session
+          out ← outLines (seWorld env)
+          hPutStrLn stderr ("scenario failed with " <> show failure <> "\n  status: " <> show status <> "\n  stdout: " <> show out)
+          requestStop session StopQuit
+          putMVar resultVar (Left failure)
+        Right () → putMVar resultVar (Right ())
+      letScenarioGo env
 
 -- | The history the session holds now.
 historyNow ∷ Session → IO History

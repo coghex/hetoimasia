@@ -13,12 +13,12 @@
 -- the texture retires only once the window has closed and the frames that used it completed. A second example raises in the
 -- logical update after startup and shows the UI's failure status and its empty red-clear scene published and adopted
 -- through the same bindings. Both end through the session's quit path.
-module Test.LuaEngine.Graphics.Native.Facade (spec) where
+module Test.LuaEngine.Graphics.Native.Facade (spec, cancelProbe, latchProbe) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Exception (SomeException, finally, throwIO, try)
+import Control.Concurrent (throwTo)
+import Control.Exception (AsyncException (UserInterrupt), SomeException, throwIO, try)
 import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -26,7 +26,10 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (UTCTime), secondsToDiffTime)
-import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, defaultLogFilter, mkLoggerWith)
+import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, defaultLogFilter, mkLoggerWith, unsafeComponent)
+import Hetoimasia.Foundation.Worker (awaitCompletion, workerDefinition)
+import Hetoimasia.Runtime.Supervision (Recognition (Unrecognized), SupervisedStart (WorkerStarted), WorkerPolicy (..), startSupervised, supervisedWorker)
+import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.GLFW.Window (WindowId)
 import qualified Data.Map.Strict as Map
@@ -56,6 +59,7 @@ import Test.LuaEngine.Graphics.FrameLog (frameLogMark)
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Native.Scenes hiding (spec)
 import Test.LuaEngine.Graphics.Native.Session (Env (..), noteWindows, serveMain)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Env → Spec
 spec env = describe "graphics facade" $ do
@@ -107,6 +111,50 @@ spec env = describe "graphics facade" $ do
       step env "the end of every hold" $ atomically (ledgerReading (graphicsLedger (envGraphics env)) >>= \held → unless (null (readingHeld held)) retry)
       published env window >>= (`shouldBe` Just revision)
       evidence env ("graphics facade: the logical update raised after startup; the UI warned with the failure message and published the empty red-clear scene (revision " <> Text.pack (show revision) <> "), which the owner adopted and recorded holding no texture")
+
+-- | The cancellation probe (#599), run by @--probe-cancel-loop@ on its own and never as part of the profile: the quad example's
+-- window is live and holds its texture, and the process main thread, which serves the owner loop, is cancelled right there. The
+-- run must end by itself, with the window retired and the texture released through the loop served again, before the texture
+-- backend's drain; a shutdown that waits for the window while the loop stays stopped never returns. The session's own
+-- cancellation is the run's expected failure ('Main' judges the rest from the facts).
+cancelProbe ∷ Env → Spec
+cancelProbe env = describe "cancelling the owner loop while a window holds a texture" $
+  it "is cancelled with the quad example's window live and its texture held" $
+    within 180 . withFacadeSession env quadExample (\_ → pure ()) $ \_ _ window → do
+      awaitAdopted env window 1
+      awaitHeld env
+      expectHeld env
+      evidence env "cancellation probe: the main thread is cancelled while the quad example's window is live and its texture held"
+      throwTo (envMain env) UserInterrupt
+      -- the profile thread is killed by the settling run of the loop; this wait only keeps the scenario here until it is
+      newEmptyMVar >>= takeMVar
+
+-- | The same probe with the failure a latched supervision gives (#599), run by @--probe-latch-loop@: a required supervised worker
+-- fails while the quad example's window is live and its texture held, so the application's supervision latches a fatal
+-- failure and the owner loop, which checks its supervision before it serves anything, is left by it. Serving it again under the
+-- same supervision would end at once and the window could never retire; the settling run makes a fresh supervision, as the
+-- shipped owner drain does, and the run must end by itself.
+latchProbe ∷ Env → Spec
+latchProbe env = describe "leaving the owner loop by a latched supervision failure while a window holds a texture" $
+  it "latches the supervision with the quad example's window live and its texture held" $
+    within 180 . withFacadeSession env quadExample (\_ → pure ()) $ \_ _ window → do
+      awaitAdopted env window 1
+      awaitHeld env
+      expectHeld env
+      evidence env "latch probe: a required supervised worker fails while the quad example's window is live and its texture held"
+      gate ← newEmptyMVar
+      started ←
+        startSupervised
+          (envControl env)
+          (WorkerPolicy Supervision.Service Supervision.Required (unsafeComponent "test.luaengine.graphics.native.latch") (\_ → pure Unrecognized))
+          (workerDefinition "test.luaengine.graphics.native.latch" (\_ → pure ()) (\_ () → (readMVar gate >> ioError (userError "LatchingProbe") ∷ IO ())))
+      handle ← case started of
+        WorkerStarted found → pure found
+        _ → assertFailure "the latching worker did not start"
+      putMVar gate ()
+      void (atomically (awaitCompletion (supervisedWorker handle)))
+      -- the profile thread is killed by the settling run of the loop; this wait only keeps the scenario here until it is
+      newEmptyMVar >>= takeMVar
 
 succeeded ∷ SessionOutcome → Expectation
 succeeded outcome = do
@@ -170,9 +218,7 @@ withFacadeSession env entry judge scenario = do
         withOutput outSink errSink $ \output → do
           handle ← newEmptyMVar
           result ← newEmptyMVar
-          terminated ← newEmptyMVar
-          _ ← forkIO $
-            ( do
+          let scenarioAction = do
                 found ← readMVar handle
                 writeIORef sessionRef (Just found)
                 attempted ← try @SomeException $ do
@@ -182,8 +228,6 @@ withFacadeSession env entry judge scenario = do
                 -- However the scenario ended, the session stops normally.
                 requestStop found StopQuit
                 putMVar result attempted
-            )
-              `finally` putMVar terminated ()
           let sessionSpec =
                 SessionSpec
                   { sxProfile = compositionProfile
@@ -199,9 +243,14 @@ withFacadeSession env entry judge scenario = do
                   , sxHarness = noHarness
                   , sxGraphics = Just injection
                   }
-          outcome ← runSession sessionSpec (putMVar handle)
-          takeMVar terminated
-          takeMVar result >>= either throwIO pure
+          -- The scenario's thread is owned by the call (#599): ended and joined however the session's run ends, a cancellation
+          -- delivered before the scenario started included.
+          outcome ←
+            withOwnedThread scenarioAction $ \_ terminated → do
+              ran ← runSession sessionSpec (putMVar handle)
+              terminated
+              takeMVar result >>= either throwIO pure
+              pure ran
           judge outcome
           outRetired outcome `shouldBe` True
   -- Everything the session made is gone: the window is destroyed and the texture retired on the table's own evidence.

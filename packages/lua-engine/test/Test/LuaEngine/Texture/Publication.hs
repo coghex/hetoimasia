@@ -7,7 +7,6 @@
 -- begun. One gated example per path that publishes a texture and per path a shutdown releases one.
 module Test.LuaEngine.Texture.Publication (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
@@ -19,6 +18,7 @@ import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (..))
 import Test.Hspec
 import Test.LuaEngine.Texture.Contract (layout, small, started)
 import Test.LuaEngine.Texture.Support
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "publication" $ do
@@ -78,14 +78,16 @@ spec = describe "publication" $ do
           held ← uploadN (ssFake session) 0
           -- The texture is registered and the job settled; the answer is held just before it decides.
           registered ← newEmptyMVar
-          _ ← forkIO (finishUpload (ssFake session) held >>= putMVar registered)
-          readMVar (arrived gate)
-          started session other "j" "k1" "b.png"
-          _ ← atomically (awaitPipelineFailure (ssPipeline session))
-          -- The failed pipeline claims the texture nobody offered.
-          awaitReleaseCalls (ssFake session) 1
-          releaseHeldGate gate
-          identity ← readMVar registered
+          -- The answer's thread is owned by the example (#599), and the gate it is held at is let go first however it ends.
+          identity ←
+            withOwnedThreadOpening (releaseHeldGate gate) (finishUpload (ssFake session) held >>= putMVar registered) $ \_ _ → do
+              readMVar (arrived gate)
+              started session other "j" "k1" "b.png"
+              _ ← atomically (awaitPipelineFailure (ssPipeline session))
+              -- The failed pipeline claims the texture nobody offered.
+              awaitReleaseCalls (ssFake session) 1
+              releaseHeldGate gate
+              readMVar registered
           -- The answer found the texture claimed, so it answered a failure, which an opt-in request's
           -- service does not declare: the host counts a provider defect and builds nothing. Had the answer
           -- offered the texture it would have been adopted instead.
@@ -106,14 +108,16 @@ spec = describe "publication" $ do
       awaitUploads (ssFake session) 1
       held ← uploadN (ssFake session) 0
       registered ← newEmptyMVar
-      _ ← forkIO (finishUpload (ssFake session) held >>= putMVar registered)
-      readMVar (arrived gate)
-      -- The job is settled and its texture delivered; the script cancels, and the host tells the pipeline.
-      command session owner "i" "cancel" "k0"
-      awaitNote session "i cancel k0 cancelled"
-      awaitReleaseCalls (ssFake session) 1
-      releaseHeldGate gate
-      identity ← readMVar registered
+      -- The answer's thread is owned by the example (#599), and the gate it is held at is let go first however it ends.
+      identity ←
+        withOwnedThreadOpening (releaseHeldGate gate) (finishUpload (ssFake session) held >>= putMVar registered) $ \_ _ → do
+          readMVar (arrived gate)
+          -- The job is settled and its texture delivered; the script cancels, and the host tells the pipeline.
+          command session owner "i" "cancel" "k0"
+          awaitNote session "i cancel k0 cancelled"
+          awaitReleaseCalls (ssFake session) 1
+          releaseHeldGate gate
+          readMVar registered
       releaseCalls (ssFake session) `shouldReturn` [identity]
       -- The answer found the job withdrawn and said nothing: the host counts no late reply and no defect.
       reading ← vmDiagnostics owner
@@ -135,25 +139,28 @@ spec = describe "publication" $ do
         awaitUploads (ssFake session) 1
         held ← uploadN (ssFake session) 0
         registered ← newEmptyMVar
-        _ ← forkIO (finishUpload (ssFake session) held >>= putMVar registered)
-        readMVar (arrived offering)
-        -- The host ends the request, and its telling the pipeline is held on the way: the job is not
-        -- withdrawn yet, so the answer offers the texture to a host that no longer wants it.
-        command session owner "i" "cancel" "k0"
-        readMVar (arrived cancelling)
-        releaseHeldGate offering
-        identity ← readMVar registered
-        awaitReleaseCalls (ssFake session) 1
-        releaseCalls (ssFake session) `shouldReturn` [identity]
-        reading ← vmDiagnostics owner
-        (rdLateReplies reading + rdUnknownReplies reading, rdAdopting reading, rdDefects reading) `shouldBe` (1, 0, 0)
-        -- The telling arrives now and finds nothing left to release.
-        releaseHeldGate cancelling
-        awaitNote session "i cancel k0 cancelled"
-        retireTexture (ssFake session) identity
-        takeCancelled session owner "i" "k0"
-        awaitOwner owner "i" (== OwnerReading 0 0)
-        releaseCalls (ssFake session) `shouldReturn` [identity]
+        -- The answer's thread is owned by the example (#599), and the gates it may be held at are let go first however it ends.
+        -- The scope encloses the whole example: the cancelling gate stays closed until the example's own release below, so the
+        -- observations before it cannot be satisfied by a release the held cancellation would make once let go.
+        withOwnedThreadOpening (releaseHeldGate offering >> releaseHeldGate cancelling) (finishUpload (ssFake session) held >>= putMVar registered) $ \_ _ → do
+          readMVar (arrived offering)
+          -- The host ends the request, and its telling the pipeline is held on the way: the job is not
+          -- withdrawn yet, so the answer offers the texture to a host that no longer wants it.
+          command session owner "i" "cancel" "k0"
+          readMVar (arrived cancelling)
+          releaseHeldGate offering
+          identity ← readMVar registered
+          awaitReleaseCalls (ssFake session) 1
+          releaseCalls (ssFake session) `shouldReturn` [identity]
+          reading ← vmDiagnostics owner
+          (rdLateReplies reading + rdUnknownReplies reading, rdAdopting reading, rdDefects reading) `shouldBe` (1, 0, 0)
+          -- The telling arrives now and finds nothing left to release.
+          releaseHeldGate cancelling
+          awaitNote session "i cancel k0 cancelled"
+          retireTexture (ssFake session) identity
+          takeCancelled session owner "i" "k0"
+          awaitOwner owner "i" (== OwnerReading 0 0)
+          releaseCalls (ssFake session) `shouldReturn` [identity]
 
   it "waits, when the scope closes, for the host to adopt or drop a texture it was offered, and does not release it: the adopted texture stays with its lease" $
     withSession (config small layout) $ \session _ runtime → do

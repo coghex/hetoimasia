@@ -14,6 +14,7 @@ module Test.LuaEngine.Graphics.PeersRig
   , withPeersHooked
   , withPeersConfigured
   , mainLoop
+  , mainLoopAs
   , retireAndAwait
   , stop
   , awaitLine
@@ -27,9 +28,8 @@ module Test.LuaEngine.Graphics.PeersRig
   , quietLogger
   ) where
 
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
+import Control.Concurrent (ThreadId)
 import Control.Exception (finally, onException)
 import System.IO (hPutStrLn, stderr)
 import Control.Monad (forM_, forever, join, unless, void)
@@ -80,6 +80,7 @@ import qualified Test.LuaEngine.Graphics.Fake as Fake
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Rig (Rig (..), bounded, openEveryHold, withRig)
 import Test.LuaEngine.Graphics.SceneHost
+import Test.Support.Owned (withOwnedThread)
 import qualified Test.LuaEngine.Graphics.Window.Fake as WF
 
 -- | Everything an example drives.
@@ -139,6 +140,9 @@ withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = boun
         ]
   withComposition compositionProfile files (rigPort rig) $ \composition control runtime →
     withWindowProviderWith hooks config (retarget (WF.fakePort windows)) $ \provider →
+      -- The main-thread steps are served for the whole scope, retirement and the windows' teardown included (#599): they are what
+      -- those exits may wait for, so the loop's scope encloses them and the loop is ended and joined after them.
+      mainLoop provider $
       ( do
           let publisher = scenePublisherOver textures provider (\window scene → fst (modelTarget model window) scene) (\window → snd (modelTarget model window))
               injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks issuedMemory)
@@ -230,7 +234,7 @@ withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = boun
                   admitBehaviorInstance (scheduledEndpoint owner) request >>= \case
                     InstanceAccepted identity ticket → pure (Spawned (declaredId declared) identity ticket)
                     other → assertFailure ("expected the instance accepted, found " <> take 100 (show other))
-            ( mainLoop provider (body (Peers facade owner model provider out signal admit fake windows composition control runtime output))
+            ( body (Peers facade owner model provider out signal admit fake windows composition control runtime output)
                 -- (however the body ended, the host model lets go of every adoption first, so that the instances' textures can retire)
                 `finally` (openEveryHold fake >> releaseAllReads composition >> dissolve model >> WF.releaseAll windows >> retireAndAwait control owner)
               )
@@ -249,12 +253,17 @@ withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = boun
         , boundServiceBudget = Nothing
         }
 
--- | Serve the provider's main-thread steps for the length of the body, on a thread that is ended and waited for.
+-- | Serve the provider's main-thread steps for the length of the body, on a thread that is owned by the call (#599): ended and
+-- joined however the body ended, a cancellation delivered between the thread's start and the body's first step included.
 mainLoop ∷ WindowProvider Int → IO a → IO a
-mainLoop provider action = do
-  ended ← newEmptyMVar
-  thread ← forkIO (forever (atomically (windowMainReady provider >>= \ready → unless ready retry) >> windowMainStep provider) `finally` putMVar ended ())
-  action `finally` (killThread thread >> takeMVar ended)
+mainLoop = mainLoopAs (\_ → pure ())
+
+-- | 'mainLoop' with a test-side seam: the action runs on the calling thread, inside the scope and before the body's first step,
+-- and is given the loop's thread. It lets an example learn the thread and place a cancellation exactly there. No example of the
+-- suite passes anything else.
+mainLoopAs ∷ (ThreadId → IO ()) → WindowProvider Int → IO a → IO a
+mainLoopAs seam provider action =
+  withOwnedThread (forever (atomically (windowMainReady provider >>= \ready → unless ready retry) >> windowMainStep provider)) (\thread _ → seam thread >> action)
 
 -- | Ask the owner to retire and wait, under supervision, until it is no longer live.
 retireAndAwait ∷ RuntimeControl → ScheduledOwner → IO ()
