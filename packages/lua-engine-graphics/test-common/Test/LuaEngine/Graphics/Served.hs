@@ -15,9 +15,10 @@
 -- the host's own teardown can retire what the profile still holds; and the one thing that must still run when the loop is left
 -- abnormally, before the texture backend's drain (3) begins, is the loop itself, serving the windows' retirement ('serveProfile'):
 -- the profile thread is killed by a second owned thread, which unwinds its window scopes, and the loop is served again until the
--- thread has ended. A latched failure that makes serving the loop again impossible is the one case that cannot be answered from
--- here (the windows can never retire); the failure of the second serving is reported as the original failure's companion and
--- not masked, but it is not made to hang the run by the helper either.
+-- thread has ended. The second serving is a different run from the first and is made by the caller for that: under a /fresh
+-- supervision/, as the shipped owner drain does (@ownerDrain@ in @Hetoimasia.Run.Graphics@), because the application's own
+-- supervision may have latched the very failure that ended the first run, and the loop checks its supervision before it serves
+-- anything, so serving again under the same one would end at once and the windows could never retire.
 --
 -- State owner: the caller owns the host and what it hands the profile; the helper owns the input cell, the end cell and the
 -- thread. Thread: the profile's, one bound thread, owned by 'withOwnedBoundThread' (#593) from before the host starts until after
@@ -54,14 +55,15 @@ withProfileBeyond profile hostScope = do
 
 -- | Give the profile its input and serve until it has its result (the predicate @finishedWork@), as one step: serving is run
 -- unmasked inside the handler that settles an abnormal exit, so a cancellation cannot arrive between the hand-over and the
--- handler. If serving is left abnormally the profile is killed by an owned second thread and @serve@ is run again, until the
--- profile thread has ended, before the exception continues. @serve@ is given the predicate to stop on.
-serveProfile ∷ Profile → IO () → (IO Bool → IO ()) → IO Bool → IO ()
-serveProfile profile handOver serve finishedWork = mask $ \restore → do
+-- handler. If serving is left abnormally the profile is killed by an owned second thread and @serveFresh@, which the caller makes
+-- under a fresh supervision, is run until the profile thread has ended, before the exception continues. Both are given the
+-- predicate to stop on.
+serveProfile ∷ Profile → IO () → (IO Bool → IO ()) → (IO Bool → IO ()) → IO Bool → IO ()
+serveProfile profile handOver serve serveFresh finishedWork = mask $ \restore → do
   handOver
   restore (serve finishedWork) `onException` settle
   where
     -- A failure of the settling run is the original one's to report, but a cancellation of it is never swallowed.
     settle = withOwnedThread (killThread (profileThread profile)) $ \_ _ →
-      serve (profileEnded profile) `catch` \failure →
+      serveFresh (profileEnded profile) `catch` \failure →
         if isNothing (fromException failure ∷ Maybe SomeAsyncException) then pure () else throwIO (failure ∷ SomeException)

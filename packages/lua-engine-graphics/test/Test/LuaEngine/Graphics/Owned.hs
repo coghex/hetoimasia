@@ -29,12 +29,16 @@ import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar
 import Control.Exception (AsyncException (UserInterrupt), Exception, SomeException, bracket_, finally, fromException, mask_, throwIO, try, uninterruptibleMask_)
 import Control.Monad (forever, unless, void, when)
 import Data.Foldable (for_)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
+import Hetoimasia.Foundation.Log (unsafeComponent)
+import Hetoimasia.Foundation.Worker (awaitCompletion, workerDefinition)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), WindowProvider, noProviderHooks, windowMainReady, windowMainStep, withWindowProviderWith)
+import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Test.Hspec
 import Test.LuaEngine.Graphics.Fake
-import Test.LuaEngine.Graphics.PeersRig (mainLoopAs, retarget)
+import Test.LuaEngine.Graphics.PeersRig (mainLoopAs, quietLogger, retarget)
 import Test.LuaEngine.Graphics.Rig
 import Test.LuaEngine.Graphics.Served (serveProfile, withProfileBeyond)
 import Test.LuaEngine.Graphics.Unowned
@@ -192,14 +196,17 @@ drainScopeAfter wait fake =
     _ ← awaitTerminal probe
     uninterruptibleMask_ (wait >> hold fake HoldReclaim >> setVersionHolders fake 1)
 
--- | The failure the main thread raises after serving (an assertion), and the one the host's teardown raises as well.
-data Boom = Boom | TeardownBoom
+-- | The failure the main thread raises after serving (an assertion), the one the host's teardown raises as well, and the one a
+-- required supervised worker raises to latch the application's supervision.
+data Boom = Boom | TeardownBoom | Latching
   deriving (Eq, Show)
 
 instance Exception Boom
 
--- | How the native session ends.
-data Exit = ExitNormal | ExitAssertion | ExitCancelled
+-- | How the native session ends. @ExitLatched@ is the cancelled exit with the application's supervision latched by a required
+-- worker's fatal failure before the loop is served: the loop checks its supervision before it serves anything, so it raises that
+-- failure at once, and serving it again under the same supervision could never serve the window's retirement.
+data Exit = ExitNormal | ExitAssertion | ExitCancelled | ExitLatched
   deriving (Eq, Show)
 
 exits ∷ [(String, Exit)]
@@ -207,52 +214,89 @@ exits =
   [ ("the profile ends and the run returns", ExitNormal)
   , ("the profile ends and the main thread's assertion then fails", ExitAssertion)
   , ("the main thread is cancelled while a window is live", ExitCancelled)
+  , ("the owner loop is left by a latched supervision failure while a window is live", ExitLatched)
   ]
+
+-- | Latch a fatal failure of a required supervised worker on the control, and wait until it is published.
+latch ∷ Supervision.RuntimeControl → IO ()
+latch control = do
+  gate ← newEmptyMVar
+  started ←
+    Supervision.startSupervised
+      control
+      (Supervision.WorkerPolicy Supervision.Service Supervision.Required (unsafeComponent "test.luaengine.graphics.owned.latch") (\_ → pure Supervision.Unrecognized))
+      (workerDefinition "test.luaengine.graphics.owned.latch" (\_ → pure ()) (\_ () → (readMVar gate >> throwIO Latching ∷ IO ())))
+  handle ← case started of
+    Supervision.WorkerStarted found → pure found
+    _ → expectationFailure "the latching worker did not start" >> fail "unreachable"
+  putMVar gate ()
+  void (atomically (awaitCompletion (Supervision.supervisedWorker handle)))
 
 -- | The native session's shutdown, with the dependencies of 'Test.LuaEngine.Graphics.Served' modelled and nothing else: a window
 -- the profile thread closes in its own cleanup, which retires only while the loop is being served; the texture backend's scope,
 -- inside the host's body, whose exit drains (waits for that window to retire, not interruptibly); the host, whose teardown
--- runs after it. The owner loop is served by the main thread, and the cancelled exit leaves its first run by a cancellation while
--- the profile's window is live. Whether the call returned (no cycle: each wait's server was running when the wait began) with the
--- profile thread ended and joined, and the exception the exit should have raised.
+-- runs after it. The owner loop is served by the main thread and checks its supervision, a real one, on every turn before it
+-- serves; the cancelled exits leave its first run while the profile's window is live, the second serving is made under a fresh
+-- supervision as the shipped drain makes it. Whether the call returned (no cycle: each wait's server was running when the wait
+-- began) with the profile thread ended and joined, and the exception the exit should have raised.
 shutdownModel ∷ IORef [ThreadId] → Exit → Bool → Bool → IO Bool
 shutdownModel seen exit hostFails judgeExit = do
-  serving ← newTVarIO False
-  windowRetired ← newEmptyMVar
-  result ← newEmptyMVar
-  runs ← newIORef (0 ∷ Int)
-  parked ← newEmptyMVar
-  hostDown ← newEmptyMVar
-  let closeWindow = uninterruptibleMask_ (atomically (readTVar serving >>= \now → unless now retry) >> void (tryPutMVar windowRetired ()))
-      profile () = do
-        noteThread seen
-        case exit of
-          ExitCancelled → (putMVar parked () >> forever (threadDelayForever)) `finally` closeWindow
-          _ → closeWindow >> putMVar result ()
-      threadDelayForever = newEmptyMVar >>= readMVar
-      serve stopWhen = do
-        run ← atomicModifyIORef' runs (\count → (count + 1, count))
-        bracket_ (atomically (writeTVar serving True)) (atomically (writeTVar serving False)) $
+  answer ← newIORef Nothing
+  -- the application's supervision raises a latched failure at its own exit: that is part of the exit, and the answer is kept aside
+  void . try @SomeException . withLoggingLifetime quietLogger $ \lifetime → Supervision.withSupervision lifetime $ \control → do
+    serving ← newTVarIO False
+    windowRetired ← newEmptyMVar
+    result ← newEmptyMVar
+    runs ← newIORef (0 ∷ Int)
+    parked ← newEmptyMVar
+    hostDown ← newEmptyMVar
+    when (exit == ExitLatched) (latch control)
+    let closeWindow = uninterruptibleMask_ (atomically (readTVar serving >>= \now → unless now retry) >> void (tryPutMVar windowRetired ()))
+        profile () = do
+          noteThread seen
+          case exit of
+            ExitNormal → closeWindow >> putMVar result ()
+            ExitAssertion → closeWindow >> putMVar result ()
+            _ → (putMVar parked () >> (newEmptyMVar >>= readMVar)) `finally` closeWindow
+        -- one run of the loop: the control's check, then a turn, until the predicate holds
+        loop supervision stopWhen =
+          bracket_ (atomically (writeTVar serving True)) (atomically (writeTVar serving False)) $ do
+            let go = do
+                  Supervision.checkRuntime supervision
+                  over ← stopWhen
+                  unless over (yield >> go)
+            go
+        serve stopWhen = do
+          run ← atomicModifyIORef' runs (\count → (count + 1, count))
           if exit == ExitCancelled && run == 0
             then readMVar parked >> throwIO UserInterrupt
-            else bounded (let go = stopWhen >>= \over → unless over (yield >> go) in go)
-      finished = isJust <$> tryReadMVar result
-      drain = uninterruptibleMask_ (readMVar windowRetired)
-      teardown = void (tryPutMVar hostDown ()) >> when hostFails (throwIO TeardownBoom)
-  outcome ←
-    try @SomeException $
-      withProfileBeyond profile $ \hand running →
-        bracket_ (pure ()) drain (serveProfile running (hand ()) serve finished >> when (exit == ExitAssertion) (throwIO Boom))
-          `finally` teardown
-  -- the exit raised what it should have
-  when judgeExit $ case (exit, hostFails) of
-    (_, True) → either (\failure → fromException failure `shouldBe` Just TeardownBoom) (const (expectationFailure "the host's failure was lost")) outcome
-    (ExitNormal, _) → either (\failure → expectationFailure (show failure)) pure outcome
-    (ExitAssertion, _) → either (\failure → fromException failure `shouldBe` Just Boom) (const (expectationFailure "the assertion was lost")) outcome
-    (ExitCancelled, _) → either (\failure → fromException failure `shouldBe` Just UserInterrupt) (const (expectationFailure "the cancellation was lost")) outcome
-  joined ← allJoined seen
-  void (isEmptyMVar hostDown)
-  pure joined
+            else
+              when (exit == ExitLatched && run == 0) (readMVar parked)
+                >> bounded (loop control stopWhen)
+        serveFresh stopWhen = Supervision.withSupervision lifetime $ \fresh → bounded (loop fresh stopWhen)
+        finished = isJust <$> tryReadMVar result
+        drain = uninterruptibleMask_ (readMVar windowRetired)
+        teardown = void (tryPutMVar hostDown ()) >> when hostFails (throwIO TeardownBoom)
+    outcome ←
+      try @SomeException $
+        withProfileBeyond profile $ \hand running →
+          bracket_ (pure ()) drain (serveProfile running (hand ()) serve serveFresh finished >> when (exit == ExitAssertion) (throwIO Boom))
+            `finally` teardown
+    joined ← allJoined seen
+    void (isEmptyMVar hostDown)
+    writeIORef answer (Just (outcome, joined))
+  readIORef answer >>= \case
+    -- a cancellation that lands before the answer is recorded is the at-once row's own, which judges only that nothing is alive
+    Nothing → if judgeExit then expectationFailure "the model did not finish" >> pure False else pure True
+    Just (outcome, joined) → do
+      -- the exit raised what it should have
+      when judgeExit $ case (exit, hostFails) of
+        (_, True) → either (\failure → fromException failure `shouldBe` Just TeardownBoom) (const (expectationFailure "the host's failure was lost")) outcome
+        (ExitNormal, _) → either (\failure → expectationFailure (show failure)) pure outcome
+        (ExitAssertion, _) → either (\failure → fromException failure `shouldBe` Just Boom) (const (expectationFailure "the assertion was lost")) outcome
+        (ExitCancelled, _) → either (\failure → fromException failure `shouldBe` Just UserInterrupt) (const (expectationFailure "the cancellation was lost")) outcome
+        (ExitLatched, _) → either (const (pure ())) (const (expectationFailure "the latched failure was lost")) outcome
+      pure joined
 
 -- | Run the helper or control cancelled at once; whatever it started is not alive once it has returned or raised.
 cancelledAtOnce ∷ (IORef [ThreadId] → IO ()) → IO Bool

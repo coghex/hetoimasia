@@ -68,7 +68,7 @@ import Hetoimasia.LuaEngine.Graphics.Window.Configuration (configureWindows)
 import Hetoimasia.GPU.Vulkan.GLFW (runVulkanOwnerLoop)
 import Hetoimasia.Runtime.GLFW (HostConfig (..), ScheduledStep (..), UpdateSchedule (NoUpdateDemand), defaultHostConfig, defaultScheduledHooks, runGraphicsOwnerApplication, wakeGraphicsHost)
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
-import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Hetoimasia.Runtime.Supervision (RuntimeControl, withSupervision)
 
 -- | What an example is given.
 data Env = Env
@@ -263,7 +263,15 @@ runSession complete backend features configuration examples = do
               join (readIORef serve)
               finished ← stopWhen
               pure (if finished then FinishWith () else ContinueWith NoUpdateDemand)
-        serveProfile running (hand env) (\stopWhen → runVulkanOwnerLoop vulkan control (defaultScheduledHooks quietLogger (update stopWhen))) (isJust <$> tryReadMVar done)
+        let hooks stopWhen = defaultScheduledHooks quietLogger (update stopWhen)
+        serveProfile
+          running
+          (hand env)
+          (\stopWhen → runVulkanOwnerLoop vulkan control (hooks stopWhen))
+          -- the settling run makes its own supervision, as the shipped owner drain does: the application's may have latched the
+          -- very failure that ended the first run, and its checkpoints would end this one before it served anything
+          (\stopWhen → withLoggingLifetime quietLogger $ \lifetime → withSupervision lifetime $ \fresh → runVulkanOwnerLoop vulkan fresh (hooks stopWhen))
+          (isJust <$> tryReadMVar done)
         takeMVar done >>= \case
           Left failure → throwIO failure
           Right success → writeIORef passedCell success
