@@ -253,31 +253,32 @@ cabal test hetoimasia-tests --test-show-details=direct
   starts a subprocess through `Test.Support.Subprocess` (#588 converted the
   subprocess sites the baseline listed; #608 converted the two display-helper suites,
   which run the helper on a host of `Test.Support.Subprocess.Host` so that its
-  process group outlives the call, and whose probe calls are one-shot owned calls). `glfw-tests` was converted in #593, narrowed by
-  the owner (2026-11-02): every thread it starts is owned (`Test.GLFW.Support`'s
-  `onThread`, `onBoundThread`, `withDeferredThread`, `withMainThread` and the
-  scoped helpers beside the specs that use them) except three references that keep
-  their baseline entries: the evidence supplier (`forkIO`) and the dedicated bound
-  runner (`onMainThreadKeepingContext`, `forkOS`) of `Protected.hs`
-  `testStallWarningCancelledAtItsSink` (that file's entry went from 21 to 2), and
-  the harassing `forkIO` of `testRetirementRecordSurvivesCancellation` in
-  `Owner/Failure/Interruption.hs` (from 2 to 1). That removes 130 of the 133
-  references the suite had. Nine examples are left as before #593 and belong to
-  follow-ups, because an early cancellation can leave a protected drain waiting
-  for ever and test code cannot rescue it: those two;
-  `testStallWarningCancelledAtItsSink`, whose cleanup kill can land before any
-  rescue of the protected drain exists, so the drain enters the stall diagnostic's
-  sink and blocks there (the only caller of its dedicated runner helper; the
-  exception covers no other main-thread runner); `Owner/Exit/Settlement.hs`
-  `testCoherentDestructionSnapshot` (no raw thread start and no baseline entry;
-  its destruction hook waits for an owner handle that only the consumer callback
-  publishes, which an early cancellation can prevent; scenario and assertions
-  unchanged); and the six that hold the graphics owner inside its startup
-  (`Owner/Port.hs` `testPortFullReported` and `testFullPortDoesNotBlockExit`,
-  `Owner/Exit/Settlement.hs` `testUnannouncedDirectAttachSettles` and
-  `testUnannouncedClosedSettles`, `Owner/Handover.hs` `testHandoffOrder` and
-  `testHandoverRecovery`; these start no thread and carry no baseline entry, but
-  their startup gate cannot be armed later than the owner's creation). The examples that hold the
+  process group outlives the call, and whose probe calls are one-shot owned calls). `glfw-tests` was converted in #593 and #612: every thread it starts is owned
+  (`Test.GLFW.Support`'s `onThread`, `onBoundThread`, `withDeferredThread`, `withMainThread`,
+  `withMainThreadKeepingContextVia` and the scoped helpers beside the specs that use them), and no
+  baseline entry is left for it. #593 was narrowed by the owner (2026-11-02) and left nine examples
+  to #612, which converted or rescued them: `Owner/Port.hs` `testPortFullReported` and
+  `testFullPortDoesNotBlockExit`, `Owner/Exit/Settlement.hs` `testUnannouncedDirectAttachSettles`,
+  `testUnannouncedClosedSettles` and `testCoherentDestructionSnapshot`, `Owner/Handover.hs`
+  `testHandoffOrder` and `testHandoverRecovery`, `Owner/Failure/Interruption.hs`
+  `testRetirementRecordSurvivesCancellation` (its harasser is an owned start that stops at the
+  target's record; under `-N2` the old stream of cancellations outlasted the target's retirement and
+  reached the owner's destruction, which production rightly leaves unverified), and `Protected.hs`
+  `testStallWarningCancelledAtItsSink` (its supplier and runner are owned; the scope that owns the
+  runner releases the registered owners and the sink's hold before it kills the runner).
+  The seven that hold the owner's startup or its destruction are cut at every boundary of the
+  owner's start by `Test.GLFW.Owner.Fixture.Cut` (`boundaryExamples`, and `boundaryControls` where
+  the fixture without its rescue strands): the private host hook `ownerBoundary` (called with
+  `OwnerBeforePublication` before the owner's handle is published and `OwnerStarted` after the start
+  has published it), the rig's startup callback, and the body's entry, each ending the run by a
+  failure, a cancellation pending when the boundary is reached, or a cancellation delivered while the
+  run is parked there. The rescue is the exit's own: the wait for the owner's destruction opens the
+  fixture's gate on its first snapshot (`afterDestructionSnapshot`), and the body opens it on every
+  way out (`heldBody`). **Known production gap (#613).** Two boundaries of the start are not cut:
+  after the owner's handle is published inside the preparation step, and the abandoned-start path of
+  the startup wait. There the worker start drains an owner that never entered its run, destruction
+  evidence is recorded only inside that run's drain, and the protected exit waits for it for ever, so
+  no fixture can close them; #613 fixes it in production and adds those two cuts. The examples that hold the
   conversion to account run in `glfw-tests` (`--match '#593'`), each as an owned
   example and a negative control: the start-and-wait helper, the bound
   main-thread helper and the bound start in a session, a deferred thread, a
