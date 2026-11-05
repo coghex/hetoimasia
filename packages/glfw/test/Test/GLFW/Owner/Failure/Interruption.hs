@@ -138,8 +138,9 @@ data EndsAt
 -- * __The target's retirement call.__ Nothing is masked: the call stays interruptible. No cancellation lands here: the harasser waits
 --   for the host hook that runs after the call returned. One that landed here would leave no record, which is its own example
 --   ('testRetirementInterruptedInsideItsCall').
--- * __Committed, not delivered.__ The retirement returned and the harasser is admitted, held at its throw. A scenario ends the body
---   here; the rescue opens the throw's gate with the abandonment, so the throw is made, and the owner's later calls wait for it.
+-- * __Committed, not delivered.__ The retirement returned and the harasser is admitted, held at its throw until the owner has entered
+--   its whole-owner retirement. A scenario ends the body here, so the throw is made after the abandonment, in the call's wait, which
+--   absorbs it; the owner's calls could not otherwise wait for a throw nobody had made yet.
 -- * __Answer to record.__ The owner is masked until the record commits. The harasser's one cancellation is pending against a masked
 --   owner and cannot interrupt the commit.
 -- * __Whole-owner retirement.__ An interruptible call. The cancellation may be received at its start (survivable: the destruction is
@@ -159,7 +160,6 @@ retirementRecord scope position atParked = do
   -- 0: not admitted, 1: admitted and committed to its throw, 2: delivered.
   phase ← newTVarIO (0 ∷ Int)
   abandoned ← newTVarIO False
-  throwGate ← newTVarIO (position /= BetweenAdmissionAndDelivery)
   release ← newTVarIO (not held)
   recorded ← newTVarIO []
   absorbed ← newTVarIO (0 ∷ Int)
@@ -184,6 +184,12 @@ retirementRecord scope position atParked = do
           check (reached == 2 || (gone && reached == 0))
   script (fakeRetireOwner (rigFake rig)) $ \_ → afterHarassment >> pure (ownerRetired (Text.pack "retired"))
   script (fakeDestroy (rigFake rig)) $ \_ → afterHarassment >> pure (ownerDestroyed (Text.pack "destroyed"))
+  -- When a committed harasser may throw. At 'BetweenAdmissionAndDelivery' it is held until the owner has entered its whole-owner
+  -- retirement, which is the one place a throw decided before the abandonment and made after it could do harm if the owner's calls did
+  -- not wait for it; the owner is by then in the call's wait, which absorbs it.
+  let throwReady
+        | position == BetweenAdmissionAndDelivery = (OwnerRetirement `elem`) <$> readTVar (rigJournal rig)
+        | otherwise = pure True
   let harry = do
         -- Admission and commitment are one step; the body's abandonment cannot slip between them.
         atomically $ do
@@ -191,7 +197,7 @@ retirementRecord scope position atParked = do
           gone ← readTVar abandoned
           check (r && not gone)
           writeTVar phase 1
-        atomically (readTVar throwGate >>= check)
+        atomically (throwReady >>= check)
         ownerThread ← atomically $
           readTVar (fakeThreads (rigFake rig)) >>= \case
             thread : _ → pure thread
@@ -208,9 +214,9 @@ retirementRecord scope position atParked = do
   scope letGo harry $ \_ _ → do
     outcome ← ownedHostCaughtHooked hooks (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control →
       -- The rescue is installed in the masked step that also creates and registers the attachment, before any of it exists: a
-      -- cancellation pending when the handover returns finds the handler. It publishes the completion evidence the exit waits for,
-      -- records the abandonment and opens the throw's gate in one step, so a harasser that is committed makes its throw and one that is
-      -- not never will. The harasser itself is not let go by it: it is the scope's to stop and join.
+      -- cancellation pending when the handover returns finds the handler. It publishes the completion evidence the exit waits for and
+      -- records the abandonment: a harasser that is committed still makes its throw, and the owner's later calls wait for it, while
+      -- one that is not never will. The harasser itself is not let go by it: it is the scope's to stop and join.
       mask $ \restore →
         ( restore $ do
             window ← theWindow host
@@ -238,9 +244,7 @@ retirementRecord scope position atParked = do
             -- cancellation at its exit, so the body's value never reaches the caller.
             atomically . writeTVar recorded . Map.keys =<< atomically (readTargetTerminalsNow owner)
         )
-          `onException` ( atomically (writeTVar abandoned True >> writeTVar throwGate True)
-                            >> rescuePublishing tracked host owner
-                        )
+          `onException` (atomically (writeTVar abandoned True) >> rescuePublishing tracked host owner)
     -- Offered exactly once, over the whole run and its drain, however many
     -- cancellations arrived and however the example ended.
     offers `shouldReturn` 1
