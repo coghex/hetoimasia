@@ -16,10 +16,10 @@
 -- stuck example from hanging the run.
 module Test.LuaEngine.Graphics.Owned (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (AsyncException (UserInterrupt), SomeException, finally, throwIO, try)
-import Control.Monad (forever, unless, void)
+import Control.Concurrent (ThreadId, forkIO, killThread, yield)
+import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Exception (AsyncException (UserInterrupt), SomeException, finally, throwIO, try, uninterruptibleMask_)
+import Control.Monad (forever, unless, void, when)
 import Control.Concurrent.STM (atomically, retry)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
@@ -92,12 +92,32 @@ previousForkScope _ scope body = do
   thread ← forkIO ((try @SomeException scope >>= putMVar result) `finally` putMVar done ())
   body Forked {forkedThread = thread, forkedJoin = takeMVar result <* takeMVar done}
 
+-- | A scope on a thread of its own, held at a gate it waits at uninterruptibly (as a drain waits for evidence only the example
+-- supplies, so the kill alone cannot end it), with the example ended the way the ending says: whether the thread has ended and
+-- been joined when the call returned. The gate is not let go by the example: only the stop does, which is the thing judged. A
+-- control lets the gate go itself afterwards, so the thread ends of its own accord and nothing waits for a kill; the judgement is
+-- made first. The gate is referenced by the example until then, so the runtime does not end the parked thread as deadlocked.
+gatedScope ∷ Ending → (IO () → IO () → (Forked () → IO ()) → IO ()) → Bool → IO Bool
+gatedScope ending start letGoAfterwards = do
+  seen ← newIORef []
+  gate ← newEmptyMVar
+  let letGo = void (tryPutMVar gate ())
+      scope = noteThread seen >> uninterruptibleMask_ (readMVar gate)
+  runEnding ending $ \end → start letGo scope $ \_ → end (waitUntilNoted seen)
+  joined ← allJoined seen
+  when letGoAfterwards letGo
+  -- the gate stays reachable until the judgement is made
+  void (isEmptyMVar gate)
+  pure joined
+  where
+    waitUntilNoted seen = bounded (let go = readIORef seen >>= \held → if null held then yield >> go else pure () in go)
+
 -- | A backend scope on a thread of its own, held in its drain by evidence only the example supplies, with the example ended the
--- way the ending says once the scope has closed and is waiting: whether the thread has ended and been joined when the call
--- returned. What the control left is let go and stopped inside the fake owner's scope, because the drain it is held in needs the
--- owner; the judgement is made first.
-heldScope ∷ Ending → (IO () → IO () → (Forked () → IO ()) → IO ()) → (Fake → IORef [ThreadId] → IO ()) → IO Bool
-heldScope ending start afterwards = do
+-- way the ending says: whether the thread has ended and been joined when the call returned. Owned only: it is the real drain
+-- that 'Test.LuaEngine.Graphics.Teardown' and 'Test.LuaEngine.Graphics.Lifecycle' hold, and a leaked one cannot be stopped
+-- without the fake owner it needs, so no control leaves one.
+heldDrain ∷ Ending → IO Bool
+heldDrain ending = do
   fake ← newFake defaultFakeConfig
   seen ← newIORef []
   withFakeOwner fake $ do
@@ -107,10 +127,8 @@ heldScope ending start afterwards = do
           _ ← awaitTerminal probe
           hold fake HoldReclaim
           setVersionHolders fake 1)
-    runEnding ending $ \end → start (openEveryHold fake) scope $ \_ → end (bounded (awaitEvent fake "released"))
-    joined ← allJoined seen
-    afterwards fake seen
-    pure joined
+    runEnding ending $ \end → withForkedScope (openEveryHold fake) scope $ \_ → end (bounded (awaitEvent fake "released"))
+    allJoined seen
 
 spec ∷ Spec
 spec = describe "the threads the helpers start are owned (#599)" $ do
@@ -131,8 +149,9 @@ spec = describe "the threads the helpers start are owned (#599)" $ do
       (mainLoopCancelledAtStart previousMainLoop seen >>= (`shouldBe` False)) `finally` stopNoted seen
   for_ endings $ \(label, ending) →
     describe ("a scope on a thread of its own, held in its drain, when " <> label) $ do
-      it "has ended and been joined when the call returns: the example's hold is let go by the stop" $
-        heldScope ending withForkedScope (\_ _ → pure ()) >>= (`shouldBe` True)
-      it "negative control: the previous helper leaves the thread held in its drain" $ do
-        joined ← heldScope ending previousForkScope (\fake seen → openEveryHold fake >> stopNoted seen)
-        joined `shouldBe` False
+      it "has ended and been joined when the call returns: the real drain's hold is let go by the stop" $
+        heldDrain ending >>= (`shouldBe` True)
+      it "has ended and been joined when the call returns: the gate it waits at uninterruptibly is let go by the stop" $
+        gatedScope ending withForkedScope False >>= (`shouldBe` True)
+      it "negative control: the previous helper leaves the thread held at its gate" $
+        gatedScope ending previousForkScope True >>= (`shouldBe` False)

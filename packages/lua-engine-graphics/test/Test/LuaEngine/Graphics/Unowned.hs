@@ -39,6 +39,7 @@ import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVa
 import Control.Exception (AsyncException (UserInterrupt), Exception, finally, mask_, throwIO, try)
 import Control.Monad (void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Foreign.StablePtr (freeStablePtr, newStablePtr)
 import GHC.Conc (BlockReason, ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Test.Hspec (shouldBe)
 import Test.Support.Bounded (bounded)
@@ -117,10 +118,15 @@ runEnding ending scenario = case ending of
     try @AsyncException (bounded (scenario (\parked → withCancellationAfter parked (pure ()) holdUntilCancelled)))
       >>= (`shouldBe` Left UserInterrupt)
 
--- | Wait where only the example's own end can reach it. The wait is bounded by the caller's 'bounded', and keeps the waiting
--- thread reachable so the runtime does not end it as deadlocked.
+-- | Wait where only the example's own end can reach it. The wait is bounded by the caller's 'bounded'. The cell is anchored by a
+-- stable pointer for the length of the wait: the cancellation arrives from another thread that knows only this thread's
+-- identity, which does not keep a thread blocked on an otherwise unreferenced cell alive, so without the anchor the runtime
+-- could end the wait as deadlocked (and the run with it) before the cancellation is delivered.
 holdUntilCancelled ∷ IO ()
-holdUntilCancelled = newEmptyMVar >>= \hold → readMVar hold `finally` void (tryPutMVar hold ())
+holdUntilCancelled = do
+  hold ← newEmptyMVar
+  anchor ← newStablePtr hold
+  readMVar hold `finally` (void (tryPutMVar hold ()) >> freeStablePtr anchor)
 
 -- | The judgement the facility makes true: the thread has ended, and been joined, when the scope returns. A thread that is
 -- blocked has not ended; one that ended is finished, or is running its last steps after announcing its end, which the poll
