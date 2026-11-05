@@ -5576,7 +5576,7 @@ own on Linux, or the desktop opt-in on a real desktop.
   A new example that needs no native session — a model, seam, host, or boundary
   contract — belongs in `glfw-tests`, beside the component spec that owns it. A
   helper thread an example needs is started through `Test.Support.Owned` (#593),
-  and in `glfw-tests` through the helpers `Test.GLFW.Support` offers over it:
+  and in `glfw-native-tests` through `Test.GLFW.Native.Threads` (#594, below), and in `glfw-tests` through the helpers `Test.GLFW.Support` offers over it:
   `onThread` and `onBoundThread` run an action on an owned thread and wait for its
   outcome; `withMainThread` runs one on an owned bound thread designated as the
   process main thread; `withDeferredThread` starts a thread that waits to be handed
@@ -5792,6 +5792,38 @@ it, through a recorded launcher; and that a directly invoked child refuses
 before its scenario is looked up, keeping the unknown-scenario exit for an
 approved one. Each refusal message names the variable, the desktop opt-in, the
 owner's standing approval, and the isolated alternative.
+
+Every thread the native suite starts is owned (#594): started through
+`Test.Support.Owned` in the one masked step that registers its stop-and-join,
+and stopped and joined on every way out of the scope that needed it, a
+cancellation delivered while it starts included. The helpers no longer take a
+fork primitive; a thread's boundness is a value (`Test.GLFW.Native.Threads`,
+`Unbound` or `Bound`, the latter on the facility's owned bound start of #593),
+so the four starts that were `forkOS` (the bound wakers of the private-session
+rounds and of the wake examples, and the session examples' bound worker) are
+still OS-bound and no example's thread identity changed. `onThread` is an owned
+start; `wokenWait` and `wokenWaitBy` own the worker that wakes the owner's wait,
+whose "owner is done" flag the scope also raises, so a cancellation before the
+owner's own `finally` cannot leave it spinning; the harness's `withForked` owns
+the threads its examples start, and `withForkedOpening` opens a gate only the
+scope can open before it joins; the launch-interruption example's launcher is
+owned, and with it the child, its readers and its handles. A worker that acts
+during a release, after the borrower returned, has a scope that encloses the
+whole run. `runOwned`'s borrower is owned too: its settlement is unchanged (it
+lets the borrower finish, absorbs a further cancellation in that wait, and holds
+the resource until the borrower has) and the scope closes the one interval it
+did not cover, a cancellation after the borrower started and before the
+settlement was installed. The private-session rounds' wakers outlive the session
+until their capability answers `WakeTerminal`, so their scopes enclose the
+session's, and the capability reaches them through a cell. The ownership
+regressions are `owns the threads its helpers start (#594)` under `the native
+opt-in`, so they run with no consent, session or display
+(`--match "owns the threads its helpers start"`): each ends the scope while the
+thread is parked, by a failing body and by a cancellation, and judges that it has
+ended and been joined, and each has a negative control through the deliberately
+unowned start of `Test.GLFW.Native.Unowned`, which must fail. The helpers that
+need a session (`Private.hs`, the Wayland scenarios, the wake examples) are
+covered by their own examples in the display groups.
 
 The native examples cover:
 
