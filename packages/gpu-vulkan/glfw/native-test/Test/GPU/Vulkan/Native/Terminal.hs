@@ -42,8 +42,7 @@ module Test.GPU.Vulkan.Native.Terminal
   , injectedMessageId
   ) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry)
+import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newEmptyTMVarIO, newTVarIO, orElse, readTMVar, readTVar, readTVarIO, registerDelay, retry, tryPutTMVar)
 import Control.Exception (SomeException, displayException, finally, throwIO, try, tryWithContext)
 import Control.Monad (forM_, replicateM, unless, void, when)
 import Data.ByteString (ByteString)
@@ -186,6 +185,7 @@ import Hetoimasia.Runtime.GLFW
   )
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
+import Test.Support.Owned (withOwnedThreadOpening)
 import Test.Vulkan.Proof.Interop
   ( ProofWindow
   , createProofWindow
@@ -661,6 +661,7 @@ runRetention backend journal conclude = do
   heading journal "VK-15: a retained unverified resource, reported rather than released"
   recorded ← newIORef []
   logged ← newTVarIO []
+  watched ← newEmptyTMVarIO
   scene ← prepare ()
   budgets ← either (stopWith . tshow) pure (validateBudgets defaultBudgetRequest)
   let window = (hiddenTestWindowConfig "hetoimasia VK-15 retention" 160 120) {windowVisible = True}
@@ -672,23 +673,31 @@ runRetention backend journal conclude = do
           , vulkanValidationFeatures = validationFeatures
           , vulkanObserver = nativeCallObserver recorded
           }
-  outcome ←
-    try @SomeException $
-      withLoaderIntegration $ \integration →
-        runGraphicsOwnerApplication
-          (withLoggingLifetime logger)
-          "vulkan-native-vk15-retention"
-          (\_ use → fst <$> withVulkanOwnerHost logger integration config use)
-          vulkanWindowHost
-          (\vulkan _ → pure vulkan)
-          (\vulkan _ → body vulkan recorded)
-  -- The host's exit waits for evidence nobody will produce; returning here
-  -- means it did not, which is itself the failure.
-  conclude (Left ("the host returned, or failed, instead of retaining: " <> either (Text.pack . displayException) (const "it returned") outcome))
-  stopWith "the process was not terminated"
+  -- The watcher is owned (#596), and its scope is this whole case, not the application callback that gives it something to
+  -- watch: the watcher supplies the evidence the host's exit waits for, so it has to outlive the callback's return and the
+  -- drain that follows, which never ends by itself. It is started, with its stop-and-join registered, in one masked step
+  -- before anything native exists, and waits for the callback to hand it what it watches. The opening hands it nothing,
+  -- idempotently and without blocking, so a scope that ends first (the host failing to start, a cancellation) releases it
+  -- before the join. On the case's one deliberate exit the scope does not unwind: the watcher itself hands the facts to
+  -- @conclude@, which terminates the process, and nothing here runs after that.
+  withOwnedThreadOpening (atomically (void (tryPutTMVar watched Nothing))) (atomically (readTMVar watched) >>= sequence_) $ \_ _ → do
+    outcome ←
+      try @SomeException $
+        withLoaderIntegration $ \integration →
+          runGraphicsOwnerApplication
+            (withLoggingLifetime logger)
+            "vulkan-native-vk15-retention"
+            (\_ use → fst <$> withVulkanOwnerHost logger integration config use)
+            vulkanWindowHost
+            (\vulkan _ → pure vulkan)
+            (\vulkan _ → body vulkan recorded watched)
+    -- The host's exit waits for evidence nobody will produce; returning here
+    -- means it did not, which is itself the failure.
+    conclude (Left ("the host returned, or failed, instead of retaining: " <> either (Text.pack . displayException) (const "it returned") outcome))
+    stopWith "the process was not terminated"
   where
     defaultHost = requestingBackend backend . defaultHostConfig
-    body vulkan recorded = do
+    body vulkan recorded watched = do
       let controller = vulkanController vulkan
           owner = vulkanGraphicsOwner vulkan
       readiness ← awaitWithin 10 "the owner's startup" (settledReadiness <$> readReadiness controller)
@@ -725,43 +734,46 @@ runRetention backend journal conclude = do
       -- The watcher: once the owner's drain has reported the retention, the
       -- owner's run has ended without destruction evidence and the host has
       -- said so, it records what it saw and hands it on. Everything it reads
-      -- is read while the host still waits.
-      void . forkIO $ do
-        facts ← try @SomeException $ do
-          (report, terminal) ← awaitWithin 20 "the reported retention" $ do
-            report ← readVulkanTerminal controller
-            terminal ← readOwnerTerminalNow owner
-            pure $
-              if ownerRunEnded terminal && any retainedEvidence (reportEvidence report)
-                then Just (report, terminal)
-                else Nothing
-          roots ← atomically (readVulkanRoots controller)
-          generations ← atomically (readVulkanGenerations controller (graphicsAttachment service))
-          calls ← map (.callName) . reverse <$> readIORef recorded
-          -- The owner ended; the attachment it could not retire has no terminal
-          -- record, so the host still holds the window, and will.
-          terminals ← atomically (readTargetTerminalsNow owner)
-          held' ← (windowId `elem`) <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
-          pure
-            RetentionFacts
-              { retentionHeld = either (const False) (const True) held
-              , retentionReport = report
-              , retentionOwner = terminal
-              , retentionRoots = roots
-              , retentionGeneration = generations >>= \view → lookup active [(viewGeneration each, viewStanding each) | each ← viewGenerations view]
-              , retentionCalls = calls
-              , retentionWindowHeld = held' && Map.notMember (graphicsAttachment service) terminals
-              }
-        case facts of
-          Right found → conclude (Right found)
-          Left failure → do
-            -- Say which part of the report never arrived.
-            report ← atomically (readVulkanTerminal controller)
-            terminal ← atomically (readOwnerTerminalNow owner)
-            conclude . Left $
-              Text.pack (displayException failure)
-                <> "; the owner's run ended: " <> tshow (ownerRunEnded terminal)
-                <> "; the report: " <> tshow report
+      -- is read while the host still waits. It runs on the owned thread
+      -- 'runRetention' started, which is handed it here, now that there is
+      -- something to watch.
+      let watcher = do
+            facts ← try @SomeException $ do
+              (report, terminal) ← awaitWithin 20 "the reported retention" $ do
+                report ← readVulkanTerminal controller
+                terminal ← readOwnerTerminalNow owner
+                pure $
+                  if ownerRunEnded terminal && any retainedEvidence (reportEvidence report)
+                    then Just (report, terminal)
+                    else Nothing
+              roots ← atomically (readVulkanRoots controller)
+              generations ← atomically (readVulkanGenerations controller (graphicsAttachment service))
+              calls ← map (.callName) . reverse <$> readIORef recorded
+              -- The owner ended; the attachment it could not retire has no terminal
+              -- record, so the host still holds the window, and will.
+              terminals ← atomically (readTargetTerminalsNow owner)
+              held' ← (windowId `elem`) <$> atomically (hostWindowIdentities (vulkanWindowHost vulkan))
+              pure
+                RetentionFacts
+                  { retentionHeld = either (const False) (const True) held
+                  , retentionReport = report
+                  , retentionOwner = terminal
+                  , retentionRoots = roots
+                  , retentionGeneration = generations >>= \view → lookup active [(viewGeneration each, viewStanding each) | each ← viewGenerations view]
+                  , retentionCalls = calls
+                  , retentionWindowHeld = held' && Map.notMember (graphicsAttachment service) terminals
+                  }
+            case facts of
+              Right found → conclude (Right found)
+              Left failure → do
+                -- Say which part of the report never arrived.
+                report ← atomically (readVulkanTerminal controller)
+                terminal ← atomically (readOwnerTerminalNow owner)
+                conclude . Left $
+                  Text.pack (displayException failure)
+                    <> "; the owner's run ended: " <> tshow (ownerRunEnded terminal)
+                    <> "; the report: " <> tshow report
+      atomically (void (tryPutTMVar watched (Just watcher)))
       note journal "the host exits with the generation's use still held"
     settledReadiness = \case
       RootsPending → Nothing

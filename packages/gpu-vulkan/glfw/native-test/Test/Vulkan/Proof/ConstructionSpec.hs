@@ -23,17 +23,7 @@
 -- retained and why.
 module Test.Vulkan.Proof.ConstructionSpec (spec) where
 
-import Control.Concurrent
-  ( ThreadId
-  , forkOn
-  , myThreadId
-  , newEmptyMVar
-  , putMVar
-  , takeMVar
-  , throwTo
-  , yield
-  )
-import Control.Exception (Exception, SomeException, displayException, throwIO, try)
+import Control.Exception (Exception, SomeException, displayException, throwIO, toException, try)
 import Control.Monad (forM, forM_, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
@@ -41,7 +31,6 @@ import Data.List (isInfixOf)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
-import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Test.Hspec
 
 import Test.Vulkan.Proof.Construction
@@ -57,6 +46,7 @@ import Test.Vulkan.Proof.Construction
   )
 import Test.Vulkan.Proof.Findings (Failure (..), Outcome (..), TeardownFacts (..))
 import Test.Vulkan.Proof.Journal (newJournal)
+import Test.Vulkan.Proof.PendingCancellation (withCancelledWorker)
 import Test.Vulkan.Proof.Record (renderRecord)
 import Test.Vulkan.Proof.Ownership
   ( Cleanups
@@ -370,38 +360,13 @@ firstSemaphore = "the acquisition semaphore of slot 0"
 theCapability ∷ Int
 theCapability = 0
 
--- | Make a cancellation of this thread certainly pending, without delivering
--- it and without waiting anywhere it could be delivered.
---
--- 'throwTo' does not return until its exception has been raised in the target,
--- and it blocks while the target is masked. So a killer sitting in
--- 'BlockedOnException' is exactly the state this needs to establish, and
--- waiting for that state is what makes the example deterministic instead of
--- timed: no sleep, no timeout, no repeated attempt, and no window in which the
--- two threads could race to a different answer. 'yield' is the only thing the
--- wait does, and it is not interruptible, so it cannot itself become the place
--- the cancellation lands.
---
--- Where it does land is the code under test's decision. Under 'holding''s mask
--- the killer blocks, this returns, the handle is written, and the exception is
--- taken when that mask is restored. Without the mask the killer never blocks:
--- 'throwTo' raises immediately, here, before the created handle has an owner.
-armCancellation ∷ Text → IO ()
-armCancellation reason = do
-  target ← myThreadId
-  killer ← forkOn theCapability (throwTo target (Injected reason))
-  awaitPendingThrow killer
-
--- | Wait until a thread is blocked delivering an exception, or has finished.
-awaitPendingThrow ∷ ThreadId → IO ()
-awaitPendingThrow target =
-  threadStatus target >>= \case
-    ThreadBlocked BlockedOnException → pure ()
-    -- A killer that is already done raised its exception before returning, so
-    -- there is nothing left to wait for either way.
-    ThreadFinished → pure ()
-    ThreadDied → pure ()
-    _ → yield *> awaitPendingThrow target
+-- The arm the cancellation example's stand-in calls is the one 'withCancelledWorker' hands it (see
+-- "Test.Vulkan.Proof.PendingCancellation"): it makes a cancellation of this thread certainly pending, without delivering it
+-- and without waiting anywhere it could be delivered. 'throwTo' does not return until its exception has been raised in the
+-- target, and it blocks while the target is masked, so a killer sitting in 'BlockedOnException' is exactly the state this
+-- needs to establish. Where the cancellation lands is the code under test's decision: under 'holding''s mask the killer
+-- blocks, the arm returns, the handle is written, and the exception is taken when that mask is restored. Without the mask the
+-- killer never blocks: 'throwTo' raises immediately, in the arm, before the created handle has an owner.
 
 -- | The ownership invariant this issue exists to establish, asserted over one
 -- run: every object that was created was released exactly once, and every one
@@ -646,9 +611,8 @@ spec = do
       journal ← newJournal
       registerParents fake [] cleanups
       places ← newSlotPlaces "slot 0"
-      done ← newEmptyMVar
       semaphores ← newIORef [firstSemaphore, "the presentation semaphore of slot 0"]
-      let operations =
+      let operations armCancellation =
             SlotOps
               { createSlotSemaphore = do
                   role ←
@@ -665,7 +629,7 @@ spec = do
                   -- cancellation is taken at is decided by 'holding' and by
                   -- nothing this example arranges.
                   when (role == firstSemaphore) $
-                    armCancellation "the run was cancelled at the handoff"
+                    armCancellation
                   pure name
               , destroySlotSemaphore = release fake []
               , createSlotFence = acquire fake Nothing "an unreached fence of slot 0"
@@ -674,15 +638,19 @@ spec = do
               , destroySlotPool = release fake []
               , allocateSlotCommands = \pool → acquire fake Nothing (pool <> "'s command buffer")
               }
-      for_ (reverse (slotPlaceReleases operations "slot 0" places)) $ \(what, cleanup) →
+      -- The release entries do not depend on the arm, so they are built from stand-in operations that never arm anything.
+      for_ (reverse (slotPlaceReleases (operations (pure ())) "slot 0" places)) $ \(what, cleanup) →
         onExitHolding cleanups what cleanup
       -- The worker runs on 'theCapability', which is where its killer runs
       -- too, so a throw between them is settled where it is made rather than
-      -- sent as a message. Nothing here waits on the worker except for its
-      -- result, so a cancellation that never arrived would fail an assertion
-      -- rather than hang the example.
-      _ ← forkOn theCapability (try @SomeException (fillSlot operations places) >>= putMVar done)
-      outcome ← takeMVar done
+      -- sent as a message. Both are owned starts: the killer is started with
+      -- the worker and outlives the arm, so its cancellation stays pending
+      -- against the worker until the worker has received it, and both have
+      -- ended and been joined when this returns. Nothing here waits on the
+      -- worker except for its result, so a cancellation that never arrived
+      -- would fail an assertion rather than hang the example.
+      outcome ← withCancelledWorker theCapability (toException (Injected "the run was cancelled at the handoff")) $ \arm →
+        fillSlot (operations arm) places
       facts ← runCleanups journal ledger cleanups
       let session = Session fake facts (either (Just . stopReason) (const Nothing) outcome)
       session.sessionStopped `shouldSatisfy` maybe False (Text.isInfixOf "cancelled")
