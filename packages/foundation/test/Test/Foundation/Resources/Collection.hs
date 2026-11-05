@@ -85,7 +85,7 @@ import Test.Hspec
   , shouldBe
   , shouldReturn
   )
-import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOn, withOwnedThreadOpeningOn)
 
 spec ∷ Spec
 spec = do
@@ -297,15 +297,27 @@ boundedExample action = do
     Just () → pure ()
     Nothing → expectationFailure "the example did not finish within its bound"
 
--- | Wait until @target@ has stopped making progress towards its 'throwTo'.
+-- | Wait until @sender@ is blocked delivering an exception (or has ended, because it will never block again). The target and
+-- the sender of every cancellation this waits on are pinned to 'sharedCapability' ('withOwnedThreadOn'), so the exception is
+-- already pending against the target when the sender is seen blocked and is raised the moment the target restores its masking
+-- state; the examples that assert the cancellation preempts the target's next effect rely on that (#610). Pinned, the target
+-- must give up its capability for the sender to run, which the 'yield' of the poll does.
 awaitPendingThrow ∷ ThreadId → IO ()
-awaitPendingThrow target = do
-  status ← threadStatus target
+awaitPendingThrow sender = do
+  status ← threadStatus sender
   case status of
     ThreadBlocked BlockedOnException → pure ()
     ThreadFinished → pure ()
     ThreadDied → pure ()
-    _ → yield *> awaitPendingThrow target
+    _ → yield *> awaitPendingThrow sender
+
+-- | The one capability the examples that wait for a cancellation to be pending run their target and its sender on (#610). On one
+-- capability @throwTo@ to a masked thread queues the exception before the sender is recorded as blocked, so a sender seen in
+-- 'BlockedOnException' has an exception pending against its target; across capabilities it is a message the target's capability
+-- takes in later (GHC 9.14.1 @rts/Schedule.c@, @scheduleProcessInbox@ returns at once when the capability's lock is busy), and no
+-- wait on the sender's status, a yield after it included, establishes receipt. See "Test.Support.Owned".
+sharedCapability ∷ Int
+sharedCapability = 0
 
 -- | Run an owner body on a thread the example owns, and give the example that thread and the slot the scope's outcome is
 -- written to. However the example ends (a return, a failed assertion, a timeout, a cancellation) the thread has been killed
@@ -320,7 +332,7 @@ withOwner = withOwnerOpening (pure ())
 withOwnerOpening ∷ IO () → IO () → (ThreadId → MVar (Either SomeException ()) → IO a) → IO a
 withOwnerOpening open body continue = do
   outcome ← newEmptyMVar
-  withOwnedThreadOpening open (try body >>= putMVar outcome) (\owner _ → continue owner outcome)
+  withOwnedThreadOpeningOn sharedCapability open (try body >>= putMVar outcome) (\owner _ → continue owner outcome)
 
 -- Admission ------------------------------------------------------------------
 
@@ -428,7 +440,7 @@ testCancellationPendingAtRegistration = do
     )
     $ \owner outcome → do
       takeMVar acquiring
-      withOwnedThread (throwTo owner ThreadKilled) $ \killer _ → do
+      withOwnedThreadOn sharedCapability (throwTo owner ThreadKilled) $ \killer _ → do
         putMVar killerSlot (Just killer)
         takeMVar outcome >>= \case
           Right () → expectationFailure "expected the cancellation to propagate"
@@ -501,7 +513,7 @@ testHandoffBeforePendingCancellation = do
     )
     $ \owner outcome → do
       takeMVar handing
-      withOwnedThread (throwTo owner ThreadKilled) $ \killer _ → do
+      withOwnedThreadOn sharedCapability (throwTo owner ThreadKilled) $ \killer _ → do
         putMVar killerSlot (Just killer)
         takeMVar outcome >>= \case
           Right () → expectationFailure "expected the cancellation to propagate"
