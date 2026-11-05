@@ -28,6 +28,7 @@ module Test.GLFW.Support
   , withMainThread
   , withMainThreadVia
   , withMainThreadKeepingContext
+  , withMainThreadKeepingContextVia
   , caughtAs
   , caughtAsUnless
   , unexpected
@@ -235,9 +236,21 @@ withMainThreadVia scope seam open action body = do
 -- exception carries.
 withMainThreadKeepingContext
   ∷ ∀ a r. Seam → IO () → IO a → (ThreadId → MVar (Either (ExceptionWithContext SomeException) a) → IO r) → IO r
-withMainThreadKeepingContext seam open action body = do
+withMainThreadKeepingContext = withMainThreadKeepingContextVia withOwnedBoundThreadOpening
+
+-- | 'withMainThreadKeepingContext' through the given way of starting the bound thread (#612): the owned one, or the unowned one a
+-- negative control compares it with.
+withMainThreadKeepingContextVia
+  ∷ ∀ a r
+   . Scope
+  → Seam
+  → IO ()
+  → IO a
+  → (ThreadId → MVar (Either (ExceptionWithContext SomeException) a) → IO r)
+  → IO r
+withMainThreadKeepingContextVia scope seam open action body = do
   finished ← newEmptyMVar
-  withOwnedBoundThreadOpening
+  scope
     open
     (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
     (\runner _ → body runner finished)

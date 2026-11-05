@@ -105,17 +105,20 @@ retirementRecordScenario scope atParked = retirementRecord scope True atParked
 -- = The harasser and what it may hit
 --
 -- It delivers 'ThreadKilled' to the owner's thread again and again from the instant the retirement call is entered, so one lands
--- wherever the owner is least protected: inside the call, on its way out, or after the record. It must not outlive the target's
--- retirement, though: a cancellation that lands in the whole-owner retirement or destruction that follows interrupts a call whose
--- evidence the exit then waits for, correctly, for ever (the cause of the hang this example had under @-N2@, where the harasser runs
--- beside the owner instead of ahead of it: 8 of 204 runs, each ended with @OwnerRetirement@ in the journal and no
--- @OwnerDestruction@). So the owner's whole-owner retirement and destruction wait, absorbing what is still delivered, for the
--- harassment to be over. Nothing else about the owner is gated, and nothing waits on time.
+-- wherever the owner is least protected: inside the call, on its way out, or after the record. It stops once the record exists.
+-- It used to go on for all of its cancellations, and that is the cause of the hang this example had under @-N2@ (8 of 204 runs; in
+-- the two captured, the journal ended with @OwnerRetirement@ and no @OwnerDestruction@): a cancellation that is pending while the
+-- owner is masked is received at the next point it is unmasked, which for a stream of them is the start of each backend call in
+-- turn, so one reached the destruction, interrupted a call whose evidence the exit then waits for, for ever, and the owner (correctly)
+-- retained everything. Where the harasser runs beside the owner rather than ahead of it, the stream outlasts the target's retirement.
+-- Production is not at fault: an interrupted destruction is unverified and the exit waits for independent evidence. So the owner's
+-- whole-owner retirement and destruction wait, absorbing what is still delivered, for the harassment to be over; nothing waits on time.
 retirementRecord ∷ Scope → Bool → IO () → IO ()
 retirementRecord scope held atParked = do
   rig ← newRig
   entered ← newTVarIO False
   harassed ← newTVarIO False
+  abandoned ← newTVarIO False
   started ← newTVarIO False
   release ← newTVarIO (not held)
   attempts ← newTVarIO (0 ∷ Int)
@@ -129,20 +132,29 @@ retirementRecord scope held atParked = do
   -- The owner's later calls wait for a harassment that has begun, and absorb what is still being delivered while they wait.
   let afterHarassment = absorbing absorbed . atomically $ do
         begun ← readTVar entered
-        when begun (readTVar harassed >>= check)
+        when begun (readTVar harassed >>= \over → readTVar abandoned >>= check . (over ||))
   script (fakeRetireOwner (rigFake rig)) $ \_ → afterHarassment >> pure (ownerRetired (Text.pack "retired"))
   script (fakeDestroy (rigFake rig)) $ \_ → afterHarassment >> pure (ownerDestroyed (Text.pack "destroyed"))
+  -- The owner, handed to the harasser by the body, so that it can tell when the record exists.
+  ownerCell ← newTVarIO Nothing
   let harry = do
         atomically (readTVar entered >>= check)
+        owner ← atomically (readTVar ownerCell >>= maybe retry pure)
         ownerThread ← atomically $
           readTVar (fakeThreads (rigFake rig)) >>= \case
             thread : _ → pure thread
             [] → retry
+        -- Stops as soon as the record exists: a cancellation pending when it is committed is received at the next point the owner is
+        -- unmasked, which is the start of its whole-owner retirement, and that one is survivable (the destruction is still offered).
+        -- A second, or one for the destruction, is not: it interrupts a call whose evidence the exit then waits for, for ever.
+        let harass n = unless (n > (20 ∷ Int)) $ do
+              known ← atomically (not . Map.null <$> readTargetTerminalsNow owner)
+              unless known (throwTo ownerThread ThreadKilled >> harass (n + 1))
         ( do
             throwTo ownerThread ThreadKilled
             atomically (writeTVar started True)
             atomically (readTVar release >>= check)
-            forM_ [2 ∷ Int .. 20] (\_ → throwTo ownerThread ThreadKilled)
+            harass 2
           )
           `finally` atomically (writeTVar harassed True)
       letGo = atomically (writeTVar release True)
@@ -151,10 +163,12 @@ retirementRecord scope held atParked = do
   scope letGo harry $ \_ _ → do
     outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
       window ← theWindow host
+      atomically (writeTVar ownerCell (Just owner))
       service ← trackedHandedOver tracked host owner window
-      -- The completion evidence the exit waits for is published by the rescue as well when the body ends before it does, once the
-      -- harassment has been let go, so no ending can leave the exit waiting for it.
-      (`onException` (letGo >> rescuePublishing tracked host owner)) $ do
+      -- When the body ends before it has published the completion evidence the exit waits for, the rescue publishes it and tells the
+      -- owner's later calls not to wait for a harassment that nobody is going to see through. The harasser is not let go by it: it is
+      -- the scope's to stop and join, which is what the scenario judges.
+      (`onException` (atomically (writeTVar abandoned True) >> rescuePublishing tracked host owner)) $ do
         awaitStanding owner service `shouldReturn` TargetUsable
         _ ← releaseGraphicsTarget host owner service
         when held $ do

@@ -21,8 +21,8 @@
 -- waits and a completion published from another thread really ends that wait.
 module Test.GLFW.Protected (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Concurrent (ThreadId, killThread, yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -57,6 +57,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import GHC.Conc (BlockReason (BlockedOnMVar, BlockedOnException, BlockedOnSTM), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
 import Data.List (sort)
+import Data.Maybe (isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log
@@ -101,7 +102,6 @@ import Hetoimasia.GLFW.Internal.Seam
   , Seam
   , SeamScript (..)
   , asProcessMainThread
-  , designateProcessMainThread
   , defaultScript
   , newSeam
   , reportError
@@ -151,6 +151,10 @@ import Test.GLFW.Support
   , newSinkTrace
   , exitFinishes
   , ownedEnds
+  , endedAndJoined
+  , recordingThreads
+  , runEnding
+  , withMainThreadKeepingContextVia
   , raisedWith
   , retainedAs
   , retainedDiagnostics
@@ -288,6 +292,14 @@ spec = before_ clearRegistered $ describe "GLFW protected host" $ do
       (boundedExample testStallWarningFailsBesideAPrimary)
     it "defers a cancellation delivered at its sink as a cancellation, unmarked and unflushed"
       (boundedExample testStallWarningCancelledAtItsSink)
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+      it ("finishes, with the supplier and the runner ended and joined, when the example body " <> label <> " while the runner is inside its first retirement opportunity, before the stall is counted (#612)") $
+        boundedExample $ do
+          recorded ← newIORef []
+          runEnding ending (stallSinkEndedEarly (recordingThreads recorded withOwnedThreadOpening) (recordingThreads recorded withOwnedBoundThreadOpening))
+          endedAndJoined recorded >>= (`shouldBe` True)
+      it ("negative control: the same example with nothing opened before the cleanup kill does not finish when the body " <> label <> " (#612)") $
+        boundedExample (stallSinkStrands ending)
     it "is retained rather than elided when the drain's retained-failure budget is already full"
       (boundedExample testStallWarningSurvivesAFullBudget)
 
@@ -374,7 +386,20 @@ data Step
   | Blocking
     -- ^ A step that begins disposing and never returns, so an example can
     -- interrupt it partway.
-  deriving (Eq, Show)
+  | Parked !(MVar ()) !(MVar ())
+    -- ^ A step that says it has been entered and waits to be let go before it stalls, so an example can cancel the runner
+    -- inside its first retirement opportunity, before the stall has been counted (#612).
+  deriving (Eq)
+
+-- | Shown by name: the cells of 'Parked' have no 'Show' of their own.
+instance Show Step where
+  show = \case
+    Certify fact → "Certify " <> show fact
+    Await → "Await"
+    Stall → "Stall"
+    FailWith message → "FailWith " <> show message
+    Blocking → "Blocking"
+    Parked _ _ → "Parked"
 
 -- | What an example scripts one owner to do.
 data OwnerScript = OwnerScript
@@ -471,6 +496,10 @@ protocolFor journal host owner script =
       -- Reads a variable another thread writes, so this is a park rather than a
       -- deadlock the runtime would break.
       Blocking → atomically (readTVar (ownerPlan owner) >> retry)
+      Parked entered proceed → do
+        void (tryPutMVar entered ())
+        takeMVar proceed
+        RetirementStalled <$ atomically (modifyTVar' (ownerStalls owner) (+ 1))
       Certify fact → do
         atomically $ do
           seen ← hostAttachmentView host target
@@ -1859,15 +1888,6 @@ inboxFixture step = armed $ do
       WindowGone _ → True
       _ → False
 
--- | 'onMainThread' keeping the context of whatever the run raised, for the same
--- reason.
-onMainThreadKeepingContext
-  ∷ ∀ a. Seam → IO a → IO (ThreadId, MVar (Either (ExceptionWithContext SomeException) a))
-onMainThreadKeepingContext seam action = do
-  finished ← newEmptyMVar
-  runner ← forkOS (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
-  pure (runner, finished)
-
 -- | Run the work on an owned thread (#593) for the length of the body, which is given the cell the thread fills when the work
 -- is done and waits for it itself. However the body ends, the thread has been stopped and joined before this returns.
 withPublisher ∷ IO () → (MVar () → IO r) → IO r
@@ -2958,52 +2978,123 @@ testStallWarningFailsBesideAPrimary = do
     length (Logging.failedReportsInContext context) `shouldBe` 1
     readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
 
--- NOT CONVERTED (#593 narrowed by the owner a third time, 2026-11-02; moved to #612): the cleanup kill of this example can land before any rescue of
--- the protected drain exists, so the drain enters the stall diagnostic's sink and a scope's join waits for ever. It stays as it is on master, with
--- its baseline entry, until #612's seam around the protected runner's lifetime lets it be rescued.
 -- | A cancellation delivered while the stall diagnostic's sink is running is
 -- never turned into a synchronous logging failure.
 --
 -- The drain defers it exactly as it defers any other, finishes on the
 -- independent evidence that arrives, and re-raises it only once retirement is
 -- safe: it leaves unmarked, with no report and no flush behind it.
+--
+-- The evidence supplier and the dedicated runner are owned starts (#612). The scope that owns the runner opens, before it kills it,
+-- what the protected drain would otherwise wait for: every registered owner is released and the sink's hold is let go. Both are
+-- idempotent and block on nothing, and they are not part of the scenario, which is what the sink's hold is for: the example kills the
+-- runner while it is inside the sink, and that cancellation is the subject.
 testStallWarningCancelledAtItsSink ∷ Expectation
 testStallWarningCancelledAtItsSink = do
-  journal ← newTVarIO []
+  recorded ← newIORef []
+  probe ← newStallProbe
+  stallSink (recordingThreads recorded withOwnedThreadOpening) (recordingThreads recorded withOwnedBoundThreadOpening) True probe Nothing
+  endedAndJoined recorded >>= (`shouldBe` True)
+
+-- | What the stall-sink fixture lets its caller see and let go.
+data StallProbe = StallProbe
+  { probeReached ∷ !(MVar ())
+    -- ^ Filled when the sink has been entered.
+  , probeNever ∷ !(MVar ())
+    -- ^ The sink's hold: nothing fills it but the runner's scope, or a control's rescue.
+  , probeEntered ∷ !(MVar ())
+    -- ^ Filled when the runner is inside its first retirement opportunity of a scenario.
+  , probeProceed ∷ !(MVar ())
+    -- ^ What that opportunity waits for; a scenario never fills it before the cleanup kill.
+  , probeOwned ∷ !(TVar (Maybe Owner))
+  , probeJournal ∷ !(TVar [Flag])
+  }
+
+newStallProbe ∷ IO StallProbe
+newStallProbe = StallProbe <$> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar <*> newTVarIO Nothing <*> newTVarIO []
+
+-- | Everything the scope that owns the runner opens before it kills it: the registered owners are released, and the sink's hold is let
+-- go. Idempotent and non-blocking.
+openStallSink ∷ StallProbe → IO ()
+openStallSink probe = rescueNow >> void (tryPutMVar (probeNever probe) ())
+
+-- | The fixture. With @scenario@ absent it is the example: the runner enters the sink, the example cancels it there and judges the
+-- deferral. With @scenario@ present the example's body is ended by it, while the runner is inside its first retirement opportunity and
+-- the stall has not been counted: the opportunity is withdrawn when the cleanup kill interrupts it, the drain declares the stall it
+-- never counted, enters the sink with that cancellation already spent, and the supplier waits for a stall that was never counted.
+-- @rescued@ false leaves the scope's opening empty, which is the unrescued fixture the control runs.
+stallSink ∷ Scope → Scope → Bool → StallProbe → Maybe (IO ()) → Expectation
+stallSink supplierScope runnerScope rescued probe scenario = do
+  let journal = probeJournal probe
   seam ← journallingSeam journal
-  owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
   trace ← newSinkTrace
-  reached ← newEmptyMVar
-  never ← newEmptyMVar
-  helper ← forkIO (supplyEvidence journal hostHeld owned afterStall allRetirementFacts)
-  let logger =
-        failingSink defaultLogFilter "glfw.retirement" (\_ → putMVar reached () >> takeMVar never) trace
-  (runner, finished) ←
-    onMainThreadKeepingContext seam $
-      protectedRunHere seam logger (settings [windowNamed "alpha"])
-        ( \host → do
-            window ← onlyWindow host
-            owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = [Stall]}
-            atomically (writeTVar owned (Just owner))
-            atomically (writeTVar hostHeld (Just host))
-        )
-        (\host _ → pure host)
-        (\_ _ → pure ())
-  -- The drain has declared the stall and is inside the diagnostic's sink.
-  takeMVar reached
-  killThread runner
-  void (pure helper)
-  (failure, context) ←
-    takeMVar finished >>= either raisedWith (\_ → unexpected "the cancelled run returned")
-  failure `shouldBe` ThreadKilled
-  diagnosticMarks context `shouldBe` []
-  null (Logging.failedReportsInContext context) `shouldBe` True
-  -- The attempt was spent and never retried, and nothing was flushed.
-  traced trace `shouldReturn` ["glfw.retirement"]
-  flushed trace `shouldReturn` 0
-  -- The cancellation was re-raised only after retirement was safe.
-  readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  let owned = probeOwned probe
+      logger =
+        failingSink defaultLogFilter "glfw.retirement" (\_ → void (tryPutMVar (probeReached probe) ()) >> takeMVar (probeNever probe)) trace
+      plan = maybe [Stall] (\_ → [Parked (probeEntered probe) (probeProceed probe)]) scenario
+  outcome ← try @SomeException . armed . supplierScope (pure ()) (supplyEvidence journal hostHeld owned afterStall allRetirementFacts) $ \_ _ →
+    withMainThreadKeepingContextVia runnerScope seam (when rescued (openStallSink probe))
+      ( protectedRunHere seam logger (settings [windowNamed "alpha"])
+          ( \host → do
+              window ← onlyWindow host
+              owner ← establishedOwner journal host window (ownerNamed "alpha") {scriptPlan = plan}
+              atomically (writeTVar owned (Just owner))
+              atomically (writeTVar hostHeld (Just host))
+          )
+          (\host _ → pure host)
+          (\_ _ → pure ())
+      )
+      $ \runner finished → case scenario of
+        Just endEarly → takeMVar (probeEntered probe) >> endEarly
+        Nothing → do
+          -- The drain has declared the stall and is inside the diagnostic's sink.
+          takeMVar (probeReached probe)
+          killThread runner
+          (failure, context) ←
+            takeMVar finished >>= either raisedWith (\_ → unexpected "the cancelled run returned")
+          failure `shouldBe` ThreadKilled
+          diagnosticMarks context `shouldBe` []
+          null (Logging.failedReportsInContext context) `shouldBe` True
+          -- The attempt was spent and never retried, and nothing was flushed.
+          traced trace `shouldReturn` ["glfw.retirement"]
+          flushed trace `shouldReturn` 0
+          -- The cancellation was re-raised only after retirement was safe.
+          readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
+  case scenario of
+    Nothing → either (\failure → throwIO failure) pure outcome
+    Just _ → do
+      -- Ended by the scenario: the supplier and the runner are gone and the session was torn down, whatever the ending was.
+      flags ← readTVarIO journal
+      flags `shouldSatisfy` elem (WindowGone 1)
+      flags `shouldSatisfy` elem SessionEnded
+      either (\failure → throwIO failure) (\() → unexpected "the ended example returned") outcome
+
+-- | The example ended, the way the ending says, while the runner waits in its first retirement opportunity (#612).
+stallSinkEndedEarly ∷ Scope → Scope → IO () → IO ()
+stallSinkEndedEarly supplierScope runnerScope atParked = do
+  probe ← newStallProbe
+  stallSink supplierScope runnerScope True probe (Just atParked)
+
+-- | The control: the fixture of 'stallSinkEndedEarly' with nothing opened before the kill. It is run on a thread of its own because it
+-- does not finish: the drain is parked in the sink with the cancellation spent, and the supplier waits for a stall that was never
+-- counted. That is recorded first. Then the rescue, which depends on neither of them, is made from here, and the run is joined.
+stallSinkStrands ∷ Ending → Expectation
+stallSinkStrands ending = do
+  probe ← newStallProbe
+  done ← newEmptyMVar @(Either SomeException ())
+  let rescue = openStallSink probe >> void (tryPutMVar (probeProceed probe) ())
+      scenario = runEnding ending (\atParked → stallSink withOwnedThreadOpening withOwnedBoundThreadOpening False probe (Just atParked))
+  withOwnedThreadOpening rescue (try scenario >>= putMVar done) $ \_ _ →
+    ( do
+        -- The sink has been entered: the drain declared a stall it never counted.
+        readMVar (probeReached probe)
+        stranded ← isNothing <$> tryReadMVar done
+        counted ← readTVarIO (probeOwned probe) >>= maybe (pure 0) (readTVarIO . ownerStalls)
+        stranded `shouldBe` True
+        counted `shouldBe` 0
+      )
+      `finally` (rescue >> void (readMVar done))
 
 -- ---------------------------------------------------------------------------
 -- Support

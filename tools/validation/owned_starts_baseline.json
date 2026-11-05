@@ -10,8 +10,6 @@
     "packages/glfw/native-tests/Test/GLFW/Native/Session.hs": 2,
     "packages/glfw/native-tests/Test/GLFW/Native/Wake.hs": 5,
     "packages/glfw/native-tests/Test/GLFW/Native/WaylandScenarios.hs": 2,
-    "packages/glfw/test/Test/GLFW/Owner/Failure/Interruption.hs": 1,
-    "packages/glfw/test/Test/GLFW/Protected.hs": 2,
     "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/ChildSpec.hs": 1,
     "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Fixture.hs": 1,
     "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Interaction.hs": 1,
