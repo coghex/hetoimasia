@@ -194,6 +194,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Terminal
         Test.GPU.Vulkan.Native.Triangle
         Test.GPU.Vulkan.Native.Unowned
+        Test.GPU.Vulkan.Native.UnownedSpec
         Test.GPU.Vulkan.Native.WindowedDepth
         Test.Vulkan.Proof.Bridge
         Test.Vulkan.Proof.BridgeSpec

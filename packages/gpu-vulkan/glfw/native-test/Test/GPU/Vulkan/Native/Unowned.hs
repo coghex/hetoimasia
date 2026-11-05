@@ -14,6 +14,7 @@
 module Test.GPU.Vulkan.Native.Unowned
   ( -- * The unowned start
     unownedScope
+  , unownedScopeProtecting
     -- * Controls
   , Cleanups
   , newCleanups
@@ -32,7 +33,7 @@ module Test.GPU.Vulkan.Native.Unowned
 
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
-import Control.Exception (AsyncException (UserInterrupt), Exception, finally, mask_, throwIO, try)
+import Control.Exception (AsyncException (UserInterrupt), Exception, finally, mask_, throwIO, try, uninterruptibleMask_)
 import Control.Monad (void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import GHC.Conc (BlockReason, ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
@@ -60,16 +61,26 @@ runCleanups (Cleanups ref) = readIORef ref >>= foldr (\cleanup rest → cleanup 
 -- always end what it left, even a thread it kills before it ran anything. The defect the controls model is the missing
 -- stop-and-join of the scope, not an unannounced end. The first argument is what must be let go before the thread can end (a
 -- gate it waits at, opened idempotently and without blocking); the control's cleanup runs it before it kills.
+--
+-- The registered stop-and-join is itself uninterruptible ('uninterruptibleMask_'): 'runCleanups' runs it through @finally@,
+-- which masks only interruptibly, so without that a cancellation delivered while the kill or the join blocks would abort the
+-- cleanup and leave the thread alive, and no later entry retries it (the same lesson as #594's round 1).
 unownedScope ∷ Cleanups → IO () → IO () → (ThreadId → IO () → IO b) → IO b
-unownedScope cleanups open action body = do
-  (thread, done) ← startUnowned cleanups open action
+unownedScope = unownedScopeProtecting uninterruptibleMask_
+
+-- | 'unownedScope' with a chosen protection for the registered stop-and-join: 'uninterruptibleMask_' is the control's own
+-- cleanup; the identity is the interruptible cleanup it replaced, which exists only for the negative control of that guarantee
+-- ("Test.GPU.Vulkan.Native.UnownedSpec").
+unownedScopeProtecting ∷ (IO () → IO ()) → Cleanups → IO () → IO () → (ThreadId → IO () → IO b) → IO b
+unownedScopeProtecting protect cleanups open action body = do
+  (thread, done) ← startUnowned protect cleanups open action
   body thread (readMVar done)
 
-startUnowned ∷ Cleanups → IO () → IO () → IO (ThreadId, MVar ())
-startUnowned cleanups open action = mask_ $ do
+startUnowned ∷ (IO () → IO ()) → Cleanups → IO () → IO () → IO (ThreadId, MVar ())
+startUnowned protect cleanups open action = mask_ $ do
   done ← newEmptyMVar
   thread ← forkIOWithUnmask $ \unmask → unmask action `finally` putMVar done ()
-  cleanupLater cleanups (open >> killThread thread >> readMVar done)
+  cleanupLater cleanups (protect (open >> killThread thread >> void (readMVar done)))
   pure (thread, done)
 
 -- | How the example that owns a scope is made to end while the scope's threads are parked.

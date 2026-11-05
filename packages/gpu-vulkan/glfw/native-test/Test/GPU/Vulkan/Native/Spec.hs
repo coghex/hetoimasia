@@ -25,6 +25,7 @@ import qualified Test.GPU.Vulkan.Native.Interaction as Interaction
 import Test.GPU.Vulkan.Native.Private (ChildRun)
 import qualified Test.GPU.Vulkan.Native.Private as Private
 import qualified Test.GPU.Vulkan.Native.Shared as Shared
+import qualified Test.GPU.Vulkan.Native.UnownedSpec as UnownedSpec
 import qualified Test.Vulkan.Proof.ConstructionSpec as Construction
 import qualified Test.Vulkan.Proof.LoaderSpec as Loader
 import qualified Test.Vulkan.Proof.PublicationSpec as Publication
@@ -41,6 +42,7 @@ spec gate fixture timings = describe "Vulkan native" $ do
     InstanceScope.spec
     ChildSpec.spec
     FixtureSpec.spec
+    UnownedSpec.spec
   Shared.spec fixture
   Private.spec gate timings
   Interaction.spec gate
