@@ -730,7 +730,11 @@ any other way, and its message names the facility that fits the kind of start.
   38 thread starts of `lua-engine-tests` (29 in 12 files), `lua-engine-graphics-tests` (6 in 5) and
   `lua-engine-graphics-native-tests` (3 in 3) it converted, 20 files in all, which left the baseline
   36 starts in 22 files (the subprocess starts of the remaining suites, the three `glfw-tests` sites
-  of the narrowed #593, and the sites no follow-up has reached). Each file's count
+  of the narrowed #593, and the sites no follow-up has reached). #594 then removed the 17
+  references (14 sites) of `glfw-native-tests` (`Fixture`, `Guard`, `Harness`, `Private`, `Session`,
+  `Wake` and `WaylandScenarios`: 7 files), which left the baseline's per-file counts summing to 57 starts in 35 files, and its
+  negative controls' deliberately unowned start, of either boundness, is exempt by binding
+  (`Test.GLFW.Native.Unowned.startUnowned`, two sites). Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven

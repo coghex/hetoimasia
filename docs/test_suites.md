@@ -278,7 +278,17 @@ cabal test hetoimasia-tests --test-show-details=direct
   demand hook with its gate closed (`GLFW admission helper threads`), an injector
   and the helper it never reaches, a runner parked in its construction whose
   rollback waits at a second gate, and an evidence supplier waiting for an owner
-  that never exists (`GLFW protected host`, `the drain`). The thread sites that
+  that never exists (`GLFW protected host`, `the drain`). `glfw-native-tests` was
+  converted in #594: its `onThread`, `runOwned`'s borrower, the harness's
+  `withForked`, the launch-interruption example's launcher, `wokenWait` and
+  `wokenWaitBy`, the private-session rounds' wakers and the two Wayland scenario
+  workers start their threads through `Test.GLFW.Native.Threads`, which takes the
+  boundness (`Unbound` or `Bound`) in place of a fork primitive, and all 17 of its
+  baseline references (14 sites) left the baseline; `WaylandScenarios.hs:938` was
+  #588's. Its regressions run with no consent in `--match "owns the threads its
+  helpers start"` (under `the native opt-in`), each as an owned example and a
+  negative control through the deliberately unowned start of
+  `Test.GLFW.Native.Unowned`. The thread sites that
   remain in other suites are a known-debt baseline to be removed by follow-up
   changes, not to be extended.
 
