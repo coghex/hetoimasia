@@ -14,7 +14,6 @@
 -- Threads are coordinated with 'MVar's and STM, never with a sleep.
 module Test.GLFW.Monitor (spec) where
 
-import Control.Concurrent (forkIO, forkOS)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), toException)
@@ -29,7 +28,7 @@ import Hetoimasia.GLFW.Internal.Seam
 import Hetoimasia.GLFW.Internal.Session (reconcileMonitorEvents, withResolvedMonitor)
 import Hetoimasia.GLFW.Monitor
 import Hetoimasia.GLFW.Session
-import Test.GLFW.Support (boundedExample, caughtAs, contextsOf, entered, onThread, originOf, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, contextsOf, entered, onBoundThread, onThread, originOf, unexpected, withDeferredThread)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -368,9 +367,9 @@ testOwnerThread = do
   (synchronizing, resolving, readElsewhere, calls) ← inSession seam $ \session → do
     identity ← published session >>= identities >>= oneOf
     before ← length <$> seamCalls seam
-    synchronizing ← onThread forkOS (fst <$> caughtAs (synchronizeMonitors session))
-    resolving ← onThread forkOS (fst <$> caughtAs (resolveMonitor session identity))
-    readElsewhere ← onThread forkIO (inventoryRevision <$> published session)
+    synchronizing ← onBoundThread (fst <$> caughtAs (synchronizeMonitors session))
+    resolving ← onBoundThread (fst <$> caughtAs (resolveMonitor session identity))
+    readElsewhere ← onThread (inventoryRevision <$> published session)
     calls ← drop before <$> seamCalls seam
     pure (synchronizing, resolving, readElsewhere, calls)
   synchronizing `shouldBe` NotSessionOwner
@@ -382,24 +381,25 @@ testClose ∷ Expectation
 testClose = do
   seam ← withTopology (laid 1 [(1, left)])
   waiter ← newEmptyMVar
-  (reader, lastOpen) ← inSession seam $ \session → do
-    observation ← atomically (readSnapshot (monitorInventory session))
-    _ ← forkIO (atomically (awaitSnapshot (monitorInventory session) (observedCursor observation)) >>= putMVar waiter)
-    pure (monitorInventory session, preparedValue (observedValue observation))
-  final ←
-    takeMVar waiter >>= \case
-      Updated observation → pure observation
-      EndOfStream → unexpected "the waiter saw the end of the inventory without its closed observation"
-  let closed = preparedValue (observedValue final)
-  inventoryPhase closed `shouldBe` InventoryClosed
-  inventoryRevision closed `shouldBe` inventoryRevision lastOpen + 1
-  inventoryMonitors closed `shouldBe` inventoryMonitors lastOpen
-  atomically (awaitSnapshot reader (observedCursor final)) >>= \case
-    EndOfStream → pure ()
-    Updated _ → unexpected "the closed inventory published again"
-  calls ← seamCalls seam
-  [call | call ← calls, call `elem` teardownCalls] `shouldBe` teardownCalls
-  seamLiveMonitorCallbacks seam `shouldReturn` 0
+  withDeferredThread (\(inventory, cursor) → atomically (awaitSnapshot inventory cursor) >>= putMVar waiter) $ \_ handOver → do
+    (reader, lastOpen) ← inSession seam $ \session → do
+      observation ← atomically (readSnapshot (monitorInventory session))
+      handOver (monitorInventory session, observedCursor observation)
+      pure (monitorInventory session, preparedValue (observedValue observation))
+    final ←
+      takeMVar waiter >>= \case
+        Updated observation → pure observation
+        EndOfStream → unexpected "the waiter saw the end of the inventory without its closed observation"
+    let closed = preparedValue (observedValue final)
+    inventoryPhase closed `shouldBe` InventoryClosed
+    inventoryRevision closed `shouldBe` inventoryRevision lastOpen + 1
+    inventoryMonitors closed `shouldBe` inventoryMonitors lastOpen
+    atomically (awaitSnapshot reader (observedCursor final)) >>= \case
+      EndOfStream → pure ()
+      Updated _ → unexpected "the closed inventory published again"
+    calls ← seamCalls seam
+    [call | call ← calls, call `elem` teardownCalls] `shouldBe` teardownCalls
+    seamLiveMonitorCallbacks seam `shouldReturn` 0
 
 -- ---------------------------------------------------------------------------
 -- Support

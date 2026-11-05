@@ -15,7 +15,7 @@
 -- display.
 module Test.GLFW.Surface (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try, uninterruptibleMask_)
@@ -33,8 +33,9 @@ import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import Hetoimasia.Runtime.GLFW.Internal.Retirement (advanceRetirements, releaseAttachmentHold, retirementStanding)
 import Hetoimasia.Runtime.GLFW.Internal.Surface
-import Test.GLFW.Support (boundedExample, onThread, quietLogger, unexpected, windowNamed)
+import Test.GLFW.Support (boundedExample, onThread, quietLogger, unexpected, windowNamed, withDeferredThread)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "GLFW surface bridge" $ do
@@ -99,7 +100,7 @@ testCreatedInConstruction = do
     certifyGraphicsFact host acknowledgement DependentsDisposed `shouldReturn` Nothing
     atomically (releaseSurfaceInstance lease) `shouldReturn` InstanceRetained (LeaseStanding False 0 1 0)
     -- The graphics owner discharges it from its own thread.
-    discharged ← onThread forkIO (dischargeSurfaceObligation (surfaceObligation surface))
+    discharged ← onThread (dischargeSurfaceObligation (surfaceObligation surface))
     show discharged `shouldBe` "SurfaceDestroyed"
     certifyGraphicsFact host acknowledgement DependentsDisposed `shouldReturn` Just AttachmentNowRetired
     atomically (releaseSurfaceInstance lease) `shouldReturn` InstanceReleasable
@@ -247,95 +248,97 @@ testReportedCreation = do
 
 testCancellationKeepsObligation ∷ Expectation
 testCancellationKeepsObligation = do
-  seam ← newSeam defaultScript
-  thrower ← newEmptyMVar
-  integration ←
-    seamIntegration
-      seam
-      defaultIntegrationScript
-        { integrationCreate = \key _ → do
-            -- A cancellation is posted to the owner while the native call runs,
-            -- and is pending by the time the call returns.
-            owner ← myThreadId
-            posting ← forkIO (throwTo owner ThreadKilled)
-            putMVar thrower posting
-            awaitBlockedThrow posting
-            pure (0, 1000 + fromIntegral key)
-        }
-  lease ← leaseSurfaceInstance integration instancePointer
-  bridged seam integration $ \host window → do
-    heard ← newIORef Nothing
-    received ← newIORef False
-    attempted ←
-      try $
-        attachWindowGraphicsWithSurfaces host window $ \access →
-          protocolOf
-            (\acknowledgement → do
-                writeIORef heard (Just acknowledgement)
-                _ ← createWindowSurface access lease
-                writeIORef received True)
-            -- A rollback that claims safety without discharging anything.
-            (pure RollbackSafe)
-    _ ← takeMVar thrower
-    case attempted of
-      Left ThreadKilled → pure ()
-      Left other → unexpected ("the attachment raised " <> show other)
-      Right answered → unexpected ("the attachment answered " <> show answered)
-    -- The creator never received the answer.
-    readIORef received `shouldReturn` False
-    acknowledgement ← readIORef heard >>= maybe (unexpected "no acknowledgement was issued") pure
-    -- The surface is still owned: its obligation is on the lease, and it holds
-    -- the attachment, whose rollback could not be safe.
-    obligations ← atomically (leasedObligations lease)
-    map obligationHandle obligations `shouldBe` [1001]
-    view ← atomically (Private.hostAttachmentView host (acknowledgedAttachment acknowledgement))
-    fmap viewConstruction view `shouldBe` Just (ConstructionFailed RollbackUnsafe)
-    certifyAllBut host acknowledgement
-    certifyGraphicsFact host acknowledgement DependentsDisposed `shouldReturn` Nothing
-    discharged ← forM obligations dischargeSurfaceObligation
-    map show discharged `shouldBe` ["SurfaceDestroyed"]
-    certifyGraphicsFact host acknowledgement DependentsDisposed `shouldReturn` Just AttachmentNowRetired
-  surfaceCalls seam `shouldReturn` [CreateWindowSurface 1, DestroyWindowSurface 1001]
+  withDeferredThread (\owner → throwTo owner ThreadKilled) $ \posting handOver → do
+    seam ← newSeam defaultScript
+    thrower ← newEmptyMVar
+    integration ←
+      seamIntegration
+        seam
+        defaultIntegrationScript
+          { integrationCreate = \key _ → do
+              -- A cancellation is posted to the owner while the native call runs,
+              -- and is pending by the time the call returns.
+              owner ← myThreadId
+              handOver owner
+              putMVar thrower posting
+              awaitBlockedThrow posting
+              pure (0, 1000 + fromIntegral key)
+          }
+    lease ← leaseSurfaceInstance integration instancePointer
+    bridged seam integration $ \host window → do
+      heard ← newIORef Nothing
+      received ← newIORef False
+      attempted ←
+        try $
+          attachWindowGraphicsWithSurfaces host window $ \access →
+            protocolOf
+              (\acknowledgement → do
+                  writeIORef heard (Just acknowledgement)
+                  _ ← createWindowSurface access lease
+                  writeIORef received True)
+              -- A rollback that claims safety without discharging anything.
+              (pure RollbackSafe)
+      _ ← takeMVar thrower
+      case attempted of
+        Left ThreadKilled → pure ()
+        Left other → unexpected ("the attachment raised " <> show other)
+        Right answered → unexpected ("the attachment answered " <> show answered)
+      -- The creator never received the answer.
+      readIORef received `shouldReturn` False
+      acknowledgement ← readIORef heard >>= maybe (unexpected "no acknowledgement was issued") pure
+      -- The surface is still owned: its obligation is on the lease, and it holds
+      -- the attachment, whose rollback could not be safe.
+      obligations ← atomically (leasedObligations lease)
+      map obligationHandle obligations `shouldBe` [1001]
+      view ← atomically (Private.hostAttachmentView host (acknowledgedAttachment acknowledgement))
+      fmap viewConstruction view `shouldBe` Just (ConstructionFailed RollbackUnsafe)
+      certifyAllBut host acknowledgement
+      certifyGraphicsFact host acknowledgement DependentsDisposed `shouldReturn` Nothing
+      discharged ← forM obligations dischargeSurfaceObligation
+      map show discharged `shouldBe` ["SurfaceDestroyed"]
+      certifyGraphicsFact host acknowledgement DependentsDisposed `shouldReturn` Just AttachmentNowRetired
+    surfaceCalls seam `shouldReturn` [CreateWindowSurface 1, DestroyWindowSurface 1001]
 
 testRollbackDischarges ∷ Expectation
 testRollbackDischarges = do
-  seam ← newSeam defaultScript
-  thrower ← newEmptyMVar
-  integration ←
-    seamIntegration
-      seam
-      defaultIntegrationScript
-        { integrationCreate = \key _ → do
-            owner ← myThreadId
-            posting ← forkIO (throwTo owner ThreadKilled)
-            putMVar thrower posting
-            awaitBlockedThrow posting
-            pure (0, 1000 + fromIntegral key)
-        }
-  lease ← leaseSurfaceInstance integration instancePointer
-  bridged seam integration $ \host window → do
-    attempted ←
-      try $
-        attachWindowGraphicsWithSurfaces host window $ \access →
-          protocolOf
-            (\_ → void (createWindowSurface access lease))
-            -- The owned rollback finds what the lost answer created, and
-            -- discharges it before claiming safety.
-            ( do
-                owed ← atomically (leasedObligations lease)
-                results ← forM owed dischargeSurfaceObligation
-                pure (if all ((== "SurfaceDestroyed") . show) results then RollbackSafe else RollbackUnsafe)
-            )
-    _ ← takeMVar thrower
-    case attempted of
-      Left ThreadKilled → pure ()
-      other → unexpected ("the attachment ended with " <> either show show other)
-    -- The rollback was safe, so the attachment has retired and the window's
-    -- slot is free.
-    status ← atomically (windowGraphicsStatus host window)
-    show status `shouldBe` show GraphicsAbsent
-    atomically (releaseSurfaceInstance lease) `shouldReturn` InstanceReleasable
-  surfaceCalls seam `shouldReturn` [CreateWindowSurface 1, DestroyWindowSurface 1001]
+  withDeferredThread (\owner → throwTo owner ThreadKilled) $ \posting handOver → do
+    seam ← newSeam defaultScript
+    thrower ← newEmptyMVar
+    integration ←
+      seamIntegration
+        seam
+        defaultIntegrationScript
+          { integrationCreate = \key _ → do
+              owner ← myThreadId
+              handOver owner
+              putMVar thrower posting
+              awaitBlockedThrow posting
+              pure (0, 1000 + fromIntegral key)
+          }
+    lease ← leaseSurfaceInstance integration instancePointer
+    bridged seam integration $ \host window → do
+      attempted ←
+        try $
+          attachWindowGraphicsWithSurfaces host window $ \access →
+            protocolOf
+              (\_ → void (createWindowSurface access lease))
+              -- The owned rollback finds what the lost answer created, and
+              -- discharges it before claiming safety.
+              ( do
+                  owed ← atomically (leasedObligations lease)
+                  results ← forM owed dischargeSurfaceObligation
+                  pure (if all ((== "SurfaceDestroyed") . show) results then RollbackSafe else RollbackUnsafe)
+              )
+      _ ← takeMVar thrower
+      case attempted of
+        Left ThreadKilled → pure ()
+        other → unexpected ("the attachment ended with " <> either show show other)
+      -- The rollback was safe, so the attachment has retired and the window's
+      -- slot is free.
+      status ← atomically (windowGraphicsStatus host window)
+      show status `shouldBe` show GraphicsAbsent
+      atomically (releaseSurfaceInstance lease) `shouldReturn` InstanceReleasable
+    surfaceCalls seam `shouldReturn` [CreateWindowSurface 1, DestroyWindowSurface 1001]
 
 testCloseDuringCreation ∷ Expectation
 testCloseDuringCreation = do
@@ -415,10 +418,10 @@ testDoubleDischarge = do
     -- While the destruction runs, the instance is still held.
     seen ← newEmptyMVar
     writeIORef during (atomically (releaseSurfaceInstance lease) >>= putMVar seen)
-    first ← onThread forkIO (dischargeSurfaceObligation obligation)
+    first ← onThread (dischargeSurfaceObligation obligation)
     readMVar seen `shouldReturn` InstanceRetained (LeaseStanding False 0 1 0)
     show first `shouldBe` "SurfaceDestroyed"
-    second ← onThread forkIO (dischargeSurfaceObligation obligation)
+    second ← onThread (dischargeSurfaceObligation obligation)
     show second `shouldBe` show (DischargeRefused AlreadyDischarged)
     atomically (readObligationState obligation) `shouldReturn` ObligationDischarged
     certifyGraphicsFact host acknowledgement DependentsDisposed `shouldReturn` Just AttachmentNowRetired
@@ -527,27 +530,28 @@ testReplacementCancelledAtReturn = do
   lease ← leaseSurfaceInstance integration instancePointer
   bridged seam integration $ \host window → do
     (service, acknowledgement) ← attachWith host window (\_ → pure ())
-    kept ← newIORef Nothing
-    thrower ← newEmptyMVar
-    attempted ←
-      try $
-        replaceWindowSurface host acknowledgement $ \access → do
-          writeIORef kept (Just access)
-          -- A cancellation is made pending while the body holds exceptions
-          -- off, so it is delivered the moment the body lets them in again, on
-          -- its way back out.
-          uninterruptibleMask_ $ do
-            owner ← myThreadId
-            posting ← forkIO (throwTo owner ThreadKilled)
-            putMVar thrower posting
-            awaitBlockedThrow posting
-    _ ← takeMVar thrower
-    case attempted of
-      Left ThreadKilled → pure ()
-      other → unexpected ("the replacement ended with " <> either show (\(_ ∷ Replacement ()) → "an answer") other)
-    access ← readIORef kept >>= maybe (unexpected "the replacement kept no access") pure
-    show <$> createWindowSurface access lease `shouldReturn` show (SurfaceRefused SurfaceAccessClosed)
-    retireFully host service acknowledgement
+    withDeferredThread (\owner → throwTo owner ThreadKilled) $ \posting handOver → do
+      kept ← newIORef Nothing
+      thrower ← newEmptyMVar
+      attempted ←
+        try $
+          replaceWindowSurface host acknowledgement $ \access → do
+            writeIORef kept (Just access)
+            -- A cancellation is made pending while the body holds exceptions
+            -- off, so it is delivered the moment the body lets them in again, on
+            -- its way back out.
+            uninterruptibleMask_ $ do
+              owner ← myThreadId
+              handOver owner
+              putMVar thrower posting
+              awaitBlockedThrow posting
+      _ ← takeMVar thrower
+      case attempted of
+        Left ThreadKilled → pure ()
+        other → unexpected ("the replacement ended with " <> either show (\(_ ∷ Replacement ()) → "an answer") other)
+      access ← readIORef kept >>= maybe (unexpected "the replacement kept no access") pure
+      show <$> createWindowSurface access lease `shouldReturn` show (SurfaceRefused SurfaceAccessClosed)
+      retireFully host service acknowledgement
   surfaceCalls seam `shouldReturn` []
 
 testDischargeDuringStallingStep ∷ Expectation
@@ -578,8 +582,8 @@ testDischargeDuringStallingStep = do
                   -- then answers from what it saw: no safe progress.
                   surface ← createdSurface created
                   finished ← newEmptyMVar
-                  _ ← forkIO (dischargeSurfaceObligation (surfaceObligation surface) >>= putMVar finished . show)
-                  takeMVar finished `shouldReturn` "SurfaceDestroyed"
+                  withOwnedThread (dischargeSurfaceObligation (surfaceObligation surface) >>= putMVar finished . show) $ \_ _ →
+                    takeMVar finished `shouldReturn` "SurfaceDestroyed"
                   pure RetirementStalled
           }
     service ← case attached of

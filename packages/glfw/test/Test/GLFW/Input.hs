@@ -11,7 +11,7 @@
 -- transaction that would wait is observed by composing it with 'orElse'.
 module Test.GLFW.Input (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically, orElse)
 import Control.Exception (AsyncException (ThreadKilled), IOException, SomeException, fromException, throwIO, try)
@@ -56,6 +56,7 @@ import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Test.GLFW.Support (boundedExample, caughtAs, entered, unexpected)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldNotBe, shouldReturn, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "GLFW input feeds" $ do
@@ -360,16 +361,19 @@ testCancelledConsumer = do
   seen ← newEmptyMVar
   never ← newEmptyMVar
   finished ← newEmptyMVar
-  consumer ← forkIO $ do
-    outcome ← try $ do
-      found ← atomically (awaitInput reader)
-      putMVar seen found
-      takeMVar never ∷ IO ()
-    putMVar finished (outcome ∷ Either SomeException ())
-  takeMVar seen `shouldReturn` InputResetRequired token
-  killThread consumer
-  ended ← takeMVar finished
-  either (\caught → fromException caught `shouldBe` Just ThreadKilled) (\() → unexpected "the consumer returned") ended
+  withOwnedThread
+    ( do
+        outcome ← try $ do
+          found ← atomically (awaitInput reader)
+          putMVar seen found
+          takeMVar never ∷ IO ()
+        putMVar finished (outcome ∷ Either SomeException ())
+    )
+    $ \consumer _ → do
+      takeMVar seen `shouldReturn` InputResetRequired token
+      killThread consumer
+      ended ← takeMVar finished
+      either (\caught → fromException caught `shouldBe` Just ThreadKilled) (\() → unexpected "the consumer returned") ended
   statisticsPhase <$> statisticsOf feed `shouldReturn` InputResetPending
   attemptOverflowWarning quietLogger feed `shouldReturn` WarningLogged
   resumeInput feed `shouldReturn` ResumeAwaitingAcknowledgement
@@ -489,14 +493,14 @@ testWarningBlocksResumption = do
   atomically (acknowledgeReset (feedReader feed) token) `shouldReturn` Right Acknowledged
   resumeInput feed `shouldReturn` ResumeAwaitingWarning
   attempted ← newEmptyMVar
-  _ ← forkIO (try (attemptOverflowWarning logger feed) >>= putMVar attempted)
-  takeMVar started
-  (summaryWarning <$>) . statisticsLastReset <$> statisticsOf feed `shouldReturn` Just WarningAttempting
-  resumeInput feed `shouldReturn` ResumeAwaitingWarning
-  produceInput feed (TextInput 'x') `shouldReturn` ProductionSuppressed
-  attemptOverflowWarning logger feed `shouldReturn` NoWarningDue
-  putMVar release ()
-  (takeMVar attempted ∷ IO (Either SomeException WarningAttempt)) >>= either throwIO (`shouldBe` WarningLogged)
+  withOwnedThread (try (attemptOverflowWarning logger feed) >>= putMVar attempted) $ \_ _ → do
+    takeMVar started
+    (summaryWarning <$>) . statisticsLastReset <$> statisticsOf feed `shouldReturn` Just WarningAttempting
+    resumeInput feed `shouldReturn` ResumeAwaitingWarning
+    produceInput feed (TextInput 'x') `shouldReturn` ProductionSuppressed
+    attemptOverflowWarning logger feed `shouldReturn` NoWarningDue
+    putMVar release ()
+    (takeMVar attempted ∷ IO (Either SomeException WarningAttempt)) >>= either throwIO (`shouldBe` WarningLogged)
   attemptOverflowWarning logger feed `shouldReturn` NoWarningDue
   resumeInput feed `shouldReturn` Resumed (resetEpoch token)
   written ← readIORef entries
@@ -541,13 +545,13 @@ testWarningCancelled = do
   fill feed 1
   token ← overflow feed
   attempted ← newEmptyMVar
-  attempt ← forkIO (try (attemptOverflowWarning blocking feed) >>= putMVar attempted)
-  takeMVar started
-  -- Shutdown: the feed closes and the owner is cancelled mid-attempt.
-  atomically (closeInputFeed feed)
-  killThread attempt
-  outcome ← takeMVar attempted ∷ IO (Either SomeException WarningAttempt)
-  either (\caught → fromException caught `shouldBe` Just ThreadKilled) (\_ → unexpected "the attempt finished") outcome
+  withOwnedThread (try (attemptOverflowWarning blocking feed) >>= putMVar attempted) $ \attempt _ → do
+    takeMVar started
+    -- Shutdown: the feed closes and the owner is cancelled mid-attempt.
+    atomically (closeInputFeed feed)
+    killThread attempt
+    outcome ← takeMVar attempted ∷ IO (Either SomeException WarningAttempt)
+    either (\caught → fromException caught `shouldBe` Just ThreadKilled) (\_ → unexpected "the attempt finished") outcome
   final ← statisticsOf feed
   statisticsPhase final `shouldBe` InputFeedClosed
   statisticsLastReset final
