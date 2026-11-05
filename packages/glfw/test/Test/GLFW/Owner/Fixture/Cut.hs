@@ -42,7 +42,7 @@ module Test.GLFW.Owner.Fixture.Cut
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryReadMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -180,16 +180,17 @@ withCutting recorded state boundary rescued body = do
     finished ← newTVarIO False
     body (Cutting (Just boundary) cut rescued gate rigs snapshots finished crossed release)
 
--- | Make a cancellation pending against the calling thread, which is protected before the sender exists and receives the cancellation
--- as it is unprotected, inside the sender's scope.
+-- | Make a cancellation pending against the calling thread, which is protected before the senders exist and receives the cancellation
+-- as it is unprotected, inside their scope.
 --
--- The whole is under an uninterruptible mask, so the target is protected before the sender is started (the scope restores its body to
--- the caller's state, which is that mask). The sender is started on the capability the target is on and, once the target is blocked on
--- its hand-over, checks that the target is still on that capability before it throws: a thread blocked on a capability stays there,
--- so the throw is made on the target's own capability, where it is settled where it is made, or it is not made and the whole is tried
--- again. The target then confirms that the sender is blocked delivering, which on one capability means the exception is queued
--- against it, and only then lifts the mask: the cancellation is raised there, inside the scope, which stops and joins the sender
--- (recorded for the caller's judgement).
+-- The whole is under an uninterruptible mask, so the target is protected before anything else is started. The sender is started on the
+-- capability the target is on; while the target is blocked, it checks that the target is still on that capability and throws: a
+-- thread blocked on a capability stays there, so the throw is made on the target's own capability, where it is settled where it is
+-- made, and the sender is then blocked delivering with the exception queued against the target. The target is not woken by the sender
+-- (a bound thread woken by the thread that then throws can move to another capability before the throw is made) but by a second thread
+-- on the same capability, which waits for the sender to be blocked delivering and only then hands the target the confirmation. The
+-- target lifts the mask for the instant it takes to receive the cancellation, inside the scope, which stops and joins both threads
+-- (recorded for the caller's judgement). A sender that found the target elsewhere reports it and the whole is tried again.
 pending ∷ IORef [ThreadId] → IO ()
 pending recorded = do
   settled ← uninterruptibleMask_ $ do
@@ -198,28 +199,29 @@ pending recorded = do
     there ← newEmptyMVar
     let sender = do
           (now, _) ← threadCapability me
-          putMVar there (now == capability)
-          when (now == capability) (throwTo me UserInterrupt)
-    withOwnedThreadOn capability sender $ \thread _ → do
-      atomicModifyIORef' recorded (\known → (thread : known, ()))
-      same ← takeMVar there
-      when same $ do
-        awaitThrowing thread
-        -- Pending, confirmed. The mask is lifted for the instant it takes to receive it, in the scope.
-        unsafeUnmask (pure ())
-      pure same
-  -- Raised above when it was made. Reached only when the caller had moved: again, from where it is now.
+          if now == capability then throwTo me UserInterrupt else void (tryPutMVar there False)
+        waker thread = do
+          awaitSettled thread
+          void (tryPutMVar there True)
+    withOwnedThreadOn capability sender $ \sendingThread _ →
+      withOwnedThreadOn capability (waker sendingThread) $ \wakingThread _ → do
+        atomicModifyIORef' recorded (\known → (sendingThread : wakingThread : known, ()))
+        same ← takeMVar there
+        when same $ do
+          -- Pending, confirmed: the sender is blocked delivering on the target's own capability.
+          unsafeUnmask (pure ())
+        pure same
+  -- Raised above when it was made. Reached only when the sender found the caller elsewhere: again, from where it is now.
   unless settled (pending recorded)
 
--- | Wait, by yielding, until the thread is blocked delivering its exception. Only a sender on the target's own capability makes that a
--- proof that the exception is pending (see 'CutPending').
-awaitThrowing ∷ ThreadId → IO ()
-awaitThrowing thread =
+-- | Wait, by yielding, until the thread is blocked delivering its exception or has ended.
+awaitSettled ∷ ThreadId → IO ()
+awaitSettled thread =
   threadStatus thread >>= \case
     ThreadBlocked BlockedOnException → pure ()
-    ThreadFinished → unexpected "the thread that delivers the cancellation ended before it was pending"
-    ThreadDied → unexpected "the thread that delivers the cancellation died before it was pending"
-    _ → yield >> awaitThrowing thread
+    ThreadFinished → pure ()
+    ThreadDied → pure ()
+    _ → yield >> awaitSettled thread
 
 -- | 'ownedHostAt' with the cutting's boundaries and its exit rescue. The cut is performed at its boundary and nowhere else. When the
 -- rescue is in force the exit's wait for the owner's destruction opens the cutting's gate on every turn, whatever the run was cut in
