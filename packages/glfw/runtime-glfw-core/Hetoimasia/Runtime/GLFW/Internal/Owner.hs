@@ -137,6 +137,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner
   , withGraphicsOwnerHost
   , withGraphicsOwnerHostIn
   , withGraphicsOwnerHostWith
+  , withGraphicsOwnerHostObserved
   , runGraphicsOwnerApplication
   , superviseGraphicsOwner
 

@@ -271,6 +271,23 @@ data GraphicsOwner scene = GraphicsOwner
     -- read only. It is what a per-window scene's publication is checked
     -- against, and what the owner prunes the publications of ended windows by.
   , ownerStarted ∷ !(TVar Bool)
+  , ownerEntered ∷ !(TVar Bool)
+    -- ^ Whether the owner's run action has installed its protected retirement
+    -- (#613). Owner: the owner's worker, which sets it once, in the first
+    -- masked step of 'Hetoimasia.Runtime.GLFW.Internal.Owner.Worker.runOwnerAction',
+    -- before anything the backend could be asked to do; it is never reset.
+    -- Readers: the starter, in the transaction that withdraws an owner whose
+    -- start was abandoned, and nothing else. Thread: any. Lifetime: the
+    -- owner's.
+    --
+    -- An unset flag on a terminal worker is the proof that the run's
+    -- retirement, and so the destruction evidence only it records, can never
+    -- come: the worker ended before the action began, so it holds nothing the
+    -- backend must release. A set flag is never read as that proof. The
+    -- foundation's own record of a run exit says only that the worker's frame
+    -- was entered, which is true of a worker cancelled between its
+    -- acknowledgement and the first instruction of the action, so it cannot
+    -- stand in for this flag.
   , ownerRetainedLimit ∷ !Int
     -- ^ How many failures the owner keeps, derived from the host's own window
     -- limit rather than chosen: a round can fail one construction and one

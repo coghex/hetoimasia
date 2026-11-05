@@ -149,17 +149,25 @@ handoffOrder cutting = do
       Constructed _ → True
       _ → False
 
--- | The private hook the cut examples use is called exactly where the graphics owner's start documents it, once each and in order,
--- and a run without it is the production run: every other example of the suite passes 'Private.noHostHooks' through the same call
--- sites (#612).
+-- | The private hooks the cut examples use are called exactly where the graphics owner's start documents them, once each and in
+-- order, and a run without them is the production run: every other example of the suite passes 'Private.noHostHooks' through the
+-- same call sites (#612, #613). The starting thread's four boundaries are crossed in the order of the start; the worker's two are
+-- crossed in the order of its life, and the worker has reached both by the time its first round has completed.
 testOwnerBoundariesCalledOnce ∷ IO ()
 testOwnerBoundariesCalledOnce = do
   rig ← newRig
   reached ← newTVarIO []
-  let hooks = Private.noHostHooks {Private.ownerBoundary = \boundary → atomically (modifyTVar' reached (<> [boundary]))}
+  workerReached ← newTVarIO []
+  let hooks =
+        Private.noHostHooks
+          { Private.ownerBoundary = \boundary → atomically (modifyTVar' reached (<> [boundary]))
+          , Private.ownerWorkerBoundary = \boundary → atomically (modifyTVar' workerReached (<> [boundary]))
+          }
   ownedHostHooked hooks quietLogger (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control →
     void (awaitRound owner 0)
-  readTVarIO reached `shouldReturn` [Private.OwnerBeforePublication, Private.OwnerStarted]
+  readTVarIO reached
+    `shouldReturn` [Private.OwnerBeforePublication, Private.OwnerPublished, Private.OwnerAwaitingStartup, Private.OwnerStarted]
+  readTVarIO workerReached `shouldReturn` [Private.OwnerWorkerStarting, Private.OwnerWorkerEntering]
 
 -- | A target's observations carry their own monotonic revision, and the slot
 -- is keyed by the exact attachment.

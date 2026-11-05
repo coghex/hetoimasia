@@ -372,6 +372,7 @@ test-suite glfw-tests
         Test.GLFW.Owner.Exit.Retirement
         Test.GLFW.Owner.Exit.Settlement
         Test.GLFW.Owner.Extent
+        Test.GLFW.Owner.Failure.AbandonedStart
         Test.GLFW.Owner.Failure.Cancellation
         Test.GLFW.Owner.Failure.Evidence
         Test.GLFW.Owner.Failure.Interruption

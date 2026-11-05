@@ -84,6 +84,10 @@ import Hetoimasia.Runtime.GLFW.Internal.RenderDemand (RenderEligibility (RenderS
 -- outcome.
 runOwnerAction ∷ GraphicsOwner scene → StopToken → IO ()
 runOwnerAction owner token = mask $ \restore → do
+  -- The first thing, in the first masked step: from here on the drain below is
+  -- certain to run, so from here on this owner is never withdrawn from the
+  -- protected exit for want of evidence (#613).
+  atomically (writeTVar (ownerEntered owner) True)
   -- The protected retirement is installed here, first, before a single
   -- dependent is constructed: from this line on, every way this action can end
   -- — an expected stop, a startup failure, a run failure, and a cancellation —
