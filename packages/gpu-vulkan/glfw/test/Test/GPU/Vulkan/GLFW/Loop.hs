@@ -12,7 +12,7 @@
 -- something /not/ to happen is labelled where it is made.
 module Test.GPU.Vulkan.GLFW.Loop (spec) where
 
-import Control.Concurrent.STM (atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
+import Control.Concurrent.STM (STM, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, retry, writeTVar)
 import Control.Exception (Exception (..), SomeException, throwIO, toException, try)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.List (isInfixOf, isSubsequenceOf)
@@ -82,6 +82,7 @@ spec = describe "Vulkan loop adapter" $ do
     itBounded "keeps a redraw the owner took before any target was constructed, and renders it once one is" testRedrawBeforeTarget
     itBounded "keeps a closed window's retirement observable while the owner's step is held and demand waits" testCloseWhileSaturated
     itBounded "returns as soon as its condition holds, offering the update opportunity first on every turn, and fails nothing" testComposedUntilReturns
+    itBounded "is idle only once the round that took the latest demand has ended, though the demand is taken and the status shows nothing owed" testIdleAfterRoundTakingDemand
     itBounded "fails at its turn bound naming what it waited for, with the phase's elapsed time and turns, the render owner's rounds and next deadline, and the journal's last entries" testComposedUntilDiagnosed
 
   describe "the owner's pacing" $ do
@@ -212,8 +213,7 @@ firstFrame rig host control window = do
   awaitObservationsFolded host [service]
   demandFrame host window
   composedUntil rig host control "a first presented frame" (\_ → pure ()) ((>= 1) <$> presentsOf rig (graphicsAttachment service))
-  presentedIn ← last . (0 :) <$> presentRounds rig
-  awaitOwnerIdle rig host presentedIn
+  awaitOwnerIdle rig host
   pure service
 
 -- | A condition that holds on the fifth turn ends the run there: every turn
@@ -236,6 +236,31 @@ testComposedUntilReturns = do
       (atomically (modifyTVar' questions (+ 1) >> (>= 5) <$> readTVar questions))
     (,) <$> readTVarIO offers <*> readTVarIO questions
   (offered, asked) `shouldBe` (5, 5)
+
+-- | The owner held inside the round that took a demand has taken that demand,
+-- and its status, the previous round's, shows nothing owed: 'awaitOwnerIdle'
+-- must still not say idle, and must once the round has ended, the frame of
+-- that demand then presented.
+testIdleAfterRoundTakingDemand ∷ IO ()
+testIdleAfterRoundTakingDemand = do
+  rig ← scriptedRigOf 1
+  (whileHeld, gained) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← firstFrame rig host control window
+    before ← presentsOf rig (graphicsAttachment service)
+    gate ← newTVarIO False
+    holding ← holdAcquisitions rig gate
+    demandFrame host window
+    composedUntil rig host control "the owner's step held" (\_ → pure ()) (atomically holding)
+    idle ← ownerIdleBarrier rig host
+    whileHeld ← atomically idle
+    atomically (writeTVar gate True)
+    atomically (idle >>= check)
+    after ← presentsOf rig (graphicsAttachment service)
+    letExitFinish rig
+    pure (whileHeld, after - before)
+  whileHeld `shouldBe` False
+  gained `shouldBe` 1
 
 -- | A condition that never holds, under the same demand on every turn as the
 -- direct hide's frames while hidden, meets the unchanged bound of 20000 turns,
@@ -904,8 +929,7 @@ testDirectHideShowBetweenSteps = do
     -- only when this example moves it, so once the owner has no round owed at
     -- once and none due at the standing clock, no deadline of its comes, and
     -- nothing the update opportunity below does wakes it.
-    presentedIn ← last . (0 :) <$> presentRounds rig
-    awaitOwnerIdle rig host presentedIn
+    awaitOwnerIdle rig host
     old ← activeSwapchain host service
     rounds ← newTVarIO Nothing
     composedUntil
@@ -946,25 +970,40 @@ testDirectHideShowBetweenSteps = do
       WindowHidden _ → True
       _ → False
 
--- | Wait until the owner has completed a round beyond this one and is idle at
--- the scripted clock's standing instant: it has taken the latest demand, its
--- last step owed no further work at once, and its next deadline, if it has
--- one, is not yet due. The owner's status is written once, at the end of a
--- round, and the owner then waits for an event or for that deadline, so a
--- status that says so is an owner with no round in flight and none due, until
--- the clock moves or something is published to it.
-awaitOwnerIdle ∷ Rig → VulkanHost Scene → Natural → IO ()
-awaitOwnerIdle rig host seen = do
+-- | Wait until the owner is idle at the scripted clock's standing instant, its
+-- latest demand taken by a round that has ended.
+--
+-- That the latest demand is taken says only that a round has read it: the
+-- flag flips when the round's step begins, and the owner's status describes
+-- the round before, which ends later. So the demand is followed by an empty
+-- one, published once the first is taken. The round that takes the second
+-- begins after the round that took the first has ended, rounds being one at a
+-- time, and the status then describes that round or a later one: its last
+-- step owed no further work at once, and its next deadline, if it has one, is
+-- not yet due. Nothing then wakes the owner until the clock moves or something
+-- is published to it. The empty demand asks no frame of any target and resets
+-- nothing, as the pacing example that publishes one shows.
+awaitOwnerIdle ∷ Rig → VulkanHost Scene → IO ()
+awaitOwnerIdle rig host = ownerIdleBarrier rig host >>= \idle → atomically (idle >>= check)
+
+-- | Wait until the owner has taken its latest demand, publish an empty one
+-- after it, and answer the transaction that says whether the owner is idle
+-- once a round has taken that one too ('awaitOwnerIdle' waits on it).
+ownerIdleBarrier ∷ Rig → VulkanHost Scene → IO (STM Bool)
+ownerIdleBarrier rig host = do
   let owner = vulkanGraphicsOwner host
-  atomically $ do
-    status ← awaitOwnerRound owner seen
+  atomically (readOwnerDemandTaken owner >>= check)
+  nothing ← prepare (OwnerDemand False Nothing)
+  _ ← atomically (publishOwnerDemand (ownerHandoff owner) nothing)
+  pure $ do
+    taken ← readOwnerDemandTaken owner
+    status ← readOwnerStatusNow owner
     -- A rig on the real clock has no standing instant to compare a deadline
     -- with, and its owner serves a due deadline by itself.
     due ← case rigClock rig of
       Nothing → pure False
       Just clock → (\now → maybe False (deadlineReached now) (statusNextDeadline status)) <$> readTVar clock
-    taken ← readOwnerDemandTaken owner
-    check (taken && not (statusImmediate status) && not due)
+    pure (taken && not (statusImmediate status) && not due)
 
 -- | Submit a command through the host's port and wait for its settlement,
 -- from a thread that is not the main one.
@@ -1369,8 +1408,7 @@ testCombinedDemand = do
       ((||) . (> still) <$> total <*> ((>= 400) <$> readTVarIO turns))
     -- The loop ends at the first frame; the deadline's demand asks a frame of
     -- each target, and the other's may be the owner's next round.
-    presentedIn ← last . (0 :) <$> presentRounds rig
-    awaitOwnerIdle rig host presentedIn
+    awaitOwnerIdle rig host
     late ← total
     letExitFinish rig
     pure (early - base, still - early, late - still)
