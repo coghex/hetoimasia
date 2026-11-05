@@ -50,15 +50,17 @@ fullCapacity = describe "with every place taken" $ do
           nudgeArmed world 1000000 1000000000
           awaitSinkEntered world "second"
           done ← newEmptyMVar
-          -- four stoppers, each owned by the scenario (#599): the sink they may be parked behind is let go first
+          -- four stoppers, each owned by the scenario (#599): the sink they may be parked behind is let go first however the
+          -- scenario ends, and not before the example's own release below, which the status checks before it depend on
           withOwnedThreadsOpening
             (releaseSink world)
             (replicate 4 (requestStop session StopQuit >> requestStop session StopInterrupt >> putMVar done ()))
-            $ \_ → replicateM_ 4 (bounded (takeMVar done))
-          status ← statusNow session
-          statusStopping status `shouldBe` True
-          fmap rolePhase (presentationOf status) `shouldBe` Just Stopping
-          releaseSink world
+            $ \_ → do
+              replicateM_ 4 (bounded (takeMVar done))
+              status ← statusNow session
+              statusStopping status `shouldBe` True
+              fmap rolePhase (presentationOf status) `shouldBe` Just Stopping
+              releaseSink world
           -- the held reads are provider work the role still owes: it is not retired while they are held
           void (awaitStatus session (\status' → fmap rolePhase (presentationOf status') == Just Stopping))
           st <- statusNow session

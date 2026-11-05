@@ -35,7 +35,7 @@ import Test.Hspec
 import Test.LuaEngine.Graphics.Fake
 import Test.LuaEngine.Graphics.PeersRig (mainLoopAs, retarget)
 import Test.LuaEngine.Graphics.Rig
-import Test.LuaEngine.Graphics.Served (withServedBoundThread)
+import Test.LuaEngine.Graphics.Served (withProfileBeyond)
 import Test.LuaEngine.Graphics.Unowned
 import qualified Test.LuaEngine.Graphics.Window.Fake as WF
 import Test.Support.Cancel (withCancellationAfter)
@@ -191,39 +191,37 @@ drainScopeAfter wait fake =
     _ ← awaitTerminal probe
     uninterruptibleMask_ (wait >> hold fake HoldReclaim >> setVersionHolders fake 1)
 
--- | The failure the first run of the loop raises.
-data Boom = Boom
+-- | The failure the host's body raises, and the one its teardown then raises as well.
+data Boom = Boom | TeardownBoom
   deriving (Eq, Show)
 
 instance Exception Boom
 
--- | The profile thread needs the loop served again to finish (as an example's window scope drains only as the loop services its
--- commands), and its wait is uninterruptible, so only serving ends it. The first run of the loop fails.
-servedAfterFailure ∷ IORef [ThreadId] → IO Bool
-servedAfterFailure seen = do
-  needServing ← newEmptyMVar
-  runs ← newIORef (0 ∷ Int)
-  let profile = noteThread seen >> uninterruptibleMask_ (readMVar needServing)
-      serve stopWhen = do
-        run ← atomicModifyIORef' runs (\count → (count + 1, count))
-        if run == 0
-          then waitNoted seen >> throwIO Boom
-          else void (tryPutMVar needServing ()) >> bounded (let go = stopWhen >>= \over → unless over (yield >> go) in go)
-  outcome ← try @Boom (withServedBoundThread profile (pure False) serve)
-  outcome `shouldBe` Left Boom
+-- | The profile thread of the native session. It waits, not interruptibly, for the host's teardown to retire what it holds (as an
+-- example's window scope drains only as the host services the commands that retire its windows), so it can only end after the
+-- host's scope has: the thread's scope encloses the host's. Whether the thread has ended and been joined when the call returned,
+-- the host's body ended the way the ending says.
+profileBeyondHost ∷ IORef [ThreadId] → Ending → IO Bool
+profileBeyondHost seen ending = do
+  retired ← newEmptyMVar
+  let profile () = noteThread seen >> uninterruptibleMask_ (readMVar retired)
+      retire = void (tryPutMVar retired ())
+  runEnding ending $ \end → withProfileBeyond profile (\hand → (hand () >> end (waitNoted seen)) `finally` retire)
   joined ← allJoined seen
-  void (isEmptyMVar needServing)
+  void (isEmptyMVar retired)
   pure joined
 
--- | The same profile thread, with a loop that always serves and an example cancelled at once: wherever the cancellation lands
--- the thread has ended once the call has raised.
-servedWhileCancelled ∷ IORef [ThreadId] → IO ()
-servedWhileCancelled seen = do
-  needServing ← newEmptyMVar
-  let profile = noteThread seen >> uninterruptibleMask_ (readMVar needServing)
-      serve stopWhen = void (tryPutMVar needServing ()) >> bounded (let go = stopWhen >>= \over → unless over (yield >> go) in go)
-  withServedBoundThread profile (pure False) serve
-  void (isEmptyMVar needServing)
+-- | The same, with the host's teardown failing too, after it has retired what the profile holds.
+profileBeyondFailingHost ∷ IORef [ThreadId] → IO Bool
+profileBeyondFailingHost seen = do
+  retired ← newEmptyMVar
+  let profile () = noteThread seen >> uninterruptibleMask_ (readMVar retired)
+      retire = void (tryPutMVar retired ()) >> throwIO TeardownBoom
+  outcome ← try @Boom (withProfileBeyond profile (\hand → (hand () >> waitNoted seen >> throwIO Boom) `finally` retire))
+  either id (\() → Boom) outcome `shouldBe` TeardownBoom
+  joined ← allJoined seen
+  void (isEmptyMVar retired)
+  pure joined
 
 -- | Run the helper or control cancelled at once; whatever it started is not alive once it has returned or raised.
 cancelledAtOnce ∷ (IORef [ThreadId] → IO ()) → IO Bool
@@ -278,9 +276,15 @@ spec = describe "the threads the helpers start are owned (#599)" $ do
       cancelledAtOnce (\seen → void (heldDrain seen Cancelled)) >>= (`shouldBe` True)
     it "leaves nothing alive when the control is cancelled at once" $
       cancelledAtOnce (\seen → void (gatedScope seen Cancelled previousForkScope)) >>= (`shouldBe` True)
-  describe "the loop that serves a bound profile thread" $ do
-    it "is served again when it is left abnormally, until the thread has ended" $ do
+  describe "the profile thread of the native session, whose scope encloses the host's" $ do
+    for_ endings $ \(label, ending) →
+      it ("has ended and been joined, after the host's teardown retired what it holds, when the host's body ends because " <> label) $ do
+        seen ← newIORef []
+        profileBeyondHost seen ending >>= (`shouldBe` True)
+    it "has ended and been joined when the host's teardown fails as well" $ do
       seen ← newIORef []
-      servedAfterFailure seen >>= (`shouldBe` True)
+      profileBeyondFailingHost seen >>= (`shouldBe` True)
     it "leaves nothing alive when it is cancelled at once" $
-      cancelledAtOnce servedWhileCancelled >>= (`shouldBe` True)
+      cancelledAtOnce (\seen → void (profileBeyondHost seen Cancelled)) >>= (`shouldBe` True)
+    it "leaves nothing alive when the host's teardown fails and it is cancelled at once" $
+      cancelledAtOnce (void . profileBeyondFailingHost) >>= (`shouldBe` True)

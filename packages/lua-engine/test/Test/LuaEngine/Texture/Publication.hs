@@ -140,26 +140,27 @@ spec = describe "publication" $ do
         held ← uploadN (ssFake session) 0
         registered ← newEmptyMVar
         -- The answer's thread is owned by the example (#599), and the gates it may be held at are let go first however it ends.
-        identity ←
-          withOwnedThreadOpening (releaseHeldGate offering >> releaseHeldGate cancelling) (finishUpload (ssFake session) held >>= putMVar registered) $ \_ _ → do
-            readMVar (arrived offering)
-            -- The host ends the request, and its telling the pipeline is held on the way: the job is not
-            -- withdrawn yet, so the answer offers the texture to a host that no longer wants it.
-            command session owner "i" "cancel" "k0"
-            readMVar (arrived cancelling)
-            releaseHeldGate offering
-            readMVar registered
-        awaitReleaseCalls (ssFake session) 1
-        releaseCalls (ssFake session) `shouldReturn` [identity]
-        reading ← vmDiagnostics owner
-        (rdLateReplies reading + rdUnknownReplies reading, rdAdopting reading, rdDefects reading) `shouldBe` (1, 0, 0)
-        -- The telling arrives now and finds nothing left to release.
-        releaseHeldGate cancelling
-        awaitNote session "i cancel k0 cancelled"
-        retireTexture (ssFake session) identity
-        takeCancelled session owner "i" "k0"
-        awaitOwner owner "i" (== OwnerReading 0 0)
-        releaseCalls (ssFake session) `shouldReturn` [identity]
+        -- The scope encloses the whole example: the cancelling gate stays closed until the example's own release below, so the
+        -- observations before it cannot be satisfied by a release the held cancellation would make once let go.
+        withOwnedThreadOpening (releaseHeldGate offering >> releaseHeldGate cancelling) (finishUpload (ssFake session) held >>= putMVar registered) $ \_ _ → do
+          readMVar (arrived offering)
+          -- The host ends the request, and its telling the pipeline is held on the way: the job is not
+          -- withdrawn yet, so the answer offers the texture to a host that no longer wants it.
+          command session owner "i" "cancel" "k0"
+          readMVar (arrived cancelling)
+          releaseHeldGate offering
+          identity ← readMVar registered
+          awaitReleaseCalls (ssFake session) 1
+          releaseCalls (ssFake session) `shouldReturn` [identity]
+          reading ← vmDiagnostics owner
+          (rdLateReplies reading + rdUnknownReplies reading, rdAdopting reading, rdDefects reading) `shouldBe` (1, 0, 0)
+          -- The telling arrives now and finds nothing left to release.
+          releaseHeldGate cancelling
+          awaitNote session "i cancel k0 cancelled"
+          retireTexture (ssFake session) identity
+          takeCancelled session owner "i" "k0"
+          awaitOwner owner "i" (== OwnerReading 0 0)
+          releaseCalls (ssFake session) `shouldReturn` [identity]
 
   it "waits, when the scope closes, for the host to adopt or drop a texture it was offered, and does not release it: the adopted texture stays with its lease" $
     withSession (config small layout) $ \session _ runtime → do
