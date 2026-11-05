@@ -736,7 +736,11 @@ any other way, and its message names the facility that fits the kind of start.
   references (14 sites) of `glfw-native-tests` (`Fixture`, `Guard`, `Harness`, `Private`, `Session`,
   `Wake` and `WaylandScenarios`: 7 files), which left the baseline's per-file counts summing to 57 starts in 35 files, and its
   negative controls' deliberately unowned start, of either boundness, is exempt by binding
-  (`Test.GLFW.Native.Unowned.startUnowned`, two sites). Each file's count
+  (`Test.GLFW.Native.Unowned.startUnowned`, two sites). #596 then removed the 9 thread starts of `vulkan-native-tests`
+  (`Fixture`, `ChildSpec`, `Interaction`, `Terminal`, `Bridge`, `ConstructionSpec` and `PublicationSpec`: 7 files), after which the
+  baseline's per-file counts sum to 65 starts in 35 files (`Compositor.hs`'s exit waiter went with #588); the suite's negative
+  controls' deliberately unowned start (`Test.GPU.Vulkan.Native.Unowned.startUnowned`) and the pinned start's plain `forkOn` control
+  (`tools/test/OwnedThread.hs`, `startUnownedOn`) are exempt by binding, one site each. Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven

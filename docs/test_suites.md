@@ -337,6 +337,20 @@ cabal test hetoimasia-tests --test-show-details=direct
   `--test-options='--match "#595"'` on `native-tests` and `diagnostics-tests`, and on
   `integration-tests` with `--match "#595"`, `--match "owns the thread parked"` and
   `--match "negative control"`.
+  Every helper thread `vulkan-native-tests` starts is an owned start through `Test.Support.Owned` (#596): the shared fixture's
+  borrower (the Hspec run, served by the process main thread), the interrupted-launch launcher of `a bounded child launcher`,
+  the interaction probe's scene thread, the retention case's watcher (its scope is the whole case, because the watcher supplies the
+  evidence the host's exit waits for), the bound discharger of the bridge case (`withOwnedBoundThread`), and the killers and workers
+  of the construction and publication examples, which are pinned to one capability (`withOwnedThreadOn`; the killer is started with
+  the worker and outlives the arm, `Test.Vulkan.Proof.PendingCancellation`). However the scope that needed a thread ends, it has ended
+  and been joined before the scope returns. The consent-free regressions are in the suite's approval-free group, `--match "without a
+  native session"`: `a bounded child launcher` (the launcher and its child, by a failure and by a cancellation) and `the shared
+  fixture's borrower is owned (#596)` (a cancellation while serving is idle, while the stand-in session is served, and after a session
+  failure the dispatch caught, with and without a following cancellation (the wait for the borrower after a reported failure is
+  bounded, so a parked borrower is stopped and joined and the dispatch raises), and a cancellation that escapes the session). Each runs twice with one judgement, through the facility
+  and through the deliberately unowned start of `Test.GPU.Vulkan.Native.Unowned` (the negative control, which must fail). The fixture's
+  seams (`runSharedWith`) exist test-side only. The pinned start's own examples, with a plain `forkOn` control, are in `workflow-tests`
+  (`--match "a thread pinned to a capability"`).
   The generic run command's real-device suite `run-native-tests` (the root package, `run-native-test/`,
   full-product build only, group `test.vulkan-run-native`) takes the same desktop consent as the other
   window-opening native suites, under the same standing approval, and the runner starts an isolated X11

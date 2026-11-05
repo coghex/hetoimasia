@@ -52,9 +52,9 @@ module Test.GLFW.Native.Private
   , unknownScenarioExit
   ) where
 
-import Control.Concurrent (forkIO, forkOS, threadDelay)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar)
+import Control.Concurrent.STM (TVar, atomically, newEmptyTMVarIO, newTVarIO, putTMVar, readTMVar, readTVar, writeTVar)
 import qualified Control.Concurrent.STM as STM
 import Control.Exception (ErrorCall (ErrorCall), SomeException, displayException, fromException, throw, try)
 import Control.Monad (forever, unless, void, when, (>=>))
@@ -107,6 +107,7 @@ import System.Environment (getExecutablePath)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
 import System.IO (hFlush, hPutStrLn, stderr, stdout)
 import System.Posix.Signals (nullSignal, signalProcess)
+import Test.GLFW.Native.Threads (Boundness (..), startOwned)
 import Test.GLFW.Native.Child (ChildEnd (..), Launched (..), launchCommand, terminationGrace)
 import Test.GLFW.Native.Consent (Consent, Refusal, refusalMessage)
 import Test.GLFW.Native.Support (Gate, admit, consentBackend, consentSessionConfig, hostBackend)
@@ -483,18 +484,41 @@ wakeTeardown = do
               wakeCountsForCheck >>= writeIORef atTerminate . Just
               nativeTerminate productionNative
           }
-      forks = [forkIO, forkOS, forkIO, forkOS]
+      -- Two of the four wakers are OS-bound threads, as they were when they were started with @forkOS@ (#594).
+      boundnesses = [Unbound, Bound, Unbound, Bound]
       round' index = do
         writeIORef atTerminate Nothing
         (before, _) ← wakeCountsForCheck
-        (workers, stale) ←
-          withScoped (allocComposite (sessionAssembly traced defaultSessionConfig)) $ \session → do
-            let wake = sessionWake session
-            posted ← mapM (const (newTVarIO False)) forks
-            workers ← mapM (\(fork, flag) → startWaker fork wake flag) (zip forks posted)
-            atomically (mapM_ (readTVar >=> STM.check) posted)
-            pure (workers, wake)
-        counts ← mapM (takeMVar >=> either (\failure → failCheck ("a waking worker failed: " <> displayException (failure ∷ SomeException))) pure) workers
+        capability ← newEmptyTMVarIO
+        posted ← mapM (const (newTVarIO False)) boundnesses
+        -- The wakers outlive the session until their capability answers 'WakeTerminal', and their results are read after
+        -- the session has closed, so their scopes enclose the session's. They are owned (#594): however the round ends
+        -- (a failed check, a cancellation, a session that never opened) each has ended and been joined before the
+        -- round returns. A waker whose session never opened waits for the capability it is never given, which a kill
+        -- ends; one whose session closed is ended by 'WakeTerminal', which is what the round waits for.
+        withWakers (zip boundnesses posted) (atomically (readTMVar capability)) $ \workers → do
+          stale ←
+            withScoped (allocComposite (sessionAssembly traced defaultSessionConfig)) $ \session → do
+              let wake = sessionWake session
+              atomically (putTMVar capability wake)
+              atomically (mapM_ (readTVar >=> STM.check) posted)
+              pure wake
+          counts ← mapM (>>= either (\failure → failCheck ("a waking worker failed: " <> displayException (failure ∷ SomeException))) pure) workers
+          wakeRound index before atTerminate stale counts
+  posts ← mapM round' [1 .. wakeRounds]
+  (entered, returned) ← wakeCountsForCheck
+  pure
+    ( show wakeRounds
+        <> " rounds of 4 workers; wakes posted per round "
+        <> show posts
+        <> "; in every round the wake calls entered equalled those returned when termination began, and none entered afterwards; "
+        <> show entered
+        <> " entered and "
+        <> show returned
+        <> " returned in total"
+    )
+  where
+    wakeRound index before atTerminate stale counts = do
         terminated ← readIORef atTerminate >>= maybe (failCheck "termination recorded no wake counts") pure
         afterClose ← wakeCountsForCheck
         staleOutcome ← wakeSession stale
@@ -509,28 +533,21 @@ wakeTeardown = do
         unless (fromIntegral (sum counts) == enteredAtTerminate - before) $
           failCheck ("round " <> show index <> ": workers posted " <> show counts <> " but " <> show (enteredAtTerminate - before) <> " calls entered")
         pure (sum counts)
-  posts ← mapM round' [1 .. wakeRounds]
-  (entered, returned) ← wakeCountsForCheck
-  pure
-    ( show wakeRounds
-        <> " rounds of 4 workers; wakes posted per round "
-        <> show posts
-        <> "; in every round the wake calls entered equalled those returned when termination began, and none entered afterwards; "
-        <> show entered
-        <> " entered and "
-        <> show returned
-        <> " returned in total"
-    )
-  where
-    startWaker fork wake posted = do
-      done ← newEmptyMVar
-      let loop count =
+
+    -- A waker wakes until its capability answers 'WakeTerminal', then publishes how many wakes it posted. Its result is read
+    -- once it has ended; a waker that ended without one (it was killed) is a failed check, not a hang.
+    withWakers ∷ [(Boundness, TVar Bool)] → IO SessionWake → ([IO (Either SomeException Int)] → IO a) → IO a
+    withWakers [] _ continue = continue []
+    withWakers ((boundness, flag) : more) capability continue = do
+      result ← newEmptyMVar
+      let loop wake count =
             wakeSession wake >>= \case
-              WakePosted → atomically (writeTVar posted True) >> loop (count + 1)
+              WakePosted → atomically (writeTVar flag True) >> loop wake (count + 1)
               WakeTerminal → pure (count ∷ Int)
               WakeFailed reports → failCheck ("a wake failed: " <> show reports)
-      _ ← fork (try (loop 0) >>= putMVar done)
-      pure done
+      startOwned boundness (try (capability >>= \wake → loop wake 0) >>= putMVar result) $ \_ ended →
+        withWakers more capability $ \rest →
+          continue ((ended >> tryReadMVar result >>= maybe (failCheck "a waking worker ended without a result") pure) : rest)
 
 -- | Keep one real session's capability and use it during and after a later
 -- session: it answers 'WakeTerminal' each time and no call enters GLFW.

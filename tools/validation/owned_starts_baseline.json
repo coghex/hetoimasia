@@ -3,13 +3,6 @@
   "note": "Unowned thread and process starts in the test sources that existed when the guard was introduced (#584), one count per file, classified mechanically. This is a known-debt list, not a list of proven leaks: verify a site before converting it. Entries can only shrink; an entry whose count is no longer reached fails the check. Written by `owned_starts.py bootstrap`; edited afterwards only to lower or remove an entry. The two display-helper suites (tools/x11-test/Main.hs and tools/wayland-test/Main.hs) keep their entries on purpose: #588's owner decision of 2026-11-02 moved the hosted-subprocess helper they need out of that issue, to a separate one.",
   "files": {
     "packages/content/test/Test/Content/Support.hs": 1,
-    "packages/glfw/native-tests/Test/GLFW/Native/Fixture.hs": 1,
-    "packages/glfw/native-tests/Test/GLFW/Native/Guard.hs": 2,
-    "packages/glfw/native-tests/Test/GLFW/Native/Harness.hs": 1,
-    "packages/glfw/native-tests/Test/GLFW/Native/Private.hs": 4,
-    "packages/glfw/native-tests/Test/GLFW/Native/Session.hs": 2,
-    "packages/glfw/native-tests/Test/GLFW/Native/Wake.hs": 5,
-    "packages/glfw/native-tests/Test/GLFW/Native/WaylandScenarios.hs": 2,
     "packages/glfw/test/Test/GLFW/Owner/Failure/Interruption.hs": 1,
     "packages/glfw/test/Test/GLFW/Protected.hs": 2,
     "packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Facade.hs": 1,
