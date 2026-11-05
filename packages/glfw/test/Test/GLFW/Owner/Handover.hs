@@ -9,6 +9,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
   , check
+  , modifyTVar'
   , newTVarIO
   , readTVar
   , readTVarIO
@@ -86,6 +87,8 @@ spec = do
     (boundedExample testVerifiedRollback)
   it "leaks no port reservation when a handover is refused, and tells the owner about an attachment whose answer was lost"
     (boundedExample testHandoverRecovery)
+  it "calls the owner-boundary hook at the start's two boundaries, once each and in order, and nowhere else (#612)"
+    (boundedExample testOwnerBoundariesCalledOnce)
   boundaryExamples "the handoff order" handoffOrder
   boundaryControls "the handoff order" handoffOrder
   boundaryExamples "the handover recovery" handoverRecovery
@@ -143,6 +146,18 @@ handoffOrder cutting = do
     isConstruction = \case
       Constructed _ → True
       _ → False
+
+-- | The private hook the cut examples use is called exactly where the graphics owner's start documents it, once each and in order,
+-- and a run without it is the production run: every other example of the suite passes 'Private.noHostHooks' through the same call
+-- sites (#612).
+testOwnerBoundariesCalledOnce ∷ IO ()
+testOwnerBoundariesCalledOnce = do
+  rig ← newRig
+  reached ← newTVarIO []
+  let hooks = Private.noHostHooks {Private.ownerBoundary = \boundary → atomically (modifyTVar' reached (<> [boundary]))}
+  ownedHostHooked hooks quietLogger (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control →
+    void (awaitRound owner 0)
+  readTVarIO reached `shouldReturn` [Private.OwnerBeforePublication, Private.OwnerStarted]
 
 -- | A target's observations carry their own monotonic revision, and the slot
 -- is keyed by the exact attachment.
