@@ -142,6 +142,17 @@ cabal test hetoimasia-tests --test-show-details=direct
   failures, independent loads and release, the close and drain, and a separately compiled public client, The fixed M1 scene schema (LFE-19, `Test.LuaEngine.Scene.*`, `--match Scene`) is covered on real instances that own real textures behind the injected backend and a controlled sink: the schema's accepted and refused tables, the colour and geometry rules, the limits at the limit and one past under the fixed and smaller profiles, the calling instance's texture authority, refusals as ordinary Lua errors, and the translation to the renderer's snapshot under its validation, draw plan and oracle; the host's per-binding argument limits are `lua-host-tests`' (`Test.Lua.Boundary.ArgumentLimits`) and the non-throwing lease borrow `lua-runtime-tests`' (`Test.LuaRuntime.Instance.Lease.*`). The module coordinator (LFE-11, `Test.LuaEngine.Modules.*`, `--match Modules`): real modules through real VMs on supervised scheduled owners over a real content root, inventory and read pool, with the production reader behind gates and nothing slept, and a separately compiled client. The authoring facade (LFE-12, `Test.LuaEngine.Facade.*`, `--match Facade`): the accepted P-72 example, every call's schema table-driven in every role and phase, instance ownership, the lexical import and the instance-rooted requests, the request records, the role clocks and waits under an injected clock and fake timer, print and warn with their exact bound, the sinks under contention and failure, and a separately compiled client, on real instances over a real content root, inventory and read pool with recording sinks and nothing slept. It starts no window or GPU; its one example of the Lua host's
   module loader under the fixed profile (`Test.LuaEngine.Loader`, LFE-9) starts an in-process Lua owner. A new
   manifest or profile example belongs there, in the component spec that owns it.
+  Every helper thread `lua-engine-tests` starts is an owned start through `Test.Support.Owned` (#599): the scenario runners
+  (`runScenarioWith`, `runCaught`, `runHeld`), the cancellers, closing threads and workers parked in a held sink, grant or
+  hook, and the two helpers of the texture suite (`withJanitor`, and `withNested`'s helper, which supplies what the nested pipeline's
+  drain waits for and whose scope therefore encloses that exit). However the scope that needed a thread ends, it has ended and been
+  joined before the scope returns, and what only the example can open (the held sink, the pool reader's gates, a recorder's
+  hold) is let go by the same release, before the kill. The shapes have regressions (`Test.LuaEngine.Owned`,
+  `--test-options='--match "the threads the helpers start are owned (#599)"'`) that run twice with one judgement, through the
+  facility and through the previous form of the helper or the deliberately unowned start of `Test.LuaEngine.Unowned` (the negative
+  control, which must fail): the runner's thread when the session's run is cancelled before the scenario started and when the
+  example is cancelled once the session has ended, a canceller waiting for a point never reached, a writer parked in a held sink, and a
+  supplier that is not ended before the exit it serves. The runner's seams (`RunnerSeams`) exist test-side only.
   `lua-runtime-tests` also owns the host's opt-in admission (`Test.LuaRuntime.Admission.*`, including the caller's instance),
   the notification of a hook's segments (`Test.LuaRuntime.Instance.Behavior`, `--match 'notification of a hook'`), the elapsed wait through the whole
   Word64 range (`Test.LuaRuntime.Scheduled.Execution`) and the shared bounded output (`Test.LuaRuntime.Runner.Output`)
@@ -267,7 +278,17 @@ cabal test hetoimasia-tests --test-show-details=direct
   demand hook with its gate closed (`GLFW admission helper threads`), an injector
   and the helper it never reaches, a runner parked in its construction whose
   rollback waits at a second gate, and an evidence supplier waiting for an owner
-  that never exists (`GLFW protected host`, `the drain`). The thread sites that
+  that never exists (`GLFW protected host`, `the drain`). `glfw-native-tests` was
+  converted in #594: its `onThread`, `runOwned`'s borrower, the harness's
+  `withForked`, the launch-interruption example's launcher, `wokenWait` and
+  `wokenWaitBy`, the private-session rounds' wakers and the two Wayland scenario
+  workers start their threads through `Test.GLFW.Native.Threads`, which takes the
+  boundness (`Unbound` or `Bound`) in place of a fork primitive, and all 17 of its
+  baseline references (14 sites) left the baseline; `WaylandScenarios.hs:938` was
+  #588's. Its regressions run with no consent in `--match "owns the threads its
+  helpers start"` (under `the native opt-in`), each as an owned example and a
+  negative control through the deliberately unowned start of
+  `Test.GLFW.Native.Unowned`. The thread sites that
   remain in other suites are a known-debt baseline to be removed by follow-up
   changes, not to be extended.
 
@@ -365,6 +386,16 @@ cabal test hetoimasia-tests --test-show-details=direct
   (group `test.vulkan-headless`), a gated fake port inside the real request
   admission, leases and a Lua owner; the shared composition lives in the
   package's `test-common` directory, not in either suite's spec modules.
+  Every helper thread `lua-engine-graphics-tests` and `lua-engine-graphics-native-tests` start is an owned start
+  (#599): `withFakeOwner` and the peers rig's `mainLoop` (whose scope encloses the retirement and the windows' teardown, which
+  may wait for a main-thread step), the backend scope forked by `withForkedScope` (whose `forkedJoin` may be made again, so the
+  scope's own join never waits on a signal an example consumed), the scenario threads of the facade, the window coordinator and the
+  native `Facade` and `Pixels` groups, and the native session's bound OS thread that runs the complete profile, started by
+  `withOwnedBoundThread` while the process main thread serves the owner loop and joined before that scope returns. The headless
+  regressions are `Test.LuaEngine.Graphics.Owned` (`--match "the threads the helpers start are owned (#599)"`), each run through
+  the facility and through the previous form of the helper (the negative control): the fake owner and the main-step loop cancelled
+  between the fork and the body's first step, and a scope held in its drain. The native sites are covered by their examples still
+  passing in `test.vulkan-lua-engine-native` and by the baseline guard.
   Its scene publication (LFE-20) has a second native subgroup, `scene retention`:
   a published scene adopted by the real owner, its texture protected and recorded
   again after Lua released it, a publication naming the released lease refused,
