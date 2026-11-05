@@ -533,11 +533,6 @@ spec = describe "The unowned-start guard (tools/validation/owned_starts.py)" $ d
       text ← readFile (checkout </> "tools/validation/owned_starts_baseline.json")
       forM_ converted $ \path → text `shouldNotContain` path
 
-    it "keeps the two display-helper suites' baseline entries, which #588's owner decision moved to a separate issue with the hosted-subprocess helper they need" $ inCheckout $ \checkout → do
-      text ← readFile (checkout </> "tools/validation/owned_starts_baseline.json")
-      text `shouldContain` "tools/x11-test/Main.hs"
-      text `shouldContain` "tools/wayland-test/Main.hs"
-
     it "has not grown its baseline relative to the review base" $ inCheckout $ \checkout → do
       settings ← sanitizedEnvironment
       (resolved, _, _) ← run settings checkout "git" ["rev-parse", "--verify", "--quiet", "origin/master^{commit}"]
@@ -633,8 +628,8 @@ withRatchet initialBaseline action = withSystemTempDirectory "hetoimasia-owned-r
   base ← takeWhile (/= '\n') <$> git settings directory ["rev-parse", "HEAD"]
   action directory base
 
--- | The files whose every baselined start was a subprocess start (or a thread that existed only to serve one), converted in #588: none
--- of them has a baseline entry any more.
+-- | The files whose every baselined start was a subprocess start (or a thread that existed only to serve one), converted in #588 and, for
+-- the two display-helper suites (which run their helper on a host), in #608: none of them has a baseline entry any more.
 converted ∷ [FilePath]
 converted =
       [ "packages/asset-image/test/Test/Asset/Image/Bc7Opacity.hs",
@@ -671,5 +666,7 @@ converted =
       "tools/test-support/src/Test/Support/ExternalClient.hs",
       "tools/test/RunnerIdentity.hs",
       "tools/test/Sandbox.hs",
-      "tools/test/VulkanProof.hs"
+      "tools/test/VulkanProof.hs",
+      "tools/wayland-test/Main.hs",
+      "tools/x11-test/Main.hs"
       ]
