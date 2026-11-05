@@ -1452,6 +1452,45 @@ cleanupSpec = describe "A cancellation delivered into a cleanup of the host" $ d
         Nothing -> expectationFailure ("the owner's scope raised " <> show failure)
       Right () -> expectationFailure "the failure the worker was handling was not raised by the owner's scope"
 
+  it "Cleanup: a bound that passes before the body starts leaves the handles the host never handed over to be closed by the host, before it answers" $ do
+    ran <- newIORef False
+    wires <- newWires
+    -- The body's bound has passed before the body can start: the limit answers 'Nothing' without running it.
+    let hooks =
+          (withWires wires)
+            { hostLimit = \site deadline action -> case (site, deadline) of
+                (AtBody, DeadlineAt _) -> pure Nothing
+                _ -> limitBy wires site deadline action
+            }
+    withSupplied $ \handle ->
+      withHostEx noSeams hooks $ \host ->
+        withSubmission host (supplying handle (readyChild (Within 60000000) "a" nowhere)) (flagged ran) $ \a -> do
+          answered a >>= (`shouldSatisfy` namesBound "60 s")
+          closed handle `shouldReturn` True
+          readIORef ran `shouldReturn` False
+          bounded (awaitHostState host (== Idle))
+
+  it "Cleanup: a close that cannot be confirmed for a request whose submitter has gone is raised by the owner's scope, with no second cancellation injected" $ do
+    taking <- newGate
+    ran <- newIORef False
+    -- A reap bound of zero is a close that cannot complete in time: the host says so, and the handle is left for the example to close.
+    outcome <-
+      tryWithContext @SomeException . withSupplied $ \handle ->
+        withHostUsing quick {boundReap = 0} noSeams noHostSeams {hostTaking = park taking, hostOpen = openGate taking} $ \host ->
+          withSubmission host (supplying handle (readyChild (Within 60000000) "a" nowhere)) (flagged ran) $ \a -> do
+            awaitReached taking
+            cancelSubmitter a
+            answered a >>= (`shouldSatisfy` isCancellation)
+            openGate taking
+            -- The worker closes the handle after the submitter has returned; the body never runs.
+            bounded (awaitHostState host (== Idle))
+            readIORef ran `shouldReturn` False
+    case outcome of
+      Left (ExceptionWithContext _ failure) -> case fromException failure of
+        Just (SubprocessFailure message) -> message `shouldSatisfy` (\text -> "cleanup was not confirmed" `isInfixOf` text && "could not be flushed" `isInfixOf` text)
+        Nothing -> expectationFailure ("the owner's scope raised " <> show failure)
+      Right () -> expectationFailure "the unconfirmed close was lost: the owner's scope returned"
+
 -- | Rule F: the limit of a body that is not cancellable.
 cancellabilitySpec :: Spec
 cancellabilitySpec = describe "A body outside the cancellability precondition (rule F)" $ do

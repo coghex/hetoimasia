@@ -276,6 +276,9 @@ data Host = Host
   , hostSlot ∷ !(TMVar Pending)
   , hostRunning ∷ !(TVar Bool)
   -- ^ A request is claimed and not yet answered.
+  , hostOrphans ∷ !(TVar [String])
+  -- ^ The cleanup the worker could not confirm for a request, kept at the host's scope as well as on the answer: the submitter may
+  -- have gone, and an answer nobody reads must not hide it. The owner's scope raises it.
   , hostStopSeen ∷ !(TVar Bool)
   -- ^ The stop was recorded, once and for good: a submitter told that the host is gone says which it was, whichever of the stop and
   -- the end it happens to observe first.
@@ -345,9 +348,10 @@ withHostUsing bounds facility hooks use = do
   slot ← newEmptyTMVarIO
   running ← newTVarIO False
   stopSeen ← newTVarIO False
+  orphans ← newTVarIO []
   outcome ← newEmptyTMVarIO
   observed ← newIORef Nothing
-  let host = Host phase slot running stopSeen bounds facility hooks
+  let host = Host phase slot running orphans stopSeen bounds facility hooks
       stop = recordStop host >> hostOpen hooks
   scoped ←
     tryWithContext @SomeException . withOwnedThreadOpening stop (workerMain host outcome) $ \_ _ →
@@ -358,7 +362,8 @@ withHostUsing bounds facility hooks use = do
     atomically (writeTVar phase PhaseEnded >> void (tryPutTMVar outcome (Right ())))
     worker ← atomically (readTMVar outcome) >>= workerFailure
     owner ← readIORef observed
-    pure (conclude scoped owner worker)
+    orphans' ← readTVarIO orphans
+    pure (conclude scoped owner worker orphans')
   conclusion
 
 -- | What the owner's scope raises or returns, from how the owned scope ended, how the use ended and how the worker did.
@@ -366,15 +371,21 @@ conclude
   ∷ Either (ExceptionWithContext SomeException) ()
   → Maybe (Either (ExceptionWithContext SomeException) a)
   → Maybe (ExceptionWithContext SomeException)
+  → [String]
   → IO a
-conclude scoped owner worker = case (scoped, owner) of
+conclude scoped owner worker orphans = case (scoped, owner) of
   -- A cancellation reached the scope after the use had ended (the release is uninterruptible, so it arrives as the mask ends): it is
   -- raised, with the use's own failure and the worker's retained.
-  (Left interruption, _) → rethrowIO (withWorker (withOwner interruption))
-  (Right (), Just (Left failure)) → rethrowIO (withWorker failure)
-  (Right (), Just (Right result)) → maybe (pure result) rethrowIO worker
-  (Right (), Nothing) → maybe (throwIO (SubprocessFailure "the host's scope ended without running its body")) rethrowIO worker
+  (Left interruption, _) → rethrowIO (kept (withWorker (withOwner interruption)))
+  (Right (), Just (Left failure)) → rethrowIO (kept (withWorker failure))
+  (Right (), Just (Right result)) → maybe (cleanOrOrphans (pure result)) (rethrowIO . kept) worker
+  (Right (), Nothing) → maybe (cleanOrOrphans (throwIO (SubprocessFailure "the host's scope ended without running its body"))) (rethrowIO . kept) worker
   where
+    -- The cleanup a worker could not confirm for a request whose submitter had gone is raised, beside whatever else is raised.
+    kept = retainProblems orphans
+    cleanOrOrphans ok
+      | null orphans = ok
+      | otherwise = throwIO (SubprocessFailure ("a cleanup was not confirmed: " <> intercalate "; " orphans))
     withOwner interruption = case owner of
       Just (Left failure) → retain "the failure of what was being run" failure interruption
       _ → interruption
@@ -480,7 +491,10 @@ releaseClaimed host pending failure = do
     if isAsync failure
       then stoppedOrEnded host (pendCommand pending) >>= captureFailure
       else pure failure
-  atomically (pendFail pending (retainProblems problems told) >> writeTVar (hostRunning host) False)
+  atomically $ do
+    unless (null problems) (modifyTVar' (hostOrphans host) (<> problems))
+    pendFail pending (retainProblems problems told)
+    writeTVar (hostRunning host) False
   pure (retainProblems problems . retain "the failure of what was being run" failure <$> interruption)
 
 -- | Why a request that will not be answered by a child is told so: the stop was recorded, or the worker ended without it.
@@ -521,20 +535,30 @@ hosted host spec body = mask $ \restore → do
       answer result = void (tryPutTMVar reply result) >> writeTVar (hostRunning host) False
       expiry = SubprocessFailure (command <> " did not finish within its run bound of " <> describeBound (specBound spec))
       execute child = do
-        result ← tryWithContext @SomeException (hostLimit hooks AtBody deadline (body child))
+        -- The handles are the caller's from the moment the body starts. A bound that passed before it did, or a cancellation, leaves
+        -- them the host's to close, and the host closes them before it answers.
+        started ← newTVarIO False
+        result ← tryWithContext @SomeException (hostLimit hooks AtBody deadline (atomically (writeTVar started True) >> body child))
+        ran ← readTVarIO started
+        (problems, closeInterruption) ←
+          if ran then pure ([], Nothing) else closeRemembering (hostBounds host) (hostClosing hooks) (pendHandles pending)
+        let kept = retainProblems problems
+            -- A cancellation that landed in the close is raised, with the failure being handled retained beside it.
+            raising failure = (\interrupted → kept (retain "the failure of what was being run" failure interrupted)) <$> closeInterruption
+            answerWith told = atomically (unless (null problems) (modifyTVar' (hostOrphans host) (<> problems)) >> answer (Left (kept told)))
         case result of
           Right (Just value) → atomically (answer (Right value)) >> pure Nothing
           Right Nothing → do
             failure ← captureFailure expiry
-            atomically (answer (Left failure))
-            pure Nothing
+            answerWith failure
+            pure (raising failure)
           Left failure
             | isAsync failure → do
                 -- A cancellation of the body is the host's stop, or the worker's own: the submitter is told which, and service ends.
                 told ← stoppedOrEnded host command >>= captureFailure
-                atomically (answer (Left told))
-                pure (Just failure)
-            | otherwise → atomically (answer (Left failure)) >> pure Nothing
+                answerWith told
+                pure (Just (fromMaybe (kept failure) (raising failure)))
+            | otherwise → answerWith failure >> pure (raising failure)
       pending =
         Pending
           { pendSpec = spec {specBound = Unbounded}
