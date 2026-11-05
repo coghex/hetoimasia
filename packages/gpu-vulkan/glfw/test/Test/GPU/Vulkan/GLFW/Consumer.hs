@@ -964,10 +964,18 @@ composedUntil rig host control what each done =
 
 -- | Hand the host's window over, wait until its owner has built it a
 -- generation, and present one frame through the composed loop.
+--
+-- The window's observation is published, and the owner waited on to have
+-- folded it, before the frame is demanded. An owner round that took the demand
+-- first would find the target not yet eligible and refuse the frame, and the
+-- retry it sets is paced on the owner's clock, which a scripted one never moves
+-- on its own. The helper moves no clock.
 firstFrame ∷ Rig → VulkanHost Scene → RuntimeControl → WindowId → IO GraphicsService
 firstFrame rig host control window = do
   service ← handedOver host window RequiredTarget
   TargetUsable ← awaitStanding host service
+  publishObservation host service window
+  awaitObservationsFolded host [service]
   demandFrame host window
   composedUntil rig host control "a first presented frame" (\_ → pure ()) ((>= 1) <$> presentsOf rig (graphicsAttachment service))
   pure service

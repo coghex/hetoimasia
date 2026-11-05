@@ -26,7 +26,7 @@ import Numeric (showFFloat)
 import System.Timeout (timeout)
 
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
-import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, durationFromNanoseconds, elapsedBetween, readInstant, scriptedInstant, zeroDuration)
+import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), Instant, addDuration, deadlineReached, durationFromNanoseconds, elapsedBetween, readInstant, scriptedInstant, zeroDuration)
 import Hetoimasia.GLFW.Command (Disposition (Attempted), WaitedSubmission (..), WindowCommand, awaitCompletion, awaitSubmitWindowCommand, clientDemandPublisher, hideWindowCommand, newWindowCommandHost, performWindowCommand, setWindowSizeCommand, showWindowCommand)
 import Hetoimasia.GLFW.Demand (deadlineDemand, immediateDemand, publishDemand)
 import Hetoimasia.GLFW.Window (Extent (..), WindowId, WindowResult (..))
@@ -194,12 +194,26 @@ journalTail = 20
 
 -- | Hand the host's window over, wait until its owner has built it a
 -- generation, and present one frame through the composed loop.
+--
+-- The window's observation is published, and the owner waited on to have
+-- folded it, before the frame is demanded. An owner round that took the demand
+-- first would find the target not yet eligible and refuse the frame, and the
+-- retry it sets is paced on the owner's clock, which a scripted one never moves
+-- on its own. It returns once the owner is idle, having completed the work
+-- that demand set going: a demand asks a frame of every eligible target, so a
+-- window handed over after another may have the other's frame still to come in
+-- a round of its own, and a caller that counts presentations would otherwise
+-- count it. The helper moves no clock.
 firstFrame ∷ Rig → VulkanHost Scene → RuntimeControl → WindowId → IO GraphicsService
 firstFrame rig host control window = do
   service ← handedOver host window RequiredTarget
   TargetUsable ← awaitStanding host service
+  publishObservation host service window
+  awaitObservationsFolded host [service]
   demandFrame host window
   composedUntil rig host control "a first presented frame" (\_ → pure ()) ((>= 1) <$> presentsOf rig (graphicsAttachment service))
+  presentedIn ← last . (0 :) <$> presentRounds rig
+  awaitOwnerIdle rig host presentedIn
   pure service
 
 -- | A condition that holds on the fifth turn ends the run there: every turn
@@ -872,11 +886,15 @@ testDirectHideShowBetweenSteps = do
     [window] ← windowsOf host
     service ← firstFrame rig host control window
     let owner = vulkanGraphicsOwner host
-    -- The round that presented has completed. The scripted clock moves only
-    -- when this example moves it, so no deadline of the owner's comes, and
+    -- The round that presented has completed, but completing it does not
+    -- leave the owner idle: it can owe the round that polls the presentation
+    -- fences, a deadline already due at the clock, which it takes at once and
+    -- which may fall between the two readings below. The scripted clock moves
+    -- only when this example moves it, so once the owner has no round owed at
+    -- once and none due at the standing clock, no deadline of its comes, and
     -- nothing the update opportunity below does wakes it.
     presentedIn ← last . (0 :) <$> presentRounds rig
-    _ ← atomically (awaitOwnerRound owner presentedIn)
+    awaitOwnerIdle rig host presentedIn
     old ← activeSwapchain host service
     rounds ← newTVarIO Nothing
     composedUntil
@@ -916,6 +934,26 @@ testDirectHideShowBetweenSteps = do
     isHidden = \case
       WindowHidden _ → True
       _ → False
+
+-- | Wait until the owner has completed a round beyond this one and is idle at
+-- the scripted clock's standing instant: it has taken the latest demand, its
+-- last step owed no further work at once, and its next deadline, if it has
+-- one, is not yet due. The owner's status is written once, at the end of a
+-- round, and the owner then waits for an event or for that deadline, so a
+-- status that says so is an owner with no round in flight and none due, until
+-- the clock moves or something is published to it.
+awaitOwnerIdle ∷ Rig → VulkanHost Scene → Natural → IO ()
+awaitOwnerIdle rig host seen = do
+  let owner = vulkanGraphicsOwner host
+  atomically $ do
+    status ← awaitOwnerRound owner seen
+    -- A rig on the real clock has no standing instant to compare a deadline
+    -- with, and its owner serves a due deadline by itself.
+    due ← case rigClock rig of
+      Nothing → pure False
+      Just clock → (\now → maybe False (deadlineReached now) (statusNextDeadline status)) <$> readTVar clock
+    taken ← readOwnerDemandTaken owner
+    check (taken && not (statusImmediate status) && not due)
 
 -- | Submit a command through the host's port and wait for its settlement,
 -- from a thread that is not the main one.
@@ -1318,6 +1356,10 @@ testCombinedDemand = do
       "the request by the deadline"
       (\_ → atomically (modifyTVar' turns (+ 1)))
       ((||) . (> still) <$> total <*> ((>= 400) <$> readTVarIO turns))
+    -- The loop ends at the first frame; the deadline's demand asks a frame of
+    -- each target, and the other's may be the owner's next round.
+    presentedIn ← last . (0 :) <$> presentRounds rig
+    awaitOwnerIdle rig host presentedIn
     late ← total
     letExitFinish rig
     pure (early - base, still - early, late - still)
