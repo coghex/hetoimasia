@@ -726,7 +726,11 @@ any other way, and its message names the facility that fits the kind of start.
   starts of the macOS probe library left as audited helpers (below); the three it deferred
   (`Test.Lua.Support.detached` and the two starts of `Test.Lua.Reentry`, which run inside an
   owner that may be trapped in a `safe` foreign call, so joining them would hang the example
-  whose bound exists to fail) stay, their reason recorded at each start. Each file's count
+  whose bound exists to fail) stay, their reason recorded at each start. #599 then removed the
+  38 thread starts of `lua-engine-tests` (29 in 12 files), `lua-engine-graphics-tests` (6 in 5) and
+  `lua-engine-graphics-native-tests` (3 in 3) it converted, 20 files in all, which left the baseline
+  36 starts in 22 files (the subprocess starts of the remaining suites, the three `glfw-tests` sites
+  of the narrowed #593, and the sites no follow-up has reached). Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven
@@ -758,6 +762,12 @@ any other way, and its message names the facility that fits the kind of start.
   `Compositor.hs`, whose `stopProcess` could time out unconfirmed) remained in the
   baseline until #588 moved those subprocess starts onto the shared subprocess
   facility, which ends and reaps them.
+  The negative controls of the Lua-first engine suites (#599) keep one deliberately unowned start in
+  the binding `startUnowned` of `Test.LuaEngine.Unowned` and of `Test.LuaEngine.Graphics.Unowned`, and
+  the previous form of each converted helper, exempt by binding and stopped and joined independently
+  by the control that ran it: `previousRunScenario` (`Test.LuaEngine.Owned`, the scenario runner as
+  it was) and `previousWithFakeOwner`, `previousMainLoop` and `previousForkScope`
+  (`Test.LuaEngine.Graphics.Owned`). A converted helper is never exempt.
   The negative controls of the foundation and runtime suites (#597) keep one
   deliberately unowned start each, in the one binding `startUnowned` of
   `Test.Foundation.OwnedControl` and `Test.Runtime.OwnedControl`: the thread is
