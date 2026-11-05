@@ -5,7 +5,7 @@
 -- This module belongs to the private @runtime-glfw-core@ sublibrary, so no
 -- package outside @hetoimasia-glfw@ can import it. The public
 -- "Hetoimasia.Runtime.GLFW" re-exports everything here except 'HostHooks',
--- 'noHostHooks', 'OwnerBoundary', and 'allocWindowHostWith', and carries the contract.
+-- 'noHostHooks', 'OwnerBoundary', 'OwnerWorkerBoundary', and 'allocWindowHostWith', and carries the contract.
 --
 -- = Where each part lives
 --
@@ -51,6 +51,7 @@ module Hetoimasia.Runtime.GLFW.Internal
   , allocWindowHostWith
   , HostHooks (..)
   , OwnerBoundary (..)
+  , OwnerWorkerBoundary (..)
   , noHostHooks
   , hostMonitors
   , hostCommandPort
@@ -283,6 +284,7 @@ import Hetoimasia.Runtime.GLFW.Internal.Host.State
   ( HostActivity (..)
   , HostHooks (..)
   , OwnerBoundary (..)
+  , OwnerWorkerBoundary (..)
   , RetirementDemand (..)
   , WindowHost
   , hostConfiguration

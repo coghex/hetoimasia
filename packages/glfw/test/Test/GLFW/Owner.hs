@@ -18,6 +18,7 @@ import qualified Test.GLFW.Owner.Discipline as Discipline
 import qualified Test.GLFW.Owner.Exit.Retirement as ExitRetirement
 import qualified Test.GLFW.Owner.Exit.Settlement as ExitSettlement
 import qualified Test.GLFW.Owner.Extent as Extent
+import qualified Test.GLFW.Owner.Failure.AbandonedStart as FailureAbandonedStart
 import qualified Test.GLFW.Owner.Failure.Cancellation as FailureCancellation
 import qualified Test.GLFW.Owner.Failure.Evidence as FailureEvidence
 import qualified Test.GLFW.Owner.Failure.Interruption as FailureInterruption
@@ -46,5 +47,6 @@ spec = describe "GLFW graphics owner" $ do
     FailureCancellation.spec
     FailureReporting.spec
     FailureInterruption.spec
+    FailureAbandonedStart.spec
   describe "the owner's GLFW discipline" Discipline.spec
   describe "the extent seam" Extent.spec

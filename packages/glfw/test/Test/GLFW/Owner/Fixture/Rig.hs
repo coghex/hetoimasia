@@ -12,6 +12,9 @@ module Test.GLFW.Owner.Fixture.Rig
   , ownedHostWith
   , ownedHostHooked
   , ownedHostAt
+  , Observer (..)
+  , noObserver
+  , ownedHostObserved
   , ownedHostBeforeBody
   , armedBody
   , armedFinally
@@ -31,7 +34,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeException, finally, mask, onException, try)
+import Control.Exception (SomeException, finally, mask, onException, throwIO, try)
 import Control.Monad (forM_, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Text as Text
@@ -178,8 +181,41 @@ ownedHostAt
   → GraphicsOwnerConfig Scene
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO a
-ownedHostAt hooks startup logger seam config ownerConfig action =
-  asProcessMainThread seam (ownedHostRun hooks startup logger seam config ownerConfig action)
+ownedHostAt hooks = ownedHostObserved hooks noObserver
+
+-- | What an example observes of a run that the application never sees (#613): the owner the moment its handle is published to the
+-- protected exit, which a start that is abandoned never returns, and the failure the run ends with, caught on the designated main
+-- thread, where it still carries its context. An exception that crosses out of 'asProcessMainThread' arrives with none.
+data Observer = Observer
+  { observedOwner ∷ GraphicsOwner Scene → IO ()
+  , observedFailure ∷ SomeException → IO ()
+  }
+
+noObserver ∷ Observer
+noObserver = Observer (\_ → pure ()) (\_ → pure ())
+
+-- | 'ownedHostAt' with an observer.
+ownedHostObserved
+  ∷ Private.HostHooks
+  → Observer
+  → IO ()
+  → Logger
+  → Seam
+  → HostConfig
+  → GraphicsOwnerConfig Scene
+  → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
+  → IO a
+ownedHostObserved hooks observer startup logger seam config ownerConfig action =
+  asProcessMainThread seam $
+    ownedHostRun hooks (observedOwner observer) startup logger seam config ownerConfig action
+      `onException'` observedFailure observer
+
+-- | Run the action and, if it raises, tell the observer what it raised before raising it again unchanged.
+onException' ∷ IO a → (SomeException → IO ()) → IO a
+onException' action observe =
+  try action >>= \case
+    Right result → pure result
+    Left failure → observe failure >> throwIO failure
 
 -- | 'ownedHostWith' that runs an action on the main thread after the host is built and before the application's body begins (the
 -- host's own 'beforeConsumer' hook), so an example can end a run during its startup (#593).
@@ -249,11 +285,12 @@ ownedHostCaughtHooked
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO (Either SomeException a)
 ownedHostCaughtHooked hooks seam config ownerConfig action =
-  asProcessMainThread seam (try (ownedHostRun hooks (pure ()) quietLogger seam config ownerConfig action))
+  asProcessMainThread seam (try (ownedHostRun hooks (\_ → pure ()) (pure ()) quietLogger seam config ownerConfig action))
 
 -- | The composition itself, already on the designated main thread.
 ownedHostRun
   ∷ Private.HostHooks
+  → (GraphicsOwner Scene → IO ())
   → IO ()
   → Logger
   → Seam
@@ -261,13 +298,14 @@ ownedHostRun
   → GraphicsOwnerConfig Scene
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO a
-ownedHostRun hooks startup logger seam config ownerConfig action =
+ownedHostRun hooks observe startup logger seam config ownerConfig action =
     runGraphicsOwnerApplication
       (withLoggingLifetime logger)
       (Text.pack "owner-example")
       ( \_ use →
-          Private.withGraphicsOwnerHostWith
+          Private.withGraphicsOwnerHostObserved
             hooks
+            observe
             logger
             (seamSession seam defaultSessionConfig)
             config

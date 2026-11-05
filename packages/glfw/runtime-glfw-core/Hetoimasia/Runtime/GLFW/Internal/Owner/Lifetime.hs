@@ -47,6 +47,7 @@ module Hetoimasia.Runtime.GLFW.Internal.Owner.Lifetime
   ( withGraphicsOwnerHost
   , withGraphicsOwnerHostIn
   , withGraphicsOwnerHostWith
+  , withGraphicsOwnerHostObserved
   , runGraphicsOwnerApplication
   , superviseGraphicsOwner
   ) where
@@ -125,8 +126,28 @@ withGraphicsOwnerHostWith
   → GraphicsOwnerConfig scene
   → (WindowHost → GraphicsOwner scene → IO r)
   → IO r
-withGraphicsOwnerHostWith hooks logger sessionScope =
-  withGraphicsOwnerHostAll hooks logger (Just sessionScope)
+withGraphicsOwnerHostWith hooks = withGraphicsOwnerHostObserved hooks (\_ → pure ())
+
+-- | 'withGraphicsOwnerHostWith' that also hands the owner to an observer the
+-- moment its handle is published to the protected exit (#613).
+--
+-- A start that is abandoned never returns the handle to the application, so
+-- an example that must judge such an owner afterwards — that its worker is
+-- terminal and never ran its action, or that it must be given independent
+-- evidence — has no other way to name it. The observer runs on the starting
+-- thread, in the start's preparation step, after the publication committed;
+-- like the hooks it is private and nothing in production passes one.
+withGraphicsOwnerHostObserved
+  ∷ HostHooks
+  → (GraphicsOwner scene → IO ())
+  → Logger
+  → Scoped Session
+  → HostConfig
+  → GraphicsOwnerConfig scene
+  → (WindowHost → GraphicsOwner scene → IO r)
+  → IO r
+withGraphicsOwnerHostObserved hooks observe logger sessionScope =
+  withGraphicsOwnerHostAll hooks observe logger (Just sessionScope)
 
 withGraphicsOwnerHostOver
   ∷ Logger
@@ -135,17 +156,18 @@ withGraphicsOwnerHostOver
   → GraphicsOwnerConfig scene
   → (WindowHost → GraphicsOwner scene → IO r)
   → IO r
-withGraphicsOwnerHostOver = withGraphicsOwnerHostAll noHostHooks
+withGraphicsOwnerHostOver = withGraphicsOwnerHostAll noHostHooks (\_ → pure ())
 
 withGraphicsOwnerHostAll
   ∷ HostHooks
+  → (GraphicsOwner scene → IO ())
   → Logger
   → Maybe (Scoped Session)
   → HostConfig
   → GraphicsOwnerConfig scene
   → (WindowHost → GraphicsOwner scene → IO r)
   → IO r
-withGraphicsOwnerHostAll hooks logger sessionScope config ownerConfig use = do
+withGraphicsOwnerHostAll hooks observe logger sessionScope config ownerConfig use = do
   -- The exit runs after the consumer has returned, so it reads the owner from
   -- a cell the consumer filled rather than from a value it could be given. An
   -- exit that finds none is a host whose owner never started, which still
@@ -164,8 +186,28 @@ withGraphicsOwnerHostAll hooks logger sessionScope config ownerConfig use = do
           , exitBeforeDrain = \_ _ → readTVarIO pending >>= traverse_ beginOwnerExit
           , exitAfterDrain = \host restore → readTVarIO pending >>= traverse_ (finishOwnerExit (afterDestructionSnapshot hooks) restore logger host)
           }
-      publish owner = atomically $ do
-        writeTVar pending (Just owner)
+      publish owner = do
+        atomically $ do
+          writeTVar pending (Just owner)
+          closed ← readTVar quiesced
+          when closed (closeOwnerPublications (ownerHandoff' owner))
+        observe owner
+      -- The starter's: an owner whose start was abandoned before its run action
+      -- began is taken back out of the cell the exit reads (#613). The exit
+      -- then finds none and settles as it does for a host whose owner never
+      -- started; it has nothing to wait for, because the worker is terminal
+      -- and recorded no destruction evidence only because the action that
+      -- records it never ran. Mechanism A of the owner's decision: nothing is
+      -- published as evidence, and the exit's wait is not changed.
+      --
+      -- Idempotent, and a no-op for an owner that was never published. If the
+      -- host's quiescence committed while the owner was published, it closed
+      -- the owner's publications then; if it committed before, 'publish' did;
+      -- either way the withdrawn owner admits nothing from here on. Run in the
+      -- transaction that observed the worker terminal, so no quiescence or
+      -- exit step falls between the two.
+      withdraw owner = do
+        writeTVar pending Nothing
         closed ← readTVar quiesced
         when closed (closeOwnerPublications (ownerHandoff' owner))
   -- The group's own scope sits outside the protected host lifetime
@@ -176,7 +218,7 @@ withGraphicsOwnerHostAll hooks logger sessionScope config ownerConfig use = do
   -- has already drained, so its automatic join finds it settled.
   withWorkerGroup $ \group →
     withProtectedWindowHostOver hooks exit logger sessionScope config $ \host → do
-      owner ← startGraphicsOwner group host (afterOwnerOperation hooks) (ownerBoundary hooks) ownerConfig publish
+      owner ← startGraphicsOwner group host (afterOwnerOperation hooks) (ownerBoundary hooks) (ownerWorkerBoundary hooks) ownerConfig publish withdraw
       use host owner
 
 -- | 'Hetoimasia.Runtime.GLFW.runProtectedWindowApplication' over a host that
