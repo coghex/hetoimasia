@@ -18,6 +18,7 @@ module Test.GLFW.Native.Unowned
   , cleanupLater
   , runCleanups
   , unownedScope
+  , unownedScopeProtecting
 
     -- * Ending a scope
   , Ending (..)
@@ -62,18 +63,28 @@ runCleanups (Cleanups ref) = readIORef ref >>= foldr (\cleanup rest → cleanup 
 -- however it ended, and nothing stops or joins it when the scope ends. Its independent stop-and-join is registered with the
 -- control in the same masked step, so the control can always end what it left, even a thread it kills before it ran anything.
 -- The defect the controls model is the missing stop-and-join of the scope, not an unannounced end.
+--
+-- The registered stop-and-join is itself uninterruptible ('uninterruptibleMask_'): 'runCleanups' runs it through @finally@,
+-- which masks only interruptibly, so without that a cancellation delivered while the kill or the join blocks would abort the
+-- cleanup and leave the worker alive, and no later entry retries it (round 1 of #594).
 unownedScope ∷ Cleanups → Scope
-unownedScope cleanups = Scope $ \boundness open action body → do
-  (thread, done) ← startUnowned cleanups boundness open action
+unownedScope = unownedScopeProtecting uninterruptibleMask_
+
+-- | 'unownedScope' with a chosen protection for the registered stop-and-join: 'uninterruptibleMask_' is the control's own
+-- cleanup; the identity is the interruptible cleanup it replaced, which exists only for the negative control of that guarantee
+-- ("Test.GLFW.Native.Ownership").
+unownedScopeProtecting ∷ (IO () → IO ()) → Cleanups → Scope
+unownedScopeProtecting protect cleanups = Scope $ \boundness open action body → do
+  (thread, done) ← startUnowned protect cleanups boundness open action
   body thread (readMVar done)
 
-startUnowned ∷ Cleanups → Boundness → IO () → IO () → IO (ThreadId, MVar ())
-startUnowned cleanups boundness open action = mask_ $ do
+startUnowned ∷ (IO () → IO ()) → Cleanups → Boundness → IO () → IO () → IO (ThreadId, MVar ())
+startUnowned protect cleanups boundness open action = mask_ $ do
   done ← newEmptyMVar
   thread ← case boundness of
     Unbound → forkIOWithUnmask $ \unmask → unmask action `finally` putMVar done ()
     Bound → uninterruptibleMask_ (forkOS (unsafeUnmask action `finally` putMVar done ()))
-  cleanupLater cleanups (open >> killThread thread >> readMVar done)
+  cleanupLater cleanups (protect (open >> killThread thread >> void (readMVar done)))
   pure (thread, done)
 
 -- | How the scope that owns a helper is made to end while the helper's thread is parked: its body fails, or it is cancelled.

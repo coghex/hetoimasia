@@ -43,10 +43,12 @@ import Test.GLFW.Native.Unowned
   , newCleanups
   , runCleanups
   , unownedScope
+  , unownedScopeProtecting
   )
 import Test.GLFW.Native.Wake (Waits (..), wokenWaitIn)
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.Support.Bounded (bounded)
+import Test.Support.Cancel (awaitBlockedSending)
 
 spec ∷ Spec
 spec = describe "owns the threads its helpers start (#594)" $ do
@@ -59,6 +61,12 @@ spec = describe "owns the threads its helpers start (#594)" $ do
         it ("negative control: the unowned start leaves " <> kind <> " thread running when " <> label <> " while it is parked") $ do
           cleanups ← newCleanups
           (ran (unownedScope cleanups) cleanups >>= (`shouldBe` False)) `finally` runCleanups cleanups
+
+  describe "the controls' own cleanup" $ do
+    it "is not abandoned by a cancellation delivered while the kill is blocked, so the worker it registered is stopped and joined" $
+      cleanupCancelled uninterruptibleMask_ >>= (`shouldBe` True)
+    it "negative control: an interruptible cleanup is abandoned by that cancellation and leaves the worker alive" $
+      cleanupCancelled id >>= (`shouldBe` False)
 
   describe "runOwned's borrower" $
     for_ endings $ \(label, ending) → do
@@ -216,3 +224,35 @@ launcherHeld scope cleanups ending = do
       readers ← atomically (sequence (Child.ownedReadersFinished owned))
       gone ← either (\(_ ∷ IOException) → True) (const False) <$> try (signalProcess nullSignal (Child.ownedPid owned))
       pure (ended && and readers && gone)
+
+-- | The cleanup a control registers for the unowned thread it leaves, run on a thread of its own and cancelled while its kill
+-- is blocked: the worker is held where only its own unmasking can receive the kill, so the cleanup blocks in @killThread@, the
+-- cancellation is aimed at it there, and only then is the worker let go. A cleanup that is not interruptible defers the
+-- cancellation until it has stopped and joined the worker (which then has ended); an interruptible one takes the cancellation
+-- in the blocked kill, is abandoned, and never sends the kill, so the worker goes on to the wait only the kill can end.
+cleanupCancelled ∷ (IO () → IO ()) → IO Bool
+cleanupCancelled protect = do
+  cleanups ← newCleanups
+  who ← newEmptyMVar
+  held ← newEmptyMVar
+  gate ← newEmptyMVar
+  never ← newEmptyMVar ∷ IO (MVar ())
+  result ← newEmptyMVar
+  -- The worker's wait at the end is reachable from this scenario's frame until it has judged, so the runtime does not end the
+  -- worker as deadlocked; it is then let go whatever happened.
+  ( do
+      startIn (unownedScopeProtecting protect cleanups) Unbound (pure ()) (myThreadId >>= putMVar who >> putMVar held () >> uninterruptibleMask_ (readMVar gate) >> readMVar never) $ \_ _ →
+        readMVar held
+      worker ← readMVar who
+      startIn ownedScope Unbound (pure ()) (try @SomeException (runCleanups cleanups) >>= putMVar result) $ \runner runnerEnded → do
+        blockedKill ← awaitBlockedSending runner
+        blockedKill `shouldBe` True
+        startIn ownedScope Unbound (pure ()) (throwTo runner UserInterrupt) $ \canceller _ → do
+          -- Deferred (the thrower blocks) when the cleanup cannot be interrupted; taken at once (the thrower ends) when it can.
+          void (awaitBlockedSending canceller)
+          putMVar gate ()
+          runnerEnded
+          readMVar result >>= (`shouldBe` True) . endedAs Cancelled
+        hasEnded worker
+    )
+    `finally` void (tryPutMVar never ())
