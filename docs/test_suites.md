@@ -261,9 +261,11 @@ cabal test hetoimasia-tests --test-show-details=direct
   `testFullPortDoesNotBlockExit`, `Owner/Exit/Settlement.hs` `testUnannouncedDirectAttachSettles`,
   `testUnannouncedClosedSettles` and `testCoherentDestructionSnapshot`, `Owner/Handover.hs`
   `testHandoffOrder` and `testHandoverRecovery`, `Owner/Failure/Interruption.hs`
-  `testRetirementRecordSurvivesCancellation` (its harasser is an owned start that stops at the
-  target's record; under `-N2` the old stream of cancellations outlasted the target's retirement and
-  reached the owner's destruction, which production rightly leaves unverified), and `Protected.hs`
+  `testRetirementRecordSurvivesCancellation` (its harasser is an owned start that
+  delivers one cancellation, after the retirement call returned, and the owner's later calls wait for
+  it; under `-N2` the old stream of cancellations outlasted the target's retirement and reached the
+  owner's destruction, which production rightly leaves unverified; a cancellation that interrupts
+  the call instead is its own example), and `Protected.hs`
   `testStallWarningCancelledAtItsSink` (its supplier and runner are owned; the scope that owns the
   runner releases the registered owners and the sink's hold before it kills the runner).
   The seven that hold the owner's startup or its destruction are cut at every boundary of the
@@ -272,7 +274,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   `OwnerBeforePublication` before the owner's handle is published and `OwnerStarted` after the start
   has published it), the rig's startup callback, and the body's entry, each ending the run by a
   failure, a cancellation pending when the boundary is reached, or a cancellation delivered while the
-  run is parked there. The rescue is the exit's own: the wait for the owner's destruction opens the
+  run is parked there. A pending cancellation is made pending by a sender pinned to the target's
+  capability (`withOwnedThreadOn`, #610), because across capabilities a throw is a message that is
+  taken in later. The rescue is the exit's own: the wait for the owner's destruction opens the
   fixture's gate on its first snapshot (`afterDestructionSnapshot`), and the body opens it on every
   way out (`heldBody`). **Known production gap (#613).** Two boundaries of the start are not cut:
   after the owner's handle is published inside the preparation step, and the abandoned-start path of
