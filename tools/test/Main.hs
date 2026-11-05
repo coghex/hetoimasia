@@ -12,6 +12,7 @@ import qualified ApprovalProvenance
 import qualified CiImage
 import qualified DismissalStep
 import qualified Execution
+import qualified OwnedHost
 import qualified OwnedStarts
 import qualified OwnedSubprocess
 import qualified OwnedThread
@@ -102,6 +103,7 @@ suite = hspec $ do
   Packaging.spec
   OwnedThread.spec
   OwnedSubprocess.spec
+  OwnedHost.spec
   OwnedStarts.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a

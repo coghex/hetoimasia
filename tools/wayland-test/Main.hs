@@ -19,7 +19,7 @@ import System.Directory
   , setPermissions
   )
 import System.Environment (getEnvironment)
-import System.Process (CreateProcess (cwd, env), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd, env), proc)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -37,11 +37,16 @@ import Test.Hspec
   )
 
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
+import Test.Support.Subprocess (RunBound (Within), runCaptured)
+import Test.Support.Subprocess.Host (Host, hostedCaptured, withHost)
 
 data Display = Display
   { directory ∷ FilePath
   , toolbox ∷ FilePath
   , script ∷ FilePath
+  , host ∷ Host
+  -- ^ Where the helper runs. It keeps the helper's process group until the session's scope ends (#608), so an example can look at
+  -- what the helper left behind, and it ends and reaps whatever remains then.
   }
 
 main ∷ IO ()
@@ -68,14 +73,14 @@ installStubs display stubs =
 withHelper ∷ FilePath → (Display → IO a) → IO a
 withHelper relative action = do
   checkout ← getCurrentDirectory
-  withSystemTempDirectory "hetoimasia-display" $ \scratch → do
+  withSystemTempDirectory "hetoimasia-display" $ \scratch → withHost $ \hostedAt → do
     let box = scratch </> "bin"
     createDirectory box
     forM_ utilities $ \name →
       findExecutable name >>= \case
         Just found → createFileLink found (box </> name)
         Nothing → expectationFailure (name ++ " is not on PATH, so the helper's toolbox cannot be assembled")
-    action (Display scratch box (checkout </> relative))
+    action (Display scratch box (checkout </> relative) hostedAt)
 
 -- | The ordinary utilities the helpers and these examples' commands use. The
 -- display programs themselves are deliberately absent unless stubbed.
@@ -354,12 +359,12 @@ helperRun defaultSignals session arguments = do
   if defaultSignals
     then do
       perl ← findExecutable "perl" >>= maybe (fail "perl is not on PATH") pure
-      run
-        settings
-        (directory session)
-        perl
-        (["-e", "$SIG{HUP} = 'DEFAULT'; $SIG{INT} = 'DEFAULT'; exec @ARGV", bash, script session] ++ arguments)
-    else run settings (directory session) bash (script session : arguments)
+      hosted settings (directory session) perl (["-e", "$SIG{HUP} = 'DEFAULT'; $SIG{INT} = 'DEFAULT'; exec @ARGV", bash, script session] ++ arguments)
+    else hosted settings (directory session) bash (script session : arguments)
+  where
+    hosted environment path executable options =
+      hostedCaptured (host session) helperBound (invocation environment path executable options) ""
+
 
 -- | A shell command that records the Wayland environment the helper gave it.
 -- The socket the helper named is not predictable, so what is asserted is the
@@ -552,6 +557,18 @@ refusedSession session reason = do
 
 -- Each shell fixture supplies its private display environment.
 run ∷ [(String, String)] → FilePath → String → [String] → IO (ExitCode, String, String)
-run environment path executable arguments =
-  readCreateProcessWithExitCode
-    (proc executable arguments) {cwd = Just path, env = Just environment} ""
+run environment path executable arguments = runCaptured probeBound (invocation environment path executable arguments) ""
+
+invocation ∷ [(String, String)] → FilePath → String → [String] → CreateProcess
+invocation environment path executable arguments = (proc executable arguments) {cwd = Just path, env = Just environment}
+
+-- | The run bound of one helper run. The helper's own deadline is 10 seconds for the compositor to serve its socket, its teardown
+-- after it waits for what it stopped, and the examples' own watchdog is 30 seconds (@watched@); 120 seconds never cuts a helper run
+-- short before they have finished, and is far under the 600 seconds the catalog allows the whole suite.
+helperBound ∷ RunBound
+helperBound = Within (120 * 1000000)
+
+-- | The run bound of a probe (@kill@, @ps@, @mkfifo@): short utilities that never wait behind a helper run, because they are one-shot
+-- owned calls and not requests to the host.
+probeBound ∷ RunBound
+probeBound = Within (60 * 1000000)
