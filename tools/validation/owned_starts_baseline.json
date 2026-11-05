@@ -5,13 +5,6 @@
     "packages/content/test/Test/Content/Support.hs": 1,
     "packages/glfw/test/Test/GLFW/Owner/Failure/Interruption.hs": 1,
     "packages/glfw/test/Test/GLFW/Protected.hs": 2,
-    "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/ChildSpec.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Fixture.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Interaction.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Terminal.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/Vulkan/Proof/Bridge.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/Vulkan/Proof/ConstructionSpec.hs": 2,
-    "packages/gpu-vulkan/glfw/native-test/Test/Vulkan/Proof/PublicationSpec.hs": 2,
     "packages/scripting-lua/test/Test/Lua/Reentry.hs": 2,
     "packages/scripting-lua/test/Test/Lua/Support.hs": 1,
     "run-native-test/Main.hs": 1

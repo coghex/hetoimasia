@@ -262,6 +262,18 @@
       "reason": "the glfw-tests negative controls' deliberately unowned bound start, a plain forkOS (#593), stopped and joined independently by the control that made it"
     },
     {
+      "file": "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Unowned.hs",
+      "binding": "startUnowned",
+      "sites": 1,
+      "reason": "the vulkan-native-tests ownership regressions' negative controls' deliberately unowned start (#596), which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
+      "file": "tools/test/OwnedThread.hs",
+      "binding": "startUnownedOn",
+      "sites": 1,
+      "reason": "the negative control's deliberately unowned pinned start (a plain forkOn, #596), which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
       "file": "packages/lua-engine/test/Test/LuaEngine/Unowned.hs",
       "binding": "startUnowned",
       "sites": 1,

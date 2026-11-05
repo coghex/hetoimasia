@@ -44,6 +44,12 @@ module Test.GPU.Vulkan.Native.Fixture
   , SharedReport (..)
   , ThreadCheck (..)
   , runShared
+    -- * The test-side seams
+  , Request
+  , Session
+  , Seams (..)
+  , afterFailureBound
+  , runSharedWith
   , fixtureConsent
   , onMain
   , sharedHost
@@ -58,7 +64,7 @@ module Test.GPU.Vulkan.Native.Fixture
   , awaitWithin
   ) where
 
-import Control.Concurrent (ThreadId, forkFinally, isCurrentThreadBound, myThreadId)
+import Control.Concurrent (ThreadId, isCurrentThreadBound, myThreadId)
 import Control.Concurrent.STM
   ( STM
   , TMVar
@@ -101,6 +107,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Encoding
 import Data.Word (Word64)
+import System.Timeout (timeout)
 
 import Hetoimasia.Foundation.Log
   ( DebugSelection (DebugAll)
@@ -157,6 +164,7 @@ import Test.GPU.Vulkan.Native.Environment (checkValidationFeatures, validationFe
 import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, consentBackend)
 import Test.GPU.Vulkan.Native.Gate (Gate, admit, gateConsent)
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
+import Test.Support.Owned (withOwnedThreadOpening)
 import Test.Vulkan.Proof.Interop (osThread)
 import Test.Vulkan.Proof.Roots (NativeCall, nativeCallObserver, rootsCaptureConfig)
 
@@ -219,10 +227,57 @@ instance Exception Finished
 fixtureConsent ∷ Fixture → Either Refusal Consent
 fixtureConsent = gateConsent . fixtureGate
 
+-- | What serves the first operation once the session is acquired: the production session, or a test's stand-in. It
+-- answers when the borrower has finished and the session has been released, and it is given the cell the verdict is
+-- written to. It is the only place the native layer is entered.
+type Session = Fixture → IORef (Maybe DiagnosticVerdict) → Request → IO ()
+
+-- | The two seams a test of the dispatch itself needs, and nothing a run uses by default ('runShared' gives the
+-- production values). Neither changes what a run does: a test substitutes a stand-in session so that the dispatch can be
+-- exercised without a native acquisition, and the start of the borrower so that the unowned start it replaced can be
+-- compared with the owned one.
+data Seams = Seams
+  { seamSession ∷ Session
+  , seamBorrow ∷ ∀ b. IO () → IO () → (ThreadId → IO () → IO b) → IO b
+    -- ^ How the borrower is started for the length of the dispatch: what must be let go before it can end (idempotent,
+    -- non-blocking), its action, and the body that serves it. Production: 'withOwnedThreadOpening'.
+  , seamFailureBound ∷ Int
+    -- ^ How long, in microseconds, the dispatch waits for the borrower to finish on its own once the session has failed and
+    -- been reported (see 'runSharedWith'). Production: 'afterFailureBound'. A test that wants the expiry states zero, which
+    -- expires at once and needs no timing.
+  }
+
+-- | The bound on the wait for the borrower after a session failure: fifteen minutes, an order of magnitude beyond what the whole
+-- profile takes on the slowest runner, so it only ever turns a borrower that nothing will finish into a failure, never a slow
+-- run into one. It is a failure bound and not a coordination: the wait ends earlier, on the borrower's result, in every run
+-- that is not stuck.
+afterFailureBound ∷ Int
+afterFailureBound = 15 * 60 * 1000000
+
 -- | Run the borrower — the Hspec run — on a thread of its own, and serve its
 -- operations on this one, which must be the process main thread.
+--
+-- The borrower is owned (#596): however serving ends — a return, a failure, a timeout of the example, a cancellation, in
+-- the idle wait, in the session or in the wait for the borrower's result — the borrower has ended and been joined before
+-- this returns or raises. Its start and its stop-and-join are one masked step, and the release first fills the cell that
+-- ends every wait on the session (an idempotent, non-blocking opening), so a borrower held at the session's end is let
+-- go before it is killed. The wait for the borrower's result stays: it is what lets the Hspec run finish and report after a
+-- session that could not be served, and ownership adds only that no exit leaves the borrower behind. That wait is the one place
+-- a session failure that was caught and reported could keep the scope from reaching its release, when the borrower is parked
+-- where nothing now ends it, so it is bounded ('seamFailureBound'): a borrower still running when the bound expires is stopped
+-- and joined by the scope's release, and the dispatch raises, naming the failure that was reported. Every other path already
+-- holds the borrower's result when it gets here (the serving loop ends only when the borrower has), so the wait there takes it
+-- at once.
+--
+-- State owner: this function owns the borrower's thread, and the request queue, the cells and the counters the borrower
+-- shares with the serving thread. Readers/writers: the borrower (requests, its result, its done flag) and the serving thread
+-- (the replies). Thread: the borrower's, one per call. Lifetime: the call. Disposal: the scope's release.
 runShared ∷ Gate → (Fixture → IO a) → IO (a, SharedReport)
-runShared gate borrower = do
+runShared = runSharedWith Seams {seamSession = nativeSession, seamBorrow = withOwnedThreadOpening, seamFailureBound = afterFailureBound}
+
+-- | 'runShared' with its seams given (see 'Seams'); a test-side entry only.
+runSharedWith ∷ Seams → Gate → (Fixture → IO a) → IO (a, SharedReport)
+runSharedWith seams gate borrower = do
   requests ← newTQueueIO
   done ← newTVarIO False
   ended ← newEmptyTMVarIO
@@ -235,78 +290,99 @@ runShared gate borrower = do
   mainOs ← osThread
   let fixture = Fixture gate requests done ended host calls checks acquisitions mainThread mainOs entries
   result ← newEmptyTMVarIO
-  _ ← forkFinally (borrower fixture) (\outcome → atomically (putTMVar result outcome >> writeTVar done True))
-  verdictCell ← newIORef Nothing
-  failure ← idle fixture verdictCell
-  -- Anything still queued, or submitted from now on, is answered: the session
-  -- has gone.
-  void (atomically (tryPutTMVar ended (maybe (toException Finished) id failure)))
-  declineQueued fixture
-  outcome ← atomically (takeTMVar result)
-  report ←
-    SharedReport
-      <$> readIORef acquisitions
-      <*> (reverse <$> readIORef calls)
-      <*> readIORef verdictCell
-      <*> pure (Text.pack . displayException <$> failure)
-      <*> (reverse <$> readIORef checks)
-      <*> pure mainOs
-      <*> pure mainThread
-      <*> (reverse <$> readIORef entries)
-  either throwIO (\value → pure (value, report)) outcome
+  let -- What 'forkFinally' did, so the borrower's result and done flag are published however it ended.
+      borrow = mask $ \restore → try @SomeException (restore (borrower fixture)) >>= \outcome → atomically (putTMVar result outcome >> writeTVar done True)
+      -- Anything waiting on the session is answered, once, by whoever gets there first.
+      release = void (atomically (tryPutTMVar ended (toException Finished)))
+  seamBorrow seams release borrow $ \_ _ → do
+    verdictCell ← newIORef Nothing
+    failure ← idle (seamSession seams) fixture verdictCell
+    -- Anything still queued, or submitted from now on, is answered: the session
+    -- has gone.
+    void (atomically (tryPutTMVar ended (maybe (toException Finished) id failure)))
+    declineQueued fixture
+    outcome ← case failure of
+      Nothing → atomically (takeTMVar result)
+      Just reported →
+        timeout (seamFailureBound seams) (atomically (takeTMVar result))
+          >>= maybe
+            (throwIO (userError ("the borrower had not finished when the bound on waiting for it after the session failed expired; the session failed: " <> displayException reported)))
+            pure
+    report ←
+      SharedReport
+        <$> readIORef acquisitions
+        <*> (reverse <$> readIORef calls)
+        <*> readIORef verdictCell
+        <*> pure (Text.pack . displayException <$> failure)
+        <*> (reverse <$> readIORef checks)
+        <*> pure mainOs
+        <*> pure mainThread
+        <*> (reverse <$> readIORef entries)
+    either throwIO (\value → pure (value, report)) outcome
 
 -- | Wait for the first operation, or for the borrower to finish without one.
-idle ∷ Fixture → IORef (Maybe DiagnosticVerdict) → IO (Maybe SomeException)
-idle fixture verdictCell = do
+idle ∷ Session → Fixture → IORef (Maybe DiagnosticVerdict) → IO (Maybe SomeException)
+idle session fixture verdictCell = do
   next ← atomically ((Just <$> readTQueue (fixtureRequests fixture)) `orElse` (Nothing <$ (readTVar (fixtureBorrowerDone fixture) >>= check)))
   case next of
     Nothing → pure Nothing
     Just request → do
       gone ← readTVarIO (requestAbandoned request)
       if gone
-        then requestDecline request (toException Finished) >> idle fixture verdictCell
-        else acquire fixture verdictCell request
+        then requestDecline request (toException Finished) >> idle session fixture verdictCell
+        else acquire session fixture verdictCell request
 
 -- | Enter the session for the first operation, serve every operation until
 -- the borrower finishes, and release it.
-acquire ∷ Fixture → IORef (Maybe DiagnosticVerdict) → Request → IO (Maybe SomeException)
-acquire fixture verdictCell first = do
+--
+-- A failure of the session is answered and reported, never retried. A cancellation is not a failure of the session: it is
+-- answered to the operation that was waiting for the session, and then raised again, so that it ends the dispatch (and the
+-- scope that owns the borrower) instead of being read as a session that failed and followed by a wait for a borrower that
+-- nothing now ends.
+acquire ∷ Session → Fixture → IORef (Maybe DiagnosticVerdict) → Request → IO (Maybe SomeException)
+acquire session fixture verdictCell first = do
   modifyIORef' (fixtureAcquisitions fixture) (+ 1)
-  outcome ← try @SomeException $ do
-    -- Consent is asked again before anything native is initialized, so an
-    -- operation that reached the owner without passing the gate is refused
-    -- here. It also names the backend the session requests.
-    consent ← admit (fixtureGate fixture)
-    checkValidationFeatures >>= either (throwIO . userError . Text.unpack) pure
-    scene ← prepare ()
-    budgets ← either (throwIO . userError . show) pure (validateBudgets defaultBudgetRequest)
-    let logger = collectingLogger (fixtureEntries fixture)
-        host = requestingBackend (consentBackend consent) (defaultHostConfig []) {hostIdleWait = 0.02, hostWindowLimit = 8}
-        config =
-          (vulkanHostConfig host rootsCaptureConfig budgets scene)
-            { vulkanLayers = [Encoding.encodeUtf8 "VK_LAYER_KHRONOS_validation"]
-            , vulkanValidationFeatures = validationFeatures
-            , vulkanObserver = nativeCallObserver (fixtureCalls fixture)
-            }
-    withLoaderIntegration $ \integration →
-      runGraphicsOwnerApplication
-        (withLoggingLifetime logger)
-        "vulkan-native-tests"
-        ( \_ use → do
-            (served, verdict) ← withVulkanOwnerHost logger integration config use
-            writeIORef verdictCell (Just verdict)
-            pure served
-        )
-        vulkanWindowHost
-        (\vulkan _ → pure vulkan)
-        (serve fixture first)
+  outcome ← try @SomeException (session fixture verdictCell first)
   case outcome of
     Left failure → do
       -- An acquisition that failed is never retried: the first operation and
       -- every later one are answered with the failure.
       requestDecline first failure
-      pure (Just failure)
+      case fromException failure of
+        Just (_ ∷ SomeAsyncException) → throwIO failure
+        Nothing → pure (Just failure)
     Right () → pure Nothing
+
+-- | The production session: the shared graphics session, entered for the first operation.
+nativeSession ∷ Session
+nativeSession fixture verdictCell first = do
+  -- Consent is asked again before anything native is initialized, so an
+  -- operation that reached the owner without passing the gate is refused
+  -- here. It also names the backend the session requests.
+  consent ← admit (fixtureGate fixture)
+  checkValidationFeatures >>= either (throwIO . userError . Text.unpack) pure
+  scene ← prepare ()
+  budgets ← either (throwIO . userError . show) pure (validateBudgets defaultBudgetRequest)
+  let logger = collectingLogger (fixtureEntries fixture)
+      host = requestingBackend (consentBackend consent) (defaultHostConfig []) {hostIdleWait = 0.02, hostWindowLimit = 8}
+      config =
+        (vulkanHostConfig host rootsCaptureConfig budgets scene)
+          { vulkanLayers = [Encoding.encodeUtf8 "VK_LAYER_KHRONOS_validation"]
+          , vulkanValidationFeatures = validationFeatures
+          , vulkanObserver = nativeCallObserver (fixtureCalls fixture)
+          }
+  withLoaderIntegration $ \integration →
+    runGraphicsOwnerApplication
+      (withLoggingLifetime logger)
+      "vulkan-native-tests"
+      ( \_ use → do
+          (served, verdict) ← withVulkanOwnerHost logger integration config use
+          writeIORef verdictCell (Just verdict)
+          pure served
+      )
+      vulkanWindowHost
+      (\vulkan _ → pure vulkan)
+      (serve fixture first)
 
 -- | Turn the owner loop, running each queued operation between turns, until
 -- the borrower has finished.

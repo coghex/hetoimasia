@@ -14,7 +14,7 @@
 --
 -- The cancellation is real rather than simulated: a second thread's 'throwTo',
 -- delivered at the first point the code under test permits one. Determinism
--- comes from 'throwTo' itself and not from a delay — see 'armCancellation' —
+-- comes from 'throwTo' itself and not from a delay — see 'withCancelledWorker' —
 -- so there is no sleep here, no retry budget, and nothing that could pass by
 -- luck. An unprotected handoff is cancelled inside the stand-in enqueue
 -- instead of after it, which is a different recorded result and a different
@@ -22,8 +22,6 @@
 -- them.
 module Test.Vulkan.Proof.PublicationSpec (spec) where
 
-import Control.Concurrent (ThreadId, forkOn, myThreadId, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , Exception
@@ -32,15 +30,12 @@ import Control.Exception
   , displayException
   , getMaskingState
   , throwIO
-  , throwTo
   , toException
-  , try
   )
 import Data.Foldable (for_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Test.Hspec
 
 import Vulkan.Core10.Enums.Result (Result (..))
@@ -48,6 +43,7 @@ import Vulkan.Exception (VulkanException (..))
 
 import Test.Vulkan.Proof.Findings (Failure (..))
 import Test.Vulkan.Proof.Ownership (Ledger, newLedger, observations, observe)
+import Test.Vulkan.Proof.PendingCancellation (withCancelledWorker)
 import Test.Vulkan.Proof.Publication (catchAll, publishPresent)
 import Test.Vulkan.Proof.Retention
   ( Disposition (..)
@@ -96,14 +92,14 @@ data Attempt = Attempt
 
 -- | Run one present handoff through the production path, with a stand-in for
 -- the native call, and report what it left behind.
-attempt ∷ Ledger → SlotName → (IORef Bool → IO Result) → IO Attempt
+attempt ∷ Ledger → SlotName → (IO () → IORef Bool → IO Result) → IO Attempt
 attempt ledger slot enqueue = do
   enqueued ← newIORef False
   presented ← newIORef False
   ended ←
-    onItsOwnThread $
+    onItsOwnThread $ \arm →
       catchAll
-        (Completed . snd <$> publishPresent ledger slot presented (enqueue enqueued))
+        (Completed . snd <$> publishPresent ledger slot presented (enqueue arm enqueued))
         (pure . StoppedAt)
   Attempt (either escaped id ended)
     <$> readIORef enqueued
@@ -112,17 +108,17 @@ attempt ledger slot enqueue = do
   where
     escaped = Escaped . Text.pack . displayException
 
--- | Run the attempt on a thread of its own, on 'theCapability'.
+-- | Run the attempt on a thread of its own, on 'theCapability', and answer how it ended. The thread, and the killer that
+-- 'cancelledEnqueue' arms, are owned starts ('withCancelledWorker', #596): they are started and joined by this call however it
+-- ends, and the killer outlives the arm, so the cancellation it delivers stays pending against the attempt until the attempt
+-- has received it.
 --
 -- A handoff that fails to protect its publication is cancelled for real, and
 -- the thread it was cancelled on dies; that must be this thread rather than
 -- the one Hspec is reporting on, so the failure is an assertion about what was
 -- recorded rather than a dead runner.
-onItsOwnThread ∷ IO a → IO (Either SomeException a)
-onItsOwnThread action = do
-  done ← newEmptyMVar
-  _ ← forkOn theCapability (try @SomeException action >>= putMVar done)
-  takeMVar done
+onItsOwnThread ∷ (IO () → IO a) → IO (Either SomeException a)
+onItsOwnThread = withCancelledWorker theCapability (toException ThreadKilled)
 
 -- | The one capability the attempt and its killer both run on.
 --
@@ -148,59 +144,28 @@ theCapability = 0
 -- The order is what makes it faithful. The effect exists before the
 -- cancellation can be taken, exactly as it does the instant the real call
 -- returns, and the result is reported after it, exactly as the real one's is.
-cancelledEnqueue ∷ Result → IORef Bool → IO Result
-cancelledEnqueue reported enqueued = do
+cancelledEnqueue ∷ Result → IO () → IORef Bool → IO Result
+cancelledEnqueue reported armCancellation enqueued = do
   writeIORef enqueued True
   armCancellation
   pure reported
 
 -- | The same stand-in without a cancellation: the ordinary path, which this
 -- change must leave exactly as it was.
-plainEnqueue ∷ Result → IORef Bool → IO Result
-plainEnqueue reported enqueued = reported <$ writeIORef enqueued True
+plainEnqueue ∷ Result → IO () → IORef Bool → IO Result
+plainEnqueue reported _ enqueued = reported <$ writeIORef enqueued True
 
 -- | A stand-in that throws instead of returning, which is how the binding
 -- reports an error code and how anything else that goes wrong arrives.
-throwingEnqueue ∷ SomeException → IORef Bool → IO Result
-throwingEnqueue failure enqueued = writeIORef enqueued True *> throwIO failure
+throwingEnqueue ∷ SomeException → IO () → IORef Bool → IO Result
+throwingEnqueue failure _ enqueued = writeIORef enqueued True *> throwIO failure
 
--- | Arrange for this thread to be cancelled at the first point the code under
--- test permits one, and do not return until that cancellation is certain.
---
--- 'throwTo' does not return until its exception has been raised in the target,
--- and it blocks while the target is masked. So a killer sitting in
--- 'BlockedOnException' is exactly the state "a cancellation is pending against
--- us, and will be taken the moment we are unmasked" — and waiting for that
--- state is what makes these examples deterministic instead of timed. There is
--- no sleep, no retry budget, and no window in which the two threads could race
--- to a different answer. Both threads run on 'theCapability', which is what
--- makes that state mean what it says.
---
--- Where the cancellation then lands is decided by the code under test, which
--- is the point. A masked handoff takes it after the publication, where
--- 'Test.Vulkan.Proof.Publication.publishing' restores the caller's masking
--- state. An unmasked one never lets the killer block at all: 'throwTo' raises
--- immediately, here, before this stand-in has reported its result. Either way
--- this wait ends — the loop sees the killer blocked, or is itself cancelled.
-armCancellation ∷ IO ()
-armCancellation = do
-  target ← myThreadId
-  killer ← forkOn theCapability (throwTo target ThreadKilled)
-  awaitPending killer
-
-awaitPending ∷ ThreadId → IO ()
-awaitPending killer =
-  threadStatus killer >>= \case
-    ThreadBlocked BlockedOnException → pure ()
-    -- A killer that is already done raised its exception before returning, so
-    -- there is nothing left to wait for either way.
-    ThreadFinished → pure ()
-    ThreadDied → pure ()
-    -- 'yield' rather than a delay: the killer is runnable and only needs the
-    -- capability, so this terminates with one capability as readily as with
-    -- several, and it is not a retry — the state it waits for is reached once
-    -- and never left.
-    _ → yield *> awaitPending killer
+-- The arm the stand-in calls is the one 'withCancelledWorker' hands the attempt (see "Test.Vulkan.Proof.PendingCancellation"):
+-- it arranges for this thread to be cancelled at the first point the code under test permits one, and does not return until
+-- that cancellation is certain. Where the cancellation then lands is decided by the code under test, which is the point. A
+-- masked handoff takes it after the publication, where 'Test.Vulkan.Proof.Publication.publishing' restores the caller's
+-- masking state. An unmasked one never lets the killer block at all: 'throwTo' raises immediately, in the arm, before this
+-- stand-in has reported its result. Either way the arm returns, or is itself cancelled.
 
 -- --------------------------------------------------------------------------
 -- What teardown then sees
