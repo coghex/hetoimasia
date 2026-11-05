@@ -2,7 +2,6 @@
 -- and the entry and ownership rules that hold while it is live.
 module Test.GLFW.Native.Session (spec) where
 
-import Control.Concurrent (forkIO, forkOS)
 import Control.Monad (when)
 import Hetoimasia.GLFW.Session
   ( SessionMisuse (..)
@@ -26,6 +25,7 @@ import Test.GLFW.Native.Support
   , sharedBackend
   , threadFacts
   )
+import Test.GLFW.Native.Threads (Boundness (..))
 import Test.Hspec (Spec, describe, it, pendingWith, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Shared → Spec
@@ -60,11 +60,11 @@ spec shared = describe "the shared session" $ do
     owned shared (pure . sessionBackend) `shouldReturn` sharedBackend (sharedGate shared)
 
   it "rejects entry from a bound worker thread" $
-    onThread forkOS (expectFailure (withSession defaultSessionConfig (\_ → pure ())))
+    onThread Bound (expectFailure (withSession defaultSessionConfig (\_ → pure ())))
       `shouldReturn` NotProcessMainThread
 
   it "rejects entry from an unbound thread" $
-    onThread forkIO (expectFailure (withSession defaultSessionConfig (\_ → pure ())))
+    onThread Unbound (expectFailure (withSession defaultSessionConfig (\_ → pure ())))
       `shouldReturn` NotProcessMainThread
 
   it "rejects owner-only use of the shared session from the Hspec worker" $ do

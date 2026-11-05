@@ -65,6 +65,7 @@ module Test.GLFW.Native.Support
   , expectFailure
   , failed
   , onThread
+  , onThreadIn
   , currentObservation
   , requestClose
   , platformSizeLimits
@@ -95,6 +96,7 @@ import System.Environment (lookupEnv)
 import System.Info (os)
 import Test.GLFW.Native.Consent (Consent (..), NativeSessionRefused (..), Refusal)
 import Test.GLFW.Native.Fixture (Fixture, Owner (..), acquisitionCount, dispatch)
+import Test.GLFW.Native.Threads (Boundness, Scope, ownedScope, startIn)
 import Test.Hspec (SpecWith, before_, expectationFailure)
 
 -- | The fixture over the shared production session, its thread evidence, and
@@ -354,12 +356,18 @@ expectFailure action =
 failed ∷ String → IO a
 failed message = expectationFailure message >> ioError (userError message)
 
--- | Run an action on a thread started by the given fork, and wait for it.
-onThread ∷ (IO () → IO ThreadId) → IO a → IO a
-onThread fork action = do
+-- | Run an action on an owned thread of the given boundness, and wait for it (#594). However the wait ends, a failure, a
+-- timeout of the example or a cancellation, the thread has ended and been joined before this returns: the start is
+-- "Test.Support.Owned"'s, and a caller can no longer supply an unowned one.
+onThread ∷ Boundness → IO a → IO a
+onThread = onThreadIn ownedScope
+
+-- | 'onThread' in a chosen kind of scope, for the ownership regressions' negative controls ("Test.GLFW.Native.Ownership").
+onThreadIn ∷ Scope → Boundness → IO a → IO a
+onThreadIn scope boundness action = do
   finished ← newEmptyMVar
-  _ ← fork (try action >>= putMVar finished)
-  takeMVar finished >>= either (\failure → failed (displayException (failure ∷ SomeException))) pure
+  startIn scope boundness (pure ()) (try action >>= putMVar finished) $ \_ _ →
+    takeMVar finished >>= either (\failure → failed (displayException (failure ∷ SomeException))) pure
 
 -- | A window's latest published observation.
 currentObservation ∷ Window → IO WindowObservation
