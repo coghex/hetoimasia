@@ -270,19 +270,28 @@ cabal test hetoimasia-tests --test-show-details=direct
   runner releases the registered owners and the sink's hold before it kills the runner).
   The seven that hold the owner's startup or its destruction are cut at every boundary of the
   owner's start by `Test.GLFW.Owner.Fixture.Cut` (`boundaryExamples`, and `boundaryControls` where
-  the fixture without its rescue strands): the private host hook `ownerBoundary` (called with
-  `OwnerBeforePublication` before the owner's handle is published and `OwnerStarted` after the start
-  has published it), the rig's startup callback, and the body's entry, each ending the run by a
-  failure, a cancellation pending when the boundary is reached, or a cancellation delivered while the
-  run is parked there. A pending cancellation is made pending by a sender pinned to the target's
-  capability (`withOwnedThreadOn`, #610), because across capabilities a throw is a message that is
-  taken in later. The rescue is the exit's own: the wait for the owner's destruction opens the
-  fixture's gate on its first snapshot (`afterDestructionSnapshot`), and the body opens it on every
-  way out (`heldBody`). **Known production gap (#613).** Two boundaries of the start are not cut:
-  after the owner's handle is published inside the preparation step, and the abandoned-start path of
-  the startup wait. There the worker start drains an owner that never entered its run, destruction
-  evidence is recorded only inside that run's drain, and the protected exit waits for it for ever, so
-  no fixture can close them; #613 fixes it in production and adds those two cuts. The examples that hold the
+  the fixture without its rescue strands): the private host hooks `ownerBoundary` (called, on the
+  starting thread, with `OwnerBeforePublication` before the owner's handle is published,
+  `OwnerPublished` once it is, `OwnerAwaitingStartup` before the wait for the worker's startup, and
+  `OwnerStarted` after the start has published it) and `ownerWorkerBoundary` (on the worker's
+  thread, which holds the worker before its acknowledgement for the `AwaitingStartup` cut and after
+  it for the `AwaitingEntry` cut), the rig's startup callback, and the body's entry, each ending the
+  run by a failure, a cancellation pending when the boundary is reached, or a cancellation delivered
+  while the run is parked there. A pending cancellation is made pending by a sender pinned to the
+  target's capability (`withOwnedThreadOn`, #610), because across capabilities a throw is a message
+  that is taken in later. The rescue is the exit's own: the wait for the owner's destruction opens
+  the fixture's gate on its first snapshot (`afterDestructionSnapshot`), and the body opens it on
+  every way out (`heldBody`). **The four boundaries before the owner's run action begins (#613)**
+  have no rescue and no control, because the exit has nothing to wait for: the starter withdraws
+  an owner whose worker was drained without running its action, so each of those cells judges that
+  the exit finished without a destruction snapshot, that the backend was asked for nothing, and that
+  the failure, caught on the main thread where it still carries its context, holds the
+  abandoned-start evidence of one drained worker. `Test.GLFW.Owner.Failure.AbandonedStart` holds
+  what the matrix cannot say: an owner whose run began and ended without evidence is still waited
+  for when the start is abandoned afterwards (and the exit retains everything until independent
+  evidence ends the wait), an owner withdrawn from an exit whose quiescence committed before or while
+  it was published has its publications closed, and a worker that ends before it acknowledges while
+  the start's wait returns is withdrawn too. The examples that hold the
   conversion to account run in `glfw-tests` (`--match '#593'`), each as an owned
   example and a negative control: the start-and-wait helper, the bound
   main-thread helper and the bound start in a session, a deferred thread, a
