@@ -24,18 +24,19 @@
 module Test.LuaEngine.Graphics.Owned (spec) where
 
 import Control.Concurrent (ThreadId, forkIO, killThread, yield)
-import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (AsyncException (UserInterrupt), Exception, SomeException, finally, mask_, throwIO, try, uninterruptibleMask_)
-import Control.Monad (forever, unless, void)
+import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
+import Control.Exception (AsyncException (UserInterrupt), Exception, SomeException, bracket_, finally, fromException, mask_, throwIO, try, uninterruptibleMask_)
+import Control.Monad (forever, unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.Maybe (isJust)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), WindowProvider, noProviderHooks, windowMainReady, windowMainStep, withWindowProviderWith)
 import Test.Hspec
 import Test.LuaEngine.Graphics.Fake
 import Test.LuaEngine.Graphics.PeersRig (mainLoopAs, retarget)
 import Test.LuaEngine.Graphics.Rig
-import Test.LuaEngine.Graphics.Served (withProfileBeyond)
+import Test.LuaEngine.Graphics.Served (serveProfile, withProfileBeyond)
 import Test.LuaEngine.Graphics.Unowned
 import qualified Test.LuaEngine.Graphics.Window.Fake as WF
 import Test.Support.Cancel (withCancellationAfter)
@@ -191,36 +192,66 @@ drainScopeAfter wait fake =
     _ ← awaitTerminal probe
     uninterruptibleMask_ (wait >> hold fake HoldReclaim >> setVersionHolders fake 1)
 
--- | The failure the host's body raises, and the one its teardown then raises as well.
+-- | The failure the main thread raises after serving (an assertion), and the one the host's teardown raises as well.
 data Boom = Boom | TeardownBoom
   deriving (Eq, Show)
 
 instance Exception Boom
 
--- | The profile thread of the native session. It waits, not interruptibly, for the host's teardown to retire what it holds (as an
--- example's window scope drains only as the host services the commands that retire its windows), so it can only end after the
--- host's scope has: the thread's scope encloses the host's. Whether the thread has ended and been joined when the call returned,
--- the host's body ended the way the ending says.
-profileBeyondHost ∷ IORef [ThreadId] → Ending → IO Bool
-profileBeyondHost seen ending = do
-  retired ← newEmptyMVar
-  let profile () = noteThread seen >> uninterruptibleMask_ (readMVar retired)
-      retire = void (tryPutMVar retired ())
-  runEnding ending $ \end → withProfileBeyond profile (\hand → (hand () >> end (waitNoted seen)) `finally` retire)
-  joined ← allJoined seen
-  void (isEmptyMVar retired)
-  pure joined
+-- | How the native session ends.
+data Exit = ExitNormal | ExitAssertion | ExitCancelled
+  deriving (Eq, Show)
 
--- | The same, with the host's teardown failing too, after it has retired what the profile holds.
-profileBeyondFailingHost ∷ IORef [ThreadId] → IO Bool
-profileBeyondFailingHost seen = do
-  retired ← newEmptyMVar
-  let profile () = noteThread seen >> uninterruptibleMask_ (readMVar retired)
-      retire = void (tryPutMVar retired ()) >> throwIO TeardownBoom
-  outcome ← try @Boom (withProfileBeyond profile (\hand → (hand () >> waitNoted seen >> throwIO Boom) `finally` retire))
-  either id (\() → Boom) outcome `shouldBe` TeardownBoom
+exits ∷ [(String, Exit)]
+exits =
+  [ ("the profile ends and the run returns", ExitNormal)
+  , ("the profile ends and the main thread's assertion then fails", ExitAssertion)
+  , ("the main thread is cancelled while a window is live", ExitCancelled)
+  ]
+
+-- | The native session's shutdown, with the dependencies of 'Test.LuaEngine.Graphics.Served' modelled and nothing else: a window
+-- the profile thread closes in its own cleanup, which retires only while the loop is being served; the texture backend's scope,
+-- inside the host's body, whose exit drains (waits for that window to retire, not interruptibly); the host, whose teardown
+-- runs after it. The owner loop is served by the main thread, and the cancelled exit leaves its first run by a cancellation while
+-- the profile's window is live. Whether the call returned (no cycle: each wait's server was running when the wait began) with the
+-- profile thread ended and joined, and the exception the exit should have raised.
+shutdownModel ∷ IORef [ThreadId] → Exit → Bool → Bool → IO Bool
+shutdownModel seen exit hostFails judgeExit = do
+  serving ← newTVarIO False
+  windowRetired ← newEmptyMVar
+  result ← newEmptyMVar
+  runs ← newIORef (0 ∷ Int)
+  parked ← newEmptyMVar
+  hostDown ← newEmptyMVar
+  let closeWindow = uninterruptibleMask_ (atomically (readTVar serving >>= \now → unless now retry) >> void (tryPutMVar windowRetired ()))
+      profile () = do
+        noteThread seen
+        case exit of
+          ExitCancelled → (putMVar parked () >> forever (threadDelayForever)) `finally` closeWindow
+          _ → closeWindow >> putMVar result ()
+      threadDelayForever = newEmptyMVar >>= readMVar
+      serve stopWhen = do
+        run ← atomicModifyIORef' runs (\count → (count + 1, count))
+        bracket_ (atomically (writeTVar serving True)) (atomically (writeTVar serving False)) $
+          if exit == ExitCancelled && run == 0
+            then readMVar parked >> throwIO UserInterrupt
+            else bounded (let go = stopWhen >>= \over → unless over (yield >> go) in go)
+      finished = isJust <$> tryReadMVar result
+      drain = uninterruptibleMask_ (readMVar windowRetired)
+      teardown = void (tryPutMVar hostDown ()) >> when hostFails (throwIO TeardownBoom)
+  outcome ←
+    try @SomeException $
+      withProfileBeyond profile $ \hand running →
+        bracket_ (pure ()) drain (serveProfile running (hand ()) serve finished >> when (exit == ExitAssertion) (throwIO Boom))
+          `finally` teardown
+  -- the exit raised what it should have
+  when judgeExit $ case (exit, hostFails) of
+    (_, True) → either (\failure → fromException failure `shouldBe` Just TeardownBoom) (const (expectationFailure "the host's failure was lost")) outcome
+    (ExitNormal, _) → either (\failure → expectationFailure (show failure)) pure outcome
+    (ExitAssertion, _) → either (\failure → fromException failure `shouldBe` Just Boom) (const (expectationFailure "the assertion was lost")) outcome
+    (ExitCancelled, _) → either (\failure → fromException failure `shouldBe` Just UserInterrupt) (const (expectationFailure "the cancellation was lost")) outcome
   joined ← allJoined seen
-  void (isEmptyMVar retired)
+  void (isEmptyMVar hostDown)
   pure joined
 
 -- | Run the helper or control cancelled at once; whatever it started is not alive once it has returned or raised.
@@ -276,15 +307,13 @@ spec = describe "the threads the helpers start are owned (#599)" $ do
       cancelledAtOnce (\seen → void (heldDrain seen Cancelled)) >>= (`shouldBe` True)
     it "leaves nothing alive when the control is cancelled at once" $
       cancelledAtOnce (\seen → void (gatedScope seen Cancelled previousForkScope)) >>= (`shouldBe` True)
-  describe "the profile thread of the native session, whose scope encloses the host's" $ do
-    for_ endings $ \(label, ending) →
-      it ("has ended and been joined, after the host's teardown retired what it holds, when the host's body ends because " <> label) $ do
+  describe "the native session's shutdown has no dependency cycle" $ do
+    for_ exits $ \(label, exit) → do
+      it ("ends the profile thread and returns when " <> label) $ do
         seen ← newIORef []
-        profileBeyondHost seen ending >>= (`shouldBe` True)
-    it "has ended and been joined when the host's teardown fails as well" $ do
-      seen ← newIORef []
-      profileBeyondFailingHost seen >>= (`shouldBe` True)
-    it "leaves nothing alive when it is cancelled at once" $
-      cancelledAtOnce (\seen → void (profileBeyondHost seen Cancelled)) >>= (`shouldBe` True)
-    it "leaves nothing alive when the host's teardown fails and it is cancelled at once" $
-      cancelledAtOnce (void . profileBeyondFailingHost) >>= (`shouldBe` True)
+        shutdownModel seen exit False True >>= (`shouldBe` True)
+      it ("does the same when the host's teardown fails as well, when " <> label) $ do
+        seen ← newIORef []
+        shutdownModel seen exit True True >>= (`shouldBe` True)
+      it ("leaves nothing alive when it is cancelled at once, when " <> label) $
+        cancelledAtOnce (\seen → void (shutdownModel seen exit False False)) >>= (`shouldBe` True)

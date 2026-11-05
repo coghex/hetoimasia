@@ -13,11 +13,12 @@
 -- the texture retires only once the window has closed and the frames that used it completed. A second example raises in the
 -- logical update after startup and shows the UI's failure status and its empty red-clear scene published and adopted
 -- through the same bindings. Both end through the session's quit path.
-module Test.LuaEngine.Graphics.Native.Facade (spec) where
+module Test.LuaEngine.Graphics.Native.Facade (spec, cancelProbe) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Exception (SomeException, throwIO, try)
+import Control.Concurrent (throwTo)
+import Control.Exception (AsyncException (UserInterrupt), SomeException, throwIO, try)
 import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -107,6 +108,23 @@ spec env = describe "graphics facade" $ do
       step env "the end of every hold" $ atomically (ledgerReading (graphicsLedger (envGraphics env)) >>= \held → unless (null (readingHeld held)) retry)
       published env window >>= (`shouldBe` Just revision)
       evidence env ("graphics facade: the logical update raised after startup; the UI warned with the failure message and published the empty red-clear scene (revision " <> Text.pack (show revision) <> "), which the owner adopted and recorded holding no texture")
+
+-- | The cancellation probe (#599), run by @--probe-cancel-loop@ on its own and never as part of the profile: the quad example's
+-- window is live and holds its texture, and the process main thread, which serves the owner loop, is cancelled right there. The
+-- run must end by itself, with the window retired and the texture released through the loop served again, before the texture
+-- backend's drain; a shutdown that waits for the window while the loop stays stopped never returns. The session's own
+-- cancellation is the run's expected failure ('Main' judges the rest from the facts).
+cancelProbe ∷ Env → Spec
+cancelProbe env = describe "cancelling the owner loop while a window holds a texture" $
+  it "is cancelled with the quad example's window live and its texture held" $
+    within 180 . withFacadeSession env quadExample (\_ → pure ()) $ \_ _ window → do
+      awaitAdopted env window 1
+      awaitHeld env
+      expectHeld env
+      evidence env "cancellation probe: the main thread is cancelled while the quad example's window is live and its texture held"
+      throwTo (envMain env) UserInterrupt
+      -- the profile thread is killed by the settling run of the loop; this wait only keeps the scenario here until it is
+      newEmptyMVar >>= takeMVar
 
 succeeded ∷ SessionOutcome → Expectation
 succeeded outcome = do

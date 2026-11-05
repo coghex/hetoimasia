@@ -20,6 +20,7 @@ module Test.LuaEngine.Graphics.Native.Session
   , markRest
   ) where
 
+import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, retry, swapTVar)
 import Control.Exception (SomeException, displayException, finally, throwIO, try)
@@ -47,7 +48,7 @@ import Hetoimasia.GPU.Model (Usage, usage)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig)
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootsView (..))
 import Test.LuaEngine.Graphics.FrameLog (FrameLog, emptyFrameLog, recordEvent)
-import Test.LuaEngine.Graphics.Served (withProfileBeyond)
+import Test.LuaEngine.Graphics.Served (serveProfile, withProfileBeyond)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
   , NativeObserver (..)
@@ -94,6 +95,9 @@ data Env = Env
   , envFrames ∷ !(TVar (FrameLog FrameEvent))
     -- ^ The host's frame events, bounded, with a monotonic cursor: what the owner reported of each frame's acquisition,
     -- submission, presentation and observed completion, on its own thread.
+  , envMain ∷ !ThreadId
+    -- ^ The process main thread, which serves the owner loop: the cancellation probe ('Test.LuaEngine.Graphics.Native.Facade')
+    -- cancels it while an example's window is live.
   }
 
 -- | What the run saw, once the session is released.
@@ -154,6 +158,7 @@ awaitUsage env wanted = atomically $ do
 -- | Run the examples inside a session that requests this backend, or the platform's own.
 runSession ∷ Bool → Maybe Backend → [ValidationFeature] → TextureGraphicsConfiguration → (Env → Spec) → IO Facts
 runSession complete backend features configuration examples = do
+  mainThread ← myThreadId
   recorded ← newIORef []
   verdictCell ← newIORef Nothing
   passedCell ← newIORef False
@@ -180,7 +185,7 @@ runSession complete backend features configuration examples = do
       -- services its commands. The host's own teardown is what retires whatever the profile still holds when the loop is left
       -- abnormally (even for a failure that makes serving the loop again impossible), so the thread is killed and joined after the
       -- host's scope has ended, never inside it ('Test.LuaEngine.Graphics.Served').
-      withProfileBeyond (profile done) $ \hand →
+      withProfileBeyond (profile done) $ \hand running →
         withLoaderIntegration $ \integration →
           runGraphicsOwnerApplication
             (withLoggingLifetime quietLogger)
@@ -192,7 +197,7 @@ runSession complete backend features configuration examples = do
             )
             vulkanWindowHost
             (\vulkan _ → pure vulkan)
-            (\vulkan control → body done hand scenes vulkan control config evidence passedCell windowCount deviceCell frames)
+            (\vulkan control → body done hand running mainThread scenes vulkan control config evidence passedCell windowCount deviceCell frames)
   calls ← reverse <$> readIORef recorded
   verdict ← readIORef verdictCell
   passed ← readIORef passedCell
@@ -222,7 +227,7 @@ runSession complete backend features configuration examples = do
             else isSuccess <$> hspecWithResult defaultConfig {configFailOnEmpty = True} (examples env)
       putMVar done result
       wakeGraphicsHost (vulkanGraphicsOwner (envHost env))
-    body done hand scenes vulkan control config evidence passedCell windowCount deviceCell frames = do
+    body done hand running mainThread scenes vulkan control config evidence passedCell windowCount deviceCell frames = do
       progressNote "the owner is starting"
       readiness ← atomically $
         readReadiness (vulkanController vulkan) >>= \case
@@ -244,19 +249,21 @@ runSession complete backend features configuration examples = do
         rest ← newIORef Nothing
         jobs ← newTVarIO []
         serve ← newIORef (pure ())
-        let env = Env vulkan config scenes graphics control now rest evidence jobs serve windowCount frames
+        let env = Env vulkan config scenes graphics control now rest evidence jobs serve windowCount frames mainThread
         -- The profile starts now that its environment exists (the thread was started beyond the host's scope and waits for it).
-        hand env
         -- The process main thread serves the owner loop until the examples are done: window creation, surfaces and native
         -- events belong to it. A turn runs the jobs the examples handed it and the action they installed, then asks to finish
-        -- once Hspec has. The loop is woken for each, so none waits on the idle bound.
-        let update _ = do
+        -- once Hspec has. The loop is woken for each, so none waits on the idle bound. This scope is the texture backend's,
+        -- whose drain waits for the textures live windows hold, and those windows retire only as this thread serves the loop:
+        -- if the loop is left abnormally it is served again, with the profile thread killed, until the thread has ended, before
+        -- this scope's drain begins ('Test.LuaEngine.Graphics.Served').
+        let update stopWhen _ = do
               pending ← atomically (swapTVar jobs [])
               sequence_ pending
               join (readIORef serve)
-              finished ← tryReadMVar done
-              pure (if isJust finished then FinishWith () else ContinueWith NoUpdateDemand)
-        runVulkanOwnerLoop vulkan control (defaultScheduledHooks quietLogger update)
+              finished ← stopWhen
+              pure (if finished then FinishWith () else ContinueWith NoUpdateDemand)
+        serveProfile running (hand env) (\stopWhen → runVulkanOwnerLoop vulkan control (defaultScheduledHooks quietLogger (update stopWhen))) (isJust <$> tryReadMVar done)
         takeMVar done >>= \case
           Left failure → throwIO failure
           Right success → writeIORef passedCell success

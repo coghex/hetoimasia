@@ -53,8 +53,8 @@ main = do
   started ← getCurrentTime
   environment ← establishEnvironment
   arguments ← getArgs
-  when (completeFlag `elem` arguments && arguments /= [completeFlag]) $ do
-    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile and takes no other argument")
+  when ((completeFlag `elem` arguments || probeFlag `elem` arguments) && length arguments /= 1) $ do
+    hPutStrLn stderr ("lua-engine-graphics-native-tests: " <> completeFlag <> " runs the whole profile and " <> probeFlag <> " the cancellation probe, each alone")
     exitWith (ExitFailure 2)
   forM_ environment (Text.putStrLn . ("lua-engine-graphics-native-tests: " <>))
   consent ← readConsent >>= either refuse pure
@@ -62,9 +62,13 @@ main = do
   loader ← checkLoader >>= either (\why → stop ("the qualified loader: " <> why)) pure
   Text.putStrLn ("lua-engine-graphics-native-tests: the binding's loader is the recorded loader " <> Text.pack loader)
   configuration ← either (\refused → stop ("the profile could not be mapped: " <> Text.pack (show refused))) pure (configurationFor fixedM1Profile)
-  facts ← runSession (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration (\env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> Facade.spec env)
+  let probing = arguments == [probeFlag]
+  facts ← runSession (arguments == [completeFlag] || probing) (consentBackend consent) validationFeatures configuration $
+    if probing
+      then Facade.cancelProbe
+      else \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> Facade.spec env
   finished ← getCurrentTime
-  let problems = checks facts
+  let problems = if probing then probeChecks facts else checks facts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double
   record ← evidenceRecord consent loader configuration facts problems seconds
   Text.putStrLn record
@@ -82,6 +86,19 @@ main = do
 -- the suite is an ordinary Hspec run that selects as asked.
 completeFlag ∷ String
 completeFlag = "--complete"
+
+-- | Runs the cancellation probe alone: the quad example's window is live and holds its texture when the process main thread is
+-- cancelled, and the run must end by itself with everything torn down in order and the diagnostic verdict clean.
+probeFlag ∷ String
+probeFlag = "--probe-cancel-loop"
+
+-- | What the probe must have shown: the run's only failure is the cancellation it made, a window existed, and everything else a
+-- run must show (the destruction order, no native call raised, a clean diagnostic verdict) holds.
+probeChecks ∷ Facts → [Text]
+probeChecks facts =
+  [ "the session did not end with the probe's cancellation: " <> Text.pack (show (factsFailure facts)) | not (maybe False ("user interrupt" `Text.isInfixOf`) (factsFailure facts)) ]
+    <> [ problem | problem ← checks facts, problem /= "an example failed", not ("the session ended with a failure: user interrupt" `Text.isPrefixOf` problem) ]
+    <> [ "the probe made no window" | factsWindows facts == 0 ]
 
 -- | What a run must have shown whatever Hspec reported.
 checks ∷ Facts → [Text]
