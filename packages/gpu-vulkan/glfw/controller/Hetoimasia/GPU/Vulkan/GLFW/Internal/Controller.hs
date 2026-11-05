@@ -392,13 +392,14 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions
   , ActionRefusal (..)
   , ActionTicket
   , Actions
+  , Batch
   , Started (..)
   , VulkanAction (..)
-  , actionsCount
   , actionsWaiting
   , admitAction
   , admitRelease
   , awaitActionTicket
+  , beginBatch
   , newActions
   , pendingBarriers
   , readActionTicket
@@ -967,7 +968,11 @@ controllerOperations (VulkanController state) renderer lifecycle offscreen =
   GraphicsOperations
     { graphicsStartOwner = \_ → startOwner state
     , graphicsConstructTarget = constructTarget state
-    , graphicsStep = \step →
+    , graphicsStep = \step → do
+        -- The step's batch of owner-thread actions is fixed here, before the
+        -- checkpoint and the scene adoption: an action admitted from now on
+        -- waits for the next round, which its admission asks for.
+        batch ← atomically (beginBatch (stateActions state))
         checkpointRoots (stateRoots state) >>= \case
           CheckpointFailed primary → do
             atomically (writeTVar (stateFailureTaken state) True)
@@ -977,7 +982,7 @@ controllerOperations (VulkanController state) renderer lifecycle offscreen =
           CheckpointPending → noStepWork <$ atomically (writeTVar (stateDiagnosticPending state) True)
           CheckpointClear → do
             atomically (writeTVar (stateDiagnosticPending state) False)
-            progress step
+            progress batch step
     , graphicsNextDeadline = ownerDeadline state
     , -- A capture requested from another thread asks the idle owner for the
       -- round that asks its target a frame, and is false once that round has.
@@ -1003,7 +1008,7 @@ controllerOperations (VulkanController state) renderer lifecycle offscreen =
     , graphicsDestroyOwner = \_ → endingScenes state offscreen (settlingSwaps state (retaining state (destroyOwner state)))
     }
   where
-    progress step = do
+    progress batch step = do
         -- Owner-thread actions first, each alone on this thread: none runs
         -- beside a frame's rendering, and what they release is reclaimed by
         -- this same step.
@@ -1050,7 +1055,7 @@ controllerOperations (VulkanController state) renderer lifecycle offscreen =
         -- newer publication are still owed when a release has made room.
         let pressed = [attachment | (attachment, AtLimit) ← answered]
             adoptable = foldr Map.delete scenes pressed
-        served ← serviceActions state
+        served ← serviceActions state batch
         settled ← settleUnannounced state
         let geometries = Map.fromList [(target, targetGeometry view) | (target, view) ← constructed]
             observed = Map.fromList [(target, (viewRevision view, viewEligibility view, viewWithdrawals view)) | (target, view) ← constructed]
@@ -1301,8 +1306,14 @@ actionGate roots ownerOpen =
     Just primary → pure (Just (ActionSessionFailed primary))
     Nothing → join (readTVar ownerOpen) <&> \open → if open then Nothing else Just ActionOwnerClosed
 
--- | Run the owner-thread actions queued when the step began, one at a time,
--- on the owner's thread. Each is taken and marked running in one transaction,
+-- | Run the owner-thread actions queued when the step began — its 'Batch',
+-- fixed before the step's checkpoint and its scene adoption — one at a time,
+-- on the owner's thread. An action admitted after the step began, whenever in
+-- the step, is not run in it: it waits for the next round, which its admission
+-- asks for. Each batch entry is taken when it is reached, if the gate and, for
+-- a release request, its barrier allow it then, so a release request the
+-- step's own adoption satisfies runs in this same step. Each is taken and
+-- marked running in one transaction,
 -- which the gate refuses once the session has failed or the owner's admission
 -- has closed. From that transaction until its ticket is settled, asynchronous
 -- exceptions are masked except inside the construction's setup and the action
@@ -1318,20 +1329,15 @@ actionGate roots ownerOpen =
 -- handled it — caught and returned, or raised — which settles the ticket as
 -- that failure unless the action raised its own; or a failure the session
 -- latched, which a checkpoint raises as its primary as the step's own does.
-serviceActions ∷ State inst msgr phys dev cmd lease obligation → IO Bool
-serviceActions state = do
-  -- Only those waiting now: a flood of later admissions waits for the next
-  -- round, which the queue's wake asks for, rather than holding this one.
-  due ← atomically (actionsCount (stateActions state))
-  go due False
+serviceActions ∷ State inst msgr phys dev cmd lease obligation → Batch → IO Bool
+serviceActions state batch = go False
   where
-    go 0 served = pure served
-    go remaining served = do
+    go served = do
       ran ← mask $ \restore →
-        atomically (startAction (stateActions state)) >>= \case
+        atomically (startAction (stateActions state) batch) >>= \case
           Nothing → pure False
           Just started → True <$ run restore started
-      if ran then go (remaining - 1 ∷ Int) True else pure served
+      if ran then go True else pure served
     run ∷ (∀ a. IO a → IO a) → Started → IO ()
     run restore (Started action settle) =
       tryWithContext (restore (lendConstruction (stateRendering state))) >>= \case
