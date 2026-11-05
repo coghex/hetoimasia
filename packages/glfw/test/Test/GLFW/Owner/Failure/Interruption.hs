@@ -138,9 +138,9 @@ data EndsAt
 -- * __The target's retirement call.__ Nothing is masked: the call stays interruptible. No cancellation lands here: the harasser waits
 --   for the host hook that runs after the call returned. One that landed here would leave no record, which is its own example
 --   ('testRetirementInterruptedInsideItsCall').
--- * __Committed, not delivered.__ The retirement returned and the harasser is admitted, held at its throw until the owner has entered
---   its whole-owner retirement. A scenario ends the body here, so the throw is made after the abandonment, in the call's wait, which
---   absorbs it; the owner's calls could not otherwise wait for a throw nobody had made yet.
+-- * __Committed, not delivered.__ The retirement returned and the harasser is admitted, held at its throw until one of the owner's later
+--   calls is waiting for it. A scenario ends the body here, so the throw is made after the abandonment, in that wait, which absorbs
+--   it. Were the calls not to wait for a committed throw, it would never be made and the scenario's final assertion (delivered) fails.
 -- * __Answer to record.__ The owner is masked until the record commits. The harasser's one cancellation is pending against a masked
 --   owner and cannot interrupt the commit.
 -- * __Whole-owner retirement.__ An interruptible call. The cancellation may be received at its start (survivable: the destruction is
@@ -176,19 +176,29 @@ retirementRecord scope position atParked = do
               when entered (atomically (writeTVar returned True))
           }
   -- The owner's later calls wait until the harassment is delivered, or was never decided, and absorb what is still delivered meanwhile.
-  let afterHarassment = absorbing absorbed . atomically $ do
+  -- A call that has to wait says so first, which is what releases a held harasser at 'BetweenAdmissionAndDelivery': its throw is
+  -- made while the owner is waiting for it, and never if the owner's calls did not wait.
+  waiting ← newTVarIO False
+  let passable = do
         begun ← readTVar returned
-        when begun $ do
-          reached ← readTVar phase
-          gone ← readTVar abandoned
-          check (reached == 2 || (gone && reached == 0))
+        if not begun
+          then pure True
+          else do
+            reached ← readTVar phase
+            gone ← readTVar abandoned
+            pure (reached == 2 || (gone && reached == 0))
+      afterHarassment = absorbing absorbed $ do
+        ready ← atomically passable
+        unless ready $ do
+          atomically (writeTVar waiting True)
+          atomically (passable >>= check)
   script (fakeRetireOwner (rigFake rig)) $ \_ → afterHarassment >> pure (ownerRetired (Text.pack "retired"))
   script (fakeDestroy (rigFake rig)) $ \_ → afterHarassment >> pure (ownerDestroyed (Text.pack "destroyed"))
-  -- When a committed harasser may throw. At 'BetweenAdmissionAndDelivery' it is held until the owner has entered its whole-owner
-  -- retirement, which is the one place a throw decided before the abandonment and made after it could do harm if the owner's calls did
-  -- not wait for it; the owner is by then in the call's wait, which absorbs it.
+  -- When a committed harasser may throw. At 'BetweenAdmissionAndDelivery' it is held until one of the owner's later calls is waiting
+  -- for it, which is the one place a throw decided before the abandonment and made after it could do harm if the calls did not wait;
+  -- the owner is then in a wait that absorbs it.
   let throwReady
-        | position == BetweenAdmissionAndDelivery = (OwnerRetirement `elem`) <$> readTVar (rigJournal rig)
+        | position == BetweenAdmissionAndDelivery = readTVar waiting
         | otherwise = pure True
   let harry = do
         -- Admission and commitment are one step; the body's abandonment cannot slip between them.
@@ -254,6 +264,9 @@ retirementRecord scope position atParked = do
         -- for the ending's judgement. (The whole-owner retirement may have been the call the cancellation interrupted.)
         notes ← journalled (rigJournal rig)
         ordered notes [OwnerDestruction, SessionEnded]
+        -- And whatever was decided was delivered before the owner could leave the calls that wait for it.
+        reached ← readTVarIO phase
+        reached `shouldBe` (if position == AfterHandover then 0 else 2)
         either throwIO (\() → unexpected "the ended run returned") outcome
       else do
         -- However it ended, it ended by raising the cancellation rather than
