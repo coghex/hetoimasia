@@ -23,11 +23,14 @@ module Test.GLFW.Native.Threads
   ) where
 
 import Control.Concurrent (ThreadId)
-import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThreadOpening, withOwnedThreadOpeningOn)
 
 -- | Whether a thread is to be an OS-bound thread. The sessions refuse entry from a bound worker and from an unbound thread, and
--- the wake examples run their waker both ways, so the choice is part of what an example asserts.
-data Boundness = Unbound | Bound
+-- the wake examples run their waker both ways, so the choice is part of what an example asserts. 'Pinned' is an unbound thread
+-- pinned to one capability (#610, "Test.Support.Owned"): an example whose point is that a cancellation is /pending/ against a
+-- thread starts that thread and the cancellation's sender pinned to the same capability, where a sender seen blocked delivering
+-- has an exception pending against its target, always.
+data Boundness = Unbound | Bound | Pinned Int
   deriving (Eq, Show)
 
 -- | A way to start a thread for the length of a body: the boundness wanted, what must be let go before the thread can end (a
@@ -40,6 +43,7 @@ ownedScope ∷ Scope
 ownedScope = Scope $ \boundness open action body → case boundness of
   Unbound → withOwnedThreadOpening open action body
   Bound → withOwnedBoundThreadOpening open action body
+  Pinned capability → withOwnedThreadOpeningOn capability open action body
 
 -- | Start a thread in the given kind of scope.
 startIn ∷ Scope → Boundness → IO () → IO () → (ThreadId → IO () → IO a) → IO a

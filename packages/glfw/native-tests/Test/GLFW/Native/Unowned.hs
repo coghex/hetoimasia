@@ -82,8 +82,9 @@ startUnowned ∷ (IO () → IO ()) → Cleanups → Boundness → IO () → IO (
 startUnowned protect cleanups boundness open action = mask_ $ do
   done ← newEmptyMVar
   thread ← case boundness of
-    Unbound → forkIOWithUnmask $ \unmask → unmask action `finally` putMVar done ()
+    -- The controls never pin: a pinned start is the facility's, not the unowned start the controls model.
     Bound → uninterruptibleMask_ (forkOS (unsafeUnmask action `finally` putMVar done ()))
+    _ → forkIOWithUnmask $ \unmask → unmask action `finally` putMVar done ()
   cleanupLater cleanups (protect (open >> killThread thread >> void (readMVar done)))
   pure (thread, done)
 

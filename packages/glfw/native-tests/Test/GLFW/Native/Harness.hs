@@ -73,7 +73,7 @@ import Test.GLFW.Native.Fixture
   , runOwned
   )
 import Test.GLFW.Native.Support (Shared (..), acquisitions, consented, failed, owned, sharedBackend)
-import Test.GLFW.Native.Threads (Boundness (Unbound), Scope, ownedScope, startIn)
+import Test.GLFW.Native.Threads (Boundness (Pinned, Unbound), Scope, ownedScope, startIn)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldNotBe, shouldReturn)
 import Test.Hspec.Core.Formatters.V2 (formatterToFormat, silent)
 import Test.Hspec.Runner
@@ -275,7 +275,7 @@ spec shared = describe "the shared fixture" $ do
       let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
       map fromException retained `shouldBe` [Just ReleaseFailed]
 
-    it "keeps the initiating failure primary when a later cancellation is deferred through the release" $ do
+    it "keeps the initiating failure primary when a later cancellation is deferred through the release" $ pinnedScenario $ do
       (script, enteredRelease, releaseGate) ← newScriptBlockingRelease True
       owner ← myThreadId
       -- Once the release begins, a further cancellation is aimed at the owner;
@@ -284,9 +284,13 @@ spec shared = describe "the shared fixture" $ do
       -- observed pending, so the deferral is certain. Both workers act during
       -- the release, after the borrower has returned, so their scopes enclose
       -- the whole run; the release's gate is also opened by the scope that
-      -- owns its opener, whatever way that scope ends.
-      withForked (readMVar enteredRelease >> throwTo owner OwnerKilledAgain) $ \canceller cancelled →
-        withForkedOpening
+      -- owns its opener, whatever way that scope ends. The scenario, the
+      -- canceller and the opener are pinned to one capability (#610), where a
+      -- canceller seen blocked delivering has its exception pending against
+      -- the owner, always; across capabilities it has only sent it.
+      withForkedOn pinnedCapability (readMVar enteredRelease >> throwTo owner OwnerKilledAgain) $ \canceller cancelled →
+        withForkedOpeningOn
+          pinnedCapability
           (void (tryPutMVar releaseGate ()))
           (readMVar enteredRelease >> awaitThrowing canceller >> putMVar releaseGate ())
           $ \_ opened → do
@@ -307,7 +311,7 @@ spec shared = describe "the shared fixture" $ do
             let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
             map fromException retained `shouldBe` [Just ReleaseFailed]
 
-    it "settles a cancellation pending at the acquisition handoff, and a later one deferred through the release" $ do
+    it "settles a cancellation pending at the acquisition handoff, and a later one deferred through the release" $ pinnedScenario $ do
       (script, enteredRelease, releaseGate) ← newScriptBlockingRelease True
       owner ← myThreadId
       acquiring ← newEmptyMVar ∷ IO (MVar ())
@@ -317,9 +321,9 @@ spec shared = describe "the shared fixture" $ do
           -- is while the owner is masked, so its throw stays pending.
           acquire thrower = do
             putMVar acquiring ()
-            -- The thrower may run on another capability, where its throw is only a message in this one's inbox until the
-            -- scheduler next runs; yielding processes it, so the cancellation is pending before the acquisition returns.
-            uninterruptibleMask_ (awaitThrowing thrower >> yield)
+            -- The thrower and this owner are pinned to one capability (#610), so a thrower seen blocked delivering has the
+            -- cancellation pending against this masked owner, always.
+            uninterruptibleMask_ (awaitThrowing thrower)
             note script "acquired"
             pure (7 ∷ Int)
           release _ = do
@@ -329,9 +333,10 @@ spec shared = describe "the shared fixture" $ do
             throwIO ReleaseFailed
       -- The thrower, the canceller and the opener all act around the owner's
       -- acquisition and release, so their scopes enclose the whole run.
-      withForked (readMVar acquiring >> throwTo owner OwnerKilled) $ \thrower thrown →
-        withForked (readMVar enteredRelease >> throwTo owner OwnerKilledAgain) $ \canceller cancelled →
-          withForkedOpening
+      withForkedOn pinnedCapability (readMVar acquiring >> throwTo owner OwnerKilled) $ \thrower thrown →
+        withForkedOn pinnedCapability (readMVar enteredRelease >> throwTo owner OwnerKilledAgain) $ \canceller cancelled →
+          withForkedOpeningOn
+            pinnedCapability
             (void (tryPutMVar releaseGate ()))
             (readMVar enteredRelease >> awaitThrowing canceller >> putMVar releaseGate ())
             $ \_ opened → do
@@ -533,11 +538,35 @@ withForked = withForkedOpening (pure ())
 withForkedOpening ∷ IO () → IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
 withForkedOpening = withForkedIn ownedScope
 
+-- | 'withForked' for a thread pinned to a capability (#610): see "Test.GLFW.Native.Threads".
+withForkedOn ∷ Int → IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
+withForkedOn capability = withForkedOpeningOn capability (pure ())
+
+-- | 'withForkedOpening' for a thread pinned to a capability.
+withForkedOpeningOn ∷ Int → IO () → IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
+withForkedOpeningOn capability = withForkedAs ownedScope (Pinned capability)
+
+-- | The capability the examples whose point is a pending cancellation pin their scenario, sender and target to.
+pinnedCapability ∷ Int
+pinnedCapability = 0
+
+-- | Run an example's scenario on an owned thread pinned to 'pinnedCapability' and wait for its outcome: the scenario's own
+-- thread is the target of the cancellations it pends, and must share a capability with their senders. A failure is rethrown as
+-- itself; the thread has ended and been joined however the wait ends.
+pinnedScenario ∷ IO a → IO a
+pinnedScenario scenario = do
+  outcome ← newEmptyMVar
+  startIn ownedScope (Pinned pinnedCapability) (pure ()) (try scenario >>= putMVar outcome) $ \_ ended → ended
+  readMVar outcome >>= either (throwIO ∷ SomeException → IO a) pure
+
 -- | 'withForkedOpening' in a chosen kind of scope, for the ownership regressions' negative controls.
 withForkedIn ∷ Scope → IO () → IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
-withForkedIn scope open action body = do
+withForkedIn scope = withForkedAs scope Unbound
+
+withForkedAs ∷ Scope → Boundness → IO () → IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
+withForkedAs scope boundness open action body = do
   finished ← newEmptyMVar
-  startIn scope Unbound open (try action >>= putMVar finished) $ \thread ended →
+  startIn scope boundness open (try action >>= putMVar finished) $ \thread ended →
     body thread (ended >> tryReadMVar finished >>= maybe (pure (Left (toException ThreadKilled))) pure)
 
 -- | Wait until the thread is blocked delivering an exception, so a
