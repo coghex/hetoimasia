@@ -348,7 +348,10 @@ cabal test hetoimasia-tests --test-show-details=direct
   fixture's borrower is owned (#596)` (a cancellation while serving is idle, while the stand-in session is served, and after a session
   failure the dispatch caught, with and without a following cancellation (the wait for the borrower after a reported failure is
   bounded, so a parked borrower is stopped and joined and the dispatch raises), and a cancellation that escapes the session). Each runs twice with one judgement, through the facility
-  and through the deliberately unowned start of `Test.GPU.Vulkan.Native.Unowned` (the negative control, which must fail). The fixture's
+  and through the deliberately unowned start of `Test.GPU.Vulkan.Native.Unowned` (the negative control, which must fail). The controls' own
+  stop-and-join is uninterruptible, and `the negative controls' own cleanup (#596)` holds that to account (a cancellation while its
+  kill is blocked, and the example cancelled before the worker is let go, each with its control), as the GLFW native suite's does
+  (#594). The fixture's
   seams (`runSharedWith`) exist test-side only. The pinned start's own examples, with a plain `forkOn` control, are in `workflow-tests`
   (`--match "a thread pinned to a capability"`).
   The generic run command's real-device suite `run-native-tests` (the root package, `run-native-test/`,
@@ -412,12 +415,20 @@ cabal test hetoimasia-tests --test-show-details=direct
   (#599): `withFakeOwner` and the peers rig's `mainLoop` (whose scope encloses the retirement and the windows' teardown, which
   may wait for a main-thread step), the backend scope forked by `withForkedScope` (whose `forkedJoin` may be made again, so the
   scope's own join never waits on a signal an example consumed), the scenario threads of the facade, the window coordinator and the
-  native `Facade` and `Pixels` groups, and the native session's bound OS thread that runs the complete profile, started by
-  `withOwnedBoundThread` while the process main thread serves the owner loop and joined before that scope returns. The headless
-  regressions are `Test.LuaEngine.Graphics.Owned` (`--match "the threads the helpers start are owned (#599)"`), each run through
-  the facility and through the previous form of the helper (the negative control): the fake owner and the main-step loop cancelled
-  between the fork and the body's first step, and a scope held in its drain. The native sites are covered by their examples still
-  passing in `test.vulkan-lua-engine-native` and by the baseline guard.
+  native `Facade` and `Pixels` groups, and the native session's bound OS thread that runs the complete profile (`withProfileBeyond`,
+  `Test.LuaEngine.Graphics.Served`). That thread is started by `withOwnedBoundThread` before the owner host and joined after the
+  host's own teardown, because the host and the texture backend's drain wait for windows that only the thread's example scopes can
+  close, and those windows retire only while the process main thread serves the owner loop: when the loop is left abnormally,
+  `serveProfile` (inside the backend's scope, before its drain) kills the thread through a second owned thread and serves the loop
+  again until the thread has ended. The order and its waits are tabulated in the pull request that made it (#620). A latched
+  supervision failure that makes serving the loop again impossible is a known gap with its own issue. The headless regressions are
+  `Test.LuaEngine.Graphics.Owned` (`--match "the threads the helpers start are owned (#599)"`), each run through the facility and
+  through the previous form of the helper (the negative control): the fake owner and the main-step loop cancelled between the fork
+  and the body's first step, a scope held at a gate it waits at uninterruptibly, the real drain a stop latches the fake's holds
+  for, and a model of the whole shutdown order for the normal, assertion-failure and main-thread-cancellation exits. The native
+  sites are covered by their examples still passing in `test.vulkan-lua-engine-native` and by the baseline guard; the live-window
+  cancellation is the probe `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests --
+  --probe-cancel-loop` (a window-opening run, so the desktop opt-in on that one command; it is not part of the catalog group).
   Its scene publication (LFE-20) has a second native subgroup, `scene retention`:
   a published scene adopted by the real owner, its texture protected and recorded
   again after Lua released it, a publication naming the released lease refused,

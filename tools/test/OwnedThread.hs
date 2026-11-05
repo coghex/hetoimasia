@@ -19,7 +19,7 @@
 -- the full-product run library. The real child helper runs under the same orchestration in @run-native-test@.
 module OwnedThread (spec) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, forkOS, getNumCapabilities, isCurrentThreadBound, killThread, myThreadId, threadCapability, throwTo, yield)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, forkOS, forkOn, getNumCapabilities, isCurrentThreadBound, killThread, myThreadId, threadCapability, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Exception
   ( AsyncException (ThreadKilled, UserInterrupt)
@@ -160,6 +160,21 @@ startUnownedBound started action = uninterruptibleMask_ $ do
   -- @forkOS@ waits, interruptibly even under @mask_@, for the new OS thread to report itself; the start and its registration for
   -- the rescue are uninterruptible, and the thread runs the action unmasked as a plain @forkOS@ from an unmasked caller does.
   thread ← forkOS (unsafeUnmask action `finally` putMVar done ())
+  atomicModifyIORef' started (\known → (Unowned thread done (pure ()) : known, ()))
+  pure (thread, done)
+
+-- | 'unownedScope' for a thread pinned to a capability (#596): the control for the pinned start is the plain @forkOn@ the suites
+-- used before the facility offered one. Its start is, like 'startUnowned', announced and masked so that the cleanup can always
+-- join it, and the thread runs the action unmasked as a plain @forkOn@ from an unmasked caller does.
+unownedOnScope ∷ Int → IORef [Unowned] → Scope
+unownedOnScope capability started action body = do
+  (thread, done) ← startUnownedOn capability started action
+  body thread (readMVar done)
+
+startUnownedOn ∷ Int → IORef [Unowned] → IO () → IO (ThreadId, MVar ())
+startUnownedOn capability started action = mask_ $ do
+  done ← newEmptyMVar
+  thread ← forkOn capability (unsafeUnmask action `finally` putMVar done ())
   atomicModifyIORef' started (\known → (Unowned thread done (pure ()) : known, ()))
   pure (thread, done)
 
@@ -387,8 +402,21 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
         runEnding (withOwnedThreadOpeningOn 0 (void (tryPutMVar (probeGate probe) ()))) stubbornWorker probe ending
         endedAfterScope probe >>= (`shouldBe` True)
 
+      it ("negative control: a plain forkOn start leaves the pinned thread parked when the scope " <> label) $ do
+        started ← newIORef []
+        probe ← newProbe
+        (do
+            runEnding (unownedOnScope 0 started) parkedWorker probe ending
+            -- Recorded first, about the thread the scope left; only then does anything independent stop and join it.
+            judgement ← endedAfterScope probe
+            judgement `shouldBe` False)
+          `finally` (reapUnowned started >> void (tryPutMVar (probeGate probe) ()))
+        endedAfterScope probe >>= (`shouldBe` True)
+
     it "runs the thread on the capability asked for, pinned there, and with the caller's interruptibility not inherited" $ do
       capabilities ← getNumCapabilities
+      -- A start hard-coded to capability 0 cannot pass: some capability asked for here is not 0.
+      (capabilities >= 2) `shouldSatisfy` id
       for_ [0 .. capabilities - 1] $ \capability → do
         placed ← newEmptyMVar
         withOwnedThreadOn capability (myThreadId >>= threadCapability >>= \place → getMaskingState >>= putMVar placed . (,) place) $ \_ awaitEnd →
