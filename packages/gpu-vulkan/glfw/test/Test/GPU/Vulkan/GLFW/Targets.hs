@@ -776,24 +776,23 @@ testExitDrainCompletesBatch ∷ IO ()
 testExitDrainCompletesBatch = do
   rig ← surfaceFreeRig 0
   submissionsComplete rig False
-  (hostAfter, target, ticket) ←
-    withRunHelper
-      (pure ())
-      ( \host → do
-          atomically (targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host)) >>= check . not)
-          submissionsComplete rig True
-      )
-      $ \supply → runRig rig $ \host _ → do
+  (hostAfter, target, ticket) ← runRig rig $ \host _ → do
     awaitReady host
     target ← registered host
     awaitTargetStanding host target ((== Just 0) . windowAdopted)
     _ ← publishNow host target 1
     awaitTargetStanding host target ((== Just 1) . windowAdopted)
     (batch, _) ← recordFor host target
-    -- The batch is pending as the body returns. Its completion is let through only once the owner's exit has begun,
-    -- which the host's own admission says in a transaction: the owner's shutdown drain, not an ordinary step, is what
-    -- observes it.
-    supply host
+    -- The batch is pending as the body returns, and an ordinary owner step cannot complete it. Its completion is let
+    -- through only once the owner is in its drain: the fence query reads the owner's own phase in its transaction, and
+    -- the owner writes 'OwnerRetiring' as the first thing its drain does, so only the shutdown drain (and the
+    -- retirement and destruction after it) can observe a completion, on whatever capability the exit runs. A closed
+    -- admission is not enough: the owner's ordinary step in flight when the exit begins would still be running.
+    submissionsCompleteWhen rig ((>= OwnerRetiring) . statusPhase <$> readOwnerStatusNow (vulkanGraphicsOwner host))
+    -- Two owner-thread actions in a row: the second runs in a step after the first step has ended, polls included, so
+    -- at least one whole ordinary step has run with the gate installed and the batch must still be pending.
+    replicateM_ 2 (void (act host (VulkanAction (\_ → pure ()))))
+    ticketNow batch >>= (`shouldBe` TicketPending)
     pure (host, target, batch)
   ticketNow ticket >>= (`shouldBe` TicketComplete)
   events ← readTVarIO (rigSceneEvents rig)
@@ -816,7 +815,10 @@ testExitFailureStillSettles = do
     withRunHelper
       (pure ())
       ( \owner → do
-          atomically (readOwnerFailure owner >>= check . isJust)
+          -- The owner's run has ended, by whichever of its two ways of finding the uncertain orphan: a round's own
+          -- settlement of it, which latches a failure, or the retirement's first step, which does not. Either way
+          -- it ended without destroying anything, and the exit waits for evidence the owner cannot make.
+          atomically (readOwnerStatusNow owner >>= check . (== OwnerFinished) . statusPhase)
           publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
       )
       $ \supply → runRigCaught rig $ \host control → do
@@ -846,6 +848,9 @@ testExitFailureStillSettles = do
     supply owner
     checkRuntime control
   (host, target) ← readTVarIO observed >>= maybe (failWith ("the exit example did not reach its observation: " <> either show (const "it returned") outcome)) pure
+  -- The owner did fail: its checkpoint raised, whichever way it found the orphan whose destruction was uncertain (a
+  -- round's settlement of it, the retirement's first step, or the exit's own report that nothing was verified).
+  either (\_ → pure ()) (\_ → failWith "the owner's failure did not reach the checkpoint") outcome
   events ← readTVarIO (rigSceneEvents rig)
   adoptedOf events target `shouldBe` [(0, 0), (1, 1)]
   -- Both adoptions are released, once each, in order, though the retirement failed before it settled anything.
