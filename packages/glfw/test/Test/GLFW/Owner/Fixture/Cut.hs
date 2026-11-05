@@ -76,7 +76,7 @@ import Hetoimasia.Runtime.GLFW
 import qualified Hetoimasia.Runtime.GLFW.Internal as Private
 import Hetoimasia.GLFW.Internal.Seam (Seam)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
-import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene, journalled)
+import Test.GLFW.Owner.Fixture.Journal (Note (..), Scene, journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig (Rig (..), ownedHostAt)
 import Test.GLFW.Support
   ( Boom (..)
@@ -375,7 +375,8 @@ judgeFinished boundary cutting = do
   let started = OwnerStartup `elem` notes
   when (boundary == BeforePublication) (started `shouldBe` False)
   when (boundary /= BeforePublication) $ do
-    notes `shouldSatisfy` elem OwnerDestruction
+    -- The owner was destroyed before the session was released (D-33's order), and its held gate was opened to let it.
+    ordered notes [OwnerDestruction, SessionEnded]
     readTVarIO (cuttingGate cutting) >>= (`shouldBe` True)
 
 cutStrands ∷ CutState → Boundary → (Cutting → IO ()) → Expectation
