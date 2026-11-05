@@ -1,15 +1,8 @@
 {
   "schema_version": 1,
-  "note": "Unowned thread and process starts in the test sources that existed when the guard was introduced (#584), one count per file, classified mechanically. This is a known-debt list, not a list of proven leaks: verify a site before converting it. Entries can only shrink; an entry whose count is no longer reached fails the check. Written by `owned_starts.py bootstrap`; edited afterwards only to lower or remove an entry. The two display-helper suites (tools/x11-test/Main.hs and tools/wayland-test/Main.hs) keep their entries on purpose: #588's owner decision of 2026-11-02 moved the hosted-subprocess helper they need out of that issue, to a separate one.",
+  "note": "Unowned thread and process starts in the test sources that existed when the guard was introduced (#584), one count per file, classified mechanically. This is a known-debt list, not a list of proven leaks: verify a site before converting it. Entries can only shrink; an entry whose count is no longer reached fails the check. Written by `owned_starts.py bootstrap`; edited afterwards only to lower or remove an entry.",
   "files": {
     "packages/content/test/Test/Content/Support.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/ChildSpec.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Fixture.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Interaction.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Terminal.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/Vulkan/Proof/Bridge.hs": 1,
-    "packages/gpu-vulkan/glfw/native-test/Test/Vulkan/Proof/ConstructionSpec.hs": 2,
-    "packages/gpu-vulkan/glfw/native-test/Test/Vulkan/Proof/PublicationSpec.hs": 2,
     "packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Facade.hs": 1,
     "packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Pixels.hs": 1,
     "packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Session.hs": 1,
@@ -32,8 +25,6 @@
     "packages/lua-engine/test/Test/LuaEngine/Texture/Support.hs": 2,
     "packages/scripting-lua/test/Test/Lua/Reentry.hs": 2,
     "packages/scripting-lua/test/Test/Lua/Support.hs": 1,
-    "run-native-test/Main.hs": 1,
-    "tools/wayland-test/Main.hs": 1,
-    "tools/x11-test/Main.hs": 1
+    "run-native-test/Main.hs": 1
   }
 }

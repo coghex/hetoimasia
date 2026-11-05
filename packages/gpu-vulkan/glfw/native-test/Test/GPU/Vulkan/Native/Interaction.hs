@@ -67,9 +67,9 @@ module Test.GPU.Vulkan.Native.Interaction
   , probePhases
   ) where
 
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
-import Control.Exception (SomeException, displayException, try)
+import Control.Exception (SomeException, displayException, mask_, try)
 import Control.Monad (forM_, unless, when)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (intercalate, isPrefixOf, sortOn)
@@ -169,6 +169,7 @@ import Test.GPU.Vulkan.Native.Consent (Consent, Refusal, consentBackend, refusal
 import Test.GPU.Vulkan.Native.Platform (requestingBackend)
 import Test.GPU.Vulkan.Native.Environment (validationFeatures)
 import Test.GPU.Vulkan.Native.Gate (Gate, admit)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 -- ---------------------------------------------------------------------------
 -- Activation
@@ -372,36 +373,40 @@ measure backend duration = do
       let trace = hostTrace (vulkanWindowHost vulkan)
       -- The scene thread: every 16 ms a new scene, from a thread that is not
       -- the main one, so a stalled main thread does not stall it.
+      --
+      -- The thread is owned (#596): it is started and its stop-and-join registered in one masked step, and however the phases
+      -- end (a return, a failure, a cancellation) it has been stopped and joined before the application's body returns, so it
+      -- never publishes into a host that is being torn down. Its scope's opening clears @running@ first, so it ends at its next
+      -- check by itself; the kill that follows lands in its pause between two scenes, never inside a publication (a publication
+      -- is masked, and the pause is the only interruptible step of an iteration).
       running ← newTVarIO True
-      _ ← forkIO $
-        let publish number = do
-              continue ← readTVarIO running
-              when continue $ do
-                _ ← publishVulkanScene vulkan =<< prepare number
-                threadDelay 16000
-                publish (number + 1)
-         in publish 1
-      case probePhases of
-        [] → pure ()
-        first : rest → do
-          pending ← newIORef rest
-          current ← newIORef first
-          announce first
-          deadline ← newIORef =<< after clock duration
-          startTrace trace clock defaultTraceCapacity
-          writeIORef traced (Just trace)
-          mark trace first "begins"
-          runVulkanOwnerLoop vulkan control . defaultScheduledHooks quietLogger $ \turn → do
-            let number = turnNumber (scheduledTurn turn)
-            recordTrace trace (UpdateHookEntered number)
-            now ← readInstant clock
-            reached ← deadlineReached now <$> readIORef deadline
-            recordTrace trace (UpdateHookLeft number)
-            if reached
-              then advance trace collected pending current deadline
-              else pure (ContinueWith NoUpdateDemand)
-          writeIORef traced Nothing
-      atomically (writeTVar running False)
+      let publish number = do
+            continue ← readTVarIO running
+            when continue $ do
+              _ ← mask_ (publishVulkanScene vulkan =<< prepare number)
+              threadDelay 16000
+              publish (number + 1)
+      withOwnedThreadOpening (atomically (writeTVar running False)) (publish 1) $ \_ _ →
+        case probePhases of
+          [] → pure ()
+          first : rest → do
+            pending ← newIORef rest
+            current ← newIORef first
+            announce first
+            deadline ← newIORef =<< after clock duration
+            startTrace trace clock defaultTraceCapacity
+            writeIORef traced (Just trace)
+            mark trace first "begins"
+            runVulkanOwnerLoop vulkan control . defaultScheduledHooks quietLogger $ \turn → do
+              let number = turnNumber (scheduledTurn turn)
+              recordTrace trace (UpdateHookEntered number)
+              now ← readInstant clock
+              reached ← deadlineReached now <$> readIORef deadline
+              recordTrace trace (UpdateHookLeft number)
+              if reached
+                then advance trace collected pending current deadline
+                else pure (ContinueWith NoUpdateDemand)
+            writeIORef traced Nothing
     settled = \case
       Just TargetConstructing → False
       Nothing → False

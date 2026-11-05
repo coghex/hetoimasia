@@ -43,7 +43,7 @@ module Test.Vulkan.Proof.Bridge
   , failedInitializationBackend
   ) where
 
-import Control.Concurrent (forkOS, myThreadId)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (SomeException, bracket, displayException, throwIO, try)
@@ -104,6 +104,7 @@ import Hetoimasia.Runtime.GLFW
 import Test.Vulkan.Proof.Interop (Provenance (..), describeProvenance, initVulkanLoader, provenanceOf)
 import Test.GPU.Vulkan.Native.Platform (notePlatform)
 import Test.Vulkan.Proof.Journal (Journal, heading, note)
+import Test.Support.Owned (withOwnedBoundThread)
 
 -- | What a failed initialization left, where one could be provoked.
 data FailedInitialization
@@ -257,11 +258,17 @@ session backend journal = do
               note journal ("while it was owed, the disposal fact answered " <> tshow disposedWhileOwed <> " and the instance release " <> releaseWhileOwed)
               owner ← myThreadId
               finished ← newEmptyMVar
-              _ ← forkOS $ do
-                discharger ← myThreadId
-                outcome ← dischargeSurfaceObligation (surfaceObligation surface)
-                putMVar finished (outcome, discharger /= owner)
-              (discharge, offOwner) ← takeMVar finished
+              -- An owned bound start (#596): the obligation is discharged from an OS-bound thread other than the owner, and the
+              -- scope that needed that thread has stopped and joined it before it returns, whichever way it ends. The example
+              -- still waits for the answer itself.
+              (discharge, offOwner) ←
+                withOwnedBoundThread
+                  ( do
+                      discharger ← myThreadId
+                      outcome ← dischargeSurfaceObligation (surfaceObligation surface)
+                      putMVar finished (outcome, discharger /= owner)
+                  )
+                  (\_ _ → takeMVar finished)
               note journal ("another thread discharged it: " <> tshow discharge)
               disposedAfter ← certifyGraphicsFact host acknowledgement DependentsDisposed
               releaseAfter ← tshow <$> atomically (releaseSurfaceInstance lease)

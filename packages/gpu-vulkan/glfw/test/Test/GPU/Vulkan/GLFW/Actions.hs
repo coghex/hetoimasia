@@ -13,7 +13,7 @@ module Test.GPU.Vulkan.GLFW.Actions (spec) where
 
 import Control.Concurrent (myThreadId)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, writeTVar)
-import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, throwIO, toException, try)
+import Control.Exception (Exception (..), ExceptionWithContext (..), SomeException, finally, throwIO, toException, try)
 import Control.Monad (void, when)
 import qualified Data.ByteString as ByteString
 import Data.List (isSubsequenceOf)
@@ -394,17 +394,41 @@ testSetupFailure = do
     Just (ActionRaised (ExceptionWithContext _ inner)) → fromException inner `shouldBe` Just failure
     other → failWith ("the ticket was not settled with the setup failure: " <> maybe "nothing" outcomeText other)
 
+-- | An action admitted before the session's failure, which never started, is
+-- refused with its cause, and so is every later one.
+--
+-- The failure arrives the way a validation error does in production, inside a
+-- call the owner made: an owner-thread action reports it and then holds the
+-- owner while the queued action is admitted, so nothing is latched at the
+-- admission (the admission consults the session's terminal latch, which only a
+-- checkpoint sets) and no round has to be waited for. The held action's own
+-- checkpoint, after it returns, latches the error before the owner takes
+-- anything else, so the queued action is never entered. Reporting from the
+-- example's own thread instead left the latch to whichever round happened to
+-- reach its checkpoint next ("Reporting an error wakes no one",
+-- docs/gpu_backend.md).
 testTerminalRefusal ∷ IO ()
 testTerminalRefusal = do
   rig ← surfaceFreeRig 0
   observed ← newTVarIO Nothing
+  entered ← newTVarIO False
   outcome ← runRigCaught rig $ \host control → do
     _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
     awaitReady host
-    reportErrorNow rig "an error before an action"
-    -- Nothing is latched yet, so this is admitted, and it wakes the owner,
-    -- whose checkpoint latches the error before it starts anything.
-    queued ← admitted =<< atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
+    gate ← newTVarIO False
+    reported ← newTVarIO False
+    let reporting = VulkanAction $ \_ → do
+          reportErrorNow rig "an error before an action"
+          atomically (writeTVar reported True)
+          atomically (readTVar gate >>= check)
+        release = atomically (writeTVar gate True)
+    queued ← (do
+      _ ← admitted =<< atomically (submitVulkanAction (vulkanController host) reporting)
+      atomically (readTVar reported >>= check)
+      -- The error is reported and nothing is latched yet, so this is admitted;
+      -- the owner is inside the reporting action and starts nothing else
+      -- until it has returned and its checkpoint has latched the error.
+      admitted =<< atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → atomically (writeTVar entered True))))) `finally` release
     atomically (readOwnerFailure (vulkanGraphicsOwner host) >>= check . isJust)
     settled ← atomically (awaitVulkanAction queued)
     later ← atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → pure ())))
@@ -414,6 +438,8 @@ testTerminalRefusal = do
   failure `shouldBe` GraphicsSessionFailed TerminalValidationError
   readTVarIO observed
     `shouldReturnValue` Just (outcomeText (ActionRefused @() (ActionSessionFailed TerminalValidationError)), Just (ActionSessionFailed TerminalValidationError))
+  -- The queued action's body was never entered, whatever its refusal says.
+  readTVarIO entered `shouldReturnValue` False
 
 testExitRefusal ∷ IO ()
 testExitRefusal = do

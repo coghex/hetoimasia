@@ -2,6 +2,11 @@
 -- or consent: once a launch returns or propagates it owns no output reader and
 -- no parent-side pipe handle ("Test.GPU.Vulkan.Native.Child").
 --
+-- The launcher thread of the interrupted-launch example is an owned start (#596): however the example ends, a failure or a
+-- cancellation while the launcher is parked at its child included, the launcher has ended and been joined, and its child
+-- reaped, before the example returns. Two examples hold that to account per way of ending, with a negative control that
+-- applies the same judgement to the unowned start the example used before.
+--
 -- Each example asks what the launch still holds afterwards: the observer is shown
 -- the parent's pipe handles and each reader's completion the moment they are
 -- acquired, and the example reads them once the launch is over. The examples cover
@@ -15,12 +20,14 @@
 -- are selected with @--match "a bounded child launcher"@.
 module Test.GPU.Vulkan.Native.ChildSpec (spec) where
 
-import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, throwTo)
+import Control.Concurrent (ThreadId, newEmptyMVar, putMVar, readMVar, takeMVar, throwTo)
+import Control.Concurrent.MVar (MVar)
 import Control.Concurrent.STM (atomically, check)
 import Control.Exception (SomeException, annotateIO, someExceptionContext, ErrorCall (..), throwIO, IOException, bracket, finally, fromException, try)
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (getExceptionAnnotations)
 import Control.Monad (void)
+import Data.Foldable (for_)
 import System.IO.Error (ioeGetErrorString)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import GHC.Clock (getMonotonicTime)
@@ -36,6 +43,8 @@ import System.Timeout (timeout)
 import Text.Read (readMaybe)
 
 import qualified Test.GPU.Vulkan.Native.Child as Child
+import Test.GPU.Vulkan.Native.Unowned (cleanupLater, endings, hasEnded, newCleanups, runCleanups, runEnding, unownedScope)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "a bounded child launcher" $ do
@@ -69,23 +78,48 @@ spec = describe "a bounded child launcher" $ do
       escaped ← escapedPid pidFile
       try (signalProcess nullSignal escaped) >>= (`shouldSatisfy` either (\(_ ∷ IOException) → False) (const True))
 
-  it "owns no reader or pipe handle when an interruption reaches the launch, and propagates the interruption" $ do
-    acquired ← newEmptyMVar
-    result ← newEmptyMVar
-    launcher ← forkIO (try (Child.launchCommandObserved (putMVar acquired) Child.terminationGrace Nothing 300 "sh" ["-c", "sleep 300"]) >>= putMVar result)
-    owned ← takeMVar acquired
-    -- Whatever the child does next, it is ended with its group on the way out.
-    ( do
-        throwTo launcher (ErrorCall "the launch was interrupted")
-        outcome ← bounded (takeMVar result)
-        case outcome of
-          Left failure → fmap (\(ErrorCall message) → message) (fromException failure) `shouldBe` Just "the launch was interrupted"
-          Right (_ ∷ Child.Launched) → expectationFailure "the interrupted launch returned"
-        reclaimed owned
-        try (signalProcess nullSignal (Child.ownedPid owned)) >>= (`shouldSatisfy` either (\(_ ∷ IOException) → True) (const False))
-      )
-      `finally` void (try (signalProcessGroup sigKILL (Child.ownedPid owned)) ∷ IO (Either IOException ()))
+  it "owns no reader or pipe handle when an interruption reaches the launch, and propagates the interruption" $
+    withSleepingLauncher withOwnedThreadOpening $ \launcher owned result →
+      -- Whatever the child does next, it is ended with its group on the way out.
+      ( do
+          throwTo launcher (ErrorCall "the launch was interrupted")
+          outcome ← bounded (takeMVar result)
+          case outcome of
+            Left failure → fmap (\(ErrorCall message) → message) (fromException failure) `shouldBe` Just "the launch was interrupted"
+            Right (_ ∷ Child.Launched) → expectationFailure "the interrupted launch returned"
+          reclaimed owned
+          try (signalProcess nullSignal (Child.ownedPid owned)) >>= (`shouldSatisfy` either (\(_ ∷ IOException) → True) (const False))
+        )
+        `finally` void (try (signalProcessGroup sigKILL (Child.ownedPid owned)) ∷ IO (Either IOException ()))
 
+  describe "the launcher thread of an interrupted launch is owned (#596)" $
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined, and its child is reaped, when " <> label <> " while the launcher is parked at its child") $ do
+        placed ← newEmptyMVar
+        runEnding ending $ \end →
+          withSleepingLauncher withOwnedThreadOpening $ \launcher owned _ → do
+            putMVar placed (launcher, Child.ownedPid owned)
+            end (pure ())
+        (launcher, child) ← readMVar placed
+        (,) <$> hasEnded launcher <*> childReaped child >>= (`shouldBe` (True, True))
+
+      it ("negative control: the unowned launcher start leaves the launcher and its child when " <> label <> " while the launcher is parked at its child") $ do
+        cleanups ← newCleanups
+        placed ← newEmptyMVar
+        -- The judgement is recorded first, about what the scope left; only then does anything independent stop the child and the
+        -- launcher, even if an assertion before it failed.
+        ( do
+            runEnding ending $ \end →
+              withSleepingLauncher (unownedScope cleanups) $ \launcher owned _ → do
+                putMVar placed (launcher, Child.ownedPid owned)
+                cleanupLater cleanups (void (try (signalProcessGroup sigKILL (Child.ownedPid owned)) ∷ IO (Either IOException ())))
+                end (pure ())
+            (launcher, child) ← readMVar placed
+            (,) <$> hasEnded launcher <*> childReaped child >>= (`shouldBe` (False, False))
+          )
+          `finally` runCleanups cleanups
+        (launcher, child) ← readMVar placed
+        (,) <$> hasEnded launcher <*> childReaped child >>= (`shouldBe` (True, True))
 
   it "returns the status and output of every short-lived child, however soon it is reaped" $
     -- The identifier is read before anything waits on the child, so no child can be
@@ -131,6 +165,25 @@ spec = describe "a bounded child launcher" $ do
             `finally` (readIORef seen >>= maybe (pure ()) (\(pid, _) → void (try (signalProcessGroup sigKILL pid) ∷ IO (Either IOException ()))))
     )
     ["the child started", "its reaper", "its readers"]
+
+-- | The interrupted-launch scenario: a launcher thread, started by the given scope, runs a launch of a child that sleeps, and the
+-- body is entered once the launch has shown its observer what it owns (the child is running and its readers are started). The
+-- body is given the launcher's thread, what the launch owns, and the cell the launcher's outcome is put in. The scope is the
+-- facility ('withOwnedThreadOpening') or the unowned start the negative controls compare it with.
+withSleepingLauncher
+  ∷ (IO () → IO () → (ThreadId → IO () → IO a) → IO a)
+  → (ThreadId → Child.Owned → MVar (Either SomeException Child.Launched) → IO a)
+  → IO a
+withSleepingLauncher scope body = do
+  acquired ← newEmptyMVar
+  result ← newEmptyMVar
+  scope (pure ()) (try (Child.launchCommandObserved (putMVar acquired) Child.terminationGrace Nothing 300 "sh" ["-c", "sleep 300"]) >>= putMVar result) $ \launcher _ → do
+    owned ← takeMVar acquired
+    body launcher owned result
+
+-- | Whether the child has been ended and reaped: signalling it fails because no such process remains.
+childReaped ∷ ProcessID → IO Bool
+childReaped child = either (\(_ ∷ IOException) → True) (const False) <$> try (signalProcess nullSignal child)
 
 -- | The setup stage a named point in the examples above stands for.
 key ∷ String → String
