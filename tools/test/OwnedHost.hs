@@ -20,7 +20,7 @@
 -- cancellation of that submitter, so no failing example leaves a thread waiting.
 module OwnedHost (spec) where
 
-import Control.Concurrent (ThreadId, myThreadId, throwTo)
+import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM
   ( TMVar
@@ -63,6 +63,7 @@ import System.Process (CreateProcess, createPipe, getPid, proc, waitForProcess)
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.Support.Bounded (bounded)
+import Test.Support.Cancel (awaitBlockedSending)
 import Test.Support.Owned (withOwnedThread)
 import Test.Support.Subprocess
   ( Bounds (boundGrace, boundReap)
@@ -86,7 +87,7 @@ import Test.Support.Subprocess.Host
   ( Deadline (DeadlineAt, NoDeadline)
   , Host
   , HostFailure (HostEnded, HostStopped)
-  , HostSeams (hostAbandoning, hostBeforeServing, hostClosing, hostEntering, hostLimit, hostOpen, hostStarting, hostTaking)
+  , HostSeams (hostAbandoning, hostBeforeServing, hostCaptured, hostClosing, hostDeciding, hostEntering, hostLimit, hostOpen, hostStarting, hostTaking)
   , HostState (..)
   , Site (AtBody, AtSubmission)
   , awaitHostState
@@ -1577,6 +1578,36 @@ lifecycleSpec = describe "The lifecycle of a request's handles" $ do
         Just (SubprocessFailure message) -> message `shouldSatisfy` (\text -> "cleanup was not confirmed" `isInfixOf` text && "could not be flushed" `isInfixOf` text)
         Nothing -> expectationFailure ("the owner's scope raised " <> show failure)
       Right () -> expectationFailure "the unconfirmed close was lost: the owner's scope returned"
+
+  -- The owner's scope with a cancellation pending (sent, and not yet deliverable because the owner is masked) while it holds the
+  -- owner's failure: the owner's use raises, the hold waits until the sender is blocked in its send, and the scope goes on.
+  let pendingCancellation :: (IO () -> HostSeams) -> IO (Answer ())
+      pendingCancellation withHold = do
+        reached <- newEmptyTMVarIO
+        senderVar <- newEmptyTMVarIO
+        result <- newEmptyTMVarIO
+        let hold = do
+              atomically (void (tryPutTMVar reached ()))
+              let findSender = atomically (tryReadTMVar senderVar) >>= maybe (yield >> findSender) pure
+              sender <- findSender
+              void (awaitBlockedSending sender)
+            owner = tryWithContext @SomeException (withHostUsing quick noSeams (withHold hold) (\_ -> ioError (userError "owner-marker")))
+        withOwnedThread (owner >>= atomically . putTMVar result) $ \ownerThread _ -> do
+          bounded (atomically (readTMVar reached))
+          withOwnedThread (throwTo ownerThread UserInterrupt) $ \senderThread _ -> do
+            atomically (putTMVar senderVar senderThread)
+            bounded (atomically (readTMVar result))
+      keepsOwnerFailure answer = case answer of
+        Left failure@(ExceptionWithContext _ cause) -> do
+          fromException cause `shouldBe` Just UserInterrupt
+          retained failure `shouldSatisfy` any ("owner-marker" `isInfixOf`)
+        Right () -> expectationFailure "the cancellation was not raised"
+
+  it "Lifecycle owner: the owner's failure is captured and stored in one masked step, so a cancellation pending at that moment is raised with the failure retained" $
+    pendingCancellation (\hold -> noHostSeams {hostCaptured = hold}) >>= keepsOwnerFailure
+
+  it "Lifecycle owner: a cancellation pending when the result is decided is let in with the decision in hand, and raised with the owner's failure retained" $
+    pendingCancellation (\hold -> noHostSeams {hostDeciding = hold}) >>= keepsOwnerFailure
 
   -- A failed start, the submitter gone (cancelled where the worker has claimed the request), and a handle whose flush cannot
   -- complete: the facility's own close times out, annotates the start failure and closes the handle, so the worker's second close finds

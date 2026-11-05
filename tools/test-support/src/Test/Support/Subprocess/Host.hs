@@ -108,7 +108,6 @@ import Control.Exception
   , SomeException
   , catch
   , mask
-  , mask_
   , rethrowIO
   , throwIO
   , try
@@ -199,6 +198,11 @@ data HostSeams = HostSeams
   , hostEntering ∷ IO ()
   -- ^ Run by the worker inside the child's scope, before the entry of the body is decided: where an example holds the race of an
   -- abandonment with the entry of the body.
+  , hostCaptured ∷ IO ()
+  -- ^ Run, masked, once the owner's use has ended and before its outcome is recorded: where an example holds a cancellation pending
+  -- (sent, not yet delivered) while the owner's failure is captured.
+  , hostDeciding ∷ IO ()
+  -- ^ Run, masked, once the owned scope has ended and before the result is decided and raised: the same, for the decision.
   , hostStarting ∷ IO ()
   -- ^ Run in the masked entry of a request's body, after the entry is decided and inside the cleanup that closes the handles, before
   -- the timed body starts: where an example delivers a cancellation to the worker between the entry and the start of the body.
@@ -224,6 +228,8 @@ noHostSeams =
     { hostBeforeServing = pure ()
     , hostTaking = pure ()
     , hostEntering = pure ()
+    , hostCaptured = pure ()
+    , hostDeciding = pure ()
     , hostStarting = pure ()
     , hostAbandoning = \_ → pure ()
     , hostClosing = pure ()
@@ -347,7 +353,7 @@ withHost = withHostUsing defaultBounds noSeams noHostSeams
 -- confirmed retained beside it; otherwise the worker's failure is raised, once. A cancellation of the worker is never raised in the
 -- owner.
 withHostUsing ∷ Bounds → Seams → HostSeams → (Host → IO a) → IO a
-withHostUsing bounds facility hooks use = do
+withHostUsing bounds facility hooks use = mask $ \restoreAll → do
   phase ← newTVarIO PhaseStarting
   slot ← newEmptyTMVarIO
   running ← newTVarIO False
@@ -357,18 +363,24 @@ withHostUsing bounds facility hooks use = do
   observed ← newIORef Nothing
   let host = Host phase slot running orphans stopSeen bounds facility hooks
       stop = recordStop host >> hostOpen hooks
+  -- Everything here is masked except the owned scope: a cancellation reaches the owner only where this function can keep the
+  -- failure it is raising beside it. The use's outcome is captured and stored in one masked step, and interruptibility is restored
+  -- only around the use itself.
   scoped ←
-    tryWithContext @SomeException . withOwnedThreadOpening stop (workerMain host outcome) $ \_ _ →
-      tryWithContext @SomeException (use host) >>= writeIORef observed . Just
-  -- Past the join, nothing can be interrupted: the host is Ended (a worker cancelled before it ran anything never said so), the
-  -- result is decided and raised.
-  conclusion ← mask_ $ do
-    atomically (writeTVar phase PhaseEnded >> void (tryPutTMVar outcome (Right ())))
-    worker ← atomically (readTMVar outcome) >>= workerFailure
-    owner ← readIORef observed
-    orphans' ← readTVarIO orphans
-    pure (conclude scoped owner worker orphans')
-  conclusion
+    tryWithContext @SomeException . restoreAll . withOwnedThreadOpening stop (workerMain host outcome) $ \_ _ →
+      mask $ \restore → do
+        result ← tryWithContext @SomeException (restore (use host))
+        hostCaptured hooks
+        writeIORef observed (Just result)
+  -- Past the join: the host is Ended (a worker cancelled before it ran anything never said so) and the result is decided.
+  atomically (writeTVar phase PhaseEnded >> void (tryPutTMVar outcome (Right ())))
+  worker ← atomically (readTMVar outcome) >>= workerFailure
+  owner ← readIORef observed
+  kept ← readTVarIO orphans
+  hostDeciding hooks
+  -- A cancellation still pending is let in here, where the decision can be kept beside it, and not when the raise leaves the mask.
+  landed ← tryWithContext @SomeException (restoreAll (pure ()))
+  conclude (case (scoped, landed) of (Left earlier, _) → Left earlier; (Right (), Left arrived) → Left arrived; (Right (), Right ()) → Right ()) owner worker kept
 
 -- | What the owner's scope raises or returns, from how the owned scope ended, how the use ended and how the worker did.
 conclude
