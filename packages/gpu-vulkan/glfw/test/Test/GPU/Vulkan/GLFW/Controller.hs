@@ -1639,6 +1639,11 @@ testReplacementAdmittedByRetirement = do
     TargetUsable ← awaitStanding host two
     publishObservation host one first
     publishObservation host two second
+    -- The demand below is the first frame of each target, so the owner takes
+    -- it after it has folded the observations that make the targets eligible:
+    -- a round that has the demand but not the observations is refused a frame
+    -- by each target, and its retry waits on the scripted clock.
+    awaitObservationsFolded host [one, two]
     -- One presentation to each, which holds each target's generation.
     redraw ← prepare (OwnerDemand True Nothing)
     _ ← atomically (publishOwnerDemand (ownerHandoff owner) redraw)
