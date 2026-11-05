@@ -164,6 +164,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Consent
         Test.GPU.Vulkan.Native.Environment
         Test.GPU.Vulkan.Native.Fixture
+        Test.GPU.Vulkan.Native.FixtureSpec
         Test.GPU.Vulkan.Native.Frames
         Test.GPU.Vulkan.Native.Presentation
         Test.GPU.Vulkan.Native.Recovery
@@ -192,6 +193,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Spec
         Test.GPU.Vulkan.Native.Terminal
         Test.GPU.Vulkan.Native.Triangle
+        Test.GPU.Vulkan.Native.Unowned
         Test.GPU.Vulkan.Native.WindowedDepth
         Test.Vulkan.Proof.Bridge
         Test.Vulkan.Proof.BridgeSpec
@@ -206,6 +208,7 @@ test-suite vulkan-native-tests
         Test.Vulkan.Proof.LoaderSpec
         Test.Vulkan.Proof.Matrix
         Test.Vulkan.Proof.Ownership
+        Test.Vulkan.Proof.PendingCancellation
         Test.Vulkan.Proof.Publication
         Test.Vulkan.Proof.PublicationSpec
         Test.Vulkan.Proof.Record

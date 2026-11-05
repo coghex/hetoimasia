@@ -2,8 +2,9 @@
 --
 -- The first two groups need no consent and enter no session: the consent
 -- rules themselves, and the migrated proof's release, construction,
--- publication and loader-selection decisions and the private cases' instance
--- scopes over stand-in native layers.
+-- publication and loader-selection decisions, the private cases' instance
+-- scopes over stand-in native layers, the bounded child launcher's ownership and
+-- the shared fixture's dispatch over a stand-in session.
 -- The next two are native: the shared roots, and the cases that need roots of
 -- their own in a child process. The last is VK-16's graphics-owner interaction
 -- probe, pending unless it is activated. Each native example asks the consent
@@ -17,6 +18,7 @@ import Hetoimasia.GLFW.Session (Backend (Wayland))
 import qualified Test.GPU.Vulkan.Native.ChildSpec as ChildSpec
 import Test.GPU.Vulkan.Native.Consent (Consent (..), Refusal (..), consentBackend, consentFrom)
 import Test.GPU.Vulkan.Native.Fixture (Fixture)
+import qualified Test.GPU.Vulkan.Native.FixtureSpec as FixtureSpec
 import Test.GPU.Vulkan.Native.Gate (Gate)
 import qualified Test.GPU.Vulkan.Native.InstanceScopeSpec as InstanceScope
 import qualified Test.GPU.Vulkan.Native.Interaction as Interaction
@@ -38,6 +40,7 @@ spec gate fixture timings = describe "Vulkan native" $ do
     Loader.spec
     InstanceScope.spec
     ChildSpec.spec
+    FixtureSpec.spec
   Shared.spec fixture
   Private.spec gate timings
   Interaction.spec gate
