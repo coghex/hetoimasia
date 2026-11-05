@@ -202,8 +202,9 @@ ownedHostCut cutting hooks logger seam config ownerConfig action =
               Private.OwnerStarted → at AfterStart
             Private.ownerBoundary hooks reached
         , Private.afterDestructionSnapshot = do
-            atomically (modifyTVar' (cuttingSnapshots cutting) (+ 1))
+            -- Opened before the snapshot is counted: a control that has seen the count has seen whether the gate was opened.
             when (cuttingRescued cutting) (atomically (writeTVar (cuttingGate cutting) True))
+            atomically (modifyTVar' (cuttingSnapshots cutting) (+ 1))
             Private.afterDestructionSnapshot hooks
         }
 
@@ -299,7 +300,10 @@ cutStrands state boundary fixture = do
           stranded ← isNothing <$> tryReadMVar done
           rig ← readIORef (cuttingRig cutting) >>= maybe (unexpected "the fixture recorded no rig") pure
           notes ← journalled (rigJournal rig)
-          -- The judgement, recorded before anything is released.
+          gate ← readTVarIO (cuttingGate cutting)
+          -- The judgement, recorded before anything is released: the owner is still held at its gate, which nothing opened, and the
+          -- run has not finished.
+          gate `shouldBe` False
           stranded `shouldBe` True
           -- Nothing was released while the owner was unfinished: the session is still open.
           notes `shouldSatisfy` notElem SessionEnded

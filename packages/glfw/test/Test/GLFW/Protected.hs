@@ -3008,15 +3008,19 @@ data StallProbe = StallProbe
     -- ^ What that opportunity waits for; a scenario never fills it before the cleanup kill.
   , probeOwned ∷ !(TVar (Maybe Owner))
   , probeJournal ∷ !(TVar [Flag])
+  , probeOpened ∷ !(TVar Bool)
+    -- ^ Whether the scope that owns the runner opened what the drain waits for. A control that sees the drain parked in the sink sees
+    -- whether anything had been opened before it.
   }
 
 newStallProbe ∷ IO StallProbe
-newStallProbe = StallProbe <$> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar <*> newTVarIO Nothing <*> newTVarIO []
+newStallProbe =
+  StallProbe <$> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar <*> newTVarIO Nothing <*> newTVarIO [] <*> newTVarIO False
 
 -- | Everything the scope that owns the runner opens before it kills it: the registered owners are released, and the sink's hold is let
 -- go. Idempotent and non-blocking.
 openStallSink ∷ StallProbe → IO ()
-openStallSink probe = rescueNow >> void (tryPutMVar (probeNever probe) ())
+openStallSink probe = atomically (writeTVar (probeOpened probe) True) >> rescueNow >> void (tryPutMVar (probeNever probe) ())
 
 -- | The fixture. With @scenario@ absent it is the example: the runner enters the sink, the example cancels it there and judges the
 -- deferral. With @scenario@ present the example's body is ended by it, while the runner is inside its first retirement opportunity and
@@ -3091,6 +3095,8 @@ stallSinkStrands ending = do
         readMVar (probeReached probe)
         stranded ← isNothing <$> tryReadMVar done
         counted ← readTVarIO (probeOwned probe) >>= maybe (pure 0) (readTVarIO . ownerStalls)
+        opened ← readTVarIO (probeOpened probe)
+        opened `shouldBe` False
         stranded `shouldBe` True
         counted `shouldBe` 0
       )
