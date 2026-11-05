@@ -348,7 +348,10 @@ cabal test hetoimasia-tests --test-show-details=direct
   fixture's borrower is owned (#596)` (a cancellation while serving is idle, while the stand-in session is served, and after a session
   failure the dispatch caught, with and without a following cancellation (the wait for the borrower after a reported failure is
   bounded, so a parked borrower is stopped and joined and the dispatch raises), and a cancellation that escapes the session). Each runs twice with one judgement, through the facility
-  and through the deliberately unowned start of `Test.GPU.Vulkan.Native.Unowned` (the negative control, which must fail). The fixture's
+  and through the deliberately unowned start of `Test.GPU.Vulkan.Native.Unowned` (the negative control, which must fail). The controls' own
+  stop-and-join is uninterruptible, and `the negative controls' own cleanup (#596)` holds that to account (a cancellation while its
+  kill is blocked, and the example cancelled before the worker is let go, each with its control), as the GLFW native suite's does
+  (#594). The fixture's
   seams (`runSharedWith`) exist test-side only. The pinned start's own examples, with a plain `forkOn` control, are in `workflow-tests`
   (`--match "a thread pinned to a capability"`).
   The generic run command's real-device suite `run-native-tests` (the root package, `run-native-test/`,
