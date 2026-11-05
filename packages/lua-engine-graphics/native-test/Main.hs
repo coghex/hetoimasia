@@ -88,16 +88,18 @@ completeFlag ∷ String
 completeFlag = "--complete"
 
 -- | Runs the cancellation probe alone: the quad example's window is live and holds its texture when the process main thread is
--- cancelled, and the run must end by itself with everything torn down in order and the diagnostic verdict clean.
+-- cancelled, and the run must end by itself with everything torn down in order.
 probeFlag ∷ String
 probeFlag = "--probe-cancel-loop"
 
--- | What the probe must have shown: the run's only failure is the cancellation it made, a window existed, and everything else a
--- run must show (the destruction order, no native call raised, a clean diagnostic verdict) holds.
+-- | What the probe must have shown: the run ended by itself (it returned), its only failure is the cancellation it made, a window
+-- existed and was destroyed, and everything else a run must show about the native calls (the destruction order, none raised)
+-- holds. The host gives its diagnostic verdict only on a normal exit, so a cancelled host gives none, and that absence is the one
+-- check of a normal run the probe does not make.
 probeChecks ∷ Facts → [Text]
 probeChecks facts =
   [ "the session did not end with the probe's cancellation: " <> Text.pack (show (factsFailure facts)) | not (maybe False ("user interrupt" `Text.isInfixOf`) (factsFailure facts)) ]
-    <> [ problem | problem ← checks facts, problem /= "an example failed", not ("the session ended with a failure: user interrupt" `Text.isPrefixOf` problem) ]
+    <> [ problem | problem ← checks facts, problem /= "an example failed", problem /= "the session gave no diagnostic verdict", not ("the session ended with a failure: user interrupt" `Text.isPrefixOf` problem) ]
     <> [ "the probe made no window" | factsWindows facts == 0 ]
 
 -- | What a run must have shown whatever Hspec reported.
