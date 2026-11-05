@@ -5,7 +5,6 @@
 -- never decides what a logical script sees.
 module Test.LuaEngine.Data.Workers (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar, readMVar)
 import Control.Monad (forM_)
 import qualified Data.ByteString as BS
@@ -17,6 +16,7 @@ import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (..))
 import Test.Hspec
 import Test.LuaEngine.Data.Support
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "workers and timing" $ do
@@ -121,12 +121,13 @@ timing = describe "assigned positions" $ do
       startAt session vm "i" "a" "f1.bin" Nothing
       awaitStarted (ssProbe session) 1
       finished ← newEmptyMVar
-      _ ← forkIO (grantOne control vm >> putMVar finished ())
-      -- The grant that would reach tick one is held while the read is outstanding.
-      awaitVmDiagnostic vm (\d → rdAdmitted d == 1)
-      tryReadMVar finished `shouldReturn` Nothing
-      openGate (ssProbe session) "f1.bin"
-      readMVar finished
+      -- The grant is owned by the example (#599), and the read it is held behind is let go first however the example ends.
+      withOwnedThreadOpening (openGate (ssProbe session) "f1.bin") (grantOne control vm >> putMVar finished ()) $ \_ _ → do
+        -- The grant that would reach tick one is held while the read is outstanding.
+        awaitVmDiagnostic vm (\d → rdAdmitted d == 1)
+        tryReadMVar finished `shouldReturn` Nothing
+        openGate (ssProbe session) "f1.bin"
+        readMVar finished
       readyIs session vm "i" "a" "after" True
 
   it "settles on arrival for an owner on elapsed time, and refuses a tick offset there before any work" $

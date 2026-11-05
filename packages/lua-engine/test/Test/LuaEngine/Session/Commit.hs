@@ -11,7 +11,7 @@
 -- the protection it proves, through the private harness, and shows the proof detects its absence.
 module Test.LuaEngine.Session.Commit (spec) where
 
-import Control.Concurrent (forkIO, myThreadId, throwTo)
+import Control.Concurrent (myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, onException, throwIO, toException, try)
@@ -26,6 +26,7 @@ import Hetoimasia.Foundation.Time (readInstant, scriptedSource)
 import Test.Hspec
 import Test.LuaEngine.Session.Support
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "the one commit" $ do
@@ -144,11 +145,12 @@ boundaries = describe "at each boundary between a commit and its effects" $ do
       outcome ← runScenarioWith env (recording recorder []) $ \session → do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
-        stopper ← forkIO (requestStop session StopQuit)
-        awaitPoint recorder (Committed "Stop")
-        throwTo stopper ThreadKilled
-        releaseHold recorder (Committed "Stop")
-        void (awaitRetired session)
+        -- the committing thread is owned by the scenario (#599); the example itself cancels it at the recorded point
+        withOwnedThreadOpening (releaseHold recorder (Committed "Stop")) (requestStop session StopQuit) $ \stopper _ → do
+          awaitPoint recorder (Committed "Stop")
+          throwTo stopper ThreadKilled
+          releaseHold recorder (Committed "Stop")
+          void (awaitRetired session)
       out ← outLines world
       out `shouldSatisfy` elem "shutdown gameplay stopped"
       out `shouldSatisfy` elem "shutdown presentation stopped"
@@ -323,19 +325,25 @@ facts = describe "the facts a commit carries" $ do
       holdAt recorder (Resumed (InstanceKey Presentation 0))
       self ← myThreadId
       handle ← newEmptyMVar
-      _ ← forkIO $ do
-        session ← readMVar handle
-        awaitPoint recorder (Resumed (InstanceKey Presentation 0))
-        pumpUntil world (elem "init presentation" <$> outLines world)
-        awaitRegistration world 1000000
-        passTime world 1000000000 (maybe False roleFailed . presentationOf <$> statusNow session)
-        -- from here every reading of the clock fails, while the session is torn down
-        atomically (writeTVar broken True)
-        throwTo self ThreadKilled
-      result ← try (runSession (scenarioSpec env' (recordingHarness recorder noHarness)) (putMVar handle))
-      case result of
-        Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
-        Right _ → expectationFailure "the cancellation was lost"
+      -- the canceller is owned by the example (#599). The hold it waits at is not let go by the stop: the session is cancelled
+      -- while its driver is held there, and the example never lets that hold go, so releasing it afterwards would run the
+      -- orphaned driver against the clock this example has broken
+      withOwnedThread
+        ( do
+            session ← readMVar handle
+            awaitPoint recorder (Resumed (InstanceKey Presentation 0))
+            pumpUntil world (elem "init presentation" <$> outLines world)
+            awaitRegistration world 1000000
+            passTime world 1000000000 (maybe False roleFailed . presentationOf <$> statusNow session)
+            -- from here every reading of the clock fails, while the session is torn down
+            atomically (writeTVar broken True)
+            throwTo self ThreadKilled
+        )
+        $ \_ _ → do
+          result ← try (runSession (scenarioSpec env' (recordingHarness recorder noHarness)) (putMVar handle))
+          case result of
+            Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
+            Right _ → expectationFailure "the cancellation was lost"
       session ← readMVar handle
       status ← statusNow session
       fmap roleInitialized (presentationOf status) `shouldBe` Just True

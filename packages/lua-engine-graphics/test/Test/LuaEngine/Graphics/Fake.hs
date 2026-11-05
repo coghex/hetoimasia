@@ -20,6 +20,9 @@ module Test.LuaEngine.Graphics.Fake
   , fakeLedger
   , setBarrier
   , withFakeOwner
+  , withFakeOwnerAs
+  , latchHolds
+  , ownerLoop
 
     -- * Holds
   , Hold (..)
@@ -53,8 +56,6 @@ module Test.LuaEngine.Graphics.Fake
   , ImageState (..)
   ) where
 
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -68,7 +69,7 @@ import Control.Concurrent.STM
   , throwSTM
   , writeTVar
   )
-import Control.Exception (SomeException, finally, throwIO, try)
+import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as ByteString
 import Data.Map.Strict (Map)
@@ -80,6 +81,8 @@ import qualified Data.Text as Text
 import Data.Word (Word32)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld, newSceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
+import Test.Support.Owned (withOwnedThread)
+import Control.Concurrent (ThreadId)
 
 -- | What the fake owner holds back. A held stage waits until the example releases it.
 data Hold
@@ -187,6 +190,10 @@ data Fake = Fake
   , fLedger ∷ !(SceneLedger Int)
     -- ^ The production ledger of what adopted scene revisions hold, which the fake's release is gated on exactly as
     -- the production port's is. The examples that adopt scenes drive its lifecycle hooks.
+  , fLatched ∷ !(TVar Bool)
+    -- ^ Set once the example's scope is stopping ('latchHolds'): from then on 'hold', 'holdTicket' and 'setVersionHolders'
+    -- install nothing, so a worker that is cancelled before it installs its holds cannot reinstall them after the stop let go
+    -- of every one (#599).
   }
 
 newFake ∷ FakeConfig → IO Fake
@@ -213,6 +220,7 @@ newFake cfg =
     <*> newTVarIO (pure (pure True))
     <*> newTVarIO Set.empty
     <*> newSceneLedger
+    <*> newTVarIO False
 
 -- | Install what a release request captures at its admission: a transaction that reads the scene host's state and
 -- answers the gate the owner waits on. The scene host model (the lifecycle suite's stand-in for the host's
@@ -227,7 +235,7 @@ fakeLedger = fLedger
 -- Holds and injections ---------------------------------------------------------------------------------------
 
 hold ∷ Fake → Hold → IO ()
-hold fake which = atomically (modifyTVar' (fHolds fake) (Set.insert which))
+hold fake which = atomically (unlessLatched fake (modifyTVar' (fHolds fake) (Set.insert which)))
 
 release ∷ Fake → Hold → IO ()
 release fake which = atomically (modifyTVar' (fHolds fake) (Set.delete which) >> bump fake)
@@ -235,7 +243,7 @@ release fake which = atomically (modifyTVar' (fHolds fake) (Set.delete which) >>
 -- | Hold the completion of one upload (by the ticket its start event names) while the others complete: how an example
 -- completes two open uploads in the reverse of the order they started.
 holdTicket ∷ Fake → Int → IO ()
-holdTicket fake ticket = atomically (modifyTVar' (fTicketHolds fake) (Set.insert ticket))
+holdTicket fake ticket = atomically (unlessLatched fake (modifyTVar' (fTicketHolds fake) (Set.insert ticket)))
 
 -- | Let one held upload complete.
 releaseTicket ∷ Fake → Int → IO ()
@@ -286,7 +294,16 @@ grantOwner ∷ Fake → Int → IO ()
 grantOwner fake count = atomically (modifyTVar' (fGrants fake) (+ count))
 
 setVersionHolders ∷ Fake → Int → IO ()
-setVersionHolders fake count = atomically (writeTVar (fHolders fake) count >> bump fake)
+setVersionHolders fake count = atomically (readTVar (fLatched fake) >>= \latched → writeTVar (fHolders fake) (if latched then 0 else count) >> bump fake)
+
+-- | From now on no hold is installed: the stop of a scope calls this before it lets every hold go, in the same step, so a worker
+-- the stop reaches before the worker has installed its holds does not install them afterwards and wait on them in a drain the
+-- stop's kill cannot end. Idempotent; it never blocks.
+latchHolds ∷ Fake → IO ()
+latchHolds fake = atomically (writeTVar (fLatched fake) True >> bump fake)
+
+unlessLatched ∷ Fake → STM () → STM ()
+unlessLatched fake action = readTVar (fLatched fake) >>= \latched → unless latched action
 
 bump ∷ Fake → STM ()
 bump fake = modifyTVar' (fEpoch fake) (+ 1)
@@ -569,12 +586,18 @@ deviceFor fake =
 -- The owner's thread -------------------------------------------------------------------------------------------
 
 -- | Run the fake owner for the body: one thread that does what no hold forbids — runs a queued action,
--- starts and completes uploads, binds the table, reclaims released slots — and nothing else.
+-- starts and completes uploads, binds the table, reclaims released slots — and nothing else. The thread is owned by the call
+-- (#599): started and registered for its stop-and-join in one masked step, and ended and joined however the body ended, a
+-- cancellation delivered between the thread's start and the body's first step included. It waits only in STM, so the kill ends
+-- it wherever it is.
 withFakeOwner ∷ Fake → IO a → IO a
-withFakeOwner fake body = do
-  done ← newEmptyMVar
-  thread ← forkIO (ownerLoop fake `finally` putMVar done ())
-  body `finally` (killThread thread >> takeMVar done)
+withFakeOwner = withFakeOwnerAs (\_ → pure ())
+
+-- | 'withFakeOwner' with a test-side seam: the action runs on the calling thread, inside the scope and before the body's first
+-- step, and is given the owner's thread. It lets an example learn the thread and place a cancellation exactly there. No example
+-- of the suite passes anything else.
+withFakeOwnerAs ∷ (ThreadId → IO ()) → Fake → IO a → IO a
+withFakeOwnerAs seam fake body = withOwnedThread (ownerLoop fake) (\thread _ → seam thread >> body)
 
 ownerLoop ∷ Fake → IO ()
 ownerLoop fake = do
