@@ -407,7 +407,18 @@ testBackoffSchedule = do
     _ ← releaseGraphicsTarget (vulkanWindowHost host) owner service
     _ ← atomically (awaitOwnerRound owner (statusRounds beforeClose))
     afterClose ← elapsedBetween closedAt <$> awaitDeadlineAfter host closedAt
+    -- The owner can have a round of the close's own already under way here: its
+    -- status is written when a round ends, so the readings above do not show
+    -- one. Such a round reads the clock at its retirement check and again at
+    -- its poll, and a clock moved between the two lets the poll observe the
+    -- retirements that the check had already judged, leaving the target owed
+    -- until the next poll, which the standing clock never reaches. So the
+    -- clock is moved once for the round that takes the move, whichever that
+    -- is, and once more after it has ended, when nothing is left to observe.
+    exitRounds ← statusRounds <$> atomically (readOwnerStatusNow owner)
     letExitFinish rig
+    _ ← atomically (awaitOwnerRound owner exitRounds)
+    advanceClock rig 60000
     _ ← awaitTerminal host service
     pure (walked, unrelated, afterDemand, afterCompletion, afterClose)
   walked `shouldBe` map millis [5, 10, 20, 40, 80, 100, 100]
