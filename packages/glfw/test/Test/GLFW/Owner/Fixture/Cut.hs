@@ -42,7 +42,7 @@ module Test.GLFW.Owner.Fixture.Cut
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryReadMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryReadMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -65,10 +65,10 @@ import Control.Exception
   , try
   , uninterruptibleMask_
   )
-import Control.Monad (forM_, join, void, when)
+import Control.Monad (forM_, join, unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isNothing)
-import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadCapability, threadStatus)
 import GHC.IO (unsafeUnmask)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Runtime.GLFW
@@ -88,7 +88,7 @@ import Test.GLFW.Support
   , withDeferredThreadVia
   )
 import Test.Hspec (Expectation, Spec, it, shouldBe, shouldSatisfy)
-import Test.Support.Owned (withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThreadOn, withOwnedThreadOpening)
 
 -- | Where a run is cut.
 data Boundary
@@ -162,20 +162,49 @@ withCutting recorded state boundary rescued body = do
   crossed ← newIORef []
   let scope ∷ Scope
       scope = recordingThreads recorded withOwnedThreadOpening
-  withDeferredThreadVia scope (pure ()) (\target → throwTo target UserInterrupt) $ \helper handOver → do
+  withDeferredThreadVia scope (pure ()) (\target → throwTo target UserInterrupt) $ \_ handOver → do
     let cut = case state of
           CutFails → throwIO Boom
           CutDelivered → myThreadId >>= handOver >> holdForever
           -- Masked so the cancellation cannot be received before the boundary has been left: the thread that delivers it is blocked
           -- in its throw, which is the one state a cancellation can be pending in.
-          -- The yield afterwards is not decoration. A throw to a thread running on another capability is a message that capability
-          -- processes when its scheduler next runs, so without it the cancellation is received at some later point of the run, which
-          -- can be inside the startup wait (#613) and is not the boundary this state names.
-          CutPending → uninterruptibleMask_ (myThreadId >>= handOver >> awaitThrowing helper >> yield)
+          -- The sender and the target share a capability (#610's pinned start). On one capability a throw to a masked thread is settled
+          -- where it is made: the exception is on the target's queue before the sender is recorded as blocked delivering. Across
+          -- capabilities the throw is a message the target's capability takes in when it next looks at its inbox, so no wait on the
+          -- sender's status establishes receipt, and the cancellation could arrive anywhere later, inside the startup wait that #613
+          -- leaves stranded. The run's main thread is a bound thread and can change capability whenever it yields, so the throw is made
+          -- while it is blocked on the sender's own hand-over: the sender is started on the capability the target is on, says it is
+          -- there, and throws in the same turn, with the target woken on that capability and masked uninterruptibly. The cancellation is
+          -- received as that mask ends, inside the scope, which then stops and joins the sender.
+          CutPending → pending recorded
     finished ← newTVarIO False
     body (Cutting (Just boundary) cut rescued gate rigs snapshots finished crossed release)
 
--- | Wait, by yielding, until the thread is blocked delivering its exception.
+-- | Make a cancellation pending against the calling thread, which is masked until the cancellation is received as the mask ends.
+-- The sender is started on the capability the caller is on and, while the caller is blocked on the sender's hand-over, checks that the
+-- caller is still on it before it throws: a caller blocked on a capability stays there, so the throw is made on the caller's own
+-- capability, where it is settled at once, or not made at all and the whole is tried again. The cancellation is raised as the caller's
+-- mask ends, inside the sender's scope, which then stops and joins the sender (recorded for the caller's judgement).
+pending ∷ IORef [ThreadId] → IO ()
+pending recorded = do
+  me ← myThreadId
+  (capability, _) ← threadCapability me
+  there ← newEmptyMVar
+  let sender = do
+        (now, _) ← threadCapability me
+        putMVar there (now == capability)
+        when (now == capability) (throwTo me UserInterrupt)
+  settled ← withOwnedThreadOn capability sender $ \thread _ → do
+    atomicModifyIORef' recorded (\known → (thread : known, ()))
+    uninterruptibleMask_ $ do
+      same ← takeMVar there
+      when same (awaitThrowing thread)
+      pure same
+  -- Raised above when it was made. Reached only when the caller had moved: again, from where it is now.
+  unless settled (pending recorded)
+
+-- | Wait, by yielding, until the thread is blocked delivering its exception. Only a sender on the target's own capability makes that a
+-- proof that the exception is pending (see 'CutPending').
 awaitThrowing ∷ ThreadId → IO ()
 awaitThrowing thread =
   threadStatus thread >>= \case

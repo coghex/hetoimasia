@@ -17,6 +17,7 @@ module Test.GLFW.Owner.Fixture.Rig
   , armedFinally
   , publishAllFor
   , ownedHostCaught
+  , ownedHostCaughtHooked
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
@@ -237,8 +238,18 @@ ownedHostCaught
   → GraphicsOwnerConfig Scene
   → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
   → IO (Either SomeException a)
-ownedHostCaught seam config ownerConfig action =
-  asProcessMainThread seam (try (ownedHostRun Private.noHostHooks (pure ()) quietLogger seam config ownerConfig action))
+ownedHostCaught = ownedHostCaughtHooked Private.noHostHooks
+
+-- | 'ownedHostCaught' over the package's private host hooks (#612).
+ownedHostCaughtHooked
+  ∷ Private.HostHooks
+  → Seam
+  → HostConfig
+  → GraphicsOwnerConfig Scene
+  → (WindowHost → GraphicsOwner Scene → RuntimeControl → IO a)
+  → IO (Either SomeException a)
+ownedHostCaughtHooked hooks seam config ownerConfig action =
+  asProcessMainThread seam (try (ownedHostRun hooks (pure ()) quietLogger seam config ownerConfig action))
 
 -- | The composition itself, already on the designated main thread.
 ownedHostRun
