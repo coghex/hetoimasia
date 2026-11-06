@@ -138,8 +138,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , setWindowMetrics
   , nudgeOwner
   , awaitOwnerQuiet
-  , holdOwnerSteps
-  , releaseOwnerSteps
+  , holdSinkFailure
+  , releaseSinkFailure
   , offerExtent
   , twoWindows
   , failingSink
@@ -1592,8 +1592,8 @@ data Rig = Rig
   , rigStepSeen ∷ !(TVar [[(AttachmentId, Natural)]])
     -- ^ For every step the owner was offered, in step with 'rigStepEntries', the observation revision each
     -- target's view carried: what the owner had folded for it when the step began.
-  , rigStepsHeld ∷ !(TVar Bool)
-    -- ^ Whether the owner's steps are held at their start ('holdOwnerSteps'); a rescued rig holds none.
+  , rigSinkGate ∷ !(TVar Bool)
+    -- ^ Whether the failing sink may raise yet ('holdSinkFailure'); a rescued rig holds none.
   , rigStepEntries ∷ !(TVar [(OwnerDemand, Natural)])
     -- ^ For every step the owner was offered, oldest first, the demand it
     -- carried and the owner's completed rounds when it began: the round that
@@ -1799,15 +1799,15 @@ awaitObservationsFolded host services = atomically $ do
   geometry ← readOwnerGeometry (vulkanGraphicsOwner host)
   check (all ((`Map.member` geometry) . graphicsAttachment) services)
 
--- | Hold every owner step at its start, from the next one on, until 'releaseOwnerSteps' (or a rescue). The owner's
--- round is otherwise as it was: it takes its lifetime events, constructs and folds before the step it holds, and
--- nothing in the round after the step happens meanwhile.
-holdOwnerSteps ∷ Rig → IO ()
-holdOwnerSteps rig = atomically (writeTVar (rigStepsHeld rig) True)
+-- | Make the capture's failing sink wait before it raises, until 'releaseSinkFailure' (or a rescue). The sink is
+-- called from the thread that reports the record, which is not the owner's, so a record reported inside the owner's
+-- construction is not seen by the construction's own checks until the sink has raised: this says when it does.
+holdSinkFailure ∷ Rig → IO ()
+holdSinkFailure rig = atomically (writeTVar (rigSinkGate rig) False)
 
--- | Let the owner's steps run again. Idempotent.
-releaseOwnerSteps ∷ Rig → IO ()
-releaseOwnerSteps rig = atomically (writeTVar (rigStepsHeld rig) False)
+-- | Let the failing sink raise. Idempotent.
+releaseSinkFailure ∷ Rig → IO ()
+releaseSinkFailure rig = atomically (writeTVar (rigSinkGate rig) True)
 
 -- | Wait until the owner is idle: it has folded an observation published now for this target, the round that
 -- folded it has ended, and nothing is owed at once, so nothing wakes it until something is published to it.
@@ -1999,7 +1999,7 @@ newRigClocked visible windows clock = do
   presentRounds' ← newTVarIO []
   stepEntries ← newTVarIO []
   stepSeen ← newTVarIO []
-  stepsHeld ← newTVarIO False
+  sinkGate ← newTVarIO True
   armings ← newTVarIO []
   armHook ← newTVarIO Nothing
   sceneLog ← newTVarIO []
@@ -2028,7 +2028,7 @@ newRigClocked visible windows clock = do
       , rigPresentRounds = presentRounds'
       , rigStepEntries = stepEntries
       , rigStepSeen = stepSeen
-      , rigStepsHeld = stepsHeld
+      , rigSinkGate = sinkGate
       , rigClock = clock
       , rigArmings = armings
       , rigArmHook = armHook
@@ -2133,11 +2133,6 @@ runRigOwned rig body = myThreadId >>= \self → withBoundThread (rigBound rig) s
                       rounds ← maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) held
                       modifyTVar' (rigStepEntries rig) (<> [(stepDemand step, rounds)])
                       modifyTVar' (rigStepSeen rig) (<> [[(viewTarget view, viewRevision view) | view ← stepTargets step]])
-                    -- Held at its start, before it reads or does anything: a rescued rig holds nothing.
-                    atomically $ do
-                      holding ← readTVar (rigStepsHeld rig)
-                      rescuedNow ← rescuing rig
-                      check (not holding || rescuedNow)
                     graphicsStep (ownerOperations owner) step
                 }
           }
@@ -2224,6 +2219,10 @@ captureLogger rig =
   mkLoggerWith defaultLogFilter systemMetadata . callbackSink $ \_ → do
     failing ← readTVarIO (rigSinkFailing rig)
     when failing $ do
+      atomically $ do
+        open ← readTVar (rigSinkGate rig)
+        rescuedNow ← rescuing rig
+        check (open || rescuedNow)
       atomically (writeTVar (rigSinkFailed rig) True)
       throwIO (StandInFailure "the diagnostic sink failed")
 

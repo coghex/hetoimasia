@@ -952,22 +952,20 @@ testSinkFailure = do
     failingSink rig
     one ← handedOver host first RequiredTarget
     TargetUsable ← awaitStanding host one
-    -- The owner is idle before the second target is handed over, and its steps are held from then until the
-    -- second target has been seen to stand. The warning is logged inside that target's construction, and the
-    -- sink's failure is raised by the checkpoint at the start of the owner's next step; a step that began
-    -- before the example's own wait had seen the standing could end the owner first, and a target that has
-    -- retired is never observed standing.
-    awaitOwnerQuiet rig host one first
+    -- The warning is logged inside the second target's construction, and a sink that raised at once could be seen
+    -- by the construction's own check after its admission, which would end it unusable instead of standing. The
+    -- sink raises once the example has seen the target stand, so the target stands whichever thread is quicker.
+    holdSinkFailure rig
     ( do
-        holdOwnerSteps rig
         -- A warning is a diagnostic, not a failure; the sink that cannot take it
         -- is.
         scriptNative rig AtSupport (ReportsWarning "a warning the sink cannot take")
         two ← handedOver host second OptionalTarget
         TargetUsable ← awaitStanding host two
+        releaseSinkFailure rig
         atomically (sinkHasFailed rig >>= check)
       )
-      `finally` releaseOwnerSteps rig
+      `finally` releaseSinkFailure rig
     -- An idle owner learns of it at its next round, which a published scene
     -- gives it; nothing here waits on a clock.
     scene ← prepare 0
