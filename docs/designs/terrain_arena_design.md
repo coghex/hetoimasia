@@ -78,6 +78,10 @@ defect verdict on Synarchy:
   compressing an entire air interval into a range record
   (S `src/World/Generate/Chunk/Columns.hs:100–115`, `:205–209`;
   `src/World/Chunk/Types.hs:72–80`).
+- When newly loaded neighbors expose a deeper cliff face, Synarchy extends
+  edge columns downward by repeating the lowest stored material. That is an
+  explicit continuation rule, not reconstruction of arbitrary deeper geology
+  (S `src/World/Slope/EdgePatch.hs:16–24`, `:95–109`).
 
 Initial tracker overlap check, 2026-11-06: the open issue list contains #446
 and #563; an all-state `terrain arena` title/body search returned no match.
@@ -90,7 +94,8 @@ not Hetoimasia delivery items.
 **Accepted direction:** begin terrain for Ecce Homo using flat arena terrain
 and demand-driven chunk loading. The full terrain model, including gaps,
 belongs in the first version (D-4). Procedural elevation generation is deferred.
-The rejected Beacon example is not the consumer.
+Compressed columns with demand-driven materialization are the chosen direction
+(D-5). The rejected Beacon example is not the consumer.
 
 **Proposal P-1:** a visible terrain arena that can be navigated, making chunk
 demand and the resulting terrain observable. Keep the first terrain source
@@ -109,17 +114,17 @@ this same model; a future procedural source would populate it differently.
 Recommend a discrete `(x,y,z)` cell model as the logical contract, independently
 of physical storage. This can express cave floors, ceilings and overhangs.
 Cell shapes/slopes, terrain versus constructed structures, vertical chunking,
-compression and exact data representation are separate decisions. P-2 is not
-approved by D-4; Q-8 asks the owner to settle the logical model first.
+exact data representation are separate decisions. D-5 selects compressed
+columns; exact cell/shape granularity and query semantics remain in Q-8.
 
-**Owner concern, 2026-11-06 — unresolved, not decision approval:**
+**Owner memory concern, 2026-11-06 — direction addressed by D-5:**
 
 > i initially avoided the 3d cell because i was worried about having too much data, what would you say to that? by compressing airgaps and only holding the top terrain, we only hold in memory the basic structure, not every cell
 
 The logical ability to answer about `(x,y,z)` does not require allocating a
 record for each cell. P-2 must not be read as a recommendation for a dense
-full-depth voxel allocation. The owner's memory concern is a constraint to
-resolve before selecting representation, not approval of P-2 or P-3.
+full-depth voxel allocation. This concern led to P-3 and the owner's subsequent
+approval of its direction in D-5; physical layout and budgets remain open.
 
 **Proposal P-3: compressed vertical spans with bounded materialization.** Keep
 columns, but describe solid/material intervals and gaps compactly. An
@@ -129,6 +134,9 @@ span boundaries instead of a separate record for each depth; exact integer
 boundary conventions and representation are not selected by this example.
 Uniform solid interiors can be compact just as air can. Gaps, cave ceilings
 and separated spans remain queryable parts of the same model.
+
+D-5 accepts this direction. The illustrative layout and all detailed choices
+below remain proposals rather than an approved implementation specification.
 
 Distinguish three questions: what terrain exists, which terrain data is
 materialized in memory, and which exposed faces are prepared for rendering.
@@ -144,6 +152,21 @@ search/split/merge work. No compression ratio or speed is claimed. Account for
 actual resident representations and derived render data when selecting bounds;
 a chunk count alone does not establish a memory bound. Compare representative
 flat, layered, hollow and fragmented cases before choosing physical storage.
+
+**Proposal P-4: demand follows consumers, not visibility alone.** Untouched
+underground detail may remain uncomputed and unallocated until needed. A small
+terrain definition/source and any retained modifications provide its meaning;
+there is no requirement to precompute every underground column's spans. Known
+air intervals likewise need no per-cell enumeration. Materialize only the
+requested region and whatever bounded neighboring data its query requires.
+
+Rendering is one possible demand producer. A future digging, collision or
+other game query can need terrain that is not visible. Such examples explain
+the contract; they do not add those systems to this arc. Unloaded terrain must
+not be interpreted as air, and revealing or reloading the same terrain must
+remain consistent with its source and retained edits. Rendering faces and CPU
+terrain detail can have different residency requirements. The demand-producer
+rule is recommended, not yet selected by the owner's question in D-5.
 
 ## Decisions
 
@@ -201,6 +224,21 @@ vertical bounds, structural-support simulation or exact editing tools. The
 remaining meaning and boundaries of the full model are refined in Q-8 and the
 other open questions, rather than silently narrowed to a fixed solid column.
 
+### D-5. Compressed columns with lazy materialization
+
+Owner, directly in this pane on 2026-11-06, answering whether the compressed
+column direction matches their intent:
+
+> yes that fits, the thing that i liked that synarchy did was leave all the empty space uncalculated when it was unrendered, then tiles get loaded into memory as they are needed, without any memory loaded in that is underground, is something wrong with that approach?
+
+Accept compressed columns and materializing terrain detail only as needed.
+Do not require dense per-cell storage or eager computation of the underground
+to satisfy D-4's complete spatial model. The owner specifically values leaving
+unneeded space uncalculated. Their question asks whether this is sound; it
+does not yet approve a visibility-only demand policy or promise literally zero
+memory for the source definition, metadata or retained underground edits.
+P-4 recommends the demand rule; Q-8/Q-9 retain representation details.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -239,6 +277,9 @@ priorities, cancellation, complete publication, failures, residency accounting
 and safe eviction. Decide how late results are prevented from reaching a
 replaced world and how renderer holds interact with CPU data eviction. A flat
 generator must not substitute for a lifetime contract.
+P-4 recommends admitting terrain queries from rendering and game consumers,
+including queries about invisible regions, while leaving undemanded detail
+unmaterialized. This producer rule remains open.
 
 ### Q-4. What can the owner see and control in the first version?
 
@@ -289,14 +330,15 @@ a dense full-world allocation, cubic storage chunks or a particular array.
 
 ### Q-9. How is terrain represented compactly, including unmaterialized depth?
 
-P-3 recommends investigating compressed vertical spans, retaining complete
-spatial meaning while materializing only demanded detail. Decide whether this
-is the intended design direction, then settle the source of deep terrain,
+D-5 selects P-3's compressed-column direction, retaining complete spatial
+meaning while materializing only demanded detail. Settle the source of deep terrain,
 uniform base/shared data, material and shape boundaries, edit overrides,
 fragmentation limits and any alternative dense representation for complicated
 regions. Do not equate a known air gap, an unstored solid interior, unavailable
 terrain and an outside-world position. Exact memory/time tradeoffs remain
-unmeasured, and physical storage is not approved yet.
+unmeasured, and the exact physical storage layout is not approved yet. P-4
+allows a shared source definition to stand in for untouched underground spans;
+choosing compressed columns does not require eagerly building every column.
 
 ## Verification strategy — proposal
 
