@@ -299,6 +299,7 @@ import Hetoimasia.Runtime.GLFW
   , acknowledgedAttachment
   , AttachmentProtocol (..)
   , GraphicsOwner
+  , GraphicsOperations (..)
   , GraphicsOwnerConfig (..)
   , ownerTimer
   , GraphicsService
@@ -306,6 +307,8 @@ import Hetoimasia.Runtime.GLFW
   , LoopHooks (..)
   , SceneMode (..)
   , TargetStanding (..)
+  , OwnerDemand (..)
+  , OwnerStep (..)
   , OwnerStatus (..)
   , readOwnerStatusNow
   , readOwnerGeometry
@@ -1567,6 +1570,10 @@ data Rig = Rig
   , rigRendering ∷ !Rendering
   , rigFrameEvents ∷ !(TVar [FrameEvent])
   , rigPresentRounds ∷ !(TVar [Natural])
+  , rigStepEntries ∷ !(TVar [(OwnerDemand, Natural)])
+    -- ^ For every step the owner was offered, oldest first, the demand it
+    -- carried and the owner's completed rounds when it began: the round that
+    -- offered it is the next one.
     -- ^ For every presentation, oldest first, the owner's completed rounds at
     -- the instant it was reported: the round that made it is the next one.
   , rigClock ∷ !(Maybe (TVar Instant))
@@ -1931,6 +1938,7 @@ newRigClocked visible windows clock = do
   rendering ← newRendering
   frameLog ← newTVarIO []
   presentRounds' ← newTVarIO []
+  stepEntries ← newTVarIO []
   armings ← newTVarIO []
   armHook ← newTVarIO Nothing
   sceneLog ← newTVarIO []
@@ -1957,6 +1965,7 @@ newRigClocked visible windows clock = do
       , rigRendering = rendering
       , rigFrameEvents = frameLog
       , rigPresentRounds = presentRounds'
+      , rigStepEntries = stepEntries
       , rigClock = clock
       , rigArmings = armings
       , rigArmHook = armHook
@@ -2048,6 +2057,21 @@ runRigOwned rig body = myThreadId >>= \self → withBoundThread (rigBound rig) s
           rounds <- maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) owner
           modifyTVar' (rigSceneRounds rig) (<> [rounds])
         readTVarIO (rigSceneHook rig) >>= ($ event)
+      -- Records each step the owner is offered as it begins, on the owner's
+      -- thread: the demand it carries, and the rounds completed so far, which
+      -- only the owner's thread changes.
+      entering owner =
+        owner
+          { ownerOperations =
+              (ownerOperations owner)
+                { graphicsStep = \step → do
+                    held ← readTVarIO (rigOwner rig)
+                    atomically $ do
+                      rounds ← maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) held
+                      modifyTVar' (rigStepEntries rig) (<> [(stepDemand step, rounds)])
+                    graphicsStep (ownerOperations owner) step
+                }
+          }
       timed owner = case rigClock rig of
         Nothing → owner
         Just cell →
@@ -2091,7 +2115,7 @@ runRigOwned rig body = myThreadId >>= \self → withBoundThread (rigBound rig) s
                 pure session
             )
             requiredInstanceExtensions
-            config {vulkanOwner = \owner → timed (maybe owner (\capacity → owner {ownerEventCapacity = capacity}) (rigPortCapacity rig))}
+            config {vulkanOwner = \owner → timed (entering (maybe owner (\capacity → owner {ownerEventCapacity = capacity}) (rigPortCapacity rig)))}
             (\host → atomically (writeTVar (rigOwner rig) (Just (vulkanGraphicsOwner host))) >> use host)
         atomically (writeTVar (rigVerdict rig) (Just verdict))
         pure result

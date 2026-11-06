@@ -1800,13 +1800,16 @@ testResizeVersusFailure = do
     resizeFramebuffer rig host window (800, 600)
     pumpUntil host control "the resize's observation" (observedFramebuffer host window (800, 600))
     publishObservation host service window
-    pumpUntil host control "the replacement" (elem (SwapchainCreated 504 (800, 600) (Just 500)) <$> journal rig)
+    -- The journal shows a swapchain at its creation, inside the native call;
+    -- the generation is published once its views are made. The active
+    -- generation is read only once the replacement is the target's own.
+    pumpUntil host control "the replacement" ((&&) <$> (elem (SwapchainCreated 504 (800, 600) (Just 500)) <$> journal rig) <*> activeSwapchainIs host service 504)
     resized ← attemptsOf host service
     forM_ [508, 512] $ \expected → do
       Just active ← (>>= viewActive) <$> atomically (readVulkanGenerations controller (graphicsAttachment service))
       _ ← atomically (noteVulkanSwapchainResult controller active SwapchainOutOfDate)
       nudgeOwner rig host service window
-      pumpUntil host control "the recovery rebuild" (any (\case SwapchainCreated handle _ _ → handle == expected; _ → False) <$> journal rig)
+      pumpUntil host control "the recovery rebuild" ((&&) <$> (any (\case SwapchainCreated handle _ _ → handle == expected; _ → False) <$> journal rig) <*> activeSwapchainIs host service expected)
     (,) resized <$> attemptsOf host service
   afterResize `shouldBe` Just 0
   afterFailures `shouldBe` Just 2
@@ -1846,6 +1849,14 @@ activeSwapchain host service = do
   case [swapchain | generation ← viewGenerations view, Just (viewGeneration generation) == viewActive view, Just swapchain ← [viewSwapchain generation]] of
     swapchain : _ → pure swapchain
     [] → failWith "the target has no active swapchain"
+
+-- | Whether this swapchain belongs to the target's active generation.
+activeSwapchainIs ∷ VulkanHost Scene → GraphicsService → Word64 → IO Bool
+activeSwapchainIs host service wanted = do
+  view ← atomically (readVulkanGenerations (vulkanController host) (graphicsAttachment service))
+  pure $ case view of
+    Nothing → False
+    Just held → or [handle == wanted | generation ← viewGenerations held, Just (viewGeneration generation) == viewActive held, Just handle ← [viewSwapchain generation]]
 
 attemptsOf ∷ VulkanHost Scene → GraphicsService → IO (Maybe Natural)
 attemptsOf host service = atomically $ do
