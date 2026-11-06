@@ -346,6 +346,11 @@ presentOne rig host control = do
   [window] ← windowsOf host
   service ← handedOver host window RequiredTarget
   TargetUsable ← awaitStanding host service
+  -- The window's observation is published, and the owner waited on to have folded it, before the frame is demanded:
+  -- an owner round that took the demand first would find the target not yet eligible and refuse the frame, and the
+  -- retry it sets is paced on the scripted clock, which nothing here moves ('awaitObservationsFolded').
+  publishObservation host service window
+  awaitObservationsFolded host [service]
   client ← atomically (hostWindowClient (vulkanWindowHost host) window) >>= maybe (throwIO (StandInFailure "the window has no client")) pure
   void (publishDemand (clientDemandPublisher client) immediateDemand)
   runVulkanOwnerLoop host control . defaultScheduledHooks quietLogger $ \_ → do

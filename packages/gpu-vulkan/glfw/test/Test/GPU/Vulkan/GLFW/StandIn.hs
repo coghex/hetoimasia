@@ -66,6 +66,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , Rendering
   , submissionsComplete
   , submissionsCompleteWhen
+  , presentationsRetireWhen
   , millisecondsOf
   , presentationsRetire
   , scriptPresentStatus
@@ -136,6 +137,9 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , awaitObservationsFolded
   , setWindowMetrics
   , nudgeOwner
+  , awaitOwnerQuiet
+  , holdSinkFailure
+  , releaseSinkFailure
   , offerExtent
   , twoWindows
   , failingSink
@@ -309,6 +313,7 @@ import Hetoimasia.Runtime.GLFW
   , TargetStanding (..)
   , OwnerDemand (..)
   , OwnerStep (..)
+  , TargetStepView (..)
   , OwnerStatus (..)
   , readOwnerStatusNow
   , readOwnerGeometry
@@ -990,6 +995,10 @@ data Rendering = Rendering
     -- ^ How many the canceller has delivered.
   , renderingCanceller ∷ !(TVar (Maybe ThreadId))
     -- ^ The thread of the run now under way that throws them, owned by the run.
+  , renderingPresentationGate ∷ !(TVar (Maybe (STM Bool)))
+    -- ^ When set, a transaction that lets a present fence answer signalled while it holds, beside
+    -- 'renderingPresentations': read in the fence query's own transaction, as 'renderingSubmissionGate' is
+    -- ('presentationsRetireWhen').
   , renderingSubmissionGate ∷ !(TVar (Maybe (STM Bool)))
     -- ^ When set, a transaction that lets a submission fence answer signalled while it holds, beside
     -- 'renderingSubmissions': the fence query reads it in its own transaction, so the completion and what the gate
@@ -1145,6 +1154,7 @@ newRendering =
     <*> newTVarIO 0
     <*> newTVarIO Nothing
     <*> newTVarIO Nothing
+    <*> newTVarIO Nothing
 
 -- | Whether a submission's fence answers signalled when it is next asked.
 submissionsComplete ∷ Rig → Bool → IO ()
@@ -1158,6 +1168,14 @@ submissionsComplete rig = atomically . writeTVar (renderingSubmissions (rigRende
 -- 'completeNextSubmissions' and replaces neither; given a rig that never calls it, a query is as it was.
 submissionsCompleteWhen ∷ Rig → STM Bool → IO ()
 submissionsCompleteWhen rig = atomically . writeTVar (renderingSubmissionGate (rigRendering rig)) . Just
+
+-- | Let every present fence answer signalled, from the fence query on which this transaction holds, and not before.
+--
+-- The presentation counterpart of 'submissionsCompleteWhen': the condition is read in the fence query's own
+-- transaction, so the retirement and the fact it waits for are one observation, with no supplier thread to be
+-- scheduled in between. It adds to 'presentationsRetire' and 'retireNextPresentations' and replaces neither.
+presentationsRetireWhen ∷ Rig → STM Bool → IO ()
+presentationsRetireWhen rig = atomically . writeTVar (renderingPresentationGate (rigRendering rig)) . Just
 
 -- | Whether a present fence answers signalled when it is next asked.
 presentationsRetire ∷ Rig → Bool → IO ()
@@ -1435,7 +1453,8 @@ renderingLayers rescued events rendering clock =
               kind ← Map.lookup handle <$> readTVar (renderingFences rendering)
               gated ← readTVar (renderingSubmissionGate rendering) >>= fromMaybe (pure False)
               submissions ← (|| gated) <$> readTVar (renderingSubmissions rendering)
-              presentations ← readTVar (renderingPresentations rendering)
+              presentationGated ← readTVar (renderingPresentationGate rendering) >>= fromMaybe (pure False)
+              presentations ← (|| presentationGated) <$> readTVar (renderingPresentations rendering)
               counted ← readTVar (renderingRetireCount rendering)
               submissionsLeft ← readTVar (renderingSubmissionCount rendering)
               kept ← readTVar (renderingKept rendering)
@@ -1570,6 +1589,11 @@ data Rig = Rig
   , rigRendering ∷ !Rendering
   , rigFrameEvents ∷ !(TVar [FrameEvent])
   , rigPresentRounds ∷ !(TVar [Natural])
+  , rigStepSeen ∷ !(TVar [[(AttachmentId, Natural)]])
+    -- ^ For every step the owner was offered, in step with 'rigStepEntries', the observation revision each
+    -- target's view carried: what the owner had folded for it when the step began.
+  , rigSinkGate ∷ !(TVar Bool)
+    -- ^ Whether the failing sink may raise yet ('holdSinkFailure'); a rescued rig holds none.
   , rigStepEntries ∷ !(TVar [(OwnerDemand, Natural)])
     -- ^ For every step the owner was offered, oldest first, the demand it
     -- carried and the owner's completed rounds when it began: the round that
@@ -1775,6 +1799,41 @@ awaitObservationsFolded host services = atomically $ do
   geometry ← readOwnerGeometry (vulkanGraphicsOwner host)
   check (all ((`Map.member` geometry) . graphicsAttachment) services)
 
+-- | Make the capture's failing sink wait before it raises, until 'releaseSinkFailure' (or a rescue). The sink is
+-- called from the thread that reports the record, which is not the owner's, so a record reported inside the owner's
+-- construction is not seen by the construction's own checks until the sink has raised: this says when it does.
+holdSinkFailure ∷ Rig → IO ()
+holdSinkFailure rig = atomically (writeTVar (rigSinkGate rig) False)
+
+-- | Let the failing sink raise. Idempotent.
+releaseSinkFailure ∷ Rig → IO ()
+releaseSinkFailure rig = atomically (writeTVar (rigSinkGate rig) True)
+
+-- | Wait until the owner is idle: it has folded an observation published now for this target, the round that
+-- folded it has ended, and nothing is owed at once, so nothing wakes it until something is published to it.
+--
+-- A step is told from the ones before by what it carries: the revision of the observation this publishes, which no
+-- earlier step can have folded. The owner folds observations before it offers its step, so the step's record names
+-- a round that began after the publication, and that round's end — the status counting it, beyond the rounds
+-- completed when the step began — is the owner's return to waiting. A target that stands is not thereby idle: the
+-- round that published its standing may still be under way, with its step, and its checkpoint, to come.
+awaitOwnerQuiet ∷ Rig → VulkanHost Scene → GraphicsService → WindowId → IO ()
+awaitOwnerQuiet rig host service window = do
+  let owner = vulkanGraphicsOwner host
+  client ← atomically (hostWindowClient (vulkanWindowHost host) window) >>= maybe (throwIO (StandInFailure "the window has no client")) pure
+  observation ← preparedValue . observedValue <$> atomically (readSnapshot (clientObservations client))
+  bump ← atomically (stateTVar (rigNudges rig) (\held → (held + 1, held + 1)))
+  let revision = observedRevision observation + 1 + bump * 1000
+  void (publishGraphicsObservation owner service revision observation (windowRenderEligibility observation) Nothing)
+  atomically $ do
+    seen ← readTVar (rigStepSeen rig)
+    entries ← readTVar (rigStepEntries rig)
+    case [rounds | (carried, (_, rounds)) ← zip seen entries, any (\(target, folded) → target == graphicsAttachment service && folded >= revision) carried] of
+      [] → retry
+      rounds : _ → do
+        status ← readOwnerStatusNow owner
+        check (statusRounds status > rounds && not (statusImmediate status))
+
 -- | Republish the window's unchanged observation at a revision above every
 -- one published so far, which takes the owner a round. A result reported
 -- from another thread wakes nothing, so an example that reports one — as an
@@ -1939,6 +1998,8 @@ newRigClocked visible windows clock = do
   frameLog ← newTVarIO []
   presentRounds' ← newTVarIO []
   stepEntries ← newTVarIO []
+  stepSeen ← newTVarIO []
+  sinkGate ← newTVarIO True
   armings ← newTVarIO []
   armHook ← newTVarIO Nothing
   sceneLog ← newTVarIO []
@@ -1966,6 +2027,8 @@ newRigClocked visible windows clock = do
       , rigFrameEvents = frameLog
       , rigPresentRounds = presentRounds'
       , rigStepEntries = stepEntries
+      , rigStepSeen = stepSeen
+      , rigSinkGate = sinkGate
       , rigClock = clock
       , rigArmings = armings
       , rigArmHook = armHook
@@ -2069,6 +2132,7 @@ runRigOwned rig body = myThreadId >>= \self → withBoundThread (rigBound rig) s
                     atomically $ do
                       rounds ← maybe (pure 0) (fmap statusRounds . readOwnerStatusNow) held
                       modifyTVar' (rigStepEntries rig) (<> [(stepDemand step, rounds)])
+                      modifyTVar' (rigStepSeen rig) (<> [[(viewTarget view, viewRevision view) | view ← stepTargets step]])
                     graphicsStep (ownerOperations owner) step
                 }
           }
@@ -2155,6 +2219,10 @@ captureLogger rig =
   mkLoggerWith defaultLogFilter systemMetadata . callbackSink $ \_ → do
     failing ← readTVarIO (rigSinkFailing rig)
     when failing $ do
+      atomically $ do
+        open ← readTVar (rigSinkGate rig)
+        rescuedNow ← rescuing rig
+        check (open || rescuedNow)
       atomically (writeTVar (rigSinkFailed rig) True)
       throwIO (StandInFailure "the diagnostic sink failed")
 

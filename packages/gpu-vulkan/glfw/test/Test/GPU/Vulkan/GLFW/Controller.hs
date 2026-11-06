@@ -952,12 +952,20 @@ testSinkFailure = do
     failingSink rig
     one ← handedOver host first RequiredTarget
     TargetUsable ← awaitStanding host one
-    -- A warning is a diagnostic, not a failure; the sink that cannot take it
-    -- is.
-    scriptNative rig AtSupport (ReportsWarning "a warning the sink cannot take")
-    two ← handedOver host second OptionalTarget
-    TargetUsable ← awaitStanding host two
-    atomically (sinkHasFailed rig >>= check)
+    -- The warning is logged inside the second target's construction, and a sink that raised at once could be seen
+    -- by the construction's own check after its admission, which would end it unusable instead of standing. The
+    -- sink raises once the example has seen the target stand, so the target stands whichever thread is quicker.
+    holdSinkFailure rig
+    ( do
+        -- A warning is a diagnostic, not a failure; the sink that cannot take it
+        -- is.
+        scriptNative rig AtSupport (ReportsWarning "a warning the sink cannot take")
+        two ← handedOver host second OptionalTarget
+        TargetUsable ← awaitStanding host two
+        releaseSinkFailure rig
+        atomically (sinkHasFailed rig >>= check)
+      )
+      `finally` releaseSinkFailure rig
     -- An idle owner learns of it at its next round, which a published scene
     -- gives it; nothing here waits on a clock.
     scene ← prepare 0
@@ -1105,6 +1113,10 @@ testQueuedConstructionStops = do
     _ ← superviseGraphicsOwner control owner
     one ← handedOver host first RequiredTarget
     TargetUsable ← awaitStanding host one
+    -- The owner is idle when the error arrives, as the scenario says: the round that stood the first target may
+    -- otherwise still be under way, and its step's checkpoint would fail the owner before the second target's
+    -- announcement is taken.
+    awaitOwnerQuiet rig host one first
     let worker = do
           atomically (creationsBegun rig >>= check . (>= 2))
           reportErrorNow rig "an error while a handover is under way"
@@ -1119,6 +1131,9 @@ testQueuedConstructionStops = do
           `orElse` (Right () <$ (journalHas rig (SupportQueried 101) >>= check))
       report ← atomically (readVulkanTerminal controller)
       atomically (writeTVar observed (Just (either rejected (const False) settled, reportPrimary report)))
+      -- The round that rejected the target goes on to its step, whose checkpoint fails the owner: the failure is
+      -- latched once the owner has raised it, and the runtime's checkpoint reports what has been latched.
+      atomically (readOwnerFailure owner >>= check . isJust)
       checkRuntime control
   failure ← raisedAs @GraphicsSessionFailed outcome
   failure `shouldBe` GraphicsSessionFailed TerminalValidationError
