@@ -24,7 +24,7 @@ module Test.GPU.Vulkan.GLFW.Targets (spec) where
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeException, catch, displayException, finally, fromException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeAsyncException, SomeException, catch, displayException, finally, fromException, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (replicateM_, void, when)
 import Data.Foldable (for_)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -976,7 +976,7 @@ testOwnerExitReleasePointFollowsStop = do
 testOwnerExitFailureBeforeHelperSupplied ∷ IO ()
 testOwnerExitFailureBeforeHelperSupplied = do
   rig ← surfaceFreeRig 0
-  outcome ← try @SomeException (heldOwnerExit rig ownerExitRelease (\_ _ _ → throwIO (ErrorCall "the arrangement failed with the owner held")) (pure ()))
+  outcome ← failureOf (heldOwnerExit rig ownerExitRelease (\_ _ _ → throwIO (ErrorCall "the arrangement failed with the owner held")) (pure ()))
   case outcome of
     Left failure → displayException failure `shouldSatisfy` ("the arrangement failed with the owner held" `isInfixOf`)
     Right _ → failWith "the failing body returned"
@@ -997,7 +997,7 @@ testOwnerExitBoundRescueWhileAwaitingRelease = do
       -- The bound expires once the body is parked with the helper supplied, so the helper awaits the held wait.
       supplier = atomically (readTVar parked >>= check) >> atomically (writeTVar expired True)
   withOwnedThread supplier $ \_ _ → do
-    outcome ← try @SomeException . runBounded settings "an owner exit awaiting its release" $ do
+    outcome ← failureOf . runBounded settings "an owner exit awaiting its release" $ do
       rig ← surfaceFreeRig 0
       atomically (writeTVar rigCell (Just rig))
       void (heldOwnerExit rig ownerExitRelease (\_ _ _ → pure ()) (atomically (writeTVar parked True) >> atomically (readTVar never >>= check)))
@@ -1008,6 +1008,15 @@ testOwnerExitBoundRescueWhileAwaitingRelease = do
     events ← journal rig
     events `shouldSatisfy` isSubsequenceOf [DeviceDestroyed, MessengerDestroyed, InstanceDestroyed, SessionEnded]
     atomically (writeTVar never True)
+
+-- | The failure an action ended with. A cancellation is not the action's failure: it is rethrown, never taken for one.
+failureOf ∷ IO a → IO (Either SomeException a)
+failureOf action =
+  tryWithContext action >>= \case
+    Right value → pure (Right value)
+    Left caught@(ExceptionWithContext _ failure)
+      | isJust (fromException failure ∷ Maybe SomeAsyncException) → rethrowIO caught
+      | otherwise → pure (Left failure)
 
 -- | Start an ordinary supervised worker that holds the interval open. When it is asked to stop, which is after the
 -- host's admission has closed and before the owner's stop is requested, it records whether the admission had closed
