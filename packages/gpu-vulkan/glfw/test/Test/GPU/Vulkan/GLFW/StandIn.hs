@@ -129,6 +129,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , clockNow
   , onTimerArmed
   , rescueRig
+  , rescuing
   , holdPump
   , pumpHeld
   , setVisible

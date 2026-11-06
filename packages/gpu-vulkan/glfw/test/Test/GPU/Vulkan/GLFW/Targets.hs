@@ -23,19 +23,23 @@ module Test.GPU.Vulkan.GLFW.Targets (spec) where
 
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, retry, writeTVar, modifyTVar')
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeException, catch, finally, fromException, throwIO, try)
+import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeAsyncException, SomeException, catch, displayException, finally, fromException, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (replicateM_, void, when)
 import Data.Foldable (for_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
+import Data.List (isInfixOf, isSubsequenceOf)
 import Data.Maybe (isJust, isNothing)
 import Data.Unique (newUnique)
 import Numeric.Natural (Natural)
 import System.IO (hPutStrLn, stderr)
 
+import Hetoimasia.Foundation.Log (unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.Foundation.Recovery (Disposition (Required))
+import Hetoimasia.Foundation.Worker (awaitStopRequest, workerDefinition)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, frameSlotLimit, validateBudgets)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
@@ -65,12 +69,12 @@ import Hetoimasia.Runtime.GLFW
   , superviseGraphicsOwner
   , targetEventsOpen
   )
-import Hetoimasia.Runtime.Supervision (RuntimeControl, checkRuntime)
+import Hetoimasia.Runtime.Supervision (Recognition (Unrecognized), Role (Service), RuntimeControl, WorkerPolicy (..), checkRuntime, startSupervised)
 import Test.Support.Owned (withOwnedThreadOpening, withOwnedThread)
-import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
+import Test.GPU.Vulkan.GLFW.Bound (BoundSettings (..), boundOf, boundedIt, runBounded)
 import Test.GPU.Vulkan.GLFW.StandIn
 import Test.GPU.Vulkan.GLFW.Unowned
-import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldSatisfy)
+import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
 spec = describe "Offscreen scene targets (LFE-27)" $ do
@@ -100,6 +104,9 @@ spec = describe "Offscreen scene targets (LFE-27)" $ do
     itBounded "settles a held release request and keeps a superseded revision's record when the target is unregistered after supersession, until the batch it waits for completes" testUnregisterAfterSupersession
     itBounded "retains the records of a target whose session failed, releasing nothing on a batch whose completion was never observed" testSessionFailureRetains
     itBounded "ends every target with the owner, leaving a pending use unreleased and a refused request never run" testOwnerExitEndsTargets
+    itBounded "releases the held owner only after its stop is requested: the host's admission closing lets it adopt a publication the exit was to leave unadopted, and the main thread's native event wait does not" testOwnerExitReleasePointFollowsStop
+    itBounded "settles an exit whose body failed after the owner was held and before the helper that lets it go had its arguments, reporting the body's failure" testOwnerExitFailureBeforeHelperSupplied
+    itBounded "settles an exit whose bound expired while the helper that lets the owner go awaited the main thread's held event wait, reporting the bound's failure" testOwnerExitBoundRescueWhileAwaitingRelease
     itBounded "releases the revision of a batch whose completion the owner's own shutdown drain established, once, though the owner ended its targets first" testExitDrainCompletesBatch
     itBounded "releases what a target adopted when the owner's retirement failed at its first step, before it settled anything" testExitFailureStillSettles
     itBounded "discards a batch whose recording the owner's cancellation interrupted before its ticket reached the caller, and releases the revision it read" testCancelledRecording
@@ -810,38 +817,90 @@ testSessionFailureRetains = do
   where
     shouldReturnState action wanted = action >>= (`shouldBe` wanted)
 
-testOwnerExitEndsTargets ∷ IO ()
-testOwnerExitEndsTargets = do
-  rig ← surfaceFreeRig 0
+-- | Where the owner-exit scenario lets the owner it holds go.
+data ReleasePoint
+  = AtAdmissionClosed
+    -- ^ When the host's admission has closed, which the host's quiescence does in a transaction before any ordinary
+    -- worker is asked to stop and before the owner's stop is requested. An owner let go here can take a round that
+    -- adopts a publication it was holding before it is asked to stop (#628, #631): the point the example used.
+  | AtEventWait
+    -- ^ When the main thread is inside its held native event wait, which the exit reaches only after
+    -- 'exitBeforeDrain' has asked the owner to stop (see 'testOwnerExitEndsTargets').
+  deriving (Eq, Show)
+
+-- | The release point 'testOwnerExitEndsTargets' lets its owner go at. The case of
+-- 'testOwnerExitReleasePointFollowsStop' runs its repaired arm at this point too, so restoring the former point here
+-- fails that case.
+ownerExitRelease ∷ ReleasePoint
+ownerExitRelease = AtEventWait
+
+-- | Whether the release point has been reached now.
+releaseReached ∷ Rig → VulkanHost Scene → ReleasePoint → STM Bool
+releaseReached rig host = \case
+  AtAdmissionClosed → not <$> targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host))
+  AtEventWait → pumpHeld rig
+
+-- | What the owner-exit scenario hands its assertions: the host, which the run has returned, the target, and the
+-- two tickets the scenario leaves unsettled when the body returns.
+data HeldExit = HeldExit (VulkanHost Scene) OffscreenTargetId (ActionTicket [SceneEvent]) (ActionTicket ())
+
+heldTarget ∷ HeldExit → OffscreenTargetId
+heldTarget (HeldExit _ target _ _) = target
+
+-- | A whole host whose owner is held inside an action when its body returns, with revision 61 published to a target
+-- (the host takes it as revision 1) and a release request queued behind that publication, and which lets the owner go
+-- at the release point. The arrangement runs in the body after the owner is held and the publication is made, and
+-- before the body hands the release its arguments; what follows runs in the body once it has.
+--
+-- Everything that releases the owner is one of two things, and each is released on every exit:
+--
+-- * the owner's action, which waits for the helper's release of the owner or for the rig's rescue (a failure that
+--   escapes the body, or the bound's rescue, as the rig's account of rescue says), so a body that fails after the owner
+--   is held and before the helper has its arguments, and a rescue while the helper still waits for its release point,
+--   leave the exit nothing to wait for;
+-- * the helper, which waits for the release point or for the rescue, and is ended and joined with the run's exit by
+--   'withRunHelper'.
+--
+-- The main thread's native event wait is held from the end of the body, for the 'AtEventWait' release point only, and
+-- the helper lets it go with the owner.
+heldOwnerExit ∷ Rig → ReleasePoint → (VulkanHost Scene → RuntimeControl → OffscreenTargetId → IO ()) → IO () → IO HeldExit
+heldOwnerExit rig point arrange afterSupply = do
   entered ← newEmptyMVar
-  proceed ← newEmptyMVar
-  (hostAfter, target, queued, holding) ←
-    withRunHelper
-      (void (tryPutMVar proceed ()))
-      ( \host → do
-          atomically (targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host)) >>= check . not)
-          putMVar proceed ()
-      )
-      $ \supply → runRig rig $ \host _ → do
-    awaitReady host
-    target ← registered host
-    awaitTargetStanding host target ((== Just 0) . windowAdopted)
-    -- The owner is held inside an action, so a publication accepted now is not adopted while it is held.
-    holding ←
-      atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → putMVar entered () >> takeMVar proceed)))
-        >>= either (\refusal → failWith ("the holding action was refused: " <> show refusal)) pure
-    takeMVar entered
-    scene ← prepare 61
-    (_, held) ← atomically ((,) <$> publishVulkanTargetScene host target scene <*> requestVulkanRelease (vulkanController host) (VulkanAction (\_ → readTVarIO (rigSceneEvents rig))))
-    queued ← either (\refusal → failWith ("refused: " <> show refusal)) pure held
-    -- The owner is let go once the host's admission has closed, in a transaction. That is the host's quiescence,
-    -- which comes before the owner's stop is requested (beginOwnerExit, on the exit's later turn), so an owner let go
-    -- here can still take a round that adopts the publication before it is asked to stop: this example is not yet
-    -- deterministic under load (#628 establishes it; the suite has no way to observe the stop request).
-    supply host
-    pure (host, target, queued, holding)
-  -- The exit ended the target: nothing can be published to it, nothing can be registered, and the request it held
-  -- was refused, never run.
+  proceed ← newTVarIO False
+  let letGo = atomically (writeTVar proceed True) >> holdPump rig False
+  withRunHelper
+    letGo
+    ( \host → do
+        reached ← atomically ((True <$ (releaseReached rig host point >>= check)) `orElse` (False <$ (rescuing rig >>= check)))
+        when reached letGo
+    )
+    $ \supply → runRig rig $ \host control → do
+      awaitReady host
+      target ← registered host
+      awaitTargetStanding host target ((== Just 0) . windowAdopted)
+      -- The owner is held inside an action, so a publication accepted now is not adopted while it is held.
+      holding ←
+        atomically
+          ( submitVulkanAction
+              (vulkanController host)
+              (VulkanAction (\_ → putMVar entered () >> atomically ((readTVar proceed >>= check) `orElse` (rescuing rig >>= check))))
+          )
+          >>= either (\refusal → failWith ("the holding action was refused: " <> show refusal)) pure
+      takeMVar entered
+      scene ← prepare 61
+      (_, held) ← atomically ((,) <$> publishVulkanTargetScene host target scene <*> requestVulkanRelease (vulkanController host) (VulkanAction (\_ → readTVarIO (rigSceneEvents rig))))
+      queued ← either (\refusal → failWith ("refused: " <> show refusal)) pure held
+      arrange host control target
+      when (point == AtEventWait) (holdPump rig True)
+      supply host
+      afterSupply
+      pure (HeldExit host target queued holding)
+
+-- | The owner is held when its exit begins: the exit ended the target, nothing can be published to it, the request it
+-- held was refused and never run, the action that held the owner returned, and what the target had adopted was
+-- released by its end, once, while the revision it never adopted was never announced.
+assertOwnerExitEnded ∷ Rig → HeldExit → IO ()
+assertOwnerExitEnded rig (HeldExit hostAfter target queued holding) = do
   after ← publishNow hostAfter target 5
   after `shouldBe` TargetSceneClosed target
   atomically (readVulkanAction queued) >>= \case
@@ -850,10 +909,134 @@ testOwnerExitEndsTargets = do
   atomically (readVulkanAction holding) >>= \case
     Just (ActionReturned ()) → pure ()
     _ → failWith "the holding action did not return"
-  -- What the target had adopted was released by its end, once; the revision it never adopted was never announced.
   events ← readTVarIO (rigSceneEvents rig)
   adoptedOf events target `shouldBe` [(0, 0)]
   releasedOf events target `shouldBe` [0]
+
+-- | The owner's exit ends every target with it: a pending use is left unreleased and a refused request is never run.
+--
+-- The owner is held inside an action when the body returns, and is let go only once the main thread is inside its
+-- native event wait, which the rig holds from the end of the body ('AtEventWait'). That wait follows the owner's stop
+-- request. The body leaves the main thread nothing to pump but the exit: no owner loop runs here, and the main thread
+-- pumps native events only in the exit's attachment drain and in its wait for the owner's destruction
+-- ('retirementEnvironmentOf', "Hetoimasia.Runtime.GLFW.Internal.Host.Lifetime":249-250; "…Owner.Exit":260), both of
+-- which come after 'exitBeforeDrain' has closed the owner's publications and asked it to stop
+-- ("…Host.Lifetime":195-199 and :275-285; 'beginOwnerExit', "…Owner.Lifetime":301-304). So an owner let go here finds
+-- its stop requested at the top of its next round and adopts nothing it was holding. That is an ordering fact, not a read
+-- of the request: 'testOwnerExitReleasePointFollowsStop' fails if the release point is ever one that precedes it. The host's
+-- admission closing is not that fact: the quiescence closes it earlier, and an owner let go on it could take a round
+-- that adopts revision 1 before it is asked to stop (#628, #631).
+testOwnerExitEndsTargets ∷ IO ()
+testOwnerExitEndsTargets = do
+  rig ← surfaceFreeRig 0
+  held ← heldOwnerExit rig ownerExitRelease (\_ _ _ → pure ()) (pure ())
+  assertOwnerExitEnded rig held
+
+-- | The interval between the host's admission closing and the owner's stop request, held open, with the owner let go
+-- at each release point.
+--
+-- An ordinary supervised worker parked in the supervision drain holds it open: that drain runs after the application's
+-- quiescence has closed the host's admission and before the protected exit asks the owner to stop
+-- ('testQuiescenceRefusal'). The worker reads that admission has closed, then:
+--
+-- * with the former release point, waits until the owner, let go on that closing, has adopted revision 1: the
+--   interval is kept open until the owner has had its round, and the round adopted the publication before any stop;
+-- * with the repaired release point, reads that the point is not reached, and returns, so the exit goes on to ask the
+--   owner to stop and only then lets it go: the example's own outcome.
+--
+-- It does not wait for the repaired point to be reached, which the exit cannot reach while the worker holds it open.
+testOwnerExitReleasePointFollowsStop ∷ IO ()
+testOwnerExitReleasePointFollowsStop = do
+  -- The former point: the owner takes a round in the interval and adopts revision 1.
+  former ← newTVarIO Nothing
+  formerRig ← surfaceFreeRig 0
+  formerHeld ← heldOwnerExit formerRig AtAdmissionClosed
+    ( \host control target →
+        holdIntervalOpen formerRig control host AtAdmissionClosed former $ do
+          events ← readTVar (rigSceneEvents formerRig)
+          check (length (adoptedOf events target) >= 2)
+    )
+    (pure ())
+  readTVarIO former `shouldReturn` Just (True, True)
+  formerEvents ← readTVarIO (rigSceneEvents formerRig)
+  adoptedOf formerEvents (heldTarget formerHeld) `shouldBe` [(0, 0), (1, 61)]
+  -- The repaired point: not reached in the interval, and the owner adopts nothing.
+  repaired ← newTVarIO Nothing
+  repairedRig ← surfaceFreeRig 0
+  repairedHeld ← heldOwnerExit repairedRig ownerExitRelease
+    (\host control _ → holdIntervalOpen repairedRig control host ownerExitRelease repaired (pure ()))
+    (pure ())
+  readTVarIO repaired `shouldReturn` Just (True, False)
+  assertOwnerExitEnded repairedRig repairedHeld
+
+-- | A body that fails after the owner is held and before the helper has its arguments leaves the exit nothing to wait
+-- for: the run settles, and reports the body's own failure, not the example's bound. The owner's action is released by
+-- the rig's rescue, which the failure escaping the body begins, because the helper's opening runs only after the run
+-- (the helper's scope encloses the exit) and the helper has nothing to release the owner with yet.
+testOwnerExitFailureBeforeHelperSupplied ∷ IO ()
+testOwnerExitFailureBeforeHelperSupplied = do
+  rig ← surfaceFreeRig 0
+  outcome ← failureOf (heldOwnerExit rig ownerExitRelease (\_ _ _ → throwIO (ErrorCall "the arrangement failed with the owner held")) (pure ()))
+  case outcome of
+    Left failure → displayException failure `shouldSatisfy` ("the arrangement failed with the owner held" `isInfixOf`)
+    Right _ → failWith "the failing body returned"
+  events ← journal rig
+  events `shouldSatisfy` isSubsequenceOf [DeviceDestroyed, MessengerDestroyed, InstanceDestroyed, SessionEnded]
+
+-- | The bound expires while the helper awaits the main thread's held wait, which a body that never returns never
+-- reaches: the bound's rescue releases the owner's action and the held wait, though it clears the hold before the
+-- helper could read it, and the run settles with the bound's own failure, its exit complete on real destruction
+-- evidence.
+testOwnerExitBoundRescueWhileAwaitingRelease ∷ IO ()
+testOwnerExitBoundRescueWhileAwaitingRelease = do
+  expired ← newTVarIO False
+  parked ← newTVarIO False
+  never ← newTVarIO False
+  rigCell ← newTVarIO Nothing
+  let settings = (boundOf 1) {boundExpiry = pure (readTVar expired >>= check), boundGrace = pure retry}
+      -- The bound expires once the body is parked with the helper supplied, so the helper awaits the held wait.
+      supplier = atomically (readTVar parked >>= check) >> atomically (writeTVar expired True)
+  withOwnedThread supplier $ \_ _ → do
+    outcome ← failureOf . runBounded settings "an owner exit awaiting its release" $ do
+      rig ← surfaceFreeRig 0
+      atomically (writeTVar rigCell (Just rig))
+      void (heldOwnerExit rig ownerExitRelease (\_ _ _ → pure ()) (atomically (writeTVar parked True) >> atomically (readTVar never >>= check)))
+    case outcome of
+      Left failure → displayException failure `shouldSatisfy` ("the example did not finish within its bound" `isInfixOf`)
+      Right () → failWith "the parked example returned"
+    rig ← readTVarIO rigCell >>= maybe (failWith "the example made no rig") pure
+    events ← journal rig
+    events `shouldSatisfy` isSubsequenceOf [DeviceDestroyed, MessengerDestroyed, InstanceDestroyed, SessionEnded]
+    atomically (writeTVar never True)
+
+-- | The failure an action ended with. A cancellation is not the action's failure: it is rethrown, never taken for one.
+failureOf ∷ IO a → IO (Either SomeException a)
+failureOf action =
+  tryWithContext action >>= \case
+    Right value → pure (Right value)
+    Left caught@(ExceptionWithContext _ failure)
+      | isJust (fromException failure ∷ Maybe SomeAsyncException) → rethrowIO caught
+      | otherwise → pure (Left failure)
+
+-- | Start an ordinary supervised worker that holds the interval open. When it is asked to stop, which is after the
+-- host's admission has closed and before the owner's stop is requested, it records whether the admission had closed
+-- and whether the release point was reached, then waits for the given condition (or for the rig's rescue, so the
+-- worker the supervision drain joins never outlives a failed example).
+holdIntervalOpen ∷ Rig → RuntimeControl → VulkanHost Scene → ReleasePoint → TVar (Maybe (Bool, Bool)) → STM () → IO ()
+holdIntervalOpen rig control host point reading condition = do
+  let worker =
+        workerDefinition
+          "owner exit interval"
+          (\_ → pure ())
+          ( \token () → do
+              atomically (awaitStopRequest token)
+              atomically $ do
+                closed ← not <$> targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host))
+                reached ← releaseReached rig host point
+                writeTVar reading (Just (closed, reached))
+              atomically (condition `orElse` (rescuing rig >>= check))
+          )
+  void (startSupervised control (WorkerPolicy Service Required (unsafeComponent "test.vulkan-targets") (\_ → pure Unrecognized)) worker)
 
 testExitDrainCompletesBatch ∷ IO ()
 testExitDrainCompletesBatch = do
