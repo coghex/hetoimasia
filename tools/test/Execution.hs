@@ -417,11 +417,38 @@ spec = describe "Validation execution" $ do
         -- The fallback starts a ps inside every pass, which a check that
         -- nothing was created during the pass would take for activity on the
         -- machine and never confirm, holding cleanup to its cap and reporting
-        -- a kill that was never needed.
-        answer ← psGracefulStage fixture
-        if answer == ["no-ps"]
+        -- a kill that was never needed. What is controlled is the creation
+        -- probe alone (psGracefulStage): the contract lets unrelated creations
+        -- on the host delay the confirmation of an empty session
+        -- (docs/validation.md, "Cleanup does not borrow completion's weaker
+        -- check"), so this example gives the runner a probe that sees no
+        -- creation but the observer's own ps, and what it asserts is the
+        -- fallback's accounting of that ps, not the host's quiet.
+        (verdict, accounting) ← psGracefulStage fixture []
+        if verdict == ["no-ps"]
           then pendingWith "this machine has no ps to fall back on"
-          else answer `shouldBe` ["timeout", "False", "True"]
+          else do
+            verdict `shouldBe` ["timeout", "False", "True"]
+            -- No pass was spoiled, an empty session was confirmed from a
+            -- quiet pass, and the ps processes the stage's own count saw
+            -- are the ones the runner discounted.
+            accounting `shouldBe` ["0", "True", "True"]
+
+    it "repeats passes spoiled by unrelated creations until a quiet one confirms the empty session, reading the ps fallback's table" $
+      withFixture $ \fixture → do
+        -- Four empty-session observations are made to show creations that
+        -- are not the observer's own (one, three, fifty-six and two of them),
+        -- and the next shows none. The runner must repeat every spoiled
+        -- observation and believe the empty session only from the quiet one:
+        -- the count of spoiled empty observations is the one cleanup made
+        -- itself, so a cleanup that accepts a spoiled empty pass sees fewer,
+        -- and one that never accepts a quiet pass reports a kill.
+        (verdict, accounting) ← psGracefulStage fixture [1, 3, 56, 2]
+        if verdict == ["no-ps"]
+          then pendingWith "this machine has no ps to fall back on"
+          else do
+            verdict `shouldBe` ["timeout", "False", "True"]
+            accounting `shouldBe` ["4", "True", "True"]
 
     it "empties a session of descendants that keep forking replacements" $
       withFixture $ \fixture →
@@ -2677,11 +2704,36 @@ transientStage fixture failures regroup = do
 
 -- | Drive the real runner's stage execution, reading the process table from the
 -- @ps@ fallback, of a command that answers the termination signal by exiting
--- zero. Reports the outcome, whether cleanup reported killing, and whether
--- cleanup took well under the grace period. Reports @no-ps@ where there is no
--- @ps@ to fall back on.
-psGracefulStage ∷ Fixture → IO [String]
-psGracefulStage fixture = do
+-- zero. The first three answers are the outcome, whether cleanup reported
+-- killing, and whether cleanup took well under the grace period; @no-ps@ alone
+-- where there is no @ps@ to fall back on. The second list says what cleanup
+-- itself observed: how many empty-session observations it found spoiled, whether
+-- they all came before a quiet one that confirmed it, and whether the @ps@
+-- processes counted by an independent tally are the ones the runner discounted.
+--
+-- Only the creation probe is replaced, and only for the observations that decide
+-- a quiet pass (@strict_observation@). The runner's contract
+-- (docs/validation.md, "Cleanup does not borrow completion's weaker check")
+-- believes an empty session only from a pass during which nothing was created
+-- on the machine, so unrelated creations on a busy host delay the confirmation
+-- and, past the cap, turn it into a reported kill. That is the contract, and
+-- this stage does not depend on it: during an observation the two markers it
+-- gets are synthetic, the second one @1@ past the first plus the @ps@
+-- processes started between them, counted here from the call that starts them
+-- and not from the runner's own counter, plus the scripted number of unrelated
+-- creations for that pass. The observation itself, its table (the real @ps@
+-- fallback), its session queries and its deadlines are the runner's own, so a
+-- runner that stopped counting its @ps@, or stopped discounting it, spoils
+-- every pass and reports a kill. The scripted numbers apply, in order, to the
+-- observations that found the session empty; observations that found members or
+-- could not read the session consume none, and the answer counts what cleanup
+-- observed, not what was scripted. Synthetic markers exist only inside
+-- @strict_observation@, which compares them and nothing more; completion's
+-- bracketed observation, which would query every identifier between two
+-- markers, gets the runner's real ones. The replacements live in the stage's
+-- own interpreter and are gone with it.
+psGracefulStage ∷ Fixture → [Int] → IO ([String], [String])
+psGracefulStage fixture spoiled = do
   (result, output, errors) ←
     run
       (environment fixture)
@@ -2690,10 +2742,10 @@ psGracefulStage fixture = do
       [ "-I"
       , "-c"
       , unlines
-          [ "import importlib.util, os, shutil, signal, sys"
+          [ "import importlib.util, os, re, shutil, signal, subprocess, sys, types"
           , "sys.dont_write_bytecode = True"
           , "signal.alarm(120)"
-          , "path, root = sys.argv[1:3]"
+          , "path, root, script = sys.argv[1:4]"
           , "specification = importlib.util.spec_from_file_location('runner_under_test', path)"
           , "runner = importlib.util.module_from_spec(specification)"
           , "specification.loader.exec_module(runner)"
@@ -2701,16 +2753,65 @@ psGracefulStage fixture = do
           , "    print('no-ps')"
           , "    sys.exit(0)"
           , "runner.process_table = runner.ps_process_table"
+          , "spoils = [int(count) for count in script.split(',') if count]"
+          , "state = {'inside': False, 'opened': None, 'found': None, 'serial': 1000000, 'used': 0, 'ps': 0}"
+          , "observed = []"
+          , "real_run = subprocess.run"
+          , "def counting_run(command, *arguments, **keywords):"
+          , "    # An independent tally of the ps processes the runner starts."
+          , "    if command and command[0] == 'ps':"
+          , "        state['ps'] += 1"
+          , "    return real_run(command, *arguments, **keywords)"
+          , "runner.subprocess = types.SimpleNamespace(**{**vars(subprocess), 'run': counting_run})"
+          , "real_observe = runner.observe_session"
+          , "def observing(session, deadline=None):"
+          , "    found = real_observe(session, deadline)"
+          , "    state['found'] = found"
+          , "    return found"
+          , "runner.observe_session = observing"
+          , "real_marker = runner.newest_pid"
+          , "def marker():"
+          , "    if not state['inside']:"
+          , "        return real_marker()"
+          , "    if state['opened'] is None:"
+          , "        state['serial'] += 1000"
+          , "        state['opened'] = (state['serial'], state['ps'])"
+          , "        return state['serial']"
+          , "    first, began = state['opened']"
+          , "    state['opened'] = None"
+          , "    extra = 0"
+          , "    if state['found'] == {} and state['used'] < len(spoils):"
+          , "        extra = spoils[state['used']]"
+          , "        state['used'] += 1"
+          , "    return first + 1 + (state['ps'] - began) + extra"
+          , "runner.newest_pid = marker"
+          , "real_strict = runner.strict_observation"
+          , "def strict(session, deadline=None):"
+          , "    state['inside'] = True"
+          , "    state['opened'] = None"
+          , "    state['found'] = None"
+          , "    try:"
+          , "        members, quiet = real_strict(session, deadline)"
+          , "    finally:"
+          , "        state['inside'] = False"
+          , "    observed.append('-' if members is None else 'M' if members else 'Q' if quiet else 'S')"
+          , "    return members, quiet"
+          , "runner.strict_observation = strict"
           , "stage = runner.execute(['sh', '-c', 'trap \"exit 0\" TERM; sleep 300 & wait'], root, 1, dict(os.environ))"
           , "print(stage['outcome'])"
           , "print(stage['expiry']['killed'])"
           , "print(stage['expiry']['cleanup_seconds'] < 5)"
+          , "empty = ''.join(letter for letter in observed if letter in 'SQ')"
+          , "print(empty.count('S'))"
+          , "print(re.fullmatch('S*Q+', empty) is not None)"
+          , "print(state['ps'] > 0 and state['ps'] == runner.observer_creations)"
           ]
       , tools fixture </> "run.py"
       , root fixture
+      , intercalate "," (map show spoiled)
       ]
   (result, errors) `shouldBe` (ExitSuccess, "")
-  pure (lines output)
+  pure (splitAt 3 (lines output))
 
 -- | Drive the real runner's stage execution of a command that exits at once
 -- while a process outside the stage creates and reaps children in a tight loop,
