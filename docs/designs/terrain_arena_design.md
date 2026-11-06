@@ -21,7 +21,9 @@ only. No tracker items or implementation are authorized by this document.
 ## Epic contract
 
 - **Goal:** a real first terrain foundation for Ecce Homo: flat terrain,
-  loaded by chunk demand, with the engine/game boundary preserved.
+  loaded by chunk demand, using a complete terrain model that includes
+  subsurface structure and gaps from the outset, with the engine/game boundary
+  preserved. Flat describes the initial terrain source, not a surface-only model.
 - **Done when:** open; agree the terrain model, loading/lifetime contract,
   visible result, controls and acceptance evidence before defining slices.
 - **Users and operators:** the owner developing Ecce Homo, game authors using
@@ -52,6 +54,24 @@ are pinned to these revisions. Synarchy has not been modified or launched.
 | Text/fonts are a separately selected future arc; beginning terrain does not automatically activate the full UI system. | H `docs/designs/render_2d_design.md:301–319` |
 | M1 supplies no working gameplay-state store. The earlier example leaves schema, initial publication, tick failure, snapshots, ownership, determinism and compatibility open. | H `packages/lua-engine/README.md:1611–1634`; `docs/designs/gameplay_state_design.md:155–212` |
 
+Follow-up inspection, 2026-11-06: H `origin/master` at
+`45c54833a2c4ad361c252f92af02ad04f08b20ce`; S remains at the revision above.
+The following are specific observed implementation choices, not a general
+defect verdict on Synarchy:
+
+- Air gaps already exist in `ColumnTiles`: interior air is stored in a
+  contiguous vertical range, with separate material/slope/vegetation arrays
+  (S `src/World/Chunk/Types.hs:72–94`).
+- A loaded chunk also stores terrain-top and rendered-surface maps
+  (S `src/World/Chunk/Types.hs:104–109`). The Lua `getTerrainAt(x,y)` query
+  returns those two surface heights, not all solid/empty intervals
+  (S `src/Engine/Scripting/Lua/API/WorldQuery/Terrain.hs:29–62`).
+- `WeSetCell` writes an arbitrary in-range cell, or grows upward with air
+  filling the gap, but returns the unchanged chunk below the stored column
+  floor. It then recomputes top surfaces; structures use a separate overlay
+  (S `src/World/Edit/Apply.hs:298–343`, `:412–438`). Do not copy those limits
+  or overlay semantics without choosing their meaning for the new model.
+
 Initial tracker overlap check, 2026-11-06: the open issue list contains #446
 and #563; an all-state `terrain arena` title/body search returned no match.
 No existing open terrain umbrella was found. Repeat at readiness; this is not
@@ -61,14 +81,29 @@ not Hetoimasia delivery items.
 ## Desired experience and scope
 
 **Accepted direction:** begin terrain for Ecce Homo using flat arena terrain
-and demand-driven chunk loading. Procedural elevation generation is deferred.
+and demand-driven chunk loading. The full terrain model, including gaps,
+belongs in the first version (D-4). Procedural elevation generation is deferred.
 The rejected Beacon example is not the consumer.
 
 **Proposal P-1:** a visible terrain arena that can be navigated, making chunk
 demand and the resulting terrain observable. Keep the first terrain source
 simple while designing proper publication and lifetime. Camera controls,
-terrain depth, world extent, appearance, editing and exact Lua APIs remain
-unapproved. No implementation or delivery order follows from this proposal.
+exact vertical extent, world extent, appearance, editing and exact Lua APIs
+remain unapproved. No implementation or delivery order follows from this proposal.
+
+**Proposal P-2: one authoritative spatial terrain model.** Represent terrain
+occupancy and its material/shape at positions in three dimensions, with gaps
+and multiple separated solid regions at the same horizontal position. Surface
+height, exposed faces and visibility are derived queries/caches with defined
+consistency, not substitute terrain authorities. Distinguish known empty space
+from unloaded/unknown terrain and outside-world positions. A flat arena fills
+this same model; a future procedural source would populate it differently.
+
+Recommend a discrete `(x,y,z)` cell model as the logical contract, independently
+of physical storage. This can express cave floors, ceilings and overhangs.
+Cell shapes/slopes, terrain versus constructed structures, vertical chunking,
+compression and exact data representation are separate decisions. P-2 is not
+approved by D-4; Q-8 asks the owner to settle the logical model first.
 
 ## Decisions
 
@@ -108,6 +143,24 @@ example superseded while preserving its unresolved state questions.
 Its Q-3–Q-9 and inherited decisions are not automatically implementation scope
 for terrain; revisit the relevant boundaries as this consumer requires them.
 
+### D-4. Establish the full terrain model, including gaps, immediately
+
+Owner, directly in this pane on 2026-11-06, answering Q-1:
+
+> yes, we need to get the whole terrain model in place from the beginning. including the possibility of gaps, so synarchy does this in a patchwork way, we need to implement correct from the start.
+
+A surface-only first model is rejected. Include subsurface structure and gaps
+in the initial terrain model; do not rely on retrofitting those through special
+cases after a flat arena is delivered. Flat terrain generation remains the
+initial source under D-1, and loading remains on demand under D-2.
+
+The owner's description of Synarchy motivates a coherent replacement; the
+inspection above establishes the narrower facts actually checked. This answer
+does not select a cell/shape representation, physical storage scheme, numeric
+vertical bounds, structural-support simulation or exact editing tools. The
+remaining meaning and boundaries of the full model are refined in Q-8 and the
+other open questions, rather than silently narrowed to a fixed solid column.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -129,12 +182,9 @@ layout has been approved yet.
 
 ### Q-1. What does flat terrain contain vertically?
 
-Recommend real terrain columns beneath the flat surface, as in Synarchy's
-arena, so this foundation has somewhere to represent later excavation and
-construction. A surface-only plane is less work initially but would leave the
-vertical model for later. Exact depth, material stack and whether it is
-authored/configurable remain separate choices; neither digging nor building
-tools follow automatically from choosing columns.
+Resolved by D-4: the initial terrain model includes subsurface structure and
+gaps. A surface-only model is rejected. Exact logical representation continues
+in Q-8; bounds, authorship and editing remain separate choices.
 
 ### Q-2. Finite arena or expandable terrain?
 
@@ -181,12 +231,33 @@ Agree observable terrain and loading behavior, dependency boundaries, failure
 and teardown cases, platform evidence and practical bounds. No performance
 claim or whole-game parity follows from a flat terrain demonstration.
 
+### Q-8. What is the logical model of solid terrain and gaps?
+
+Recommend P-2's discrete 3D cell model: terrain at each `(x,y,z)` can be
+independently present or empty, allowing multiple solid spans and multiple
+surfaces in one vertical column. A cave/overhang is ordinary terrain geometry.
+This costs richer queries and storage than a height field, but the height field
+alone cannot express the owner's requested gaps. An alternative is geometry
+defined by continuous surfaces/volumes; that would require different editing,
+intersection and rendering contracts.
+
+After the logical choice, settle partial-cell shapes/slopes, whether constructed
+terrain shares that geometry authority, empty versus unavailable answers,
+vertical bounds and physical storage. A cell contract does not itself require
+a dense full-world allocation, cubic storage chunks or a particular array.
+
 ## Verification strategy — proposal
 
 Use focused Hspec/model tests for identity, demand deduplication, bounded
 admission and refusal; causally controlled integration tests for late results,
 world replacement, cancellation and retirement. Qualify exact flat-terrain
 content independently of chunk request order where that contract is selected.
+Include non-flat authored cases that exercise D-4 even though the initial arena
+generator is flat: a cavity with a solid ceiling, separated solid spans,
+completely empty columns and geometry crossing chunk boundaries. Require the
+agreed terrain reads, rendering/picking and reload behavior to describe the same
+geometry; no procedural cave generator is implied by these cases. Exact
+consumers and evidence remain Q-4/Q-6/Q-7 decisions.
 Use captured rendering evidence for the agreed visible result and native input
 evidence for controls actually included. Select checks from Hetoimasia's
 validation catalog once slices exist (H `AGENTS.md`, Language and build;
