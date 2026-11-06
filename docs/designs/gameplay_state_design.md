@@ -6,6 +6,14 @@ not authorize implementation or tracker creation.
 
 Design state: `exploring`
 
+Superseded by owner 2026-11-06: the Beacon example is rejected. Active design
+continues in [terrain_arena_design.md](terrain_arena_design.md), starting with
+Ecce Homo's flat terrain and on-demand chunk loading. The owner approved this
+document arrangement in the designer's pane. This document is a historical
+record, not an active processing queue; its inherited state decisions and
+unresolved Q-3–Q-9 remain available for reference, without automatic inclusion
+in the terrain arc. The original scope and proposals below are historical.
+
 Paused by owner 2026-11-02 until the current reliability work completes; Q-1 and Q-2 remain open.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -14,7 +22,7 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Deliver one visible Lua-defined gameplay-state example
+- [no-issue] EPIC. Deliver one visible Lua-defined gameplay-state example — superseded by the terrain-arena design, owner 2026-11-06.
 
 No delivery slices yet. Consumer selection and the remaining state contracts
 precede decomposition. No epic or issues have been drafted or created.
@@ -59,7 +67,7 @@ closed #498/#499/#500 concern the older headless two-domain sample. This is an
 initial overlap check, not final child-issue deduplication. Repeat at readiness.
 Parallel reliability work remains with its assigned owners.
 
-## Desired experience — proposal P-1, not approved
+## Desired experience — historical proposal P-1, rejected 2026-11-06
 
 **Beacon:** one token reaches a visible target on a small board. Lua defines
 the token position, target position and round counter and the rules for
@@ -138,10 +146,13 @@ Sources: `AGENTS.md`, `docs/engine_foundation_design.md:61–94`,
 
 ### Q-1. Which named consumer?
 
-P-1 recommends Beacon. Approve or revise its player-visible purpose first.
-This blocks dependent API design, concrete acceptance and slice decomposition.
+Superseded by terrain-arena D-1. The owner rejected Beacon and selected
+Ecce Homo's flat terrain arena as the starting point.
 
 ### Q-2. Does v1 include minimal player input?
+
+Superseded as an example-specific question. Terrain-arena Q-4 owns the new
+consumer's input scope; the original tradeoff below is retained as history.
 
 Open by explicit owner direction. Recommend a narrow keyboard movement path
 if the owner wants v1 to be playable: it demonstrates input → logical state →
@@ -232,7 +243,5 @@ applicable; include test helpers. This follows the guide's concrete lesson
 
 ## Delivery plan
 
-Zero slices. Blocked on owner design choices, beginning with Q-1. Once the
-behavior and boundaries are settled, add one-PR outcomes with stable `GST-N`
-IDs and mirror them in Processing status in dependency order. Do not draft
-issue bodies or mark this design ready while these choices remain unresolved.
+Zero slices. No further issue processing for this superseded example.
+Continue the owner-led design in [terrain_arena_design.md](terrain_arena_design.md).
