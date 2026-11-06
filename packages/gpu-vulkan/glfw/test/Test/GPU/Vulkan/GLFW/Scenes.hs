@@ -15,12 +15,12 @@ module Test.GPU.Vulkan.GLFW.Scenes (spec) where
 import Control.Concurrent (ThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, stateTVar, writeTVar)
-import Control.Exception (ErrorCall (..), SomeException, throwIO, toException, try)
+import Control.Exception (ErrorCall (..), SomeException, finally, throwIO, toException, try)
 import Control.Monad (void, when)
 import Data.List (nub, sort)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
@@ -87,6 +87,7 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
     itBounded "releases a superseded revision only after the last frame recorded with it has completed, and only once" testReleaseAfterCompletion
     itBounded "releases several superseded revisions with frames in flight in adoption order, once each, as their submissions complete" testReleaseOrder
     itBounded "keeps a revision awaiting release while its submission is pending, whatever became of the frame's presentation" testAbandonedFrameKeepsRevision
+    itBounded "presents an abandoned frame again under the status the abandonment restored, however late the example acts, the owner surviving the retry" testAbandonedFrameRetry
     itBounded "releases the revisions of an ended target and of the owner's retirement, each exactly once" testReleaseAtEnd
     itBounded "holds a finite number of unreleased revisions for a target, adopting nothing newer behind a pending submission until a release makes room, then catching up in order" testRetentionBound
     itBounded "keeps a revision awaiting release when the device's loss lets its submission go without completing it" testLossKeepsRevision
@@ -99,6 +100,7 @@ spec = describe "Vulkan scenes for each window (R2D-14)" $ do
 
   describe "release requests" $ do
     itBounded "wait for the revision current when they were made, observably, and run once the window adopts it" testRequestWaitsForAdoption
+    itBounded "see a window's adoption as held only once the lifecycle's hook for it has returned, which the journal's entry for it precedes" testAdoptionObservedAfterHook
     itBounded "wait for a window with a publication and no target, run in the order made without holding back an action that has no barrier, and are released by that window's end" testRequestOrderAndWindowEnd
     itBounded "wait for every window the host holds, even one with no target and no publication, in a per-window host and in a shared one" testTargetlessWindowHolds
     itBounded "leave out a window that has never published when the host declares its initial scene holds nothing, and still wait for a published window with no target until a target adopts it or the window is dropped, in a per-window host and in a shared one" testNeverPublishedWindowLeavesBarrier
@@ -219,6 +221,19 @@ adoptedBy events window = [(revision, scene) | SceneAdopted at revision scene �
 
 releasedBy ∷ [SceneEvent] → WindowId → [Natural]
 releasedBy events window = [revision | SceneReleased at revision ← events, at == window]
+
+-- | Whether the window's adoption of this revision is observed the way a release request's barrier observes it: the
+-- window's target holds at least that revision in the controller's own scene view ('windowAdopted').
+--
+-- It is not the stand-in's journal. The stand-in journals an adoption from inside the lifecycle's hook
+-- (@adoptScene@, "Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes"), and the controller marks the target as holding the
+-- revision only after the hook has returned ("Only now does the target hold the revision for a barrier"), so a journal
+-- entry says an adoption has begun, never that a barrier already sees it: a read that follows the entry can precede
+-- the mark. An example that reads what a barrier reads waits for this.
+adoptionObserved ∷ VulkanHost Scene → WindowId → Natural → IO Bool
+adoptionObserved host window revision = do
+  state ← atomically (readVulkanSceneState (vulkanController host))
+  pure (maybe False (>= revision) (Map.lookup (KeyWindow window) (sceneWindows state) >>= windowAdopted))
 
 -- | Hand a release request to the owner, failing the example if it is refused.
 request ∷ VulkanHost Scene → VulkanAction r → IO (ActionTicket r)
@@ -429,6 +444,46 @@ testReleaseAfterCompletion = do
   afterCompletion `shouldBe` [0, 1]
   settled `shouldBe` [0, 1]
 
+-- | Make the attachment's next presentation enqueue nothing, so its frame is abandoned, and no presentation after it.
+--
+-- The status that refuses the presentation (out of memory, which also raises once) belongs to that one presentation.
+-- The owner restores it as it reports the frame abandoned, on its own thread and before it can present the frame
+-- again, never the example's thread after it has seen the abandonment: the owner paces the retry on its own clock and
+-- can present again before the example's thread acts, and a retry that finds the refusal still scripted is a
+-- presentation of unknown effect, which fails the owner.
+abandonNextPresentation ∷ Rig → AttachmentId → IO ()
+abandonNextPresentation rig attachment = do
+  scriptPresentStatus rig PresentStatusOutOfMemory
+  raiseOnPresent rig (toException StandInNotPresented)
+  onFrameEvent rig $ \case
+    FrameAbandoned abandoned _ _ | abandoned == attachment → scriptPresentStatus rig PresentStatusSuccess
+    _ → pure ()
+
+-- | The retry of an abandoned frame presents, and the owner survives it, however late the example acts. The example
+-- does nothing between publishing and this wait, so the owner's retry has every chance to run first.
+testAbandonedFrameRetry ∷ IO ()
+testAbandonedFrameRetry = do
+  rig ← scenesRig 1
+  (presented, failure) ← runRig rig $ \host control → do
+    [window] ← windowsOf host
+    service ← attach host window
+    composedUntil rig host control "the first adoption" (not . null . flip adoptedBy window <$> sceneEvents rig)
+    submissionsComplete rig False
+    abandonNextPresentation rig (graphicsAttachment service)
+    _ ← publishTo host window 71
+    -- The owner either presents the frame again or fails at the retry.
+    composedUntil rig host control "the retry's outcome" $ do
+      shown ← presentsOf rig (graphicsAttachment service)
+      failed ← atomically (readOwnerFailure (vulkanGraphicsOwner host))
+      pure (shown > 0 || isJust failed)
+    outcome ← (,) <$> presentsOf rig (graphicsAttachment service) <*> atomically (readOwnerFailure (vulkanGraphicsOwner host))
+    -- Nothing is withheld from the owner's exit once the outcome is read, as in the example this case varies.
+    submissionsComplete rig True
+    presentationsRetire rig True
+    pure outcome
+  presented `shouldBe` 1
+  failure `shouldSatisfy` isNothing
+
 testAbandonedFrameKeepsRevision ∷ IO ()
 testAbandonedFrameKeepsRevision = do
   rig ← scenesRig 1
@@ -439,13 +494,11 @@ testAbandonedFrameKeepsRevision = do
     submissionsComplete rig False
     -- The presentation enqueues nothing: the frame is abandoned after its
     -- submission, which has not completed.
-    scriptPresentStatus rig PresentStatusOutOfMemory
-    raiseOnPresent rig (toException StandInNotPresented)
+    abandonNextPresentation rig (graphicsAttachment service)
     _ <- publishTo host window 71
     composedUntil rig host control "the abandoned frame" $ do
       events ← frameEvents rig
       pure (not (null [() | FrameAbandoned attachment _ _ ← events, attachment == graphicsAttachment service]))
-    scriptPresentStatus rig PresentStatusSuccess
     _ ← publishTo host window 72
     composedUntil rig host control "the second revision's adoption" ((>= 3) . length . flip adoptedBy window <$> sceneEvents rig)
     settleOwner rig host
@@ -497,7 +550,7 @@ testRequestWaitsForAdoption = do
   (barrier, published, adoptedAtRequest, seenAtRun, after) ← runRig rig $ \host control → do
     (a, _, b, _) ← attachBoth rig host control
     _ ← publishTo host b 91
-    composedUntil rig host control "B showing revision 1" ((>= 2) . length . flip adoptedBy b <$> sceneEvents rig)
+    composedUntil rig host control "B holding revision 1" (adoptionObserved host b 1)
     second ← prepare 92
     -- The publication and the request are one fact: the request waits for
     -- the revision just published, which the owner has not yet taken.
@@ -523,6 +576,34 @@ testRequestWaitsForAdoption = do
   -- It ran only after B had adopted revision 2.
   adoptedBy seenAtRun b `shouldBe` [(0, 0), (1, 91), (2, 92)]
   sceneRequests after `shouldBe` []
+
+-- | The losing order of 'testRequestWaitsForAdoption', forced: the owner is held inside the hook of B's second
+-- adoption, after the stand-in has journaled it and before the controller marks the revision held. The journal shows
+-- the adoption; what a barrier reads does not, until the hook returns.
+testAdoptionObservedAfterHook ∷ IO ()
+testAdoptionObservedAfterHook = do
+  rig ← scenesRig 2
+  proceed ← newTVarIO False
+  (journaled, observedInHook, observedAfter) ← runRig rig $ \host control → do
+    (_, _, b, _) ← attachBoth rig host control
+    -- The hook runs on the owner's thread under the controller's uninterruptible mask, so the gate is opened by the
+    -- scope on every exit, including a cancellation, before the rig's teardown waits for the owner.
+    (`finally` atomically (writeTVar proceed True)) $ do
+      onSceneEvent rig $ \case
+        SceneAdopted window 1 _ | window == b → atomically (readTVar proceed >>= check)
+        _ → pure ()
+      _ ← publishTo host b 91
+      composedUntil rig host control "the journal's entry for B's revision 1" ((>= 2) . length . flip adoptedBy b <$> sceneEvents rig)
+      journaled ← (>= 2) . length . flip adoptedBy b <$> sceneEvents rig
+      observedInHook ← adoptionObserved host b 1
+      atomically (writeTVar proceed True)
+      composedUntil rig host control "B holding revision 1" (adoptionObserved host b 1)
+      observedAfter ← adoptionObserved host b 1
+      pure (journaled, observedInHook, observedAfter)
+  -- The premise: the journal shows the adoption while the owner is still in its hook.
+  journaled `shouldBe` True
+  observedInHook `shouldBe` False
+  observedAfter `shouldBe` True
 
 testRequestOrderAndWindowEnd ∷ IO ()
 testRequestOrderAndWindowEnd = do
