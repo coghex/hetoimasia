@@ -14,7 +14,7 @@
 -- rounds that asked a fence and were answered no.
 module Test.GPU.Vulkan.GLFW.Consumer (spec) where
 
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (Exception (..), SomeException, throwIO, toException)
 import Control.Monad (void)
 import qualified Data.ByteString as ByteString
@@ -902,16 +902,19 @@ testCaptureTerminal = do
   presentationsRetire rig False
   controller ← newIORef Nothing
   ticketHeld ← newIORef Nothing
-  outcome ←
-    withRunHelper
-      (pure ())
-      ( \host → do
-          atomically (readOwnerStatusNow (vulkanGraphicsOwner host) >>= check . (== OwnerRetiring) . statusPhase)
-          submissionsComplete rig True
-          presentationsRetire rig True
-      )
-      $ \supply → runRigCaught rig $ \host control → do
+  outcome ← runRigCaught rig $ \host control → do
     _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
+    -- The batch completes only once the owner's run has failed and its drain
+    -- has begun: its bytes are then exposed by the evidence, and must still
+    -- not be delivered. The drain's own first fence queries must already find
+    -- it complete, so the condition is read in the fence query's transaction
+    -- (as the drain example of Targets.hs does), where the owner
+    -- writes 'OwnerRetiring' as the first thing its drain does; a thread that
+    -- waited for that phase and then opened the gates could be scheduled after
+    -- the drain's polls, which would then end with nothing verified.
+    let draining = (>= OwnerRetiring) . statusPhase <$> readOwnerStatusNow (vulkanGraphicsOwner host)
+    submissionsCompleteWhen rig draining
+    presentationsRetireWhen rig draining
     [window] ← windowsOf host
     service ← handedOver host window RequiredTarget
     TargetUsable ← awaitStanding host service
@@ -919,10 +922,6 @@ testCaptureTerminal = do
     Right ticket ← atomically (requestVulkanCapture (vulkanController host) (graphicsAttachment service))
     writeIORef ticketHeld (Just ticket)
     composedUntil rig host control "the captured frame's presentation" (\_ → pure ()) ((>= 1) <$> presentsOf rig (graphicsAttachment service))
-    -- The batch completes only once the owner's run has failed and its drain
-    -- has begun: its bytes are then exposed by the evidence, and must still
-    -- not be delivered.
-    supply host
     reportErrorNow rig "an error while the captured frame's batch is in flight"
     demandFrame host window
     untilOwnerFailed rig host control
