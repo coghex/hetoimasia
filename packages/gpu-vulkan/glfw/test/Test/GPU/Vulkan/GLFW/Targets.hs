@@ -826,7 +826,7 @@ testOwnerExitEndsTargets = do
     awaitReady host
     target ← registered host
     awaitTargetStanding host target ((== Just 0) . windowAdopted)
-    -- The owner is held inside an action, so a publication accepted now is not adopted before the exit.
+    -- The owner is held inside an action, so a publication accepted now is not adopted while it is held.
     holding ←
       atomically (submitVulkanAction (vulkanController host) (VulkanAction (\_ → putMVar entered () >> takeMVar proceed)))
         >>= either (\refusal → failWith ("the holding action was refused: " <> show refusal)) pure
@@ -834,7 +834,10 @@ testOwnerExitEndsTargets = do
     scene ← prepare 61
     (_, held) ← atomically ((,) <$> publishVulkanTargetScene host target scene <*> requestVulkanRelease (vulkanController host) (VulkanAction (\_ → readTVarIO (rigSceneEvents rig))))
     queued ← either (\refusal → failWith ("refused: " <> show refusal)) pure held
-    -- The owner is let go only once its exit has begun, which the host's own admission says, in a transaction.
+    -- The owner is let go once the host's admission has closed, in a transaction. That is the host's quiescence,
+    -- which comes before the owner's stop is requested (beginOwnerExit, on the exit's later turn), so an owner let go
+    -- here can still take a round that adopts the publication before it is asked to stop: this example is not yet
+    -- deterministic under load (#628 establishes it; the suite has no way to observe the stop request).
     supply host
     pure (host, target, queued, holding)
   -- The exit ended the target: nothing can be published to it, nothing can be registered, and the request it held
