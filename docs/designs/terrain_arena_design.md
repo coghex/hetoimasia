@@ -71,6 +71,13 @@ defect verdict on Synarchy:
   floor. It then recomputes top surfaces; structures use a separate overlay
   (S `src/World/Edit/Apply.hs:298–343`, `:412–438`). Do not copy those limits
   or overlay semantics without choosing their meaning for the new model.
+- Synarchy's procedural column builder chooses its stored lower bound from
+  the surface and neighboring elevations (`exposeFrom`), then allocates
+  material/slope/vegetation arrays for that exposed range. Its current interior
+  air entries still occupy positions in those arrays; this is distinct from
+  compressing an entire air interval into a range record
+  (S `src/World/Generate/Chunk/Columns.hs:100–115`, `:205–209`;
+  `src/World/Chunk/Types.hs:72–80`).
 
 Initial tracker overlap check, 2026-11-06: the open issue list contains #446
 and #563; an all-state `terrain arena` title/body search returned no match.
@@ -104,6 +111,39 @@ of physical storage. This can express cave floors, ceilings and overhangs.
 Cell shapes/slopes, terrain versus constructed structures, vertical chunking,
 compression and exact data representation are separate decisions. P-2 is not
 approved by D-4; Q-8 asks the owner to settle the logical model first.
+
+**Owner concern, 2026-11-06 — unresolved, not decision approval:**
+
+> i initially avoided the 3d cell because i was worried about having too much data, what would you say to that? by compressing airgaps and only holding the top terrain, we only hold in memory the basic structure, not every cell
+
+The logical ability to answer about `(x,y,z)` does not require allocating a
+record for each cell. P-2 must not be read as a recommendation for a dense
+full-depth voxel allocation. The owner's memory concern is a constraint to
+resolve before selecting representation, not approval of P-2 or P-3.
+
+**Proposal P-3: compressed vertical spans with bounded materialization.** Keep
+columns, but describe solid/material intervals and gaps compactly. An
+illustrative column could be stone at z=0–99, air at z=100–119, stone at
+z=120–124, then air to the selected world ceiling. This needs a handful of
+span boundaries instead of a separate record for each depth; exact integer
+boundary conventions and representation are not selected by this example.
+Uniform solid interiors can be compact just as air can. Gaps, cave ceilings
+and separated spans remain queryable parts of the same model.
+
+Distinguish three questions: what terrain exists, which terrain data is
+materialized in memory, and which exposed faces are prepared for rendering.
+An exposed-surface cache may be small, but material omitted beneath it needs
+an explicit authoritative answer: a compact base definition, a deterministic
+source fetched/generated on demand, or an explicit unavailable state. It must
+not silently become air or lose a buried edit. These alternatives and the
+eviction/durable-edit boundary are still Q-3/Q-6/Q-9 decisions.
+
+Span compression favors coherent layers. Highly fragmented materials/shapes
+or alternating solid/air can require many spans; queries and edits also need
+search/split/merge work. No compression ratio or speed is claimed. Account for
+actual resident representations and derived render data when selecting bounds;
+a chunk count alone does not establish a memory bound. Compare representative
+flat, layered, hollow and fragmented cases before choosing physical storage.
 
 ## Decisions
 
@@ -236,8 +276,9 @@ claim or whole-game parity follows from a flat terrain demonstration.
 Recommend P-2's discrete 3D cell model: terrain at each `(x,y,z)` can be
 independently present or empty, allowing multiple solid spans and multiple
 surfaces in one vertical column. A cave/overhang is ordinary terrain geometry.
-This costs richer queries and storage than a height field, but the height field
-alone cannot express the owner's requested gaps. An alternative is geometry
+This needs richer queries than a height field, but does not require dense
+per-cell storage: P-3 preserves a compressed column representation. A single
+height per column cannot express the owner's requested gaps. Another option is geometry
 defined by continuous surfaces/volumes; that would require different editing,
 intersection and rendering contracts.
 
@@ -245,6 +286,17 @@ After the logical choice, settle partial-cell shapes/slopes, whether constructed
 terrain shares that geometry authority, empty versus unavailable answers,
 vertical bounds and physical storage. A cell contract does not itself require
 a dense full-world allocation, cubic storage chunks or a particular array.
+
+### Q-9. How is terrain represented compactly, including unmaterialized depth?
+
+P-3 recommends investigating compressed vertical spans, retaining complete
+spatial meaning while materializing only demanded detail. Decide whether this
+is the intended design direction, then settle the source of deep terrain,
+uniform base/shared data, material and shape boundaries, edit overrides,
+fragmentation limits and any alternative dense representation for complicated
+regions. Do not equate a known air gap, an unstored solid interior, unavailable
+terrain and an outside-world position. Exact memory/time tradeoffs remain
+unmeasured, and physical storage is not approved yet.
 
 ## Verification strategy — proposal
 
