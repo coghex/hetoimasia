@@ -1137,6 +1137,130 @@ part of a hook-started load is a module: it does not borrow the hook's authority
 cancelled and waited for through the common `api.request` operations; a window failure is `{status="failure",
 error={code="window_error", message=TEXT}}` with no root or path, a texture failure carries both.
 
+### The input calls (TRA-6)
+
+A composition that opts in to input (`GraphicsServices.gsInput`, an `InputServices`; the concrete composition is
+[the adapter's](../lua-engine-graphics/README.md#the-lua-input-adapter-tra-6)) adds a table `api.input` with exactly two
+functions, `poll` and `acknowledgeReset`, in both roles with one layout: a gameplay instance's call is an ordinary error of the
+binding, never a missing field. A facade whose composition did not opt in has no `api.input`, no `input_reset` handle type and no
+input consumer, so CPU-only compositions and graphics compositions that did not opt in keep exactly the `api` table they had.
+Input is a part of the graphics services because a window exists only through them: input without the window provider cannot be
+composed, so there is no Lua-visible state of it. The facade imports no GLFW, Vulkan or game module; it is handed abstract
+operations and owns every Lua-visible rule below.
+
+| Call | Arguments | Successful result |
+| --- | --- | --- |
+| `api.input.poll(window, max_events)` | the instance's own window handle; `max_events` a Lua integer from 1 to 128, and no more than the copied-value limits carry in one packet (the largest packet of `max_events` of the widest events must fit: 128 under the fixed profile) | one [packet](#the-packet) |
+| `api.input.acknowledgeReset(window, token)` | the same window and a reset token taken from one of its packets | `"acknowledged"`, `"already_acknowledged"`, `"stale"` or `"closed"` |
+
+Both are finite, nonblocking calls over copied state: no request handle, subscription, blocking wait, handler registration, option
+table or input-specific worker; neither pumps a native event loop or waits for future input. A float (an integral one included), a
+numeric string, `0`, `129`, a missing or extra argument, a colon call, a foreign, wrong-kind or retired window and a token that is not this
+window's are ordinary Lua errors raised **before a single event is read or acknowledged**; `max_events` is checked against the
+copied-value limits' capacity before the destructive read, so a normal size or shape refusal can never drain events and discard
+them. A smaller validated copied-value profile gets a smaller documented batch (`pollCapacity`) or, when not even one event fits,
+refuses every poll; it never silently drops the excess.
+
+| Call | Module top level | `init` | update | `shutdown` | After the stop latch |
+| --- | --- | --- | --- | --- | --- |
+| `input.poll` | refused | presentation | presentation | refused | refused (an ordinary error) |
+| `input.acknowledgeReset` | refused | presentation | presentation | presentation | allowed (it cannot reopen admission) |
+
+A module evaluated during a hook does not borrow the hook's authority, a captured facade of another instance is refused as every
+facade call is, and a window or token passed through a shared Lua table grants nothing: the window must be the calling instance's
+own live window and the token the one of its consumer.
+
+#### The packet
+
+```text
+{ disposition = "running" | "reset_required" | "paused" | "closed"
+, epoch       = INTEGER          -- the epoch of the running generation, or of the last one that ran
+, exhausted   = BOOLEAN          -- true only when this read saw the end of the feed; false when it stopped at max_events
+, events      = { EVENT, ... }   -- an ordered prefix of at most max_events
+, reset       = { reason = "overflow" | "suspended", epoch = INTEGER, token = HANDLE | nil } | nil
+, observation = { revision = INTEGER
+                , focused = BOOLEAN | nil
+                , cursor = {x = FLOAT, y = FLOAT} | nil, cursor_inside = BOOLEAN | nil
+                , logical = {width = INTEGER, height = INTEGER} | nil
+                , framebuffer = {width = INTEGER, height = INTEGER} | nil
+                , scale = {x = FLOAT, y = FLOAT} | nil } }
+```
+
+* **Disposition.** `running` is a feed delivering (possibly with nothing queued); `reset_required` is a pending reset, which carries
+  `reset` with its reason, the epoch it reserved and its token, and no events (a reset committed first supersedes its backlog); `paused`
+  is an acknowledged reset the owner has not resumed (`reset` without a token); `closed` is a closed feed. `exhausted` distinguishes
+  "I stopped at your bound" (`false`) from "the feed is empty" (`true`): a poll never claims the feed is empty because it stopped at its limit.
+* **Observation.** Read in the same transaction as the events and the disposition. Positions are content-area screen coordinates and
+  `framebuffer` is pixels; fractional and out-of-window coordinates are preserved; an attribute the platform could not provide is
+  absent, never zero and never a guessed scale (a zero drawable extent is a valid `{width = 0, height = 0}`). These are the
+  window's *current* values, not event-time metrics: a button's captured position stays unchanged after later motion or resize.
+  Only cursor motion and inside-ness coalesce. No conversion to desktop or terrain coordinates and no assumed 1:1 framebuffer mapping.
+* **Numbers are exact.** An epoch, a revision, an extent or a count is never passed through a float, and a value no Lua integer holds,
+  or a float that is not finite, is the host's defect: it fails the owner (`failEngine`) and is never delivered as an empty poll or a
+  made-up value.
+
+#### Events
+
+Every event has `kind` and `epoch` (the epoch it was admitted in) and then:
+
+| `kind` | fields |
+| --- | --- |
+| `"key"` | `code` (the layout-independent key, `-1` for a key the source does not name), `scancode` (the platform's, kept separate), `action` = `"press"`, `"repeat"` or `"release"`, `mods` |
+| `"text"` | `codepoint` (the exact code point, a surrogate included), `text` (a UTF-8 string only when the code point is a Unicode scalar value; absent for a surrogate, which is never replaced by U+FFFD) |
+| `"button"` | `button`, `action` = `"press"` or `"release"`, `x` and `y` (the cursor captured for the event; absent when the producer had no sample), `mods` |
+| `"scroll"` | `scroll_x`, `scroll_y` (signed fractional floats). **No `mods`**: the source captured none, and a later sample is never attached |
+| `"focus"` | `focused` (the ordered transition) |
+
+`mods` is `{shift, control, alt, super, caps_lock, num_lock}`, six booleans, the source's own names. Nothing coalesces but cursor
+motion; a repeat is never turned into a press and a missing release is never manufactured. This slice adds no action map, binding,
+acceleration, fractional-scroll accumulator or camera interpretation: a later consumer maintains held modifiers from the ordered key and focus
+stream.
+
+#### The reset protocol, from the script's side
+
+A pending reset is answered by every poll, with the **same token**, until it is acknowledged: polling consumes and acknowledges
+nothing, and no registry of tokens grows. The script must finish or abandon its in-flight handlers and clear its own held keys and
+buttons, drag or gesture state and scroll accumulators **before** it acknowledges; it must clear the same state on a focus loss
+(which is an ordered `focus` event, not a reset, with no synthetic releases) and on `closed`. The adapter cannot know an
+arbitrary Lua table and does not claim to clear it.
+
+```lua
+local held, scroll = {}, 0            -- state derived from the events this script handled
+
+local function clear() held, scroll = {}, 0 end
+
+local function pump(self, api)
+  local p = api.input.poll(self.win, 64)
+  if p.disposition == "running" then
+    for _, e in ipairs(p.events) do
+      if e.kind == "key" and e.action == "press" then held[e.code] = true
+      elseif e.kind == "key" and e.action == "release" then held[e.code] = nil
+      elseif e.kind == "scroll" then scroll = scroll + e.scroll_y
+      elseif e.kind == "focus" and not e.focused then clear() end
+    end
+  elseif p.disposition == "reset_required" then
+    clear()                                          -- first: nothing derived from the discarded backlog survives
+    api.input.acknowledgeReset(self.win, p.reset.token)   -- then acknowledge this exact reset
+  elseif p.disposition == "closed" then
+    clear()
+  end                                                 -- "paused": acknowledged, not resumed; keep polling
+end
+```
+
+Acknowledging is nonblocking and needs no command or request capacity. `"stale"` answers a token of an earlier reset (it reaches
+nothing, and an obsolete token can never acknowledge a newer reset); `"already_acknowledged"` repeats the current episode;
+`"closed"` wins over every other outcome. **Acknowledged is not resumed:** the owner resumes only when acknowledgement, the overflow
+warning's attempt, the application's admission, focus and an open feed all hold, so a feed can stay `paused` after a successful
+acknowledgement, and a key held across a reset produces no new press until it is pressed again.
+
+#### What the facade promises and what it leaves
+
+When the adapter enables the window's input admission is the adapter's contract
+([the adapter's](../lua-engine-graphics/README.md#when-admission-is-enabled)): at the instance's first successful poll of that
+window, with the consumer registered first; input produced earlier is gated by the host and is not replayed. A script that never
+polls never enables its window's input, so it never overflows. A packet that cannot be delivered after its batch was taken is the
+engine's failure, not an empty poll.
+
 ### Content roots
 
 Two calls name content, and their default roots are different on purpose.
