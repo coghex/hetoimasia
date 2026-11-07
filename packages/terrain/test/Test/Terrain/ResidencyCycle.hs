@@ -258,13 +258,11 @@ spec = describe "Residency over the real data layer" $ do
     -- Occupied now includes the growth; the unused 52 of the reservation returned.
     ledgersOf m4 `shouldBe` Ledgers (348, 0) (64, 0) (0, 0)
     assertCharged w3 {wModel = m4}
-    -- The segment now occupies 10 bytes more, so the bank (348 of 400) cannot
-    -- take another removal's 62 reserved bytes: busy by 10, and the region being
-    -- edited is not its own victim.
+    -- The segment now occupies 10 bytes more: 348 bytes, which a request naming the
+    -- region keeps pinned, plus another removal's 62 reserved bytes is 410 > 400.
+    -- No eviction or waiting can change that, so it is invalid, not busy.
     refusal2 ← stepRefused m4 (SubmitRemoval (RequestId 4) a1 (Revision 1) (mustTile 0 0 (-51)))
-    case refusal2 of
-      Busy (NoEligibleEviction 10 0 blockers') → blockedByRequest blockers' `shouldBe` 1
-      other → expectationFailure ("expected busy by the 10 missing bytes, got " <> show other)
+    refusal2 `shouldBe` Invalid (ExceedsBank ResidentBank 410 400)
   it "keeps a surviving region charged for the shared column index after each individual release" $ do
     -- Two vertical regions of one column share one real column index entry; each
     -- is charged for its own column, so evicting either leaves the other charged.

@@ -867,6 +867,49 @@ planUnit m arena owner d@(RegionDemand region cover) = do
         Right (Just (NewJob delta need (scratchBytes delta)))
   pure (UnitPlan d (maybe True (not . Map.member owner . tgInterests) target) job)
 
+-- | What one demanded region needs at the least, however long it waits and
+-- whatever else finishes, measured against what is resident and promised now (a
+-- region being released counts as absent):
+--
+-- * 'asPinned': the bytes the region occupies now, which its demand keeps pinned;
+-- * for cells neither resident nor promised to any live job, a job of its own:
+--   'asReserve', its whole reservation (the peak it needs), 'asScratch', and
+--   'asJob';
+-- * for cells promised to another owner's job, only the least that job can leave
+--   stored: promised work may complete and need no second reservation, or fail and
+--   leave the demand to load it, which costs more, so the least is the sound bound;
+-- * 'asLeast': the least the demand adds that stays resident (new and promised);
+-- * 'asAtOnce': what an atomic request holds at once: the reservation plus the
+--   least of the promised part.
+data AloneStep = AloneStep
+  { asPinned ∷ !Word64
+  , asReserve ∷ !Word64
+  , asLeast ∷ !Word64
+  , asAtOnce ∷ !Word64
+  , asScratch ∷ !Word64
+  , asJob ∷ !Bool
+  }
+
+aloneStep ∷ Model → ArenaId → RegionDemand → AloneStep
+aloneStep m arena (RegionDemand region cover) =
+  let key = (arena, region)
+      resident = case Map.lookup key (mTargets m) >>= tgResident of
+        Just r | not (rsEvicting r) → Just r
+        _ → Nothing
+      pinned = maybe 0 rsBytes resident
+      promised = foldr coverageUnion emptyCover [jbCoverage j | (_, j) ← jobsFor m key, jbState j /= JobCancelling, not (jbStale j)]
+      uncovered = coverageDifference cover (maybe emptyCover rsCoverage resident)
+      deltaNew = coverageDifference uncovered promised
+      deltaPromised = coverageDifference uncovered deltaNew
+      job = not (coverageIsEmpty deltaNew)
+      metadata = if isNothing resident then regionMetadataBytes else 0
+      reserve = if job then metadata + fromMaybe 0 (costBytes (reserveCost deltaNew)) else 0
+      promisedLeast
+        | coverageIsEmpty deltaPromised = 0
+        | otherwise = (if job then 0 else metadata) + 48 * coverageColumns deltaPromised + 34 * coverageSegments deltaPromised
+      leastNew = if job then reserve - 62 * coverageSegments deltaNew else 0
+   in AloneStep pinned reserve (leastNew + promisedLeast) (reserve + promisedLeast) (if job then scratchBytes deltaNew else 0) job
+
 -- | The units, the funding of each new job (active bytes, deferred bytes and the
 -- victims it awaits) and the committed victims.
 data Plan = Plan ![UnitPlan] ![(Word64, Word64, Map RegionKey Word64)] ![RegionKey]
@@ -882,14 +925,21 @@ planAdmission m arena owner demands extras = do
       nJobs = fromIntegral (length jobs) ∷ Word64
       nCommands = if exCommand extras then 1 else 0
       growth = if exEdit extras then removalResidentGrowthBytes else 0
-      residentNeed = sum (map njNeed jobs) + growth
       stagingNeed = newInterests * interestRecordBytes + sum (map njScratch jobs) + exRequestBytes extras
       editNeed = if exEdit extras then removalRetainedBytes else 0
-  -- Permanently invalid: cannot fit even in an empty service.
-  permanent ResidentBank residentNeed
-  permanent StagingBank stagingNeed
+  -- Permanently invalid: cannot fit even if nothing else existed. The request is
+  -- atomic, so everything it needs is held at once: the regions it names stay
+  -- resident (they are not eviction candidates for it) and every cell not yet
+  -- resident needs its job's whole reservation. Work already promised to other
+  -- owners is not subtracted: alone, the request would need it too.
+  let alone = map (aloneStep m arena) demands
+      aloneResident = sum (map asPinned alone) + sum (map asAtOnce alone) + growth
+      aloneStaging = fromIntegral (length demands) * interestRecordBytes + sum (map asScratch alone) + exRequestBytes extras
+      aloneJobs = fromIntegral (length (filter asJob alone)) ∷ Word64
+  permanent ResidentBank aloneResident
+  permanent StagingBank aloneStaging
   permanent EditBank editNeed
-  permanentSlot LoadJobSlot nJobs
+  permanentSlot LoadJobSlot aloneJobs
   permanentSlot CommandSlot nCommands
   -- Retained edits are exhausted, not merely busy, when the committed bytes
   -- plus this edit cannot fit even with every reservation returned.
@@ -1065,30 +1115,25 @@ setCamera m v a demands = do
     else Right ()
   -- Regions are admitted in demand order, and each interest stays for as long as
   -- the demand does. A demand is permanently invalid when, at some step of that
-  -- order, even the least that must already be held plus the next job's whole
-  -- reservation exceeds a bank. Staging holds the description, one record for each
-  -- interest this demand adds so far and the scratch of the job being loaded
-  -- (earlier jobs have completed and released theirs). Resident holds every earlier
-  -- region this demand loads, pinned at no less than its least size (metadata,
-  -- columns, segments and two payload bytes per segment), beside the job's full
-  -- reservation. Only what is not already resident or already promised counts, so
-  -- these are lower bounds: a demand that passes can still wait on pressure, but
-  -- one that fails can never complete.
+  -- order, what it must already hold plus the next job's whole reservation exceeds
+  -- a bank, even if nothing else existed (earlier jobs have completed and released
+  -- their scratch). What is resident now counts, because the demand keeps it
+  -- pinned; only the cells not yet resident need a job. These are lower bounds: a
+  -- demand that passes can still wait on pressure, but one that fails can never
+  -- complete.
   let stagingLimit = limitBytes limits StagingBank
       residentLimit = limitBytes limits ResidentBank
-      -- Per region: the job's reservation, its least stored size and its scratch
-      -- (all zero when no job is needed), and whether the demand adds an interest.
-      stepOf d = case planUnit m a (OwnerView v) d of
-        Right (UnitPlan _ new (Just (NewJob delta need scratch))) → (need, need - 62 * coverageSegments delta, scratch, new)
-        Right (UnitPlan _ new Nothing) → (0, 0, 0, new)
-        Left _ → (0, 0, 0, False)
-      steps = map stepOf demands
-      interestsBefore = scanl (\n (_, _, _, new) → if new then n + 1 else n) 0 steps
-      leastBefore = scanl (\n (_, l, _, _) → n + l) 0 steps
+      steps = map (aloneStep m a) demands
+      -- Staging holds the description, an interest for every region admitted so
+      -- far (existing or new: each stays as long as the demand does) and the
+      -- scratch of the job being loaded.
       stagingPeak =
-        maximum
-          (0 : [newBytes + (n + (if new then 1 else 0)) * interestRecordBytes + scratch | (n, (_, _, scratch, new)) ← zip interestsBefore steps])
-      residentPeak = maximum (0 : [held + need | (held, (need, _, _, _)) ← zip leastBefore steps])
+        maximum (0 : [newBytes + k * interestRecordBytes + asScratch st | (k, st) ← zip [1 ..] steps])
+      -- Resident holds every earlier region (what it occupies now and at least
+      -- what the demand adds to it) beside the current region (what it occupies
+      -- now) and the job's whole reservation.
+      heldBefore = scanl (\n st → n + asPinned st + asLeast st) 0 steps
+      residentPeak = maximum (last heldBefore : [held + asPinned st + asReserve st | (held, st) ← zip heldBefore steps])
   if stagingPeak > stagingLimit then Left (Invalid (ExceedsBank StagingBank stagingPeak stagingLimit)) else Right ()
   if residentPeak > residentLimit then Left (Invalid (ExceedsBank ResidentBank residentPeak residentLimit)) else Right ()
   if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
