@@ -85,14 +85,19 @@ library terrain-fixtures
     visibility: public
     hs-source-dirs: fixtures
     exposed-modules:
+        Hetoimasia.Terrain.Render2D.Agreement
         Hetoimasia.Terrain.Render2D.Evidence
         Hetoimasia.Terrain.Render2D.Scenes
     build-depends:
         base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-oracle ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
-        hetoimasia-terrain-render-2d ==0.1.0.0
+        hetoimasia-terrain-render-2d ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-material
 
 -- This package's own contracts, registered as the CPU validation group
 -- `test.terrain-render-2d`. Hspec and QuickCheck are the suite's alone.
@@ -105,7 +110,6 @@ test-suite terrain-render-2d-tests
     -- only when the program is started with -T.
     ghc-options: -rtsopts "-with-rtsopts=-T"
     other-modules:
-        Test.TerrainRender2D.Agreement
         Test.TerrainRender2D.Art
         Test.TerrainRender2D.Camera
         Test.TerrainRender2D.Fixtures

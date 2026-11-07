@@ -61,6 +61,7 @@ module Hetoimasia.Terrain.Render2D.Evidence
   , Kind (..)
   , Expected (..)
   , expectedAt
+  , expectedAtFast
   , expectedImage
   , handSides
   , handTurnSide
@@ -304,6 +305,8 @@ data Expected
     ExpectedHit
       { expectedFront ∷ !Hit
       -- ^ What a pick finds: the geometric frontmost.
+      , expectedAll ∷ ![Hit]
+      -- ^ Every solid on the line of sight, nearest first.
       , expectedShown ∷ !(Maybe (Hit, Rgba))
       -- ^ What is drawn; 'Nothing' when every solid on the line has a transparent texel there.
       }
@@ -332,16 +335,29 @@ expectedAt art sc camera plan pixel = case pixelWorldPoint plan pixel of
   Nothing → ExpectedClear
   Just (sx, sy) → expectedAtPoint art sc camera (sx, sy)
 
-expectedAtPoint ∷ (String → Maybe ArtPixels) → Scene → CameraState → (Rational, Rational) → Expected
+-- | 'expectedAt' in 'Double' arithmetic, for every pixel of an image: the same
+-- model, each decision made at the same margin (a fraction of a hundredth of a
+-- pixel, far above the arithmetic's error), so a pixel the exact model decides
+-- and this one does not is rare and never a disagreement. The CPU suite holds the
+-- two to each other.
+expectedAtFast ∷ (String → Maybe ArtPixels) → Scene → CameraState → Plan → (Int, Int) → Expected
+expectedAtFast art sc camera plan pixel = case pixelWorldPoint plan pixel of
+  Nothing → ExpectedClear
+  Just (sx, sy) → expectedAtPoint art sc camera (fromRational sx ∷ Double, fromRational sy ∷ Double)
+
+expectedAtPoint ∷ (RealFrac a) ⇒ (String → Maybe ArtPixels) → Scene → CameraState → (a, a) → Expected
 expectedAtPoint art sc camera (sx, sy) =
   case (ambiguity, geometric) of
     (Just why, _) → Ambiguous why
     (_, []) → ExpectedClear
-    (_, front : _) →
-      ExpectedHit
-        { expectedFront = fst front
-        , expectedShown = firstOpaque geometric
-        }
+    (_, front : _) → case firstOpaque geometric of
+      Left why → Ambiguous why
+      Right shown →
+        ExpectedHit
+          { expectedFront = fst front
+          , expectedAll = map fst geometric
+          , expectedShown = shown
+          }
   where
     anchorX = toInteger (axisValue (camAnchorX camera))
     anchorY = toInteger (axisValue (camAnchorY camera))
@@ -350,8 +366,14 @@ expectedAtPoint art sc camera (sx, sy) =
     count = turnsOf (camFacing camera)
     a0 = (sx / 48 + sy / 24) / 2
     b0 = (sy / 24 - sx / 48) / 2
-    -- Every level of every cell at or below the cut.
-    unitCells = [(c, z) | c ← sceneCells sc, z ← [cellZ0 c .. cellZ1 c - 1], z <= clip]
+    -- Every level of every cell at or below the cut whose hexagon (a pixel
+    -- wider) holds the point: the other cells cannot be on the line of sight.
+    unitCells = [(c, z) | c ← sceneCells sc, z ← [cellZ0 c .. cellZ1 c - 1], z <= clip, inHexagon c z]
+    inHexagon c z =
+      let (vx, vy) = turnPair count (cellX c - anchorX, cellY c - anchorY)
+          ox = 48 * fromInteger (vx - vy)
+          oy = 24 * (fromInteger (vx + vy) - 1) - 16 * fromInteger (z - ref)
+       in sx >= ox - 49 && sx <= ox + 49 && sy >= oy - 17 && sy <= oy + 49
     results = [(c, z, intersect c z) | (c, z) ← unitCells]
     geometric =
       sortOn (Down . hitExit . fst)
@@ -361,31 +383,46 @@ expectedAtPoint art sc camera (sx, sy) =
     ambiguity = case [why | (_, _, Left why) ← results] of
       why : _ → Just why
       [] → case geometric of
-        (first, _) : (second, _) : _ | hitExit first == hitExit second → Just "two solids leave the line of sight at the same point"
+        (first, _) : (second, _) : _ | abs (hitExit first - hitExit second) < margin → Just "two solids leave the line of sight at the same point"
         _ → Nothing
-    firstOpaque candidates = case [(hit, rgba) | (hit, (c, z)) ← candidates, Just rgba ← [texelAt c z], opaque rgba] of
-      found : _ → Just found
-      [] → Nothing
+    -- The nearest solid whose texel is not transparent; ambiguous when a texel is
+    -- within a sixteenth of a texel of its boundary, where nearest sampling is
+    -- not decided by the line of sight alone.
+    firstOpaque candidates = case candidates of
+      [] → Right Nothing
+      (hit, (c, z)) : rest → case texelAt c z of
+        Left why → Left why
+        Right rgba
+          | opaque rgba → Right (Just (hit, rgba))
+          | otherwise → firstOpaque rest
     opaque (_, _, _, alpha) = alpha /= 0
     -- The texel of a cell's sheet at the pixel's place: the sheet is placed at
     -- the cell origin's projection less (48, 16).
-    texelAt c z = do
-      sheet ← art (cellMaterial c)
-      let (vx, vy) = turnPair count (cellX c - anchorX, cellY c - anchorY)
-          ox = 48 * (fromInteger vx - 1 / 2 - (fromInteger vy - 1 / 2))
-          oy = 24 * ((fromInteger vx - 1 / 2) + (fromInteger vy - 1 / 2)) - 16 * fromInteger (z - ref)
-          u = floor (sx - (ox - 48)) ∷ Integer
-          v = floor (sy - (oy - 16)) ∷ Integer
-      if u < 0 || v < 0 || u >= toInteger (artWidth sheet) || v >= toInteger (artHeight sheet)
-        then Nothing
-        else Just (artTexel sheet (fromInteger u) (fromInteger v))
+    texelAt c z = case art (cellMaterial c) of
+      Nothing → Left ("no sheet for " <> cellMaterial c)
+      Just sheet →
+        let (vx, vy) = turnPair count (cellX c - anchorX, cellY c - anchorY)
+            ox = 48 * (fromInteger vx - 1 / 2 - (fromInteger vy - 1 / 2))
+            oy = 24 * ((fromInteger vx - 1 / 2) + (fromInteger vy - 1 / 2)) - 16 * fromInteger (z - ref)
+            fu = sx - (ox - 48)
+            fv = sy - (oy - 16)
+            u = floor fu ∷ Integer
+            v = floor fv ∷ Integer
+            nearBoundary t = let f = t - fromInteger (floor t) in f < 1 / 16 || f > 15 / 16
+         in
+          if u < 0 || v < 0 || u >= toInteger (artWidth sheet) || v >= toInteger (artHeight sheet)
+            then Left "the line of sight leaves the sheet"
+            else
+              if nearBoundary fu || nearBoundary fv
+                then Left "a texel boundary"
+                else Right (artTexel sheet (fromInteger u) (fromInteger v))
     intersect c z =
       let (vx, vy) = turnPair count (cellX c - anchorX, cellY c - anchorY)
           sides = map (handTurnSide count) (handSides (cellShape c))
-          zrel = fromInteger (z - ref) ∷ Rational
+          zrel = fromInteger (z - ref)
           lx0 = a0 - fromInteger vx + 1 / 2
           ly0 = b0 - fromInteger vy + 1 / 2
-          lowers = [(negate lx0, ()), (negate ly0, ()), (zrel / 3, ())]
+          lowers = [negate lx0, negate ly0, zrel / 3]
           uppers =
             [(1 - lx0, (EastWall, 'e')), (1 - ly0, (SouthWall, 's')), ((1 + zrel) / 3, (Top, 'F'))]
               <> [ case side of
@@ -395,17 +432,23 @@ expectedAtPoint art sc camera (sx, sy) =
                      _ → ((lx0 + zrel) / 2, (Top, 'W'))
                  | side ← sides
                  ]
-          tlo = maximum (map fst lowers)
+          tlo = maximum lowers
           thi = minimum (map fst uppers)
-          binding = nub [kind | (value, kind) ← uppers, value == thi]
-       in if thi < tlo
+          binding = nub [face | (value, face) ← uppers, value - thi < margin]
+       in if thi < tlo - margin
             then Right Nothing
             else
-              if thi == tlo
+              if abs (thi - tlo) <= margin
                 then Left "the line of sight only grazes a solid"
                 else case binding of
-                  [(kind, surface)] → Right (Just (Hit (cellX c, cellY c, z) kind surface thi))
+                  [(kind, surface)] → Right (Just (Hit (cellX c, cellY c, z) kind surface (toRational thi)))
                   _ → Left "the line of sight leaves a solid along an edge between faces"
+
+-- | How near, in line-of-sight units (a pixel is about a fiftieth), two answers
+-- must be to be called the same point: a fraction of a hundredth of a pixel,
+-- where a 32-bit device may decide either way.
+margin ∷ Fractional a ⇒ a
+margin = 1 / 4096
 
 -- | The expectation at every pixel of a scene's target, row by row, top to bottom.
 expectedImage ∷ (String → Maybe ArtPixels) → Scene → [[Expected]]

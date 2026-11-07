@@ -1,5 +1,6 @@
 -- | At determinate pixel centres, three answers must agree with a fourth that
--- shares no code with them: the planner's face coverage and depth order, the
+-- shares no code with them (a support component of the terrain material's CPU
+-- suite and its native evidence scenario, which both judge with it): the planner's face coverage and depth order, the
 -- terrain material's pure model, and the pure pick's frontmost cell and face,
 -- against the hand-stated line-of-sight expectation of
 -- "Hetoimasia.Terrain.Render2D.Evidence".
@@ -8,7 +9,7 @@
 -- disagreement; the negative controls hand it a deliberately wrong set of faces
 -- or a wrong picker, keeping the scene that makes the protected behaviour matter,
 -- and require it to disagree.
-module Test.TerrainRender2D.Agreement
+module Hetoimasia.Terrain.Render2D.Agreement
   ( Env (..)
   , envWith
   , Judged (..)
@@ -20,6 +21,8 @@ module Test.TerrainRender2D.Agreement
   , surfaces
   , handleFor
   , styleOf
+  , faceSurface
+  , surfaceTint
   ) where
 
 import Data.List (sortOn)
@@ -33,13 +36,15 @@ import Hetoimasia.Render.TwoD.Mapping (targetToWorld)
 import Hetoimasia.Render.TwoD.Oracle.Material (Colour (..), MaterialInput (..), MaterialModel (..), ModelFault (..))
 import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
-import Hetoimasia.Terrain.Geometry (FaceKind (..))
+import Data.Word (Word8)
+import Hetoimasia.Terrain.Geometry (Face (..), FaceKind (..), Plane (..), V3 (..), shapeSolid, solidFaces)
+import Hetoimasia.Terrain.Render2D.Camera (camFacing)
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Material
 import Hetoimasia.Terrain.Render2D.Pick
 import Hetoimasia.Terrain.Render2D.Plan
 import Hetoimasia.Terrain.Render2D.Projection (Rect (..), rvMapping)
-import Hetoimasia.Terrain.Shape (Side (..))
+import Hetoimasia.Terrain.Shape (Side (..), ViewFacing, viewShape)
 
 -- | The sheets of an environment, by authored material name.
 newtype Env = Env (Map.Map String ArtPixels)
@@ -107,6 +112,38 @@ backmost = normal {configPick = pickBackmost}
         f : _ → Just (cellOf f)
         [] → Nothing
       Nothing → Nothing
+
+-- | The plane of a planned face as the hand-stated expectation names it, from
+-- the view-frame solid of its shape: @e@ and @s@ the East and South walls, @F@ the
+-- flat top, and a ramp by the side it is lowered on, read from its outward
+-- normal's horizontal part (north @(0, -1)@, east @(1, 0)@, south @(0, 1)@, west
+-- @(-1, 0)@).
+faceSurface ∷ ViewFacing → PlannedFace → Char
+faceSurface facing face = case drop (faceIndex face) (solidFaces (shapeSolid (viewShape facing (faceShape face)))) of
+  Face {faceKind = WallFace East} : _ → 'e'
+  Face {faceKind = WallFace _} : _ → 's'
+  Face {faceKind = TopFace, facePlane = Plane (V3 nx ny _) _} : _ →
+    case (signum nx, signum ny) of
+      (0, 0) → 'F'
+      (0, -1) → 'N'
+      (1, 0) → 'E'
+      (0, 1) → 'S'
+      (-1, 0) → 'W'
+      _ → '?'
+  _ → '?'
+
+-- | The diagnostic tint of each plane, stated by hand: a technical aid that makes
+-- every face of every shape visibly its own colour, not artwork. Opaque.
+surfaceTint ∷ Char → (Word8, Word8, Word8)
+surfaceTint = \case
+  'F' → (255, 255, 255)
+  'N' → (255, 150, 150)
+  'E' → (150, 255, 150)
+  'S' → (150, 150, 255)
+  'W' → (255, 255, 130)
+  'e' → (255, 190, 80)
+  's' → (100, 200, 255)
+  _ → (255, 0, 255)
 
 cellOf ∷ PlannedFace → (Integer, Integer, Integer, FaceKind)
 cellOf face = (coordinate tileX, coordinate tileY, coordinate tileZ, faceViewKind face)
@@ -201,6 +238,9 @@ judge env config step sc = foldr tally (Judged 0 0 [] 0 0 0) (map one (sampled s
               _ → Nothing
             picked = configPick config plan windowPoint
             frontProblem = [name pixel ("the plan's frontmost face is " <> show front <> ", expected " <> show expectedFront) | front /= expectedFront]
+            surfaceProblem = case (inside, expectation) of
+              ((face, _) : _, ExpectedHit {expectedFront = hit}) → [name pixel ("the plan's frontmost face lies in plane " <> [faceSurface (camFacing camera) face] <> ", expected " <> [hitSurface hit]) | faceSurface (camFacing camera) face /= hitSurface hit]
+              _ → []
             pickProblem = [name pixel ("the pick is " <> show picked <> ", expected " <> show expectedFront) | picked /= expectedFront]
          in case shown of
               Left _ → Skipped
@@ -222,7 +262,7 @@ judge env config step sc = foldr tally (Judged 0 0 [] 0 0 0) (map one (sampled s
                     hole = case expectation of
                       ExpectedHit {expectedShown = Nothing} → True
                       _ → revealed
-                 in Compared (frontProblem <> pickProblem <> shownProblem) hole revealed (expectedFront /= Nothing)
+                 in Compared (frontProblem <> surfaceProblem <> pickProblem <> shownProblem) hole revealed (expectedFront /= Nothing)
 
     -- The nearest face whose texel is not transparent, through the pure model:
     -- Left when the model is undecided (a mask edge or a texel boundary) before one is found.

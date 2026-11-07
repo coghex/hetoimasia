@@ -9,13 +9,14 @@ module Test.TerrainRender2D.Scenes (spec) where
 
 import Control.Monad (forM_, unless)
 import Data.List (sortOn)
+import qualified Data.Map.Strict as Map
 import Data.Ord (Down (..))
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Plan (PlannedFace (..))
 import Hetoimasia.Terrain.Render2D.Scenes
 import Hetoimasia.Terrain.Shape (ViewFacing (..), allViewFacings)
 import Test.Hspec (Spec, beforeAll, describe, expectationFailure, it, shouldBe, shouldSatisfy)
-import Test.TerrainRender2D.Agreement
+import Hetoimasia.Terrain.Render2D.Agreement
 import Test.TerrainRender2D.Art
 
 loadEnv ∷ IO Env
@@ -27,6 +28,9 @@ loadEnv = do
 -- | The pixels judged of a scene: about this many.
 budget ∷ Int
 budget = 3000
+
+zip' ∷ Ord k ⇒ Map.Map k v → [(k, v)]
+zip' = Map.toList
 
 agrees ∷ Env → Scene → IO Judged
 agrees env sc = do
@@ -84,6 +88,26 @@ spec = beforeAll loadEnv $ describe "Terrain scenes against the hand-stated expe
         judgedMismatches judged `shouldBe` []
         judgedHoles judged `shouldSatisfy` (> 0)
         judgedReveals judged `shouldSatisfy` (> 0)
+
+  describe "the expectation in Double arithmetic (what the native scenario judges every pixel with)" $
+    it "decides what the exact model decides, on every compared pixel of several scenes" $ \env → do
+      let Env sheets = env
+          art name = lookup name (zip' sheets)
+          scenesChecked = [singleShape 5 FaceSouth, rampsCorners FaceWest, roofOverCavity 1 FaceNorth, disconnectedSpans FaceEast, followHeadroom FaceSouth, diagnosticOverlap FaceWest]
+          answer = \case
+            ExpectedHit {expectedFront = hit, expectedShown = shown} → Just (Just (hitCell hit, hitKind hit, hitSurface hit, fmap (\(h, rgba) → (hitCell h, rgba)) shown))
+            ExpectedClear → Just Nothing
+            Ambiguous _ → Nothing
+      forM_ scenesChecked $ \sc → do
+        let camera = sceneCameraFollowed sc
+            plan = either (\e → error (show e)) id (scenePlan sc)
+            step = stride 2500 (sceneTarget sc)
+            (w, h) = sceneTarget sc
+            pixels = [(x, y) | y ← [1, 1 + step .. h - 1], x ← [1, 1 + step .. w - 1]]
+            pairs = [(answer (expectedAt art sc camera plan p), answer (expectedAtFast art sc camera plan p)) | p ← pixels]
+            decided = [(exact, fast) | (Just exact, Just fast) ← pairs]
+        [(exact, fast) | (exact, fast) ← decided, exact /= fast] `shouldBe` []
+        length decided `shouldSatisfy` (> length pairs `div` 2)
 
   describe "negative controls (each is broken once, here, on the scene that makes the behaviour matter)" $ do
     let overlap = disconnectedSpans FaceSouth

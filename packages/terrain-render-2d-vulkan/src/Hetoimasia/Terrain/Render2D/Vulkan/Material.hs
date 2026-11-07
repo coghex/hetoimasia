@@ -25,11 +25,12 @@
 -- owns that renderer. Nothing here has a thread, a lifetime or a disposal.
 module Hetoimasia.Terrain.Render2D.Vulkan.Material
   ( terrainMaterial
+  , terrainMaterialEquivalent
   ) where
 
 import Hetoimasia.Render.TwoD.Vulkan.Material
 import Hetoimasia.Terrain.Render2D.Material (recordLayout)
-import Hetoimasia.Terrain.Render2D.Vulkan.Source (terrainSource)
+import Hetoimasia.Terrain.Render2D.Vulkan.Source (terrainSource, terrainSourceEquivalent)
 
 -- | The terrain material, cutout-capable, with its checked variants.
 terrainMaterial ∷ DefinedMaterial
@@ -40,5 +41,19 @@ terrainMaterial =
          , declaredRecord = recordLayout
          , declaredPush = []
          , declaredSource = terrainSource
+         }
+   )
+
+-- | A second, behaviourally identical material with its own checked variants, so
+-- that the renderer issues a second reference: the evidence assigns it to some
+-- faces to change the grouping of a plan into runs by material.
+terrainMaterialEquivalent ∷ DefinedMaterial
+terrainMaterialEquivalent =
+  $( defineMaterial
+       MaterialDeclaration
+         { declaredCutoutCapable = True
+         , declaredRecord = recordLayout
+         , declaredPush = []
+         , declaredSource = terrainSourceEquivalent
          }
    )

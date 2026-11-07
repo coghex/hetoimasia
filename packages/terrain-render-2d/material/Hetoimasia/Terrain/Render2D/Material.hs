@@ -77,6 +77,7 @@ module Hetoimasia.Terrain.Render2D.Material
 
     -- * Adapting a plan
   , MaterialRefusal (..)
+  , terrainView
   , AdaptedFace (..)
   , Adapted (..)
   , adaptFaces
@@ -108,13 +109,15 @@ import Hetoimasia.Render.TwoD.Oracle.Material
   , MaterialInput (..)
   , MaterialModel (..)
   )
-import Hetoimasia.Render.TwoD.Snapshot (Instance (..), Sampler (..))
+import Hetoimasia.Render.TwoD.Snapshot (Camera (..), Instance (..), Layer, Sampler (..), View (..))
 import Hetoimasia.Terrain.Cell (MaterialId)
 import Hetoimasia.Terrain.Render2D.Plan
-  ( PlannedFace (..)
+  ( Plan
+  , PlannedFace (..)
   , faceInstance
+  , planView
   )
-import Hetoimasia.Terrain.Render2D.Projection (rationalToFloat)
+import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..), rationalToFloat, rvCentre, rvSetup, rvZoom)
 
 -- ---------------------------------------------------------------------------
 -- The art
@@ -256,6 +259,30 @@ adaptedInstance material adapted =
     , instanceParameter = adaptedParameter adapted
     , instanceSampler = SamplerNearest
     }
+
+-- | The render-2d view that draws a plan's faces: the camera, viewport and
+-- settings the plan's own view maps, so that drawing and picking share one
+-- mapping, holding the adapted table for each of these materials and these
+-- layers. 'Nothing' when the camera is not representable in 32 bits, which a
+-- plan's view never is.
+terrainView ∷ Plan → [(MaterialRef, MaterialData)] → [Layer] → Maybe View
+terrainView plan held layers = do
+  let view = planView plan
+      (cx, cy) = rvCentre view
+      setup = rvSetup view
+  px ← rationalToFloat cx
+  py ← rationalToFloat cy
+  pure
+    ( ViewWith
+        (Camera (V2 px py) (rvZoom view) Nothing)
+        (setupViewport setup)
+        (setupSettings setup)
+        []
+        (Map.fromList held)
+        []
+        0
+        layers
+    )
 
 -- | What a view holds for the material: the table, and no push block (the
 -- material has none).
