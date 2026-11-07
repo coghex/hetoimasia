@@ -404,6 +404,21 @@ fullBankSpec = describe "each bank and slot full independently" $ do
     m3 ← withdraw m2 1
     _ ← stepOk m3 (SubmitRemoval (RequestId 3) a1 rev0 (tileAt 32 0 0))
     pure ()
+  it "never funds a request by evicting a region it names" $ do
+    -- Extent one cell by two levels, 1,100 resident bytes. A is resident and unused (338);
+    -- an open request pins another region (338), leaving 424. A query for level 1 of A
+    -- (a 144-byte job) and a fresh region B (400) needs 544: 120 short. A's own bytes
+    -- would cover it, but the request needs A, so it must not be taken: busy.
+    m0 ← opened (limitsWith $ \x → x {specExtentZ = 2, specResidentBytes = 1100})
+    m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
+    m2 ← loadCell m1 2 (reg 5 0 0) (cell 0 0 0)
+    let both = SubmitQuery (RequestId 3) a1 rev0 [demand (reg 0 0 0) (cell 0 0 1), demand (reg 1 0 0) (cell 0 0 0)]
+    r ← stepRefused m2 both
+    r `shouldBe` Busy (NoEligibleEviction 120 0 (Blockers 0 0 0 0 1 0 1))
+    -- With the other request gone, its region is the victim, never A.
+    m3 ← withdraw m2 2
+    (_, accepted) ← stepOk m3 both
+    admissionVictims (admission accepted) `shouldBe` [(a1, reg 5 0 0)]
   it "rolls back a request that fails in a later bank: no partial interest, job or reservation" $ do
     m0 ← opened tiny
     m1 ← loadCell m0 1 (reg 9 9 9) (cell 0 0 0)
