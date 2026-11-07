@@ -468,46 +468,69 @@ and never clamped.
 requests.** The limits carry the explicit request caps, and `mkLimits` refuses a
 configuration whose banks cannot hold the worst-case footprint of the largest
 admissible explicit request of every kind (`BankBelowMinimum`, naming the bank, the
-bytes needed and the bytes configured; `LoadJobsBelowMinimum` for the load-job
-slots). An explicit request (a query or a removal) within its caps is therefore never
-refused as invalid for lack of capacity, in any state; a shortage is only ever busy,
-and ends when the holders the progress assumptions name release.
+bytes needed and the bytes configured). An explicit request (a query or a removal)
+within its caps is therefore never refused as invalid for lack of capacity, in any
+state; a shortage is only ever busy, and ends when the holders the progress
+assumptions name release. A query is capped at 257 regions, which admits the approved
+8,192-level column at any alignment; the cap does not depend on the number of
+load-job slots, because a slot is taken when a job is dispatched, not when it is
+admitted (an admitted job waits queued holding only its reservation). A surface
+(highest-occupied or next-solid) query needs no resident detail beyond the same
+8,192-level range, so the same cap bounds it.
 
 **Camera demand is best effort.** It has no region cap, so the approved zoom range
 and depth band (about 11,200 regions at zoom 0.125 on a 3840 x 2160 display with the
 250-level band) are not limited by the model, and it is never refused for its size.
 The model admits as much of it as the banks allow, strictly in the order the
 producer lists it (nearest and visible first), and leaves the rest pending; unloaded
-terrain stays absent until it fits. Camera work does not starve explicit work: it
-leaves the explicit requests' load-job slots (`specQueryRegions`) and staging bytes
-(`limitExplicitStagingBytes`) free, and a region only a camera view holds yields to
-an explicit request (the view's interest is dropped and its demand for the region is
-pending again), while camera work never takes a region anyone holds an interest in.
+terrain stays absent until it fits. A description is normalized, never rejected: an
+empty one withdraws the view's demand, repeated keys coalesce into the first
+occurrence (keeping its priority), keys outside the supported coordinate range and
+cells outside the configured extent are excluded and reported (`cameraExcluded`),
+and a description longer than its structural maximum (`specCameraRegions`, 16,384:
+more than the approved envelope needs) or than the staging the camera may use is cut
+at the end, lowest priority first, and the remainder reported (`cameraTruncated`).
+
+What camera work can occupy, and why it cannot starve explicit work:
+
+| Camera holding | Reclaimable by an explicit request? | Bound |
+| --- | --- | --- |
+| Resident detail held only by camera interests | Yes: the view's interest is dropped and its demand is pending again | none needed |
+| Queued and running camera jobs (reservation, scratch) | They finish under the progress assumptions; foreground jobs are dispatched first and aged ones are not starved | none beyond finite work |
+| Pins and borrowers over resident regions | No while held | the bytes pinned by holds are bounded by the resident bank less the explicit resident minimum (`limitExplicitResidentBytes`), so a view that keeps re-pinning leaves it unpinned |
+| Descriptions, interests, hold records, scratch | No while held | draw only on the staging beyond the explicit staging minimum (`limitExplicitStagingBytes`) |
+| Load-job slots | Dispatch is foreground first | no reservation needed |
+
+Camera work never takes a region anyone holds an interest in.
 
 The explicit caps are validated from the request alone, independent of the model's
 state:
 
-* a query names at most `specQueryRegions` regions (`DemandTooLarge`);
-* every cell lies inside the extent `specExtentX` x `specExtentY` x `specExtentZ`
-  of its region, at most the region's 16 x 16 x 32 (`OutsideExtent`; a camera
-  demand is checked against it too, which the default full extent never refuses).
-  The extent is the storage format's maximum per-region cost: whatever sequence of
-  requests loads a region, it stores at most `256 + 48 c + 32 s + 2 n` bytes, with `c`
-  columns, `s` separate intervals (a column of `z` levels has at most `ceiling (z /
-  2)`) and `n` cells, and a job over the extent reserves at most `48 c + 96 s` beyond
-  it;
+* a query names at most `specQueryRegions` regions (`DemandTooLarge`); a hold names at
+  most `specHoldRegions` (`DemandTooLarge`);
+* every cell of an explicit request lies inside the extent `specExtentX` x
+  `specExtentY` x `specExtentZ` of its region, at most the region's 16 x 16 x 32
+  (`OutsideExtent`). The extent is the storage format's maximum per-region cost:
+  whatever sequence of requests and edits made a region, it occupies at most
+  `256 + 48 c + 34 n` bytes, with `c` columns and `n` cells (every cell its own
+  segment of 32 bytes of metadata and two payload bytes, which removals can make of
+  it), and a job over the extent reserves at most `48 c + 96 s` beyond it, `s` being
+  its separate intervals. The model charges a region for its own column entries once
+  each (the columns its coverage gains, whatever the data layer reports) and refuses
+  a completion that would take a region past that maximum (`RegionExceedsMaximum`),
+  so a region's accumulated charge never exceeds the bound the check assumed;
 * a handoff duplicate is at most one region at its stored maximum
   (`HandoffTooLarge`).
 
-The minimum budgets for explicit requests (`minimumBytes`, `minimumLoadJobs`, exact
-integer arithmetic):
+The minimum budgets (`explicitMinimumBytes` for explicit requests, `minimumBytes` with
+holds, exact integer arithmetic):
 
 | Bank | Worst-case footprint it must hold |
 | --- | --- |
-| Resident | the most of: a query's regions, a removal; each region may already hold its stored maximum and then load the largest job beyond it (a removal: the stored maximum, one cell's 144 and its 62 of growth) |
-| Staging | the most of: a query (command 128 + 32 per region, an interest and the scratch of the whole extent for each region), a removal (command, its 512 and one cell's scratch) and a handoff duplicate of a region at its stored maximum; this is also the headroom camera work leaves free |
+| Resident | the most of: a query's regions, a removal; each region may already hold its stored maximum and then load the largest job beyond it (a removal: the stored maximum, one cell's 144 and its 62 of growth). Camera pins leave this much unpinned |
+| Staging | the most of: a query (command 128 + 32 per region, an interest and the scratch of the whole extent for each region), a removal (command, its 512 and one cell's scratch) and a handoff duplicate of a region at its stored maximum; this is the headroom camera work and holds leave free. Beside it the largest hold's records (64 per region) |
 | Edit | one removal's retained growth, 64 |
-| Load jobs | a query's regions, one job each; camera work leaves these free too |
+| Load jobs | one: a slot is taken at dispatch |
 
 `defaultLimits` is the approved initial CPU profile, sized for a normal laptop
 (hundreds of megabytes), and satisfies them:
@@ -517,19 +540,23 @@ integer arithmetic):
 | Resident terrain bank | 256 MiB |
 | Retained session edit bank | 64 MiB |
 | CPU render and staging bank | 128 MiB |
-| Internal load jobs | 128 |
+| Internal load jobs (running at once) | 128 |
 | Queued (accepted, unsettled) terrain commands | 256 |
 | Pinned CPU view revisions per view | 2 |
-| Regions in a query | 16 |
+| Regions in a query | 257 |
+| Regions in a hold | 16,384 |
+| Regions in a stored camera description (structural maximum) | 16,384 |
 | Region extent (columns, rows, levels) | 16 x 16 x 32 |
 | Aging threshold (dispatches an eligible job may be passed over) | 8 |
 
-Their worst cases (computed in the tests): a region stores at most 160,000 bytes at
-that extent and its largest job reserves 405,504 more, so a 16-region query needs
-9,048,064 of the 268,435,456 resident bytes and 267,904 of the 134,217,728 staging
-bytes (command 128 + 32 x 16, an interest each, and 16,640 of scratch per region);
-a removal needs 64 edit bytes of 67,108,864; a query needs 16 of the 128 jobs. These
-are engineering defaults for the initial profile, not measured capacity.
+Their worst cases (computed in the tests): a region stores at most 291,072 bytes at
+that extent and its largest job reserves 405,504 more, so a 257-region query needs
+179,020,032 of the 268,435,456 resident bytes and 4,301,280 of the 134,217,728
+staging bytes (command 128 + 32 x 257, an interest each, and 16,640 of scratch per
+region), which camera work and holds leave free, plus 1,048,576 for the records of
+the largest hold; a removal needs 64 edit bytes of 67,108,864; a query needs one
+load-job slot of 128. These are engineering defaults for the initial profile, not
+measured capacity.
 
 The byte banks are service-wide, never multiplied per arena. The 128 MiB GPU
 data, the arena, view and lease caps and the source, column and input limits
@@ -555,7 +582,7 @@ Each cost category is assigned to exactly one bank or slot:
 | The pending latest-value camera description of a view | Staging | 128 + 64 per region named |
 | Removal staging (overlay and affected snapshot) | Staging | 512 |
 | Temporary duplicate during a handoff | Staging | supplied by the owner |
-| Internal load jobs; accepted commands; pins of one view | Slots | one each |
+| Internal load jobs (taken at dispatch, held until completion or acknowledgement); accepted commands; pins of one view | Slots | one each |
 
 A region count or payload-only estimate is never enough: because region
 metadata is charged, vertical regions holding almost no cells still consume the
@@ -605,8 +632,11 @@ Checks run in a fixed order and the first failure is reported:
    the bank even with every reservation returned. It names the bank and persists until
    an arena's teardown frees retained bytes; the public Lua mapping stays `busy`
    until then (TRA-5 owns it). Reads, navigation and camera demand continue within
-   their own banks.
-3. **Busy**: the command slot, the job slot, the staging bank, the edit bank (other
+   their own banks. This bound and its persistent refusal are the current, interim
+   rule: the design's D-40 (temporary disk backing for retained terrain changes,
+   pending Q-19 and Q-20) is outside this slice, and the bound is not the arena's
+   final total-history contract.
+3. **Busy**: the command slot, the staging bank, the edit bank (other
    reservations outstanding) and last the resident bank, whose refusal names the
    shortfall, the bytes of eligible victims and how many regions each condition
    keeps out of eviction.
@@ -646,11 +676,19 @@ is admitted as its own unit, strictly in the order of the demand: the first regi
 that cannot be admitted holds back the regions after it, so a later region never
 takes room an earlier one needs. A replacement's staging counts the interests it
 retains in the regions it keeps, beside its new description and the interest and
-scratch of the region being admitted; the minimum staging budget covers all of them
-for a demand at its cap, so an accepted replacement can always be staged. What is not admitted stays as coalesced pending demand, holds nothing,
+scratch of the region being admitted, all drawn from the staging beyond the headroom
+kept for explicit work; a description that does not fit is cut at its lowest-priority
+end and the remainder reported, so an accepted replacement can always be staged. What is not admitted stays as coalesced pending demand, holds nothing,
 and is retried in the same order by the owner's `Service` quantum.
 
 ### Eviction, holds and handoffs
+
+A hold (a borrower or a publication pin) names at most `specHoldRegions` regions (a
+typed refusal beyond that, from any state). Its records draw only on the staging the
+camera may use, and the bytes the holds pin in total may not exceed the resident
+bank less `limitExplicitResidentBytes`; a hold beyond either is busy, so a view that
+keeps releasing and re-acquiring pins can never take the room an explicit request
+needs.
 
 A resident region may be chosen as a victim only when it has no interest, no hold
 (borrower or publication pin), no job, no unsettled changes and no handoff in
