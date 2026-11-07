@@ -44,6 +44,10 @@ diagonal opening into an unrevealed space must discover it. Whole-air-cell
 adjacency alone is insufficient; the exact per-shape catalog still needs
 specification and review under Q-16/Q-20.
 
+D-36 chooses one logical shape authority shared by cavity discovery and
+terrain point/ray queries, correcting the existing solid definitions.
+Rendering and screen picking retain face-map coverage as their visual authority.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1065,6 +1069,36 @@ The inclusion of partial-shape and diagonal openings in Q-16/Q-20 is resolved
 by D-35. Their exact geometric catalog and validation remain open, along with
 exterior/capacity/completion and fog interaction policies.
 
+### D-36. Share logical geometry between discovery and terrain queries
+
+Owner, directly in this design pane on 2026-11-07:
+
+> ok cool, let me answer the question. i approve your recommended shared
+> geometry authority
+
+Use one canonical logical definition of each shape's solid/empty regions and
+openings for both cavity discovery and terrain point/ray queries. Correct
+the existing mathematical-solid definitions to that agreed catalog; do not
+retain incompatible occupancy/intersection answers alongside a separate
+discovery model. D-35's partial and diagonal opening rules are part of this
+authority. Rotation acts consistently on the same world-space shape.
+
+GPU rendering and screen-space picking continue to use the approved face-map
+and artwork coverage (D-29/D-30). A screen hit identifies the displayed tile;
+it is not substituted for a logical world-space point/ray query. Conversely,
+the logical intersection model must not replace the sprite-alpha screen picker.
+The reference art and logical definitions must be checked together for their
+intended shape meaning, without pretending raster silhouettes uniquely specify
+every interior geometric detail.
+
+This resolves the query-authority/fate choice in Q-16: amend the existing solid
+query implementation to use the shared, corrected shape authority. The exact
+16-shape definitions, boundary conventions and compatibility details still
+need a concrete specification and review. No particular geometric encoding
+or new gameplay physics system is chosen by this decision; movement/speed
+remain deferred. Q-19 must include the merged geometry/query corrections and
+their consistency evidence with discovery in the follow-up work.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1967,7 +2001,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-35 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-36 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1977,8 +2011,9 @@ The exact emission/occlusion/cap contract is still open; the verified S path
 is one whole quad per non-air visible-range cell, not three separately meshed
 faces. Preserve sparse authoritative cell/material/shape state and atomic
 removal; do not infer world occupancy from camera-facing texture alpha.
-The relationship of existing subcell intersection APIs to that logical state
-must be explicitly settled, not called physically equivalent without proof.
+D-36 resolves the query authority: the existing subcell point/ray queries and
+cavity discovery use the same corrected logical shape definitions. The exact
+per-shape catalog and compatibility details remain to be specified and reviewed.
 
 D-30 selects the picking approach: use the adopted drawn quads, matching
 artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
@@ -2170,10 +2205,13 @@ logical shape openings for discovery, including ramp-created diagonal
 connections; the exact 16-shape solid/empty-region catalog is still to be
 specified and reviewed.
 
-Still open: the fate/meaning of #637's exact subcell-solid query APIs,
-full-cell versus isolated-face emission, hidden-face/cap behavior and the
-authority of those query results relative to the visible sprite. Do not
-silently retain incompatible ray/coverage claims. Exact sample/threshold and
+D-36 resolves #637's subcell query authority: correct those definitions so
+point/ray queries and discovery share the canonical logical shape model.
+Rendering/screen picking retain sprite coverage as their visual authority.
+
+Still open: the exact 16-shape logical geometry and query boundary/compatibility
+details, full-cell versus isolated-face emission and hidden-face/cap behavior.
+Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
 coverage resource contracts remain Q-17; the approved picking approach itself
 does not need another sign-off.
 
@@ -2208,7 +2246,7 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-35. Preserve fog over both solid and air until
+Partially resolved by D-31–D-36. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
@@ -2227,6 +2265,9 @@ D-35 requires discovery through explicit partial-shape openings, including
 real diagonal openings from ramps into unrevealed spaces. It excludes both
 the shortcut of treating all shaped cells as sealed blocks and the shortcut
 of treating every diagonal neighbor as connected.
+
+D-36 makes those logical shape definitions the common authority for discovery
+and terrain point/ray queries, correcting the previous solid definitions.
 
 Still open: specify and review the exact 16-shape solid/empty regions,
 openings and internal connectivity; distinguish a cavity from unbounded exterior
