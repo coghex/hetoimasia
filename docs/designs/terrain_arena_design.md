@@ -35,6 +35,10 @@ D-33 resolves discovery retention: record revealed state as chunk changes,
 retain it on offload and replay it before publishing the reloaded chunk.
 Discovery lasts for the arena session while off-screen chunks stream normally.
 
+D-34 resolves connectivity between empty cells: six shared-face neighbors;
+edge-only or corner-only contact does not join cavities. Partial openings
+around shaped terrain remain a separate Q-16/Q-20 choice.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -980,6 +984,28 @@ implementation still need the concrete contract; eviction may not silently
 discard approved retained discovery. Q-19 must cover replay-before-publication
 and cross-chunk offload/reload evidence in the amended work.
 
+### D-34. Empty cells connect through shared faces only
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that is
+correct” to the recommendation that empty cells connect up, down, north,
+south, east and west, with edge-only or corner-only contact excluded.
+
+For whole empty cells, D-32 discovery traverses the six face-adjacent
+neighbors, including across chunk boundaries. Diagonally touching cells do
+not join cavities merely because their edges or corners meet; discovery must
+not pass through a zero-width contact. This is a world-coordinate rule and
+does not change when the camera rotates. Paths through other face-connected
+empty cells can still join two regions; only the edge/corner shortcut is
+excluded.
+
+This resolves the face-versus-edge/corner choice in Q-20. It does not yet
+define partial empty regions inside cells containing ramps/corner slopes, or
+whether/how their openings connect. Those need an explicit logical shape
+contract under Q-16/Q-20; camera-facing sprite alpha is not that contract.
+The remaining exterior, capacity/completion and fog interaction choices
+remain open. Q-19 qualification must include face-connected cross-chunk
+spaces and distinct cavities that touch only at an edge or corner.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1882,7 +1908,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-33 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-34 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1910,8 +1936,10 @@ terrain beyond adjacent cells and across chunks, processed in bounded steps.
 D-33 retains discovery as chunk changes across normal offload/reload for the
 arena session, replayed before render/pick publication. Revealing terrain is
 distinct from editing its contents; discovered chunks need not stay resident.
-Exact connectivity, capacity/completion, API authority and fog hit behavior
-remain Q-20.
+D-34 connects whole empty cells through their six shared faces and excludes
+edge/corner-only contacts. Partial openings around shaped cells still need
+their own logical contract. That choice, capacity/completion, API authority
+and fog hit behavior remain Q-20.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2117,7 +2145,7 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-33. Preserve fog over both solid and air until
+Partially resolved by D-31–D-34. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
@@ -2129,8 +2157,11 @@ persists for the arena session while off-screen chunks may unload normally;
 closing/resetting the arena discards it. Both revealed air and exposed solid
 boundary tiles retain their known state.
 
-Still open: define connectivity through faces, edge/corner contacts and partial
-openings around shaped cells; distinguish a cavity from unbounded exterior
+D-34 resolves whole-empty-cell connectivity: six shared-face neighbors,
+including across chunks, with edge/corner-only contacts excluded.
+
+Still open: define partial empty regions/openings around shaped cells and
+their connectivity; distinguish a cavity from unbounded exterior
 air; specify completion and memory-pressure behavior for very large spaces.
 Specify initial known surface, Lua/engine authority and the concrete reset,
 reveal-job resumability and replay/publication boundaries. Decide the fog pick
@@ -2144,8 +2175,9 @@ work must be bounded; an enormous or exterior-connected air region cannot
 force an unbounded flood fill or eager underground allocation. Consider
 coherent terrain/reveal publication so a pending or failed edit/reveal cannot
 flash secret contents. D-32 settles whole-space propagation in bounded steps;
-D-33 settles session retention/replay with normal streaming. Exact API,
-representation, connectivity, failure and capacity policies remain open.
+D-33 settles session retention/replay with normal streaming; D-34 settles
+whole-empty-cell face adjacency. Exact API, representation, partial-shape
+connectivity, failure and capacity policies remain open.
 Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
