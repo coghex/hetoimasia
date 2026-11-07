@@ -48,6 +48,9 @@ D-36 chooses one logical shape authority shared by cavity discovery and
 terrain point/ray queries, correcting the existing solid definitions.
 Rendering and screen picking retain face-map coverage as their visual authority.
 
+D-37 makes generic blank fog tiles non-interactive and unselectable. They
+occlude picks of hidden terrain and produce no player-selectable target.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1099,6 +1102,39 @@ or new gameplay physics system is chosen by this decision; movement/speed
 remain deferred. Q-19 must include the merged geometry/query corrections and
 their consistency evidence with discovery in the follow-up work.
 
+### D-37. Fog tiles are unselectable and block interaction with hidden terrain
+
+Owner, directly in this design pane on 2026-11-07, corrected the proposal to
+return a selectable unknown-cell location:
+
+> yes that is right, generic blank tiles should be uninteractable, not even
+> selectable by the player.
+
+Generic blank fog tiles provide concealment only. They are not player hover,
+selection or action targets. A player-facing screen pick whose frontmost
+covering surface is fog yields no selectable target, including no unknown-cell
+selection handle or hidden material/shape/air information. The temporary
+removal shortcut does nothing at that fog-covered point; it must not submit
+a removal using coordinates inferred from the blank.
+
+Fog still participates in visual occlusion: stop the hit search at its covered
+pixels rather than skipping the non-selectable quad and selecting secret
+terrain behind it. Visible selectable terrain drawn in front of fog remains
+eligible. D-30's ordinary transparent-ramp behavior remains in force where
+there is no intervening fog cover.
+
+This supersedes the agent's unapproved unknown-cell selection proposal and
+resolves the fog interaction/result choice in Q-20. Keep this player-facing
+rule distinct from trusted engine queries needed to load/generate terrain or
+carry out discovery; it does not make fog a physical solid or create a new
+general Lua permission system. Concrete API result encoding belongs in the
+amended contract; the behavior must expose no selectable fog target.
+
+Q-19 qualification must cover no selection/removal on blank fog, no picking
+through fog to hidden solid or air, and normal selection of genuinely visible
+foreground terrain. Reveal/load/reload publication must preserve this rule
+without transiently exposing secret contents.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2001,7 +2037,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-36 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-37 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2033,8 +2069,9 @@ distinct from editing its contents; discovered chunks need not stay resident.
 D-34 connects whole empty cells through their six shared faces and excludes
 edge/corner-only contacts. D-35 additionally requires explicit shape openings,
 including real diagonal openings through ramps into unrevealed spaces. Exact
-per-shape geometry, capacity/completion, API authority and fog hit behavior
-remain Q-16/Q-20.
+per-shape geometry, capacity/completion and API authority remain Q-16/Q-20.
+D-37 resolves fog interaction: fog is unselectable, returns no player target
+and blocks screen picks/removal of the terrain it conceals.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2200,7 +2237,9 @@ The result identifies the logical cell for the existing edit contract.
 
 D-31 additionally preserves blank fog coverage over undiscovered terrain,
 including air. Cutaway movement and data residency do not grant discovery.
-Fog-specific picking and reveal behavior are tracked in Q-20. D-35 requires
+Fog-specific picking is resolved by D-37: no selectable target, no interaction
+and no picking through the fog. Remaining reveal behavior is tracked in Q-20.
+D-35 requires
 logical shape openings for discovery, including ramp-created diagonal
 connections; the exact 16-shape solid/empty-region catalog is still to be
 specified and reviewed.
@@ -2246,7 +2285,7 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-36. Preserve fog over both solid and air until
+Partially resolved by D-31–D-37. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
@@ -2269,14 +2308,16 @@ of treating every diagonal neighbor as connected.
 D-36 makes those logical shape definitions the common authority for discovery
 and terrain point/ray queries, correcting the previous solid definitions.
 
+D-37 resolves fog interaction: generic blanks are non-interactive and
+unselectable. A fog-covered screen pick gives no player target and does not
+continue through the cover; the temporary removal shortcut does nothing there.
+
 Still open: specify and review the exact 16-shape solid/empty regions,
 openings and internal connectivity; distinguish a cavity from unbounded exterior
 air; specify completion and memory-pressure behavior for very large spaces.
 Specify initial known surface, Lua/engine authority and the concrete reset,
-reveal-job resumability and replay/publication boundaries. Decide the fog pick
-result and whether the
-development removal action can operate on a concealed cell without leaking
-its contents.
+reveal-job resumability and replay/publication boundaries, including the API
+encoding of D-37's no-selectable-target fog result.
 
 Proposed storage direction: implicit unknown plus sparse discovered spans or
 regions, budgeted separately from resident terrain and retained edits. Reveal
