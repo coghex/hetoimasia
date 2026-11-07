@@ -51,7 +51,7 @@ library
         template-haskell >=2.24 && <2.25,
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-2d-vulkan ==0.1.0.0,
-        hetoimasia-terrain-render-2d:terrain-material
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0
 
 -- The material's device-free contracts, registered with the group
 -- `test.vulkan-headless`: its declaration against the pure record layout,
@@ -77,5 +77,5 @@ test-suite terrain-render-2d-vulkan-tests
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-render-2d ==0.1.0.0,
         hetoimasia-terrain-render-2d-vulkan,
-        hetoimasia-terrain-render-2d:terrain-fixtures,
-        hetoimasia-terrain-render-2d:terrain-material
+        hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0

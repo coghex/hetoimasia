@@ -97,7 +97,7 @@ library terrain-fixtures
         hetoimasia-render-api ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-render-2d ==0.1.0.0,
-        hetoimasia-terrain-render-2d:terrain-material
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0
 
 -- This package's own contracts, registered as the CPU validation group
 -- `test.terrain-render-2d`. Hspec and QuickCheck are the suite's alone.
@@ -142,6 +142,6 @@ test-suite terrain-render-2d-tests
         hetoimasia-render-api ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-render-2d ==0.1.0.0,
-        hetoimasia-terrain-render-2d:terrain-fixtures,
-        hetoimasia-terrain-render-2d:terrain-material,
+        hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0

@@ -302,6 +302,6 @@ test-suite vulkan-native-tests
         hetoimasia-asset-image ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-render-2d ==0.1.0.0,
-        hetoimasia-terrain-render-2d:terrain-fixtures,
-        hetoimasia-terrain-render-2d:terrain-material,
+        hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
         hetoimasia-terrain-render-2d-vulkan ==0.1.0.0
