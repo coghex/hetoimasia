@@ -339,18 +339,18 @@ spec = describe "Planning" $ do
     it "stops collecting overlap pairs at the bound instead of finishing the enumeration" $ do
       -- n floating cells along the line of sight project to the same place: 3n
       -- faces in one region and about 4.5 n^2 overlapping pairs. Refusing at one
-      -- pair must cost work that grows with the faces, not with the pairs: doubling
-      -- n roughly doubles the allocation (a full enumeration would quadruple it).
+      -- pair must cost work that grows with the faces, not with the pairs: quadrupling
+      -- n roughly quadruples the allocation (a full enumeration would multiply it by sixteen).
       let stackRun n =
             planWith
               (\r → r {requestConfig = (requestConfig r) {pcLimits = (pcLimits (requestConfig r)) {limitPairs = 1}}})
               (setup 480 480)
               (manualCamera (n - 1) (n - 1) (3 * (n - 1)))
               (factsOf (sceneSource [(k, k, 3 * k, 0) | k ← [0 .. n - 1]]))
-      small ← allocatedBy (stackRun 125)
-      large ← allocatedBy (stackRun 250)
-      stackRun 250 `shouldBe'` PlanInsufficient LimitPairs
-      large `shouldSatisfy` (< 3 * small)
+      small ← allocatedBy (stackRun 100)
+      large ← allocatedBy (stackRun 400)
+      stackRun 400 `shouldBe'` PlanInsufficient LimitPairs
+      large `shouldSatisfy` (< 8 * small)
     it "accepts exactly at a bound" $ do
       limited (\l → l {limitFaces = 3, limitKeys = 3}) `shouldSatisfy` isRight'
       let examined = statLevelsEvaluated (planStats (plan (setup 288 144) camera facts))
