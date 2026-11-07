@@ -816,15 +816,24 @@ supportedRegion region = case (mkLocalCoord 0 0 0, mkLocalCoord 15 15 31) of
 data Block = BlockEvicting | BlockHandoff | BlockDirty | BlockHeld | BlockInterest | BlockJob
   deriving stock (Eq, Show)
 
-blockOf ∷ Model → Set RegionKey → Set RegionKey → RegionKey → Target → Residence → Maybe Block
-blockOf _ held jobKeys key t r
+-- | The first reason a resident region cannot be a victim. An explicit request may
+-- take a region only a camera view has an interest in (camera work is best effort
+-- and yields to explicit work; the view's interest is dropped and the region is
+-- pending again), while camera work never takes a region anyone has an interest
+-- in. A region with a job, a hold, unsettled changes or a handoff is never taken.
+blockOf ∷ Bool → Set RegionKey → Set RegionKey → RegionKey → Target → Residence → Maybe Block
+blockOf explicit held jobKeys key t r
   | rsEvicting r = Just BlockEvicting
   | isJust (rsHandoff r) = Just BlockHandoff
   | rsDirty r = Just BlockDirty
   | Set.member key held = Just BlockHeld
-  | not (Map.null (tgInterests t)) = Just BlockInterest
+  | interested = Just BlockInterest
   | Set.member key jobKeys = Just BlockJob
   | otherwise = Nothing
+  where
+    interested
+      | explicit = or [True | OwnerRequest _ ← Map.keys (tgInterests t)]
+      | otherwise = not (Map.null (tgInterests t))
 
 -- | A job to create: the cells it loads, its resident reservation and its scratch.
 data NewJob = NewJob !Coverage !Word64 !Word64
@@ -899,8 +908,8 @@ planAdmission m arena owner demands extras = do
     then Left (RetainedEditsExhausted EditBank (ledgerLimit editLedger) (ledgerOccupied editLedger) editNeed)
     else Right ()
   slotFree CommandSlot nCommands
-  slotFree LoadJobSlot nJobs
-  bankFree StagingBank stagingNeed
+  if nJobs > 0 then slotFree LoadJobSlot (nJobs + jobHeadroom) else Right ()
+  if stagingNeed > 0 then bankFree StagingBank (stagingNeed + stagingHeadroom) else Right ()
   bankFree EditBank editNeed
   if nJobs > maxBound - mNextJob m then Left (ContractFailure JobIdsExhausted) else Right ()
   -- Resident funding: free bytes first, in unit order; the rest from victims.
@@ -913,9 +922,16 @@ planAdmission m arena owner demands extras = do
   (funding, victims) ←
     if shortfall == 0
       then Right ([(a, d, Map.empty) | (a, d) ← parts], [])
-      else fundByEviction m (Set.union (exProtect extras) (Set.fromList [(arena, demandRegion d) | d ← demands])) parts shortfall
+      else fundByEviction m explicit (Set.union (exProtect extras) (Set.fromList [(arena, demandRegion d) | d ← demands])) parts shortfall
   pure (Plan units funding victims)
   where
+    explicit = case owner of
+      OwnerRequest _ → True
+      OwnerView _ → False
+    -- Camera work is best effort and leaves room for explicit requests: the load-job
+    -- slots and staging bytes the largest explicit request needs.
+    jobHeadroom = if explicit then 0 else limitQueryRegions (mLimits m)
+    stagingHeadroom = if explicit then 0 else limitExplicitStagingBytes (mLimits m)
     slotFree slot n =
       let total = limitSlot (mLimits m) slot
           used = slotInUse m slot
@@ -925,8 +941,8 @@ planAdmission m arena owner demands extras = do
        in if n > freeBytes l then Left (Busy (BankFull bank (ledgerLimit l) (ledgerOccupied l + ledgerReserved l) n)) else Right ()
 
 -- | Choose victims, in LRU order, to fund the deferred part of each job.
-fundByEviction ∷ Model → Set RegionKey → [(Word64, Word64)] → Word64 → Either Refusal ([(Word64, Word64, Map RegionKey Word64)], [RegionKey])
-fundByEviction m exclude parts shortfall =
+fundByEviction ∷ Model → Bool → Set RegionKey → [(Word64, Word64)] → Word64 → Either Refusal ([(Word64, Word64, Map RegionKey Word64)], [RegionKey])
+fundByEviction m explicit exclude parts shortfall =
   case assign parts [] [] candidates of
     Just (funding, used) → Right (funding, used)
     Nothing →
@@ -935,7 +951,7 @@ fundByEviction m exclude parts shortfall =
             ( NoEligibleEviction
                 shortfall
                 (sum (map snd candidates))
-                (blockers m exclude held jobKeys)
+                (blockers m explicit exclude held jobKeys)
             )
         )
   where
@@ -947,7 +963,7 @@ fundByEviction m exclude parts shortfall =
         | (key@(a, _), t@Target {tgResident = Just r}) ← Map.toAscList (mTargets m)
         , maybe False ((== ArenaLive) . arPhase) (Map.lookup a (mArenas m))
         , not (Set.member key exclude)
-        , isNothing (blockOf m held jobKeys key t r)
+        , isNothing (blockOf explicit held jobKeys key t r)
         ]
     -- Victims are shared across the jobs of one admission: each job takes the
     -- credit it lacks from the least recently used victims in turn, and a
@@ -967,13 +983,13 @@ fundByEviction m exclude parts shortfall =
               pool' = if remaining == credit then pool else (k, remaining - credit) : pool
            in fmap (\(t, r) → ((k, credit) : t, r)) (takeFor (need - credit) pool')
 
-blockers ∷ Model → Set RegionKey → Set RegionKey → Set RegionKey → Blockers
-blockers m exclude held jobKeys =
+blockers ∷ Model → Bool → Set RegionKey → Set RegionKey → Set RegionKey → Blockers
+blockers m explicit exclude held jobKeys =
   foldl' count (Blockers 0 0 0 0 0 0 0) [(k, t, r) | (k, t@Target {tgResident = Just r}) ← Map.toAscList (mTargets m)]
   where
     count b (k, t, r)
       | Set.member k exclude = b {blockedByRequest = blockedByRequest b + 1}
-      | otherwise = case blockOf m held jobKeys k t r of
+      | otherwise = case blockOf explicit held jobKeys k t r of
           Nothing → b
           Just BlockEvicting → b {blockedEvicting = blockedEvicting b + 1}
           Just BlockHandoff → b {blockedHandoff = blockedHandoff b + 1}
@@ -1001,7 +1017,9 @@ applyPlan m arena owner (Plan units funding victims) =
       m1 = foldl' withInterest m units
       m2 = foldl' markVictim m1 victims
       markVictim mm key = case Map.lookup key (mTargets mm) of
-        Just t@Target {tgResident = Just r} → mm {mTargets = Map.insert key t {tgResident = Just r {rsEvicting = True}} (mTargets mm)}
+        -- A victim loses any camera interest in it (only an explicit request can take a
+        -- region a view has an interest in); the view's demand for it is pending again.
+        Just t@Target {tgResident = Just r} → mm {mTargets = Map.insert key t {tgResident = Just r {rsEvicting = True}, tgInterests = Map.filterWithKey (\o _ → case o of OwnerRequest _ → True; OwnerView _ → False) (tgInterests t)} (mTargets mm)}
         _ → mm
       newJobs = [(u, j) | u@UnitPlan {upJob = Just j} ← units]
       allocate (mm, acc) ((UnitPlan (RegionDemand region _) _ _, NewJob delta _ scratch), (active, deferred, awaiting)) =
@@ -1020,7 +1038,7 @@ submit m rid a rev demands edit = do
   if Map.member rid (mRequests m) then Left (Invalid (DuplicateRequest rid)) else Right ()
   arena ← liveArena m a
   if arRevision arena /= rev then Left (Stale (RevisionMismatch (arRevision arena) rev)) else Right ()
-  checkDemand m (limitQueryRegions (mLimits m)) demands
+  checkDemand m (Just (limitQueryRegions (mLimits m))) demands
   let count = fromIntegral (length demands)
       recordBytes = commandRecordBytes count
       extras = Extras True (recordBytes + maybe 0 (const removalStagingBytes) edit) (isJust edit) Set.empty
@@ -1032,12 +1050,15 @@ submit m rid a rev demands edit = do
   Right (m1 {mRequests = Map.insert rid request (mRequests m1)}, Accepted admission)
 
 -- | The request-only checks: a nonempty demand of distinct, supported regions
--- within the cap for its kind, naming only cells inside the configured extent.
+-- within the cap for its kind (an explicit request has one; camera demand is best
+-- effort and has none), naming only cells inside the configured extent.
 -- Nothing here reads the model's state, so what fails is invalid from every state.
-checkDemand ∷ Model → Word64 → [RegionDemand] → Either Refusal ()
+checkDemand ∷ Model → Maybe Word64 → [RegionDemand] → Either Refusal ()
 checkDemand m cap demands = do
   if null demands then Left (Invalid EmptyDemand) else Right ()
-  if fromIntegral (length demands) > cap then Left (Invalid (DemandTooLarge (length demands) cap)) else Right ()
+  case cap of
+    Just limit | fromIntegral (length demands) > limit → Left (Invalid (DemandTooLarge (length demands) limit))
+    _ → Right ()
   let regions = map demandRegion demands
   case [r | (r, n) ← Map.toList (Map.fromListWith (+) [(r', 1 ∷ Int) | r' ← regions]), n > 1] of
     (r : _) → Left (Invalid (DuplicateRegion r))
@@ -1052,19 +1073,27 @@ checkDemand m cap demands = do
 -- ---------------------------------------------------------------------------
 -- Camera demand
 
+-- | The staging bytes camera work may still use: what is free beyond the headroom
+-- kept for explicit requests.
+cameraFree ∷ Model → Ledger → Word64
+cameraFree m staging =
+  let free = freeBytes staging
+      headroom = limitExplicitStagingBytes (mLimits m)
+   in if free > headroom then free - headroom else 0
+
 setCamera ∷ Model → ViewId → ArenaId → [RegionDemand] → Run
 setCamera m v a demands = do
   _ ← liveArena m a
-  checkDemand m (limitDemandRegions (mLimits m)) demands
-  -- The replacement description is held for as long as the demand is, beside the
-  -- interests the view retains in the regions it keeps; the minimum budgets
-  -- guarantee that the description, an interest for every region of the demand
-  -- and the scratch of its loads fit an empty staging bank, so pressure here is
-  -- only ever busy and ends when other holders release.
+  -- Camera demand is best effort: it has no region cap and is never refused as
+  -- invalid for its size. The replacement description is held for as long as the
+  -- demand is, beside the interests the view retains in the regions it keeps;
+  -- camera work leaves the explicit requests' staging headroom free, so a
+  -- description that does not fit is busy and the previous demand stays.
+  checkDemand m Nothing demands
   let newBytes = descriptionBytes (fromIntegral (length demands))
       oldBytes = maybe 0 (descriptionBytes . fromIntegral . length . vwDemand) (Map.lookup v (mViews m))
       staging = bankLedger m StagingBank
-  if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
+  if newBytes > oldBytes && newBytes - oldBytes > cameraFree m staging
     then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) (newBytes - oldBytes)))
     else Right ()
   let wanted = Set.fromList [(a, demandRegion d) | d ← demands]
@@ -1274,8 +1303,6 @@ acquireHold m h a kind regions = do
   if Map.member h (mHolds m) then Left (Invalid (DuplicateHold h)) else Right ()
   _ ← liveArena m a
   if null regions then Left (Invalid EmptyDemand) else Right ()
-  let limit = limitDemandRegions (mLimits m)
-  if fromIntegral (length regions) > limit then Left (Invalid (DemandTooLarge (length regions) limit)) else Right ()
   case [r | (r, n) ← Map.toList (Map.fromListWith (+) [(r', 1 ∷ Int) | r' ← regions]), n > 1] of
     (r : _) → Left (Invalid (DuplicateRegion r))
     [] → Right ()

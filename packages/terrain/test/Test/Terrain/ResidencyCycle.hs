@@ -247,7 +247,7 @@ spec = describe "Residency over the real data layer" $ do
     -- reserves 1,584, so one region per request needs 2,464 bytes. Six pinned one-cell
     -- regions (6 x 338) and the uniform segment (338) leave exactly 124 of 2,490: room
     -- for two removals' growth (62 each).
-    w00 ← initialWith (limitsWith $ \s → s {specResidentBytes = 2490, specStagingBytes = 4096, specQueuedCommands = 16, specQueryRegions = 1, specDemandRegions = 1, specExtentZ = 32})
+    w00 ← initialWith (limitsWith $ \s → s {specResidentBytes = 2490, specStagingBytes = 4096, specQueuedCommands = 16, specQueryRegions = 1, specExtentZ = 32})
     w0 ← foldM (\w i → submit w (SubmitQuery (RequestId (fromInteger i)) a1 rev0 [demand (reg (10 + i) 0 0) (cell 0 0 0)]) >>= drain) w00 [11 .. 16]
     -- Region (0,0,-2) is levels -64..-33: all stone, one uniform segment of 2 bytes.
     w1 ← submit w0 (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 (-2)) (box 0 1 0 1 0 32)]) >>= drain >>= \w → settle w 1

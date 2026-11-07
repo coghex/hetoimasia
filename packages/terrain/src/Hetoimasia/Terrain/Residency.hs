@@ -130,8 +130,8 @@ module Hetoimasia.Terrain.Residency
   , limitBytes
   , limitSlot
   , limitQueryRegions
-  , limitDemandRegions
   , limitExtent
+  , limitExplicitStagingBytes
   , limitRegionStoredBytes
   , limitAgingQuanta
   , minimumBytes

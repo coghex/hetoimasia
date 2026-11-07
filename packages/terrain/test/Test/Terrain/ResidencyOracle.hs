@@ -121,7 +121,10 @@ oracle m arena demands removal
     freeResident = lim ResidentBank - residentOcc - residentRes
     shortfall = max 0 (reserveSum + growth - freeResident)
     requested = [demandRegion d | d ← demands]
-    interested r = or [True | i ← modelInterests m, interestArena i == regionArena r, interestRegion i == regionCoord r]
+    -- A camera view's interest does not protect a region from an explicit request.
+    interested r = or [True | i ← modelInterests m, interestArena i == regionArena r, interestRegion i == regionCoord r, requestOwned (interestOwner i)]
+    requestOwned (OwnerRequest _) = True
+    requestOwned (OwnerView _) = False
     held r = or [True | (_, a, _, regions) ← modelHolds m, a == regionArena r, regionCoord r `elem` regions]
     busyJob r = or [True | j ← modelJobs m, jobArena j == regionArena r, jobRegion j == regionCoord r]
     liveArena r = or [True | a ← modelArenas m, arenaId a == regionArena r, arenaPhase a == ArenaLive]

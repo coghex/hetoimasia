@@ -50,7 +50,7 @@ pressure =
       , specLoadJobs = 4
       , specQueuedCommands = 4
       , specPinsPerView = 2
-      , specDemandRegions = 2
+      
       , specAgingQuanta = 2
       , specQueryRegions = 2
       , specExtentX = 2
@@ -249,19 +249,25 @@ ownerCanSettle m =
 -- | Carry out every action in turn until none remains; the result is nothing
 -- reserved, no job, victim, hold or retiring arena.
 settleEverything ∷ Model → Either String Model
-settleEverything = go (500 ∷ Int)
+settleEverything = settleWith True
+
+-- | The same, optionally leaving the cameras' demands (and so their interests and
+-- descriptions) in place: everything else the owner can release is released.
+settleWith ∷ Bool → Model → Either String Model
+settleWith clearViews = go (500 ∷ Int)
   where
     go 0 _ = Left "the owner's actions did not settle the model"
-    go n m = case ownerActions m of
+    go n m = case filter keep (ownerActions m) of
       [] → leftovers m
       (ev : _) → case step m ev of
         (m', Right _) → go (n - 1) m'
         (_, Left r) → Left ("the owner's " <> show ev <> " was refused: " <> show r)
+    keep ev = clearViews || case ev of ClearCameraDemand _ → False; _ → True
     leftovers m =
       case concat
         [ ["a job remains: " <> show j | j ← modelJobs m]
         , ["a bank still reserves bytes: " <> show b <> " " <> show (bankLedger m b) | b ← allBanks, ledgerReserved (bankLedger m b) /= 0]
-        , ["staging still occupied: " <> show (bankLedger m StagingBank) | ledgerOccupied (bankLedger m StagingBank) /= 0]
+        , ["staging still occupied: " <> show (bankLedger m StagingBank) | clearViews, ledgerOccupied (bankLedger m StagingBank) /= 0]
         , ["a victim remains: " <> show (regionCoord r) | r ← modelRegions m, regionEvicting r]
         , ["an arena is still retiring: " <> show (arenaId a) | a ← modelArenas m, arenaPhase a == ArenaRetiringPhase]
         ] of
@@ -284,7 +290,7 @@ roomyPressure =
       , specLoadJobs = 8
       , specQueuedCommands = 8
       , specPinsPerView = 2
-      , specDemandRegions = 2
+      
       , specAgingQuanta = 2
       , specQueryRegions = 2
       , specExtentX = 2
@@ -420,7 +426,7 @@ limitsOf (resident, staging, jobs) =
       , specLoadJobs = jobs
       , specQueuedCommands = 3
       , specPinsPerView = 2
-      , specDemandRegions = 2
+      
       , specAgingQuanta = 3
       , specQueryRegions = 2
       , specExtentX = 2
@@ -428,10 +434,10 @@ limitsOf (resident, staging, jobs) =
       , specExtentZ = 6
       }
 
--- | A camera demand within the caps completes when it is alone, whatever banks
--- the validated configuration chose and whatever the model holds: none of it can
--- stay pending once the work that holds the room has finished. Here the model
--- starts empty with some regions left resident.
+-- | A camera demand completes when it is alone and the camera's share of the banks
+-- (what is left beyond the explicit headroom) holds it, whatever resident regions
+-- are left over: none of it can stay pending once the work that holds the room has
+-- finished.
 acceptedDemandCompletes ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → Property
 acceptedDemandCompletes triple leftovers picks =
   case limitsOf triple of
@@ -497,9 +503,7 @@ busyEndsWhenReleased seeds picks =
             ]
   where
     admitted what (_, result) = case result of
-      Right report
-        | what == "camera", CameraSet {cameraPending = waiting} ← reportDecision report → null waiting
-        | otherwise → True
+      Right _ → True
       Left (RetainedEditsExhausted {}) → what == "removal"
       Left _ → False
 
@@ -511,6 +515,31 @@ quiesce m0 = do
   let dirty = [r | r ← modelRegions m1, regionDirty r, regionHandoff r == Nothing]
       offload m r = fst (step (fst (step m (BeginHandoff (regionArena r) (regionCoord r) 0))) (HandoffConfirmed (regionArena r) (regionCoord r)))
   settleEverything (foldl offload m1 dirty)
+
+-- | Explicit requests are not blocked by camera holdings beyond what eviction can
+-- release: with every camera demand left in place (their interests, descriptions
+-- and any regions they have loaded), once the owner has released everything else, an
+-- in-cap query or removal is admitted at once.
+explicitWithCameraPresent ∷ [(Int, Int, Int)] → [(Int, Int)] → Property
+explicitWithCameraPresent seeds picks =
+  let m0 = modelAfter pressure seeds
+   in case settleWith False m0 >>= offloadAll of
+        Left why → counterexample why False
+        Right m →
+          conjoin
+            [ counterexample (what <> " was blocked by the camera in an otherwise quiescent model: " <> show r) (admitted what r)
+            | (what, event) ← take 2 (inCapRequests m picks)
+            , let r = snd (step m event)
+            ]
+  where
+    admitted what result = case result of
+      Right _ → True
+      Left (RetainedEditsExhausted {}) → what == "removal"
+      Left _ → False
+    offloadAll m1 =
+      let dirty = [r | r ← modelRegions m1, regionDirty r, regionHandoff r == Nothing]
+          offload m r = fst (step (fst (step m (BeginHandoff (regionArena r) (regionCoord r) 0))) (HandoffConfirmed (regionArena r) (regionCoord r)))
+       in settleWith False (foldl offload m1 dirty)
 
 -- | A request over its caps is invalid from every state, with a typed reason.
 overCapAlwaysInvalid ∷ [(Int, Int, Int)] → Property
@@ -525,7 +554,6 @@ overCapAlwaysInvalid seeds =
               outside z x = [demand (reg 0 0 0) (cell x 0 z)]
            in conjoin
                 [ expect "a three-region query" (SubmitQuery (RequestId 1000000) a rev three) (Invalid (DemandTooLarge 3 2))
-                , expect "a three-region camera demand" (SetCameraDemand (ViewId 7) a three) (Invalid (DemandTooLarge 3 2))
                 , expect "a cell above the extent" (SubmitQuery (RequestId 1000000) a rev (outside 6 0)) (Invalid (OutsideExtent (reg 0 0 0)))
                 , expect "a cell beyond the extent's columns" (SetCameraDemand (ViewId 7) a (outside 0 2)) (Invalid (OutsideExtent (reg 0 0 0)))
                 ]
@@ -535,11 +563,11 @@ overCapAlwaysInvalid seeds =
               Right _ → counterexample (what <> " was accepted") False
 
 -- | A configuration is refused at construction exactly when a bank (or the load
--- jobs) is below the worst-case footprint of the largest admissible request,
--- restated here by hand: the region at its stored maximum, the largest job beyond
--- it, and the staging each kind of request holds.
-minimumBudgetsAreEnforced ∷ (Integer, Integer, Integer, Integer) → (Integer, Integer, Integer, Integer, Integer) → Property
-minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, camera, x, y, z) =
+-- jobs) is below the worst-case footprint of the largest admissible explicit
+-- request, restated here by hand: the region at its stored maximum, the largest
+-- job beyond it, and the staging each kind of request holds.
+minimumBudgetsAreEnforced ∷ (Integer, Integer, Integer, Integer) → (Integer, Integer, Integer, Integer) → Property
+minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, x, y, z) =
   let spec' =
         LimitsSpec
           { specResidentBytes = resident
@@ -548,7 +576,6 @@ minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, camera, x, y, 
           , specLoadJobs = jobs
           , specQueuedCommands = 3
           , specPinsPerView = 2
-          , specDemandRegions = camera
           , specAgingQuanta = 3
           , specQueryRegions = query
           , specExtentX = x
@@ -560,8 +587,8 @@ minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, camera, x, y, 
       stored = 256 + 48 * columns + 32 * intervals + 2 * columns * z
       job = 48 * columns + 96 * intervals
       scratch = 256 + 2 * columns * z
-      needResident = maximum [query * (stored + job), camera * (stored + job), stored + 48 + 96 + 62]
-      needStaging = maximum [128 + 32 * query + 64 * query + query * scratch, 128 + 64 * camera + 64 * camera + camera * scratch, 160 + 512 + 64 + 258, 64 * camera, stored]
+      needResident = maximum [query * (stored + job), stored + 48 + 96 + 62]
+      needStaging = maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258, stored]
       expected
         | resident < needResident = Just (BankBelowMinimum ResidentBank needResident resident)
         | edit < 64 = Just (BankBelowMinimum EditBank 64 edit)
@@ -578,7 +605,7 @@ spec = describe "Residency model properties" $ do
   it "refuses a configuration exactly when a bank is below the worst-case footprint of its largest request" $
     withNumTests 5000 $
       forAll ((,,,) <$> chooseInteger (1, 12000) <*> chooseInteger (1, 200) <*> chooseInteger (1, 12000) <*> chooseInteger (1, 4)) $ \banks →
-        forAll ((,,,,) <$> chooseInteger (1, 4) <*> chooseInteger (1, 4) <*> chooseInteger (1, 4) <*> chooseInteger (1, 3) <*> chooseInteger (1, 12)) $ \caps →
+        forAll ((,,,) <$> chooseInteger (1, 4) <*> chooseInteger (1, 4) <*> chooseInteger (1, 3) <*> chooseInteger (1, 12)) $ \caps →
           minimumBudgetsAreEnforced banks caps
   it "holds its invariants over random sequences" $
     withNumTests 200 $
@@ -588,7 +615,7 @@ spec = describe "Residency model properties" $ do
           (Right _, _) → property True
   it "completes every in-cap camera demand when it is alone, under random valid budgets and leftovers" $
     withNumTests 2000 $
-      forAll ((,,) <$> chooseInteger (2400, 5000) <*> chooseInteger (900, 3000) <*> chooseInteger (1, 4)) $ \limitsTriple →
+      forAll ((,,) <$> chooseInteger (2480, 5000) <*> chooseInteger (3000, 8000) <*> chooseInteger (4, 6)) $ \limitsTriple →
         forAll (vectorOf 3 pair) $ \leftovers →
           forAll (vectorOf 4 pair) $ \picks →
             acceptedDemandCompletes limitsTriple leftovers picks
@@ -598,6 +625,9 @@ spec = describe "Residency model properties" $ do
   it "admits every in-cap request once everything releasable has been released" $
     withNumTests 300 $
       forAll seedsOf $ \seeds → forAll (vectorOf 3 pair) $ \picks → busyEndsWhenReleased seeds picks
+  it "never blocks an explicit request on camera holdings, whatever demands the cameras left" $
+    withNumTests 300 $
+      forAll seedsOf $ \seeds → forAll (vectorOf 3 pair) $ \picks → explicitWithCameraPresent seeds picks
   it "refuses an over-cap request as invalid from every state" $
     withNumTests 200 $
       forAll seedsOf overCapAlwaysInvalid

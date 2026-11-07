@@ -106,7 +106,7 @@ baseSpec =
     , specLoadJobs = 3
     , specQueuedCommands = 3
     , specPinsPerView = 2
-    , specDemandRegions = 2
+    
     , specAgingQuanta = 3
     , specQueryRegions = 2
     , specExtentX = 1

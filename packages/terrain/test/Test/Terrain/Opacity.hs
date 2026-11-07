@@ -284,7 +284,7 @@ residencyClient =
     , ""
     , "main :: IO ()"
     , "main = do"
-    , "  let spec0 = LimitsSpec 1000 192 2048 3 3 2 2 3 2 1 1 1"
+    , "  let spec0 = LimitsSpec 1000 192 2048 3 3 2 3 2 1 1 1"
     , "  putStrLn (either show (const \"valid\") (mkLimits spec0))"
     , "  putStrLn (either show (const \"valid\") (mkLimits spec0 {specLoadJobs = 0}))"
     , "  putStrLn (either show (const \"valid\") (mkLimits spec0 {specResidentBytes = limitCeiling + 1}))"
