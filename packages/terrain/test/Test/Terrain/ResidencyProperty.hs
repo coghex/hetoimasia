@@ -242,6 +242,48 @@ lcg seed n = take n (triples (drop 1 (iterate next seed)))
     triples (x : y : z : rest) = (x `div` 65536, y `div` 65536, z `div` 65536) : triples rest
     triples _ = []
 
+-- | A camera demand the model accepts completes when it is alone: the owner
+-- services and completes every job, storing the least each can, and nothing is
+-- left pending. This is the feasibility bound checked against the order in which
+-- admission actually reserves, over random tiny budgets and random mixed demands.
+acceptedDemandCompletes ∷ (Integer, Integer, Integer) → [(Int, Int)] → Property
+acceptedDemandCompletes (resident, staging, jobs) picks =
+  case mkLimits (LimitsSpec resident 192 staging jobs 3 2 4 3) of
+    Left _ → property True
+    Right limits →
+      let xs = take 4 (nubInts (map fst picks))
+          demands = zipWith (\x (_, j) → demandFor' x j) xs picks
+          start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
+       in if null demands
+            then property True
+            else case step start (SetCameraDemand (ViewId 1) (ArenaId 1) demands) of
+              (_, Left _) → property True
+              (m, Right _) → case converge (200 ∷ Int) m of
+                Left why → counterexample why False
+                Right done →
+                  counterexample
+                    ("demand accepted but left pending: " <> show (map viewPending (modelViews done)) <> " with " <> show (demands, limits))
+                    (all (null . viewPending) (modelViews done))
+  where
+    nubInts = foldl (\acc x → if x `elem` acc then acc else acc <> [x]) []
+    demandFor' x j = demand (reg (toInteger (x ∷ Int)) 0 0) (fromMaybe (cell 0 0 0) (pick coverages j))
+    -- Service, dispatch every queued job and complete each with the least it can
+    -- store, until a round does no work.
+    converge 0 _ = Left "did not converge"
+    converge n m =
+      let (m1, serviced) = step m Service
+          admittedAny = case serviced of
+            Right r | Serviced xs ← reportDecision r → not (null xs)
+            _ → False
+          (m2, dispatched) = dispatchAll m1 (0 ∷ Int)
+          running = [j | j ← modelJobs m2, jobPhase j == JobRunningPhase]
+          leastCost j = let c = jobCoverage j in Cost (coverageColumns c) (coverageSegments c) (2 * coverageSegments c)
+          m3 = foldl (\mm j → fst (step mm (JobCompleted (jobId j) (leastCost j)))) m2 running
+       in if not admittedAny && dispatched == 0 && null running then Right m3 else converge (n - 1) m3
+    dispatchAll m k = case step m Dispatch of
+      (m', Right r) | Dispatched {} ← reportDecision r → dispatchAll m' (k + 1)
+      _ → (m, k)
+
 spec ∷ Spec
 spec = describe "Residency model properties" $ do
   it "holds its invariants over random sequences" $
@@ -250,6 +292,11 @@ spec = describe "Residency model properties" $ do
         case runSequence seeds of
           (Left why, _) → counterexample why False
           (Right _, _) → property True
+  it "completes every camera demand the model accepts when it is alone, under random tiny budgets" $
+    withNumTests 400 $
+      forAll ((,,) <$> chooseInteger (300, 2400) <*> chooseInteger (300, 1500) <*> chooseInteger (1, 3)) $ \limitsTriple →
+        forAll (vectorOf 4 ((,) <$> chooseInt (0, 5) <*> chooseInt (0, 2))) $ \picks →
+          acceptedDemandCompletes limitsTriple picks
   it "exercises completion, eviction, commit, refusal and retirement in a fixed long sequence" $ do
     let (outcome, stats) = runSequence (lcg 7 30000)
     outcome `shouldSatisfy` either (const False) (const True)
