@@ -501,8 +501,6 @@ granite cell counts. The inspected Synarchy arena has that finite base stack
 Exact default soil thickness, material assets and recipe API remain to be
 specified. No geological generation or additional material system is implied.
 
-## Design boundaries
-
 ### D-17. Haskell mechanisms, Lua arena rules
 
 Owner, directly in this pane on 2026-11-06, selected:
@@ -541,7 +539,33 @@ memory/request admission returns `busy` without losing earlier changes or
 partially applying a new edit. Unloaded terrain is visibly absent until ready;
 no loading UI is introduced. Define concrete request/cancellation, snapshot
 and publication semantics in the technical contract. This choice does not
-decide the separate Q-10 general gameplay-state boundary.
+decide the separate Q-10 general gameplay-state boundary, settled by D-20.
+
+### D-20. Narrow terrain transactions; general gameplay state stays deferred
+
+Owner, directly in this pane on 2026-11-06, selected:
+
+> Yes—terrain transactions only
+
+Implement a narrow terrain service with atomic individual edits. Leave the
+general gameplay-state/ECS system and whole-tick rollback for their later arc.
+The service does not implement or replace `api.state`, nor promise rollback
+of earlier terrain operations when later Lua code fails. Preserve the earlier
+state design and its decisions. This resolves the scope fork in Q-10.
+
+### D-21. Explicit full blocks, ramps and corner slopes
+
+Owner, directly in this pane on 2026-11-06, selected:
+
+> Yes—explicit shapes, no automatic reshaping
+
+Include full blocks, ramps and corner slopes. Removal deletes only the
+requested tile; it does not reshape neighbors. Neighbor visibility and derived
+render data must still be recomputed where affected. Slopes come from authored
+terrain definitions for now. No procedural slope inference, general editor,
+or automatic material-dependent smoothing belongs to this arc.
+
+## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
 libraries, using narrow services. Synarchy's world managers and coupled
