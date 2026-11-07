@@ -177,3 +177,35 @@ accounting.
 | A commit does not report the queued and running jobs of the changed region | the commit-report and stale-failure examples |
 | A failure does not report the jobs it leaves unneeded | the failure-report example |
 | The camera peak ignores the last job's reservation | the multi-region footprint example |
+| A superseded running job is not cancelling | the acknowledgement-after-commit example |
+| The camera resident peak ignores the admission order | the mixed-size order examples |
+| The camera feasibility counts work that is already resident | the already-resident example |
+
+The random-sequence property also checks, after every step, that the owner can
+perform every action the model has asked of it (each accepted) and, from the final
+state of every run, that performing all of them leaves no job, victim, hold,
+retiring arena or reserved byte behind.
+| Camera admission skips past a busy region | the in-order admission example and the accepted-demand-completes property |
+| Service skips past a busy region | the accepted-demand-completes property |
+
+### Randomized properties
+
+`Test.Terrain.ResidencyProperty` drives 22 kinds of event (open, retire, query,
+removal, camera replacement and clear, withdraw, service, dispatch, complete, fail,
+acknowledge, commit, hold, release, handoff start/confirm/fail, victim release, and
+a targeted "advance an edit" step) chosen from random integers against the model's
+current state, so most are valid and some are deliberately wrong. After every
+step it checks: a refusal returned the model unchanged; the invariants; every bank
+recomputed from the model's records; no bank over its limit; retained edits never
+decrease; a changed region is not lost without a handoff; and that the owner can
+perform every action the model has asked of it (each accepted). At the end of each
+run, performing all of them leaves no job, victim, hold, retiring arena or reserved
+byte. It runs 200 random sequences of 250 events, a 12,000-event fixed sequence under
+tight budgets, a 12,000-event fixed sequence under room for concurrent work (where
+commits meet queued and running jobs of their region) and 1,000 random camera
+demands under random tiny budgets, each of which, if accepted, must complete when
+it is alone. The fixed sequences assert workload floors so that a degenerate
+generator fails: for example under the roomy profile at least 4,000 accepted events,
+40 commits, 3 superseding commits, 20 acknowledgements and 20 camera replacements
+that cancel work.
+

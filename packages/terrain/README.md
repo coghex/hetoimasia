@@ -593,9 +593,12 @@ region as well as in a dropped one: a region whose new coverage cannot be admitt
 yet keeps no interest in the coverage it replaced, and what the withdrawal freed is
 offered to the pending regions in the same step. Shared work is kept; the jobs the
 replacement made obsolete are reported (dropped at once if queued, awaiting their
-acknowledgement if running), whether or not the replacement was admitted. Each region is admitted as its own unit; what is not admitted stays
-as coalesced pending demand, holds nothing, and is retried by the owner's
-`Service` quantum.
+acknowledgement if running), whether or not the replacement was admitted. Each region
+is admitted as its own unit, strictly in the order of the demand: the first region
+that cannot be admitted holds back the regions after it, so a later region never
+takes room an earlier one needs (this is the order the feasibility check above
+measures). What is not admitted stays as coalesced pending demand, holds nothing,
+and is retried in the same order by the owner's `Service` quantum.
 
 ### Eviction, holds and handoffs
 
