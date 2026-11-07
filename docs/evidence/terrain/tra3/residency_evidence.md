@@ -174,3 +174,6 @@ accounting.
 | A successful replacement drops its cancellation lists | the replacement-report example |
 | The camera footprint counts one interest only | the multi-region footprint example |
 | Pinned camera regions not bounded by the resident bank | the multi-region footprint example |
+| A commit does not report the queued and running jobs of the changed region | the commit-report and stale-failure examples |
+| A failure does not report the jobs it leaves unneeded | the failure-report example |
+| The camera peak ignores the last job's reservation | the multi-region footprint example |
