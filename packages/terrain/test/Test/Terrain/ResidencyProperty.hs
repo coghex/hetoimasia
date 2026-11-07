@@ -627,6 +627,44 @@ cameraStartsWhatItKeeps staging picks = case limitsNear 4384 staging of
               ]
           (_, Left r) → counterexample ("the camera demand was refused: " <> show r) False
 
+-- | The same for a replacement: a camera that has loaded one description and pans to
+-- another (the owner has completed everything in between, and nothing else holds the
+-- room) never has the new description cut to nothing. Whatever staging, a non-empty
+-- replacement retains a non-empty description and starts its first region, because the
+-- interests and queued work the replacement drops are credited before it is cut.
+cameraReplacementStarts ∷ Integer → [(Int, Int)] → [(Int, Int)] → Property
+cameraReplacementStarts staging firstPicks nextPicks = case limitsNear 4384 staging of
+  Nothing → counterexample ("a configuration at the minimum was refused: " <> show staging) False
+  Just limits →
+    let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
+        distinctOf picks = foldr (\d acc → if demandRegion d `elem` map demandRegion acc then acc else d : acc) [] [demandAt x j | (x, j) ← picks]
+        settle ∷ Int → Model → Maybe Model
+        settle 0 _ = Nothing
+        settle n m = case events m of
+          (ev : _) → case step m ev of (m', Right _) → settle (n - 1) m'; _ → Nothing
+          [] → case step m Service of
+            (m', Right r) | reportDecision r /= Serviced [] → settle (n - 1) m'
+            _ → Just m
+        events m =
+          [VictimReleased (regionArena r) (regionCoord r) | r ← modelRegions m, regionEvicting r]
+            <> [JobCompleted (jobId j) (honestCost m j) | j ← modelJobs m, jobPhase j `elem` [JobRunningPhase, JobCancellingPhase]]
+            <> [Dispatch | any ((== JobQueued) . jobPhase) (modelJobs m)]
+        firstDemand = distinctOf firstPicks
+        nextDemand = distinctOf nextPicks
+     in case step start (SetCameraDemand (ViewId 1) (ArenaId 1) firstDemand) of
+          (m1, Right _) → case settle 200 m1 of
+            Nothing → counterexample "the first description did not settle" False
+            Just m2 → case step m2 (SetCameraDemand (ViewId 1) (ArenaId 1) nextDemand) of
+              (m3, Right _) →
+                conjoin
+                  [ counterexample ("a replacement of " <> show (length nextDemand) <> " regions kept " <> show (length (viewDemand v)) <> " and started " <> show (length (viewDemand v) - length (viewPending v)) <> " at " <> show staging) $
+                      not (null (viewDemand v)) && length (viewPending v) < length (viewDemand v)
+                  | not (null nextDemand)
+                  , v ← modelViews m3
+                  ]
+              (_, Left r) → counterexample ("the replacement was refused: " <> show r) False
+          (_, Left r) → counterexample ("the first demand was refused: " <> show r) False
+
 -- | A request over its caps is invalid from every state, with a typed reason.
 overCapAlwaysInvalid ∷ [(Int, Int, Int)] → Property
 overCapAlwaysInvalid seeds =
@@ -730,6 +768,9 @@ spec = describe "Residency model properties" $ do
   it "starts the first region of every camera description it retains, at any staging from the minimum" $
     withNumTests 2000 $
       forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \picks → cameraStartsWhatItKeeps staging picks
+  it "starts the first region of every replacement of a settled camera description, at any staging from the minimum" $
+    withNumTests 2000 $
+      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts staging a b
   it "never reserves more for an explicit request than the construction-time worst case" $
     withNumTests 2000 $
       forAll (vectorOf 3 pair) reservationWithinMinimum

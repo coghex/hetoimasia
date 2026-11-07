@@ -1292,6 +1292,22 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     map (map demandRegion . viewDemand) (modelViews m1) `shouldBe` [[reg 0 0 0]]
     m2 ← drainDemand m1
     map viewPending (modelViews m2) `shouldBe` [[]]
+  it "credits the interest a pan drops: after a completed load, panning to another region at the minimum budget keeps and starts it" $ do
+    -- 1,446 resident and 1,508 staging bytes, the least a camera-enabled configuration of
+    -- this extent allows. A camera share of 514 holds one region's description (192),
+    -- interest (64) and scratch (258). View 1 has loaded region A, so its interest in A
+    -- (64) is still charged when it pans to B; the replacement drops it, and B's
+    -- description, interest and scratch fit exactly.
+    let limits = limitsWith $ \x → x {specResidentBytes = 1446, specStagingBytes = 1508, specCameraRegions = 64}
+    m0 ← opened limits
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch, JobCompleted (JobId 0) oneCellCost]
+    (m2, set) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [demand (reg 1 0 0) (cell 0 0 0)])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ excluded truncated → (map (map snd . admissionJobs) admitted, waiting, excluded, truncated) `shouldBe` ([[reg 1 0 0]], [], [], [])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 1 0 0]]
+    m3 ← drainDemand m2
+    map viewPending (modelViews m3) `shouldBe` [[]]
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])

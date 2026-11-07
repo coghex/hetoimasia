@@ -1161,12 +1161,14 @@ setCamera m v a demands0 = do
   -- cut the end of it, the lowest priority, and the remainder is reported.
   let limits = mLimits m
       (normal, excluded) = normalizeCamera (limitExtent limits) demands0
-      oldBytes = maybe 0 (descriptionBytes . fromIntegral . length . vwDemand) (Map.lookup v (mViews m))
-      staging = bankLedger m StagingBank
-      share = cameraFree m staging + oldBytes
-      -- The description must leave room for the camera to progress: beside it, the
-      -- interest and scratch of the first region of the prefix this view has no interest
-      -- in yet. A description that kept more regions than it can start would stall.
+      -- The description must leave room for the camera to progress, judged against the
+      -- state the replacement produces (the same 'replaceView' that applies it): that
+      -- state has this view's old description gone, the interests it no longer needs
+      -- dropped and the queued work nothing needs pruned, and beside the description it
+      -- must hold the interest and scratch of the first region of the kept prefix this
+      -- view has no interest in yet. A description that kept more regions than it can
+      -- start would stall. A longer prefix only adds to what the state holds, so the
+      -- longest prefix that fits is found by bisection.
       covered d = case Map.lookup (a, demandRegion d) (mTargets m) >>= Map.lookup (OwnerView v) . tgInterests of
         Just i → coverageSubset (demandCoverage d) (inCoverage i)
         Nothing → False
@@ -1174,10 +1176,21 @@ setCamera m v a demands0 = do
       unit = case drop leading normal of
         (d : _) → interestRecordBytes + scratchBytes (demandCoverage d)
         [] → 0
-      regionsFor room = if room >= descriptionBytes 0 then fromIntegral ((room - descriptionBytes 0) `div` 64) else 0 ∷ Int
       most = min (length normal) (fromIntegral (limitCameraRegions limits))
-      withStart = if share >= unit then min most (regionsFor (share - unit)) else 0
-      keep = if withStart > leading then withStart else min leading (min most (regionsFor share))
+      fits k
+        | k <= 0 = True
+        | otherwise =
+            let (mk, _, _, _) = replaceView m v a (take k normal)
+                need = if k > leading then unit else 0
+                room = toInteger (freeBytes (bankLedger mk StagingBank)) - toInteger (limitExplicitStagingBytes limits)
+             in room >= toInteger need
+      longest lo hi
+        | lo >= hi = lo
+        | fits mid = longest mid hi
+        | otherwise = longest lo (mid - 1)
+        where
+          mid = (lo + hi + 1) `div` 2
+      keep = longest 0 most
       demands = take keep normal
       truncated = map demandRegion (drop keep normal)
   if null demands
@@ -1188,20 +1201,8 @@ setCamera m v a demands0 = do
 
 setCameraNormal ∷ Model → ViewId → ArenaId → [RegionDemand] → [RegionCoord] → [RegionCoord] → Run
 setCameraNormal m v a demands excluded truncated = do
-  let wanted = Set.fromList [(a, demandRegion d) | d ← demands]
-      owner = OwnerView v
-      obsolete =
-        [ key
-        | (key, t) ← Map.toAscList (mTargets m)
-        , Map.member owner (tgInterests t)
-        , not (Set.member key wanted)
-        ]
-      dropInterest mm key = case Map.lookup key (mTargets mm) of
-        Nothing → mm
-        Just t → putTarget key t {tgInterests = Map.delete owner (tgInterests t)} mm
-      m1 = foldl' dropInterest m obsolete
-      m2 = m1 {mViews = Map.insert v (View a demands Set.empty) (mViews m1)}
-      (m3, gone, cancelling) = pruneJobs m2
+  let owner = OwnerView v
+      (m3, obsolete, gone, cancelling) = replaceView m v a demands
       -- Only pressure leaves a region pending; any other refusal fails the event.
       -- A region that stays pending drops this view's interest in the coverage it
       -- replaced, so an obsolete interest never survives a replacement. Whatever a
@@ -1209,6 +1210,8 @@ setCameraNormal m v a demands excluded truncated = do
       -- is told to cancel every job the replacement made obsolete.
       -- Regions are admitted strictly in demand order: once one is busy the rest
       -- wait behind it, so a later region never takes room an earlier one needs.
+      wanted = Set.fromList [(a, demandRegion d) | d ← demands]
+      dropInterest mm key = dropViewInterest owner mm key
       attempt (mm, done, waiting, replaced, goneAcc, cancelAcc) d = case (if null waiting then planAdmission mm a owner [d] noExtras {exProtect = wanted} else Left (Busy (RegionEvicting (demandRegion d)))) of
         Right plan →
           let (mm', admission, _) = applyPlan mm a owner plan
@@ -1228,6 +1231,30 @@ setCameraNormal m v a demands excluded truncated = do
   -- the regions that stayed pending, once.
   (m5, admitted2, pending2, _, gone2, cancelling2) ← foldM attempt (m4, admitted, [], [], gone1, cancelling1) [d | d ← demands, demandRegion d `elem` pending]
   Right (m5, CameraSet admitted2 pending2 (map snd obsolete <> replaced) gone2 cancelling2 excluded truncated)
+
+-- | The state a view's replacement demand leaves before any region is admitted: the
+-- view holds the new description, the interests it no longer needs are dropped, and the
+-- queued work nothing needs is pruned. Both the truncation of a description and its
+-- application are this one function.
+replaceView ∷ Model → ViewId → ArenaId → [RegionDemand] → (Model, [(ArenaId, RegionCoord)], [JobId], [JobId])
+replaceView m v a demands =
+  let wanted = Set.fromList [(a, demandRegion d) | d ← demands]
+      owner = OwnerView v
+      obsolete =
+        [ key
+        | (key, t) ← Map.toAscList (mTargets m)
+        , Map.member owner (tgInterests t)
+        , not (Set.member key wanted)
+        ]
+      m1 = foldl' (dropViewInterest owner) m obsolete
+      m2 = m1 {mViews = Map.insert v (View a demands Set.empty) (mViews m1)}
+      (m3, gone, cancelling) = pruneJobs m2
+   in (m3, obsolete, gone, cancelling)
+
+dropViewInterest ∷ Owner → Model → RegionKey → Model
+dropViewInterest owner mm key = case Map.lookup key (mTargets mm) of
+  Nothing → mm
+  Just t → putTarget key t {tgInterests = Map.delete owner (tgInterests t)} mm
 
 -- | Retry the pending part of every view's latest camera demand, in view order.
 service ∷ Model → (Model, Decision)
