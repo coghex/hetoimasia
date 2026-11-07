@@ -184,6 +184,8 @@ module Hetoimasia.Terrain.Residency
   , InvalidReason (..)
   , StaleReason (..)
   , ContractReason (..)
+  , ChargeViolation (..)
+  , chargeCheck
   , Report (..)
   , Decision (..)
   , Admission (..)

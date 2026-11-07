@@ -1246,6 +1246,35 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     modelInvariants m4 `shouldBe` []
     (_, explicit) ← stepOk m4 (SubmitQuery (RequestId 9) a1 rev0 [demand (reg 5 0 0) wide])
     length (admissionJobs (admission explicit)) `shouldBe` 1
+  it "counts the reservations of jobs in a held region, so widening a pinned region one cell at a time stops at the camera share" $ do
+    -- Extent 1 x 1 x 32, one region per query and per hold: a region stores at most 1,392
+    -- bytes and a job beyond that reserves 1,584, so explicit work needs 2,976, and the
+    -- camera share must hold one camera job (2,976): 5,952 bytes. Region A is loaded for
+    -- the camera and pinned (charged 1,392). The camera then widens it one level at a
+    -- time; none of the jobs is dispatched. Each reserves 144, so only 11 fit the 1,584
+    -- left of the share: the 12th is busy (and drops the view's interest in what it
+    -- replaced, so the queued jobs go and the view starts over from the pinned detail).
+    -- At every step the reservations in flight stay within the 1,584, the model obeys the
+    -- charge rules, and an explicit query for sixteen separate intervals of another region
+    -- is admitted at once.
+    let limits = limitsWith $ \x → x {specResidentBytes = 5952, specStagingBytes = 16384, specLoadJobs = 6, specQueryRegions = 1, specHoldRegions = 1, specExtentZ = 32, specCameraRegions = 64}
+        upTo z = demand (reg 0 0 0) (box 0 1 0 1 0 z)
+    m0 ← opened limits
+    m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [upTo 1])
+    m2 ← drainDemand m1
+    (m3, _) ← stepOk m2 (AcquireHold (HoldId 1) a1 (Pin (ViewId 1)) [reg 0 0 0])
+    let widen (m, busiest) z = do
+          (m', _) ← stepOk m (SetCameraDemand (ViewId 1) a1 [upTo z])
+          modelInvariants m' `shouldBe` []
+          let reserved = sum [jobActive j + jobDeferred j | j ← modelJobs m']
+          reserved `shouldSatisfy` (<= 1584)
+          pure (m', max busiest reserved)
+    (m4, busiest) ← foldM widen (m3, 0) [2 .. 32]
+    -- (It does reach the share: eleven jobs of 144.)
+    busiest `shouldBe` 1584
+    let odds = foldr1 coverageUnion [cell 0 0 z | z ← [0, 2 .. 30]]
+    (_, explicit) ← stepOk m4 (SubmitQuery (RequestId 9) a1 rev0 [demand (reg 5 0 0) odds])
+    length (admissionJobs (admission explicit)) `shouldBe` 1
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
@@ -1377,15 +1406,21 @@ editSpec = describe "retained edits" $ do
     m6 ← fst <$> stepOk m5 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
     stepRefused m6 (RemovalCommitted (RequestId 3) (Revision 2) 64 0) `shouldReturn` Stale (RevisionMismatch (Revision 1) rev0)
   it "treats more resident growth than was reserved, or growth still awaiting its victims, as a contract failure" $ do
-    m0 ← opened tiny
-    m1 ← fst <$> stepOk m0 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 0))
-    m2 ← stepsOk m1 [Dispatch, JobCompleted (JobId 0) oneCellCost]
+    -- Two levels per column: a region stores at most 372 bytes, 34 more than the 338 a
+    -- one-cell region holds.
+    mz ← opened (limitsWith $ \x → x {specExtentZ = 2, specResidentBytes = 1100})
+    m1z ← fst <$> stepOk mz (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 0))
+    m2z ← stepsOk m1z [Dispatch, JobCompleted (JobId 0) oneCellCost]
     -- 62 bytes were reserved for the rebuilt segment.
-    stepRefused m2 (RemovalCommitted (RequestId 1) (Revision 1) 64 63) `shouldReturn` ContractFailure (ResidentGrowthExceedsReservation 62 63)
-    (m3, committed) ← stepOk m2 (RemovalCommitted (RequestId 1) (Revision 1) 64 62)
+    stepRefused m2z (RemovalCommitted (RequestId 1) (Revision 1) 64 63) `shouldReturn` ContractFailure (ResidentGrowthExceedsReservation 62 63)
+    -- Growth that would take the region past the 372 its extent allows is an impossible
+    -- figure: refused before anything changes.
+    stepRefused m2z (RemovalCommitted (RequestId 1) (Revision 1) 64 62) `shouldReturn` ContractFailure (RegionExceedsMaximum 400 372)
+    (m3, committed) ← stepOk m2z (RemovalCommitted (RequestId 1) (Revision 1) 64 34)
     reportDecision committed `shouldBe` Committed (Revision 1) 0 [] [] []
-    -- The growth is occupied: 338 + 62.
-    ledgersOf m3 `shouldBe` Ledgers (400, 0) (64, 0) (0, 0)
+    -- The growth is occupied: 338 + 34.
+    ledgersOf m3 `shouldBe` Ledgers (372, 0) (64, 0) (0, 0)
+    m0 ← opened tiny
     -- Growth funded by a committed eviction is not occupied before the release:
     -- 676 stored of 1,000 leave 324; the job (400) takes it and the growth (62) waits.
     m4 ← loadCell m0 1 (reg 5 0 0) (cell 0 0 0) >>= \m → withdraw m 1

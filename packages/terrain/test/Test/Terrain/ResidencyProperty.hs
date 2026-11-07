@@ -299,6 +299,28 @@ roomyPressure =
       , specCameraRegions = 64
       }
 
+-- | The pressure configuration with its resident and staging banks as given, which must
+-- meet the minimum budgets (4,384 and 1,530 here: the explicit reserve plus a camera
+-- share that holds one camera unit).
+limitsNear ∷ Integer → Integer → Maybe Limits
+limitsNear resident staging =
+  either (const Nothing) Just . mkLimits $
+    LimitsSpec
+      { specResidentBytes = resident
+      , specEditBytes = 640
+      , specStagingBytes = staging
+      , specLoadJobs = 4
+      , specQueuedCommands = 4
+      , specPinsPerView = 2
+      , specAgingQuanta = 2
+      , specQueryRegions = 2
+      , specExtentX = 2
+      , specExtentY = 1
+      , specExtentZ = 6
+      , specHoldRegions = 2
+      , specCameraRegions = 64
+      }
+
 runSequenceWith ∷ Limits → [(Int, Int, Int)] → (Either String Model, Stats)
 runSequenceWith limits seeds = go (newModel limits) seeds (Stats 0 0 0 0 0 0 0 0 0 0 0 0)
   where
@@ -670,6 +692,21 @@ spec = describe "Residency model properties" $ do
   it "admits every in-cap request once everything releasable has been released" $
     withNumTests 300 $
       forAll seedsOf $ \seeds → forAll (vectorOf 3 pair) $ \picks → busyEndsWhenReleased seeds picks
+  it "keeps every charge rule across load, complete, pin, unpin, camera expansion, withdraw, removal, handoff and eviction under budgets at and just above the minimum" $
+    withNumTests 300 $
+      forAll ((,) <$> chooseInteger (4384, 6400) <*> chooseInteger (1530, 3600)) $ \(resident, staging) →
+        forAll seedsOf $ \seeds → case limitsNear resident staging of
+          Nothing → counterexample ("a configuration at or above the minimum was refused: " <> show (resident, staging)) False
+          Just limits → case runSequenceWith limits seeds of
+            (Left why, _) → counterexample why False
+            (Right _, _) → property True
+  it "keeps every charge rule over a long sequence at exactly the minimum budgets" $ do
+    case limitsNear 4384 1530 of
+      Nothing → expectationFailure "the minimum configuration was refused"
+      Just limits → do
+        let (outcome, stats) = runSequenceWith limits (lcg 21 12000)
+        outcome `shouldSatisfy` either (const False) (const True)
+        accepted stats `shouldSatisfy` (> 1000)
   it "never reserves more for an explicit request than the construction-time worst case" $
     withNumTests 2000 $
       forAll (vectorOf 3 pair) reservationWithinMinimum

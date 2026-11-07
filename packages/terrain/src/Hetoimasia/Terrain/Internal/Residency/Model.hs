@@ -22,6 +22,8 @@ module Hetoimasia.Terrain.Internal.Residency.Model
   , InvalidReason (..)
   , StaleReason (..)
   , ContractReason (..)
+  , ChargeViolation (..)
+  , chargeCheck
   , Report (..)
   , Decision (..)
   , Admission (..)
@@ -232,7 +234,10 @@ data StaleReason
   deriving stock (Eq, Show)
 
 data ContractReason
-  = -- | The bytes a region would occupy and the most the configured extent allows.
+  = -- | A transition that would have broken the charge rules (a defect, never a
+    -- result of valid events).
+    ChargeBreached !ChargeViolation
+  | -- | The bytes a region would occupy and the most the configured extent allows.
     RegionExceedsMaximum !Word64 !Word64
   | -- | Reserved bytes and the larger actual bytes the data layer reported.
     CostExceedsReservation !Word64 !Word64
@@ -377,6 +382,9 @@ data Job = Job
   , jbScratch ∷ !Word64
   , jbSkips ∷ !Word64
   , jbStale ∷ !Bool
+  , -- | Created for a camera view: its reservation is charged to the camera share for
+    -- as long as it lives, whoever later shares it.
+    jbCamera ∷ !Bool
   }
   deriving stock (Eq, Show)
 
@@ -644,9 +652,21 @@ step m event
       Right (m1, decision) →
         let (m2, settled) = settleAll m1
             funded = [i | (i, j) ← Map.toAscList (mJobs m), jbDeferred j > 0, Just j' ← [Map.lookup i (mJobs m2)], jbDeferred j' == 0]
-         in (m2, Right (Report decision settled funded))
+         in -- The one gate: no transition's result is returned unless it obeys the
+            -- charge rules, so a rule cannot be bypassed by a path that forgot it.
+            case chargeCheck m2 of
+              [] → (m2, Right (Report decision settled funded))
+              (v : _) → (m, Left (ContractFailure (ChargeBreached v)))
 
 type Run = Either Refusal (Model, Decision)
+
+-- | An owner's report is accepted only if the state it produces obeys the charge rules;
+-- an impossible figure is a contract failure and changes nothing.
+guardCharge ∷ Model → Decision → Run
+guardCharge m decision = case chargeCheck m of
+  [] → Right (m, decision)
+  (RegionOverMaximum _ bytes largest : _) → Left (ContractFailure (RegionExceedsMaximum bytes largest))
+  (v : _) → Left (ContractFailure (ChargeBreached v))
 
 run ∷ Model → Event → Run
 run m = \case
@@ -918,19 +938,6 @@ planAdmission m arena owner demands extras = do
     then Left (RetainedEditsExhausted EditBank (ledgerLimit editLedger) (ledgerOccupied editLedger) editNeed)
     else Right ()
   slotFree CommandSlot nCommands
-  -- Camera work leaves the resident room an explicit request may need: the new jobs
-  -- (and the detail of regions they enter) join what the camera side keeps out of
-  -- explicit reach only while that stays within the bank less the explicit minimum.
-  if explicit
-    then Right ()
-    else
-      let held = heldKeys m
-          before = cameraBlocked m held
-          counted = Set.fromList [(jbArena j, jbRegion j) | j ← Map.elems (mJobs m)]
-          detail key = maybe 0 rsBytes (Map.lookup key (mTargets m) >>= tgResident)
-          extra = sum [njNeed j + (if Set.member key held || Set.member key counted then 0 else detail key) | (UnitPlan (RegionDemand region _) _ (Just j)) ← units, let key = (arena, region)]
-          cap = cameraResidentCap m
-       in if before + extra > cap then Left (Busy (BankFull ResidentBank cap before extra)) else Right ()
   if stagingNeed > 0 then bankFree StagingBank (stagingNeed + stagingHeadroom) else Right ()
   bankFree EditBank editNeed
   if nJobs > maxBound - mNextJob m then Left (ContractFailure JobIdsExhausted) else Right ()
@@ -945,7 +952,19 @@ planAdmission m arena owner demands extras = do
     if shortfall == 0
       then Right ([(a, d, Map.empty) | (a, d) ← parts], [])
       else fundByEviction m explicit (Set.union (exProtect extras) (Set.fromList [(arena, demandRegion d) | d ← demands])) parts shortfall
-  pure (Plan units funding victims)
+  -- Camera work draws only on the camera share: the state this admission would produce
+  -- must obey the charge rules, or the camera waits (busy) and explicit work keeps its
+  -- reserve.
+  let plan = Plan units funding victims
+  if explicit
+    then Right ()
+    else
+      let (m1, _, _) = applyPlan m arena owner plan
+          before = ccTotal (cameraCharge m)
+       in case [v | v@(CameraResidentOverShare _ _) ← admissionCheck m1] of
+            (CameraResidentOverShare used cap : _) → Left (Busy (BankFull ResidentBank cap before (used - min used before)))
+            _ → Right ()
+  pure plan
   where
     explicit = case owner of
       OwnerRequest _ → True
@@ -1045,7 +1064,7 @@ applyPlan m arena owner (Plan units funding victims) =
       newJobs = [(u, j) | u@UnitPlan {upJob = Just j} ← units]
       allocate (mm, acc) ((UnitPlan (RegionDemand region _) _ _, NewJob delta _ scratch), (active, deferred, awaiting)) =
         let jid = JobId (mNextJob mm)
-            job = Job arena revision region delta JobPending active deferred awaiting scratch 0 False
+            job = Job arena revision region delta JobPending active deferred awaiting scratch 0 False (case owner of OwnerView _ → True; OwnerRequest _ → False)
          in (mm {mNextJob = mNextJob mm + 1, mJobs = Map.insert jid job (mJobs mm)}, acc <> [(jid, region)])
       (m3, created) = foldl' allocate (m2, []) (zip newJobs funding)
       -- Whatever funding is left after the jobs belongs to a removal's growth.
@@ -1278,11 +1297,6 @@ completeJob m jid cost = case Map.lookup jid (mJobs m) of
           bytes ← maybe (Left (ContractFailure CostOverflow)) Right (costBytes cost {costColumns = gained})
           actual ← maybe (Left (ContractFailure CostOverflow)) Right (checkedAdd bytes meta)
           if actual > jbActive job then Left (ContractFailure (CostExceedsReservation (jbActive job) actual)) else Right ()
-          -- No region can occupy more than the configured extent allows; a cost that
-          -- would is an impossible figure from the owner.
-          let total = maybe 0 rsBytes (tgResident target) + actual
-              largest = limitRegionStoredBytes (mLimits m)
-          if total > largest then Left (ContractFailure (RegionExceedsMaximum total largest)) else Right ()
           let res = case tgResident target of
                 Nothing → Residence (jbCoverage job) actual (mClock m) False 0 Nothing False
                 Just r → r {rsCoverage = coverageUnion (rsCoverage r) (jbCoverage job), rsBytes = rsBytes r + actual, rsLastUse = mClock m}
@@ -1293,7 +1307,9 @@ completeJob m jid cost = case Map.lookup jid (mJobs m) of
                 , coverageSubset (inCoverage i) (rsCoverage res)
                 ]
               m1 = m {mJobs = Map.delete jid (mJobs m), mTargets = Map.insert key target {tgResident = Just res} (mTargets m)}
-          Right (m1, Published jid satisfied)
+          -- (A cost that would take the region past what its extent allows is an
+          -- impossible figure from the owner: the charge function refuses it.)
+          guardCharge m1 (Published jid satisfied)
   where
     discard _ = (m {mJobs = Map.delete jid (mJobs m)}, Discarded jid)
 
@@ -1358,7 +1374,7 @@ commitRemoval m rid newRev actual growth = do
         | (o, i) ← Map.toList (tgInterests t1)
         , not (coverageSubset (inCoverage i) (haveCoverage m3 key))
         ]
-  Right (m3, Committed newRev (erRetained reservation - actual) lost droppedJobs staleJobs)
+  guardCharge m3 (Committed newRev (erRetained reservation - actual) lost droppedJobs staleJobs)
   where
     restamp a region rev j
       | jbArena j /= a = Just j
@@ -1375,34 +1391,107 @@ commitRemoval m rid newRev actual growth = do
 heldKeys ∷ Model → Set RegionKey
 heldKeys m = Set.fromList [(hdArena h, r) | h ← Map.elems (mHolds m), r ← hdRegions h]
 
--- | The resident bytes the camera side keeps out of an explicit request's reach until
--- it lets go. Every held region counts at its stored maximum (a pinned region can grow
--- and cannot be evicted); each other region with a job only views need counts the
--- detail it holds plus the job's reservation (finite work, but not reclaimable while
--- it is queued or running).
-cameraBlocked ∷ Model → Set RegionKey → Word64
-cameraBlocked m held =
-  let storedMax = limitRegionStoredBytes (mLimits m)
-      heldBytes = storedMax * fromIntegral (Set.size held)
-      viewOnly j = not (any (\(o, _) → case o of OwnerRequest _ → True; OwnerView _ → False) (neededBy m j))
-      perRegion =
-        Map.fromListWith
-          (+)
-          [ ((jbArena j, jbRegion j), jbActive j + jbDeferred j)
-          | j ← Map.elems (mJobs m)
-          , viewOnly j
-          , not (Set.member (jbArena j, jbRegion j) held)
-          ]
-      detail key = maybe 0 rsBytes (Map.lookup key (mTargets m) >>= tgResident)
-   in heldBytes + sum [n + detail key | (key, n) ← Map.toList perRegion]
+-- ---------------------------------------------------------------------------
+-- The charge function
+--
+-- Every bank total is /derived/ from the records ('bankLedger'); nothing stores or
+-- adjusts one. The rules a total must obey are defined once, here, and every
+-- transition is held to them: an admission, a hold and an owner's report are each
+-- tested against the state they would produce ('admissionCheck', 'chargeCheck'), and
+-- 'step' refuses any transition whose result breaks them ('ChargeBreached'). The
+-- partition of each bank into an explicit reserve and a camera share, and the stored
+-- maximum of a region, are enforced nowhere else.
 
--- | What the camera side may keep out of explicit reach: the resident bank less the
--- most an explicit request may need.
+-- | A breach of the charge rules.
+data ChargeViolation
+  = -- | A bank's occupied and reserved bytes, and its limit.
+    BankOverLimit !Bank !Word64 !Word64
+  | -- | A slot's use, and its limit.
+    SlotOverLimit !Slot !Word64 !Word64
+  | -- | A resident region's bytes, and the most its extent allows.
+    RegionOverMaximum !RegionKey !Word64 !Word64
+  | -- | What the camera side keeps out of explicit reach in the resident bank, and the
+    -- camera share.
+    CameraResidentOverShare !Word64 !Word64
+  | -- | What the camera side uses of the staging bank, and the camera share.
+    CameraStagingOverShare !Word64 !Word64
+  deriving stock (Eq, Show)
+
+-- | What the camera side keeps out of explicit reach in the resident bank: every held
+-- region at its stored maximum (a pinned region can grow and cannot be evicted), the
+-- reservations of the jobs created for camera views (finite work, but not reclaimable
+-- while queued or running), and the detail of each other region such a job is in.
+data CameraCharge = CameraCharge
+  { ccHeld ∷ !Word64
+  , ccReserved ∷ !Word64
+  , ccDetail ∷ !Word64
+  }
+
+-- | The part of a camera charge no other transition can raise; it is held under the
+-- camera share at all times. The detail of a region can also grow when an explicit job
+-- completes there, which is that request's own footprint, so admission (but not the
+-- invariant) counts it too.
+ccStable ∷ CameraCharge → Word64
+ccStable c = ccHeld c + ccReserved c
+
+ccTotal ∷ CameraCharge → Word64
+ccTotal c = ccStable c + ccDetail c
+
+cameraCharge ∷ Model → CameraCharge
+cameraCharge m =
+  let storedMax = limitRegionStoredBytes (mLimits m)
+      held = heldKeys m
+      cameraJobs = [j | j ← Map.elems (mJobs m), jbCamera j]
+      inJob = Set.fromList [(jbArena j, jbRegion j) | j ← cameraJobs, not (Set.member (jbArena j, jbRegion j) held)]
+      detail key = maybe 0 rsBytes (Map.lookup key (mTargets m) >>= tgResident)
+   in CameraCharge
+        { ccHeld = storedMax * fromIntegral (Set.size held)
+        , ccReserved = sum [jbActive j + jbDeferred j | j ← cameraJobs]
+        , ccDetail = sum (map detail (Set.toList inJob))
+        }
+
+-- | The resident camera share: the bank less the most an explicit request may need.
 cameraResidentCap ∷ Model → Word64
 cameraResidentCap m =
   let limit = limitBytes (mLimits m) ResidentBank
       reserve = limitExplicitResidentBytes (mLimits m)
    in if limit > reserve then limit - reserve else 0
+
+-- | The staging the camera side uses: view descriptions, the interest records of
+-- views, hold records and the scratch of camera jobs.
+cameraStagingUsed ∷ Model → Word64
+cameraStagingUsed m =
+  sum [descriptionBytes (fromIntegral (length (vwDemand v))) | v ← Map.elems (mViews m)]
+    + interestRecordBytes * fromIntegral (length [() | t ← Map.elems (mTargets m), OwnerView _ ← Map.keys (tgInterests t)])
+    + sum [fromIntegral (length (hdRegions h)) * holdRecordBytes | h ← Map.elems (mHolds m)]
+    + sum [jbScratch j | j ← Map.elems (mJobs m), jbCamera j]
+
+-- | The camera share of the staging bank.
+cameraStagingCap ∷ Model → Word64
+cameraStagingCap m =
+  let limit = limitBytes (mLimits m) StagingBank
+      reserve = limitExplicitStagingBytes (mLimits m)
+   in if limit > reserve then limit - reserve else 0
+
+-- | The charge rules every state obeys: no bank or slot over its limit, no region over
+-- the most its extent allows, and what the camera side holds within the camera share of
+-- the resident and the staging bank.
+chargeCheck ∷ Model → [ChargeViolation]
+chargeCheck m =
+  [BankOverLimit b (ledgerOccupied l + ledgerReserved l) (ledgerLimit l) | b ← allBanks, let l = bankLedger m b, ledgerOccupied l + ledgerReserved l > ledgerLimit l]
+    <> [SlotOverLimit s (slotInUse m s) (limitSlot (mLimits m) s) | s ← [LoadJobSlot, CommandSlot, ViewPinSlot], slotInUse m s > limitSlot (mLimits m) s]
+    <> [RegionOverMaximum k (rsBytes r) storedMax | (k, r) ← residentTargets m, rsBytes r > storedMax]
+    <> [CameraResidentOverShare (ccStable cc) (cameraResidentCap m) | ccStable cc > cameraResidentCap m]
+    <> [CameraStagingOverShare (cameraStagingUsed m) (cameraStagingCap m) | cameraStagingUsed m > cameraStagingCap m]
+  where
+    storedMax = limitRegionStoredBytes (mLimits m)
+    cc = cameraCharge m
+
+-- | The same rules for a state an admission would produce, which also count the detail
+-- of the regions camera jobs enter.
+admissionCheck ∷ Model → [ChargeViolation]
+admissionCheck m =
+  chargeCheck m <> [CameraResidentOverShare (ccTotal (cameraCharge m)) (cameraResidentCap m) | ccTotal (cameraCharge m) > cameraResidentCap m, ccStable (cameraCharge m) <= cameraResidentCap m]
 
 acquireHold ∷ Model → HoldId → ArenaId → HoldKind → [RegionCoord] → Run
 acquireHold m h a kind regions = do
@@ -1425,14 +1514,15 @@ acquireHold m h a kind regions = do
   if fromIntegral (length regions) > holdCap then Left (Invalid (DemandTooLarge (length regions) holdCap)) else Right ()
   let bytes = fromIntegral (length regions) * holdRecordBytes
       staging = bankLedger m StagingBank
-      held' = Set.union (heldKeys m) (Set.fromList [(a, r) | r ← regions])
-      before = cameraBlocked m (heldKeys m)
-      after = cameraBlocked m held'
-      cap = cameraResidentCap m
+      held' = Hold a kind regions
+      mHeld = m {mHolds = Map.insert h held' (mHolds m)}
+      before = ccTotal (cameraCharge m)
   -- A held region can grow while it is pinned, so it is charged at its stored maximum
-  -- from the moment it is held, together with the camera's in-flight jobs: pins can
+  -- from the moment it is held, together with the camera's jobs in flight: pins can
   -- never take the room an explicit request may need, however they are re-acquired.
-  if after > cap then Left (Busy (BankFull ResidentBank cap before (after - before))) else Right ()
+  case [v | v@(CameraResidentOverShare _ _) ← admissionCheck mHeld] of
+    (CameraResidentOverShare used cap : _) → Left (Busy (BankFull ResidentBank cap before (used - min used before)))
+    _ → Right ()
   case kind of
     Pin v → do
       let total = limitSlot (mLimits m) ViewPinSlot
@@ -1487,15 +1577,7 @@ endHandoff m a region ok = do
 modelInvariants ∷ Model → [String]
 modelInvariants m =
   concat
-    [ [ show b <> " exceeds its limit: " <> show l
-      | b ← allBanks
-      , let l = bankLedger m b
-      , ledgerOccupied l + ledgerReserved l > ledgerLimit l
-      ]
-    , [show s <> " exceeds its limit" | s ← [LoadJobSlot, CommandSlot, ViewPinSlot], slotInUse m s > limitSlot (mLimits m) s]
-    , [ "held regions at their stored maximum exceed what explicit work leaves: " <> show (limitRegionStoredBytes (mLimits m) * fromIntegral (Set.size (heldKeys m)))
-      | limitRegionStoredBytes (mLimits m) * fromIntegral (Set.size (heldKeys m)) > cameraResidentCap m
-      ]
+    [ map show (chargeCheck m)
     , [ "job " <> show i <> " deferred bytes disagree with its awaiting victims"
       | (i, j) ← Map.toList (mJobs m)
       , jbDeferred j /= sum (Map.elems (jbAwaiting j))
