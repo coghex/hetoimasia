@@ -95,6 +95,10 @@ specific symptom is now recorded in P-10: expected hazed background terrain
 is absent outside the camera loading radius. Source inspection supports a
 load/view mismatch; no runtime reproduction is claimed.
 
+D-48 approves viewport-driven terrain demand and view-aware eviction within
+the existing budgets. The face-map integration must prove that visible hazed
+background terrain is requested and retained when capacity permits.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1449,6 +1453,39 @@ qualification work can still be specified without an exact reproduction.
 Q-19 must assign D-47's tests/evidence to the lighting and integration work,
 and carry the requirement into final TRA-12 acceptance.
 
+### D-48. Load terrain from the projected view, not a flat camera radius
+
+Owner, directly in this design pane on 2026-11-07, answered “yes, if you think
+its feasable, its what i want” to P-10's viewport-driven loading contract.
+
+The feasibility basis is the existing pure planner's viewport/height-window
+calculation and the approved bounded runtime demand model, verified in P-10.
+This establishes a feasible implementation direction, not measured capacity
+or completion of the face-map integration.
+
+Derive camera demand from viewport size/aspect, zoom, facing, cutaway and the
+visible height range. Include potentially visible background tiles even when
+their horizontal chunks are far from the camera anchor. Visible demand comes
+before the small prefetch margin, while explicit query/removal priority remains.
+Eviction respects current view interests and capacity rather than a fixed
+horizontal radius. Preserve D-42's bounded best-effort admission: unresolved
+visible demand remains pending, and insufficient memory can still leave
+terrain absent. No memory-limit increase or full-view residency guarantee is
+implied.
+
+P-10's refinement and regression package are approved. The solver must show
+the owner's background/haze case requested from a nonresident starting state,
+loaded and retained when budgets suffice, and distinguished from expected
+capacity pressure when budgets do not suffice. Include rotation, zoom,
+viewport changes, cutaway/elevation displacement and eviction/reload. Keep
+fog concealment and sparse underground materialization intact; merely moving
+the camera cannot discover a hidden cavern.
+
+This refines P-5's visible-region demand and D-42 rather than adopting S's
+5×5 camera square. Q-16/Q-19 must carry the actual whole-tile bounds and the
+planning-limit/runtime integration work; the existing pure planner alone is
+not the solver proof. No code or tracker change is made in this design turn.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2504,7 +2541,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-47 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-48 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2571,6 +2608,11 @@ space through camera rotation. D-47 retains both adjustable depth darkening
 and blue haze and requires improved numerical/visual/navigation coverage.
 Exact units/binding, depth/colour equations and initial strengths remain Q-18;
 this paragraph settles no other amendment proposal.
+
+D-48 approves P-10's viewport-driven demand, view-aware eviction and explicit
+background/haze regression within D-42's existing budgets. The face-map path
+must preserve the height-aware footprint and reconcile bounded planning with
+best-effort runtime admission; this is not a guarantee that every view fits.
 
 Affected tracker work, for later approved revisions only:
 
@@ -2827,7 +2869,7 @@ target to approve and test rather than asking the solver to invent the shape
 semantics while fixing artwork. An illustrated owner review of the catalog,
 especially ID 15, remains required before it becomes a decision.
 
-### P-10. Viewport-driven demand and missing hazed background — pending review
+### P-10. Viewport-driven demand and missing hazed background — approved by D-48
 
 **Owner's clarified symptom, 2026-11-07:**
 
@@ -2837,8 +2879,9 @@ especially ID 15, remains required before it becomes a decision.
 > blank. it looks ok, but i would like to look into the possibility of loading
 > the chunks needed based on what the camera sees, not just a flat radius
 
-This is a request to investigate viewport-based loading, not approval of an
-unbounded resident world or a larger arbitrary camera radius. It explains the
+This request initiated the viewport-based loading investigation; D-48 approves
+the resulting contract below. It does not approve an unbounded resident world
+or a larger arbitrary camera radius. It explains the
 D-47 complaint as missing terrain that the haze would have shaded, rather
 than establishing that its colour formula is wrong.
 
@@ -2888,7 +2931,7 @@ runtime admission alone has fixed every upstream limit. The filed #645 view
 adapter connects this demand to runtime; that integration remains separate
 from a pure planner's existence. This turn changes no code or tracker item.
 
-**Recommendation for explicit owner review:**
+**Refined contract approved by D-48:**
 
 1. Derive demand from the current viewport, aspect, zoom, facing, cutaway and
    allowed height range. Include any known/discovered terrain whose projected
@@ -2913,7 +2956,7 @@ from a pure planner's existence. This turn changes no code or tracker item.
    system is introduced. Prefetch must not consume the capacity needed for
    visible terrain or explicit work.
 
-**Required proposed regression coverage:** a controlled, discovered terrain
+**Required regression coverage under D-48:** a controlled, discovered terrain
 scene with lower/distant background surfaces outside a camera-radius square
 but inside the projected viewport, with both depth effects enabled. With ample
 budgets, assert those chunks enter demand and remain available while needed,
@@ -2930,8 +2973,8 @@ fog concealment and sparse underground allocation in those traces.
 Q-16 owns the amended projection/emission demand bounds, Q-18 the owner's
 visible haze/background qualification, and Q-19 the planner/view integration
 and final evidence assignment. The viewport-based direction already has P-5
-support; the explicit refinement and regression package above is now presented
-for owner approval. This does not settle Q-20's separate cavity discovery work.
+support; D-48 approves the explicit refinement and regression package above.
+This does not settle Q-20's separate cavity discovery work.
 
 ## Open questions and review checkpoints
 
@@ -3093,8 +3136,9 @@ conventions still need review; approval of the correction direction does not
 select unspecified geometry.
 P-10 adds the owner's viewport-loading concern and source comparison. Preserve
 the existing view-aware direction when adapting demand bounds to whole-tile
-face maps, and reconcile planning limits with D-42. The proposed explicit
-coverage/admission/eviction contract remains under review.
+face maps, and reconcile planning limits with D-42. The explicit
+coverage/admission/eviction contract is approved by D-48; the concrete planner
+integration and qualification remain implementation work to assign in Q-19.
 Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
 coverage resource contracts remain Q-17; the approved picking approach itself
 does not need another sign-off.
@@ -3145,8 +3189,8 @@ proof, all-16/four-facing captures and geometry/opening/picking checks to the
 owning correction and integration work; carry its evidence gate into TRA-12.
 Also assign D-47's numerical, isolated/combined depth-effect and navigation/
 streaming regression evidence to the lighting and integration slices.
-Include P-10's viewport-driven demand/eviction refinement and background
-regression once approved, preserving the existing D-42 capacity policy and
+Include D-48/P-10's viewport-driven demand/eviction refinement and background
+regression, preserving the existing D-42 capacity policy and
 reconciling the pure planner's limits with progressive camera preparation.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
