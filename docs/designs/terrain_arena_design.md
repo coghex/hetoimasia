@@ -529,6 +529,20 @@ copy Synarchy's renderer implementation. Exact bindings, asset packaging,
 shape masks/material adaptation and pixel/depth correctness belong in the
 concrete presentation contract.
 
+### D-19. Bounded asynchronous loading and atomic edits
+
+Owner, directly in this pane on 2026-11-06, selected:
+
+> Yes—bounded asynchronous requests
+
+Camera controls remain responsive while terrain loads. Loading and editing
+use bounded asynchronous requests; edits complete atomically. Exhausted
+memory/request admission returns `busy` without losing earlier changes or
+partially applying a new edit. Unloaded terrain is visibly absent until ready;
+no loading UI is introduced. Define concrete request/cancellation, snapshot
+and publication semantics in the technical contract. This choice does not
+decide the separate Q-10 general gameplay-state boundary.
+
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
 libraries, using narrow services. Synarchy's world managers and coupled
 environment are not the new architecture (H `docs/vision.md:15–36`).
