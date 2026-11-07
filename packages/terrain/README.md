@@ -489,7 +489,11 @@ occurrence (keeping its priority), keys outside the supported coordinate range a
 cells outside the configured extent are excluded and reported (`cameraExcluded`),
 and a description longer than its structural maximum (`specCameraRegions`, 16,384:
 more than the approved envelope needs) or than the staging the camera may use is cut
-at the end, lowest priority first, and the remainder reported (`cameraTruncated`).
+at the end, lowest priority first, and the remainder reported (`cameraTruncated`). The
+staging the camera may use must hold the description and, beside it, the interest and
+scratch of the first region of the kept prefix that the view has no interest in yet, so
+a description is never kept longer than the camera can start: whatever is retained,
+its first region is admitted at once.
 
 What camera work can occupy, and why it cannot starve explicit work. The mechanism is
 a reserve of room, not a race: camera admission and hold acquisition are refused
