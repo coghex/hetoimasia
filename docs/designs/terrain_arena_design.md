@@ -33,7 +33,7 @@ concrete precondition
 - [x] TRA-6. Expose ordered window input to Lua — [#642]
 - [x] TRA-7. Implement isometric cutaway planning and picking — [#643]
 - [x] TRA-8. Qualify terrain materials and depth ordering offscreen — [#644]
-- [ ] TRA-9. Publish retained terrain views with safe GPU retirement
+- [x] TRA-9. Publish retained terrain views with safe GPU retirement — [#645]
 - [ ] TRA-10. Expose terrain views and camera controls to Lua
 - [ ] TRA-11. Assemble the authored terrain arena
 - [ ] TRA-12. Qualify the arena and remove the development shortcut
