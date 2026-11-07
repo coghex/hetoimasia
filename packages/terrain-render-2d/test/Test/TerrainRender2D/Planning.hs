@@ -340,17 +340,20 @@ spec = describe "Planning" $ do
       -- n floating cells along the line of sight project to the same place: 3n
       -- faces in one region and about 4.5 n^2 overlapping pairs. Refusing at one
       -- pair must cost work that grows with the faces, not with the pairs: quadrupling
-      -- n roughly quadruples the allocation (a full enumeration would multiply it by sixteen).
+      -- n adds a constant multiple of the allocation (a full enumeration would add quadratically more).
       let stackRun n =
             planWith
               (\r → r {requestConfig = (requestConfig r) {pcLimits = (pcLimits (requestConfig r)) {limitPairs = 1}}})
               (setup 480 480)
               (manualCamera (n - 1) (n - 1) (3 * (n - 1)))
               (factsOf (sceneSource [(k, k, 3 * k, 0) | k ← [0 .. n - 1]]))
-      small ← allocatedBy (stackRun 100)
-      large ← allocatedBy (stackRun 400)
+      a100 ← allocatedBy (stackRun 100)
+      a200 ← allocatedBy (stackRun 200)
+      a400 ← allocatedBy (stackRun 400)
       stackRun 400 `shouldBe'` PlanInsufficient LimitPairs
-      large `shouldSatisfy` (< 8 * small)
+      -- Linear growth doubles the increment between successive doublings of n;
+      -- quadratic growth would quadruple it.
+      (a400 - a200) `shouldSatisfy` (< 3 * (a200 - a100))
     it "accepts exactly at a bound" $ do
       limited (\l → l {limitFaces = 3, limitKeys = 3}) `shouldSatisfy` isRight'
       let examined = statLevelsEvaluated (planStats (plan (setup 288 144) camera facts))
