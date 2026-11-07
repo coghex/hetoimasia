@@ -100,7 +100,9 @@ data LimitsSpec = LimitsSpec
     specExtentX ∷ !Integer
   , specExtentY ∷ !Integer
   , specExtentZ ∷ !Integer
-  , -- | The most regions one borrower or publication hold may name.
+  , -- | The most regions one borrower or publication hold may name, zero for none.
+    -- A held region is charged at its stored maximum, and the resident bank must hold
+    -- that many at the maximum beside the explicit minimum.
     specHoldRegions ∷ !Integer
   , -- | The structural maximum of a view's stored camera description, in regions.
     -- A longer description is truncated in priority order and the remainder
@@ -180,13 +182,17 @@ mkLimits spec = do
   ex ← checkInt FieldExtentX 16 (specExtentX spec)
   ey ← checkInt FieldExtentY 16 (specExtentY spec)
   ez ← checkInt FieldExtentZ 32 (specExtentZ spec)
-  hold ← check FieldHoldRegions limitCeiling (specHoldRegions spec)
+  hold ← checkNonNegative FieldHoldRegions limitCeiling (specHoldRegions spec)
   camera ← check FieldCameraRegions limitCeiling (specCameraRegions spec)
   mapM_ (atLeast spec) allBanks
   pure (Limits resident edit staging jobs commands pins aging query (fromInteger ex, fromInteger ey, fromInteger ez) (fromInteger (explicitMinimumBytes spec StagingBank)) (fromInteger (explicitMinimumBytes spec ResidentBank)) hold camera)
   where
     check field top n
       | n <= 0 = Left (LimitNotPositive field n)
+      | n > top = Left (LimitUnrepresentable field n)
+      | otherwise = Right (fromInteger n)
+    checkNonNegative field top n
+      | n < 0 = Left (LimitNotPositive field n)
       | n > top = Left (LimitUnrepresentable field n)
       | otherwise = Right (fromInteger n)
     checkInt ∷ LimitField → Integer → Integer → Either LimitError Integer
@@ -265,11 +271,16 @@ explicitMinimumBytes spec bank = case bank of
     interest = toInteger interestRecordBytes
     scratch = 256 + 2 * x * y * z
 
--- | What each bank must hold: the explicit worst case, and for staging also the
--- records of the largest hold (borrowers and publication pins) beside it, so the
--- largest hold fits when the camera has taken nothing of its share.
+-- | What each bank must hold: the explicit worst case and, beside it, the largest
+-- hold (borrowers and publication pins). A held region is charged at its stored
+-- maximum, since it can grow while pinned, so the resident bank also holds that
+-- many regions at the maximum; staging holds the hold's 64-byte records. The largest
+-- hold then fits when the camera has taken nothing of its share.
 minimumBytes ∷ LimitsSpec → Bank → Integer
 minimumBytes spec bank = case bank of
+  ResidentBank →
+    explicitMinimumBytes spec ResidentBank
+      + specHoldRegions spec * regionStoredBytes (specExtentX spec) (specExtentY spec) (specExtentZ spec)
   StagingBank → explicitMinimumBytes spec StagingBank + toInteger holdRecordBytes * specHoldRegions spec
   _ → explicitMinimumBytes spec bank
 
@@ -279,7 +290,7 @@ minimumBytes spec bank = case bank of
 -- render and staging, 128 load jobs, 256 queued commands and two pinned view
 -- revisions per view, an aging threshold of 8 service quanta, and the explicit
 -- request caps: at most 257 regions in a query (the approved 8,192-level column),
--- 16,384 in a hold or a stored camera description, and the region's whole 16 x 16 x 32
+-- 256 in a hold, 16,384 in a stored camera description, and the region's whole 16 x 16 x 32
 -- extent. They satisfy 'mkLimits' (the worst-case footprints are recorded in the
 -- terrain README and checked by the tests). Camera demand has no cap: it is best
 -- effort.
@@ -297,7 +308,7 @@ defaultLimits =
     , lExtent = (16, 16, 32)
     , lExplicitStaging = 4301280
     , lExplicitResident = 179020032
-    , lHold = 16384
+    , lHold = 256
     , lCamera = 16384
     }
   where

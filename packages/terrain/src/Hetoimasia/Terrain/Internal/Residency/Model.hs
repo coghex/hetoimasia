@@ -918,6 +918,19 @@ planAdmission m arena owner demands extras = do
     then Left (RetainedEditsExhausted EditBank (ledgerLimit editLedger) (ledgerOccupied editLedger) editNeed)
     else Right ()
   slotFree CommandSlot nCommands
+  -- Camera work leaves the resident room an explicit request may need: the new jobs
+  -- (and the detail of regions they enter) join what the camera side keeps out of
+  -- explicit reach only while that stays within the bank less the explicit minimum.
+  if explicit
+    then Right ()
+    else
+      let held = heldKeys m
+          before = cameraBlocked m held
+          counted = Set.fromList [(jbArena j, jbRegion j) | j ← Map.elems (mJobs m)]
+          detail key = maybe 0 rsBytes (Map.lookup key (mTargets m) >>= tgResident)
+          extra = sum [njNeed j + (if Set.member key held || Set.member key counted then 0 else detail key) | (UnitPlan (RegionDemand region _) _ (Just j)) ← units, let key = (arena, region)]
+          cap = cameraResidentCap m
+       in if before + extra > cap then Left (Busy (BankFull ResidentBank cap before extra)) else Right ()
   if stagingNeed > 0 then bankFree StagingBank (stagingNeed + stagingHeadroom) else Right ()
   bankFree EditBank editNeed
   if nJobs > maxBound - mNextJob m then Left (ContractFailure JobIdsExhausted) else Right ()
@@ -1358,6 +1371,39 @@ commitRemoval m rid newRev actual growth = do
 -- ---------------------------------------------------------------------------
 -- Holds and handoffs
 
+-- | The regions any hold protects.
+heldKeys ∷ Model → Set RegionKey
+heldKeys m = Set.fromList [(hdArena h, r) | h ← Map.elems (mHolds m), r ← hdRegions h]
+
+-- | The resident bytes the camera side keeps out of an explicit request's reach until
+-- it lets go. Every held region counts at its stored maximum (a pinned region can grow
+-- and cannot be evicted); each other region with a job only views need counts the
+-- detail it holds plus the job's reservation (finite work, but not reclaimable while
+-- it is queued or running).
+cameraBlocked ∷ Model → Set RegionKey → Word64
+cameraBlocked m held =
+  let storedMax = limitRegionStoredBytes (mLimits m)
+      heldBytes = storedMax * fromIntegral (Set.size held)
+      viewOnly j = not (any (\(o, _) → case o of OwnerRequest _ → True; OwnerView _ → False) (neededBy m j))
+      perRegion =
+        Map.fromListWith
+          (+)
+          [ ((jbArena j, jbRegion j), jbActive j + jbDeferred j)
+          | j ← Map.elems (mJobs m)
+          , viewOnly j
+          , not (Set.member (jbArena j, jbRegion j) held)
+          ]
+      detail key = maybe 0 rsBytes (Map.lookup key (mTargets m) >>= tgResident)
+   in heldBytes + sum [n + detail key | (key, n) ← Map.toList perRegion]
+
+-- | What the camera side may keep out of explicit reach: the resident bank less the
+-- most an explicit request may need.
+cameraResidentCap ∷ Model → Word64
+cameraResidentCap m =
+  let limit = limitBytes (mLimits m) ResidentBank
+      reserve = limitExplicitResidentBytes (mLimits m)
+   in if limit > reserve then limit - reserve else 0
+
 acquireHold ∷ Model → HoldId → ArenaId → HoldKind → [RegionCoord] → Run
 acquireHold m h a kind regions = do
   if Map.member h (mHolds m) then Left (Invalid (DuplicateHold h)) else Right ()
@@ -1379,13 +1425,14 @@ acquireHold m h a kind regions = do
   if fromIntegral (length regions) > holdCap then Left (Invalid (DemandTooLarge (length regions) holdCap)) else Right ()
   let bytes = fromIntegral (length regions) * holdRecordBytes
       staging = bankLedger m StagingBank
-      residentLedger = bankLedger m ResidentBank
-      held0 = Set.fromList [(hdArena hd, r) | hd ← Map.elems (mHolds m), r ← hdRegions hd]
-      sizeOf key = maybe 0 rsBytes (Map.lookup key (mTargets m) >>= tgResident)
-      pinned = sum (map sizeOf (Set.toList held0))
-      adding = sum [sizeOf (a, r) | r ← regions, not (Set.member (a, r) held0)]
-      pinCap = let limit = ledgerLimit residentLedger; reserve = limitExplicitResidentBytes (mLimits m) in if limit > reserve then limit - reserve else 0
-  if pinned + adding > pinCap then Left (Busy (BankFull ResidentBank pinCap pinned adding)) else Right ()
+      held' = Set.union (heldKeys m) (Set.fromList [(a, r) | r ← regions])
+      before = cameraBlocked m (heldKeys m)
+      after = cameraBlocked m held'
+      cap = cameraResidentCap m
+  -- A held region can grow while it is pinned, so it is charged at its stored maximum
+  -- from the moment it is held, together with the camera's in-flight jobs: pins can
+  -- never take the room an explicit request may need, however they are re-acquired.
+  if after > cap then Left (Busy (BankFull ResidentBank cap before (after - before))) else Right ()
   case kind of
     Pin v → do
       let total = limitSlot (mLimits m) ViewPinSlot
@@ -1446,6 +1493,9 @@ modelInvariants m =
       , ledgerOccupied l + ledgerReserved l > ledgerLimit l
       ]
     , [show s <> " exceeds its limit" | s ← [LoadJobSlot, CommandSlot, ViewPinSlot], slotInUse m s > limitSlot (mLimits m) s]
+    , [ "held regions at their stored maximum exceed what explicit work leaves: " <> show (limitRegionStoredBytes (mLimits m) * fromIntegral (Set.size (heldKeys m)))
+      | limitRegionStoredBytes (mLimits m) * fromIntegral (Set.size (heldKeys m)) > cameraResidentCap m
+      ]
     , [ "job " <> show i <> " deferred bytes disagree with its awaiting victims"
       | (i, j) ← Map.toList (mJobs m)
       , jbDeferred j /= sum (Map.elems (jbAwaiting j))

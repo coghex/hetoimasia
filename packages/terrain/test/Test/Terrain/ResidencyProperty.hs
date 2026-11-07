@@ -37,14 +37,13 @@ import Test.Terrain.ResidencyOracle (Verdict (..), oracle)
 import Test.Terrain.ResidencySupport
 
 -- | Tight enough that every kind of pressure occurs within a few events: the
--- smallest resident bank its caps allow is 2,864 bytes (two regions, each at its
--- stored maximum of 760 bytes plus a job of 672; a hold may pin what is left beyond
--- it), and the extent is two columns, one row and six levels.
+-- smallest resident bank its caps allow is 4,384 bytes (two regions, each at its
+-- stored maximum of 760 bytes plus a job of 672, and two held regions at 760), and the extent is two columns, one row and six levels.
 pressure ∷ Limits
 pressure =
   limitsWith $ \s →
     s
-      { specResidentBytes = 3700
+      { specResidentBytes = 5000
       , specEditBytes = 640
       , specStagingBytes = 3000
       , specLoadJobs = 4
@@ -56,7 +55,7 @@ pressure =
       , specExtentX = 2
       , specExtentY = 1
       , specExtentZ = 6
-      , specHoldRegions = 4
+      , specHoldRegions = 2
       , specCameraRegions = 64
       }
 
@@ -284,7 +283,7 @@ roomyPressure ∷ Limits
 roomyPressure =
   limitsWith $ \s →
     s
-      { specResidentBytes = 8000
+      { specResidentBytes = 9000
       , specEditBytes = 2048
       , specStagingBytes = 12000
       , specLoadJobs = 8
@@ -296,7 +295,7 @@ roomyPressure =
       , specExtentX = 2
       , specExtentY = 1
       , specExtentZ = 6
-      , specHoldRegions = 4
+      , specHoldRegions = 2
       , specCameraRegions = 64
       }
 
@@ -433,7 +432,7 @@ limitsOf (resident, staging, jobs) =
       , specExtentX = 2
       , specExtentY = 1
       , specExtentZ = 6
-      , specHoldRegions = 4
+      , specHoldRegions = 0
       , specCameraRegions = 64
       }
 
@@ -614,7 +613,7 @@ minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, x, y, z) =
       stored = 256 + 48 * columns + 34 * columns * z
       job = 48 * columns + 96 * intervals
       scratch = 256 + 2 * columns * z
-      needResident = maximum [query * (stored + job), stored + 48 + 96 + 62]
+      needResident = 4 * stored + maximum [query * (stored + job), stored + 48 + 96 + 62]
       needStaging = 64 * 4 + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258, stored]
       expected
         | resident < needResident = Just (BankBelowMinimum ResidentBank needResident resident)
@@ -641,7 +640,7 @@ spec = describe "Residency model properties" $ do
           (Right _, _) → property True
   it "completes every in-cap camera demand when it is alone, under random valid budgets and leftovers" $
     withNumTests 2000 $
-      forAll ((,,) <$> chooseInteger (2864, 5000) <*> chooseInteger (3000, 8000) <*> chooseInteger (4, 6)) $ \limitsTriple →
+      forAll ((,,) <$> chooseInteger (4800, 6500) <*> chooseInteger (3000, 8000) <*> chooseInteger (4, 6)) $ \limitsTriple →
         forAll (vectorOf 3 pair) $ \leftovers →
           forAll (vectorOf 4 pair) $ \picks →
             acceptedDemandCompletes limitsTriple leftovers picks
