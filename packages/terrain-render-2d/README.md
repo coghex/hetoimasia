@@ -109,7 +109,12 @@ known air (so a face at the last supported coordinate is exposed to the void).
 so a client cannot rewrite one). Every transition that takes a `CameraConfig`
 (`newCamera`, `applyCommand`, `refollow`, `completeJump`) validates it first and
 answers `Left InvalidConfig` without touching the camera: a negative headroom or
-an unordered zoom range is never installed as a cut. `newCamera`, `applyCommand`, `refollow`,
+an unordered zoom range is never installed as a cut. The same transitions also
+bound the camera's zoom by the configuration in force, so a camera built under a
+wider range cannot keep a zoom the current range forbids. `PlanConfig` is
+validated the same way: a negative or over-large depth, margin or chunk margin, a
+negative `PlanLimits` bound, or a key bound beyond the 24-bit key space is
+`InvalidPlanConfig`. `newCamera`, `applyCommand`, `refollow`,
 `completeJump` and `cancelJump` are the transitions; each returns a new state or
 a typed refusal and changes nothing on refusal. There are no key bindings or
 gesture accumulators.
