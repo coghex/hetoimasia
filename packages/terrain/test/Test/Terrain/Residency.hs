@@ -849,8 +849,13 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (1, [reg 11 0 0, reg 12 0 0])
       other → expectationFailure (show other)
     [jobRegion j | j ← modelJobs m1] `shouldBe` [reg 10 0 0]
+    -- A service quantum keeps the order too: C fits the room that is left but may not
+    -- be admitted ahead of B.
+    (m1', idle) ← stepOk m1 Service
+    reportDecision idle `shouldBe` Serviced []
+    [jobRegion j | j ← modelJobs m1'] `shouldBe` [reg 10 0 0]
     -- Release the pins and let the owner finish everything: the whole demand completes.
-    m2 ← foldM withdraw m1 [1 .. 5]
+    m2 ← foldM withdraw m1' [1 .. 5]
     m3 ← drainDemand m2
     map viewPending (modelViews m3) `shouldBe` [[]]
     sort [regionCoord r | r ← modelRegions m3, regionCoord r `elem` [reg 10 0 0, reg 11 0 0, reg 12 0 0]] `shouldBe` [reg 10 0 0, reg 11 0 0, reg 12 0 0]
@@ -929,6 +934,30 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       other → expectationFailure (show other)
     m5 ← drainDemand m4
     map viewPending (modelViews m5) `shouldBe` [[]]
+  it "reports the job a successful same-region replacement made obsolete, queued or running" $ do
+    -- View 1 names level 0 of region 0 (job 0). Replacing it with level 1 of the same
+    -- region is admitted whole (job 1) and leaves job 0 without an interest.
+    let level z = demand (reg 0 0 0) (cell 0 0 z)
+    m0 ← opened roomy2
+    (m1, _) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 [level 0])
+    (_, queued) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [level 1])
+    case reportDecision queued of
+      CameraSet admitted waiting _ dropped awaiting → (map admissionJobs admitted, waiting, dropped, awaiting) `shouldBe` ([[(JobId 1, reg 0 0 0)]], [], [JobId 0], [])
+      other → expectationFailure (show other)
+    -- Running, the job is cancelling and awaits the owner's acknowledgement.
+    m2 ← stepsOk m1 [Dispatch]
+    (_, running) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [level 1])
+    case reportDecision running of
+      CameraSet _ _ _ dropped awaiting → (dropped, awaiting) `shouldBe` ([], [JobId 0])
+      other → expectationFailure (show other)
+  it "reports the jobs a failure leaves without an interest" $ do
+    -- Caller 1 asks for level 0 (job 0) and caller 2 for levels 0 and 1 (job 1 covers
+    -- level 1 only; level 0 is shared). Job 0 fails: both callers lose their interest in
+    -- it, and job 1, which only they needed, is reported as cancelling.
+    m0 ← opened roomy2
+    m1 ← stepsOk m0 [q 1 (reg 0 0 0) (cell 0 0 0), q 2 (reg 0 0 0) (box 0 1 0 1 0 2), Dispatch, Dispatch]
+    (_, failed) ← stepOk m1 (JobFailed (JobId 0))
+    reportDecision failed `shouldBe` JobFailedFor (JobId 0) [OwnerRequest (RequestId 1), OwnerRequest (RequestId 2)] [] [JobId 1]
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])

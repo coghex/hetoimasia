@@ -1174,9 +1174,7 @@ completeJob m jid cost = case Map.lookup jid (mJobs m) of
   Just job → case jbState job of
     JobPending → Left (ContractFailure (JobNotRunning jid))
     JobCancelling → Right (discard job)
-    JobRunning
-      | jbStale job → Right (discard job)
-      | otherwise → do
+    JobRunning → do
           bytes ← maybe (Left (ContractFailure CostOverflow)) Right (costBytes cost)
           let key = (jbArena job, jbRegion job)
               target = fromMaybe (Target Nothing Map.empty) (Map.lookup key (mTargets m))
@@ -1203,8 +1201,8 @@ failJob m jid = case Map.lookup jid (mJobs m) of
   Just job → case jbState job of
     JobPending → Left (ContractFailure (JobNotRunning jid))
     JobCancelling → Right (m {mJobs = Map.delete jid (mJobs m)}, Discarded jid)
-    -- A failure of work the commit superseded must not touch current demand.
-    JobRunning | jbStale job → Right (m {mJobs = Map.delete jid (mJobs m)}, Discarded jid)
+    -- (Work a commit superseded is cancelling, handled above, so a late failure of
+    -- it never reaches the running case and cannot touch current demand.)
     JobRunning →
       let key = (jbArena job, jbRegion job)
           owners = [o | (o, _) ← neededBy m job]
