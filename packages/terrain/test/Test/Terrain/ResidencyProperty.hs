@@ -242,6 +242,19 @@ lcg seed n = take n (triples (drop 1 (iterate next seed)))
     triples (x : y : z : rest) = (x `div` 65536, y `div` 65536, z `div` 65536) : triples rest
     triples _ = []
 
+-- | Coverages of every size and shape the feasibility bound has to tell apart:
+-- one cell, two cells in one column, two columns, two separate intervals, a
+-- whole column and a block.
+demandCoverages ∷ [Coverage]
+demandCoverages =
+  [ cell 0 0 0
+  , box 0 1 0 1 0 2
+  , coverageUnion (cell 0 0 0) (cell 1 0 0)
+  , coverageUnion (cell 0 0 0) (cell 0 0 9)
+  , box 0 1 0 1 0 32
+  , box 0 3 0 2 0 4
+  ]
+
 -- | A camera demand the model accepts completes when it is alone: the owner
 -- services and completes every job, storing the least each can, and nothing is
 -- left pending. This is the feasibility bound checked against the order in which
@@ -266,7 +279,7 @@ acceptedDemandCompletes (resident, staging, jobs) picks =
                     (all (null . viewPending) (modelViews done))
   where
     nubInts = foldl (\acc x → if x `elem` acc then acc else acc <> [x]) []
-    demandFor' x j = demand (reg (toInteger (x ∷ Int)) 0 0) (fromMaybe (cell 0 0 0) (pick coverages j))
+    demandFor' x j = demand (reg (toInteger (x ∷ Int)) 0 0) (fromMaybe (cell 0 0 0) (pick demandCoverages j))
     -- Service, dispatch every queued job and complete each with the least it can
     -- store, until a round does no work.
     converge 0 _ = Left "did not converge"
@@ -293,9 +306,9 @@ spec = describe "Residency model properties" $ do
           (Left why, _) → counterexample why False
           (Right _, _) → property True
   it "completes every camera demand the model accepts when it is alone, under random tiny budgets" $
-    withNumTests 400 $
-      forAll ((,,) <$> chooseInteger (300, 2400) <*> chooseInteger (300, 1500) <*> chooseInteger (1, 3)) $ \limitsTriple →
-        forAll (vectorOf 4 ((,) <$> chooseInt (0, 5) <*> chooseInt (0, 2))) $ \picks →
+    withNumTests 1000 $
+      forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
+        forAll (vectorOf 4 ((,) <$> chooseInt (0, 5) <*> chooseInt (0, 5))) $ \picks →
           acceptedDemandCompletes limitsTriple picks
   it "exercises completion, eviction, commit, refusal and retirement in a fixed long sequence" $ do
     let (outcome, stats) = runSequence (lcg 7 30000)
