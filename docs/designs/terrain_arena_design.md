@@ -29,7 +29,7 @@ concrete precondition
 - [x] TRA-2. Implement layered sources and compressed terrain changes — [#638]
 - [x] TRA-3. Define bounded horizontal and vertical residency — [#639]
 - [x] TRA-4. Implement the transactional terrain service — [#640]
-- [ ] TRA-5. Expose terrain requests through Lua
+- [x] TRA-5. Expose terrain requests through Lua — [#641]
 - [ ] TRA-6. Expose ordered window input to Lua
 - [ ] TRA-7. Implement isometric cutaway planning and picking
 - [ ] TRA-8. Qualify terrain materials and depth ordering offscreen
