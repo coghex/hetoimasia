@@ -21,6 +21,64 @@ Picking scope resolved by D-30: select from the adopted drawn quads in
 front-to-back order using matching artwork/face-map coverage. Q-16 remains
 partially open for logical geometry, emission and cut-surface contracts.
 
+D-31 preserves generic blank terrain as gameplay fog of war over undiscovered
+underground solids and air gaps, and reaffirms lazy loading with gaps. Q-20
+tracks reveal rules, retention and the fog interaction contract; they are not
+settled by the earlier picking or cutaway proposals.
+
+D-32 chooses whole-cavity discovery: unsealing a connected empty space reveals
+that space and loads all newly exposed boundary terrain, including across
+chunks. Work proceeds in bounded steps; Q-20 retains connectivity, capacity,
+retention and fog interaction details.
+
+D-33 resolves discovery retention: record revealed state as chunk changes,
+retain it on offload and replay it before publishing the reloaded chunk.
+Discovery lasts for the arena session while off-screen chunks stream normally.
+
+D-34 resolves connectivity between empty cells: six shared-face neighbors;
+edge-only or corner-only contact does not join cavities. Partial openings
+around shaped terrain remain a separate Q-16/Q-20 choice.
+
+D-35 requires explicit logical opening rules for ramps/corner slopes: a real
+diagonal opening into an unrevealed space must discover it. Whole-air-cell
+adjacency alone is insufficient; the exact per-shape catalog still needs
+specification and review under Q-16/Q-20.
+
+D-36 chooses one logical shape authority shared by cavity discovery and
+terrain point/ray queries, correcting the existing solid definitions.
+Rendering and screen picking retain face-map coverage as their visual authority.
+
+D-37 makes generic blank fog tiles non-interactive and unselectable. They
+occlude picks of hidden terrain and produce no player-selectable target.
+
+D-38 makes sky and initially sky-connected cavities discovered from the start,
+without requiring their residency. Concurrent openings of a previously sealed
+cavity must share safe bounded discovery, never expand across the open sky.
+
+D-39 approves the shared discovery-work mechanism: distinguish unseen,
+pending and expanded regions; share overlapping fronts, seed new edit-created
+connections and stop only outward branches at known exterior.
+
+D-40 approves temporary per-arena disk backing for retained edits/discovery,
+with a bounded RAM cache and asynchronous I/O. The store is session-only and
+discarded on arena close/reset; exact quota/failure/lifecycle details remain open.
+
+D-41 approves pausing new edits/discovery on storage exhaustion or write
+failure, retaining acknowledged changes and unfinished work. Startup space
+checks, reservation and a hard disk allowance are proposed below, not yet chosen.
+D-42 records the manager-relayed CPU budget increase and best-effort camera
+demand; it does not select the temporary store's disk quota.
+
+D-43 approves a reserved, configurable disk allowance before arena opening,
+including storage overhead, and refusal when it cannot be reserved. Keep the
+world expandable; pause new edits/discovery before exceeding the allowance.
+The numeric allowance and the qualified storage mechanism remain Q-20.
+
+Additional Q-16 finding: the pinned N/E mask silhouettes fail a cross-facing
+unit-cell geometry consistency check. The audit below records a concrete
+counterexample. Correcting inconsistent masks while preserving all 16 IDs is
+a proposal requiring owner approval; no artwork or code has been changed.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -850,6 +908,428 @@ shared CPU coverage is now a chosen mechanism, not an open alternative.
 The amendment remains exploring; follow-up slices and issue revisions still
 require Q-19 sign-off.
 
+### D-31. Preserve underground fog of war, including concealed air gaps
+
+Owner, directly in this design pane on 2026-11-07, corrected the proposed
+removal of generic blank cutaway tiles:
+
+> the generic blank tile is important from a gameplay perspective, the
+> player should not know what's underground, its supposed to be fog of war,
+> that includes air gaps.
+
+The owner also reaffirmed lazy underground loading with gaps, approving it
+if it can be implemented correctly. Preserve the blank tile's concealment
+role: undiscovered underground terrain must not disclose either its material/
+shape or the presence of air. Moving a cutaway through hidden underground
+space must not by itself expose a cavern. The concealed region can therefore
+look filled even when the authoritative terrain contains air; this is an
+intentional knowledge boundary, not fabricated physical terrain.
+
+This supersedes the agent's unapproved recommendation to replace every blank
+with the real material or a visible gap. The source audit remains accurate
+about S's blank fallback condition, but its implication that covering a real
+gap is inherently a fidelity defect was incomplete. The owner has supplied
+the gameplay intent that the source condition alone did not establish.
+No claim that S already separates residency from player knowledge follows.
+
+Lazy storage and fog must coexist: actual terrain, materialized/resident data
+and what the player has discovered are distinct meanings. A query or streaming
+load must not silently grant player knowledge. Concealment must also apply to
+visual picking: D-30 does not authorize clicking through a fog quad to return
+the secret terrain behind it. The exact fog hit result and permitted actions
+are open in Q-20, rather than treating the blank as an ordinary removable
+physical solid.
+
+The sparse source/overlay model can represent buried solids and air gaps
+without allocating each cell. The feasibility approach is to keep unknown
+knowledge implicit and represent discovered regions sparsely as well;
+bounded demand materializes only what a reveal/query actually needs.
+That approach and its costs need implementation qualification. A large or
+fragmented revealed region still consumes resources; this is not a promise
+of unlimited exploration history in bounded memory. Exact representation,
+budgets, reveal propagation and retention remain Q-20/Q-17/Q-19.
+
+The owner has not yet chosen how excavation discovers an air gap, whether
+discovery spreads through connected space, whether it survives offload, or
+how Lua controls it. This decision adds the fog requirement without silently
+adding units, line-of-sight simulation or the deferred general gameplay-state
+system. Q-16 remains partially open; Q-20 is a new blocking design question.
+
+### D-32. Unsealing a cavity discovers and loads the whole connected space
+
+Owner, directly in this design pane on 2026-11-07, answered the choice between
+whole-cavity discovery and exposure limited to the opening:
+
+> yes we will need to consider more than just loading in the adjacent tiles,
+> when we unseal a empty space it needs to load in all the new tiles for the
+> whole space
+
+Unsealing a cavity starts discovery of its entire connected empty space and
+loads the newly exposed terrain surfaces throughout it: walls, floor, ceiling
+and other terrain bordering that connected space. Discovery must propagate
+beyond the immediately adjacent cells and across chunk boundaries; it is not
+silently restricted to the current viewport. The owner accepted the proposed
+bounded-step processing: discovery/loading may progress asynchronously while
+the camera remains responsive. This is whole-space discovery, not character
+line of sight, so the selected behavior can reveal around corners.
+
+Preserve D-31's separation of terrain, residency and knowledge. This does not
+require allocating one record for every empty cell or materializing solids
+deeper behind the newly exposed boundary. Empty ranges and discovered regions
+may remain compressed; a solid barrier still conceals separate sealed spaces.
+Do not interpret the requirement to load the whole cavity as permission to
+stop after one neighboring ring, skip off-screen boundary terrain or abandon
+the remaining discovery work silently.
+
+This resolves the propagation-scope part of Q-20 and supersedes the local-only
+reveal alternative. Exact connectivity (face versus edge/corner contact and
+partial openings around shaped cells), the boundary with the unbounded
+exterior, initial disclosure, work/residency budgets, completion/failure
+behavior, retention on offload and fog interactions remain open. In particular,
+the design still must reconcile a cavity larger than available resident memory
+with whole-space discovery/loading; no unlimited resident allocation or
+permanent pin of every discovered tile is silently authorized. Q-19 must
+account for the discovery/loading work in the amended slices and qualification.
+
+### D-33. Retain discovery as chunk changes and replay it on reload
+
+Owner, directly in this design pane on 2026-11-07, approved remembering
+discovery for the arena session while allowing normal off-screen unloading:
+
+> yes, revealed tiles would need to be regestered as changes to the chunk and
+> offloaded and replayed on load, i think, that sounds right.
+
+Register revealed state as retained changes belonging to the affected chunk.
+On offload, preserve those changes alongside retained terrain edits; on reload,
+reapply them before the chunk is published for rendering/picking. A previously
+discovered cavity must not become unknown again just because its chunks were
+unloaded. This includes discovered air as well as exposed solid boundary tiles,
+so a remembered opening cannot turn back into a fog-filled apparent solid.
+
+Discovery and material/shape/removal changes remain distinct kinds of state:
+revealing a cell does not change what occupies it. Retention need not allocate
+one change record per empty cell; compressed revealed ranges/regions may carry
+the same knowledge. Exact encoding and accounting remain to be specified.
+
+Off-screen chunks can unload normally; discovery does not permanently pin the
+whole cavern in resident memory. D-32 still requires traversal/discovery and
+loading of the newly exposed terrain throughout the connected space. The
+retained discovery survives eviction for this arena incarnation and is
+discarded when that arena is reset/closed, consistent with D-10's session-only
+scope. This decision does not add persistence across application runs.
+
+The retention/replay choice in Q-20 is resolved by D-33. Exact capacity refusal,
+in-progress discovery resumability, publication/commit boundaries and reset
+implementation still need the concrete contract; eviction may not silently
+discard approved retained discovery. Q-19 must cover replay-before-publication
+and cross-chunk offload/reload evidence in the amended work.
+
+### D-34. Empty cells connect through shared faces only
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that is
+correct” to the recommendation that empty cells connect up, down, north,
+south, east and west, with edge-only or corner-only contact excluded.
+
+For whole empty cells, D-32 discovery traverses the six face-adjacent
+neighbors, including across chunk boundaries. Diagonally touching cells do
+not join cavities merely because their edges or corners meet; discovery must
+not pass through a zero-width contact. This is a world-coordinate rule and
+does not change when the camera rotates. Paths through other face-connected
+empty cells can still join two regions; only the edge/corner shortcut is
+excluded.
+
+This resolves the face-versus-edge/corner choice in Q-20. It does not yet
+define partial empty regions inside cells containing ramps/corner slopes, or
+whether/how their openings connect. Those need an explicit logical shape
+contract under Q-16/Q-20; camera-facing sprite alpha is not that contract.
+The remaining exterior, capacity/completion and fog interaction choices
+remain open. Q-19 qualification must include face-connected cross-chunk
+spaces and distinct cavities that touch only at an edge or corner.
+
+### D-35. Explicit shape openings connect and reveal cavities
+
+Owner, directly in this design pane on 2026-11-07, approved connectivity through
+the partial empty space above ramps/corner slopes and made the diagonal case
+explicit:
+
+> yes, we will need explicit shape rules too, no cutting corners here. a ramp
+> that has a diagonal open to the air gap of an unrevealed space needs to
+> reveal that space
+
+Define logical solid/empty regions and their connected openings for the full
+16-ID shape catalog. Discovery must follow continuous empty space through
+shaped cells, including a ramp-created diagonal opening into an unrevealed
+cavity. That opening triggers D-32 discovery/loading of the connected space;
+it cannot be blocked simply because the ramp cell has a non-air material or
+because the route is diagonal. Treating every shaped cell as a sealed full
+block is not an acceptable first implementation.
+
+D-34 still governs whole empty cells and excludes mere zero-width edge/corner
+contact. It is not a restriction to a flood fill that only visits completely
+empty cells: the actual open regions of intervening shapes must participate.
+The exact geometric mapping must distinguish a genuine ramp-created opening
+from a corner/edge coincidence, rather than approving all diagonal neighbors.
+
+Connectivity is world-space terrain meaning, independent of camera facing,
+lighting and sprite alpha. Each shape needs explicit openings and internal
+connections, including which openings are joined within that cell; a loose
+list of open sides cannot silently connect otherwise separate empty regions.
+The previous analytic solids and ID-15-equals-ID-0 assumption are not a
+validated replacement for that catalog. Define and review the actual shape
+rules before declaring the amendment ready; preserving IDs alone is not proof.
+No particular triangulation, sampling resolution or per-shape geometry table
+is approved by this behavioral decision.
+
+Q-19 qualification must cover the owner's diagonal-ramp reveal case, sealed
+controls, all shape IDs and world orientations, cross-chunk openings and
+retained discovery replay. Missing neighbor data is pending/unknown until
+resolved, not proof of an air connection. Camera rotation must not change
+which spaces are connected. Movement, speed and unit line-of-sight remain
+deferred; discovery connectivity must not be borrowed uncritically from a
+movement rule.
+
+Relevant S evidence: `src/Unit/Pathing/Cost.hs:343–347,486–528` interprets
+slope bits for surface movement and classifies diagonal one-level steps as
+cliffs. That is not a cavity-connectivity contract and cannot decide this
+owner-approved reveal behavior. `src/World/Slope/FaceMaps.hs:33–47,80–119`
+supplies only a partial procedural mask helper, not an authoritative 16-shape
+logical volume catalog. The earlier source audit records why actual PNG
+silhouettes and the old CPU solids cannot be equated.
+
+The inclusion of partial-shape and diagonal openings in Q-16/Q-20 is resolved
+by D-35. Their exact geometric catalog and validation remain open, along with
+exterior/capacity/completion and fog interaction policies.
+
+### D-36. Share logical geometry between discovery and terrain queries
+
+Owner, directly in this design pane on 2026-11-07:
+
+> ok cool, let me answer the question. i approve your recommended shared
+> geometry authority
+
+Use one canonical logical definition of each shape's solid/empty regions and
+openings for both cavity discovery and terrain point/ray queries. Correct
+the existing mathematical-solid definitions to that agreed catalog; do not
+retain incompatible occupancy/intersection answers alongside a separate
+discovery model. D-35's partial and diagonal opening rules are part of this
+authority. Rotation acts consistently on the same world-space shape.
+
+GPU rendering and screen-space picking continue to use the approved face-map
+and artwork coverage (D-29/D-30). A screen hit identifies the displayed tile;
+it is not substituted for a logical world-space point/ray query. Conversely,
+the logical intersection model must not replace the sprite-alpha screen picker.
+The reference art and logical definitions must be checked together for their
+intended shape meaning, without pretending raster silhouettes uniquely specify
+every interior geometric detail.
+
+This resolves the query-authority/fate choice in Q-16: amend the existing solid
+query implementation to use the shared, corrected shape authority. The exact
+16-shape definitions, boundary conventions and compatibility details still
+need a concrete specification and review. No particular geometric encoding
+or new gameplay physics system is chosen by this decision; movement/speed
+remain deferred. Q-19 must include the merged geometry/query corrections and
+their consistency evidence with discovery in the follow-up work.
+
+### D-37. Fog tiles are unselectable and block interaction with hidden terrain
+
+Owner, directly in this design pane on 2026-11-07, corrected the proposal to
+return a selectable unknown-cell location:
+
+> yes that is right, generic blank tiles should be uninteractable, not even
+> selectable by the player.
+
+Generic blank fog tiles provide concealment only. They are not player hover,
+selection or action targets. A player-facing screen pick whose frontmost
+covering surface is fog yields no selectable target, including no unknown-cell
+selection handle or hidden material/shape/air information. The temporary
+removal shortcut does nothing at that fog-covered point; it must not submit
+a removal using coordinates inferred from the blank.
+
+Fog still participates in visual occlusion: stop the hit search at its covered
+pixels rather than skipping the non-selectable quad and selecting secret
+terrain behind it. Visible selectable terrain drawn in front of fog remains
+eligible. D-30's ordinary transparent-ramp behavior remains in force where
+there is no intervening fog cover.
+
+This supersedes the agent's unapproved unknown-cell selection proposal and
+resolves the fog interaction/result choice in Q-20. Keep this player-facing
+rule distinct from trusted engine queries needed to load/generate terrain or
+carry out discovery; it does not make fog a physical solid or create a new
+general Lua permission system. Concrete API result encoding belongs in the
+amended contract; the behavior must expose no selectable fog target.
+
+Q-19 qualification must cover no selection/removal on blank fog, no picking
+through fog to hidden solid or air, and normal selection of genuinely visible
+foreground terrain. Reveal/load/reload publication must preserve this rule
+without transiently exposing secret contents.
+
+### D-38. Exterior-connected space starts discovered; overlapping reveals are safe
+
+Owner, directly in this design pane on 2026-11-07, accepted the exterior
+boundary and clarified its meaning:
+
+> open sky should be discovered from the start obviously, and a newly
+> discovered cavity that was exposed to air would already be discovered from
+> that, so any newly discovered caverns would be closed systems, not exposed
+> to air.
+
+The owner also identified the interleaving case: while bounded discovery is
+still progressing, two openings at opposite ends of the same sealed space can
+be made, allowing the traversed space to connect back to the exterior. The
+owner requires logic to handle this and requested engineering guidance rather
+than selecting an algorithm.
+
+Sky/exterior air and spaces already connected to it in the initial terrain
+start discovered. Discovery is distinct from loading: this does not preload
+every exterior-connected cave or allocate a record for every sky cell. A
+space that requires a later unsealing discovery was previously enclosed.
+The initial known set must account for actual connectivity through the agreed
+shape rules, not merely a fixed Z threshold or whether a chunk was loaded.
+
+Subsequent openings must discover the newly reachable enclosed space without
+expanding into open sky, rediscovering the world, losing unfinished branches
+or confusing already-discovered space with pending discovery work. Two fronts
+meeting in the same space must not duplicate unbounded work or cancel each
+other's remaining obligations. Newly created connections must be considered
+even if neighboring terrain has already been processed. Preserve D-32's
+whole-space discovery and D-33's retained knowledge throughout.
+
+This resolves the initial exterior/discovery behavior in Q-20 and supersedes
+any reading of the earlier exterior proposal as initially fogged sky or an
+already-open cave waiting to be unsealed. P-7 below is the recommended
+engineering mechanism, not an owner-approved queue/source representation.
+Exact initial-knowledge derivation, publication/cancellation and capacity
+contracts remain for review before amendment readiness.
+
+### D-39. Share bounded discovery work across overlapping openings
+
+Owner, directly in this design pane on 2026-11-07, answered “that sounds good”
+to the proposed shared discovery queue and its two-opening explanation.
+
+Use shared arena-owned discovery work with distinct undiscovered,
+pending-exploration and fully-explored states. Each new excavation seeds the
+connections it creates, including connections adjacent to already-explored
+terrain. Pending regions retain their unfinished branches and boundary-load
+obligations. When two fronts meet, they share that work rather than duplicate
+it or cancel each other's remaining exploration.
+
+Already-known exterior ends the outward branch only; finding an exit does not
+finish the cavern. Prior knowledge and pending work remain distinguishable
+from the fact that a newly opened cavity now physically connects to sky.
+Process the work in bounded steps under the existing terrain-owner model,
+preserving whole-space discovery, retention and camera responsiveness.
+
+This approves the shared-work mechanism presented in P-7. It does not approve
+its still-open exact source-metadata compiler, shape/component encoding,
+capacity policy, disk backing, API result types or commit/cancellation details.
+Those remain concrete contract work under Q-16/Q-20 and the final Q-19 review.
+
+### D-40. Back retained chunk changes with a temporary session disk store
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that works”
+to the recommendation for temporary disk backing of retained chunk edits and
+discovery, with a bounded RAM cache and asynchronous I/O.
+
+Retained chunk changes can move to a per-arena temporary backing store when
+they leave the active memory working set. Reload reads and replays those
+records before publication, including both terrain edits and revealed state.
+Use bounded RAM caching and asynchronous storage work so retained history need
+not remain entirely in memory and storage I/O does not block camera response.
+Compressed terrain and knowledge remain compressed; this does not require
+writing every unchanged or empty cell.
+
+The store belongs to the arena session and is discarded on arena close/reset.
+There is no user save, restoration across application runs or crash-recovery
+feature in this decision. It preserves D-10/D-33's session lifetime while
+superseding P-5's RAM-only authoritative-retention policy and its hard total
+32 MiB session-history limit. RAM staging/cache and disk consumption still
+need explicit bounds; no unlimited disk allocation is authorized.
+
+Q-20 must specify quotas, record/index format, I/O ownership and scheduling,
+atomic offload/replay, errors and cleanup. An acknowledged edit or revealed
+state cannot be discarded from RAM before a backing copy is safe to replay;
+normal eviction must not erase discovery or remaining reveal obligations.
+The exact write/commit and failure policy remains a concrete design choice.
+Q-19 must include this storage work and qualification in the amended slices.
+
+### D-41. Pause new changes on storage exhaustion without losing progress
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that sounds
+fine” to pausing new edits and discovery when temporary storage fills or a
+write fails, preserving existing changes and unfinished work, reporting the
+problem through Lua, and resuming after storage recovers. Navigation may
+continue wherever its required data remains available; this does not promise
+that an unavailable backing store can serve further reads.
+
+Expected storage exhaustion or write failure must not erase acknowledged
+terrain edits, revealed state or outstanding discovery obligations. Keep the
+last coherent published view and the unwritten committed state needed for
+safe replay. Do not continue accepting changes into an unbounded RAM fallback
+or report an unfinished reveal as complete. Exact admission, write/commit,
+error-result and recovery mechanics remain Q-20. This selects a recoverable
+storage-failure behavior, not a replacement for supervision of unknown host
+faults or a cross-run recovery guarantee.
+
+The owner also suggested checking free space, limiting the terrain store,
+refusing startup without enough room and never creating a world that could
+exceed that budget, asking for advice. Those suggestions remain proposals:
+a hard storage limit is compatible with D-11's expandable world if new retained
+changes can pause at capacity; a guarantee that every possible future change
+fits would require bounding the world or its allowed changes. P-8 records this
+distinction for the next decision. No finite world boundary is approved here.
+
+### D-42. Raise CPU budgets and keep camera demand best effort
+
+Verified `het-manager` relayed the owner's decision in `#het-terrain` on
+2026-11-07T16:56:07Z, message `2tw98c6v6pkzge9yzhdvntgtki`, and instructed
+this design to record [#639 amendment 2](https://github.com/coghex/hetoimasia/issues/639#issuecomment-6710245034).
+
+Raise the configurable, service-wide initial CPU banks to 256 MiB resident
+terrain, 64 MiB retained session edits and 128 MiB CPU render/staging. Other
+limits remain unchanged. Camera demand keeps the full approved zoom/depth
+range and is best effort: admit what fits, nearest/visible first under the
+priority/aging rules, keep the remainder pending and show unloaded terrain as
+absent. Large camera demand is not invalid merely because it exceeds a bank.
+It must not block or starve explicit queries/removals; latest-value replacement
+and withdrawal remain. The construction-time capacity guarantee in that
+amendment applies to explicit requests, not the whole camera envelope.
+
+This supersedes P-5's earlier 64/32/64 MiB CPU defaults and any reading of its
+camera bounds as a restriction on the approved zoom range. The 64 MiB edit
+bank is the revised pre-backing CPU allowance; D-40 still supersedes RAM-only
+total-history retention. Q-20 must map edits, discovery, cache and staging to
+explicit banks in the backing-store contract rather than silently treat this
+CPU number as a disk quota or unlimited memory for discovery.
+
+### D-43. Reserve a hard storage allowance while keeping the world expandable
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that is sound
+i think” to the recommendation to keep the expandable world with a reserved
+storage allowance and pause when that allowance is exhausted.
+
+Before arena opening succeeds, check the actual storage volume and reserve a
+configurable allowance for its temporary store, including bookkeeping and
+temporary write space. Refuse arena opening if that allowance cannot be
+reserved. Enforce the allowance before accepting additional retained changes;
+unchanged terrain is regenerated from its source instead of saved. At capacity
+or on storage failure, D-41's pause/preserve/report behavior applies to edits
+and discovery, including unfinished discovery work. Do not acknowledge changes
+on the assumption that more disk space will become available later.
+
+This chooses a storage boundary rather than a finite terrain boundary. It
+preserves D-11's expandable procedural world without promising unlimited
+retained history in a fixed store. The alternative of guaranteeing that every
+possible future change fits by bounding the world or allowed changes is not
+selected. A free-space query alone is not the required reservation; runtime
+storage failures still need D-41 even after a successful reservation.
+
+Q-20 must specify the numeric allowance, filesystem and multi-arena accounting,
+physical reservation and write protocol, safety margin, bounded continuation,
+exact Lua results and recovery/cleanup behavior. These are not established by
+this high-level approval. Opening the engine application itself is not
+prohibited: the failure boundary is opening the terrain arena. This decision
+does not create a UI, a persistent game-save feature or a live quota-change API.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1108,6 +1588,13 @@ by arena/revision/region, retaining separate caller interests. Canceling one
 interest must not cancel work another still needs. Foreground queries and
 edits precede view prefetch; use aging so accepted finite requests progress.
 
+D-42/#639 amendment 2 makes camera demand best effort across the full approved
+zoom/depth range: admit nearest/visible regions as capacity permits and leave
+the rest pending and visibly absent. Do not reject an oversized camera demand
+as invalid or reduce the zoom range to make all its regions fit. Explicit
+requests retain priority and their construction-time capacity guarantee;
+camera holdings must not prevent progress when eviction can release them.
+
 Separate the followed surface level, automatic headroom and manual slice.
 Initial configurable automatic headroom is 25 levels, matching Synarchy;
 the effective automatic clip level is followed surface plus headroom. Manual
@@ -1123,8 +1610,8 @@ interval summaries plus removed-span indexes answer next-solid/surface
 queries without enumerating a long contiguous air gap. Bound the number of
 resident vertical regions independently of horizontal columns.
 
-Proposed initial host profile (engineering defaults, not measured capacity):
-64 MiB resident terrain data, 32 MiB session edits, 64 MiB CPU render/staging,
+Initial host profile, amended by D-42 (defaults, not measured capacity):
+256 MiB resident terrain data, 64 MiB session edits, 128 MiB CPU render/staging,
 128 MiB terrain GPU data including retiring versions, 128 internal load jobs,
 256 queued terrain commands and at most two pinned CPU view revisions per
 view. Also cap the service at 4 arenas, 8 views and 64 arena leases per session;
@@ -1142,8 +1629,11 @@ Do not spin, silently grow a bank, remove old edits or retry a failed edit.
 An accepted removal must have reserved enough edit space to survive offload.
 Infinite exploration does not imply infinite retained edits: at the configured
 edit bound, new edits return busy until the arena ends; reads/navigation can
-continue within their own bounds. A session-wide failure ends arenas under
-the existing supervision policy; no error UI is introduced.
+continue within their own bounds. This is the original RAM-only behavior:
+D-40 replaces total-history retention with temporary backing, and D-41 selects
+pause/preserve/recover for expected storage exhaustion or write failures.
+The amended cache/disk admission contract remains Q-20. A session-wide failure
+ends arenas under the existing supervision policy; no error UI is introduced.
 
 Expected domain failures include `not_found`, `arena_closed`, `stale_view`,
 `definition`, `source_failure`, `too_large` and `name_in_use`. Terrain requests
@@ -1426,7 +1916,8 @@ owner and individual asynchronous cell calls may bottleneck future fluid or
 navigation scans. Recommend range/snapshot/batch paths and measurement before
 choosing the final physical layout or expanding worker concurrency.
 
-The 32 MiB retained-edit cap is also not an eviction solution: retained edits
+The original 32 MiB retained-edit cap (raised to 64 MiB by D-42) is also not
+an eviction solution: retained edits
 cannot be discarded, so new edits can remain refused until reset, even with
 no chunks resident. This is an explicit P-5 policy, not observed Synarchy
 equivalence or a measured capacity requirement. Preserve the owner's session-
@@ -1434,6 +1925,9 @@ only arena, but design configurable accounting and a future backing-store
 boundary; explain capacity exhaustion distinctly from short-lived queue
 pressure. No bounded-memory system can retain arbitrarily many unrelated
 edits indefinitely without another storage policy.
+
+D-40 now selects temporary session backing; this paragraph preserves the
+earlier rationale, not a recommendation to retain all history in RAM.
 
 ### Assessment and proposed next action
 
@@ -1590,8 +2084,11 @@ Synarchy was read from a temporary snapshot, never modified.
 ### Focused terrain-picking audit, 2026-11-07
 
 The owner requested this closer inspection before answering Q-16. This is
-source/asset evidence at the same S revision, not approval of the proposed
-replacement picker and not a report of a running-game reproduction.
+source/asset evidence at the same S revision, not a report of a running-game
+reproduction. D-30 subsequently approves the proposed picking approach;
+D-31 subsequently establishes that blank cutaway coverage deliberately
+conceals undiscovered terrain, including air gaps. Interpret the blank/pick
+observation below in that fog context, not as a direction to remove the blank.
 
 **What S already does well.** Hover and synchronous terrain clicks use the
 same pure `pickWorldTile`, with facing, zoom, framebuffer aspect, window-pixel
@@ -1671,6 +2168,69 @@ miss visible side/top pixels that belong to another candidate at that Z.
 Cell identity and edit authority remain distinct from visual coverage; exact
 cut-surface handling and filtering/threshold rules still require agreement.
 
+### Cross-facing shape-mask consistency audit, 2026-11-07
+
+The all-16 logical geometry catalog must not be inferred from image names or
+from S's incomplete procedural generator. A further source/asset check finds
+that even arbitrary geometry confined to a unit cell cannot have every pinned
+mask as its exact rotated silhouette. This is distinct from the already-known
+failure of H's particular lower-envelope solids to match the artwork.
+
+**Scope and assumptions.** S `src/World/Render/Textures.hs:24–56` rotates
+the four slope bits for the camera and selects the corresponding PNG; it
+does not supply independent geometry per facing. S `src/World/Grid.hs:61–65,
+99–108,226–236` gives the 96-pixel width, 48-pixel diamond and 16-pixel level;
+`src/World/Render/TileQuads.hs:54–66,101–104` uses the same full-canvas quad
+placement/UV for these masks. Compare the same shape under a quarter turn,
+within the approved unit-cell bounds, at equal elevation and without fog or
+other tiles hiding it. Under that interpretation the following is impossible.
+This does not assert that S implements an exact geometric solid: its draw
+path is deliberately sprites, and it can display inconsistent silhouettes.
+
+**Reproducible counterexample, using S's pinned assets.** In local unit-cell
+coordinates, the full-block canvas fixes
+`u = 48 + 48(x-y)` and `v = 16 + 24(x+y) - 16z`, for `0 <= x,y,z <= 1`.
+A positive shape quarter turn maps N to E and maps points to `(1-y,x,z)`
+(the adopted H convention, `packages/terrain/src/Hetoimasia/Terrain/Geometry.hs`,
+`rotatePoint`; equivalently compare S's matching camera/facing-bit rotations).
+
+- `isoface_slope_e.png` texel `(48,2)` is `(0,255,0,255)`: fully opaque.
+- For any point in the unit cell that could project into that entire texel,
+  `u in [48,49]`, `v in [2,3]`, let `q=x+y`, `d=x-y`. Then
+  `0 <= q <= 1/8`, `0 <= d <= 1/48`, and `13/16 <= z <= 1`.
+- Inverse rotation puts the corresponding N point at `(y,1-x,z)`. Its
+  projection is `uN=48q`, `vN=40-24d-16z`: contained in
+  `[0,6] × [23.5,27]`.
+- Every enclosing N texel is transparent. The first opaque N texels in
+  columns `0..7` occur at rows `39,39,38,38,37,37,36,36`. This separation is
+  much larger than a pixel-edge or nearest-versus-linear sampling convention.
+
+Thus an opaque part required by E would have to exist inside a transparent
+part of N after rotation. Allowing a non-convex solid inside the same cell
+does not resolve this example. This is a mathematical source/PNG check with
+Pillow reading existing pixels, not a game launch, GPU test or proof that
+every other mask is inconsistent. Snapshot integrity was checked against
+S's Git blobs: N `effc21564c7a653605dcbafca23ce7bc560e262d`,
+E `5ed533b4d9467fa3b371a4cb489a87844fa64611`.
+
+**Proposal, not a decision.** Preserve all 16 authored IDs, the isometric
+material artwork and the face-map shader approach, but authorize corrections
+to inconsistent mask silhouettes/face weights in the new project's catalog.
+Specify the intended logical shapes/openings explicitly, then derive or
+validate their four-facing masks against those definitions. This keeps cavity
+discovery and queries camera-independent and makes their openings agree with
+the visible shape. It would qualify/supersede D-25's visual-form fidelity
+where the pinned artwork is inconsistent; it does not authorize renumbering
+IDs, dropping shapes, automatic neighbor reshaping or editing Synarchy.
+
+The alternative is to retain the exact masks as stylized illustrations and
+explicitly accept some disagreement between visible openings and logical
+geometry. D-36 already distinguishes visual and logical authorities, but does
+not approve that disagreement. The owner must choose before the all-16 catalog
+can be finalized. Concrete replacement shapes, the special ID-15 meaning,
+pixel-edge conventions and appearance still require review; permission to
+correct a mask would not approve an unspecified replacement catalog.
+
 ### Existing material ABI and the remaining integration gap
 
 The manager's ABI reading is supported. H
@@ -1749,7 +2309,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29/D-30 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-43 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1759,13 +2319,48 @@ The exact emission/occlusion/cap contract is still open; the verified S path
 is one whole quad per non-air visible-range cell, not three separately meshed
 faces. Preserve sparse authoritative cell/material/shape state and atomic
 removal; do not infer world occupancy from camera-facing texture alpha.
-The relationship of existing subcell intersection APIs to that logical state
-must be explicitly settled, not called physically equivalent without proof.
+D-36 resolves the query authority: the existing subcell point/ray queries and
+cavity discovery use the same corrected logical shape definitions. The exact
+per-shape catalog and compatibility details remain to be specified and reviewed.
+
+The cross-facing mask audit above adds a Q-16 choice: the pinned N/E assets
+cannot both be exact silhouettes of one rotated unit-cell shape. Correcting
+inconsistent masks while retaining all 16 IDs is proposed, not authorized.
+Do not silently choose camera-dependent logical geometry or claim the current
+PNG set establishes a coherent solid catalog.
 
 D-30 selects the picking approach: use the adopted drawn quads, matching
 artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
 The former analytic-solid picker is not the visual authority. Exact emission,
 cut surfaces and the remaining sampling/ownership details are still open.
+
+D-31 requires a separate fog presentation over undiscovered underground
+terrain, including real air gaps. The generic blank is intentional gameplay
+concealment. The earlier proposal to expose real material/air at every cutaway
+is superseded; lazily loading terrain must not itself reveal it. Fog must
+occlude visual picking without becoming authoritative physical occupancy.
+D-32 selects whole-cavity discovery/loading on unsealing, including boundary
+terrain beyond adjacent cells and across chunks, processed in bounded steps.
+D-33 retains discovery as chunk changes across normal offload/reload for the
+arena session, replayed before render/pick publication. Revealing terrain is
+distinct from editing its contents; discovered chunks need not stay resident.
+D-34 connects whole empty cells through their six shared faces and excludes
+edge/corner-only contacts. D-35 additionally requires explicit shape openings,
+including real diagonal openings through ramps into unrevealed spaces. Exact
+per-shape geometry, capacity/completion and API authority remain Q-16/Q-20.
+D-37 resolves fog interaction: fog is unselectable, returns no player target
+and blocks screen picks/removal of the terrain it conceals.
+D-38 starts sky and initially exterior-connected spaces discovered and requires
+overlapping unsealing operations to preserve all pending discovery without
+expanding across the exterior. D-39 approves the bounded shared-work mechanism
+in P-7; its remaining concrete representation/capacity choices are still open.
+D-40 approves P-8's temporary session disk backing for retained changes with
+bounded RAM caching. D-41 selects pause/preserve/recover for expected storage
+exhaustion or write failures; its exact protocol and storage/quota/lifecycle
+rules remain open. D-42 records larger CPU banks and best-effort camera demand,
+without choosing the disk allowance. D-43 selects reservation of a hard disk
+allowance before arena opening and pausing at capacity while preserving the
+expandable world; the allowance's size and qualified mechanism remain open.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -1797,9 +2392,156 @@ Affected tracker work, for later approved revisions only:
   data/texture ownership before shortcut removal and final acceptance.
 
 The owner chose a follow-up before TRA-12. Exact one-PR slice boundaries,
-dependency insertion and existing-issue revisions await Q-16–Q-19; the ledger
+dependency insertion and existing-issue revisions await Q-16–Q-20; the ledger
 and delivery plan remain the original filed arc until those changes receive
 sign-off. No final issue bodies are drafted here.
+
+### P-7. Shared discovery mechanism — D-39 approved, concrete details open
+
+The high-level shared-work mechanism implementing D-31–D-38 is approved by
+D-39. The detailed engineering below still identifies representation,
+capacity, publication and source-compilation choices requiring a concrete
+contract; this is not a claim that the algorithm is implemented. It builds
+on P-5's existing single terrain owner, serialized edit commits and bounded
+round-robin work quanta.
+
+1. **Initial knowledge is a source property, not a global sky flood.** Derive
+   or supply compact metadata for the immutable initial source's exterior-
+   connected empty regions and their exposed terrain boundaries. The exterior
+   is implicit; a query can recognize it without allocating/enqueueing sky
+   cells. The current source is bounded authored layers/column runs
+   (`packages/terrain/src/Hetoimasia/Terrain/Source.hs:1–30`), which supports
+   a run/region-level compilation approach; its actual connectivity compiler,
+   accounting and refusal rules still need specification. No claim of a
+   general constant-time exterior oracle is made. Initially known cave
+   detail loads only on demand. Never reclassify an entire newly opened cave
+   as already-processed exterior merely because it now has a path to sky.
+2. **One shared discovery work set per arena.** Track unseen regions,
+   claimed-but-pending work and fully expanded regions separately. Keys must
+   distinguish the logical empty components of a shaped cell/region, so one
+   discovered component cannot expose another disconnected part. Claims and
+   their queue/continuation obligations are installed together by the terrain
+   owner. Discovering/claiming a region is not proof that all of its exits or
+   boundary terrain loads have been processed. Use compressed spans/regions
+   where valid; do not turn this into a dense visited-cell array.
+3. **Edits seed new connectivity in the same commit boundary.** Each accepted
+   removal installs the obligation to inspect its new empty regions and open
+   connections before work can be lost to cancellation/offload. Inspect both
+   sides of newly created connections, including already-known neighbors.
+   A visited bit from before the edit is not permission to ignore a newly
+   opened passage. Reserve the minimal continuation/claim capacity before
+   committing the edit, or refuse admission without a partial edit. Later
+   discovery capacity/failure behavior remains an explicit open contract.
+4. **Process bounded batches, share claims and stop at known exterior.** An
+   unseen reachable region is claimed once and queued. A pending region joins
+   existing work without dropping its queued exits/boundary loads. A completed
+   known region or implicit initial exterior needs no traversal through it;
+   edits that change its connectivity must have supplied new obligations as
+   above. Reaching sky ends that branch, not the entire reveal. The queue is
+   shared, so opposite openings naturally contribute to the same work rather
+   than running unrelated flood fills with conflicting visited sets.
+5. **Version topology and retain obligations.** Revalidate work against arena
+   incarnation and relevant topology changes before publishing it. A removal
+   can merge previously separate empty components; stale component keys must
+   be remapped/re-examined rather than publishing old connectivity. Completed
+   knowledge uses D-33 retention. Pending work is separately arena-owned and
+   must survive ordinary chunk offload; its cancellation/close/reset and
+   publication rules must be specified. A component is complete only when its
+   discovery and required boundary-load obligations are fulfilled, never just
+   because two fronts met.
+
+For the owner's two-opening example: opening A queues one end of the cave;
+opening B queues the other end. Each meets already-known sky at its entrance
+and stops only that outward branch. They traverse the cave until their claims
+meet, reuse the same pending work, and finish all remaining branches and
+boundary loads. A small abstract graph check exercised immediate and delayed
+second openings in both directions, including a side branch: each of eight
+unknown nodes expanded once and sky expanded zero times. This is a design-
+model sanity check, not a repository test, a geometric proof or performance
+evidence. The concrete implementation needs interleaving, chunk-offload,
+capacity, later-edit and partial-shape cases before its claims are qualified.
+
+**Still unresolved:** the exact 16-shape region/portal catalog; source metadata
+for initially exterior-connected spaces (including unbounded authored air
+layers); definition of completion for boundary loading with normal eviction;
+retained-discovery and pending-work capacity/refusal; API results and coherent
+publication. An enormous/infinite component cannot silently become an
+unbounded allocation, a completed partial reveal or an erased obligation.
+
+### P-8. Session retention backing — D-40/D-41/D-43 approved, concrete details open
+
+The original P-5 keeps retained changes in memory, with an initial 32 MiB
+session-edit cap (raised to 64 MiB by D-42) and new edits refused once that
+retention capacity is exhausted. Offloading
+reconstructible terrain does not free the authoritative changes it must retain.
+D-33 adds retained discovery, including large connected cavities. D-40 now
+explicitly supersedes the RAM-only retention policy with temporary disk backing;
+the original cap is historical rather than the amended total-history contract.
+
+D-40 selects a temporary per-arena disk backing store for
+retained chunk edits and discovery, with a bounded RAM cache and asynchronous
+I/O. Keep only the active working set resident; committed retained records
+can be loaded and replayed when their chunks return. This is session storage,
+discarded on arena close/reset, not a user save or cross-run recovery feature.
+This does not authorize unbounded disk consumption or silently store game saves.
+
+The tradeoff is additional storage/I/O lifecycle and failure handling now.
+D-41 selects pausing new edits/discovery while preserving existing state and
+unfinished work on storage exhaustion or write failure, reporting through Lua
+and resuming after recovery. Navigation continues only where data is available.
+The concrete contract still needs quotas, atomic offload, bounded queue/cache
+ownership, exact read/write results and recovery triggers, cleanup and pending
+discovery recovery within the live arena. In particular, no acknowledged edit
+or revealed state may be evicted from RAM before its backing copy is safe to replay.
+
+The RAM-only alternative is superseded: it would cap exploration history even
+after resident chunks were evicted. Temporary backing does not make an infinite
+region exhaustively materializable. The storage direction is resolved; its
+concrete quota/failure contract remains Q-20, and its scope must be incorporated
+in Q-19 before issue revisions are drafted.
+
+**Storage allowance — approved by D-43 (2026-11-07).** The
+owner suggested checking free space, imposing a terrain disk allowance,
+refusing startup without enough room and ensuring the world cannot exceed it.
+D-43 chooses a configurable hard allowance for the arena's whole temporary store,
+including indexes, metadata and peak replacement/compaction/write overhead;
+check capacity on the actual store volume and reserve the required storage
+before arena opening succeeds. The proposed separate free-space safety margin
+and its size remain part of the concrete contract review.
+If the required capacity cannot be established, refuse arena opening with a
+clear Lua result. This is an arena-creation requirement, not a prohibition on
+launching the engine application.
+
+Maintain accounting and reserve capacity before admitting retained changes;
+do not spend space reserved for completing in-flight writes on new work.
+At capacity, preserve existing changes and pending discovery under D-41.
+Unchanged terrain remains reconstructible from its source; revisiting readable
+terrain need not grow retained history. For a large cavity, do not promise a
+whole reveal fits based on its opening tile: continuation and its capacity
+must remain bounded and resumable. Exact default size, reservations, platform
+support and admission/recovery protocol remain open.
+
+A free-space query is a snapshot, not a reservation against other writers.
+[Apple's file-control documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html)
+documents file preallocation, including an all-requested-space-or-none option;
+this establishes an available mechanism, not a qualified guarantee for the
+eventual storage layout or every supported filesystem. Platform qualification
+must cover physical allocation, filesystem overhead, replacement writes and
+failure handling; merely setting a sparse file's logical length is insufficient.
+Reservation also does not eliminate device failures, so D-41 remains necessary.
+
+The D-43 boundary is on retained storage, not world coordinates.
+An expandable procedural world can be cheap before edits, but arbitrarily
+many independent changes/discovery records cannot be guaranteed to fit a fixed
+finite store. Guaranteeing every possible future edit fits at startup would
+need a finite world/allowed-change bound and worst-case storage sizing, not
+an assumed compression ratio. That would narrow D-11 and is not approved.
+
+Other-game evidence is limited, not a universal industry policy: in a
+[Factorio staff diagnosis](https://forums.factorio.com/viewtopic.php?t=130690)
+of a save failure, the write directory had only 27 MB free at startup and the
+developer fixed the error to report insufficient space. It supports retaining
+runtime error handling, not claiming Factorio pre-reserves all future saves.
 
 ## Open questions and review checkpoints
 
@@ -1929,10 +2671,27 @@ Partially resolved by D-30: picking uses the adopted drawn quads and matching
 artwork/mask coverage in front-to-back order, with shared CPU asset coverage.
 The result identifies the logical cell for the existing edit contract.
 
-Still open: the fate/meaning of #637's exact subcell-solid query APIs,
-full-cell versus isolated-face emission, hidden-face/cap behavior and the
-authority of those query results relative to the visible sprite. Do not
-silently retain incompatible ray/coverage claims. Exact sample/threshold and
+D-31 additionally preserves blank fog coverage over undiscovered terrain,
+including air. Cutaway movement and data residency do not grant discovery.
+Fog-specific picking is resolved by D-37: no selectable target, no interaction
+and no picking through the fog. Remaining reveal behavior is tracked in Q-20.
+D-35 requires
+logical shape openings for discovery, including ramp-created diagonal
+connections; the exact 16-shape solid/empty-region catalog is still to be
+specified and reviewed.
+
+D-36 resolves #637's subcell query authority: correct those definitions so
+point/ray queries and discovery share the canonical logical shape model.
+Rendering/screen picking retain sprite coverage as their visual authority.
+
+Still open: the exact 16-shape logical geometry and query boundary/compatibility
+details, full-cell versus isolated-face emission and hidden-face/cap behavior.
+The cross-facing mask audit above also requires a fidelity decision: authorize
+correction of inconsistent mask artwork to match the canonical shapes, or
+explicitly accept a visual/logical mismatch. The recommendation is correction
+while preserving the 16 IDs and face-map approach. No replacement catalog or
+asset edits are approved by the evidence alone.
+Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
 coverage resource contracts remain Q-17; the approved picking approach itself
 does not need another sign-off.
 
@@ -1958,11 +2717,81 @@ zoom-map crossfade remain outside the approved arena unless explicitly changed.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
-Open. After the behavior is settled, approve dependency-ordered follow-up
+Open. After the behavior, including D-31/D-32/Q-20 fog and discovery, is
+settled, approve dependency-ordered follow-up
 slices and exact revision needs for #645–#648, with the owner-selected barrier
 before TRA-12 and explicit coordination of held PR #654. Mirror approved new
 slice IDs in the ledger and delivery plan; preserve earlier IDs. Readiness
 requires fresh owner sign-off. This design turn files or edits no tracker item.
+
+### Q-20. Underground discovery, fog interactions and sparse retention
+
+Partially resolved by D-31–D-41/D-43. Preserve fog over both solid and air until
+discovery, distinct from residency and authoritative terrain. Unsealing a
+cavity reveals its whole connected empty space and loads the newly exposed
+boundary terrain, beyond the adjacent cells and across chunks, in bounded
+steps. The local-only discovery alternative is rejected.
+
+D-33 records revealed state as retained chunk changes, preserved on offload
+and replayed before reload publication alongside terrain edits. Discovery
+persists for the arena session while off-screen chunks may unload normally;
+closing/resetting the arena discards it. Both revealed air and exposed solid
+boundary tiles retain their known state.
+
+D-34 resolves whole-empty-cell connectivity: six shared-face neighbors,
+including across chunks, with edge/corner-only contacts excluded.
+
+D-35 requires discovery through explicit partial-shape openings, including
+real diagonal openings from ramps into unrevealed spaces. It excludes both
+the shortcut of treating all shaped cells as sealed blocks and the shortcut
+of treating every diagonal neighbor as connected.
+
+D-36 makes those logical shape definitions the common authority for discovery
+and terrain point/ray queries, correcting the previous solid definitions.
+
+D-37 resolves fog interaction: generic blanks are non-interactive and
+unselectable. A fog-covered screen pick gives no player target and does not
+continue through the cover; the temporary removal shortcut does nothing there.
+
+D-38 starts sky and initially sky-connected cavities discovered, without
+requiring all their detail resident. Later discovery applies to previously
+sealed space. Overlapping openings during progressive work must not flood the
+exterior, duplicate work or lose unprocessed branches. D-39 approves shared
+pending work, new-edit seeding and stopping only exterior branches. P-7's exact
+representations, source metadata and API/capacity contract remain open.
+
+D-40 chooses temporary per-arena disk backing for retained edits/discovery,
+with bounded RAM caching and asynchronous I/O, discarded on arena close/reset.
+The earlier RAM-only total-history cap is superseded. Exact record/index,
+quota and lifecycle rules remain open. D-41 selects pause/preserve/recover
+on storage exhaustion or write failure; exact read/write results, admission
+and recovery triggers remain open. D-43 resolves startup reservation and a
+hard allowance: reserve before opening the arena, refuse opening if that is
+not possible, and pause at capacity while preserving the expandable world.
+The numeric allowance and qualified reservation mechanism remain open. D-42
+raises the CPU banks independently; it does not choose the disk allowance.
+
+Still open: specify and review the exact 16-shape solid/empty regions,
+openings and internal connectivity; derive/budget the initial exterior-connected
+knowledge metadata without scanning infinite sky. Specify completion and
+memory-pressure behavior for very large spaces, including P-8/D-40's concrete
+temporary-store cache/staging/disk quotas and write/read failure behavior. Specify
+Lua/engine authority and concrete reset,
+reveal-job resumability and replay/publication boundaries, including the API
+encoding of D-37's no-selectable-target fog result.
+
+Proposed storage direction: implicit unknown plus sparse discovered spans or
+regions, budgeted separately from resident terrain and retained edits. Reveal
+work must be bounded; an enormous or exterior-connected air region cannot
+force an unbounded flood fill or eager underground allocation. Consider
+coherent terrain/reveal publication so a pending or failed edit/reveal cannot
+flash secret contents. D-32 settles whole-space propagation in bounded steps;
+D-33 settles session retention/replay with normal streaming; D-34 settles
+whole-empty-cell face adjacency. D-35 includes partial-shape/diagonal openings.
+Exact API, representation, per-shape geometric rules, failure and capacity
+policies remain open.
+Do not introduce
+full unit vision/day-night visibility or general gameplay state by inference.
 
 ## Verification strategy — approved through Q-12
 

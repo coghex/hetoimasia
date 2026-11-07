@@ -329,9 +329,12 @@ demand orders; and allocation at two widely separated depths and gap widths. It
 also runs the pure residency and admission model (TRA-3) with controlled events
 and no thread, sleep or deadline, recomputing every ledger from the model's
 records after each step: validated limits (the approved defaults; zero, negative
-and unrepresentable figures refused by field); separate resident, edit and staging
+and unrepresentable figures refused by field; request caps and a configuration
+below the worst-case footprint of the largest admissible request refused at
+construction); separate resident, edit and staging
 ledgers around reservation, completion, cancellation and handoff; each bank and
-slot full on its own and permanently invalid work kept apart from busy; shared
+slot full on its own, every shortage busy and only over-cap requests invalid,
+from every state; shared
 jobs by arena, revision and region that survive one caller canceling and never
 fill the cells between disjoint demands; late, withdrawn and failed results;
 admission funded by a committed eviction whose release arrives later;
