@@ -490,9 +490,10 @@ Each cost category is assigned to exactly one bank or slot:
 | Category | Bank or slot | Charge |
 | --- | --- | --- |
 | Region metadata, for every resident region however little of it is known | Resident | 256 bytes |
-| Sparse column index entries | Resident | 48 bytes each |
+| Sparse column index entries, charged to each region for its own columns | Resident | 48 bytes each |
 | Segment metadata | Resident | 32 bytes each |
-| Packed detail payload | Resident | the encoded bytes (reserved at 2 per cell) |
+| Packed detail payload | Resident | the encoded bytes stored; reserved at the dense bound, 64 per interval |
+| A removal's rebuilt segment (its payload is between 2 and 64 bytes) | Resident | 62 reserved; the growth actually stored is charged at the commit |
 | Retained removals | Edit | 16 per interval and 48 per column entry (worst case for one removal: 64) |
 | Load scratch | Staging | 256 + 2 per cell |
 | Interest records | Staging | 64 each |
@@ -506,11 +507,25 @@ Each cost category is assigned to exactly one bank or slot:
 A region count or payload-only estimate is never enough: because region
 metadata is charged, vertical regions holding almost no cells still consume the
 resident bank, and descending cannot grow residency without bound while the
-horizontal column count stays fixed. The model reserves for what the data layer
-will store; when a job completes the owner reports the cost it actually stored
-(`Cost`, taken from `residentStats`), and a larger figure than reserved, or
-arithmetic that does not fit 64 bits, is a contract failure, never silent growth
-or a retroactive busy.
+horizontal column count stays fixed. A one-cell job therefore reserves 256 + 48 +
+32 + 64 = 400 resident bytes and, when its cell needs two payload bytes, stores 338.
+
+The reservation bounds the growth whatever else is or becomes known in the region
+and in whatever order other work completes or is canceled: merging cells into an
+existing segment can raise that segment's payload (a uniform 31-cell segment is two
+bytes, the merged dense segment 64), so a figure proportional to the new cells alone
+would not bound it, and a job never depends on another job to fund its column. The
+data layer keeps one index entry per column across all vertical regions; the model
+charges each region for its own columns and keeps that charge until the region is
+released, so it over-charges the shared index and evicting one region never leaves
+another under-charged. When a job completes the owner reports what it stored as a
+`Cost` whose columns are the region's own columns of the cells it added (not the
+shared index's growth) and whose segments and payload are what it stored there; a
+larger figure than reserved, or arithmetic that does not fit 64 bits, is a contract
+failure, never silent growth or a retroactive busy. A removal's commit reports the
+growth of the rebuilt segment the same way (`RemovalCommitted`'s last argument,
+at most the 62 reserved); the removal's growth is funded like a job's and the commit
+is refused (`EditNotFunded`) while it still waits for a victim's release.
 
 ### Admission
 
@@ -524,9 +539,12 @@ waits only for those victims' `VictimReleased` events, then is queued. A victim
 cannot regain an interest or a hold, and a victim's bytes are never promised twice.
 Checks run in a fixed order and the first failure is reported:
 
-1. **Invalid** (permanent): an empty, oversized or duplicated demand, a region whose
-   minimal reservation exceeds a bank's configured total, or more of a slot than
-   exists. Never busy, so explicit work cannot stay busy forever.
+1. **Invalid** (permanent): an empty, oversized or duplicated demand, a region key
+   that names a tile outside the supported coordinate range (`UnsupportedRegion`,
+   checked at the lowest and highest cell of the region), a region whose minimal
+   reservation exceeds a bank's configured total (for a camera demand, together with
+   its description: the description and a region job must coexist), or more of a
+   slot than exists. Never busy, so explicit work cannot stay busy forever.
 2. **RetainedEditsExhausted** (edits only): the committed bytes plus this edit exceed
    the bank even with every reservation returned. It names the bank and persists until
    an arena's teardown frees retained bytes; the public Lua mapping stays `busy`
@@ -558,8 +576,10 @@ are reported.
 
 Camera demand is latest-value state per view: bounded (a description of at most
 1,024 regions, charged to staging), replaced as a whole, never a queue of pan
-events. Replacing it withdraws only that view's obsolete interests and keeps
-shared work. Each region is admitted as its own unit; what is not admitted stays
+events. Replacing it withdraws only that view's obsolete interests, in a retained
+region as well as in a dropped one: a region whose new coverage cannot be admitted
+yet keeps no interest in the coverage it replaced, and what the withdrawal freed is
+offered to the pending regions in the same step. Shared work is kept. Each region is admitted as its own unit; what is not admitted stays
 as coalesced pending demand, holds nothing, and is retried by the owner's
 `Service` quantum.
 
@@ -573,7 +593,9 @@ a removal commits, its region stays protected (dirty) until a handoff transfers 
 changes: the transfer reserves its duplicate in staging, a confirmed transfer needs
 no new edit allocation because the retained bytes were funded at the removal, and a
 failed transfer keeps the changes, the protection and the retained bytes and is not
-retried by the model.
+retried by the model. A handoff records the region's change generation, so confirming
+an older handoff never clears a removal committed after it began: the region stays
+changed and protected until a handoff that covers the newer change is confirmed.
 
 ### Scheduling
 
@@ -582,7 +604,9 @@ job already passed over for the aging threshold first, then the job whose caller
 arrived or were served longest ago (callers take turns, however many regions each
 asked for), then the lowest job number. Progress assumptions: required victims are
 released, required holds are released, and dispatched finite work reports completion.
-Superseded camera work need not finish solely for an obsolete view.
+Superseded camera work need not finish solely for an obsolete view. A late failure
+or completion of work a commit superseded is dropped and never touches current
+demand.
 
 ### Arena retirement
 
