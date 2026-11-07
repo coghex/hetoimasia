@@ -105,6 +105,8 @@ without eagerly filling underground depth (D-7).
 Development verification uses a temporary mouse-targeted keyboard shortcut
 for tile removal, with no UI system or on-screen UI controls (D-8/D-9). Remove
 the shortcut by task completion; the Lua removal API remains.
+Changes survive chunk offload/reload within the current arena session, but
+the arena is not persistent across sessions (D-10).
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
@@ -327,6 +329,26 @@ general camera/input or terrain-query capabilities from this cleanup.
 The exact API name, arguments, result/failure semantics and temporary key
 remain to be designed. No UI implementation is introduced.
 
+### D-10. Session-only changes retained across chunk offload/reload
+
+Owner, directly in this pane on 2026-11-06:
+
+> yes that fits, the testing arena is not supposed to be persistent, but the loaded chunks will have to track the changes, then save thos changes on chunk offload, then reapply them on reload
+
+Loaded chunks track their changes. Before offloading a changed chunk, retain
+those changes in a store owned by the current arena session. Reloading
+regenerates terrain from the same source and reapplies the retained changes
+before the chunk becomes usable. Further edits and repeated offload/reload
+must preserve all earlier changes, including removals, without resurrecting
+deleted tiles. Untouched underground detail remains lazy under D-7.
+
+Here, saving on offload means retaining changes for the current session;
+the accepted scope does not require disk saves or recovery across application
+restarts. Destroying the arena ends the store's lifetime, and a new arena
+starts fresh. The store retains changes independently of resident chunk data,
+so chunk eviction cannot discard them. Exact encoding, compaction, threading
+and transfer/publication mechanics remain design choices in Q-3/Q-6/Q-9.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -367,6 +389,11 @@ priorities, cancellation, complete publication, failures, residency accounting
 and safe eviction. Decide how late results are prevented from reaching a
 replaced world and how renderer holds interact with CPU data eviction. A flat
 generator must not substitute for a lifetime contract.
+D-10 requires offload to preserve changes before discarding resident data and
+reload to apply them before publication. Define that handoff and failure
+behavior. Account separately for resident terrain, derived render data and
+session-retained changes; a resident-chunk limit does not bound accumulated
+edits across the explored arena.
 Queries can concern invisible regions while undemanded detail remains
 unmaterialized. The producer rule is settled; its operational contract remains
 open.
@@ -396,18 +423,18 @@ component store is the right representation for every terrain cell.
 ### Q-6. Mutation, persistence and state publication?
 
 D-7 requires removal to reveal newly materialized terrain; D-9 selects a
-durable Lua removal API with a temporary development shortcut. Decide any
-additional edits, what survives chunk eviction, whether
-save/load or reset is included, and the relevant schema,
-snapshot, tick/failure and determinism guarantees. Generated base data,
-resident copies and durable edits need distinct meanings if all are included.
-The earlier state agenda remains reference material; no save migration,
-replay, mods or hot swap has been activated by D-1/D-2.
+durable Lua removal API with a temporary development shortcut. D-10 settles
+retention: track changes while loaded, retain them on offload, and reapply
+them on reload within the same arena session. No cross-session persistence.
+Define change representation, repeated-edit composition, handoff failures,
+publication and determinism guarantees. Generated base terrain, resident
+copies and session-retained changes have distinct lifetimes. Additional edit
+operations and an explicit in-session reset command remain open.
+The earlier state agenda remains reference material; save migration, gameplay
+replay, mods and hot swap remain outside this scope. Reapplying terrain changes
+on reload under D-10 does not introduce a general replay system.
 The development removal tool is accepted; its lifecycle is D-9 and remaining
-input choices are in Q-4. For the next owner choice, recommend preserving
-removals through chunk eviction/reload for the lifetime of the current arena,
-with a fresh arena on application restart. Disk save/load could be included
-instead, but adds a persistence contract. This scope choice remains open.
+input choices are in Q-4.
 
 ### Q-7. What proves this first terrain foundation complete?
 
@@ -444,6 +471,12 @@ unmeasured, and the exact physical storage layout is not approved yet. P-4
 allows a shared source definition to stand in for untouched underground spans;
 choosing compressed columns does not require eagerly building every column.
 
+Next vertical-extent choice: recommend a configurable lower terrain limit for
+the testing arena, with a defined outside-world answer below it. It allows
+shallow or deep test cases without allocating untouched depth. Extending
+downward as digging proceeds is the alternative. Neither is selected yet;
+the initial material/layer recipe also remains open.
+
 ## Verification strategy — proposal
 
 Use focused Hspec/model tests for identity, demand deduplication, bounded
@@ -461,6 +494,10 @@ materialization, repeated removal revealing deeper terrain, and exposure of
 side faces and gaps. Inspect terrain allocations as well as rendered output
 to verify that untouched depth stays unmaterialized. Check explicit invisible
 queries separately under D-6 and returning to an edited, evicted region.
+Under D-10, verify remove/offload/reload, additional removal followed by another
+cycle, and reconstruction independent of chunk demand order. Verify a fresh
+arena inherits no changes from the previous session. No disk persistence test
+is implied by this session-only contract.
 During development, exercise the D-8/D-9 shortcut through the agreed
 targeting/input path, including no valid target and focus/reset behavior.
 Capture its removal/reveal evidence before deleting the shortcut. Final
