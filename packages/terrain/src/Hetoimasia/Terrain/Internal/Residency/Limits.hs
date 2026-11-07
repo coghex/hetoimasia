@@ -27,16 +27,20 @@ module Hetoimasia.Terrain.Internal.Residency.Limits
   , limitQueryRegions
   , limitExtent
   , limitExplicitStagingBytes
+  , limitExplicitResidentBytes
+  , limitHoldRegions
+  , limitCameraRegions
   , limitRegionStoredBytes
   , limitAgingQuanta
   , minimumBytes
-  , minimumLoadJobs
+  , explicitMinimumBytes
   , regionStoredBytes
   ) where
 
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Internal.Residency.Coverage
   ( commandRecordBytes
+  , holdRecordBytes
   , interestRecordBytes
   , regionColumnReserveBytes
   , regionMetadataBytes
@@ -84,8 +88,9 @@ data LimitsSpec = LimitsSpec
   , specQueuedCommands ∷ !Integer
   , specPinsPerView ∷ !Integer
   , specAgingQuanta ∷ !Integer
-  , -- | The most regions an explicit query may name; one internal load job each,
-    -- so at most 'specLoadJobs'.
+  , -- | The most regions an explicit query may name (the approved 8,192-level
+    -- column spans up to 257). Load-job slots are taken at dispatch, so a query
+    -- may name more regions than there are slots.
     specQueryRegions ∷ !Integer
   , -- | The cells of a region that may ever be loaded: columns @x < specExtentX@,
     -- rows @y < specExtentY@ and levels @z < specExtentZ@ (at most the region's
@@ -95,6 +100,12 @@ data LimitsSpec = LimitsSpec
     specExtentX ∷ !Integer
   , specExtentY ∷ !Integer
   , specExtentZ ∷ !Integer
+  , -- | The most regions one borrower or publication hold may name.
+    specHoldRegions ∷ !Integer
+  , -- | The structural maximum of a view's stored camera description, in regions.
+    -- A longer description is truncated in priority order and the remainder
+    -- reported; it is never refused.
+    specCameraRegions ∷ !Integer
   }
   deriving stock (Eq, Show)
 
@@ -111,6 +122,8 @@ data LimitField
   | FieldExtentX
   | FieldExtentY
   | FieldExtentZ
+  | FieldHoldRegions
+  | FieldCameraRegions
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | Why a limit was refused. A permanently invalid limit is never clamped.
@@ -124,9 +137,6 @@ data LimitError
     -- request: the bank, the bytes that footprint needs and the bytes configured.
     -- The shortfall is the difference.
     BankBelowMinimum !Bank !Integer !Integer
-  | -- | Fewer load-job slots than an admissible query can need at once: the slots
-    -- it needs and the slots configured.
-    LoadJobsBelowMinimum !Integer !Integer
   deriving stock (Eq, Show)
 
 -- | A validated set of limits.
@@ -141,6 +151,9 @@ data Limits = Limits
   , lQuery ∷ !Word64
   , lExtent ∷ !(Int, Int, Int)
   , lExplicitStaging ∷ !Word64
+  , lExplicitResident ∷ !Word64
+  , lHold ∷ !Word64
+  , lCamera ∷ !Word64
   }
   deriving stock (Eq, Show)
 
@@ -167,11 +180,10 @@ mkLimits spec = do
   ex ← checkInt FieldExtentX 16 (specExtentX spec)
   ey ← checkInt FieldExtentY 16 (specExtentY spec)
   ez ← checkInt FieldExtentZ 32 (specExtentZ spec)
+  hold ← check FieldHoldRegions limitCeiling (specHoldRegions spec)
+  camera ← check FieldCameraRegions limitCeiling (specCameraRegions spec)
   mapM_ (atLeast spec) allBanks
-  if minimumLoadJobs spec > specLoadJobs spec
-    then Left (LoadJobsBelowMinimum (minimumLoadJobs spec) (specLoadJobs spec))
-    else Right ()
-  pure (Limits resident edit staging jobs commands pins aging query (fromInteger ex, fromInteger ey, fromInteger ez) (fromInteger (minimumBytes spec StagingBank)))
+  pure (Limits resident edit staging jobs commands pins aging query (fromInteger ex, fromInteger ey, fromInteger ez) (fromInteger (explicitMinimumBytes spec StagingBank)) (fromInteger (explicitMinimumBytes spec ResidentBank)) hold camera)
   where
     check field top n
       | n <= 0 = Left (LimitNotPositive field n)
@@ -190,19 +202,19 @@ mkLimits spec = do
             StagingBank → specStagingBytes sp
        in if needed > have then Left (BankBelowMinimum bank needed have) else Right ()
 
--- | The most one region can hold, whatever sequence of requests loaded it: its
--- metadata, a column index entry for each of the extent's columns, a segment for
--- each interval (a column of @z@ levels has at most @ceiling (z / 2)@ separate
--- intervals) and two payload bytes per cell. Computed with exact integers.
+-- | The most one region can occupy, whatever sequence of requests and edits made
+-- it: its metadata, a column index entry for each of the extent's columns, and for
+-- each cell at most one segment of its own (32 bytes of metadata) with two payload
+-- bytes. A segment of @k@ cells costs at most @32 + min 64 (2 k)@, which is at most
+-- 34 per cell, so a region that removals have fragmented into one-cell segments is
+-- the worst case. Computed with exact integers.
 regionStoredBytes ∷ Integer → Integer → Integer → Integer
 regionStoredBytes x y z =
   toInteger regionMetadataBytes
     + toInteger regionColumnReserveBytes * columns
-    + toInteger regionSegmentStoredBytes * segments
-    + 2 * columns * z
+    + (toInteger regionSegmentStoredBytes + 2) * columns * z
   where
     columns = x * y
-    segments = columns * ((z + 1) `div` 2)
 
 -- | The most a job for cells inside the extent can reserve, beyond the region's
 -- metadata: every column and every interval, at the model's reservation figures.
@@ -224,11 +236,13 @@ regionJobBytes x y z = toInteger regionColumnReserveBytes * columns + toInteger 
 -- * 'StagingBank': the most of a query (its command record, an interest and the
 --   scratch of a load of the whole extent for each region), a removal (its command
 --   and staging) and a handoff's temporary duplicate of a region at its stored
---   maximum. This is also the headroom camera work leaves free (see
---   'limitExplicitStagingBytes');
+--   maximum;
 -- * 'EditBank': one removal's retained growth.
-minimumBytes ∷ LimitsSpec → Bank → Integer
-minimumBytes spec bank = case bank of
+--
+-- Camera work and holds always leave the 'ResidentBank' and 'StagingBank' figures
+-- free ('limitExplicitResidentBytes', 'limitExplicitStagingBytes').
+explicitMinimumBytes ∷ LimitsSpec → Bank → Integer
+explicitMinimumBytes spec bank = case bank of
   ResidentBank →
     maximum
       [ queryN * (stored + job)
@@ -251,15 +265,21 @@ minimumBytes spec bank = case bank of
     interest = toInteger interestRecordBytes
     scratch = 256 + 2 * x * y * z
 
--- | The load-job slots an admissible query can need at once: one per region.
-minimumLoadJobs ∷ LimitsSpec → Integer
-minimumLoadJobs = specQueryRegions
+-- | What each bank must hold: the explicit worst case, and for staging also the
+-- records of the largest hold (borrowers and publication pins) beside it, so the
+-- largest hold fits when the camera has taken nothing of its share.
+minimumBytes ∷ LimitsSpec → Bank → Integer
+minimumBytes spec bank = case bank of
+  StagingBank → explicitMinimumBytes spec StagingBank + toInteger holdRecordBytes * specHoldRegions spec
+  _ → explicitMinimumBytes spec bank
+
 
 -- | The approved initial CPU limits (sized for a normal laptop, hundreds of
 -- megabytes): 256 MiB resident terrain, 64 MiB retained session edits, 128 MiB CPU
 -- render and staging, 128 load jobs, 256 queued commands and two pinned view
 -- revisions per view, an aging threshold of 8 service quanta, and the explicit
--- request caps: at most 16 regions in a query and the region's whole 16 x 16 x 32
+-- request caps: at most 257 regions in a query (the approved 8,192-level column),
+-- 16,384 in a hold or a stored camera description, and the region's whole 16 x 16 x 32
 -- extent. They satisfy 'mkLimits' (the worst-case footprints are recorded in the
 -- terrain README and checked by the tests). Camera demand has no cap: it is best
 -- effort.
@@ -273,9 +293,12 @@ defaultLimits =
     , lCommands = 256
     , lPins = 2
     , lAging = 8
-    , lQuery = 16
+    , lQuery = 257
     , lExtent = (16, 16, 32)
-    , lExplicitStaging = 267904
+    , lExplicitStaging = 4301280
+    , lExplicitResident = 179020032
+    , lHold = 16384
+    , lCamera = 16384
     }
   where
     mib = 1024 * 1024
@@ -294,12 +317,25 @@ limitSlot l ViewPinSlot = lPins l
 limitQueryRegions ∷ Limits → Word64
 limitQueryRegions = lQuery
 
--- | The staging bytes camera work always leaves free, so that an explicit request
--- is never starved of staging by camera interests: the staging minimum for the
--- explicit requests. Camera work likewise leaves 'limitQueryRegions' load-job
--- slots free.
+-- | The staging bytes camera work and holds always leave free, so that an explicit
+-- request is never starved of staging by camera interests: the staging minimum for
+-- the explicit requests.
 limitExplicitStagingBytes ∷ Limits → Word64
 limitExplicitStagingBytes = lExplicitStaging
+
+-- | The resident bytes camera pins always leave unpinned (free or evictable), so
+-- that an explicit request is never starved of resident room by a view that keeps
+-- re-pinning: the resident minimum for the explicit requests.
+limitExplicitResidentBytes ∷ Limits → Word64
+limitExplicitResidentBytes = lExplicitResident
+
+-- | The most regions one hold may name.
+limitHoldRegions ∷ Limits → Word64
+limitHoldRegions = lHold
+
+-- | The structural maximum of a view's stored camera description, in regions.
+limitCameraRegions ∷ Limits → Word64
+limitCameraRegions = lCamera
 
 -- | The columns, rows and levels of a region that may ever be loaded.
 limitExtent ∷ Limits → (Int, Int, Int)

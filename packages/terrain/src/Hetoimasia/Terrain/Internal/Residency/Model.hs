@@ -232,7 +232,9 @@ data StaleReason
   deriving stock (Eq, Show)
 
 data ContractReason
-  = -- | Reserved bytes and the larger actual bytes the data layer reported.
+  = -- | The bytes a region would occupy and the most the configured extent allows.
+    RegionExceedsMaximum !Word64 !Word64
+  | -- | Reserved bytes and the larger actual bytes the data layer reported.
     CostExceedsReservation !Word64 !Word64
   | CostOverflow
   | JobNotRunning !JobId
@@ -288,6 +290,11 @@ data Decision
       , cameraWithdrawn ∷ ![RegionCoord]
       , cameraCancelled ∷ ![JobId]
       , cameraAwaitingAck ∷ ![JobId]
+      , -- | Regions of the description left out as unsupported or wholly outside the extent.
+        cameraExcluded ∷ ![RegionCoord]
+      , -- | Regions cut from the end of the description (the lowest priority) because
+        -- it exceeds the structural maximum or the staging the camera may use.
+        cameraTruncated ∷ ![RegionCoord]
       }
   | CameraCleared ![RegionCoord] ![JobId] ![JobId]
   | Withdrawn ![JobId] ![JobId]
@@ -492,7 +499,10 @@ freeBytes (Ledger l o r) = l - min l (o + r)
 -- | Slots in use. 'ViewPinSlot' is counted per view by 'viewPins'; here it is
 -- the largest count over views.
 slotInUse ∷ Model → Slot → Word64
-slotInUse m LoadJobSlot = fromIntegral (Map.size (mJobs m))
+-- A load-job slot is taken when a job is dispatched and held until it completes or
+-- its cancellation is acknowledged; an admitted job waiting its turn holds only its
+-- reservation.
+slotInUse m LoadJobSlot = fromIntegral (Map.size (Map.filter (\j → jbState j /= JobPending) (mJobs m)))
 slotInUse m CommandSlot = fromIntegral (Map.size (mRequests m))
 slotInUse m ViewPinSlot = maximum (0 : [viewPins m v | v ← Set.toList (Set.fromList [v' | Hold {hdKind = Pin v'} ← Map.elems (mHolds m)])])
 
@@ -908,7 +918,6 @@ planAdmission m arena owner demands extras = do
     then Left (RetainedEditsExhausted EditBank (ledgerLimit editLedger) (ledgerOccupied editLedger) editNeed)
     else Right ()
   slotFree CommandSlot nCommands
-  if nJobs > 0 then slotFree LoadJobSlot (nJobs + jobHeadroom) else Right ()
   if stagingNeed > 0 then bankFree StagingBank (stagingNeed + stagingHeadroom) else Right ()
   bankFree EditBank editNeed
   if nJobs > maxBound - mNextJob m then Left (ContractFailure JobIdsExhausted) else Right ()
@@ -928,9 +937,8 @@ planAdmission m arena owner demands extras = do
     explicit = case owner of
       OwnerRequest _ → True
       OwnerView _ → False
-    -- Camera work is best effort and leaves room for explicit requests: the load-job
-    -- slots and staging bytes the largest explicit request needs.
-    jobHeadroom = if explicit then 0 else limitQueryRegions (mLimits m)
+    -- Camera work is best effort and leaves room for explicit requests: the staging
+    -- bytes the largest explicit request needs.
     stagingHeadroom = if explicit then 0 else limitExplicitStagingBytes (mLimits m)
     slotFree slot n =
       let total = limitSlot (mLimits m) slot
@@ -1081,21 +1089,61 @@ cameraFree m staging =
       headroom = limitExplicitStagingBytes (mLimits m)
    in if free > headroom then free - headroom else 0
 
+-- | Normalize a camera description: unsupported keys are excluded, cells outside the
+-- configured extent are clipped away (a region left with none is excluded), and
+-- repeated keys coalesce into the first occurrence, which keeps the priority order.
+normalizeCamera ∷ (Int, Int, Int) → [RegionDemand] → ([RegionDemand], [RegionCoord])
+normalizeCamera extent = foldl' step' ([], [])
+  where
+    (ex, ey, ez) = extent
+    window = either (const Nothing) Just (coverageBox 0 ex 0 ey 0 ez)
+    clip cover = case window of
+      Just box → coverageDifference cover (coverageDifference cover box)
+      Nothing → cover
+    step' (kept, excluded) (RegionDemand region cover)
+      | not (supportedRegion region) = (kept, excluded <> [region | region `notElem` excluded])
+      | coverageIsEmpty clipped = (kept, excluded <> [region | region `notElem` excluded])
+      | any ((== region) . demandRegion) kept =
+          (map (\d → if demandRegion d == region then d {demandCoverage = coverageUnion (demandCoverage d) clipped} else d) kept, excluded)
+      | otherwise = (kept <> [RegionDemand region clipped], excluded)
+      where
+        clipped = clip cover
+
+-- | Withdraw a view's demand: its interests, description and unneeded jobs.
+clearView ∷ Model → ViewId → (Model, [RegionCoord], [JobId], [JobId])
+clearView m v = case Map.lookup v (mViews m) of
+  Nothing → (m, [], [], [])
+  Just w →
+    let m1 = withdrawOwner (OwnerView v) m {mViews = Map.delete v (mViews m)}
+        (m2, gone, cancelling) = pruneJobs m1
+     in (m2, map demandRegion (vwDemand w), gone, cancelling)
+
 setCamera ∷ Model → ViewId → ArenaId → [RegionDemand] → Run
-setCamera m v a demands = do
+setCamera m v a demands0 = do
   _ ← liveArena m a
-  -- Camera demand is best effort: it has no region cap and is never refused as
-  -- invalid for its size. The replacement description is held for as long as the
-  -- demand is, beside the interests the view retains in the regions it keeps;
-  -- camera work leaves the explicit requests' staging headroom free, so a
-  -- description that does not fit is busy and the previous demand stays.
-  checkDemand m Nothing demands
-  let newBytes = descriptionBytes (fromIntegral (length demands))
+  -- Camera demand is best effort and its description is normalized, never refused:
+  -- an empty description withdraws the demand, repeated keys coalesce, unsupported
+  -- keys and cells outside the extent are excluded and reported. The description is
+  -- bounded: its structural maximum, and the staging the camera may use beside the
+  -- headroom kept for explicit requests (the replaced description is released first),
+  -- cut the end of it, the lowest priority, and the remainder is reported.
+  let limits = mLimits m
+      (normal, excluded) = normalizeCamera (limitExtent limits) demands0
       oldBytes = maybe 0 (descriptionBytes . fromIntegral . length . vwDemand) (Map.lookup v (mViews m))
       staging = bankLedger m StagingBank
-  if newBytes > oldBytes && newBytes - oldBytes > cameraFree m staging
-    then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) (newBytes - oldBytes)))
-    else Right ()
+      share = cameraFree m staging + oldBytes
+      fitting = if share >= descriptionBytes 0 then (share - descriptionBytes 0) `div` 64 else 0
+      keep = fromIntegral (min (min (fromIntegral (length normal)) (limitCameraRegions limits)) fitting) ∷ Int
+      demands = take keep normal
+      truncated = map demandRegion (drop keep normal)
+  if null demands
+    then
+      let (mCleared, regions, gone, cancelling) = clearView m v
+       in Right (mCleared, CameraSet [] [] regions gone cancelling excluded truncated)
+    else setCameraNormal m v a demands excluded truncated
+
+setCameraNormal ∷ Model → ViewId → ArenaId → [RegionDemand] → [RegionCoord] → [RegionCoord] → Run
+setCameraNormal m v a demands excluded truncated = do
   let wanted = Set.fromList [(a, demandRegion d) | d ← demands]
       owner = OwnerView v
       obsolete =
@@ -1135,7 +1183,7 @@ setCamera m v a demands = do
   -- Dropping an obsolete interest may have freed a slot or bytes: offer them to
   -- the regions that stayed pending, once.
   (m5, admitted2, pending2, _, gone2, cancelling2) ← foldM attempt (m4, admitted, [], [], gone1, cancelling1) [d | d ← demands, demandRegion d `elem` pending]
-  Right (m5, CameraSet admitted2 pending2 (map snd obsolete <> replaced) gone2 cancelling2)
+  Right (m5, CameraSet admitted2 pending2 (map snd obsolete <> replaced) gone2 cancelling2 excluded truncated)
 
 -- | Retry the pending part of every view's latest camera demand, in view order.
 service ∷ Model → (Model, Decision)
@@ -1171,6 +1219,7 @@ service m0 =
 dispatch ∷ Model → (Model, Decision)
 dispatch m =
   case sortOn rank queued of
+    _ | slotInUse m LoadJobSlot >= limitSlot (mLimits m) LoadJobSlot → (m, NothingToDispatch)
     [] → (m, NothingToDispatch)
     ((jid, job, _) : _) →
       let clock = mClock m
@@ -1204,12 +1253,23 @@ completeJob m jid cost = case Map.lookup jid (mJobs m) of
     JobPending → Left (ContractFailure (JobNotRunning jid))
     JobCancelling → Right (discard job)
     JobRunning → do
-          bytes ← maybe (Left (ContractFailure CostOverflow)) Right (costBytes cost)
           let key = (jbArena job, jbRegion job)
               target = fromMaybe (Target Nothing Map.empty) (Map.lookup key (mTargets m))
               meta = if isNothing (tgResident target) then regionMetadataBytes else 0
+              before = maybe 0 (coverageColumns . rsCoverage) (tgResident target)
+              after = maybe (jbCoverage job) (coverageUnion (jbCoverage job) . rsCoverage) (tgResident target)
+              -- A region is charged for its own column entries, once each: the
+              -- columns its coverage gains, not the columns each job reports, so the
+              -- charge of many jobs in one column cannot exceed the region's maximum.
+              gained = coverageColumns after - before
+          bytes ← maybe (Left (ContractFailure CostOverflow)) Right (costBytes cost {costColumns = gained})
           actual ← maybe (Left (ContractFailure CostOverflow)) Right (checkedAdd bytes meta)
           if actual > jbActive job then Left (ContractFailure (CostExceedsReservation (jbActive job) actual)) else Right ()
+          -- No region can occupy more than the configured extent allows; a cost that
+          -- would is an impossible figure from the owner.
+          let total = maybe 0 rsBytes (tgResident target) + actual
+              largest = limitRegionStoredBytes (mLimits m)
+          if total > largest then Left (ContractFailure (RegionExceedsMaximum total largest)) else Right ()
           let res = case tgResident target of
                 Nothing → Residence (jbCoverage job) actual (mClock m) False 0 Nothing False
                 Just r → r {rsCoverage = coverageUnion (rsCoverage r) (jbCoverage job), rsBytes = rsBytes r + actual, rsLastUse = mClock m}
@@ -1312,15 +1372,27 @@ acquireHold m h a kind regions = do
         _ → Left (Stale (NotResident r))
     )
     regions
+  -- A hold is bounded by a static region cap, a typed refusal when exceeded; its
+  -- records and the bytes it pins draw on what camera work may use, never on the
+  -- headroom kept for explicit requests.
+  let holdCap = limitHoldRegions (mLimits m)
+  if fromIntegral (length regions) > holdCap then Left (Invalid (DemandTooLarge (length regions) holdCap)) else Right ()
   let bytes = fromIntegral (length regions) * holdRecordBytes
       staging = bankLedger m StagingBank
+      residentLedger = bankLedger m ResidentBank
+      held0 = Set.fromList [(hdArena hd, r) | hd ← Map.elems (mHolds m), r ← hdRegions hd]
+      sizeOf key = maybe 0 rsBytes (Map.lookup key (mTargets m) >>= tgResident)
+      pinned = sum (map sizeOf (Set.toList held0))
+      adding = sum [sizeOf (a, r) | r ← regions, not (Set.member (a, r) held0)]
+      pinCap = let limit = ledgerLimit residentLedger; reserve = limitExplicitResidentBytes (mLimits m) in if limit > reserve then limit - reserve else 0
+  if pinned + adding > pinCap then Left (Busy (BankFull ResidentBank pinCap pinned adding)) else Right ()
   case kind of
     Pin v → do
       let total = limitSlot (mLimits m) ViewPinSlot
           used = viewPins m v
       if used + 1 > total then Left (Busy (SlotFull ViewPinSlot total used 1)) else Right ()
     Borrow → Right ()
-  if bytes > freeBytes staging then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) bytes)) else Right ()
+  if bytes > cameraFree m staging then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) bytes)) else Right ()
   let touch key mm = case Map.lookup key (mTargets mm) of
         Just t@Target {tgResident = Just r} → mm {mTargets = Map.insert key t {tgResident = Just r {rsLastUse = mClock mm}} (mTargets mm)}
         _ → mm

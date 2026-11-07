@@ -132,10 +132,13 @@ module Hetoimasia.Terrain.Residency
   , limitQueryRegions
   , limitExtent
   , limitExplicitStagingBytes
+  , limitExplicitResidentBytes
+  , limitHoldRegions
+  , limitCameraRegions
   , limitRegionStoredBytes
   , limitAgingQuanta
   , minimumBytes
-  , minimumLoadJobs
+  , explicitMinimumBytes
 
     -- * Coverage and charges
   , Coverage

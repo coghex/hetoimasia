@@ -30,6 +30,7 @@ module Test.Terrain.ResidencySupport
   , box
   , demand
   , oneCellCost
+  , honestCost
 
     -- * Stepping with checks
   , Ledgers (..)
@@ -88,15 +89,28 @@ removalStaging = 512
 oneCellCost ∷ Cost
 oneCellCost = Cost {costColumns = 1, costSegments = 1, costPayloadBytes = 2}
 
+-- | What an honest data layer reports for a job: the net growth of what it stores.
+-- Its cells are new to the region, so each adds two payload bytes, and the segments
+-- are those the region gains once the new cells merge into the ones it has (columns
+-- are charged by the model from the coverage, whatever is reported).
+honestCost ∷ Model → JobInfo → Cost
+honestCost m j =
+  let prior = [regionCoverage r | r ← modelRegions m, regionArena r == jobArena j, regionCoord r == jobRegion j]
+      united = foldr coverageUnion (jobCoverage j) prior
+      before = sum (map coverageSegments prior)
+      gained = if coverageSegments united > before then coverageSegments united - before else 0
+   in Cost 0 gained (2 * coverageCells (jobCoverage j))
+
 -- | The tiny budget the traces share: two one-cell regions fit, three do not. Its
 -- caps are two regions per request and a one-cell extent, so its banks satisfy
 -- the minimum budgets (a request of two regions needs 964 resident bytes).
 tiny ∷ Limits
 tiny = limitsWith id
 
--- | The tiny specification: two regions per request, a one-cell extent, and banks
--- that meet the minimum budgets (a request of two regions needs 964 resident bytes
--- and 994 staging bytes).
+-- | The tiny specification: two regions per query, a one-cell extent, holds of up to
+-- four regions, camera descriptions of up to 64, and banks that meet the minimum
+-- budgets (a query of two regions needs 964 resident bytes, and 994 staging bytes
+-- plus 64 for each region of the largest hold).
 baseSpec ∷ LimitsSpec
 baseSpec =
   LimitsSpec
@@ -112,6 +126,8 @@ baseSpec =
     , specExtentX = 1
     , specExtentY = 1
     , specExtentZ = 1
+    , specHoldRegions = 4
+    , specCameraRegions = 64
     }
 
 -- | Validated limits from the tiny budget with some figures changed. A change

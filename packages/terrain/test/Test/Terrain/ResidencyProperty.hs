@@ -37,14 +37,14 @@ import Test.Terrain.ResidencyOracle (Verdict (..), oracle)
 import Test.Terrain.ResidencySupport
 
 -- | Tight enough that every kind of pressure occurs within a few events: the
--- smallest resident bank its caps allow is 2,480 bytes (two regions, each at its
--- stored maximum of 568 bytes plus a job of 672), and the extent is two columns,
--- one row and six levels.
+-- smallest resident bank its caps allow is 2,864 bytes (two regions, each at its
+-- stored maximum of 760 bytes plus a job of 672; a hold may pin what is left beyond
+-- it), and the extent is two columns, one row and six levels.
 pressure ∷ Limits
 pressure =
   limitsWith $ \s →
     s
-      { specResidentBytes = 2500
+      { specResidentBytes = 3700
       , specEditBytes = 640
       , specStagingBytes = 3000
       , specLoadJobs = 4
@@ -56,6 +56,8 @@ pressure =
       , specExtentX = 2
       , specExtentY = 1
       , specExtentZ = 6
+      , specHoldRegions = 4
+      , specCameraRegions = 64
       }
 
 pick ∷ [a] → Int → Maybe a
@@ -157,9 +159,7 @@ eventFor m (k, a, b) = case k `mod` 22 of
           isOwn j = or [(jobArena j, jobRegion j) == (ar, g) && coverageIntersects (jobCoverage j) c | (ar, g, c) ← ownCells]
           (first, rest) = (filter isOwn js, filter (not . isOwn) js)
        in if null first then rest else first
-    completion j =
-      let c = jobCoverage j
-       in JobCompleted (jobId j) (Cost 0 (coverageSegments c) (coverageCells c))
+    completion j = JobCompleted (jobId j) (honestCost m j)
 
 -- | For an explicit query or removal that is otherwise well formed, the class the
 -- brute-force oracle says the answer must be, and the class the model gave.
@@ -284,7 +284,7 @@ roomyPressure ∷ Limits
 roomyPressure =
   limitsWith $ \s →
     s
-      { specResidentBytes = 6000
+      { specResidentBytes = 8000
       , specEditBytes = 2048
       , specStagingBytes = 12000
       , specLoadJobs = 8
@@ -296,6 +296,8 @@ roomyPressure =
       , specExtentX = 2
       , specExtentY = 1
       , specExtentZ = 6
+      , specHoldRegions = 4
+      , specCameraRegions = 64
       }
 
 runSequenceWith ∷ Limits → [(Int, Int, Int)] → (Either String Model, Stats)
@@ -387,8 +389,7 @@ converge n m0 =
         _ → False
       (m2, dispatched) = dispatchAll m1 (0 ∷ Int)
       running = [j | j ← modelJobs m2, jobPhase j == JobRunningPhase]
-      leastCost j = let c = jobCoverage j in Cost (coverageColumns c) (coverageSegments c) (2 * coverageSegments c)
-      m3 = foldl (\mm j → fst (step mm (JobCompleted (jobId j) (leastCost j)))) m2 running
+      m3 = foldl (\mm j → fst (step mm (JobCompleted (jobId j) (honestCost mm j)))) m2 running
    in if not admittedAny && dispatched == 0 && null running && null [() | r ← modelRegions m3, regionEvicting r]
         then Right m3
         else converge (n - 1) m3
@@ -432,6 +433,8 @@ limitsOf (resident, staging, jobs) =
       , specExtentX = 2
       , specExtentY = 1
       , specExtentZ = 6
+      , specHoldRegions = 4
+      , specCameraRegions = 64
       }
 
 -- | A camera demand completes when it is alone and the camera's share of the banks
@@ -516,6 +519,28 @@ quiesce m0 = do
       offload m r = fst (step (fst (step m (BeginHandoff (regionArena r) (regionCoord r) 0))) (HandoffConfirmed (regionArena r) (regionCoord r)))
   settleEverything (foldl offload m1 dirty)
 
+-- | The reservation admission computes for an in-cap explicit request, into a model
+-- that holds nothing, never exceeds the worst case the construction check assumed:
+-- resident and staging bytes (reserved and occupied) stay within the explicit
+-- minimum for their bank.
+reservationWithinMinimum ∷ [(Int, Int)] → Property
+reservationWithinMinimum picks =
+  let empty = modelAfter pressure []
+   in conjoin
+        [ counterexample (what <> " reserved more than the construction-time worst case: " <> show (ledgersOf m)) $
+            conjoin
+              [ resident ledgersOfModel <= toInteger (limitExplicitResidentBytes pressure)
+              , staging ledgersOfModel <= toInteger (limitExplicitStagingBytes pressure)
+              ]
+        | (what, event) ← inCapRequests empty picks
+        , what /= "camera"
+        , (m, Right _) ← [step empty event]
+        , let ledgersOfModel = ledgersOf m
+        ]
+  where
+    resident l = let (o, r) = (\(Ledgers a _ _) → a) l in toInteger (o + r)
+    staging l = let (o, r) = (\(Ledgers _ _ c) → c) l in toInteger (o + r)
+
 -- | Explicit requests are not blocked by camera holdings beyond what eviction can
 -- release: with every camera demand left in place (their interests, descriptions
 -- and any regions they have loaded), once the owner has released everything else, an
@@ -555,7 +580,7 @@ overCapAlwaysInvalid seeds =
            in conjoin
                 [ expect "a three-region query" (SubmitQuery (RequestId 1000000) a rev three) (Invalid (DemandTooLarge 3 2))
                 , expect "a cell above the extent" (SubmitQuery (RequestId 1000000) a rev (outside 6 0)) (Invalid (OutsideExtent (reg 0 0 0)))
-                , expect "a cell beyond the extent's columns" (SetCameraDemand (ViewId 7) a (outside 0 2)) (Invalid (OutsideExtent (reg 0 0 0)))
+                , expect "a cell beyond the extent's columns" (SubmitQuery (RequestId 1000000) a rev (outside 0 2)) (Invalid (OutsideExtent (reg 0 0 0)))
                 ]
           where
             expect what event want = case snd (step m event) of
@@ -581,19 +606,20 @@ minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, x, y, z) =
           , specExtentX = x
           , specExtentY = y
           , specExtentZ = z
+          , specHoldRegions = 4
+          , specCameraRegions = 64
           }
       columns = x * y
       intervals = columns * ((z + 1) `div` 2)
-      stored = 256 + 48 * columns + 32 * intervals + 2 * columns * z
+      stored = 256 + 48 * columns + 34 * columns * z
       job = 48 * columns + 96 * intervals
       scratch = 256 + 2 * columns * z
       needResident = maximum [query * (stored + job), stored + 48 + 96 + 62]
-      needStaging = maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258, stored]
+      needStaging = 64 * 4 + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258, stored]
       expected
         | resident < needResident = Just (BankBelowMinimum ResidentBank needResident resident)
         | edit < 64 = Just (BankBelowMinimum EditBank 64 edit)
         | staging < needStaging = Just (BankBelowMinimum StagingBank needStaging staging)
-        | jobs < query = Just (LoadJobsBelowMinimum query jobs)
         | otherwise = Nothing
    in counterexample (show (spec', expected)) $ case (mkLimits spec', expected) of
         (Right _, Nothing) → property True
@@ -615,7 +641,7 @@ spec = describe "Residency model properties" $ do
           (Right _, _) → property True
   it "completes every in-cap camera demand when it is alone, under random valid budgets and leftovers" $
     withNumTests 2000 $
-      forAll ((,,) <$> chooseInteger (2480, 5000) <*> chooseInteger (3000, 8000) <*> chooseInteger (4, 6)) $ \limitsTriple →
+      forAll ((,,) <$> chooseInteger (2864, 5000) <*> chooseInteger (3000, 8000) <*> chooseInteger (4, 6)) $ \limitsTriple →
         forAll (vectorOf 3 pair) $ \leftovers →
           forAll (vectorOf 4 pair) $ \picks →
             acceptedDemandCompletes limitsTriple leftovers picks
@@ -625,6 +651,9 @@ spec = describe "Residency model properties" $ do
   it "admits every in-cap request once everything releasable has been released" $
     withNumTests 300 $
       forAll seedsOf $ \seeds → forAll (vectorOf 3 pair) $ \picks → busyEndsWhenReleased seeds picks
+  it "never reserves more for an explicit request than the construction-time worst case" $
+    withNumTests 2000 $
+      forAll (vectorOf 3 pair) reservationWithinMinimum
   it "never blocks an explicit request on camera holdings, whatever demands the cameras left" $
     withNumTests 300 $
       forAll seedsOf $ \seeds → forAll (vectorOf 3 pair) $ \picks → explicitWithCameraPresent seeds picks

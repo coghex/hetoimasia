@@ -19,6 +19,7 @@ module Test.Terrain.Residency (spec) where
 
 import Control.Monad (foldM, forM_)
 import Data.List (sort)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, tileCoord)
 import Hetoimasia.Terrain.Residency
 import Test.Hspec
@@ -69,10 +70,12 @@ defaultSpec =
     , specPinsPerView = 2
     
     , specAgingQuanta = 8
-    , specQueryRegions = 16
+    , specQueryRegions = 257
     , specExtentX = 16
     , specExtentY = 16
     , specExtentZ = 32
+    , specHoldRegions = 16384
+    , specCameraRegions = 16384
     }
 
 opened ∷ Limits → IO Model
@@ -137,9 +140,8 @@ drainDemand = go (60 ∷ Int)
             Serviced [] → pure m'
             _ → go (n - 1) m'
     victims m = [VictimReleased (regionArena r) (regionCoord r) | r ← modelRegions m, regionEvicting r]
-    running m = [JobCompleted (jobId j) (leastCost (jobCoverage j)) | j ← modelJobs m, jobPhase j == JobRunningPhase]
+    running m = [JobCompleted (jobId j) (honestCost m j) | j ← modelJobs m, jobPhase j == JobRunningPhase]
     queued m = [Dispatch | any ((== JobQueued) . jobPhase) (modelJobs m)]
-    leastCost c = Cost (coverageColumns c) (coverageSegments c) (2 * coverageSegments c)
 
 -- | Remove a cell and take the edit through its commit; returns the new model
 -- and revision.
@@ -148,7 +150,9 @@ removeCellAt m a rev rid tile = do
   (m1, accepted) ← stepOk m (SubmitRemoval (RequestId (fromInteger rid)) a rev tile)
   case jobsOf accepted of
     [j] → do
-      m2 ← stepsOk m1 [Dispatch, JobCompleted j oneCellCost]
+      m1d ← stepsOk m1 [Dispatch]
+      let cost = maybe oneCellCost (honestCost m1d) (listToMaybe [x | x ← modelJobs m1d, jobId x == j])
+      m2 ← stepsOk m1d [JobCompleted j cost]
       let Revision n = rev
           next = Revision (n + 1)
       (m3, committed) ← stepOk m2 (RemovalCommitted (RequestId (fromInteger rid)) next 64 0)
@@ -164,23 +168,28 @@ limitSpec = describe "validated limits" $ do
     let l = defaultLimits
     (limitBytes l ResidentBank, limitBytes l EditBank, limitBytes l StagingBank) `shouldBe` (256 * 1048576, 64 * 1048576, 128 * 1048576)
     (limitSlot l LoadJobSlot, limitSlot l CommandSlot, limitSlot l ViewPinSlot) `shouldBe` (128, 256, 2)
-    -- The explicit request caps: 16 regions in a query and a region's whole
-    -- 16 x 16 x 32 extent. Camera demand has no cap: it is best effort.
-    (limitQueryRegions l, limitExtent l) `shouldBe` (16, (16, 16, 32))
+    -- The explicit request caps: 257 regions in a query (the approved 8,192-level column
+    -- spans up to 257) and a region's whole 16 x 16 x 32 extent. Camera demand has no
+    -- cap: it is best effort. A hold names at most 16,384 regions, and a stored camera
+    -- description is bounded at 16,384 (more than the approved view envelope needs).
+    (limitQueryRegions l, limitExtent l) `shouldBe` (257, (16, 16, 32))
+    (limitHoldRegions l, limitCameraRegions l) `shouldBe` (16384, 16384)
     mkLimits defaultSpec `shouldBe` Right l
-    -- The worst cases, computed by hand. A region at the extent's maximum stores
-    -- 256 + 256 columns x 48 + 4,096 segments x 32 + 8,192 cells x 2 = 160,000
-    -- bytes; the largest job beyond it reserves 256 x 48 + 4,096 x 96 = 405,504;
-    -- a 16-region query needs 9,048,064 resident bytes of the 268,435,456 available.
-    limitRegionStoredBytes l `shouldBe` 160000
-    minimumBytes defaultSpec ResidentBank `shouldBe` 16 * (160000 + 405504)
-    -- Staging for a 16-region query: command 128 + 32 x 16, an interest each (64 x 16)
-    -- and the scratch of each load, 256 + 2 x 8,192 = 16,640: 267,904 of 134,217,728,
-    -- which camera work always leaves free.
-    minimumBytes defaultSpec StagingBank `shouldBe` 128 + 32 * 16 + 64 * 16 + 16 * 16640
-    limitExplicitStagingBytes l `shouldBe` 267904
+    -- The worst cases, computed by hand. A region at the extent's maximum, every cell
+    -- its own segment, stores 256 + 256 columns x 48 + 8,192 cells x (32 + 2) =
+    -- 291,072 bytes; the largest job beyond it reserves 256 x 48 + 4,096 x 96 =
+    -- 405,504; a 257-region query needs 179,020,032 resident bytes of the 268,435,456
+    -- available.
+    limitRegionStoredBytes l `shouldBe` 291072
+    explicitMinimumBytes defaultSpec ResidentBank `shouldBe` 257 * (291072 + 405504)
+    limitExplicitResidentBytes l `shouldBe` 179020032
+    -- Staging for a 257-region query: command 128 + 32 x 257, an interest each (64 x
+    -- 257) and the scratch of each load, 256 + 2 x 8,192 = 16,640: 4,301,280, which
+    -- camera work and holds always leave free; a hold adds 64 per region of its 16,384.
+    explicitMinimumBytes defaultSpec StagingBank `shouldBe` 128 + 32 * 257 + 64 * 257 + 257 * 16640
+    limitExplicitStagingBytes l `shouldBe` 4301280
+    minimumBytes defaultSpec StagingBank `shouldBe` 4301280 + 64 * 16384
     minimumBytes defaultSpec EditBank `shouldBe` 64
-    minimumLoadJobs defaultSpec `shouldBe` 16
   it "refuses a zero, negative or unrepresentable limit by field, without clamping" $ do
     let spec0 = baseSpec
     fmap (const ()) (mkLimits spec0) `shouldBe` (Right () ∷ Either LimitError ())
@@ -204,28 +213,31 @@ limitSpec = describe "validated limits" $ do
     -- a 144-byte job (48 column + 96 segment), so a request needs 2 x 482 = 964.
     mkLimits baseSpec {specResidentBytes = 963} `shouldBe` Left (BankBelowMinimum ResidentBank 964 963)
     fmap (const ()) (mkLimits baseSpec {specResidentBytes = 964}) `shouldBe` Right ()
-    -- A removal is the largest staging request here: command 160 + removal 512 +
+    -- A removal is the largest explicit staging request here: command 160 + removal 512 +
     -- interest 64 + the scratch of its one cell, 258.
-    mkLimits baseSpec {specStagingBytes = 993} `shouldBe` Left (BankBelowMinimum StagingBank 994 993)
-    fmap (const ()) (mkLimits baseSpec {specStagingBytes = 994}) `shouldBe` Right ()
+    -- (plus 64 for each of the four regions of the largest hold: 994 + 256)
+    mkLimits baseSpec {specStagingBytes = 1249} `shouldBe` Left (BankBelowMinimum StagingBank 1250 1249)
+    fmap (const ()) (mkLimits baseSpec {specStagingBytes = 1250}) `shouldBe` Right ()
     -- One removal retains 64 bytes.
     mkLimits baseSpec {specEditBytes = 63} `shouldBe` Left (BankBelowMinimum EditBank 64 63)
-    -- A query of three regions can need three jobs at once.
-    mkLimits baseSpec {specQueryRegions = 3, specLoadJobs = 2, specResidentBytes = 4000} `shouldBe` Left (LoadJobsBelowMinimum 3 2)
+    -- A query may name more regions than there are load-job slots: a slot is taken at
+    -- dispatch.
+    fmap (const ()) (mkLimits baseSpec {specQueryRegions = 3, specLoadJobs = 1, specResidentBytes = 4000}) `shouldBe` Right ()
     -- The first bank below its minimum, in the order resident, edit, staging.
     mkLimits baseSpec {specResidentBytes = 100, specStagingBytes = 100} `shouldBe` Left (BankBelowMinimum ResidentBank 964 100)
   it "admits the largest request even when every region it names already holds the most its extent allows" $ do
-    -- Extent 2 x 1 x 6. A region stores at most 256 + 2 x 48 + 6 x 32 + 12 x 2 = 568
-    -- bytes (six isolated cells over two columns), and a job over the extent reserves
-    -- at most 2 x 48 + 6 x 96 = 672 more: two such regions need exactly 2,480 bytes.
-    let spec' = baseSpec {specResidentBytes = 2480, specStagingBytes = 994, specExtentX = 2, specExtentZ = 6}
+    -- Extent 2 x 1 x 6. A region stores at most 256 + 2 x 48 + 12 x 34 = 760 bytes (every
+    -- cell its own segment, which removals can make of it), and a job over the extent
+    -- reserves at most 2 x 48 + 6 x 96 = 672 more: two such regions need exactly 2,864
+    -- bytes.
+    let spec' = baseSpec {specResidentBytes = 2864, specStagingBytes = 1250, specExtentX = 2, specExtentZ = 6}
         cols zs = foldr1 coverageUnion [cell x 0 z | x ← [0, 1], z ← zs]
         odds = cols [1, 3, 5]
         evens = cols [0, 2, 4]
         pair' rid c = SubmitQuery (RequestId rid) a1 rev0 [demand (reg 0 0 0) c, demand (reg 1 0 0) c]
-    minimumBytes spec' ResidentBank `shouldBe` 2480
+    minimumBytes spec' ResidentBank `shouldBe` 2864
     limits ← either (\e → expectationFailure (show e) >> fail "limits") pure (mkLimits spec')
-    mkLimits spec' {specResidentBytes = 2479} `shouldBe` Left (BankBelowMinimum ResidentBank 2480 2479)
+    mkLimits spec' {specResidentBytes = 2863} `shouldBe` Left (BankBelowMinimum ResidentBank 2864 2863)
     m0 ← opened limits
     (m1, first) ← stepOk m0 (pair' 1 odds)
     let jobs = jobsOf first
@@ -233,7 +245,7 @@ limitSpec = describe "validated limits" $ do
     m2 ← stepsOk m1 (Dispatch : Dispatch : [JobCompleted j (Cost 2 6 24) | j ← jobs])
     map regionBytes (modelRegions m2) `shouldBe` [568, 568]
     m3 ← withdraw m2 1
-    -- Every region holds the most it can; the largest job beyond it fits exactly.
+    -- Every region holds what two queries made of it; the largest job fits with room to spare.
     (m4, second) ← stepOk m3 (pair' 2 evens)
     admissionVictims (admission second) `shouldBe` []
     admissionDeferred (admission second) `shouldBe` 0
@@ -249,7 +261,12 @@ limitSpec = describe "validated limits" $ do
     -- A cell outside the one-cell extent, in each axis.
     forM_ [cell 1 0 0, cell 0 1 0, cell 0 0 1] $ \c → do
       stepRefused m0 (q 1 (reg 0 0 0) c) `shouldReturn` Invalid (OutsideExtent (reg 0 0 0))
-      stepRefused m2 (SetCameraDemand (ViewId 1) a1 [demand (reg 2 0 0) c]) `shouldReturn` Invalid (OutsideExtent (reg 2 0 0))
+      -- A camera demand is normalized, not refused: cells outside the extent are clipped
+      -- away and a region left with none is excluded and reported.
+      (_, clipped) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [demand (reg 2 0 0) c])
+      case reportDecision clipped of
+        CameraSet _ _ _ _ _ excluded _ → excluded `shouldBe` [reg 2 0 0]
+        other → expectationFailure (show other)
     stepRefused m0 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 1 0 0)) `shouldReturn` Invalid (OutsideExtent (reg 0 0 0))
     stepRefused m0 (SubmitQuery (RequestId 1) a1 rev0 []) `shouldReturn` Invalid EmptyDemand
     stepRefused m0 (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 0) (cell 0 0 0), demand (reg 0 0 0) (cell 0 0 0)])
@@ -276,7 +293,11 @@ limitSpec = describe "validated limits" $ do
     forM_ accepted' $ \r → stepOk m0 (q 1 r (cell 0 0 0))
     forM_ refused' $ \r → do
       stepRefused m0 (q 1 r (cell 0 0 0)) `shouldReturn` Invalid (UnsupportedRegion r)
-      stepRefused m0 (SetCameraDemand (ViewId 1) a1 [demand r (cell 0 0 0)]) `shouldReturn` Invalid (UnsupportedRegion r)
+      -- A camera description excludes and reports the key; nothing is loaded for it.
+      (_, camera) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand r (cell 0 0 0)])
+      case reportDecision camera of
+        CameraSet admitted _ _ _ _ excluded _ → (length admitted, excluded) `shouldBe` (0, [r])
+        other → expectationFailure (show other)
 
 -- ---------------------------------------------------------------------------
 
@@ -290,9 +311,12 @@ ledgerSpec = describe "separate resident, edit and staging ledgers" $ do
     -- Reserved, not yet occupied: 400 resident, 258 scratch; occupied staging is
     -- the command (160) and the interest (64).
     ledgersOf m1 `shouldBe` Ledgers (0, 400) (0, 0) (224, 258)
-    (slotInUse m1 LoadJobSlot, slotInUse m1 CommandSlot) `shouldBe` (1, 1)
+    -- A job holds only its reservation until it is dispatched; a load-job slot is
+    -- taken at dispatch.
+    (slotInUse m1 LoadJobSlot, slotInUse m1 CommandSlot) `shouldBe` (0, 1)
     (m2, _) ← stepOk m1 Dispatch
     ledgersOf m2 `shouldBe` ledgersOf m1
+    (slotInUse m2 LoadJobSlot, slotInUse m2 CommandSlot) `shouldBe` (1, 1)
     (m3, done) ← stepOk m2 (JobCompleted (JobId 0) oneCellCost)
     reportDecision done `shouldBe` Published (JobId 0) [OwnerRequest (RequestId 1)]
     ledgersOf m3 `shouldBe` Ledgers (338, 0) (0, 0) (224, 0)
@@ -328,18 +352,28 @@ fullBankSpec = describe "each bank and slot full independently" $ do
     r ← stepRefused m2 (q 3 (reg 2 0 0) (cell 0 0 0))
     r `shouldBe` Busy (NoEligibleEviction 76 0 (Blockers 0 0 0 0 2 0 0))
   it "staging bank: busy, naming the bank, its limit, what is in use and what was asked" $ do
-    -- 994 staging bytes is the tiny configuration's minimum. Each one-cell query
+    -- 1,250 staging bytes is the tiny configuration's minimum. Each one-cell query
     -- holds 224 occupied (interest 64 + command 160) and 258 reserved scratch.
-    m0 ← opened (limitsWith $ \s → s {specStagingBytes = 994, specResidentBytes = 4000})
+    m0 ← opened (limitsWith $ \s → s {specStagingBytes = 1250, specResidentBytes = 4000})
     m2 ← foldM (\m i → fst <$> stepOk m (q i (reg i 0 0) (cell 0 0 0))) m0 [1, 2]
-    -- 964 in use; 30 free; 482 asked.
+    -- 964 in use; 286 free; 482 asked.
     r ← stepRefused m2 (q 3 (reg 3 0 0) (cell 0 0 0))
-    r `shouldBe` Busy (BankFull StagingBank 994 964 482)
-  it "job slot: busy" $ do
-    m0 ← opened (limitsWith $ \s → s {specLoadJobs = 1, specQueryRegions = 1, specResidentBytes = 4000})
+    r `shouldBe` Busy (BankFull StagingBank 1250 964 482)
+  it "job slot: an admitted job waits queued for a slot and is dispatched when one frees" $ do
+    m0 ← opened (limitsWith $ \s → s {specLoadJobs = 1, specResidentBytes = 4000})
     m1 ← fst <$> stepOk m0 (q 1 (reg 0 0 0) (cell 0 0 0))
-    r ← stepRefused m1 (q 2 (reg 1 0 0) (cell 0 0 0))
-    r `shouldBe` Busy (SlotFull LoadJobSlot 1 1 1)
+    -- Admission does not need a slot: the second query is admitted and queued.
+    (m2, second) ← stepOk m1 (q 2 (reg 1 0 0) (cell 0 0 0))
+    jobsOf second `shouldBe` [JobId 1]
+    (m3, first) ← stepOk m2 Dispatch
+    reportDecision first `shouldBe` Dispatched (JobId 0) (a1, reg 0 0 0) (cell 0 0 0)
+    slotInUse m3 LoadJobSlot `shouldBe` 1
+    -- The one slot is taken: nothing more is dispatched until the running job completes.
+    (m4, none) ← stepOk m3 Dispatch
+    reportDecision none `shouldBe` NothingToDispatch
+    m5 ← stepsOk m4 [JobCompleted (JobId 0) oneCellCost]
+    (_, next) ← stepOk m5 Dispatch
+    reportDecision next `shouldBe` Dispatched (JobId 1) (a1, reg 1 0 0) (cell 0 0 0)
   it "command slot: busy even for a request that would need no new job" $ do
     m0 ← opened (limitsWith $ \s → s {specQueuedCommands = 1})
     m1 ← fst <$> stepOk m0 (q 1 (reg 0 0 0) (cell 0 0 0))
@@ -430,7 +464,8 @@ sharingSpec = describe "shared work and coverage" $ do
     -- And the other completion order, with no caller leaving.
     m4 ← stepsOk m1 [Dispatch, Dispatch]
     m5 ← stepsOk m4 [JobCompleted (JobId 1) oneCellCost, JobCompleted (JobId 0) oneCellCost]
-    map regionBytes (modelRegions m5) `shouldBe` [338 + 82]
+    -- Two cells of one column: the column entry is charged once, with two segments.
+    map regionBytes (modelRegions m5) `shouldBe` [338 + 34]
   it "keeps jobs apart across arena incarnations and content revisions" $ do
     m0 ← opened roomy
     (m1, _) ← stepOk m0 (OpenArena a2 rev0)
@@ -583,22 +618,24 @@ fundedEvictionSpec = describe "admission funded by a committed eviction" $ do
 lruSpec ∷ Spec
 lruSpec = describe "least-recently-used selection" $ do
   it "skips a held region and a region in use, and chooses the oldest of the rest" $ do
-    let limits = limitsWith $ \s → s {specResidentBytes = 1100, specStagingBytes = 4096}
+    -- (1,302 resident bytes: the 964 an explicit request may need stay unpinned, so a
+    -- hold may pin 338 of them.)
+    let limits = limitsWith $ \s → s {specResidentBytes = 1302, specStagingBytes = 4096}
     m0 ← opened limits
     -- B is loaded first and held, so B is the oldest and must be skipped.
     mB ← loadCell m0 1 (reg 1 0 0) (cell 0 0 0)
     (mHeld, _) ← stepOk mB (AcquireHold (HoldId 1) a1 Borrow [reg 1 0 0])
     mA ← loadCell mHeld 2 (reg 0 0 0) (cell 0 0 0)
     mC ← loadCell mA 3 (reg 2 0 0) (cell 0 0 0)
-    -- A and B and C are all resident (1,014 of 1,100); settle A's and B's
+    -- A and B and C are all resident (1,014 of 1,302); settle A's and B's
     -- requests; C's request stays open, so C is in use.
     mFree ← withdraw mC 1 >>= \m → withdraw m 2
     ledgersOf mFree `shouldBe` Ledgers (1014, 0) (0, 0) (64 + 160 + 64, 0)
-    -- 86 free, 400 needed: 314 from victims. B is oldest but held, C is in use,
+    -- 288 free, 400 needed: 112 from victims. B is oldest but held, C is in use,
     -- so A is the only candidate.
     (_, accepted) ← stepOk mFree (q 4 (reg 3 0 0) (cell 0 0 0))
     admissionVictims (admission accepted) `shouldBe` [(a1, reg 0 0 0)]
-    admissionDeferred (admission accepted) `shouldBe` 314
+    admissionDeferred (admission accepted) `shouldBe` 112
   it "touches a region when a new interest reuses it, moving it to the back" $ do
     let limits = limitsWith $ \s → s {specResidentBytes = 1100, specStagingBytes = 4096}
     m0 ← opened limits
@@ -675,16 +712,19 @@ descentSpec = describe "bounded residency in both directions" $ do
 holdSpec ∷ Spec
 holdSpec = describe "borrowed data and pinned view revisions" $ do
   it "never selects a held region and says so" $ do
-    m0 ← opened tiny
+    -- 1,302 resident bytes: a hold may pin 338 of them. A held region, and two
+    -- regions pinned by open requests, fill all but 288.
+    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1302})
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m1' ← loadCell m1 3 (reg 2 0 0) (cell 0 0 0)
-    (m2, _) ← stepOk m1' (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0])
+    m1'' ← loadCell m1' 4 (reg 3 0 0) (cell 0 0 0)
+    (m2, _) ← stepOk m1'' (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0])
     -- The hold costs 64 staging bytes and protects the region from eviction; the
-    -- other region is pinned by its open request (224 staging bytes).
-    ledgersOf m2 `shouldBe` Ledgers (676, 0) (0, 0) (64 + 224, 0)
-    -- 324 free; a 400-byte job is 76 short and no resident region may be taken.
+    -- others are pinned by their open requests (224 staging bytes each).
+    ledgersOf m2 `shouldBe` Ledgers (1014, 0) (0, 0) (64 + 448, 0)
+    -- 288 free; a 400-byte job is 112 short and no resident region may be taken.
     r ← stepRefused m2 (q 2 (reg 1 0 0) (cell 0 0 0))
-    r `shouldBe` Busy (NoEligibleEviction 76 0 (Blockers 0 0 0 1 1 0 0))
+    r `shouldBe` Busy (NoEligibleEviction 112 0 (Blockers 0 0 0 1 2 0 0))
     -- Released, the same region becomes the victim.
     m3 ← fst <$> stepOk m2 (ReleaseHold (HoldId 1))
     (_, accepted) ← stepOk m3 (q 2 (reg 1 0 0) (cell 0 0 0))
@@ -740,30 +780,27 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     (m2, replaced) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [demand (reg 5 0 0) (cell 0 0 0)])
     -- The shared job survives for view 2; view 1 has a job of its own.
     case reportDecision replaced of
-      CameraSet _ waiting withdrawn cancelled awaiting → (waiting, withdrawn, cancelled, awaiting) `shouldBe` ([], [reg 0 0 0], [], [])
+      CameraSet _ waiting withdrawn cancelled awaiting _ _ → (waiting, withdrawn, cancelled, awaiting) `shouldBe` ([], [reg 0 0 0], [], [])
       other → expectationFailure (show other)
     sort (map jobRegion (modelJobs m2)) `shouldBe` [reg 0 0 0, reg 5 0 0]
   it "admits what fits, keeps the rest as coalesced pending demand and reserves nothing for it" $ do
-    -- Three job slots; four regions named.
-    m0 ← opened roomy
+    -- 964 resident bytes hold two 400-byte jobs; four regions are named.
+    m0 ← opened (limitsWith $ \x → x {specResidentBytes = 964, specStagingBytes = 8192})
     let four = [demand (reg i 0 0) (cell 0 0 0) | i ← [0 .. 3]]
     (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 four)
     case reportDecision set of
-      CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (3, [reg 3 0 0])
+      CameraSet admitted waiting _ _ _ _ _ → (length admitted, waiting) `shouldBe` (2, [reg 2 0 0, reg 3 0 0])
       other → expectationFailure (show other)
-    -- The unadmitted region holds no job, interest or reservation.
-    ledgersOf m1 `shouldBe` Ledgers (0, 3 * 400) (0, 0) (128 + 4 * 64 + 3 * 64, 3 * 258)
-    map viewPending (modelViews m1) `shouldBe` [[reg 3 0 0]]
+    -- The unadmitted regions hold no job, interest or reservation.
+    ledgersOf m1 `shouldBe` Ledgers (0, 2 * 400) (0, 0) (128 + 4 * 64 + 2 * 64, 2 * 258)
+    map viewPending (modelViews m1) `shouldBe` [[reg 2 0 0, reg 3 0 0]]
     -- Pending demand is retried on a service quantum, and only when there is room.
     (m2, idle) ← stepOk m1 Service
     reportDecision idle `shouldBe` Serviced []
     m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 0) oneCellCost]
-    (m4, serviced) ← stepOk m3 Service
-    case reportDecision serviced of
-      Serviced [(ViewId 1, admission')] → admissionJobs admission' `shouldBe` [(JobId 3, reg 3 0 0)]
-      other → expectationFailure (show other)
-    map viewPending (modelViews m4) `shouldBe` [[]]
-  it "preserves the previous demand when the new description cannot be held" $ do
+    (_, still) ← stepOk m3 Service
+    reportDecision still `shouldBe` Serviced []
+  it "cuts the end of a description that does not fit the camera's staging, reports it and still serves the rest" $ do
     -- 2,000 staging bytes, of which camera work leaves 994 for explicit requests: the
     -- view's 192-byte description, its interest (64) and the region job's scratch (258)
     -- are 514; an open request holds 482 more, which leaves camera work 10.
@@ -772,114 +809,14 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     ledgersOf m1 `shouldBe` Ledgers (0, 400) (0, 0) (192 + 64, 258)
     (m2, _) ← stepOk m1 (q 1 (reg 5 0 0) (cell 0 0 0))
     ledgersOf m2 `shouldBe` Ledgers (0, 800) (0, 0) (256 + 224, 516)
-    -- A description of two regions needs 256 bytes, 64 more than is held; only 54 are
-    -- free, so it is busy and the previous demand stays.
-    r ← stepRefused m2 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0), demand (reg 1 0 0) (cell 0 0 0)])
-    r `shouldBe` Busy (BankFull StagingBank 2000 996 64)
-    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0]]
-  it "ignores a late failure of work a commit superseded, and keeps the replacement work" $ do
-    m0 ← opened roomy2
-    -- A camera load is running when a removal commits in its region.
-    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch]
-    (m2, _) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 1))
-    m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 1) oneCellCost]
-    (m4, committed) ← stepOk m3 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
-    reportDecision committed `shouldBe` Committed (Revision 1) 0 [OwnerView (ViewId 1)] [] [JobId 0]
-    -- The next service quantum admits replacement work at the new revision.
-    (m5, serviced) ← stepOk m4 Service
-    case reportDecision serviced of
-      Serviced [(ViewId 1, replacement)] → map snd (admissionJobs replacement) `shouldBe` [reg 0 0 0]
+    -- A description of two regions needs 256 bytes, 64 more than is held; the camera
+    -- may use 10 more, so the second region is cut (the lowest priority), reported, and
+    -- the first keeps being served: the description stays one region.
+    (m3, replaced) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0), demand (reg 1 0 0) (cell 0 0 0)])
+    case reportDecision replaced of
+      CameraSet _ _ _ _ _ excluded truncated → (excluded, truncated) `shouldBe` ([], [reg 1 0 0])
       other → expectationFailure (show other)
-    -- The original job fails late: nothing of the current demand is touched.
-    (m6, late) ← stepOk m5 (JobFailed (JobId 0))
-    reportDecision late `shouldBe` Discarded (JobId 0)
-    map viewFailed (modelViews m6) `shouldBe` [[]]
-    map jobPhase (modelJobs m6) `shouldBe` [JobQueued]
-    [interestOwner i | i ← modelInterests m6] `shouldBe` [OwnerView (ViewId 1)]
-    -- And a late completion of superseded work is dropped the same way.
-    m7 ← stepsOk m5 [JobFailed (JobId 0)]
-    (_, none) ← stepOk m7 Service
-    reportDecision none `shouldBe` Serviced []
-  it "accepts the owner's cancellation acknowledgement of work a commit superseded" $ do
-    m0 ← opened roomy2
-    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch]
-    (m2, _) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 1))
-    m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 1) oneCellCost]
-    (m4, committed) ← stepOk m3 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
-    -- The commit reports the running job; it is cancelling, still holding its slot,
-    -- scratch and reservation until the owner acknowledges.
-    reportDecision committed `shouldBe` Committed (Revision 1) 0 [OwnerView (ViewId 1)] [] [JobId 0]
-    map jobPhase (modelJobs m4) `shouldBe` [JobCancellingPhase]
-    -- (Staging holds the view's 192-byte description and its 64-byte interest.)
-    ledgersOf m4 `shouldBe` Ledgers (338, 400) (64, 0) (256, 258)
-    (m5, acked) ← stepOk m4 (JobAcknowledged (JobId 0))
-    reportDecision acked `shouldBe` Discarded (JobId 0)
-    modelJobs m5 `shouldBe` []
-    ledgersOf m5 `shouldBe` Ledgers (338, 0) (64, 0) (256, 0)
-  it "completes a demand of mixed sizes in either order" $ do
-    -- Extent 2 x 1 x 1. A: one cell (reserves 400, stores 338). B: two cells in two
-    -- columns (reserves 256 + 96 + 64 + 128 = 544, stores 420). Two regions of this
-    -- extent need 2 x (420 + 288) = 1,416 resident bytes at the least.
-    let regionA = demand (reg 0 0 0) (cell 0 0 0)
-        regionB = demand (reg 1 0 0) (coverageUnion (cell 0 0 0) (cell 1 0 0))
-        costB = Cost 2 2 4
-        mixed = limitsWith $ \x → x {specResidentBytes = 1416, specStagingBytes = 4096, specLoadJobs = 4, specExtentX = 2}
-    forM_ [([regionA, regionB], [oneCellCost, costB]), ([regionB, regionA], [costB, oneCellCost])] $ \(order, costs) → do
-      m0 ← opened mixed
-      (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 order)
-      case reportDecision set of
-        CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (2, [])
-        other → expectationFailure (show other)
-      m2 ← stepsOk m1 (Dispatch : Dispatch : [JobCompleted (JobId (fromIntegral i)) c | (i, c) ← zip [0 ∷ Int ..] costs])
-      sum (map regionBytes (modelRegions m2)) `shouldBe` 420 + 338
-      map viewPending (modelViews m2) `shouldBe` [[]]
-  it "admits regions strictly in demand order, so a later region never takes room an earlier one needs" $ do
-    -- Extent 2 x 1 x 4, three regions per demand: a region stores at most 496 and a
-    -- job reserves at most 480 more, so the bank holds 3 x 976 = 2,928 at the least.
-    -- Five unrelated regions are pinned (5 x 338 = 1,690), leaving 1,238. A (two
-    -- columns) reserves 544, leaving 694; B (two intervals in each column) reserves
-    -- 256 + 96 + 4 x 96 = 736 and must wait; C (one cell, 400) would fit the 694 but
-    -- may not take room B is waiting for.
-    let a' = demand (reg 10 0 0) (coverageUnion (cell 0 0 0) (cell 1 0 0))
-        b' = demand (reg 11 0 0) (foldr1 coverageUnion [cell x 0 z | x ← [0, 1], z ← [0, 2]])
-        c' = demand (reg 12 0 0) (cell 0 0 0)
-        limits = limitsWith $ \x → x {specResidentBytes = 2928, specStagingBytes = 4096, specLoadJobs = 4, specQueuedCommands = 8, specExtentX = 2, specExtentZ = 4}
-    m0 ← opened limits
-    pinned ← foldM (\m i → loadCell m i (reg i 0 0) (cell 0 0 0)) m0 [1 .. 5]
-    (m1, set) ← stepOk pinned (SetCameraDemand (ViewId 1) a1 [a', b', c'])
-    case reportDecision set of
-      CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (1, [reg 11 0 0, reg 12 0 0])
-      other → expectationFailure (show other)
-    [jobRegion j | j ← modelJobs m1] `shouldBe` [reg 10 0 0]
-    -- A service quantum keeps the order too: C fits the room that is left but may not
-    -- be admitted ahead of B.
-    (m1', idle) ← stepOk m1 Service
-    reportDecision idle `shouldBe` Serviced []
-    [jobRegion j | j ← modelJobs m1'] `shouldBe` [reg 10 0 0]
-    -- Release the pins and let the owner finish everything: the whole demand completes.
-    m2 ← foldM withdraw m1' [1 .. 5]
-    m3 ← drainDemand m2
-    map viewPending (modelViews m3) `shouldBe` [[]]
-    sort [regionCoord r | r ← modelRegions m3, regionCoord r `elem` [reg 10 0 0, reg 11 0 0, reg 12 0 0]] `shouldBe` [reg 10 0 0, reg 11 0 0, reg 12 0 0]
-  it "waits, rather than failing, when what a replacement retains leaves too little room, and completes once room appears" $ do
-    -- 1,000 resident bytes: A is resident (338) and view 1 keeps it pinned; another
-    -- request pins a second region (338), leaving 324 free. Replacing the demand with
-    -- [A, B] needs B's 400-byte job: B waits, holds nothing, and A is kept.
-    let regionA = demand (reg 0 0 0) (cell 0 0 0)
-        regionB = demand (reg 1 0 0) (cell 0 0 0)
-    m0 ← opened tiny
-    m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
-    m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionA])
-    m2' ← loadCell m2 2 (reg 2 0 0) (cell 0 0 0)
-    (m3, set) ← stepOk m2' (SetCameraDemand (ViewId 1) a1 [regionA, regionB])
-    case reportDecision set of
-      CameraSet admitted waiting _ _ _ → (map admissionShared admitted, waiting) `shouldBe` ([[reg 0 0 0]], [reg 1 0 0])
-      other → expectationFailure (show other)
-    map viewPending (modelViews m3) `shouldBe` [[reg 1 0 0]]
-    -- Once the other request lets go, its region is evicted for B and the demand completes.
-    m4 ← withdraw m3 2
-    m5 ← drainDemand m4
-    map viewPending (modelViews m5) `shouldBe` [[]]
+    map (map demandRegion . viewDemand) (modelViews m3) `shouldBe` [[reg 0 0 0]]
   it "keeps a replacement stageable at the minimum staging bank: the interests it retains are counted" $ do
     -- 1,636 staging bytes: 994 stay free for explicit requests and 642 are the camera's.
     -- View 1 holds B and its 192-byte description; replacing the demand with [A, B] keeps
@@ -894,7 +831,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionB])
     (m3, set) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [regionA, regionB])
     case reportDecision set of
-      CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (2, [])
+      CameraSet admitted waiting _ _ _ _ _ → (length admitted, waiting) `shouldBe` (2, [])
       other → expectationFailure (show other)
     ledgersOf m3 `shouldBe` Ledgers (338, 400) (0, 0) (256 + 2 * 64, 258)
     m4 ← drainDemand m3
@@ -911,7 +848,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     (m2, held) ← stepOk m1' (SetCameraDemand (ViewId 1) a1 [regionA, regionB])
     case reportDecision held of
       -- B waits behind A: regions are admitted strictly in demand order.
-      CameraSet admitted waiting _ _ _ → (concatMap admissionVictims admitted, waiting) `shouldBe` ([], [reg 0 0 0, reg 1 0 0])
+      CameraSet admitted waiting _ _ _ _ _ → (concatMap admissionVictims admitted, waiting) `shouldBe` ([], [reg 0 0 0, reg 1 0 0])
       other → expectationFailure (show other)
     [regionCoord r | r ← modelRegions m2, regionEvicting r] `shouldBe` []
     -- With the pin gone, A is funded from that region, not from B.
@@ -926,14 +863,14 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- in the tiny configuration this is accepted whole and completes.
     let regionN = demand (reg 2 0 0) (cell 0 0 0)
         regionR = demand (reg 0 0 0) (cell 0 0 0)
-    m0 ← opened tiny
+    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1302})
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionR])
     (m3, holdRes) ← stepOk m2 (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0])
     reportDecision holdRes `shouldBe` HoldAcquired
     (m4, set) ← stepOk m3 (SetCameraDemand (ViewId 1) a1 [regionN, regionR])
     case reportDecision set of
-      CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (2, [])
+      CameraSet admitted waiting _ _ _ _ _ → (length admitted, waiting) `shouldBe` (2, [])
       other → expectationFailure (show other)
     m5 ← drainDemand m4
     map viewPending (modelViews m5) `shouldBe` [[]]
@@ -945,13 +882,13 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     (m1, _) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 [level 0])
     (_, queued) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [level 1])
     case reportDecision queued of
-      CameraSet admitted waiting _ dropped awaiting → (map admissionJobs admitted, waiting, dropped, awaiting) `shouldBe` ([[(JobId 1, reg 0 0 0)]], [], [JobId 0], [])
+      CameraSet admitted waiting _ dropped awaiting _ _ → (map admissionJobs admitted, waiting, dropped, awaiting) `shouldBe` ([[(JobId 1, reg 0 0 0)]], [], [JobId 0], [])
       other → expectationFailure (show other)
     -- Running, the job is cancelling and awaits the owner's acknowledgement.
     m2 ← stepsOk m1 [Dispatch]
     (_, running) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [level 1])
     case reportDecision running of
-      CameraSet _ _ _ dropped awaiting → (dropped, awaiting) `shouldBe` ([], [JobId 0])
+      CameraSet _ _ _ dropped awaiting _ _ → (dropped, awaiting) `shouldBe` ([], [JobId 0])
       other → expectationFailure (show other)
   it "reports the jobs a failure leaves without an interest" $ do
     -- Caller 1 asks for level 0 (job 0) and caller 2 for levels 0 and 1 (job 1 covers
@@ -968,7 +905,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     m0 ← opened limits
     (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 far)
     case reportDecision set of
-      CameraSet admitted waiting _ _ _ → (map (map snd . admissionJobs) admitted, waiting) `shouldBe` ([[reg 0 0 0], [reg 1 0 0]], [reg i 0 0 | i ← [2 .. 39]])
+      CameraSet admitted waiting _ _ _ _ _ → (map (map snd . admissionJobs) admitted, waiting) `shouldBe` ([[reg 0 0 0], [reg 1 0 0]], [reg i 0 0 | i ← [2 .. 39]])
       other → expectationFailure (show other)
     -- Nothing is refused or reserved for the rest, and the camera still leaves explicit
     -- work its job slots and staging.
@@ -992,21 +929,10 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- Panning on releases the old interests: the demand moves to the next regions.
     (m8, panned) ← stepOk m7 (SetCameraDemand (ViewId 1) a1 (drop 2 far))
     case reportDecision panned of
-      CameraSet admitted _ _ _ _ → length admitted `shouldSatisfy` (>= 1)
+      CameraSet admitted _ _ _ _ _ _ → length admitted `shouldSatisfy` (>= 1)
       other → expectationFailure (show other)
     m9 ← drainDemand m8
     sort [regionCoord r | r ← modelRegions m9, regionCoord r `elem` [reg i 0 0 | i ← [0 .. 39]]] `shouldBe` [reg 2 0 0, reg 3 0 0]
-  it "leaves explicit work its job slots and staging, however much the camera names" $ do
-    -- Four job slots, two of which stay free for a two-region query.
-    let far = [demand (reg i 0 0) (cell 0 0 0) | i ← [0 .. 9]]
-        limits = limitsWith $ \x → x {specResidentBytes = 40000, specStagingBytes = 8192, specLoadJobs = 4}
-    m0 ← opened limits
-    (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 far)
-    case reportDecision set of
-      CameraSet admitted waiting _ _ _ → (length admitted, length waiting) `shouldBe` (2, 8)
-      other → expectationFailure (show other)
-    (_, explicit) ← stepOk m1 (q2 rev0 1 (reg 100 0 0) (reg 101 0 0))
-    length (admissionJobs (admission explicit)) `shouldBe` 2
   it "keeps the staging an explicit request needs free of camera interests and scratch" $ do
     -- 1,636 staging bytes: 994 stay free for explicit requests, so the camera may use 642.
     -- Its 256-byte description and the first region (interest 64 + scratch 258) take 578;
@@ -1015,27 +941,116 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     m0 ← opened limits
     (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0), demand (reg 1 0 0) (cell 0 0 0)])
     case reportDecision set of
-      CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (1, [reg 1 0 0])
+      CameraSet admitted waiting _ _ _ _ _ → (length admitted, waiting) `shouldBe` (1, [reg 1 0 0])
       other → expectationFailure (show other)
     ledgersOf m1 `shouldBe` Ledgers (0, 400) (0, 0) (256 + 64, 258)
     -- The largest explicit request here (a removal, 994 bytes of staging) is admitted.
     (_, removal) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 16 0 0))
     length (admissionJobs (admission removal)) `shouldBe` 1
   it "withdraws the interest in the coverage a busy replacement replaced" $ do
-    -- View 1 holds level 0 of region A. View 2's load takes the one load-job slot the
-    -- camera may use (the other two stay free for explicit work), so view 1's
-    -- replacement, level 1 of A, is busy: the old interest must not survive it.
-    let level z = demand (reg 0 0 0) (cell 0 0 z)
-        limits = limitsWith $ \x → x {specResidentBytes = 4000, specStagingBytes = 4096, specExtentZ = 2}
+    -- 1,508 staging bytes: 994 stay free for explicit requests. View 1 holds level 0 of
+    -- region A (description 192 + interest 64 once the job's scratch is released) and a
+    -- borrower's record takes 64 more. The replacement, both levels of A, needs 258
+    -- bytes of scratch for level 1 beside the headroom and only 1,188 - 994 = 194 are
+    -- left: it is busy, and the old interest must not survive it.
+    let both = demand (reg 0 0 0) (box 0 1 0 1 0 2)
+        limits = limitsWith $ \x → x {specResidentBytes = 4000, specStagingBytes = 1508, specExtentZ = 2}
     m0 ← opened limits
-    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [level 0], Dispatch, JobCompleted (JobId 0) oneCellCost]
-    m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 2) a1 [demand (reg 5 0 0) (cell 0 0 0)])
-    (m3, replaced) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [level 1])
+    m1a ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch, JobCompleted (JobId 0) oneCellCost]
+    -- A borrower's 64-byte record takes the room the replacement's scratch needs.
+    (m1, _) ← stepOk m1a (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0])
+    (m2, replaced) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [both])
     case reportDecision replaced of
-      CameraSet admitted waiting withdrawn _ _ → (length admitted, waiting, withdrawn) `shouldBe` (0, [reg 0 0 0], [reg 0 0 0])
+      CameraSet admitted waiting withdrawn _ _ _ _ → (length admitted, waiting, withdrawn) `shouldBe` (0, [reg 0 0 0], [reg 0 0 0])
       other → expectationFailure (show other)
-    [o | InterestInfo o _ r _ ← modelInterests m3, r == reg 0 0 0] `shouldBe` []
-    map viewPending (modelViews m3) `shouldBe` [[reg 0 0 0], []]
+    [o | InterestInfo o _ r _ ← modelInterests m2, r == reg 0 0 0] `shouldBe` []
+    map viewPending (modelViews m2) `shouldBe` [[reg 0 0 0]]
+  it "admits explicit work however the camera pins and re-pins: pinned bytes never take the explicit headroom" $ do
+    -- 1,302 resident bytes: 964 stay unpinned for explicit work, so pins may cover 338.
+    -- A camera view fills the bank with six regions' worth of demand (three fit) and keeps
+    -- one pin; a second pin over another region is busy. Every quantum the view moves its
+    -- pin to another resident region, and an explicit query for two fresh regions
+    -- (800 bytes) arrives each time: it is admitted, taking the unpinned camera regions.
+    let far = [demand (reg i 0 0) (cell 0 0 0) | i ← [0 .. 5]]
+        limits = limitsWith $ \x → x {specResidentBytes = 1302, specStagingBytes = 8192, specLoadJobs = 6, specQueuedCommands = 8}
+    m0 ← opened limits
+    m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 far)
+    m2 ← drainDemand m1
+    length (modelRegions m2) `shouldBe` 3
+    (m3, _) ← stepOk m2 (AcquireHold (HoldId 1) a1 (Pin (ViewId 1)) [reg 0 0 0])
+    stepRefused m3 (AcquireHold (HoldId 2) a1 (Pin (ViewId 1)) [reg 1 0 0]) `shouldReturn` Busy (BankFull ResidentBank 338 338 338)
+    let round' (m, held) k = do
+          (mq, admitted) ← stepOk m (q2 rev0 (10 + k) (reg (100 + 2 * k) 0 0) (reg (101 + 2 * k) 0 0))
+          length (admissionJobs (admission admitted)) `shouldBe` 2
+          mFinished ← drainDemand mq >>= \x → withdraw x (10 + k) >>= drainDemand
+          -- Move the pin to another resident region of the demand.
+          let target = fromMaybe held (listToMaybe [regionCoord r | r ← modelRegions mFinished, regionCoord r `elem` map demandRegion far, regionCoord r /= held])
+          (mr, _) ← stepOk mFinished (ReleaseHold (HoldId (fromInteger k)))
+          (mp, _) ← stepOk mr (AcquireHold (HoldId (fromInteger k + 1)) a1 (Pin (ViewId 1)) [target])
+          pure (mp, target)
+    _ ← foldM round' (m3, reg 0 0 0) [1 .. 4]
+    pure ()
+  it "admits an 8,192-level column of 257 regions at the default 128 load-job slots, running 128 at a time" $ do
+    -- Levels 5 to 8,196 of one column: 257 regions, the first and last partial.
+    m0 ← fst <$> stepOk (newModel defaultLimits) (OpenArena a1 rev0)
+    let column = [demand (reg 0 0 z) (if z == 0 then box 0 1 0 1 5 32 else if z == 256 then box 0 1 0 1 0 5 else box 0 1 0 1 0 32) | z ← [0 .. 256]]
+    (m1, accepted) ← stepOk m0 (SubmitQuery (RequestId 1) a1 rev0 column)
+    length (admissionJobs (admission accepted)) `shouldBe` 257
+    ledgerReserved (bankLedger m1 ResidentBank) `shouldSatisfy` (<= limitExplicitResidentBytes defaultLimits)
+    -- Slots are taken at dispatch: 128 run, the rest wait, and one completion frees one.
+    m2 ← foldM (\m _ → fst <$> stepOk m Dispatch) m1 [1 .. 128 ∷ Int]
+    slotInUse m2 LoadJobSlot `shouldBe` 128
+    (m3, none) ← stepOk m2 Dispatch
+    reportDecision none `shouldBe` NothingToDispatch
+    m4 ← stepsOk m3 [JobCompleted (JobId 0) (Cost 0 1 54)]
+    (_, next) ← stepOk m4 Dispatch
+    case reportDecision next of
+      Dispatched j _ _ → j `shouldBe` JobId 128
+      other → expectationFailure (show other)
+    -- A column of 258 regions is over the query cap, invalid from any state.
+    stepRefused m1 (SubmitQuery (RequestId 2) a1 rev0 (column <> [demand (reg 1 0 0) (cell 0 0 0)])) `shouldReturn` Invalid (DemandTooLarge 258 257)
+  it "normalizes a camera description: empty withdraws, repeated keys coalesce, bad keys are excluded and reported" $ do
+    let level z = demand (reg 0 0 0) (cell 0 0 z)
+        other' = demand (reg 1 0 0) (cell 0 0 0)
+        bad = RegionCoord maxBound 0 0
+    m0 ← opened roomy2
+    -- Repeated keys coalesce into the first occurrence, keeping its priority; an
+    -- unsupported key and a region whose cells all lie outside the extent are excluded,
+    -- reported, and do not stop the valid entries.
+    (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 [level 0, other', level 1, demand bad (cell 0 0 0), demand (reg 2 0 0) (cell 1 0 0)])
+    case reportDecision set of
+      CameraSet admitted _ _ _ _ excluded truncated → (map (map snd . admissionJobs) admitted, excluded, truncated) `shouldBe` ([[reg 0 0 0], [reg 1 0 0]], [bad, reg 2 0 0], [])
+      other → expectationFailure (show other)
+    [coverageCells (jobCoverage j) | j ← modelJobs m1, jobRegion j == reg 0 0 0] `shouldBe` [2]
+    map (map demandRegion . viewDemand) (modelViews m1) `shouldBe` [[reg 0 0 0, reg 1 0 0]]
+    -- An empty description withdraws the view's demand, its interests and its jobs.
+    (m2, cleared) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [])
+    case reportDecision cleared of
+      CameraSet admitted waiting withdrawn dropped _ _ _ → (length admitted, waiting, withdrawn, length dropped) `shouldBe` (0, [], [reg 0 0 0, reg 1 0 0], 2)
+      other → expectationFailure (show other)
+    modelViews m2 `shouldBe` []
+    modelInterests m2 `shouldBe` []
+  it "cuts a camera description at its structural maximum, lowest priority first, and reports the rest" $ do
+    let named = [demand (reg i 0 0) (cell 0 0 0) | i ← [0 .. 5]]
+    m0 ← opened (limitsWith $ \x → x {specResidentBytes = 40000, specStagingBytes = 8192, specLoadJobs = 6, specCameraRegions = 4})
+    (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 named)
+    case reportDecision set of
+      CameraSet _ _ _ _ _ excluded truncated → (excluded, truncated) `shouldBe` ([], [reg 4 0 0, reg 5 0 0])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m1) `shouldBe` [[reg i 0 0 | i ← [0 .. 3]]]
+  it "bounds a hold by a static region cap and draws its records on the camera's share of staging" $ do
+    let four = [reg i 0 0 | i ← [0 .. 3]]
+    m0 ← opened (limitsWith $ \x → x {specResidentBytes = 40000, specStagingBytes = 4096, specLoadJobs = 6, specQueryRegions = 2, specQueuedCommands = 8})
+    m1 ← foldM (\m i → loadCell m i (reg i 0 0) (cell 0 0 0) >>= \x → withdraw x i) m0 [0 .. 4]
+    stepRefused m1 (AcquireHold (HoldId 1) a1 Borrow (four <> [reg 4 0 0])) `shouldReturn` Invalid (DemandTooLarge 5 4)
+    (m2, _) ← stepOk m1 (AcquireHold (HoldId 1) a1 Borrow four)
+    ledgersOf m2 `shouldBe` Ledgers (5 * 338, 0) (0, 0) (4 * 64, 0)
+    -- With 1,250 staging bytes, 994 of which stay free for explicit work, an open
+    -- request's 224 leave the camera's share 32: the same hold is busy though 1,026
+    -- bytes are free.
+    tight ← opened (limitsWith $ \x → x {specResidentBytes = 40000, specStagingBytes = 1250, specQueryRegions = 2, specQueuedCommands = 8})
+    t1 ← foldM (\m i → loadCell m i (reg i 0 0) (cell 0 0 0) >>= \x → if i == 4 then pure x else withdraw x i) tight [0 .. 4]
+    stepRefused t1 (AcquireHold (HoldId 1) a1 Borrow four) `shouldReturn` Busy (BankFull StagingBank 1250 224 256)
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
@@ -1125,7 +1140,7 @@ editSpec = describe "retained edits" $ do
     [arenaRevision a | a ← modelArenas m3] `shouldBe` [Revision 1]
     [regionDirty r | r ← modelRegions m3] `shouldBe` [True]
   it "returns the unused part of a reservation, down to nothing for an adjacent removal" $ do
-    m0 ← opened (limitsWith $ \s → s {specExtentZ = 2})
+    m0 ← opened (limitsWith $ \s → s {specExtentZ = 2, specResidentBytes = 1100})
     (m1, _) ← removeCellAt m0 a1 rev0 1 (tileAt 0 0 0)
     (m2, accepted) ← stepOk m1 (SubmitRemoval (RequestId 2) a1 (Revision 1) (tileAt 0 0 1))
     admissionJobs (admission accepted) `shouldBe` [(JobId 1, reg 0 0 0)]
@@ -1134,10 +1149,11 @@ editSpec = describe "retained edits" $ do
     ledgersOf m2 `shouldBe` Ledgers (338, 144 + 62) (64, 64) (224, 258 + 512)
     -- The cell above is in the same removed interval: no retained growth, so the
     -- whole 64-byte reservation returns.
-    m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 1) (Cost 0 1 2)]
+    -- (The adjacent cell joins the existing segment: two payload bytes, no new segment.)
+    m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 1) (Cost 0 0 2)]
     (m4, committed) ← stepOk m3 (RemovalCommitted (RequestId 2) (Revision 2) 0 0)
     reportDecision committed `shouldBe` Committed (Revision 2) 64 [] [] []
-    ledgersOf m4 `shouldBe` Ledgers (338 + 34, 0) (64, 0) (0, 0)
+    ledgersOf m4 `shouldBe` Ledgers (338 + 2, 0) (64, 0) (0, 0)
     [arenaRetainedBytes a | a ← modelArenas m4] `shouldBe` [64]
   it "returns every reservation when a removal is abandoned before commit" $ do
     m0 ← opened tiny
@@ -1378,10 +1394,11 @@ contractSpec = describe "checked arithmetic and identity boundaries" $ do
   it "refuses a cost whose byte total does not fit 64 bits" $ do
     m0 ← opened tiny
     m1 ← stepsOk m0 [q 1 (reg 0 0 0) (cell 0 0 0), Dispatch]
-    stepRefused m1 (JobCompleted (JobId 0) (Cost maxBound 0 0)) `shouldReturn` ContractFailure CostOverflow
     stepRefused m1 (JobCompleted (JobId 0) (Cost 0 maxBound 0)) `shouldReturn` ContractFailure CostOverflow
     stepRefused m1 (JobCompleted (JobId 0) (Cost 0 0 maxBound)) `shouldReturn` ContractFailure CostOverflow
     stepRefused m1 (JobCompleted (JobId 0) (Cost 1 0 maxBound)) `shouldReturn` ContractFailure CostOverflow
+    -- (The reported column count is not charged: the model charges the columns the
+    -- region's coverage gains.)
   it "refuses a report for work that was never dispatched" $ do
     m0 ← opened tiny
     m1 ← fst <$> stepOk m0 (q 1 (reg 0 0 0) (cell 0 0 0))

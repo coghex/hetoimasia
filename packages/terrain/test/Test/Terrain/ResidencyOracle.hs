@@ -41,7 +41,6 @@ oracle m arena demands removal
   | any evicting demands = NotNow
   | removal && editOccupied + retainedBytes > lim EditBank = Exhausted
   | commandsUsed + 1 > slot CommandSlot = NotNow
-  | jobsUsed + newJobs > slot LoadJobSlot = NotNow
   | stagingNeed > stagingFree = NotNow
   | removal && retainedBytes > editFree = NotNow
   | shortfall > 0 && not (any (>= shortfall) subsetBytes) = NotNow
@@ -103,7 +102,6 @@ oracle m arena demands removal
     ps = map parts demands
     reserveSum = sum [r | (_, r, _, _, _) ← ps]
     scratchSum = sum [s | (_, _, _, s, _) ← ps]
-    newJobs = toInteger (length [() | (_, _, _, _, True) ← ps])
 
     ledgers = independentLedgers m
     (residentOcc, residentRes) = both (resident ledgers)
@@ -115,7 +113,6 @@ oracle m arena demands removal
     editFree = lim EditBank - editOccupied - editReserved
     stagingNeed = interest * n + scratchSum + commandBytes + removalStaging
     commandsUsed = toInteger (length (modelRequests m))
-    jobsUsed = toInteger (length (modelJobs m))
 
     -- Resident funding: free bytes, then some set of regions that nothing needs.
     freeResident = lim ResidentBank - residentOcc - residentRes
