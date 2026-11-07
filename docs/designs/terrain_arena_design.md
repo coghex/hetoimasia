@@ -1434,6 +1434,13 @@ render-2d ABI. If the proof fails, stop those dependent slices and return a
 specific renderer-change proposal to the owner. Do not broaden renderer
 interfaces, substitute incorrect visuals or call the arc complete.
 
+Measured outcome (TRA-8, #644, offscreen on one device, material and geometry path
+only, not runtime qualification): the existing ABI represented every supported
+fixture correctly; see
+[the assessment](../evidence/terrain/tra8/README.md), which also records a
+fidelity finding against the reference sprites' silhouettes for the owner's
+reading. This links the measurement and changes no owner decision.
+
 The broader historical “full Synarchy port” memory reconciliation is not an
 implementation dependency for this explicitly approved first arena. Fidelity
 beyond this arc remains uncommitted; MEMORY.md is unchanged.
