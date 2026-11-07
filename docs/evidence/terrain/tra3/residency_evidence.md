@@ -240,6 +240,7 @@ repeats what hold acquisition enforces.
 | The camera unit is left out of the resident minimum | the re-admission example (1,025 refused) and the minimum property (1) |
 | The largest hold is left out of the resident minimum | the defaults, below-minimum and hold examples and the minimum property (4) |
 | A camera description is not cut to the staging it may use | the truncation example and two random properties |
+| A camera description is not left room for its first region to start | the minimum-budget example and the starts-what-it-keeps property |
 | A camera description is not cut to its structural maximum | the structural-maximum example |
 | Repeated camera keys are not coalesced | the normalization example |
 | Cells outside the extent are not clipped from a camera description | the normalization and over-cap examples |
@@ -374,6 +375,12 @@ progress and a configuration that cannot is refused at construction. The propert
 - **Camera headroom** (example): of 1,636 staging bytes the camera uses at most 642
   and the 994 a removal needs stay free; a hold draws on the camera's share, not the
   headroom.
+- **A retained description can start** (example at the minimum budgets, 1,446 resident
+  and 1,508 staging bytes, and a property over 2,000 random descriptions at any staging
+  from the minimum): the camera's staging share of 514 holds one region (192 of
+  description, 64 of interest, 258 of scratch) but not a two-region description (256)
+  beside the first job, so it is cut to one region, the other reported, and the first is
+  admitted at once; whatever description is retained has its first region admitted.
 - **Normalized descriptions** (examples): an empty description withdraws the demand,
   repeated keys coalesce into the first occurrence, an unsupported key and a region
   wholly outside the extent are excluded and reported while the valid entries are
