@@ -539,24 +539,28 @@ waits only for those victims' `VictimReleased` events, then is queued. A victim
 cannot regain an interest or a hold, and a victim's bytes are never promised twice.
 Checks run in a fixed order and the first failure is reported:
 
-1. **Invalid** (permanent), by the owner's rule: a request is invalid only when its
-   minimum final footprint cannot fit a bank or slot /even from an empty model/ (no
-   other resident, job or interest), or when it is malformed (an empty, oversized or
-   duplicated demand, or a region key that names a tile outside the supported
-   coordinate range, `UnsupportedRegion`, checked at the lowest and highest cell of
-   the region). Every other shortfall, however long it lasts, is busy. One feasibility
-   function serves every admission path (an atomic request, a removal and a camera
-   demand alike) and never reads the model's state, so the classification is the
-   same whatever is resident, promised or held. An atomic request holds one job per
-   region for its whole coverage (with fresh region metadata) at once, plus a
-   removal's resident growth and its staging. A camera demand is judged in the order
-   its regions are admitted, one job at a time, keeping what the earlier ones stored:
-   at each step staging must hold the description, an interest for every region
-   admitted so far and the scratch of the job being loaded, and the resident bank the
-   least the earlier regions stored plus the job's whole reservation. The check runs
-   before anything that depends on state (such as a region being released), so it is
-   never masked by a busy answer. Never busy for what can never fit, so explicit work
-   cannot stay busy forever for that reason.
+1. **Invalid** (permanent; Requirement 7 keeps it apart from pressure): a malformed
+   demand (empty, oversized or duplicated, or a region key that names a tile outside
+   the supported coordinate range, `UnsupportedRegion`, checked at the lowest and
+   highest cell of the region), or a request whose cells *still to load* cannot fit a
+   bank or slot even if nothing else existed. The cells still to load are those no
+   resident detail and no live job covers; for each region they are sized as a fresh
+   job would store them, merged with the coverage the region already has (the
+   columns and segments the union needs beyond those in use, so a cell next to an
+   existing segment adds none, with region metadata only when nothing of the region
+   is covered). A request with nothing to load is never invalid: it is served by the
+   shared coverage and only gains interests (the sharing contract). Every other
+   shortfall, however long it lasts, is busy, because it depends on state that can
+   change. One feasibility function serves every admission path (an atomic request,
+   a removal and a camera demand alike), runs before anything that depends on state
+   (such as a region being released) and weighs state only as which cells are
+   covered, so what is invalid in any state is invalid from an empty model. An atomic
+   request holds one such job per region at once, plus a removal's resident growth
+   and its staging. A camera demand is judged in the order its regions are admitted,
+   one job at a time, keeping what the earlier ones stored: at each step staging must
+   hold the description, an interest for every region admitted so far and the scratch
+   of the job being loaded, and the resident bank the least the earlier regions
+   stored plus the job's whole reservation.
 2. **RetainedEditsExhausted** (edits only): the committed bytes plus this edit exceed
    the bank even with every reservation returned. It names the bank and persists until
    an arena's teardown frees retained bytes; the public Lua mapping stays `busy`
