@@ -337,19 +337,20 @@ spec = describe "Planning" $ do
       limited (\l → l {limitPairs = 0}) `shouldBe'` PlanInsufficient LimitPairs
       limited (\l → l {limitKeys = 2}) `shouldBe'` PlanInsufficient LimitDepthKeys
     it "stops collecting overlap pairs at the bound instead of finishing the enumeration" $ do
-      -- Sixty floating cells along the line of sight project to the same place:
-      -- 180 faces in one region, some 16,000 overlapping pairs. Refusing at one
-      -- pair must cost about what refusing after building the faces costs, not
-      -- what enumerating every pair costs.
-      let stack = sceneSource [(k, k, 3 * k, 0) | k ← [0 .. 59]]
-          sfacts = factsOf stack
-          scamera = manualCamera 59 59 177
-          run f = planWith (\r → r {requestConfig = (requestConfig r) {pcLimits = f (pcLimits (requestConfig r))}}) (setup 480 480) scamera sfacts
-      baseline ← allocatedBy (run (\l → l {limitKeys = 1}))
-      early ← allocatedBy (run (\l → l {limitPairs = 1}))
-      run (\l → l {limitPairs = 1}) `shouldBe'` PlanInsufficient LimitPairs
-      run (\l → l {limitKeys = 1}) `shouldBe'` PlanInsufficient LimitDepthKeys
-      early `shouldSatisfy` (< baseline + baseline `div` 5)
+      -- n floating cells along the line of sight project to the same place: 3n
+      -- faces in one region and about 4.5 n^2 overlapping pairs. Refusing at one
+      -- pair must cost work that grows with the faces, not with the pairs: doubling
+      -- n roughly doubles the allocation (a full enumeration would quadruple it).
+      let stackRun n =
+            planWith
+              (\r → r {requestConfig = (requestConfig r) {pcLimits = (pcLimits (requestConfig r)) {limitPairs = 1}}})
+              (setup 480 480)
+              (manualCamera (n - 1) (n - 1) (3 * (n - 1)))
+              (factsOf (sceneSource [(k, k, 3 * k, 0) | k ← [0 .. n - 1]]))
+      small ← allocatedBy (stackRun 125)
+      large ← allocatedBy (stackRun 250)
+      stackRun 250 `shouldBe'` PlanInsufficient LimitPairs
+      large `shouldSatisfy` (< 3 * small)
     it "accepts exactly at a bound" $ do
       limited (\l → l {limitFaces = 3, limitKeys = 3}) `shouldSatisfy` isRight'
       let examined = statLevelsEvaluated (planStats (plan (setup 288 144) camera facts))
