@@ -20,6 +20,7 @@ module Hetoimasia.Terrain.Internal.Residency.Coverage
   , coverageSegments
   , coverageColumnSet
   , coverageIntervals
+  , coverageWithin
 
     -- * Charges
   , Cost (..)
@@ -34,6 +35,9 @@ module Hetoimasia.Terrain.Internal.Residency.Coverage
   , scratchBytes
   , removalRetainedBytes
   , removalStagingBytes
+  , regionColumnReserveBytes
+  , regionSegmentReserveBytes
+  , regionSegmentStoredBytes
   , checkedAdd
   , checkedMul
   ) where
@@ -138,6 +142,12 @@ coverageColumnSet (Coverage a) = Map.keysSet a
 coverageIntervals ∷ Coverage → [((Int, Int), [(Int, Int)])]
 coverageIntervals (Coverage a) = Map.toAscList a
 
+-- | Every cell lies inside the first @x@ columns, first @y@ rows and first @z@
+-- levels of its region.
+coverageWithin ∷ (Int, Int, Int) → Coverage → Bool
+coverageWithin (x, y, z) (Coverage a) =
+  all (\((cx, cy), ivs) → cx < x && cy < y && all ((<= z) . snd) ivs) (Map.toList a)
+
 -- ---------------------------------------------------------------------------
 -- Charges
 
@@ -237,3 +247,17 @@ removalRetainedBytes = fromIntegral (changeIntervalBytes + changeColumnBytes)
 -- staged overlay and the result settlement.
 removalStagingBytes ∷ Word64
 removalStagingBytes = 512
+
+-- | What 'reserveCost' charges for one column index entry of a job.
+regionColumnReserveBytes ∷ Word64
+regionColumnReserveBytes = fromIntegral columnIndexBytes
+
+-- | What 'reserveCost' charges for one interval of a job: its segment metadata
+-- (32) and the dense payload bound (64).
+regionSegmentReserveBytes ∷ Word64
+regionSegmentReserveBytes = 32 + 64
+
+-- | What one stored segment can occupy beyond its payload: its metadata. The
+-- payload is at most two bytes per cell.
+regionSegmentStoredBytes ∷ Word64
+regionSegmentStoredBytes = 32

@@ -25,7 +25,7 @@ import Hetoimasia.Terrain.Query (cellAt)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Resident
 import Hetoimasia.Terrain.Segment (segmentLength)
-import Hetoimasia.Terrain.Source (Source)
+import Hetoimasia.Terrain.Source (Source, SourceSpec (..))
 import Test.Hspec
 import Test.Terrain.Model
 import Test.Terrain.ResidencySupport
@@ -37,18 +37,30 @@ data World = World
   , wResident ∷ !Resident
   }
 
+-- | Soil over stone, with soil from level -3 up to level 40, so cells of the first
+-- two vertical regions are solid.
+deepSoil ∷ SourceSpec
+deepSoil =
+  SourceSpec
+    { specMaterials = ["soil", "stone"]
+    , specLayers = [softLayer Nothing (Just (-3)) "stone" 0, layer (-3) 40 "soil" 0]
+    , specPatches = []
+    }
+
 source ∷ Source
-source = mustSource soilOverStone
+source = mustSource deepSoil
 
 changeLimits ∷ ChangeLimits
 changeLimits = ChangeLimits 1000000
 
--- | Room for the two edited regions together (420 and 338 bytes stored once both
--- columns are touched, 944 reserved to load them again) but not for them and two
--- other regions as well, so other
--- demand must evict them and reconstructing them must evict that demand.
+-- | Two columns and two levels of a region (the edits touch levels 0 and 1 of the
+-- first region and level 0 of the one above), two regions per request: a region
+-- stores at most 424 bytes and a job beyond that reserves 288, so the bank holds
+-- 1,424 at the least. Other demand (two fresh regions of 544 reserved bytes each)
+-- does not fit beside an edited region, so it must evict it, and reconstructing
+-- the edited regions must in turn evict that demand.
 limits ∷ Limits
-limits = limitsWith $ \s → s {specResidentBytes = 1100}
+limits = limitsWith $ \s → s {specResidentBytes = 1424, specEditBytes = 256, specExtentX = 2, specExtentZ = 2}
 
 initial ∷ IO World
 initial = initialWith limits
@@ -140,8 +152,8 @@ removals cells = [(x, 0, z, z + 1) | (x, z) ← cells]
 -- | Every cell in a small box agrees with the independent model.
 agreeWithModel ∷ World → [(Integer, Integer)] → Expectation
 agreeWithModel w cells =
-  forM_ [(x, 0, z) | x ← [0 .. 2], z ← [-4 .. 2]] $ \(x, y, z) →
-    fromCell (cellAt source (wChanges w) (mustTile x y z)) `shouldBe` modelCell soilOverStone (removals cells) (x, y, z)
+  forM_ [(x, 0, z) | x ← [0 .. 2], z ← [-4 .. 35]] $ \(x, y, z) →
+    fromCell (cellAt source (wChanges w) (mustTile x y z)) `shouldBe` modelCell deepSoil (removals cells) (x, y, z)
 
 -- | What the resident detail says about the cell: unmaterialized, or its value.
 residentAnswer ∷ World → Integer → Integer → Integer → Maybe (Maybe (String, Int))
@@ -154,7 +166,7 @@ spec ∷ Spec
 spec = describe "Residency over the real data layer" $ do
   it "keeps every retained removal through repeated reserve, commit, handoff, evict and reconstruct cycles" $ do
     w0 ← initial
-    let plan = [(0, 0), (1, 0), (0, -1), (1, -1), (0, -2), (1, -2)] ∷ [(Integer, Integer)]
+    let plan = [(0, 0), (1, 0), (0, 1), (1, 1), (0, 32), (1, 32)] ∷ [(Integer, Integer)]
     (final, done, _) ←
       foldM
         ( \(w, removed, rid) (x, z) → do
@@ -184,7 +196,7 @@ spec = describe "Residency over the real data layer" $ do
             m4 ← stepsOk m3 [BeginHandoff a1 region (fromIntegral (changesBytes changes')), HandoffConfirmed a1 region]
             [arenaRetainedBytes a | a ← modelArenas m4] `shouldBe` retainedBefore
             -- Pressure from other demand evicts the clean, unused regions.
-            let fillers = [demand (reg 40 0 0) (cell 0 0 0), demand (reg 41 0 0) (cell 0 0 0)]
+            let fillers = [demand (reg (40 + 2 * rid) 0 0) (box 0 2 0 1 0 2), demand (reg (41 + 2 * rid) 0 0) (box 0 2 0 1 0 2)]
             w3 ← submit w2 {wModel = m4, wChanges = changes'} (SubmitQuery (RequestId (fromInteger rid + 1000)) a1 next fillers) >>= drain
             w4 ← settle w3 (rid + 1000)
             -- The edited region is no longer resident: unknown, not air.
@@ -203,15 +215,17 @@ spec = describe "Residency over the real data layer" $ do
         (w0, [], 1)
         plan
     -- The model's retained bytes are the real changes' accounted size: two
-    -- columns and two intervals (the later cells coalesce into them).
-    changesBytes (wChanges final) `shouldBe` 2 * 48 + 2 * 16
+    -- columns and two intervals each (levels 0 and 1 coalesce; level 32 is apart).
+    changesBytes (wChanges final) `shouldBe` 2 * 48 + 4 * 16
     [arenaRetainedBytes a | a ← modelArenas (wModel final)] `shouldBe` [fromIntegral (changesBytes (wChanges final))]
     done `shouldBe` plan
     -- Nothing is left reserved and every bank is within its limit.
     let Ledgers (_, residentReserved) (_, editReserved) (stagingOccupied, stagingReserved) = ledgersOf (wModel final)
     (residentReserved, editReserved, stagingOccupied, stagingReserved) `shouldBe` (0, 0, 0, 0)
   it "reconciles every conservative reservation against the real stored cost" $ do
-    w0 ← initial
+    -- Levels up to 20 of one column: a region stores at most 256 + 48 + 11 x 32 + 42
+    -- = 698 bytes here and a job reserves at most 1,104 more.
+    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 4000, specStagingBytes = 4096, specExtentZ = 21})
     -- A request over several widely separated cells of one column: the model
     -- reserves for each interval, the real detail stores exactly that.
     let cells = [cell 0 0 0, cell 0 0 10, cell 0 0 20]
@@ -229,24 +243,26 @@ spec = describe "Residency over the real data layer" $ do
     -- The reservation covered it (and was larger, by the payload bound).
     reserved `shouldBe` [256 + 48 + 3 * 32 + 3 * 64]
   it "reserves the growth of a compressed segment and reconciles it with the real rebuilt segment" $ do
-    -- 462 resident bytes is the least a bank can have to edit at all (a 400-byte job
-    -- and the 62 a removal reserves for its rebuilt segment). One 32-cell uniform
-    -- segment stores 338, leaving 124: room for two removals' growth.
-    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 462, specStagingBytes = 4096})
+    -- A column of 32 levels: a region stores at most 880 bytes and a job beyond it
+    -- reserves 1,584, so one region per request needs 2,464 bytes. Six pinned one-cell
+    -- regions (6 x 338) and the uniform segment (338) leave exactly 124 of 2,490: room
+    -- for two removals' growth (62 each).
+    w00 ← initialWith (limitsWith $ \s → s {specResidentBytes = 2490, specStagingBytes = 4096, specQueuedCommands = 16, specQueryRegions = 1, specDemandRegions = 1, specExtentZ = 32})
+    w0 ← foldM (\w i → submit w (SubmitQuery (RequestId (fromInteger i)) a1 rev0 [demand (reg (10 + i) 0 0) (cell 0 0 0)]) >>= drain) w00 [11 .. 16]
     -- Region (0,0,-2) is levels -64..-33: all stone, one uniform segment of 2 bytes.
     w1 ← submit w0 (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 (-2)) (box 0 1 0 1 0 32)]) >>= drain >>= \w → settle w 1
-    map regionBytes (modelRegions (wModel w1)) `shouldBe` [338]
+    map regionBytes [r | r ← modelRegions (wModel w1), regionCoord r == reg 0 0 (-2)] `shouldBe` [338]
     map segmentLength (residentSegments (wResident w1) (mustColumn 0 0)) `shouldBe` [32]
     let tile = mustTile 0 0 (-50)
         (region, cover) = regionOf 0 0 (-50)
     (w2, accepted) ← submitAdmission w1 (SubmitRemoval (RequestId 2) a1 rev0 tile)
     -- The cell is resident: no job, and the growth is reserved from the free 62.
     admissionJobs accepted `shouldBe` []
-    ledgersOf (wModel w2) `shouldBe` Ledgers (338, 62) (0, 64) (224, 512)
-    -- A second removal takes the other 62; a third finds the bank full: busy (it fits
-    -- an empty model), not invalid.
+    ledgersOf (wModel w2) `shouldBe` Ledgers (2366, 62) (0, 64) (1568, 512)
+    -- A second removal takes the other 62; a third finds the bank full: busy,
+    -- since nothing may be evicted (every other region is pinned).
     (w2b, _) ← submitAdmission w2 (SubmitRemoval (RequestId 3) a1 rev0 (mustTile 0 0 (-51)))
-    ledgersOf (wModel w2b) `shouldBe` Ledgers (338, 124) (0, 128) (448, 1024)
+    ledgersOf (wModel w2b) `shouldBe` Ledgers (2366, 124) (0, 128) (1792, 1024)
     refusal ← stepRefused (wModel w2b) (SubmitRemoval (RequestId 5) a1 rev0 (mustTile 0 0 (-52)))
     case refusal of
       Busy (NoEligibleEviction 62 0 _) → pure ()
@@ -262,16 +278,16 @@ spec = describe "Residency over the real data layer" $ do
     (m4, committed) ← stepOk (wModel w3) (RemovalCommitted (RequestId 2) (Revision 1) (fromIntegral (changesBytes changes')) (fromIntegral regrown))
     reportDecision committed `shouldBe` Committed (Revision 1) 0 [] [] []
     -- Occupied now includes the growth; the unused 52 of the reservation returned.
-    ledgersOf m4 `shouldBe` Ledgers (348, 0) (64, 0) (0, 0)
+    ledgersOf m4 `shouldBe` Ledgers (2376, 0) (64, 0) (1344, 0)
     assertCharged w3 {wModel = m4}
     -- The segment now occupies 348 bytes: another removal's 62 still fits (114 free).
     (w4, again) ← submitAdmission w3 {wModel = m4, wChanges = changes'} (SubmitRemoval (RequestId 4) a1 (Revision 1) (mustTile 0 0 (-51)))
     admissionJobs again `shouldBe` []
-    ledgersOf (wModel w4) `shouldBe` Ledgers (348, 62) (64, 64) (224, 512)
+    ledgersOf (wModel w4) `shouldBe` Ledgers (2376, 62) (64, 64) (1568, 512)
   it "keeps a surviving region charged for the shared column index after each individual release" $ do
     -- Two vertical regions of one column share one real column index entry; each
     -- is charged for its own column, so evicting either leaves the other charged.
-    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 800})
+    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 964})
     w1 ← submit w0 (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 0) (cell 0 0 0)]) >>= drain >>= \w → settle w 1
     w2 ← submit w1 (SubmitQuery (RequestId 2) a1 rev0 [demand (reg 0 0 1) (cell 0 0 0)]) >>= drain >>= \w → settle w 2
     statColumns (residentStats (wResident w2)) `shouldBe` 1

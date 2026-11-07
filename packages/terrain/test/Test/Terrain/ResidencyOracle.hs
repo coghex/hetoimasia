@@ -9,11 +9,11 @@
 --
 -- The decisions it checks:
 --
--- * __permanently invalid__ exactly when the cells the request still has to load
---   (those no resident detail and no live job covers), sized as a fresh job would
---   store them merged with the coverage already in the region, cannot fit a bank or
---   slot. A request with nothing to load is never invalid; every other shortfall is
---   busy (Requirement 7);
+-- * __never permanently invalid for capacity__: the configuration was validated
+--   against the worst-case footprint of the largest admissible request, so a
+--   well-formed request within its caps is admitted or busy (or, for a removal,
+--   retained-edit exhaustion), whatever the state. The oracle never expects an
+--   invalid answer for one;
 -- * __admitted__ exactly when every slot and bank has room and the resident
 --   shortfall can be covered by some set of evictable regions, found here by
 --   trying /every subset/ of them (not by the model's least-recently-used walk);
@@ -28,6 +28,8 @@ import Data.Maybe (isJust, isNothing)
 import Hetoimasia.Terrain.Residency
 import Test.Terrain.ResidencySupport (Ledgers (..), independentLedgers)
 
+-- | 'Never' is the answer "invalid": no verdict of the oracle is ever 'Never'; it
+-- names the class of a model answer that must not occur for such a request.
 data Verdict = Admit | NotNow | Never | Exhausted
   deriving stock (Eq, Show)
 
@@ -36,9 +38,7 @@ data Verdict = Admit | NotNow | Never | Exhausted
 -- supported regions within the demand limit.
 oracle ∷ Model → ArenaId → [RegionDemand] → Bool → Verdict
 oracle m arena demands removal
-  | emptyResident > lim ResidentBank || emptyStaging > lim StagingBank || emptyJobs > slot LoadJobSlot = Never
   | any evicting demands = NotNow
-  | removal && retainedBytes > lim EditBank = Never
   | removal && editOccupied + retainedBytes > lim EditBank = Exhausted
   | commandsUsed + 1 > slot CommandSlot = NotNow
   | jobsUsed + newJobs > slot LoadJobSlot = NotNow
@@ -104,30 +104,6 @@ oracle m arena demands removal
     reserveSum = sum [r | (_, r, _, _, _) ← ps]
     scratchSum = sum [s | (_, _, _, s, _) ← ps]
     newJobs = toInteger (length [() | (_, _, _, _, True) ← ps])
-
-    -- What each region still has to load, sized merged with the coverage it has.
-    loads =
-      [ (reserveOf covered nw, 256 + 2 * toInteger (coverageCells nw))
-      | d ← demands
-      , let covered = coveredCells d
-      , Just nw ← [uncoveredBy (demandCoverage d) covered]
-      ]
-    coveredCells d = case (fmap regionCoverage (residentRegion d), promisedCover d) of
-      (Nothing, Nothing) → Nothing
-      (Just a, Nothing) → Just a
-      (Nothing, Just b) → Just b
-      (Just a, Just b) → Just (coverageUnion a b)
-    reserveOf covered nw =
-      let united = maybe nw (coverageUnion nw) covered
-          cols = maybe 0 coverageColumns covered
-          segs = maybe 0 coverageSegments covered
-          extra a b = if a > b then a - b else 0
-       in (if isNothing covered then metadata else 0)
-            + 48 * toInteger (extra (coverageColumns united) cols)
-            + 96 * toInteger (extra (coverageSegments united) segs)
-    emptyResident = sum (map fst loads) + growth
-    emptyStaging = interest * n + sum (map snd loads) + commandBytes + removalStaging
-    emptyJobs = toInteger (length loads)
 
     ledgers = independentLedgers m
     (residentOcc, residentRes) = both (resident ledgers)

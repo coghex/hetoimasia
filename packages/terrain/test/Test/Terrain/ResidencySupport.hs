@@ -20,6 +20,7 @@ module Test.Terrain.ResidencySupport
     -- * Building blocks
   , tiny
   , limitsWith
+  , baseSpec
   , a1
   , a2
   , a3
@@ -87,36 +88,36 @@ removalStaging = 512
 oneCellCost ∷ Cost
 oneCellCost = Cost {costColumns = 1, costSegments = 1, costPayloadBytes = 2}
 
--- | The tiny budget the traces share: two one-cell regions fit, three do not.
+-- | The tiny budget the traces share: two one-cell regions fit, three do not. Its
+-- caps are two regions per request and a one-cell extent, so its banks satisfy
+-- the minimum budgets (a request of two regions needs 964 resident bytes).
 tiny ∷ Limits
-tiny =
-  limitsWith $ \s →
-    s
-      { specResidentBytes = 1000
-      , specEditBytes = 192
-      , specStagingBytes = 2048
-      , specLoadJobs = 3
-      , specQueuedCommands = 3
-      , specPinsPerView = 2
-      , specDemandRegions = 4
-      , specAgingQuanta = 3
-      }
+tiny = limitsWith id
 
--- | Validated limits from the tiny budget with some figures changed.
+-- | The tiny specification: two regions per request, a one-cell extent, and banks
+-- that meet the minimum budgets (a request of two regions needs 964 resident bytes
+-- and 994 staging bytes).
+baseSpec ∷ LimitsSpec
+baseSpec =
+  LimitsSpec
+    { specResidentBytes = 1000
+    , specEditBytes = 192
+    , specStagingBytes = 2048
+    , specLoadJobs = 3
+    , specQueuedCommands = 3
+    , specPinsPerView = 2
+    , specDemandRegions = 2
+    , specAgingQuanta = 3
+    , specQueryRegions = 2
+    , specExtentX = 1
+    , specExtentY = 1
+    , specExtentZ = 1
+    }
+
+-- | Validated limits from the tiny budget with some figures changed. A change
+-- that breaks the minimum budgets is an error in the example, not a refusal.
 limitsWith ∷ (LimitsSpec → LimitsSpec) → Limits
-limitsWith change = either (error . show) id (mkLimits (change base))
-  where
-    base =
-      LimitsSpec
-        { specResidentBytes = 1000
-        , specEditBytes = 192
-        , specStagingBytes = 2048
-        , specLoadJobs = 3
-        , specQueuedCommands = 3
-        , specPinsPerView = 2
-        , specDemandRegions = 4
-        , specAgingQuanta = 3
-        }
+limitsWith change = either (error . show) id (mkLimits (change baseSpec))
 
 a1, a2, a3 ∷ ArenaId
 a1 = ArenaId 1

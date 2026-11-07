@@ -36,19 +36,26 @@ import Test.QuickCheck
 import Test.Terrain.ResidencyOracle (Verdict (..), oracle)
 import Test.Terrain.ResidencySupport
 
--- | Tight enough that every kind of pressure occurs within a few events.
+-- | Tight enough that every kind of pressure occurs within a few events: the
+-- smallest resident bank its caps allow is 2,480 bytes (two regions, each at its
+-- stored maximum of 568 bytes plus a job of 672), and the extent is two columns,
+-- one row and six levels.
 pressure ∷ Limits
 pressure =
   limitsWith $ \s →
     s
-      { specResidentBytes = 800
+      { specResidentBytes = 2500
       , specEditBytes = 640
       , specStagingBytes = 3000
       , specLoadJobs = 4
       , specQueuedCommands = 4
       , specPinsPerView = 2
-      , specDemandRegions = 3
+      , specDemandRegions = 2
       , specAgingQuanta = 2
+      , specQueryRegions = 2
+      , specExtentX = 2
+      , specExtentY = 1
+      , specExtentZ = 6
       }
 
 pick ∷ [a] → Int → Maybe a
@@ -164,12 +171,11 @@ oracleClasses prior event result = do
     _ → Nothing
   info ← listToMaybe [x | x ← modelArenas prior, arenaId x == arena, arenaPhase x == ArenaLive]
   if arenaRevision info == rev && rid `notElem` [requestId r | r ← modelRequests prior] then Just () else Nothing
-  if not (null demands) && length demands <= 3 && distinct (map demandRegion demands) then Just () else Nothing
+  if not (null demands) && length demands <= 2 && distinct (map demandRegion demands) then Just () else Nothing
   got ← case result of
     Right _ → Just Admit
     Left (Busy _) → Just NotNow
-    Left (Invalid (ExceedsBank _ _ _)) → Just Never
-    Left (Invalid (ExceedsSlot _ _ _)) → Just Never
+    Left (Invalid _) → Just Never
     Left (RetainedEditsExhausted {}) → Just Exhausted
     Left _ → Nothing
   Just (oracle prior arena demands removal, got)
@@ -278,12 +284,16 @@ roomyPressure =
       , specLoadJobs = 8
       , specQueuedCommands = 8
       , specPinsPerView = 2
-      , specDemandRegions = 3
+      , specDemandRegions = 2
       , specAgingQuanta = 2
+      , specQueryRegions = 2
+      , specExtentX = 2
+      , specExtentY = 1
+      , specExtentZ = 6
       }
 
 runSequenceWith ∷ Limits → [(Int, Int, Int)] → (Either String Model, Stats)
-runSequenceWith limits seeds = go (newModel limits) seeds (Stats 0 0 0 0 0 0 0 0 0 0 0 0 0)
+runSequenceWith limits seeds = go (newModel limits) seeds (Stats 0 0 0 0 0 0 0 0 0 0 0 0)
   where
     go m [] st = (settleEverything m, st)
     go m (s : rest) st =
@@ -309,7 +319,6 @@ data Stats = Stats
   , -- | Decisions the brute-force oracle checked, by the class it expected.
     oracleAdmit ∷ !Int
   , oracleNotNow ∷ !Int
-  , oracleNever ∷ !Int
   , oracleExhausted ∷ !Int
   }
   deriving stock (Eq, Show)
@@ -320,7 +329,7 @@ tally prior event result st0 = withOracle (tallyResult event result st0)
     withOracle st = case oracleClasses prior event result of
       Just (Admit, _) → st {oracleAdmit = oracleAdmit st + 1}
       Just (NotNow, _) → st {oracleNotNow = oracleNotNow st + 1}
-      Just (Never, _) → st {oracleNever = oracleNever st + 1}
+      Just (Never, _) → st
       Just (Exhausted, _) → st {oracleExhausted = oracleExhausted st + 1}
       Nothing → st
 
@@ -347,17 +356,16 @@ lcg seed n = take n (triples (drop 1 (iterate next seed)))
     triples (x : y : z : rest) = (x `div` 65536, y `div` 65536, z `div` 65536) : triples rest
     triples _ = []
 
--- | Coverages of every size and shape the feasibility bound has to tell apart:
--- one cell, two cells in one column, two columns, two separate intervals, a
--- whole column and a block.
+-- | Coverages of every size and shape within the extent: one cell, two cells in
+-- one column, two columns, two separate intervals, a whole column and a block.
 demandCoverages ∷ [Coverage]
 demandCoverages =
   [ cell 0 0 0
   , box 0 1 0 1 0 2
   , coverageUnion (cell 0 0 0) (cell 1 0 0)
-  , coverageUnion (cell 0 0 0) (cell 0 0 9)
-  , box 0 1 0 1 0 32
-  , box 0 3 0 2 0 4
+  , coverageUnion (cell 0 0 0) (cell 0 0 4)
+  , box 0 1 0 1 0 6
+  , box 0 2 0 1 0 4
   ]
 
 -- | Service, dispatch every queued job and complete each with the least it can
@@ -400,27 +408,41 @@ demandAt x j = demand (reg (toInteger x) 0 0) (fromMaybe (cell 0 0 0) (pick dema
 distinctDemands ∷ [(Int, Int)] → [RegionDemand]
 distinctDemands picks =
   let xs = foldl (\acc (x, _) → if x `elem` acc then acc else acc <> [x]) [] picks
-   in [demandAt x j | x ← take 4 xs, Just j ← [lookup x picks]]
+   in [demandAt x j | x ← take 2 xs, Just j ← [lookup x picks]]
 
 limitsOf ∷ (Integer, Integer, Integer) → Maybe Limits
-limitsOf (resident, staging, jobs) = either (const Nothing) Just (mkLimits (LimitsSpec resident 192 staging jobs 3 2 4 3))
+limitsOf (resident, staging, jobs) =
+  either (const Nothing) Just . mkLimits $
+    LimitsSpec
+      { specResidentBytes = resident
+      , specEditBytes = 192
+      , specStagingBytes = staging
+      , specLoadJobs = jobs
+      , specQueuedCommands = 3
+      , specPinsPerView = 2
+      , specDemandRegions = 2
+      , specAgingQuanta = 3
+      , specQueryRegions = 2
+      , specExtentX = 2
+      , specExtentY = 1
+      , specExtentZ = 6
+      }
 
--- | A camera demand the model accepts completes when it is alone in an empty
--- model. The permanent check is exact for that case: it is the feasibility bound
--- in the order regions are admitted, and the model admits them in that order. (From
--- other states a shortfall may be busy for as long as other work holds the room, so
--- nothing is claimed there.)
-acceptedDemandCompletes ∷ (Integer, Integer, Integer) → [(Int, Int)] → Property
-acceptedDemandCompletes triple picks =
+-- | A camera demand within the caps completes when it is alone, whatever banks
+-- the validated configuration chose and whatever the model holds: none of it can
+-- stay pending once the work that holds the room has finished. Here the model
+-- starts empty with some regions left resident.
+acceptedDemandCompletes ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → Property
+acceptedDemandCompletes triple leftovers picks =
   case limitsOf triple of
     Nothing → property True
     Just limits →
-      let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
+      let start = withLeftovers limits leftovers
           demands = distinctDemands picks
        in if null demands
             then property True
             else case step start (SetCameraDemand (ViewId 1) (ArenaId 1) demands) of
-              (_, Left _) → property True
+              (_, Left r) → counterexample ("an in-cap camera demand was refused: " <> show (r, demands, limits)) False
               (m, Right _) → case converge 200 m of
                 Left why → counterexample why False
                 Right done →
@@ -428,66 +450,157 @@ acceptedDemandCompletes triple picks =
                     ("demand accepted but left pending: " <> show (map viewPending (modelViews done)) <> " with " <> show (demands, limits))
                     (all (null . viewPending) (modelViews done))
 
--- | Whether a request is permanently invalid: by the owner's rule only when its
--- footprint cannot fit from an empty model, and so independent of the state the
--- model is in.
-permanentlyInvalid ∷ Either Refusal a → Bool
-permanentlyInvalid r = case r of
-  Left (Invalid (ExceedsBank {})) → True
-  Left (Invalid (ExceedsSlot {})) → True
-  _ → False
+-- | The model a run of the sequence's events leaves behind, whatever they did.
+modelAfter ∷ Limits → [(Int, Int, Int)] → Model
+modelAfter limits = foldl (\m s → fst (step m (eventFor m s))) (fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0))))
 
--- | By the rule that invalidity needs a footprint that cannot fit, a request that
--- is invalid in any state is also invalid from an empty model (it only ever sheds
--- cells already covered), and a request whose cells are all covered is never
--- invalid. Checked for a query, a removal and a camera demand, from a model with
--- resident leftovers and an earlier demand of the same view.
-permanentClassIsOnlyNarrower ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → [(Int, Int)] → Property
-permanentClassIsOnlyNarrower triple leftovers firstPicks picks =
-  case limitsOf triple of
-    Nothing → property True
-    Just limits →
-      let empty = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
-          loaded = withLeftovers limits leftovers
-          earlier = distinctDemands firstPicks
-          base = case step loaded (SetCameraDemand (ViewId 1) (ArenaId 1) earlier) of
-            (m, Right _) | not (null earlier) → either (const loaded) id (converge 200 m)
-            _ → loaded
-          demands = distinctDemands picks
-          tile = case picks of
-            ((x, j) : _) → either (const Nothing) Just (tileCoord (toInteger x * 16) 0 (toInteger (j `mod` 4)))
-            [] → Nothing
-          requests =
-            [("query", SubmitQuery (RequestId 7) (ArenaId 1) (Revision 0) demands) | not (null demands)]
-              <> [("removal", SubmitRemoval (RequestId 8) (ArenaId 1) (Revision 0) t) | Just t ← [tile]]
-              <> [("camera", SetCameraDemand (ViewId 2) (ArenaId 1) demands) | not (null demands)]
-       in conjoin
-            [ counterexample
-                (what <> " is invalid in the loaded model but not from an empty one: " <> show (event, limits))
-                (not (permanentlyInvalid (snd (step base event))) || permanentlyInvalid (snd (step empty event)))
-            | (what, event) ← requests
+-- | In-cap requests built against a state: the first live arena, at its current
+-- revision, and fresh identities.
+inCapRequests ∷ Model → [(Int, Int)] → [(String, Event)]
+inCapRequests m picks = case [a | a ← modelArenas m, arenaPhase a == ArenaLive] of
+  [] → []
+  (arena : _) →
+    let a = arenaId arena
+        rev = arenaRevision arena
+        demands = distinctDemands picks
+        tile = case picks of
+          ((x, j) : _) → either (const Nothing) Just (tileCoord (toInteger (x `mod` 3) * 16 + toInteger (j `mod` 2)) 0 (toInteger (fromMaybe (0 ∷ Int) (pick [0, 5, 1, 2] j))))
+          [] → Nothing
+     in [("query", SubmitQuery (RequestId 1000000) a rev demands) | not (null demands)]
+          <> [("removal", SubmitRemoval (RequestId 1000001) a rev t) | Just t ← [tile]]
+          <> [("camera", SetCameraDemand (ViewId 7) a demands) | not (null demands)]
+
+-- | A request within its caps is never invalid for capacity in any state: the
+-- reasons the model can still call invalid are about the request alone.
+inCapNeverInvalid ∷ [(Int, Int, Int)] → [(Int, Int)] → Property
+inCapNeverInvalid seeds picks =
+  let m = modelAfter pressure seeds
+   in conjoin
+        [ counterexample (what <> " within its caps was invalid: " <> show r) (case r of Left (Invalid _) → False; _ → True)
+        | (what, event) ← inCapRequests m picks
+        , let r = snd (step m event)
+        ]
+
+-- | Every busy request in a quiescent model, one where the owner has released
+-- everything releasable (jobs finished, victims released, handoffs confirmed,
+-- holds released, requests and camera demands withdrawn), is admitted at once.
+busyEndsWhenReleased ∷ [(Int, Int, Int)] → [(Int, Int)] → Property
+busyEndsWhenReleased seeds picks =
+  let m0 = modelAfter pressure seeds
+   in case quiesce m0 of
+        Left why → counterexample why False
+        Right m →
+          conjoin
+            [ counterexample (what <> " was not admitted in a quiescent model: " <> show r) (admitted what r)
+            | (what, event) ← inCapRequests m picks
+            , let r = step m event
             ]
+  where
+    admitted what (_, result) = case result of
+      Right report
+        | what == "camera", CameraSet {cameraPending = waiting} ← reportDecision report → null waiting
+        | otherwise → True
+      Left (RetainedEditsExhausted {}) → what == "removal"
+      Left _ → False
+
+-- | Carry out everything the model has asked of the owner, then offload every
+-- changed region (begin and confirm its handoff), until nothing is left.
+quiesce ∷ Model → Either String Model
+quiesce m0 = do
+  m1 ← settleEverything m0
+  let dirty = [r | r ← modelRegions m1, regionDirty r, regionHandoff r == Nothing]
+      offload m r = fst (step (fst (step m (BeginHandoff (regionArena r) (regionCoord r) 0))) (HandoffConfirmed (regionArena r) (regionCoord r)))
+  settleEverything (foldl offload m1 dirty)
+
+-- | A request over its caps is invalid from every state, with a typed reason.
+overCapAlwaysInvalid ∷ [(Int, Int, Int)] → Property
+overCapAlwaysInvalid seeds =
+  let m = modelAfter pressure seeds
+   in case [a | a ← modelArenas m, arenaPhase a == ArenaLive] of
+        [] → property True
+        (arena : _) →
+          let a = arenaId arena
+              rev = arenaRevision arena
+              three = [demand (reg x 0 0) (cell 0 0 0) | x ← [0, 1, 2]]
+              outside z x = [demand (reg 0 0 0) (cell x 0 z)]
+           in conjoin
+                [ expect "a three-region query" (SubmitQuery (RequestId 1000000) a rev three) (Invalid (DemandTooLarge 3 2))
+                , expect "a three-region camera demand" (SetCameraDemand (ViewId 7) a three) (Invalid (DemandTooLarge 3 2))
+                , expect "a cell above the extent" (SubmitQuery (RequestId 1000000) a rev (outside 6 0)) (Invalid (OutsideExtent (reg 0 0 0)))
+                , expect "a cell beyond the extent's columns" (SetCameraDemand (ViewId 7) a (outside 0 2)) (Invalid (OutsideExtent (reg 0 0 0)))
+                ]
+          where
+            expect what event want = case snd (step m event) of
+              Left got → counterexample (what <> ": " <> show got) (got == want)
+              Right _ → counterexample (what <> " was accepted") False
+
+-- | A configuration is refused at construction exactly when a bank (or the load
+-- jobs) is below the worst-case footprint of the largest admissible request,
+-- restated here by hand: the region at its stored maximum, the largest job beyond
+-- it, and the staging each kind of request holds.
+minimumBudgetsAreEnforced ∷ (Integer, Integer, Integer, Integer) → (Integer, Integer, Integer, Integer, Integer) → Property
+minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, camera, x, y, z) =
+  let spec' =
+        LimitsSpec
+          { specResidentBytes = resident
+          , specEditBytes = edit
+          , specStagingBytes = staging
+          , specLoadJobs = jobs
+          , specQueuedCommands = 3
+          , specPinsPerView = 2
+          , specDemandRegions = camera
+          , specAgingQuanta = 3
+          , specQueryRegions = query
+          , specExtentX = x
+          , specExtentY = y
+          , specExtentZ = z
+          }
+      columns = x * y
+      intervals = columns * ((z + 1) `div` 2)
+      stored = 256 + 48 * columns + 32 * intervals + 2 * columns * z
+      job = 48 * columns + 96 * intervals
+      scratch = 256 + 2 * columns * z
+      needResident = maximum [query * (stored + job), camera * (stored + job), stored + 48 + 96 + 62]
+      needStaging = maximum [128 + 32 * query + 64 * query + query * scratch, 128 + 64 * camera + 64 * camera + camera * scratch, 160 + 512 + 64 + 258, 64 * camera, stored]
+      expected
+        | resident < needResident = Just (BankBelowMinimum ResidentBank needResident resident)
+        | edit < 64 = Just (BankBelowMinimum EditBank 64 edit)
+        | staging < needStaging = Just (BankBelowMinimum StagingBank needStaging staging)
+        | jobs < query = Just (LoadJobsBelowMinimum query jobs)
+        | otherwise = Nothing
+   in counterexample (show (spec', expected)) $ case (mkLimits spec', expected) of
+        (Right _, Nothing) → property True
+        (Left got, Just want) → got === want
+        (other, _) → counterexample ("unexpected " <> either show (const "accepted") other) False
 
 spec ∷ Spec
 spec = describe "Residency model properties" $ do
+  it "refuses a configuration exactly when a bank is below the worst-case footprint of its largest request" $
+    withNumTests 5000 $
+      forAll ((,,,) <$> chooseInteger (1, 12000) <*> chooseInteger (1, 200) <*> chooseInteger (1, 12000) <*> chooseInteger (1, 4)) $ \banks →
+        forAll ((,,,,) <$> chooseInteger (1, 4) <*> chooseInteger (1, 4) <*> chooseInteger (1, 4) <*> chooseInteger (1, 3) <*> chooseInteger (1, 12)) $ \caps →
+          minimumBudgetsAreEnforced banks caps
   it "holds its invariants over random sequences" $
     withNumTests 200 $
       forAll (vectorOf 250 ((,,) <$> chooseInt (0, 1000) <*> chooseInt (0, 1000) <*> chooseInt (0, 1000))) $ \seeds →
         case runSequence seeds of
           (Left why, _) → counterexample why False
           (Right _, _) → property True
-  it "completes every camera demand the model accepts when it is alone in an empty model, under random tiny budgets" $
+  it "completes every in-cap camera demand when it is alone, under random valid budgets and leftovers" $
     withNumTests 2000 $
-      forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
-        forAll (vectorOf 4 pair) $ \picks →
-          acceptedDemandCompletes limitsTriple picks
-  it "never calls a request invalid in a loaded model unless it is invalid from an empty one" $
-    withNumTests 3000 $
-      forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
+      forAll ((,,) <$> chooseInteger (2400, 5000) <*> chooseInteger (900, 3000) <*> chooseInteger (1, 4)) $ \limitsTriple →
         forAll (vectorOf 3 pair) $ \leftovers →
-          forAll (vectorOf 4 pair) $ \firstPicks →
-            forAll (vectorOf 4 pair) $ \picks →
-              permanentClassIsOnlyNarrower limitsTriple leftovers firstPicks picks
+          forAll (vectorOf 4 pair) $ \picks →
+            acceptedDemandCompletes limitsTriple leftovers picks
+  it "never refuses an in-cap request as invalid, from any state the sequences reach" $
+    withNumTests 300 $
+      forAll seedsOf $ \seeds → forAll (vectorOf 3 pair) $ \picks → inCapNeverInvalid seeds picks
+  it "admits every in-cap request once everything releasable has been released" $
+    withNumTests 300 $
+      forAll seedsOf $ \seeds → forAll (vectorOf 3 pair) $ \picks → busyEndsWhenReleased seeds picks
+  it "refuses an over-cap request as invalid from every state" $
+    withNumTests 200 $
+      forAll seedsOf overCapAlwaysInvalid
   it "exercises completion, eviction, commit, refusal and retirement in a fixed long sequence" $ do
     let (outcome, stats) = runSequence (lcg 7 12000)
     outcome `shouldSatisfy` either (const False) (const True)
@@ -505,7 +618,6 @@ spec = describe "Residency model properties" $ do
       , ("replaced", replaced, 1)
       , ("oracle: admitted", oracleAdmit, 100)
       , ("oracle: busy", oracleNotNow, 100)
-      , ("oracle: invalid", oracleNever, 5)
       ]
   it "reaches supersede, cancel and acknowledge interleavings under room for concurrent work" $ do
     let (outcome, stats) = runSequenceWith roomyPressure (lcg 11 12000)
@@ -520,6 +632,7 @@ spec = describe "Residency model properties" $ do
       , ("replaced", replaced, 20)
       ]
   where
+    seedsOf = vectorOf 150 ((,,) <$> chooseInt (0, 1000) <*> chooseInt (0, 1000) <*> chooseInt (0, 1000))
     pair = (,) <$> chooseInt (0, 5) <*> chooseInt (0, 5)
     reaches stats floors =
       forM_ floors $ \(name, field, floor') →

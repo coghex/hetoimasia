@@ -203,17 +203,18 @@ data Blockers = Blockers
 
 data InvalidReason
   = EmptyDemand
-  | DemandTooLarge !Int !Word64
+  | -- | Regions named, and the most the request kind allows.
+    DemandTooLarge !Int !Word64
+  | -- | A region naming a cell outside the configured extent.
+    OutsideExtent !RegionCoord
+  | -- | A handoff duplicate larger than a region can ever be, and that maximum.
+    HandoffTooLarge !Word64 !Word64
   | DuplicateRegion !RegionCoord
   | DuplicateRequest !RequestId
   | DuplicateHold !HoldId
   | -- | A region key naming cells outside the supported coordinate range.
     UnsupportedRegion !RegionCoord
   | ArenaNotIncreasing !ArenaId
-  | -- | The bank, the minimal bytes this needs, and the bank's configured total.
-    ExceedsBank !Bank !Word64 !Word64
-  | -- | The slot, the slots this needs, and the slot's configured total.
-    ExceedsSlot !Slot !Word64 !Word64
   | CostArithmetic
   deriving stock (Eq, Show)
 
@@ -871,90 +872,6 @@ planUnit m arena owner d@(RegionDemand region cover) = do
         Right (Just (NewJob delta need (scratchBytes delta)))
   pure (UnitPlan d (maybe True (not . Map.member owner . tgInterests) target) job)
 
--- | How a demand's regions are admitted: all at once (an atomic request) or one
--- after another in demand order (a camera demand).
-data Admit = AllAtOnce | InOrder
-
--- | What one demanded region still has to /load/, and what a fresh job for just
--- those cells would need: the job's whole reservation ('stReserve', with fresh
--- region metadata, as in an empty model), the least it leaves stored ('stLeast')
--- and its scratch ('stScratch'). A region whose demanded cells are all covered by
--- resident detail or by a live job (the sharing contract: it only gains an
--- interest) has nothing to load and costs nothing here.
-data Step = Step
-  { stReserve ∷ !Word64
-  , stLeast ∷ !Word64
-  , stScratch ∷ !Word64
-  , stLoads ∷ !Bool
-  }
-
--- | The cells of a demand that resident detail and live jobs already cover, and
--- those they do not (a region being released counts as absent); 'Nothing' when
--- nothing is left to load.
-uncoveredCells ∷ Model → ArenaId → RegionDemand → (Coverage, Maybe Coverage)
-uncoveredCells m arena (RegionDemand region cover) =
-  let resident = case Map.lookup (arena, region) (mTargets m) >>= tgResident of
-        Just r | not (rsEvicting r) → Just r
-        _ → Nothing
-      promised = [jbCoverage j | (_, j) ← jobsFor m (arena, region), jbState j /= JobCancelling, not (jbStale j)]
-      covered = maybe id (coverageUnion . rsCoverage) resident (foldr coverageUnion emptyCover promised)
-      delta = coverageDifference cover covered
-   in (covered, if coverageIsEmpty delta then Nothing else Just delta)
-
--- | A fresh job for the cells still to load, sized as storage would hold them,
--- merged per region and segment with the coverage already there: the columns and
--- segments the union needs beyond those the covered cells already use (adjacent
--- cells join an existing segment and add none), and fresh region metadata only
--- when nothing of the region is covered. With nothing covered this is an empty
--- model's job for the whole demand.
-emptyStep ∷ (Coverage, Maybe Coverage) → Step
-emptyStep (_, Nothing) = Step 0 0 0 False
-emptyStep (covered, Just delta) =
-  let united = coverageUnion covered delta
-      extra a b = if a > b then a - b else 0
-      columns = extra (coverageColumns united) (coverageColumns covered)
-      segments = extra (coverageSegments united) (coverageSegments covered)
-      metadata = if coverageIsEmpty covered then regionMetadataBytes else 0
-      reserve = metadata + 48 * columns + 96 * segments
-   in Step reserve (metadata + 48 * columns + 34 * segments) (scratchBytes delta) True
-
--- | The one permanent-feasibility check every admission path uses
--- (Requirement 7: permanent invalidity is distinct from pressure). A request is
--- invalid only when the cells it still has to load, sized as a fresh job would
--- store them (see 'emptyStep'), cannot fit a bank or slot even if nothing else
--- existed. A request that has nothing to load is never invalid, and every other
--- shortfall, however long it lasts, is busy: it depends on state that can change,
--- which the check weighs only as which cells are already covered.
---
--- 'fixedStaging' is staging held for the whole demand (an atomic request's command
--- record and staging, or a camera demand's description); 'growth' is a removal's
--- resident growth. An atomic request holds all of its jobs at once; a camera
--- demand is admitted in demand order, one job at a time, keeping what the earlier
--- ones stored.
-footprintCheck ∷ Model → ArenaId → Admit → Word64 → Word64 → [RegionDemand] → Either Refusal ()
-footprintCheck m arena mode fixedStaging growth demands = do
-  let limits = mLimits m
-      steps = map (emptyStep . uncoveredCells m arena) demands
-      residentLimit = limitBytes limits ResidentBank
-      stagingLimit = limitBytes limits StagingBank
-      slotLimit = limitSlot limits LoadJobSlot
-      jobsNeeded = fromIntegral (length (filter stLoads steps)) ∷ Word64
-      (stagingPeak, residentPeak, slotsPeak) = case mode of
-        AllAtOnce →
-          ( fixedStaging + fromIntegral (length demands) * interestRecordBytes + sum (map stScratch steps)
-          , sum (map stReserve steps) + growth
-          , jobsNeeded
-          )
-        InOrder →
-          let leastBefore = scanl (\n st → n + stLeast st) 0 steps
-           in ( maximum (0 : [fixedStaging + k * interestRecordBytes + stScratch st | (k, st) ← zip [1 ..] steps])
-              , maximum (last leastBefore : [added + stReserve st | (added, st) ← zip leastBefore steps])
-              , if jobsNeeded > 0 then 1 else 0
-              )
-  if stagingPeak > stagingLimit then Left (Invalid (ExceedsBank StagingBank stagingPeak stagingLimit)) else Right ()
-  if residentPeak > residentLimit then Left (Invalid (ExceedsBank ResidentBank residentPeak residentLimit)) else Right ()
-  if slotsPeak > slotLimit then Left (Invalid (ExceedsSlot LoadJobSlot slotsPeak slotLimit)) else Right ()
-
 -- | The units, the funding of each new job (active bytes, deferred bytes and the
 -- victims it awaits) and the committed victims.
 data Plan = Plan ![UnitPlan] ![(Word64, Word64, Map RegionKey Word64)] ![RegionKey]
@@ -964,10 +881,9 @@ data Plan = Plan ![UnitPlan] ![(Word64, Word64, Map RegionKey Word64)] ![RegionK
 -- from free capacity plus a committed eviction set. Nothing is changed.
 planAdmission ∷ Model → ArenaId → Owner → [RegionDemand] → Extras → Either Refusal Plan
 planAdmission m arena owner demands extras = do
-  -- Permanently invalid first, before anything that depends on state: the
-  -- footprint cannot fit even from an empty model (see 'footprintCheck').
-  footprintCheck m arena AllAtOnce (exRequestBytes extras) (if exEdit extras then removalResidentGrowthBytes else 0) demands
-  permanent EditBank (if exEdit extras then removalRetainedBytes else 0)
+  -- No capacity check can refuse permanently here: a request within its caps
+  -- fits an empty model by the minimum budgets 'mkLimits' enforced, so every
+  -- shortfall below is pressure (busy), or exhausted retained edits.
   units ← mapM (planUnit m arena owner) demands
   let jobs = [j | UnitPlan {upJob = Just j} ← units]
       newInterests = fromIntegral (length [() | u ← units, upNewInterest u])
@@ -976,7 +892,6 @@ planAdmission m arena owner demands extras = do
       growth = if exEdit extras then removalResidentGrowthBytes else 0
       stagingNeed = newInterests * interestRecordBytes + sum (map njScratch jobs) + exRequestBytes extras
       editNeed = if exEdit extras then removalRetainedBytes else 0
-  permanentSlot CommandSlot nCommands
   -- Retained edits are exhausted, not merely busy, when the committed bytes
   -- plus this edit cannot fit even with every reservation returned.
   let editLedger = bankLedger m EditBank
@@ -1001,12 +916,6 @@ planAdmission m arena owner demands extras = do
       else fundByEviction m (Set.union (exProtect extras) (Set.fromList [(arena, demandRegion d) | d ← demands])) parts shortfall
   pure (Plan units funding victims)
   where
-    permanent bank n =
-      let total = limitBytes (mLimits m) bank
-       in if n > total then Left (Invalid (ExceedsBank bank n total)) else Right ()
-    permanentSlot slot n =
-      let total = limitSlot (mLimits m) slot
-       in if n > total then Left (Invalid (ExceedsSlot slot n total)) else Right ()
     slotFree slot n =
       let total = limitSlot (mLimits m) slot
           used = slotInUse m slot
@@ -1111,7 +1020,7 @@ submit m rid a rev demands edit = do
   if Map.member rid (mRequests m) then Left (Invalid (DuplicateRequest rid)) else Right ()
   arena ← liveArena m a
   if arRevision arena /= rev then Left (Stale (RevisionMismatch (arRevision arena) rev)) else Right ()
-  checkDemand m demands
+  checkDemand m (limitQueryRegions (mLimits m)) demands
   let count = fromIntegral (length demands)
       recordBytes = commandRecordBytes count
       extras = Extras True (recordBytes + maybe 0 (const removalStagingBytes) edit) (isJust edit) Set.empty
@@ -1122,17 +1031,22 @@ submit m rid a rev demands edit = do
       request = Request a (map demandRegion demands) recordBytes reservation active deferred awaiting
   Right (m1 {mRequests = Map.insert rid request (mRequests m1)}, Accepted admission)
 
-checkDemand ∷ Model → [RegionDemand] → Either Refusal ()
-checkDemand m demands = do
+-- | The request-only checks: a nonempty demand of distinct, supported regions
+-- within the cap for its kind, naming only cells inside the configured extent.
+-- Nothing here reads the model's state, so what fails is invalid from every state.
+checkDemand ∷ Model → Word64 → [RegionDemand] → Either Refusal ()
+checkDemand m cap demands = do
   if null demands then Left (Invalid EmptyDemand) else Right ()
-  let limit = limitDemandRegions (mLimits m)
-  if fromIntegral (length demands) > limit then Left (Invalid (DemandTooLarge (length demands) limit)) else Right ()
+  if fromIntegral (length demands) > cap then Left (Invalid (DemandTooLarge (length demands) cap)) else Right ()
   let regions = map demandRegion demands
   case [r | (r, n) ← Map.toList (Map.fromListWith (+) [(r', 1 ∷ Int) | r' ← regions]), n > 1] of
     (r : _) → Left (Invalid (DuplicateRegion r))
     [] → Right ()
   case filter (not . supportedRegion) regions of
     (r : _) → Left (Invalid (UnsupportedRegion r))
+    [] → Right ()
+  case [demandRegion d | d ← demands, not (coverageWithin (limitExtent (mLimits m)) (demandCoverage d))] of
+    (r : _) → Left (Invalid (OutsideExtent r))
     [] → Right ()
 
 -- ---------------------------------------------------------------------------
@@ -1141,17 +1055,15 @@ checkDemand m demands = do
 setCamera ∷ Model → ViewId → ArenaId → [RegionDemand] → Run
 setCamera m v a demands = do
   _ ← liveArena m a
-  checkDemand m demands
-  let limits = mLimits m
-      newBytes = descriptionBytes (fromIntegral (length demands))
+  checkDemand m (limitDemandRegions (mLimits m)) demands
+  -- The replacement description is held for as long as the demand is, beside the
+  -- interests the view retains in the regions it keeps; the minimum budgets
+  -- guarantee that the description, an interest for every region of the demand
+  -- and the scratch of its loads fit an empty staging bank, so pressure here is
+  -- only ever busy and ends when other holders release.
+  let newBytes = descriptionBytes (fromIntegral (length demands))
       oldBytes = maybe 0 (descriptionBytes . fromIntegral . length . vwDemand) (Map.lookup v (mViews m))
       staging = bankLedger m StagingBank
-  if newBytes > limitBytes limits StagingBank
-    then Left (Invalid (ExceedsBank StagingBank newBytes (limitBytes limits StagingBank)))
-    else Right ()
-  -- Permanently invalid: in demand order, the footprint cannot fit even from an empty
-  -- model (see 'footprintCheck'; the description is held for as long as the demand is).
-  footprintCheck m a InOrder newBytes 0 demands
   if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
     then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) (newBytes - oldBytes)))
     else Right ()
@@ -1378,7 +1290,6 @@ acquireHold m h a kind regions = do
     regions
   let bytes = fromIntegral (length regions) * holdRecordBytes
       staging = bankLedger m StagingBank
-  if bytes > ledgerLimit staging then Left (Invalid (ExceedsBank StagingBank bytes (ledgerLimit staging))) else Right ()
   case kind of
     Pin v → do
       let total = limitSlot (mLimits m) ViewPinSlot
@@ -1401,7 +1312,11 @@ beginHandoff m a region dup = do
     _ → Left (Stale (NotResident region))
   if not (rsDirty r) || isJust (rsHandoff r) then Left (ContractFailure (HandoffNotNeeded region)) else Right ()
   let staging = bankLedger m StagingBank
-  if dup > ledgerLimit staging then Left (Invalid (ExceedsBank StagingBank dup (ledgerLimit staging))) else Right ()
+  -- A duplicate larger than a region can ever be is a contract-size violation by
+  -- the owner, independent of the model's state; the minimum budgets guarantee a
+  -- region-sized duplicate fits an otherwise empty staging bank.
+  let largest = limitRegionStoredBytes (mLimits m)
+  if dup > largest then Left (Invalid (HandoffTooLarge dup largest)) else Right ()
   if dup > freeBytes staging then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) dup)) else Right ()
   Right (m {mTargets = Map.insert key t {tgResident = Just r {rsHandoff = Just (dup, rsGeneration r)}} (mTargets m)}, HandoffStarted)
 
