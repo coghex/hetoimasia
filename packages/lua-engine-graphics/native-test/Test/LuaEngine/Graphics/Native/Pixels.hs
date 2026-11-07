@@ -550,7 +550,7 @@ withLiveSession env name files held scenario = do
         writeIORef providerStep (windowMainStep provider)
         warns ← newTVarIO []
         let publisher = scenePublisherOver (graphicsTextures (envGraphics env)) provider (offscreenTargetAnswer (envHost env)) (displayUsable display)
-            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks defaultIssuedMemory)
+            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks defaultIssuedMemory Nothing)
         checkpoint ← bootCheckpointFrom compositionProfile (cpRoot composition) (cpInventory composition) >>= either (\refused → assertFailure ("boot refused: " <> show refused)) pure
         let outSink = OutputSink {sinkLine = \_ → pure (), sinkFlush = pure ()}
             errSink = OutputSink {sinkLine = \line → atomically (modifyTVar' warns (<> [line])), sinkFlush = pure ()}

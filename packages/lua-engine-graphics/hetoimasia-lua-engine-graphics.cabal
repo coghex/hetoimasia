@@ -35,6 +35,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.LuaEngine.Graphics.Facade
+        Hetoimasia.LuaEngine.Graphics.Input
         Hetoimasia.LuaEngine.Graphics.Scene
         Hetoimasia.LuaEngine.Graphics.Scene.Configuration
         Hetoimasia.LuaEngine.Graphics.Scene.Ledger
@@ -96,6 +97,9 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Facade
         Test.LuaEngine.Graphics.FacadeScripts
         Test.LuaEngine.Graphics.Faults
+        Test.LuaEngine.Graphics.InputFeed
+        Test.LuaEngine.Graphics.Input
+        Test.LuaEngine.Graphics.InputSession
         Test.LuaEngine.Graphics.Integrated
         Test.LuaEngine.Graphics.Lifecycle
         Test.LuaEngine.Graphics.Owned

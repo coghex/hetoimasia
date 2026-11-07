@@ -93,6 +93,25 @@ module Hetoimasia.LuaEngine.Facade
   , graphicsWindowRequestType
   , graphicsTextureValueSchema
   , graphicsWindowValueSchema
+  , graphicsInputResetType
+  , InputServices (..)
+  , InputPoll (..)
+  , InputAck (..)
+  , InputPacket (..)
+  , InputDisposition (..)
+  , InputEventRecord (..)
+  , InputBody (..)
+  , InputKeyAction (..)
+  , InputButtonAction (..)
+  , InputModifiers (..)
+  , InputResetInfo (..)
+  , InputResetReason (..)
+  , InputObservation (..)
+  , pollMaximum
+  , pollCapacity
+  , packetSchema
+  , packetValue
+  , worstPacketBytes
   , AdmissionState (..)
   , FacadeEndpoints (..)
   , SessionEndpoints (..)
@@ -183,6 +202,7 @@ import Hetoimasia.LuaEngine.Facade.Caller
   , newRegistry
   )
 import Hetoimasia.LuaEngine.Facade.Graphics (graphicsBindings, graphicsHandleTypes)
+import Hetoimasia.LuaEngine.Facade.Input (inputBindings, packetSchema, packetValue, pollCapacity, pollMaximum, worstPacketBytes)
 import Hetoimasia.LuaEngine.Facade.Content (contentBindings, dataHandleName, lexicalResolver, moduleHandleName, validRootId)
 import Hetoimasia.LuaEngine.Facade.Output
 import Hetoimasia.LuaEngine.Facade.Request (requestBindings)
@@ -466,13 +486,13 @@ facadeExportLimits facade = limits {exportMaxIdentities = exportMaxIdentities li
 -- module, and the export ceilings. The owner's other settings are the caller's.
 installFacade ∷ Facade → [Namespace] → [CapabilityType] → VmConfig → Either InstallRefused VmConfig
 installFacade facade others types config = do
-  registered ← either (Left . RegistrationRefused) Right (registration (handleTypes <> types) (facadeNamespace facade : others))
   limits ← either (Left . ValueLimitsRefused) Right (copiedValueLimits (fcProfile facade))
+  registered ← either (Left . RegistrationRefused) Right (registration (handleTypes <> types) (facadeNamespace facade limits : others))
   Right
     config
       { vmRegistration = registered
       , vmPolicy = nub (vmPolicy config <> [engineNamespaceName] <> [nameOf found | found ← others])
-      , vmInitialChunks = vmInitialChunks config <> [(engineChunkName, engineChunk (isJust (fcGraphics facade)) (limitPrintBytes (fcLimits facade)))]
+      , vmInitialChunks = vmInitialChunks config <> [(engineChunkName, engineChunk (isJust (fcGraphics facade)) (isJust (facadeInput facade)) (limitPrintBytes (fcLimits facade)))]
       , vmExports = vmExports config <> [builderSource]
       , vmExportLimits = facadeExportLimits facade
       , vmValueLimits = limits
@@ -481,6 +501,7 @@ installFacade facade others types config = do
     handleTypes =
       [m1HandleType (fcRequests facade) moduleHandleName, m1HandleType (fcRequests facade) dataHandleName]
         <> maybe [] (\graphics → graphicsHandleTypes facade <> gsTypes graphics) (fcGraphics facade)
+        <> maybe [] isTypes (facadeInput facade)
     nameOf = namespaceName
 
 -- | The copied-value ceilings of a profile as the limits on everything that crosses for an owner: 16 MiB
@@ -494,8 +515,8 @@ copiedValueLimits profile = valueLimits (fromIntegral bytes) (fromIntegral depth
     Count elements = countLimit profile CopiedValueElements
 
 -- | The namespace of the facade's bindings: hidden, read once by the initial chunk and removed.
-facadeNamespace ∷ Facade → Namespace
-facadeNamespace facade =
+facadeNamespace ∷ Facade → ValueLimits → Namespace
+facadeNamespace facade limits =
   namespace
     engineNamespaceName
     ( outputBindings facade
@@ -505,7 +526,12 @@ facadeNamespace facade =
         <> timeBindings facade
         <> sessionBindings facade
         <> maybe [] (graphicsBindings facade) (fcGraphics facade)
+        <> maybe [] (\input → inputBindings facade input limits) (facadeInput facade)
     )
+
+-- | The presentation-input operations of this facade, if the composition opted in.
+facadeInput ∷ Facade → Maybe InputServices
+facadeInput facade = fcGraphics facade >>= gsInput
 
 -- | A configuration of a VM's instances that tells the facade whenever a hook begins or resumes, after
 -- whatever the configuration already did.

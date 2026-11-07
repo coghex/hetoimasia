@@ -22,7 +22,7 @@ import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank)
 import Hetoimasia.LuaEngine.Request (M1Ask (..), M1Start (..), m1Ask, startM1)
 import Hetoimasia.LuaEngine.Scene (sceneSchema)
 import Hetoimasia.Scripting.Lua.Admission (Necessity (RequiredRequest))
-import Hetoimasia.Scripting.Lua.Lease (Ownership (InstanceOwned), ReleaseAnswer (..), leaseCapabilityType, newLeases, releaseLease, withLeaseOr)
+import Hetoimasia.Scripting.Lua.Lease (Leases, Ownership (InstanceOwned), ReleaseAnswer (..), leaseCapabilityType, newLeases, releaseLease, withLeaseOr)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Provider
   ( Adoption (Adoption)
@@ -34,11 +34,13 @@ import Hetoimasia.Scripting.Lua.Provider
   , Submission (..)
   , completeRequest
   )
-import Hetoimasia.Scripting.Lua.Registration (stateOperation, withArgumentCheck)
+import Hetoimasia.Scripting.Lua.Registration (capabilityType, stateOperation, withArgumentCheck)
 import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SNil, SRecord), Value (VCapability, VInteger, VNil, VRecord), capability)
-import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
+import Hetoimasia.LuaEngine.Profile (ByteLimit (CopiedValueBytes, DataBytes, SceneInputBytes), Profile, fixedM1Profile)
+import Numeric.Natural (Natural)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
+import Test.LuaEngine.Request.Profiles (bytesOf)
 
 -- | What the fake providers were asked and what they hold.
 data Gfx = Gfx
@@ -46,10 +48,79 @@ data Gfx = Gfx
   , gxBusy ∷ !(IORef Bool)
   , gxHanded ∷ !(TVar [(Text, Completion, TVar RetirementState)])
   , gxIssued ∷ !(TVar (Map.Map Word64 Text))
+  , gxInput ∷ !Inp
   }
 
 newGfx ∷ IO Gfx
-newGfx = Gfx <$> newIORef [] <*> newIORef False <*> newTVarIO [] <*> newTVarIO Map.empty
+newGfx = Gfx <$> newIORef [] <*> newIORef False <*> newTVarIO [] <*> newTVarIO Map.empty <*> newInp
+
+-- | The injected ordered input port: a feed the example loads, with the disposition it is in, the observation a read
+-- takes and the answers an acknowledgement is told to give. Every operation it is asked to do is logged, so a refused call
+-- is shown to have asked it for nothing.
+data Inp = Inp
+  { inLog ∷ !(IORef [Text])
+  , inFeed ∷ !(TVar Feed)
+  , inObservation ∷ !(TVar InputObservation)
+  , inAcks ∷ !(IORef [InputAck])
+  , inRefuse ∷ !(IORef (Maybe Text))
+  }
+
+data Feed = Feed
+  { feedQueue ∷ ![InputEventRecord]
+  , feedMode ∷ !FeedMode
+  , feedEpoch ∷ !Natural
+  }
+
+data FeedMode = FeedRunning | FeedReset | FeedPaused | FeedClosed
+  deriving (Eq)
+
+newInp ∷ IO Inp
+newInp = Inp <$> newIORef [] <*> newTVarIO (Feed [] FeedRunning 3) <*> newTVarIO emptyObservation <*> newIORef [] <*> newIORef Nothing
+
+emptyObservation ∷ InputObservation
+emptyObservation = InputObservation 0 Nothing Nothing Nothing Nothing Nothing Nothing
+
+inCalls ∷ Gfx → IO [Text]
+inCalls = fmap reverse . readIORef . inLog . gxInput
+
+noteIn ∷ Inp → Text → IO ()
+noteIn inp entry = atomicModifyIORef' (inLog inp) (\held → (entry : held, ()))
+
+-- | The token key every reset the fake shows is under.
+fakeTokenKey ∷ Word64
+fakeTokenKey = (1 * 4294967296) + 1
+
+fakeInput ∷ Gfx → Leases → InputServices
+fakeInput gx leases =
+  InputServices
+    { isTypes = [leaseCapabilityTypeFor]
+    , isCheckPoll = \_ key → noteIn inp "check poll" >> windowOwned key
+    , isPoll = \_ _ count → do
+        noteIn inp ("poll " <> Text.pack (show count))
+        refused ← readIORef (inRefuse inp)
+        case refused of
+          Just why → pure (PollRefused why)
+          Nothing → atomically $ do
+            feed ← readTVar (inFeed inp)
+            observation ← readTVar (inObservation inp)
+            let (taken, rest) = splitAt count (feedQueue feed)
+                packet disposition events exhausted reset = Polled (InputPacket disposition (feedEpoch feed) events exhausted reset observation)
+            case feedMode feed of
+              FeedRunning → writeTVar (inFeed inp) feed {feedQueue = rest} >> pure (packet DispositionRunning taken (length taken < count) Nothing)
+              FeedReset → pure (packet DispositionResetRequired [] True (Just (InputResetInfo ResetReasonOverflow (feedEpoch feed + 1) (Just fakeTokenKey))))
+              FeedPaused → pure (packet DispositionPaused [] True (Just (InputResetInfo ResetReasonOverflow (feedEpoch feed + 1) Nothing)))
+              FeedClosed → pure (packet DispositionClosed [] True Nothing)
+    , isCheckAcknowledge = \_ key _ → noteIn inp "check ack" >> windowOwned key
+    , isAcknowledge = \_ _ _ → do
+        noteIn inp "ack"
+        atomicModifyIORef' (inAcks inp) $ \case
+          answer : more → (more, answer)
+          [] → ([], AckAcknowledged)
+    }
+  where
+    inp = gxInput gx
+    leaseCapabilityTypeFor = capabilityType graphicsInputResetType (\key → pure (key == fakeTokenKey))
+    windowOwned key = withLeaseOr leases key (\why → pure (Just why)) (\(_ ∷ Text) → pure Nothing)
 
 calls ∷ Gfx → IO [Text]
 calls = fmap reverse . readIORef . gxCalls
@@ -62,7 +133,11 @@ countOf ∷ Gfx → Text → IO Int
 countOf gx word = length . filter (Text.isPrefixOf word) <$> calls gx
 
 injection ∷ Gfx → GraphicsInjection
-injection gx = GraphicsInjection $ \vm → do
+injection = injectionOpt False
+
+-- | The same, with the ordered input port injected when asked to.
+injectionOpt ∷ Bool → Gfx → GraphicsInjection
+injectionOpt withInput gx = GraphicsInjection $ \vm → do
   lending ← newLending
   leases ← newLeases lending 17
   pure
@@ -89,6 +164,7 @@ injection gx = GraphicsInjection $ \vm → do
       , gsRelease = \key → do
           note gx "release"
           word <$> releaseLease leases key
+      , gsInput = if withInput then Just (fakeInput gx leases) else Nothing
       }
   where
     word = \case
@@ -125,6 +201,9 @@ injection gx = GraphicsInjection $ \vm → do
       VRecord fields → VRecord (("texture", VCapability (capability graphicsTextureType key)) : fields)
       other → other)
     windowCompose = (InstanceOwned, \_ key → VCapability (capability graphicsWindowType key))
+
+awaitHanded ∷ Gfx → Int → IO ()
+awaitHanded gx wanted = atomically (readTVar (gxHanded gx) >>= \held → if length held >= wanted then pure () else retry)
 
 -- | The provider answers the nth handed request.
 handed ∷ Gfx → Int → IO (Text, Completion)
@@ -438,8 +517,8 @@ spec = describe "graphics calls" $ do
         countOf gx "start" `shouldReturn` 0
       )
       `finally` finishAll gx
+  inputSpec
   where
-    awaitHanded gx wanted = atomically (readTVar (gxHanded gx) >>= \held → if length held >= wanted then pure () else retry)
     updateLua =
       [ "if self.done or not api.request.ready(self.t) or not api.request.ready(self.w) then return end"
       , "self.done = true"
@@ -451,3 +530,391 @@ spec = describe "graphics calls" $ do
       , "local second = api.texture.release(t.value.texture)"
       , "print('release', first, second)"
       ]
+
+-- Input (TRA-6) ------------------------------------------------------------------------------------------
+
+-- | Lua helpers the input examples share: an event or a packet as one short line.
+inputPrelude ∷ [Text]
+inputPrelude =
+  [ "local function flags(m) return (m.shift and 'S' or '-') .. (m.control and 'C' or '-') .. (m.alt and 'A' or '-') .. (m.super and 'U' or '-') .. (m.caps_lock and 'L' or '-') .. (m.num_lock and 'N' or '-') end"
+  , "local function brief(e)"
+  , "  local parts = {e.kind, tostring(e.epoch)}"
+  , "  for _, k in ipairs({'code', 'scancode', 'action', 'codepoint', 'button', 'x', 'y', 'scroll_x', 'scroll_y', 'focused'}) do"
+  , "    if e[k] ~= nil then parts[#parts + 1] = k .. '=' .. tostring(e[k]) end"
+  , "  end"
+  , "  if e.text ~= nil then parts[#parts + 1] = 'bytes=' .. table.concat({string.byte(e.text, 1, -1)}, ',') end"
+  , "  if e.mods ~= nil then parts[#parts + 1] = 'mods=' .. flags(e.mods) end"
+  , "  return table.concat(parts, ' ')"
+  , "end"
+  , "local function show_packet(tag, p)"
+  , "  print(tag, p.disposition, p.epoch, p.exhausted, #p.events)"
+  , "  for i, e in ipairs(p.events) do print(tag .. i, brief(e)) end"
+  , "end"
+  ]
+
+openWindow ∷ [Text]
+openWindow = ["self.w = api.window.open({title = 't', width = 2, height = 2})"]
+
+-- | The start of every update: take the window once it is there, and run the rest once.
+takeWindow ∷ [Text]
+takeWindow =
+  [ "if not self.win then"
+  , "  if not api.request.ready(self.w) then return end"
+  , "  self.win = api.request.take(self.w).value"
+  , "end"
+  , "if self.ran then return end"
+  , "self.ran = true"
+  ]
+
+-- | A presentation instance that opens a window, takes it and then runs this Lua once with @self.win@ the handle, ending
+-- with the line @ran@; then the check, over the world and the instance.
+runInputWith ∷ Profile → Gfx → [Text] → [Text] → (World → Spawned → IO ()) → IO ()
+runInputWith profile gx body shutdown check =
+  ( withWorld profile (Layout [("lua/main.lua", scriptSource found)]) $ \world _ runtime →
+      withFvm world runtime (presentationShape {shGraphics = Just (injectionOpt True gx)}) $ \fvm → do
+        spawned ← spawn world fvm "modules-test" mainPath
+        awaitHanded gx 1
+        answerWindow gx 0
+        pumpUntil world (advanceClock world 2000000000 >> (elem "ran" <$> outLines world))
+        check world spawned
+        finishAll gx
+  )
+    `finally` finishAll gx
+  where
+    found = script {scPrelude = dumpPrelude <> inputPrelude, scInit = openWindow, scUpdate = takeWindow <> body <> ["print('ran')"], scShutdown = shutdown}
+
+runInput ∷ Gfx → [Text] → [Text] → (World → Spawned → IO ()) → IO ()
+runInput = runInputWith fixedM1Profile
+
+shiftMods, ctrlMods, noMods ∷ InputModifiers
+shiftMods = InputModifiers True False False False False False
+ctrlMods = InputModifiers False True False False False False
+noMods = InputModifiers False False False False False False
+
+-- | Every kind of event, in one epoch.
+orderedEvents ∷ [InputEventRecord]
+orderedEvents =
+  map
+    (InputEventRecord 3)
+    [ BodyKey 65 30 KeyActionPress shiftMods
+    , BodyKey 65 30 KeyActionRepeat shiftMods
+    , BodyKey 65 30 KeyActionRelease noMods
+    , BodyText 65
+    , BodyText 233
+    , BodyText 0xD800
+    , BodyButton 0 ButtonActionPress (Just (10.5, -3.25)) ctrlMods
+    , BodyButton 0 ButtonActionRelease Nothing noMods
+    , BodyScroll (-1.5) 0.25
+    , BodyFocus False
+    , BodyFocus True
+    ]
+
+loadFeed ∷ Gfx → [InputEventRecord] → FeedMode → IO ()
+loadFeed gx events mode = atomically (writeTVar (inFeed (gxInput gx)) (Feed events mode 3))
+
+-- | What the feed still holds.
+remaining ∷ Gfx → IO Int
+remaining gx = length . feedQueue <$> readTVarIO (inFeed (gxInput gx))
+
+inputSpec ∷ Spec
+inputSpec = describe "input calls" $ do
+  it "polls a synthetic ordered sequence as a prefix and then the remainder, with exact payloads, order and epoch, and no false empty" $ do
+    gx ← newGfx
+    loadFeed gx orderedEvents FeedRunning
+    runInput
+      gx
+      [ "show_packet('a', api.input.poll(self.win, 4))"
+      , "show_packet('b', api.input.poll(self.win, 4))"
+      , "show_packet('c', api.input.poll(self.win, 4))"
+      ]
+      []
+      $ \world _ → do
+        outLines world
+          >>= ( `shouldBe`
+                  [ "a\trunning\t3\tfalse\t4"
+                  , "a1\tkey 3 code=65 scancode=30 action=press mods=S-----"
+                  , "a2\tkey 3 code=65 scancode=30 action=repeat mods=S-----"
+                  , "a3\tkey 3 code=65 scancode=30 action=release mods=------"
+                  , "a4\ttext 3 codepoint=65 bytes=65"
+                  , "b\trunning\t3\tfalse\t4"
+                  , "b1\ttext 3 codepoint=233 bytes=195,169"
+                  , -- a surrogate has no UTF-8 text: the exact code point, and no substitute character
+                    "b2\ttext 3 codepoint=55296"
+                  , "b3\tbutton 3 action=press button=0 x=10.5 y=-3.25 mods=-C----"
+                  , "b4\tbutton 3 action=release button=0 mods=------"
+                  , "c\trunning\t3\ttrue\t3"
+                  , "c1\tscroll 3 scroll_x=-1.5 scroll_y=0.25"
+                  , "c2\tfocus 3 focused=false"
+                  , "c3\tfocus 3 focused=true"
+                  , "ran"
+                  ]
+              )
+        inCalls gx `shouldReturn` ["check poll", "poll 4", "check poll", "poll 4", "check poll", "poll 4"]
+        remaining gx `shouldReturn` 0
+
+  it "carries 128 events in one packet, then the rest, under the fixed profile" $ do
+    gx ← newGfx
+    loadFeed gx (replicate 130 (InputEventRecord 3 (BodyButton 7 ButtonActionRelease (Just (1.5, 2.5)) (InputModifiers True True True True True True)))) FeedRunning
+    runInput gx ["local a = api.input.poll(self.win, 128)", "local b = api.input.poll(self.win, 128)", "print(#a.events, a.exhausted, #b.events, b.exhausted)"] [] $ \world _ →
+      outLines world >>= (`shouldBe` ["128\tfalse\t2\ttrue", "ran"])
+
+  it "reports the observation of the same read: latest cursor and focus, logical and framebuffer extents and the content scale" $ do
+    gx ← newGfx
+    atomically (writeTVar (inObservation (gxInput gx)) (InputObservation 7 (Just False) (Just (-2.5, 100.75)) (Just False) (Just (800, 600)) (Just (1600, 1200)) (Just (2.0, 1.5))))
+    runInput gx ["print(dump(api.input.poll(self.win, 1).observation))"] [] $ \world _ →
+      outLines world
+        >>= ( `shouldBe`
+                [ "{cursor={x=-2.5,y=100.75},cursor_inside=false,focused=false,framebuffer={height=1200,width=1600},logical={height=600,width=800},revision=7,scale={x=2.0,y=1.5}}"
+                , "ran"
+                ]
+            )
+
+  it "leaves an unavailable attribute absent rather than zero, and keeps a zero drawable extent" $ do
+    gx ← newGfx
+    atomically (writeTVar (inObservation (gxInput gx)) (InputObservation 8 Nothing Nothing Nothing Nothing (Just (0, 0)) Nothing))
+    runInput gx ["print(dump(api.input.poll(self.win, 1).observation))"] [] $ \world _ →
+      outLines world >>= (`shouldBe` ["{framebuffer={height=0,width=0},revision=8}", "ran"])
+
+  it "shows a reset's reason, reserved epoch and token, a paused feed's reset without a token, and a closed feed" $ do
+    gx ← newGfx
+    loadFeed gx [] FeedReset
+    runInput gx ["local p = api.input.poll(self.win, 1)", "print(p.disposition, p.epoch, p.exhausted, #p.events, p.reset.reason, p.reset.epoch, type(p.reset.token))", "local q = api.input.poll(self.win, 1)", "print(rawequal(p.reset.token, q.reset.token), p.reset.token == q.reset.token)"] [] $ \world _ →
+      outLines world >>= (`shouldBe` ["reset_required\t3\ttrue\t0\toverflow\t4\tuserdata", "false\ttrue", "ran"])
+    paused ← newGfx
+    loadFeed paused [] FeedPaused
+    runInput paused ["local p = api.input.poll(self.win, 1)", "print(p.disposition, p.reset.reason, p.reset.epoch, p.reset.token == nil, #p.events)"] [] $ \world _ →
+      outLines world >>= (`shouldBe` ["paused\toverflow\t4\ttrue\t0", "ran"])
+    closed ← newGfx
+    loadFeed closed [] FeedClosed
+    runInput closed ["local p = api.input.poll(self.win, 1)", "print(p.disposition, p.reset == nil, #p.events, p.exhausted)"] [] $ \world _ →
+      outLines world >>= (`shouldBe` ["closed\ttrue\t0\ttrue", "ran"])
+
+  it "refuses every misshapen or out-of-range call as an ordinary error before a single event is read or acknowledged" $ do
+    gx ← newGfx
+    loadFeed gx orderedEvents FeedRunning
+    let cases =
+          [ Case "poll colon" "api.input:poll(self.win, 1)" (Refused ["input_poll"])
+          , Case "poll no arguments" "api.input.poll()" (Refused ["expected 2 values, found 0"])
+          , Case "poll one argument" "api.input.poll(self.win)" (Refused ["expected 2 values, found 1"])
+          , Case "poll extra argument" "api.input.poll(self.win, 1, nil)" (Refused ["expected 2 values, found 3"])
+          , Case "poll explicit nil count" "api.input.poll(self.win, nil)" (Refused ["expected integer"])
+          , Case "poll integral float" "api.input.poll(self.win, 3.0)" (Refused ["a float where an integer is declared"])
+          , Case "poll float" "api.input.poll(self.win, 1.5)" (Refused ["a float where an integer is declared"])
+          , Case "poll numeric string" "api.input.poll(self.win, '3')" (Refused ["expected integer"])
+          , Case "poll zero" "api.input.poll(self.win, 0)" (Refused ["from 1 to 128"])
+          , Case "poll negative" "api.input.poll(self.win, -1)" (Refused ["from 1 to 128"])
+          , Case "poll 129" "api.input.poll(self.win, 129)" (Refused ["from 1 to 128"])
+          , Case "poll huge" "api.input.poll(self.win, math.maxinteger)" (Refused ["from 1 to 128"])
+          , Case "poll nil window" "api.input.poll(nil, 1)" (Refused ["expected capability"])
+          , Case "poll number window" "api.input.poll(7, 1)" (Refused ["expected capability"])
+          , Case "poll table window" "api.input.poll({}, 1)" (Refused ["expected capability"])
+          , Case "poll extra options" "api.input.poll(self.win, 1, {})" (Refused ["expected 2 values, found 3"])
+          , Case "ack colon" "api.input:acknowledgeReset(self.win, self.win)" (Refused ["input_acknowledge_reset"])
+          , Case "ack no arguments" "api.input.acknowledgeReset()" (Refused ["expected 2 values, found 0"])
+          , Case "ack one argument" "api.input.acknowledgeReset(self.win)" (Refused ["expected 2 values, found 1"])
+          , Case "ack integer token" "api.input.acknowledgeReset(self.win, 1)" (Refused ["expected capability"])
+          , Case "ack string token" "api.input.acknowledgeReset(self.win, 'x')" (Refused ["expected capability"])
+          , Case "ack window as token" "api.input.acknowledgeReset(self.win, self.win)" (Refused [])
+          ]
+    runInput gx (map caseLua cases) [] $ \world _ → do
+      outLines world >>= checkCases cases
+      -- nothing was asked of the port, and the feed holds every event it held
+      inCalls gx `shouldReturn` []
+      remaining gx `shouldReturn` length orderedEvents
+
+  it "takes one valid poll and reads exactly once after its own check" $ do
+    gx ← newGfx
+    loadFeed gx orderedEvents FeedRunning
+    runInput gx (map caseLua [Case "valid" "api.input.poll(self.win, 1)" Accepted]) [] $ \world _ → do
+      outLines world >>= checkCases [Case "valid" "" Accepted]
+      inCalls gx `shouldReturn` ["check poll", "poll 1"]
+      remaining gx `shouldReturn` (length orderedEvents - 1)
+
+  it "turns a refusal that lands after the check into an ordinary error, having read nothing" $ do
+    gx ← newGfx
+    loadFeed gx orderedEvents FeedRunning
+    writeIORef (inRefuse (gxInput gx)) (Just "the instance has ended")
+    runInput gx (map caseLua [Case "late" "api.input.poll(self.win, 2)" (Refused ["the instance has ended"])] <> ["print(select('#', pcall(api.input.poll, self.win, 2)))"]) [] $ \world _ → do
+      outLines world >>= \printed → printed `shouldSatisfy` (\ls → any (Text.isInfixOf "the instance has ended") ls)
+      remaining gx `shouldReturn` length orderedEvents
+
+  it "refuses polling in shutdown and to the logical role, and acknowledging to the logical role, and asks the port for nothing" $ do
+    gx ← newGfx
+    loadFeed gx [] FeedReset
+    let shutdownCases =
+          [ Case "shutdown poll" "api.input.poll(self.win, 1)" (Refused ["not available in shutdown"])
+          , Case "shutdown ack" "api.input.acknowledgeReset(self.win, self.token) == 'acknowledged'" Holds
+          ]
+    runInput gx ["self.token = api.input.poll(self.win, 1).reset.token"] (map caseLua shutdownCases) $ \world spawned → do
+      stopSpawned spawned
+      _ ← settledOf spawned
+      outLines world >>= checkCases shutdownCases
+      -- the poll before the shutdown and the acknowledgement in it are the only reads
+      inCalls gx `shouldReturn` ["check poll", "poll 1", "check ack", "ack"]
+    logical ← newGfx
+    let logicalCases =
+          [ Case "logical poll" "api.input.poll(nil, 1)" (Refused ["presentation role only"])
+          , Case "logical ack" "api.input.acknowledgeReset(nil, nil)" (Refused ["presentation role only"])
+          ]
+    ( withOneGraphics (injectionOpt True logical) Gameplay script {scInit = map caseLua logicalCases} [] $ \world _ _ _ → do
+        outLines world >>= checkCases logicalCases
+        inCalls logical `shouldReturn` []
+        finishAll logical
+      )
+      `finally` finishAll logical
+
+  it "refuses polling once the session takes no new work, while acknowledgement stays usable" $ do
+    gx ← newGfx
+    loadFeed gx [] FeedReset
+    let stopped =
+          [ Case "stopping poll" "api.input.poll(self.win, 1)" (Refused ["the session is stopping"])
+          , Case "stopping ack" "api.input.acknowledgeReset(self.win, self.token) == 'acknowledged'" Holds
+          ]
+        update =
+          takeWindow'
+            <> ["if not self.got then self.got = true self.token = api.input.poll(self.win, 1).reset.token print('got') return end", "if self.cased then return end", "self.cased = true"]
+            <> map caseLua stopped
+            <> ["print('cased')"]
+        takeWindow' =
+          [ "if not self.win then"
+          , "  if not api.request.ready(self.w) then return end"
+          , "  self.win = api.request.take(self.w).value"
+          , "end"
+          ]
+    ( withOneGraphics (injectionOpt True gx) Presentation script {scPrelude = dumpPrelude <> inputPrelude, scInit = openWindow, scUpdate = update} [] $ \world _ _ _ → do
+        awaitHanded gx 1
+        answerWindow gx 0
+        pumpUntil world (advanceClock world 2000000000 >> (elem "got" <$> outLines world))
+        setAdmission world AdmissionStopping
+        pumpUntil world (advanceClock world 2000000000 >> (elem "cased" <$> outLines world))
+        outLines world >>= checkCases stopped
+        inCalls gx `shouldReturn` ["check poll", "poll 1", "check ack", "ack"]
+        finishAll gx
+      )
+      `finally` finishAll gx
+
+  it "answers each acknowledgement outcome as a word, and refuses a late-found refusal as an ordinary error" $ do
+    gx ← newGfx
+    loadFeed gx [] FeedReset
+    writeIORef (inAcks (gxInput gx)) [AckAcknowledged, AckAlready, AckStale, AckClosed, AckRefused "the reset token does not belong to this window"]
+    runInput
+      gx
+      [ "local p = api.input.poll(self.win, 1)"
+      , "for i = 1, 5 do print('ack', i, pcall(api.input.acknowledgeReset, self.win, p.reset.token)) end"
+      ]
+      []
+      $ \world _ → do
+        printed ← outLines world
+        take 4 printed
+          `shouldBe` ["ack\t1\ttrue\tacknowledged", "ack\t2\ttrue\talready_acknowledged", "ack\t3\ttrue\tstale", "ack\t4\ttrue\tclosed"]
+        printed !! 4 `shouldSatisfy` (\line → "ack\t5\tfalse\t" `Text.isPrefixOf` line && "does not belong to this window" `Text.isInfixOf` line)
+
+  it "installs api.input with exactly poll and acknowledgeReset in both roles when injected, and nothing when not" $ do
+    gx <- newGfx
+    let probe =
+          [ "local names = {}"
+          , "for k in pairs(api.input or {}) do names[#names + 1] = k end"
+          , "table.sort(names)"
+          , "print('layout', api.role, api.input ~= nil, table.concat(names, ','), type(api.input and api.input.poll), type(api.input and api.input.acknowledgeReset))"
+          ]
+    withOneGraphics (injectionOpt True gx) Presentation script {scInit = probe} [] (\world _ _ _ → outLines world >>= (`shouldBe` ["layout\tpresentation\ttrue\tacknowledgeReset,poll\tfunction\tfunction"]) >> finishAll gx)
+      `finally` finishAll gx
+    gx' ← newGfx
+    withOneGraphics (injectionOpt True gx') Gameplay script {scInit = probe} [] (\world _ _ _ → outLines world >>= (`shouldBe` ["layout\tgameplay\ttrue\tacknowledgeReset,poll\tfunction\tfunction"]) >> finishAll gx')
+      `finally` finishAll gx'
+    gx'' ← newGfx
+    withOneGraphics (injection gx'') Presentation script {scInit = probe} [] (\world _ _ _ → outLines world >>= (`shouldBe` ["layout\tpresentation\tfalse\t\tnil\tnil"]) >> finishAll gx'')
+      `finally` finishAll gx''
+    withOne Presentation fixedM1Profile script {scInit = probe} (\world _ _ _ → outLines world >>= (`shouldBe` ["layout\tpresentation\tfalse\t\tnil\tnil"]))
+
+  it "refuses a facade a module kept when its top level reaches for input, and another instance's captured facade" $ do
+    gx ← newGfx
+    let shared = ("lua/share.lua", luaMain ["return {apis = {}}"])
+        late =
+          ( "lua/late.lua"
+          , luaMain $
+              tryPrelude
+                <> [ "local share = import('lua/share.lua')"
+                   , "local api = share.apis[1]"
+                   , "try('late poll', function() return api.input.poll(share.win, 1) end)"
+                   , "try('late ack', function() return api.input.acknowledgeReset(share.win, share.win) end)"
+                   , "return {}"
+                   ]
+          )
+        mainSource =
+          scriptSource
+            script
+              { scPrelude = ["local share = import('lua/share.lua')"]
+              , scInit = ["share.apis[#share.apis + 1] = api", "if #share.apis == 1 then api.content.module('lua/late.lua') end"]
+              , scUpdate =
+                  [ "if self.ran or #share.apis < 2 then return end self.ran = true"
+                  , "if api.instance_id ~= share.apis[2].instance_id then return end"
+                  , "try('foreign facade poll', function() return share.apis[1].input.poll(nil, 1) end)"
+                  , "try('foreign facade ack', function() return share.apis[1].input.acknowledgeReset(nil, nil) end)"
+                  , "print('ran')"
+                  ]
+              }
+    ( withWorld fixedM1Profile (Layout [("lua/main.lua", mainSource), shared, late]) $ \world _ runtime →
+        withFvm world runtime (presentationShape {shGraphics = Just (injectionOpt True gx)}) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          _ ← spawn world fvm "modules-test" mainPath
+          pumpUntil world (advanceClock world 2000000000 >> (elem "ran" <$> outLines world))
+          printed ← outLines world
+          let named prefix = [line | line ← printed, prefix `Text.isPrefixOf` line]
+          named "late poll => " `shouldSatisfy` all (\line → "false ; " `Text.isPrefixOf` Text.drop 13 line || "services are not available while a module is evaluated" `Text.isInfixOf` line)
+          length (named "late ") `shouldBe` 2
+          named "late " `shouldSatisfy` all ("services are not available while a module is evaluated" `Text.isInfixOf`)
+          length (named "foreign facade") `shouldBe` 2
+          named "foreign facade" `shouldSatisfy` all ("belongs to another instance" `Text.isInfixOf`)
+          inCalls gx `shouldReturn` []
+          finishAll gx
+      )
+      `finally` finishAll gx
+
+  it "bounds a poll by what the copied-value limits carry: the largest count that fits is delivered whole, and one more is refused before any read" $ do
+    gx ← newGfx
+    loadFeed gx (replicate 130 (InputEventRecord 3 (BodyButton 7 ButtonActionRelease (Just (1.5, 2.5)) (InputModifiers True True True True True True)))) FeedRunning
+    runInputWith
+      (bytesOf [(CopiedValueBytes, 24000), (DataBytes, 64), (SceneInputBytes, 64)])
+      gx
+      [ "local n, why = 128, nil"
+      , "while n >= 1 do"
+      , "  local ok, result = pcall(api.input.poll, self.win, n)"
+      , "  if ok then print('fits', n, #result.events) break end"
+      , "  why = result"
+      , "  n = n - 1"
+      , "end"
+      , "print('refused above', tostring(why):find('copied-value limits', 1, true) ~= nil, tostring(why):find('max_events ' .. (n + 1), 1, true) ~= nil)"
+      ]
+      []
+      $ \world _ → do
+        printed ← outLines world
+        let fitted = [(read (Text.unpack a), read (Text.unpack b)) | line ← printed, ["fits", a, b] ← [Text.splitOn "\t" line]] ∷ [(Int, Int)]
+        case fitted of
+          [(n, delivered)] → do
+            n `shouldSatisfy` (\count → count >= 1 && count < 128)
+            delivered `shouldBe` n
+            remaining gx `shouldReturn` (130 - n)
+            -- only the accepted poll reached the port
+            inCalls gx `shouldReturn` ["check poll", "poll " <> Text.pack (show n)]
+          other → expectationFailure ("a poll must fit once: " <> show other <> " in " <> show printed)
+        printed `shouldSatisfy` elem "refused above\ttrue\ttrue"
+
+  it "fails the owner as the host's defect, never an empty poll, when the provider's data cannot be a Lua integer or a finite number" $ do
+    let failing events expected = do
+          gx ← newGfx
+          loadFeed gx events FeedRunning
+          (failures, _) ←
+            fatalWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource script {scInit = openWindow, scUpdate = takeWindow <> ["api.input.poll(self.win, 1)", "print('survived')"]})]) $ \world control runtime →
+              withFvm world runtime (presentationShape {shGraphics = Just (injectionOpt True gx)}) $ \fvm → do
+                _ ← admitOnly world fvm "modules-test" mainPath
+                awaitHanded gx 1
+                answerWindow gx 0
+                pumpUntil world (advanceClock world 2000000000 >> (not . null <$> failuresSeen world))
+                void (awaitEnded control fvm)
+                  `finally` finishAll gx
+          failures `shouldSatisfy` any (\(EngineFailure why) → expected `Text.isInfixOf` why)
+          -- the batch was taken: it is not replayed and not hidden behind an empty poll
+          remaining gx `shouldReturn` 0
+    failing [InputEventRecord (2 ^ (63 ∷ Int)) (BodyFocus True)] "Lua integer ceiling"
+    failing [InputEventRecord 3 (BodyScroll (1 / 0) 0)] "not a finite number"

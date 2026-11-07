@@ -13,6 +13,7 @@ module Test.LuaEngine.Graphics.PeersRig
   , withPeersWith
   , withPeersHooked
   , withPeersConfigured
+  , withPeersInput
   , mainLoop
   , mainLoopAs
   , retireAndAwait
@@ -45,7 +46,8 @@ import Hetoimasia.Foundation.Time (DurationRequirement (RequirePositive), durati
 import Hetoimasia.LuaEngine.Behavior (behaviorRequest)
 import Hetoimasia.LuaEngine.Data (dataService, newByteBankFor)
 import Hetoimasia.LuaEngine.Facade
-import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), graphicsInjection)
+import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), defaultIssuedMemory, graphicsInjection)
+import Hetoimasia.LuaEngine.Graphics.Input (InputHost)
 import Hetoimasia.LuaEngine.Graphics.Scene (noPublishHooks, scenePublisherOver)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
@@ -99,6 +101,8 @@ data Peers = Peers
   , peControl ∷ !RuntimeControl
   , peRuntime ∷ !LuaRuntime
   , peOutput ∷ !Output
+  , peTakes ∷ !(TVar Bool)
+  -- ^ Whether the fake session still takes new work for the VM: the admission an input read is gated on in its own transaction.
   }
 
 -- | An instance admitted to the VM.
@@ -119,7 +123,14 @@ withPeersHooked = withPeersConfigured Fake.defaultFakeConfig
 
 -- | The same with the given configuration of the texture owner's fake: the stages it holds from the start.
 withPeersConfigured ∷ Fake.FakeConfig → ProviderHooks → WF.FakeConfig → ByteString → Int → (Peers → IO a) → IO a
-withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = bounded . withRig fakeConfig $ \rig → do
+withPeersConfigured = withPeersFull Nothing
+
+-- | The same composition with the window integration's input injected from this host, and nothing else changed.
+withPeersInput ∷ InputHost → ByteString → (Peers → IO a) → IO a
+withPeersInput host entry = withPeersFull (Just host) Fake.defaultFakeConfig noProviderHooks WF.defaultFakeConfig entry defaultIssuedMemory
+
+withPeersFull ∷ Maybe InputHost → Fake.FakeConfig → ProviderHooks → WF.FakeConfig → ByteString → Int → (Peers → IO a) → IO a
+withPeersFull inputHost fakeConfig hooks windowConfig entry issuedMemory body = bounded . withRig fakeConfig $ \rig → do
   let fake = rigFake rig
   model ← newModel (fakeLedger fake)
   setBarrier fake (modelCapture model)
@@ -145,7 +156,7 @@ withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = boun
       mainLoop provider $
       ( do
           let publisher = scenePublisherOver textures provider (\window scene → fst (modelTarget model window) scene) (\window → snd (modelTarget model window))
-              injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks issuedMemory)
+              injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks issuedMemory inputHost)
               profile = compositionProfile
               inventory = cpInventory composition
           handles ← newRequestHandles
@@ -153,6 +164,7 @@ withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = boun
           phase ← newModulePhase
           out ← newTVarIO []
           signal ← newTVarIO False
+          takes ← newTVarIO True
           let moduleSpec =
                 ModuleSpec
                   { specRequests = requests
@@ -170,7 +182,7 @@ withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = boun
             bank ← newByteBankFor profile
             service ← either (\refused → assertFailure ("the data service was refused: " <> show refused)) pure (dataService requests inventory (cpPool composition) bank)
             ids ← newInstanceIds
-            services ← injectGraphics injection (GraphicsVm Presentation requests (pure True))
+            services ← injectGraphics injection (GraphicsVm Presentation requests (readTVar takes))
             let endpoints =
                   FacadeEndpoints
                     { endpointAdmission = pure AdmissionOpen
@@ -234,7 +246,7 @@ withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = boun
                   admitBehaviorInstance (scheduledEndpoint owner) request >>= \case
                     InstanceAccepted identity ticket → pure (Spawned (declaredId declared) identity ticket)
                     other → assertFailure ("expected the instance accepted, found " <> take 100 (show other))
-            ( body (Peers facade owner model provider out signal admit fake windows composition control runtime output)
+            ( body (Peers facade owner model provider out signal admit fake windows composition control runtime output takes)
                 -- (however the body ended, the host model lets go of every adoption first, so that the instances' textures can retire)
                 `finally` (openEveryHold fake >> releaseAllReads composition >> dissolve model >> WF.releaseAll windows >> retireAndAwait control owner)
               )

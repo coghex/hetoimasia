@@ -210,7 +210,7 @@ withFacadeSession env entry judge scenario = do
               when (answer == HostAccepted) (modifyTVar' accepted (<> [preparedValue scene]))
               pure answer
             publisher = scenePublisherOver (graphicsTextures (envGraphics env)) provider tap targetUsable
-            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks defaultIssuedMemory)
+            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks defaultIssuedMemory Nothing)
         checkpoint ← bootCheckpoint compositionProfile (cpInventory composition) (\_ _ → pure (Right (manifestFor True))) >>= either (\refused → assertFailure ("boot refused: " <> show refused)) pure
         errLines ← newTVarIO []
         let outSink = OutputSink {sinkLine = \_ → pure (), sinkFlush = pure ()}
