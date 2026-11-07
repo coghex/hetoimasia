@@ -1087,12 +1087,20 @@ never silently truncated.
 | `api.terrain.surface(arena, {x,y})` | Highest occupied cell level after edits, via source/change indexes; can explicitly answer absent for authored empty columns. |
 | `api.terrain.remove(arena, {x,y,z} [, pick])` | One cell removal, including an explicitly queried buried cell; optional opaque pick token enforces displayed-revision consistency. Returns changed flag and committed revision. |
 | `api.terrain.release(arena)` | Release this instance's lease; releasing the creator's final owner lease closes the arena, invalidates attached authority and cancels outstanding requests. Instance exit closes owned arenas. |
-| `api.terrainView.open(window, arena, style)` | Presentation-only view, with instance-owned window/texture authorities; creates a separate terrain publication path. One terrain view owns the window's presentation while attached. |
-| `api.terrainView.move(view, {x,y} [, z])` | Async jump; default surface following or explicit manual Z. Newest jump identity wins; canceled/older results cannot reposition the camera. |
-| `api.terrainView.configure(view, changes)` | Bounded camera changes: pan delta, zoom, facing or slice. Applied coherently; slice enters manual mode. |
-| `api.terrainView.pick(view, cursor)` | Pick the currently displayed snapshot; return no hit, loading, or cell/face plus revision token. Never pick unloaded or hidden geometry. |
+| `api.terrainView.open(window, arena, style)` | Presentation-only `OptionalRequest` through `api.request`, yielding a view with instance-owned window/texture authorities and a separate terrain publication path. One terrain view owns the window's presentation while attached. |
+| `api.terrainView.move(view, {x,y} [, z])` | Async jump as an `OptionalRequest` through `api.request`; default surface following or explicit manual Z. Newest jump identity wins; canceled/older results cannot reposition the camera. |
+| `api.terrainView.configure(view, changes)` | Bounded nonwaiting latest-intent update: pan delta, zoom, facing or slice. Success is `true,nil`; temporary pressure is `nil,{code="busy",...}` with no partial change. Applied coherently; slice enters manual mode. |
+| `api.terrainView.pick(view, cursor)` | Bounded nonwaiting read of the currently adopted snapshot; returns a copied `hit`/`no_hit`/`loading` record with opaque consistency authority on a hit. Never loads terrain or picks unloaded/hidden geometry. |
 | `api.terrainView.close(view)` | Stop demand/publication; release CPU holds and retire GPU resources through existing host rules. |
 | `api.input.poll(window, max_events)` / `acknowledgeReset(window, token)` | Presentation-only ordered input/reset boundary, preserving GLFW epochs; cursor observation is coalesced. |
+
+The view-call timing and results above are a manager-authorized P-5
+clarification: verified `het-manager` in `#het-terrain`, message
+`v3zqruduivrr3i59p3a2zj96gi`, at 2026-11-07T03:32Z (2026-11-06 local).
+`configure` and `pick` return no request handle and do not wait for terrain
+preparation, graphics adoption or GPU completion. Terrain loading and render
+publication remain asynchronous under the view adapter; a camera-intent
+update is not a claim that its frame has already been adopted.
 
 The named arena table is local to this narrow service, keyed by session and
 content root; it is not a universal service locator. Claim a name in the same
