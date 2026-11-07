@@ -15,9 +15,21 @@ concrete precondition
 ## Processing status
 
 - [ ] EPIC. Establish Ecce Homo's flat terrain with on-demand chunk loading
+- [ ] TRA-1. Define terrain coordinates and shared shape geometry
+- [ ] TRA-2. Implement layered sources and compressed terrain changes
+- [ ] TRA-3. Define bounded horizontal and vertical residency
+- [ ] TRA-4. Implement the transactional terrain service
+- [ ] TRA-5. Expose terrain requests through Lua
+- [ ] TRA-6. Expose ordered window input to Lua
+- [ ] TRA-7. Implement isometric cutaway planning and picking
+- [ ] TRA-8. Qualify terrain materials and depth ordering offscreen
+- [ ] TRA-9. Publish retained terrain views with safe GPU retirement
+- [ ] TRA-10. Expose terrain views and camera controls to Lua
+- [ ] TRA-11. Assemble the authored terrain arena
+- [ ] TRA-12. Qualify the arena and remove the development shortcut
 
-No delivery slices yet; material choices below remain open. This is design
-only. No tracker items or implementation are authorized by this document.
+The slices below are a concrete proposed delivery plan pending Q-12 review.
+This is design only; no tracker items or implementation are authorized here.
 
 ## Epic contract
 
@@ -26,8 +38,14 @@ only. No tracker items or implementation are authorized by this document.
   extends the arena, using a complete terrain model that includes
   subsurface structure and gaps from the outset, with the engine/game boundary
   preserved. Flat describes the initial terrain source, not a surface-only model.
-- **Done when:** open; agree the terrain model, loading/lifetime contract,
-  visible result, controls and acceptance evidence before defining slices.
+- **Done when (proposed acceptance):** the Lua-authored flat arena streams with
+  camera and explicit query demand, supports the agreed cutaway/follow modes,
+  uses the approved artwork, removes tiles through the Lua API, retains edits
+  through horizontal/vertical offload and starts fresh in a new session.
+  Authored gaps and slopes agree across queries, picking and captured renders;
+  bounded-memory, cancellation and teardown checks pass. The temporary removal
+  binding is gone, existing M1 behavior remains intact, and the required docs,
+  test catalog entries and retained visual evidence have landed.
 - **Users and operators:** the owner developing Ecce Homo, game authors using
   engine services, and later players of the recreated game.
 - **Arc label:** None proposed.
@@ -48,7 +66,7 @@ are pinned to these revisions. Synarchy has not been modified or launched.
 | One arena generator supplies initial chunks, demand loading and reconstruction. Each base column has twelve granite cells below four loam cells, a flat top and seeded surface vegetation variants; fluids, flora instances and structures begin empty. | S `src/World/Generate/Arena.hs:2–33`, `:126–149`, `:212–232` |
 | The default arena starts with 5 × 5 chunks and expands on demand; that startup footprint is not a world boundary. | S `scripts/test_arena.lua:188–207`; `src/World/Generate/Arena.hs:70–104` |
 | Arena topology does not wrap. A caller may request finite dimensions; larger finite arenas also load their remaining chunks on demand, with absent cells outside their rectangle. | S `docs/engine_contracts.md:8200–8246` |
-| Arena controls include zoom, rotation and vertical slice selection; these are existing reference behaviors, not yet this arc's scope. | S `scripts/test_arena.lua:255–293` |
+| Arena controls include zoom, rotation and vertical slice selection; Hetoimasia's selected behavior is recorded separately in D-12–D-14/D-18/D-22. | S `scripts/test_arena.lua:255–293` |
 | Synarchy projects a diamond grid and has four camera facings 90 degrees apart. Camera input includes keyboard panning and middle-button dragging. | S `src/World/Grid.hs:220–236`; `src/Engine/Graphics/Camera.hs:22–37`; `src/Engine/Loop/Camera.hs:116–181` |
 | Synarchy routes Shift-scroll to Z-slice input; arena slice input disables automatic Z tracking and increments/decrements the slice. Its inspected `camera.gotoTile` accepts two coordinates, computes a surface-based slice and enables Z tracking; it does not read an optional third Z argument. | S `src/Engine/Input/Thread/Scroll.hs:128–138`; `scripts/test_arena.lua:265–275`; `src/Engine/Scripting/Lua/API/Camera.hs:223–318` |
 | Synarchy's renderer follows the terrain beneath the camera while Z tracking is enabled. Arena manual slice input disables tracking, the reset action restores it, and a zoom-map transition can also restore tracking. Rotation preserves the current tracking flag. | S `src/World/Render.hs:282–322`; `scripts/test_arena.lua:265–293`; `src/Engine/Scripting/Lua/API/Camera.hs:325–361` |
@@ -94,6 +112,29 @@ No existing open terrain umbrella was found. Repeat at readiness; this is not
 final per-slice deduplication. Synarchy's own terrain trackers are references,
 not Hetoimasia delivery items.
 
+Completion-pass inspection on 2026-11-06 used H `origin/master` at
+`551c768405e0ce7f328e3d247bf131738b942b9d` and the same S revision above.
+The open tracker still contains only #446 and #563; the all-state terrain/arena
+search still has no match. This is umbrella overlap checking, not child issue
+deduplication. No tracker mutation occurred.
+
+- H already supplies bounded instance-owned asynchronous requests and explicit
+  cancellation/result variants (`packages/lua-engine/request/Hetoimasia/LuaEngine/Request.hs:1–42`).
+- H's session injects narrow services rather than a global environment
+  (`packages/lua-engine/README.md:1332–1350`). Its graphics host distinguishes
+  acceptance, adoption and actual frame completion
+  (`packages/lua-engine-graphics/README.md:416–447`).
+- H's renderer is pure and leaves isometric projection/facings/slices to
+  adapters (`packages/render-2d/README.md:43–56`). Its material ABI changes
+  fragment colour, not the vertex or depth interface
+  (`packages/render-2d-vulkan/README.md:325–355`, `:948–953`).
+- S's approved texture sources are
+  `assets/textures/world/loam/loam.png` and
+  `assets/textures/world/granite/granite.png`, loaded by
+  `scripts/test_arena.lua:122–132`. Its slope face-map lookup contains 16 mask
+  entries (`src/World/Render/Textures.hs:23–57`); this is reference artwork
+  machinery, not a selected geometry specification for Hetoimasia.
+
 ## Desired experience and scope
 
 **Accepted direction:** begin terrain for Ecce Homo using flat arena terrain
@@ -125,8 +166,8 @@ that continues downward on demand (D-16).
 that can be navigated, making camera demand and the resulting terrain
 observable. Keep the first terrain source simple while designing proper
 publication and lifetime. Exact camera controls, coordinate limits, appearance,
-temporary key binding and exact Lua APIs remain open. No implementation or delivery order
-follows from this direction alone.
+temporary key binding and exact Lua APIs are specified provisionally in P-5.
+The proposed delivery order follows below and needs Q-12 review.
 
 **Proposal P-2: one authoritative spatial terrain model.** Represent terrain
 occupancy and its material/shape at positions in three dimensions, with gaps
@@ -150,7 +191,8 @@ decisions. Detailed shape and query semantics remain in Q-8.
 The logical ability to answer about `(x,y,z)` does not require allocating a
 record for each cell. P-2 must not be read as a recommendation for a dense
 full-depth voxel allocation. This concern led to P-3 and the owner's subsequent
-approval of its direction in D-5; physical layout and budgets remain open.
+approval of its direction in D-5; P-5 supplies physical layout and budgets
+for review.
 
 **Proposal P-3: compressed vertical spans with bounded materialization.** Keep
 columns, but describe solid/material intervals and gaps compactly. An
@@ -193,7 +235,7 @@ the contract; they do not add those systems to this arc. Unloaded terrain must
 not be interpreted as air, and revealing or reloading the same terrain must
 remain consistent with its source and retained edits. Rendering faces and CPU
 terrain detail can have different residency requirements. D-6 selects the
-demand-producer rule; exact request APIs, budgets and scheduling remain open.
+demand-producer rule; exact request APIs, budgets and scheduling are in P-5.
 
 ## Decisions
 
@@ -305,8 +347,9 @@ model remains D-4/D-5, and D-6 still allows explicit game queries to demand
 invisible terrain. A compact source definition supplies the meaning of
 unmaterialized terrain without allocating its individual tiles.
 
-Removal/reveal behavior is part of the terrain contract. The exact removal
-interaction, additional editing operations and disk persistence remain open.
+Removal/reveal behavior is part of the terrain contract. Subsequent D-8–D-10
+settle its development interaction and session-only retention, and D-21
+excludes automatic shape edits.
 For gaps and openings, exposure must include relevant neighboring side faces,
 floors and ceilings rather than assume every removal merely lowers a single
 height value. This follows from the agreed full model; it does not require
@@ -464,8 +507,8 @@ snapping to the surface.
 | Move/jump with Z | Honor requested depth rather than automatic surface selection. |
 
 No UI toggle or additional reset shortcut is selected by this decision.
-Detailed zoom/rotation behavior during manual override remains part of the
-camera contract to specify; do not import Synarchy's zoom-map reset implicitly.
+D-22 subsequently settles zoom/rotation behavior during manual override;
+do not import Synarchy's zoom-map reset implicitly.
 
 ### D-15. Full blocks and slopes in the initial terrain foundation
 
@@ -478,8 +521,9 @@ Include full blocks and slopes in the first terrain contract, with consistent
 shape meaning for rendering, mouse picking and terrain queries. The default
 arena remains flat. Use small authored slope cases to verify the contract;
 procedural hill generation remains deferred. The exact slope catalog and
-orientation rules, additional partial-height shapes and automatic reshaping
-after removal are not selected by this scope decision.
+orientation rules and additional partial-height shapes are not selected by
+this scope decision alone; D-21 settles no automatic reshaping and P-5 proposes
+the exact catalog.
 
 ### D-16. Configurable soil-over-stone arena recipe
 
@@ -565,6 +609,17 @@ render data must still be recomputed where affected. Slopes come from authored
 terrain definitions for now. No procedural slope inference, general editor,
 or automatic material-dependent smoothing belongs to this arc.
 
+### D-22. Manual depth survives all local navigation
+
+Owner, directly in this pane on 2026-11-06, selected:
+
+> Yes—manual depth survives local navigation
+
+Pan, zoom and rotation preserve a manually selected cutaway level. A jump
+without Z restores terrain following; a jump with Z enters manual mode at the
+requested depth. This completes the manual-mode transition in D-12–D-14.
+Synarchy's zoom-map-triggered reset is not carried over.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -580,165 +635,413 @@ V-1. Do not silently update memory or equate recreation with source portability.
 Before selecting state or concurrency, document its owner, readers/writers,
 thread, lifetime, reset and disposal. CPU completion and GPU retirement remain
 distinct (H `AGENTS.md:14–35`). No terrain-specific ownership table or storage
-layout has been approved yet.
+layout was approved by the earlier direction alone. P-5 now proposes these
+details explicitly for the final contract review.
 
-## Open questions
+## Concrete technical contract — proposal P-5
+
+This section fills the implementation contract for owner review. D-1–D-22
+remain the approved behavior. The package names, API spellings, numeric
+defaults and mechanisms below are a concrete proposal, not additional owner
+decisions. They require a single review checkpoint before readiness.
+
+### Scope and compatibility
+
+Ship the expanding flat arena, layer recipe, sparse gap-capable terrain,
+explicit block/ramp/corner geometry, session edits, demand loading, isometric
+presentation, camera/input APIs and Lua removal. Verify caves, slopes and
+disconnected spans with small authored definitions using the same source
+interface as the arena. Keep the temporary removal binding only long enough
+to capture development evidence; delete it before final acceptance.
+
+Exclude procedural elevation/geology, fluids, flora, units, pathfinding,
+structural support, constructed buildings, automatic slope inference, a
+general set-cell editor, UI/fonts, disk saves, multiplayer, general ECS/state
+and whole-tick rollback. Excluding a simulator does not prevent it using the
+terrain query contract in a future arc. No Synarchy saved-world or Lua-source
+compatibility is claimed. Preserve asset provenance and authored identifiers.
+
+Existing M1 scenes, profiles and CPU-only compositions keep their current
+behavior. Terrain is an optional injected service with its own validated
+limits and request kinds. Leave `api.state` and its unavailable guard intact.
+Do not grow the simple rectangle schema into a per-tile transport or raise
+its 4,096-sprite cap to hide a missing terrain path.
+
+### Components and dependency direction
+
+| Proposed component | Owns | Depends on |
+| --- | --- | --- |
+| `hetoimasia-terrain` | Coordinates, shapes, source recipes, sparse spans, overlays, queries and pure residency/transaction decisions | Base/containers/packed data and math as used; no Lua, GLFW, graphics or game |
+| `hetoimasia-terrain-runtime` | Bounded requests, the single writer, arena lifetime, revisions and CPU snapshots | Terrain, runtime/resources/logging; no concrete game |
+| `hetoimasia-terrain-render-2d` | Projection, cutaway visibility, picking, render descriptions and terrain material declaration | Terrain, math and render-2d; pure planning separated from backend effects |
+| Lua terrain/input adapter | Argument/role/lease checks and request conversion; no game rules | Abstract terrain/input ports plus Lua host/facade; backend composition kept separate |
+| Graphics composition | Retained terrain uploads, target publication and GPU holds | Terrain render adapter and existing graphics host/backend |
+| Ecce Homo arena content | Recipe/material identifiers, artwork references, camera controls and temporary development removal binding | Public Lua APIs only |
+
+The generic launcher assembles these services; it imports no concrete arena.
+An application material implements generic terrain face shading; Lua supplies
+its soil/stone textures and style parameters. Do not add terrain concepts to
+the generic 2D renderer's public snapshot types. See current renderer boundary
+at H `packages/render-2d/README.md:43–56` and current material interface at
+H `packages/render-2d-vulkan/README.md:325–355`.
+
+### Spatial identity, shapes and sources
+
+Use signed 64-bit tile coordinates with an explicitly checked supported range
+`[-2^62, 2^62-1]` on each axis. Compute intermediate additions, products and
+floor division in a checked wider representation. Refuse out-of-range inputs;
+never wrap. Horizontal storage keys cover 16 × 16 columns. Vertical residency
+keys cover 32 tile levels, but are accounting/index regions, not allocated
+16 × 16 × 32 voxel arrays. Negative coordinates use floor division and
+nonnegative local remainders. Render using integer camera-relative offsets
+before float conversion, never huge absolute float positions.
+
+A cell `(x,y,z)` occupies the unit footprint and begins at elevation `z`.
+The cutaway level `k` includes cell levels `z <= k`, with a clipping plane at
+`k+1`; surface following returns the highest occupied cell level. Empty space
+is a value, not a material requiring allocation. Public answers distinguish
+`air`, `solid(material,shape)`, pending request, failure and coordinate refusal.
+
+Propose thirteen solid shapes: full block; four rotated ramps; four rotated
+single-high-corner slopes; four rotated single-low-corner slopes. Specify each
+as a solid under a top height function on the unit square, with flat bottom:
+block `h=1`, canonical ramp `h=x`, high corner `h=max(0,1-x-y)`, low corner
+`h=min(1,x+y)`. Rotations are exact quarter turns of these definitions. Render
+faces and picking intersections derive from the same functions/triangulation.
+Do not infer shape from the sprite's alpha. Opposite-corner saddles, arbitrary
+fractional slabs and inverted slopes are outside this first catalog; new
+shape IDs require an explicit extension rather than a flat fallback.
+
+The initial Lua source is copied declarative data, not callbacks invoked from
+a loading worker. Example: surface cell level `0`, soil depth `4`, material
+identifiers `loam` and `granite`, then stone to the supported lower coordinate
+limit. Recipe parameters may differ; no per-column buried stack is created.
+Source queries evaluate only requested coordinates/ranges. Bounded authored
+span patches allow the slope/cavity fixtures; reject overlapping source
+patches, unknown materials, invalid shapes and oversized definitions at open.
+The source is immutable for one arena incarnation. No random generator is
+needed for this first flat source.
+
+Concrete definition record: `materials` is a bounded list of unique authored
+IDs; `layers` is a sorted, nonoverlapping list of `{z_min,z_max,material,shape}`
+half-open intervals shared by all columns, with omitted lower/upper endpoints
+meaning the supported coordinate extremes; `patches` contains bounded
+`{x,y,z_min,z_max,value}` overrides, where value is air or material/shape.
+Uncovered base intervals are air. The Lua arena builds stone `[-infinity,-3)`
+and soil `[-3,1)` for its four-soil-cell default. Thus the engine implements
+generic layers, not soil/stone-specific rules. Names/IDs are validated UTF-8
+text with bounded length; unknown record fields and duplicate material IDs
+are refused. Built-in shape IDs name the exact P-5 catalog.
+
+### Sparse representation and edits
+
+Keep three distinct representations: immutable source definition, sparse
+resident detail, and retained session changes. Each resident column region
+contains sorted, nonoverlapping half-open Z runs, coalesced when material and
+shape match. Air gaps are intervals or implicit source answers, never dense
+air arrays. A top-only camera load creates only its required surface entries;
+region indexing does not license filling that region's buried solid cells.
+
+For this removal-only API, changes are canonical removed-cell intervals per
+column. A removal of a ramp removes its entire occupied cell shape. Removing
+air returns `changed=false` and creates no redundant change record. Repeated
+removals merge into existing intervals; no ever-growing operation log is
+required. The source plus these changes is the authority. Full materialized
+chunks and derived render data are reconstructible caches.
+
+A loaded region owns its working changes plus the revision inherited from
+the session store. Every successful removal reserves its worst-case retained
+edit storage before commit, so later offload can transfer the already-funded
+changes without dropping them or requiring new storage. Offload atomically
+merges/transfers changes into the arena store before discarding resident data.
+Reload composes the immutable source and all retained removals before
+publication. Querying an offloaded area must consult retained changes too.
+Removing a tile only invalidates affected visibility/shape queries and render
+regions; neighboring authoritative shapes remain unchanged (D-21).
+
+### Execution, transactions and coherence
+
+Use one dedicated terrain owner thread per injected session service. This is
+the single writer for its arenas and keeps generation/edit work off the Lua
+and native-window threads. It runs bounded work quanta and services queued
+requests round-robin; initial generation uses this owner rather than an
+additional worker pool. Pure source/shape algorithms remain independently
+testable. No synchronous cross-VM calls and no Lua callbacks from this thread.
+
+Assign monotonically increasing arena incarnations, content revisions and
+request identities; never reuse a live identity or wrap exhaustion. Content
+revisions change only on committed edits; residency changes have a separate
+generation. A read captures one immutable content revision, including its
+change overlay, and returns that revision with its result. A render/pick
+snapshot also carries the camera revision and residency generation. No frame
+mixes faces, picking and surface-following answers from different snapshots.
+
+For removal: validate and reserve first; materialize the requested cell if
+needed; stage the overlay and affected snapshot; then commit the edit and
+successful result settlement in the same arbitration as cancellation and
+arena admission. If cancellation/close wins before commit, nothing changes.
+If commit wins, cancellation answers already settled and cannot undo it.
+Provider adapters must expose that arbitration through the request endpoint;
+never commit state and subsequently report a winning cancellation. Failure
+leaves the previous content revision intact. Lua errors after a successful
+operation do not roll back it or earlier operations (D-20).
+
+Query/source results carry the arena incarnation and content revision. A late
+result for a closed arena is discarded; a result based on superseded edits is
+recomputed or rejected before publication. A stale picking token is refused
+as `stale_view` rather than removing a different tile behind the old image.
+CPU edit completion means authoritative commit, not immediate GPU display.
+The previous coherent frame may remain until its replacement is adopted.
+
+### Demand, bounds and failures
+
+Camera demand describes a bounded visible region plus a one-chunk horizontal
+prefetch margin; it is latest-value state, not a FIFO of every camera motion.
+Manual/API queries may demand invisible coordinates. Deduplicate source work
+by arena/revision/region, retaining separate caller interests. Canceling one
+interest must not cancel work another still needs. Foreground queries and
+edits precede view prefetch; use aging so accepted finite requests progress.
+
+Visible cutaway content uses a 32-level band below the selected slice by
+default. This is a render/residency limit, not a terrain floor. Render only
+bounded visible faces and minimal adjacency facts; deep shafts and absent
+columns must not cause an unbounded scan toward negative infinity. Source
+interval summaries plus removed-span indexes answer next-solid/surface
+queries without enumerating a long contiguous air gap. Bound the number of
+resident vertical regions independently of horizontal columns.
+
+Proposed initial host profile (engineering defaults, not measured capacity):
+64 MiB resident terrain data, 32 MiB session edits, 64 MiB CPU render/staging,
+128 MiB terrain GPU data including retiring versions, 128 internal load jobs,
+256 queued terrain commands and at most two pinned CPU view revisions per
+view. Also cap the service at 4 arenas, 8 views and 64 arena leases per session;
+source definitions at 256 KiB/8,192 authored runs; a column result at 1,024
+runs and an 8,192-level requested range; input polls at 128 events. Validate
+each definition/result against the tighter existing copied-value limits too.
+Existing per-instance/VM request limits still apply and may be the
+tighter bound. Use explicit conservative byte accounting for metadata and
+scratch, plus allocation measurements; these caps are not a process-RSS claim.
+
+Evict unused LRU regions, excluding active readers, pending edit handoffs and
+reserved publication dependencies. If no safe eviction fits, return busy for
+explicit work and retain/coalesce camera demand for a later service quantum.
+Do not spin, silently grow a bank, remove old edits or retry a failed edit.
+An accepted removal must have reserved enough edit space to survive offload.
+Infinite exploration does not imply infinite retained edits: at the configured
+edit bound, new edits return busy until the arena ends; reads/navigation can
+continue within their own bounds. A session-wide failure ends arenas under
+the existing supervision policy; no error UI is introduced.
+
+Expected domain failures include `arena_closed`, `stale_view`, `definition`
+and `source_failure`; transient admission is `busy`. Malformed Lua types,
+foreign handles and out-of-range coordinates are ordinary validation errors
+before provider work. Unknown failures/provider contract defects remain host
+failures, not disguised empty terrain. Diagnostic records contain bounded
+arena/request/revision context, not a per-cell stream.
+
+### State ownership and shutdown
+
+| State | Owner / writer | Readers / thread | Lifetime and disposal |
+| --- | --- | --- | --- |
+| Recipe, source patches, material IDs | Arena, immutable after open | Terrain owner; copied pure reads | Arena incarnation; freed after requests/snapshots release |
+| Residency, working edits, retained changes, budgets | Terrain service single writer | Terrain owner only; snapshots for other threads | Session arena; offload transfers edits; close discards all changes |
+| Commands, request settlement | Request adapter plus terrain owner | Lua threads submit; owner executes; settlement arbitrated atomically | Bounded per request; cancel/close settles once |
+| Camera and input gestures | Presentation instance | Its Lua owner; copied view demand | Window/view; input reset clears held state before acknowledgement |
+| Terrain view/pick snapshots | Terrain view adapter | Immutable borrows by presentation/planning | Bounded revisions; release never mutates another snapshot |
+| Retained chunks, textures, pending uploads | Existing graphics host/backend | Backend owner; adopted frames hold exact generations | CPU release marks retirement; free only after actual frame completion |
+
+Construct service resources through `withResource`. Closing first revokes new
+admission and camera demand, then settles/cancels pending work at bounded safe
+points, retires views, joins the terrain owner and releases CPU stores after
+borrowers finish. Graphics retirement continues through the existing host's
+adoption/completion protocol before device resources are destroyed. Never wait
+for GPU completion while holding the terrain owner or a publication lock.
+Arena replacement is close plus a fresh incarnation, not in-place identity
+reuse; no explicit reset command is added in this arc.
+
+### Lua surface and authority
+
+Proposed dot-call surface below. Operations that may load, edit or allocate
+return the existing `request,nil` / `nil,{code="busy",...}` convention and
+settle through `api.request`. The facade validates copied records with no
+metamethod execution. Names may be revised at review; semantics may not be
+left implicit. Result arrays are complete and bounded, never silently truncated.
+
+| Call | Contract |
+| --- | --- |
+| `api.terrain.open(name, definition)` | Create one session-local named arena with copied layered source and bounded authored patches; request result is an opaque arena lease. Either role may create; duplicate name is refused. |
+| `api.terrain.attach(name)` | Obtain this instance's own lease to an existing arena in the same content root/session; no global lookup or cross-content authority. A not-yet-created arena returns `not_found`, not an unbounded wait. |
+| `api.terrain.cell(arena, {x,y,z})` | Async demand/read; result has revision and `air` or material/shape. |
+| `api.terrain.column(arena, {x,y,z_min,z_max})` | Complete bounded runs for a finite half-open range; oversized result is refused, not a partial answer. |
+| `api.terrain.surface(arena, {x,y})` | Highest occupied cell level after edits, via source/change indexes; can explicitly answer absent for authored empty columns. |
+| `api.terrain.remove(arena, {x,y,z} [, pick])` | One cell removal, including an explicitly queried buried cell; optional opaque pick token enforces displayed-revision consistency. Returns changed flag and committed revision. |
+| `api.terrain.release(arena)` | Release this instance's lease; releasing the creator's final owner lease closes the arena, invalidates attached authority and cancels outstanding requests. Instance exit closes owned arenas. |
+| `api.terrainView.open(window, arena, style)` | Presentation-only view, with instance-owned window/texture authorities; creates a separate terrain publication path. One terrain view owns the window's presentation while attached. |
+| `api.terrainView.move(view, {x,y} [, z])` | Async jump; default surface following or explicit manual Z. Newest jump identity wins; canceled/older results cannot reposition the camera. |
+| `api.terrainView.configure(view, changes)` | Bounded camera changes: pan delta, zoom, facing or slice. Applied coherently; slice enters manual mode. |
+| `api.terrainView.pick(view, cursor)` | Pick the currently displayed snapshot; return no hit, loading, or cell/face plus revision token. Never pick unloaded or hidden geometry. |
+| `api.terrainView.close(view)` | Stop demand/publication; release CPU holds and retire GPU resources through existing host rules. |
+| `api.input.poll(window, max_events)` / `acknowledgeReset(window, token)` | Presentation-only ordered input/reset boundary, preserving GLFW epochs; cursor observation is coalesced. |
+
+The named arena table is local to this narrow service, keyed by session and
+content root; it is not a universal service locator. Trusted instances within
+that content may obtain their own query/edit leases; handles themselves never
+cross VMs. Terrain mutation requests are domain operations, not direct memory
+writes by presentation. A future gameplay integration can restrict authority
+through injected ports without changing storage. Acquisitions are allowed in
+init/update; waits only in update, and release/cancel in shutdown. No calls at
+module top level. Parent session admission dominates every service gate.
+
+View `style` maps the arena's material IDs to instance-owned texture handles,
+face tint/filter settings and the selected view zoom/band settings; missing
+material mappings are refused before attachment. It contains no shader source
+or arbitrary callback. The adapter validates the full mapping and acquires
+texture authority before it can publish a terrain view. Attaching a view
+temporarily claims exclusive scene publication for that window; attempts to
+publish an M1 rectangle scene while attached fail without replacing either
+scene. Closing the view retires it and returns the target to normal use.
+
+### Camera, appearance and render publication
+
+Proposed bindings: WASD/arrows pan, middle-button drag, wheel zoom, Q/E rotate,
+Shift-wheel changes slice by one cell level per wheel step. Positive scroll
+raises the slice; accumulate fractional scroll before applying whole steps.
+Use F8 for the temporary one-removal-per-press binding, ignoring key repeat;
+delete that binding/glue in TRA-12. Default zoom scale is 1, range 0.125–8
+relative to the artwork's native scale; these are view configuration,
+not terrain coordinate limits.
+Release/reset clears held keys, drags and scroll accumulators before input
+acknowledgement. D-22 controls follow/manual transitions. Preserve zoom and
+facing across camera jumps; no implicit Synarchy tile-level zoom reset.
+
+In follow mode query the highest remaining solid cell at the camera's anchor
+column, using retained edits as well as base terrain. Use that top level as the
+cutaway level. If the destination is not ready, preserve the last coherent view
+until the jump can resolve; ordinary pan can show unloaded regions as blank.
+An authored empty column preserves the current slice and reports no surface.
+Rotation preserves the same world anchor. Clamp zoom to the configured finite
+range to keep view demand bounded, without restricting world extent.
+
+Preserve Synarchy's diamond proportions (96-pixel width, 48-pixel top diamond,
+16-pixel cell side at source scale; S `src/World/Grid.hs:47–65`, `:90–109`).
+Copy the approved loam/granite artwork deliberately into authored content,
+recording source paths and revision; no runtime dependency on `~/work/synarchy`.
+Use the existing bounded texture pipeline. Derive geometric coverage masks
+from the shared shape definitions and reuse the approved texture artwork;
+Synarchy's face-map IDs are not the authoritative geometry definition.
+
+Render only faces exposed to air or to the cutaway; do not modify terrain to
+make a cutaway. Floors, walls and ceilings share material/shape authority.
+An application material can shade/sample face textures under the existing
+material ABI. If fixed-quad depth ordering cannot represent the selected
+geometry correctly, stop and present that renderer-contract change before
+expanding the backend: no per-fragment depth or vertex-ABI change is silently
+authorized. Prove ordering with intersecting projections of roofs, ramps and
+disconnected spans; a flat-arena screenshot alone is insufficient.
+
+Prepared render regions key on arena/content revision, cutaway, facing and
+material/asset version. Rebuild invalidated regions whole; bounds include all
+projected faces. Publish new references coherently, retire old references
+only after adopted frames finish, and include both versions in budget checks.
+Picking uses the exact adopted view's geometry, metrics and camera mapping.
+Retain a last coherent frame during preparation; missing new terrain stays
+blank. The temporary removal shortcut submits the picked cell/token through
+the public Lua API, then disappears before final qualification.
+
+## Open questions and review checkpoints
 
 ### Q-1. What does flat terrain contain vertically?
 
-Resolved by D-4: the initial terrain model includes subsurface structure and
-gaps. A surface-only model is rejected. Exact logical representation continues
-in Q-8; bounds, authorship and editing remain separate choices.
+Resolved by D-4: the model includes subsurface structure and gaps. D-15/D-21
+add explicit blocks, ramps and corner slopes.
 
 ### Q-2. Finite arena or expandable terrain?
 
-Resolved in direction by D-7: keep extending as the camera explores. The finite
-arena recommendation was declined. D-11 also selects no designed bottom.
-Specify coordinate conventions and machine limits, chunk dimensions and
-absent/unloaded behavior. Synarchy's
-5 × 5 startup footprint is not an approved extent or budget.
+Resolved in direction by D-7/D-11: expand horizontally and downward with no
+designed boundary. P-5 specifies checked coordinate limits and region sizes;
+these machine/resource limits do not introduce a gameplay terrain floor.
 
 ### Q-3. How does demand become usable terrain and then retire?
 
-Rendering and game queries are allowed demand producers under D-6. Define
-their authority, request deduplication, bounded admission,
-priorities, cancellation, complete publication, failures, residency accounting
-and safe eviction. Decide how late results are prevented from reaching a
-replaced world and how renderer holds interact with CPU data eviction. A flat
-generator must not substitute for a lifetime contract.
-D-10 requires offload to preserve changes before discarding resident data and
-reload to apply them before publication. Define that handoff and failure
-behavior. Account separately for resident terrain, derived render data and
-session-retained changes; a resident-chunk limit does not bound accumulated
-edits across the explored arena.
-Under D-11, define vertical residency and retirement as well as horizontal
-chunk offload. A long-lived horizontal chunk must not retain all depth ever
-visited merely because the camera is still over that column.
-Queries can concern invisible regions while undemanded detail remains
-unmaterialized. The producer rule is settled; its operational contract remains
-open.
+Behavior resolved by D-2/D-6/D-10/D-19. P-5 supplies the concrete owner,
+request/cancellation protocol, revision checks, vertical residency, memory
+budgets, offload transfer and GPU retirement contract for review in Q-12.
 
 ### Q-4. What can the owner see and control in the first version?
 
-Camera exploration/loading is selected by D-7. Decide projection, terrain
-assets/materials, camera movement/zoom/rotation controls,
-and detailed picking behavior. D-12 selects Shift-scroll cutaway levels and
-optional Z on camera jumps. D-8/D-9 select temporary shortcut-based removal
-and exclude UI implementation for this arc. Determine the narrow Lua rendering/input
-services required. Input ordering, focus/reset and routing need explicit
-contracts. Loading behavior must respect the no-UI scope.
-
-Targeting is settled by D-9: point at an exposed tile with the mouse and press
-the temporary shortcut, removing one tile per press. The exact key remains
-open. Delete this development binding by completion; the final removal
-interface is the Lua API, not a persistent keyboard control.
-
-Presentation direction resolved by D-18: Synarchy's isometric-style diamond
-view, four 90-degree facings, keyboard pan, mouse drag, wheel zoom and reuse of
-soil/stone artwork. Specify the asset/material adaptation and exact bindings.
-
-D-12 settles cutaway viewing: Shift-scroll changes the displayed Z level while
-terrain above is hidden, and jumps choose the destination's top level unless
-given explicit Z. Distinguish slice visibility from actual exposure caused by
-removal. Cut-face appearance, visible depth range, exact top-level semantics
-remain open. D-13 selects terrain following for normal pan/zoom/rotation;
-the previous fixed-Z recommendation for normal navigation is withdrawn.
-D-14 selects pinned Z during manual panning and restores following on a jump
-without Z; an explicit jump Z takes precedence. Remaining manual-mode zoom
-and rotation details must be specified without importing the reference's
-zoom-map feature. No UI widgets are implied. D-18 independently settles the
-isometric/four-facing presentation and basic navigation controls.
+Behavior resolved by D-8/D-9/D-12–D-14/D-18/D-22: isometric four-facing view,
+pan/drag/zoom, Shift-scroll cutaway, follow/manual modes and optional jump Z.
+The removal shortcut is development-only. P-5 supplies exact bindings,
+surface selection, cutaway band, picking and artwork adaptation for Q-12.
 
 ### Q-5. What belongs to the reusable engine and what belongs to Ecce Homo?
 
-Direction resolved by D-17: reusable Haskell storage, streaming, geometry and
-edit retention; Lua arena recipes and orchestration. Specify concrete package
-and service boundaries under V-1, including application material provision.
-Do not inherit Synarchy's concrete `WorldState` or assume an ECS component
-store is the right representation for every terrain cell.
+Direction resolved by D-17. P-5 supplies the concrete package/port split and
+instance-owned Lua leases. Game recipe/artwork remain outside engine packages.
 
 ### Q-6. Mutation, persistence and state publication?
 
-D-7 requires removal to reveal newly materialized terrain; D-9 selects a
-durable Lua removal API with a temporary development shortcut. D-10 settles
-retention: track changes while loaded, retain them on offload, and reapply
-them on reload within the same arena session. No cross-session persistence.
-Define change representation, repeated-edit composition, handoff failures,
-publication and determinism guarantees. Generated base terrain, resident
-copies and session-retained changes have distinct lifetimes. Additional edit
-operations and an explicit in-session reset command remain open.
-The earlier state agenda remains reference material; save migration, gameplay
-replay, mods and hot swap remain outside this scope. Reapplying terrain changes
-on reload under D-10 does not introduce a general replay system.
-The development removal tool is accepted; its lifecycle is D-9 and remaining
-input choices are in Q-4.
+Resolved in scope by D-9/D-10/D-19/D-20/D-21: atomic tile removal, session-only
+changes, no automatic neighboring shape edits, no whole-tick rollback. P-5
+specifies canonical removed spans, snapshots, request cancellation and
+arena replacement. General editing/reset tools are excluded in this proposal.
 
 ### Q-7. What proves this first terrain foundation complete?
 
-Agree observable terrain and loading behavior, dependency boundaries, failure
-and teardown cases, platform evidence and practical bounds. No performance
-claim or whole-game parity follows from a flat terrain demonstration.
+The epic done condition, verification matrix and TRA-12 below give the proposed
+observable acceptance. Review these with the delivery boundaries in Q-12.
+Actual runtime/visual/performance evidence belongs to implementation; none is
+claimed from this documentation turn.
 
 ### Q-8. What is the logical model of solid terrain and gaps?
 
-D-4/D-5/D-15 establish gap-capable compressed tile columns supporting full
-blocks and slopes. Multiple solid spans and surfaces may occur within one
-column, and no dense per-cell allocation is required. The flat arena uses
-full tiles; authored slope cases verify agreement between rendering, picking
-and terrain queries.
-
-Specify the finite slope catalog and orientations, shape intersections and
-exposed faces, whether constructed terrain shares that geometry authority,
-empty versus unavailable answers, coordinate limits and physical storage.
-Additional partial-height shapes and rules for creating or automatically
-changing shapes remain open. D-11 selects no designed depth floor. None of
-these decisions requires cubic storage chunks or a particular array.
+Scope resolved by D-4/D-5/D-15/D-21. P-5 proposes the exact thirteen-shape
+catalog, shared geometry and coordinate conventions. Additional shape kinds
+require a later explicit extension; no automatic fallback to a full block.
 
 ### Q-9. How is terrain represented compactly, including unmaterialized depth?
 
-D-5 selects P-3's compressed-column direction, retaining complete spatial
-meaning while materializing only demanded detail. D-7 selects a procedural
-arena source and top-tile-only initial materialization. Settle its deep-terrain recipe,
-uniform base/shared data, material and shape boundaries, edit overrides,
-fragmentation limits and any alternative dense representation for complicated
-regions. Do not equate a known air gap, an unstored solid interior, unavailable
-terrain and an outside-world position. Exact memory/time tradeoffs remain
-unmeasured, and the exact physical storage layout is not approved yet. P-4
-allows a shared source definition to stand in for untouched underground spans;
-choosing compressed columns does not require eagerly building every column.
-
-D-11 settles the vertical direction: extend downward on demand, without a
-designed bottom. D-16 selects a configurable shallow soil layer over stone
-continuing downward, queried without generating intervening tiles. Specify
-default thickness, material identifiers and recipe API alongside vertical
-residency, coordinate limits and bounded range queries. The layering direction
-is settled; its concrete representation remains open.
+Direction resolved by D-5/D-7/D-11/D-16. P-5 specifies implicit layered source,
+sparse region spans, compressed removed intervals, vertical eviction and
+memory accounting. Review numeric defaults and API boundaries in Q-12.
 
 ### Q-10. Terrain transactions versus the deferred gameplay-state service?
 
-H `docs/vision.md:24–30` and the preserved gameplay-state D-30–D-40 describe
-engine-held, Lua-defined state with tick publication and failure rules. The
-delivered M1 still exposes an unavailable-state guard, not that service
-(H `packages/lua-engine/README.md:1611–1634`). D-17 settles Haskell ownership,
-but does not decide whether this terrain arc implements the general state
-system or uses a narrow terrain service with its own operation transactions.
-
-Recommend the narrow terrain service for this arena: no general ECS/schema
-store, no implementation of `api.state`, and no claim that a terrain removal
-rolls back with arbitrary Lua code or a whole future gameplay tick. Preserve
-the earlier state decisions for their own arc. The alternative is to make the
-general gameplay-state commit protocol a prerequisite, substantially expanding
-this design. This is an owner scope/compatibility checkpoint before fixing
-the execution contract and delivery slices.
+Resolved by D-20: narrow terrain transactions only. Preserve the general
+gameplay-state design and M1 unavailable-state guard. Per-operation commit is
+not a promise of full gameplay tick rollback or arbitrary Lua rollback.
 
 ### Q-11. Complete scope of the camera and shapes?
 
-D-18 settles presentation and basic navigation. Remaining concrete proposals
-must specify manual-mode zoom/rotation, top-surface selection after edits,
-bounded cutaway depth and picking; the slope catalog, automatic reshaping
-after removal and whether any general set-cell operation belongs in v1 also
-need an explicit scope choice. These will be presented as small, enumerated
-behavior contracts rather than left for implementers to infer.
+Resolved in behavior by D-18/D-21/D-22. P-5 makes the exact geometry and
+presentation mechanisms reviewable. It does not copy Synarchy's zoom-map
+reset, material-dependent slope inference or game managers.
+
+### Q-12. Approve the concrete technical contract and delivery boundaries?
+
+Remaining owner checkpoint: review P-5, its explicit defaults/limitations, the
+epic done condition and TRA-1–TRA-12. In particular review the single-writer
+service, copied declarative recipes, content-scoped arena attachment, finite
+memory caps with busy admission, thirteen-shape set, finite visible depth
+band, API semantics and coherent scene/pick publication. None is silently
+promoted to an owner decision by inclusion in this draft.
+
+The document remains exploring until that contract and delivery plan are
+accepted and the owner explicitly calls it ready for issue processing.
+No issues or epic are created by this design task.
+
+### Q-13. Can the current renderer represent the geometry correctly?
+
+Deliberately gated implementation question, owned by TRA-7/TRA-8 before
+TRA-9–TRA-12 proceed. Prove depth ordering, cutaway coverage and pick/render
+agreement for roofs, gaps, ramps and corner slopes through the current
+render-2d ABI. If the proof fails, stop those dependent slices and return a
+specific renderer-change proposal to the owner. Do not broaden renderer
+interfaces, substitute incorrect visuals or call the arc complete.
+
+The broader historical “full Synarchy port” memory reconciliation is not an
+implementation dependency for this explicitly approved first arena. Fidelity
+beyond this arc remains uncommitted; MEMORY.md is unchanged.
 
 ## Verification strategy — proposal
 
@@ -796,6 +1099,197 @@ validation catalog once slices exist (H `AGENTS.md`, Language and build;
 
 ## Delivery plan
 
-Zero slices. Define one-PR outcomes with stable `TRA-N` IDs only after the
-material choices are settled, and mirror their dependency order in Processing
-status. Readiness and tracker processing require later explicit owner choices.
+Proposed one-PR boundaries, pending Q-12. Phases express dependency barriers,
+not permission to create issues. The independent input and geometry work can
+be prepared earlier; the ledger lists a valid complete order. Every slice
+includes its owning contract/tests/catalog updates; documentation lands through
+`docs-push` and is linked from its eventual PR. Broader scope discovered during
+processing is split/reviewed explicitly, never hidden inside a child.
+
+### TRA-1. Define terrain coordinates and shared shape geometry
+
+- **Outcome/scope:** CPU terrain component, checked coordinates, negative
+  region indexing, shape catalog, exact rotations and shared intersection/face
+  semantics. No resource effects.
+- **Phase:** 1. **Depends on:** none. **Ordering:** critical path.
+- **Relevant decisions:** D-4, D-11, D-15, D-17, D-21.
+- **Acceptance signals:** independent geometry fixtures, all orientations,
+  boundary coordinates, shared-face agreement and external-client boundary checks.
+- **Out of scope:** streaming, Lua and rendering effects.
+- **Open questions:** Q-12 approval of exact geometry/coordinate contract.
+
+### TRA-2. Implement layered sources and compressed terrain changes
+
+- **Outcome/scope:** immutable copied recipes, bounded authored span patches,
+  sparse materialized runs and canonical removal overlays; pure cell/range/
+  surface queries and source-plus-edits reconstruction.
+- **Phase:** 1. **Depends on:** TRA-1. **Ordering:** critical path.
+- **Relevant decisions:** D-5, D-7, D-10, D-16, D-17, D-21.
+- **Acceptance signals:** soil/stone boundary, cavities and slopes, repeated
+  removals, air no-op, arbitrary deep queries without intervening allocation,
+  and complete bounded range results.
+- **Out of scope:** live service, persistence and automatic slopes.
+- **Open questions:** Q-12 approval of recipe/change encoding contract.
+
+### TRA-3. Define bounded horizontal and vertical residency
+
+- **Outcome/scope:** pure residency/admission model, coalesced camera demand,
+  interest deduplication, eviction eligibility, edit-transfer reservations and
+  separate data/staging/edit accounting. Include limit validation.
+- **Phase:** 1. **Depends on:** TRA-2. **Ordering:** critical path.
+- **Relevant decisions:** D-2, D-6, D-10, D-11, D-19.
+- **Acceptance signals:** tiny-budget model traces, starvation/fairness cases,
+  vertical descent, shared-interest cancellation and no eviction of borrowed data.
+- **Out of scope:** threads, GPU ownership and numeric performance claims.
+- **Open questions:** Q-12 approval of bounds/admission defaults.
+
+### TRA-4. Implement the transactional terrain service
+
+- **Outcome/scope:** scoped single owner, bounded command execution, arenas and
+  incarnations, immutable snapshots, atomic removal/cancellation settlement,
+  offload/reload and orderly close over TRA-2/TRA-3.
+- **Phase:** 2. **Depends on:** TRA-3. **Ordering:** critical path.
+- **Relevant decisions:** D-10, D-17, D-19, D-20, D-21.
+- **Acceptance signals:** controlled race tests for cancel/commit, close/load,
+  repeated edit/offload/reload, stale revisions and failure cleanup; same ordered
+  command trace yields identical terrain despite residency scheduling changes.
+- **Out of scope:** general gameplay-state transactions and Lua bindings.
+- **Open questions:** Q-12 approval of execution/lifetime contract.
+
+### TRA-5. Expose terrain requests through Lua
+
+- **Outcome/scope:** optional narrow service injection, open/attach/lease,
+  query/remove/release bindings, copied recipe validation, role/phase checks and
+  existing request protocol. Preserve unavailable `api.state` behavior.
+- **Phase:** 2. **Depends on:** TRA-4. **Ordering:** critical path.
+- **Relevant decisions:** D-9, D-17, D-19, D-20.
+- **Acceptance signals:** real Lua clients, foreign/stale lease refusal,
+  busy-before-action, duplicate names, cross-role own-lease attachment, canceled
+  mutation and invalid recipes, plus existing M1 compatibility tests.
+- **Out of scope:** window/input/view bindings and general state schemas.
+- **Open questions:** Q-12 approval of named arena authority/API.
+
+### TRA-6. Expose ordered window input to Lua
+
+- **Outcome/scope:** presentation input poll/observation/reset acknowledgement
+  through a narrow injected port; native modifier/button/key/scroll semantics.
+- **Phase:** 2. **Depends on:** none. **Ordering:** independent; can land first.
+- **Relevant decisions:** D-8, D-9, D-12, D-18.
+- **Acceptance signals:** synthetic ordered feed tests, overflow and focus
+  reset, clear-before-acknowledge, window/instance authority and cursor metrics.
+- **Out of scope:** UI routing, action-rebinding UI and terrain mutation.
+- **Open questions:** Q-12 approval of public input contract.
+
+### TRA-7. Implement isometric cutaway planning and picking
+
+- **Outcome/scope:** pure projection/rebasing, camera follow/manual transitions,
+  bounded visible faces, cutaway caps, shared-shape picking and stable ordering
+  candidates. Authored fixtures cover roofs, gaps, ramps and corners.
+- **Phase:** 2. **Depends on:** TRA-2. **Ordering:** critical path; independent
+  of live terrain service and Lua integration.
+- **Relevant decisions:** D-4, D-12–D-16, D-18, D-21, D-22.
+- **Acceptance signals:** geometry/pick consistency, all facings, negative and
+  far coordinates, manual/jump transitions, seam and occlusion fixtures.
+- **Out of scope:** Vulkan uploads and new renderer ABI.
+- **Open questions:** Q-12; Q-13 ordering feasibility. Escalate rather than
+  approximate if the geometry cannot be ordered correctly.
+
+### TRA-8. Qualify terrain materials and depth ordering offscreen
+
+- **Outcome/scope:** generic terrain face material/masks under the existing
+  renderer ABI, approved artwork provenance, and offscreen fixture rendering.
+- **Phase:** 3. **Depends on:** TRA-7. **Ordering:** critical prerequisite to
+  runtime graphics integration.
+- **Relevant decisions:** D-15, D-17, D-18, D-21.
+- **Acceptance signals:** retained exported captures and oracle/geometry
+  comparisons for slopes, roofs, gaps, cutaways and all facings, including
+  overlapping projections. Establish correct depth and transparent coverage.
+- **Out of scope:** live streaming and unapproved vertex/depth ABI changes.
+- **Open questions:** Q-13 is a hard stop gate: failed proof returns a concrete
+  renderer proposal to the owner before dependent slices proceed.
+
+### TRA-9. Publish retained terrain views with safe GPU retirement
+
+- **Outcome/scope:** view adapter from coherent CPU snapshots to retained
+  render regions, bounded uploads, target ownership, adoption/picking snapshot
+  linkage and release through existing frame-completion holds.
+- **Phase:** 3. **Depends on:** TRA-4, TRA-8. **Ordering:** critical path.
+- **Relevant decisions:** D-2, D-6, D-17, D-19.
+- **Acceptance signals:** held-frame replacement/close tests, stale-view
+  refusal, superseded camera demand, retiring-version accounting, no mixed
+  terrain/camera revision and no release before GPU completion.
+- **Out of scope:** Lua view facade and general scene schema expansion.
+- **Open questions:** Q-12; Q-13 must have passed.
+
+### TRA-10. Expose terrain views and camera controls to Lua
+
+- **Outcome/scope:** view open/close, move with optional Z, configure and pick
+  through instance-owned leases and the coherent graphics adapter.
+- **Phase:** 3. **Depends on:** TRA-5, TRA-6, TRA-9. **Ordering:** critical path.
+- **Relevant decisions:** D-12–D-14, D-17–D-19, D-22.
+- **Acceptance signals:** Lua camera traces, unloaded jump with/without Z,
+  consecutive jumps, stale picks and view/window/arena teardown; old M1 scenes
+  remain valid and cannot concurrently seize an attached terrain target.
+- **Out of scope:** UI widgets and camera behavior not selected here.
+- **Open questions:** Q-12; Q-13 must have passed.
+
+### TRA-11. Assemble the authored terrain arena
+
+- **Outcome/scope:** generic launcher/service composition plus Lua arena
+  content, approved textures, four-layer soil default, camera controls and
+  temporary mouse-targeted removal shortcut through the public API.
+- **Phase:** 4. **Depends on:** TRA-10. **Ordering:** critical path.
+- **Relevant decisions:** D-1–D-3, D-7–D-10, D-16–D-18, D-22.
+- **Acceptance signals:** visible exploration beyond startup footprint,
+  underground/cutaway demand, surface/manual navigation, soil-to-stone removal,
+  revisit after offload and fresh state after session restart.
+- **Out of scope:** production editor, gameplay systems and UI.
+- **Open questions:** Q-12; Q-13 must have passed. Development shortcut removal
+  is mandatory in TRA-12, not an optional follow-up.
+
+### TRA-12. Qualify the arena and remove the development shortcut
+
+- **Outcome/scope:** complete end-to-end and resource evidence, remove the
+  temporary binding and its dedicated glue, retain Lua API regressions and
+  finish current subsystem contracts/test catalog entries.
+- **Phase:** 4. **Depends on:** TRA-11. **Ordering:** final acceptance barrier.
+- **Relevant decisions:** D-4–D-22 as applicable.
+- **Acceptance signals:** the epic done condition and matrix below pass;
+  exported visual evidence is retained, allocation trends and configured caps
+  are reported honestly, shortcut is absent, and the public Lua removal path
+  remains tested. Existing M1/native resource qualification stays green.
+- **Out of scope:** broader profiling campaigns, gameplay parity and new art.
+- **Open questions:** Q-12 acceptance scope; Q-13 must have passed.
+
+### Acceptance matrix and evidence delivery
+
+| Concern | Required evidence |
+| --- | --- |
+| Model/source | Independent geometry and recipe fixtures; deep queries allocate no intervening volume; compressed gaps and soil transition |
+| Retention | Multiple edit/offload/reload cycles and new-session freshness; no unbounded duplicate removal log |
+| Concurrency | Causally controlled cancellation/close/publication tests, one settlement and no stale incarnation publication |
+| Camera/input | Follow over authored hills, manual pan/zoom/rotation, Shift-scroll and jumps; reset clears held input; no UI dependency |
+| Presentation | Exported offscreen and native captures for four facings, ramps/corners, roofs/cavities, cutaways and chunk seams; pick agrees with displayed geometry |
+| Residency | Traverse and descend many region boundaries under fixed caps; record resident bytes/counts, retained edits, staging and retiring GPU data separately |
+| Compatibility | Existing M1 rectangle scenes, state-unavailable behavior, CPU composition and role/lease rules remain intact |
+| Delivery | Updated owning contracts and validation catalog; public Lua API remains; temporary shortcut/glue absent |
+
+Qualify deterministic terrain for an identical source and ordered successful
+command trace on the same build/platform. Vary internal loading/eviction order
+without changing that trace. This does not claim arbitrary asynchronous
+submission races or the unfinished general gameplay scheduler are deterministic.
+Do not add whole-game replay or cross-platform bit identity.
+
+Use Hspec and controlled synchronization for CPU/contracts, the existing
+offscreen renderer path for image evidence, and the owning native suite for
+input/display integration. Select required groups using the repository's
+validation planner when each implementation slice exists. Numeric budgets are
+proposed caps, not benchmark results: measure representative flat/layered/
+hollow/sloped/fragmented fixtures and report allocation cost and refusal
+behavior. No arbitrary FPS claim is an acceptance criterion.
+
+Retain requested captures and measurement summaries with the owning evidence
+document through `docs-push`; an ignored local screenshot is not delivery.
+No code, build, test, native launch or performance measurement was performed
+while drafting this design. Final design signoff and tracker processing are
+separate from implementation qualification.
