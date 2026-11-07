@@ -16,7 +16,13 @@
 --   matches the victims awaited, no hold protects a missing region);
 -- * a live arena's retained edit bytes never decrease;
 -- * a changed region stays resident until its handoff is confirmed or its arena
---   is released.
+--   is released;
+-- * the owner can always do what the model has asked of it: every running job
+--   can report completion or failure, every cancelling job can be acknowledged,
+--   every committed victim released, every handoff settled, every hold released
+--   and every request and camera demand withdrawn, each accepted by the model;
+-- * doing all of that, from any reachable state, leaves nothing reserved, no job,
+--   no victim, no hold and no retiring arena behind.
 --
 -- No example here sleeps, starts a thread or reads a clock.
 module Test.Terrain.ResidencyProperty (spec) where
@@ -135,6 +141,7 @@ check prior latest result = case result of
           , arenaId old == arenaId new
           , arenaRetainedBytes new < arenaRetainedBytes old
           ]
+      , ownerCanSettle latest
       , listToMaybe
           [ "changed region " <> show (regionCoord r) <> " lost without a handoff"
           | r ← modelRegions prior
@@ -147,11 +154,59 @@ check prior latest result = case result of
   where
     firstJust = listToMaybe . concatMap (maybe [] pure)
 
+-- | What the owner would do to carry out everything the model has asked of it,
+-- each as an event.
+ownerActions ∷ Model → [Event]
+ownerActions m =
+  [JobCompleted (jobId j) (Cost 0 0 0) | j ← modelJobs m, jobPhase j `elem` [JobRunningPhase, JobCancellingPhase]]
+    <> [Dispatch | any ((== JobQueued) . jobPhase) (modelJobs m)]
+    <> [VictimReleased (regionArena r) (regionCoord r) | r ← modelRegions m, regionEvicting r]
+    <> [HandoffConfirmed (regionArena r) (regionCoord r) | r ← modelRegions m, Just _ ← [regionHandoff r]]
+    <> [ReleaseHold h | (h, _, _, _) ← modelHolds m]
+    <> [Withdraw (requestId r) | r ← modelRequests m]
+    <> [ClearCameraDemand (viewId v) | v ← modelViews m]
+
+-- | Every action the owner might be asked to take is accepted by the model.
+ownerCanSettle ∷ Model → Maybe String
+ownerCanSettle m =
+  listToMaybe
+    [ "the owner's " <> show ev <> " was refused: " <> show r
+    | ev ← ownerActions m <> alternatives
+    , (_, Left r) ← [step m ev]
+    ]
+  where
+    alternatives =
+      [JobFailed (jobId j) | j ← modelJobs m, jobPhase j == JobRunningPhase]
+        <> [JobAcknowledged (jobId j) | j ← modelJobs m, jobPhase j == JobCancellingPhase]
+        <> [HandoffFailed (regionArena r) (regionCoord r) | r ← modelRegions m, Just _ ← [regionHandoff r]]
+
+-- | Carry out every action in turn until none remains; the result is nothing
+-- reserved, no job, victim, hold or retiring arena.
+settleEverything ∷ Model → Either String Model
+settleEverything = go (500 ∷ Int)
+  where
+    go 0 _ = Left "the owner's actions did not settle the model"
+    go n m = case ownerActions m of
+      [] → leftovers m
+      (ev : _) → case step m ev of
+        (m', Right _) → go (n - 1) m'
+        (_, Left r) → Left ("the owner's " <> show ev <> " was refused: " <> show r)
+    leftovers m =
+      case concat
+        [ ["a job remains: " <> show j | j ← modelJobs m]
+        , ["a bank still reserves bytes: " <> show b <> " " <> show (bankLedger m b) | b ← allBanks, ledgerReserved (bankLedger m b) /= 0]
+        , ["staging still occupied: " <> show (bankLedger m StagingBank) | ledgerOccupied (bankLedger m StagingBank) /= 0]
+        , ["a victim remains: " <> show (regionCoord r) | r ← modelRegions m, regionEvicting r]
+        , ["an arena is still retiring: " <> show (arenaId a) | a ← modelArenas m, arenaPhase a == ArenaRetiringPhase]
+        ] of
+        [] → Right m
+        (problem : _) → Left problem
+
 -- | Run a sequence; return the first failure and the event that caused it.
 runSequence ∷ [(Int, Int, Int)] → (Either String Model, Stats)
 runSequence seeds = go (newModel pressure) seeds (Stats 0 0 0 0 0 0)
   where
-    go m [] st = (Right m, st)
+    go m [] st = (settleEverything m, st)
     go m (s : rest) st =
       let event = eventFor m s
           (m', result) = step m event
