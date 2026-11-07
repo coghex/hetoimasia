@@ -25,6 +25,7 @@ module Hetoimasia.Terrain.Internal.Residency.Coverage
   , Cost (..)
   , costBytes
   , reserveCost
+  , removalResidentGrowthBytes
   , regionMetadataBytes
   , interestRecordBytes
   , holdRecordBytes
@@ -168,18 +169,35 @@ costBytes (Cost columns segments payload) = do
   where
     segmentBytes = 32
 
--- | The conservative cost of making @delta@ known when @have@ is already known
--- in the same region: a column index entry for each column @have@ lacks, at
--- most one segment per interval of @delta@ (adjacent intervals only merge,
--- which is cheaper), and two payload bytes per cell (the dense encoding is the
--- largest). Cheaper encodings only lower the figure.
-reserveCost ∷ Coverage → Coverage → Cost
-reserveCost have delta =
+-- | The conservative cost of making @delta@ known in one region, whatever else is
+-- or becomes known there, and whatever order other work completes or cancels in:
+--
+-- * a column index entry for every column of @delta@. The data layer keeps one
+--   index entry per column across all vertical regions, but a region is charged
+--   for its own columns and keeps that charge until it is released, so evicting
+--   one region never leaves another under-charged (the model over-charges, never
+--   under-charges, the shared index). A job does not depend on any other job to
+--   fund its columns.
+-- * at most one segment per interval of @delta@ (merging only lowers the count);
+-- * the dense payload bound, 64 bytes, per interval: an interval becomes, or
+--   merges into, one segment of at most 32 cells, and a segment's payload is at
+--   most two bytes per cell. Merging into segments that already exist can raise
+--   the payload of the merged segment (a uniform 31-cell segment is two bytes,
+--   the merged dense segment 64), so a figure proportional to the new cells alone
+--   would not bound the growth.
+reserveCost ∷ Coverage → Cost
+reserveCost delta =
   Cost
-    { costColumns = fromIntegral (Set.size (Set.difference (coverageColumnSet delta) (coverageColumnSet have)))
+    { costColumns = coverageColumns delta
     , costSegments = coverageSegments delta
-    , costPayloadBytes = 2 * coverageCells delta
+    , costPayloadBytes = 64 * coverageSegments delta
     }
+
+-- | The most a whole-cell removal can raise the payload of the segment it edits:
+-- a segment's payload is at least 2 bytes (uniform) and at most 64 (dense, 32
+-- cells), and the edit rebuilds exactly that one segment.
+removalResidentGrowthBytes ∷ Word64
+removalResidentGrowthBytes = 62
 
 -- | Fixed metadata charged for each resident region, however little of it is
 -- known: the region key, its coverage index and its bookkeeping. This is what

@@ -16,6 +16,7 @@
 module Test.Terrain.ResidencyCycle (spec) where
 
 import Control.Monad (foldM, forM_)
+import Data.List (sort)
 import Hetoimasia.Terrain.Cell (Column, ZRange)
 import Hetoimasia.Terrain.Changes
 import Hetoimasia.Terrain.Coordinate
@@ -23,6 +24,7 @@ import Hetoimasia.Terrain.Palette
 import Hetoimasia.Terrain.Query (cellAt)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Resident
+import Hetoimasia.Terrain.Segment (segmentLength)
 import Hetoimasia.Terrain.Source (Source)
 import Test.Hspec
 import Test.Terrain.Model
@@ -41,15 +43,19 @@ source = mustSource soilOverStone
 changeLimits ∷ ChangeLimits
 changeLimits = ChangeLimits 1000000
 
--- | Room for the two edited regions together (420 and 338 bytes once both
--- columns are touched) but not for them and two other regions as well, so other
+-- | Room for the two edited regions together (420 and 338 bytes stored once both
+-- columns are touched, 944 reserved to load them again) but not for them and two
+-- other regions as well, so other
 -- demand must evict them and reconstructing them must evict that demand.
 limits ∷ Limits
-limits = limitsWith $ \s → s {specResidentBytes = 900}
+limits = limitsWith $ \s → s {specResidentBytes = 1100}
 
 initial ∷ IO World
-initial = do
-  (m, _) ← stepOk (newModel limits) (OpenArena a1 rev0)
+initial = initialWith limits
+
+initialWith ∷ Limits → IO World
+initialWith lim = do
+  (m, _) ← stepOk (newModel lim) (OpenArena a1 rev0)
   palette ← either (fail . show) pure (internSourceMaterials source emptyPalette)
   pure (World m emptyChanges palette emptyResident)
 
@@ -74,14 +80,33 @@ realMaterialize w region cover = do
       grew f = fromIntegral (max 0 (f stored' - f stored))
   pure
     ( w {wPalette = palette, wResident = resident}
-    , Cost (grew statColumns) (grew statSegments) (grew statPayloadBytes)
+    , -- Columns are attributed to the region (its own columns), not read from the
+      -- shared index's growth: the data layer keeps one index entry per column
+      -- across vertical regions, and a region must keep its own charge.
+      Cost (coverageColumns cover) (grew statSegments) (grew statPayloadBytes)
     )
+
+-- | The accounted bytes of the real resident detail: payload, segment metadata and
+-- column index entries.
+realBytes ∷ World → Int
+realBytes w = let st = residentStats (wResident w) in statPayloadBytes st + statMetadataBytes st
+
+-- | The model never charges less than the real detail occupies: every resident
+-- region's own metadata plus the accounted bytes of the real detail.
+assertCharged ∷ World → Expectation
+assertCharged w = do
+  let charged = sum [toInteger (regionBytes r) | r ← modelRegions (wModel w)]
+      physical = 256 * toInteger (length (modelRegions (wModel w))) + toInteger (realBytes w)
+  charged `shouldSatisfy` (>= physical)
 
 -- | Perform the effects of every victim: discard its real detail, then report.
 release ∷ World → RegionKey → IO World
 release w (a, region) = do
   (m, _) ← stepOk (wModel w) (VictimReleased a region)
-  pure w {wModel = m, wResident = discardRegion region (wResident w)}
+  let w' = w {wModel = m, wResident = discardRegion region (wResident w)}
+  -- After each individual release the survivors are still charged for what they hold.
+  assertCharged w'
+  pure w'
 
 -- | Submit an event that admits work and perform its victims' releases.
 submit ∷ World → Event → IO World
@@ -148,7 +173,10 @@ spec = describe "Residency over the real data layer" $ do
             -- Stage the edit: recompute the resident cell from source plus changes.
             (w2, _) ← realMaterialize w1 {wChanges = changes'} region cover
             residentAnswer w2 x 0 z `shouldBe` Just Nothing
-            (m3, committed) ← stepOk (wModel w2) (RemovalCommitted (RequestId (fromInteger rid)) next (fromIntegral grown))
+            -- What the rebuilt segment now accounts beyond the old one.
+            let regrown = max 0 (realBytes w2 - realBytes w1)
+            (m3, committed) ← stepOk (wModel w2) (RemovalCommitted (RequestId (fromInteger rid)) next (fromIntegral grown) (fromIntegral regrown))
+            assertCharged w2 {wModel = m3}
             -- What was reserved but not needed (64 minus the real growth) returns.
             reportDecision committed `shouldBe` Committed next (64 - fromIntegral grown) []
             -- Hand the changes off; the retained bytes do not grow again.
@@ -193,13 +221,71 @@ spec = describe "Residency over the real data layer" $ do
     length (admissionJobs (admission' report)) `shouldBe` 1
     w1 ← drain w0 {wModel = m}
     -- 256 metadata + 48 column + 3 x 32 segments + 3 x 2 payload = 406 actually
-    -- stored: the three cells do not merge into one segment.
+    -- stored: the three cells do not merge into one segment. The reservation is the
+    -- dense bound, 64 payload bytes for each of the three intervals.
     let stats = residentStats (wResident w1)
     (statColumns stats, statSegments stats, statKnownCells stats) `shouldBe` (1, 3, 3)
     map regionBytes (modelRegions (wModel w1)) `shouldBe` [256 + 48 + 3 * 32 + 3 * 2]
-    -- The conservative reservation was exactly what the real detail stored.
-    reserved `shouldBe` [256 + 48 + 3 * 32 + 3 * 2]
+    -- The reservation covered it (and was larger, by the payload bound).
+    reserved `shouldBe` [256 + 48 + 3 * 32 + 3 * 64]
+  it "reserves the growth of a compressed segment and reconciles it with the real rebuilt segment" $ do
+    -- 400 resident bytes: one 32-cell uniform segment (338 stored of the 400
+    -- reserved) leaves exactly the 62 a removal reserves for its rebuilt segment.
+    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 400})
+    -- Region (0,0,-2) is levels -64..-33: all stone, one uniform segment of 2 bytes.
+    w1 ← submit w0 (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 (-2)) (box 0 1 0 1 0 32)]) >>= drain >>= \w → settle w 1
+    map regionBytes (modelRegions (wModel w1)) `shouldBe` [338]
+    map segmentLength (residentSegments (wResident w1) (mustColumn 0 0)) `shouldBe` [32]
+    let tile = mustTile 0 0 (-50)
+        (region, cover) = regionOf 0 0 (-50)
+    (w2, accepted) ← submitAdmission w1 (SubmitRemoval (RequestId 2) a1 rev0 tile)
+    -- The cell is resident: no job, and the growth is reserved from the free 62.
+    admissionJobs accepted `shouldBe` []
+    ledgersOf (wModel w2) `shouldBe` Ledgers (338, 62) (0, 64) (224, 512)
+    -- With the bank full a second removal cannot be admitted: busy, not growth.
+    refusal ← stepRefused (wModel w2) (SubmitRemoval (RequestId 3) a1 rev0 (mustTile 0 0 (-51)))
+    case refusal of
+      Busy (NoEligibleEviction 62 0 _) → pure ()
+      other → expectationFailure ("expected a busy refusal for the growth, got " <> show other)
+    -- The real removal splits the uniform segment into three runs: 2 -> 12 bytes.
+    outcome ← either (fail . show) pure (removeCell changeLimits source tile (wChanges w2))
+    let changes' = removeResult outcome
+    (w3, _) ← realMaterialize w2 {wChanges = changes'} region cover
+    let regrown = realBytes w3 - realBytes w2
+    regrown `shouldBe` 10
+    (m4, committed) ← stepOk (wModel w3) (RemovalCommitted (RequestId 2) (Revision 1) (fromIntegral (changesBytes changes')) (fromIntegral regrown))
+    reportDecision committed `shouldBe` Committed (Revision 1) 0 []
+    -- Occupied now includes the growth; the unused 52 of the reservation returned.
+    ledgersOf m4 `shouldBe` Ledgers (348, 0) (64, 0) (0, 0)
+    assertCharged w3 {wModel = m4}
+    -- The segment now occupies 10 bytes more, so the bank (348 of 400) cannot
+    -- take another removal's 62 reserved bytes: busy by 10, and the region being
+    -- edited is not its own victim.
+    refusal2 ← stepRefused m4 (SubmitRemoval (RequestId 4) a1 (Revision 1) (mustTile 0 0 (-51)))
+    case refusal2 of
+      Busy (NoEligibleEviction 10 0 blockers') → blockedByRequest blockers' `shouldBe` 1
+      other → expectationFailure ("expected busy by the 10 missing bytes, got " <> show other)
+  it "keeps a surviving region charged for the shared column index after each individual release" $ do
+    -- Two vertical regions of one column share one real column index entry; each
+    -- is charged for its own column, so evicting either leaves the other charged.
+    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 800})
+    w1 ← submit w0 (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 0) (cell 0 0 0)]) >>= drain >>= \w → settle w 1
+    w2 ← submit w1 (SubmitQuery (RequestId 2) a1 rev0 [demand (reg 0 0 1) (cell 0 0 0)]) >>= drain >>= \w → settle w 2
+    statColumns (residentStats (wResident w2)) `shouldBe` 1
+    map regionBytes (modelRegions (wModel w2)) `shouldBe` [338, 338]
+    assertCharged w2
+    -- Another region needs room: the older region is released first, and the check
+    -- inside the release sees the survivor still charged its own 338 bytes.
+    w3 ← submit w2 (SubmitQuery (RequestId 3) a1 rev0 [demand (reg 40 0 0) (cell 0 0 0)]) >>= drain
+    sort [regionCoord r | r ← modelRegions (wModel w3)] `shouldBe` sort [reg 0 0 1, reg 40 0 0]
+    assertCharged w3
+    map regionBytes [r | r ← modelRegions (wModel w3), regionCoord r == reg 0 0 1] `shouldBe` [338]
   where
+    submitAdmission w event = do
+      (m, report) ← stepOk (wModel w) event
+      case reportDecision report of
+        Accepted a → (\w' → (w', a)) <$> foldM release w {wModel = m} (admissionVictims a)
+        other → expectationFailure ("expected an admission, got " <> show other) >> fail "not admitted"
     revisionOf w = case [arenaRevision a | a ← modelArenas (wModel w)] of
       [r] → r
       _ → error "one arena expected"

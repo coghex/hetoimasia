@@ -58,11 +58,12 @@ import Control.Monad (foldM)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Either (isRight)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord, decomposeTile)
+import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord, composeTile, decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Internal.Residency.Coverage
 import Hetoimasia.Terrain.Internal.Residency.Limits
 
@@ -136,8 +137,10 @@ data Event
     JobFailed !JobId
   | -- | A running job whose interests are gone acknowledged its cancellation.
     JobAcknowledged !JobId
-  | -- | A removal committed at a new revision, retaining this many bytes.
-    RemovalCommitted !RequestId !Revision !Word64
+  | -- | A removal committed at a new revision, retaining this many edit bytes and
+    -- growing the edited region's resident detail by this many bytes (what the
+    -- rebuilt segment now accounts beyond the old one, never above the reservation).
+    RemovalCommitted !RequestId !Revision !Word64 !Word64
   | -- | Acquire a hold on resident regions.
     AcquireHold !HoldId !ArenaId !HoldKind [RegionCoord]
   | ReleaseHold !HoldId
@@ -204,6 +207,8 @@ data InvalidReason
   | DuplicateRegion !RegionCoord
   | DuplicateRequest !RequestId
   | DuplicateHold !HoldId
+  | -- | A region key naming cells outside the supported coordinate range.
+    UnsupportedRegion !RegionCoord
   | ArenaNotIncreasing !ArenaId
   | -- | The bank, the minimal bytes this needs, and the bank's configured total.
     ExceedsBank !Bank !Word64 !Word64
@@ -235,6 +240,10 @@ data ContractReason
   | EditBeforeResident !RequestId
   | RevisionNotAdvancing !Revision !Revision
   | CommitExceedsReservation !Word64 !Word64
+  | -- | The removal's resident growth is still waiting for its victims to be released.
+    EditNotFunded !RequestId
+  | -- | Reserved and reported resident growth.
+    ResidentGrowthExceedsReservation !Word64 !Word64
   | HandoffNotNeeded !RegionCoord
   | HandoffNotPending !RegionCoord
   | JobIdsExhausted
@@ -319,7 +328,11 @@ data Residence = Residence
   , rsBytes ∷ !Word64
   , rsLastUse ∷ !Word64
   , rsDirty ∷ !Bool
-  , rsHandoff ∷ !(Maybe Word64)
+  , -- | Counts the removals committed in this region; a handoff records the
+    -- count it transfers, so an older handoff cannot clear a newer change.
+    rsGeneration ∷ !Word64
+  , -- | A handoff in flight: its duplicate bytes and the generation it transfers.
+    rsHandoff ∷ !(Maybe (Word64, Word64))
   , rsEvicting ∷ !Bool
   }
   deriving stock (Eq, Show)
@@ -368,6 +381,11 @@ data Request = Request
   , rqRegions ∷ ![RegionCoord]
   , rqBytes ∷ !Word64
   , rqEdit ∷ !(Maybe EditReservation)
+  , -- | A removal's reserved resident growth, funded like a job's: the bytes
+    -- reserved now, the bytes waiting for victims and the victims awaited.
+    rqActive ∷ !Word64
+  , rqDeferred ∷ !Word64
+  , rqAwaiting ∷ !(Map RegionKey Word64)
   }
   deriving stock (Eq, Show)
 
@@ -443,7 +461,7 @@ interestCount m = fromIntegral (sum [Map.size (tgInterests t) | t ← Map.elems 
 bankLedger ∷ Model → Bank → Ledger
 bankLedger m bank = case bank of
   ResidentBank →
-    Ledger limit (sum [rsBytes r | (_, r) ← residentTargets m]) (sum [jbActive j | j ← Map.elems (mJobs m)])
+    Ledger limit (sum [rsBytes r | (_, r) ← residentTargets m]) (sum [jbActive j | j ← Map.elems (mJobs m)] + sum [rqActive r | r ← Map.elems (mRequests m)])
   EditBank →
     Ledger
       limit
@@ -456,7 +474,7 @@ bankLedger m bank = case bank of
           + interestCount m * interestRecordBytes
           + sum [fromIntegral (length (hdRegions h)) * holdRecordBytes | h ← Map.elems (mHolds m)]
           + sum [descriptionBytes (fromIntegral (length (vwDemand v))) | v ← Map.elems (mViews m)]
-          + sum [d | (_, Residence {rsHandoff = Just d}) ← residentTargets m]
+          + sum [d | (_, Residence {rsHandoff = Just (d, _)}) ← residentTargets m]
       )
       (sum [jbScratch j | j ← Map.elems (mJobs m)] + sum [erStaging e | Request {rqEdit = Just e} ← Map.elems (mRequests m)])
   where
@@ -497,6 +515,8 @@ data RegionInfo = RegionInfo
   , regionBytes ∷ !Word64
   , regionLastUse ∷ !Word64
   , regionDirty ∷ !Bool
+  , -- | The removals committed in this region so far.
+    regionGeneration ∷ !Word64
   , regionHandoff ∷ !(Maybe Word64)
   , regionEvicting ∷ !Bool
   }
@@ -504,7 +524,7 @@ data RegionInfo = RegionInfo
 
 modelRegions ∷ Model → [RegionInfo]
 modelRegions m =
-  [ RegionInfo a r (rsCoverage x) (rsBytes x) (rsLastUse x) (rsDirty x) (rsHandoff x) (rsEvicting x)
+  [ RegionInfo a r (rsCoverage x) (rsBytes x) (rsLastUse x) (rsDirty x) (rsGeneration x) (fmap fst (rsHandoff x)) (rsEvicting x)
   | ((a, r), x) ← residentTargets m
   ]
 
@@ -577,11 +597,14 @@ data RequestInfo = RequestInfo
   , requestRegions ∷ ![RegionCoord]
   , -- | Whether it holds a removal's edit and staging reservations.
     requestRemoval ∷ !Bool
+  , -- | The removal's resident growth reserved now and still waiting for victims.
+    requestResidentActive ∷ !Word64
+  , requestResidentDeferred ∷ !Word64
   }
   deriving stock (Eq, Show)
 
 modelRequests ∷ Model → [RequestInfo]
-modelRequests m = [RequestInfo r (rqArena x) (rqRegions x) (isJust (rqEdit x)) | (r, x) ← Map.toAscList (mRequests m)]
+modelRequests m = [RequestInfo r (rqArena x) (rqRegions x) (isJust (rqEdit x)) (rqActive x) (rqDeferred x) | (r, x) ← Map.toAscList (mRequests m)]
 
 modelHolds ∷ Model → [(HoldId, ArenaId, HoldKind, [RegionCoord])]
 modelHolds m = [(h, hdArena x, hdKind x, hdRegions x) | (h, x) ← Map.toAscList (mHolds m)]
@@ -659,7 +682,7 @@ run m = \case
     Just job
       | jbState job == JobCancelling → Right (m {mJobs = Map.delete j (mJobs m)}, Discarded j)
       | otherwise → Left (ContractFailure (JobNotCancelling j))
-  RemovalCommitted rid newRev actual → commitRemoval m rid newRev actual
+  RemovalCommitted rid newRev actual growth → commitRemoval m rid newRev actual growth
   AcquireHold h a kind regions → acquireHold m h a kind regions
   ReleaseHold h
     | Map.member h (mHolds m) → Right (m {mHolds = Map.delete h (mHolds m)}, HoldReleased)
@@ -742,12 +765,16 @@ pruneJobs m =
 
 -- | Convert a released victim's credit into the funding of the jobs awaiting it.
 releaseVictim ∷ RegionKey → Model → Model
-releaseVictim key m = m {mJobs = Map.map convert (mJobs m)}
+releaseVictim key m = m {mJobs = Map.map convert (mJobs m), mRequests = Map.map convertRequest (mRequests m)}
   where
     convert j = case Map.lookup key (jbAwaiting j) of
       Nothing → j
       Just credit →
         j {jbActive = jbActive j + credit, jbDeferred = jbDeferred j - credit, jbAwaiting = Map.delete key (jbAwaiting j)}
+    convertRequest q = case Map.lookup key (rqAwaiting q) of
+      Nothing → q
+      Just credit →
+        q {rqActive = rqActive q + credit, rqDeferred = rqDeferred q - credit, rqAwaiting = Map.delete key (rqAwaiting q)}
 
 -- | Release every retiring arena whose in-flight work has all acknowledged.
 settleAll ∷ Model → (Model, [ArenaId])
@@ -770,6 +797,13 @@ settleAll m0 = foldl' settle (m0, []) [a | (a, x) ← Map.toAscList (mArenas m0)
 -- Admission
 
 -- | Why a resident region may not be chosen as a victim, if it may not.
+-- | Whether every cell of a region key is a supported tile: its lowest and
+-- highest cells both compose into the supported coordinate range.
+supportedRegion ∷ RegionCoord → Bool
+supportedRegion region = case (mkLocalCoord 0 0 0, mkLocalCoord 15 15 31) of
+  (Right low, Right high) → isRight (composeTile region low) && isRight (composeTile region high)
+  _ → False
+
 data Block = BlockEvicting | BlockHandoff | BlockDirty | BlockHeld | BlockInterest | BlockJob
   deriving stock (Eq, Show)
 
@@ -820,7 +854,7 @@ planUnit m arena owner d@(RegionDemand region cover) = do
     if coverageIsEmpty delta
       then Right Nothing
       else do
-        bytes ← maybe (Left (Invalid CostArithmetic)) Right (costBytes (reserveCost have delta))
+        bytes ← maybe (Left (Invalid CostArithmetic)) Right (costBytes (reserveCost delta))
         need ← maybe (Left (Invalid CostArithmetic)) Right (checkedAdd bytes (if isNothing resident then regionMetadataBytes else 0))
         Right (Just (NewJob delta need (scratchBytes delta)))
   pure (UnitPlan d (maybe True (not . Map.member owner . tgInterests) target) job)
@@ -829,7 +863,7 @@ planUnit m arena owner d@(RegionDemand region cover) = do
 -- nothing is resident, plus the interest record.
 minimalNeed ∷ Coverage → Either Refusal (Word64, Word64)
 minimalNeed cover = do
-  bytes ← maybe (Left (Invalid CostArithmetic)) Right (costBytes (reserveCost emptyCover cover))
+  bytes ← maybe (Left (Invalid CostArithmetic)) Right (costBytes (reserveCost cover))
   need ← maybe (Left (Invalid CostArithmetic)) Right (checkedAdd bytes regionMetadataBytes)
   pure (need, scratchBytes cover + interestRecordBytes)
 
@@ -847,7 +881,8 @@ planAdmission m arena owner demands extras = do
       newInterests = fromIntegral (length [() | u ← units, upNewInterest u])
       nJobs = fromIntegral (length jobs) ∷ Word64
       nCommands = if exCommand extras then 1 else 0
-      residentNeed = sum (map njNeed jobs)
+      growth = if exEdit extras then removalResidentGrowthBytes else 0
+      residentNeed = sum (map njNeed jobs) + growth
       stagingNeed = newInterests * interestRecordBytes + sum (map njScratch jobs) + exRequestBytes extras
       editNeed = if exEdit extras then removalRetainedBytes else 0
   -- Permanently invalid: cannot fit even in an empty service.
@@ -870,8 +905,9 @@ planAdmission m arena owner demands extras = do
   -- Resident funding: free bytes first, in unit order; the rest from victims.
   let free0 = freeBytes (bankLedger m ResidentBank)
       split _ [] = []
-      split free (j : js) = let active = min free (njNeed j) in (active, njNeed j - active) : split (free - active) js
-      parts = split free0 jobs
+      split free (need : needs) = let active = min free need in (active, need - active) : split (free - active) needs
+      -- Each new job is funded in turn, then a removal's resident growth.
+      parts = split free0 (map njNeed jobs <> [growth | exEdit extras])
       shortfall = sum (map snd parts)
   (funding, victims) ←
     if shortfall == 0
@@ -953,7 +989,7 @@ blockers m exclude held jobKeys =
 
 -- | Apply a plan: add the interests, create the jobs funded as planned and
 -- commit the victims.
-applyPlan ∷ Model → ArenaId → Owner → Plan → (Model, Admission)
+applyPlan ∷ Model → ArenaId → Owner → Plan → (Model, Admission, Maybe (Word64, Word64, Map RegionKey Word64))
 applyPlan m arena owner (Plan units funding victims) =
   let clock = mClock m
       revision = maybe (Revision 0) arRevision (Map.lookup arena (mArenas m))
@@ -978,10 +1014,12 @@ applyPlan m arena owner (Plan units funding victims) =
             job = Job arena revision region delta JobPending active deferred awaiting scratch 0 False
          in (mm {mNextJob = mNextJob mm + 1, mJobs = Map.insert jid job (mJobs mm)}, acc <> [(jid, region)])
       (m3, created) = foldl' allocate (m2, []) (zip newJobs funding)
+      -- Whatever funding is left after the jobs belongs to a removal's growth.
+      requestFunding = listToMaybe (drop (length newJobs) funding)
       shared = [demandRegion (upDemand u) | u ← units, isNothing (upJob u)]
       deferredTotal = sum [d | (_, d, _) ← funding]
       (m4, _, _) = pruneJobs m3
-   in (m4, Admission created shared victims deferredTotal)
+   in (m4, Admission created shared victims deferredTotal, requestFunding)
 
 submit ∷ Model → RequestId → ArenaId → Revision → [RegionDemand] → Maybe (RegionCoord, Coverage) → Run
 submit m rid a rev demands edit = do
@@ -993,9 +1031,10 @@ submit m rid a rev demands edit = do
       recordBytes = commandRecordBytes count
       extras = Extras True (recordBytes + maybe 0 (const removalStagingBytes) edit) (isJust edit)
   plan ← planAdmission m a (OwnerRequest rid) demands extras
-  let (m1, admission) = applyPlan m a (OwnerRequest rid) plan
+  let (m1, admission, funding) = applyPlan m a (OwnerRequest rid) plan
       reservation = fmap (\(r, c) → EditReservation r c rev removalRetainedBytes removalStagingBytes) edit
-      request = Request a (map demandRegion demands) recordBytes reservation
+      (active, deferred, awaiting) = fromMaybe (0, 0, Map.empty) funding
+      request = Request a (map demandRegion demands) recordBytes reservation active deferred awaiting
   Right (m1 {mRequests = Map.insert rid request (mRequests m1)}, Accepted admission)
 
 checkDemand ∷ Model → [RegionDemand] → Either Refusal ()
@@ -1006,6 +1045,9 @@ checkDemand m demands = do
   let regions = map demandRegion demands
   case [r | (r, n) ← Map.toList (Map.fromListWith (+) [(r', 1 ∷ Int) | r' ← regions]), n > 1] of
     (r : _) → Left (Invalid (DuplicateRegion r))
+    [] → Right ()
+  case filter (not . supportedRegion) regions of
+    (r : _) → Left (Invalid (UnsupportedRegion r))
     [] → Right ()
   -- A region whose minimal reservation exceeds a bank's total can never be
   -- admitted: refuse the whole demand now, rather than leave it pending forever.
@@ -1033,6 +1075,15 @@ setCamera m v a demands = do
   if newBytes > limitBytes limits StagingBank
     then Left (Invalid (ExceedsBank StagingBank newBytes (limitBytes limits StagingBank)))
     else Right ()
+  -- The description and a region job must coexist: a demand whose description
+  -- plus the smallest job it names can never fit staging is permanently invalid.
+  mapM_
+    ( \d →
+        let footprint = newBytes + interestRecordBytes + scratchBytes (demandCoverage d)
+            stagingLimit = limitBytes limits StagingBank
+         in if footprint > stagingLimit then Left (Invalid (ExceedsBank StagingBank footprint stagingLimit)) else Right ()
+    )
+    demands
   if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
     then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) (newBytes - oldBytes)))
     else Right ()
@@ -1051,14 +1102,26 @@ setCamera m v a demands = do
       m2 = m1 {mViews = Map.insert v (View a demands Set.empty) (mViews m1)}
       (m3, gone, cancelling) = pruneJobs m2
       -- Only pressure leaves a region pending; any other refusal fails the event.
-      attempt (mm, done, waiting) d = case planAdmission mm a owner [d] noExtras of
+      -- A region that stays pending drops this view's interest in the coverage it
+      -- replaced, so an obsolete interest never survives a replacement.
+      attempt (mm, done, waiting, replaced) d = case planAdmission mm a owner [d] noExtras of
         Right plan →
-          let (mm', admission) = applyPlan mm a owner plan
-           in Right (mm', done <> [admission], waiting)
-        Left (Busy _) → Right (mm, done, waiting <> [demandRegion d])
+          let (mm', admission, _) = applyPlan mm a owner plan
+           in Right (mm', done <> [admission], waiting, replaced)
+        Left (Busy _) →
+          let key = (a, demandRegion d)
+              old = Map.lookup key (mTargets mm) >>= Map.lookup owner . tgInterests
+           in case old of
+                Just i | inCoverage i /= demandCoverage d → Right (dropInterest mm key, done, waiting <> [demandRegion d], replaced <> [demandRegion d])
+                _ → Right (mm, done, waiting <> [demandRegion d], replaced)
         Left other → Left other
-  (m4, admitted, pending) ← foldM attempt (m3, [], []) demands
-  Right (m4, CameraSet admitted pending (map snd obsolete) gone cancelling)
+  (m4, admitted, pending, replaced) ← foldM attempt (m3, [], [], []) demands
+  let (m5, gone2, cancelling2) = pruneJobs m4
+  -- Dropping an obsolete interest may have freed a slot or bytes: offer them to
+  -- the regions that stayed pending, once.
+  (m6, admitted2, pending2, _) ← foldM attempt (m5, admitted, [], []) [d | d ← demands, demandRegion d `elem` pending]
+  let (m7, gone3, cancelling3) = pruneJobs m6
+  Right (m7, CameraSet admitted2 pending2 (map snd obsolete <> replaced) (gone <> gone2 <> gone3) (cancelling <> cancelling2 <> cancelling3))
 
 -- | Retry the pending part of every view's latest camera demand, in view order.
 service ∷ Model → (Model, Decision)
@@ -1069,7 +1132,7 @@ service m0 =
         | Set.member (demandRegion d) (vwFailed w) = (m, acc)
         | needs m v w d =
             case planAdmission m (vwArena w) (OwnerView v) [d] noExtras of
-              Right plan → let (m', admission) = applyPlan m (vwArena w) (OwnerView v) plan in (m', acc <> [(v, admission)])
+              Right plan → let (m', admission, _) = applyPlan m (vwArena w) (OwnerView v) plan in (m', acc <> [(v, admission)])
               Left _ → (m, acc)
         | otherwise = (m, acc)
       needs m v w d =
@@ -1132,7 +1195,7 @@ completeJob m jid cost = case Map.lookup jid (mJobs m) of
           actual ← maybe (Left (ContractFailure CostOverflow)) Right (checkedAdd bytes meta)
           if actual > jbActive job then Left (ContractFailure (CostExceedsReservation (jbActive job) actual)) else Right ()
           let res = case tgResident target of
-                Nothing → Residence (jbCoverage job) actual (mClock m) False Nothing False
+                Nothing → Residence (jbCoverage job) actual (mClock m) False 0 Nothing False
                 Just r → r {rsCoverage = coverageUnion (rsCoverage r) (jbCoverage job), rsBytes = rsBytes r + actual, rsLastUse = mClock m}
               satisfied =
                 [ o
@@ -1151,6 +1214,8 @@ failJob m jid = case Map.lookup jid (mJobs m) of
   Just job → case jbState job of
     JobPending → Left (ContractFailure (JobNotRunning jid))
     JobCancelling → Right (m {mJobs = Map.delete jid (mJobs m)}, Discarded jid)
+    -- A failure of work the commit superseded must not touch current demand.
+    JobRunning | jbStale job → Right (m {mJobs = Map.delete jid (mJobs m)}, Discarded jid)
     JobRunning →
       let key = (jbArena job, jbRegion job)
           owners = [o | (o, _) ← neededBy m job]
@@ -1168,8 +1233,8 @@ failJob m jid = case Map.lookup jid (mJobs m) of
 -- ---------------------------------------------------------------------------
 -- Removal commit
 
-commitRemoval ∷ Model → RequestId → Revision → Word64 → Run
-commitRemoval m rid newRev actual = do
+commitRemoval ∷ Model → RequestId → Revision → Word64 → Word64 → Run
+commitRemoval m rid newRev actual growth = do
   request ← maybe (Left (Stale (UnknownRequest rid))) Right (Map.lookup rid (mRequests m))
   reservation ← maybe (Left (ContractFailure (NotAnEdit rid))) Right (rqEdit request)
   let a = rqArena request
@@ -1177,6 +1242,9 @@ commitRemoval m rid newRev actual = do
   if arRevision arena /= erRevision reservation then Left (Stale (RevisionMismatch (arRevision arena) (erRevision reservation))) else Right ()
   if newRev <= arRevision arena then Left (ContractFailure (RevisionNotAdvancing (arRevision arena) newRev)) else Right ()
   if actual > erRetained reservation then Left (ContractFailure (CommitExceedsReservation (erRetained reservation) actual)) else Right ()
+  -- The rebuilt segment's growth must have been funded, not merely promised.
+  if rqDeferred request > 0 then Left (ContractFailure (EditNotFunded rid)) else Right ()
+  if growth > rqActive request then Left (ContractFailure (ResidentGrowthExceedsReservation (rqActive request) growth)) else Right ()
   let key = (a, erRegion reservation)
   target ← case Map.lookup key (mTargets m) of
     Just t@Target {tgResident = Just r}
@@ -1186,7 +1254,7 @@ commitRemoval m rid newRev actual = do
       m1 = withdrawOwner (OwnerRequest rid) m {mRequests = Map.delete rid (mRequests m)}
       -- Re-read the target after dropping this request's interest.
       t1 = fromMaybe t (Map.lookup key (mTargets m1))
-      r' = r {rsDirty = True, rsLastUse = mClock m}
+      r' = r {rsDirty = True, rsGeneration = rsGeneration r + 1, rsBytes = rsBytes r + growth, rsLastUse = mClock m}
       m2 = m1 {mTargets = Map.insert key t1 {tgResident = Just r'} (mTargets m1)}
       m3 =
         m2
@@ -1252,19 +1320,21 @@ beginHandoff m a region dup = do
   let staging = bankLedger m StagingBank
   if dup > ledgerLimit staging then Left (Invalid (ExceedsBank StagingBank dup (ledgerLimit staging))) else Right ()
   if dup > freeBytes staging then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) dup)) else Right ()
-  Right (m {mTargets = Map.insert key t {tgResident = Just r {rsHandoff = Just dup}} (mTargets m)}, HandoffStarted)
+  Right (m {mTargets = Map.insert key t {tgResident = Just r {rsHandoff = Just (dup, rsGeneration r)}} (mTargets m)}, HandoffStarted)
 
--- | Settle a handoff. A confirmed transfer clears the region's pending changes
--- (they are already funded in the retained bank); a failed one keeps them, and
--- the region stays protected.
+-- | Settle a handoff. A confirmed transfer clears the pending changes it
+-- transferred (they are already funded in the retained bank) but not a removal
+-- committed in the region after the handoff began: the region stays changed, and
+-- protected, until that one has been transferred too. A failed transfer keeps
+-- every change, and the region stays protected.
 endHandoff ∷ Model → ArenaId → RegionCoord → Bool → Run
 endHandoff m a region ok = do
   let key = (a, region)
   (t, r) ← case Map.lookup key (mTargets m) of
     Just t@Target {tgResident = Just r} → Right (t, r)
     _ → Left (Stale (NotResident region))
-  if isNothing (rsHandoff r) then Left (ContractFailure (HandoffNotPending region)) else Right ()
-  let r' = r {rsHandoff = Nothing, rsDirty = not ok}
+  transferred ← maybe (Left (ContractFailure (HandoffNotPending region))) (Right . snd) (rsHandoff r)
+  let r' = r {rsHandoff = Nothing, rsDirty = not ok || transferred /= rsGeneration r}
   Right (m {mTargets = Map.insert key t {tgResident = Just r'} (mTargets m)}, if ok then HandoffSettled else HandoffAbandoned)
 
 -- ---------------------------------------------------------------------------
@@ -1285,6 +1355,15 @@ modelInvariants m =
     , [ "job " <> show i <> " deferred bytes disagree with its awaiting victims"
       | (i, j) ← Map.toList (mJobs m)
       , jbDeferred j /= sum (Map.elems (jbAwaiting j))
+      ]
+    , [ "request " <> show i <> " deferred bytes disagree with its awaiting victims"
+      | (i, q) ← Map.toList (mRequests m)
+      , rqDeferred q /= sum (Map.elems (rqAwaiting q))
+      ]
+    , [ "request " <> show i <> " awaits " <> show k <> ", which is not a committed victim"
+      | (i, q) ← Map.toList (mRequests m)
+      , k ← Map.keys (rqAwaiting q)
+      , not (maybe False rsEvicting (Map.lookup k (mTargets m) >>= tgResident))
       ]
     , [ "job " <> show i <> " awaits " <> show k <> ", which is not a committed victim"
       | (i, j) ← Map.toList (mJobs m)

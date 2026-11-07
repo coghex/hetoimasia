@@ -79,8 +79,8 @@ eventFor m (k, a, b) = case k `mod` 22 of
   13 → maybe (JobFailed (JobId 98)) (JobFailed . jobId) (pick (running JobRunningPhase) a)
   14 → maybe (JobAcknowledged (JobId 97)) (JobAcknowledged . jobId) (pick (running JobCancellingPhase) a)
   15 → case pick [r | r ← modelRequests m, requestRemoval r] a of
-    Just r → RemovalCommitted (requestId r) (Revision (revisionNumber (requestArena r) + 1)) (fromIntegral (b `mod` 66))
-    Nothing → RemovalCommitted (RequestId 99) (Revision 1) 0
+    Just r → RemovalCommitted (requestId r) (Revision (revisionNumber (requestArena r) + 1)) (fromIntegral (b `mod` 66)) (fromIntegral (b `mod` 63))
+    Nothing → RemovalCommitted (RequestId 99) (Revision 1) 0 0
   16 → case pick (resident (const True)) a of
     Just r → AcquireHold (HoldId (modelClock m + 1)) (regionArena r) (if even b then Borrow else Pin (ViewId (fromIntegral (b `mod` 2)))) [regionCoord r]
     Nothing → ReleaseHold (HoldId 99)

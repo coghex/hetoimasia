@@ -9,6 +9,8 @@ module Test.Terrain.ResidencySupport
   ( -- * Constants restated from the contract
     metaBytes
   , oneCellResident
+  , oneCellStored
+  , removalGrowth
   , oneCellScratch
   , interestBytes
   , commandBytes1
@@ -50,10 +52,19 @@ import Test.Hspec (HasCallStack, expectationFailure, shouldBe)
 metaBytes ∷ Word
 metaBytes = 256
 
--- | A one-cell region job: metadata 256, one column entry 48, one segment 32 and
--- two payload bytes.
+-- | What a one-cell region job reserves: metadata 256, one column entry 48, one
+-- segment 32 and the dense payload bound of 64.
 oneCellResident ∷ Word
-oneCellResident = 256 + 48 + 32 + 2
+oneCellResident = 256 + 48 + 32 + 64
+
+-- | What the data layer stores for one isolated cell: the same, with the payload
+-- it actually needs (two bytes).
+oneCellStored ∷ Word
+oneCellStored = 256 + 48 + 32 + 2
+
+-- | The resident growth a removal reserves for its rebuilt segment.
+removalGrowth ∷ Word
+removalGrowth = 62
 
 -- | Scratch of a one-cell load: a 256-byte frame and two bytes per cell.
 oneCellScratch ∷ Word
@@ -149,7 +160,7 @@ w = fromIntegral
 independentLedgers ∷ Model → Ledgers
 independentLedgers m =
   Ledgers
-    { resident = (sum [w (regionBytes r) | r ← modelRegions m], sum [w (jobActive j) | j ← modelJobs m])
+    { resident = (sum [w (regionBytes r) | r ← modelRegions m], sum [w (jobActive j) | j ← modelJobs m] + sum [w (requestResidentActive r) | r ← modelRequests m])
     , edit = (sum [w (arenaRetainedBytes a) | a ← modelArenas m], removalReserve * w (length removals))
     , staging =
         ( interestBytes * w (length (modelInterests m))
