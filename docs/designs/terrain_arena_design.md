@@ -69,6 +69,11 @@ checks, reservation and a hard disk allowance are proposed below, not yet chosen
 D-42 records the manager-relayed CPU budget increase and best-effort camera
 demand; it does not select the temporary store's disk quota.
 
+D-43 approves a reserved, configurable disk allowance before arena opening,
+including storage overhead, and refusal when it cannot be reserved. Keep the
+world expandable; pause new edits/discovery before exceeding the allowance.
+The numeric allowance and the qualified storage mechanism remain Q-20.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1291,6 +1296,35 @@ total-history retention. Q-20 must map edits, discovery, cache and staging to
 explicit banks in the backing-store contract rather than silently treat this
 CPU number as a disk quota or unlimited memory for discovery.
 
+### D-43. Reserve a hard storage allowance while keeping the world expandable
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that is sound
+i think” to the recommendation to keep the expandable world with a reserved
+storage allowance and pause when that allowance is exhausted.
+
+Before arena opening succeeds, check the actual storage volume and reserve a
+configurable allowance for its temporary store, including bookkeeping and
+temporary write space. Refuse arena opening if that allowance cannot be
+reserved. Enforce the allowance before accepting additional retained changes;
+unchanged terrain is regenerated from its source instead of saved. At capacity
+or on storage failure, D-41's pause/preserve/report behavior applies to edits
+and discovery, including unfinished discovery work. Do not acknowledge changes
+on the assumption that more disk space will become available later.
+
+This chooses a storage boundary rather than a finite terrain boundary. It
+preserves D-11's expandable procedural world without promising unlimited
+retained history in a fixed store. The alternative of guaranteeing that every
+possible future change fits by bounding the world or allowed changes is not
+selected. A free-space query alone is not the required reservation; runtime
+storage failures still need D-41 even after a successful reservation.
+
+Q-20 must specify the numeric allowance, filesystem and multi-arena accounting,
+physical reservation and write protocol, safety margin, bounded continuation,
+exact Lua results and recovery/cleanup behavior. These are not established by
+this high-level approval. Opening the engine application itself is not
+prohibited: the failure boundary is opening the terrain arena. This decision
+does not create a UI, a persistent game-save feature or a live quota-change API.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2207,7 +2241,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-42 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-43 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2250,7 +2284,9 @@ D-40 approves P-8's temporary session disk backing for retained changes with
 bounded RAM caching. D-41 selects pause/preserve/recover for expected storage
 exhaustion or write failures; its exact protocol and storage/quota/lifecycle
 rules remain open. D-42 records larger CPU banks and best-effort camera demand,
-without choosing the disk allowance.
+without choosing the disk allowance. D-43 selects reservation of a hard disk
+allowance before arena opening and pausing at capacity while preserving the
+expandable world; the allowance's size and qualified mechanism remain open.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2358,7 +2394,7 @@ retained-discovery and pending-work capacity/refusal; API results and coherent
 publication. An enormous/infinite component cannot silently become an
 unbounded allocation, a completed partial reveal or an erased obligation.
 
-### P-8. Session retention backing — D-40 approved, concrete details open
+### P-8. Session retention backing — D-40/D-41/D-43 approved, concrete details open
 
 The original P-5 keeps retained changes in memory, with an initial 32 MiB
 session-edit cap (raised to 64 MiB by D-42) and new edits refused once that
@@ -2390,16 +2426,17 @@ region exhaustively materializable. The storage direction is resolved; its
 concrete quota/failure contract remains Q-20, and its scope must be incorporated
 in Q-19 before issue revisions are drafted.
 
-**Owner proposal and recommendation, awaiting decision (2026-11-07).** The
+**Storage allowance — approved by D-43 (2026-11-07).** The
 owner suggested checking free space, imposing a terrain disk allowance,
 refusing startup without enough room and ensuring the world cannot exceed it.
-Recommend a configurable hard allowance for the arena's whole temporary store,
+D-43 chooses a configurable hard allowance for the arena's whole temporary store,
 including indexes, metadata and peak replacement/compaction/write overhead;
 check capacity on the actual store volume and reserve the required storage
-before arena opening succeeds, leaving a separate free-space safety margin.
+before arena opening succeeds. The proposed separate free-space safety margin
+and its size remain part of the concrete contract review.
 If the required capacity cannot be established, refuse arena opening with a
-clear Lua result. This is a proposed arena-creation requirement, not an already
-approved prohibition on launching the engine application.
+clear Lua result. This is an arena-creation requirement, not a prohibition on
+launching the engine application.
 
 Maintain accounting and reserve capacity before admitting retained changes;
 do not spend space reserved for completing in-flight writes on new work.
@@ -2419,7 +2456,7 @@ must cover physical allocation, filesystem overhead, replacement writes and
 failure handling; merely setting a sparse file's logical length is insufficient.
 Reservation also does not eliminate device failures, so D-41 remains necessary.
 
-The recommended boundary is on retained storage, not world coordinates.
+The D-43 boundary is on retained storage, not world coordinates.
 An expandable procedural world can be cheap before edits, but arbitrarily
 many independent changes/discovery records cannot be guaranteed to fit a fixed
 finite store. Guaranteeing every possible future edit fits at startup would
@@ -2610,7 +2647,7 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-41. Preserve fog over both solid and air until
+Partially resolved by D-31–D-41/D-43. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
@@ -2649,9 +2686,11 @@ with bounded RAM caching and asynchronous I/O, discarded on arena close/reset.
 The earlier RAM-only total-history cap is superseded. Exact record/index,
 quota and lifecycle rules remain open. D-41 selects pause/preserve/recover
 on storage exhaustion or write failure; exact read/write results, admission
-and recovery triggers remain open. Startup reservation and a hard allowance
-versus a worst-case-bounded world remain the next P-8 decision. D-42 raises the
-CPU banks independently; it does not choose the disk allowance.
+and recovery triggers remain open. D-43 resolves startup reservation and a
+hard allowance: reserve before opening the arena, refuse opening if that is
+not possible, and pause at capacity while preserving the expandable world.
+The numeric allowance and qualified reservation mechanism remain open. D-42
+raises the CPU banks independently; it does not choose the disk allowance.
 
 Still open: specify and review the exact 16-shape solid/empty regions,
 openings and internal connectivity; derive/budget the initial exterior-connected
