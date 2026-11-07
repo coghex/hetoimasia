@@ -1021,6 +1021,21 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- The largest explicit request here (a removal, 994 bytes of staging) is admitted.
     (_, removal) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 16 0 0))
     length (admissionJobs (admission removal)) `shouldBe` 1
+  it "withdraws the interest in the coverage a busy replacement replaced" $ do
+    -- View 1 holds level 0 of region A. View 2's load takes the one load-job slot the
+    -- camera may use (the other two stay free for explicit work), so view 1's
+    -- replacement, level 1 of A, is busy: the old interest must not survive it.
+    let level z = demand (reg 0 0 0) (cell 0 0 z)
+        limits = limitsWith $ \x → x {specResidentBytes = 4000, specStagingBytes = 4096, specExtentZ = 2}
+    m0 ← opened limits
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [level 0], Dispatch, JobCompleted (JobId 0) oneCellCost]
+    m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 2) a1 [demand (reg 5 0 0) (cell 0 0 0)])
+    (m3, replaced) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [level 1])
+    case reportDecision replaced of
+      CameraSet admitted waiting withdrawn _ _ → (length admitted, waiting, withdrawn) `shouldBe` (0, [reg 0 0 0], [reg 0 0 0])
+      other → expectationFailure (show other)
+    [o | InterestInfo o _ r _ ← modelInterests m3, r == reg 0 0 0] `shouldBe` []
+    map viewPending (modelViews m3) `shouldBe` [[reg 0 0 0], []]
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
