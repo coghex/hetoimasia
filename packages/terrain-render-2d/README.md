@@ -7,9 +7,13 @@ their exposure, missing-data demand, deterministic back-to-front ordering
 candidates inside the 2D renderer's 24-bit depth keys, and CPU picking against
 the exact plan it was given.
 
-It plans; it does not draw. The material and shader work, artwork selection and
-offscreen qualification are TRA-8 (#644); retained uploads, adoption and live
-publication are TRA-9; the Lua pick and removal connection is TRA-10. Nothing
+It plans; it does not draw. Its `terrain-material` component (TRA-8, #644) adds
+the pure half of the terrain material: the art sheet, the record a face carries,
+the adaptation of a plan's faces into render-2d instances and the model the oracle
+judges the device by. The Vulkan half is
+[`hetoimasia-terrain-render-2d-vulkan`](../terrain-render-2d-vulkan/README.md).
+Retained uploads, adoption and live publication are TRA-9; the Lua pick and
+removal connection is TRA-10. Nothing
 here edits terrain, takes a lease, reads mutable state, launches a worker or
 keeps a cache.
 
@@ -20,6 +24,17 @@ keeps a cache.
 | `Hetoimasia.Terrain.Render2D.Facts` | Versions, availability, the three-way fact answer, surface lookup, demand |
 | `Hetoimasia.Terrain.Render2D.Plan` | Visible faces, exposure, bounds, demand, ordering and depth keys |
 | `Hetoimasia.Terrain.Render2D.Pick` | CPU picking against one plan |
+
+Two further public components of the package have no GPU, window, Lua or game
+dependency either (they add the render-2d oracle):
+
+| Component | Modules | Purpose |
+| --- | --- | --- |
+| `hetoimasia-terrain-render-2d:terrain-material` | `Hetoimasia.Terrain.Render2D.Material` | `ArtSheet`/`TerrainStyle` (caller data), `recordLayout`, `faceRecord`, `adaptFaces`, `adaptedInstance`, `terrainView`, and `terrainModel`, the pure model of the fragment function |
+| `hetoimasia-terrain-render-2d:terrain-fixtures` | `Hetoimasia.Terrain.Render2D.{Evidence,Scenes,Agreement}` | The evidence scenes, the hand-stated line-of-sight expectation, and the judge that compares the planner, the model and the pick with it; shared by the CPU suite and the native scenario so neither imports the other's spec. No engine library depends on it. |
+
+`PlannedFace.faceCellOrigin` (TRA-8) is the render-world projection of the face's
+cell's own origin; the adapter places a cell's art sheet from it.
 
 `Hetoimasia.Terrain.Render2D.Internal.*` are private; the package does not expose
 them and the suite proves a client cannot import them.
@@ -319,14 +334,47 @@ zoom to the configuration in force, advances the camera revision (stamped agains
 the camera as it was passed in). Planning never adopts a GPU frame or issues a live
 pick token.
 
-## What remains for TRA-8
+## The terrain material (TRA-8)
 
-This package proves, on the CPU, that the shared face and coverage geometry
-projects, orders and picks consistently. It does not prove what the GPU draws.
-TRA-8 must qualify, offscreen: the actual materials and transparent coverage of
-the masks, depth behaviour of ordered and cutout paths with these keys, and the
-visual matrix of all 16 identities in all four facings. If a required geometry
-cannot be ordered through the existing instance ABI, the refusals above name it.
+The adapter turns a plan's faces into render-2d instances of one application
+material through the existing fixed-quad and material ABI; nothing is added to the
+renderer.
+
+- **A face is a quad and a mask.** The instance is the face's quad and depth key;
+  its record holds the art sheet's handle, the face's art map and its mask polygon.
+  The material samples the sheet where the mask covers the fragment and gives
+  transparent black elsewhere, so a face not covered writes neither colour nor depth
+  and the renderer's ordinary depth key decides which face is nearest.
+- **The art sheet is one picture of a whole cell**: the 96 x 64 hexagon a unit
+  cube projects to, placed at (-48, -16) from the cell's origin. A face shows the
+  part of that picture its own projection covers, so tops, walls, ramps and caps of
+  one material show the same artwork and a cell's faces are never textured from
+  face-map identifiers. The sheet is sampled nearest and registered as colour art
+  (sRGB, binary alpha), so its decoded mark routes its faces to the cutout path.
+- **Records are shared.** The record depends on the face's shape in its view frame,
+  its index and the art, not on where the cell is, so a view's table is a few dozen
+  records however many faces it draws.
+- **Refusals, never approximations**: a material with no art, a mask of fewer than
+  three or more than eight vertices, an unrepresentable coefficient.
+- **The model** (`terrainModel`) is the fragment function over the same inputs in
+  `Double`; a fragment within `boundaryTolerance` of a mask edge, where a 32-bit
+  device and the model may fall on either side, is given the alpha the cutout
+  threshold sits at, which the oracle reports as indeterminate.
+
+### Evidence
+
+The CPU suite checks the artwork against its provenance manifest (the SHA-256 and
+dimensions of each committed PNG, the source revision and paths), the record layout
+and packing against hand-worked art coordinates, the model at hand-stated points,
+the adapter's sharing and refusals, and, for every shape identity in every facing
+and for roofs over cavities, disconnected spans, ramps and corners, cutaways, the
+automatic follow, a floor 34 levels below the cut and the view variants, that the
+planner's coverage and depth order, the model and the pure pick agree with a
+line-of-sight expectation worked out from half-spaces (`Evidence`), with negative
+controls that reject reversed overlap, an incorrect coverage mask and a pick through
+a nearer face. The device proof is the `tra8-terrain` scenario of
+`vulkan-native-tests`; its measured outcome and the Q-13 assessment are under
+`docs/evidence/terrain/tra8/`.
 
 ## Tests
 

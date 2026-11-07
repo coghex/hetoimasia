@@ -319,17 +319,30 @@ cabal test hetoimasia-tests --test-show-details=direct
 ## Vulkan suites
 
 - The Vulkan native backend and window integration packages, the 2D
-  renderer's Vulkan recorder (`packages/render-2d-vulkan`), and the
+  renderer's Vulkan recorder (`packages/render-2d-vulkan`), the terrain
+  material for it (`packages/terrain-render-2d-vulkan`, TRA-8, with the pure
+  `packages/terrain` and `packages/terrain-render-2d` as prerequisites), and the
   triangle, sprites, image2d and scene3d samples, build only through `cabal.project.vulkan`, by
   `bash tools/vulkan/run.sh`. Its test mode runs their headless suites
   (`native-tests`, `shader-tests`, `integration-tests`, `triangle-tests`,
   `sprites-tests`, `image2d-tests`, `scene3d-tests`, `render-2d-vulkan-tests`,
+  `terrain-render-2d-vulkan-tests` (the terrain material's declaration, record
+  conversion and draw path, device-free),
   the Lua-first engine's graphics adapter's `lua-engine-graphics-tests`, and the root package's
   full-product `hetoimasia-tests`) — the group `test.vulkan-headless` — and needs no consent. The native suite `vulkan-native-tests` (`test.vulkan-native`) opens
   windows and presents on macOS, so it takes the same desktop opt-in, under the
   same standing approval, as `glfw-native-tests`; on Linux its runner starts an
   isolated X11 display, and `test.vulkan-wayland` runs it on the isolated
   headless Wayland compositor. See [gpu_backend.md](gpu_backend.md#the-native-suite).
+  Its `tra8-terrain` scenario (TRA-8, Q-13; `--private-roots tra8-terrain`, in the
+  complete profile) draws plans of the terrain arena's faces through the existing
+  fixed-quad and material ABI into surface-free targets with a real `D32_SFLOAT`
+  depth image and judges every pixel against the render-2d oracle and against an
+  independent line-of-sight expectation; it creates no window, must finish inside
+  the 20-second child deadline, and fails (never skips) where the device chooses
+  another depth format. It reads the approved artwork under
+  `samples/ecce-homo/content/textures/`. Its evidence is under
+  `docs/evidence/terrain/tra8/`.
   Every helper thread `diagnostics-tests`, `native-tests`, `integration-tests`,
   `render-2d-vulkan-tests` and the `allocator-parity-probe` start is an owned start
   through `Test.Support.Owned` (#595): however the scope that needed it ends (a return, a

@@ -539,27 +539,24 @@ waits only for those victims' `VictimReleased` events, then is queued. A victim
 cannot regain an interest or a hold, and a victim's bytes are never promised twice.
 Checks run in a fixed order and the first failure is reported:
 
-1. **Invalid** (permanent; one feasibility function serves every admission path, an atomic
-   request, a removal and a camera demand alike): an empty, oversized or duplicated demand, a region key
-   that names a tile outside the supported coordinate range (`UnsupportedRegion`,
-   checked at the lowest and highest cell of the region), a region whose minimal
-   reservation exceeds a bank's configured total, or more of a slot than exists, all
-   measured as if nothing else existed but counting what the request keeps. An atomic
-   request holds everything at once: the regions it names that are resident now stay
-   (they cannot be victims of their own request), every cell neither resident nor
-   promised to a live job needs a job's whole reservation, and cells promised to
-   another owner's job count at the least that job can leave stored (it may complete,
-   needing no second reservation, or fail and leave the request to load them, which
-   costs more). A camera demand is judged the same way in the order its regions are
-   admitted, at each step: staging must hold the description, an interest for every
-   region admitted so far and for every region still to come in which the view already
-   holds one, and the scratch of the job being loaded; the resident bank must hold
-   every region of the demand that is resident now (the demand never evicts its own
-   regions to load another), the least it has added to the regions before, and the
-   job's whole reservation. If some step cannot fit, the demand can never complete; a
-   demand that passes can still wait on pressure, and from a quiescent model (nothing
-   pinned, running or promised) a request is admitted or invalid, never merely busy.
-   Never busy, so explicit work cannot stay busy forever.
+1. **Invalid** (permanent), by the owner's rule: a request is invalid only when its
+   minimum final footprint cannot fit a bank or slot /even from an empty model/ (no
+   other resident, job or interest), or when it is malformed (an empty, oversized or
+   duplicated demand, or a region key that names a tile outside the supported
+   coordinate range, `UnsupportedRegion`, checked at the lowest and highest cell of
+   the region). Every other shortfall, however long it lasts, is busy. One feasibility
+   function serves every admission path (an atomic request, a removal and a camera
+   demand alike) and never reads the model's state, so the classification is the
+   same whatever is resident, promised or held. An atomic request holds one job per
+   region for its whole coverage (with fresh region metadata) at once, plus a
+   removal's resident growth and its staging. A camera demand is judged in the order
+   its regions are admitted, one job at a time, keeping what the earlier ones stored:
+   at each step staging must hold the description, an interest for every region
+   admitted so far and the scratch of the job being loaded, and the resident bank the
+   least the earlier regions stored plus the job's whole reservation. The check runs
+   before anything that depends on state (such as a region being released), so it is
+   never masked by a busy answer. Never busy for what can never fit, so explicit work
+   cannot stay busy forever for that reason.
 2. **RetainedEditsExhausted** (edits only): the committed bytes plus this edit exceed
    the bank even with every reservation returned. It names the bank and persists until
    an arena's teardown frees retained bytes; the public Lua mapping stays `busy`
