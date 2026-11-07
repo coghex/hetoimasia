@@ -8,10 +8,10 @@ choices are evidence, not automatically requirements for the new engine.
 
 Design state: `exploring`
 
-Migration review: the comparison with Synarchy below identifies unresolved
-P-5 risks, including automatic-camera clipping. Resolve Q-14 before approving
-the technical contract or calling the design ready. The recorded owner
-decisions remain unchanged.
+Migration review disposition: D-23–D-26 separate automatic headroom from
+manual cutaway, retain Synarchy's full mask set, explicitly defer later game
+integration, and select adaptive sparse storage. Q-12 still owns final
+technical-contract review; Q-13 retains the rendering proof gate.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -166,6 +166,9 @@ without explicit Z restores terrain following (D-14).
 The initial terrain foundation supports full blocks and slopes; the default
 arena remains flat (D-15), with a configurable shallow soil layer above stone
 that continues downward on demand (D-16).
+Later decisions retain Synarchy's full 16 slope/mask IDs (D-25), separate
+automatic headroom from manual cutaway (D-23), defer later-game integration
+(D-24), and select adaptive sparse packed storage (D-26).
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
@@ -625,6 +628,59 @@ without Z restores terrain following; a jump with Z enters manual mode at the
 requested depth. This completes the manual-mode transition in D-12–D-14.
 Synarchy's zoom-map-triggered reset is not carried over.
 
+### D-23. Separate automatic headroom from manual cutaway
+
+Owner, directly in this pane on 2026-11-06, responding to MR-1:
+
+> yes, they need ot be seperate, the headroom makes things much more natrual.
+
+Automatic terrain-following uses headroom; an explicitly selected manual
+cutaway is a separate setting. Do not clip ordinary navigation exactly at the
+ground under the camera. Retain D-12–D-14/D-22's follow/manual transitions.
+P-5 uses Synarchy's 25-level headroom as its initial configurable default and
+sets a corresponding viewing band below it; manual slice selection adds no
+automatic headroom to the explicitly requested level.
+
+### D-24. Defer movement and later-game integration
+
+Owner, directly on 2026-11-06: walkable connections and movement speed are
+deferred; MR-3 source/general-edit extension, MR-4 gameplay commit integration
+and MR-5 future scene composition are also deferred.
+
+These are recorded future migration work, not prerequisites added to the first
+terrain arena. Do not implement navigation, speed rules, generalized edits,
+geology, whole-game transaction coordination or entity/UI scene composition
+in this arc. Keep D-20's narrow terrain transactions and the current arena-only
+interfaces. Their limits remain explicit rather than claiming whole-game parity.
+
+### D-25. Preserve Synarchy's full 16-ID slope set
+
+Owner, directly in this pane on 2026-11-06, selected:
+
+> Yes—preserve Synarchy’s full 16-ID set
+
+Replace the agent's thirteen-shape simplification with all Synarchy slope/mask
+IDs 0–15 and their visual forms in all four facings. ID 0 is flat; ID 15 is a
+distinct authored ID with flat-top treatment in Synarchy's generation logic.
+Do not collapse their identities or omit opposite-direction masks. Walkable
+connections and movement speed remain deferred under D-24. D-21 still forbids
+automatic neighbor reshaping. Rendering, geometric coverage and mouse picking
+must agree; current visual fidelity is qualified without adding pathfinding.
+
+### D-26. Delegated storage selection: adaptive sparse packed segments
+
+Owner, directly in this pane on 2026-11-06:
+
+> about the compressed storage, figure out which system is better and specify that one
+
+The selected technical design is sparse columns whose materialized segments
+use uniform, run-length or dense packed encoding according to their content.
+The rationale and exact selection rule are in P-5's storage comparison below.
+This is the agent's determination under the owner's explicit delegation, not
+a claim that the owner approved a measured speedup. Unrequested underground
+remains implicit; dense fallback is restricted to already-materialized small
+segments and never expands into unknown cells.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -645,8 +701,9 @@ details explicitly for the final contract review.
 
 ## Concrete technical contract — proposal P-5
 
-This section fills the implementation contract for owner review. D-1–D-22
-remain the approved behavior. The package names, API spellings, numeric
+This section fills the implementation contract for owner review. D-1–D-25
+record owner choices and D-26 records the explicitly delegated storage choice.
+The package names, API spellings, remaining numeric
 defaults and mechanisms below are a concrete proposal, not additional owner
 decisions. They require a single review checkpoint before readiness.
 
@@ -707,15 +764,27 @@ The cutaway level `k` includes cell levels `z <= k`, with a clipping plane at
 is a value, not a material requiring allocation. Public answers distinguish
 `air`, `solid(material,shape)`, pending request, failure and coordinate refusal.
 
-Propose thirteen solid shapes: full block; four rotated ramps; four rotated
-single-high-corner slopes; four rotated single-low-corner slopes. Specify each
-as a solid under a top height function on the unit square, with flat bottom:
-block `h=1`, canonical ramp `h=x`, high corner `h=max(0,1-x-y)`, low corner
-`h=min(1,x+y)`. Rotations are exact quarter turns of these definitions. Render
-faces and picking intersections derive from the same functions/triangulation.
-Do not infer shape from the sprite's alpha. Opposite-corner saddles, arbitrary
-fractional slabs and inverted slopes are outside this first catalog; new
-shape IDs require an explicit extension rather than a flat fallback.
+Use the full 16-ID mask catalog selected by D-25:
+
+| IDs | Canonical reference names |
+| --- | --- |
+| 0 | Flat |
+| 1, 2, 4, 8 | N, E, S, W |
+| 3, 6, 9, 12 | NE, ES, NW, SW |
+| 5, 10 | NS, EW (opposite-direction forms) |
+| 7, 11, 13, 14 | NES, NEW, NSW, ESW |
+| 15 | NESW; preserve the ID even with flat-top treatment |
+
+Rotation permutes the four bits; the world ID itself does not change when
+the camera turns. Preserve reference silhouettes and face orientation in all
+four facings. Establish canonical geometric coverage alongside each reference
+mask so render faces/cutaway coverage and picking agree; do not substitute the
+discarded thirteen analytic forms. TRA-1/TRA-7 must cover every ID, and TRA-8
+compares the full visual matrix. Synarchy's mask selection is at S
+`src/World/Render/Textures.hs:23–57`; its all-four normalization is at
+`src/World/Slope/Compute.hs:153–166`. Walkability, speed and slope inference
+remain deferred. Arbitrary fractional slabs and new IDs require a later
+extension rather than silently falling back to flat terrain.
 
 The initial Lua source is copied declarative data, not callbacks invoked from
 a loading worker. Example: surface cell level `0`, soil depth `4`, material
@@ -741,11 +810,74 @@ are refused. Built-in shape IDs name the exact P-5 catalog.
 ### Sparse representation and edits
 
 Keep three distinct representations: immutable source definition, sparse
-resident detail, and retained session changes. Each resident column region
-contains sorted, nonoverlapping half-open Z runs, coalesced when material and
-shape match. Air gaps are intervals or implicit source answers, never dense
-air arrays. A top-only camera load creates only its required surface entries;
-region indexing does not license filling that region's buried solid cells.
+resident detail, and retained session changes. Resident detail is a sparse map
+of known column segments, each covering at most 32 consecutive levels within a
+vertical region. Coverage is explicit: an absent segment is unmaterialized,
+not air. Nonadjacent known segments do not force allocation or computation of
+their intervening levels. A top-only load creates a one-cell segment, not a
+32-cell slab. Region indexing never licenses filling buried source cells.
+
+Within a materialized segment use the smallest of these packed encodings:
+
+- **Uniform:** one 16-bit cell value for the entire known interval.
+- **Runs:** sorted exclusive-end/value pairs, one packed 32-bit word per run;
+  adjacent equal values coalesce. Segment start/length are common metadata.
+- **Dense:** contiguous 16-bit values for exactly the known segment length.
+
+A cell value has a 12-bit arena-local material palette index and the 4-bit
+Synarchy slope ID. Index 0 is air, canonically encoded as zero; non-air indices
+1–4095 map to stable authored material IDs. Reject an oversized catalog rather
+than truncate it. Vegetation and other deferred systems are not stored here.
+The packing is internal, not a saved-game or Lua numeric-ID compatibility
+promise. The recipe validates IDs before values are packed.
+
+For a segment of N cells and R runs choose uniform if R=1, otherwise runs
+if `4*R < 2*N`, otherwise dense (dense wins ties for direct indexing).
+This deterministic rule minimizes value payload among the three encodings;
+the common sparse-index/segment metadata remains additional. It does not
+claim minimum total process memory or universal optimal throughput.
+
+Uniform lookup is constant time; dense lookup is direct indexing; runs use
+binary search, with at most 15 runs in a selected nonuniform 32-cell segment.
+Updates split/merge or use owner-local scratch for at most 32 known cells,
+then choose the encoding once at commit. Published buffers are immutable and
+must not alias subsequently mutated scratch. Range queries traverse runs in
+bulk; callers are not required to issue a Lua request per cell. Do not expand
+long implicit source/air intervals merely to select an encoding.
+
+#### Storage comparison and selection evidence
+
+Design-time exact payload calculation, 2026-11-06; not a runtime benchmark.
+All candidates encode the same 16-bit material/shape values. A dense segment
+costs 2N bytes, run records cost 4R bytes, and uniform costs 2 bytes. Segment
+metadata, sparse indexes, Haskell allocation headers, source definitions,
+retained changes and graphics are excluded from this payload-only comparison.
+
+| Known segment | Dense bytes | Runs bytes | Selected bytes / mode |
+| --- | ---: | ---: | --- |
+| One requested surface tile | 2 | 4 | 2 / uniform |
+| 32 identical cells | 64 | 4 | 2 / uniform |
+| 32 cells, soil/stone in 2 runs | 64 | 8 | 8 / runs |
+| 32 cells, a cavity in 3 runs | 64 | 12 | 12 / runs |
+| 32 cells, 16 runs | 64 | 64 | 64 / dense |
+| 32 alternating cells | 64 | 128 | 64 / dense |
+
+Unrequested underground has no resident segment/value payload in any of these
+cases. Source/retention metadata still exists. These values follow directly
+from the proposed layouts. Synarchy's material+slope arrays also use two bytes
+per stored cell (plus its separate vegetation array; S
+`src/World/Chunk/Types.hs:72–94`); do not compare its full process memory with
+this isolated payload table.
+
+**Selection:** adaptive sparse packed segments (D-26). Always-dense spans lose
+the uniform/layered-space savings; always-run storage can double payload for
+alternating cells. Adaptive encoding retains direct indexing where runs cease
+to save space, bounds recompression work and leaves untouched depth implicit.
+This is a storage/algorithmic determination, not a measured speedup claim.
+TRA-2/TRA-12 must still measure allocation, metadata overhead, lookup/scan/edit
+cost and representation transitions on the implementation. Numerical host
+budgets remain provisional; no terrain benchmark was compiled or executed,
+and neither engine was launched for this payload calculation.
 
 For this removal-only API, changes are canonical removed-cell intervals per
 column. A removal of a ramp removes its entire occupied cell shape. Removing
@@ -807,9 +939,16 @@ by arena/revision/region, retaining separate caller interests. Canceling one
 interest must not cancel work another still needs. Foreground queries and
 edits precede view prefetch; use aging so accepted finite requests progress.
 
-Visible cutaway content uses a 32-level band below the selected slice by
-default. This is a render/residency limit, not a terrain floor. Render only
-bounded visible faces and minimal adjacency facts; deep shafts and absent
+Separate the followed surface level, automatic headroom and manual slice.
+Initial configurable automatic headroom is 25 levels, matching Synarchy;
+the effective automatic clip level is followed surface plus headroom. Manual
+mode uses the exact selected slice without adding headroom. Initially permit
+up to 250 levels below the effective clip level, with budgeted demand; this
+matches Synarchy's maximum depth rather than the rejected fixed 32-level
+viewing band. This is a visibility cap, not a promise to preload 250 levels
+or a terrain floor. Zoom-dependent tuning is qualified visually in TRA-8;
+do not conflate the 32-cell storage region size with the viewing depth.
+Render only bounded visible faces and minimal adjacency facts; deep shafts and absent
 columns must not cause an unbounded scan toward negative infinity. Source
 interval summaries plus removed-span indexes answer next-solid/surface
 queries without enumerating a long contiguous air gap. Bound the number of
@@ -920,9 +1059,11 @@ acknowledgement. D-22 controls follow/manual transitions. Preserve zoom and
 facing across camera jumps; no implicit Synarchy tile-level zoom reset.
 
 In follow mode query the highest remaining solid cell at the camera's anchor
-column, using retained edits as well as base terrain. Use that top level as the
-cutaway level. If the destination is not ready, preserve the last coherent view
-until the jump can resolve; ordinary pan can show unloaded regions as blank.
+column, using retained edits as well as base terrain. Track that surface,
+then derive automatic visibility using separate headroom (D-23); do not turn
+the followed ground level into a manual cut plane. If the destination is not
+ready, preserve the last coherent view until the jump can resolve; ordinary
+pan can show unloaded regions as blank.
 An authored empty column preserves the current slice and reports no surface.
 Rotation preserves the same world anchor. Clamp zoom to the configured finite
 range to keep view demand bounded, without restricting world extent.
@@ -962,9 +1103,16 @@ Comparison baseline: S `3777d437ea00e1302bf55162ad5693fee4879187`, H design
 engine was launched or benchmarked. The following distinctions and concerns
 do not change accepted behavior or silently approve replacement proposals.
 
-### What carries over, and what changes
+**Subsequent owner disposition:** D-23 corrects automatic headroom separation;
+D-25 selects the full 16-ID visual catalog; D-24 defers movement/traversal and
+MR-3/MR-4/MR-5 integration work; D-26 selects adaptive storage. The comparison
+table and MR narratives below describe the earlier draft at the baseline above,
+not unresolved instructions to expand the current arc. P-5 carries the updated
+contract. No measured performance superiority is claimed.
 
-| Area | Synarchy at the inspected revision | This design | Assessment |
+### Earlier draft comparison, preserved as review history
+
+| Area | Synarchy at the inspected revision | Earlier design at `233fcfcdd01` | Assessment at review |
 | --- | --- | --- | --- |
 | Arena identity | Flat loam over granite; starting 5 × 5 chunks are not a horizontal boundary (S `src/World/Generate/Arena.hs:2–33`, `:70–104`) | Same layering direction and exploration-driven chunks | Familiar first consumer, not a new gameplay goal |
 | Depth/storage | Arena base has 16 cells; columns have contiguous arrays, including interior air (S `src/World/Generate/Arena.hs:16–22`; `src/World/Chunk/Types.hs:72–94`) | Implicit deep stone, sparse runs, top-only initial detail and vertical eviction | Better fit for the owner's deep/gapped model; performance is unproved |
@@ -1082,11 +1230,13 @@ and no performance, fidelity or completed implementation claim is supported.
 Synarchy's shared reconstruction authority and edit replay are strengths to
 preserve, not defects this design invented a solution for.
 
-Before final approval, revise or explicitly resolve MR-1–MR-5 and qualify
-MR-6's cost assumptions; keep the existing Q-13 renderer proof gate. Preserve
-all owner decisions and the narrow first arena scope. These are integration
-seams and migration fixtures, not a proposal to implement the whole game in
-this arc. The comparison is recorded for the owner's next design decision.
+The review originally requested resolution before approval. The owner has now
+provided that disposition in D-23–D-26: camera separation and mask fidelity are
+current work, MR-3/MR-4/MR-5 and traversal are deferred, and storage uses the
+adaptive design with payload analysis and later runtime qualification. Keep
+Q-13's renderer proof gate and the narrow first-arena scope. Deferred migration
+concerns remain recorded without blocking this arena or pretending full-game
+compatibility has been implemented.
 
 ## Open questions and review checkpoints
 
@@ -1135,15 +1285,18 @@ claimed from this documentation turn.
 
 ### Q-8. What is the logical model of solid terrain and gaps?
 
-Scope resolved by D-4/D-5/D-15/D-21. P-5 proposes the exact thirteen-shape
-catalog, shared geometry and coordinate conventions. Additional shape kinds
-require a later explicit extension; no automatic fallback to a full block.
+Scope resolved by D-4/D-5/D-15/D-21/D-25: preserve all 16 Synarchy slope/mask
+IDs and visual forms. Shared coverage/picking and four-facing fixture fidelity
+are current requirements; movement and walkable connections are deferred by
+D-24. Do not silently fall back to a full block for a supported mask.
 
 ### Q-9. How is terrain represented compactly, including unmaterialized depth?
 
-Direction resolved by D-5/D-7/D-11/D-16. P-5 specifies implicit layered source,
-sparse region spans, compressed removed intervals, vertical eviction and
-memory accounting. Review numeric defaults and API boundaries in Q-12.
+Direction resolved by D-5/D-7/D-11/D-16/D-26. P-5 specifies implicit layered
+source, sparse adaptive uniform/run/dense segments, compressed removed
+intervals, vertical eviction and memory accounting. Its payload comparison
+selects the representation; runtime allocation/throughput remain implementation
+qualification. Review host-budget defaults and API boundaries in Q-12.
 
 ### Q-10. Terrain transactions versus the deferred gameplay-state service?
 
@@ -1162,15 +1315,16 @@ reset, material-dependent slope inference or game managers.
 Remaining owner checkpoint: review P-5, its explicit defaults/limitations, the
 epic done condition and TRA-1–TRA-12. In particular review the single-writer
 service, copied declarative recipes, content-scoped arena attachment, finite
-memory caps with busy admission, thirteen-shape set, finite visible depth
-band, API semantics and coherent scene/pick publication. None is silently
+memory caps with busy admission, full 16-ID visual mapping, separate headroom
+and manual slice, finite visible depth band, API semantics and coherent
+scene/pick publication. None is silently
 promoted to an owner decision by inclusion in this draft.
 
 The document remains exploring until that contract and delivery plan are
 accepted and the owner explicitly calls it ready for issue processing.
 No issues or epic are created by this design task.
-The subsequent migration review in Q-14 must be resolved before that signoff;
-P-5 should not be approved unchanged on the assumption of Synarchy parity.
+Q-14 records the owner's migration-review dispositions. Review this updated
+P-5, not the earlier thirteen-shape/no-headroom proposal.
 
 ### Q-13. Can the current renderer represent the geometry correctly?
 
@@ -1185,15 +1339,15 @@ The broader historical “full Synarchy port” memory reconciliation is not an
 implementation dependency for this explicitly approved first arena. Fidelity
 beyond this arc remains uncommitted; MEMORY.md is unchanged.
 
-### Q-14. Resolve the migration review before technical signoff
+### Q-14. Migration-review disposition
 
-The owner explicitly wants Synarchy migration compatibility, not a different
-game that merely resembles its arena. MR-1–MR-6 identify where P-5 needs
-correction, an extension seam or evidence. No new behavior is approved by this
-review request. Settle automatic-camera headroom, slope/traversal mapping,
-source/change extensibility, gameplay command/lifetime integration and scene
-composition; record which cost/budget choices remain measured implementation
-defaults. Amend affected TRA slices and Q-12 before declaring readiness.
+Resolved for this arc by D-23–D-26. Separate automatic headroom and manual
+cutaway; preserve the full 16-ID visual mask catalog; defer walkability/speed,
+source/general-edit expansion, gameplay transaction integration and later scene
+composition. Select adaptive sparse storage using the stated payload/complexity
+analysis, with actual runtime costs qualified during implementation. Those
+deferred systems are not added readiness gates for the first arena. Q-12 and
+the deliberately gated Q-13 remain.
 
 ## Verification strategy — proposal
 
@@ -1212,6 +1366,14 @@ picking and terrain queries, including shape orientation. Require the
 agreed terrain reads, rendering/picking and reload behavior to describe the same
 geometry; no procedural cave generator is implied by these cases. Exact
 consumers and evidence remain Q-4/Q-6/Q-7 decisions.
+Include all 16 masks in all four facings, with explicit identity checks for
+0 and 15 and visual cases for NS/EW; do not add traversal or movement tests.
+Check automatic headroom over nearby higher terrain separately from exact
+manual slicing. For D-26, require identical decoded values/query results and
+removal/reload behavior across uniform/run/dense encodings, transitions at the
+byte-cost threshold and segment boundaries, and no allocation of unknown
+intervening cells. Measure metadata/heap costs separately from the payload
+table; include coherent and fragmented lookup, scan and edit workloads.
 Exercise camera exploration beyond the startup footprint, top-only initial
 materialization, repeated removal revealing deeper terrain, and exposure of
 side faces and gaps. Inspect terrain allocations as well as rendered output
@@ -1264,22 +1426,24 @@ processing is split/reviewed explicitly, never hidden inside a child.
   region indexing, shape catalog, exact rotations and shared intersection/face
   semantics. No resource effects.
 - **Phase:** 1. **Depends on:** none. **Ordering:** critical path.
-- **Relevant decisions:** D-4, D-11, D-15, D-17, D-21.
+- **Relevant decisions:** D-4, D-11, D-15, D-17, D-21, D-24, D-25.
 - **Acceptance signals:** independent geometry fixtures, all orientations,
-  boundary coordinates, shared-face agreement and external-client boundary checks.
+  boundary coordinates, all 16 mask IDs/four facings, shared coverage agreement
+  and external-client boundary checks. Movement/pathing is deferred.
 - **Out of scope:** streaming, Lua and rendering effects.
 - **Open questions:** Q-12 approval of exact geometry/coordinate contract.
 
 ### TRA-2. Implement layered sources and compressed terrain changes
 
 - **Outcome/scope:** immutable copied recipes, bounded authored span patches,
-  sparse materialized runs and canonical removal overlays; pure cell/range/
-  surface queries and source-plus-edits reconstruction.
+  sparse adaptive uniform/run/dense segments and canonical removal overlays;
+  pure cell/range/surface queries and source-plus-edits reconstruction.
 - **Phase:** 1. **Depends on:** TRA-1. **Ordering:** critical path.
-- **Relevant decisions:** D-5, D-7, D-10, D-16, D-17, D-21.
+- **Relevant decisions:** D-5, D-7, D-10, D-16, D-17, D-21, D-26.
 - **Acceptance signals:** soil/stone boundary, cavities and slopes, repeated
   removals, air no-op, arbitrary deep queries without intervening allocation,
-  and complete bounded range results.
+  and complete bounded range results; encoding round trips, cost-threshold
+  transitions and allocation/work bounds without densifying unknown depth.
 - **Out of scope:** live service, persistence and automatic slopes.
 - **Open questions:** Q-12 approval of recipe/change encoding contract.
 
@@ -1339,9 +1503,10 @@ processing is split/reviewed explicitly, never hidden inside a child.
   candidates. Authored fixtures cover roofs, gaps, ramps and corners.
 - **Phase:** 2. **Depends on:** TRA-2. **Ordering:** critical path; independent
   of live terrain service and Lua integration.
-- **Relevant decisions:** D-4, D-12–D-16, D-18, D-21, D-22.
+- **Relevant decisions:** D-4, D-12–D-16, D-18, D-21–D-25.
 - **Acceptance signals:** geometry/pick consistency, all facings, negative and
-  far coordinates, manual/jump transitions, seam and occlusion fixtures.
+  far coordinates, manual/jump transitions, separate automatic headroom,
+  all 16 mask forms, seam and occlusion fixtures. No movement-cost work.
 - **Out of scope:** Vulkan uploads and new renderer ABI.
 - **Open questions:** Q-12; Q-13 ordering feasibility. Escalate rather than
   approximate if the geometry cannot be ordered correctly.
@@ -1352,10 +1517,10 @@ processing is split/reviewed explicitly, never hidden inside a child.
   renderer ABI, approved artwork provenance, and offscreen fixture rendering.
 - **Phase:** 3. **Depends on:** TRA-7. **Ordering:** critical prerequisite to
   runtime graphics integration.
-- **Relevant decisions:** D-15, D-17, D-18, D-21.
+- **Relevant decisions:** D-15, D-17, D-18, D-21, D-23, D-25.
 - **Acceptance signals:** retained exported captures and oracle/geometry
-  comparisons for slopes, roofs, gaps, cutaways and all facings, including
-  overlapping projections. Establish correct depth and transparent coverage.
+  comparisons for all 16 reference masks, roofs, gaps, cutaways and all facings,
+  including overlapping projections. Establish correct depth and transparent coverage.
 - **Out of scope:** live streaming and unapproved vertex/depth ABI changes.
 - **Open questions:** Q-13 is a hard stop gate: failed proof returns a concrete
   renderer proposal to the owner before dependent slices proceed.
@@ -1378,7 +1543,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
 - **Outcome/scope:** view open/close, move with optional Z, configure and pick
   through instance-owned leases and the coherent graphics adapter.
 - **Phase:** 3. **Depends on:** TRA-5, TRA-6, TRA-9. **Ordering:** critical path.
-- **Relevant decisions:** D-12–D-14, D-17–D-19, D-22.
+- **Relevant decisions:** D-12–D-14, D-17–D-19, D-22, D-23.
 - **Acceptance signals:** Lua camera traces, unloaded jump with/without Z,
   consecutive jumps, stale picks and view/window/arena teardown; old M1 scenes
   remain valid and cannot concurrently seize an attached terrain target.
@@ -1391,7 +1556,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   content, approved textures, four-layer soil default, camera controls and
   temporary mouse-targeted removal shortcut through the public API.
 - **Phase:** 4. **Depends on:** TRA-10. **Ordering:** critical path.
-- **Relevant decisions:** D-1–D-3, D-7–D-10, D-16–D-18, D-22.
+- **Relevant decisions:** D-1–D-3, D-7–D-10, D-16–D-18, D-22, D-23.
 - **Acceptance signals:** visible exploration beyond startup footprint,
   underground/cutaway demand, surface/manual navigation, soil-to-stone removal,
   revisit after offload and fresh state after session restart.
@@ -1405,7 +1570,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   temporary binding and its dedicated glue, retain Lua API regressions and
   finish current subsystem contracts/test catalog entries.
 - **Phase:** 4. **Depends on:** TRA-11. **Ordering:** final acceptance barrier.
-- **Relevant decisions:** D-4–D-22 as applicable.
+- **Relevant decisions:** D-4–D-26 as applicable.
 - **Acceptance signals:** the epic done condition and matrix below pass;
   exported visual evidence is retained, allocation trends and configured caps
   are reported honestly, shortcut is absent, and the public Lua removal path
@@ -1417,11 +1582,11 @@ processing is split/reviewed explicitly, never hidden inside a child.
 
 | Concern | Required evidence |
 | --- | --- |
-| Model/source | Independent geometry and recipe fixtures; deep queries allocate no intervening volume; compressed gaps and soil transition |
+| Model/source | All 16 mask identities and shared geometry; deep queries allocate no intervening volume; compressed gaps and soil transition; uniform/run/dense round trips and transitions |
 | Retention | Multiple edit/offload/reload cycles and new-session freshness; no unbounded duplicate removal log |
 | Concurrency | Causally controlled cancellation/close/publication tests, one settlement and no stale incarnation publication |
-| Camera/input | Follow over authored hills, manual pan/zoom/rotation, Shift-scroll and jumps; reset clears held input; no UI dependency |
-| Presentation | Exported offscreen and native captures for four facings, ramps/corners, roofs/cavities, cutaways and chunk seams; pick agrees with displayed geometry |
+| Camera/input | Follow with headroom over authored hills; exact manual slice through pan/zoom/rotation; Shift-scroll and jumps; reset clears held input; no UI dependency |
+| Presentation | Exported offscreen and native captures for all 16 masks in four facings, roofs/cavities, cutaways and chunk seams; pick agrees with displayed geometry |
 | Residency | Traverse and descend many region boundaries under fixed caps; record resident bytes/counts, retained edits, staging and retiring GPU data separately |
 | Compatibility | Existing M1 rectangle scenes, state-unavailable behavior, CPU composition and role/lease rules remain intact |
 | Delivery | Updated owning contracts and validation catalog; public Lua API remains; temporary shortcut/glue absent |
