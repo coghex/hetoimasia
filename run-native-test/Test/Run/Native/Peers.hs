@@ -466,7 +466,7 @@ compose lifetime folder graphics vulkan frames disposals jobs providerStep scena
             withWindowProvider windowConfig port $ \provider → do
               writeIORef providerStep (windowMainStep provider)
               let publisher = scenePublisher (graphicsTextures graphics) provider
-                  injection = graphicsInjection (GraphicsFacade profile pipeline provider publisher noPublishHooks defaultIssuedMemory)
+                  injection = graphicsInjection (GraphicsFacade profile pipeline provider publisher noPublishHooks defaultIssuedMemory Nothing)
               statusRef ← newTVarIO (pure (StatusSample False Nothing Nothing))
               tickDuration ← either (\refused → ioError (userError ("the tick duration was refused: " <> show refused))) pure (durationFromNanoseconds RequirePositive 10000000)
               let status = join (readTVar statusRef)

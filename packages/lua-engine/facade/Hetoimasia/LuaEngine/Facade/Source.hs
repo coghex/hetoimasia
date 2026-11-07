@@ -53,9 +53,10 @@ builderSource =
     }
 
 -- | The initial chunk, for a call that writes at most this many bytes, with the graphics layout (the texture
--- request, the window request, the scene publication and the texture release) when a composition injected one.
-engineChunk ∷ Bool → Int → ByteString
-engineChunk graphics limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLinesWith limit <> body))
+-- request, the window request, the scene publication and the texture release) when a composition injected one, and
+-- with the presentation-input layout (@api.input.poll@ and @api.input.acknowledgeReset@) when it also opted in to input.
+engineChunk ∷ Bool → Bool → Int → ByteString
+engineChunk graphics input limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLinesWith limit <> body))
   where
     ns = engineNamespaceName
     prelude =
@@ -80,6 +81,7 @@ engineChunk graphics limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFun
       , "local error = error"
       ]
         <> graphicsLocals
+        <> inputLocals
         <> bodyTail
     -- The graphics layout (LFE-21): the same in either role, so that a logical instance's call is an ordinary error of
     -- the binding rather than a missing field. The window and the texture calls take exactly their declared arguments
@@ -100,6 +102,17 @@ engineChunk graphics limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFun
           , "local texture_ops = { ready = E.ready_texture, take = E.take_texture, cancel = E.cancel_texture, wait = E.wait_texture }"
           , "local window_ops = { ready = E.ready_window, take = E.take_window, cancel = E.cancel_window, wait = E.wait_window }"
           ]
+      | otherwise = []
+    -- The input layout (TRA-6): present only when the composition injected input, and then the same in either role, so
+    -- that a logical instance's call is an ordinary error of the binding rather than a missing field. Both calls take
+    -- exactly their declared arguments and pass them unchanged, so the host's arity is the call's.
+    inputLocals ∷ [Text]
+    inputLocals
+      | input = ["local input_poll, input_acknowledge_reset = E.input_poll, E.input_acknowledge_reset"]
+      | otherwise = []
+    inputMembers ∷ [Text]
+    inputMembers
+      | input = ["    input = { poll = guard(input_poll), acknowledgeReset = guard(input_acknowledge_reset) },"]
       | otherwise = []
     bodyTail ∷ [Text]
     bodyTail =
@@ -160,6 +173,7 @@ engineChunk graphics limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFun
       , "    session = { status = guard(session_status), quit = guard(session_quit) },"
       ]
         <> graphicsMembers
+        <> inputMembers
         <> [ "    state = terminal,"
       , "    time = {"
       , "      tick = guard(tick),"

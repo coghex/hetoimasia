@@ -53,6 +53,21 @@ module Hetoimasia.LuaEngine.Facade.Types
   , graphicsWindowRequestType
   , graphicsTextureValueSchema
   , graphicsWindowValueSchema
+    -- * Injected input
+  , graphicsInputResetType
+  , InputServices (..)
+  , InputPoll (..)
+  , InputAck (..)
+  , InputPacket (..)
+  , InputDisposition (..)
+  , InputEventRecord (..)
+  , InputBody (..)
+  , InputKeyAction (..)
+  , InputButtonAction (..)
+  , InputModifiers (..)
+  , InputResetInfo (..)
+  , InputResetReason (..)
+  , InputObservation (..)
   , engineNamespaceName
   , engineBuilderName
     -- * Failures
@@ -67,6 +82,7 @@ import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Word (Word64)
+import Numeric.Natural (Natural)
 import Hetoimasia.Content.Identity (ContentKey)
 import Hetoimasia.Content.Inventory (Inventory)
 import Hetoimasia.Foundation.Time (Duration, Instant, MonotonicSource)
@@ -367,7 +383,139 @@ data GraphicsServices = GraphicsServices
   -- special release path's to answer.
   , gsRelease ∷ Word64 → IO Text
   -- ^ Release a texture lease by key through the host's special release path: @done@, @retiring@ or @already_released@.
+  , gsInput ∷ !(Maybe InputServices)
+  -- ^ The presentation-input operations (TRA-6), when the composition opted in. 'Nothing' keeps the facade exactly as it
+  -- was: no @api.input@ field, no handle type. Input is a part of the graphics services because a window exists only
+  -- through them, so input without a window provider cannot be composed.
   }
+
+-- Injected input -------------------------------------------------------------------------------------
+
+-- | The name of the capability type of a reset-acknowledgement token.
+graphicsInputResetType ∷ Text
+graphicsInputResetType = "input_reset"
+
+-- | The narrow presentation-input operations of one VM, supplied by a composition that opted in. The CPU facade validates
+-- the caller, role, phase, session admission, arity, every argument's shape and the result capacity, and decides which
+-- Lua error a refusal is; these do what only the window integration can: check that the window handle is the calling
+-- instance's own live window, read a bounded prefix of its ordered input atomically with the feed's disposition and the
+-- window's observation, and acknowledge a reset. Every operation names the calling instance by the identity the facade
+-- issued it and the window by its lease key. Nothing here waits, blocks or runs Lua.
+data InputServices = InputServices
+  { isTypes ∷ ![CapabilityType]
+  -- ^ The capability type of a reset token ('graphicsInputResetType'), with its liveness check.
+  , isCheckPoll ∷ Text → Word64 → IO (Maybe Text)
+  -- ^ Whether this instance may poll this window handle: a refusal is the text of an ordinary error, and nothing is read.
+  , isPoll ∷ Text → Word64 → Int → IO InputPoll
+  -- ^ Read at most this many events from the window's feed, with its disposition and observation, in one atomic step.
+  , isCheckAcknowledge ∷ Text → Word64 → Word64 → IO (Maybe Text)
+  -- ^ Whether this instance may acknowledge with this token (a reset-token key) for this window handle.
+  , isAcknowledge ∷ Text → Word64 → Word64 → IO InputAck
+  -- ^ Acknowledge the reset the token names, on the window's reader, nonblocking.
+  }
+
+-- | What a poll came to.
+data InputPoll
+  = -- | A lifecycle change that landed after the check (an ending instance, a stopped session, a retired window): nothing
+    -- was read. The facade raises it as the ordinary error it is.
+    PollRefused !Text
+  | Polled !InputPacket
+
+-- | What an acknowledgement came to.
+data InputAck
+  = -- | A lifecycle change that landed after the check, or a token that is not this window's: nothing was acknowledged.
+    AckRefused !Text
+  | -- | The pending reset is now acknowledged.
+    AckAcknowledged
+  | -- | This reset was already acknowledged, or has resumed.
+    AckAlready
+  | -- | The token is not the feed's newest reset: nothing changed.
+    AckStale
+  | -- | The feed has closed.
+    AckClosed
+  deriving (Eq, Show)
+
+-- | Where the feed stood when a poll stopped reading.
+data InputDisposition
+  = DispositionRunning
+  | DispositionResetRequired
+  | DispositionPaused
+  | DispositionClosed
+  deriving (Eq, Show)
+
+-- | One bounded poll: an ordered prefix of events, the disposition the read stopped on, and the window's observation read
+-- in the same step.
+data InputPacket = InputPacket
+  { packetDisposition ∷ !InputDisposition
+  , packetEpoch ∷ !Natural
+  -- ^ The epoch of the running generation, or of the last one that ran.
+  , packetEvents ∷ ![InputEventRecord]
+  , packetExhausted ∷ !Bool
+  -- ^ True only when the read observed the end of the feed: an empty running feed, or any other disposition. A poll that
+  -- stopped at its bound says false, because it did not look.
+  , packetReset ∷ !(Maybe InputResetInfo)
+  , packetObservation ∷ !InputObservation
+  }
+  deriving (Eq, Show)
+
+-- | An event as the feed delivered it: its epoch and its payload.
+data InputEventRecord = InputEventRecord
+  { eventEpoch ∷ !Natural
+  , eventBody ∷ !InputBody
+  }
+  deriving (Eq, Show)
+
+data InputBody
+  = -- | A key transition: key code, platform scancode, action, modifiers.
+    BodyKey !Int !Int !InputKeyAction !InputModifiers
+  | -- | One character, by its exact code point (a surrogate included).
+    BodyText !Int
+  | -- | A button transition: number, action, the cursor position captured for it, modifiers.
+    BodyButton !Int !InputButtonAction !(Maybe (Double, Double)) !InputModifiers
+  | -- | Both scroll offsets; no modifiers, because the source captured none.
+    BodyScroll !Double !Double
+  | BodyFocus !Bool
+  deriving (Eq, Show)
+
+data InputKeyAction = KeyActionPress | KeyActionRepeat | KeyActionRelease
+  deriving (Eq, Show)
+
+data InputButtonAction = ButtonActionPress | ButtonActionRelease
+  deriving (Eq, Show)
+
+-- | The six modifier flags of the source, under its own names.
+data InputModifiers = InputModifiers
+  { modShift ∷ !Bool
+  , modControl ∷ !Bool
+  , modAlt ∷ !Bool
+  , modSuper ∷ !Bool
+  , modCapsLock ∷ !Bool
+  , modNumLock ∷ !Bool
+  }
+  deriving (Eq, Show)
+
+data InputResetReason = ResetReasonOverflow | ResetReasonSuspension
+  deriving (Eq, Show)
+
+-- | The reset the feed is in: why, the epoch it reserved and, only while it is pending, the key of its token.
+data InputResetInfo = InputResetInfo
+  { resetReason ∷ !InputResetReason
+  , resetEpoch ∷ !Natural
+  , resetTokenKey ∷ !(Maybe Word64)
+  }
+  deriving (Eq, Show)
+
+-- | The window's latest observation, each attribute the platform could not provide left 'Nothing'.
+data InputObservation = InputObservation
+  { observationRevision ∷ !Natural
+  , observationFocused ∷ !(Maybe Bool)
+  , observationCursor ∷ !(Maybe (Double, Double))
+  , observationCursorInside ∷ !(Maybe Bool)
+  , observationLogical ∷ !(Maybe (Int, Int))
+  , observationFramebuffer ∷ !(Maybe (Int, Int))
+  , observationScale ∷ !(Maybe (Double, Double))
+  }
+  deriving (Eq, Show)
 
 -- | The session's authored output: both streams, the lock one whole call is written under, and the
 -- state of the output (open and counting calls, failed, or closed). Made and used by

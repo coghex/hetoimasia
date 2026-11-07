@@ -223,7 +223,7 @@ runNativeWith observation environment choice lifetime stop link prepared = do
                         withWindowProvider (linkWindowConfig link') port $ \provider → do
                           writeIORef providerStep (windowMainStep provider)
                           let publisher = scenePublisher (graphicsTextures graphics) provider
-                              injection = graphicsInjection (GraphicsFacade profile pipeline provider publisher noPublishHooks defaultIssuedMemory)
+                              injection = graphicsInjection (GraphicsFacade profile pipeline provider publisher noPublishHooks defaultIssuedMemory Nothing)
                           continue injection `finally` writeIORef providerStep (pure ())
                     }
             runPrepared environment lifetime stop link prepared (Just production) (\_ → pure ())

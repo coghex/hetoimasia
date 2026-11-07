@@ -41,6 +41,7 @@ module Hetoimasia.LuaEngine.Graphics.Facade
 
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO)
 import Control.Exception (Exception, throwIO)
+import Control.Monad (forM)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -53,6 +54,7 @@ import Hetoimasia.LuaEngine.Facade
   , GraphicsStart (..)
   , GraphicsVm (..)
   )
+import Hetoimasia.LuaEngine.Graphics.Input (InputConfig (..), InputHost (inputObserve), declareInput, forgetInput, inputServices, newInputRegistry)
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (PublishHooks, ScenePublisher, graphicsPublishBindingWith, publisherGatedBy)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
   ( WindowOwner
@@ -110,6 +112,9 @@ data GraphicsFacade target = GraphicsFacade
   -- its commit with them, to land a stop there.
   , gfIssuedMemory ∷ !Int
   -- ^ How many of the most recently issued texture handles a VM remembers the issuing instance of ('defaultIssuedMemory').
+  , gfInput ∷ !(Maybe InputHost)
+  -- ^ The window integration's input, when the composition opts in (TRA-6). 'Nothing' adds no @api.input@ field, no handle
+  -- type and no consumer, and enables no window's input admission: the composition is exactly what it was.
   }
 
 -- | Why a VM's graphics could not be composed: a failure of the composition, with its reason, and nothing of a
@@ -170,6 +175,11 @@ graphicsInjection config = GraphicsInjection $ \vm → do
   owners ← newTVarIO (Map.empty ∷ Map Text Owners)
   -- The instance each recent texture handle was issued to: bounded ('gfIssuedMemory').
   issued ← newTVarIO emptyIssued
+  -- The VM's input bookkeeping, when the composition opted in: one consumer at most for each declared instance.
+  input ← forM (gfInput config) $ \host → do
+    registry ← newInputRegistry
+    inputObserve host registry
+    pure (registry, inputServices @target (InputConfig host (gvTakesWork vm)) leases registry)
   let window = windowService requests (gfProvider config)
       textureRole = case gvRole vm of
         Gameplay → LogicalRole
@@ -191,7 +201,11 @@ graphicsInjection config = GraphicsInjection $ \vm → do
       , gsDeclare = \identity → do
           made ← Owners <$> newTextureOwner (gfPipeline config) textureRole <*> newWindowOwner (gfProvider config) windowRole
           atomically (modifyTVar' owners (Map.insert identity made))
+          mapM_ (\(registry, _) → declareInput registry identity) input
       , gsForget = \identity → do
+          -- The instance's input ends first, in one transaction, and waits for nothing: no acknowledgement and no
+          -- queue capacity stand between the instance's end and its window's retirement.
+          mapM_ (\(registry, _) → forgetInput registry identity) input
           held ← atomically $ do
             found ← Map.lookup identity <$> readTVar owners
             modifyTVar' owners (Map.delete identity)
@@ -229,6 +243,7 @@ graphicsInjection config = GraphicsInjection $ \vm → do
             -- Otherwise the lease says: borrowing refuses a lease of another kind; one that has ended is the release path's.
             _ → withTextureOr leases key (\why → pure (if Text.isInfixOf "another" why then Just why else Nothing)) (\_ → pure Nothing)
       , gsRelease = \key → releaseWord <$> releaseTexture leases key
+      , gsInput = snd <$> input
       }
   where
     necessity optional = if optional then OptionalRequest else RequiredRequest
