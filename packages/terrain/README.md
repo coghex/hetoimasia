@@ -539,7 +539,8 @@ waits only for those victims' `VictimReleased` events, then is queued. A victim
 cannot regain an interest or a hold, and a victim's bytes are never promised twice.
 Checks run in a fixed order and the first failure is reported:
 
-1. **Invalid** (permanent): an empty, oversized or duplicated demand, a region key
+1. **Invalid** (permanent; one feasibility function serves every admission path, an atomic
+   request, a removal and a camera demand alike): an empty, oversized or duplicated demand, a region key
    that names a tile outside the supported coordinate range (`UnsupportedRegion`,
    checked at the lowest and highest cell of the region), a region whose minimal
    reservation exceeds a bank's configured total, or more of a slot than exists, all

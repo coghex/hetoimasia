@@ -86,8 +86,11 @@ and begins at elevation `z`.
 grid separately, so adjacent faces with different fractional origins would be
 drawn apart by up to half a pixel and open cracks. Face origins lie on a lattice
 of 48 pixels horizontally and 8 vertically at native scale, so every origin is on
-a whole pixel exactly when the zoom is a whole multiple of 1/8. A view that
-snaps at any other zoom is refused (`PixelSnapUnsupported`); `snapCompatible`
+a whole pixel exactly when the mapping's world scale is a whole multiple of 1/8.
+The scale is taken from the render-2d world transform itself, so it includes the
+scale a fixed-half-height zoom mode gives (viewport height times zoom over twice
+the half-height), not the camera zoom alone. A view that snaps at any other
+scale is refused (`PixelSnapUnsupported`, carrying the scale); `snapCompatible`
 answers it. A view that does not snap has no such restriction.
 
 Refusals are explicit: an invalid or non-finite view or zoom is
@@ -221,11 +224,13 @@ planner. `defaultPlanLimits` are engineering defaults, not measured capacity.
 `PlanStats` reports columns, levels examined and faces. The bounds on levels and
 faces are checked as the work proceeds, the overlap-pair bound stops the
 enumeration at the first pair past it, and the demand ring is generated
-incrementally and refused at the first chunk past its bound.
+incrementally, with its offsets clipped to the supported chunk range first, and
+refused at the first chunk past its bound.
 
 ## Demand
 
-A plan is `Complete` or `Incomplete`. `planDemand` names the unavailable facts the
+Levels outside the supported range hold nothing and are known air, so demand
+never names them. A plan is `Complete` or `Incomplete`. `planDemand` names the unavailable facts the
 plan needed as `ChunkDemand`s: the horizontal chunk key, explicit half-open level
 intervals (ascending, coalesced) and the vertical region keys (32 levels) they
 touch, so later integration can coalesce and admit them without re-deriving them
