@@ -28,7 +28,7 @@ concrete precondition
 - [x] TRA-1. Define terrain coordinates and shared shape geometry — [#637]
 - [x] TRA-2. Implement layered sources and compressed terrain changes — [#638]
 - [x] TRA-3. Define bounded horizontal and vertical residency — [#639]
-- [ ] TRA-4. Implement the transactional terrain service
+- [x] TRA-4. Implement the transactional terrain service — [#640]
 - [ ] TRA-5. Expose terrain requests through Lua
 - [ ] TRA-6. Expose ordered window input to Lua
 - [ ] TRA-7. Implement isometric cutaway planning and picking
