@@ -51,6 +51,7 @@ are pinned to these revisions. Synarchy has not been modified or launched.
 | Arena controls include zoom, rotation and vertical slice selection; these are existing reference behaviors, not yet this arc's scope. | S `scripts/test_arena.lua:255–293` |
 | Synarchy projects a diamond grid and has four camera facings 90 degrees apart. Camera input includes keyboard panning and middle-button dragging. | S `src/World/Grid.hs:220–236`; `src/Engine/Graphics/Camera.hs:22–37`; `src/Engine/Loop/Camera.hs:116–181` |
 | Synarchy routes Shift-scroll to Z-slice input; arena slice input disables automatic Z tracking and increments/decrements the slice. Its inspected `camera.gotoTile` accepts two coordinates, computes a surface-based slice and enables Z tracking; it does not read an optional third Z argument. | S `src/Engine/Input/Thread/Scroll.hs:128–138`; `scripts/test_arena.lua:265–275`; `src/Engine/Scripting/Lua/API/Camera.hs:223–318` |
+| Synarchy's renderer follows the terrain beneath the camera while Z tracking is enabled. Arena manual slice input disables tracking, the reset action restores it, and a zoom-map transition can also restore tracking. Rotation preserves the current tracking flag. | S `src/World/Render.hs:282–322`; `scripts/test_arena.lua:265–293`; `src/Engine/Scripting/Lua/API/Camera.hs:325–361` |
 | Geological hydrology, settled-terrain processing, chunk composition and runtime fluid simulation are separate stages. Flat generation can avoid the geological work. | S `docs/hydrology_pipeline.md:24–43` |
 | Hetoimasia's reusable renderer has world/UI views, cameras, depth, retained chunks and application materials. M1's Lua scene exposes only simple rectangles with a fixed camera, default material and one UI layer. | H `packages/render-2d/README.md:3–17`, `:59–69`; `packages/lua-engine/README.md:941–968`, `:1002–1011` |
 | GLFW already supplies ordered input with explicit reset/acknowledgement, but the M1 Lua facade has no input binding. | H `packages/glfw/src/Hetoimasia/GLFW/Input.hs:1–26`; `packages/lua-engine/README.md:1042–1057`, `:1086–1101` |
@@ -113,6 +114,8 @@ Depth should also extend on demand, with no designed bottom to the arena
 (D-11). Numeric limits and bounded residency still need explicit contracts.
 Shift-scroll controls the cutaway level. A camera jump defaults to the
 destination's top level unless its Lua command supplies a Z level (D-12).
+Normal panning, zooming and rotation automatically follow terrain height
+(D-13); the interaction with an explicit manual depth override remains open.
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
@@ -403,12 +406,33 @@ name/signature, loading publication and failure behavior remain open.
 
 Synarchy confirms the Shift-scroll reference. Its inspected jump API has no
 optional Z argument, so optional Z is a selected Hetoimasia requirement rather
-than a claim of existing Synarchy parity. The owner specified snapping on a
-jump; whether ordinary panning continuously follows the surface is still open.
-Recommend keeping a manually or explicitly selected Z fixed while panning,
-zooming or rotating, and selecting the surface again on a jump without Z.
-The detailed meaning of top level at an edited or empty destination, scroll
-step/direction and any surface-tracking mode remain to be specified.
+than a claim of existing Synarchy parity. D-13 subsequently selects normal
+terrain-following navigation and rejects the recommendation to keep the view
+at a fixed Z through ordinary navigation. The detailed meaning of top level at
+an edited or empty destination, scroll step/direction and transitions between
+manual depth and automatic tracking remain to be specified.
+
+### D-13. Follow terrain during ordinary camera navigation
+
+Owner, directly in this pane on 2026-11-06, correcting the fixed-Z navigation
+recommendation:
+
+> no, like synarchy panning zooming and rotation simply follow the terrain, so that we can move around hills without having to manually set the z slice level
+
+Normal panning, zooming and rotation automatically follow terrain height.
+Moving around hills must not require manually adjusting the cutaway level.
+The previous fixed-Z navigation recommendation is withdrawn. Flat initial
+generation remains D-1; this camera behavior must also accommodate varied
+terrain heights and edits without requiring procedural hills in this arc.
+
+D-12's manual Shift-scroll and explicit jump Z still apply. Their interaction
+with subsequent navigation needs one clarification: should a manual selection
+temporarily disable tracking until reset, or should subsequent camera
+navigation resume terrain following? Synarchy's inspected implementation uses
+a tracking flag: Shift-scroll disables it, a reset action restores it, and a
+zoom-map transition can also restore it. Its ordinary pan/rotation paths do
+not unconditionally reset a manually selected slice. Do not silently adopt
+that exception or erase the owner's requested terrain-following behavior.
 
 ## Design boundaries
 
@@ -489,9 +513,10 @@ D-12 settles cutaway viewing: Shift-scroll changes the displayed Z level while
 terrain above is hidden, and jumps choose the destination's top level unless
 given explicit Z. Distinguish slice visibility from actual exposure caused by
 removal. Cut-face appearance, visible depth range, exact top-level semantics
-and behavior during ordinary panning remain open. Recommend preserving manual
-or explicit Z during pan/zoom/rotation; a jump without Z selects the surface
-again. No UI widgets are implied. The isometric/four-facing presentation and
+remain open. D-13 selects terrain following for normal pan/zoom/rotation;
+the previous fixed-Z recommendation is withdrawn. Clarify the transition
+back to following after manual Shift-scroll or an explicit jump Z, as recorded
+in D-13. No UI widgets are implied. The isometric/four-facing presentation and
 remaining navigation proposal above are not independently settled by the
 cutaway decision.
 
@@ -592,6 +617,10 @@ camera jumps choose the surface when Z is omitted and honor explicit Z for
 both resident and unloaded targets. Exercise successive jumps so a late result
 cannot reset a newer view. Verify picking against the displayed cutaway and
 that viewing a deep slice does not materialize the intervening volume.
+For D-13, navigate varied-height authored terrain using pan/zoom/rotation and
+verify that normal terrain following keeps the relevant surface visible.
+Specify manual-override transition checks after that remaining choice is
+settled. These fixtures do not add a procedural hill generator to the arc.
 During development, exercise the D-8/D-9 shortcut through the agreed
 targeting/input path, including no valid target and focus/reset behavior.
 Capture its removal/reveal evidence before deleting the shortcut. Final
