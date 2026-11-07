@@ -235,14 +235,18 @@ consumerSpec = describe "one consumer" $ do
       ack consumer 0 >>= (`shouldSatisfy` isRefused)
       ack consumer 3 >>= (`shouldSatisfy` isRefused)
 
-  it "lets closure win over every acknowledgement and every read, without waiting for any" $
+  it "lets closure win over every acknowledgement and every read, the current token and an older one alike, without waiting for any" $
     withConsumer 2 $ \feed consumer → do
       atomically (texts feed "abc")
+      _ ← poll consumer 8
+      ack consumer 1 `shouldReturn` AckAcknowledged
+      atomically (resumeFeed feed) `shouldReturn` True
+      atomically (texts feed "def")
       _ ← poll consumer 8
       atomically (closeFeed feed)
       closed ← poll consumer 8
       (packetDisposition closed, packetEvents closed, packetExhausted closed, packetReset closed) `shouldBe` (DispositionClosed, [], True, Nothing)
-      ack consumer 1 `shouldReturn` AckClosed
+      ack consumer 2 `shouldReturn` AckClosed
       ack consumer 1 `shouldReturn` AckClosed
 
   it "reads a reset that was committed first instead of its backlog, and a batch it already took whole, and never mixes epochs" $ do
