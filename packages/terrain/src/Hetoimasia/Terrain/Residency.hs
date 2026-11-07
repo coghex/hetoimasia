@@ -54,10 +54,15 @@
 -- committed victims waits only for those victims' 'VictimReleased' events
 -- ('JobWaiting'), then becomes queued. A victim cannot regain an interest.
 -- Checks run in a fixed order and the first failure is reported: permanently
--- invalid ('Invalid': a request that cannot fit an empty bank or slot), then
--- exhausted retained edits, then busy for the command slot, the job slot, the
--- staging bank, the edit bank and last the resident bank with its eviction
--- set.
+-- invalid ('Invalid', decided from the request alone: a malformed demand, more
+-- regions than the cap, a cell outside the configured extent), then exhausted
+-- retained edits, then busy for the command slot, the job slot, the staging bank,
+-- the edit bank and last the resident bank with its eviction set.
+--
+-- Capacity is guaranteed by configuration, not decided per request: 'mkLimits'
+-- refuses a configuration whose banks cannot hold the worst-case footprint of
+-- the largest admissible request ('minimumBytes'), so a request within its caps
+-- is never invalid for lack of capacity and every shortage is busy.
 --
 -- Reads of a hold, a handoff duplicate or a pin also admit small staging
 -- records; they answer busy for the same reasons and start nothing when they do.

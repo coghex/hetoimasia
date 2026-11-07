@@ -1087,8 +1087,7 @@ setCamera m v a demands = do
       -- step leaves without an interest is pruned at once and reported, so the owner
       -- is told to cancel every job the replacement made obsolete.
       -- Regions are admitted strictly in demand order: once one is busy the rest
-      -- wait behind it, so a later region never takes room an earlier one needs
-      -- (the feasibility bound above is the order in which admission reserves).
+      -- wait behind it, so a later region never takes room an earlier one needs.
       attempt (mm, done, waiting, replaced, goneAcc, cancelAcc) d = case (if null waiting then planAdmission mm a owner [d] noExtras {exProtect = wanted} else Left (Busy (RegionEvicting (demandRegion d)))) of
         Right plan →
           let (mm', admission, _) = applyPlan mm a owner plan
