@@ -133,8 +133,8 @@ region plus the accounted payload, segment metadata and column entries the real
 Two further real-data examples cover the accounting the first review round found
 missing. A uniform 32-cell segment (2 bytes) of the stone region is edited in a
 462-byte bank, the least that can edit at all: the removal reserves its 62 bytes of
-growth, a second removal takes the other 62, a third is busy (it fits an empty model,
-so it is not invalid), the real rebuilt segment (three runs, 12 bytes) grows by 10,
+growth, a second removal takes the other 62, a third is busy (its load fits an empty
+model, so it is not invalid), the real rebuilt segment (three runs, 12 bytes) grows by 10,
 and the commit charges exactly 10. Two vertical regions
 of one column share one real column index entry; each is charged for its own column,
 and evicting the older region leaves the survivor charged its own 338 bytes.
@@ -192,9 +192,9 @@ accounting.
 | A request may evict the regions it names | the brute-force oracle |
 | A staging shortfall off by one byte | the scripted bank-full examples |
 | The oldest evictable region is never a victim | the least-recently-used and funded-eviction examples and the oracle |
-| An empty-model footprint that reads the model (resident regions subtracted) | the empty-model example, the state-independence property and the random sequences |
-| The empty-model footprint omits region metadata | the empty-model, bank-boundary, camera and removal-boundary examples and the accepted-demand-completes property |
-| The empty-model footprint omits a removal growth | the removal boundary example (461 refuses, 462 admits) |
+| The check ignores what is already covered | the covered-request examples, the camera and request examples and the random sequences |
+| The fresh-job sizing always charges region metadata, even for a covered region | the random sequences (the oracle) |
+| The footprint omits a removal's growth | the removal boundary example (461 refuses, 462 admits) |
 
 ### Randomized properties
 
@@ -213,7 +213,7 @@ arena or reserved byte. It runs 200 random sequences of 250 events, a 12,000-eve
 fixed sequence under tight budgets, a 12,000-event fixed sequence under room for
 concurrent work (where commits meet queued and running jobs of their region), 2,000
 random camera demands accepted into an empty model (each must complete when it is
-alone) and 3,000 random cases of the state-independence property below. The fixed
+alone) and 3,000 random cases of the narrowing property below. The fixed
 sequences assert workload floors so that a degenerate generator fails.
 
 ### Brute-force admission oracle
@@ -222,28 +222,30 @@ sequences assert workload floors so that a degenerate generator fails.
 decision from the model's observations alone and the contract's charge table
 restated by hand, and the random sequences compare it with the model at every query
 and removal, from an empty model and from every state they reach: __permanently
-invalid__ exactly when the request's minimum final footprint cannot fit a bank or
-slot even from an empty model (one fresh job per region for its whole coverage; it
-reads no state); __admitted__ exactly when every slot and bank has room and the
-resident shortfall can be covered by some set of regions nothing needs, found by
-trying every subset of them rather than the model's least-recently-used walk;
-__busy__ otherwise (and __exhausted__ for a removal the retained-edit bank cannot
-take). In the fixed sequences it checked 101 admitted, 1,627 busy, 17 invalid and 61
-exhausted decisions under tight budgets and 194 admitted and 1,592 busy under room
-for concurrent work, and never disagreed with the model.
+invalid__ exactly when the cells the request still has to load (those no resident
+detail and no live job covers), sized as a fresh job would store them merged with
+the coverage already in the region, cannot fit a bank or slot, so a request with
+nothing to load is never invalid; __admitted__ exactly when every slot and bank has
+room and the resident shortfall can be covered by some set of regions nothing needs,
+found by trying every subset of them rather than the model's least-recently-used
+walk; __busy__ otherwise (and __exhausted__ for a removal the retained-edit bank
+cannot take). In the fixed sequences it checked 101 admitted, 1,635 busy, 9 invalid
+and 61 exhausted decisions under tight budgets and 194 admitted and 1,592 busy
+under room for concurrent work, and never disagreed with the model.
 
-### The owner's rule for permanent refusals (extension rounds 6 and 7)
+### The permanent-refusal rule (Requirement 7), review rounds 5 to 7
 
-The owner directed that a request is permanently invalid only if its minimum final
-footprint cannot fit a bank "even from an empty model"; every other shortfall is
-busy. The state-dependent lower bounds of the earlier rounds (resident data,
-promised work, retained interests) were removed from the permanent-refusal path:
-they were the source of the last review rounds' false permanent refusals. What is
-resident, who has pinned it and what is promised now decides only whether a request
-is admitted now or waits. The permanent class of a query, a removal and a camera
-demand is the same from an empty model and from a model holding resident leftovers
-and an earlier demand of the same view (the state-independence property). The
-earlier "accepted completes from non-empty states" and "quiescent never busy"
-properties were retired with the bounds they tested; the exhaustive oracle covers
-the busy/admitted decisions from every state.
-
+Requirement 7 keeps permanent invalidity apart from pressure. Rounds 2 to 5 derived
+permanent refusals from state-dependent lower bounds (resident data, promised work,
+retained interests); each was found unsound by a reviewer in a new case, the last
+being the least a promised job leaves stored. The rule now is: invalid only when the
+cells a request still has to load cannot fit even if nothing else existed; a request
+with nothing to load is never invalid; every other shortfall is busy. State enters
+only as which cells are already covered, so a request that is invalid in any state is
+invalid from an empty model (the narrowing property, 3,000 cases), a demand accepted
+into an empty model completes when alone (2,000 cases), and the request the review
+found wrongly refused (a column z 0..31 admitted, then a query for z 0, 2 and 4, in a
+400-byte bank) is admitted before and after the covering job completes. The earlier
+"accepted completes from non-empty states" and "quiescent never busy" properties were
+retired with the bounds they tested; the exhaustive oracle covers the busy and
+admitted decisions from every state.
