@@ -20,6 +20,7 @@ module Test.GPU.Vulkan.Native.TerrainJudge
   , Independent (..)
   , judgeIndependent
   , expectedByte
+  , expectedRgba
   , Json (..)
   , renderJson
   ) where
@@ -65,6 +66,17 @@ expectedByte texel tint = round (max 0 (min 255 (255 * encode (decode (fromInteg
     encode l
       | l <= 0.0031308 = 12.92 * l
       | otherwise = 1.055 * l ** (1 / 2.4) - 0.055
+
+-- | The colour the independent expectation gives a pixel under a look, or
+-- 'Nothing' where it cannot decide.
+expectedRgba ∷ Look → Expected → Maybe (Word8, Word8, Word8, Word8)
+expectedRgba look = \case
+  ExpectedClear → Just (0, 0, 0, 255)
+  Ambiguous _ → Nothing
+  ExpectedHit {expectedShown = Nothing} → Just (0, 0, 0, 255)
+  ExpectedHit {expectedShown = Just (hit, (r, g, b, _))} →
+    let (tr, tg, tb) = tintOf look (hitSurface hit)
+     in Just (expectedByte r tr, expectedByte g tg, expectedByte b tb, 255)
 
 -- | What judging every pixel against the independent expectation found.
 data Independent = Independent

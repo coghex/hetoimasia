@@ -478,12 +478,14 @@ data Extra = Extra
   , extraPick ∷ !(Maybe Judged)
   , extraRejected ∷ !(Maybe Bool)
   , extraTargets ∷ ![(Int, Int)]
+  , extraSnapDifferences ∷ !(Maybe Int)
+  -- ^ For a snapping fixture: pixels read as the snapped view and not as the unsnapped one.
   , extraSeconds ∷ ![Double]
   -- ^ Rendering and reading back, the oracle's verdicts, the independent expectation, the pure judge.
   }
 
 emptyExtra ∷ Spec → Extra
-emptyExtra s = Extra s [] [] [] [] [] Nothing Nothing Nothing [] []
+emptyExtra s = Extra s [] [] [] [] [] Nothing Nothing Nothing [] Nothing []
 
 failed ∷ String → String → FixtureResult
 failed name why = FixtureResult (Text.pack name) [] [] [] (Just (Text.pack why))
@@ -669,13 +671,35 @@ renderSnapshot ctx s parts = do
             , part ← parts
             , (toInteger (axisValue (camClip (partCamera part))), camRef (partCamera part)) /= wanted
             ]
-          missing = [need | need ← specNeeds s, need `notElem` map fst named]
+          missing = [need | need ← specNeeds s, need `notElem` (SnapSensitive : map fst named)]
           runFacts = runsOf (planSnapshot marks valid)
       markFacts ← traverse (\(sheet, handle) → (,) sheet <$> registeredMark (ctxTextures ctx) handle) (Map.toList (ctxHandles ctx))
       result ← runValidatedWith models (retainedBase (ctxHost ctx)) terrainSuite (ctxDirectory ctx) Depth32Float (ctxRenderer ctx) marks buffers decodedAt (Text.pack name) shapes (map snd named) valid
       let perPass = splitPasses (map (sceneTarget . partScene) parts) (resultProbes result)
           independents = [judgeIndependent (specLook s) (sceneTarget (partScene part)) (grid !) (observedFrom (fst (sceneTarget (partScene part))) probes) | (part, grid, probes) ← zip3 parts grids perPass]
           independent = foldr1 plus independents
+          -- Pixels the readback shows as the snapped view and not as the same view
+          -- without snapping: the expectations differ by more than the tolerance, and
+          -- the pixel read agrees with the snapped one and not with the other.
+          snapDifferences = case (SnapSensitive `elem` specNeeds s, parts, perPass) of
+            (True, part : _, firstProbes : _) → case alternative part SnapSensitive of
+              Just unsnapped →
+                let (gw, gh) = sceneTarget (partScene part)
+                    observed = observedFrom gw firstProbes
+                    tolerance = lookTolerance (specLook s)
+                    near (a, b, c, d) (Rgba8 e f g h') = all (\(x, y) → abs (fromIntegral x - fromIntegral y) <= tolerance) [(a, e), (b, f), (c, g), (d, h')]
+                 in length
+                      [ ()
+                      | x ← [0 .. gw - 1]
+                      , y ← [0 .. gh - 1]
+                      , Just with ← [expectedRgba (specLook s) (firstGrid ! (x, y))]
+                      , Just without ← [expectedRgba (specLook s) (unsnapped (x, y))]
+                      , Just seen ← [observed x y]
+                      , near with seen
+                      , not (near without seen)
+                      ]
+              Nothing → 0
+            _ → 0
           plus a b = Independent (indCompared a + indCompared b) (indAmbiguous a + indAmbiguous b) (indCovered a + indCovered b) (indReveals a + indReveals b) (indMismatchCount a + indMismatchCount b) (take 12 (indMismatches a <> indMismatches b))
       pickJudgeds ← traverse (pureJudge ctx s . partScene) parts
       let pickJudged = foldr1 plusJudged pickJudgeds
@@ -690,6 +714,7 @@ renderSnapshot ctx s parts = do
             ]
               <> ["the pure pick, the planner's coverage or the material's model disagreed at " <> show (judgedMismatchCount pickJudged) <> " pixels, e.g. " <> show (take 3 (judgedMismatches pickJudged)) | not (specControl s), judgedMismatchCount pickJudged > 0]
               <> cameraProblems
+              <> ["pixel snapping changed " <> show snapDifferences <> " pixels the readback shows, fewer than the 20 that discriminate it from a view that ignores the setting" | SnapSensitive `elem` specNeeds s, snapDifferences < 20]
               <> ["no determinate probe for " <> show need | need ← missing]
               <> ["the independent expectation compared no pixel the scene covers" | indCovered independent == 0]
               <> ["the control was not rejected: the judge found no disagreement with a draw broken on purpose" | rejected == Just False]
@@ -709,6 +734,7 @@ renderSnapshot ctx s parts = do
               , extraPick = Just pickJudged
               , extraRejected = rejected
               , extraTargets = map (sceneTarget . partScene) parts
+              , extraSnapDifferences = if SnapSensitive `elem` specNeeds s then Just snapDifferences else Nothing
               , extraSeconds = []
               }
       pure (finished, factsExtra)
@@ -909,6 +935,7 @@ writeRecord ctx sheets format seconds results = do
             [ ("name", JString (specName sp))
             , ("passed", JBool (OrderedPath.fixturePassed result))
             , ("failure", maybe JNull (JString . Text.unpack) (resultFailure result))
+            , ("snap_discriminating_pixels", maybe JNull (JNumber . show) (extraSnapDifferences extra))
             , ("seconds", JNumber (show (sum (extraSeconds extra))))
             , ("seconds_by_stage", JObject (zip ["render_and_readback", "oracle_verdicts", "independent_expectation", "pure_coverage_model_pick"] (map (JNumber . show) (extraSeconds extra))))
             , ("variant", JString (show (specVariant sp)))
