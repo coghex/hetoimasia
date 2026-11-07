@@ -309,7 +309,7 @@ applyCommand config facts command camera0
   | otherwise = case command of
       Pan dx dy → do
         moved ← pan dx dy camera
-        pure (stamp camera (followIfFollowing config facts moved))
+        pure (stamp camera0 (followIfFollowing config facts moved))
       ZoomBy factor
         | bad factor → Left NonFiniteInput
         | otherwise → Right (plain (camera {csZoom = clampZoom config (csZoom camera * factor)}))
@@ -324,13 +324,14 @@ applyCommand config facts command camera0
         let target = toInteger (axisValue (csClip camera)) + delta
         level ← either (const (Left SliceOutOfRange)) Right (axisFromInteger target)
         Right (plain (camera {csMode = Manual level, csClip = level}))
-      Jump target → Right (stamp camera (beginJump config facts target camera))
+      Jump target → Right (stamp camera0 (beginJump config facts target camera))
   where
     -- Whatever the zoom the camera was last given, the configuration in force now
-    -- bounds it.
+    -- bounds it. The revision is stamped against the camera as it was passed in, so
+    -- a clamp alone is a change.
     camera = withinConfig config camera0
     bad x = isNaN x || isInfinite x || x <= 0
-    plain next = stamp camera (Step next FollowNotApplied NoJump)
+    plain next = stamp camera0 (Step next FollowNotApplied NoJump)
 
 -- | Re-resolve the followed surface with new facts (for example after the
 -- residency generation changes). A camera that is not following is unchanged.

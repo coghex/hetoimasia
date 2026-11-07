@@ -228,6 +228,16 @@ spec = describe "Camera" $ do
       zoomAfter (either (error . show) id (applyCommand narrow variedFacts (Pan 1 0) wide)) `shouldBe` 2
       zoomAfter (ok (refollow narrow variedFacts wide)) `shouldBe` 2
       zoomAfter (either (error . show) id (applyCommand narrow variedFacts (SetFacing FaceWest) wide)) `shouldBe` 2
+    it "counts a clamp to the configuration in force as a change of revision, with every transition" $ do
+      let wide = camera' (SetZoom 8) variedFacts start
+          narrow = cfg {ccZoomMax = 2}
+          viaCommand c = stepCamera (either (error . show) id (applyCommand narrow variedFacts c wide))
+      forM_ [ZoomBy 1, SetZoom 8, Pan 0 0, SetFacing FaceSouth, SelectSlice (camClip wide)] $ \c → do
+        camRevision (viaCommand c) `shouldSatisfy` (> camRevision wide)
+        camZoom (viaCommand c) `shouldBe` 2
+      camRevision (stepCamera (ok (refollow narrow variedFacts wide))) `shouldSatisfy` (> camRevision wide)
+      -- Within the range, the same no-op commands change nothing.
+      camRevision (camera' (ZoomBy 1) variedFacts wide) `shouldBe` camRevision wide
     it "refuses every unusable configuration" $ do
       forM_ [cfg {ccHeadroom = -1}, cfg {ccZoomMin = 0}, cfg {ccZoomMin = 3}, cfg {ccZoomMax = 1 / 0}, cfg {ccZoomDefault = 0 / 0}] $ \bad → do
         applyCommand bad variedFacts (SetZoom 1) start `shouldBe` Left InvalidConfig
