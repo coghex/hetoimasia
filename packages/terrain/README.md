@@ -6,10 +6,10 @@ and the pure source, storage and query kernel of the terrain arena arc (epic
 exact rotation, and the one geometric authority that face generation, cutaway
 coverage and picking will share. TRA-2 adds the immutable layered source, the
 packed sparse resident-detail representation and the retained-removal overlay
-with the queries over them. It is a data and query kernel, not a world store:
-residency admission and eviction (TRA-3), transactional ownership, revisions and
-live offload (TRA-4), Lua copying (TRA-5), input, camera, rendering and arena
-assembly belong to later slices.
+with the queries over them, and TRA-3 the pure residency and admission model
+over them. It is a data, query and decision kernel, not a world store:
+transactional ownership, revisions and live offload (TRA-4), Lua copying
+(TRA-5), input, camera, rendering and arena assembly belong to later slices.
 
 | Module | Purpose |
 | --- | --- |
@@ -23,6 +23,7 @@ assembly belong to later slices.
 | `Hetoimasia.Terrain.Palette` | The 12-bit material palette and the 16-bit packed cell |
 | `Hetoimasia.Terrain.Segment` | One known segment of at most 32 levels in uniform, runs or dense encoding |
 | `Hetoimasia.Terrain.Resident` | Sparse resident detail: explicit coverage, materialization, discard, accounting |
+| `Hetoimasia.Terrain.Residency` | The pure residency and admission model: validated limits, banks, admission, eviction, edit reservations, scheduling |
 
 `Hetoimasia.Terrain.Internal.*` are private implementation modules; the package
 does not expose them, and the suite proves a client cannot import them.
@@ -397,8 +398,9 @@ bounded by the caller's level limit. `residentStats` reports segments, known
 cells, payload bytes and metadata bytes separately.
 
 A region key is an index key, never an allocated 16 × 16 × 32 array. Residency
-admission, eviction eligibility and retained-edit reservations (TRA-3), the
-single writer, revisions and the live offload protocol (TRA-4) are not here.
+admission, eviction eligibility and retained-edit reservations are decided by
+[the residency model](#residency-and-admission); the single writer, revisions
+and the live offload protocol (TRA-4) are not here.
 
 ### Growth
 
@@ -425,6 +427,182 @@ scattered), bulk-scan, edit and encoding-transition costs in nanoseconds per
 operation. These are one run on one machine; they make no speedup, universal
 ratio or threshold claim, and the retained-heap figure is larger than the payload
 because it includes object headers and the indexing maps.
+
+## Residency and admission
+
+`Hetoimasia.Terrain.Residency` (TRA-3) decides which regions may be admitted, shared,
+evicted and protected under bounded horizontal and vertical residency. It
+performs nothing: `step :: Model -> Event -> (Model, Either Refusal Report)` takes an
+immutable `Model` and one `Event` and returns the next model with either a typed
+refusal or a report. A refusal returns the model it was given, byte for byte. There
+is no worker, mutable registry, STM or IO, and no Lua or graphics dependency. The
+model is not a second authority for terrain contents: it tracks which cells of
+which region are known, what they cost and who needs them, while the values live in
+`Resident`, `Changes` and `Source`.
+
+### State, owner and lifetime
+
+| Item | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| `Model` | The later terrain service (TRA-4) | Its single owner thread feeds events and reads decisions | That owner thread | The service's | A fresh `newModel`; `RetireArena` releases an incarnation |
+| Identities (arena incarnation, content revision, request, view, hold) | The service | Supplied with events, never reused | Owner | Never wrap | Not allocated here |
+| Job numbers | The model | Allocated by admission, checked | Owner | Until the job completes or is dropped | A refusal when exhausted |
+
+The owner carries out every decision and reports the corresponding event: it
+discards the detail of each victim a decision names and then sends
+`VictimReleased`, runs the job a `Dispatched` decision names and sends
+`JobCompleted` with the cost it actually stored, and so on. The ledgers are derived
+from the model's records, so a credit cannot be freed twice or underflow. Time is
+logical: an event counter orders least-recently-used choices and aging, and no
+deadline or clock is read.
+
+### Validated limits
+
+`LimitsSpec` is plain data; `mkLimits` is the only way to a `Limits`, whose
+constructor and fields are private, so a validated figure cannot be rewritten by
+record update. A limit that is zero or negative (`LimitNotPositive`) or above
+2^40 (`LimitUnrepresentable`) is refused by field and never clamped. There is no
+lower bound relative to the smallest unit charge: a limit smaller than one job
+(for example 337 resident bytes against the 338 a one-cell job reserves) is valid,
+and the work that needs it is refused as permanently invalid, per request.
+`defaultLimits` is the approved initial CPU profile:
+
+| Limit | Initial |
+| --- | --- |
+| Resident terrain bank | 64 MiB |
+| Retained session edit bank | 32 MiB |
+| CPU render and staging bank | 64 MiB |
+| Internal load jobs | 128 |
+| Queued (accepted, unsettled) terrain commands | 256 |
+| Pinned CPU view revisions per view | 2 |
+| Regions in one demand description | 1,024 |
+| Aging threshold (dispatches an eligible job may be passed over) | 8 |
+
+The byte banks are service-wide, never multiplied per arena. The 128 MiB GPU
+data, the arena, view and lease caps and the source, column and input limits
+belong to their owning slices. These budgets are conservative accounting, not a
+process-RSS or measured performance guarantee.
+
+### Who is charged for what
+
+Each cost category is assigned to exactly one bank or slot:
+
+| Category | Bank or slot | Charge |
+| --- | --- | --- |
+| Region metadata, for every resident region however little of it is known | Resident | 256 bytes |
+| Sparse column index entries | Resident | 48 bytes each |
+| Segment metadata | Resident | 32 bytes each |
+| Packed detail payload | Resident | the encoded bytes (reserved at 2 per cell) |
+| Retained removals | Edit | 16 per interval and 48 per column entry (worst case for one removal: 64) |
+| Load scratch | Staging | 256 + 2 per cell |
+| Interest records | Staging | 64 each |
+| Hold records (borrowers and publication pins) | Staging | 64 per region held |
+| Accepted command records | Staging | 128 + 32 per region |
+| The pending latest-value camera description of a view | Staging | 128 + 64 per region named |
+| Removal staging (overlay and affected snapshot) | Staging | 512 |
+| Temporary duplicate during a handoff | Staging | supplied by the owner |
+| Internal load jobs; accepted commands; pins of one view | Slots | one each |
+
+A region count or payload-only estimate is never enough: because region
+metadata is charged, vertical regions holding almost no cells still consume the
+resident bank, and descending cannot grow residency without bound while the
+horizontal column count stays fixed. The model reserves for what the data layer
+will store; when a job completes the owner reports the cost it actually stored
+(`Cost`, taken from `residentStats`), and a larger figure than reserved, or
+arithmetic that does not fit 64 bits, is a contract failure, never silent growth
+or a retroactive busy.
+
+### Admission
+
+Admission is the only point where work answers busy (a hold or handoff duplicate
+admits a small staging record and may answer busy for the same reasons). The atomic
+admission unit is one explicit request covering all of its regions, or one region
+job of a camera demand. A unit reserves every credit together or none, and is fully
+funded at admission from free capacity plus an eviction set chosen and committed in
+the same step; it is never refused afterwards. A job funded by committed victims
+waits only for those victims' `VictimReleased` events, then is queued. A victim
+cannot regain an interest or a hold, and a victim's bytes are never promised twice.
+Checks run in a fixed order and the first failure is reported:
+
+1. **Invalid** (permanent): an empty, oversized or duplicated demand, a region whose
+   minimal reservation exceeds a bank's configured total, or more of a slot than
+   exists. Never busy, so explicit work cannot stay busy forever.
+2. **RetainedEditsExhausted** (edits only): the committed bytes plus this edit exceed
+   the bank even with every reservation returned. It names the bank and persists until
+   an arena's teardown frees retained bytes; the public Lua mapping stays `busy`
+   until then (TRA-5 owns it). Reads, navigation and camera demand continue within
+   their own banks.
+3. **Busy**: the command slot, the job slot, the staging bank, the edit bank (other
+   reservations outstanding) and last the resident bank, whose refusal names the
+   shortfall, the bytes of eligible victims and how many regions each condition
+   keeps out of eviction.
+
+Work is shared by arena incarnation, content revision and region. A caller whose
+cells are already resident or already being loaded only gains an interest; any
+cells that are not get a job of exactly those cells. Disjoint demands in one region
+are never joined by filling the cells between them, and unloaded detail is never
+air. Canceling an interest cancels a job only when no other interest intersects it;
+a running job nobody needs is marked cancelling and keeps its scratch and resident
+reservation until its completion or acknowledgement is reported, and its result is
+dropped.
+
+### Content revisions
+
+A request names the arena's current revision or is stale. Revisions change only at
+`RemovalCommitted`, and a removal changes exactly one region. Work for other regions
+carries over; queued work for the changed region is dropped, running work is
+marked stale and discarded at completion, and the owners whose demand lost work
+are reported.
+
+### Camera demand
+
+Camera demand is latest-value state per view: bounded (a description of at most
+1,024 regions, charged to staging), replaced as a whole, never a queue of pan
+events. Replacing it withdraws only that view's obsolete interests and keeps
+shared work. Each region is admitted as its own unit; what is not admitted stays
+as coalesced pending demand, holds nothing, and is retried by the owner's
+`Service` quantum.
+
+### Eviction, holds and handoffs
+
+A resident region may be chosen as a victim only when it has no interest, no hold
+(borrower or publication pin), no job, no unsettled changes and no handoff in
+flight, and its arena is live. Candidates are taken in least-recently-used order of
+the logical clock, ties by arena and region. Retained edits are never evicted. After
+a removal commits, its region stays protected (dirty) until a handoff transfers its
+changes: the transfer reserves its duplicate in staging, a confirmed transfer needs
+no new edit allocation because the retained bytes were funded at the removal, and a
+failed transfer keeps the changes, the protection and the retained bytes and is not
+retried by the model.
+
+### Scheduling
+
+`Dispatch` chooses one queued job: foreground work (any explicit interest) and any
+job already passed over for the aging threshold first, then the job whose callers
+arrived or were served longest ago (callers take turns, however many regions each
+asked for), then the lowest job number. Progress assumptions: required victims are
+released, required holds are released, and dispatched finite work reports completion.
+Superseded camera work need not finish solely for an obsolete view.
+
+### Arena retirement
+
+`RetireArena` takes an incarnation the owner supplies. It withdraws that
+incarnation's requests, interests and camera demand; its resident, staging and
+retained-edit charges become releasable only after its in-flight jobs, borrowers,
+pins and handoffs acknowledge, in the same step as the last acknowledgement. Later
+results for the incarnation are stale. The owner still performs the real close.
+
+### What later owners must supply
+
+TRA-4 supplies identities, sequencing, the real cells of each job, the measured cost
+of each completed job, the real edit and its commit revision, and the discard of each
+victim. TRA-5 maps refusals to the Lua `busy`. Native memory, GPU ownership and
+retirement, and every GPU limit belong to their render and graphics slices.
+
+Retained trace evidence (separate resident, edit and staging ledgers around
+reservation, cancellation, completion and handoff, vertical turnover, a failed
+handoff, aging, and the negative controls) is in
+[the TRA-3 evidence](../../docs/evidence/terrain/tra3/residency_evidence.md).
 
 ## Reference mapping
 
@@ -507,13 +685,18 @@ with the library, and with literals; the encoding examples assert the approved
 payload table. The suite is built with `-with-rtsopts=-T` for the growth
 examples, and an example that finds the statistics disabled fails. No example's
 expected value is produced by the code it checks. `Test.Support.ExternalClient`
-compiles a client outside the package: one must link and run, and every attempt
-to name a private constructor, forge a value from one, or import a private module
-must be refused for the specific diagnostic that names the cause.
+compiles a client outside the package: two must link and run, and every attempt
+to name a private constructor, forge a value from one, rewrite a validated limit or
+the model's state with record update, or import a private module must be refused for
+the specific diagnostic that names the cause. The residency examples drive the model
+with controlled events (no thread, sleep or deadline), recompute every ledger from
+the model's records after each step, run the model beside the real source, changes
+and resident detail across repeated edit, handoff, evict and reconstruct cycles, and
+check the structural invariants over randomized event sequences.
 
 ## Consumers
 
-TRA-3 and TRA-4 build residency policy and the transactional service on the
-sparse representation and the removal overlay. TRA-5 copies values across the Lua
+TRA-4 builds the transactional service on the sparse representation, the removal
+overlay and the residency model. TRA-5 copies values across the Lua
 boundary. TRA-7 builds camera projection, picking and visible-face planning on `Solid`,
 `sideCoverage`, `castRay` and `castSegment`; TRA-8 compares the visual matrix.

@@ -153,6 +153,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
 | `test.math` | `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct` | no | no | any |
 | `test.terrain` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | no | no | any |
+| `test.terrain-render-2d` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct` | no | no | any |
 | `test.content` | `cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct` | no | no | any |
 | `test.asset-image` | `cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct` | no | no | any |
 | `test.render-api` | `cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct` | no | no | any |
@@ -324,9 +325,26 @@ truncated at 8,192 levels and 1,024 runs; canonical retained removals; the packe
 the payloads of the approved table and on both sides of the run/dense threshold;
 sparse resident detail that materializes exactly the requested cells and
 reconstructs from source plus all retained removals across discard cycles and
-demand orders; and allocation at two widely separated depths and gap widths. A
-client compiled outside the package shows its checked constructors and private
-modules unreachable. It is mandatory but outside the floor, like `test.math`, and
+demand orders; and allocation at two widely separated depths and gap widths. It
+also runs the pure residency and admission model (TRA-3) with controlled events
+and no thread, sleep or deadline, recomputing every ledger from the model's
+records after each step: validated limits (the approved defaults; zero, negative
+and unrepresentable figures refused by field); separate resident, edit and staging
+ledgers around reservation, completion, cancellation and handoff; each bank and
+slot full on its own and permanently invalid work kept apart from busy; shared
+jobs by arena, revision and region that survive one caller canceling and never
+fill the cells between disjoint demands; late, withdrawn and failed results;
+admission funded by a committed eviction whose release arrives later;
+least-recently-used selection that skips held, pinned, changed and in-use
+regions, with vertical and horizontal turnover under fixed caps; camera
+replacement storms and partial admission; foreground priority, caller turns and
+aging; worst-case edit reservation, handoff protection and failure,
+retained-edit exhaustion that still allows reads, and arena retirement; checked
+arithmetic and identity boundaries; repeated edit, handoff, evict and reconstruct
+cycles over the real TRA-2 values; and a randomized event property of the
+structural invariants. A client compiled outside the package shows its checked
+constructors, validated limits, model state and private modules unreachable,
+including through record update. It is mandatory but outside the floor, like `test.math`, and
 runs through `cabal.project.cpu`: the library depends on `base`, `containers`
 and `array` (a GHC boot library) alone, so no native prerequisite exists. The
 package's `terrain-measure` benchmark is not part of this group and asserts
@@ -334,6 +352,33 @@ nothing. Its
 package directory and its two Cabal files are inputs of `test.workflow` as well,
 because the owned-start guard scans every test suite of the packages
 `cabal.project` lists. See [the package's contract](../packages/terrain/README.md).
+
+`test.terrain-render-2d` runs the pure isometric cutaway planner's own suite (TRA-7):
+the exact rebased projection with the 96-pixel tile, 48-pixel top diamond and
+16-pixel elevation proportions, in all four facings, with hand-stated offsets,
+viewport offsets, unequal logical and framebuffer extents, pixel snapping, zero
+extent and non-finite input, and adjacent cells kept distinct at both supported
+axis extremes; the follow and manual cutaway camera as pure state, with the
+separate 25-level headroom, known-empty against unavailable anchor columns, exact
+manual depth, zoom clamping and jumps whose late completions cannot move a newer
+view; the visible faces of all 16 shapes in all four facings, cutaway caps and no
+geometry above the cut, partial-shape contacts decided by the shared wall
+coverage, the 250-level band and deep slices without enumerating the volume,
+unavailable data kept distinct from air with bounded demand and identical
+geometry across chunk and vertical-region seams; deterministic distinct 24-bit
+depth keys checked against an independent exact ray-casting oracle over roof,
+cavity, ramp, corner and disconnected-span scenes and over generated scenes;
+picking that matches the drawn, pixel-snapped quad; every plan limit refused
+rather than truncated; and, through external clients, that the camera, plan and
+view cannot be forged and the private modules are unreachable. It is mandatory
+but outside the floor, like `test.terrain`, and runs through
+`cabal.project.cpu` on the `haskell-engine` worker, with a reusable receipt: the
+library depends on the pure terrain, math, render-2d and render-api packages
+alone. Its package directory and Cabal file are inputs of `test.workflow` as well,
+because the owned-start guard scans every test suite of the packages
+`cabal.project` lists. It proves geometry, order and picking on the CPU, not what
+a GPU draws: that remains TRA-8's offscreen proof. See
+[the package's contract](../packages/terrain-render-2d/README.md).
 
 `test.lua-engine` runs the Lua-first engine package's own suite, `lua-engine-tests`:
 the strict format-1 manifest parsed from supplied bytes -- its accepted examples, the
@@ -1230,7 +1275,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,test.terrain,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,test.terrain,test.terrain-render-2d,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland,test.vulkan-lua-engine-native,test.vulkan-run-native
@@ -1395,7 +1440,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `test.terrain`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `test.terrain`, `test.terrain-render-2d`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`, `test.vulkan-lua-engine-native`, `test.vulkan-run-native` |
