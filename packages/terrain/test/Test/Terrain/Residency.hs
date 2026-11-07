@@ -1016,6 +1016,14 @@ editSpec = describe "retained edits" $ do
     -- The job waits; the removal cannot commit before its growth is funded.
     map requestResidentDeferred (modelRequests m6) `shouldBe` [62]
     stepRefused m6 (RemovalCommitted (RequestId 3) (Revision 1) 64 0) `shouldReturn` ContractFailure (EditNotFunded (RequestId 3))
+  it "counts a removal's growth in the footprint an empty model must hold: 461 refuses, 462 admits" $ do
+    -- A removal's job (400) and the 62 bytes reserved for its rebuilt segment.
+    m0 ← opened (limitsWith $ \x → x {specResidentBytes = 461, specStagingBytes = 4096})
+    stepRefused m0 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 0)) `shouldReturn` Invalid (ExceedsBank ResidentBank 462 461)
+    m1 ← opened (limitsWith $ \x → x {specResidentBytes = 462, specStagingBytes = 4096})
+    (m2, ok) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 0))
+    admissionJobs (admission ok) `shouldBe` [(JobId 0, reg 0 0 0)]
+    ledgersOf m2 `shouldBe` Ledgers (0, 462) (0, 64) (224, 258 + 512)
   it "refuses new edits at the retained bound while reads and navigation continue" $ do
     m0 ← opened roomy
     (m3, _) ← foldM (\(m, rv) i → removeCellAt m a1 rv i (tileAt (16 * i) 0 0)) (m0, rev0) [1, 2, 3]
