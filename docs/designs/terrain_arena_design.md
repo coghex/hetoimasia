@@ -595,6 +595,15 @@ coordinate limits and physical storage. D-11 selects no designed depth floor.
 A cell contract does not itself require
 a dense full-world allocation, cubic storage chunks or a particular array.
 
+Next owner-facing choice, proposed 2026-11-06: include full blocks and slopes
+in the initial terrain contract, while the default flat arena uses full tiles.
+This would establish shared shape meaning for rendering, picking and terrain
+queries before later elevation generation. Sloped authored verification cases
+could exercise that contract without adding procedural hills. A full-block-only
+first contract is the narrower alternative but leaves slope integration for a
+later arc. The recommendation is not yet accepted; the exact slope set,
+partial-height shapes and rules for creating/changing shapes remain open.
+
 ### Q-9. How is terrain represented compactly, including unmaterialized depth?
 
 D-5 selects P-3's compressed-column direction, retaining complete spatial
