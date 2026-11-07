@@ -777,7 +777,7 @@ chooseNamed plan sc expectedAtPixel alternative determinate = concatMap one
       listToMaybe
         [ (need, NamedProbe behaviour (probeAt a) (probeAt b))
         | a ← take 5 (filter ok candidates)
-        , b ← take 5 contrasts
+        , b ← take 5 (filter ok contrasts)
         , differs a b
         ]
     one = \case
