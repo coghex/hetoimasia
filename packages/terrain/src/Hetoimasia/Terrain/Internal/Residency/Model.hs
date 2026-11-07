@@ -783,14 +783,15 @@ settleAll m0 = foldl' settle (m0, []) [a | (a, x) ← Map.toAscList (mArenas m0)
     settle (m, done) a
       | ready m a =
           let keys = [k | k@(a', _) ← Map.keys (mTargets m), a' == a]
-              victims = [k | k ← keys, Just Target {tgResident = Just Residence {rsEvicting = True}} ← [Map.lookup k (mTargets m)]]
-              m1 = m {mTargets = foldr Map.delete (mTargets m) keys, mArenas = Map.delete a (mArenas m)}
-           in (foldl' (flip releaseVictim) m1 victims, done <> [a])
+           in (m {mTargets = foldr Map.delete (mTargets m) keys, mArenas = Map.delete a (mArenas m)}, done <> [a])
       | otherwise = (m, done)
     ready m a =
       null (jobsFor' m a)
         && null [() | h ← Map.elems (mHolds m), hdArena h == a]
         && null [() | ((a', _), Target {tgResident = Just Residence {rsHandoff = Just _}}) ← Map.toList (mTargets m), a' == a]
+        -- A committed victim's credit funds another admission only once the owner
+        -- has reported the physical release: retirement waits for it too.
+        && null [() | ((a', _), Target {tgResident = Just Residence {rsEvicting = True}}) ← Map.toList (mTargets m), a' == a]
     jobsFor' m a = [() | j ← Map.elems (mJobs m), jbArena j == a]
 
 -- ---------------------------------------------------------------------------
@@ -1018,8 +1019,7 @@ applyPlan m arena owner (Plan units funding victims) =
       requestFunding = listToMaybe (drop (length newJobs) funding)
       shared = [demandRegion (upDemand u) | u ← units, isNothing (upJob u)]
       deferredTotal = sum [d | (_, d, _) ← funding]
-      (m4, _, _) = pruneJobs m3
-   in (m4, Admission created shared victims deferredTotal, requestFunding)
+   in (m3, Admission created shared victims deferredTotal, requestFunding)
 
 submit ∷ Model → RequestId → ArenaId → Revision → [RegionDemand] → Maybe (RegionCoord, Coverage) → Run
 submit m rid a rev demands edit = do
@@ -1075,15 +1075,25 @@ setCamera m v a demands = do
   if newBytes > limitBytes limits StagingBank
     then Left (Invalid (ExceedsBank StagingBank newBytes (limitBytes limits StagingBank)))
     else Right ()
-  -- The description and a region job must coexist: a demand whose description
-  -- plus the smallest job it names can never fit staging is permanently invalid.
-  mapM_
-    ( \d →
-        let footprint = newBytes + interestRecordBytes + scratchBytes (demandCoverage d)
-            stagingLimit = limitBytes limits StagingBank
-         in if footprint > stagingLimit then Left (Invalid (ExceedsBank StagingBank footprint stagingLimit)) else Right ()
-    )
-    demands
+  -- What a demand must hold while it completes, all at once, is unavoidable:
+  -- its description and an interest for every region it names (each interest
+  -- stays for as long as the demand does) plus the scratch of the largest job it
+  -- needs. If that exceeds the staging bank, the demand can never be completed:
+  -- permanently invalid. Likewise, every named region stays pinned resident by
+  -- its interest, so the least each can occupy (its metadata, its columns and
+  -- segments, and two payload bytes per segment) must fit the resident bank.
+  let stagingLimit = limitBytes limits StagingBank
+      residentLimit = limitBytes limits ResidentBank
+      count = fromIntegral (length demands) ∷ Word64
+      footprint = newBytes + count * interestRecordBytes + maximum (0 : map (scratchBytes . demandCoverage) demands)
+      leastResident =
+        sum
+          [ regionMetadataBytes + 48 * coverageColumns c + 34 * coverageSegments c
+          | d ← demands
+          , let c = demandCoverage d
+          ]
+  if footprint > stagingLimit then Left (Invalid (ExceedsBank StagingBank footprint stagingLimit)) else Right ()
+  if leastResident > residentLimit then Left (Invalid (ExceedsBank ResidentBank leastResident residentLimit)) else Right ()
   if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
     then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) (newBytes - oldBytes)))
     else Right ()
@@ -1103,25 +1113,28 @@ setCamera m v a demands = do
       (m3, gone, cancelling) = pruneJobs m2
       -- Only pressure leaves a region pending; any other refusal fails the event.
       -- A region that stays pending drops this view's interest in the coverage it
-      -- replaced, so an obsolete interest never survives a replacement.
-      attempt (mm, done, waiting, replaced) d = case planAdmission mm a owner [d] noExtras of
+      -- replaced, so an obsolete interest never survives a replacement. Whatever a
+      -- step leaves without an interest is pruned at once and reported, so the owner
+      -- is told to cancel every job the replacement made obsolete.
+      attempt (mm, done, waiting, replaced, goneAcc, cancelAcc) d = case planAdmission mm a owner [d] noExtras of
         Right plan →
           let (mm', admission, _) = applyPlan mm a owner plan
-           in Right (mm', done <> [admission], waiting, replaced)
+              (mm'', g, c) = pruneJobs mm'
+           in Right (mm'', done <> [admission], waiting, replaced, goneAcc <> g, cancelAcc <> c)
         Left (Busy _) →
           let key = (a, demandRegion d)
               old = Map.lookup key (mTargets mm) >>= Map.lookup owner . tgInterests
            in case old of
-                Just i | inCoverage i /= demandCoverage d → Right (dropInterest mm key, done, waiting <> [demandRegion d], replaced <> [demandRegion d])
-                _ → Right (mm, done, waiting <> [demandRegion d], replaced)
+                Just i | inCoverage i /= demandCoverage d →
+                  let (mm', g, c) = pruneJobs (dropInterest mm key)
+                   in Right (mm', done, waiting <> [demandRegion d], replaced <> [demandRegion d], goneAcc <> g, cancelAcc <> c)
+                _ → Right (mm, done, waiting <> [demandRegion d], replaced, goneAcc, cancelAcc)
         Left other → Left other
-  (m4, admitted, pending, replaced) ← foldM attempt (m3, [], [], []) demands
-  let (m5, gone2, cancelling2) = pruneJobs m4
+  (m4, admitted, pending, replaced, gone1, cancelling1) ← foldM attempt (m3, [], [], [], gone, cancelling) demands
   -- Dropping an obsolete interest may have freed a slot or bytes: offer them to
   -- the regions that stayed pending, once.
-  (m6, admitted2, pending2, _) ← foldM attempt (m5, admitted, [], []) [d | d ← demands, demandRegion d `elem` pending]
-  let (m7, gone3, cancelling3) = pruneJobs m6
-  Right (m7, CameraSet admitted2 pending2 (map snd obsolete <> replaced) (gone <> gone2 <> gone3) (cancelling <> cancelling2 <> cancelling3))
+  (m5, admitted2, pending2, _, gone2, cancelling2) ← foldM attempt (m4, admitted, [], [], gone1, cancelling1) [d | d ← demands, demandRegion d `elem` pending]
+  Right (m5, CameraSet admitted2 pending2 (map snd obsolete <> replaced) gone2 cancelling2)
 
 -- | Retry the pending part of every view's latest camera demand, in view order.
 service ∷ Model → (Model, Decision)

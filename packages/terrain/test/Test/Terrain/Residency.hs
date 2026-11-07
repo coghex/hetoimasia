@@ -644,7 +644,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     map viewPending (modelViews m4) `shouldBe` [[]]
   it "preserves the previous demand when the new description cannot be held" $ do
     -- 900 staging bytes: a 192-byte description plus a region job (64 + 258).
-    m0 ← opened (limitsWith $ \s → s {specStagingBytes = 900})
+    m0 ← opened (limitsWith $ \s → s {specStagingBytes = 900, specResidentBytes = 4000})
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
     ledgersOf m1 `shouldBe` Ledgers (0, 400) (0, 0) (192 + 64, 258)
     -- A description of 4 regions needs 384 bytes, 192 more than is held; 386 are
@@ -714,6 +714,45 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     case reportDecision serviced of
       Serviced [(ViewId 1, a')] → admissionJobs a' `shouldBe` [(JobId 1, reg 0 0 0)]
       other → expectationFailure (show other)
+  it "reports the work a successful replacement made obsolete, so the owner can cancel it" $ do
+    m0 ← opened roomy
+    -- A running job for the old coverage: the replacement is admitted, and the
+    -- running job is reported as awaiting its acknowledgement.
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch]
+    (m2, running) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 5)])
+    case reportDecision running of
+      CameraSet admitted waiting withdrawn cancelled awaiting → (length admitted, waiting, withdrawn, cancelled, awaiting) `shouldBe` (1, [], [], [], [JobId 0])
+      other → expectationFailure (show other)
+    map jobPhase (modelJobs m2) `shouldBe` [JobCancellingPhase, JobQueued]
+    -- A queued job for the old coverage is dropped and reported as such.
+    m3 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
+    (_, queued) ← stepOk m3 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 5)])
+    case reportDecision queued of
+      CameraSet _ waiting withdrawn cancelled awaiting → (waiting, withdrawn, cancelled, awaiting) `shouldBe` ([], [], [JobId 0], [])
+      other → expectationFailure (show other)
+  it "counts every interest a camera demand keeps in the footprint it can never escape" $ do
+    -- Two regions: a 256-byte description, two 64-byte interests that stay for
+    -- as long as the demand does, and the 258 bytes of scratch of one job: 642.
+    let two = [demand (reg i 0 0) (cell 0 0 0) | i ← [0, 1]]
+    m0 ← opened (limitsWith $ \s → s {specStagingBytes = 578})
+    stepRefused m0 (SetCameraDemand (ViewId 1) a1 two) `shouldReturn` Invalid (ExceedsBank StagingBank 642 578)
+    -- At 642 it completes: the first job's scratch is released before the second
+    -- job is admitted, which then fits exactly.
+    m1 ← opened (limitsWith $ \s → s {specStagingBytes = 642})
+    (m2, set) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 two)
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (1, [reg 1 0 0])
+      other → expectationFailure (show other)
+    m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 0) oneCellCost]
+    (m4, serviced) ← stepOk m3 Service
+    case reportDecision serviced of
+      Serviced [(ViewId 1, a')] → admissionJobs a' `shouldBe` [(JobId 1, reg 1 0 0)]
+      other → expectationFailure (show other)
+    map viewPending (modelViews m4) `shouldBe` [[]]
+    -- Pinned by their interests, the regions must also fit the resident bank at
+    -- the least they can occupy: 2 x (256 + 48 + 34) = 676.
+    m5 ← opened (limitsWith $ \s → s {specResidentBytes = 600})
+    stepRefused m5 (SetCameraDemand (ViewId 1) a1 two) `shouldReturn` Invalid (ExceedsBank ResidentBank 676 600)
   it "counts the description in the footprint a camera demand can never escape" $ do
     -- 192 (description) + 64 (interest) + 258 (scratch) = 514 staging bytes.
     m0 ← opened (limitsWith $ \s → s {specStagingBytes = 400})
@@ -994,6 +1033,29 @@ retirementSpec = describe "arena retirement" $ do
     ledgersOf m5 `shouldBe` Ledgers (0, 0) (0, 0) (0, 0)
     stepRefused m5 (q 3 (reg 6 0 0) (cell 0 0 0)) `shouldReturn` Stale (UnknownArena a1)
     stepRefused m5 (RetireArena a1) `shouldReturn` Stale (UnknownArena a1)
+  it "waits for a committed victim's release before settling its arena, so its credit is not reused early" $ do
+    -- 400 resident bytes: arena 1 holds 338; arena 2's 400-byte job is funded by
+    -- committing arena 1's region as its victim.
+    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 400, specStagingBytes = 4096})
+    m1 ← fst <$> stepOk m0 (OpenArena a2 rev0)
+    m2 ← loadCell m1 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
+    (m3, funded) ← stepOk m2 (SubmitQuery (RequestId 2) a2 rev0 [demand (reg 0 0 0) (cell 0 0 0)])
+    admissionVictims (admission funded) `shouldBe` [(a1, reg 0 0 0)]
+    ledgersOf m3 `shouldBe` Ledgers (338, 62) (0, 0) (224, 258)
+    -- The owner has not yet released the victim's detail: retiring arena 1 must
+    -- not hand its credit to arena 2's job.
+    (m4, retiring) ← stepOk m3 (RetireArena a1)
+    reportSettled retiring `shouldBe` []
+    reportFunded retiring `shouldBe` []
+    ledgersOf m4 `shouldBe` Ledgers (338, 62) (0, 0) (224, 258)
+    (_, nothing) ← stepOk m4 Dispatch
+    reportDecision nothing `shouldBe` NothingToDispatch
+    -- The release is the acknowledgement: arena 1 settles and arena 2's job is funded.
+    (m5, released) ← stepOk m4 (VictimReleased a1 (reg 0 0 0))
+    reportSettled released `shouldBe` [a1]
+    reportFunded released `shouldBe` [JobId 1]
+    ledgersOf m5 `shouldBe` Ledgers (0, 400) (0, 0) (224, 258)
+    stepRefused m5 (VictimReleased a1 (reg 0 0 0)) `shouldReturn` Stale (NotEvicting (reg 0 0 0))
   it "requires incarnations to increase and never reuses one" $ do
     m0 ← fst <$> stepOk (newModel tiny) (OpenArena (ArenaId 5) rev0)
     stepRefused m0 (OpenArena (ArenaId 5) rev0) `shouldReturn` Invalid (ArenaNotIncreasing (ArenaId 5))
