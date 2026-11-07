@@ -59,6 +59,10 @@ D-39 approves the shared discovery-work mechanism: distinguish unseen,
 pending and expanded regions; share overlapping fronts, seed new edit-created
 connections and stop only outward branches at known exterior.
 
+D-40 approves temporary per-arena disk backing for retained edits/discovery,
+with a bounded RAM cache and asynchronous I/O. The store is session-only and
+discarded on arena close/reset; exact quota/failure/lifecycle details remain open.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1204,6 +1208,34 @@ its still-open exact source-metadata compiler, shape/component encoding,
 capacity policy, disk backing, API result types or commit/cancellation details.
 Those remain concrete contract work under Q-16/Q-20 and the final Q-19 review.
 
+### D-40. Back retained chunk changes with a temporary session disk store
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that works”
+to the recommendation for temporary disk backing of retained chunk edits and
+discovery, with a bounded RAM cache and asynchronous I/O.
+
+Retained chunk changes can move to a per-arena temporary backing store when
+they leave the active memory working set. Reload reads and replays those
+records before publication, including both terrain edits and revealed state.
+Use bounded RAM caching and asynchronous storage work so retained history need
+not remain entirely in memory and storage I/O does not block camera response.
+Compressed terrain and knowledge remain compressed; this does not require
+writing every unchanged or empty cell.
+
+The store belongs to the arena session and is discarded on arena close/reset.
+There is no user save, restoration across application runs or crash-recovery
+feature in this decision. It preserves D-10/D-33's session lifetime while
+superseding P-5's RAM-only authoritative-retention policy and its hard total
+32 MiB session-history limit. RAM staging/cache and disk consumption still
+need explicit bounds; no unlimited disk allocation is authorized.
+
+Q-20 must specify quotas, record/index format, I/O ownership and scheduling,
+atomic offload/replay, errors and cleanup. An acknowledged edit or revealed
+state cannot be discarded from RAM before a backing copy is safe to replay;
+normal eviction must not erase discovery or remaining reveal obligations.
+The exact write/commit and failure policy remains a concrete design choice.
+Q-19 must include this storage work and qualification in the amended slices.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2106,7 +2138,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-39 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-40 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2145,6 +2177,8 @@ D-38 starts sky and initially exterior-connected spaces discovered and requires
 overlapping unsealing operations to preserve all pending discovery without
 expanding across the exterior. D-39 approves the bounded shared-work mechanism
 in P-7; its remaining concrete representation/capacity choices are still open.
+D-40 approves P-8's temporary session disk backing for retained changes with
+bounded RAM caching; exact storage, quota, failure and lifecycle rules remain open.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2252,22 +2286,21 @@ retained-discovery and pending-work capacity/refusal; API results and coherent
 publication. An enormous/infinite component cannot silently become an
 unbounded allocation, a completed partial reveal or an erased obligation.
 
-### P-8. Session retention backing — proposal, not yet approved
+### P-8. Session retention backing — D-40 approved, concrete details open
 
 The original P-5 keeps retained changes in memory, with a 32 MiB session-edit
 cap and new edits refused once that retention capacity is exhausted. Offloading
 reconstructible terrain does not free the authoritative changes it must retain.
-D-33 now adds retained discovery, including large connected cavities, making
-the backing policy an explicit amendment choice rather than a hidden extension
-of the old edit cap.
+D-33 adds retained discovery, including large connected cavities. D-40 now
+explicitly supersedes the RAM-only retention policy with temporary disk backing;
+the original cap is historical rather than the amended total-history contract.
 
-Recommendation: introduce a temporary per-arena disk backing store for
+D-40 selects a temporary per-arena disk backing store for
 retained chunk edits and discovery, with a bounded RAM cache and asynchronous
 I/O. Keep only the active working set resident; committed retained records
 can be loaded and replayed when their chunks return. This is session storage,
 discarded on arena close/reset, not a user save or cross-run recovery feature.
-It would supersede the RAM-only retention policy if approved. It does not
-authorize unbounded disk consumption or silently store game saves.
+This does not authorize unbounded disk consumption or silently store game saves.
 
 The tradeoff is additional storage/I/O lifecycle and failure handling now.
 The later concrete contract would need quotas, atomic offload, bounded queue
@@ -2275,12 +2308,11 @@ and cache ownership, read/write errors, cleanup and pending-discovery recovery
 within the live arena. In particular, no acknowledged edit or revealed state
 may be evicted from RAM before the retained backing copy is safe to replay.
 
-Alternative: keep session retention RAM-only and expose its hard capacity
-limit. Under that policy, larger exploration can exhaust the knowledge/edit
-store even after resident chunks are evicted; discovery/edits then need an
-explicit refusal/paused-progress policy. Neither alternative makes an infinite
-region exhaustively materializable. This storage choice remains Q-20, and its
-scope must be incorporated in Q-19 before issue revisions are drafted.
+The RAM-only alternative is superseded: it would cap exploration history even
+after resident chunks were evicted. Temporary backing does not make an infinite
+region exhaustively materializable. The storage direction is resolved; its
+concrete quota/failure contract remains Q-20, and its scope must be incorporated
+in Q-19 before issue revisions are drafted.
 
 ## Open questions and review checkpoints
 
@@ -2460,7 +2492,7 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-39. Preserve fog over both solid and air until
+Partially resolved by D-31–D-40. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
@@ -2494,11 +2526,16 @@ exterior, duplicate work or lose unprocessed branches. D-39 approves shared
 pending work, new-edit seeding and stopping only exterior branches. P-7's exact
 representations, source metadata and API/capacity contract remain open.
 
+D-40 chooses temporary per-arena disk backing for retained edits/discovery,
+with bounded RAM caching and asynchronous I/O, discarded on arena close/reset.
+The earlier RAM-only total-history cap is superseded. Exact record/index,
+quota, lifecycle and storage-failure rules remain open.
+
 Still open: specify and review the exact 16-shape solid/empty regions,
 openings and internal connectivity; derive/budget the initial exterior-connected
 knowledge metadata without scanning infinite sky. Specify completion and
-memory-pressure behavior for very large spaces, including P-8's proposed
-temporary disk backing versus the earlier RAM-only retention cap. Specify
+memory-pressure behavior for very large spaces, including P-8/D-40's concrete
+temporary-store cache/staging/disk quotas and write/read failure behavior. Specify
 Lua/engine authority and concrete reset,
 reveal-job resumability and replay/publication boundaries, including the API
 encoding of D-37's no-selectable-target fog result.
