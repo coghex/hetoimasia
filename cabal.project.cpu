@@ -10,6 +10,7 @@ packages:
   packages/content
   packages/math
   packages/terrain
+  packages/terrain-render-2d
   packages/asset
   packages/asset-image
   packages/render-api

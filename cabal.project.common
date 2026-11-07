@@ -28,6 +28,12 @@ package hetoimasia-math
 package hetoimasia-terrain
   ghc-options: -Werror -j
 
+-- The pure isometric cutaway planner and picker (TRA-7) is held to the same
+-- policy. It needs no GLFW or Vulkan, so both `cabal.project` and
+-- `cabal.project.cpu` list it.
+package hetoimasia-terrain-render-2d
+  ghc-options: -Werror -j
+
 package hetoimasia-asset
   ghc-options: -Werror -j
 
