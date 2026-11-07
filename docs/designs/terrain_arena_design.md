@@ -51,6 +51,10 @@ Rendering and screen picking retain face-map coverage as their visual authority.
 D-37 makes generic blank fog tiles non-interactive and unselectable. They
 occlude picks of hidden terrain and produce no player-selectable target.
 
+D-38 makes sky and initially sky-connected cavities discovered from the start,
+without requiring their residency. Concurrent openings of a previously sealed
+cavity must share safe bounded discovery, never expand across the open sky.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1135,6 +1139,44 @@ through fog to hidden solid or air, and normal selection of genuinely visible
 foreground terrain. Reveal/load/reload publication must preserve this rule
 without transiently exposing secret contents.
 
+### D-38. Exterior-connected space starts discovered; overlapping reveals are safe
+
+Owner, directly in this design pane on 2026-11-07, accepted the exterior
+boundary and clarified its meaning:
+
+> open sky should be discovered from the start obviously, and a newly
+> discovered cavity that was exposed to air would already be discovered from
+> that, so any newly discovered caverns would be closed systems, not exposed
+> to air.
+
+The owner also identified the interleaving case: while bounded discovery is
+still progressing, two openings at opposite ends of the same sealed space can
+be made, allowing the traversed space to connect back to the exterior. The
+owner requires logic to handle this and requested engineering guidance rather
+than selecting an algorithm.
+
+Sky/exterior air and spaces already connected to it in the initial terrain
+start discovered. Discovery is distinct from loading: this does not preload
+every exterior-connected cave or allocate a record for every sky cell. A
+space that requires a later unsealing discovery was previously enclosed.
+The initial known set must account for actual connectivity through the agreed
+shape rules, not merely a fixed Z threshold or whether a chunk was loaded.
+
+Subsequent openings must discover the newly reachable enclosed space without
+expanding into open sky, rediscovering the world, losing unfinished branches
+or confusing already-discovered space with pending discovery work. Two fronts
+meeting in the same space must not duplicate unbounded work or cancel each
+other's remaining obligations. Newly created connections must be considered
+even if neighboring terrain has already been processed. Preserve D-32's
+whole-space discovery and D-33's retained knowledge throughout.
+
+This resolves the initial exterior/discovery behavior in Q-20 and supersedes
+any reading of the earlier exterior proposal as initially fogged sky or an
+already-open cave waiting to be unsealed. P-7 below is the recommended
+engineering mechanism, not an owner-approved queue/source representation.
+Exact initial-knowledge derivation, publication/cancellation and capacity
+contracts remain for review before amendment readiness.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2037,7 +2079,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-37 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-38 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2072,6 +2114,9 @@ including real diagonal openings through ramps into unrevealed spaces. Exact
 per-shape geometry, capacity/completion and API authority remain Q-16/Q-20.
 D-37 resolves fog interaction: fog is unselectable, returns no player target
 and blocks screen picks/removal of the terrain it conceals.
+D-38 starts sky and initially exterior-connected spaces discovered and requires
+overlapping unsealing operations to preserve all pending discovery without
+expanding across the exterior. P-7 proposes the bounded shared-work mechanism.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2106,6 +2151,75 @@ The owner chose a follow-up before TRA-12. Exact one-PR slice boundaries,
 dependency insertion and existing-issue revisions await Q-16–Q-20; the ledger
 and delivery plan remain the original filed arc until those changes receive
 sign-off. No final issue bodies are drafted here.
+
+### P-7. Proposed bounded discovery mechanism for overlapping openings
+
+This is an engineering proposal implementing D-31–D-38, not a new D-number or
+a claim that the algorithm is implemented. It builds on P-5's existing single
+terrain owner, serialized edit commits and bounded round-robin work quanta.
+
+1. **Initial knowledge is a source property, not a global sky flood.** Derive
+   or supply compact metadata for the immutable initial source's exterior-
+   connected empty regions and their exposed terrain boundaries. The exterior
+   is implicit; a query can recognize it without allocating/enqueueing sky
+   cells. The current source is bounded authored layers/column runs
+   (`packages/terrain/src/Hetoimasia/Terrain/Source.hs:1–30`), which supports
+   a run/region-level compilation approach; its actual connectivity compiler,
+   accounting and refusal rules still need specification. No claim of a
+   general constant-time exterior oracle is made. Initially known cave
+   detail loads only on demand. Never reclassify an entire newly opened cave
+   as already-processed exterior merely because it now has a path to sky.
+2. **One shared discovery work set per arena.** Track unseen regions,
+   claimed-but-pending work and fully expanded regions separately. Keys must
+   distinguish the logical empty components of a shaped cell/region, so one
+   discovered component cannot expose another disconnected part. Claims and
+   their queue/continuation obligations are installed together by the terrain
+   owner. Discovering/claiming a region is not proof that all of its exits or
+   boundary terrain loads have been processed. Use compressed spans/regions
+   where valid; do not turn this into a dense visited-cell array.
+3. **Edits seed new connectivity in the same commit boundary.** Each accepted
+   removal installs the obligation to inspect its new empty regions and open
+   connections before work can be lost to cancellation/offload. Inspect both
+   sides of newly created connections, including already-known neighbors.
+   A visited bit from before the edit is not permission to ignore a newly
+   opened passage. Reserve the minimal continuation/claim capacity before
+   committing the edit, or refuse admission without a partial edit. Later
+   discovery capacity/failure behavior remains an explicit open contract.
+4. **Process bounded batches, share claims and stop at known exterior.** An
+   unseen reachable region is claimed once and queued. A pending region joins
+   existing work without dropping its queued exits/boundary loads. A completed
+   known region or implicit initial exterior needs no traversal through it;
+   edits that change its connectivity must have supplied new obligations as
+   above. Reaching sky ends that branch, not the entire reveal. The queue is
+   shared, so opposite openings naturally contribute to the same work rather
+   than running unrelated flood fills with conflicting visited sets.
+5. **Version topology and retain obligations.** Revalidate work against arena
+   incarnation and relevant topology changes before publishing it. A removal
+   can merge previously separate empty components; stale component keys must
+   be remapped/re-examined rather than publishing old connectivity. Completed
+   knowledge uses D-33 retention. Pending work is separately arena-owned and
+   must survive ordinary chunk offload; its cancellation/close/reset and
+   publication rules must be specified. A component is complete only when its
+   discovery and required boundary-load obligations are fulfilled, never just
+   because two fronts met.
+
+For the owner's two-opening example: opening A queues one end of the cave;
+opening B queues the other end. Each meets already-known sky at its entrance
+and stops only that outward branch. They traverse the cave until their claims
+meet, reuse the same pending work, and finish all remaining branches and
+boundary loads. A small abstract graph check exercised immediate and delayed
+second openings in both directions, including a side branch: each of eight
+unknown nodes expanded once and sky expanded zero times. This is a design-
+model sanity check, not a repository test, a geometric proof or performance
+evidence. The concrete implementation needs interleaving, chunk-offload,
+capacity, later-edit and partial-shape cases before its claims are qualified.
+
+**Still unresolved:** the exact 16-shape region/portal catalog; source metadata
+for initially exterior-connected spaces (including unbounded authored air
+layers); definition of completion for boundary loading with normal eviction;
+retained-discovery and pending-work capacity/refusal; API results and coherent
+publication. An enormous/infinite component cannot silently become an
+unbounded allocation, a completed partial reveal or an erased obligation.
 
 ## Open questions and review checkpoints
 
@@ -2285,7 +2399,7 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-37. Preserve fog over both solid and air until
+Partially resolved by D-31–D-38. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
@@ -2312,10 +2426,17 @@ D-37 resolves fog interaction: generic blanks are non-interactive and
 unselectable. A fog-covered screen pick gives no player target and does not
 continue through the cover; the temporary removal shortcut does nothing there.
 
+D-38 starts sky and initially sky-connected cavities discovered, without
+requiring all their detail resident. Later discovery applies to previously
+sealed space. Overlapping openings during progressive work must not flood the
+exterior, duplicate work or lose unprocessed branches. P-7 proposes shared
+claims/work and source-provided initial knowledge; it is not yet the final
+approved mechanism or concrete API contract.
+
 Still open: specify and review the exact 16-shape solid/empty regions,
-openings and internal connectivity; distinguish a cavity from unbounded exterior
-air; specify completion and memory-pressure behavior for very large spaces.
-Specify initial known surface, Lua/engine authority and the concrete reset,
+openings and internal connectivity; derive/budget the initial exterior-connected
+knowledge metadata without scanning infinite sky. Specify completion and
+memory-pressure behavior for very large spaces, Lua/engine authority and concrete reset,
 reveal-job resumability and replay/publication boundaries, including the API
 encoding of D-37's no-selectable-target fog result.
 
