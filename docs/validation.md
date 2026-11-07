@@ -153,6 +153,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
 | `test.math` | `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct` | no | no | any |
 | `test.terrain` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | no | no | any |
+| `test.terrain-render-2d` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct` | no | no | any |
 | `test.content` | `cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct` | no | no | any |
 | `test.asset-image` | `cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct` | no | no | any |
 | `test.render-api` | `cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct` | no | no | any |
@@ -351,6 +352,33 @@ nothing. Its
 package directory and its two Cabal files are inputs of `test.workflow` as well,
 because the owned-start guard scans every test suite of the packages
 `cabal.project` lists. See [the package's contract](../packages/terrain/README.md).
+
+`test.terrain-render-2d` runs the pure isometric cutaway planner's own suite (TRA-7):
+the exact rebased projection with the 96-pixel tile, 48-pixel top diamond and
+16-pixel elevation proportions, in all four facings, with hand-stated offsets,
+viewport offsets, unequal logical and framebuffer extents, pixel snapping, zero
+extent and non-finite input, and adjacent cells kept distinct at both supported
+axis extremes; the follow and manual cutaway camera as pure state, with the
+separate 25-level headroom, known-empty against unavailable anchor columns, exact
+manual depth, zoom clamping and jumps whose late completions cannot move a newer
+view; the visible faces of all 16 shapes in all four facings, cutaway caps and no
+geometry above the cut, partial-shape contacts decided by the shared wall
+coverage, the 250-level band and deep slices without enumerating the volume,
+unavailable data kept distinct from air with bounded demand and identical
+geometry across chunk and vertical-region seams; deterministic distinct 24-bit
+depth keys checked against an independent exact ray-casting oracle over roof,
+cavity, ramp, corner and disconnected-span scenes and over generated scenes;
+picking that matches the drawn, pixel-snapped quad; every plan limit refused
+rather than truncated; and, through external clients, that the camera, plan and
+view cannot be forged and the private modules are unreachable. It is mandatory
+but outside the floor, like `test.terrain`, and runs through
+`cabal.project.cpu` on the `haskell-engine` worker, with a reusable receipt: the
+library depends on the pure terrain, math, render-2d and render-api packages
+alone. Its package directory and Cabal file are inputs of `test.workflow` as well,
+because the owned-start guard scans every test suite of the packages
+`cabal.project` lists. It proves geometry, order and picking on the CPU, not what
+a GPU draws: that remains TRA-8's offscreen proof. See
+[the package's contract](../packages/terrain-render-2d/README.md).
 
 `test.lua-engine` runs the Lua-first engine package's own suite, `lua-engine-tests`:
 the strict format-1 manifest parsed from supplied bytes -- its accepted examples, the
@@ -1247,7 +1275,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,test.terrain,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,test.terrain,test.terrain-render-2d,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland,test.vulkan-lua-engine-native,test.vulkan-run-native
@@ -1412,7 +1440,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `test.terrain`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `test.terrain`, `test.terrain-render-2d`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`, `test.vulkan-lua-engine-native`, `test.vulkan-run-native` |
