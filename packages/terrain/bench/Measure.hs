@@ -107,8 +107,8 @@ buildResident source palette requests = do
   let step r (x, y, lo, hi) = either (error . show) snd (materialize 8192 source emptyChanges palette r (column x y) (must (mkZRange lo hi)))
   resident ← evaluate (foldl' step emptyResident requests)
   _ ← evaluate (statKnownCells (residentStats resident))
-  allocAfter ← allocatedBytes
   performMajorGC
+  allocAfter ← allocatedBytes
   liveAfter ← liveBytes
   -- Hold the resident detail past the second collection.
   _ ← evaluate (statSegments (residentStats resident))
