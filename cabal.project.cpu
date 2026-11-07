@@ -9,6 +9,7 @@ packages:
   packages/foundation
   packages/content
   packages/math
+  packages/terrain
   packages/asset
   packages/asset-image
   packages/render-api

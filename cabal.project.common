@@ -22,6 +22,12 @@ package hetoimasia-content
 package hetoimasia-math
   ghc-options: -Werror -j
 
+-- The terrain coordinate and shape-geometry package (TRA-1) is held to the same
+-- policy. It needs no GLFW or Vulkan, so both `cabal.project` and
+-- `cabal.project.cpu` list it.
+package hetoimasia-terrain
+  ghc-options: -Werror -j
+
 package hetoimasia-asset
   ghc-options: -Werror -j
 
