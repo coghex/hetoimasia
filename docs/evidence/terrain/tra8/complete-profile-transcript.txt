@@ -1,0 +1,304 @@
+vulkan: ghc 9.14.1, cabal 3.18.1.0
+vulkan: native prefix /Users/vincentcoghlan/.cache/hetoimasia/native/glfw
+vulkan: VK_DRIVER_FILES=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/MoltenVK_icd.json
+vulkan: VK_LAYER_PATH=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
+vulkan: validation features synchronization
+vulkan: VMA binding calls unsafe (VulkanMemoryAllocator -safe-foreign-calls), build directory /Users/vincentcoghlan/worktrees/coghex/hetoimasia/issue-644-terrain-materials-offscreen/dist-vulkan
+vulkan: repository revision 726c4c2d97e832340b4f3c503ae7cc64e541d8e8
+vulkan: source digest f38fe2fdcb6ec07892a886231a936ba3382b84f9ac65f5b4d6a0582aee7bb564
+vulkan-native-tests: implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
+vulkan-native-tests: layer settings: VK_LAYER_SETTINGS_PATH=/dev/null, so no settings file decides what the layer validates
+
+Vulkan native
+  the native opt-in
+    accepts the desktop opt-in for one run, on either platform [✔]
+    accepts an isolated X11 display only on Linux, and only for the display it names [✔]
+    accepts an isolated Wayland socket only on Linux, only for the socket WAYLAND_DISPLAY names, and never beside a DISPLAY [✔]
+    requests Wayland by name under the isolated compositor's consent, and nothing under any other [✔]
+    takes nothing else as consent: an unset or empty variable, another value, a bare DISPLAY or WAYLAND_DISPLAY, or CI [✔]
+  without a native session
+    A whole run
+      releases the same ten entries, in the same order [✔]
+      retains nothing and destroys every handle in plan order [✔]
+      counts the boundary as an entry that ran and not as a handle destroyed [✔]
+      reports the ordinary destruction rules, not device loss [✔]
+    A present fence that times out
+      retains that slot's present fence and presentation semaphore, the swapchain, and every parent above them [✔]
+      destroys only what does not depend on the unretired present [✔]
+      names the reason on each retained handle [✔]
+      is not device loss, however long the wait went unsatisfied [✔]
+    A teardown boundary that fails without device loss
+      prohibits every release whose safety the boundary was to establish [✔]
+      reports the boundary failure as the reason rather than a presentation [✔]
+      is not discharged by a later valid present fence [✔]
+    Later valid present-fence evidence
+      permits ordered release once the fence signals during teardown [✔]
+    Device loss
+      permits destruction under the specification's own rule [✔]
+      is never reached by promoting a timeout to it [✔]
+      is established by the boundary alone as readily as by a fence [✔]
+    A present rejected out-of-date or surface-lost
+      counts its enqueued operations and holds the slot [✔]
+      releases the slot only on the fence, never on the error result [✔]
+      creates no obligation for the specified no-effect results [✔]
+    An exception in place of a result
+      classifies a thrown Vulkan result as that result [✔]
+      treats an exception carrying no result as evidence of nothing [✔]
+      treats a boundary that threw as a boundary that failed [✔]
+    A run that stopped before the boundary was registered
+      releases what it registered [✔]
+      still withholds when a registered boundary reached no result at all [✔]
+    A recycled slot
+      is not discharged by the completion of the present before it [✔]
+    The record a stopped run renders
+      keeps the failing step and the failed verdict [✔]
+      renders the retained handles, their reasons, and the disposition [✔]
+      still claims nothing the run did not establish [✔]
+    A frame slot whose construction stops
+      releases every child it created when step 0 fails [✔]
+      releases every child it created when step 1 fails [✔]
+      releases every child it created when step 2 fails [✔]
+      releases every child it created when step 3 fails [✔]
+      releases every child it created when step 4 fails [✔]
+      releases every child it created when step 5 fails [✔]
+      releases every child it created when step 6 fails [✔]
+      releases every child it created when step 7 fails [✔]
+      releases every child it created when step 8 fails [✔]
+      releases every child it created when step 9 fails [✔]
+      releases every child it created when step 10 fails [✔]
+      releases every child it created when step 11 fails [✔]
+      creates exactly the prefix of children the failing step allows [✔]
+      destroys a slot's children in dependency order [✔]
+      owns a command buffer through its command pool rather than separately [✔]
+      never destroys a handle the failing step never created [✔]
+    A cleanup entry that holds nothing
+      is neither destroyed nor retained when the construction created nothing [✔]
+      names only the children a partial construction actually created [✔]
+      does not claim a capture handle a stopped capture never created [✔]
+      does not retain an empty place when the boundary failed [✔]
+    A release that fails under device loss
+      still withholds the parents that must outlive what may have survived [✔]
+    A cleanup entry that owns several children
+      records every failure, not only the first [✔]
+      still names the sibling that was destroyed [✔]
+      is not reported as an entry that released [✔]
+    The capture freeing its own handles
+      leaves a failed self-release visible to teardown [✔]
+      withholds the device over what may have survived [✔]
+      does not retry the destroy that failed, and finishes the buffer [✔]
+    A swapchain whose construction stops after it exists
+      releases it before the device when the step after its creation fails [✔]
+    A cancellation at the acquisition-to-registration handoff
+      leaves the handle owned rather than orphaned [✔]
+    A release that fails while a construction failure is being handled
+      keeps the primary failure and records the release failure beside it [✔]
+      continues the independent releases and retries none of them [✔]
+      withholds the parents that must outlive what may have survived [✔]
+      renders both failures in the record a stopped run writes [✔]
+    The capture path
+      owns both handles when it stops while creating the buffer [✔]
+      owns both handles when it stops while allocating the memory [✔]
+      owns both handles when it stops while binding the memory [✔]
+      owns both handles when it stops while acquiring the image [✔]
+      owns both handles when it stops while submitting the copy [✔]
+      owns both handles when it stops while waiting for the copy to complete [✔]
+      owns both handles when it stops while mapping the memory [✔]
+      owns both handles when it stops while presenting [✔]
+      frees the memory before the buffer, as the successful path does [✔]
+      destroys neither handle when it never created it [✔]
+      reports both handles as destroyed rather than only as entries [✔]
+      retains both when the boundary established no completion for the copy [✔]
+      is not held by an unretired present, which touches neither handle [✔]
+    A run that completes
+      frees the capture's two handles itself, exactly once [✔]
+      arrives at teardown holding neither of them [✔]
+      builds both whole slots and releases each child once [✔]
+      releases the same ten entries, in the same order [✔]
+      destroys every object it created, exactly once and before its device [✔]
+    A cancellation taken at the present handoff
+      records the presentation the enqueue created before it is taken [✔]
+      preserves the result the present reported rather than the exception that stopped the run [✔]
+      stops the run at the presentation step, carrying the cancellation's own failure [✔]
+      keeps teardown's own boundary and fence-wait observations beside it [✔]
+      retains the slot's present fence and presentation semaphore, the swapchain, and every parent [✔]
+      names each retained handle and why it was retained [✔]
+    A cancellation at the handoff of a recycled slot
+      records the new present rather than carrying the retired one forward [✔]
+      reopens the obligation the earlier present's completion had closed [✔]
+      retains exactly what the fresh slot's cancellation retains [✔]
+    A present handoff no cancellation reaches
+      records the result and returns, exactly as it did before [✔]
+      leaves the caller unmasked, so the waits after it are as interruptible as ever [✔]
+      keeps the classification of a call that threw [✔]
+    The loaded Vulkan loader
+      accepts the recorded loader [✔]
+      refuses an alternate loader found ahead of it on the search path, naming both [✔]
+      refuses a run whose runner named no recorded loader [✔]
+      refuses an entry point attributed to no image [✔]
+    A native fixture's instance scope
+      VK-6's capture session
+        over injected operations
+          returns the body's result and the destruction's evidence when everything succeeds [✔]
+          rethrows the body's failure, with its context and nothing retained, when the body fails and the destruction returns [✔]
+          rethrows the body's failure, with its context, and keeps the destruction's failure beside it, when both fail [✔]
+          fails with the destruction's failure, retained under its label, and returns neither result nor evidence, when only the destruction fails [✔]
+          keeps a messenger destruction's failure under the messenger's label, and still destroys the instance once [✔]
+          runs neither the body nor a destruction when the instance is never created [✔]
+        inside the production diagnostic lifetime
+          is quiescent, and returns the body's result, when everything succeeds [✔]
+          stops for the body's failure, with its verdict attached, quiescent when the destruction returned while it unwound [✔]
+          stops for the body's failure, not the destruction's, and is not quiescent, when both fail [✔]
+          stops for the destruction's failure, and is not quiescent, when only the destruction fails [✔]
+      the synchronization hazard
+        over injected operations
+          returns the body's result and the destruction's evidence when everything succeeds [✔]
+          rethrows the body's failure, with its context and nothing retained, when the body fails and the destruction returns [✔]
+          rethrows the body's failure, with its context, and keeps the destruction's failure beside it, when both fail [✔]
+          fails with the destruction's failure, retained under its label, and returns neither result nor evidence, when only the destruction fails [✔]
+          keeps a messenger destruction's failure under the messenger's label, and still destroys the instance once [✔]
+          runs neither the body nor a destruction when the instance is never created [✔]
+        inside the production diagnostic lifetime
+          is quiescent, and returns the body's result, when everything succeeds [✔]
+          stops for the body's failure, with its verdict attached, quiescent when the destruction returned while it unwound [✔]
+          stops for the body's failure, not the destruction's, and is not quiescent, when both fail [✔]
+          stops for the destruction's failure, and is not quiescent, when only the destruction fails [✔]
+    a bounded child launcher
+      owns no reader or pipe handle after a child that exits with its output complete [✔]
+      owns no reader or pipe handle after giving up on output a writer in another session holds open, and keeps what was read [✔]
+      owns no reader or pipe handle when an interruption reaches the launch, and propagates the interruption [✔]
+      the launcher thread of an interrupted launch is owned (#596)
+        has ended and been joined, and its child is reaped, when the example fails while the launcher is parked at its child [✔]
+        negative control: the unowned launcher start leaves the launcher and its child when the example fails while the launcher is parked at its child [✔]
+        has ended and been joined, and its child is reaped, when the example is cancelled while the launcher is parked at its child [✔]
+        negative control: the unowned launcher start leaves the launcher and its child when the example is cancelled while the launcher is parked at its child [✔]
+      returns the status and output of every short-lived child, however soon it is reaped [✔]
+      propagates the exception that ended a launch with the context it carried, and still reclaims [✔]
+      owns no pipe handle when setup fails after the child started, and propagates the failure [✔]
+      owns no pipe handle when setup fails after its reaper, and propagates the failure [✔]
+      owns no pipe handle when setup fails after its readers, and propagates the failure [✔]
+    the shared fixture's borrower is owned (#596)
+      the borrower is ended and joined, and its work reported, as before
+        returns the borrower's result with the report when nothing was requested [✔]
+        reports a session that failed and still returns what the borrower finished with, after the wait for it [✔]
+        raises the borrower's own failure, after the borrower has been joined [✔]
+      has ended and been joined when serving is cancelled while the dispatch is idle and the borrower is parked [✔]
+      negative control: the unowned start leaves the borrower running when serving is cancelled while the dispatch is idle and the borrower is parked [✔]
+      has ended and been joined when serving is cancelled while the session is being served and the borrower waits for it [✔]
+      negative control: the unowned start leaves the borrower running when serving is cancelled while the session is being served and the borrower waits for it [✔]
+      has ended and been joined when serving is cancelled while the dispatch waits for a borrower parked after the session failed [✔]
+      negative control: the unowned start leaves the borrower running when serving is cancelled while the dispatch waits for a borrower parked after the session failed [✔]
+      has ended and been joined when the session failed, was reported, and the borrower is parked where nothing ends it (no cancellation follows) [✔]
+      negative control: the unowned start leaves the borrower running when the session failed, was reported, and the borrower is parked where nothing ends it (no cancellation follows) [✔]
+      has ended and been joined when a cancellation escapes the session, which is not a failure of the session, while the borrower waits for it [✔]
+      negative control: the unowned start leaves the borrower running when a cancellation escapes the session, which is not a failure of the session, while the borrower waits for it [✔]
+    the negative controls' own cleanup (#596)
+      is not abandoned by a cancellation delivered while the kill is blocked, so the worker it registered is stopped and joined [✔]
+      negative control: an interruptible cleanup is abandoned by that cancellation and leaves the worker alive [✔]
+      unwinds by itself, its worker ended, when the example is cancelled after the kill blocks and before the worker is let go [✔]
+      negative control: without the gate opened by the runner's scope and the independent stop, that cancellation leaves the example unable to unwind [✔]
+  the shared roots
+    entered GLFW on the backend the run's consent names, before any example renders [✔]
+    runs every dispatched operation on the process main thread that entered the session [✔]
+    creates the instance and its explicit messenger on the graphics owner's thread, never the main thread [✔]
+    hands two windows over as required targets on one shared device, and keeps the roots live when the first-created closes [✔]
+    VK-10 generation: 320x240 from ExtentFromSurface, window 160x120 at content scale 2.0, 3 images of format 50
+    builds a generation on the owner's thread from the surface's extent and the profile's format, the framebuffer's pixels rather than the window's size [✔]
+    replaces a generation after a resize through the main-thread dispatch, retiring the old one only after its hold ends [✔]
+    replaces a lost surface through the bridge on the main thread under the same attachment, leaving another window's target presenting [✔]
+    serves a later example's target from the same device [✔]
+  with private roots in a child process
+    proves the VK-2 compatibility profile, presentation completion, safe abandonment and capture [✔]
+    proves VK-6's C-only validation capture on an instance of its own [✔]
+    proves VK-5's loader-aware surface bridge in a session of its own [✔]
+    proves VK-7's roots under the graphics owner, through their destruction at the host's exit [✔]
+    records and discards a triangle batch through VK-11's managed resources, with validation reporting nothing [✔]
+    acquires, submits and awaits a triangle batch with its capture, and returns images without presenting, with validation reporting nothing [✔]
+    presents to two windows on verified present fences, retires a resized generation and the first window on that evidence, with validation reporting nothing [✔]
+    replaces a lost surface on its live window while another presents, and recovers an allocation by reclaiming a retired generation, with validation reporting nothing [✔]
+    stops rendering at the checkpoint after an injected validation error, tearing down under the ordinary rules with the error as the primary and the final callbacks in the verdict [✔]
+    reports a deliberately retained unverified generation and its parents rather than releasing them, and ends by process termination [✔]
+    renders two targets through the composed loop, suspending and resuming one while the other presents, and exits through D-33 with validation reporting nothing [✔]
+    publishes a scene for each of two windows, presenting to the published window alone with a frame cleared to its scene's colour, and runs a release request only once the second window has adopted the revision current when it was made, with validation reporting nothing [✔]
+    renders the image2d sample's PNG in a world layer and a UI layer and its KTX2 image offscreen through the 2D recorder and passes every determinate probe of the render-2d oracle and every named probe's hand-stated colour, shows the swap rule refusing a different mark and accepting it kept, and defers a texture's release, requested while the adopted snapshot shows it, until a snapshot without it is adopted, refusing a snapshot that names it, through the per-window adapter and the host's adoption callbacks, with validation reporting nothing [✔]
+    renders the triangle sample in two windows with one frame slot, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing [✔]
+    renders the triangle sample in two windows with two frame slots, capturing each, the first again after its resize, and the second after the first closes, with validation reporting nothing [✔]
+    captures a consumer-built triangle from two targets through the production host, each beside its frame's verified presentation, with validation reporting nothing [✔]
+    creates the device with no surface and no window, builds and releases a pipeline through owner-thread actions, and retires cleanly, with validation reporting nothing [✔]
+    creates the device with no surface, then admits a window against its queue family and presents to it, with validation reporting nothing [✔]
+    orders a managed depth target and buffer through checked transitions and boundary barriers across two batches submitted in order, with synchronization validation reporting nothing [✔]
+    records frame-less batches through owner-thread actions in a surface-free session, submits each when its action returns, waits for their tickets and retires cleanly, with validation reporting nothing [✔]
+    renders into managed RGBA8 color targets, sRGB and linear, in frame-less batches of a surface-free session, copies each to a readback buffer after its transition, and reads exact bytes inside and outside the triangle, with validation reporting nothing [✔]
+    draws an indexed, instanced quad from the shared ring's regions with a pushed color into an RGBA8 color target in a frame-less batch of a surface-free session, and reads exact bytes inside each quad and outside both, with validation reporting nothing [✔]
+    uploads an RGBA8 texture of two levels over several turns, a BC7 one where the device takes it, and vertex, offset and index buffers through bounded staging in a surface-free session, admitted off the owner's thread and waited for with a deadline; copies every level back exactly and draws from the buffers, with validation reporting nothing [✔]
+    samples textures through bindless handles in frame-less batches of a surface-free session: the transparent placeholder before an upload, two uploaded textures each with its own sampler, and a batch recorded before its texture's release and submitted after it drawing the original, whose slot is reused only once that batch completes, with validation reporting nothing [✔]
+    draws four instances of one two-texel texture in a single draw call of a frame-less batch of a surface-free session, through a shader-sampled table layout and no selected sampler: one instance with nearest/clamp-to-edge, one with linear/clamp-to-edge, one with sampler index 7 and one with 3, reads the target back, and checks that the nearest instance reads the texel exactly, the linear one the blend within one step, and index 7 as sampler 3, with validation reporting nothing [✔]
+    records eleven render-2d snapshots through the ordered path into offscreen targets of a surface-free session — zoom modes with pixel snap, mixed samplers, a quarter-turn camera, tint, brightness and additive output, overlap order, UI content scales, fractional views, sRGB and UNORM targets, cutout art drawn ordered, placeholder handles and a snapping origin just below one half — reads each target back after completion, passes every determinate probe of the render-2d oracle with each named behaviour distinguished from its contrast, and writes lossless PNGs and a probe record, with validation reporting nothing [✔]
+    records seven render-2d snapshots with cutout art depth-tested in world layers into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — cutouts and translucent instances interleaved, both equal-key rules, a discarded fragment exposing farther art, a filtered edge writing white, a minified texture sampling its mips, two depth-enabled layers with independent keys, and a UI layer and a world layer without depth in the same pass — reads each back after completion, judges every pixel against the render-2d oracle, and writes a lossless PNG a target and a probe record naming the depth format and every indeterminate reason; where the device chooses another depth format it reports that and checks the recorder's refusal [✔]
+    records seven render-2d snapshots whose instances carry clip indices into their views' clip tables into offscreen targets of a surface-free session, the batch's tables written into one ring region and bound as the storage table and the fragment stage discarding outside each instance's clip — an unclipped, a clipped and a nested-clipped instance in one draw under a camera turned an eighth of a turn, two views whose one clip index selects each view's own rectangle, a UI clip at content scale 2 in a viewport away from the origin, a clip under pixel snap and zoom that neither follows a sprite's origin snap nor ignores the view's snapped translation, a view of world coordinates near 65536 at a zoom of 100 whose clip edge an absolute single-precision coordinate would misplace by most of a pixel, a clipped-away cutout that writes no depth, and an empty clip with a clip under one — reads each target back after completion, passes every determinate probe of the render-2d oracle with each named behaviour distinguished from its contrast, and writes lossless PNGs and a probe record, with validation reporting nothing [✔]
+    records eleven frames of render-2d snapshots that list retained chunks built once beside dynamic content that alone is republished, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — retained cutouts and a translucent instance interleaved with dynamic cutouts, a world chunk without depth and a UI chunk drawn in the ordered path beside dynamic content, a texture swap showing through a chunk and a mark-changing swap refused, a chunk released while the adopted snapshot shows it and still drawn until a snapshot without it is adopted, and a chunk outside a view skipped — reads each back after completion, judges every pixel against the render-2d oracle, and writes a lossless PNG a target, a probe record and the bytes uploaded and written to the ring; where the device chooses another depth format it reports that [✔]
+    records six frames of render-2d snapshots that name application materials defined by a Template Haskell splice, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — the sample material's second texture through a record in the ordered and the cutout paths, a push block that changes the colour, default and application materials split into runs, a chunk carrying its own records, and a released texture's index reused with its old handle sampling the placeholder — reads each back after completion, judges every pixel against the render-2d oracle given a model of each material, and writes a lossless PNG a target and a probe record; where the device chooses another depth format it reports that [✔]
+    draws plans of the terrain arena's faces through the existing fixed-quad and material ABI into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — the 16 shape identities in each of 4 facings, roofs over cavities, disconnected spans, ramps and corners, manual and automatic cutaways, a floor 70 levels below the cut, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, the same scene submitted in plan order, scrambled, split between two materials and split between retained chunks, transparent coverage, and three negative controls — reads each back after its batch completed, judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated line-of-sight expectation, compares the pure pick, and writes a lossless PNG a target, a probe record and a fixture record; where the device chooses another depth format it reports that it cannot qualify, and fails [✔]
+    records nine render-2d snapshots whose instances name a frame table of their view, with the view's animation time, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — an animated dynamic sprite and an animated tile of a retained chunk built once and never rebuilt, at times including one near 10^6 seconds and times exactly on frame boundaries, the same chunk drawn in two views with different tables and times, a non-animated instance in the same draw, and the two counterexamples to a 32-bit phase — the batch's frame tables written into its storage region and the vertex stage reading each instance's rectangle from the current frame of its table, reads each target back after completion, judges every pixel against the render-2d oracle and each named colour against the frame worked out by hand, and writes a lossless PNG a target and a probe record; where the device chooses another depth format it reports that [✔]
+    draws twice in one batch of a frame-less batch of a surface-free session, through a shader-sampled table layout that also holds set 2 and no selected sampler: two per-batch tables are written into regions of a ring made with a storage-table window, and each is bound at its own dynamic offset before its draw, whose fragment shader reads its colour from the bound table; reads the target back and checks that each draw shows its own table's colour exactly, with validation reporting nothing [✔]
+    draws the sprites sample's scene of instanced textured quads through texture handles with premultiplied-alpha blending in a frame-less batch of a surface-free session, reads the target back after completion, passes every probe of the independent oracle and writes a lossless PNG and a probe record, with validation reporting nothing [✔]
+    swaps the sprites sample's atlas under its texture handle in a surface-free session: the frame before the swap and a frame recorded before it and submitted after it sample the atlas, the frame after it samples the replacement from the same instance data, every probe passes the independent oracle, and the atlas's slot is reused only once the delayed frame completes, with validation reporting nothing [✔]
+    draws the scene3d sample's two flat-coloured cubes with a depth test from two camera poses into a colour target and a depth target in frame-less batches of a surface-free session, reads each pose back after completion, passes every probe of the independent oracle — the nearer cube, drawn first, showing where the cubes overlap — and writes a lossless PNG a pose and a probe record, with validation reporting nothing [✔]
+    clears a rectangle of a D32_SFLOAT depth attachment to 1.0 inside a pass that cleared it to 0.0, draws a full-target quad at depth 0.5 with a less-or-equal test in a frame-less batch of a surface-free session, and reads exact bytes: the quad inside the rectangle and the pass's clear outside it, on both sides of each edge, with synchronization validation reporting nothing [✔]
+    draws the scene3d sample's two flat-coloured cubes with a depth test into a window's own image with the depth image of its swapchain generation, captures a frame and passes every probe of the independent oracle — the nearer cube, drawn first, showing where the cubes overlap — resizes the window and captures a frame of the generation built at the new size, which gave itself a depth image of its own, with synchronization validation reporting nothing [✔]
+    grows the texture table of a surface-free session twice to a cap that is no power of two, samples correctly from a batch recorded before a growth and submitted after it, draws textures registered before and after growth with a pipeline built before it, and answers backpressure at the cap, with validation reporting nothing [✔]
+    observes a deliberate synchronization hazard, proving synchronization validation active [✔]
+    carries a provoked validation report's named managed resource, and its batch's label, into the capture [✔]
+    ends its own compositor while the production host renders to a Wayland surface, and the session ends terminally with the loss, retired under the protected boundary with no completion recorded for interrupted work [‐]
+      # PENDING: this case ends a Wayland compositor, and runs only under the isolated compositor's consent (tools/display/wayland.sh)
+  graphics-owner progress during window interactions
+    records the native pump, the callbacks inside it, owner turns, and the graphics owner's present requests and present-fence completions while a person moves, resizes, and uses the menu bar [‐]
+      # PENDING: the graphics-owner interaction probe runs only when HETOIMASIA_INTERACTION_PROBE_SECONDS names the seconds each phase lasts, and it needs a person at the desktop
+
+Finished in 21.0731 seconds
+199 examples, 0 failures, 2 pending
+vulkan-native-tests: shared session acquisitions: 1
+vulkan-native-tests: shared session native calls: 145
+vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
+vulkan-native-tests: shared session verdict: clean, 70 records delivered
+vulkan-native-tests: private debug-names: ExitSuccess in 0.170334s
+vulkan-native-tests: private grs10-scene3d: ExitSuccess in 0.20567s
+vulkan-native-tests: private grs12-frameless: ExitSuccess in 0.145992s
+vulkan-native-tests: private grs13-window-depth: ExitSuccess in 0.709588s
+vulkan-native-tests: private grs14-table-growth: ExitSuccess in 0.258579s
+vulkan-native-tests: private grs15-surface-free: ExitSuccess in 0.113669s
+vulkan-native-tests: private grs15-surface-free-window: ExitSuccess in 0.18199s
+vulkan-native-tests: private grs3-ordering: ExitSuccess in 0.218823s
+vulkan-native-tests: private grs4-drawing: ExitSuccess in 0.152175s
+vulkan-native-tests: private grs5-offscreen: ExitSuccess in 0.160525s
+vulkan-native-tests: private grs6-uploads: ExitSuccess in 0.149408s
+vulkan-native-tests: private grs7-texture-table: ExitSuccess in 0.256181s
+vulkan-native-tests: private grs8-sprites: ExitSuccess in 0.245596s
+vulkan-native-tests: private grs9-swap: ExitSuccess in 0.204539s
+vulkan-native-tests: private r2d10-retained: ExitSuccess in 0.619681s
+vulkan-native-tests: private r2d11-materials: ExitSuccess in 0.596649s
+vulkan-native-tests: private r2d12-clip: ExitSuccess in 0.293619s
+vulkan-native-tests: private r2d14-window-scenes: ExitSuccess in 0.201701s
+vulkan-native-tests: private r2d15-storage-tables: ExitSuccess in 0.188132s
+vulkan-native-tests: private r2d16-shader-samplers: ExitSuccess in 0.244015s
+vulkan-native-tests: private r2d17-depth-rect: ExitSuccess in 0.127634s
+vulkan-native-tests: private r2d18-animation: ExitSuccess in 0.319812s
+vulkan-native-tests: private r2d7-ordered-path: ExitSuccess in 0.429619s
+vulkan-native-tests: private r2d8-image: ExitSuccess in 1.900888s
+vulkan-native-tests: private r2d9-cutout-depth: ExitSuccess in 0.358867s
+vulkan-native-tests: private synchronization-hazard: ExitSuccess in 4.8586e-2s
+vulkan-native-tests: private tra8-terrain: ExitSuccess in 6.745854s
+vulkan-native-tests: private vk11-recording: ExitSuccess in 0.237141s
+vulkan-native-tests: private vk12-frames: ExitSuccess in 0.217525s
+vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.275536s
+vulkan-native-tests: private vk14-recovery: ExitSuccess in 0.271372s
+vulkan-native-tests: private vk15-retention: ExitSuccess in 0.136145s
+vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 0.205181s
+vulkan-native-tests: private vk16-composed: ExitSuccess in 0.263129s
+vulkan-native-tests: private vk17-one-slot: ExitSuccess in 0.424369s
+vulkan-native-tests: private vk17-two-slots: ExitSuccess in 0.282775s
+vulkan-native-tests: private vk19-capture: ExitSuccess in 0.208851s
+vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.637114s
+vulkan-native-tests: private vk5-bridge: ExitSuccess in 0.158821s
+vulkan-native-tests: private vk6-capture: ExitSuccess in 5.9882e-2s
+vulkan-native-tests: private vk7-roots: ExitSuccess in 0.179126s
+vulkan-native-tests: the process ran for 21.085494s, fixtures, examples and teardown included
