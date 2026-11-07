@@ -186,7 +186,8 @@ surfaces (Env sheets) sc step =
     camera = sceneCameraFollowed sc
     plan = either (\e → error ("surfaces plan: " <> show e)) id (scenePlan sc)
 
--- | Judge one scene on a stride of its pixel centres.
+-- | Judge one scene on a stride of its pixel centres. For a scene whose view snaps,
+-- only the pick is compared (see below).
 judge ∷ Env → Config → Int → Scene → Judged
 judge env config step sc = foldr tally (Judged 0 0 [] 0 0 0) (map one (sampled step (sceneTarget sc)))
   where
@@ -262,7 +263,15 @@ judge env config step sc = foldr tally (Judged 0 0 [] 0 0 0) (map one (sampled s
                     hole = case expectation of
                       ExpectedHit {expectedShown = Nothing} → True
                       _ → revealed
-                 in Compared (frontProblem <> surfaceProblem <> pickProblem <> shownProblem) hole revealed (expectedFront /= Nothing)
+                 in Compared
+                      -- Pixel snapping moves each instance's origin to the pixel grid separately, which
+                      -- this judge's polygons and quads, in the unsnapped render world, do not model; the
+                      -- pick does (it draws the outline as the recorder places it), and the device's
+                      -- pixels are judged by the oracle and the independent expectation, both of which do.
+                      (if sceneSnap sc then pickProblem else frontProblem <> surfaceProblem <> pickProblem <> shownProblem)
+                      hole
+                      revealed
+                      (expectedFront /= Nothing)
 
     -- The nearest face whose texel is not transparent, through the pure model:
     -- Left when the model is undecided (a mask edge or a texel boundary) before one is found.

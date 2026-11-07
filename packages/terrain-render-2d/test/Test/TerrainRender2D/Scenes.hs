@@ -112,15 +112,18 @@ spec = beforeAll loadEnv $ describe "Terrain scenes against the hand-stated expe
       _ ← agrees env sc
       pure ()
     it "a target of content scale 2" $ \env → () <$ agrees env scaledTarget
-    it "pixel snapping at native scale with the camera off the pixel grid, which moves pixels the unsnapped view keeps" $ \env → do
+    it "pixel snapping at native scale with the camera off the pixel grid, which draws pixels (edges and texels) the unsnapped view draws differently" $ \env → do
       let unsnapped = snapped {sceneSnap = False}
           Env sheets = env
           art = (`Map.lookup` sheets)
           expectation sc = [expectedAt art sc (sceneCameraFollowed sc) (either (\e → error (show e)) id (scenePlan sc)) p | p ← [(x, y) | x ← [0 .. fst (sceneTarget sc) - 1], y ← [0 .. snd (sceneTarget sc) - 1]]]
-          decided e = case e of
-            Ambiguous _ → False
-            _ → True
-          differing = [() | (a, b) ← zip (expectation snapped) (expectation unsnapped), decided a, decided b, a /= b]
+          shown e = case e of
+            ExpectedHit {expectedShown = Just (_, (r, g, b, _))} → Just (fromIntegral r ∷ Int, fromIntegral g ∷ Int, fromIntegral b ∷ Int)
+            ExpectedHit {} → Just (0, 0, 0)
+            ExpectedClear → Just (0, 0, 0)
+            Ambiguous _ → Nothing
+          differs (r, g, b) (r', g', b') = any (> 2) [abs (r - r'), abs (g - g'), abs (b - b')]
+          differing = [() | (a, b) ← zip (expectation snapped) (expectation unsnapped), Just x ← [shown a], Just y ← [shown b], differs x y]
       length differing `shouldSatisfy` (> 20)
       () <$ agrees env snapped
 

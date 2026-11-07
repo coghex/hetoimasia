@@ -242,7 +242,7 @@ capTarget (cw, ch) sc =
     { sceneTarget = (w, h)
     , sceneLogical = (w `div` scaleOf, h `div` scaleOf)
     , sceneViewport = (0, 0, fromIntegral w, fromIntegral h)
-    , scenePan = if sceneSnap sc then (0.2, 0.12) else (0.0048, 0.0226)
+    , scenePan = if sceneSnap sc then (0.20521, 0.11563) else (0.0048, 0.0226)
     }
   where
     (w0, h0) = sceneTarget sc
@@ -286,7 +286,19 @@ scaledTarget = fitScene 8 ((rampsCorners FaceEast) {sceneName = "scaled", sceneS
 -- view's translation to the pixel grid and the image differs from the unsnapped
 -- one.
 snapped ∷ Scene
-snapped = capTarget (96, 64) (fitScene 3 ((rampsCorners FaceSouth) {sceneName = "snapped", sceneSnap = True, sceneZoom = 2, sceneMode = ManualAt 2 1}))
+snapped =
+  capTarget (96, 64) $
+    fitScene 3 $
+      let base = rampsCorners FaceSouth
+       in base
+            { sceneName = "snapped"
+            , sceneSnap = True
+            , sceneZoom = 1
+            , sceneMode = ManualAt 2 1
+            , -- The technical sheet, whose neighbouring texels differ by more than any tolerance:
+              -- a shift of the sampling by snapping is then a different colour.
+              sceneCells = [c {cellMaterial = "diagnostic"} | c ← sceneCells base]
+            }
 
 -- ---------------------------------------------------------------------------
 -- Layout

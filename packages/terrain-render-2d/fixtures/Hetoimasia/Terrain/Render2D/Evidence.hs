@@ -251,9 +251,10 @@ data ArtPixels = ArtPixels
   }
 
 -- | A technical diagnostic sheet, not artwork: 96 × 64, every opaque texel
--- unique to its place (red grows with the column, green with the row, blue with
--- their sum), so a mirrored, flipped, shifted or transposed sampling cannot
--- agree with it; blocks of 6 × 6 texels on a lattice of 24 × 20 from (9, 5) are
+-- distinct from its neighbours by at least 6 steps of a channel (red steps 6 with
+-- the column, green 7 with the row, blue 1 with their sum, wrapping), so a
+-- mirrored, flipped, shifted or transposed sampling cannot agree with it and a
+-- sampling shifted by one texel is farther than any tolerance; blocks of 6 × 6 texels on a lattice of 24 × 20 from (9, 5) are
 -- transparent (binary alpha), the places a transparent part of a quad must
 -- show what lies behind.
 diagnosticSheet ∷ ArtPixels
@@ -261,7 +262,7 @@ diagnosticSheet = ArtPixels 96 64 texel
   where
     texel x y
       | (x - 9) `mod` 24 < 6 && (y - 5) `mod` 20 < 6 && x >= 9 && y >= 5 = (0, 0, 0, 0)
-      | otherwise = (byte (2 * x + 20), byte (3 * y + 30), byte (x + y + 40), 255)
+      | otherwise = (byte (6 * x + 20), byte (7 * y + 30), byte (x + y + 40), 255)
     byte ∷ Int → Word8
     byte = fromIntegral
 
