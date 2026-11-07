@@ -1089,7 +1089,7 @@ never silently truncated.
 | `api.terrain.release(arena)` | Release this instance's lease; releasing the creator's final owner lease closes the arena, invalidates attached authority and cancels outstanding requests. Instance exit closes owned arenas. |
 | `api.terrainView.open(window, arena, style)` | Presentation-only `OptionalRequest` through `api.request`, yielding a view with instance-owned window/texture authorities and a separate terrain publication path. One terrain view owns the window's presentation while attached. |
 | `api.terrainView.move(view, {x,y} [, z])` | Async jump as an `OptionalRequest` through `api.request`; default surface following or explicit manual Z. Newest jump identity wins; canceled/older results cannot reposition the camera. |
-| `api.terrainView.configure(view, changes)` | Bounded nonwaiting latest-intent update: pan delta, zoom, facing or slice. Success is `true,nil`; temporary pressure is `nil,{code="busy",...}` with no partial change. Applied coherently; slice enters manual mode. |
+| `api.terrainView.configure(view, changes)` | Bounded nonwaiting latest-intent update: pan delta, zoom, facing, absolute slice or checked integer `slice_delta`. Success is `true,nil`; temporary pressure is `nil,{code="busy",...}` with no partial change. Applied coherently; either slice form enters manual mode. Absolute slice and `slice_delta` together are rejected. |
 | `api.terrainView.pick(view, cursor)` | Bounded nonwaiting read of the currently adopted snapshot; returns a copied `hit`/`no_hit`/`loading` record with opaque consistency authority on a hit. Never loads terrain or picks unloaded/hidden geometry. |
 | `api.terrainView.close(view)` | Stop demand/publication; release CPU holds and retire GPU resources through existing host rules. |
 | `api.input.poll(window, max_events)` / `acknowledgeReset(window, token)` | Presentation-only ordered input/reset boundary, preserving GLFW epochs; cursor observation is coalesced. |
@@ -1101,6 +1101,16 @@ clarification: verified `het-manager` in `#het-terrain`, message
 preparation, graphics adoption or GPU completion. Terrain loading and render
 publication remain asynchronous under the view adapter; a camera-intent
 update is not a claim that its frame has already been adopted.
+
+`slice_delta` is added atomically to the current effective clip level:
+followed surface plus headroom in follow mode, or the selected slice in
+manual mode. The result becomes the exact manual slice, with no further
+headroom; positive deltas raise it. Lua accumulates fractional Shift-scroll
+and submits whole-level deltas, without reading/reconstructing camera height.
+An invalid combined absolute/relative slice record or a busy refusal applies
+neither change. This is the manager-authorized P-5 consequence of D-12/D-14,
+verified `het-manager` in `#het-terrain`, message
+`yhfa7a443kthfhksqntcnjwct2`, at 2026-11-07T03:40Z (2026-11-06 local).
 
 The named arena table is local to this narrow service, keyed by session and
 content root; it is not a universal service locator. Claim a name in the same
