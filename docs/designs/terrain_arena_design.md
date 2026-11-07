@@ -78,7 +78,8 @@ Additional Q-16 finding: the pinned N/E mask silhouettes fail a cross-facing
 unit-cell geometry consistency check. The audit below records a concrete
 counterexample. D-44 approves correcting inconsistent masks while preserving
 all 16 IDs, conditional on solver-delivered proof. The exact replacement
-catalog remains open; no artwork or code has been changed in this design turn.
+logical catalog is approved by D-49/P-9; no artwork or code has been changed
+in this design turn.
 
 D-45 selects crisp nearest-neighbor sampling for terrain colour artwork and
 face maps, with the same alpha cutoff for rendering and screen picking.
@@ -98,6 +99,10 @@ load/view mismatch; no runtime reproduction is claimed.
 D-48 approves viewport-driven terrain demand and view-aware eviction within
 the existing budgets. The face-map integration must prove that visible hazed
 background terrain is requested and retained when capacity permits.
+
+D-49 approves P-9's illustrated 16-shape catalog: named edges are lowered to
+the base; ID 15 is a central half-height peak. The exact table is the logical
+target for corrected masks, discovery and queries; solver proof remains required.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -1486,6 +1491,35 @@ This refines P-5's visible-region demand and D-42 rather than adopting S's
 planning-limit/runtime integration work; the existing pure planner alone is
 not the solver proof. No code or tracker change is made in this design turn.
 
+### D-49. Adopt the illustrated lowered-edge catalog, including peak ID 15
+
+Owner, directly in this design pane on 2026-11-07, answered “ok sounds good”
+to adopting the illustrated P-9 catalog as the logical target for corrected
+masks and solver proof. All 16 IDs were shown with their forms and maximum
+heights; the diagram was explicitly a design illustration, not engine output.
+
+Adopt P-9's exact rule in the unit cell: `N=y`, `E=1-x`, `S=1-y`, `W=x`;
+ID 0 has top height 1 and every other ID uses the minimum of the expressions
+selected by its bits. The solid lies between the base and that top. Combining
+lowered edges gives the illustrated corner and ridge forms. ID 15 is the
+four-sided central peak, height 1/2, with all four edges at the base.
+
+This explicitly supersedes D-25/P-5's flat-top treatment of ID 15 and the old
+alias between IDs 0 and 15. Retain the IDs and rotation/coordinate conventions.
+For IDs 0–14 the intended mathematical shapes agree with the existing
+lower-envelope definitions; that does not make the mismatching reference
+artwork correct. Correct and qualify the masks against the chosen catalog
+under D-44. Discovery and terrain point/ray queries continue to share D-36's
+logical geometry, with real openings rather than image-alpha connectivity.
+
+P-9's table durably specifies the illustrated forms. Its opening regions
+follow from those solids and D-34/D-35's positive-area connection rule; query
+and portal implementation still require the specified qualification. This is
+not approval of automatic reshaping, movement rules, new IDs or a new renderer
+ABI. Q-16 retains emission/cutaway and compatibility details; Q-20 retains
+discovery execution/storage mechanics. The solver must still provide evidence
+rather than treating this approval or the illustration as a completed proof.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1579,6 +1613,11 @@ Use the full 16-ID mask catalog selected by D-25:
 | 5, 10 | NS, EW (opposite-direction forms) |
 | 7, 11, 13, 14 | NES, NEW, NSW, ESW |
 | 15 | NESW; preserve the ID even with flat-top treatment |
+
+Amendment: D-49/P-9 now defines the exact logical catalog and replaces ID 15's
+flat-top treatment with a central half-height peak. D-44 permits demonstrated
+mask corrections and requires solver proof; the original reference-fidelity
+wording below does not override those decisions.
 
 Rotation permutes the four bits; the world ID itself does not change when
 the camera turns. Preserve reference silhouettes and face orientation in all
@@ -2369,7 +2408,7 @@ every other mask is inconsistent. Snapshot integrity was checked against
 S's Git blobs: N `effc21564c7a653605dcbafca23ce7bc560e262d`,
 E `5ed533b4d9467fa3b371a4cb489a87844fa64611`.
 
-**Correction direction approved by D-44; exact catalog still open.** Preserve
+**Correction direction approved by D-44; catalog approved by D-49.** Preserve
 all 16 authored IDs, the isometric material artwork and the face-map shader
 approach, with corrections to inconsistent mask silhouettes/face weights in
 the new project's catalog.
@@ -2383,9 +2422,9 @@ IDs, dropping shapes, automatic neighbor reshaping or editing Synarchy.
 The alternative of retaining exact masks while accepting disagreement between
 visible openings and logical geometry is not selected. D-44 requires proof
 from the solver, including reproduction of the original mismatch and the
-corrected result. Concrete replacement shapes, the special ID-15 meaning,
-pixel-edge conventions and appearance still require review; permission to
-correct a mask does not approve an unspecified replacement catalog.
+corrected result. D-49/P-9 now specifies the replacement shapes, including
+ID 15's central half-height peak. Pixel-edge conventions and lighting still
+need a concrete contract; approval of the catalog is not implementation proof.
 
 ### Solver evidence required for the shape/mask correction — D-44
 
@@ -2541,7 +2580,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-48 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-49 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2553,12 +2592,13 @@ faces. Preserve sparse authoritative cell/material/shape state and atomic
 removal; do not infer world occupancy from camera-facing texture alpha.
 D-36 resolves the query authority: the existing subcell point/ray queries and
 cavity discovery use the same corrected logical shape definitions. The exact
-per-shape catalog and compatibility details remain to be specified and reviewed.
+per-shape catalog is now selected by D-49/P-9; API compatibility and the
+implementation's geometry/coverage proof remain to be specified and qualified.
 
 The cross-facing mask audit above found that the pinned N/E assets cannot
 both be exact silhouettes of one rotated unit-cell shape. D-44 approves
 correcting inconsistent masks while retaining all 16 IDs, with solver-delivered
-proof of the defect and correction. The exact catalog remains Q-16; do not
+proof of the defect and correction. D-49 supplies the logical catalog; do not
 choose camera-dependent logical geometry or claim the current PNG set already
 establishes a coherent solid catalog.
 
@@ -2581,8 +2621,8 @@ arena session, replayed before render/pick publication. Revealing terrain is
 distinct from editing its contents; discovered chunks need not stay resident.
 D-34 connects whole empty cells through their six shared faces and excludes
 edge/corner-only contacts. D-35 additionally requires explicit shape openings,
-including real diagonal openings through ramps into unrevealed spaces. Exact
-per-shape geometry, capacity/completion and API authority remain Q-16/Q-20.
+including real diagonal openings through ramps into unrevealed spaces. D-49
+supplies the shape geometry; capacity/completion and API authority remain Q-20.
 D-37 resolves fog interaction: fog is unselectable, returns no player target
 and blocks screen picks/removal of the terrain it conceals.
 D-38 starts sky and initially exterior-connected spaces discovered and requires
@@ -2704,7 +2744,8 @@ model sanity check, not a repository test, a geometric proof or performance
 evidence. The concrete implementation needs interleaving, chunk-offload,
 capacity, later-edit and partial-shape cases before its claims are qualified.
 
-**Still unresolved:** the exact 16-shape region/portal catalog; source metadata
+**Still unresolved:** implementation/encoding of D-49's regions/portals;
+source metadata
 for initially exterior-connected spaces (including unbounded authored air
 layers); definition of completion for boundary loading with normal eviction;
 retained-discovery and pending-work capacity/refusal; API results and coherent
@@ -2786,11 +2827,11 @@ of a save failure, the write directory had only 27 MB free at startup and the
 developer fixed the error to report insufficient space. It supports retaining
 runtime error handling, not claiming Factorio pre-reserves all future saves.
 
-### P-9. Concrete logical shape catalog — proposal for Q-16 review
+### P-9. Concrete logical shape catalog — approved by D-49
 
-This is a proposed replacement catalog, not an approved interpretation of the
-corrected artwork. D-44 permits demonstrated mask corrections but does not
-choose these shapes. It preserves S's documented meaning of a set bit as a
+This is the intended logical catalog approved after an illustrated owner
+review in D-49. D-44 requires the solver to correct and prove the artwork
+against it. It preserves S's documented meaning of a set bit as a
 lower cardinal neighbor (`src/World/Slope/Compute.hs:135–143,173–205`), and
 makes that direction the cell's lowered edge. It does not infer terrain shape
 from camera pixels or enable automatic slope recomputation after removal.
@@ -2801,7 +2842,7 @@ other shape's top is the minimum of the expressions named by its bits.
 Its closed solid is `0 <= z <= h(x,y)`. This is a finite, piecewise-planar
 catalog with exact rational intersections, not an arbitrary height-field API.
 
-| ID | Name | Proposed top height | Form / maximum height |
+| ID | Name | Approved top height | Form / maximum height |
 | --- | --- | --- | --- |
 | 0 | Flat | `1` | Full block, 1 |
 | 1 | N | `N` | Ramp, 1 at S edge |
@@ -2826,21 +2867,21 @@ exception. Quarter turns permute the bits and rotate the same solid. The
 half-height peaks are consequences of intersecting unit-rise/unit-run slopes,
 not new fractional-slab IDs or an arbitrary authored-height parameter.
 
-**Important proposed departure:** ID 15 becomes a central half-height peak
+**Departure approved by D-49:** ID 15 becomes a central half-height peak
 with all four edges at the base, instead of the old flat-block alias or S's
 lowered flat-diamond mask. This changes D-25/P-5's earlier flat-top treatment
-and needs explicit owner approval. The alternative is to retain ID 15 as a
-documented flat-block exception; do not silently choose between them.
+as explicitly approved in D-49. The alternative of retaining ID 15 as a
+documented flat-block exception is not selected.
 
 For IDs 0–14, this mathematical rule matches the existing H
 `packages/terrain/src/Hetoimasia/Terrain/Geometry.hs` lower-envelope definition.
 The audit disproved its claimed fidelity to the pinned masks; it did not
 establish that the solids are intrinsically invalid. Keeping that rule as the
-new intended catalog while correcting the masks would be an explicit design
-choice. ID 15 would remove the existing full-block special case. Actual API
+new intended catalog while correcting the masks is the D-49 design choice.
+ID 15 removes the existing full-block special case. Actual API
 compatibility, corrected masks and evidence still belong to the amendment.
 
-**Derived opening contract, also proposed for review:**
+**Opening geometry derived from D-49's catalog and D-34/D-35:**
 
 - In each shaped cell, the empty region is the space above `h`. Shape 0 has
   no interior empty region; each other catalog shape has one connected empty
@@ -2863,11 +2904,11 @@ compatibility, corrected masks and evidence still belong to the amendment.
   from the same catalog, without unrelated floating tolerances. Qualify the
   table and rotated portal intersections independently under D-44.
 
-This proposal does not settle full-cell emission/cutaway ordering, sampling
+This catalog does not settle full-cell emission/cutaway ordering, sampling
 edges, lighting weights or the renderer proof. It provides a concrete logical
-target to approve and test rather than asking the solver to invent the shape
-semantics while fixing artwork. An illustrated owner review of the catalog,
-especially ID 15, remains required before it becomes a decision.
+target to implement and test rather than asking the solver to invent the shape
+semantics while fixing artwork. The illustrated owner review is complete;
+the solver's independent implementation qualification is still required.
 
 ### P-10. Viewport-driven demand and missing hazed background — approved by D-48
 
@@ -3117,23 +3158,22 @@ Fog-specific picking is resolved by D-37: no selectable target, no interaction
 and no picking through the fog. Remaining reveal behavior is tracked in Q-20.
 D-35 requires
 logical shape openings for discovery, including ramp-created diagonal
-connections; the exact 16-shape solid/empty-region catalog is still to be
-specified and reviewed.
+connections; D-49/P-9 now supplies the approved 16-shape solid/empty regions
+and their derived openings.
 
 D-36 resolves #637's subcell query authority: correct those definitions so
 point/ray queries and discovery share the canonical logical shape model.
 Rendering/screen picking retain sprite coverage as their visual authority.
 
-Still open: the exact 16-shape logical geometry and query boundary/compatibility
-details, full-cell versus isolated-face emission and hidden-face/cap behavior.
-P-9 now proposes a complete lowered-edge shape table and derived portal rules,
-including a central half-height peak for ID 15. Neither the table nor this
-change to the earlier flat-top treatment is approved yet.
+Still open: query/API compatibility details, full-cell versus isolated-face
+emission and hidden-face/cap behavior. D-49 approves P-9's lowered-edge catalog,
+including the central half-height peak for ID 15, replacing its earlier
+flat-block exception. The existing closed-solid boundary convention and the
+derived positive-area portal geometry remain the qualification targets.
 D-44 resolves the fidelity choice: correct demonstrated mask inconsistencies
 while preserving all 16 IDs and face-map rendering, and require solver proof
-of both defect and correction. The exact replacement catalog and sampling
-conventions still need review; approval of the correction direction does not
-select unspecified geometry.
+of both defect and correction. D-49 selects the replacement logical catalog;
+exact sampling conventions and corrected-mask evidence remain separate work.
 P-10 adds the owner's viewport-loading concern and source comparison. Preserve
 the existing view-aware direction when adapting demand bounds to whole-tile
 face maps, and reconcile planning limits with D-42. The explicit
@@ -3142,6 +3182,11 @@ integration and qualification remain implementation work to assign in Q-19.
 Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
 coverage resource contracts remain Q-17; the approved picking approach itself
 does not need another sign-off.
+
+Current owner question: at the integer cutaway, hide levels above the slice
+and keep each remaining known tile's actual shape/material, including ramps,
+without additional flat caps; unknown regions retain generic blank fog. This
+is the recommended cap/emission behavior, pending the owner's answer.
 
 ### Q-17. Face-map data loading, sampling and ownership
 
@@ -3240,8 +3285,9 @@ not possible, and pause at capacity while preserving the expandable world.
 The numeric allowance and qualified reservation mechanism remain open. D-42
 raises the CPU banks independently; it does not choose the disk allowance.
 
-Still open: specify and review the exact 16-shape solid/empty regions,
-openings and internal connectivity; derive/budget the initial exterior-connected
+The logical 16-shape regions and their openings are now specified by D-49/P-9;
+their implementation still requires D-44 qualification. Still open: derive and
+budget the initial exterior-connected
 knowledge metadata without scanning infinite sky. Specify completion and
 memory-pressure behavior for very large spaces, including P-8/D-40's concrete
 temporary-store cache/staging/disk quotas and write/read failure behavior. Specify
