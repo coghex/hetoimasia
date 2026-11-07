@@ -177,8 +177,9 @@ row failed at least the examples named. The controls of the retired state-depend
 feasibility computation, of the camera cap and of the job-slot reserve were removed
 with them, and a stale-running-job branch in `failJob` and `completeJob` that no
 transition can reach (a superseded running job becomes cancelling) was deleted rather
-than controlled. Two protections are not controlled because they are redundant by
-construction: a camera demand's own regions need no protection from camera eviction
+than controlled. Three protections are not controlled because they are redundant by
+construction (the step gate is a backstop that valid events never reach, and the
+camera staging share repeats what the admission checks of free staging enforce): a camera demand's own regions need no protection from camera eviction
 (its own interest already blocks them), and the held-region bound in the invariants
 repeats what hold acquisition enforces.
 
@@ -229,6 +230,11 @@ repeats what hold acquisition enforces.
 | A load-job slot is taken at admission | the 257-region column, the job-slot and camera examples (9) |
 | Dispatch ignores the load-job slots | the 257-region column and job-slot examples (4) |
 | A hold is not bounded by its region cap | the hold-cap example |
+| Job reservations inside held regions are not charged to the camera | the widening examples (2) |
+| A removal commit is not held to the charge rules | the removal-growth example |
+| A completion is not held to the charge rules | the completion-past-the-maximum example |
+| The stored maximum is not a charge rule | the removal-growth and completion examples |
+| Camera admission is not tested against the state it would produce | the camera examples (6) |
 | Camera jobs in flight are not kept within the room explicit work leaves | the re-admission, zoom-out, partial-admission and widening examples (5) |
 | A held region is charged what it holds now, not its stored maximum | the widening example and two random properties (4) |
 | The camera unit is left out of the resident minimum | the re-admission example (1,025 refused) and the minimum property (1) |
@@ -314,6 +320,19 @@ progress and a configuration that cannot is refused at construction. The propert
   sequence left them, once the explicit-only work has drained (requests withdrawn, running
   jobs finished, victims released, changed regions offloaded) an in-cap query or removal
   is admitted at once.
+- **One charge function, checked after every step** (random sequences of load, complete,
+  pin, unpin, camera expansion, withdraw, removal, handoff and eviction): under the
+  three fixed profiles, 200 random sequences, 300 sequences under random budgets from
+  exactly the minimum (4,384 resident, 1,530 staging) upward, and one 12,000-event
+  sequence at exactly the minimum, `modelInvariants` (which is `chargeCheck` plus the
+  structural checks) holds after every event.
+- **Reservations inside a held region** (example, extent 1 x 1 x 32, 5,952 resident
+  bytes): widening a pinned region one level at a time never lets the reservations in
+  flight exceed the 1,584 the camera share has left, the charge rules hold at every step,
+  and an explicit query for sixteen separate intervals is admitted.
+- **A removal commit past the stored maximum** (example, extent 1 x 1 x 2): growth that
+  would take a region to 400 where 372 is the most is a contract failure before anything
+  changes; growth of 34 is accepted.
 - **Reservation within the worst case** (2,000 random queries and removals into a
   model that holds nothing): the resident and staging bytes admission reserves never
   exceed the explicit minimum the construction check assumed.
