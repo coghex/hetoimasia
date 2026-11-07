@@ -80,6 +80,22 @@ spec = describe "Growth with depth and gap width" $ do
     cheap ← allocatedBy (repeatN 500 (top narrow))
     costly ← allocatedBy (repeatN 500 (top wide))
     sameCost "air gap" cheap costly
+  it "answers a cell, a range and a removal with the allocation of the intervals near it, not of all retained intervals" $ do
+    let source = mustSource soilOverStone
+        unrelated n = either (error . show) id (changesFromIntervals (ChangeLimits 1000000) [(mustColumn 0 0, mustRange (100 + 10 * i) (101 + 10 * i)) | i ← [0 .. n - 1]])
+        few = unrelated 1000
+        many = unrelated 100000
+        cellOf' changes = evaluate (cellAt source changes (mustTile 0 0 (-10)) == Air)
+        rangeOf changes = evaluate (either (const 0) length (columnRuns defaultQueryLimits source changes (mustColumn 0 0) (mustRange (-8) 8)))
+        removeOf changes = evaluate (either (const False) removeChanged (removeCell (ChangeLimits 1000000) source (mustTile 0 0 (-5)) changes))
+    _ ← evaluate (changeIntervalCount few + changeIntervalCount many)
+    forM_ [("cell", cellOf' ∷ Changes → IO Bool), ("remove", removeOf)] $ \(label, act) → do
+      small ← allocatedBy (repeatN 300 (act few))
+      large ← allocatedBy (repeatN 300 (act many))
+      sameCost ("unrelated intervals, " <> label) small large
+    smallRange ← allocatedBy (repeatN 300 (rangeOf few))
+    largeRange ← allocatedBy (repeatN 300 (rangeOf many))
+    sameCost "unrelated intervals, range" smallRange largeRange
   it "crosses a removed interval of 2^20 levels and of 2^60 levels at the same cost" $ do
     let source = mustSource soilOverStone
         removed width = either (error . show) id (changesFromIntervals (ChangeLimits 4) [(mustColumn 0 0, mustRange (-width) 1)])

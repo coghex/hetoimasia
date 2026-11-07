@@ -101,6 +101,14 @@ rangeSpec = describe "column ranges" $ do
     ask 2049 `shouldBe` Left (TooManyRuns 1024)
     fmap length (columnRuns QueryLimits {limitReturnedRuns = 1023, limitRangeLevels = 8192} source emptyChanges (mustColumn 0 0) (mustRange 0 2048))
       `shouldBe` Left (TooManyRuns 1023)
+  it "does not wrap a returned-run limit of maxBound into an empty answer" $ do
+    let source = mustSource (SourceSpec [] [] [])
+        ask limits lo hi = columnRuns limits source emptyChanges (mustColumn 0 0) (mustRange lo hi)
+        wide = QueryLimits {limitReturnedRuns = maxBound, limitRangeLevels = 8192}
+    fmap (map (fromCell . runCell)) (ask wide 0 1) `shouldBe` Right [Nothing]
+    fmap (map (\r → (zRangeLo (runRange r), zRangeHi (runRange r)))) (ask wide (-5) 5) `shouldBe` Right [(-5, 5)]
+    ask wide {limitReturnedRuns = 0} 0 1 `shouldBe` Left (TooManyRuns 0)
+    ask wide {limitReturnedRuns = 1} 0 1 `shouldSatisfy` either (const False) (const True)
   it "covers the requested interval contiguously from end to end" $ do
     let source = mustSource soilOverStone {specPatches = [patchAir 0 0 (-2) 0, patchSolid 0 0 3 5 "soil" 9]}
         runs = runsOf source emptyChanges 0 0 (-10) 20

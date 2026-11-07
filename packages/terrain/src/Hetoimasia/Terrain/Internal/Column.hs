@@ -19,6 +19,7 @@ module Hetoimasia.Terrain.Internal.Column
   ) where
 
 import Data.Int (Int64)
+import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Internal.Cell
 import Hetoimasia.Terrain.Internal.Changes
@@ -29,7 +30,7 @@ import Hetoimasia.Terrain.Internal.Source
 data ColumnView = ColumnView
   { viewBase ∷ !(IntervalMap Cell)
   , viewPatches ∷ !(IntervalMap Cell)
-  , viewRemoved ∷ !(IntervalMap ())
+  , viewRemoved ∷ !(Map Int64 Int64)
   }
 
 -- | The view of one column; building it reads only that column's records.
@@ -38,7 +39,7 @@ columnView source changes column =
   ColumnView
     { viewBase = sourceLayerMap source
     , viewPatches = Map.findWithDefault Map.empty column (sourcePatchMap source)
-    , viewRemoved = removedMap changes column
+    , viewRemoved = removedSet changes column
     }
 
 -- | The run of constant content around level @z@: @(lo, hi, cell)@ with
@@ -49,7 +50,7 @@ step view z = (lo, hi, cell)
   where
     base = spanAt (viewBase view) z
     patch = spanAt (viewPatches view) z
-    removed = spanAt (viewRemoved view) z
+    removed = spanAtSet (viewRemoved view) z
     lo = maximum [spanLo base, spanLo patch, spanLo removed]
     hi = minimum [spanHi base, spanHi patch, spanHi removed]
     cell = case (spanValue removed, spanValue patch, spanValue base) of

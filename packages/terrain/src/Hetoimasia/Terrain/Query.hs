@@ -94,11 +94,13 @@ columnRuns ∷ QueryLimits → Source → Changes → Column → ZRange → Eith
 columnRuns limits source changes column range@(ZRange lo hi)
   | zRangeLevels range > toInteger (limitRangeLevels limits) =
       Left (RangeTooLarge (zRangeLevels range) (limitRangeLevels limits))
-  | length bounded > bound = Left (TooManyRuns bound)
-  | otherwise = Right [Run (ZRange a b) c | (a, b, c) ← bounded]
+  | not (null (drop bound runs)) = Left (TooManyRuns bound)
+  | otherwise = Right [Run (ZRange a b) c | (a, b, c) ← runs]
   where
+    -- Never @bound + 1@: a limit of 'maxBound' must not wrap. Dropping @bound@
+    -- runs pulls at most one more than the limit before it stops.
     bound = max 0 (limitReturnedRuns limits)
-    bounded = take (bound + 1) (runsIn (columnView source changes column) lo hi)
+    runs = runsIn (columnView source changes column) lo hi
 
 -- | The highest solid cell of a column, or 'Nothing' for an empty column.
 highestOccupied ∷ Source → Changes → Column → Maybe Occupied

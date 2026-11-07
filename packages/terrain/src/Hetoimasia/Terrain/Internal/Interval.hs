@@ -11,6 +11,7 @@ module Hetoimasia.Terrain.Internal.Interval
   ( IntervalMap
   , Span (..)
   , spanAt
+  , spanAtSet
   , insertDisjoint
   , insertCoalesced
   ) where
@@ -41,6 +42,19 @@ spanAt intervals z = case Map.lookupLE z intervals of
   Nothing → Span bottomLevel nextLo Nothing
   where
     nextLo = maybe topExclusive fst (Map.lookupGT z intervals)
+
+-- | The same view over a canonical set of removed intervals (inclusive start to
+-- exclusive end), searched in place: no copy of the set is made, so the work is
+-- logarithmic in the intervals held and nothing is allocated for those outside
+-- the neighbourhood of @z@.
+spanAtSet ∷ Map Int64 Int64 → Int64 → Span ()
+spanAtSet set z = case Map.lookupLE z set of
+  Just (lo, hi)
+    | z < hi → Span lo hi (Just ())
+    | otherwise → Span hi nextLo Nothing
+  Nothing → Span bottomLevel nextLo Nothing
+  where
+    nextLo = maybe topExclusive fst (Map.lookupGT z set)
 
 -- | Insert @[lo, hi)@, or 'Nothing' if it overlaps an interval already there.
 -- Touching intervals do not overlap.

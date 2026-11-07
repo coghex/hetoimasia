@@ -221,6 +221,22 @@ limitSpec = describe "definition bounds" $ do
     let definition = soilOverStone {specPatches = [patchAir 0 0 0 1]}
     mkSource defaultSourceLimits {limitAuthoredRuns = 3} definition `shouldSatisfy` either (const False) (const True)
     mkSource defaultSourceLimits {limitAuthoredRuns = 2} definition `shouldBe` Left (TooManyAuthoredRuns 2)
+  it "lets a run limit of maxBound neither wrap nor bypass the byte limit" $ do
+    -- 64 header + (16 + 1) material + 24 layer = 105 accounted bytes.
+    let one = SourceSpec ["a"] [layer 0 1 "a" 0] []
+        huge = SourceLimits {limitDefinitionBytes = 105, limitAuthoredRuns = maxBound}
+    fmap sourceLayerCount (mkSource huge one) `shouldBe` Right 1
+    fmap sourceDefinitionBytes (mkSource huge one) `shouldBe` Right 105
+    mkSource huge {limitDefinitionBytes = 81} one `shouldBe` Left (DefinitionTooLarge 105 81)
+    mkSource huge {limitDefinitionBytes = 104} one `shouldBe` Left (DefinitionTooLarge 105 104)
+    fmap sourceLayerCount (mkSource SourceLimits {limitDefinitionBytes = maxBound, limitAuthoredRuns = maxBound} one) `shouldBe` Right 1
+    -- A tight byte limit refuses a long list without reading all of it.
+    -- The reported total is then the accounted bytes of what was read: at least
+    -- the limit, not the full 2,490.
+    mkSource huge {limitDefinitionBytes = 1000} (withLayers [layer (toInteger i) (toInteger i + 1) "a" 0 | i ← [0 .. 99 ∷ Int]])
+      `shouldSatisfy` either (\e → case e of DefinitionTooLarge total 1000 → total > 1000 && total < 2490; _ → False) (const False)
+    mkSource huge {limitDefinitionBytes = 1000} (withLayers [layer (toInteger i) (toInteger i + 1) "a" 0 | i ← [0 ∷ Int ..]])
+      `shouldSatisfy` either (\e → case e of DefinitionTooLarge {} → True; _ → False) (const False)
   it "refuses an oversized definition before validating a single record" $ do
     -- The records after the count bound are never reached: a shape fault in the
     -- 10,000th layer is not what is reported.

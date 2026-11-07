@@ -8,7 +8,7 @@
 module Hetoimasia.Terrain.Internal.Changes
   ( Changes (..)
   , emptyChanges
-  , removedMap
+  , removedSet
   , addRemoval
   ) where
 
@@ -16,7 +16,7 @@ import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Internal.Cell (Column)
-import Hetoimasia.Terrain.Internal.Interval
+import Hetoimasia.Terrain.Internal.Interval (insertCoalesced)
 
 -- | Canonical removed-cell intervals per column, with their running total.
 data Changes = Changes
@@ -29,11 +29,10 @@ data Changes = Changes
 emptyChanges ∷ Changes
 emptyChanges = Changes Map.empty 0
 
--- | A column's removed intervals as an interval map for stepping.
-removedMap ∷ Changes → Column → IntervalMap ()
-removedMap changes column = case Map.lookup column (changeColumns changes) of
-  Nothing → Map.empty
-  Just set → Map.map (\hi → (hi, ())) set
+-- | A column's removed intervals, as stored: stepping searches this set in place
+-- ('spanAtSet'), so building a view of a column copies nothing.
+removedSet ∷ Changes → Column → Map Int64 Int64
+removedSet changes column = Map.findWithDefault Map.empty column (changeColumns changes)
 
 -- | Add a removed @[lo, hi)@ to a column, merging every overlapped or touching
 -- interval.

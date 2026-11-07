@@ -97,8 +97,10 @@ data SourceError
     TooManyMaterials !Int
   | -- | More authored runs (layers plus patches) than the limit.
     TooManyAuthoredRuns !Int
-  | -- | The conservative byte accounting exceeded the limit: the total and the
-    -- limit.
+  | -- | The conservative byte accounting exceeded the limit: the accounted total
+    -- and the limit. When the lists are longer than any definition within the
+    -- limit could be, the total is that of the prefix read (still above the
+    -- limit), because the rest is never traversed.
     DefinitionTooLarge !Integer !Int
   | -- | The material at this index of the list is not a valid identifier.
     InvalidMaterialId !Int !MaterialIdError
@@ -154,8 +156,14 @@ mkSource ∷ SourceLimits → SourceSpec → Either SourceError Source
 mkSource limits spec = do
   let materialCount = boundedLength (maxAuthoredMaterials + 1) (specMaterials spec)
       runBound = max 0 (limitAuthoredRuns limits)
-      layerCount = boundedLength (runBound + 1) (specLayers spec)
-      patchCount = boundedLength (runBound + 1) (specPatches spec)
+      -- No definition within the byte limit holds more records than the limit
+      -- divided by the cheapest record, so the traversal never needs to go
+      -- further than that, whatever run limit the caller supplied; the sums
+      -- below stay far from 'maxBound'.
+      byteCap = max 0 (limitDefinitionBytes limits) `div` layerRecordBytes + 1
+      traversalCap = min runBound byteCap
+      layerCount = boundedLength (traversalCap + 1) (specLayers spec)
+      patchCount = boundedLength (traversalCap + 1) (specPatches spec)
   if materialCount > maxAuthoredMaterials then Left (TooManyMaterials maxAuthoredMaterials) else pure ()
   if layerCount + patchCount > runBound then Left (TooManyAuthoredRuns runBound) else pure ()
   let total =
