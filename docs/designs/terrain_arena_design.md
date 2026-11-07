@@ -499,6 +499,19 @@ specified. No geological generation or additional material system is implied.
 
 ## Design boundaries
 
+### D-17. Haskell mechanisms, Lua arena rules
+
+Owner, directly in this pane on 2026-11-06, selected:
+
+> Yes—Haskell mechanisms, Lua arena rules
+
+The accepted division is reusable Haskell terrain storage, streaming, geometry
+and edit retention, with Lua defining the arena's material/layer recipe and
+driving camera, query and removal calls. Haskell engine libraries must not
+contain Ecce Homo's soil/stone choices or import concrete game modules. This
+settles the direction of Q-5; the concrete package/service interfaces and
+execution/lifetime contract still require specification.
+
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
 libraries, using narrow services. Synarchy's world managers and coupled
 environment are not the new architecture (H `docs/vision.md:15–36`).
@@ -587,11 +600,11 @@ cutaway decision.
 
 ### Q-5. What belongs to the reusable engine and what belongs to Ecce Homo?
 
-Separate generic storage/loading/rendering mechanisms from the game's flat
-terrain recipe, material meanings and presentation policy. Decide Lua authoring
-and Haskell boundaries under V-1, including how any application material is
-provided. Do not inherit Synarchy's concrete `WorldState` or assume an ECS
-component store is the right representation for every terrain cell.
+Direction resolved by D-17: reusable Haskell storage, streaming, geometry and
+edit retention; Lua arena recipes and orchestration. Specify concrete package
+and service boundaries under V-1, including application material provision.
+Do not inherit Synarchy's concrete `WorldState` or assume an ECS component
+store is the right representation for every terrain cell.
 
 ### Q-6. Mutation, persistence and state publication?
 
