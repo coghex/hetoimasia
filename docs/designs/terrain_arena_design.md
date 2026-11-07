@@ -95,7 +95,8 @@ not Hetoimasia delivery items.
 and demand-driven chunk loading. The full terrain model, including gaps,
 belongs in the first version (D-4). Procedural elevation generation is deferred.
 Compressed columns with demand-driven materialization are the chosen direction
-(D-5). The rejected Beacon example is not the consumer.
+(D-5). Rendering and game queries can both demand terrain; undemanded detail
+stays unmaterialized (D-6). The rejected Beacon example is not the consumer.
 
 **Proposal P-1:** a visible terrain arena that can be navigated, making chunk
 demand and the resulting terrain observable. Keep the first terrain source
@@ -153,7 +154,7 @@ actual resident representations and derived render data when selecting bounds;
 a chunk count alone does not establish a memory bound. Compare representative
 flat, layered, hollow and fragmented cases before choosing physical storage.
 
-**Proposal P-4: demand follows consumers, not visibility alone.** Untouched
+**P-4, direction accepted by D-6: demand follows consumers.** Untouched
 underground detail may remain uncomputed and unallocated until needed. A small
 terrain definition/source and any retained modifications provide its meaning;
 there is no requirement to precompute every underground column's spans. Known
@@ -165,8 +166,8 @@ other game query can need terrain that is not visible. Such examples explain
 the contract; they do not add those systems to this arc. Unloaded terrain must
 not be interpreted as air, and revealing or reloading the same terrain must
 remain consistent with its source and retained edits. Rendering faces and CPU
-terrain detail can have different residency requirements. The demand-producer
-rule is recommended, not yet selected by the owner's question in D-5.
+terrain detail can have different residency requirements. D-6 selects the
+demand-producer rule; exact request APIs, budgets and scheduling remain open.
 
 ## Decisions
 
@@ -239,6 +240,20 @@ does not yet approve a visibility-only demand policy or promise literally zero
 memory for the source definition, metadata or retained underground edits.
 P-4 recommends the demand rule; Q-8/Q-9 retain representation details.
 
+### D-6. Rendering and game queries can both demand terrain
+
+Owner, directly in this pane on 2026-11-06:
+
+> yes that sounds correct
+
+This answers the recommendation to let rendering and game queries both
+request terrain while leaving everything else unmaterialized. Visibility is
+not the sole condition for loading: a consumer may request invisible terrain.
+Loading the requested region does not require materializing all underlying
+depth. An unloaded region is not air, and reloading must preserve the meaning
+of the terrain source and any retained modifications. Specific gameplay
+systems, editing tools and save/load remain separate scope decisions.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -270,16 +285,24 @@ Both can load on demand. Decide boundaries, nonwrapping versus other topology,
 coordinate conventions, chunk dimensions and behavior at absent/unloaded
 terrain. Synarchy's 5 × 5 startup footprint is not an approved extent or budget.
 
+Recommendation for the next owner choice: a finite, nonwrapping arena with
+configurable horizontal bounds, using the same demand loading within those
+bounds even when most of the arena is not resident. This makes its edges and
+outside-world answers explicit. An expandable arena is the alternative if
+unbounded exploration is part of the initial experience. Neither is selected
+yet; exact dimensions and vertical limits remain separate choices.
+
 ### Q-3. How does demand become usable terrain and then retire?
 
-Name demand producers and authority, request deduplication, bounded admission,
+Rendering and game queries are allowed demand producers under D-6. Define
+their authority, request deduplication, bounded admission,
 priorities, cancellation, complete publication, failures, residency accounting
 and safe eviction. Decide how late results are prevented from reaching a
 replaced world and how renderer holds interact with CPU data eviction. A flat
 generator must not substitute for a lifetime contract.
-P-4 recommends admitting terrain queries from rendering and game consumers,
-including queries about invisible regions, while leaving undemanded detail
-unmaterialized. This producer rule remains open.
+Queries can concern invisible regions while undemanded detail remains
+unmaterialized. The producer rule is settled; its operational contract remains
+open.
 
 ### Q-4. What can the owner see and control in the first version?
 
