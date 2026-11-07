@@ -337,17 +337,19 @@ spec = describe "Planning" $ do
       limited (\l → l {limitPairs = 0}) `shouldBe'` PlanInsufficient LimitPairs
       limited (\l → l {limitKeys = 2}) `shouldBe'` PlanInsufficient LimitDepthKeys
     it "stops collecting overlap pairs at the bound instead of finishing the enumeration" $ do
-      -- A dense stack of faces in one region: refusing at a tiny bound must cost
-      -- much less than ordering the same faces.
-      let dense = sceneSource [(x, y, z, 0) | x ← [-2 .. 2], y ← [-2 .. 2], z ← [0, 2, 4, 6]]
-          dfacts = factsOf dense
-          dcamera = manualCamera 0 0 7
-          run f = planWith (\r → r {requestConfig = (requestConfig r) {pcLimits = f (pcLimits (requestConfig r))}}) (setup 480 480) dcamera dfacts
-          force = either (const 0) (length . planFaces)
-      full ← allocatedBy (force (run id))
-      early ← allocatedBy (force (run (\l → l {limitPairs = 1})))
+      -- Sixty floating cells along the line of sight project to the same place:
+      -- 180 faces in one region, some 16,000 overlapping pairs. Refusing at one
+      -- pair must cost about what refusing after building the faces costs, not
+      -- what enumerating every pair costs.
+      let stack = sceneSource [(k, k, 3 * k, 0) | k ← [0 .. 59]]
+          sfacts = factsOf stack
+          scamera = manualCamera 59 59 177
+          run f = planWith (\r → r {requestConfig = (requestConfig r) {pcLimits = f (pcLimits (requestConfig r))}}) (setup 480 480) scamera sfacts
+      baseline ← allocatedBy (run (\l → l {limitKeys = 1}))
+      early ← allocatedBy (run (\l → l {limitPairs = 1}))
       run (\l → l {limitPairs = 1}) `shouldBe'` PlanInsufficient LimitPairs
-      early `shouldSatisfy` (< full)
+      run (\l → l {limitKeys = 1}) `shouldBe'` PlanInsufficient LimitDepthKeys
+      early `shouldSatisfy` (< baseline + baseline `div` 5)
     it "accepts exactly at a bound" $ do
       limited (\l → l {limitFaces = 3, limitKeys = 3}) `shouldSatisfy` isRight'
       let examined = statLevelsEvaluated (planStats (plan (setup 288 144) camera facts))
@@ -413,12 +415,12 @@ isLeft' ∷ Either a b → Bool
 isLeft' (Left _) = True
 isLeft' _ = False
 
-allocatedBy ∷ Int → IO Int
+allocatedBy ∷ Either PlanError Plan → IO Int
 allocatedBy value = do
   enabled ← getRTSStatsEnabled
   if not enabled then fail "the suite must run with -T" else pure ()
   before ← getRTSStats
-  _ ← evaluate value
+  _ ← evaluate (either (const 0) (length . planFaces) value)
   after ← getRTSStats
   pure (fromIntegral (allocated_bytes after - allocated_bytes before))
 
