@@ -27,6 +27,7 @@ component's test module is imported.
 | `…Texture.Backend` | The state machine and its one pump thread, over a `Port`. Nothing in it names Vulkan. |
 | `…Texture.Port` | The boundary to the graphics owner, as values: the seam the lifecycle suite injects. |
 | `…Texture.Host` | The production `Port`, over a running `VulkanHost`. |
+| `Hetoimasia.LuaEngine.Graphics.Input` | The Lua input adapter (TRA-6): the source of one window's feed, the single consumer, the per-VM registry and the facade's `InputServices`. |
 
 ## Composition and ownership
 
@@ -604,6 +605,78 @@ reservation of its own: it composes theirs. What it adds are four checks, each m
   scene state, with no pixel captured. Run it with
   `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:lua-engine-graphics-native-tests -- --match 'graphics facade'`
   (on Linux the runner starts its own display).
+
+## The Lua input adapter (TRA-6)
+
+`Hetoimasia.LuaEngine.Graphics.Input` is the concrete composition of the CPU facade's optional `InputServices`
+([the facade's rules](../lua-engine/README.md#the-input-calls-tra-6)) over the window integration's public interfaces and nothing
+else: the window's one `InputReader` and `InputControl` and its observation snapshot, reached through the narrow `WindowInput`
+the production port yields (`Window.Host.newHostPorts`, `hostPortsInput`). `WindowTarget` is unchanged and grants scene publication
+only; input is a separate capability, so the scene target does not become a general window handle. A composition opts in with
+`gfInput = Just (glfwInputHost (hostPortsInput ports))`; `Nothing` adds no `api.input`, no handle type and no consumer, and enables no
+window's admission.
+
+### Source, consumer, registry
+
+* **`Source ev tok`** is the record of transactions a consumer needs of one window's feed (`readInput`, the reset token's
+  epoch and reason, `acknowledgeReset`, the epoch, the last reset, closure, the observation, enable and suspend). `glfwSource` is the production source.
+  No public API outside the GLFW package can produce an input event or a reset token, so the logic is written over the source and the
+  suites drive it with a controlled one; the translation of a payload (`translateEvent`) is a thin function over the public payload types.
+* **`Consumer`** is the single logical consumer of one window incarnation's feed. It owns no thread and no queue. A poll is one
+  transaction: a bounded prefix of the feed, the disposition the read stopped on, the epoch and the window's observation, so they are one
+  coherent boundary. A batch taken in an earlier transaction belongs to the script; events of two epochs are never in one packet because the
+  feed changes epoch in a transaction of its own; nothing is retried or replayed. It remembers one thing: the newest `ResetToken` it
+  handed out and its order.
+* **Reset tokens** are `input_reset` capabilities whose key is `consumerId * 2^32 + order`. Polling a pending reset again answers the same
+  order; a newer reset a newer one; an older order acknowledges nothing and answers `stale` without touching the feed (closure still
+  wins); an order never issued is refused. Authenticity and liveness are that arithmetic and the registry's live consumers, so nothing
+  remembers a reset that is over, and a key is never issued twice by one consumer. A token of another VM is refused by the host, one of a
+  peer instance by the registry (`the reset token does not belong to this window`), both with nothing acknowledged.
+* **`InputRegistry`** is one VM's bookkeeping: for each declared instance, at most one consumer (the instance's one window slot admits one
+  live window handle at a time; a consumer for a later window replaces and ends the one for an earlier). Owner: the VM's graphics
+  services. Writers: the instance's owner thread (a poll registers its consumer) and the declaring thread (`declareInput`,
+  `forgetInput`), all in STM. Readers: the capability liveness check and the examples' `inputReading`. Bound: the instances a VM may have;
+  forgetting an instance removes its entry, and polls, resets and closure add nothing that outlives them.
+
+### When admission is enabled
+
+A feed starts gated until the application's admission is enabled. The adapter enables it **in the transaction that registers the
+consumer**, at the instance's first successful `poll` of that window incarnation, so admission is never open before the consumer is
+registered. Input produced before that first poll is gated and dropped by the host (it is not replayed). A window whose script never
+polls is never enabled: it never overflows, never resets and never owes the host's overflow warning, and the adapter keeps no queue.
+When the consumer ends (its instance is forgotten, or a later window replaces its window) the adapter suspends admission in the
+transaction that removes it: that begins a reset of reason suspension, which owes no warning, and stops a feed nobody reads from filling.
+
+### Closure and disposal
+
+Revoking a window or an instance invalidates input and token authority and stops consumption **without waiting for an acknowledgement**:
+`forgetInput` is one transaction, and the window's native and graphics retirement is the provider's, which never reads this registry.
+Acknowledgement is one STM transaction on the reader and needs no command or request capacity; the provider's close still waits for room
+in the host's bounded command queue, as it always did, and this slice does not change that. A poll is gated in its own transaction on the
+instance still taking work and the session's admission (`gvTakesWork`); an acknowledgement is not, because it is cleanup.
+
+### Tests
+
+* `lua-engine-graphics-tests` (`test.vulkan-headless`), `input adapter over a controlled feed`: the translation of every payload, the
+  observation and the token key; and one consumer over `Test.LuaEngine.Graphics.InputFeed`, a model of a window's feed that follows its
+  documented contract (the bound without a false empty, each event once and in order, gating before readiness, a pending reset
+  answered with one token and no growing history, acknowledgement and the paused feed, the resume gates, a key held across a reset,
+  newer and older tokens, closure over every acknowledgement, a reset committed before or after a poll, suspension at the consumer's end,
+  and a concurrent run in which a producer thread overflows and resumes the feed while the consumer polls and acknowledges, checking on every
+  packet that its events are of one epoch and that no event repeats or reorders).
+  **This is an injected feed, not device evidence.**
+* `lua-engine-graphics-tests`, `input through the production graphics injection`: real Lua over the production injection, the real
+  leases and the real window provider (the fake port's windows, the model's feeds): admission enabled at the first poll and not before,
+  a window nobody polls, the clear-before-acknowledge contract with a feed that stays paused until acknowledged, a focus loss as an
+  event, a stale token reaching nothing, closure before the acknowledgement and an instance that ends owing one, an acknowledgement while the host's command queue is full (it takes no command capacity; a window's close still waits for room, as it always
+  did), and two windows' feeds,
+  epochs and tokens kept apart with the registry returning to zero.
+* `lua-engine-tests`, `graphics calls`, `input calls`: the CPU facade's rules over an injected ordered port, on real Lua.
+* `lua-engine-graphics-native-tests` (`test.vulkan-lua-engine-native`), `graphics facade`: a real window's feed polled from real Lua on the
+  production host: the first poll enables admission, the public `suspendInput` reset is read as reason `suspended` in the next epoch and
+  acknowledged, the feed stays paused with admission suspended, and the instance's end retires the window. It delivers no key, button or
+  scroll: no public API can, and real native event delivery through the adapter is **not covered** here; the GLFW package's own suites and
+  `glfw-native-tests` own the producer.
 
 ## Lua offscreen pixels (LFE-24)
 

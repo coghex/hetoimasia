@@ -456,6 +456,14 @@ cabal test hetoimasia-tests --test-show-details=direct
   a model of the host's ledger rules, which is injected evidence), `scene
   publication` (real Lua instances, leases, pipeline and window provider) and `the
   frame of an adopted scene` (the pure adaptation against the render-2d oracle).
+  Its presentation input (TRA-6) is covered in four layers, none of which delivers a real key, button or scroll (no public API can):
+  the CPU facade's `input calls` group of `lua-engine-tests` (`test.lua-engine`: real Lua over an injected ordered port: the exact
+  packet, order and epoch, a prefix and then the remainder, 128 events, the observation, and every refusal before a read);
+  the graphics adapter's `input adapter over a controlled feed` and `input through the production graphics injection` groups of
+  `lua-engine-graphics-tests` (`test.vulkan-headless`: the consumer over a model of the feed in `Test.LuaEngine.Graphics.InputFeed`,
+  and real Lua over the production injection, the real leases and the window provider's fake port; both injected evidence); and one
+  native example in the `graphics facade` subgroup of `lua-engine-graphics-native-tests` (`test.vulkan-lua-engine-native`) that polls a
+  real window's feed through the production host and reads the public suspension reset, its acknowledgement and the paused feed.
   Its surface-free scene target (LFE-27) has a third native group, `an offscreen scene
   target on a real device (LFE-27)`, which opens no window: with the owner held on a
   gate it makes a scene naming a texture the target's latest value, releases the

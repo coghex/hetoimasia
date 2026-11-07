@@ -82,6 +82,12 @@ bounded cleanup evidence through the existing resource/supervision contract.
 Lua finalizers, coroutine-local closing handlers and explicit script disposal
 are not the sole owners of essential engine cleanup.
 
+Input authority follows the same rule (TRA-6). A window's input is read and acknowledged through the instance's own window handle
+and the reset tokens of its own consumer, never through a number, a global registry or a table another instance can reach. The
+consumer is registered by the instance's first poll and ends with the instance or its window: its end suspends the window's input
+admission in one transaction and waits for no acknowledgement, so a script that stopped, failed or never acknowledged cannot strand the
+window's retirement. Token bookkeeping lives and dies with that consumer and does not grow with reset history.
+
 Scripts may explicitly release a handle early for convenience. Handle state and
 scope accounting make repeated release safe: return an already-released result
 rather than invoking the native release twice. Invalid or missing Lua values
