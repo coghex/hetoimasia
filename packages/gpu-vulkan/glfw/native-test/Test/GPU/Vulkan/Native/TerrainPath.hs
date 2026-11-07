@@ -125,7 +125,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Textures
 import Hetoimasia.Terrain.Cell (mkMaterialId)
 import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
 import Hetoimasia.Terrain.Render2D.Agreement
-import Hetoimasia.Terrain.Render2D.Camera (CameraState, camFacing)
+import Hetoimasia.Terrain.Render2D.Camera (CameraState, camClip, camFacing, camRef)
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Material
 import Hetoimasia.Terrain.Render2D.Plan
@@ -174,7 +174,7 @@ data Variant
 
 -- | What a fixture must show, each by a named probe that is determinate for the
 -- oracle and differs from its contrast.
-data Need = Foreground | Overlap | Reveal | Cap
+data Need = Foreground | Overlap | Reveal | Cap | Clipped | SnapSensitive
   deriving stock (Eq, Show)
 
 data Spec = Spec
@@ -186,6 +186,9 @@ data Spec = Spec
   , specNeeds ∷ ![Need]
   , specControl ∷ !Bool
   -- ^ Whether the independent judge must reject the draw.
+  , specCamera ∷ !(Maybe (Integer, Integer))
+  -- ^ The cut level and vertical reference the scene's camera must come to, stated
+  -- here by hand, so that a camera that was panned off its column is a failure.
   }
 
 suffixOf ∷ Variant → String
@@ -200,12 +203,16 @@ suffixOf = \case
 
 -- | A fixture of one scene.
 spec ∷ Look → [Need] → Variant → Scene → Spec
-spec look needs variant sc = Spec (sceneName sc <> suffixOf variant) [sc] variant look needs (isControl variant)
+spec look needs variant sc = Spec (sceneName sc <> suffixOf variant) [sc] variant look needs (isControl variant) Nothing
+
+-- | A fixture that must come to this cut level and vertical reference.
+expecting ∷ (Integer, Integer) → Spec → Spec
+expecting camera s = s {specCamera = Just camera}
 
 -- | A fixture of several scenes, each drawn in a pass of its own into a small
 -- target, so the oracle's work for a pixel is that of its own scene alone.
 specMany ∷ String → Look → [Need] → [Scene] → Spec
-specMany name look needs scs = Spec name scs Dynamic look needs False
+specMany name look needs scs = Spec name scs Dynamic look needs False Nothing
 
 isControl ∷ Variant → Bool
 isControl variant = variant `elem` [ReversedKeys, WholeQuad, BackmostPick]
@@ -231,14 +238,14 @@ specs =
        ]
     <> [spec Plain [Foreground, Cap] Dynamic (atZoom 0.125 (staircase cut FaceSouth)) | cut ← [1, 3]]
     <> [spec Plain [Foreground] Dynamic (atZoom 0.125 (staircase 5 FaceSouth))]
-    <> [ spec Plain [Foreground, Cap] Dynamic (atZoom 0.125 (followHeadroom FaceSouth))
-       , spec Plain [Foreground] Dynamic (deepFloor FaceSouth)
+    <> [ expecting (28, 4) (spec Plain [Foreground, Cap] Dynamic (atZoom 0.125 (followHeadroom FaceSouth)))
+       , expecting (0, -33) (spec Plain [Foreground] Dynamic (deepFloor FaceSouth))
        ]
     <> [spec Plain [Foreground] Dynamic (capTarget (96, 64) (zoomEndpoint zoom)) | zoom ← [0.125, 8]]
     <> [ spec Plain [Foreground] Dynamic (atZoom 0.1875 fractionalCamera)
-       , spec Plain [Foreground] Dynamic (atZoom 0.125 viewportOffset)
+       , spec Plain [Foreground, Clipped] Dynamic (viewportOffset 0.125)
        , spec Plain [Foreground] Dynamic (capTarget (96, 64) (atZoom 0.125 scaledTarget))
-       , spec Plain [Foreground] Dynamic (capTarget (64, 48) (atZoom 1 snapped))
+       , spec Plain [Foreground, SnapSensitive] Dynamic snapped
        ]
     <> [spec Tinted [Foreground, Overlap, Reveal] Dynamic (atZoom 0.25 (diagnosticOverlap facing)) | facing ← [FaceSouth, FaceWest]]
     <> [ spec Plain [Foreground, Overlap] ReversedKeys (atZoom 0.125 (disconnectedSpans FaceSouth))
@@ -644,9 +651,24 @@ renderSnapshot ctx s parts = do
           firstGrid = case grids of
             g : _ → g
             [] → listArray ((0, 0), (0, 0)) [ExpectedClear]
+          alternative part need = case need of
+            Clipped → altGrid part (partScene part) {sceneViewport = let (aw, ah) = sceneTarget (partScene part) in (0, 0, fromIntegral aw, fromIntegral ah)}
+            SnapSensitive → altGrid part (partScene part) {sceneSnap = False}
+            _ → Nothing
+          altGrid part alt = case scenePlan alt of
+            Right altPlan →
+              let (gw, gh) = sceneTarget alt
+               in Just ((listArray ((0, 0), (gw - 1, gh - 1)) [expectedAtFast (`Map.lookup` ctxSheets ctx) alt (partCamera part) altPlan (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected) !)
+            Left _ → Nothing
           named = case parts of
-            part : _ → chooseNamed (partPlan part) (partScene part) (firstGrid !) determinate (specNeeds s)
+            part : _ → chooseNamed (partPlan part) (partScene part) (firstGrid !) (alternative part) determinate (specNeeds s)
             [] → []
+          cameraProblems =
+            [ "the camera came to cut " <> show (axisValue (camClip (partCamera part)), camRef (partCamera part)) <> " (cut, reference), expected " <> show wanted <> ": it was panned off its column or follows another surface"
+            | Just wanted <- [specCamera s]
+            , part ← parts
+            , (toInteger (axisValue (camClip (partCamera part))), camRef (partCamera part)) /= wanted
+            ]
           missing = [need | need ← specNeeds s, need `notElem` map fst named]
           runFacts = runsOf (planSnapshot marks valid)
       markFacts ← traverse (\(sheet, handle) → (,) sheet <$> registeredMark (ctxTextures ctx) handle) (Map.toList (ctxHandles ctx))
@@ -667,6 +689,7 @@ renderSnapshot ctx s parts = do
             , indMismatchCount independent > 0
             ]
               <> ["the pure pick, the planner's coverage or the material's model disagreed at " <> show (judgedMismatchCount pickJudged) <> " pixels, e.g. " <> show (take 3 (judgedMismatches pickJudged)) | not (specControl s), judgedMismatchCount pickJudged > 0]
+              <> cameraProblems
               <> ["no determinate probe for " <> show need | need ← missing]
               <> ["the independent expectation compared no pixel the scene covers" | indCovered independent == 0]
               <> ["the control was not rejected: the judge found no disagreement with a draw broken on purpose" | rejected == Just False]
@@ -732,10 +755,11 @@ chooseNamed
   ∷ Plan
   → Scene
   → ((Int, Int) → Expected)
+  → (Need → Maybe ((Int, Int) → Expected))
   → (Probe → Maybe Expectation)
   → [Need]
   → [(Need, NamedProbe)]
-chooseNamed plan sc expectedAtPixel determinate = concatMap one
+chooseNamed plan sc expectedAtPixel alternative determinate = concatMap one
   where
     (w, h) = sceneTarget sc
     pixels = [(x, y) | y ← [0 .. h - 1], x ← [0 .. w - 1]]
@@ -766,6 +790,20 @@ chooseNamed plan sc expectedAtPixel determinate = concatMap one
         let revealed = [p | p ← covered, ExpectedHit {expectedFront = f, expectedShown = Just (h', _)} ← [expectedAtPixel p], hitCell f /= hitCell h' || hitKind f /= hitKind h']
             shown = [p | p ← covered, ExpectedHit {expectedFront = f, expectedShown = Just (h', _)} ← [expectedAtPixel p], hitCell f == hitCell h', hitKind f == hitKind h']
          in maybe [] pure (pair Reveal "a transparent part of a nearer face shows what lies behind it, not the face" revealed shown)
+      Clipped → case alternative Clipped of
+        -- A pixel outside the viewport that the scene would cover if the viewport were
+        -- the whole target: clear here only because the viewport clips it.
+        Just unclipped →
+          let clippedAway = [p | p ← pixels, expectedAtPixel p == ExpectedClear, ExpectedHit {} ← [unclipped p]]
+           in maybe [] pure (pair Clipped "a viewport away from the corner clips the scene and leaves the rest of the target clear" covered clippedAway)
+        Nothing → []
+      SnapSensitive → case alternative SnapSensitive of
+        -- Pixels that snapping changes: covered with it and clear without it, and the reverse.
+        Just unsnapped →
+          let movedIn = [p | p ← pixels, ExpectedHit {} ← [expectedAtPixel p], unsnapped p == ExpectedClear]
+              movedOut = [p | p ← pixels, expectedAtPixel p == ExpectedClear, ExpectedHit {} ← [unsnapped p]]
+           in maybe [] pure (pair SnapSensitive "pixel snapping moves the image: a pixel covered only when snapping, against one covered only when not" movedIn movedOut)
+        Nothing → []
       Cap →
         let capCentres =
               [ pixel

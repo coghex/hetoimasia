@@ -242,7 +242,7 @@ capTarget (cw, ch) sc =
     { sceneTarget = (w, h)
     , sceneLogical = (w `div` scaleOf, h `div` scaleOf)
     , sceneViewport = (0, 0, fromIntegral w, fromIntegral h)
-    , scenePan = if sceneSnap sc then (0, 0) else (0.0048, 0.0226)
+    , scenePan = if sceneSnap sc then (0.2, 0.12) else (0.0048, 0.0226)
     }
   where
     (w0, h0) = sceneTarget sc
@@ -261,25 +261,31 @@ fractionalCamera =
 -- | The ramps and corners in a viewport that starts away from the target's
 -- corner and stops short of its far edge: the rest of the target is the clear
 -- colour.
-viewportOffset ∷ Scene
-viewportOffset =
-  let base = rampsCorners FaceNorth
-      (w, h) = sceneTarget base
-      margin = 8
-   in base
-        { sceneName = "viewport"
-        , sceneViewport = (fromIntegral margin, fromIntegral (margin * 2), fromIntegral (w - 3 * margin), fromIntegral (h - 4 * margin))
-        }
+viewportOffset ∷ Float → Scene
+viewportOffset zoom =
+  base
+    { sceneName = "viewport@" <> show zoom
+    , sceneViewport = (fromIntegral x, fromIntegral y, fromIntegral (w - x - x'), fromIntegral (h - y - y'))
+    }
+  where
+    -- Fitted first: the viewport is set after the refit would have overwritten it.
+    base = atZoom zoom (rampsCorners FaceNorth)
+    (w, h) = sceneTarget base
+    (x, y) = (w `div` 4, h `div` 8)
+    (x', y') = (w `div` 8, h `div` 4)
 
 -- | The ramps and corners on a target of content scale 2: its logical extent is
 -- half its framebuffer's.
 scaledTarget ∷ Scene
 scaledTarget = fitScene 8 ((rampsCorners FaceEast) {sceneName = "scaled", sceneScale = 2})
 
--- | The ramps and corners with pixel snapping on, at a zoom whose scale is a
--- whole multiple of 1/8 so that every face origin is on a whole pixel.
+-- | The ramps and corners with pixel snapping on at native scale (a whole multiple
+-- of 1/8, which every face origin needs), the camera a fraction of a pixel off the
+-- pixel grid ('capTarget' gives a snapping scene one), so that snapping moves the
+-- view's translation to the pixel grid and the image differs from the unsnapped
+-- one.
 snapped ∷ Scene
-snapped = fitScene 8 ((rampsCorners FaceSouth) {sceneName = "snapped", sceneZoom = 2, sceneSnap = True})
+snapped = capTarget (64, 48) (fitScene 3 ((rampsCorners FaceSouth) {sceneName = "snapped", sceneSnap = True, sceneMode = ManualAt 2 1}))
 
 -- ---------------------------------------------------------------------------
 -- Layout
@@ -333,11 +339,17 @@ fitScene margin input =
     x1 = maximum [b | (_, b, _, _) ← hexagons]
     y0 = minimum [c | (_, _, c, _) ← hexagons]
     y1 = maximum [d | (_, _, _, d) ← hexagons]
-    centre = ((x0 + x1) / 2, (y0 + y1) / 2)
+    -- A following scene stays on its anchor column, which decides the surface it
+    -- follows: the camera is not panned away, and the target is made large enough
+    -- about the anchor to hold every hexagon instead.
+    follow = sceneMode sc == FollowSurface
+    centre = if follow then (0, 0) else ((x0 + x1) / 2, (y0 + y1) / 2)
+    halfWidth = if follow then max (abs x0) (abs x1) else (x1 - x0) / 2
+    halfHeight = if follow then max (abs y0) (abs y1) else (y1 - y0) / 2
     zoom = toRational (sceneZoom sc)
     evenUp n = let m = ceiling n ∷ Integer in fromInteger (m + m `mod` 2) ∷ Int
-    w = evenUp (zoom * (x1 - x0) + 2 * fromIntegral margin) * scaleOf
-    h = evenUp (zoom * (y1 - y0) + 2 * fromIntegral margin) * scaleOf
+    w = evenUp (zoom * 2 * halfWidth + 2 * fromIntegral margin) * scaleOf
+    h = evenUp (zoom * 2 * halfHeight + 2 * fromIntegral margin) * scaleOf
     scaleOf = round (sceneScale sc) ∷ Int
     -- The view-frame shift that puts the camera at the centre, then back to the world axes.
     vx' = (fst centre / 48 + snd centre / 24) / 2
