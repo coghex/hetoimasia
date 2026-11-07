@@ -27,7 +27,7 @@ concrete precondition
 - [x] EPIC. Establish Ecce Homo's flat terrain with on-demand chunk loading — [#636]
 - [x] TRA-1. Define terrain coordinates and shared shape geometry — [#637]
 - [x] TRA-2. Implement layered sources and compressed terrain changes — [#638]
-- [ ] TRA-3. Define bounded horizontal and vertical residency
+- [x] TRA-3. Define bounded horizontal and vertical residency — [#639]
 - [ ] TRA-4. Implement the transactional terrain service
 - [ ] TRA-5. Expose terrain requests through Lua
 - [ ] TRA-6. Expose ordered window input to Lua
