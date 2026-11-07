@@ -135,13 +135,28 @@ data Face = Face
   deriving stock (Eq, Show)
 
 -- | A cell's canonical solid. Obtain one with 'shapeSolid'.
-data Solid = Solid
-  { solidShape ∷ !ShapeId
-  , solidPlanes ∷ ![Plane]
-  , solidVertices ∷ ![V3]
-  , solidFaces ∷ ![Face]
-  }
+--
+-- The type is positional, with plain accessor functions rather than record
+-- fields: a field label exported from this module would let a client rewrite one
+-- with record-update syntax and forge a solid that disagrees with its shape.
+data Solid = Solid !ShapeId ![Plane] ![V3] ![Face]
   deriving stock (Eq, Show)
+
+-- | The shape a solid was derived from.
+solidShape ∷ Solid → ShapeId
+solidShape (Solid shape _ _ _) = shape
+
+-- | The bounding half-spaces, normals pointing out.
+solidPlanes ∷ Solid → [Plane]
+solidPlanes (Solid _ planes _ _) = planes
+
+-- | The distinct vertices, in ascending order.
+solidVertices ∷ Solid → [V3]
+solidVertices (Solid _ _ vertices _) = vertices
+
+-- | The faces of positive area, in canonical order.
+solidFaces ∷ Solid → [Face]
+solidFaces (Solid _ _ _ faces) = faces
 
 -- | The canonical solid of a shape, with its half-spaces, distinct vertices and
 -- faces of positive area in canonical order.
@@ -226,11 +241,19 @@ classifyPoint solid point
     values = map (`planeValue` point) (solidPlanes solid)
 
 -- | A ray: an origin and a nonzero direction. Obtain one with 'mkRay'.
-data Ray = Ray
-  { rayOrigin ∷ !V3
-  , rayDirection ∷ !V3
-  }
+--
+-- Positional, with plain accessor functions, so that no field label lets a client
+-- rewrite the direction to zero with record-update syntax.
+data Ray = Ray !V3 !V3
   deriving stock (Eq, Show)
+
+-- | Where the ray starts.
+rayOrigin ∷ Ray → V3
+rayOrigin (Ray origin _) = origin
+
+-- | The nonzero direction.
+rayDirection ∷ Ray → V3
+rayDirection (Ray _ direction) = direction
 
 -- | A ray with a nonzero direction, refusing a zero direction.
 mkRay ∷ V3 → V3 → Either GeometryError Ray

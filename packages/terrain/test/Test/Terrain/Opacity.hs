@@ -19,6 +19,8 @@
 --   unnormalized turn, a ray with no direction or a forged solid: @GHC-10237@
 --   for an import, and @GHC-01928@ (an illegal term-level use of the type
 --   constructor) for a use of the constructor in an expression;
+-- * an exported accessor of a checked value (a solid or a ray) is a function,
+--   never a field label, so record-update syntax cannot rewrite one;
 -- * each private module is refused as a hidden module of the package's main
 --   library, @GHC-87110@.
 module Test.Terrain.Opacity (spec) where
@@ -71,6 +73,16 @@ spec = describe "Terrain opacity across the package boundary" $ do
         clientOutput outcome `shouldContain` "Illegal term-level use of the type constructor"
         clientOutput outcome `shouldContain` name
 
+  forM_ recordUpdates $ \(name, imports, source) →
+    it ("rejects a client that rewrites " <> name <> " with record-update syntax") $
+      withClient "Client.hs" (clientImporting imports source) $ \compile → do
+        outcome ← compile Typecheck
+        -- Every accessor is a plain function, not a field label, so the update
+        -- is refused for naming something that is not a record field.
+        rejectedBecause outcome "GHC-22385"
+        clientOutput outcome `shouldContain` "Not in scope: record field"
+        clientOutput outcome `shouldContain` name
+
   forM_ hidden $ \module' →
     it ("rejects a client that imports the hidden module " <> module') $
       withClient "Client.hs" (unlines ["module Client () where", "", "import " <> module']) $ \compile → do
@@ -120,6 +132,18 @@ forged =
   , ("ShapeId", ["import Hetoimasia.Terrain.Shape (ShapeId)"], ["unsupported :: ShapeId", "unsupported = ShapeId 99"])
   , ("Turns", ["import Hetoimasia.Terrain.Shape (Turns)"], ["unnormalized :: Turns", "unnormalized = Turns 7"])
   , ("Ray", ["import Hetoimasia.Terrain.Geometry (Ray, V3 (..))"], ["noDirection :: Ray", "noDirection = Ray (V3 0 0 0) (V3 0 0 0)"])
+  ]
+
+-- | A checked value rewritten through an exported accessor used as a field
+-- label. Each accessor is a function, so none can be updated.
+recordUpdates ∷ [(String, [String], [String])]
+recordUpdates =
+  [ ("solidPlanes", ["import Hetoimasia.Terrain.Geometry (Solid, solidPlanes)"], ["emptied :: Solid → Solid", "emptied s = s {solidPlanes = []}"])
+  , ("solidFaces", ["import Hetoimasia.Terrain.Geometry (Solid, solidFaces)"], ["emptied :: Solid → Solid", "emptied s = s {solidFaces = []}"])
+  , ("solidVertices", ["import Hetoimasia.Terrain.Geometry (Solid, solidVertices)"], ["emptied :: Solid → Solid", "emptied s = s {solidVertices = []}"])
+  , ("solidShape", ["import Hetoimasia.Terrain.Geometry (Solid, solidShape)"], ["swapped :: Solid → Solid", "swapped s = s {solidShape = solidShape s}"])
+  , ("rayDirection", ["import Hetoimasia.Terrain.Geometry (Ray, V3 (..), rayDirection)"], ["noDirection :: Ray → Ray", "noDirection r = r {rayDirection = V3 0 0 0}"])
+  , ("rayOrigin", ["import Hetoimasia.Terrain.Geometry (Ray, V3 (..), rayOrigin)"], ["moved :: Ray → Ray", "moved r = r {rayOrigin = V3 0 0 0}"])
   ]
 
 supportedClient ∷ String
