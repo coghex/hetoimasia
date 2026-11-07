@@ -17,6 +17,7 @@
 -- > api.time.tick() / tick_seconds() / seconds() / wait_ticks(n) / wait_seconds(s) / yield()
 -- > api.session.status() / quit()    -- the session controls (LFE-26): a copied status, a returning normal stop
 -- > api.state(...)                   -- the unavailable-state guard (also the global @state(...)@)
+-- > api.input.poll(window, n) / acknowledgeReset(window, token)   -- only when the composition opted in to input (TRA-6)
 --
 -- Every call is a dot call with exactly its declared arguments: a mistaken colon call, an extra or
 -- missing argument (an explicit @nil@ counts as an argument), a value of the wrong type or a table
@@ -38,6 +39,11 @@
 -- * @time.wait_ticks@: a gameplay instance's update. @time.wait_seconds@: a presentation instance's update.
 -- * @session.status@: a presentation instance's, in @init@, an update and @shutdown@, answering the capture taken at the
 --   entry of the hook or resumed segment. @session.quit@: either role's instance, in any hook.
+-- * @input.poll@ (TRA-6): a presentation instance's, in @init@ and an update, while the session's admission is open; refused in
+--   @shutdown@ and to the logical role. @input.acknowledgeReset@: a presentation instance's, in any finite hook, shutdown and
+--   after a stop included (it is cleanup, and never reads the admission). Both are ordinary errors, before a single event is read,
+--   for a float or out-of-range count, a foreign or retired window and a token that is not the window's. See
+--   "Hetoimasia.LuaEngine.Facade.Input" for the packet and the encoding, and the package README for the contract.
 -- * @state(...)@ and @api.state(...)@: anywhere, and with any arguments: they latch the whole session's failure and
 --   raise (see "Hetoimasia.LuaEngine.Facade.Session"); no role, phase or arity check stands before them.
 --
@@ -108,10 +114,7 @@ module Hetoimasia.LuaEngine.Facade
   , InputResetReason (..)
   , InputObservation (..)
   , pollMaximum
-  , pollCapacity
   , packetSchema
-  , packetValue
-  , worstPacketBytes
   , AdmissionState (..)
   , FacadeEndpoints (..)
   , SessionEndpoints (..)
@@ -202,7 +205,7 @@ import Hetoimasia.LuaEngine.Facade.Caller
   , newRegistry
   )
 import Hetoimasia.LuaEngine.Facade.Graphics (graphicsBindings, graphicsHandleTypes)
-import Hetoimasia.LuaEngine.Facade.Input (inputBindings, packetSchema, packetValue, pollCapacity, pollMaximum, worstPacketBytes)
+import Hetoimasia.LuaEngine.Facade.Input (inputBindings, packetSchema, pollMaximum)
 import Hetoimasia.LuaEngine.Facade.Content (contentBindings, dataHandleName, lexicalResolver, moduleHandleName, validRootId)
 import Hetoimasia.LuaEngine.Facade.Output
 import Hetoimasia.LuaEngine.Facade.Request (requestBindings)

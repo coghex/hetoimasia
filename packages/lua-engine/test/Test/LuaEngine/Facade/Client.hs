@@ -41,10 +41,10 @@ spec = describe "composition from outside the packages" $ do
         ExitSuccess → pure ()
         status → expectationFailure ("the client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
 
-  it "keeps the input bindings and the packet's encoding out of a client's reach: no module of them is exposed" $
+  it "keeps the input bindings out of a client's reach: the facade module does not export them" $
     withClient "Client.hs" inputInternalsClient $ \compile → do
       outcome ← compile Typecheck
-      rejectedBecause outcome "GHC-87110"
+      rejectedBecause outcome "GHC-61689"
   where
     withClient = withStorePackageClient ["base", "bytestring", "text", "hetoimasia-lua-engine-0.1.0.0-inplace", "hetoimasia-lua-engine-0.1.0.0-inplace-facade", "hetoimasia-lua-engine-0.1.0.0-inplace-modules", "hetoimasia-lua-engine-0.1.0.0-inplace-request", "hetoimasia-lua-engine-0.1.0.0-inplace-data", "hetoimasia-scripting-lua-0.1.0.0-inplace", "hetoimasia-scripting-lua-0.1.0.0-inplace-runtime-lua", "hetoimasia-content-0.1.0.0-inplace", "hetoimasia-foundation-0.1.0.0-inplace"]
 
@@ -113,6 +113,7 @@ inputClient =
   unlines
     [ "module Client (services, packet) where"
     , ""
+    , "import qualified Data.Text as Text"
     , "import Hetoimasia.LuaEngine.Facade"
     , ""
     , "services ∷ InputServices"
@@ -120,7 +121,7 @@ inputClient =
     , "  InputServices"
     , "    { isTypes = []"
     , "    , isCheckPoll = \\_ _ → pure Nothing"
-    , "    , isPoll = \\_ _ _ → pure (PollRefused (toEnum 0 `seq` \"no\"))"
+    , "    , isPoll = \\_ _ _ → pure (PollRefused (Text.pack \"no\"))"
     , "    , isCheckAcknowledge = \\_ _ _ → pure Nothing"
     , "    , isAcknowledge = \\_ _ _ → pure AckClosed"
     , "    }"
@@ -134,7 +135,7 @@ inputInternalsClient =
   unlines
     [ "module Client (reach) where"
     , ""
-    , "import Hetoimasia.LuaEngine.Facade.Input (inputBindings)"
+    , "import Hetoimasia.LuaEngine.Facade (inputBindings)"
     , ""
     , "reach ∷ ()"
     , "reach = inputBindings `seq` ()"

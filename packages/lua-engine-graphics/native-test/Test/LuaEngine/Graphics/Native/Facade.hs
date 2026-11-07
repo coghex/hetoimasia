@@ -149,6 +149,10 @@ inputExample ∷ ByteString
 inputExample =
   Text.encodeUtf8 . Text.unlines $
     [ "return {"
+    , "  gameplay = {"
+    , "    every_ticks = 1,"
+    , "    update = function(self, dt_seconds) end"
+    , "  },"
     , "  presentation = {"
     , "    every_seconds = 0.05,"
     , "    init = function(self, api)"
