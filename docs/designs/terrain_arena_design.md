@@ -197,6 +197,10 @@ demand-producer rule; exact request APIs, budgets and scheduling remain open.
 
 ## Decisions
 
+The owner requested a fully filled design on 2026-11-06. Remaining technical
+contracts are being made concrete for review. That request does not itself
+approve proposals or call the design ready; accepted choices continue below.
+
 ### D-1. Start with flat terrain for Ecce Homo
 
 Owner, directly in this pane on 2026-11-06:
@@ -671,6 +675,32 @@ continuing downward, queried without generating intervening tiles. Specify
 default thickness, material identifiers and recipe API alongside vertical
 residency, coordinate limits and bounded range queries. The layering direction
 is settled; its concrete representation remains open.
+
+### Q-10. Terrain transactions versus the deferred gameplay-state service?
+
+H `docs/vision.md:24–30` and the preserved gameplay-state D-30–D-40 describe
+engine-held, Lua-defined state with tick publication and failure rules. The
+delivered M1 still exposes an unavailable-state guard, not that service
+(H `packages/lua-engine/README.md:1611–1634`). D-17 settles Haskell ownership,
+but does not decide whether this terrain arc implements the general state
+system or uses a narrow terrain service with its own operation transactions.
+
+Recommend the narrow terrain service for this arena: no general ECS/schema
+store, no implementation of `api.state`, and no claim that a terrain removal
+rolls back with arbitrary Lua code or a whole future gameplay tick. Preserve
+the earlier state decisions for their own arc. The alternative is to make the
+general gameplay-state commit protocol a prerequisite, substantially expanding
+this design. This is an owner scope/compatibility checkpoint before fixing
+the execution contract and delivery slices.
+
+### Q-11. Complete scope of the camera and shapes?
+
+D-18 settles presentation and basic navigation. Remaining concrete proposals
+must specify manual-mode zoom/rotation, top-surface selection after edits,
+bounded cutaway depth and picking; the slope catalog, automatic reshaping
+after removal and whether any general set-cell operation belongs in v1 also
+need an explicit scope choice. These will be presented as small, enumerated
+behavior contracts rather than left for implementers to infer.
 
 ## Verification strategy — proposal
 
