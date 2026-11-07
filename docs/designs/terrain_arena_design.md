@@ -50,6 +50,7 @@ are pinned to these revisions. Synarchy has not been modified or launched.
 | Arena topology does not wrap. A caller may request finite dimensions; larger finite arenas also load their remaining chunks on demand, with absent cells outside their rectangle. | S `docs/engine_contracts.md:8200–8246` |
 | Arena controls include zoom, rotation and vertical slice selection; these are existing reference behaviors, not yet this arc's scope. | S `scripts/test_arena.lua:255–293` |
 | Synarchy projects a diamond grid and has four camera facings 90 degrees apart. Camera input includes keyboard panning and middle-button dragging. | S `src/World/Grid.hs:220–236`; `src/Engine/Graphics/Camera.hs:22–37`; `src/Engine/Loop/Camera.hs:116–181` |
+| Synarchy routes Shift-scroll to Z-slice input; arena slice input disables automatic Z tracking and increments/decrements the slice. Its inspected `camera.gotoTile` accepts two coordinates, computes a surface-based slice and enables Z tracking; it does not read an optional third Z argument. | S `src/Engine/Input/Thread/Scroll.hs:128–138`; `scripts/test_arena.lua:265–275`; `src/Engine/Scripting/Lua/API/Camera.hs:223–318` |
 | Geological hydrology, settled-terrain processing, chunk composition and runtime fluid simulation are separate stages. Flat generation can avoid the geological work. | S `docs/hydrology_pipeline.md:24–43` |
 | Hetoimasia's reusable renderer has world/UI views, cameras, depth, retained chunks and application materials. M1's Lua scene exposes only simple rectangles with a fixed camera, default material and one UI layer. | H `packages/render-2d/README.md:3–17`, `:59–69`; `packages/lua-engine/README.md:941–968`, `:1002–1011` |
 | GLFW already supplies ordered input with explicit reset/acknowledgement, but the M1 Lua facade has no input binding. | H `packages/glfw/src/Hetoimasia/GLFW/Input.hs:1–26`; `packages/lua-engine/README.md:1042–1057`, `:1086–1101` |
@@ -110,6 +111,8 @@ Changes survive chunk offload/reload within the current arena session, but
 the arena is not persistent across sessions (D-10).
 Depth should also extend on demand, with no designed bottom to the arena
 (D-11). Numeric limits and bounded residency still need explicit contracts.
+Shift-scroll controls the cutaway level. A camera jump defaults to the
+destination's top level unless its Lua command supplies a Z level (D-12).
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
@@ -380,6 +383,33 @@ wall mesh to stay resident. Session edit storage remains D-10 and can grow
 with edits; compression does not promise constant memory for arbitrary
 modifications. None of these constraints requires a gameplay depth floor.
 
+### D-12. Shift-scroll cutaway and optional Z on camera jumps
+
+Owner, directly in this pane on 2026-11-06, accepting cutaway viewing:
+
+> yes that works, i was thinking shift-scroll would change the z level of the cutaway, that should be how synarchy works, with the camera automatically snapping to the top level when the camera first jumps to a location, unless the optional z level was included in the camera move api command.
+
+Include manual cutaway viewing, controlled by Shift-scroll. Terrain above the
+selected plane is hidden rather than removed. The view demands needed terrain
+under D-6 without materializing the full depth between the surface and slice.
+The selected slice and terrain picking must describe the same displayed view.
+
+The Lua camera move/jump command accepts an optional Z level. With Z omitted,
+the camera initially snaps to the destination's top terrain level; with Z
+provided, that level overrides automatic surface selection. The command must
+work for an unloaded destination through terrain demand and must not
+subsequently overwrite an explicit Z with a late surface lookup. Exact API
+name/signature, loading publication and failure behavior remain open.
+
+Synarchy confirms the Shift-scroll reference. Its inspected jump API has no
+optional Z argument, so optional Z is a selected Hetoimasia requirement rather
+than a claim of existing Synarchy parity. The owner specified snapping on a
+jump; whether ordinary panning continuously follows the surface is still open.
+Recommend keeping a manually or explicitly selected Z fixed while panning,
+zooming or rotating, and selecting the surface again on a jump without Z.
+The detailed meaning of top level at an edited or empty destination, scroll
+step/direction and any surface-tracking mode remain to be specified.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -437,7 +467,8 @@ open.
 
 Camera exploration/loading is selected by D-7. Decide projection, terrain
 assets/materials, camera movement/zoom/rotation controls,
-vertical slices and picking. D-8/D-9 select temporary shortcut-based removal
+and detailed picking behavior. D-12 selects Shift-scroll cutaway levels and
+optional Z on camera jumps. D-8/D-9 select temporary shortcut-based removal
 and exclude UI implementation for this arc. Determine the narrow Lua rendering/input
 services required. Input ordering, focus/reset and routing need explicit
 contracts. Loading behavior must respect the no-UI scope.
@@ -454,15 +485,15 @@ wheel zoom, with exact bindings adjustable during implementation. These are
 proposals; prior approval of camera-driven loading did not select projection,
 rotation or navigation behavior.
 
-The material underground-view choice is whether the owner can move a cutaway
-plane down through intact terrain, or only inspect openings made by removal.
-Recommend manual depth slices for inspecting gaps and ceilings, with terrain
-above the chosen plane hidden rather than deleted. Selecting such a slice
-would demand its visible terrain through D-6 while leaving intervening hidden
-depth unmaterialized. This is not yet approved; distinguish slice visibility
-from actual exposure caused by removal and keep picking consistent with the
-displayed geometry. Exact cut-face appearance, visible depth range and any
-automatic surface tracking also remain open. No UI widgets are implied.
+D-12 settles cutaway viewing: Shift-scroll changes the displayed Z level while
+terrain above is hidden, and jumps choose the destination's top level unless
+given explicit Z. Distinguish slice visibility from actual exposure caused by
+removal. Cut-face appearance, visible depth range, exact top-level semantics
+and behavior during ordinary panning remain open. Recommend preserving manual
+or explicit Z during pan/zoom/rotation; a jump without Z selects the surface
+again. No UI widgets are implied. The isometric/four-facing presentation and
+remaining navigation proposal above are not independently settled by the
+cutaway decision.
 
 ### Q-5. What belongs to the reusable engine and what belongs to Ecce Homo?
 
@@ -556,6 +587,11 @@ volume; verify vertical eviction/reload and bounded resident/render data as
 the demanded depth moves. Include coordinate-limit and conversion checks once
 the representation is chosen. Report retained edit storage separately from
 resident terrain; no test can establish literal infinite resource capacity.
+For D-12, verify Shift-scroll changes visibility without editing terrain;
+camera jumps choose the surface when Z is omitted and honor explicit Z for
+both resident and unloaded targets. Exercise successive jumps so a late result
+cannot reset a newer view. Verify picking against the displayed cutaway and
+that viewing a deep slice does not materialize the intervening volume.
 During development, exercise the D-8/D-9 shortcut through the agreed
 targeting/input path, including no valid target and focus/reset behavior.
 Capture its removal/reveal evidence before deleting the shortcut. Final
