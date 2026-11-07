@@ -47,12 +47,12 @@ spec = describe "Residency model" $ do
 -- Helpers
 
 roomy ∷ Limits
-roomy = limitsWith $ \s → s {specResidentBytes = 4000, specStagingBytes = 8192, specLoadJobs = 5, specHoldRegions = 1}
+roomy = limitsWith $ \s → s {specResidentBytes = 4000, specStagingBytes = 8192, specLoadJobs = 5, specHoldRegions = 1, specCameraRegions = 64}
 
 -- | Room for camera work beside the explicit headroom (994 staging bytes and two job
 -- slots stay free for explicit requests), and cells up to level 1 of a region.
 roomy2 ∷ Limits
-roomy2 = limitsWith $ \s → s {specResidentBytes = 4000, specStagingBytes = 8192, specLoadJobs = 5, specExtentZ = 2, specHoldRegions = 1}
+roomy2 = limitsWith $ \s → s {specResidentBytes = 4000, specStagingBytes = 8192, specLoadJobs = 5, specExtentZ = 2, specHoldRegions = 1, specCameraRegions = 64}
 
 -- | Room for cells up to level 10 of a region: two regions per request.
 tall ∷ Limits
@@ -188,7 +188,9 @@ limitSpec = describe "validated limits" $ do
     -- camera work and holds always leave free; a hold adds 64 per region of its 16,384.
     explicitMinimumBytes defaultSpec StagingBank `shouldBe` 128 + 32 * 257 + 64 * 257 + 257 * 16640
     limitExplicitStagingBytes l `shouldBe` 4301280
-    minimumBytes defaultSpec StagingBank `shouldBe` 4301280 + 64 * 256
+    -- A camera unit (a description of one region, its interest and 16,640 of scratch,
+    -- 16,896) is larger than a hold's 256 records (16,384): the camera share needs it.
+    minimumBytes defaultSpec StagingBank `shouldBe` 4301280 + 16896
     -- A held region is charged at its stored maximum, so the largest hold, 256 regions,
     -- adds 74,514,432 to the resident minimum: 253,534,464 of 268,435,456.
     minimumBytes defaultSpec ResidentBank `shouldBe` 257 * (291072 + 405504) + 256 * 291072
@@ -808,7 +810,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
   it "admits what fits, keeps the rest as coalesced pending demand and reserves nothing for it" $ do
     -- 1,764 resident bytes: 964 stay for explicit requests, so camera jobs in flight may
     -- reserve 800 (two 400-byte jobs). Four regions are named.
-    m0 ← opened (limitsWith $ \x → x {specResidentBytes = 1764, specStagingBytes = 8192})
+    m0 ← opened (limitsWith $ \x → x {specResidentBytes = 1764, specStagingBytes = 8192, specCameraRegions = 64})
     let four = [demand (reg i 0 0) (cell 0 0 0) | i ← [0 .. 3]]
     (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 four)
     case reportDecision set of
@@ -833,7 +835,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- 2,000 staging bytes, of which camera work leaves 994 for explicit requests: the
     -- view's 192-byte description, its interest (64) and the region job's scratch (258)
     -- are 514; an open request holds 482 more, which leaves camera work 10.
-    m0 ← opened (limitsWith $ \s → s {specStagingBytes = 2000, specResidentBytes = 4000, specLoadJobs = 5})
+    m0 ← opened (limitsWith $ \s → s {specStagingBytes = 2000, specResidentBytes = 4000, specLoadJobs = 5, specCameraRegions = 64})
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
     ledgersOf m1 `shouldBe` Ledgers (0, 400) (0, 0) (192 + 64, 258)
     (m2, _) ← stepOk m1 (q 1 (reg 5 0 0) (cell 0 0 0))
@@ -893,7 +895,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     let regionA = demand (reg 0 0 0) (cell 0 0 0)
         regionB = demand (reg 1 0 0) (coverageUnion (cell 0 0 0) (cell 1 0 0))
         costB = Cost 2 2 4
-        mixed = limitsWith $ \x → x {specResidentBytes = 2360, specStagingBytes = 4096, specLoadJobs = 4, specExtentX = 2}
+        mixed = limitsWith $ \x → x {specResidentBytes = 2360, specStagingBytes = 4096, specLoadJobs = 4, specExtentX = 2, specCameraRegions = 64}
     forM_ [([regionA, regionB], [oneCellCost, costB]), ([regionB, regionA], [costB, oneCellCost])] $ \(order, costs) → do
       m0 ← opened mixed
       (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 order)
@@ -905,16 +907,16 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       map viewPending (modelViews m2) `shouldBe` [[]]
   it "admits regions strictly in demand order, so a later region never takes room an earlier one needs" $ do
     -- Extent 2 x 1 x 4, two regions per query: a region stores at most 624 and a job
-    -- reserves at most 480 more, so explicit work needs 2,208 of the 3,200 bytes and
-    -- camera jobs in flight may reserve 992. Five unrelated regions are pinned by open
+    -- reserves at most 480 more, so explicit work needs 2,208 of the 3,320 bytes and
+    -- camera jobs in flight may reserve 1,112. Five unrelated regions are pinned by open
     -- requests (5 x 338 = 1,690). A (two columns) reserves 544; B (two intervals in
     -- each column) reserves 256 + 96 + 4 x 96 = 736, which with A's would exceed what the
-    -- camera may have in flight (1,280 > 992), so it waits; C (one cell, 400) would fit
+    -- camera may have in flight (1,280 > 1,112), so it waits; C (one cell, 400) would fit
     -- (944) but may not take room B is waiting for.
     let a' = demand (reg 10 0 0) (coverageUnion (cell 0 0 0) (cell 1 0 0))
         b' = demand (reg 11 0 0) (foldr1 coverageUnion [cell x 0 z | x ← [0, 1], z ← [0, 2]])
         c' = demand (reg 12 0 0) (cell 0 0 0)
-        limits = limitsWith $ \x → x {specResidentBytes = 3200, specStagingBytes = 4096, specLoadJobs = 4, specQueuedCommands = 8, specExtentX = 2, specExtentZ = 4}
+        limits = limitsWith $ \x → x {specResidentBytes = 3320, specStagingBytes = 4096, specLoadJobs = 4, specQueuedCommands = 8, specExtentX = 2, specExtentZ = 4, specCameraRegions = 64}
     m0 ← opened limits
     pinned ← foldM (\m i → loadCell m i (reg i 0 0) (cell 0 0 0)) m0 [1 .. 5]
     (m1, set) ← stepOk pinned (SetCameraDemand (ViewId 1) a1 [a', b', c'])
@@ -939,7 +941,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- waits, holds nothing, and A is kept.
     let regionA = demand (reg 0 0 0) (cell 0 0 0)
         regionB = demand (reg 1 0 0) (cell 0 0 0)
-    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1500, specQueuedCommands = 8})
+    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1500, specQueuedCommands = 8, specCameraRegions = 64})
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionA])
     m2' ← foldM (\m i → loadCell m i (reg (i + 1) 0 0) (cell 0 0 0)) m2 [2, 3, 4]
@@ -961,7 +963,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- stalling.
     let regionA = demand (reg 0 0 0) (cell 0 0 0)
         regionB = demand (reg 1 0 0) (cell 0 0 0)
-        minimal = limitsWith $ \x → x {specStagingBytes = 1636, specResidentBytes = 1500}
+        minimal = limitsWith $ \x → x {specStagingBytes = 1636, specResidentBytes = 1500, specCameraRegions = 64}
     m0 ← opened minimal
     m1 ← loadCell m0 1 (reg 1 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionB])
@@ -979,7 +981,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- must not: A waits (busy).
     let regionA = demand (reg 0 0 0) (cell 0 0 0)
         regionB = demand (reg 1 0 0) (cell 0 0 0)
-    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1500, specQueuedCommands = 8})
+    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1500, specQueuedCommands = 8, specCameraRegions = 64})
     m1 ← loadCell m0 1 (reg 1 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m1' ← foldM (\m i → loadCell m i (reg (i + 1) 0 0) (cell 0 0 0)) m1 [2, 3, 4]
     (m2, held) ← stepOk m1' (SetCameraDemand (ViewId 1) a1 [regionA, regionB])
@@ -999,7 +1001,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- in the tiny configuration this is accepted whole and completes.
     let regionN = demand (reg 2 0 0) (cell 0 0 0)
         regionR = demand (reg 0 0 0) (cell 0 0 0)
-    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1750, specHoldRegions = 1})
+    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1750, specHoldRegions = 1, specCameraRegions = 64})
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionR])
     (m3, holdRes) ← stepOk m2 (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0])
@@ -1039,7 +1041,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- at most 800. The camera names 40 regions, nearest first.
     let far = [demand (reg i 0 0) (cell 0 0 0) | i ← [0 .. 39]]
         nearest = [reg i 0 0 | i ← [0 .. 39]]
-        limits = limitsWith $ \x → x {specResidentBytes = 1764, specStagingBytes = 8192, specLoadJobs = 6}
+        limits = limitsWith $ \x → x {specResidentBytes = 1764, specStagingBytes = 8192, specLoadJobs = 6, specCameraRegions = 64}
         resident m = sort [regionCoord r | r ← modelRegions m, regionCoord r `elem` nearest]
     m0 ← opened limits
     (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 far)
@@ -1077,7 +1079,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- 1,636 staging bytes: 994 stay free for explicit requests, so the camera may use 642.
     -- Its 256-byte description and the first region (interest 64 + scratch 258) take 578;
     -- the second region would take 322 more and waits.
-    let limits = limitsWith $ \x → x {specResidentBytes = 40000, specStagingBytes = 1636, specLoadJobs = 6}
+    let limits = limitsWith $ \x → x {specResidentBytes = 40000, specStagingBytes = 1636, specLoadJobs = 6, specCameraRegions = 64}
     m0 ← opened limits
     (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0), demand (reg 1 0 0) (cell 0 0 0)])
     case reportDecision set of
@@ -1088,13 +1090,13 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     (_, removal) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 16 0 0))
     length (admissionJobs (admission removal)) `shouldBe` 1
   it "withdraws the interest in the coverage a busy replacement replaced" $ do
-    -- 1,508 staging bytes: 994 stay free for explicit requests. View 1 holds level 0 of
+    -- 1,510 staging bytes: 994 stay free for explicit requests. View 1 holds level 0 of
     -- region A (description 192 + interest 64 once the job's scratch is released) and a
     -- borrower's record takes 64 more. The replacement, both levels of A, needs 258
     -- bytes of scratch for level 1 beside the headroom and only 1,188 - 994 = 194 are
     -- left: it is busy, and the old interest must not survive it.
     let both = demand (reg 0 0 0) (box 0 1 0 1 0 2)
-        limits = limitsWith $ \x → x {specResidentBytes = 4000, specStagingBytes = 1508, specExtentZ = 2, specHoldRegions = 1}
+        limits = limitsWith $ \x → x {specResidentBytes = 4000, specStagingBytes = 1510, specExtentZ = 2, specHoldRegions = 1, specCameraRegions = 64}
     m0 ← opened limits
     m1a ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch, JobCompleted (JobId 0) oneCellCost]
     -- A borrower's 64-byte record takes the room the replacement's scratch needs.
@@ -1113,7 +1115,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- explicit query for two fresh regions (800 bytes) arrives each time: it is
     -- admitted, taking the unpinned camera regions.
     let far = [demand (reg i 0 0) (cell 0 0 0) | i ← [0 .. 5]]
-        limits = limitsWith $ \x → x {specResidentBytes = 1664, specStagingBytes = 8192, specLoadJobs = 6, specQueuedCommands = 8, specHoldRegions = 1}
+        limits = limitsWith $ \x → x {specResidentBytes = 1664, specStagingBytes = 8192, specLoadJobs = 6, specQueuedCommands = 8, specHoldRegions = 1, specCameraRegions = 64}
     m0 ← opened limits
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 far)
     m2 ← drainDemand m1
@@ -1194,15 +1196,17 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     tight ← opened (limitsWith $ \x → x {specResidentBytes = 40000, specStagingBytes = 1250, specQueryRegions = 2, specQueuedCommands = 8, specHoldRegions = 4})
     t1 ← foldM (\m i → loadCell m i (reg i 0 0) (cell 0 0 0) >>= \x → if i == 4 then pure x else withdraw x i) tight [0 .. 4]
     stepRefused t1 (AcquireHold (HoldId 1) a1 Borrow four) `shouldReturn` Busy (BankFull StagingBank 1250 224 256)
-  it "keeps explicit work admissible however camera jobs are re-admitted: reservations in flight stay within the room left" $ do
-    -- One region per query (explicit work needs 544 resident bytes) and a 944-byte bank:
-    -- the camera may have 400 in flight. Every round the camera is moved to a fresh
-    -- region and its job runs and completes; an explicit one-cell query arrives while
-    -- the camera job is queued, and is admitted each time (the bank is never taken by
-    -- re-admitted camera reservations).
-    let limits = limitsWith $ \x → x {specResidentBytes = 944, specStagingBytes = 8192, specQueryRegions = 1, specQueuedCommands = 8}
+  it "keeps explicit work admissible however camera jobs are re-admitted: reservations in flight stay within the camera share" $ do
+    -- One region per query (explicit work needs 544 resident bytes) and one camera region
+    -- (a camera job needs 338 + 144 = 482 to make progress): a camera that is enabled
+    -- needs a share of 482, so 1,026 bytes; 1,025 is refused at construction. The camera
+    -- may keep 482 in flight. Every round the camera is moved to a fresh region while an
+    -- explicit one-cell query arrives with the camera job queued: it is admitted each time,
+    -- however the camera's reservation is restored between retries.
+    let spec' = baseSpec {specResidentBytes = 1026, specStagingBytes = 8192, specQueryRegions = 1, specQueuedCommands = 8, specCameraRegions = 64}
         region k = demand (reg k 0 0) (cell 0 0 0)
-    m0 ← opened limits
+    mkLimits spec' {specResidentBytes = 1025} `shouldBe` Left (BankBelowMinimum ResidentBank 1026 1025)
+    m0 ← opened (limitsWith (const spec'))
     let round' m k = do
           (m1, set) ← stepOk m (SetCameraDemand (ViewId 1) a1 [region k])
           case reportDecision set of
@@ -1212,31 +1216,25 @@ cameraSpec = describe "camera demand is latest-value state" $ do
           length (admissionJobs (admission explicit)) `shouldBe` 1
           withdraw m2 (50 + k) >>= drainDemand
     _ ← foldM round' m0 [1 .. 5]
-    -- With the bank exactly the explicit minimum, the camera is never admitted at all.
-    tight ← opened (limitsWith $ \x → x {specResidentBytes = 544, specStagingBytes = 8192, specQueryRegions = 1})
-    (t1, camera) ← stepOk tight (SetCameraDemand (ViewId 1) a1 [region 1])
-    case reportDecision camera of
-      CameraSet admitted waiting _ _ _ _ _ → (length admitted, waiting) `shouldBe` (0, [reg 1 0 0])
-      other → expectationFailure (show other)
-    (_, explicit) ← stepOk t1 (q 1 (reg 100 0 0) (cell 0 0 0))
-    length (admissionJobs (admission explicit)) `shouldBe` 1
+    pure ()
   it "fits a hold the configuration allows once competing resources are released" $ do
     -- One region per query and one per hold, a one-cell extent: 544 bytes for explicit
     -- work and 338 for the held region, 882 in all. At 881 the configuration is refused.
     mkLimits baseSpec {specQueryRegions = 1, specHoldRegions = 1, specResidentBytes = 881, specStagingBytes = 2048} `shouldBe` Left (BankBelowMinimum ResidentBank 882 881)
+    -- (An enabled camera needs the larger of a hold and one region's job: 544 + 482 = 1,026.)
     m0 ← opened (limitsWith $ \x → x {specQueryRegions = 1, specHoldRegions = 1, specResidentBytes = 882, specStagingBytes = 2048})
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     (m2, _) ← stepOk m1 (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0])
     ledgersOf m2 `shouldBe` Ledgers (338, 0) (0, 0) (64, 0)
   it "charges a held region at its stored maximum, so a pinned region that grows cannot take the explicit room" $ do
     -- Extent 16 x 1 x 1: a region stores at most 256 + 16 x 48 + 16 x 34 = 1,568 bytes and
-    -- a full-region job reserves 16 x 144 = 2,304 more, so explicit work needs 3,872.
-    -- Two held regions are charged 3,136; the bank of 7,008 leaves exactly that to the
-    -- camera. Two cameras' regions are loaded one cell wide and pinned; widening them
+    -- a full-region job reserves 16 x 144 = 2,304 more, so explicit work needs 3,872 and
+    -- the camera share must hold one region's job (3,872): 7,744 bytes. Two held regions
+    -- are charged 3,136 of that share. Two cameras' regions are loaded one cell wide and pinned; widening them
     -- to the whole region is refused (it would take what pins may not), so the pinned
     -- total cannot grow, and an explicit query for a whole fresh region is admitted.
     let wide = box 0 16 0 1 0 1
-        limits = limitsWith $ \x → x {specQueryRegions = 1, specHoldRegions = 2, specExtentX = 16, specResidentBytes = 7008, specStagingBytes = 8192, specLoadJobs = 6}
+        limits = limitsWith $ \x → x {specQueryRegions = 1, specHoldRegions = 2, specExtentX = 16, specResidentBytes = 7744, specStagingBytes = 8192, specLoadJobs = 6, specCameraRegions = 64}
     m0 ← opened limits
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0), demand (reg 1 0 0) (cell 0 0 0)])
     m2 ← drainDemand m1

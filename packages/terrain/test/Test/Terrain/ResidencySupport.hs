@@ -107,8 +107,8 @@ honestCost m j =
 tiny ∷ Limits
 tiny = limitsWith id
 
--- | The tiny specification: two regions per query, a one-cell extent, no holds,
--- camera descriptions of up to 64, and banks that meet the minimum budgets (a query
+-- | The tiny specification: two regions per query, a one-cell extent, no holds and
+-- no camera (each needs room beyond the explicit minimum), and banks that meet the minimum budgets (a query
 -- of two regions needs 964 resident bytes and 994 staging bytes; each region of the
 -- largest hold adds 338 and 64).
 baseSpec ∷ LimitsSpec
@@ -127,7 +127,7 @@ baseSpec =
     , specExtentY = 1
     , specExtentZ = 1
     , specHoldRegions = 0
-    , specCameraRegions = 64
+    , specCameraRegions = 0
     }
 
 -- | Validated limits from the tiny budget with some figures changed. A change

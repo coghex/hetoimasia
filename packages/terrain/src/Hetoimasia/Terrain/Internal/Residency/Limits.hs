@@ -40,6 +40,7 @@ module Hetoimasia.Terrain.Internal.Residency.Limits
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Internal.Residency.Coverage
   ( commandRecordBytes
+  , descriptionBytes
   , holdRecordBytes
   , interestRecordBytes
   , regionColumnReserveBytes
@@ -104,7 +105,8 @@ data LimitsSpec = LimitsSpec
     -- A held region is charged at its stored maximum, and the resident bank must hold
     -- that many at the maximum beside the explicit minimum.
     specHoldRegions ∷ !Integer
-  , -- | The structural maximum of a view's stored camera description, in regions.
+  , -- | The structural maximum of a view's stored camera description, in regions, zero
+    -- to disable the camera (every description is then withdrawn).
     -- A longer description is truncated in priority order and the remainder
     -- reported; it is never refused.
     specCameraRegions ∷ !Integer
@@ -183,7 +185,7 @@ mkLimits spec = do
   ey ← checkInt FieldExtentY 16 (specExtentY spec)
   ez ← checkInt FieldExtentZ 32 (specExtentZ spec)
   hold ← checkNonNegative FieldHoldRegions limitCeiling (specHoldRegions spec)
-  camera ← check FieldCameraRegions limitCeiling (specCameraRegions spec)
+  camera ← checkNonNegative FieldCameraRegions limitCeiling (specCameraRegions spec)
   mapM_ (atLeast spec) allBanks
   pure (Limits resident edit staging jobs commands pins aging query (fromInteger ex, fromInteger ey, fromInteger ez) (fromInteger (explicitMinimumBytes spec StagingBank)) (fromInteger (explicitMinimumBytes spec ResidentBank)) hold camera)
   where
@@ -271,19 +273,35 @@ explicitMinimumBytes spec bank = case bank of
     interest = toInteger interestRecordBytes
     scratch = 256 + 2 * x * y * z
 
--- | What each bank must hold: the explicit worst case and, beside it, the largest
--- hold (borrowers and publication pins). A held region is charged at its stored
--- maximum, since it can grow while pinned, so the resident bank also holds that
--- many regions at the maximum; staging holds the hold's 64-byte records. The largest
--- hold then fits when the camera has taken nothing of its share.
+-- | What each bank must hold. Every bank is partitioned into an explicit reserve (the
+-- explicit worst case, 'explicitMinimumBytes') and a camera share (the rest). Camera
+-- work and holds draw only on the share and never touch the reserve, so the share
+-- must hold the largest single camera unit, or the camera could never make progress:
+--
+-- * 'ResidentBank': the largest hold, its regions each at the stored maximum (a held
+--   region can grow while pinned), or one region's camera job at its worst, the stored
+--   maximum plus the largest job;
+-- * 'StagingBank': the largest hold's 64-byte records, or one camera region (its
+--   description of one region, its interest and its scratch).
+--
+-- A camera disabled ('specCameraRegions' zero) needs no camera unit, and holds
+-- disabled ('specHoldRegions' zero) need no hold.
 minimumBytes ∷ LimitsSpec → Bank → Integer
 minimumBytes spec bank = case bank of
   ResidentBank →
     explicitMinimumBytes spec ResidentBank
-      + specHoldRegions spec * regionStoredBytes (specExtentX spec) (specExtentY spec) (specExtentZ spec)
-  StagingBank → explicitMinimumBytes spec StagingBank + toInteger holdRecordBytes * specHoldRegions spec
+      + maximum [specHoldRegions spec * stored, if cameraOn then stored + job else 0]
+  StagingBank →
+    explicitMinimumBytes spec StagingBank
+      + maximum [toInteger holdRecordBytes * specHoldRegions spec, if cameraOn then toInteger (descriptionBytes 1) + toInteger interestRecordBytes + 256 + 2 * x * y * z else 0]
   _ → explicitMinimumBytes spec bank
-
+  where
+    cameraOn = specCameraRegions spec > 0
+    x = specExtentX spec
+    y = specExtentY spec
+    z = specExtentZ spec
+    stored = regionStoredBytes x y z
+    job = regionJobBytes x y z
 
 -- | The approved initial CPU limits (sized for a normal laptop, hundreds of
 -- megabytes): 256 MiB resident terrain, 64 MiB retained session edits, 128 MiB CPU

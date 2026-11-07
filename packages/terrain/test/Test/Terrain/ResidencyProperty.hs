@@ -540,18 +540,42 @@ reservationWithinMinimum picks =
     resident l = let (o, r) = (\(Ledgers a _ _) → a) l in toInteger (o + r)
     staging l = let (o, r) = (\(Ledgers _ _ c) → c) l in toInteger (o + r)
 
--- | Explicit requests are not blocked by camera holdings beyond what eviction can
--- release: with every camera demand left in place (their interests, descriptions
--- and any regions they have loaded), once the owner has released everything else, an
--- in-cap query or removal is admitted at once.
+-- | The owner finishes the explicit-only work and nothing of the camera's: it
+-- withdraws every request, finishes every running job (finite work), releases every
+-- victim, offloads every changed region and dispatches only what a request needs. It
+-- releases no hold, withdraws no camera demand and leaves every camera job that has not
+-- been dispatched queued.
+settleExplicitOnly ∷ Model → Either String Model
+settleExplicitOnly = go (800 ∷ Int)
+  where
+    go 0 _ = Left "the explicit-only work did not drain"
+    go n m = case actions m of
+      [] → Right m
+      (ev : _) → case step m ev of
+        (m', Right _) → go (n - 1) m'
+        (_, Left r) → Left ("the owner's " <> show ev <> " was refused: " <> show r)
+    actions m =
+      [Withdraw (requestId r) | r ← modelRequests m]
+        <> [JobCompleted (jobId j) (honestCost m j) | j ← modelJobs m, jobPhase j `elem` [JobRunningPhase, JobCancellingPhase]]
+        <> [VictimReleased (regionArena r) (regionCoord r) | r ← modelRegions m, regionEvicting r]
+        <> [HandoffConfirmed (regionArena r) (regionCoord r) | r ← modelRegions m, Just _ ← [regionHandoff r]]
+        <> [BeginHandoff (regionArena r) (regionCoord r) 0 | r ← modelRegions m, regionDirty r, regionHandoff r == Nothing, regionArena r `elem` [arenaId a | a ← modelArenas m, arenaPhase a == ArenaLive]]
+        <> [Dispatch | any (neededByRequest m) [j | j ← modelJobs m, jobPhase j == JobQueued]]
+    neededByRequest m j = or [True | i ← modelInterests m, requestOwned (interestOwner i), interestArena i == jobArena j, interestRegion i == jobRegion j, coverageIntersects (interestCoverage i) (jobCoverage j)]
+    requestOwned (OwnerRequest _) = True
+    requestOwned (OwnerView _) = False
+
+-- | Explicit requests are never blocked by camera activity: with every camera demand,
+-- pin, interest and undispatched camera job left exactly as the sequence left them,
+-- once the explicit-only work has drained an in-cap query or removal is admitted at once.
 explicitWithCameraPresent ∷ [(Int, Int, Int)] → [(Int, Int)] → Property
 explicitWithCameraPresent seeds picks =
   let m0 = modelAfter pressure seeds
-   in case settleWith False m0 >>= offloadAll of
+   in case settleExplicitOnly m0 of
         Left why → counterexample why False
         Right m →
           conjoin
-            [ counterexample (what <> " was blocked by the camera in an otherwise quiescent model: " <> show r) (admitted what r)
+            [ counterexample (what <> " was blocked by the camera once the explicit work drained: " <> show r) (admitted what r)
             | (what, event) ← take 2 (inCapRequests m picks)
             , let r = snd (step m event)
             ]
@@ -560,10 +584,6 @@ explicitWithCameraPresent seeds picks =
       Right _ → True
       Left (RetainedEditsExhausted {}) → what == "removal"
       Left _ → False
-    offloadAll m1 =
-      let dirty = [r | r ← modelRegions m1, regionDirty r, regionHandoff r == Nothing]
-          offload m r = fst (step (fst (step m (BeginHandoff (regionArena r) (regionCoord r) 0))) (HandoffConfirmed (regionArena r) (regionCoord r)))
-       in settleWith False (foldl offload m1 dirty)
 
 -- | A request over its caps is invalid from every state, with a typed reason.
 overCapAlwaysInvalid ∷ [(Int, Int, Int)] → Property
@@ -613,8 +633,8 @@ minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, x, y, z) =
       stored = 256 + 48 * columns + 34 * columns * z
       job = 48 * columns + 96 * intervals
       scratch = 256 + 2 * columns * z
-      needResident = 4 * stored + maximum [query * (stored + job), stored + 48 + 96 + 62]
-      needStaging = 64 * 4 + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258, stored]
+      needResident = maximum [4 * stored, stored + job] + maximum [query * (stored + job), stored + 48 + 96 + 62]
+      needStaging = maximum [64 * 4, 192 + 64 + scratch] + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 512 + 64 + 258, stored]
       expected
         | resident < needResident = Just (BankBelowMinimum ResidentBank needResident resident)
         | edit < 64 = Just (BankBelowMinimum EditBank 64 edit)
