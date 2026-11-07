@@ -605,11 +605,13 @@ data RequestInfo = RequestInfo
   , -- | The removal's resident growth reserved now and still waiting for victims.
     requestResidentActive ∷ !Word64
   , requestResidentDeferred ∷ !Word64
+  , -- | The cell a removal is for.
+    requestRemovalCell ∷ !(Maybe Coverage)
   }
   deriving stock (Eq, Show)
 
 modelRequests ∷ Model → [RequestInfo]
-modelRequests m = [RequestInfo r (rqArena x) (rqRegions x) (isJust (rqEdit x)) (rqActive x) (rqDeferred x) | (r, x) ← Map.toAscList (mRequests m)]
+modelRequests m = [RequestInfo r (rqArena x) (rqRegions x) (isJust (rqEdit x)) (rqActive x) (rqDeferred x) (fmap erCoverage (rqEdit x)) | (r, x) ← Map.toAscList (mRequests m)]
 
 modelHolds ∷ Model → [(HoldId, ArenaId, HoldKind, [RegionCoord])]
 modelHolds m = [(h, hdArena x, hdKind x, hdRegions x) | (h, x) ← Map.toAscList (mHolds m)]
@@ -1111,7 +1113,10 @@ setCamera m v a demands = do
       -- replaced, so an obsolete interest never survives a replacement. Whatever a
       -- step leaves without an interest is pruned at once and reported, so the owner
       -- is told to cancel every job the replacement made obsolete.
-      attempt (mm, done, waiting, replaced, goneAcc, cancelAcc) d = case planAdmission mm a owner [d] noExtras of
+      -- Regions are admitted strictly in demand order: once one is busy the rest
+      -- wait behind it, so a later region never takes room an earlier one needs
+      -- (the feasibility bound above is the order in which admission reserves).
+      attempt (mm, done, waiting, replaced, goneAcc, cancelAcc) d = case (if null waiting then planAdmission mm a owner [d] noExtras else Left (Busy (RegionEvicting (demandRegion d)))) of
         Right plan →
           let (mm', admission, _) = applyPlan mm a owner plan
               (mm'', g, c) = pruneJobs mm'
@@ -1135,14 +1140,18 @@ setCamera m v a demands = do
 service ∷ Model → (Model, Decision)
 service m0 =
   let views = Map.toAscList (mViews m0)
-      go (m, acc) (v, w) = foldl' (try v w) (m, acc) (vwDemand w)
-      try v w (m, acc) d
-        | Set.member (demandRegion d) (vwFailed w) = (m, acc)
+      go (m, acc) (v, w) = let (m', acc', _) = foldl' (try v w) (m, acc, False) (vwDemand w) in (m', acc')
+      -- In demand order, like the first admission: the first region that cannot
+      -- be admitted holds back the regions after it.
+      try v w (m, acc, blocked) d
+        | Set.member (demandRegion d) (vwFailed w) = (m, acc, blocked)
         | needs m v w d =
-            case planAdmission m (vwArena w) (OwnerView v) [d] noExtras of
-              Right plan → let (m', admission, _) = applyPlan m (vwArena w) (OwnerView v) plan in (m', acc <> [(v, admission)])
-              Left _ → (m, acc)
-        | otherwise = (m, acc)
+            if blocked
+              then (m, acc, True)
+              else case planAdmission m (vwArena w) (OwnerView v) [d] noExtras of
+                Right plan → let (m', admission, _) = applyPlan m (vwArena w) (OwnerView v) plan in (m', acc <> [(v, admission)], False)
+                Left _ → (m, acc, True)
+        | otherwise = (m, acc, blocked)
       needs m v w d =
         let key = (vwArena w, demandRegion d)
          in case Map.lookup key (mTargets m) >>= Map.lookup (OwnerView v) . tgInterests of

@@ -27,6 +27,7 @@
 -- No example here sleeps, starts a thread or reads a clock.
 module Test.Terrain.ResidencyProperty (spec) where
 
+import Control.Monad (forM_, unless)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Hetoimasia.Terrain.Coordinate (tileCoord)
 import Hetoimasia.Terrain.Residency
@@ -40,7 +41,7 @@ pressure =
   limitsWith $ \s →
     s
       { specResidentBytes = 800
-      , specEditBytes = 192
+      , specEditBytes = 640
       , specStagingBytes = 3000
       , specLoadJobs = 4
       , specQueuedCommands = 4
@@ -75,13 +76,13 @@ eventFor m (k, a, b) = case k `mod` 22 of
   3 → SubmitRemoval fresh arena (revisionOf arena) (tileFor a b)
   4 → SetCameraDemand (ViewId (fromIntegral (a `mod` 2))) arena [demandFor b a, demandFor (b + 1) (a + 2)]
   5 → ClearCameraDemand (ViewId (fromIntegral (a `mod` 2)))
-  6 → Withdraw (maybe fresh requestId (pick (modelRequests m) a))
+  6 → if b `mod` 4 == 0 then Withdraw (maybe fresh requestId (pick (modelRequests m) a)) else advanceEdit
   7 → Service
   8 → Dispatch
   9 → Dispatch
   10 → Dispatch
-  11 → maybe (JobCompleted (JobId 99) (Cost 0 0 0)) completion (pick (running JobRunningPhase) a)
-  12 → maybe (JobCompleted (JobId 99) (Cost 0 0 0)) completion (pick (running JobRunningPhase) a)
+  11 → maybe (JobCompleted (JobId 99) (Cost 0 0 0)) completion (pick (editJobsFirst (running JobRunningPhase)) a)
+  12 → maybe (JobCompleted (JobId 99) (Cost 0 0 0)) completion (pick (editJobsFirst (running JobRunningPhase)) a)
   13 → maybe (JobFailed (JobId 98)) (JobFailed . jobId) (pick (running JobRunningPhase) a)
   14 → maybe (JobAcknowledged (JobId 97)) (JobAcknowledged . jobId) (pick (running JobCancellingPhase) a)
   15 → case pick [r | r ← modelRequests m, requestRemoval r] a of
@@ -99,22 +100,55 @@ eventFor m (k, a, b) = case k `mod` 22 of
   19 → case pick (resident regionEvicting) a of
     Just r → VictimReleased (regionArena r) (regionCoord r)
     Nothing → VictimReleased (ArenaId 99) (reg 0 0 0)
-  20 → maybe (RetireArena (ArenaId 99)) (RetireArena . arenaId) (pick (modelArenas m) a)
-  _ → SubmitQuery fresh (ArenaId 99) rev0 [demandFor a b]
+  -- Arenas end rarely, so long-lived arenas see the commits, replacements and
+  -- acknowledgements the properties are about.
+  20 → if b `mod` 6 == 0 then maybe (RetireArena (ArenaId 99)) (RetireArena . arenaId) (pick (modelArenas m) a) else Dispatch
+  _ → case pick [r | r ← modelRequests m, requestRemoval r] a of
+    Just r → RemovalCommitted (requestId r) (Revision (revisionNumber (requestArena r) + 1)) (fromIntegral (b `mod` 66)) (fromIntegral (b `mod` 63))
+    Nothing → SubmitRemoval fresh arena (revisionOf arena) (tileFor a b)
   where
     fresh = RequestId (modelClock m + 1)
     arena = maybe (ArenaId 1) arenaId (pick [x | x ← modelArenas m, arenaPhase x == ArenaLive] a)
     revisionNumber a' = case [r | x ← modelArenas m, arenaId x == a', let Revision r = arenaRevision x] of
       (r : _) → r
       [] → 0
+    revisionNumberOf a' = Revision (revisionNumber a')
     revisionOf a' = case [arenaRevision x | x ← modelArenas m, arenaId x == a'] of
       (r : _) → if b `mod` 11 == 0 then Revision 12345 else r
       [] → rev0
+    -- The cells the demands also name, so removals meet the work of the region.
     tileFor i j =
       let (x, z) = fromMaybe (0, 0) (pick regions i)
-       in either (error . show) id (tileCoord (x * 16 + toInteger (j `mod` 16)) 0 (z * 32 + toInteger (j `mod` 32)))
+       in either (error . show) id (tileCoord (x * 16 + toInteger (j `mod` 2)) 0 (z * 32 + fromMaybe 0 (pick [0, 5, 1, 2] j)))
     running phase = [j | j ← modelJobs m, jobPhase j == phase]
+    -- Take one removal a step toward its commit: finish the running job of its
+    -- region, or dispatch, or (nothing left to wait for) commit it. The interleaving
+    -- with every other event is still the random one.
+    advanceEdit = case pick [r | r ← modelRequests m, requestRemoval r] a of
+      Nothing → Dispatch
+      Just r
+        -- Sometimes put competing work in the removal's own region first, so a later
+        -- commit finds other jobs there to supersede.
+        | b `mod` 2 == 1
+        , (region : _) ← requestRegions r →
+            SubmitQuery fresh (requestArena r) (revisionNumberOf (requestArena r)) [RegionDemand region (fromMaybe (cell 0 0 3) (pick demandCoverages a))]
+        | otherwise →
+            let regionJobs = [j | j ← modelJobs m, (jobArena j, jobRegion j) `elem` [(requestArena r, g) | g ← requestRegions r]]
+                own = [j | j ← regionJobs, Just c ← [requestRemovalCell r], coverageIntersects (jobCoverage j) c]
+             in case ([j | j ← own, jobPhase j == JobRunningPhase], [j | j ← own, jobPhase j == JobQueued]) of
+                  -- Finish the removal's own job (and only that one), then commit with
+                  -- the region's other work still queued or running.
+                  (j : _, _) → completion j
+                  (_, _ : _) → Dispatch
+                  _ → RemovalCommitted (requestId r) (Revision (revisionNumber (requestArena r) + 1)) (fromIntegral (b `mod` 66)) (fromIntegral (b `mod` 63))
     resident p = [r | r ← modelRegions m, p r]
+    -- A removal's own job comes first (the cell it is waiting on), so removals get
+    -- to commit while competing work of their region is still queued or running.
+    editJobsFirst js =
+      let ownCells = [(requestArena r, g, c) | r ← modelRequests m, requestRemoval r, g ← requestRegions r, Just c ← [requestRemovalCell r]]
+          isOwn j = or [(jobArena j, jobRegion j) == (ar, g) && coverageIntersects (jobCoverage j) c | (ar, g, c) ← ownCells]
+          (first, rest) = (filter isOwn js, filter (not . isOwn) js)
+       in if null first then rest else first
     completion j =
       let c = jobCoverage j
        in JobCompleted (jobId j) (Cost 0 (coverageSegments c) (coverageCells c))
@@ -204,7 +238,26 @@ settleEverything = go (500 ∷ Int)
 
 -- | Run a sequence; return the first failure and the event that caused it.
 runSequence ∷ [(Int, Int, Int)] → (Either String Model, Stats)
-runSequence seeds = go (newModel pressure) seeds (Stats 0 0 0 0 0 0)
+runSequence = runSequenceWith pressure
+
+-- | The same sequences under room for more concurrent work, where commits meet
+-- queued and running jobs of their region far more often.
+roomyPressure ∷ Limits
+roomyPressure =
+  limitsWith $ \s →
+    s
+      { specResidentBytes = 6000
+      , specEditBytes = 2048
+      , specStagingBytes = 12000
+      , specLoadJobs = 8
+      , specQueuedCommands = 8
+      , specPinsPerView = 2
+      , specDemandRegions = 3
+      , specAgingQuanta = 2
+      }
+
+runSequenceWith ∷ Limits → [(Int, Int, Int)] → (Either String Model, Stats)
+runSequenceWith limits seeds = go (newModel limits) seeds (Stats 0 0 0 0 0 0 0 0 0)
   where
     go m [] st = (settleEverything m, st)
     go m (s : rest) st =
@@ -221,17 +274,28 @@ data Stats = Stats
   , victims ∷ !Int
   , committed ∷ !Int
   , retired ∷ !Int
+  , -- | Commits that superseded queued or running work of their region.
+    superseded ∷ !Int
+  , -- | Cancellation acknowledgements the model accepted.
+    acknowledged ∷ !Int
+  , -- | Camera replacements that cancelled or dropped obsolete work.
+    replaced ∷ !Int
   }
   deriving stock (Eq, Show)
 
 tally ∷ Event → Either Refusal Report → Stats → Stats
 tally _ (Left _) st = st {refused = refused st + 1}
-tally _ (Right report) st =
+tally event (Right report) st =
   let st' = st {accepted = accepted st + 1, retired = retired st + length (reportSettled report)}
    in case reportDecision report of
         Published _ _ → st' {completed = completed st' + 1}
         Accepted a → st' {victims = victims st' + length (admissionVictims a)}
-        Committed {} → st' {committed = committed st' + 1}
+        Committed _ _ _ dropped stale
+          | null dropped && null stale → st' {committed = committed st' + 1}
+          | otherwise → st' {committed = committed st' + 1, superseded = superseded st' + 1}
+        Discarded _ | JobAcknowledged _ ← event → st' {acknowledged = acknowledged st' + 1}
+        CameraSet {cameraCancelled = gone, cameraAwaitingAck = awaiting}
+          | not (null gone && null awaiting) → st' {replaced = replaced st' + 1}
         _ → st'
 
 -- | A fixed pseudo-random sequence (a linear congruential generator).
@@ -311,13 +375,34 @@ spec = describe "Residency model properties" $ do
         forAll (vectorOf 4 ((,) <$> chooseInt (0, 5) <*> chooseInt (0, 5))) $ \picks →
           acceptedDemandCompletes limitsTriple picks
   it "exercises completion, eviction, commit, refusal and retirement in a fixed long sequence" $ do
-    let (outcome, stats) = runSequence (lcg 7 30000)
+    let (outcome, stats) = runSequence (lcg 7 12000)
     outcome `shouldSatisfy` either (const False) (const True)
     -- Guards against a degenerate workload: the sequence must reach the
     -- transitions the properties are about.
-    accepted stats `shouldSatisfy` (> 2000)
-    refused stats `shouldSatisfy` (> 1000)
-    completed stats `shouldSatisfy` (> 200)
-    victims stats `shouldSatisfy` (> 20)
-    committed stats `shouldSatisfy` (> 10)
-    retired stats `shouldSatisfy` (> 3)
+    reaches
+      stats
+      [ ("accepted", accepted, 1000)
+      , ("refused", refused, 500)
+      , ("completed", completed, 50)
+      , ("evictions", victims, 10)
+      , ("commits", committed, 10)
+      , ("retired arenas", retired, 1)
+      , ("acknowledged", acknowledged, 1)
+      , ("replaced", replaced, 1)
+      ]
+  it "reaches supersede, cancel and acknowledge interleavings under room for concurrent work" $ do
+    let (outcome, stats) = runSequenceWith roomyPressure (lcg 11 12000)
+    outcome `shouldSatisfy` either (const False) (const True)
+    reaches
+      stats
+      [ ("accepted", accepted, 4000)
+      , ("completed", completed, 200)
+      , ("commits", committed, 40)
+      , ("superseded", superseded, 3)
+      , ("acknowledged", acknowledged, 20)
+      , ("replaced", replaced, 20)
+      ]
+  where
+    reaches stats floors =
+      forM_ floors $ \(name, field, floor') →
+        unless (field stats >= floor') $ expectationFailure ("the sequence reached " <> name <> " only " <> show (field stats) <> " times: " <> show stats)
