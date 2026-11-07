@@ -30,15 +30,16 @@ cabal exec --project-file cabal.project.cpu -- ghc -O0 -package hetoimasia-terra
 ./evidence
 ```
 
-Limits: A and D use 1,000 resident, 192 edit and 2,048 staging bytes with 3 load jobs
-and 3 commands, at most two regions per query, holds of up to four regions, camera
-descriptions of up to 64 and a one-cell region extent (the configuration meets the
-minimum budgets: a query of two regions needs 964 resident bytes, 994 staging bytes
-that camera work and holds leave free, and 256 more for the records of the largest
-hold); B uses 1,302 resident bytes (a hold may pin the 338 left beyond the 964 an
-explicit request may need); C uses 964, the least that configuration allows; E uses
-4,000 resident and 4,096 staging bytes, aging threshold 3. A load-job slot is taken
-when a job is dispatched, so the slot column reads 0 for admitted work that waits.
+Limits: A, D and E use the tiny configuration: 1,000 resident, 192 edit and 2,048
+staging bytes with 3 load jobs and 3 commands, at most two regions per query, no holds,
+camera descriptions of up to 64 and a one-cell region extent (it meets the minimum
+budgets: a query of two regions needs 964 resident bytes and 994 staging bytes that
+camera work and holds leave free); E has 4,000 resident and 4,096 staging bytes and an
+aging threshold of 3. B has 1,302 resident bytes and holds of one region (the 964 an
+explicit request may need and the held region at its stored maximum, 338, with 64 more
+staging bytes for its record); C uses 964, the least the tiny configuration allows. A
+load-job slot is taken when a job is dispatched, so the slot column reads 0 for admitted
+work that waits.
 
 ## A. Reservation, completion, cancellation: shared job survives one caller canceling
 | step | decision | ledgers (occupied+reserved/limit) | slots |
@@ -170,13 +171,16 @@ reached 1,568), and the query for levels 1, 3, ..., 31 (one job of sixteen inter
 ## Negative controls
 
 Each protected behavior was broken once locally while keeping the scenario premise,
-the focused suite (`Residency`, 94 to 108 examples) was run, and the mutation was
+the focused suite (`Residency`, 94 to 112 examples) was run, and the mutation was
 reverted without being committed (the implementation was committed first). Every
 row failed at least the examples named. The controls of the retired state-dependent
 feasibility computation, of the camera cap and of the job-slot reserve were removed
 with them, and a stale-running-job branch in `failJob` and `completeJob` that no
 transition can reach (a superseded running job becomes cancelling) was deleted rather
-than controlled.
+than controlled. Two protections are not controlled because they are redundant by
+construction: a camera demand's own regions need no protection from camera eviction
+(its own interest already blocks them), and the held-region bound in the invariants
+repeats what hold acquisition enforces.
 
 | Mutation | Failing examples |
 | --- | --- |
@@ -207,9 +211,8 @@ than controlled.
 | A superseded running job is not cancelling | the late-failure and acknowledgement-after-commit examples |
 | Camera admission skips past a busy region | the in-order example |
 | Service skips past a busy region | the in-order example (service quantum) |
-| A demand may evict its own regions | the own-region example and a random property |
 | A job-slot refusal off by one | 12 bank and slot examples |
-| A request may evict the regions it names | a random property |
+| A request may evict the regions it names | the names-a-region example |
 | A staging shortfall off by one byte | the bank-full and retained-bound examples (7) |
 | The oldest evictable region is never a victim | 21 least-recently-used and funded-eviction examples |
 | The resident minimum ignores a region at its stored maximum | the defaults, below-minimum and largest-request examples, the minimum property |
@@ -226,6 +229,10 @@ than controlled.
 | A load-job slot is taken at admission | the 257-region column, the job-slot and camera examples (9) |
 | Dispatch ignores the load-job slots | the 257-region column and job-slot examples (4) |
 | A hold is not bounded by its region cap | the hold-cap example |
+| Camera jobs in flight are not kept within the room explicit work leaves | the re-admission, zoom-out, partial-admission and widening examples (5) |
+| A held region is charged what it holds now, not its stored maximum | the widening example and two random properties (4) |
+| The camera unit is left out of the resident minimum | the re-admission example (1,025 refused) and the minimum property (1) |
+| The largest hold is left out of the resident minimum | the defaults, below-minimum and hold examples and the minimum property (4) |
 | A camera description is not cut to the staging it may use | the truncation example and two random properties |
 | A camera description is not cut to its structural maximum | the structural-maximum example |
 | Repeated camera keys are not coalesced | the normalization example |
@@ -283,9 +290,17 @@ passes the minimum-budget rule at 64 MiB. The approved issue-review clarificatio
 so the approved 8,192-level column (257 regions) fits the unchanged 128 slots; the
 worst case is computed from the same charge rule admission reserves; holds, pins and
 handoff duplicates have static bounds; camera holdings cannot starve explicit work,
-including through pins that are released and re-acquired; camera descriptions are
-normalized and truncated in priority order instead of refused. The properties and
-examples:
+including through pins that are released and re-acquired and camera jobs that are
+re-admitted; camera descriptions are normalized and truncated in priority order
+instead of refused. The mechanism is a partition of each bank into an explicit reserve
+(the explicit worst case) and a camera share (the rest): every camera-originated
+reservation (jobs, interests, pins and borrows, staging) draws only on the share and is
+refused (busy) at admission when it would not fit. In the resident bank the camera side
+keeps out of explicit reach each held region at its stored maximum plus the detail and
+reservations of regions with a job only views need, within the bank less the explicit
+minimum; the configuration check requires the share to hold the largest single camera
+unit (the largest hold, or one region's camera job), so the camera can always make
+progress and a configuration that cannot is refused at construction. The properties and examples:
 
 - **In-cap requests are never invalid, in any state** (300 random states reached by
   the event sequences; a query, a removal and a camera demand each).
@@ -294,9 +309,11 @@ examples:
   (beginning those not yet begun), and withdraws every request and camera demand, the
   same in-cap query and removal are admitted at once; a removal may still find
   retained edits exhausted, which is unchanged.
-- **Explicit requests are not blocked by camera holdings** (300 random states): with
-  every camera demand left in place (their interests, descriptions and the regions
-  they loaded) and everything else released, an in-cap query or removal is admitted.
+- **Explicit requests are not blocked by any camera activity** (300 random states): with
+  every camera demand, pin, interest and undispatched camera job left exactly as the
+  sequence left them, once the explicit-only work has drained (requests withdrawn, running
+  jobs finished, victims released, changed regions offloaded) an in-cap query or removal
+  is admitted at once.
 - **Reservation within the worst case** (2,000 random queries and removals into a
   model that holds nothing): the resident and staging bytes admission reserves never
   exceed the explicit minimum the construction check assumed.
@@ -321,11 +338,20 @@ examples:
   victims and the view's demand for them is pending again; once the explicit work
   lets go the camera resumes nearest first, and panning on moves it to the next
   regions as the old interests are released.
-- **Re-pinning cannot starve explicit work** (example): a camera view fills a bank with
-  six regions' worth of demand and keeps a pin, a second pin is busy (338 pinned
-  bytes are all this bank lets holds take), and each of four quanta in which the view
-  releases its pin and re-pins another region an explicit two-region query arrives and
-  is admitted at once.
+- **Re-pinning cannot starve explicit work** (example): a camera view fills a 1,664-byte
+  bank and keeps two pins (a held region is charged 338, its stored maximum), a third
+  is busy, and each of four quanta in which the view releases a pin and re-pins another
+  region an explicit two-region query arrives and is admitted at once.
+- **Re-admitted camera jobs cannot starve explicit work** (example): at a bank of 944
+  bytes the camera may have 400 in flight; five rounds in which the camera moves to a
+  fresh region while an explicit query arrives each admit the query, and at exactly the
+  explicit minimum (544) the camera is never admitted.
+- **A pinned region that grows** (example, extent 16 x 1 x 1): two held regions are
+  charged their stored maximum (1,568 each); widening both from one cell to the whole
+  region is refused, so the pinned total cannot grow, and an explicit full-region query
+  is admitted. The model's invariants include the held-region bound.
+- **A hold the configuration allows fits** (example): the resident minimum includes the
+  hold (544 + 338 = 882 refused at 881), and the one-region hold is acquired.
 - **Camera headroom** (example): of 1,636 staging bytes the camera uses at most 642
   and the 994 a removal needs stay free; a hold draws on the camera's share, not the
   headroom.
@@ -344,6 +370,8 @@ examples:
 
 The defaults record: a region stores at most 291,072 bytes (every cell its own
 segment) and its largest job reserves 405,504 more, so a 257-region query needs
-179,020,032 of 268,435,456 resident bytes; the explicit staging worst case is
-4,301,280 of 134,217,728 bytes, plus 1,048,576 for the records of the largest hold; a
-removal needs 64 of 67,108,864 edit bytes; a query needs one of the 128 load-job slots.
+179,020,032 of 268,435,456 resident bytes, and the largest hold (256 regions at
+their stored maximum) adds 74,514,432: 253,534,464 in all; the explicit staging worst
+case is 4,301,280 of 134,217,728 bytes, plus 16,384 for the records of the largest hold;
+a removal needs 64 of 67,108,864 edit bytes; a query needs one of the 128 load-job
+slots.
