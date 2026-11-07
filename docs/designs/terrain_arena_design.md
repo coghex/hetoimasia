@@ -118,7 +118,8 @@ Normal panning, zooming and rotation automatically follow terrain height
 (D-13). Shift-scroll temporarily pins the slice during panning; a camera jump
 without explicit Z restores terrain following (D-14).
 The initial terrain foundation supports full blocks and slopes; the default
-arena remains flat (D-15).
+arena remains flat (D-15), with a configurable shallow soil layer above stone
+that continues downward on demand (D-16).
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
@@ -476,6 +477,26 @@ procedural hill generation remains deferred. The exact slope catalog and
 orientation rules, additional partial-height shapes and automatic reshaping
 after removal are not selected by this scope decision.
 
+### D-16. Configurable soil-over-stone arena recipe
+
+Owner, directly in this pane on 2026-11-06, accepting a shallow soil layer over
+stone continuing downward, defined by a configurable recipe:
+
+> yes that is what synarchy does too, i approve
+
+The initial flat arena uses soil above stone, with stone continuing downward
+on demand under D-11. Soil thickness and material identifiers are recipe
+parameters rather than engine constants. A shared rule answers the material
+at a requested depth without allocating intervening tiles. Initial camera
+demand still materializes only the top tile; removal or other explicit demand
+reveals deeper soil and then stone.
+
+This selects the layering pattern, not Synarchy's exact four loam/twelve
+granite cell counts. The inspected Synarchy arena has that finite base stack
+(see the evidence table); Hetoimasia's selected source continues downward.
+Exact default soil thickness, material assets and recipe API remain to be
+specified. No geological generation or additional material system is implied.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -623,17 +644,11 @@ allows a shared source definition to stand in for untouched underground spans;
 choosing compressed columns does not require eagerly building every column.
 
 D-11 settles the vertical direction: extend downward on demand, without a
-designed bottom. Settle a recipe that answers for the requested depth without
-generating every intervening tile, along with vertical residency, coordinate
-limits and bounded range queries. The initial material/layer recipe remains
-open.
-
-Next owner-facing proposal: a shallow soil layer over stone continuing
-downward on demand, described by a shared configurable recipe. This exercises
-a material transition while preserving flat terrain and top-only initial
-materialization. Soil thickness and material identifiers would be recipe
-parameters, not engine constants. A single uniform material is the simpler
-alternative. This recipe direction is not yet accepted.
+designed bottom. D-16 selects a configurable shallow soil layer over stone
+continuing downward, queried without generating intervening tiles. Specify
+default thickness, material identifiers and recipe API alongside vertical
+residency, coordinate limits and bounded range queries. The layering direction
+is settled; its concrete representation remains open.
 
 ## Verification strategy — proposal
 
@@ -641,6 +656,9 @@ Use focused Hspec/model tests for identity, demand deduplication, bounded
 admission and refusal; causally controlled integration tests for late results,
 world replacement, cancellation and retirement. Qualify exact flat-terrain
 content independently of chunk request order where that contract is selected.
+For D-16, exercise removal across the configured soil/stone boundary and
+reload on each side of it, plus direct deep-stone demand without intervening
+allocation. Check that different configured soil depths use the same contract.
 Include non-flat authored cases that exercise D-4 even though the initial arena
 generator is flat: a cavity with a solid ceiling, separated solid spans,
 completely empty columns and geometry crossing chunk boundaries. Require the
