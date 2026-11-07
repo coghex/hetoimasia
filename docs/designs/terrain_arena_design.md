@@ -102,14 +102,15 @@ stays unmaterialized (D-6). The rejected Beacon example is not the consumer.
 The arena expands with exploration; camera loading initially materializes only
 the top tile of each untouched column. Removal demands newly exposed terrain
 without eagerly filling underground depth (D-7).
-The first arena includes tile removal by keyboard shortcut, with no UI system
-or on-screen UI controls in this arc (D-8).
+Development verification uses a temporary mouse-targeted keyboard shortcut
+for tile removal, with no UI system or on-screen UI controls (D-8/D-9). Remove
+the shortcut by task completion; the Lua removal API remains.
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
 observable. Keep the first terrain source simple while designing proper
 publication and lifetime. Exact camera controls, vertical extent, appearance,
-removal targeting/key binding and Lua APIs remain open. No implementation or delivery order
+temporary key binding and exact Lua APIs remain open. No implementation or delivery order
 follows from this direction alone.
 
 **Proposal P-2: one authoritative spatial terrain model.** Represent terrain
@@ -304,7 +305,27 @@ D-7's lazy exposure behavior. Do not add a UI system, menus, toolbar, buttons
 or other on-screen UI controls for this arc. The exact key and how the target
 is chosen remain to be specified; accepting keyboard activation does not
 choose mouse hover, click selection or a keyboard-controlled tile cursor.
-Other editing tools remain outside the accepted scope.
+Other editing tools remain outside the accepted scope. D-9 subsequently
+settles mouse targeting and limits this shortcut to development verification.
+
+### D-9. Temporary development shortcut; retain the Lua API
+
+Owner, directly in this pane on 2026-11-06, accepting mouse targeting and one
+tile removal per shortcut press:
+
+> that is fine, this would be a dev only shortcut that we would soon delete when the task is done, leaving only the lua api call
+
+Use the mouse to target an exposed tile and a keyboard shortcut to remove one
+tile per press during development. The shortcut is temporary verification
+scaffolding, not a shipped arena editing control. Remove its binding and
+shortcut-specific glue by task completion, leaving the Lua tile-removal API
+as the durable removal interface. The temporary control must exercise that
+same API rather than a separate mutation path. Retain appropriate API-level
+regression coverage after the shortcut is deleted. Do not infer deletion of
+general camera/input or terrain-query capabilities from this cleanup.
+
+The exact API name, arguments, result/failure semantics and temporary key
+remain to be designed. No UI implementation is introduced.
 
 ## Design boundaries
 
@@ -354,16 +375,15 @@ open.
 
 Camera exploration/loading is selected by D-7. Decide projection, terrain
 assets/materials, camera movement/zoom/rotation controls,
-vertical slices and picking. D-8 selects shortcut-based removal and excludes
-UI implementation for this arc. Determine the narrow Lua rendering/input
+vertical slices and picking. D-8/D-9 select temporary shortcut-based removal
+and exclude UI implementation for this arc. Determine the narrow Lua rendering/input
 services required. Input ordering, focus/reset and routing need explicit
 contracts. Loading behavior must respect the no-UI scope.
 
-For targeting, recommend pointing at an exposed tile with the mouse and
-pressing the removal shortcut, with no menu or click-to-select step. A
-keyboard-controlled tile cursor is the alternative if targeting should also
-be entirely keyboard driven. This choice and the exact shortcut are open;
-one removal per press rather than held-key repeat is also a proposal.
+Targeting is settled by D-9: point at an exposed tile with the mouse and press
+the temporary shortcut, removing one tile per press. The exact key remains
+open. Delete this development binding by completion; the final removal
+interface is the Lua API, not a persistent keyboard control.
 
 ### Q-5. What belongs to the reusable engine and what belongs to Ecce Homo?
 
@@ -375,15 +395,19 @@ component store is the right representation for every terrain cell.
 
 ### Q-6. Mutation, persistence and state publication?
 
-D-7 requires removal to reveal newly materialized terrain; D-8 selects a
-keyboard shortcut for that action. Decide targeting and any additional edits,
-what survives chunk eviction, whether
+D-7 requires removal to reveal newly materialized terrain; D-9 selects a
+durable Lua removal API with a temporary development shortcut. Decide any
+additional edits, what survives chunk eviction, whether
 save/load or reset is included, and the relevant schema,
 snapshot, tick/failure and determinism guarantees. Generated base data,
 resident copies and durable edits need distinct meanings if all are included.
 The earlier state agenda remains reference material; no save migration,
 replay, mods or hot swap has been activated by D-1/D-2.
-The initial removal tool is accepted; its remaining input choices are in Q-4.
+The development removal tool is accepted; its lifecycle is D-9 and remaining
+input choices are in Q-4. For the next owner choice, recommend preserving
+removals through chunk eviction/reload for the lifetime of the current arena,
+with a fresh arena on application restart. Disk save/load could be included
+instead, but adds a persistence contract. This scope choice remains open.
 
 ### Q-7. What proves this first terrain foundation complete?
 
@@ -437,9 +461,12 @@ materialization, repeated removal revealing deeper terrain, and exposure of
 side faces and gaps. Inspect terrain allocations as well as rendered output
 to verify that untouched depth stays unmaterialized. Check explicit invisible
 queries separately under D-6 and returning to an edited, evicted region.
-Exercise the D-8 shortcut through the agreed targeting/input path, including
-no valid target and focus/reset behavior. No UI framework is needed to
-demonstrate this control.
+During development, exercise the D-8/D-9 shortcut through the agreed
+targeting/input path, including no valid target and focus/reset behavior.
+Capture its removal/reveal evidence before deleting the shortcut. Final
+acceptance verifies the Lua API and retained regression coverage, and that
+the temporary binding and its dedicated glue are gone. No UI framework is
+needed to demonstrate this control.
 Use captured rendering evidence for the agreed visible result and native input
 evidence for controls actually included. Select checks from Hetoimasia's
 validation catalog once slices exist (H `AGENTS.md`, Language and build;
