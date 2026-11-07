@@ -80,6 +80,10 @@ counterexample. D-44 approves correcting inconsistent masks while preserving
 all 16 IDs, conditional on solver-delivered proof. The exact replacement
 catalog remains open; no artwork or code has been changed in this design turn.
 
+D-45 selects crisp nearest-neighbor sampling for terrain colour artwork and
+face maps, with the same alpha cutoff for rendering and screen picking.
+Q-17 retains exact sample/edge conventions, data loading and ownership.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1368,6 +1372,26 @@ than declaring the correction proven. Q-13 carries this implementation gate;
 Q-19 must assign it to the geometry/mask correction and final qualification
 work. No implementation or tracker mutation is authorized by this design turn.
 
+### D-45. Keep terrain pixel edges crisp and picking consistent
+
+Owner, directly in this design pane on 2026-11-07, chose “crisp edgs” in
+response to the choice between nearest-neighbor terrain/mask sampling with
+matching picking and smooth filtered coverage.
+
+Use nearest-neighbor sampling for both terrain colour artwork and face maps.
+Rendering and screen picking use the same alpha cutoff and matching sampled
+coverage from the adopted asset versions. Do not smooth a visible edge while
+testing a different, unfiltered silhouette for picking. This chooses crisp
+pixel artwork through the existing pan/zoom/facing controls; it does not add
+camera snapping, fixed zoom steps or a new UI.
+
+This resolves Q-17's nearest-versus-smooth appearance choice, alongside D-30's
+shared CPU coverage authority. The numeric cutoff, exact UV/texel-boundary
+rule, mip/LOD policy, bounded data-image loading and resource accounting remain
+concrete contract work. Include non-integer zoom, tile edges and all four
+facings in D-44's coverage/picking evidence. No particular corrected shape or
+lighting appearance is selected by this sampling decision.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2385,7 +2409,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-44 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-45 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2408,8 +2432,10 @@ establishes a coherent solid catalog.
 
 D-30 selects the picking approach: use the adopted drawn quads, matching
 artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
-The former analytic-solid picker is not the visual authority. Exact emission,
-cut surfaces and the remaining sampling/ownership details are still open.
+D-45 selects nearest-neighbor colour/mask sampling and a shared render/pick
+alpha cutoff. The former analytic-solid picker is not the visual authority.
+Exact emission, cut surfaces, numeric sample/edge conventions and the remaining
+ownership details are still open.
 
 D-31 requires a separate fog presentation over undiscovered underground
 terrain, including real air gaps. The generic blank is intentional gameplay
@@ -2620,6 +2646,89 @@ of a save failure, the write directory had only 27 MB free at startup and the
 developer fixed the error to report insufficient space. It supports retaining
 runtime error handling, not claiming Factorio pre-reserves all future saves.
 
+### P-9. Concrete logical shape catalog — proposal for Q-16 review
+
+This is a proposed replacement catalog, not an approved interpretation of the
+corrected artwork. D-44 permits demonstrated mask corrections but does not
+choose these shapes. It preserves S's documented meaning of a set bit as a
+lower cardinal neighbor (`src/World/Slope/Compute.hs:135–143,173–205`), and
+makes that direction the cell's lowered edge. It does not infer terrain shape
+from camera pixels or enable automatic slope recomputation after removal.
+
+Use the existing local frame: X east, Y south and Z up, each in `[0,1]`.
+Let `N=y`, `E=1-x`, `S=1-y`, `W=x`. Shape 0 has top height `h=1`; every
+other shape's top is the minimum of the expressions named by its bits.
+Its closed solid is `0 <= z <= h(x,y)`. This is a finite, piecewise-planar
+catalog with exact rational intersections, not an arbitrary height-field API.
+
+| ID | Name | Proposed top height | Form / maximum height |
+| --- | --- | --- | --- |
+| 0 | Flat | `1` | Full block, 1 |
+| 1 | N | `N` | Ramp, 1 at S edge |
+| 2 | E | `E` | Ramp, 1 at W edge |
+| 3 | NE | `min(N,E)` | Corner form, 1 at SW corner |
+| 4 | S | `S` | Ramp, 1 at N edge |
+| 5 | NS | `min(N,S)` | Central E–W ridge, 1/2 |
+| 6 | ES | `min(E,S)` | Corner form, 1 at NW corner |
+| 7 | NES | `min(N,E,S)` | Ridge extending inward from W, 1/2 |
+| 8 | W | `W` | Ramp, 1 at E edge |
+| 9 | NW | `min(N,W)` | Corner form, 1 at SE corner |
+| 10 | EW | `min(E,W)` | Central N–S ridge, 1/2 |
+| 11 | NEW | `min(N,E,W)` | Ridge extending inward from S, 1/2 |
+| 12 | SW | `min(S,W)` | Corner form, 1 at NE corner |
+| 13 | NSW | `min(N,S,W)` | Ridge extending inward from E, 1/2 |
+| 14 | ESW | `min(E,S,W)` | Ridge extending inward from N, 1/2 |
+| 15 | NESW | `min(N,E,S,W)` | Central four-sided peak, 1/2 |
+
+Each named edge meets the base. Combining directions retains all their height
+constraints; this produces the ridge/corner forms without a camera-dependent
+exception. Quarter turns permute the bits and rotate the same solid. The
+half-height peaks are consequences of intersecting unit-rise/unit-run slopes,
+not new fractional-slab IDs or an arbitrary authored-height parameter.
+
+**Important proposed departure:** ID 15 becomes a central half-height peak
+with all four edges at the base, instead of the old flat-block alias or S's
+lowered flat-diamond mask. This changes D-25/P-5's earlier flat-top treatment
+and needs explicit owner approval. The alternative is to retain ID 15 as a
+documented flat-block exception; do not silently choose between them.
+
+For IDs 0–14, this mathematical rule matches the existing H
+`packages/terrain/src/Hetoimasia/Terrain/Geometry.hs` lower-envelope definition.
+The audit disproved its claimed fidelity to the pinned masks; it did not
+establish that the solids are intrinsically invalid. Keeping that rule as the
+new intended catalog while correcting the masks would be an explicit design
+choice. ID 15 would remove the existing full-block special case. Actual API
+compatibility, corrected masks and evidence still belong to the amendment.
+
+**Derived opening contract, also proposed for review:**
+
+- In each shaped cell, the empty region is the space above `h`. Shape 0 has
+  no interior empty region; each other catalog shape has one connected empty
+  region. Retain a component-aware representation so discovery does not rely
+  on every future shape necessarily sharing this property.
+- A horizontal side's opening is the exact portion where `z > h` restricted
+  to that side; a top opening exists where `h < 1`. None has a positive-area
+  bottom opening: the solid reaches the base over the footprint. A selected
+  side is open above the base; unselected sides may be partly or fully sealed
+  according to the same height function. Do not equate an unset bit with an
+  entirely sealed side.
+- Neighboring empty components connect where their common-face openings
+  overlap over positive area. Geometry within each cell connects its portals.
+  A path can turn diagonally through ramps and neighboring open regions;
+  an edge/point-only contact cannot bypass intervening sealed terrain. This
+  implements D-34/D-35's real-opening distinction without unconditional
+  diagonal-neighbor links or camera-alpha tests.
+- Keep the existing exact closed-solid point/ray boundary convention; air
+  does not include the solid boundary. Derive queries and portal polygons
+  from the same catalog, without unrelated floating tolerances. Qualify the
+  table and rotated portal intersections independently under D-44.
+
+This proposal does not settle full-cell emission/cutaway ordering, sampling
+edges, lighting weights or the renderer proof. It provides a concrete logical
+target to approve and test rather than asking the solver to invent the shape
+semantics while fixing artwork. An illustrated owner review of the catalog,
+especially ID 15, remains required before it becomes a decision.
+
 ## Open questions and review checkpoints
 
 ### Q-1. What does flat terrain contain vertically?
@@ -2770,6 +2879,9 @@ Rendering/screen picking retain sprite coverage as their visual authority.
 
 Still open: the exact 16-shape logical geometry and query boundary/compatibility
 details, full-cell versus isolated-face emission and hidden-face/cap behavior.
+P-9 now proposes a complete lowered-edge shape table and derived portal rules,
+including a central half-height peak for ID 15. Neither the table nor this
+change to the earlier flat-top treatment is approved yet.
 D-44 resolves the fidelity choice: correct demonstrated mask inconsistencies
 while preserving all 16 IDs and face-map rendering, and require solver proof
 of both defect and correction. The exact replacement catalog and sampling
@@ -2781,9 +2893,11 @@ does not need another sign-off.
 
 ### Q-17. Face-map data loading, sampling and ownership
 
-Open. D-30 selects shared CPU coverage per asset/version. Decide the bounded
-data-image route, approved asset catalog/provenance,
-filtering/cutout/premultiplication rules, CPU coverage retention and how style
+Partially resolved by D-30/D-45: shared CPU coverage per asset/version,
+nearest-neighbor colour/mask sampling and a shared render/pick alpha cutoff.
+Decide the bounded data-image route, approved asset catalog/provenance,
+numeric cutoff, UV/texel edges, mip/LOD and premultiplication rules,
+CPU coverage retention and how style
 acquires/version-checks both texture kinds. General `DataImage` support is
 not proof that the current bounded Lua loader exposes it. Preserve protected
 leases and account for new storage; no temporary colour-decoding workaround
@@ -2798,6 +2912,12 @@ whether to carry S's depth dimming/haze, and which deviations are intentional.
 S's clock phase labels and shader sine disagree; full clock parity cannot be
 claimed from labels alone. Fluids, selection outlines, lifecycle sprites and
 zoom-map crossfade remain outside the approved arena unless explicitly changed.
+
+Current owner question: recommend a Lua call supplying the sun's compass
+direction and height above the horizon, anchored in world space through camera
+rotation. This remains a proposal pending the answer; it supplies no automatic
+cycle or UI. Exact coordinate/unit conventions and appearance defaults would
+then be specified in the concrete contract.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
