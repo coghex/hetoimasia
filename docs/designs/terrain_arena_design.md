@@ -102,12 +102,14 @@ stays unmaterialized (D-6). The rejected Beacon example is not the consumer.
 The arena expands with exploration; camera loading initially materializes only
 the top tile of each untouched column. Removal demands newly exposed terrain
 without eagerly filling underground depth (D-7).
+The first arena includes tile removal by keyboard shortcut, with no UI system
+or on-screen UI controls in this arc (D-8).
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
 observable. Keep the first terrain source simple while designing proper
 publication and lifetime. Exact camera controls, vertical extent, appearance,
-editing controls and Lua APIs remain open. No implementation or delivery order
+removal targeting/key binding and Lua APIs remain open. No implementation or delivery order
 follows from this direction alone.
 
 **Proposal P-2: one authoritative spatial terrain model.** Represent terrain
@@ -290,6 +292,20 @@ floors and ceilings rather than assume every removal merely lowers a single
 height value. This follows from the agreed full model; it does not require
 materializing the full surrounding underground volume.
 
+### D-8. Keyboard shortcut for tile removal; no UI yet
+
+Owner, directly in this pane on 2026-11-06, accepting the proposed initial
+select-and-remove tile tool:
+
+> yes sure, by keyboard shortcut, we dont want to implement any ui yet
+
+Include an arena shortcut that removes one targeted exposed tile and exercises
+D-7's lazy exposure behavior. Do not add a UI system, menus, toolbar, buttons
+or other on-screen UI controls for this arc. The exact key and how the target
+is chosen remain to be specified; accepting keyboard activation does not
+choose mouse hover, click selection or a keyboard-controlled tile cursor.
+Other editing tools remain outside the accepted scope.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -338,10 +354,16 @@ open.
 
 Camera exploration/loading is selected by D-7. Decide projection, terrain
 assets/materials, camera movement/zoom/rotation controls,
-vertical slices, picking and any loading indication. Determine the narrow Lua
-rendering/input services required. Full UI, fonts, editors and Synarchy's debug
-tools are not implicitly approved. Input ordering, focus/reset and routing need
-explicit contracts if included.
+vertical slices and picking. D-8 selects shortcut-based removal and excludes
+UI implementation for this arc. Determine the narrow Lua rendering/input
+services required. Input ordering, focus/reset and routing need explicit
+contracts. Loading behavior must respect the no-UI scope.
+
+For targeting, recommend pointing at an exposed tile with the mouse and
+pressing the removal shortcut, with no menu or click-to-select step. A
+keyboard-controlled tile cursor is the alternative if targeting should also
+be entirely keyboard driven. This choice and the exact shortcut are open;
+one removal per press rather than held-key repeat is also a proposal.
 
 ### Q-5. What belongs to the reusable engine and what belongs to Ecce Homo?
 
@@ -353,17 +375,15 @@ component store is the right representation for every terrain cell.
 
 ### Q-6. Mutation, persistence and state publication?
 
-D-7 requires removal to reveal newly materialized terrain. Decide its initial
-interaction and any additional edits, what survives chunk eviction, whether
+D-7 requires removal to reveal newly materialized terrain; D-8 selects a
+keyboard shortcut for that action. Decide targeting and any additional edits,
+what survives chunk eviction, whether
 save/load or reset is included, and the relevant schema,
 snapshot, tick/failure and determinism guarantees. Generated base data,
 resident copies and durable edits need distinct meanings if all are included.
 The earlier state agenda remains reference material; no save migration,
 replay, mods or hot swap has been activated by D-1/D-2.
-For the next owner choice, recommend a simple arena tool to select and remove
-one exposed tile, making this loading contract directly observable. A
-script-only removal command is an alternative with less interaction work.
-Neither control choice is selected yet.
+The initial removal tool is accepted; its remaining input choices are in Q-4.
 
 ### Q-7. What proves this first terrain foundation complete?
 
@@ -417,6 +437,9 @@ materialization, repeated removal revealing deeper terrain, and exposure of
 side faces and gaps. Inspect terrain allocations as well as rendered output
 to verify that untouched depth stays unmaterialized. Check explicit invisible
 queries separately under D-6 and returning to an edited, evicted region.
+Exercise the D-8 shortcut through the agreed targeting/input path, including
+no valid target and focus/reset behavior. No UI framework is needed to
+demonstrate this control.
 Use captured rendering evidence for the agreed visible result and native input
 evidence for controls actually included. Select checks from Hetoimasia's
 validation catalog once slices exist (H `AGENTS.md`, Language and build;
