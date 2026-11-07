@@ -696,6 +696,31 @@ kept for explicit work; a description that does not fit is cut at its lowest-pri
 end and the remainder reported, so an accepted replacement can always be staged. What is not admitted stays as coalesced pending demand, holds nothing,
 and is retried in the same order by the owner's `Service` quantum.
 
+### One charge function
+
+Every bank total is derived from the model's records (`bankLedger`); nothing stores or
+adjusts one. The rules a total must obey are defined once, in `chargeCheck`, and every
+transition is held to them:
+
+* no bank or slot over its limit;
+* no resident region over the most its extent allows (`RegionOverMaximum`);
+* what the camera side keeps out of explicit reach within the camera share of the
+  resident bank (`CameraResidentOverShare`): every held region at its stored maximum
+  plus the reservations of the jobs created for camera views, held regions' jobs
+  included, and, for an admission, the detail of the regions those jobs enter;
+* what the camera side uses of the staging bank within the camera share
+  (`CameraStagingOverShare`): view descriptions, view interests, hold records and
+  camera job scratch.
+
+An admission (`planAdmission`) and a hold (`AcquireHold`) are tested against the state
+they would produce (`admissionCheck`) and are busy if it would break a rule; an owner's
+report (`JobCompleted`, `RemovalCommitted`) is a contract failure if it would
+(`guardCharge`), changing nothing; and `step` refuses, as a `ChargeBreached` contract
+failure, any transition whose result breaks a rule, so a path that forgot a check cannot
+return a bad state. `modelInvariants` is the same function plus the structural checks
+(victims, awaiting credits, interests), and the randomized interleaving property checks
+it after every step.
+
 ### Eviction, holds and handoffs
 
 A hold (a borrower or a publication pin) names at most `specHoldRegions` regions (a
