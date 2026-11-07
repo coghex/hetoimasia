@@ -21,6 +21,11 @@ Picking scope resolved by D-30: select from the adopted drawn quads in
 front-to-back order using matching artwork/face-map coverage. Q-16 remains
 partially open for logical geometry, emission and cut-surface contracts.
 
+D-31 preserves generic blank terrain as gameplay fog of war over undiscovered
+underground solids and air gaps, and reaffirms lazy loading with gaps. Q-20
+tracks reveal rules, retention and the fog interaction contract; they are not
+settled by the earlier picking or cutaway proposals.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -850,6 +855,53 @@ shared CPU coverage is now a chosen mechanism, not an open alternative.
 The amendment remains exploring; follow-up slices and issue revisions still
 require Q-19 sign-off.
 
+### D-31. Preserve underground fog of war, including concealed air gaps
+
+Owner, directly in this design pane on 2026-11-07, corrected the proposed
+removal of generic blank cutaway tiles:
+
+> the generic blank tile is important from a gameplay perspective, the
+> player should not know what's underground, its supposed to be fog of war,
+> that includes air gaps.
+
+The owner also reaffirmed lazy underground loading with gaps, approving it
+if it can be implemented correctly. Preserve the blank tile's concealment
+role: undiscovered underground terrain must not disclose either its material/
+shape or the presence of air. Moving a cutaway through hidden underground
+space must not by itself expose a cavern. The concealed region can therefore
+look filled even when the authoritative terrain contains air; this is an
+intentional knowledge boundary, not fabricated physical terrain.
+
+This supersedes the agent's unapproved recommendation to replace every blank
+with the real material or a visible gap. The source audit remains accurate
+about S's blank fallback condition, but its implication that covering a real
+gap is inherently a fidelity defect was incomplete. The owner has supplied
+the gameplay intent that the source condition alone did not establish.
+No claim that S already separates residency from player knowledge follows.
+
+Lazy storage and fog must coexist: actual terrain, materialized/resident data
+and what the player has discovered are distinct meanings. A query or streaming
+load must not silently grant player knowledge. Concealment must also apply to
+visual picking: D-30 does not authorize clicking through a fog quad to return
+the secret terrain behind it. The exact fog hit result and permitted actions
+are open in Q-20, rather than treating the blank as an ordinary removable
+physical solid.
+
+The sparse source/overlay model can represent buried solids and air gaps
+without allocating each cell. The feasibility approach is to keep unknown
+knowledge implicit and represent discovered regions sparsely as well;
+bounded demand materializes only what a reveal/query actually needs.
+That approach and its costs need implementation qualification. A large or
+fragmented revealed region still consumes resources; this is not a promise
+of unlimited exploration history in bounded memory. Exact representation,
+budgets, reveal propagation and retention remain Q-20/Q-17/Q-19.
+
+The owner has not yet chosen how excavation discovers an air gap, whether
+discovery spreads through connected space, whether it survives offload, or
+how Lua controls it. This decision adds the fog requirement without silently
+adding units, line-of-sight simulation or the deferred general gameplay-state
+system. Q-16 remains partially open; Q-20 is a new blocking design question.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1590,8 +1642,11 @@ Synarchy was read from a temporary snapshot, never modified.
 ### Focused terrain-picking audit, 2026-11-07
 
 The owner requested this closer inspection before answering Q-16. This is
-source/asset evidence at the same S revision, not approval of the proposed
-replacement picker and not a report of a running-game reproduction.
+source/asset evidence at the same S revision, not a report of a running-game
+reproduction. D-30 subsequently approves the proposed picking approach;
+D-31 subsequently establishes that blank cutaway coverage deliberately
+conceals undiscovered terrain, including air gaps. Interpret the blank/pick
+observation below in that fog context, not as a direction to remove the blank.
 
 **What S already does well.** Hover and synchronous terrain clicks use the
 same pure `pickWorldTile`, with facing, zoom, framebuffer aspect, window-pixel
@@ -1749,7 +1804,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29/D-30 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-31 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1766,6 +1821,13 @@ D-30 selects the picking approach: use the adopted drawn quads, matching
 artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
 The former analytic-solid picker is not the visual authority. Exact emission,
 cut surfaces and the remaining sampling/ownership details are still open.
+
+D-31 requires a separate fog presentation over undiscovered underground
+terrain, including real air gaps. The generic blank is intentional gameplay
+concealment. The earlier proposal to expose real material/air at every cutaway
+is superseded; lazily loading terrain must not itself reveal it. Fog must
+occlude visual picking without becoming authoritative physical occupancy.
+Reveal rules, retention, API authority and exact fog hit behavior remain Q-20.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -1797,7 +1859,7 @@ Affected tracker work, for later approved revisions only:
   data/texture ownership before shortcut removal and final acceptance.
 
 The owner chose a follow-up before TRA-12. Exact one-PR slice boundaries,
-dependency insertion and existing-issue revisions await Q-16–Q-19; the ledger
+dependency insertion and existing-issue revisions await Q-16–Q-20; the ledger
 and delivery plan remain the original filed arc until those changes receive
 sign-off. No final issue bodies are drafted here.
 
@@ -1929,6 +1991,10 @@ Partially resolved by D-30: picking uses the adopted drawn quads and matching
 artwork/mask coverage in front-to-back order, with shared CPU asset coverage.
 The result identifies the logical cell for the existing edit contract.
 
+D-31 additionally preserves blank fog coverage over undiscovered terrain,
+including air. Cutaway movement and data residency do not grant discovery.
+Fog-specific picking and reveal behavior are tracked in Q-20.
+
 Still open: the fate/meaning of #637's exact subcell-solid query APIs,
 full-cell versus isolated-face emission, hidden-face/cap behavior and the
 authority of those query results relative to the visible sprite. Do not
@@ -1958,11 +2024,31 @@ zoom-map crossfade remain outside the approved arena unless explicitly changed.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
-Open. After the behavior is settled, approve dependency-ordered follow-up
+Open. After the behavior, including D-31/Q-20 fog, is settled, approve
+dependency-ordered follow-up
 slices and exact revision needs for #645–#648, with the owner-selected barrier
 before TRA-12 and explicit coordination of held PR #654. Mirror approved new
 slice IDs in the ledger and delivery plan; preserve earlier IDs. Readiness
 requires fresh owner sign-off. This design turn files or edits no tracker item.
+
+### Q-20. Underground discovery, fog interactions and sparse retention
+
+Open after D-31. Preserve fog over both solid and air until discovery, distinct
+from residency and authoritative terrain. Decide how the first arena reveals
+terrain after excavation: only immediate exposure, propagation through a
+connected air space, or another explicit rule. Specify initial known surface,
+Lua/engine authority, whether knowledge survives offload/reload and how it is
+reset. Decide the fog pick result and whether the development removal action
+can operate on a concealed cell without leaking its contents.
+
+Proposed storage direction: implicit unknown plus sparse discovered spans or
+regions, budgeted separately from resident terrain and retained edits. Reveal
+work must be bounded; an enormous or exterior-connected air region cannot
+force an unbounded flood fill or eager underground allocation. Consider
+coherent terrain/reveal publication so a pending or failed edit/reveal cannot
+flash secret contents. These are requirements to resolve, not approved API,
+representation, propagation, failure or retention policies. Do not introduce
+full unit vision/day-night visibility or general gameplay state by inference.
 
 ## Verification strategy — approved through Q-12
 
