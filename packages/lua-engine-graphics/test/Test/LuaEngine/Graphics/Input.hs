@@ -11,7 +11,9 @@
 -- native suite's.
 module Test.LuaEngine.Graphics.Input (spec) where
 
-import Control.Concurrent.STM (STM, atomically)
+import Control.Concurrent.STM (STM, atomically, newTVarIO, readTVarIO, retry, writeTVar)
+import Control.Monad (forM_, unless, when)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Word (Word64)
 import GHC.Float (float2Double)
 import qualified Hetoimasia.GLFW.Input as Glfw
@@ -20,6 +22,8 @@ import Hetoimasia.LuaEngine.Facade
 import Hetoimasia.LuaEngine.Graphics.Input
 import Test.Hspec
 import Test.LuaEngine.Graphics.InputFeed
+import Test.LuaEngine.Graphics.Rig (bounded)
+import Test.Support.Owned (withOwnedThread)
 
 text ∷ Char → Glfw.InputPayload
 text = Glfw.TextInput
@@ -268,6 +272,55 @@ consumerSpec = describe "one consumer" $ do
       atomically (produce feed (text 'z'))
       fresh ← poll consumer 8
       epochsOf fresh `shouldBe` [2]
+
+  it "never mixes epochs, repeats an event or reorders one when a producer overflows the feed and the owner resumes it while the consumer polls and acknowledges (a concurrent run)" $
+    bounded $ do
+      feed ← newFeed 3
+      consumer ← atomically (newConsumer 7 (feedSource feed))
+      atomically (consumerEnable consumer)
+      done ← newTVarIO False
+      delivered ← newIORef (0 ∷ Int)
+      resets ← newIORef (0 ∷ Int)
+      let rounds = 400 ∷ Int
+          -- the producer is the window's owner. A round starts only once the consumer has drained the last one and no reset still
+          -- awaits its acknowledgement (it waits on the feed's own state, not on a clock). An ordinary round resumes what the
+          -- consumer acknowledged and produces two numbered events, each in a transaction of its own, so a poll can land between
+          -- them; every tenth round produces five in one transaction, which overflows the three-event feed whatever the consumer does.
+          producer = do
+            forM_ [1 .. rounds] $ \r → do
+              atomically $ do
+                phase ← feedPhase feed
+                queued ← feedQueued feed
+                when (phase == ResetPending || queued > 0) retry
+              let event k = produce feed (key (r * 10 + k) Glfw.KeyPressed)
+              if r `mod` 10 == 0
+                then atomically (resumeFeed feed >> mapM_ event [1 .. 5])
+                else forM_ [1, 2] $ \k → atomically (resumeFeed feed >> event k)
+            atomically (writeTVar done True)
+          consume lastCode = do
+            -- whether the producer had finished before this poll: the poll that follows has then seen everything it produced
+            finished ← readTVarIO done
+            packet ← poll consumer 4
+            let codes = [code | InputEventRecord _ (BodyKey code _ _ _) ← packetEvents packet]
+            -- every event of a packet is of the packet's one epoch, and the codes only ever rise: nothing repeats or reorders
+            map eventEpoch (packetEvents packet) `shouldBe` replicate (length codes) (packetEpoch packet)
+            and (zipWith (<) (lastCode : codes) codes) `shouldBe` True
+            case packetReset packet >>= resetTokenKey of
+              Just token → do
+                ack consumer (fromIntegral (snd (tokenParts token))) >>= (`shouldSatisfy` (`elem` [AckAcknowledged, AckAlready]))
+                modifyIORef' resets (+ 1)
+              Nothing → pure ()
+            modifyIORef' delivered (+ length codes)
+            queued ← atomically (feedQueued feed)
+            -- done once the producer had finished before this poll, nothing is queued and no reset still awaits its acknowledgement
+            -- (the owner is gone, so an acknowledged feed stays paused: that is the end of the run, not a stall)
+            unless (finished && queued == 0 && packetDisposition packet /= DispositionResetRequired) (consume (maximum (lastCode : codes)))
+      withOwnedThread producer $ \_ terminated → do
+        consume 0
+        terminated
+      -- every ordinary round's two events were delivered exactly once, and every tenth round's overflow was seen once and acknowledged
+      readIORef delivered >>= (`shouldBe` 2 * (rounds - rounds `div` 10))
+      readIORef resets >>= (`shouldBe` rounds `div` 10)
 
   it "suspends admission when the consumer ends, which begins a reset that owes no acknowledgement to anyone" $
     withConsumer 4 $ \feed consumer → do

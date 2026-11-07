@@ -33,6 +33,18 @@ spec = describe "composition from outside the packages" $ do
     withClient "Client.hs" fieldsClient $ \compile → do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-10237"
+
+  it "lets a separately compiled client supply the narrow input operations and read a packet, through the public facade alone (TRA-6)" $
+    withClient "Client.hs" inputClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status → expectationFailure ("the client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
+
+  it "keeps the input bindings and the packet's encoding out of a client's reach: no module of them is exposed" $
+    withClient "Client.hs" inputInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-87110"
   where
     withClient = withStorePackageClient ["base", "bytestring", "text", "hetoimasia-lua-engine-0.1.0.0-inplace", "hetoimasia-lua-engine-0.1.0.0-inplace-facade", "hetoimasia-lua-engine-0.1.0.0-inplace-modules", "hetoimasia-lua-engine-0.1.0.0-inplace-request", "hetoimasia-lua-engine-0.1.0.0-inplace-data", "hetoimasia-scripting-lua-0.1.0.0-inplace", "hetoimasia-scripting-lua-0.1.0.0-inplace-runtime-lua", "hetoimasia-content-0.1.0.0-inplace", "hetoimasia-foundation-0.1.0.0-inplace"]
 
@@ -92,4 +104,38 @@ fieldsClient =
     , ""
     , "reach ∷ Maybe Facade"
     , "reach = Nothing"
+    ]
+
+-- | Everything the input operations are made of is public vocabulary of the facade: plain records of copied data and a few
+-- closures. Nothing in them is a producer, a native handle or a scene target.
+inputClient ∷ String
+inputClient =
+  unlines
+    [ "module Client (services, packet) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Facade"
+    , ""
+    , "services ∷ InputServices"
+    , "services ="
+    , "  InputServices"
+    , "    { isTypes = []"
+    , "    , isCheckPoll = \\_ _ → pure Nothing"
+    , "    , isPoll = \\_ _ _ → pure (PollRefused (toEnum 0 `seq` \"no\"))"
+    , "    , isCheckAcknowledge = \\_ _ _ → pure Nothing"
+    , "    , isAcknowledge = \\_ _ _ → pure AckClosed"
+    , "    }"
+    , ""
+    , "packet ∷ InputPacket"
+    , "packet = InputPacket DispositionClosed 1 [InputEventRecord 1 (BodyFocus True)] True Nothing (InputObservation 0 Nothing Nothing Nothing Nothing Nothing Nothing)"
+    ]
+
+inputInternalsClient ∷ String
+inputInternalsClient =
+  unlines
+    [ "module Client (reach) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Facade.Input (inputBindings)"
+    , ""
+    , "reach ∷ ()"
+    , "reach = inputBindings `seq` ()"
     ]

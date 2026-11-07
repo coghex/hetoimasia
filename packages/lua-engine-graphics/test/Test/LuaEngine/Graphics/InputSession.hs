@@ -28,6 +28,7 @@ import Hetoimasia.Scripting.Lua.Instance (waitInstance)
 import Test.Hspec
 import Test.LuaEngine.Graphics.InputFeed
 import Test.LuaEngine.Graphics.PeersRig
+import qualified Test.LuaEngine.Graphics.Window.Fake as WF
 
 -- | Prepared feeds, handed to windows in the order their input is first reached, and every VM registry as it is made.
 data Inputs = Inputs
@@ -314,6 +315,28 @@ spec = describe "input through the production graphics injection" $ do
       awaitAcquisitions peers 0
       atomically (feedLog owing) `shouldReturn` ["enable", "suspend"]
       reading quiet `shouldReturn` InputReading 0 0
+
+  it "acknowledges a reset while the host's command queue is full, which takes no command capacity, and the instance then ends as usual once the queue has room" $ do
+    inputs ← newInputs 2 1
+    let feed = inFeeds inputs !! 0
+    withPeersInput (inputsHost inputs) fixtureEntry $ \peers → do
+      first ← peAdmit peers
+      awaitLine peers "window\t1"
+      awaitEnabled feed
+      atomically (texts feed "abc")
+      awaitLine peers "reset\toverflow\t2\t0\t0"
+      -- the host's bounded command queue refuses every close from here on
+      WF.setCloseFull (peWindows peers) True
+      signal peers
+      -- the acknowledgement is one transaction on the reader: it needs no command or request capacity, and the feed is acknowledged
+      awaitLine peers "ack\tacknowledged"
+      atomically (feedLog feed) `shouldReturn` ["enable", "ack 2"]
+      -- (a window's close waits for room in that queue, as it always did; that is the provider's, not the adapter's)
+      WF.setCloseFull (peWindows peers) False
+      endInstance peers first
+      atomically (feedLog feed) `shouldReturn` ["enable", "ack 2", "suspend"]
+      reading inputs `shouldReturn` InputReading 0 0
+      awaitAcquisitions peers 0
 
   it "keeps two windows' feeds, epochs and tokens apart: a peer's token, window and facade are refused with nothing acknowledged or read, and ending one leaves the other's epoch and delivery alone" $ do
     inputs ← newInputs 2 2

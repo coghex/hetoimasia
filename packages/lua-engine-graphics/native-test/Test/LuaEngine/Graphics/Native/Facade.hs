@@ -121,19 +121,23 @@ spec env = describe "graphics facade" $ do
       client ← atomically (hostWindowClient (vulkanWindowHost (envHost env)) window) >>= maybe (assertFailure "the window has no client") pure
       let reader = clientInputReader client
           control = clientInputControl client
-          warned wanted = atomically (readTVar errLines >>= \seen → unless (any (Text.isInfixOf wanted) seen) retry)
+          -- a wait that names itself, with what the script has warned so far, when it does not end
+          warned wanted =
+            timeout (40 * 1000000) (atomically (readTVar errLines >>= \seen → unless (any (Text.isInfixOf wanted) seen) retry)) >>= \case
+              Just () → pure ()
+              Nothing → readTVarIO errLines >>= \seen → assertFailure ("no line containing " <> show wanted <> " within 40 seconds; the script warned " <> show seen)
       -- the adapter's consumer opened admission at the script's first poll, and nothing else did
-      step env "the first poll" (warned "input\trunning\t1\t")
+      warned "input\trunning\t1\t"
       opened ← atomically (Glfw.inputStatistics reader)
       (Glfw.statisticsAdmission opened, Glfw.statisticsPhase opened) `shouldBe` (Glfw.InputEnabled, Glfw.InputRunning)
       -- the public suspension begins a reset of reason suspension, in the next epoch, that the script reads and acknowledges
       atomically (Glfw.suspendInput control) >>= \case
         Glfw.AdmissionReset token → (Glfw.resetReason token, Glfw.epochNumber (Glfw.resetEpoch token)) `shouldBe` (Glfw.AdmissionSuspended, 2)
         other → expectationFailure ("expected a suspension reset, found " <> show other)
-      step env "the reset" (warned "reset\tsuspended\t2")
-      step env "the acknowledgement" (warned "ack\tacknowledged")
+      warned "reset\tsuspended\t2"
+      warned "ack\tacknowledged"
       -- acknowledged is not resumed: the application's admission is suspended, and the script sees the feed paused
-      step env "the paused feed" (warned "input\tpaused\t1\t")
+      warned "input\tpaused\t1\t"
       held ← atomically (Glfw.inputStatistics reader)
       (Glfw.statisticsPhase held, Glfw.statisticsAdmission held) `shouldBe` (Glfw.InputResetAcknowledged, Glfw.InputSuspended)
       seen ← readTVarIO errLines
