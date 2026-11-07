@@ -152,6 +152,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
 | `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
 | `test.math` | `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct` | no | no | any |
+| `test.terrain` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | no | no | any |
 | `test.content` | `cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct` | no | no | any |
 | `test.asset-image` | `cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct` | no | no | any |
 | `test.render-api` | `cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct` | no | no | any |
@@ -299,6 +300,25 @@ and like `test.vulkan` its command names `cabal.project.cpu` and the group
 declares that file beside `cabal.project.common`: the library depends on `base`
 alone, and running its suite through the CPU project is what shows it needs no
 native prerequisite. See [the package's contract](../packages/math/README.md).
+
+`test.terrain` runs the terrain package's own suite: the checked signed 64-bit
+tile identity and its range `[-2^62, 2^62 - 1]`, refused at and just outside both
+ends without wrapping; exact translation and differences; floor-division region
+and local decomposition of 16 × 16 columns and 32-level regions across the
+negative seams, at the extremes and as a round trip; whole-cell cutaway levels;
+the 16-shape catalog, with the identities 0 and 15 and NS and EW kept distinct,
+unsupported identities refused, exact quarter turns and the view-facing
+selection that leaves world identities unchanged; and the canonical unit-cell
+solid of every shape against an independently authored vertex and face matrix in
+all four facings, its face coverage, point membership, and ray and segment
+intersection with their edge, vertex and in-plane tie-breaking and the refusal of
+non-finite or zero-length input. A client compiled outside the package shows its
+checked constructors and private modules unreachable. It is mandatory but outside
+the floor, like `test.math`, and runs through `cabal.project.cpu`: the library
+depends on `base` and `containers` alone, so no native prerequisite exists. Its
+package directory and its two Cabal files are inputs of `test.workflow` as well,
+because the owned-start guard scans every test suite of the packages
+`cabal.project` lists. See [the package's contract](../packages/terrain/README.md).
 
 `test.lua-engine` runs the Lua-first engine package's own suite, `lua-engine-tests`:
 the strict format-1 manifest parsed from supplied bytes -- its accepted examples, the
@@ -1195,7 +1215,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,test.terrain,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland,test.vulkan-lua-engine-native,test.vulkan-run-native
@@ -1360,7 +1380,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `test.terrain`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`, `test.vulkan-lua-engine-native`, `test.vulkan-run-native` |
