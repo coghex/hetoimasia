@@ -311,8 +311,12 @@ substitute is introduced here. The CPU fixture matrix (scenes, facings, cuts and
 A request carries `Versions` that must equal the facts' (`MixedVersions`), plus a
 material version (caller data, carried, never interpreted). The camera revision
 comes from the camera. A `PlanIdentity` records the versions, the camera
-revision, the material version, the facing, the cut level and the vertical
-reference; a pick presents it. Planning never adopts a GPU frame or issues a live
+revision, the material version, the facing, the cut level, the vertical
+reference, the view setup (target metrics, viewport and settings) and the plan
+configuration; a pick presents it, so a resize or a reconfiguration is a stale
+identity too. Every transition that changes the camera, including a clamp of its
+zoom to the configuration in force, advances the camera revision (stamped against
+the camera as it was passed in). Planning never adopts a GPU frame or issues a live
 pick token.
 
 ## What remains for TRA-8
