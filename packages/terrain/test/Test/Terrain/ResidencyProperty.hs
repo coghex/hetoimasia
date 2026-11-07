@@ -403,11 +403,18 @@ quiescentRequestNotBusy triple leftovers picks =
     Just limits →
       let base = withLeftovers limits leftovers
           demands = distinctDemands picks
+          notBusy what event = case step base event of
+            (_, Left refusal@(Busy _)) → counterexample ("busy from a quiescent model (" <> what <> "): " <> show (refusal, demands, limits)) False
+            _ → property True
+          -- A removal also reserves growth for its rebuilt segment; it names one cell.
+          removalTile = case picks of
+            ((x, j) : _) → either (const Nothing) Just (tileCoord (toInteger x * 16) 0 (toInteger (j `mod` 4)))
+            [] → Nothing
        in if null demands
             then property True
-            else case step base (SubmitQuery (RequestId 7) (ArenaId 1) (Revision 0) demands) of
-              (_, Left refusal@(Busy _)) → counterexample ("busy from a quiescent model: " <> show (refusal, demands, limits)) False
-              _ → property True
+            else
+              notBusy "query" (SubmitQuery (RequestId 7) (ArenaId 1) (Revision 0) demands)
+                .&&. maybe (property True) (notBusy "removal" . SubmitRemoval (RequestId 8) (ArenaId 1) (Revision 0)) removalTile
 
 spec ∷ Spec
 spec = describe "Residency model properties" $ do
