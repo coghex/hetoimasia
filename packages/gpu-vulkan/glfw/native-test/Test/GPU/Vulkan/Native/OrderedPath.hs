@@ -111,6 +111,7 @@ import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.Chunk (ChunkRef)
 import Hetoimasia.Render.TwoD.DrawPlan (CutoutMarks, cutoutMarks)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
+import qualified Hetoimasia.Render.TwoD.Oracle as Oracle
 import Hetoimasia.Render.TwoD.Oracle
   ( Expectation (..)
   , OracleInput (..)
@@ -566,13 +567,20 @@ runValidatedWith models host suite directory depthFormat renderer marks chunkBuf
           observed (Probe index x y) = do
             (format, extent) ← colourOf index
             either (const Nothing) Just (readPixel format extent (bytesOf index) x y)
-          judge asked = judgeReadback oracle asked (bytesOf (probePass asked))
+          -- A probe's expectation is worked out once and judged against the pixel
+          -- read, which is what 'judgeReadback' does; a pixel that cannot be read
+          -- is judged by 'judgeReadback' itself, which names the fault.
+          judgeWith expectation asked = case observed asked of
+            Just pixel → Oracle.judge expectation pixel
+            Nothing → judgeReadback oracle asked (bytesOf (probePass asked))
+          judge asked = judgeWith (expect oracle asked) asked
           probes =
-            [ ProbeResult at (expect oracle at) (observed at) (judge at)
+            [ ProbeResult at expectation (observed at) (judgeWith expectation at)
             | (index, shape, _) ← perPass
             , y ← [0 .. fromIntegral (shapeHeight shape) - 1]
             , x ← [0 .. fromIntegral (shapeWidth shape) - 1]
             , let at = Probe index x y
+            , let expectation = expect oracle at
             ]
           named =
             [ NamedResult

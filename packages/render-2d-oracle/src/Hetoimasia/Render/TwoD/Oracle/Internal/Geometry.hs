@@ -139,11 +139,18 @@ data Coverage
 
 -- | Where a pixel centre stands to a non-singular placement's quad.
 coverage ∷ Placement → Point Rational → Coverage
-coverage p centre
+coverage p centre@(cx, cy)
+  -- A centre farther than the edge distance outside the quad's bounding box is
+  -- neither inside it nor near any edge, which all lie within the box: the same
+  -- answer as below, without the distance to each edge.
+  | cx < minimum xs - tolerance || cx > maximum xs + tolerance || cy < minimum ys - tolerance || cy > maximum ys + tolerance = Outside
   | nearBoundary (1 / 16) (edges (corners p)) centre = NearEdge
   | inside = Inside (lx, ly)
   | otherwise = Outside
   where
+    xs = map fst (corners p)
+    ys = map snd (corners p)
+    tolerance = 1 / 16
     (lx, ly) = localPoint p centre
     inside = lx >= 0 && lx <= 1 && ly >= 0 && ly <= 1
     edges [p00, p10, p01, p11] = [(p00, p10), (p10, p11), (p11, p01), (p01, p00)]

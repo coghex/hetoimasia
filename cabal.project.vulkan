@@ -46,6 +46,7 @@ packages:
   packages/gpu-vulkan/native
   packages/gpu-vulkan/glfw
   packages/render-2d-vulkan
+  packages/terrain-render-2d-vulkan
   samples/triangle/renderer
   samples/triangle/app
   samples/sprites/renderer
@@ -65,6 +66,8 @@ packages:
   packages/render-api
   packages/render-2d
   packages/render-2d-oracle
+  packages/terrain
+  packages/terrain-render-2d
   tools/test-support
   packages/lua-engine-graphics
   packages/lua-engine

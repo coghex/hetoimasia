@@ -49,8 +49,81 @@ withTexture ∷ DecodedImage → Oracle
 withTexture image =
   mkOracle unorm8 [(h1, image)] [offscreenPass noClear [fullView 8 8 [world [sprite h1 (-4, -4) (8, 8)]]]]
 
+-- | Quads of every shape the oracle places, from a fixed pseudo-random sequence:
+-- the first column, the second and the origin, in eighths of a pixel, with a
+-- determinant that is not zero. The origin is in target pixels; the instance is
+-- in world units, whose origin is the middle of the 16 x 16 target.
+randomQuads ∷ [((Float, Float), (Float, Float), (Float, Float))]
+randomQuads = nearMisses <> take 150 [quad | quad@((a, b), (c, d), _) ← map toQuad (chunks (map eighth (lcg 20261107))), a * d - b * c /= 0]
+  where
+    -- A quad's left edge or corner a sixty-fourth at a time either side of 1/16
+    -- pixel from the centre of pixel (4, 3), square and sheared: the distances at
+    -- which the bounding box and the edges disagree.
+    nearMisses =
+      [ ((1, shear), (0, 1), (4.5 + 1 / 16 + fromIntegral k / 64, 3.5 - 0.25))
+      | shear ← [0, 1 / 2]
+      , k ← [-12 .. 12 ∷ Int]
+      ]
+    lcg seed = drop 1 (iterate (\x → (x * 1103515245 + 12345) `mod` 2147483648) (seed ∷ Integer))
+    eighth x = fromIntegral ((x `div` 65536) `mod` 97 - 48) / 8 ∷ Float
+    chunks = \case
+      a : b : c : d : e : f : rest → [a, b, c, d, e, f] : chunks rest
+      _ → []
+    toQuad = \case
+      [a, b, c, d, tx, ty] → ((a, b), (c, d), (tx + 8, ty + 8))
+      _ → ((0, 0), (0, 0), (0, 0))
+
+-- | How a pixel centre stands to a quad, worked out here in exact arithmetic from
+-- the definition: @E@ within 1/16 pixel of an edge, @I@ inside, @O@ outside.
+referenceStanding ∷ ((Float, Float), (Float, Float), (Float, Float)) → (Int, Int) → Char
+referenceStanding ((a, b), (c, d), (tx, ty)) (x, y)
+  | any (\(from, to) → distanceSquared from to centre <= 1 / 256) edges = 'E'
+  | inside = 'I'
+  | otherwise = 'O'
+  where
+    r = toRational
+    centre = (fromIntegral x + 1 / 2, fromIntegral y + 1 / 2) ∷ (Rational, Rational)
+    p00 = (r tx, r ty)
+    p10 = (r a + r tx, r b + r ty)
+    p01 = (r c + r tx, r d + r ty)
+    p11 = (r a + r c + r tx, r b + r d + r ty)
+    edges = [(p00, p10), (p10, p11), (p11, p01), (p01, p00)]
+    determinant = r a * r d - r b * r c
+    (dx, dy) = (fst centre - r tx, snd centre - r ty)
+    lx = (r d * dx - r c * dy) / determinant
+    ly = (r a * dy - r b * dx) / determinant
+    inside = lx >= 0 && lx <= 1 && ly >= 0 && ly <= 1
+    distanceSquared (x0, y0) (x1, y1) (px', py')
+      | len == 0 = (px' - x0) ^ (2 ∷ Int) + (py' - y0) ^ (2 ∷ Int)
+      | otherwise = (px' - (x0 + t * ex)) ^ (2 ∷ Int) + (py' - (y0 + t * ey)) ^ (2 ∷ Int)
+      where
+        ex = x1 - x0
+        ey = y1 - y0
+        len = ex * ex + ey * ey
+        t = max 0 (min 1 (((px' - x0) * ex + (py' - y0) * ey) / len))
+
 spec ∷ Spec
 spec = describe "probes" $ do
+  describe "the coverage of a quad" $
+    it "is what its definition gives for 150 sheared, turned, mirrored and offset quads: inside, within 1/16 pixel of an edge, or outside, at every pixel of a 16 x 16 target" $ do
+      let standing (Expected (Rgba8 255 0 0 255) _) = 'I'
+          standing (Expected (Rgba8 0 0 0 0) _) = 'O'
+          standing (Indeterminate (NearQuadEdge _)) = 'E'
+          standing _ = '?'
+          oracleOf quad@(col1, col2, origin) =
+            let (a, b) = col1
+                (c, d) = col2
+                (tx, ty) = origin
+                moved = (sprite h1 (0, 0) (1, 1)) {instanceTransform = fromColumns (V2 a b) (V2 c d) (V2 (tx - 8) (ty - 8))}
+             in (quad, mkOracle (targetSpec R8G8B8A8Unorm 16 16) [(h1, solid True red)] [offscreenPass noClear [fullView 16 16 [world [moved]]]])
+          disagreements =
+            [ (quad, (x, y))
+            | (quad, oracle) ← map oracleOf randomQuads
+            , y ← [0 .. 15]
+            , x ← [0 .. 15]
+            , standing (expectAt oracle x y) /= referenceStanding quad (x, y)
+            ]
+      take 3 disagreements `shouldBe` []
   describe "indeterminate probes" $ do
     it "reports a centre within 1/16 pixel of a quad's edge, and no other" $ do
       -- The quad covers [4.45, 6.45]: 0.05 pixel from the centre of pixel 4 and

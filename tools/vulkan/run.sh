@@ -259,6 +259,7 @@ fingerprints=(
   "samples/sprites/renderer/shaders/toolchain.fingerprint"
   "samples/scene3d/renderer/shaders/toolchain.fingerprint"
   "packages/render-2d-vulkan/shaders/toolchain.fingerprint"
+  "packages/terrain-render-2d-vulkan/shaders/toolchain.fingerprint"
 )
 cleanup=""
 generate_fingerprint() {
@@ -322,6 +323,8 @@ roots = ["tools/vulkan", "tools/native", "tools/display",
          "packages/gpu-vulkan/diagnostics", "packages/gpu-vulkan/model",
          "packages/runtime", "packages/foundation", "packages/math", "tools/test-support",
          "packages/render-2d-vulkan", "packages/render-2d", "packages/render-api",
+         "packages/terrain-render-2d-vulkan", "packages/terrain-render-2d", "packages/terrain",
+         "samples/ecce-homo/content/textures",
          "packages/render-2d-oracle", "packages/asset", "packages/asset-image",
          "packages/lua-engine-graphics", "packages/lua-engine", "packages/scripting-lua",
          "packages/content",

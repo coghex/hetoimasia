@@ -75,7 +75,7 @@ withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO (
 withClient =
   withPackageClient
     [ "base"
-    , "hetoimasia-terrain-render-2d"
+    , "hetoimasia-terrain-render-2d-0.1.0.0-inplace"
     , "hetoimasia-terrain"
     , "hetoimasia-render-2d"
     , "hetoimasia-math"
