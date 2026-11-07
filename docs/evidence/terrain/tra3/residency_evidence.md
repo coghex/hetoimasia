@@ -131,10 +131,11 @@ region plus the accounted payload, segment metadata and column entries the real
 `Resident` holds.
 
 Two further real-data examples cover the accounting the first review round found
-missing. A uniform 32-cell segment (2 bytes) of the stone region is edited with the
-resident bank full: the removal reserves its 62 bytes of growth, the real rebuilt
-segment (three runs, 12 bytes) grows by 10, the commit charges exactly 10, and the
-bank (348 of 400) then refuses a second removal as busy by 10. Two vertical regions
+missing. A uniform 32-cell segment (2 bytes) of the stone region is edited in a
+462-byte bank, the least that can edit at all: the removal reserves its 62 bytes of
+growth, a second removal takes the other 62, a third is busy (it fits an empty model,
+so it is not invalid), the real rebuilt segment (three runs, 12 bytes) grows by 10,
+and the commit charges exactly 10. Two vertical regions
 of one column share one real column index entry; each is charged for its own column,
 and evicting the older region leaves the survivor charged its own 338 bytes.
 
@@ -180,13 +181,20 @@ accounting.
 | A superseded running job is not cancelling | the acknowledgement-after-commit example |
 | The camera resident peak ignores the admission order | the mixed-size order examples |
 | The camera feasibility counts work that is already resident | the already-resident example |
-
-The random-sequence property also checks, after every step, that the owner can
-perform every action the model has asked of it (each accepted) and, from the final
-state of every run, that performing all of them leaves no job, victim, hold,
-retiring arena or reserved byte behind.
 | Camera admission skips past a busy region | the in-order admission example and the accepted-demand-completes property |
 | Service skips past a busy region | the accepted-demand-completes property |
+| A demand may evict its own regions | the accepted-demand-completes property |
+| Camera staging ignores interests held in later regions | the later-interests example and the property |
+| Camera resident ignores later resident regions | the replacement, own-region and property examples |
+| An explicit request ignores the resident regions it names | the complete-footprint example, the compressed-segment example |
+| Promised work counted far above its least (unsound) | the promised-work example and shared-job examples |
+| A job-slot refusal off by one | the brute-force oracle ("the model answered busy where the oracle says admit") |
+| A request may evict the regions it names | the brute-force oracle |
+| A staging shortfall off by one byte | the scripted bank-full examples |
+| The oldest evictable region is never a victim | the least-recently-used and funded-eviction examples and the oracle |
+| An empty-model footprint that reads the model (resident regions subtracted) | the empty-model example, the state-independence property and the random sequences |
+| The empty-model footprint omits region metadata | seven examples including the accepted-demand-completes property |
+| The empty-model footprint omits a removal growth | the removal footprint examples and the oracle |
 
 ### Randomized properties
 
@@ -197,42 +205,45 @@ a targeted "advance an edit" step) chosen from random integers against the model
 current state, so most are valid and some are deliberately wrong. After every
 step it checks: a refusal returned the model unchanged; the invariants; every bank
 recomputed from the model's records; no bank over its limit; retained edits never
-decrease; a changed region is not lost without a handoff; and that the owner can
-perform every action the model has asked of it (each accepted). At the end of each
-run, performing all of them leaves no job, victim, hold, retiring arena or reserved
-byte. It runs 200 random sequences of 250 events, a 12,000-event fixed sequence under
-tight budgets, a 12,000-event fixed sequence under room for concurrent work (where
-commits meet queued and running jobs of their region) and 1,000 random camera
-demands under random tiny budgets, each of which, if accepted, must complete when
-it is alone. The fixed sequences assert workload floors so that a degenerate
-generator fails: for example under the roomy profile at least 4,000 accepted events,
-40 commits, 3 superseding commits, 20 acknowledgements and 20 camera replacements
-that cancel work.
-| A demand may evict its own regions | the accepted-demand-completes property |
-| Camera staging ignores interests held in later regions | the later-interests example and the property |
-| Camera resident ignores later resident regions | the replacement, own-region and property examples |
-| An explicit request ignores the resident regions it names | the complete-footprint example, the compressed-segment example and the quiescent property |
-| Promised work counted far above its least (unsound) | the promised-work example and shared-job examples |
-
-From non-empty states the properties found two further defects before the last review round: a demand evicting a resident region it names later (so that it could never complete), and a staging bound that ignored interests the view already held in later regions. Both are fixed and pinned by examples. The properties now start from models with resident leftovers and an earlier settled demand of the same view, run 2,000 cases each, and were repeated under ten fresh random seeds.
-| A job-slot refusal off by one | the brute-force oracle ("the model answered busy where the oracle says admit") |
-| A request may evict the regions it names | the brute-force oracle and the quiescent property |
-| A staging shortfall off by one byte | the scripted bank-full examples |
-| The oldest evictable region is never a victim | the least-recently-used and funded-eviction examples and the oracle |
+decrease; a changed region is not lost without a handoff; the owner can perform
+every action the model has asked of it (each accepted); and every explicit query
+and removal was answered in the class the brute-force oracle says. At the end of
+each run, performing the owner's actions leaves no job, victim, hold, retiring
+arena or reserved byte. It runs 200 random sequences of 250 events, a 12,000-event
+fixed sequence under tight budgets, a 12,000-event fixed sequence under room for
+concurrent work (where commits meet queued and running jobs of their region), 2,000
+random camera demands accepted into an empty model (each must complete when it is
+alone) and 3,000 random cases of the state-independence property below. The fixed
+sequences assert workload floors so that a degenerate generator fails.
 
 ### Brute-force admission oracle
 
 `Test.Terrain.ResidencyOracle` re-derives the class of every explicit admission
 decision from the model's observations alone and the contract's charge table
-restated by hand, and the random-sequence property compares it with the model at
-every query and removal in every run: __permanently invalid__ exactly when the
-request's minimum final footprint (the resident regions it names, which it cannot
-evict, plus a job's whole reservation for every cell neither resident nor promised,
-plus the least that promised work leaves stored) exceeds a bank or slot;
-__admitted__ exactly when every slot and bank has room and the resident shortfall
-can be covered by some set of regions nothing needs, found by trying every subset
-of them rather than the model's least-recently-used walk; __busy__ otherwise (and
-__exhausted__ for a removal the retained-edit bank cannot take). Over the fixed
-sequences it checked hundreds of admitted, busy and invalid decisions and never
-disagreed with the model; it fails if the workload does not reach each class.
+restated by hand, and the random sequences compare it with the model at every query
+and removal, from an empty model and from every state they reach: __permanently
+invalid__ exactly when the request's minimum final footprint cannot fit a bank or
+slot even from an empty model (one fresh job per region for its whole coverage; it
+reads no state); __admitted__ exactly when every slot and bank has room and the
+resident shortfall can be covered by some set of regions nothing needs, found by
+trying every subset of them rather than the model's least-recently-used walk;
+__busy__ otherwise (and __exhausted__ for a removal the retained-edit bank cannot
+take). In the fixed sequences it checked 101 admitted, 1,626 busy, 18 invalid and 61
+exhausted decisions under tight budgets and 194 admitted and 1,592 busy under room
+for concurrent work, and never disagreed with the model.
+
+### The owner's rule for permanent refusals (extension rounds 6 and 7)
+
+The owner directed that a request is permanently invalid only if its minimum final
+footprint cannot fit a bank "even from an empty model"; every other shortfall is
+busy. The state-dependent lower bounds of the earlier rounds (resident data,
+promised work, retained interests) were removed from the permanent-refusal path:
+they were the source of the last review rounds' false permanent refusals. What is
+resident, who has pinned it and what is promised now decides only whether a request
+is admitted now or waits. The permanent class of a query, a removal and a camera
+demand is the same from an empty model and from a model holding resident leftovers
+and an earlier demand of the same view (the state-independence property). The
+earlier "accepted completes from non-empty states" and "quiescent never busy"
+properties were retired with the bounds they tested; the exhaustive oracle covers
+the busy/admitted decisions from every state.
 

@@ -83,6 +83,9 @@ suite failed; none is committed.
 | Skip the representability check | 1 |
 | Judge snapping by the camera zoom, not the mapping's scale | 1 |
 | Ask for levels outside the supported range | 1 |
+| `refollow` skips configuration validation | 1 |
+| `completeJump` skips configuration validation | 1 |
+| Stamp the camera revision against the clamped camera | 1 |
 
 ## Claims left for TRA-8
 

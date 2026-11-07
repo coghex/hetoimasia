@@ -106,7 +106,15 @@ known air (so a face at the last supported coordinate is exposed to the void).
 ## Camera
 
 `CameraState` is abstract (its accessors are plain functions, not record fields,
-so a client cannot rewrite one). `newCamera`, `applyCommand`, `refollow`,
+so a client cannot rewrite one). Every transition that takes a `CameraConfig`
+(`newCamera`, `applyCommand`, `refollow`, `completeJump`) validates it first and
+answers `Left InvalidConfig` without touching the camera: a negative headroom or
+an unordered zoom range is never installed as a cut. The same transitions also
+bound the camera's zoom by the configuration in force, so a camera built under a
+wider range cannot keep a zoom the current range forbids. `PlanConfig` is
+validated the same way: a negative or over-large depth, margin or chunk margin, a
+negative `PlanLimits` bound, or a key bound beyond the 24-bit key space is
+`InvalidPlanConfig`. `newCamera`, `applyCommand`, `refollow`,
 `completeJump` and `cancelJump` are the transitions; each returns a new state or
 a typed refusal and changes nothing on refusal. There are no key bindings or
 gesture accumulators.
@@ -303,8 +311,12 @@ substitute is introduced here. The CPU fixture matrix (scenes, facings, cuts and
 A request carries `Versions` that must equal the facts' (`MixedVersions`), plus a
 material version (caller data, carried, never interpreted). The camera revision
 comes from the camera. A `PlanIdentity` records the versions, the camera
-revision, the material version, the facing, the cut level and the vertical
-reference; a pick presents it. Planning never adopts a GPU frame or issues a live
+revision, the material version, the facing, the cut level, the vertical
+reference, the view setup (target metrics, viewport and settings) and the plan
+configuration; a pick presents it, so a resize or a reconfiguration is a stale
+identity too. Every transition that changes the camera, including a clamp of its
+zoom to the configuration in force, advances the camera revision (stamped against
+the camera as it was passed in). Planning never adopts a GPU frame or issues a live
 pick token.
 
 ## What remains for TRA-8

@@ -1,0 +1,90 @@
+cabal-version: 3.16
+name: hetoimasia-terrain-render-2d
+version: 0.1.0.0
+synopsis: Pure isometric cutaway planning and picking for Hetoimasia terrain
+description:
+    The pure planning half of the terrain arena's 2D view (TRA-7): the exact,
+    rebased isometric projection of the shared terrain solids through four
+    quarter-turn facings, the follow and manual cutaway camera as pure state and
+    commands, the bounded visible faces and the facts that decide their
+    exposure, missing-data demand, deterministic back-to-front ordering
+    candidates inside the 2D renderer's 24-bit depth keys, and CPU picking
+    against the exact plan it was given. It depends on the pure terrain,
+    math, render-2d and render-api packages only: no GPU, window, Lua, runtime
+    terrain service or game package. Every value is immutable and every function
+    pure; the package owns no state, thread or resource.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/terrain-render-2d
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Terrain.Render2D.Camera
+        Hetoimasia.Terrain.Render2D.Facts
+        Hetoimasia.Terrain.Render2D.Pick
+        Hetoimasia.Terrain.Render2D.Plan
+        Hetoimasia.Terrain.Render2D.Projection
+    -- The exact planar polygon arithmetic and the overlap ordering the public
+    -- modules share; a client cannot import them.
+    other-modules:
+        Hetoimasia.Terrain.Render2D.Internal.Order
+        Hetoimasia.Terrain.Render2D.Internal.Polygon
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0
+
+-- This package's own contracts, registered as the CPU validation group
+-- `test.terrain-render-2d`. Hspec and QuickCheck are the suite's alone.
+test-suite terrain-render-2d-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    -- The pair-bound example reads the runtime's allocation counters, which exist
+    -- only when the program is started with -T.
+    ghc-options: -rtsopts "-with-rtsopts=-T"
+    other-modules:
+        Test.TerrainRender2D.Camera
+        Test.TerrainRender2D.Fixtures
+        Test.TerrainRender2D.Generated
+        Test.TerrainRender2D.Oracle
+        Test.TerrainRender2D.Opacity
+        Test.TerrainRender2D.Ordering
+        Test.TerrainRender2D.Pick
+        Test.TerrainRender2D.Planning
+        Test.TerrainRender2D.Projection
+        Test.TerrainRender2D.Spec
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        QuickCheck >=2.15 && <2.19,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-render-2d ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0
