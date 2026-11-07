@@ -84,6 +84,10 @@ D-45 selects crisp nearest-neighbor sampling for terrain colour artwork and
 face maps, with the same alpha cutoff for rendering and screen picking.
 Q-17 retains exact sample/edge conventions, data loading and ownership.
 
+D-46 selects Lua-supplied sun compass direction and elevation, fixed relative
+to the world as the camera rotates. Appearance defaults and depth effects
+remain Q-18; no UI or automatic cycle is added.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1392,6 +1396,24 @@ concrete contract work. Include non-integer zoom, tile edges and all four
 facings in D-44's coverage/picking evidence. No particular corrected shape or
 lighting appearance is selected by this sampling decision.
 
+### D-46. Control a world-fixed sun through Lua
+
+Owner, directly in this design pane on 2026-11-07, answered “yes” to Lua
+setting the sun's compass direction and height above the horizon, with the
+same terrain side staying sunlit when the camera rotates.
+
+The preview light is anchored in world space. Camera facing changes how the
+light is expressed for the selected face map; it does not move the sun around
+the terrain. Lua supplies the direction/elevation through the terrain-view
+lighting controls. Preserve D-29's deferred automatic day/night cycle and moon
+lighting; this adds neither a UI nor a world clock.
+
+Q-18's input meaning and supply path are resolved. Exact angle units/ranges,
+binding shape, initial sun position, ambient/intensity values and depth
+dimming/haze remain concrete contract choices. D-44's evidence must include
+camera rotation at a fixed sun input and changing the sun at a fixed camera,
+so a light that accidentally follows the camera cannot pass the preview check.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2409,7 +2431,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-45 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-46 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2471,7 +2493,8 @@ The earlier fixed-configuration recommendation is superseded to the extent
 it implied an unchangeable sun. The automatic cycle is deferred; selected
 sun positions can still change the lighting without a world clock, calendar
 or solar-page/time simulation. Eventual moon lighting is deferred too.
-Exact parameter representation, preview supply path and initial appearance
+D-46 selects Lua-supplied compass direction and elevation anchored in world
+space through camera rotation. Exact units/binding and initial appearance
 remain Q-18; this paragraph settles no other amendment proposal.
 
 Affected tracker work, for later approved revisions only:
@@ -2905,19 +2928,21 @@ is approved.
 
 ### Q-18. Exact initial appearance beyond the silhouette
 
-Open. D-29 requires an adjustable sun-position input and defers its automatic
-cycle and moon lighting. Settle that input's representation, world/facing
-convention and preview supply path, the initial light and ambient values,
-whether to carry S's depth dimming/haze, and which deviations are intentional.
+Partially resolved by D-29/D-46: Lua supplies sun compass direction and
+elevation, anchored in world space through camera rotation, without an automatic
+cycle or moon lighting. Settle exact angle conventions/units/ranges and binding,
+the initial light and ambient values, whether to carry S's depth dimming/haze,
+and which deviations are intentional.
 S's clock phase labels and shader sine disagree; full clock parity cannot be
 claimed from labels alone. Fluids, selection outlines, lifecycle sprites and
 zoom-map crossfade remain outside the approved arena unless explicitly changed.
 
-Current owner question: recommend a Lua call supplying the sun's compass
-direction and height above the horizon, anchored in world space through camera
-rotation. This remains a proposal pending the answer; it supplies no automatic
-cycle or UI. Exact coordinate/unit conventions and appearance defaults would
-then be specified in the concrete contract.
+Current owner question: recommend retaining S's gradual darkening and blue
+haze with depth below the cutaway, adjustable/disableable through Lua so tile
+previews and geometry checks can inspect unmodified material colours. This
+remains a proposal, not an approved appearance choice. Alternatives are
+darkening alone or face lighting without either depth effect. These effects
+are presentation cues and must not change discovery, fog coverage or picking.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
