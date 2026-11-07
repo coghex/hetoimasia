@@ -1546,6 +1546,90 @@ Synarchy was read from a temporary snapshot, never modified.
    agreement. The new design's promise to pick what is actually drawn needs
    explicit masked-quad coverage and ordering, not a blind copy of that picker.
 
+### Focused terrain-picking audit, 2026-11-07
+
+The owner requested this closer inspection before answering Q-16. This is
+source/asset evidence at the same S revision, not approval of the proposed
+replacement picker and not a report of a running-game reproduction.
+
+**What S already does well.** Hover and synchronous terrain clicks use the
+same pure `pickWorldTile`, with facing, zoom, framebuffer aspect, window-pixel
+normalization, elevation and the displayed depth band
+(`src/World/Render/HitTest.hs:79–120`). It canonicalizes wrapped coordinates,
+rejects unavailable finite-arena tiles and missing columns, and checks chunk
+visibility (`:130–158`). A degenerate viewport returns no hit (`:95–99`).
+The synchronous click path avoids relying on a lagging hover cache and
+returns page-selection generation with the hit to protect subsequent actions
+(`src/Engine/Scripting/Lua/API/WorldQuery/Pick.hs:85–112,124–158`). These are
+useful correctness measures to preserve, not reasons to replace everything.
+
+**What the terrain picker actually intersects.** At each descending integer
+Z it subtracts half the full sprite height, inverse-projects to one rounded
+grid coordinate, and accepts nonzero material there. It never reads
+`ctSlopes`, a texture, alpha or the sorted quad list
+(`HitTest.hs:112–158`; `src/World/Grid.hs:238–243`). Thus all 16 shapes have
+the same pick footprint at a given cell/Z even though their visible coverage
+differs. The renderer instead chooses a facing-dependent mask
+(`src/World/Render/Textures.hs:24–57`), emits its whole sprite
+(`src/World/Render/TileQuads.hs:54–66,101–104`), and multiplies colour alpha
+by mask alpha (`src/Engine/Graphics/Vulkan/ShaderCode.hs:254–260,305–318`).
+
+Concrete counterexamples, calculated from those expressions and the shipped
+PNGs rather than inferred merely from the absence of an alpha lookup:
+
+- Use South facing, slice Z=0, loaded in-bounds cells and 96×64 sprite-local
+  coordinates. A cell at `(0,0,0)` has top-left projected pixel `(-48,0)`.
+  For its local point `(u,v)`, the pick's candidate at Z=0 is
+  `round(((u-48)/48 + (v-32)/24)/2)` for X and
+  `round(((v-32)/24 - (u-48)/48)/2)` for Y. Each lower Z adds `16*Z` to
+  the numerator's Y term. These are the normalized constants from
+  `Grid.hs:61–109` and `HitTest.hs:115–120`, not new engine units.
+- **Transparent ramp accepted:** at local `(57.5,15.5)` the candidate is
+  `(0,0,0)`, but `isoface_slope_n.png` texel `(57,15)` has alpha 0, with a
+  fully transparent 7×7 neighborhood. Put a flat cell at `(-1,-1,-1)`:
+  it draws behind at local `(57.5,47.5)`, where `isoface.png` has alpha 255.
+  The front ramp is still picked before the visible flat cell can be tried.
+- **Visible side assigned below:** put flat cells at `(0,0,0)` and
+  `(0,0,-1)`, with other candidates empty. At local `(48.5,58.5)` the upper
+  cell's mask alpha is 255. The picker first looks at empty `(1,1,0)`, then
+  returns `(0,0,-1)`. The upper cell is what the painter order actually draws
+  on top. This is a visual-ownership mismatch even without a ramp.
+- **Visible top tip assigned behind:** at local `(48.5,4.5)` a flat cell's
+  mask is opaque, but the pick candidate is `(-1,-1,0)`. If that rear cell
+  exists, it is returned even though `(0,0,0)` draws on top there. The fixed
+  pick diamond is centered at sprite Y=32; the artwork's top diamond is
+  centered at Y=24. Center clicks can work while these edge areas disagree.
+
+For those samples, the shipped `assets/textures/world/loam/loam.png` colour
+alpha is also 255 at the relevant opaque texels. Painter keys come from
+`TileQuads.hs:61–62`, with ordering defined by
+`src/Engine/Scene/Types/Batch.hs:128–160,187–212`. The calculations stay away
+from rounding ties; the ramp example's transparent neighborhood avoids a
+single boundary-texel artifact. This establishes source-level counterexamples,
+not their frequency in typical generated terrain or a GPU test result.
+
+Two related limits matter for the migration. The blank cutaway fallback can
+draw where there is no stored non-air cell (`src/World/Render/Quads.hs:292–311`),
+while this picker only accepts stored cells. Generic three-face cursor art
+also uses `wtIsoFaceMap`, not the target's slope map
+(`TileQuads.hs:352–370,443–457`); it is a cell marker, not evidence of exact
+ramp coverage. Separately, synchronous picks sample live camera/tile/window
+references (`WorldQuery/Pick.hs:133–149`) rather than an adopted render token.
+That is a potential displayed-frame consistency gap during updates, not a
+race reproduced by this inspection. The inspected seam tests
+(`test-headless/Test/Headless/World/Render/PickSeam.hs`, especially its
+`solidChunk` and `pixelFor` helpers) exercise coordinate framing and center
+clicks with slope zero; they do not establish sprite-alpha agreement.
+
+**Recommendation, still open under Q-16:** use the adopted draw's candidate
+quads, transforms and front-to-back order, then test the same material/mask
+coverage at the cursor. Retain spatial pruning and shared coverage per asset;
+no per-cell copy or GPU readback is implied. Merely adding an alpha rejection
+to S's one-grid-candidate-per-Z loop would address some false hits but still
+miss visible side/top pixels that belong to another candidate at that Z.
+Cell identity and edit authority remain distinct from visual coverage; exact
+cut-surface handling and filtering/threshold rules still require agreement.
+
 ### Existing material ABI and the remaining integration gap
 
 The manager's ABI reading is supported. H
