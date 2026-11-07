@@ -529,13 +529,19 @@ state:
 * a handoff duplicate is at most one region at its stored maximum
   (`HandoffTooLarge`).
 
-The minimum budgets (`explicitMinimumBytes` for explicit requests, `minimumBytes` with
-holds, exact integer arithmetic):
+Every bank is partitioned into an explicit reserve (the explicit worst case) and a
+camera share (the rest). Camera work and holds draw only on the share and never touch
+the reserve; explicit work uses the reserve and whatever of the share is free. The
+configuration check requires the reserve to meet the explicit worst case and the share
+to hold the largest single camera unit, or the camera could never make progress
+(`BankBelowMinimum`; a camera or holds disabled with a zero cap need no unit). The
+minimum budgets (`explicitMinimumBytes` for the reserve, `minimumBytes` with the unit,
+exact integer arithmetic):
 
 | Bank | Worst-case footprint it must hold |
 | --- | --- |
-| Resident | the most of: a query's regions, a removal; each region may already hold its stored maximum and then load the largest job beyond it (a removal: the stored maximum, one cell's 144 and its 62 of growth). Camera work and holds leave this much out of their reach. Beside it, the largest hold: that many regions at the stored maximum |
-| Staging | the most of: a query (command 128 + 32 per region, an interest and the scratch of the whole extent for each region), a removal (command, its 512 and one cell's scratch) and a handoff duplicate of a region at its stored maximum; this is the headroom camera work and holds leave free. Beside it the largest hold's records (64 per region) |
+| Resident | the most of: a query's regions, a removal; each region may already hold its stored maximum and then load the largest job beyond it (a removal: the stored maximum, one cell's 144 and its 62 of growth). Camera work and holds leave this much out of their reach. Beside it, the largest camera unit: the largest hold (its regions at the stored maximum) or one region's camera job (the stored maximum plus the largest job), whichever is larger |
+| Staging | the most of: a query (command 128 + 32 per region, an interest and the scratch of the whole extent for each region), a removal (command, its 512 and one cell's scratch) and a handoff duplicate of a region at its stored maximum; this is the headroom camera work and holds leave free. Beside it the larger of the largest hold's records (64 per region) and one camera region (a one-region description, its interest and its scratch) |
 | Edit | one removal's retained growth, 64 |
 | Load jobs | one: a slot is taken at dispatch |
 
@@ -560,9 +566,10 @@ Their worst cases (computed in the tests): a region stores at most 291,072 bytes
 that extent and its largest job reserves 405,504 more, so a 257-region query needs
 179,020,032 of the 268,435,456 resident bytes and 4,301,280 of the 134,217,728
 staging bytes (command 128 + 32 x 257, an interest each, and 16,640 of scratch per
-region), which camera work and holds leave free, plus 16,384 for the records of the
-largest hold (256 regions) and 74,514,432 resident bytes for the held regions at their
-stored maximum, 253,534,464 of the 268,435,456 in all; a removal needs 64 edit bytes of 67,108,864; a query needs one
+region), which camera work and holds leave free, plus 16,896 for one camera region or
+16,384 for the records of the largest hold (256 regions), and 74,514,432 resident bytes
+for the held regions at their stored maximum (larger than one region's camera job,
+696,576): 253,534,464 of the 268,435,456 in all; a removal needs 64 edit bytes of 67,108,864; a query needs one
 load-job slot of 128. These are engineering defaults for the initial profile, not
 measured capacity.
 
