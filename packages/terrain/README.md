@@ -548,7 +548,7 @@ Checks run in a fixed order and the first failure is reported:
    demand does) and the scratch of its largest job must fit staging, and the least
    each named region can occupy (metadata, columns, segments and two payload bytes
    per segment) must fit the resident bank together, because the interests pin those
-   regions. Never busy, so explicit work cannot stay busy forever.
+   regions, with the last job to complete holding its whole reservation. Never busy, so explicit work cannot stay busy forever.
 2. **RetainedEditsExhausted** (edits only): the committed bytes plus this edit exceed
    the bank even with every reservation returned. It names the bank and persists until
    an arena's teardown frees retained bytes; the public Lua mapping stays `busy`
@@ -574,7 +574,10 @@ A request names the arena's current revision or is stale. Revisions change only 
 `RemovalCommitted`, and a removal changes exactly one region. Work for other regions
 carries over; queued work for the changed region is dropped, running work is
 marked stale and discarded at completion, and the owners whose demand lost work
-are reported.
+are reported with the queued jobs that were dropped and the running jobs now stale.
+Every event that leaves a job without an interest (a withdrawal, a camera
+replacement, a failure that drops the interests it served, a commit) reports the
+jobs it dropped at once and the running ones awaiting acknowledgement.
 
 ### Camera demand
 
