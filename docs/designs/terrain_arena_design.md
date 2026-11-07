@@ -31,6 +31,10 @@ that space and loads all newly exposed boundary terrain, including across
 chunks. Work proceeds in bounded steps; Q-20 retains connectivity, capacity,
 retention and fog interaction details.
 
+D-33 resolves discovery retention: record revealed state as chunk changes,
+retain it on offload and replay it before publishing the reloaded chunk.
+Discovery lasts for the arena session while off-screen chunks stream normally.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -943,6 +947,39 @@ with whole-space discovery/loading; no unlimited resident allocation or
 permanent pin of every discovered tile is silently authorized. Q-19 must
 account for the discovery/loading work in the amended slices and qualification.
 
+### D-33. Retain discovery as chunk changes and replay it on reload
+
+Owner, directly in this design pane on 2026-11-07, approved remembering
+discovery for the arena session while allowing normal off-screen unloading:
+
+> yes, revealed tiles would need to be regestered as changes to the chunk and
+> offloaded and replayed on load, i think, that sounds right.
+
+Register revealed state as retained changes belonging to the affected chunk.
+On offload, preserve those changes alongside retained terrain edits; on reload,
+reapply them before the chunk is published for rendering/picking. A previously
+discovered cavity must not become unknown again just because its chunks were
+unloaded. This includes discovered air as well as exposed solid boundary tiles,
+so a remembered opening cannot turn back into a fog-filled apparent solid.
+
+Discovery and material/shape/removal changes remain distinct kinds of state:
+revealing a cell does not change what occupies it. Retention need not allocate
+one change record per empty cell; compressed revealed ranges/regions may carry
+the same knowledge. Exact encoding and accounting remain to be specified.
+
+Off-screen chunks can unload normally; discovery does not permanently pin the
+whole cavern in resident memory. D-32 still requires traversal/discovery and
+loading of the newly exposed terrain throughout the connected space. The
+retained discovery survives eviction for this arena incarnation and is
+discarded when that arena is reset/closed, consistent with D-10's session-only
+scope. This decision does not add persistence across application runs.
+
+The retention/replay choice in Q-20 is resolved by D-33. Exact capacity refusal,
+in-progress discovery resumability, publication/commit boundaries and reset
+implementation still need the concrete contract; eviction may not silently
+discard approved retained discovery. Q-19 must cover replay-before-publication
+and cross-chunk offload/reload evidence in the amended work.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1845,7 +1882,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-32 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-33 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1870,8 +1907,11 @@ is superseded; lazily loading terrain must not itself reveal it. Fog must
 occlude visual picking without becoming authoritative physical occupancy.
 D-32 selects whole-cavity discovery/loading on unsealing, including boundary
 terrain beyond adjacent cells and across chunks, processed in bounded steps.
-Exact connectivity, capacity/completion, retention, API authority and fog hit
-behavior remain Q-20.
+D-33 retains discovery as chunk changes across normal offload/reload for the
+arena session, replayed before render/pick publication. Revealing terrain is
+distinct from editing its contents; discovered chunks need not stay resident.
+Exact connectivity, capacity/completion, API authority and fog hit behavior
+remain Q-20.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2077,17 +2117,24 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31/D-32. Preserve fog over both solid and air until
+Partially resolved by D-31–D-33. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
 steps. The local-only discovery alternative is rejected.
 
+D-33 records revealed state as retained chunk changes, preserved on offload
+and replayed before reload publication alongside terrain edits. Discovery
+persists for the arena session while off-screen chunks may unload normally;
+closing/resetting the arena discards it. Both revealed air and exposed solid
+boundary tiles retain their known state.
+
 Still open: define connectivity through faces, edge/corner contacts and partial
 openings around shaped cells; distinguish a cavity from unbounded exterior
 air; specify completion and memory-pressure behavior for very large spaces.
-Specify initial known surface, Lua/engine authority, whether knowledge survives
-offload/reload and how it is reset. Decide the fog pick result and whether the
+Specify initial known surface, Lua/engine authority and the concrete reset,
+reveal-job resumability and replay/publication boundaries. Decide the fog pick
+result and whether the
 development removal action can operate on a concealed cell without leaking
 its contents.
 
@@ -2096,9 +2143,10 @@ regions, budgeted separately from resident terrain and retained edits. Reveal
 work must be bounded; an enormous or exterior-connected air region cannot
 force an unbounded flood fill or eager underground allocation. Consider
 coherent terrain/reveal publication so a pending or failed edit/reveal cannot
-flash secret contents. Beyond the D-32 whole-space propagation and bounded-step
-choice, these are requirements to resolve, not approved API, representation,
-connectivity, failure or retention policies. Do not introduce
+flash secret contents. D-32 settles whole-space propagation in bounded steps;
+D-33 settles session retention/replay with normal streaming. Exact API,
+representation, connectivity, failure and capacity policies remain open.
+Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
 ## Verification strategy — approved through Q-12
