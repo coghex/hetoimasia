@@ -298,10 +298,15 @@ data Decision
   | -- | A late, withdrawn or superseded job's result was dropped; its
     -- reservations were released.
     Discarded !JobId
-  | JobFailedFor !JobId ![Owner]
-  | -- | The new revision, the retained bytes returned, and the owners whose
-    -- demand lost its work to the commit.
-    Committed !Revision !Word64 ![Owner]
+  | -- | The failed job, the owners whose interests it served (dropped), and the
+    -- jobs that dropping them left unneeded: those dropped at once and those
+    -- running, awaiting their acknowledgement.
+    JobFailedFor !JobId ![Owner] ![JobId] ![JobId]
+  | -- | The new revision, the retained bytes returned, the owners whose demand
+    -- lost its work to the commit, the queued jobs of the changed region that were
+    -- dropped, and the running jobs of it now stale (their results will be
+    -- discarded; the owner may cancel them).
+    Committed !Revision !Word64 ![Owner] ![JobId] ![JobId]
   | HoldAcquired
   | HoldReleased
   | HandoffStarted
@@ -1086,12 +1091,13 @@ setCamera m v a demands = do
       residentLimit = limitBytes limits ResidentBank
       count = fromIntegral (length demands) ∷ Word64
       footprint = newBytes + count * interestRecordBytes + maximum (0 : map (scratchBytes . demandCoverage) demands)
+      least c = regionMetadataBytes + 48 * coverageColumns c + 34 * coverageSegments c
+      reserveOf c = either (const 0) fst (minimalNeed c)
+      -- Every region stays pinned at no less than its least size; the last job to
+      -- complete holds its whole reservation while the others are at their least.
       leastResident =
-        sum
-          [ regionMetadataBytes + 48 * coverageColumns c + 34 * coverageSegments c
-          | d ← demands
-          , let c = demandCoverage d
-          ]
+        sum (map (least . demandCoverage) demands)
+          + minimum [reserveOf c - least c | d ← demands, let c = demandCoverage d]
   if footprint > stagingLimit then Left (Invalid (ExceedsBank StagingBank footprint stagingLimit)) else Right ()
   if leastResident > residentLimit then Left (Invalid (ExceedsBank ResidentBank leastResident residentLimit)) else Right ()
   if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
@@ -1240,8 +1246,8 @@ failJob m jid = case Map.lookup jid (mJobs m) of
           markFailed mm = case [v | OwnerView v ← owners] of
             [] → mm
             vs → mm {mViews = foldr (Map.adjust (\w → w {vwFailed = Set.insert (jbRegion job) (vwFailed w)})) (mViews mm) vs}
-          (m3, _, _) = pruneJobs (markFailed m2)
-       in Right (m3, JobFailedFor jid owners)
+          (m3, gone, cancelling) = pruneJobs (markFailed m2)
+       in Right (m3, JobFailedFor jid owners gone cancelling)
 
 -- ---------------------------------------------------------------------------
 -- Removal commit
@@ -1274,12 +1280,15 @@ commitRemoval m rid newRev actual growth = do
           { mArenas = Map.insert a arena {arRevision = newRev, arRetained = arRetained arena + actual} (mArenas m2)
           , mJobs = Map.mapMaybe (restamp a (erRegion reservation) newRev) (mJobs m2)
           }
+      editedJobs = [(i, j) | (i, j) ← Map.toAscList (mJobs m2), jbArena j == a, jbRegion j == erRegion reservation]
+      droppedJobs = [i | (i, j) ← editedJobs, jbState j == JobPending]
+      staleJobs = [i | (i, j) ← editedJobs, jbState j == JobRunning, not (jbStale j)]
       lost =
         [ o
         | (o, i) ← Map.toList (tgInterests t1)
         , not (coverageSubset (inCoverage i) (haveCoverage m3 key))
         ]
-  Right (m3, Committed newRev (erRetained reservation - actual) lost)
+  Right (m3, Committed newRev (erRetained reservation - actual) lost droppedJobs staleJobs)
   where
     restamp a region rev j
       | jbArena j /= a = Just j

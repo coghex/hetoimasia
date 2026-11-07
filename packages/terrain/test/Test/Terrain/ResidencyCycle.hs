@@ -178,7 +178,7 @@ spec = describe "Residency over the real data layer" $ do
             (m3, committed) ← stepOk (wModel w2) (RemovalCommitted (RequestId (fromInteger rid)) next (fromIntegral grown) (fromIntegral regrown))
             assertCharged w2 {wModel = m3}
             -- What was reserved but not needed (64 minus the real growth) returns.
-            reportDecision committed `shouldBe` Committed next (64 - fromIntegral grown) []
+            reportDecision committed `shouldBe` Committed next (64 - fromIntegral grown) [] [] []
             -- Hand the changes off; the retained bytes do not grow again.
             let retainedBefore = [arenaRetainedBytes a | a ← modelArenas m3]
             m4 ← stepsOk m3 [BeginHandoff a1 region (fromIntegral (changesBytes changes')), HandoffConfirmed a1 region]
@@ -254,7 +254,7 @@ spec = describe "Residency over the real data layer" $ do
     let regrown = realBytes w3 - realBytes w2
     regrown `shouldBe` 10
     (m4, committed) ← stepOk (wModel w3) (RemovalCommitted (RequestId 2) (Revision 1) (fromIntegral (changesBytes changes')) (fromIntegral regrown))
-    reportDecision committed `shouldBe` Committed (Revision 1) 0 []
+    reportDecision committed `shouldBe` Committed (Revision 1) 0 [] [] []
     -- Occupied now includes the growth; the unused 52 of the reservation returned.
     ledgersOf m4 `shouldBe` Ledgers (348, 0) (64, 0) (0, 0)
     assertCharged w3 {wModel = m4}

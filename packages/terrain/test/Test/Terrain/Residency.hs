@@ -102,7 +102,7 @@ removeCellAt m a rev rid tile = do
       let Revision n = rev
           next = Revision (n + 1)
       (m3, committed) ← stepOk m2 (RemovalCommitted (RequestId (fromInteger rid)) next 64 0)
-      reportDecision committed `shouldBe` Committed next 0 []
+      reportDecision committed `shouldBe` Committed next 0 [] [] []
       pure (m3, next)
     other → expectationFailure ("expected one job, got " <> show other) >> pure (m1, rev)
 
@@ -374,7 +374,7 @@ cancellationSpec = describe "cancellation and late results" $ do
     m0 ← opened tiny
     m1 ← stepsOk m0 [q 1 (reg 0 0 0) (cell 0 0 0), Dispatch]
     (m2, failed) ← stepOk m1 (JobFailed (JobId 0))
-    reportDecision failed `shouldBe` JobFailedFor (JobId 0) [OwnerRequest (RequestId 1)]
+    reportDecision failed `shouldBe` JobFailedFor (JobId 0) [OwnerRequest (RequestId 1)] [] []
     ledgersOf m2 `shouldBe` Ledgers (0, 0) (0, 0) (160, 0)
     modelInterests m2 `shouldBe` []
   it "acknowledges a cancelled running job and refuses an acknowledgement of live work" $ do
@@ -671,7 +671,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     (m2, _) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 1))
     m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 1) oneCellCost]
     (m4, committed) ← stepOk m3 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
-    reportDecision committed `shouldBe` Committed (Revision 1) 0 [OwnerView (ViewId 1)]
+    reportDecision committed `shouldBe` Committed (Revision 1) 0 [OwnerView (ViewId 1)] [] [JobId 0]
     -- The next service quantum admits replacement work at the new revision.
     (m5, serviced) ← stepOk m4 Service
     case reportDecision serviced of
@@ -687,6 +687,27 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     m7 ← stepsOk m5 [JobFailed (JobId 0)]
     (_, none) ← stepOk m7 Service
     reportDecision none `shouldBe` Serviced []
+  it "reports the queued and running jobs of the changed region when a removal commits" $ do
+    m0 ← opened roomy
+    -- A removal's job (J0), a running camera load (J1) and a queued camera load (J2)
+    -- of three cells in one region; the removal commits first.
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch]
+    m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 2) a1 [demand (reg 0 0 0) (cell 0 0 9)])
+    (m3, _) ← stepOk m2 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 1))
+    -- Dispatch order is foreground first, so the removal's load runs next.
+    m4 ← stepsOk m3 [Dispatch, JobCompleted (JobId 2) oneCellCost]
+    (_, committed) ← stepOk m4 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
+    -- The queued load (J1) is dropped; the running one (J0) is stale.
+    reportDecision committed `shouldBe` Committed (Revision 1) 0 [OwnerView (ViewId 1), OwnerView (ViewId 2)] [JobId 1] [JobId 0]
+  it "reports the jobs a failure leaves unneeded" $ do
+    m0 ← opened roomy
+    -- Caller 2 asks for cells z 0 and z 5; caller 1 had asked for z 0 first, so
+    -- caller 2's second job covers z 5. When the first job fails both interests go
+    -- and the second job is needed by nobody.
+    m1 ← stepsOk m0 [q 1 (reg 0 0 0) (cell 0 0 0), q 2 (reg 0 0 0) (coverageUnion (cell 0 0 0) (cell 0 0 5)), Dispatch]
+    (m2, failed) ← stepOk m1 (JobFailed (JobId 0))
+    reportDecision failed `shouldBe` JobFailedFor (JobId 0) [OwnerRequest (RequestId 1), OwnerRequest (RequestId 2)] [JobId 1] []
+    modelJobs m2 `shouldBe` []
   it "replaces a view's coverage in a retained region, withdrawing the obsolete interest" $ do
     -- One load slot. A queued job for the old coverage is cancelled at once and
     -- its slot goes to the replacement in the same step.
@@ -750,9 +771,23 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       other → expectationFailure (show other)
     map viewPending (modelViews m4) `shouldBe` [[]]
     -- Pinned by their interests, the regions must also fit the resident bank at
-    -- the least they can occupy: 2 x (256 + 48 + 34) = 676.
-    m5 ← opened (limitsWith $ \s → s {specResidentBytes = 600})
-    stepRefused m5 (SetCameraDemand (ViewId 1) a1 two) `shouldReturn` Invalid (ExceedsBank ResidentBank 676 600)
+    -- the least they can occupy, 2 x (256 + 48 + 34) = 676, while the last job to
+    -- complete holds its whole reservation: 400 instead of 338, 62 more: 738.
+    m5 ← opened (limitsWith $ \s → s {specResidentBytes = 737})
+    stepRefused m5 (SetCameraDemand (ViewId 1) a1 two) `shouldReturn` Invalid (ExceedsBank ResidentBank 738 737)
+    -- At 738 both jobs complete: the second is admitted when the first has stored.
+    m6 ← opened (limitsWith $ \s → s {specResidentBytes = 738})
+    (m7, exact) ← stepOk m6 (SetCameraDemand (ViewId 1) a1 two)
+    case reportDecision exact of
+      CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (1, [reg 1 0 0])
+      other → expectationFailure (show other)
+    m8 ← stepsOk m7 [Dispatch, JobCompleted (JobId 0) oneCellCost]
+    (m9, second) ← stepOk m8 Service
+    case reportDecision second of
+      Serviced [(ViewId 1, a')] → admissionJobs a' `shouldBe` [(JobId 1, reg 1 0 0)]
+      other → expectationFailure (show other)
+    m10 ← stepsOk m9 [Dispatch, JobCompleted (JobId 1) oneCellCost]
+    map regionBytes (modelRegions m10) `shouldBe` [338, 338]
   it "counts the description in the footprint a camera demand can never escape" $ do
     -- 192 (description) + 64 (interest) + 258 (scratch) = 514 staging bytes.
     m0 ← opened (limitsWith $ \s → s {specStagingBytes = 400})
@@ -843,7 +878,7 @@ editSpec = describe "retained edits" $ do
     ledgersOf m1 `shouldBe` Ledgers (0, 400 + 62) (0, 64) (224, 258 + 512)
     m2 ← stepsOk m1 [Dispatch, JobCompleted (JobId 0) oneCellCost]
     (m3, committed) ← stepOk m2 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
-    reportDecision committed `shouldBe` Committed (Revision 1) 0 []
+    reportDecision committed `shouldBe` Committed (Revision 1) 0 [] [] []
     -- The retained 64 bytes are now occupied; reservations and the command are gone.
     ledgersOf m3 `shouldBe` Ledgers (338, 0) (64, 0) (0, 0)
     [arenaRevision a | a ← modelArenas m3] `shouldBe` [Revision 1]
@@ -860,7 +895,7 @@ editSpec = describe "retained edits" $ do
     -- whole 64-byte reservation returns.
     m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 1) (Cost 0 1 2)]
     (m4, committed) ← stepOk m3 (RemovalCommitted (RequestId 2) (Revision 2) 0 0)
-    reportDecision committed `shouldBe` Committed (Revision 2) 64 []
+    reportDecision committed `shouldBe` Committed (Revision 2) 64 [] [] []
     ledgersOf m4 `shouldBe` Ledgers (338 + 34, 0) (64, 0) (0, 0)
     [arenaRetainedBytes a | a ← modelArenas m4] `shouldBe` [64]
   it "returns every reservation when a removal is abandoned before commit" $ do
@@ -896,7 +931,7 @@ editSpec = describe "retained edits" $ do
     -- 62 bytes were reserved for the rebuilt segment.
     stepRefused m2 (RemovalCommitted (RequestId 1) (Revision 1) 64 63) `shouldReturn` ContractFailure (ResidentGrowthExceedsReservation 62 63)
     (m3, committed) ← stepOk m2 (RemovalCommitted (RequestId 1) (Revision 1) 64 62)
-    reportDecision committed `shouldBe` Committed (Revision 1) 0 []
+    reportDecision committed `shouldBe` Committed (Revision 1) 0 [] [] []
     -- The growth is occupied: 338 + 62.
     ledgersOf m3 `shouldBe` Ledgers (400, 0) (64, 0) (0, 0)
     -- Growth funded by a committed eviction is not occupied before the release:
