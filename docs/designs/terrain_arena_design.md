@@ -39,6 +39,11 @@ D-34 resolves connectivity between empty cells: six shared-face neighbors;
 edge-only or corner-only contact does not join cavities. Partial openings
 around shaped terrain remain a separate Q-16/Q-20 choice.
 
+D-35 requires explicit logical opening rules for ramps/corner slopes: a real
+diagonal opening into an unrevealed space must discover it. Whole-air-cell
+adjacency alone is insufficient; the exact per-shape catalog still needs
+specification and review under Q-16/Q-20.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1006,6 +1011,60 @@ The remaining exterior, capacity/completion and fog interaction choices
 remain open. Q-19 qualification must include face-connected cross-chunk
 spaces and distinct cavities that touch only at an edge or corner.
 
+### D-35. Explicit shape openings connect and reveal cavities
+
+Owner, directly in this design pane on 2026-11-07, approved connectivity through
+the partial empty space above ramps/corner slopes and made the diagonal case
+explicit:
+
+> yes, we will need explicit shape rules too, no cutting corners here. a ramp
+> that has a diagonal open to the air gap of an unrevealed space needs to
+> reveal that space
+
+Define logical solid/empty regions and their connected openings for the full
+16-ID shape catalog. Discovery must follow continuous empty space through
+shaped cells, including a ramp-created diagonal opening into an unrevealed
+cavity. That opening triggers D-32 discovery/loading of the connected space;
+it cannot be blocked simply because the ramp cell has a non-air material or
+because the route is diagonal. Treating every shaped cell as a sealed full
+block is not an acceptable first implementation.
+
+D-34 still governs whole empty cells and excludes mere zero-width edge/corner
+contact. It is not a restriction to a flood fill that only visits completely
+empty cells: the actual open regions of intervening shapes must participate.
+The exact geometric mapping must distinguish a genuine ramp-created opening
+from a corner/edge coincidence, rather than approving all diagonal neighbors.
+
+Connectivity is world-space terrain meaning, independent of camera facing,
+lighting and sprite alpha. Each shape needs explicit openings and internal
+connections, including which openings are joined within that cell; a loose
+list of open sides cannot silently connect otherwise separate empty regions.
+The previous analytic solids and ID-15-equals-ID-0 assumption are not a
+validated replacement for that catalog. Define and review the actual shape
+rules before declaring the amendment ready; preserving IDs alone is not proof.
+No particular triangulation, sampling resolution or per-shape geometry table
+is approved by this behavioral decision.
+
+Q-19 qualification must cover the owner's diagonal-ramp reveal case, sealed
+controls, all shape IDs and world orientations, cross-chunk openings and
+retained discovery replay. Missing neighbor data is pending/unknown until
+resolved, not proof of an air connection. Camera rotation must not change
+which spaces are connected. Movement, speed and unit line-of-sight remain
+deferred; discovery connectivity must not be borrowed uncritically from a
+movement rule.
+
+Relevant S evidence: `src/Unit/Pathing/Cost.hs:343–347,486–528` interprets
+slope bits for surface movement and classifies diagonal one-level steps as
+cliffs. That is not a cavity-connectivity contract and cannot decide this
+owner-approved reveal behavior. `src/World/Slope/FaceMaps.hs:33–47,80–119`
+supplies only a partial procedural mask helper, not an authoritative 16-shape
+logical volume catalog. The earlier source audit records why actual PNG
+silhouettes and the old CPU solids cannot be equated.
+
+The inclusion of partial-shape and diagonal openings in Q-16/Q-20 is resolved
+by D-35. Their exact geometric catalog and validation remain open, along with
+exterior/capacity/completion and fog interaction policies.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1908,7 +1967,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-34 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-35 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1937,9 +1996,10 @@ D-33 retains discovery as chunk changes across normal offload/reload for the
 arena session, replayed before render/pick publication. Revealing terrain is
 distinct from editing its contents; discovered chunks need not stay resident.
 D-34 connects whole empty cells through their six shared faces and excludes
-edge/corner-only contacts. Partial openings around shaped cells still need
-their own logical contract. That choice, capacity/completion, API authority
-and fog hit behavior remain Q-20.
+edge/corner-only contacts. D-35 additionally requires explicit shape openings,
+including real diagonal openings through ramps into unrevealed spaces. Exact
+per-shape geometry, capacity/completion, API authority and fog hit behavior
+remain Q-16/Q-20.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2105,7 +2165,10 @@ The result identifies the logical cell for the existing edit contract.
 
 D-31 additionally preserves blank fog coverage over undiscovered terrain,
 including air. Cutaway movement and data residency do not grant discovery.
-Fog-specific picking and reveal behavior are tracked in Q-20.
+Fog-specific picking and reveal behavior are tracked in Q-20. D-35 requires
+logical shape openings for discovery, including ramp-created diagonal
+connections; the exact 16-shape solid/empty-region catalog is still to be
+specified and reviewed.
 
 Still open: the fate/meaning of #637's exact subcell-solid query APIs,
 full-cell versus isolated-face emission, hidden-face/cap behavior and the
@@ -2145,7 +2208,7 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-34. Preserve fog over both solid and air until
+Partially resolved by D-31–D-35. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
@@ -2160,8 +2223,13 @@ boundary tiles retain their known state.
 D-34 resolves whole-empty-cell connectivity: six shared-face neighbors,
 including across chunks, with edge/corner-only contacts excluded.
 
-Still open: define partial empty regions/openings around shaped cells and
-their connectivity; distinguish a cavity from unbounded exterior
+D-35 requires discovery through explicit partial-shape openings, including
+real diagonal openings from ramps into unrevealed spaces. It excludes both
+the shortcut of treating all shaped cells as sealed blocks and the shortcut
+of treating every diagonal neighbor as connected.
+
+Still open: specify and review the exact 16-shape solid/empty regions,
+openings and internal connectivity; distinguish a cavity from unbounded exterior
 air; specify completion and memory-pressure behavior for very large spaces.
 Specify initial known surface, Lua/engine authority and the concrete reset,
 reveal-job resumability and replay/publication boundaries. Decide the fog pick
@@ -2176,8 +2244,9 @@ force an unbounded flood fill or eager underground allocation. Consider
 coherent terrain/reveal publication so a pending or failed edit/reveal cannot
 flash secret contents. D-32 settles whole-space propagation in bounded steps;
 D-33 settles session retention/replay with normal streaming; D-34 settles
-whole-empty-cell face adjacency. Exact API, representation, partial-shape
-connectivity, failure and capacity policies remain open.
+whole-empty-cell face adjacency. D-35 includes partial-shape/diagonal openings.
+Exact API, representation, per-shape geometric rules, failure and capacity
+policies remain open.
 Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
