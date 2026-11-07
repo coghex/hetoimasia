@@ -914,6 +914,49 @@ aloneStep m arena (RegionDemand region cover) =
       leastNew = if job then reserve - 62 * coverageSegments deltaNew else 0
    in AloneStep pinned reserve (leastNew + promisedLeast) (reserve + promisedLeast) (if job then scratchBytes deltaNew else 0) job
 
+-- | How a demand's regions are admitted: all at once (an atomic request) or one
+-- after another in demand order (a camera demand).
+data Admit = AllAtOnce | InOrder
+
+-- | The one permanent-feasibility check every admission path uses. A demand is
+-- invalid when its complete footprint can never fit a bank or slot, even if nothing
+-- else existed: what it keeps (the regions it names that are resident now, which it
+-- never evicts to load another of its own; the interests it holds) plus what it
+-- newly reserves, measured at the most demanding step of its admission order.
+--
+-- 'fixedStaging' is staging held for the whole demand (an atomic request's command
+-- record and staging, or a camera demand's description); 'growth' is a removal's
+-- resident growth. Work promised to other owners counts at the least it can leave
+-- stored (see 'aloneStep'), so the check never rejects a demand that could complete
+-- once that work does.
+footprintCheck ∷ Model → ArenaId → Owner → Admit → Word64 → Word64 → [RegionDemand] → Either Refusal ()
+footprintCheck m arena owner mode fixedStaging growth demands = do
+  let steps = map (aloneStep m arena) demands
+      residentLimit = limitBytes (mLimits m) ResidentBank
+      stagingLimit = limitBytes (mLimits m) StagingBank
+      jobsNeeded = fromIntegral (length (filter asJob steps)) ∷ Word64
+      pinnedAll = sum (map asPinned steps)
+      -- Interests the owner already holds in the regions still to come.
+      existing = [if hasInterest m (arena, demandRegion d) owner then 1 else 0 | d ← demands]
+      stillToCome = drop 1 (scanr (+) 0 existing)
+      interestsBy k later = k + later
+      (stagingPeak, residentPeak, slotsPeak) = case mode of
+        AllAtOnce →
+          ( fixedStaging + fromIntegral (length demands) * interestRecordBytes + sum (map asScratch steps)
+          , pinnedAll + sum (map asAtOnce steps) + growth
+          , jobsNeeded
+          )
+        InOrder →
+          let leastBefore = scanl (\n st → n + asLeast st) 0 steps
+           in ( maximum (0 : [fixedStaging + interestsBy k later * interestRecordBytes + asScratch st | (k, later, st) ← zip3 [1 ..] stillToCome steps])
+              , maximum (pinnedAll + last leastBefore : [pinnedAll + added + asReserve st | (added, st) ← zip leastBefore steps])
+              , if jobsNeeded > 0 then 1 else 0
+              )
+      slotLimit = limitSlot (mLimits m) LoadJobSlot
+  if stagingPeak > stagingLimit then Left (Invalid (ExceedsBank StagingBank stagingPeak stagingLimit)) else Right ()
+  if residentPeak > residentLimit then Left (Invalid (ExceedsBank ResidentBank residentPeak residentLimit)) else Right ()
+  if slotsPeak > slotLimit then Left (Invalid (ExceedsSlot LoadJobSlot slotsPeak slotLimit)) else Right ()
+
 -- | The units, the funding of each new job (active bytes, deferred bytes and the
 -- victims it awaits) and the committed victims.
 data Plan = Plan ![UnitPlan] ![(Word64, Word64, Map RegionKey Word64)] ![RegionKey]
@@ -931,19 +974,9 @@ planAdmission m arena owner demands extras = do
       growth = if exEdit extras then removalResidentGrowthBytes else 0
       stagingNeed = newInterests * interestRecordBytes + sum (map njScratch jobs) + exRequestBytes extras
       editNeed = if exEdit extras then removalRetainedBytes else 0
-  -- Permanently invalid: cannot fit even if nothing else existed. The request is
-  -- atomic, so everything it needs is held at once: the regions it names stay
-  -- resident (they are not eviction candidates for it) and every cell not yet
-  -- resident needs its job's whole reservation. Work already promised to other
-  -- owners is not subtracted: alone, the request would need it too.
-  let alone = map (aloneStep m arena) demands
-      aloneResident = sum (map asPinned alone) + sum (map asAtOnce alone) + growth
-      aloneStaging = fromIntegral (length demands) * interestRecordBytes + sum (map asScratch alone) + exRequestBytes extras
-      aloneJobs = fromIntegral (length (filter asJob alone)) ∷ Word64
-  permanent ResidentBank aloneResident
-  permanent StagingBank aloneStaging
+  -- Permanently invalid: the complete footprint can never fit (see 'footprintCheck').
+  footprintCheck m arena owner AllAtOnce (exRequestBytes extras) growth demands
   permanent EditBank editNeed
-  permanentSlot LoadJobSlot aloneJobs
   permanentSlot CommandSlot nCommands
   -- Retained edits are exhausted, not merely busy, when the committed bytes
   -- plus this edit cannot fit even with every reservation returned.
@@ -1117,34 +1150,9 @@ setCamera m v a demands = do
   if newBytes > limitBytes limits StagingBank
     then Left (Invalid (ExceedsBank StagingBank newBytes (limitBytes limits StagingBank)))
     else Right ()
-  -- Regions are admitted in demand order, and each interest stays for as long as
-  -- the demand does. A demand is permanently invalid when, at some step of that
-  -- order, what it must already hold plus the next job's whole reservation exceeds
-  -- a bank, even if nothing else existed (earlier jobs have completed and released
-  -- their scratch). What is resident now counts, because the demand keeps it
-  -- pinned and does not evict its own regions to load another; only the cells not
-  -- yet resident need a job. These are lower bounds: a
-  -- demand that passes can still wait on pressure, but one that fails can never
-  -- complete.
-  let stagingLimit = limitBytes limits StagingBank
-      residentLimit = limitBytes limits ResidentBank
-      steps = map (aloneStep m a) demands
-      -- Staging holds the description, an interest for every region admitted so
-      -- far, the interests this view already holds in the regions still to come
-      -- (they stay as long as the demand does) and the scratch of the job being
-      -- loaded.
-      existing = [if hasInterest m (a, demandRegion d) (OwnerView v) then 1 else 0 | d ← demands]
-      stillToCome = drop 1 (scanr (+) 0 existing)
-      stagingPeak =
-        maximum (0 : [newBytes + (k + later) * interestRecordBytes + asScratch st | (k, later, st) ← zip3 [1 ..] stillToCome steps])
-      -- Resident holds every region of the demand that is resident now (the demand
-      -- never evicts its own regions), the least it has added to the earlier ones,
-      -- and the job's whole reservation.
-      pinnedAll = sum (map asPinned steps)
-      leastBefore = scanl (\n st → n + asLeast st) 0 steps
-      residentPeak = maximum (pinnedAll + last leastBefore : [pinnedAll + added + asReserve st | (added, st) ← zip leastBefore steps])
-  if stagingPeak > stagingLimit then Left (Invalid (ExceedsBank StagingBank stagingPeak stagingLimit)) else Right ()
-  if residentPeak > residentLimit then Left (Invalid (ExceedsBank ResidentBank residentPeak residentLimit)) else Right ()
+  -- Permanently invalid: in demand order, the complete footprint can never fit
+  -- (see 'footprintCheck'; the description is held for as long as the demand is).
+  footprintCheck m a (OwnerView v) InOrder newBytes 0 demands
   if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
     then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) (newBytes - oldBytes)))
     else Right ()
