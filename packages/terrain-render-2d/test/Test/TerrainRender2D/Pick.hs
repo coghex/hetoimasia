@@ -130,5 +130,7 @@ spec = describe "Pick" $ do
         newer = (planIdentity p) {identityCameraRevision = identityCameraRevision (planIdentity p) + 1}
         elsewhere = (planIdentity p) {identityVersions = Versions 1 1 2}
         cut = (planIdentity p) {identityCut = axis 1}
-    forM_ [other, newer, elsewhere, cut] $ \identity →
+        resized = (planIdentity p) {identitySetup = setup 300 144}
+        reconfigured = (planIdentity p) {identityConfig = defaultPlanConfig {pcDepth = 10}}
+    forM_ [other, newer, elsewhere, cut, resized, reconfigured] $ \identity →
       pickPlan p (PickQuery identity (at 0 0)) `shouldBe` Left PickStale

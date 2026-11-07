@@ -216,6 +216,10 @@ data PlanIdentity = PlanIdentity
   , identityFacing ∷ !ViewFacing
   , identityCut ∷ !AxisCoord
   , identityReference ∷ !Integer
+  , identitySetup ∷ !ViewSetup
+  -- ^ The target, viewport and settings the plan was built for.
+  , identityConfig ∷ !PlanConfig
+  -- ^ The depth, margin and limits it was built under.
   }
   deriving stock (Eq, Show)
 
@@ -500,6 +504,8 @@ planTerrain request facts = do
           , identityFacing = facing
           , identityCut = camClip camera
           , identityReference = ref
+          , identitySetup = requestSetup request
+          , identityConfig = config
           }
       cands = prCands prepared
   runs ← fetchRuns config facts camera cands
