@@ -1,0 +1,70 @@
+cabal-version: 3.16
+name: hetoimasia-terrain
+version: 0.1.0.0
+synopsis: Checked terrain tile identity and canonical shape geometry for Hetoimasia
+description:
+    Tile coordinates on three axes with a checked signed 64-bit range, exact
+    region and local decomposition by floor division, the sixteen-shape catalog
+    with exact quarter-turn rotation, and the canonical unit-cell solid of every
+    shape with its faces, face coverage, point membership and ray and segment
+    intersection, all in exact rational arithmetic. The library is pure and
+    CPU-only: it has no Lua, window, renderer, GPU, runtime or game dependency
+    and owns no state, thread or resource.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/terrain
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Terrain.Coordinate
+        Hetoimasia.Terrain.Geometry
+        Hetoimasia.Terrain.Shape
+    -- The checked representations and the exact polytope arithmetic the public
+    -- modules share; a client cannot import them.
+    other-modules:
+        Hetoimasia.Terrain.Internal.Coordinate
+        Hetoimasia.Terrain.Internal.Polytope
+        Hetoimasia.Terrain.Internal.Shape
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9
+
+-- This package's own contracts, registered as the CPU validation group
+-- `test.terrain`. Hspec and QuickCheck are the suite's alone.
+test-suite terrain-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.Terrain.Coordinate
+        Test.Terrain.Fixtures
+        Test.Terrain.Geometry
+        Test.Terrain.Opacity
+        Test.Terrain.Shape
+        Test.Terrain.Spec
+    build-depends:
+        base >=4.22 && <4.23,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        QuickCheck >=2.15 && <2.19,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0
