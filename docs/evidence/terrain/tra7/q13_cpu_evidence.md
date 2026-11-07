@@ -85,6 +85,7 @@ suite failed; none is committed.
 | Ask for levels outside the supported range | 1 |
 | `refollow` skips configuration validation | 1 |
 | `completeJump` skips configuration validation | 1 |
+| Stamp the camera revision against the clamped camera | 1 |
 
 ## Claims left for TRA-8
 
