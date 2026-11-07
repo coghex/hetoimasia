@@ -82,9 +82,20 @@ and begins at elevation `z`.
    four corners through the inverse, widened by a two-pixel margin that absorbs
    the mapping's 32-bit rounding and snap.
 
+*Pixel snapping.* The recorder rounds each instance's origin to the device pixel
+grid separately, so adjacent faces with different fractional origins would be
+drawn apart by up to half a pixel and open cracks. Face origins lie on a lattice
+of 48 pixels horizontally and 8 vertically at native scale, so every origin is on
+a whole pixel exactly when the zoom is a whole multiple of 1/8. A view that
+snaps at any other zoom is refused (`PixelSnapUnsupported`); `snapCompatible`
+answers it. A view that does not snap has no such restriction.
+
 Refusals are explicit: an invalid or non-finite view or zoom is
 `InvalidView ViewRefused`; a camera not representable as a `Float` is
-`UnrepresentableCamera`. A zero-extent viewport plans no faces and has no hits;
+`UnrepresentableCamera`; a face the view's own mapping cannot place in the
+target (the composed transform overflows) is `Unrepresentable`, never an empty
+or partial polygon. A viewport with a zero extent, or a target whose logical or
+framebuffer extent has a zero side, plans no faces and no demand and has no hits;
 a point outside the viewport cannot hit. Nothing wraps and the world extent is
 never clamped: a cell beyond the supported range does not exist and counts as
 known air (so a face at the last supported coordinate is exposed to the void).
@@ -156,7 +167,8 @@ availability's intervals; a long gap of air, solid or removed cells is one run.
 ## Visible faces
 
 Cell `z` is included when `z <= clip`; the visibility band is the clip level and
-`pcDepth` (initially 250) levels below it, `[clip - 250, clip]`. This is a
+`pcDepth` (initially 250, and at most 250: a larger configured depth is
+`InvalidPlanConfig`) levels below it, `[clip - 250, clip]`. This is a
 visibility cap, not a terrain floor, and not a promise to load that volume; it is
 independent of the 32-level storage region.
 
@@ -200,13 +212,16 @@ levels where a solid cell meets a neighbour that is not an identical flat solid,
 are evaluated, so cost follows the intervals and exposed faces and not the depth;
 a deep slice or a long air gap enumerates nothing in between.
 
-`PlanLimits` bound columns, cells evaluated, faces, overlap candidate pairs,
+`PlanLimits` bound columns, levels examined, faces, overlap candidate pairs,
 depth keys, chunks and intervals in a demand, and vertical regions per chunk
 (independently of the number of columns). Each is checked before the work or
 output it limits and exceeding one is `PlanInsufficient limit`: nothing is
 truncated, no arbitrary suffix is dropped and nothing is retried inside the
 planner. `defaultPlanLimits` are engineering defaults, not measured capacity.
-`PlanStats` reports columns, cells evaluated and faces.
+`PlanStats` reports columns, levels examined and faces. The bounds on levels and
+faces are checked as the work proceeds, the overlap-pair bound stops the
+enumeration at the first pair past it, and the demand ring is generated
+incrementally and refused at the first chunk past its bound.
 
 ## Demand
 
@@ -270,6 +285,9 @@ substitute is introduced here. The CPU fixture matrix (scenes, facings, cuts and
   half-open rule), so exactly one contains it.
 - The integer cell identity is carried by the face, never derived from the float
   position, and is exact at any coordinate.
+- A face that the plan's mapping cannot place in the target makes the pick
+  `Left PickUnrepresentable`; nothing is answered from a partial polygon (a plan
+  already refuses such faces).
 - A point in a region the plan marks unknown is `PickIncomplete`, carrying the best
   known candidate if any, never `PickHit` and never `PickNoHit`. Picking removes
   nothing and issues no token; token authenticity and the Lua connection are later
@@ -308,8 +326,10 @@ terrain. Visibility, ordering and picking are checked against an independent
 oracle that casts exact rays through the same cells with the terrain package's
 `castRay`, sharing no code with the planner. Negative controls were broken once
 locally and caught (reversed order, dropped caps, backmost picking, unavailable
-treated as air, full-block contacts, ignored snapping, cells above the cut,
-accepted mixed versions, ignored band depth, shown covered tops); none is
+treated as air, full-block contacts, cells above the cut, accepted mixed
+versions, ignored band depth, shown covered tops, accepted snapped zooms, the
+symmetric chunk range, unbounded pair collection, ignored framebuffer extents,
+no depth cap, no representability check); none is
 committed. `Test.Support.ExternalClient` compiles a client outside the package:
 one must link and run, and every attempt to name a private constructor, rewrite a
 camera with record syntax or import a private module must be refused for the

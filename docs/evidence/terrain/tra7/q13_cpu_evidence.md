@@ -59,7 +59,9 @@ lattice. The same property was run once locally with 2,500 scenes of a larger bo
 
 ## Negative controls
 
-Each protected behaviour was broken once locally, keeping the scenario, and the
+Pixel snapping at zooms that are not a multiple of 1/8 is refused, because the
+recorder's separate rounding of each instance origin opens cracks between
+adjacent faces (found in review round 1). Each protected behaviour was broken once locally, keeping the scenario, and the
 suite failed; none is committed.
 
 | Mutation | Examples that failed |
@@ -69,11 +71,16 @@ suite failed; none is committed.
 | Pick the backmost face | 23 |
 | Treat an unavailable neighbour as air | 1 |
 | Full-block shortcut for wall contacts | 10 |
-| Ignore pixel snapping in picking | 1 |
 | Include cells above the cut | 12 |
 | Accept mixed versions | 1 |
 | Ignore the configured band depth | 2 |
 | Show a top covered by a solid | 4 |
+| Accept snapped views at any zoom (adjacent faces then crack) | 2 |
+| Symmetric chunk range (drops the lowest chunk of the margin) | 1 |
+| Collect every pair of a bucket before checking the pair bound | 1 |
+| Ignore the framebuffer extent | 1 |
+| No maximum visibility depth | 1 |
+| Skip the representability check | 1 |
 
 ## Claims left for TRA-8
 
