@@ -817,6 +817,109 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       CameraSet _ _ _ _ _ excluded truncated → (excluded, truncated) `shouldBe` ([], [reg 1 0 0])
       other → expectationFailure (show other)
     map (map demandRegion . viewDemand) (modelViews m3) `shouldBe` [[reg 0 0 0]]
+  it "ignores a late failure of work a commit superseded, and keeps the replacement work" $ do
+    m0 ← opened roomy2
+    -- A camera load is running when a removal commits in its region.
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch]
+    (m2, _) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 1))
+    m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 1) oneCellCost]
+    (m4, committed) ← stepOk m3 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
+    reportDecision committed `shouldBe` Committed (Revision 1) 0 [OwnerView (ViewId 1)] [] [JobId 0]
+    -- The next service quantum admits replacement work at the new revision.
+    (m5, serviced) ← stepOk m4 Service
+    case reportDecision serviced of
+      Serviced [(ViewId 1, replacement)] → map snd (admissionJobs replacement) `shouldBe` [reg 0 0 0]
+      other → expectationFailure (show other)
+    -- The original job fails late: nothing of the current demand is touched.
+    (m6, late) ← stepOk m5 (JobFailed (JobId 0))
+    reportDecision late `shouldBe` Discarded (JobId 0)
+    map viewFailed (modelViews m6) `shouldBe` [[]]
+    map jobPhase (modelJobs m6) `shouldBe` [JobQueued]
+    [interestOwner i | i ← modelInterests m6] `shouldBe` [OwnerView (ViewId 1)]
+    -- And a late completion of superseded work is dropped the same way.
+    m7 ← stepsOk m5 [JobFailed (JobId 0)]
+    (_, none) ← stepOk m7 Service
+    reportDecision none `shouldBe` Serviced []
+  it "accepts the owner's cancellation acknowledgement of work a commit superseded" $ do
+    m0 ← opened roomy2
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch]
+    (m2, _) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 0 0 1))
+    m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 1) oneCellCost]
+    (m4, committed) ← stepOk m3 (RemovalCommitted (RequestId 1) (Revision 1) 64 0)
+    -- The commit reports the running job; it is cancelling, still holding its slot,
+    -- scratch and reservation until the owner acknowledges.
+    reportDecision committed `shouldBe` Committed (Revision 1) 0 [OwnerView (ViewId 1)] [] [JobId 0]
+    map jobPhase (modelJobs m4) `shouldBe` [JobCancellingPhase]
+    -- (Staging holds the view's 192-byte description and its 64-byte interest.)
+    ledgersOf m4 `shouldBe` Ledgers (338, 400) (64, 0) (256, 258)
+    (m5, acked) ← stepOk m4 (JobAcknowledged (JobId 0))
+    reportDecision acked `shouldBe` Discarded (JobId 0)
+    modelJobs m5 `shouldBe` []
+    ledgersOf m5 `shouldBe` Ledgers (338, 0) (64, 0) (256, 0)
+  it "completes a demand of mixed sizes in either order" $ do
+    -- Extent 2 x 1 x 1. A: one cell (reserves 400, stores 338). B: two cells in two
+    -- columns (reserves 256 + 96 + 64 + 128 = 544, stores 420). Two regions of this
+    -- extent need 2 x (420 + 288) = 1,416 resident bytes at the least.
+    let regionA = demand (reg 0 0 0) (cell 0 0 0)
+        regionB = demand (reg 1 0 0) (coverageUnion (cell 0 0 0) (cell 1 0 0))
+        costB = Cost 2 2 4
+        mixed = limitsWith $ \x → x {specResidentBytes = 1416, specStagingBytes = 4096, specLoadJobs = 4, specExtentX = 2}
+    forM_ [([regionA, regionB], [oneCellCost, costB]), ([regionB, regionA], [costB, oneCellCost])] $ \(order, costs) → do
+      m0 ← opened mixed
+      (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 order)
+      case reportDecision set of
+        CameraSet admitted waiting _ _ _ _ _ → (length admitted, waiting) `shouldBe` (2, [])
+        other → expectationFailure (show other)
+      m2 ← stepsOk m1 (Dispatch : Dispatch : [JobCompleted (JobId (fromIntegral i)) c | (i, c) ← zip [0 ∷ Int ..] costs])
+      sum (map regionBytes (modelRegions m2)) `shouldBe` 420 + 338
+      map viewPending (modelViews m2) `shouldBe` [[]]
+  it "admits regions strictly in demand order, so a later region never takes room an earlier one needs" $ do
+    -- Extent 2 x 1 x 4, three regions per demand: a region stores at most 496 and a
+    -- job reserves at most 480 more, so the bank holds 3 x 976 = 2,928 at the least.
+    -- Five unrelated regions are pinned (5 x 338 = 1,690), leaving 1,238. A (two
+    -- columns) reserves 544, leaving 694; B (two intervals in each column) reserves
+    -- 256 + 96 + 4 x 96 = 736 and must wait; C (one cell, 400) would fit the 694 but
+    -- may not take room B is waiting for.
+    let a' = demand (reg 10 0 0) (coverageUnion (cell 0 0 0) (cell 1 0 0))
+        b' = demand (reg 11 0 0) (foldr1 coverageUnion [cell x 0 z | x ← [0, 1], z ← [0, 2]])
+        c' = demand (reg 12 0 0) (cell 0 0 0)
+        limits = limitsWith $ \x → x {specResidentBytes = 2928, specStagingBytes = 4096, specLoadJobs = 4, specQueuedCommands = 8, specExtentX = 2, specExtentZ = 4}
+    m0 ← opened limits
+    pinned ← foldM (\m i → loadCell m i (reg i 0 0) (cell 0 0 0)) m0 [1 .. 5]
+    (m1, set) ← stepOk pinned (SetCameraDemand (ViewId 1) a1 [a', b', c'])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ _ _ → (length admitted, waiting) `shouldBe` (1, [reg 11 0 0, reg 12 0 0])
+      other → expectationFailure (show other)
+    [jobRegion j | j ← modelJobs m1] `shouldBe` [reg 10 0 0]
+    -- A service quantum keeps the order too: C fits the room that is left but may not
+    -- be admitted ahead of B.
+    (m1', idle) ← stepOk m1 Service
+    reportDecision idle `shouldBe` Serviced []
+    [jobRegion j | j ← modelJobs m1'] `shouldBe` [reg 10 0 0]
+    -- Release the pins and let the owner finish everything: the whole demand completes.
+    m2 ← foldM withdraw m1' [1 .. 5]
+    m3 ← drainDemand m2
+    map viewPending (modelViews m3) `shouldBe` [[]]
+    sort [regionCoord r | r ← modelRegions m3, regionCoord r `elem` [reg 10 0 0, reg 11 0 0, reg 12 0 0]] `shouldBe` [reg 10 0 0, reg 11 0 0, reg 12 0 0]
+  it "waits, rather than failing, when what a replacement retains leaves too little room, and completes once room appears" $ do
+    -- 1,000 resident bytes: A is resident (338) and view 1 keeps it pinned; another
+    -- request pins a second region (338), leaving 324 free. Replacing the demand with
+    -- [A, B] needs B's 400-byte job: B waits, holds nothing, and A is kept.
+    let regionA = demand (reg 0 0 0) (cell 0 0 0)
+        regionB = demand (reg 1 0 0) (cell 0 0 0)
+    m0 ← opened tiny
+    m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
+    m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionA])
+    m2' ← loadCell m2 2 (reg 2 0 0) (cell 0 0 0)
+    (m3, set) ← stepOk m2' (SetCameraDemand (ViewId 1) a1 [regionA, regionB])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ _ _ → (map admissionShared admitted, waiting) `shouldBe` ([[reg 0 0 0]], [reg 1 0 0])
+      other → expectationFailure (show other)
+    map viewPending (modelViews m3) `shouldBe` [[reg 1 0 0]]
+    -- Once the other request lets go, its region is evicted for B and the demand completes.
+    m4 ← withdraw m3 2
+    m5 ← drainDemand m4
+    map viewPending (modelViews m5) `shouldBe` [[]]
   it "keeps a replacement stageable at the minimum staging bank: the interests it retains are counted" $ do
     -- 1,636 staging bytes: 994 stay free for explicit requests and 642 are the camera's.
     -- View 1 holds B and its 192-byte description; replacing the demand with [A, B] keeps
@@ -1391,6 +1494,15 @@ contractSpec = describe "checked arithmetic and identity boundaries" $ do
     (m2, done) ← stepOk m1 (JobCompleted (JobId 0) oneCellCost)
     reportDecision done `shouldBe` Published (JobId 0) [OwnerRequest (RequestId 1)]
     ledgersOf m2 `shouldBe` Ledgers (338, 0) (0, 0) (224, 0)
+  it "refuses a completion that would take a region past the most its extent allows" $ do
+    -- A one-cell extent stores at most 338 bytes. The job reserves 400, so 339 fits the
+    -- reservation but is an impossible figure for the region: a contract failure, and the
+    -- job stays running.
+    m0 ← opened tiny
+    m1 ← stepsOk m0 [q 1 (reg 0 0 0) (cell 0 0 0), Dispatch]
+    stepRefused m1 (JobCompleted (JobId 0) (Cost 1 1 3)) `shouldReturn` ContractFailure (RegionExceedsMaximum 339 338)
+    (_, done) ← stepOk m1 (JobCompleted (JobId 0) oneCellCost)
+    reportDecision done `shouldBe` Published (JobId 0) [OwnerRequest (RequestId 1)]
   it "refuses a cost whose byte total does not fit 64 bits" $ do
     m0 ← opened tiny
     m1 ← stepsOk m0 [q 1 (reg 0 0 0) (cell 0 0 0), Dispatch]
