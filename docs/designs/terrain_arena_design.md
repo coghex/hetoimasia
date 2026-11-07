@@ -76,8 +76,9 @@ The numeric allowance and the qualified storage mechanism remain Q-20.
 
 Additional Q-16 finding: the pinned N/E mask silhouettes fail a cross-facing
 unit-cell geometry consistency check. The audit below records a concrete
-counterexample. Correcting inconsistent masks while preserving all 16 IDs is
-a proposal requiring owner approval; no artwork or code has been changed.
+counterexample. D-44 approves correcting inconsistent masks while preserving
+all 16 IDs, conditional on solver-delivered proof. The exact replacement
+catalog remains open; no artwork or code has been changed in this design turn.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -1330,6 +1331,43 @@ this high-level approval. Opening the engine application itself is not
 prohibited: the failure boundary is opening the terrain arena. This decision
 does not create a UI, a persistent game-save feature or a live quota-change API.
 
+### D-44. Correct inconsistent masks and require solver-delivered proof
+
+Owner, directly in this design pane on 2026-11-07, approved correcting
+inconsistent masks in Hetoimasia while retaining all 16 IDs, material textures
+and face-map rendering:
+
+> yes, i may have made mistakes in synarchy, that is the motivation for our
+> rewrite in the first place, now is the perfect time to correct things, but
+> im going to need proof of this from the solver when we get to it
+
+Correct demonstrated reference mistakes instead of preserving them for exact
+pixel fidelity. This supersedes D-25's requirement to preserve visual forms
+where a pinned mask conflicts with the intended, rotation-consistent logical
+geometry. Keep the 16 authored identities, existing material artwork and
+GPU face-map cutout/lighting approach. D-36's shared geometry authority for
+discovery and point/ray queries remains; screen picking follows the corrected
+drawn coverage under D-30. This does not approve renumbering/dropping IDs,
+automatic neighbor reshaping, changes to Synarchy, or an unspecified new
+geometry catalog. Those concrete shapes still need Q-16 review.
+
+The solver must reproduce the relevant original mismatch and provide
+reviewable evidence that each correction fixes it. The design's N/E pixel
+calculation is a lead to verify, not a substitute for that proof. Require
+before/after offscreen captures and a catalog covering all 16 IDs in all four
+facings, with the intended logical shapes/openings shown alongside the mask
+results. Include reproducible checks of rotation consistency, rendered alpha,
+screen picking and discovery/query agreement; the detailed evidence contract
+below makes this a delivery gate rather than an optional screenshot.
+
+Deliver that evidence to the owner with the correction's immutable source/asset
+revision and reproduction instructions. If the solver cannot reproduce a
+claimed defect, or the correction fails the agreed geometry or coverage
+checks, report the discrepancy and stop the affected qualification rather
+than declaring the correction proven. Q-13 carries this implementation gate;
+Q-19 must assign it to the geometry/mask correction and final qualification
+work. No implementation or tracker mutation is authorized by this design turn.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2213,23 +2251,61 @@ every other mask is inconsistent. Snapshot integrity was checked against
 S's Git blobs: N `effc21564c7a653605dcbafca23ce7bc560e262d`,
 E `5ed533b4d9467fa3b371a4cb489a87844fa64611`.
 
-**Proposal, not a decision.** Preserve all 16 authored IDs, the isometric
-material artwork and the face-map shader approach, but authorize corrections
-to inconsistent mask silhouettes/face weights in the new project's catalog.
+**Correction direction approved by D-44; exact catalog still open.** Preserve
+all 16 authored IDs, the isometric material artwork and the face-map shader
+approach, with corrections to inconsistent mask silhouettes/face weights in
+the new project's catalog.
 Specify the intended logical shapes/openings explicitly, then derive or
 validate their four-facing masks against those definitions. This keeps cavity
 discovery and queries camera-independent and makes their openings agree with
-the visible shape. It would qualify/supersede D-25's visual-form fidelity
+the visible shape. D-44 qualifies/supersedes D-25's visual-form fidelity
 where the pinned artwork is inconsistent; it does not authorize renumbering
 IDs, dropping shapes, automatic neighbor reshaping or editing Synarchy.
 
-The alternative is to retain the exact masks as stylized illustrations and
-explicitly accept some disagreement between visible openings and logical
-geometry. D-36 already distinguishes visual and logical authorities, but does
-not approve that disagreement. The owner must choose before the all-16 catalog
-can be finalized. Concrete replacement shapes, the special ID-15 meaning,
+The alternative of retaining exact masks while accepting disagreement between
+visible openings and logical geometry is not selected. D-44 requires proof
+from the solver, including reproduction of the original mismatch and the
+corrected result. Concrete replacement shapes, the special ID-15 meaning,
 pixel-edge conventions and appearance still require review; permission to
-correct a mask would not approve an unspecified replacement catalog.
+correct a mask does not approve an unspecified replacement catalog.
+
+### Solver evidence required for the shape/mask correction — D-44
+
+This is an implementation acceptance requirement, not evidence already
+produced by the design or permission to begin solving. Q-19 must carry it into
+the relevant follow-up slice and final TRA-12 qualification.
+
+- **Reproduce the defect.** Pin the reference source and asset hashes; explain
+  coordinate, rotation, UV and sampling conventions. Reproduce the original
+  N/E counterexample above and identify the demonstrated mismatch motivating
+  each changed mask. Report any refuted assumption instead of using this
+  document as an unquestioned expected result.
+- **Make the correction visible.** Supply labeled original/corrected offscreen
+  captures at matched scale, facing, camera and lighting. Include all 16 IDs
+  in all four facings, isolated tiles and joined terrain; distinguish changes
+  made for correctness from unchanged artwork. Show canonical logical geometry
+  and openings beside/over the mask result so the owner can inspect what was
+  corrected. Pin captures and reproduction commands to the submitted revision.
+- **Check more than the pictures.** Verify the approved shape table's quarter
+  turns and solid/empty regions; compare projected reference coverage with
+  GPU alpha and CPU screen picks using the agreed sampling/edge convention.
+  Expected geometry comes from the approved catalog, not snapshots of whatever
+  the new implementation happens to produce. Verify the face-weight/lighting
+  changes at selected sun positions; a silhouette-only check cannot establish
+  that a changed lighting mask is correct.
+- **Prove opening behavior.** Include a ramp-created diagonal opening into a
+  hidden cavity and sealed/zero-width-contact controls, rotated through all
+  four facings and crossing a chunk boundary. Discovery and logical point/ray
+  queries must agree with the canonical shape; camera rotation must not change
+  connectivity. Check fog remains non-interactive and visual picking follows
+  the corrected drawn coverage. Exercise offload/reload for the discovered
+  result in the integrated qualification.
+- **Deliver the proof.** Land the evidence write-up and retained captures via
+  the repository's documentation/evidence workflow, link the immutable revision
+  from the correction PR and include it in the owner-facing handoff. Unit tests
+  alone, unretained local captures or the old solid-renderer evidence do not
+  satisfy this requirement. Unexplained mismatches block the affected renderer
+  qualification and final arena acceptance until resolved.
 
 ### Existing material ABI and the remaining integration gap
 
@@ -2309,7 +2385,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-43 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-44 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2323,11 +2399,12 @@ D-36 resolves the query authority: the existing subcell point/ray queries and
 cavity discovery use the same corrected logical shape definitions. The exact
 per-shape catalog and compatibility details remain to be specified and reviewed.
 
-The cross-facing mask audit above adds a Q-16 choice: the pinned N/E assets
-cannot both be exact silhouettes of one rotated unit-cell shape. Correcting
-inconsistent masks while retaining all 16 IDs is proposed, not authorized.
-Do not silently choose camera-dependent logical geometry or claim the current
-PNG set establishes a coherent solid catalog.
+The cross-facing mask audit above found that the pinned N/E assets cannot
+both be exact silhouettes of one rotated unit-cell shape. D-44 approves
+correcting inconsistent masks while retaining all 16 IDs, with solver-delivered
+proof of the defect and correction. The exact catalog remains Q-16; do not
+choose camera-dependent logical geometry or claim the current PNG set already
+establishes a coherent solid catalog.
 
 D-30 selects the picking approach: use the adopted drawn quads, matching
 artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
@@ -2642,6 +2719,13 @@ fixture correctly; see
 fidelity finding against the reference sprites' silhouettes for the owner's
 reading. This links the measurement and changes no owner decision.
 
+D-44 adds the solver evidence gate for the amended shape/mask path: reproduce
+the reference defect, deliver original/corrected captures covering all 16 IDs
+and four facings, and prove corrected coverage, picking and logical opening
+agreement as specified above. The old per-face solid-renderer measurement is
+not that proof. This evidence is required during implementation before the
+affected qualification and final arena acceptance can pass.
+
 The broader historical “full Synarchy port” memory reconciliation is not an
 implementation dependency for this explicitly approved first arena. Fidelity
 beyond this arc remains uncommitted; MEMORY.md is unchanged.
@@ -2686,11 +2770,11 @@ Rendering/screen picking retain sprite coverage as their visual authority.
 
 Still open: the exact 16-shape logical geometry and query boundary/compatibility
 details, full-cell versus isolated-face emission and hidden-face/cap behavior.
-The cross-facing mask audit above also requires a fidelity decision: authorize
-correction of inconsistent mask artwork to match the canonical shapes, or
-explicitly accept a visual/logical mismatch. The recommendation is correction
-while preserving the 16 IDs and face-map approach. No replacement catalog or
-asset edits are approved by the evidence alone.
+D-44 resolves the fidelity choice: correct demonstrated mask inconsistencies
+while preserving all 16 IDs and face-map rendering, and require solver proof
+of both defect and correction. The exact replacement catalog and sampling
+conventions still need review; approval of the correction direction does not
+select unspecified geometry.
 Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
 coverage resource contracts remain Q-17; the approved picking approach itself
 does not need another sign-off.
@@ -2723,6 +2807,10 @@ slices and exact revision needs for #645–#648, with the owner-selected barrier
 before TRA-12 and explicit coordination of held PR #654. Mirror approved new
 slice IDs in the ledger and delivery plan; preserve earlier IDs. Readiness
 requires fresh owner sign-off. This design turn files or edits no tracker item.
+
+The follow-up plan must explicitly assign D-44's reproducible defect/correction
+proof, all-16/four-facing captures and geometry/opening/picking checks to the
+owning correction and integration work; carry its evidence gate into TRA-12.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
