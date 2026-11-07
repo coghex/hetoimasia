@@ -35,7 +35,7 @@ concrete precondition
 - [x] TRA-8. Qualify terrain materials and depth ordering offscreen — [#644]
 - [x] TRA-9. Publish retained terrain views with safe GPU retirement — [#645]
 - [x] TRA-10. Expose terrain views and camera controls to Lua — [#646]
-- [ ] TRA-11. Assemble the authored terrain arena
+- [x] TRA-11. Assemble the authored terrain arena — [#647]
 - [ ] TRA-12. Qualify the arena and remove the development shortcut
 
 The delivery plan is approved through Q-12/D-27. Process the EPIC first, then
