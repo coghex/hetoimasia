@@ -63,6 +63,12 @@ D-40 approves temporary per-arena disk backing for retained edits/discovery,
 with a bounded RAM cache and asynchronous I/O. The store is session-only and
 discarded on arena close/reset; exact quota/failure/lifecycle details remain open.
 
+D-41 approves pausing new edits/discovery on storage exhaustion or write
+failure, retaining acknowledged changes and unfinished work. Startup space
+checks, reservation and a hard disk allowance are proposed below, not yet chosen.
+D-42 records the manager-relayed CPU budget increase and best-effort camera
+demand; it does not select the temporary store's disk quota.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1236,6 +1242,55 @@ normal eviction must not erase discovery or remaining reveal obligations.
 The exact write/commit and failure policy remains a concrete design choice.
 Q-19 must include this storage work and qualification in the amended slices.
 
+### D-41. Pause new changes on storage exhaustion without losing progress
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that sounds
+fine” to pausing new edits and discovery when temporary storage fills or a
+write fails, preserving existing changes and unfinished work, reporting the
+problem through Lua, and resuming after storage recovers. Navigation may
+continue wherever its required data remains available; this does not promise
+that an unavailable backing store can serve further reads.
+
+Expected storage exhaustion or write failure must not erase acknowledged
+terrain edits, revealed state or outstanding discovery obligations. Keep the
+last coherent published view and the unwritten committed state needed for
+safe replay. Do not continue accepting changes into an unbounded RAM fallback
+or report an unfinished reveal as complete. Exact admission, write/commit,
+error-result and recovery mechanics remain Q-20. This selects a recoverable
+storage-failure behavior, not a replacement for supervision of unknown host
+faults or a cross-run recovery guarantee.
+
+The owner also suggested checking free space, limiting the terrain store,
+refusing startup without enough room and never creating a world that could
+exceed that budget, asking for advice. Those suggestions remain proposals:
+a hard storage limit is compatible with D-11's expandable world if new retained
+changes can pause at capacity; a guarantee that every possible future change
+fits would require bounding the world or its allowed changes. P-8 records this
+distinction for the next decision. No finite world boundary is approved here.
+
+### D-42. Raise CPU budgets and keep camera demand best effort
+
+Verified `het-manager` relayed the owner's decision in `#het-terrain` on
+2026-11-07T16:56:07Z, message `2tw98c6v6pkzge9yzhdvntgtki`, and instructed
+this design to record [#639 amendment 2](https://github.com/coghex/hetoimasia/issues/639#issuecomment-6710245034).
+
+Raise the configurable, service-wide initial CPU banks to 256 MiB resident
+terrain, 64 MiB retained session edits and 128 MiB CPU render/staging. Other
+limits remain unchanged. Camera demand keeps the full approved zoom/depth
+range and is best effort: admit what fits, nearest/visible first under the
+priority/aging rules, keep the remainder pending and show unloaded terrain as
+absent. Large camera demand is not invalid merely because it exceeds a bank.
+It must not block or starve explicit queries/removals; latest-value replacement
+and withdrawal remain. The construction-time capacity guarantee in that
+amendment applies to explicit requests, not the whole camera envelope.
+
+This supersedes P-5's earlier 64/32/64 MiB CPU defaults and any reading of its
+camera bounds as a restriction on the approved zoom range. The 64 MiB edit
+bank is the revised pre-backing CPU allowance; D-40 still supersedes RAM-only
+total-history retention. Q-20 must map edits, discovery, cache and staging to
+explicit banks in the backing-store contract rather than silently treat this
+CPU number as a disk quota or unlimited memory for discovery.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1494,6 +1549,13 @@ by arena/revision/region, retaining separate caller interests. Canceling one
 interest must not cancel work another still needs. Foreground queries and
 edits precede view prefetch; use aging so accepted finite requests progress.
 
+D-42/#639 amendment 2 makes camera demand best effort across the full approved
+zoom/depth range: admit nearest/visible regions as capacity permits and leave
+the rest pending and visibly absent. Do not reject an oversized camera demand
+as invalid or reduce the zoom range to make all its regions fit. Explicit
+requests retain priority and their construction-time capacity guarantee;
+camera holdings must not prevent progress when eviction can release them.
+
 Separate the followed surface level, automatic headroom and manual slice.
 Initial configurable automatic headroom is 25 levels, matching Synarchy;
 the effective automatic clip level is followed surface plus headroom. Manual
@@ -1509,8 +1571,8 @@ interval summaries plus removed-span indexes answer next-solid/surface
 queries without enumerating a long contiguous air gap. Bound the number of
 resident vertical regions independently of horizontal columns.
 
-Proposed initial host profile (engineering defaults, not measured capacity):
-64 MiB resident terrain data, 32 MiB session edits, 64 MiB CPU render/staging,
+Initial host profile, amended by D-42 (defaults, not measured capacity):
+256 MiB resident terrain data, 64 MiB session edits, 128 MiB CPU render/staging,
 128 MiB terrain GPU data including retiring versions, 128 internal load jobs,
 256 queued terrain commands and at most two pinned CPU view revisions per
 view. Also cap the service at 4 arenas, 8 views and 64 arena leases per session;
@@ -1528,8 +1590,11 @@ Do not spin, silently grow a bank, remove old edits or retry a failed edit.
 An accepted removal must have reserved enough edit space to survive offload.
 Infinite exploration does not imply infinite retained edits: at the configured
 edit bound, new edits return busy until the arena ends; reads/navigation can
-continue within their own bounds. A session-wide failure ends arenas under
-the existing supervision policy; no error UI is introduced.
+continue within their own bounds. This is the original RAM-only behavior:
+D-40 replaces total-history retention with temporary backing, and D-41 selects
+pause/preserve/recover for expected storage exhaustion or write failures.
+The amended cache/disk admission contract remains Q-20. A session-wide failure
+ends arenas under the existing supervision policy; no error UI is introduced.
 
 Expected domain failures include `not_found`, `arena_closed`, `stale_view`,
 `definition`, `source_failure`, `too_large` and `name_in_use`. Terrain requests
@@ -1812,7 +1877,8 @@ owner and individual asynchronous cell calls may bottleneck future fluid or
 navigation scans. Recommend range/snapshot/batch paths and measurement before
 choosing the final physical layout or expanding worker concurrency.
 
-The 32 MiB retained-edit cap is also not an eviction solution: retained edits
+The original 32 MiB retained-edit cap (raised to 64 MiB by D-42) is also not
+an eviction solution: retained edits
 cannot be discarded, so new edits can remain refused until reset, even with
 no chunks resident. This is an explicit P-5 policy, not observed Synarchy
 equivalence or a measured capacity requirement. Preserve the owner's session-
@@ -1820,6 +1886,9 @@ only arena, but design configurable accounting and a future backing-store
 boundary; explain capacity exhaustion distinctly from short-lived queue
 pressure. No bounded-memory system can retain arbitrarily many unrelated
 edits indefinitely without another storage policy.
+
+D-40 now selects temporary session backing; this paragraph preserves the
+earlier rationale, not a recommendation to retain all history in RAM.
 
 ### Assessment and proposed next action
 
@@ -2138,7 +2207,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-40 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-42 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2178,7 +2247,10 @@ overlapping unsealing operations to preserve all pending discovery without
 expanding across the exterior. D-39 approves the bounded shared-work mechanism
 in P-7; its remaining concrete representation/capacity choices are still open.
 D-40 approves P-8's temporary session disk backing for retained changes with
-bounded RAM caching; exact storage, quota, failure and lifecycle rules remain open.
+bounded RAM caching. D-41 selects pause/preserve/recover for expected storage
+exhaustion or write failures; its exact protocol and storage/quota/lifecycle
+rules remain open. D-42 records larger CPU banks and best-effort camera demand,
+without choosing the disk allowance.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2288,8 +2360,9 @@ unbounded allocation, a completed partial reveal or an erased obligation.
 
 ### P-8. Session retention backing — D-40 approved, concrete details open
 
-The original P-5 keeps retained changes in memory, with a 32 MiB session-edit
-cap and new edits refused once that retention capacity is exhausted. Offloading
+The original P-5 keeps retained changes in memory, with an initial 32 MiB
+session-edit cap (raised to 64 MiB by D-42) and new edits refused once that
+retention capacity is exhausted. Offloading
 reconstructible terrain does not free the authoritative changes it must retain.
 D-33 adds retained discovery, including large connected cavities. D-40 now
 explicitly supersedes the RAM-only retention policy with temporary disk backing;
@@ -2303,16 +2376,61 @@ discarded on arena close/reset, not a user save or cross-run recovery feature.
 This does not authorize unbounded disk consumption or silently store game saves.
 
 The tradeoff is additional storage/I/O lifecycle and failure handling now.
-The later concrete contract would need quotas, atomic offload, bounded queue
-and cache ownership, read/write errors, cleanup and pending-discovery recovery
-within the live arena. In particular, no acknowledged edit or revealed state
-may be evicted from RAM before the retained backing copy is safe to replay.
+D-41 selects pausing new edits/discovery while preserving existing state and
+unfinished work on storage exhaustion or write failure, reporting through Lua
+and resuming after recovery. Navigation continues only where data is available.
+The concrete contract still needs quotas, atomic offload, bounded queue/cache
+ownership, exact read/write results and recovery triggers, cleanup and pending
+discovery recovery within the live arena. In particular, no acknowledged edit
+or revealed state may be evicted from RAM before its backing copy is safe to replay.
 
 The RAM-only alternative is superseded: it would cap exploration history even
 after resident chunks were evicted. Temporary backing does not make an infinite
 region exhaustively materializable. The storage direction is resolved; its
 concrete quota/failure contract remains Q-20, and its scope must be incorporated
 in Q-19 before issue revisions are drafted.
+
+**Owner proposal and recommendation, awaiting decision (2026-11-07).** The
+owner suggested checking free space, imposing a terrain disk allowance,
+refusing startup without enough room and ensuring the world cannot exceed it.
+Recommend a configurable hard allowance for the arena's whole temporary store,
+including indexes, metadata and peak replacement/compaction/write overhead;
+check capacity on the actual store volume and reserve the required storage
+before arena opening succeeds, leaving a separate free-space safety margin.
+If the required capacity cannot be established, refuse arena opening with a
+clear Lua result. This is a proposed arena-creation requirement, not an already
+approved prohibition on launching the engine application.
+
+Maintain accounting and reserve capacity before admitting retained changes;
+do not spend space reserved for completing in-flight writes on new work.
+At capacity, preserve existing changes and pending discovery under D-41.
+Unchanged terrain remains reconstructible from its source; revisiting readable
+terrain need not grow retained history. For a large cavity, do not promise a
+whole reveal fits based on its opening tile: continuation and its capacity
+must remain bounded and resumable. Exact default size, reservations, platform
+support and admission/recovery protocol remain open.
+
+A free-space query is a snapshot, not a reservation against other writers.
+[Apple's file-control documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html)
+documents file preallocation, including an all-requested-space-or-none option;
+this establishes an available mechanism, not a qualified guarantee for the
+eventual storage layout or every supported filesystem. Platform qualification
+must cover physical allocation, filesystem overhead, replacement writes and
+failure handling; merely setting a sparse file's logical length is insufficient.
+Reservation also does not eliminate device failures, so D-41 remains necessary.
+
+The recommended boundary is on retained storage, not world coordinates.
+An expandable procedural world can be cheap before edits, but arbitrarily
+many independent changes/discovery records cannot be guaranteed to fit a fixed
+finite store. Guaranteeing every possible future edit fits at startup would
+need a finite world/allowed-change bound and worst-case storage sizing, not
+an assumed compression ratio. That would narrow D-11 and is not approved.
+
+Other-game evidence is limited, not a universal industry policy: in a
+[Factorio staff diagnosis](https://forums.factorio.com/viewtopic.php?t=130690)
+of a save failure, the write directory had only 27 MB free at startup and the
+developer fixed the error to report insufficient space. It supports retaining
+runtime error handling, not claiming Factorio pre-reserves all future saves.
 
 ## Open questions and review checkpoints
 
@@ -2492,7 +2610,7 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-40. Preserve fog over both solid and air until
+Partially resolved by D-31–D-41. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
@@ -2529,7 +2647,11 @@ representations, source metadata and API/capacity contract remain open.
 D-40 chooses temporary per-arena disk backing for retained edits/discovery,
 with bounded RAM caching and asynchronous I/O, discarded on arena close/reset.
 The earlier RAM-only total-history cap is superseded. Exact record/index,
-quota, lifecycle and storage-failure rules remain open.
+quota and lifecycle rules remain open. D-41 selects pause/preserve/recover
+on storage exhaustion or write failure; exact read/write results, admission
+and recovery triggers remain open. Startup reservation and a hard allowance
+versus a worst-case-bounded world remain the next P-8 decision. D-42 raises the
+CPU banks independently; it does not choose the disk allowance.
 
 Still open: specify and review the exact 16-shape solid/empty regions,
 openings and internal connectivity; derive/budget the initial exterior-connected
