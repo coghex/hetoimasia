@@ -324,9 +324,26 @@ truncated at 8,192 levels and 1,024 runs; canonical retained removals; the packe
 the payloads of the approved table and on both sides of the run/dense threshold;
 sparse resident detail that materializes exactly the requested cells and
 reconstructs from source plus all retained removals across discard cycles and
-demand orders; and allocation at two widely separated depths and gap widths. A
-client compiled outside the package shows its checked constructors and private
-modules unreachable. It is mandatory but outside the floor, like `test.math`, and
+demand orders; and allocation at two widely separated depths and gap widths. It
+also runs the pure residency and admission model (TRA-3) with controlled events
+and no thread, sleep or deadline, recomputing every ledger from the model's
+records after each step: validated limits (the approved defaults; zero, negative
+and unrepresentable figures refused by field); separate resident, edit and staging
+ledgers around reservation, completion, cancellation and handoff; each bank and
+slot full on its own and permanently invalid work kept apart from busy; shared
+jobs by arena, revision and region that survive one caller canceling and never
+fill the cells between disjoint demands; late, withdrawn and failed results;
+admission funded by a committed eviction whose release arrives later;
+least-recently-used selection that skips held, pinned, changed and in-use
+regions, with vertical and horizontal turnover under fixed caps; camera
+replacement storms and partial admission; foreground priority, caller turns and
+aging; worst-case edit reservation, handoff protection and failure,
+retained-edit exhaustion that still allows reads, and arena retirement; checked
+arithmetic and identity boundaries; repeated edit, handoff, evict and reconstruct
+cycles over the real TRA-2 values; and a randomized event property of the
+structural invariants. A client compiled outside the package shows its checked
+constructors, validated limits, model state and private modules unreachable,
+including through record update. It is mandatory but outside the floor, like `test.math`, and
 runs through `cabal.project.cpu`: the library depends on `base`, `containers`
 and `array` (a GHC boot library) alone, so no native prerequisite exists. The
 package's `terrain-measure` benchmark is not part of this group and asserts
