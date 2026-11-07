@@ -512,6 +512,19 @@ contain Ecce Homo's soil/stone choices or import concrete game modules. This
 settles the direction of Q-5; the concrete package/service interfaces and
 execution/lifetime contract still require specification.
 
+### D-18. Synarchy presentation baseline
+
+Owner, directly in this pane on 2026-11-06, selected:
+
+> Yes—use that Synarchy presentation baseline
+
+Use an isometric view with four 90-degree facings, keyboard panning, mouse
+dragging, wheel zoom and Synarchy's soil/stone artwork. Shift-scroll and the
+camera tracking modes remain D-12–D-14. This does not introduce a UI system or
+copy Synarchy's renderer implementation. Exact bindings, asset packaging,
+shape masks/material adaptation and pixel/depth correctness belong in the
+concrete presentation contract.
+
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
 libraries, using narrow services. Synarchy's world managers and coupled
 environment are not the new architecture (H `docs/vision.md:15–36`).
@@ -578,12 +591,9 @@ the temporary shortcut, removing one tile per press. The exact key remains
 open. Delete this development binding by completion; the final removal
 interface is the Lua API, not a persistent keyboard control.
 
-Camera proposal, 2026-11-06, following the owner's request to explain what is
-unclear: use Synarchy's isometric-style diamond view and four 90-degree
-facings as the initial presentation. Recommend keyboard pan, mouse drag and
-wheel zoom, with exact bindings adjustable during implementation. These are
-proposals; prior approval of camera-driven loading did not select projection,
-rotation or navigation behavior.
+Presentation direction resolved by D-18: Synarchy's isometric-style diamond
+view, four 90-degree facings, keyboard pan, mouse drag, wheel zoom and reuse of
+soil/stone artwork. Specify the asset/material adaptation and exact bindings.
 
 D-12 settles cutaway viewing: Shift-scroll changes the displayed Z level while
 terrain above is hidden, and jumps choose the destination's top level unless
@@ -594,9 +604,8 @@ the previous fixed-Z recommendation for normal navigation is withdrawn.
 D-14 selects pinned Z during manual panning and restores following on a jump
 without Z; an explicit jump Z takes precedence. Remaining manual-mode zoom
 and rotation details must be specified without importing the reference's
-zoom-map feature. No UI widgets are implied. The isometric/four-facing presentation and
-remaining navigation proposal above are not independently settled by the
-cutaway decision.
+zoom-map feature. No UI widgets are implied. D-18 independently settles the
+isometric/four-facing presentation and basic navigation controls.
 
 ### Q-5. What belongs to the reusable engine and what belongs to Ecce Homo?
 
