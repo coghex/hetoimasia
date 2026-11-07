@@ -24,6 +24,7 @@ import Data.ByteString (ByteString)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (UTCTime), secondsToDiffTime)
 import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, defaultLogFilter, mkLoggerWith, unsafeComponent)
@@ -31,6 +32,8 @@ import Hetoimasia.Foundation.Worker (awaitCompletion, workerDefinition)
 import Hetoimasia.Runtime.Supervision (Recognition (Unrecognized), SupervisedStart (WorkerStarted), WorkerPolicy (..), startSupervised, supervisedWorker)
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Hetoimasia.Foundation.Time (monotonicSource)
+import Hetoimasia.GLFW.Command (clientInputControl, clientInputReader)
+import qualified Hetoimasia.GLFW.Input as Glfw
 import Hetoimasia.GLFW.Window (WindowId)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.GPU.Vulkan.GLFW (VulkanHost (..), VulkanSceneState (..), readVulkanSceneState)
@@ -40,7 +43,8 @@ import Hetoimasia.LuaEngine.Facade (OutputSink (..), withOutput)
 import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), defaultIssuedMemory, graphicsInjection)
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.Texture
-import Hetoimasia.LuaEngine.Graphics.Window.Host (newHostPort, targetUsable)
+import Hetoimasia.LuaEngine.Graphics.Input (glfwInputHost)
+import Hetoimasia.LuaEngine.Graphics.Window.Host (HostPorts (..), newHostPorts, targetUsable)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (fatalText)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), windowMainStep, withWindowProvider)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
@@ -49,7 +53,7 @@ import Hetoimasia.LuaEngine.Scene (SceneContent (..), SceneRect (..), SceneSprit
 import Hetoimasia.LuaEngine.Texture (TextureView (..))
 import Numeric.Natural (Natural)
 import Hetoimasia.LuaEngine.Session
-import Hetoimasia.Runtime.GLFW (hostWindowIdentities)
+import Hetoimasia.Runtime.GLFW (hostWindowClient, hostWindowIdentities)
 import Hetoimasia.Scripting.Lua.Scheduler (systemTimerBackend)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
@@ -111,6 +115,64 @@ spec env = describe "graphics facade" $ do
       step env "the end of every hold" $ atomically (ledgerReading (graphicsLedger (envGraphics env)) >>= \held → unless (null (readingHeld held)) retry)
       published env window >>= (`shouldBe` Just revision)
       evidence env ("graphics facade: the logical update raised after startup; the UI warned with the failure message and published the empty red-clear scene (revision " <> Text.pack (show revision) <> "), which the owner adopted and recorded holding no texture")
+
+  it "polls a real window's feed through the production host: the first poll enables admission, the public suspension is a reset the script acknowledges, an acknowledged feed is paused, and the instance's end strands nothing" $
+    within 180 . withFacadeSessionWith True env inputExample succeeded $ \errLines _ window → do
+      client ← atomically (hostWindowClient (vulkanWindowHost (envHost env)) window) >>= maybe (assertFailure "the window has no client") pure
+      let reader = clientInputReader client
+          control = clientInputControl client
+          warned wanted = atomically (readTVar errLines >>= \seen → unless (any (Text.isInfixOf wanted) seen) retry)
+      -- the adapter's consumer opened admission at the script's first poll, and nothing else did
+      step env "the first poll" (warned "input\trunning\t1\t")
+      opened ← atomically (Glfw.inputStatistics reader)
+      (Glfw.statisticsAdmission opened, Glfw.statisticsPhase opened) `shouldBe` (Glfw.InputEnabled, Glfw.InputRunning)
+      -- the public suspension begins a reset of reason suspension, in the next epoch, that the script reads and acknowledges
+      atomically (Glfw.suspendInput control) >>= \case
+        Glfw.AdmissionReset token → (Glfw.resetReason token, Glfw.epochNumber (Glfw.resetEpoch token)) `shouldBe` (Glfw.AdmissionSuspended, 2)
+        other → expectationFailure ("expected a suspension reset, found " <> show other)
+      step env "the reset" (warned "reset\tsuspended\t2")
+      step env "the acknowledgement" (warned "ack\tacknowledged")
+      -- acknowledged is not resumed: the application's admission is suspended, and the script sees the feed paused
+      step env "the paused feed" (warned "input\tpaused\t1\t")
+      held ← atomically (Glfw.inputStatistics reader)
+      (Glfw.statisticsPhase held, Glfw.statisticsAdmission held) `shouldBe` (Glfw.InputResetAcknowledged, Glfw.InputSuspended)
+      seen ← readTVarIO errLines
+      evidence env ("graphics facade: a real window's feed was polled from real Lua through the production host; the script's first poll enabled admission, the public suspension reset was read as reason suspended in epoch 2 and acknowledged, the feed stayed paused with admission suspended, and the instance's end then retired the window with the reset acknowledged but not resumed; the script reported " <> Text.intercalate " | " [Text.takeWhileEnd (/= ':') line | line ← seen, "input\t" `Text.isInfixOf` line])
+
+-- | A presentation instance that polls its window's feed and reports each change of what it sees, and acknowledges the first
+-- reset it is shown.
+inputExample ∷ ByteString
+inputExample =
+  Text.encodeUtf8 . Text.unlines $
+    [ "return {"
+    , "  presentation = {"
+    , "    every_seconds = 0.05,"
+    , "    init = function(self, api)"
+    , "      self.w = api.window.open({title = 'input', width = 64, height = 64})"
+    , "    end,"
+    , "    update = function(self, dt)"
+    , "      local api = self.api"
+    , "      if not self.win then"
+    , "        if not api.request.ready(self.w) then return end"
+    , "        self.win = api.request.take(self.w).value"
+    , "        return"
+    , "      end"
+    , "      local p = api.input.poll(self.win, 8)"
+    , "      local o = p.observation"
+    , "      local sig = p.disposition .. ' ' .. tostring(p.exhausted)"
+    , "      if sig ~= self.sig then"
+    , "        self.sig = sig"
+    , "        warn('input', p.disposition, p.epoch, tostring(p.exhausted), #p.events, math.type(o.revision), o.logical and (o.logical.width .. 'x' .. o.logical.height) or 'nil', o.framebuffer and (o.framebuffer.width .. 'x' .. o.framebuffer.height) or 'nil')"
+    , "      end"
+    , "      if p.disposition == 'reset_required' and not self.acked then"
+    , "        self.acked = true"
+    , "        warn('reset', p.reset.reason, p.reset.epoch)"
+    , "        warn('ack', api.input.acknowledgeReset(self.win, p.reset.token))"
+    , "      end"
+    , "    end"
+    , "  }"
+    , "}"
+    ]
 
 -- | The cancellation probe (#599), run by @--probe-cancel-loop@ on its own and never as part of the profile: the quad example's
 -- window is live and holds its texture, and the process main thread, which serves the owner loop, is cancelled right there. The
@@ -182,9 +244,14 @@ step env label action =
 -- warned and the identity of the one native window the example opens, and end the session by a normal stop once the
 -- scenario returned. The scenario's failures are raised here after the session has ended.
 withFacadeSession ∷ Env → ByteString → (SessionOutcome → Expectation) → (TVar [Text] → TVar [GraphicsScene] → WindowId → IO ()) → IO ()
-withFacadeSession env entry judge scenario = do
+withFacadeSession = withFacadeSessionWith False
+
+-- | The same, with the window integration's input injected from the production host when asked to (TRA-6).
+withFacadeSessionWith ∷ Bool → Env → ByteString → (SessionOutcome → Expectation) → (TVar [Text] → TVar [GraphicsScene] → WindowId → IO ()) → IO ()
+withFacadeSessionWith withInput env entry judge scenario = do
   earlier ← atomically (hostWindowIdentities (vulkanWindowHost (envHost env)))
-  (port, _) ← newHostPort (envHost env)
+  ports ← newHostPorts (envHost env)
+  let port = hostPortsPort ports
   providerStep ← newIORef (pure ())
   sessionRef ← newIORef Nothing
   let config =
@@ -210,7 +277,7 @@ withFacadeSession env entry judge scenario = do
               when (answer == HostAccepted) (modifyTVar' accepted (<> [preparedValue scene]))
               pure answer
             publisher = scenePublisherOver (graphicsTextures (envGraphics env)) provider tap targetUsable
-            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks defaultIssuedMemory Nothing)
+            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks defaultIssuedMemory (if withInput then Just (glfwInputHost (hostPortsInput ports)) else Nothing))
         checkpoint ← bootCheckpoint compositionProfile (cpInventory composition) (\_ _ → pure (Right (manifestFor True))) >>= either (\refused → assertFailure ("boot refused: " <> show refused)) pure
         errLines ← newTVarIO []
         let outSink = OutputSink {sinkLine = \_ → pure (), sinkFlush = pure ()}
