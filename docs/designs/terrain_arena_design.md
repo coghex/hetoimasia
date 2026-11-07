@@ -74,6 +74,11 @@ including storage overhead, and refusal when it cannot be reserved. Keep the
 world expandable; pause new edits/discovery before exceeding the allowance.
 The numeric allowance and the qualified storage mechanism remain Q-20.
 
+Additional Q-16 finding: the pinned N/E mask silhouettes fail a cross-facing
+unit-cell geometry consistency check. The audit below records a concrete
+counterexample. Correcting inconsistent masks while preserving all 16 IDs is
+a proposal requiring owner approval; no artwork or code has been changed.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -2163,6 +2168,69 @@ miss visible side/top pixels that belong to another candidate at that Z.
 Cell identity and edit authority remain distinct from visual coverage; exact
 cut-surface handling and filtering/threshold rules still require agreement.
 
+### Cross-facing shape-mask consistency audit, 2026-11-07
+
+The all-16 logical geometry catalog must not be inferred from image names or
+from S's incomplete procedural generator. A further source/asset check finds
+that even arbitrary geometry confined to a unit cell cannot have every pinned
+mask as its exact rotated silhouette. This is distinct from the already-known
+failure of H's particular lower-envelope solids to match the artwork.
+
+**Scope and assumptions.** S `src/World/Render/Textures.hs:24–56` rotates
+the four slope bits for the camera and selects the corresponding PNG; it
+does not supply independent geometry per facing. S `src/World/Grid.hs:61–65,
+99–108,226–236` gives the 96-pixel width, 48-pixel diamond and 16-pixel level;
+`src/World/Render/TileQuads.hs:54–66,101–104` uses the same full-canvas quad
+placement/UV for these masks. Compare the same shape under a quarter turn,
+within the approved unit-cell bounds, at equal elevation and without fog or
+other tiles hiding it. Under that interpretation the following is impossible.
+This does not assert that S implements an exact geometric solid: its draw
+path is deliberately sprites, and it can display inconsistent silhouettes.
+
+**Reproducible counterexample, using S's pinned assets.** In local unit-cell
+coordinates, the full-block canvas fixes
+`u = 48 + 48(x-y)` and `v = 16 + 24(x+y) - 16z`, for `0 <= x,y,z <= 1`.
+A positive shape quarter turn maps N to E and maps points to `(1-y,x,z)`
+(the adopted H convention, `packages/terrain/src/Hetoimasia/Terrain/Geometry.hs`,
+`rotatePoint`; equivalently compare S's matching camera/facing-bit rotations).
+
+- `isoface_slope_e.png` texel `(48,2)` is `(0,255,0,255)`: fully opaque.
+- For any point in the unit cell that could project into that entire texel,
+  `u in [48,49]`, `v in [2,3]`, let `q=x+y`, `d=x-y`. Then
+  `0 <= q <= 1/8`, `0 <= d <= 1/48`, and `13/16 <= z <= 1`.
+- Inverse rotation puts the corresponding N point at `(y,1-x,z)`. Its
+  projection is `uN=48q`, `vN=40-24d-16z`: contained in
+  `[0,6] × [23.5,27]`.
+- Every enclosing N texel is transparent. The first opaque N texels in
+  columns `0..7` occur at rows `39,39,38,38,37,37,36,36`. This separation is
+  much larger than a pixel-edge or nearest-versus-linear sampling convention.
+
+Thus an opaque part required by E would have to exist inside a transparent
+part of N after rotation. Allowing a non-convex solid inside the same cell
+does not resolve this example. This is a mathematical source/PNG check with
+Pillow reading existing pixels, not a game launch, GPU test or proof that
+every other mask is inconsistent. Snapshot integrity was checked against
+S's Git blobs: N `effc21564c7a653605dcbafca23ce7bc560e262d`,
+E `5ed533b4d9467fa3b371a4cb489a87844fa64611`.
+
+**Proposal, not a decision.** Preserve all 16 authored IDs, the isometric
+material artwork and the face-map shader approach, but authorize corrections
+to inconsistent mask silhouettes/face weights in the new project's catalog.
+Specify the intended logical shapes/openings explicitly, then derive or
+validate their four-facing masks against those definitions. This keeps cavity
+discovery and queries camera-independent and makes their openings agree with
+the visible shape. It would qualify/supersede D-25's visual-form fidelity
+where the pinned artwork is inconsistent; it does not authorize renumbering
+IDs, dropping shapes, automatic neighbor reshaping or editing Synarchy.
+
+The alternative is to retain the exact masks as stylized illustrations and
+explicitly accept some disagreement between visible openings and logical
+geometry. D-36 already distinguishes visual and logical authorities, but does
+not approve that disagreement. The owner must choose before the all-16 catalog
+can be finalized. Concrete replacement shapes, the special ID-15 meaning,
+pixel-edge conventions and appearance still require review; permission to
+correct a mask would not approve an unspecified replacement catalog.
+
 ### Existing material ABI and the remaining integration gap
 
 The manager's ABI reading is supported. H
@@ -2254,6 +2322,12 @@ removal; do not infer world occupancy from camera-facing texture alpha.
 D-36 resolves the query authority: the existing subcell point/ray queries and
 cavity discovery use the same corrected logical shape definitions. The exact
 per-shape catalog and compatibility details remain to be specified and reviewed.
+
+The cross-facing mask audit above adds a Q-16 choice: the pinned N/E assets
+cannot both be exact silhouettes of one rotated unit-cell shape. Correcting
+inconsistent masks while retaining all 16 IDs is proposed, not authorized.
+Do not silently choose camera-dependent logical geometry or claim the current
+PNG set establishes a coherent solid catalog.
 
 D-30 selects the picking approach: use the adopted drawn quads, matching
 artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
@@ -2612,6 +2686,11 @@ Rendering/screen picking retain sprite coverage as their visual authority.
 
 Still open: the exact 16-shape logical geometry and query boundary/compatibility
 details, full-cell versus isolated-face emission and hidden-face/cap behavior.
+The cross-facing mask audit above also requires a fidelity decision: authorize
+correction of inconsistent mask artwork to match the canonical shapes, or
+explicitly accept a visual/logical mismatch. The recommendation is correction
+while preserving the 16 IDs and face-map approach. No replacement catalog or
+asset edits are approved by the evidence alone.
 Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
 coverage resource contracts remain Q-17; the approved picking approach itself
 does not need another sign-off.
