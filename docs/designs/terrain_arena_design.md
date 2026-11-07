@@ -17,6 +17,10 @@ Lighting scope resolved by D-29: expose sun position to the face-map shader
 for previewing the tiles; defer the automatic day/night cycle and eventual
 moon lighting. Q-16–Q-19 still block amendment readiness.
 
+Picking scope resolved by D-30: select from the adopted drawn quads in
+front-to-back order using matching artwork/face-map coverage. Q-16 remains
+partially open for logical geometry, emission and cut-surface contracts.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -809,6 +813,43 @@ asset/sampling ownership, and Q-19 retains slice and readiness sign-off.
 No new issue, implementation or change to the held PR follows from this
 decision alone.
 
+### D-30. Pick the visible terrain through shared sprite coverage
+
+Owner, directly in this design pane on 2026-11-07, accepted the recommendation
+following the focused Synarchy picking investigation:
+
+> ok good investigation, note down your recommendation as what i want
+
+Terrain picking uses the actual adopted draw's candidate quads and transforms,
+examines them in front-to-back drawing order, and tests the same colour-artwork
+and face-map coverage at the cursor. A transparent part of a ramp does not
+capture the click; the visible covered tile behind it is eligible instead.
+Visible block sides and top edges belong to the quad that draws them, rather
+than to the rounded grid candidate or a lower/rear cell from Synarchy's picker.
+
+Keep spatial pruning and shared CPU coverage per asset/version. This does not
+require a CPU-side 3D mesh, a coverage copy per terrain cell or GPU readback
+on each pick. The adopted-view identity and ordering must match rendering;
+adding only alpha rejection to the old one-candidate-per-Z loop is insufficient.
+The returned hit identifies a logical terrain cell; removal still acts on
+that cell under the existing atomic edit contract. Texture coverage does not
+become authoritative world occupancy.
+
+This supersedes D-15/D-25 and P-5 wherever their shared analytic-solid coverage
+was the authority for visual terrain picking. It preserves the all-16-ID and
+four-facing requirements, coordinate/storage identity, and edit semantics.
+The new picker must be qualified with transparent-ramp, visible-side,
+top-edge and overlapping-tile cases from the focused audit, alongside the
+existing adopted-view and camera requirements.
+
+The picking approach in Q-16 is resolved by D-30. Remaining Q-16 choices are
+the meaning/fate of exact subcell-solid query APIs, tile/face emission,
+occlusion and cut-surface handling. Q-17 still owns exact sampling/threshold
+agreement and the coverage payload's budget, loading, version and lifetime;
+shared CPU coverage is now a chosen mechanism, not an open alternative.
+The amendment remains exploring; follow-up slices and issue revisions still
+require Q-19 sign-off.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1546,6 +1587,90 @@ Synarchy was read from a temporary snapshot, never modified.
    agreement. The new design's promise to pick what is actually drawn needs
    explicit masked-quad coverage and ordering, not a blind copy of that picker.
 
+### Focused terrain-picking audit, 2026-11-07
+
+The owner requested this closer inspection before answering Q-16. This is
+source/asset evidence at the same S revision, not approval of the proposed
+replacement picker and not a report of a running-game reproduction.
+
+**What S already does well.** Hover and synchronous terrain clicks use the
+same pure `pickWorldTile`, with facing, zoom, framebuffer aspect, window-pixel
+normalization, elevation and the displayed depth band
+(`src/World/Render/HitTest.hs:79–120`). It canonicalizes wrapped coordinates,
+rejects unavailable finite-arena tiles and missing columns, and checks chunk
+visibility (`:130–158`). A degenerate viewport returns no hit (`:95–99`).
+The synchronous click path avoids relying on a lagging hover cache and
+returns page-selection generation with the hit to protect subsequent actions
+(`src/Engine/Scripting/Lua/API/WorldQuery/Pick.hs:85–112,124–158`). These are
+useful correctness measures to preserve, not reasons to replace everything.
+
+**What the terrain picker actually intersects.** At each descending integer
+Z it subtracts half the full sprite height, inverse-projects to one rounded
+grid coordinate, and accepts nonzero material there. It never reads
+`ctSlopes`, a texture, alpha or the sorted quad list
+(`HitTest.hs:112–158`; `src/World/Grid.hs:238–243`). Thus all 16 shapes have
+the same pick footprint at a given cell/Z even though their visible coverage
+differs. The renderer instead chooses a facing-dependent mask
+(`src/World/Render/Textures.hs:24–57`), emits its whole sprite
+(`src/World/Render/TileQuads.hs:54–66,101–104`), and multiplies colour alpha
+by mask alpha (`src/Engine/Graphics/Vulkan/ShaderCode.hs:254–260,305–318`).
+
+Concrete counterexamples, calculated from those expressions and the shipped
+PNGs rather than inferred merely from the absence of an alpha lookup:
+
+- Use South facing, slice Z=0, loaded in-bounds cells and 96×64 sprite-local
+  coordinates. A cell at `(0,0,0)` has top-left projected pixel `(-48,0)`.
+  For its local point `(u,v)`, the pick's candidate at Z=0 is
+  `round(((u-48)/48 + (v-32)/24)/2)` for X and
+  `round(((v-32)/24 - (u-48)/48)/2)` for Y. Each lower Z adds `16*Z` to
+  the numerator's Y term. These are the normalized constants from
+  `Grid.hs:61–109` and `HitTest.hs:115–120`, not new engine units.
+- **Transparent ramp accepted:** at local `(57.5,15.5)` the candidate is
+  `(0,0,0)`, but `isoface_slope_n.png` texel `(57,15)` has alpha 0, with a
+  fully transparent 7×7 neighborhood. Put a flat cell at `(-1,-1,-1)`:
+  it draws behind at local `(57.5,47.5)`, where `isoface.png` has alpha 255.
+  The front ramp is still picked before the visible flat cell can be tried.
+- **Visible side assigned below:** put flat cells at `(0,0,0)` and
+  `(0,0,-1)`, with other candidates empty. At local `(48.5,58.5)` the upper
+  cell's mask alpha is 255. The picker first looks at empty `(1,1,0)`, then
+  returns `(0,0,-1)`. The upper cell is what the painter order actually draws
+  on top. This is a visual-ownership mismatch even without a ramp.
+- **Visible top tip assigned behind:** at local `(48.5,4.5)` a flat cell's
+  mask is opaque, but the pick candidate is `(-1,-1,0)`. If that rear cell
+  exists, it is returned even though `(0,0,0)` draws on top there. The fixed
+  pick diamond is centered at sprite Y=32; the artwork's top diamond is
+  centered at Y=24. Center clicks can work while these edge areas disagree.
+
+For those samples, the shipped `assets/textures/world/loam/loam.png` colour
+alpha is also 255 at the relevant opaque texels. Painter keys come from
+`TileQuads.hs:61–62`, with ordering defined by
+`src/Engine/Scene/Types/Batch.hs:128–160,187–212`. The calculations stay away
+from rounding ties; the ramp example's transparent neighborhood avoids a
+single boundary-texel artifact. This establishes source-level counterexamples,
+not their frequency in typical generated terrain or a GPU test result.
+
+Two related limits matter for the migration. The blank cutaway fallback can
+draw where there is no stored non-air cell (`src/World/Render/Quads.hs:292–311`),
+while this picker only accepts stored cells. Generic three-face cursor art
+also uses `wtIsoFaceMap`, not the target's slope map
+(`TileQuads.hs:352–370,443–457`); it is a cell marker, not evidence of exact
+ramp coverage. Separately, synchronous picks sample live camera/tile/window
+references (`WorldQuery/Pick.hs:133–149`) rather than an adopted render token.
+That is a potential displayed-frame consistency gap during updates, not a
+race reproduced by this inspection. The inspected seam tests
+(`test-headless/Test/Headless/World/Render/PickSeam.hs`, especially its
+`solidChunk` and `pixelFor` helpers) exercise coordinate framing and center
+clicks with slope zero; they do not establish sprite-alpha agreement.
+
+**Recommendation, subsequently approved as D-30:** use the adopted draw's candidate
+quads, transforms and front-to-back order, then test the same material/mask
+coverage at the cursor. Retain spatial pruning and shared coverage per asset;
+no per-cell copy or GPU readback is implied. Merely adding an alpha rejection
+to S's one-grid-candidate-per-Z loop would address some false hits but still
+miss visible side/top pixels that belong to another candidate at that Z.
+Cell identity and edit authority remain distinct from visual coverage; exact
+cut-surface handling and filtering/threshold rules still require agreement.
+
 ### Existing material ABI and the remaining integration gap
 
 The manager's ABI reading is supported. H
@@ -1624,7 +1749,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29 lighting decision, remaining proposals
+### P-6. Amendment framing — D-29/D-30 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1636,6 +1761,11 @@ faces. Preserve sparse authoritative cell/material/shape state and atomic
 removal; do not infer world occupancy from camera-facing texture alpha.
 The relationship of existing subcell intersection APIs to that logical state
 must be explicitly settled, not called physically equivalent without proof.
+
+D-30 selects the picking approach: use the adopted drawn quads, matching
+artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
+The former analytic-solid picker is not the visual authority. Exact emission,
+cut surfaces and the remaining sampling/ownership details are still open.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -1795,15 +1925,21 @@ and preview contract remain Q-18.
 
 ### Q-16. Logical terrain, visual coverage and picking contract
 
-Open; next after the resolved Q-15. Settle what remains authoritative for cell queries
-and edits versus the visible sprite, the fate/meaning of #637's exact subcell
-solid APIs, full-cell versus isolated-face emission, hidden-face/cap behavior,
-and CPU picking using the adopted mask/colour alpha and order. Do not silently
-keep incompatible ray/coverage claims or copy S's non-alpha picker.
+Partially resolved by D-30: picking uses the adopted drawn quads and matching
+artwork/mask coverage in front-to-back order, with shared CPU asset coverage.
+The result identifies the logical cell for the existing edit contract.
+
+Still open: the fate/meaning of #637's exact subcell-solid query APIs,
+full-cell versus isolated-face emission, hidden-face/cap behavior and the
+authority of those query results relative to the visible sprite. Do not
+silently retain incompatible ray/coverage claims. Exact sample/threshold and
+coverage resource contracts remain Q-17; the approved picking approach itself
+does not need another sign-off.
 
 ### Q-17. Face-map data loading, sampling and ownership
 
-Open. Decide the bounded data-image route, approved asset catalog/provenance,
+Open. D-30 selects shared CPU coverage per asset/version. Decide the bounded
+data-image route, approved asset catalog/provenance,
 filtering/cutout/premultiplication rules, CPU coverage retention and how style
 acquires/version-checks both texture kinds. General `DataImage` support is
 not proof that the current bounded Lua loader exposes it. Preserve protected
