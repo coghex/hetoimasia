@@ -312,10 +312,25 @@ selection that leaves world identities unchanged; and the canonical unit-cell
 solid of every shape against an independently authored vertex and face matrix in
 all four facings, its face coverage, point membership, and ray and segment
 intersection with their edge, vertex and in-plane tie-breaking and the refusal of
-non-finite or zero-length input. A client compiled outside the package shows its
-checked constructors and private modules unreachable. It is mandatory but outside
-the floor, like `test.math`, and runs through `cabal.project.cpu`: the library
-depends on `base` and `containers` alone, so no native prerequisite exists. Its
+non-finite or zero-length input. It also runs the layered source and its
+storage (TRA-2): a definition validated whole before it is exposed, with every
+half-open endpoint tested at the exact boundary, one past it and at the lower
+limit, and the 256 KiB, 8,192-authored-run and 4,095-material bounds each
+accepted exactly at the limit and refused one past it; cell, complete
+column-range and highest-occupied queries over the source plus retained removals,
+compared with an independent naive model, with range answers refused rather than
+truncated at 8,192 levels and 1,024 runs; canonical retained removals; the packed
+12-bit palette and 16-bit cell; the uniform, runs and dense segment encodings at
+the payloads of the approved table and on both sides of the run/dense threshold;
+sparse resident detail that materializes exactly the requested cells and
+reconstructs from source plus all retained removals across discard cycles and
+demand orders; and allocation at two widely separated depths and gap widths. A
+client compiled outside the package shows its checked constructors and private
+modules unreachable. It is mandatory but outside the floor, like `test.math`, and
+runs through `cabal.project.cpu`: the library depends on `base`, `containers`
+and `array` (a GHC boot library) alone, so no native prerequisite exists. The
+package's `terrain-measure` benchmark is not part of this group and asserts
+nothing. Its
 package directory and its two Cabal files are inputs of `test.workflow` as well,
 because the owned-start guard scans every test suite of the packages
 `cabal.project` lists. See [the package's contract](../packages/terrain/README.md).
