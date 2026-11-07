@@ -4,7 +4,7 @@ module Test.TerrainRender2D.Pick (spec) where
 
 import Control.Monad (forM_)
 import Hetoimasia.Math.Vector (V2 (..))
-import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), defaultViewSettings)
+import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), ZoomMode (..), defaultViewSettings)
 import Hetoimasia.Terrain.Cell (ZRange, mkZRange)
 import Hetoimasia.Terrain.Changes (emptyChanges)
 import Hetoimasia.Terrain.Coordinate (TileCoord, axisMaxValue, axisMinValue)
@@ -13,7 +13,8 @@ import Hetoimasia.Terrain.Render2D.Camera
 import Hetoimasia.Terrain.Render2D.Facts
 import Hetoimasia.Terrain.Render2D.Pick
 import Hetoimasia.Terrain.Render2D.Plan
-import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..), snapCompatible)
+import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..), mkRenderView, snapCompatible)
+import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Shape (Side (..))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.TerrainRender2D.Fixtures
@@ -93,9 +94,18 @@ spec = describe "Pick" $ do
       -- exact quad: a point just inside the top diamond's right vertex hits it.
       let p = either (error . show) id (planTerrain (request sizedSnap (camAt 0.125 0)) (factsOf (isolated 0)))
       hit (pickAt p (V2 144 72)) `shouldBe` Just (tileAt 0 0 0, TopFace)
-      snapCompatible 0.125 `shouldBe` True
-      snapCompatible 0.3125 `shouldBe` False
-      snapCompatible 3 `shouldBe` True
+      let viewAt zoom = either (error . show) id (mkRenderView sizedSnap zoom FaceSouth (1 / 2, 1 / 2))
+      snapCompatible (viewAt 0.125) `shouldBe` True
+      snapCompatible (viewAt 0.3125) `shouldBe` False
+      snapCompatible (viewAt 3) `shouldBe` True
+    it "judges the mapping's actual scale, so a fixed-half-height mode that gives a bad scale is refused" $ do
+      -- 144 pixels high, zoom 1: half-height 230.4 gives scale 0.3125; 72 gives 1.
+      let fixed h = sizedSnap {setupSettings = (setupSettings sizedSnap) {settingZoomMode = FixedHalfHeight h}}
+          camera = manualCamera 0 0 0
+      planTerrain (request (fixed 230.4) camera) (factsOf flatWorld) `shouldBe` Left (PixelSnapUnsupported 0.3125)
+      let p = either (error . show) id (planTerrain (request (fixed 72) camera) (factsOf flatWorld))
+          points = [V2 (fromIntegral x / 2) (fromIntegral y / 2) | x ← [0 .. 575 ∷ Int], y ← [0 .. 287 ∷ Int], x `mod` 7 == 0, y `mod` 5 == 0]
+      [pt | pt ← points, hit (pickAt p pt) == Nothing] `shouldBe` []
   it "never picks terrain above the cut, and picks the cap the cut exposes" $ do
     let slab = sceneSource [(x, y, z, 0) | x ← [-2 .. 2], y ← [-2 .. 2], z ← [0 .. 5]]
         atCut c = plan (setup 288 144) (manualCamera 0 0 c) (factsOf slab)

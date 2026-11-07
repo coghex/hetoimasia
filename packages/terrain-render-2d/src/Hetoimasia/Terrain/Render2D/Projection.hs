@@ -75,13 +75,14 @@ module Hetoimasia.Terrain.Render2D.Projection
   , mkRenderView
   , visibleRect
   , snapCompatible
+  , viewScale
   , drawnOutline
   ) where
 
-import Hetoimasia.Math.Affine2 (Affine2, applyPoint)
+import Hetoimasia.Math.Affine2 (Affine2, applyPoint, columns)
 import Hetoimasia.Math.Vector (V2 (..))
 import Data.Ratio (denominator)
-import Hetoimasia.Render.TwoD.Mapping (ViewMapping, mappingPixelSnap, snapPoint, targetToWorld, viewMapping, viewportIsEmpty, worldToTarget)
+import Hetoimasia.Render.TwoD.Mapping (ViewMapping, mappingPixelSnap, snapPoint, targetToWorld, viewMapping, viewportIsEmpty, worldToTarget, worldTransform)
 import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot (Camera (..), View (..), Viewport (..))
@@ -242,14 +243,21 @@ visibleRect margin view
   where
     viewport = setupViewport (vwSetup view)
 
--- | Whether a zoom keeps every instance origin on the device pixel grid when the
--- view snaps. Face origins lie on a lattice of 48 pixels horizontally and 8
--- pixels vertically at native scale, so the origins land on whole pixels exactly
--- when the zoom is a whole multiple of 1/8. Only then does the recorder's
--- rounding of each instance's origin move every face alike (by nothing), so
--- adjacent faces still meet; any other zoom would open cracks between them.
-snapCompatible ∷ Float → Bool
-snapCompatible zoom = denominator (toRational zoom * 8) == 1
+-- | Whether a view keeps every instance origin on the device pixel grid when it
+-- snaps. Face origins lie on a lattice of 48 pixels horizontally and 8 pixels
+-- vertically at native scale, so the origins land on whole pixels exactly when
+-- the mapping's own world scale, taken from its transform and so including a
+-- fixed-half-height zoom mode, is a whole multiple of 1/8. Only then does the
+-- recorder's rounding of each instance's origin move every face alike (by
+-- nothing), so adjacent faces still meet; any other scale would open cracks
+-- between them.
+snapCompatible ∷ RenderView → Bool
+snapCompatible = (`elem` [1]) . denominator . (* 8) . toRational . viewScale
+
+-- | The uniform scale of the view's world transform, in target pixels per
+-- render-world pixel, as the mapping holds it.
+viewScale ∷ RenderView → Float
+viewScale view = let (V2 a _, _, _) = columns (worldTransform (vwMapping view)) in a
 
 -- | A coverage polygon of a face in target pixels as drawing places it: each
 -- mask vertex through the instance quad and the world-to-target transform in

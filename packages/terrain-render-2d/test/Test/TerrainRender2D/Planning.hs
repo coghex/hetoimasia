@@ -320,6 +320,23 @@ spec = describe "Planning" $ do
           highChunks = map demandChunk (demandChunks (demandOf rh facts'))
       highChunks `shouldSatisfy` (ChunkKey top top `elem`)
       highChunks `shouldSatisfy` all (\(ChunkKey x y) → x <= top && y <= top)
+    it "refuses an oversized margin promptly at the supported extremes too" $ do
+      let low = axisMinValue + 24
+          r = (request (setup 1 1) (manualCamera low low 0)) {requestConfig = defaultPlanConfig {pcDepth = 0, pcChunkMargin = 1000000000000}}
+          high = axisMaxValue - 24
+          rh = (request (setup 1 1) (manualCamera high high 0)) {requestConfig = defaultPlanConfig {pcDepth = 0, pcChunkMargin = 1000000000000}}
+          facts' = factsWith flatWorld emptyChanges (mkAvailability [])
+      cameraDemand r facts' `shouldBe` Left (PlanInsufficient LimitDemandChunks)
+      cameraDemand rh facts' `shouldBe` Left (PlanInsufficient LimitDemandChunks)
+    it "never asks for levels outside the supported range" $ do
+      let everything = zr (-4611686018427387904) 4611686018427387904
+          ready cx cy = mkAvailability [(ChunkKey cx cy, [everything])]
+          top = fromInteger (2 ^ (58 ∷ Int) - 1)
+          bottom = fromInteger (negate (2 ^ (58 ∷ Int)))
+          atTop = (request (setup 1 1) (manualCamera axisMaxValue axisMaxValue axisMaxValue)) {requestConfig = defaultPlanConfig {pcDepth = 0, pcChunkMargin = 0}}
+          atBottom = (request (setup 1 1) (manualCamera axisMinValue axisMinValue axisMinValue)) {requestConfig = defaultPlanConfig {pcDepth = 0, pcChunkMargin = 0}}
+      demandOf atTop (factsWith flatWorld emptyChanges (ready top top)) `shouldBe` emptyDemand
+      demandOf atBottom (factsWith flatWorld emptyChanges (ready bottom bottom)) `shouldBe` emptyDemand
     it "adds exactly the margin ring around the visible chunks" $ do
       let narrow = req {requestConfig = (requestConfig req) {pcChunkMargin = 0}}
           wide = demandOf req known

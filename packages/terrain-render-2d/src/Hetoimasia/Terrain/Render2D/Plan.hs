@@ -368,8 +368,9 @@ data PlanError
     QueryRefused !QueryError
   | -- | The faces cannot be ordered through the renderer's depth keys.
     PlanUnorderable !OrderingFailure
-  | -- | The view snaps to the pixel grid at a zoom that is not a whole multiple of
-    -- 1/8, which would move adjacent faces apart.
+  | -- | The view snaps to the pixel grid at a world scale (zoom, or the scale a
+    -- fixed-half-height mode gives it) that is not a whole multiple of 1/8, which
+    -- would move adjacent faces apart.
     PixelSnapUnsupported !Float
   | -- | A value could not be represented.
     Unrepresentable !String
@@ -407,8 +408,8 @@ prepare request = do
     else do
       -- Instance origins must stay on whole pixels when the view snaps, or the
       -- recorder would move adjacent faces apart.
-      if settingPixelSnap (setupSettings (requestSetup request)) && not (snapCompatible (camZoom camera))
-        then Left (PixelSnapUnsupported (camZoom camera))
+      if settingPixelSnap (setupSettings (requestSetup request)) && not (snapCompatible view)
+        then Left (PixelSnapUnsupported (viewScale view))
         else pure ()
       rect ← maybe (Left (Unrepresentable "the visible rectangle")) Right (visibleRect (pcMargin config) view)
       cands ← candidates limits rect ref clip bandLo
@@ -847,23 +848,25 @@ cameraDemand request facts = do
         [] → Nothing
         ranges → Just (foldr1 hull ranges)
       margin = pcChunkMargin config
+      -- Chunk coordinates are floor quotients of the supported axis range by 16:
+      -- from -2^58 up to 2^58 - 1. The offsets are clipped to that range before
+      -- they are generated, so no iteration is spent on a chunk that cannot exist.
+      chunkLo = negate (2 ^ (58 ∷ Int)) ∷ Integer
+      chunkHi = 2 ^ (58 ∷ Int) - 1 ∷ Integer
       ring (ChunkKey cx cy) =
         [ ChunkKey (fromInteger nx) (fromInteger ny)
-        | dx ← [negate margin .. margin]
-        , dy ← [negate margin .. margin]
-        , let nx = toInteger cx + dx
-        , let ny = toInteger cy + dy
-        , inChunkRange nx
-        , inChunkRange ny
+        | nx ← [max chunkLo (toInteger cx - margin) .. min chunkHi (toInteger cx + margin)]
+        , ny ← [max chunkLo (toInteger cy - margin) .. min chunkHi (toInteger cy + margin)]
         ]
-      -- Chunk coordinates are floor quotients of the supported axis range by 16:
-      -- from -2^58 up to 2^58 - 1.
-      inChunkRange n = n >= negate (2 ^ (58 ∷ Int)) && n < 2 ^ (58 ∷ Int)
       wantedFor keys = Map.fromList [(k, r) | k ← keys, Just r ← [Map.lookup k byChunk `orElse` overall]]
       orElse a b = maybe b Just a
   ringKeys ← collectRing (limitDemandChunks limits) (Map.keysSet byChunk) (concatMap ring (Map.keys byChunk))
   let wanted = wantedFor (Set.toAscList ringKeys)
-      unmet = [(key, a, b) | (key, (lo, hi)) ← Map.toAscList wanted, (a, b) ← unknownPieces (factsAvailability facts) key lo hi]
+      -- Levels outside the supported range hold nothing and are known air: they
+      -- are never asked for.
+      worldLo = negate (2 ^ (62 ∷ Int)) ∷ Integer
+      worldHi = 2 ^ (62 ∷ Int) ∷ Integer
+      unmet = [(key, a, b) | (key, (lo, hi)) ← Map.toAscList wanted, (a, b) ← unknownPieces (factsAvailability facts) key (max lo worldLo) (min hi worldHi)]
   let demand = demandFrom unmet
   if demandIntervalCount demand > limitDemandIntervals limits then Left (PlanInsufficient LimitDemandIntervals) else pure ()
   if any ((> limitRegionsPerChunk limits) . length . demandRegions) (demandChunks demand)
