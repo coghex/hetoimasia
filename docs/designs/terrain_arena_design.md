@@ -612,6 +612,20 @@ no request handle or provider work, rather than a terminal result of an accepted
 request. The manager authorized this as a consequence of D-19 and the routine
 stale-pick refusal, not a new owner design choice.
 
+Further technical consequences authorized by verified `het-manager` in
+`#het-terrain`, message `qvcaa4ctkdb8swvxx7cvwpdkd6`, at
+2026-11-07T03:02Z (2026-11-06 local): add expected `OptionalRequest` codes
+`too_large` and `name_in_use`. A valid column request whose complete answer
+exceeds 1,024 runs settles as recoverable `too_large`, never a truncated
+answer; the caller can narrow the range. P-5's caps are unchanged.
+An open claims its name in the same admission boundary; concurrent opens
+from either role or any instance cannot both create that named arena, and
+the loser settles as recoverable `name_in_use`. A pending open, including
+one held for its gameplay logical position, holds the claim but is invisible
+to attach: attach settles `not_found` until open settles successfully, without
+waiting. Failed or cancelled opens release their claim at terminal settlement;
+a successful open keeps its claim until the arena closes.
+
 ### D-20. Narrow terrain transactions; general gameplay state stays deferred
 
 Owner, directly in this pane on 2026-11-06, selected:
@@ -1022,8 +1036,9 @@ continue within their own bounds. A session-wide failure ends arenas under
 the existing supervision policy; no error UI is introduced.
 
 Expected domain failures include `not_found`, `arena_closed`, `stale_view`,
-`definition` and `source_failure`. Terrain requests use M1's `OptionalRequest`
-policy: these failures are recoverable structured results and do not latch an
+`definition`, `source_failure`, `too_large` and `name_in_use`. Terrain requests
+use M1's `OptionalRequest` policy: these failures are recoverable structured
+results and do not latch an
 instance failure, even when unread. This is the manager-authorized D-19
 clarification recorded above; no new Lua options are added. Transient admission
 is the existing immediate `busy` result with no request handle or provider work,
@@ -1064,10 +1079,10 @@ never silently truncated.
 
 | Call | Contract |
 | --- | --- |
-| `api.terrain.open(name, definition)` | Create one session-local named arena with copied layered source and bounded authored patches; request result is an opaque arena lease. Either role may create; duplicate name is refused. |
-| `api.terrain.attach(name)` | Obtain this instance's own lease to an existing arena in the same content root/session; no global lookup or cross-content authority. A not-yet-created arena returns `not_found`, not an unbounded wait. |
+| `api.terrain.open(name, definition)` | Create one session-local named arena with copied layered source and bounded authored patches; request result is an opaque arena lease. Either role may create; duplicate name settles as expected `name_in_use`. |
+| `api.terrain.attach(name)` | Obtain this instance's own lease to an existing arena in the same content root/session; no global lookup or cross-content authority. Missing arenas and pending opens return `not_found`, without waiting for creation. |
 | `api.terrain.cell(arena, {x,y,z})` | Async demand/read; result has revision and `air` or material/shape. |
-| `api.terrain.column(arena, {x,y,z_min,z_max})` | Complete bounded runs for a finite half-open range; oversized result is refused, not a partial answer. |
+| `api.terrain.column(arena, {x,y,z_min,z_max})` | Complete bounded runs for a finite half-open range; a valid request whose answer exceeds 1,024 runs settles as expected `too_large`, never a partial answer. The caller can narrow the range; existing range/result caps are unchanged. |
 | `api.terrain.surface(arena, {x,y})` | Highest occupied cell level after edits, via source/change indexes; can explicitly answer absent for authored empty columns. |
 | `api.terrain.remove(arena, {x,y,z} [, pick])` | One cell removal, including an explicitly queried buried cell; optional opaque pick token enforces displayed-revision consistency. Returns changed flag and committed revision. |
 | `api.terrain.release(arena)` | Release this instance's lease; releasing the creator's final owner lease closes the arena, invalidates attached authority and cancels outstanding requests. Instance exit closes owned arenas. |
@@ -1079,8 +1094,17 @@ never silently truncated.
 | `api.input.poll(window, max_events)` / `acknowledgeReset(window, token)` | Presentation-only ordered input/reset boundary, preserving GLFW epochs; cursor observation is coalesced. |
 
 The named arena table is local to this narrow service, keyed by session and
-content root; it is not a universal service locator. Trusted instances within
-that content may obtain their own query/edit leases; handles themselves never
+content root; it is not a universal service locator. Claim a name in the same
+admission boundary as its open. Concurrent opens cannot both create it;
+the loser settles `name_in_use`. Pending opens, including gameplay opens held
+for their logical position, block duplicates but are invisible to attach until
+successful settlement. Failed or cancelled opens release the claim at terminal
+settlement; successful opens hold it until arena closure. These and the
+`too_large` outcome above are the manager-authorized D-19 consequences recorded
+in message `qvcaa4ctkdb8swvxx7cvwpdkd6`.
+
+Trusted instances within that content may obtain their own query/edit leases;
+handles themselves never
 cross VMs. Terrain mutation requests are domain operations, not direct memory
 writes by presentation. A future gameplay integration can restrict authority
 through injected ports without changing storage. Acquisitions are allowed in
