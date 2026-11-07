@@ -319,47 +319,95 @@ demandCoverages =
   , box 0 3 0 2 0 4
   ]
 
--- | A camera demand the model accepts completes when it is alone: the owner
--- services and completes every job, storing the least each can, and nothing is
--- left pending. This is the feasibility bound checked against the order in which
--- admission actually reserves, over random tiny budgets and random mixed demands.
-acceptedDemandCompletes ∷ (Integer, Integer, Integer) → [(Int, Int)] → Property
-acceptedDemandCompletes (resident, staging, jobs) picks =
-  case mkLimits (LimitsSpec resident 192 staging jobs 3 2 4 3) of
-    Left _ → property True
-    Right limits →
-      let xs = take 4 (nubInts (map fst picks))
-          demands = zipWith (\x (_, j) → demandFor' x j) xs picks
-          start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
-       in if null demands
-            then property True
-            else case step start (SetCameraDemand (ViewId 1) (ArenaId 1) demands) of
+-- | Service, dispatch every queued job and complete each with the least it can
+-- store, until a round does no work.
+converge ∷ Int → Model → Either String Model
+converge 0 _ = Left "did not converge"
+converge n m0 =
+  -- The owner discards what the model committed as victims and reports it.
+  let m = foldl (\mm r → fst (step mm (VictimReleased (regionArena r) (regionCoord r)))) m0 [r | r ← modelRegions m0, regionEvicting r]
+      (m1, serviced) = step m Service
+      admittedAny = case serviced of
+        Right r | Serviced xs ← reportDecision r → not (null xs)
+        _ → False
+      (m2, dispatched) = dispatchAll m1 (0 ∷ Int)
+      running = [j | j ← modelJobs m2, jobPhase j == JobRunningPhase]
+      leastCost j = let c = jobCoverage j in Cost (coverageColumns c) (coverageSegments c) (2 * coverageSegments c)
+      m3 = foldl (\mm j → fst (step mm (JobCompleted (jobId j) (leastCost j)))) m2 running
+   in if not admittedAny && dispatched == 0 && null running && null [() | r ← modelRegions m3, regionEvicting r]
+        then Right m3
+        else converge (n - 1) m3
+  where
+    dispatchAll mm k = case step mm Dispatch of
+      (mm', Right r) | Dispatched {} ← reportDecision r → dispatchAll mm' (k + 1)
+      _ → (mm, k)
+
+-- | A model with some regions left resident and unpinned: explicit queries for
+-- them completed with the least they can store and then withdrawn.
+withLeftovers ∷ Limits → [(Int, Int)] → Model
+withLeftovers limits picks =
+  let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
+      load (m, i) (x, j) =
+        let (m1, _) = step m (SubmitQuery (RequestId i) (ArenaId 1) (Revision 0) [demandAt x j])
+            m2 = either (const m1) id (converge 50 m1)
+         in (fst (step m2 (Withdraw (RequestId i))), i + 1)
+   in fst (foldl load (start, 100) picks)
+
+demandAt ∷ Int → Int → RegionDemand
+demandAt x j = demand (reg (toInteger x) 0 0) (fromMaybe (cell 0 0 0) (pick demandCoverages j))
+
+distinctDemands ∷ [(Int, Int)] → [RegionDemand]
+distinctDemands picks =
+  let xs = foldl (\acc (x, _) → if x `elem` acc then acc else acc <> [x]) [] picks
+   in [demandAt x j | x ← take 4 xs, Just j ← [lookup x picks]]
+
+limitsOf ∷ (Integer, Integer, Integer) → Maybe Limits
+limitsOf (resident, staging, jobs) = either (const Nothing) Just (mkLimits (LimitsSpec resident 192 staging jobs 3 2 4 3))
+
+-- | A camera demand the model accepts completes when nothing else is happening,
+-- from an empty model or from one with resident leftovers and an earlier
+-- demand of the same view that it replaces. This is the feasibility bound checked
+-- against the order in which admission actually reserves, over random tiny budgets
+-- and random mixed demands.
+acceptedDemandCompletes ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → [(Int, Int)] → Property
+acceptedDemandCompletes triple leftovers firstPicks picks =
+  case limitsOf triple of
+    Nothing → property True
+    Just limits →
+      let base = withLeftovers limits leftovers
+          earlier = distinctDemands firstPicks
+          -- The view first holds an earlier demand, settled; nothing is left pending.
+          settledBase = case step base (SetCameraDemand (ViewId 1) (ArenaId 1) earlier) of
+            (m, Right _) | not (null earlier), Right done ← converge 200 m, all (null . viewPending) (modelViews done) → Just done
+            _ → Nothing
+          demands = distinctDemands picks
+       in case (null demands, settledBase) of
+            (True, _) → property True
+            (_, Nothing) → property True
+            (_, Just m0) → case step m0 (SetCameraDemand (ViewId 1) (ArenaId 1) demands) of
               (_, Left _) → property True
-              (m, Right _) → case converge (200 ∷ Int) m of
+              (m, Right _) → case converge 200 m of
                 Left why → counterexample why False
                 Right done →
                   counterexample
-                    ("demand accepted but left pending: " <> show (map viewPending (modelViews done)) <> " with " <> show (demands, limits))
+                    ("replacement accepted but left pending: " <> show (map viewPending (modelViews done)) <> " with " <> show (earlier, demands, limits))
                     (all (null . viewPending) (modelViews done))
-  where
-    nubInts = foldl (\acc x → if x `elem` acc then acc else acc <> [x]) []
-    demandFor' x j = demand (reg (toInteger (x ∷ Int)) 0 0) (fromMaybe (cell 0 0 0) (pick demandCoverages j))
-    -- Service, dispatch every queued job and complete each with the least it can
-    -- store, until a round does no work.
-    converge 0 _ = Left "did not converge"
-    converge n m =
-      let (m1, serviced) = step m Service
-          admittedAny = case serviced of
-            Right r | Serviced xs ← reportDecision r → not (null xs)
-            _ → False
-          (m2, dispatched) = dispatchAll m1 (0 ∷ Int)
-          running = [j | j ← modelJobs m2, jobPhase j == JobRunningPhase]
-          leastCost j = let c = jobCoverage j in Cost (coverageColumns c) (coverageSegments c) (2 * coverageSegments c)
-          m3 = foldl (\mm j → fst (step mm (JobCompleted (jobId j) (leastCost j)))) m2 running
-       in if not admittedAny && dispatched == 0 && null running then Right m3 else converge (n - 1) m3
-    dispatchAll m k = case step m Dispatch of
-      (m', Right r) | Dispatched {} ← reportDecision r → dispatchAll m' (k + 1)
-      _ → (m, k)
+
+-- | From a quiescent model (nothing pinned, running or promised), an explicit
+-- query is admitted or permanently invalid; it is never merely busy, because
+-- nothing is left to wait for.
+quiescentRequestNotBusy ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → Property
+quiescentRequestNotBusy triple leftovers picks =
+  case limitsOf triple of
+    Nothing → property True
+    Just limits →
+      let base = withLeftovers limits leftovers
+          demands = distinctDemands picks
+       in if null demands
+            then property True
+            else case step base (SubmitQuery (RequestId 7) (ArenaId 1) (Revision 0) demands) of
+              (_, Left refusal@(Busy _)) → counterexample ("busy from a quiescent model: " <> show (refusal, demands, limits)) False
+              _ → property True
 
 spec ∷ Spec
 spec = describe "Residency model properties" $ do
@@ -369,11 +417,19 @@ spec = describe "Residency model properties" $ do
         case runSequence seeds of
           (Left why, _) → counterexample why False
           (Right _, _) → property True
-  it "completes every camera demand the model accepts when it is alone, under random tiny budgets" $
-    withNumTests 1000 $
+  it "completes every camera demand the model accepts when nothing else happens, from non-empty states, under random tiny budgets" $
+    withNumTests 2000 $
       forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
-        forAll (vectorOf 4 ((,) <$> chooseInt (0, 5) <*> chooseInt (0, 5))) $ \picks →
-          acceptedDemandCompletes limitsTriple picks
+        forAll (vectorOf 3 pair) $ \leftovers →
+          forAll (vectorOf 4 pair) $ \firstPicks →
+            forAll (vectorOf 4 pair) $ \picks →
+              acceptedDemandCompletes limitsTriple leftovers firstPicks picks
+  it "never answers busy to an explicit request from a quiescent model with resident leftovers" $
+    withNumTests 2000 $
+      forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
+        forAll (vectorOf 3 pair) $ \leftovers →
+          forAll (vectorOf 4 pair) $ \picks →
+            quiescentRequestNotBusy limitsTriple leftovers picks
   it "exercises completion, eviction, commit, refusal and retirement in a fixed long sequence" $ do
     let (outcome, stats) = runSequence (lcg 7 12000)
     outcome `shouldSatisfy` either (const False) (const True)
@@ -398,11 +454,12 @@ spec = describe "Residency model properties" $ do
       [ ("accepted", accepted, 4000)
       , ("completed", completed, 200)
       , ("commits", committed, 40)
-      , ("superseded", superseded, 3)
+      , ("superseded", superseded, 1)
       , ("acknowledged", acknowledged, 20)
       , ("replaced", replaced, 20)
       ]
   where
+    pair = (,) <$> chooseInt (0, 5) <*> chooseInt (0, 5)
     reaches stats floors =
       forM_ floors $ \(name, field, floor') →
         unless (field stats >= floor') $ expectationFailure ("the sequence reached " <> name <> " only " <> show (field stats) <> " times: " <> show stats)

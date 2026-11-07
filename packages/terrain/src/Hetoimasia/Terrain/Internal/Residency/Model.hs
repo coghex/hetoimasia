@@ -843,10 +843,14 @@ data Extras = Extras
   { exCommand ∷ !Bool
   , exRequestBytes ∷ !Word64
   , exEdit ∷ !Bool
+  , -- | Regions that may not be chosen as victims for this admission, besides the
+    -- ones it names: the rest of a camera demand, which it must not evict to load
+    -- an earlier region of the same demand.
+    exProtect ∷ !(Set RegionKey)
   }
 
 noExtras ∷ Extras
-noExtras = Extras False 0 False
+noExtras = Extras False 0 False Set.empty
 
 planUnit ∷ Model → ArenaId → Owner → RegionDemand → Either Refusal UnitPlan
 planUnit m arena owner d@(RegionDemand region cover) = do
@@ -962,7 +966,7 @@ planAdmission m arena owner demands extras = do
   (funding, victims) ←
     if shortfall == 0
       then Right ([(a, d, Map.empty) | (a, d) ← parts], [])
-      else fundByEviction m (Set.fromList [(arena, demandRegion d) | d ← demands]) parts shortfall
+      else fundByEviction m (Set.union (exProtect extras) (Set.fromList [(arena, demandRegion d) | d ← demands])) parts shortfall
   pure (Plan units funding victims)
   where
     permanent bank n =
@@ -1078,7 +1082,7 @@ submit m rid a rev demands edit = do
   checkDemand m demands
   let count = fromIntegral (length demands)
       recordBytes = commandRecordBytes count
-      extras = Extras True (recordBytes + maybe 0 (const removalStagingBytes) edit) (isJust edit)
+      extras = Extras True (recordBytes + maybe 0 (const removalStagingBytes) edit) (isJust edit) Set.empty
   plan ← planAdmission m a (OwnerRequest rid) demands extras
   let (m1, admission, funding) = applyPlan m a (OwnerRequest rid) plan
       reservation = fmap (\(r, c) → EditReservation r c rev removalRetainedBytes removalStagingBytes) edit
@@ -1118,22 +1122,27 @@ setCamera m v a demands = do
   -- order, what it must already hold plus the next job's whole reservation exceeds
   -- a bank, even if nothing else existed (earlier jobs have completed and released
   -- their scratch). What is resident now counts, because the demand keeps it
-  -- pinned; only the cells not yet resident need a job. These are lower bounds: a
+  -- pinned and does not evict its own regions to load another; only the cells not
+  -- yet resident need a job. These are lower bounds: a
   -- demand that passes can still wait on pressure, but one that fails can never
   -- complete.
   let stagingLimit = limitBytes limits StagingBank
       residentLimit = limitBytes limits ResidentBank
       steps = map (aloneStep m a) demands
       -- Staging holds the description, an interest for every region admitted so
-      -- far (existing or new: each stays as long as the demand does) and the
-      -- scratch of the job being loaded.
+      -- far, the interests this view already holds in the regions still to come
+      -- (they stay as long as the demand does) and the scratch of the job being
+      -- loaded.
+      existing = [if hasInterest m (a, demandRegion d) (OwnerView v) then 1 else 0 | d ← demands]
+      stillToCome = drop 1 (scanr (+) 0 existing)
       stagingPeak =
-        maximum (0 : [newBytes + k * interestRecordBytes + asScratch st | (k, st) ← zip [1 ..] steps])
-      -- Resident holds every earlier region (what it occupies now and at least
-      -- what the demand adds to it) beside the current region (what it occupies
-      -- now) and the job's whole reservation.
-      heldBefore = scanl (\n st → n + asPinned st + asLeast st) 0 steps
-      residentPeak = maximum (last heldBefore : [held + asPinned st + asReserve st | (held, st) ← zip heldBefore steps])
+        maximum (0 : [newBytes + (k + later) * interestRecordBytes + asScratch st | (k, later, st) ← zip3 [1 ..] stillToCome steps])
+      -- Resident holds every region of the demand that is resident now (the demand
+      -- never evicts its own regions), the least it has added to the earlier ones,
+      -- and the job's whole reservation.
+      pinnedAll = sum (map asPinned steps)
+      leastBefore = scanl (\n st → n + asLeast st) 0 steps
+      residentPeak = maximum (pinnedAll + last leastBefore : [pinnedAll + added + asReserve st | (added, st) ← zip leastBefore steps])
   if stagingPeak > stagingLimit then Left (Invalid (ExceedsBank StagingBank stagingPeak stagingLimit)) else Right ()
   if residentPeak > residentLimit then Left (Invalid (ExceedsBank ResidentBank residentPeak residentLimit)) else Right ()
   if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
@@ -1161,7 +1170,7 @@ setCamera m v a demands = do
       -- Regions are admitted strictly in demand order: once one is busy the rest
       -- wait behind it, so a later region never takes room an earlier one needs
       -- (the feasibility bound above is the order in which admission reserves).
-      attempt (mm, done, waiting, replaced, goneAcc, cancelAcc) d = case (if null waiting then planAdmission mm a owner [d] noExtras else Left (Busy (RegionEvicting (demandRegion d)))) of
+      attempt (mm, done, waiting, replaced, goneAcc, cancelAcc) d = case (if null waiting then planAdmission mm a owner [d] noExtras {exProtect = wanted} else Left (Busy (RegionEvicting (demandRegion d)))) of
         Right plan →
           let (mm', admission, _) = applyPlan mm a owner plan
               (mm'', g, c) = pruneJobs mm'
@@ -1193,7 +1202,7 @@ service m0 =
         | needs m v w d =
             if blocked
               then (m, acc, True)
-              else case planAdmission m (vwArena w) (OwnerView v) [d] noExtras of
+              else case planAdmission m (vwArena w) (OwnerView v) [d] noExtras {exProtect = Set.fromList [(vwArena w, demandRegion x) | x ← vwDemand w]} of
                 Right plan → let (m', admission, _) = applyPlan m (vwArena w) (OwnerView v) plan in (m', acc <> [(v, admission)], False)
                 Left _ → (m, acc, True)
         | otherwise = (m, acc, blocked)
