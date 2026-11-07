@@ -107,11 +107,13 @@ for tile removal, with no UI system or on-screen UI controls (D-8/D-9). Remove
 the shortcut by task completion; the Lua removal API remains.
 Changes survive chunk offload/reload within the current arena session, but
 the arena is not persistent across sessions (D-10).
+Depth should also extend on demand, with no designed bottom to the arena
+(D-11). Numeric limits and bounded residency still need explicit contracts.
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
 observable. Keep the first terrain source simple while designing proper
-publication and lifetime. Exact camera controls, vertical extent, appearance,
+publication and lifetime. Exact camera controls, coordinate limits, appearance,
 temporary key binding and exact Lua APIs remain open. No implementation or delivery order
 follows from this direction alone.
 
@@ -349,6 +351,34 @@ starts fresh. The store retains changes independently of resident chunk data,
 so chunk eviction cannot discard them. Exact encoding, compaction, threading
 and transfer/publication mechanics remain design choices in Q-3/Q-6/Q-9.
 
+### D-11. Effectively unlimited depth, generated on demand
+
+Owner, directly in this pane on 2026-11-06, responding to a proposed
+configurable bottom versus terrain extending downward with digging:
+
+> ideally it would be infinite, unless you see a reason why it cant be
+
+Select the direction of no designed bottom: terrain continues downward as
+needed. Lazy generation is compatible with this direction; no need to
+allocate or compute an infinite column. A terrain recipe can define what
+exists at a requested depth without enumerating intervening underground cells.
+The finite-bottom recommendation is not selected.
+
+This means effectively unlimited exploration, not infinite machine resources.
+Coordinate representation, arithmetic/conversion limits and out-of-range
+behavior remain explicit implementation choices. Do not silently wrap or lose
+tile identity at large depths. No specific coordinate type is approved here.
+
+Residency must work vertically too: descending must not require retaining
+every previously visited depth in the same horizontal chunk. Recommend sparse,
+bounded vertical residency within the compressed-column model and queries
+restricted to demanded ranges, rather than traversal from the surface to the
+requested depth. Exact partitioning remains Q-3/Q-9. Exposed geometry also
+needs bounded preparation; a deep shaft must not force an arbitrarily tall
+wall mesh to stay resident. Session edit storage remains D-10 and can grow
+with edits; compression does not promise constant memory for arbitrary
+modifications. None of these constraints requires a gameplay depth floor.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -377,8 +407,9 @@ in Q-8; bounds, authorship and editing remain separate choices.
 ### Q-2. Finite arena or expandable terrain?
 
 Resolved in direction by D-7: keep extending as the camera explores. The finite
-arena recommendation was declined. Specify coordinate conventions and limits,
-chunk dimensions, vertical limits and absent/unloaded behavior. Synarchy's
+arena recommendation was declined. D-11 also selects no designed bottom.
+Specify coordinate conventions and machine limits, chunk dimensions and
+absent/unloaded behavior. Synarchy's
 5 × 5 startup footprint is not an approved extent or budget.
 
 ### Q-3. How does demand become usable terrain and then retire?
@@ -394,6 +425,9 @@ reload to apply them before publication. Define that handoff and failure
 behavior. Account separately for resident terrain, derived render data and
 session-retained changes; a resident-chunk limit does not bound accumulated
 edits across the explored arena.
+Under D-11, define vertical residency and retirement as well as horizontal
+chunk offload. A long-lived horizontal chunk must not retain all depth ever
+visited merely because the camera is still over that column.
 Queries can concern invisible regions while undemanded detail remains
 unmaterialized. The producer rule is settled; its operational contract remains
 open.
@@ -455,7 +489,8 @@ intersection and rendering contracts.
 
 After the logical choice, settle partial-cell shapes/slopes, whether constructed
 terrain shares that geometry authority, empty versus unavailable answers,
-vertical bounds and physical storage. A cell contract does not itself require
+coordinate limits and physical storage. D-11 selects no designed depth floor.
+A cell contract does not itself require
 a dense full-world allocation, cubic storage chunks or a particular array.
 
 ### Q-9. How is terrain represented compactly, including unmaterialized depth?
@@ -471,11 +506,11 @@ unmeasured, and the exact physical storage layout is not approved yet. P-4
 allows a shared source definition to stand in for untouched underground spans;
 choosing compressed columns does not require eagerly building every column.
 
-Next vertical-extent choice: recommend a configurable lower terrain limit for
-the testing arena, with a defined outside-world answer below it. It allows
-shallow or deep test cases without allocating untouched depth. Extending
-downward as digging proceeds is the alternative. Neither is selected yet;
-the initial material/layer recipe also remains open.
+D-11 settles the vertical direction: extend downward on demand, without a
+designed bottom. Settle a recipe that answers for the requested depth without
+generating every intervening tile, along with vertical residency, coordinate
+limits and bounded range queries. The initial material/layer recipe remains
+open.
 
 ## Verification strategy — proposal
 
@@ -498,6 +533,11 @@ Under D-10, verify remove/offload/reload, additional removal followed by another
 cycle, and reconstruction independent of chunk demand order. Verify a fresh
 arena inherits no changes from the previous session. No disk persistence test
 is implied by this session-only contract.
+For D-11, query widely separated depths without constructing the intervening
+volume; verify vertical eviction/reload and bounded resident/render data as
+the demanded depth moves. Include coordinate-limit and conversion checks once
+the representation is chosen. Report retained edit storage separately from
+resident terrain; no test can establish literal infinite resource capacity.
 During development, exercise the D-8/D-9 shortcut through the agreed
 targeting/input path, including no valid target and focus/reset behavior.
 Capture its removal/reveal evidence before deleting the shortcut. Final
