@@ -304,8 +304,8 @@ data Decision
     JobFailedFor !JobId ![Owner] ![JobId] ![JobId]
   | -- | The new revision, the retained bytes returned, the owners whose demand
     -- lost its work to the commit, the queued jobs of the changed region that were
-    -- dropped, and the running jobs of it now stale (their results will be
-    -- discarded; the owner may cancel them).
+    -- dropped, and the running jobs of it now superseded: they are cancelling, so
+    -- their results are discarded and the owner's acknowledgement releases them.
     Committed !Revision !Word64 ![Owner] ![JobId] ![JobId]
   | HoldAcquired
   | HoldReleased
@@ -865,14 +865,6 @@ planUnit m arena owner d@(RegionDemand region cover) = do
         Right (Just (NewJob delta need (scratchBytes delta)))
   pure (UnitPlan d (maybe True (not . Map.member owner . tgInterests) target) job)
 
--- | The minimal reservation a demand could ever need: its job's cost when
--- nothing is resident, plus the interest record.
-minimalNeed ∷ Coverage → Either Refusal (Word64, Word64)
-minimalNeed cover = do
-  bytes ← maybe (Left (Invalid CostArithmetic)) Right (costBytes (reserveCost cover))
-  need ← maybe (Left (Invalid CostArithmetic)) Right (checkedAdd bytes regionMetadataBytes)
-  pure (need, scratchBytes cover + interestRecordBytes)
-
 -- | The units, the funding of each new job (active bytes, deferred bytes and the
 -- victims it awaits) and the committed victims.
 data Plan = Plan ![UnitPlan] ![(Word64, Word64, Map RegionKey Word64)] ![RegionKey]
@@ -1054,17 +1046,6 @@ checkDemand m demands = do
   case filter (not . supportedRegion) regions of
     (r : _) → Left (Invalid (UnsupportedRegion r))
     [] → Right ()
-  -- A region whose minimal reservation exceeds a bank's total can never be
-  -- admitted: refuse the whole demand now, rather than leave it pending forever.
-  mapM_
-    ( \d → do
-        (resident, staging) ← minimalNeed (demandCoverage d)
-        let residentLimit = limitBytes (mLimits m) ResidentBank
-            stagingLimit = limitBytes (mLimits m) StagingBank
-        if resident > residentLimit then Left (Invalid (ExceedsBank ResidentBank resident residentLimit)) else Right ()
-        if staging > stagingLimit then Left (Invalid (ExceedsBank StagingBank staging stagingLimit)) else Right ()
-    )
-    demands
 
 -- ---------------------------------------------------------------------------
 -- Camera demand
@@ -1080,26 +1061,34 @@ setCamera m v a demands = do
   if newBytes > limitBytes limits StagingBank
     then Left (Invalid (ExceedsBank StagingBank newBytes (limitBytes limits StagingBank)))
     else Right ()
-  -- What a demand must hold while it completes, all at once, is unavoidable:
-  -- its description and an interest for every region it names (each interest
-  -- stays for as long as the demand does) plus the scratch of the largest job it
-  -- needs. If that exceeds the staging bank, the demand can never be completed:
-  -- permanently invalid. Likewise, every named region stays pinned resident by
-  -- its interest, so the least each can occupy (its metadata, its columns and
-  -- segments, and two payload bytes per segment) must fit the resident bank.
+  -- Regions are admitted in demand order, and each interest stays for as long as
+  -- the demand does. A demand is permanently invalid when, at some step of that
+  -- order, even the least that must already be held plus the next job's whole
+  -- reservation exceeds a bank. Staging holds the description, one record for each
+  -- interest this demand adds so far and the scratch of the job being loaded
+  -- (earlier jobs have completed and released theirs). Resident holds every earlier
+  -- region this demand loads, pinned at no less than its least size (metadata,
+  -- columns, segments and two payload bytes per segment), beside the job's full
+  -- reservation. Only what is not already resident or already promised counts, so
+  -- these are lower bounds: a demand that passes can still wait on pressure, but
+  -- one that fails can never complete.
   let stagingLimit = limitBytes limits StagingBank
       residentLimit = limitBytes limits ResidentBank
-      count = fromIntegral (length demands) ∷ Word64
-      footprint = newBytes + count * interestRecordBytes + maximum (0 : map (scratchBytes . demandCoverage) demands)
-      least c = regionMetadataBytes + 48 * coverageColumns c + 34 * coverageSegments c
-      reserveOf c = either (const 0) fst (minimalNeed c)
-      -- Every region stays pinned at no less than its least size; the last job to
-      -- complete holds its whole reservation while the others are at their least.
-      leastResident =
-        sum (map (least . demandCoverage) demands)
-          + minimum [reserveOf c - least c | d ← demands, let c = demandCoverage d]
-  if footprint > stagingLimit then Left (Invalid (ExceedsBank StagingBank footprint stagingLimit)) else Right ()
-  if leastResident > residentLimit then Left (Invalid (ExceedsBank ResidentBank leastResident residentLimit)) else Right ()
+      -- Per region: the job's reservation, its least stored size and its scratch
+      -- (all zero when no job is needed), and whether the demand adds an interest.
+      stepOf d = case planUnit m a (OwnerView v) d of
+        Right (UnitPlan _ new (Just (NewJob delta need scratch))) → (need, need - 62 * coverageSegments delta, scratch, new)
+        Right (UnitPlan _ new Nothing) → (0, 0, 0, new)
+        Left _ → (0, 0, 0, False)
+      steps = map stepOf demands
+      interestsBefore = scanl (\n (_, _, _, new) → if new then n + 1 else n) 0 steps
+      leastBefore = scanl (\n (_, l, _, _) → n + l) 0 steps
+      stagingPeak =
+        maximum
+          (0 : [newBytes + (n + (if new then 1 else 0)) * interestRecordBytes + scratch | (n, (_, _, scratch, new)) ← zip interestsBefore steps])
+      residentPeak = maximum (0 : [held + need | (held, (need, _, _, _)) ← zip leastBefore steps])
+  if stagingPeak > stagingLimit then Left (Invalid (ExceedsBank StagingBank stagingPeak stagingLimit)) else Right ()
+  if residentPeak > residentLimit then Left (Invalid (ExceedsBank ResidentBank residentPeak residentLimit)) else Right ()
   if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
     then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) (newBytes - oldBytes)))
     else Right ()
@@ -1294,7 +1283,9 @@ commitRemoval m rid newRev actual growth = do
       | jbArena j /= a = Just j
       | jbRegion j /= region = Just j {jbRevision = rev}
       | jbState j == JobPending = Nothing
-      | otherwise = Just j {jbStale = True}
+      -- Superseded work that is running becomes cancelling: its result is
+      -- discarded, and the owner's completion or acknowledgement releases it.
+      | otherwise = Just j {jbState = JobCancelling, jbStale = True}
 
 -- ---------------------------------------------------------------------------
 -- Holds and handoffs
