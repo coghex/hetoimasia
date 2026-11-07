@@ -98,6 +98,7 @@ import Hetoimasia.Render.TwoD.Oracle
   , newOracleWith
   )
 import Hetoimasia.Render.TwoD.Oracle.Colour (Rgba8 (..))
+import Hetoimasia.Render.TwoD.Settings (ViewSettings (..))
 import Hetoimasia.Render.TwoD.Snapshot
 import Hetoimasia.Render.TwoD.Validation (validateSnapshotWith)
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
@@ -678,27 +679,29 @@ renderSnapshot ctx s parts = do
       let perPass = splitPasses (map (sceneTarget . partScene) parts) (resultProbes result)
           independents = [judgeIndependent (specLook s) (sceneTarget (partScene part)) (grid !) (observedFrom (fst (sceneTarget (partScene part))) probes) | (part, grid, probes) ← zip3 parts grids perPass]
           independent = foldr1 plus independents
-          -- Pixels the readback shows as the snapped view and not as the same view
-          -- without snapping: the expectations differ by more than the tolerance, and
-          -- the pixel read agrees with the snapped one and not with the other.
-          snapDifferences = case (SnapSensitive `elem` specNeeds s, parts, perPass) of
-            (True, part : _, firstProbes : _) → case alternative part SnapSensitive of
-              Just unsnapped →
-                let (gw, gh) = sceneTarget (partScene part)
-                    observed = observedFrom gw firstProbes
-                    tolerance = lookTolerance (specLook s)
-                    near (a, b, c, d) (Rgba8 e f g h') = all (\(x, y) → abs (fromIntegral x - fromIntegral y) <= tolerance) [(a, e), (b, f), (c, g), (d, h')]
-                 in length
-                      [ ()
-                      | x ← [0 .. gw - 1]
-                      , y ← [0 .. gh - 1]
-                      , Just with ← [expectedRgba (specLook s) (firstGrid ! (x, y))]
-                      , Just without ← [expectedRgba (specLook s) (unsnapped (x, y))]
-                      , Just seen ← [observed x y]
-                      , near with seen
-                      , not (near without seen)
-                      ]
-              Nothing → 0
+          -- Pixels the readback shows as the snapped view and not as the same snapshot
+          -- with snapping off: the oracle (which models the recorder's snapping) expects
+          -- colours that differ by more than the tolerance there, and the pixel read agrees
+          -- with the snapped one and not with the other.
+          snapDifferences = case (SnapSensitive `elem` specNeeds s, perPass) of
+            (True, firstProbes : _) →
+              let unsnappedSnapshot = Snapshot [pass' {passViews = [v {viewSettings = (viewSettings v) {settingPixelSnap = False}} | v ← passViews pass']} | pass' ← snapshotPasses snapshot]
+               in case validateSnapshotWith held unsnappedSnapshot of
+                    Left _ → 0
+                    Right unsnappedValid →
+                      let unsnappedOracle = newOracleWith models (oracleInput unsnappedValid marks shapes decodedAt)
+                          tolerance = lookTolerance (specLook s)
+                          (gw, _) = sceneTarget (partScene (case parts of { part : _ → part; [] → error "a fixture without a part" }))
+                          near (Rgba8 a b c d) (Rgba8 e f g h') = all (\(x, y) → abs (fromIntegral x - fromIntegral y) <= tolerance) [(a, e), (b, f), (c, g), (d, h')]
+                       in length
+                            [ ()
+                            | (index, probed) ← zip [0 ∷ Int ..] firstProbes
+                            , Expected with _ ← [probeExpectation probed]
+                            , Just seen ← [probeObserved probed]
+                            , Expected without _ ← [expect unsnappedOracle (Probe 0 (index `mod` gw) (index `div` gw))]
+                            , near with seen
+                            , not (near without seen)
+                            ]
             _ → 0
           plus a b = Independent (indCompared a + indCompared b) (indAmbiguous a + indAmbiguous b) (indCovered a + indCovered b) (indReveals a + indReveals b) (indMismatchCount a + indMismatchCount b) (take 12 (indMismatches a <> indMismatches b))
       pickJudgeds ← traverse (pureJudge ctx s . partScene) parts

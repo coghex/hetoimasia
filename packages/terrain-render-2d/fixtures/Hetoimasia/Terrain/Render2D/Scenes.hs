@@ -286,19 +286,7 @@ scaledTarget = fitScene 8 ((rampsCorners FaceEast) {sceneName = "scaled", sceneS
 -- view's translation to the pixel grid and the image differs from the unsnapped
 -- one.
 snapped ∷ Scene
-snapped =
-  capTarget (96, 64) $
-    fitScene 3 $
-      let base = rampsCorners FaceSouth
-       in base
-            { sceneName = "snapped"
-            , sceneSnap = True
-            , sceneZoom = 1
-            , sceneMode = ManualAt 2 1
-            , -- The technical sheet, whose neighbouring texels differ by more than any tolerance:
-              -- a shift of the sampling by snapping is then a different colour.
-              sceneCells = [c {cellMaterial = "diagnostic"} | c ← sceneCells base]
-            }
+snapped = capTarget (96, 64) (fitScene 3 ((rampsCorners FaceSouth) {sceneName = "snapped", sceneSnap = True, sceneZoom = 1, sceneMode = ManualAt 2 1}))
 
 -- ---------------------------------------------------------------------------
 -- Layout
