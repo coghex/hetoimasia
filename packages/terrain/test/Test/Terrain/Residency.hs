@@ -149,21 +149,45 @@ limitSpec = describe "validated limits" $ do
     stepRefused mDemand (SubmitQuery (RequestId 1) a1 rev0 []) `shouldReturn` Invalid EmptyDemand
     stepRefused mDemand (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 0) (cell 0 0 0), demand (reg 0 0 0) (cell 1 0 0)])
       `shouldReturn` Invalid (DuplicateRegion (reg 0 0 0))
-  it "calls a request invalid only if it cannot fit from an empty model, whatever is resident" $ do
-    -- 600 resident bytes. From an empty model the request needs a 400-byte job for
-    -- each of two regions: 800 can never fit, whatever is or is not resident.
+  it "calls a request invalid only if the cells it still has to load cannot fit, and never one that has nothing to load" $ do
+    -- 600 resident bytes. Two regions each need a 400-byte job: 800 can never fit.
     let both = SubmitQuery (RequestId 2) a1 rev0 [demand (reg 0 0 0) (cell 0 0 0), demand (reg 1 0 0) (cell 0 0 0)]
     m0 ← opened (limitsWith $ \x → x {specResidentBytes = 600, specStagingBytes = 4096})
     stepRefused m0 both `shouldReturn` Invalid (ExceedsBank ResidentBank 800 600)
+    -- With region A resident only B has cells to load (400): it fits an empty bank,
+    -- so the shortfall (A is pinned by this very request) is busy, not invalid.
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
-    stepRefused m1 both `shouldReturn` Invalid (ExceedsBank ResidentBank 800 600)
-    -- At 800 it can fit an empty model, so it is never invalid. With region A resident
-    -- (338) it is admitted at once with no victim.
+    stepRefused m1 both `shouldReturn` Busy (NoEligibleEviction 138 0 (Blockers 0 0 0 0 0 0 1))
+    -- At 800 it is admitted at once with no victim.
     m2 ← opened (limitsWith $ \x → x {specResidentBytes = 800, specStagingBytes = 4096})
     m3 ← loadCell m2 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     (_, ok) ← stepOk m3 both
     admissionVictims (admission ok) `shouldBe` []
     admissionDeferred (admission ok) `shouldBe` 0
+  it "keeps admitting a request whose cells are already covered, before and after the covering job completes" $ do
+    -- 400 resident bytes. One column z 0..31 is a 400-byte job that stores 338. A
+    -- query for just z 0, 2 and 4 would need three segments (592) from an empty model,
+    -- but the covering region already holds them: nothing to load, never invalid.
+    m0 ← opened (limitsWith $ \x → x {specResidentBytes = 400, specStagingBytes = 4096, specQueuedCommands = 4})
+    let column = box 0 1 0 1 0 32
+        picked = coverageUnion (coverageUnion (cell 0 0 0) (cell 0 0 2)) (cell 0 0 4)
+    stepRefused m0 (q 9 (reg 0 0 0) picked) `shouldReturn` Invalid (ExceedsBank ResidentBank 592 400)
+    (m1, _) ← stepOk m0 (q 1 (reg 0 0 0) column)
+    -- Covered by the promised job.
+    (m2, promised) ← stepOk m1 (q 2 (reg 0 0 0) picked)
+    (admissionJobs (admission promised), admissionShared (admission promised)) `shouldBe` ([], [reg 0 0 0])
+    (m3, camera) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) picked])
+    case reportDecision camera of
+      CameraSet admitted waiting _ _ _ → (map admissionJobs admitted, waiting) `shouldBe` ([[]], [])
+      other → expectationFailure (show other)
+    -- And after the covering job has completed and stored 338.
+    m4 ← stepsOk m3 [Dispatch, JobCompleted (JobId 0) oneCellCost]
+    (_, resident) ← stepOk m4 (q 3 (reg 0 0 0) picked)
+    (admissionJobs (admission resident), admissionShared (admission resident)) `shouldBe` ([], [reg 0 0 0])
+    (_, camera2) ← stepOk m4 (SetCameraDemand (ViewId 2) a1 [demand (reg 0 0 0) picked])
+    case reportDecision camera2 of
+      CameraSet admitted waiting _ _ _ → (map admissionJobs admitted, waiting) `shouldBe` ([[]], [])
+      other → expectationFailure (show other)
   it "answers a shortfall that depends on the model's state with busy, however long it lasts" $ do
     -- 800 resident bytes. Regions A and C are resident and pinned by open requests
     -- (676); a request for B needs 400 and only 124 are free. It fits an empty model,
@@ -787,32 +811,42 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       other → expectationFailure (show other)
     m6 ← stepsOk m5 [Dispatch, JobCompleted (JobId 2) oneCellCost]
     map viewPending (modelViews m6) `shouldBe` [[]]
-  it "counts the resident data and existing interests a replacement keeps, and keeps the previous demand when it can never complete" $ do
-    -- A is resident (338 bytes) and view 1 keeps it pinned. Replacing the demand with
-    -- [A, B] needs A's 338 beside B's 400-byte reservation: 738.
+  it "answers a replacement that cannot complete because of what it retains with pending demand, not invalid" $ do
+    -- A is resident (338) and view 1 keeps it pinned. Replacing the demand with
+    -- [A, B] needs B's 400-byte job beside A's 338: 738 > 700. B alone fits an empty
+    -- bank (400), so this is a shortfall that depends on state: the demand is
+    -- accepted, A is kept and B waits.
     let regionA = demand (reg 0 0 0) (cell 0 0 0)
         regionB = demand (reg 1 0 0) (cell 0 0 0)
     m0 ← opened (limitsWith $ \x → x {specResidentBytes = 700, specStagingBytes = 4096})
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionA])
-    stepRefused m2 (SetCameraDemand (ViewId 1) a1 [regionA, regionB]) `shouldReturn` Invalid (ExceedsBank ResidentBank 738 700)
-    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0]]
-    -- Staging: the new 256-byte description, A's interest and B's interest (128) and
-    -- B's 258 bytes of scratch are 642; 578 cannot hold them although the existing
-    -- interest and the new description alone leave room for neither job.
+    (m3, set) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [regionA, regionB])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ → (map admissionShared admitted, waiting) `shouldBe` ([[reg 0 0 0]], [reg 1 0 0])
+      other → expectationFailure (show other)
+    map viewPending (modelViews m3) `shouldBe` [[reg 1 0 0]]
+    -- Staging: the new 256-byte description, both interests (128) and B's 258 bytes
+    -- of scratch are 642. At 578 that cannot fit even an empty bank (B's job alone
+    -- would need it), so it is invalid whatever is resident, and the previous
+    -- demand is kept.
     s0 ← opened (limitsWith $ \x → x {specStagingBytes = 578, specResidentBytes = 4000})
     s1 ← stepsOk s0 [SetCameraDemand (ViewId 1) a1 [regionA], Dispatch, JobCompleted (JobId 0) oneCellCost]
     stepRefused s1 (SetCameraDemand (ViewId 1) a1 [regionA, regionB]) `shouldReturn` Invalid (ExceedsBank StagingBank 642 578)
     map (map demandRegion . viewDemand) (modelViews s1) `shouldBe` [[reg 0 0 0]]
-  it "never evicts a region of its own demand to load an earlier one, and counts the later resident regions" $ do
+  it "never evicts a region of its own demand to load an earlier one" $ do
     -- B is resident (338) and named second. Loading A (400) with B kept needs 738; at
-    -- 700 the demand can never complete, and the model must not "make room" by
-    -- evicting B, which the demand needs and would have to reload.
+    -- 700 that cannot complete, and the model must not "make room" by evicting B,
+    -- which the demand needs and would have to reload: the demand waits (busy).
     let regionA = demand (reg 0 0 0) (cell 0 0 0)
         regionB = demand (reg 1 0 0) (cell 0 0 0)
     m0 ← opened (limitsWith $ \x → x {specResidentBytes = 700, specStagingBytes = 4096})
     m1 ← loadCell m0 1 (reg 1 0 0) (cell 0 0 0) >>= \m → withdraw m 1
-    stepRefused m1 (SetCameraDemand (ViewId 1) a1 [regionA, regionB]) `shouldReturn` Invalid (ExceedsBank ResidentBank 738 700)
+    (m2, held) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionA, regionB])
+    case reportDecision held of
+      CameraSet admitted _ _ _ _ → concatMap admissionVictims admitted `shouldBe` []
+      other → expectationFailure (show other)
+    [regionCoord r | r ← modelRegions m2, regionEvicting r] `shouldBe` []
     -- At 738 it is admitted without evicting anything, and completes.
     n0 ← opened (limitsWith $ \x → x {specResidentBytes = 738, specStagingBytes = 4096})
     n1 ← loadCell n0 1 (reg 1 0 0) (cell 0 0 0) >>= \m → withdraw m 1
@@ -822,17 +856,22 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       other → expectationFailure (show other)
     n3 ← stepsOk n2 [Dispatch, JobCompleted (JobId 1) oneCellCost]
     map regionBytes (modelRegions n3) `shouldBe` [338, 338]
-  it "counts the interests a view already holds in the regions still to come" $ do
+  it "counts the interests a view already holds in the regions still to come when admitting" $ do
     -- View 1 holds an interest in resident region 0. Replacing its demand with
     -- [region 2 (new), region 0] needs the 256-byte description, both interests
-    -- (the one in region 0 stays) and region 2's 258 bytes of scratch: 642.
+    -- (the one in region 0 stays) and region 2's 258 bytes of scratch: 642. At 600
+    -- it waits (busy); at 642 it is admitted and completes.
     let regionN = demand (reg 2 0 0) (cell 0 0 0)
         regionR = demand (reg 0 0 0) (cell 0 0 0)
     m0 ← opened (limitsWith $ \x → x {specStagingBytes = 600, specResidentBytes = 4000})
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionR])
-    stepRefused m2 (SetCameraDemand (ViewId 1) a1 [regionN, regionR]) `shouldReturn` Invalid (ExceedsBank StagingBank 642 600)
-    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0]]
+    (m3, waits) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [regionN, regionR])
+    case reportDecision waits of
+      CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (0, [reg 2 0 0, reg 0 0 0])
+      other → expectationFailure (show other)
+    -- (Region 0 keeps the interest the view already held.)
+    map viewPending (modelViews m3) `shouldBe` [[reg 2 0 0]]
     n0 ← opened (limitsWith $ \x → x {specStagingBytes = 642, specResidentBytes = 4000})
     n1 ← loadCell n0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     n2 ← fst <$> stepOk n1 (SetCameraDemand (ViewId 1) a1 [regionR])
@@ -860,13 +899,17 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       Serviced [(ViewId 1, x)] → map snd (admissionJobs x) `shouldBe` [reg 0 0 0]
       other → expectationFailure (show other)
     map viewPending (modelViews m4) `shouldBe` [[]]
-  it "judges a camera demand as if the model were empty, even when its work is already resident" $ do
+  it "judges a camera demand by the cells it still has to load, so resident work is never invalid" $ do
     -- From an empty model this demand needs 192 + 64 + 258 = 514 staging bytes. The
-    -- bank holds 500, so it is invalid whether or not the region is resident.
+    -- bank holds 500, so it is invalid; once the region is resident there is nothing
+    -- to load (and only 256 staging bytes to hold), so it is admitted.
     m0 ← opened (limitsWith $ \x → x {specStagingBytes = 500})
     stepRefused m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)]) `shouldReturn` Invalid (ExceedsBank StagingBank 514 500)
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
-    stepRefused m1 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)]) `shouldReturn` Invalid (ExceedsBank StagingBank 514 500)
+    (_, set) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ → (map admissionShared admitted, waiting) `shouldBe` ([[reg 0 0 0]], [])
+      other → expectationFailure (show other)
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])

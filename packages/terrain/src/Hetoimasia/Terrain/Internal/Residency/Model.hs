@@ -875,50 +875,81 @@ planUnit m arena owner d@(RegionDemand region cover) = do
 -- after another in demand order (a camera demand).
 data Admit = AllAtOnce | InOrder
 
--- | What one demanded region needs from an /empty/ model: one job for all of its
--- cells, with a fresh region (metadata included): the job's whole reservation
--- ('stReserve'), the least it leaves stored ('stLeast') and its scratch
--- ('stScratch'). It depends on the demand alone, never on what is resident,
--- promised or held.
+-- | What one demanded region still has to /load/, and what a fresh job for just
+-- those cells would need: the job's whole reservation ('stReserve', with fresh
+-- region metadata, as in an empty model), the least it leaves stored ('stLeast')
+-- and its scratch ('stScratch'). A region whose demanded cells are all covered by
+-- resident detail or by a live job (the sharing contract: it only gains an
+-- interest) has nothing to load and costs nothing here.
 data Step = Step
   { stReserve ∷ !Word64
   , stLeast ∷ !Word64
   , stScratch ∷ !Word64
+  , stLoads ∷ !Bool
   }
 
-emptyStep ∷ RegionDemand → Step
-emptyStep (RegionDemand _ cover) =
-  let reserve = regionMetadataBytes + fromMaybe 0 (costBytes (reserveCost cover))
-   in Step reserve (reserve - 62 * coverageSegments cover) (scratchBytes cover)
+-- | The cells of a demand that resident detail and live jobs already cover, and
+-- those they do not (a region being released counts as absent); 'Nothing' when
+-- nothing is left to load.
+uncoveredCells ∷ Model → ArenaId → RegionDemand → (Coverage, Maybe Coverage)
+uncoveredCells m arena (RegionDemand region cover) =
+  let resident = case Map.lookup (arena, region) (mTargets m) >>= tgResident of
+        Just r | not (rsEvicting r) → Just r
+        _ → Nothing
+      promised = [jbCoverage j | (_, j) ← jobsFor m (arena, region), jbState j /= JobCancelling, not (jbStale j)]
+      covered = maybe id (coverageUnion . rsCoverage) resident (foldr coverageUnion emptyCover promised)
+      delta = coverageDifference cover covered
+   in (covered, if coverageIsEmpty delta then Nothing else Just delta)
 
--- | The one permanent-feasibility check every admission path uses, by the owner's
--- rule: a request is invalid only when its minimum final footprint cannot fit a
--- bank or slot /even from an empty model/ (no other resident, job or interest).
--- Every other shortfall, however long it may last, is busy: it depends on state
--- that can change, and the check never looks at that state.
+-- | A fresh job for the cells still to load, sized as storage would hold them,
+-- merged per region and segment with the coverage already there: the columns and
+-- segments the union needs beyond those the covered cells already use (adjacent
+-- cells join an existing segment and add none), and fresh region metadata only
+-- when nothing of the region is covered. With nothing covered this is an empty
+-- model's job for the whole demand.
+emptyStep ∷ (Coverage, Maybe Coverage) → Step
+emptyStep (_, Nothing) = Step 0 0 0 False
+emptyStep (covered, Just delta) =
+  let united = coverageUnion covered delta
+      extra a b = if a > b then a - b else 0
+      columns = extra (coverageColumns united) (coverageColumns covered)
+      segments = extra (coverageSegments united) (coverageSegments covered)
+      metadata = if coverageIsEmpty covered then regionMetadataBytes else 0
+      reserve = metadata + 48 * columns + 96 * segments
+   in Step reserve (metadata + 48 * columns + 34 * segments) (scratchBytes delta) True
+
+-- | The one permanent-feasibility check every admission path uses
+-- (Requirement 7: permanent invalidity is distinct from pressure). A request is
+-- invalid only when the cells it still has to load, sized as a fresh job would
+-- store them (see 'emptyStep'), cannot fit a bank or slot even if nothing else
+-- existed. A request that has nothing to load is never invalid, and every other
+-- shortfall, however long it lasts, is busy: it depends on state that can change,
+-- which the check weighs only as which cells are already covered.
 --
 -- 'fixedStaging' is staging held for the whole demand (an atomic request's command
 -- record and staging, or a camera demand's description); 'growth' is a removal's
 -- resident growth. An atomic request holds all of its jobs at once; a camera
 -- demand is admitted in demand order, one job at a time, keeping what the earlier
 -- ones stored.
-footprintCheck ∷ Limits → Admit → Word64 → Word64 → [RegionDemand] → Either Refusal ()
-footprintCheck limits mode fixedStaging growth demands = do
-  let steps = map emptyStep demands
+footprintCheck ∷ Model → ArenaId → Admit → Word64 → Word64 → [RegionDemand] → Either Refusal ()
+footprintCheck m arena mode fixedStaging growth demands = do
+  let limits = mLimits m
+      steps = map (emptyStep . uncoveredCells m arena) demands
       residentLimit = limitBytes limits ResidentBank
       stagingLimit = limitBytes limits StagingBank
       slotLimit = limitSlot limits LoadJobSlot
+      jobsNeeded = fromIntegral (length (filter stLoads steps)) ∷ Word64
       (stagingPeak, residentPeak, slotsPeak) = case mode of
         AllAtOnce →
           ( fixedStaging + fromIntegral (length demands) * interestRecordBytes + sum (map stScratch steps)
           , sum (map stReserve steps) + growth
-          , fromIntegral (length steps)
+          , jobsNeeded
           )
         InOrder →
           let leastBefore = scanl (\n st → n + stLeast st) 0 steps
            in ( maximum (0 : [fixedStaging + k * interestRecordBytes + stScratch st | (k, st) ← zip [1 ..] steps])
               , maximum (last leastBefore : [added + stReserve st | (added, st) ← zip leastBefore steps])
-              , 1
+              , if jobsNeeded > 0 then 1 else 0
               )
   if stagingPeak > stagingLimit then Left (Invalid (ExceedsBank StagingBank stagingPeak stagingLimit)) else Right ()
   if residentPeak > residentLimit then Left (Invalid (ExceedsBank ResidentBank residentPeak residentLimit)) else Right ()
@@ -935,7 +966,7 @@ planAdmission ∷ Model → ArenaId → Owner → [RegionDemand] → Extras → 
 planAdmission m arena owner demands extras = do
   -- Permanently invalid first, before anything that depends on state: the
   -- footprint cannot fit even from an empty model (see 'footprintCheck').
-  footprintCheck (mLimits m) AllAtOnce (exRequestBytes extras) (if exEdit extras then removalResidentGrowthBytes else 0) demands
+  footprintCheck m arena AllAtOnce (exRequestBytes extras) (if exEdit extras then removalResidentGrowthBytes else 0) demands
   permanent EditBank (if exEdit extras then removalRetainedBytes else 0)
   units ← mapM (planUnit m arena owner) demands
   let jobs = [j | UnitPlan {upJob = Just j} ← units]
@@ -1120,7 +1151,7 @@ setCamera m v a demands = do
     else Right ()
   -- Permanently invalid: in demand order, the footprint cannot fit even from an empty
   -- model (see 'footprintCheck'; the description is held for as long as the demand is).
-  footprintCheck limits InOrder newBytes 0 demands
+  footprintCheck m a InOrder newBytes 0 demands
   if newBytes > oldBytes && newBytes - oldBytes > freeBytes staging
     then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) (newBytes - oldBytes)))
     else Right ()

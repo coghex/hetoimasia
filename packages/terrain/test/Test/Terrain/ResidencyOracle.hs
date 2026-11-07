@@ -9,10 +9,11 @@
 --
 -- The decisions it checks:
 --
--- * __permanently invalid__ exactly when the request's minimum final footprint
---   cannot fit a bank or slot /even from an empty model/: one job for each region's
---   whole coverage, each with fresh region metadata (the owner's rule: everything
---   else is busy). It does not depend on the model's state at all;
+-- * __permanently invalid__ exactly when the cells the request still has to load
+--   (those no resident detail and no live job covers), sized as a fresh job would
+--   store them merged with the coverage already in the region, cannot fit a bank or
+--   slot. A request with nothing to load is never invalid; every other shortfall is
+--   busy (Requirement 7);
 -- * __admitted__ exactly when every slot and bank has room and the resident
 --   shortfall can be covered by some set of evictable regions, found here by
 --   trying /every subset/ of them (not by the model's least-recently-used walk);
@@ -104,10 +105,29 @@ oracle m arena demands removal
     scratchSum = sum [s | (_, _, _, s, _) ← ps]
     newJobs = toInteger (length [() | (_, _, _, _, True) ← ps])
 
-    -- From an empty model: one fresh job per region for its whole coverage.
-    emptyResident = sum [metadata + 48 * toInteger (coverageColumns (demandCoverage d)) + 96 * toInteger (coverageSegments (demandCoverage d)) | d ← demands] + growth
-    emptyStaging = interest * n + sum [256 + 2 * toInteger (coverageCells (demandCoverage d)) | d ← demands] + commandBytes + removalStaging
-    emptyJobs = n
+    -- What each region still has to load, sized merged with the coverage it has.
+    loads =
+      [ (reserveOf covered nw, 256 + 2 * toInteger (coverageCells nw))
+      | d ← demands
+      , let covered = coveredCells d
+      , Just nw ← [uncoveredBy (demandCoverage d) covered]
+      ]
+    coveredCells d = case (fmap regionCoverage (residentRegion d), promisedCover d) of
+      (Nothing, Nothing) → Nothing
+      (Just a, Nothing) → Just a
+      (Nothing, Just b) → Just b
+      (Just a, Just b) → Just (coverageUnion a b)
+    reserveOf covered nw =
+      let united = maybe nw (coverageUnion nw) covered
+          cols = maybe 0 coverageColumns covered
+          segs = maybe 0 coverageSegments covered
+          extra a b = if a > b then a - b else 0
+       in (if isNothing covered then metadata else 0)
+            + 48 * toInteger (extra (coverageColumns united) cols)
+            + 96 * toInteger (extra (coverageSegments united) segs)
+    emptyResident = sum (map fst loads) + growth
+    emptyStaging = interest * n + sum (map snd loads) + commandBytes + removalStaging
+    emptyJobs = toInteger (length loads)
 
     ledgers = independentLedgers m
     (residentOcc, residentRes) = both (resident ledgers)

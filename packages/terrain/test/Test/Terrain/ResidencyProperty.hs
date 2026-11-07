@@ -437,11 +437,13 @@ permanentlyInvalid r = case r of
   Left (Invalid (ExceedsSlot {})) → True
   _ → False
 
--- | The permanent classification of a query, a removal and a camera demand is the
--- same from an empty model and from a model with resident leftovers and an earlier
--- demand of the same view.
-permanentClassIsStateIndependent ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → [(Int, Int)] → Property
-permanentClassIsStateIndependent triple leftovers firstPicks picks =
+-- | By the rule that invalidity needs a footprint that cannot fit, a request that
+-- is invalid in any state is also invalid from an empty model (it only ever sheds
+-- cells already covered), and a request whose cells are all covered is never
+-- invalid. Checked for a query, a removal and a camera demand, from a model with
+-- resident leftovers and an earlier demand of the same view.
+permanentClassIsOnlyNarrower ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → [(Int, Int)] → Property
+permanentClassIsOnlyNarrower triple leftovers firstPicks picks =
   case limitsOf triple of
     Nothing → property True
     Just limits →
@@ -461,8 +463,8 @@ permanentClassIsStateIndependent triple leftovers firstPicks picks =
               <> [("camera", SetCameraDemand (ViewId 2) (ArenaId 1) demands) | not (null demands)]
        in conjoin
             [ counterexample
-                (what <> " is invalid from " <> (if permanentlyInvalid (snd (step empty event)) then "an empty model" else "the loaded model") <> " but not from the other: " <> show (event, limits))
-                (permanentlyInvalid (snd (step base event)) == permanentlyInvalid (snd (step empty event)))
+                (what <> " is invalid in the loaded model but not from an empty one: " <> show (event, limits))
+                (not (permanentlyInvalid (snd (step base event))) || permanentlyInvalid (snd (step empty event)))
             | (what, event) ← requests
             ]
 
@@ -479,13 +481,13 @@ spec = describe "Residency model properties" $ do
       forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
         forAll (vectorOf 4 pair) $ \picks →
           acceptedDemandCompletes limitsTriple picks
-  it "classifies a request as permanently invalid only by an empty model, whatever the model holds" $
+  it "never calls a request invalid in a loaded model unless it is invalid from an empty one" $
     withNumTests 3000 $
       forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
         forAll (vectorOf 3 pair) $ \leftovers →
           forAll (vectorOf 4 pair) $ \firstPicks →
             forAll (vectorOf 4 pair) $ \picks →
-              permanentClassIsStateIndependent limitsTriple leftovers firstPicks picks
+              permanentClassIsOnlyNarrower limitsTriple leftovers firstPicks picks
   it "exercises completion, eviction, commit, refusal and retirement in a fixed long sequence" $ do
     let (outcome, stats) = runSequence (lcg 7 12000)
     outcome `shouldSatisfy` either (const False) (const True)
@@ -503,7 +505,7 @@ spec = describe "Residency model properties" $ do
       , ("replaced", replaced, 1)
       , ("oracle: admitted", oracleAdmit, 100)
       , ("oracle: busy", oracleNotNow, 100)
-      , ("oracle: invalid", oracleNever, 10)
+      , ("oracle: invalid", oracleNever, 5)
       ]
   it "reaches supersede, cancel and acknowledge interleavings under room for concurrent work" $ do
     let (outcome, stats) = runSequenceWith roomyPressure (lcg 11 12000)
