@@ -170,3 +170,7 @@ accounting.
 | Unsupported region keys accepted | the region-boundary example |
 | The owner reports the shared index growth as the region's columns | the cycle example and the shared-column eviction example |
 | A removal commit does not add the rebuilt segment growth | the growth-contract and compressed-segment examples |
+| Retirement settles with a victim release outstanding | the cross-arena retirement example and the random properties |
+| A successful replacement drops its cancellation lists | the replacement-report example |
+| The camera footprint counts one interest only | the multi-region footprint example |
+| Pinned camera regions not bounded by the resident bank | the multi-region footprint example |

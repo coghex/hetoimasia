@@ -542,9 +542,13 @@ Checks run in a fixed order and the first failure is reported:
 1. **Invalid** (permanent): an empty, oversized or duplicated demand, a region key
    that names a tile outside the supported coordinate range (`UnsupportedRegion`,
    checked at the lowest and highest cell of the region), a region whose minimal
-   reservation exceeds a bank's configured total (for a camera demand, together with
-   its description: the description and a region job must coexist), or more of a
-   slot than exists. Never busy, so explicit work cannot stay busy forever.
+   reservation exceeds a bank's configured total, or more of a slot than exists. A
+   camera demand is also measured by what it must hold while it completes: its
+   description, an interest for every region it names (each stays for as long as the
+   demand does) and the scratch of its largest job must fit staging, and the least
+   each named region can occupy (metadata, columns, segments and two payload bytes
+   per segment) must fit the resident bank together, because the interests pin those
+   regions. Never busy, so explicit work cannot stay busy forever.
 2. **RetainedEditsExhausted** (edits only): the committed bytes plus this edit exceed
    the bank even with every reservation returned. It names the bank and persists until
    an arena's teardown frees retained bytes; the public Lua mapping stays `busy`
@@ -579,7 +583,9 @@ Camera demand is latest-value state per view: bounded (a description of at most
 events. Replacing it withdraws only that view's obsolete interests, in a retained
 region as well as in a dropped one: a region whose new coverage cannot be admitted
 yet keeps no interest in the coverage it replaced, and what the withdrawal freed is
-offered to the pending regions in the same step. Shared work is kept. Each region is admitted as its own unit; what is not admitted stays
+offered to the pending regions in the same step. Shared work is kept; the jobs the
+replacement made obsolete are reported (dropped at once if queued, awaiting their
+acknowledgement if running), whether or not the replacement was admitted. Each region is admitted as its own unit; what is not admitted stays
 as coalesced pending demand, holds nothing, and is retried by the owner's
 `Service` quantum.
 
@@ -613,7 +619,9 @@ demand.
 `RetireArena` takes an incarnation the owner supplies. It withdraws that
 incarnation's requests, interests and camera demand; its resident, staging and
 retained-edit charges become releasable only after its in-flight jobs, borrowers,
-pins and handoffs acknowledge, in the same step as the last acknowledgement. Later
+pins and handoffs acknowledge, and after the owner has reported the release of every
+region of it that was committed as another admission's victim (that credit funds the
+other admission only at the release), in the same step as the last acknowledgement. Later
 results for the incarnation are stale. The owner still performs the real close.
 
 ### What later owners must supply
