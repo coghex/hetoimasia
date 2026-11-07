@@ -194,7 +194,7 @@ accounting.
 | The oldest evictable region is never a victim | the least-recently-used and funded-eviction examples and the oracle |
 | An empty-model footprint that reads the model (resident regions subtracted) | the empty-model example, the state-independence property and the random sequences |
 | The empty-model footprint omits region metadata | seven examples including the accepted-demand-completes property |
-| The empty-model footprint omits a removal growth | the removal footprint examples and the oracle |
+| The empty-model footprint omits a removal growth | the removal boundary example (461 refuses, 462 admits) |
 
 ### Randomized properties
 
