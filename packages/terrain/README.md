@@ -543,12 +543,16 @@ Checks run in a fixed order and the first failure is reported:
    that names a tile outside the supported coordinate range (`UnsupportedRegion`,
    checked at the lowest and highest cell of the region), a region whose minimal
    reservation exceeds a bank's configured total, or more of a slot than exists. A
-   camera demand is also measured by what it must hold while it completes: its
-   description, an interest for every region it names (each stays for as long as the
-   demand does) and the scratch of its largest job must fit staging, and the least
-   each named region can occupy (metadata, columns, segments and two payload bytes
-   per segment) must fit the resident bank together, because the interests pin those
-   regions, with the last job to complete holding its whole reservation. Never busy, so explicit work cannot stay busy forever.
+   camera demand is also judged in the order its regions are admitted (the order of
+   the demand), by what it must hold while it completes, counting only what is not
+   already resident or promised to other work. At each step staging must hold its
+   description, one record for each interest the demand has added so far (each stays
+   for as long as the demand does) and the scratch of the job being loaded, and the
+   resident bank must hold every earlier region the demand loads, pinned at no less
+   than its least size (metadata, columns, segments and two payload bytes per
+   segment), beside that job's whole reservation. If some step cannot fit, the
+   demand can never complete; a demand that passes can still wait on pressure. Never
+   busy, so explicit work cannot stay busy forever.
 2. **RetainedEditsExhausted** (edits only): the committed bytes plus this edit exceed
    the bank even with every reservation returned. It names the bank and persists until
    an arena's teardown frees retained bytes; the public Lua mapping stays `busy`
@@ -573,9 +577,10 @@ dropped.
 A request names the arena's current revision or is stale. Revisions change only at
 `RemovalCommitted`, and a removal changes exactly one region. Work for other regions
 carries over; queued work for the changed region is dropped, running work is
-marked stale and discarded at completion, and the owners whose demand lost work
-are reported with the queued jobs that were dropped and the running jobs now stale.
-Every event that leaves a job without an interest (a withdrawal, a camera
+superseded: it becomes cancelling, so its result is discarded and the owner's
+completion or acknowledgement releases its slot, scratch and reservation. The owners
+whose demand lost work are reported with the queued jobs that were dropped and the
+running jobs now cancelling. Every event that leaves a job without an interest (a withdrawal, a camera
 replacement, a failure that drops the interests it served, a commit) reports the
 jobs it dropped at once and the running ones awaiting acknowledgement.
 
@@ -588,9 +593,12 @@ region as well as in a dropped one: a region whose new coverage cannot be admitt
 yet keeps no interest in the coverage it replaced, and what the withdrawal freed is
 offered to the pending regions in the same step. Shared work is kept; the jobs the
 replacement made obsolete are reported (dropped at once if queued, awaiting their
-acknowledgement if running), whether or not the replacement was admitted. Each region is admitted as its own unit; what is not admitted stays
-as coalesced pending demand, holds nothing, and is retried by the owner's
-`Service` quantum.
+acknowledgement if running), whether or not the replacement was admitted. Each region
+is admitted as its own unit, strictly in the order of the demand: the first region
+that cannot be admitted holds back the regions after it, so a later region never
+takes room an earlier one needs (this is the order the feasibility check above
+measures). What is not admitted stays as coalesced pending demand, holds nothing,
+and is retried in the same order by the owner's `Service` quantum.
 
 ### Eviction, holds and handoffs
 
