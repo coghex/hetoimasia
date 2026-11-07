@@ -25,7 +25,7 @@ concrete precondition
 ## Processing status
 
 - [x] EPIC. Establish Ecce Homo's flat terrain with on-demand chunk loading — [#636]
-- [ ] TRA-1. Define terrain coordinates and shared shape geometry
+- [x] TRA-1. Define terrain coordinates and shared shape geometry — [#637]
 - [ ] TRA-2. Implement layered sources and compressed terrain changes
 - [ ] TRA-3. Define bounded horizontal and vertical residency
 - [ ] TRA-4. Implement the transactional terrain service
