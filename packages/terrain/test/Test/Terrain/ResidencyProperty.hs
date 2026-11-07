@@ -29,10 +29,11 @@ module Test.Terrain.ResidencyProperty (spec) where
 
 import Control.Monad (forM_, unless)
 import Data.Maybe (fromMaybe, listToMaybe)
-import Hetoimasia.Terrain.Coordinate (tileCoord)
+import Hetoimasia.Terrain.Coordinate (decomposeTile, tileCoord)
 import Hetoimasia.Terrain.Residency
 import Test.Hspec
 import Test.QuickCheck
+import Test.Terrain.ResidencyOracle (Verdict (..), oracle)
 import Test.Terrain.ResidencySupport
 
 -- | Tight enough that every kind of pressure occurs within a few events.
@@ -153,9 +154,31 @@ eventFor m (k, a, b) = case k `mod` 22 of
       let c = jobCoverage j
        in JobCompleted (jobId j) (Cost 0 (coverageSegments c) (coverageCells c))
 
+-- | For an explicit query or removal that is otherwise well formed, the class the
+-- brute-force oracle says the answer must be, and the class the model gave.
+oracleClasses ∷ Model → Event → Either Refusal Report → Maybe (Verdict, Verdict)
+oracleClasses prior event result = do
+  (rid, arena, rev, demands, removal) ← case event of
+    SubmitQuery r a v ds → Just (r, a, v, ds, False)
+    SubmitRemoval r a v tile → let (region, local) = decomposeTile tile in Just (r, a, v, [RegionDemand region (coverageTile local)], True)
+    _ → Nothing
+  info ← listToMaybe [x | x ← modelArenas prior, arenaId x == arena, arenaPhase x == ArenaLive]
+  if arenaRevision info == rev && rid `notElem` [requestId r | r ← modelRequests prior] then Just () else Nothing
+  if not (null demands) && length demands <= 3 && distinct (map demandRegion demands) then Just () else Nothing
+  got ← case result of
+    Right _ → Just Admit
+    Left (Busy _) → Just NotNow
+    Left (Invalid (ExceedsBank _ _ _)) → Just Never
+    Left (Invalid (ExceedsSlot _ _ _)) → Just Never
+    Left (RetainedEditsExhausted {}) → Just Exhausted
+    Left _ → Nothing
+  Just (oracle prior arena demands removal, got)
+  where
+    distinct xs = length xs == length (foldr (\x acc → if x `elem` acc then acc else x : acc) [] xs)
+
 -- | The properties after one event; 'Nothing' means all hold.
-check ∷ Model → Model → Either Refusal Report → Maybe String
-check prior latest result = case result of
+check ∷ Event → Model → Model → Either Refusal Report → Maybe String
+check event prior latest result = case result of
   Left _
     | latest /= prior → Just "a refusal changed the model"
   _ →
@@ -176,6 +199,9 @@ check prior latest result = case result of
           , arenaRetainedBytes new < arenaRetainedBytes old
           ]
       , ownerCanSettle latest
+      , case oracleClasses prior event result of
+          Just (expected, got) | expected /= got → Just ("the model answered " <> show got <> " where the brute-force oracle says " <> show expected <> " for " <> show event)
+          _ → Nothing
       , listToMaybe
           [ "changed region " <> show (regionCoord r) <> " lost without a handoff"
           | r ← modelRegions prior
@@ -257,15 +283,15 @@ roomyPressure =
       }
 
 runSequenceWith ∷ Limits → [(Int, Int, Int)] → (Either String Model, Stats)
-runSequenceWith limits seeds = go (newModel limits) seeds (Stats 0 0 0 0 0 0 0 0 0)
+runSequenceWith limits seeds = go (newModel limits) seeds (Stats 0 0 0 0 0 0 0 0 0 0 0 0 0)
   where
     go m [] st = (settleEverything m, st)
     go m (s : rest) st =
       let event = eventFor m s
           (m', result) = step m event
-       in case check m m' result of
+       in case check event m m' result of
             Just why → (Left (why <> " after " <> show event), st)
-            Nothing → go m' rest (tally event result st)
+            Nothing → go m' rest (tally m event result st)
 
 data Stats = Stats
   { accepted ∷ !Int
@@ -280,12 +306,27 @@ data Stats = Stats
     acknowledged ∷ !Int
   , -- | Camera replacements that cancelled or dropped obsolete work.
     replaced ∷ !Int
+  , -- | Decisions the brute-force oracle checked, by the class it expected.
+    oracleAdmit ∷ !Int
+  , oracleNotNow ∷ !Int
+  , oracleNever ∷ !Int
+  , oracleExhausted ∷ !Int
   }
   deriving stock (Eq, Show)
 
-tally ∷ Event → Either Refusal Report → Stats → Stats
-tally _ (Left _) st = st {refused = refused st + 1}
-tally event (Right report) st =
+tally ∷ Model → Event → Either Refusal Report → Stats → Stats
+tally prior event result st0 = withOracle (tallyResult event result st0)
+  where
+    withOracle st = case oracleClasses prior event result of
+      Just (Admit, _) → st {oracleAdmit = oracleAdmit st + 1}
+      Just (NotNow, _) → st {oracleNotNow = oracleNotNow st + 1}
+      Just (Never, _) → st {oracleNever = oracleNever st + 1}
+      Just (Exhausted, _) → st {oracleExhausted = oracleExhausted st + 1}
+      Nothing → st
+
+tallyResult ∷ Event → Either Refusal Report → Stats → Stats
+tallyResult _ (Left _) st = st {refused = refused st + 1}
+tallyResult event (Right report) st =
   let st' = st {accepted = accepted st + 1, retired = retired st + length (reportSettled report)}
    in case reportDecision report of
         Published _ _ → st' {completed = completed st' + 1}
@@ -452,6 +493,9 @@ spec = describe "Residency model properties" $ do
       , ("retired arenas", retired, 1)
       , ("acknowledged", acknowledged, 1)
       , ("replaced", replaced, 1)
+      , ("oracle: admitted", oracleAdmit, 100)
+      , ("oracle: busy", oracleNotNow, 100)
+      , ("oracle: invalid", oracleNever, 10)
       ]
   it "reaches supersede, cancel and acknowledge interleavings under room for concurrent work" $ do
     let (outcome, stats) = runSequenceWith roomyPressure (lcg 11 12000)

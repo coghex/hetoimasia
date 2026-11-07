@@ -87,6 +87,7 @@ test-suite terrain-tests
         Test.Terrain.Query
         Test.Terrain.Residency
         Test.Terrain.ResidencyCycle
+        Test.Terrain.ResidencyOracle
         Test.Terrain.ResidencyProperty
         Test.Terrain.ResidencySupport
         Test.Terrain.Resident
