@@ -735,6 +735,31 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       other → expectationFailure (show other)
     m8 ← stepsOk m7 [Dispatch, JobCompleted (JobId 1) costB]
     map viewPending (modelViews m8) `shouldBe` [[]]
+  it "admits regions strictly in demand order, so a later region never takes room an earlier one needs" $ do
+    -- 1,594 resident bytes. A (two columns) least 420 / reserves 544; B (a 3 x 2 x 4
+    -- block, six columns) least 748 / reserves 1,120; C (one 32-cell column) least
+    -- 338 / reserves 400. In order: 544; then 420 + 1,120 = 1,540; then 1,168 + 400
+    -- = 1,568. All fit. Admitting C ahead of B would pin 420 + 338 and leave 836 < 1,120.
+    let a' = demand (reg 4 0 0) (coverageUnion (cell 0 0 0) (cell 1 0 0))
+        b' = demand (reg 1 0 0) (box 0 3 0 2 0 4)
+        c' = demand (reg 3 0 0) (box 0 1 0 1 0 32)
+    m0 ← opened (limitsWith $ \x → x {specResidentBytes = 1594, specStagingBytes = 1029, specLoadJobs = 2})
+    (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 [a', b', c'])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ → (length admitted, waiting) `shouldBe` (1, [reg 1 0 0, reg 3 0 0])
+      other → expectationFailure (show other)
+    m2 ← stepsOk m1 [Dispatch, JobCompleted (JobId 0) (Cost 2 2 4)]
+    (m3, second) ← stepOk m2 Service
+    case reportDecision second of
+      Serviced [(ViewId 1, x)] → admissionJobs x `shouldBe` [(JobId 1, reg 1 0 0)]
+      other → expectationFailure (show other)
+    m4 ← stepsOk m3 [Dispatch, JobCompleted (JobId 1) (Cost 6 6 12)]
+    (m5, third) ← stepOk m4 Service
+    case reportDecision third of
+      Serviced [(ViewId 1, x)] → admissionJobs x `shouldBe` [(JobId 2, reg 3 0 0)]
+      other → expectationFailure (show other)
+    m6 ← stepsOk m5 [Dispatch, JobCompleted (JobId 2) oneCellCost]
+    map viewPending (modelViews m6) `shouldBe` [[]]
   it "does not call a demand impossible for work that is already resident" $ do
     -- From scratch this demand would need 192 + 64 + 258 = 514 staging bytes, over
     -- the 500 available; the region is already resident, so it needs only 256.
