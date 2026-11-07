@@ -59,7 +59,7 @@ lattice. The same property was run once locally with 2,500 scenes of a larger bo
 
 ## Negative controls
 
-Pixel snapping at zooms that are not a multiple of 1/8 is refused, because the
+Pixel snapping at world scales that are not a multiple of 1/8 is refused, because the
 recorder's separate rounding of each instance origin opens cracks between
 adjacent faces (found in review round 1). Each protected behaviour was broken once locally, keeping the scenario, and the
 suite failed; none is committed.
@@ -81,6 +81,8 @@ suite failed; none is committed.
 | Ignore the framebuffer extent | 1 |
 | No maximum visibility depth | 1 |
 | Skip the representability check | 1 |
+| Judge snapping by the camera zoom, not the mapping's scale | 1 |
+| Ask for levels outside the supported range | 1 |
 
 ## Claims left for TRA-8
 
