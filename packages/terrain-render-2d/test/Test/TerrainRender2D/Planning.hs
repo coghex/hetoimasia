@@ -376,6 +376,13 @@ spec = describe "Planning" $ do
       limited (\l → l {limitFaces = -1}) `shouldBe'` InvalidPlanConfig
       limited (\l → l {limitDemandChunks = -1}) `shouldBe'` InvalidPlanConfig
       limited (\l → l {limitKeys = 16777217}) `shouldBe'` InvalidPlanConfig
+    it "accepts exactly the number of columns a plan examines and refuses one fewer, whatever the view" $
+      forM_ [(setup 288 144, 1, 250), (setup 960 540, 0.125, 250), (setup 960 540, 8, 250), (setup 480 480, 1, 0), (setup 100 1000, 0.5, 40)] $ \(vs, zoom, depth) → do
+        let cam = stepCamera (either (error . show) id (applyCommand defaultCameraConfig facts (SetZoom zoom) camera))
+            with f = planWith (\r → r {requestConfig = (requestConfig r) {pcDepth = depth, pcLimits = f (pcLimits (requestConfig r))}}) vs cam facts
+            columns = either (error . show) (statColumns . planStats) (with id)
+        with (\l → l {limitColumns = columns}) `shouldSatisfy` isRight'
+        if columns > 0 then with (\l → l {limitColumns = columns - 1}) `shouldBe'` PlanInsufficient LimitColumns else pure ()
     it "accepts exactly at a bound" $ do
       limited (\l → l {limitFaces = 3, limitKeys = 3}) `shouldSatisfy` isRight'
       let examined = statLevelsEvaluated (planStats (plan (setup 288 144) camera facts))

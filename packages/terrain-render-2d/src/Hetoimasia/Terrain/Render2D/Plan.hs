@@ -454,7 +454,7 @@ zeroDrawable setup =
 candidates ∷ PlanLimits → Rect → Integer → Integer → Integer → Either PlanError [Cand]
 candidates limits (Rect x1 x2 y1 y2) ref clip bandLo
   | bandLo > clip = Right []
-  | width * height > 2 * toInteger (limitColumns limits) + 2 = Left (PlanInsufficient LimitColumns)
+  | width * height > 4 * toInteger (limitColumns limits) + 4 = Left (PlanInsufficient LimitColumns)
   | not (null (drop (limitColumns limits) found)) = Left (PlanInsufficient LimitColumns)
   | otherwise = Right found
   where
