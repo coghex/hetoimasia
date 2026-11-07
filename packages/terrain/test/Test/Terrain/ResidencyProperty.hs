@@ -607,6 +607,26 @@ explicitWithCameraPresent seeds picks =
       Left (RetainedEditsExhausted {}) → what == "removal"
       Left _ → False
 
+-- | A camera description is never kept longer than the camera can start: whatever the
+-- staging, a non-empty description that is retained has its first region admitted at
+-- once (an interest or a job), so the camera never sits pending with nothing in flight.
+cameraStartsWhatItKeeps ∷ Integer → [(Int, Int)] → Property
+cameraStartsWhatItKeeps staging picks = case limitsNear 4384 staging of
+  Nothing → counterexample ("a configuration at the minimum was refused: " <> show staging) False
+  Just limits →
+    let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
+        demands = [demandAt x j | (x, j) ← picks]
+        distinct = foldr (\d acc → if demandRegion d `elem` map demandRegion acc then acc else d : acc) [] demands
+     in case step start (SetCameraDemand (ViewId 1) (ArenaId 1) distinct) of
+          (m, Right _) →
+            conjoin
+              [ counterexample ("a retained description of " <> show (length (viewDemand v)) <> " regions started none of them at " <> show staging) $
+                  length (viewPending v) < length (viewDemand v)
+              | v ← modelViews m
+              , not (null (viewDemand v))
+              ]
+          (_, Left r) → counterexample ("the camera demand was refused: " <> show r) False
+
 -- | A request over its caps is invalid from every state, with a typed reason.
 overCapAlwaysInvalid ∷ [(Int, Int, Int)] → Property
 overCapAlwaysInvalid seeds =
@@ -707,6 +727,9 @@ spec = describe "Residency model properties" $ do
         let (outcome, stats) = runSequenceWith limits (lcg 21 12000)
         outcome `shouldSatisfy` either (const False) (const True)
         accepted stats `shouldSatisfy` (> 1000)
+  it "starts the first region of every camera description it retains, at any staging from the minimum" $
+    withNumTests 2000 $
+      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \picks → cameraStartsWhatItKeeps staging picks
   it "never reserves more for an explicit request than the construction-time worst case" $
     withNumTests 2000 $
       forAll (vectorOf 3 pair) reservationWithinMinimum

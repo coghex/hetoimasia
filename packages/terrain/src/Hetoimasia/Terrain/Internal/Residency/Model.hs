@@ -1164,8 +1164,20 @@ setCamera m v a demands0 = do
       oldBytes = maybe 0 (descriptionBytes . fromIntegral . length . vwDemand) (Map.lookup v (mViews m))
       staging = bankLedger m StagingBank
       share = cameraFree m staging + oldBytes
-      fitting = if share >= descriptionBytes 0 then (share - descriptionBytes 0) `div` 64 else 0
-      keep = fromIntegral (min (min (fromIntegral (length normal)) (limitCameraRegions limits)) fitting) ∷ Int
+      -- The description must leave room for the camera to progress: beside it, the
+      -- interest and scratch of the first region of the prefix this view has no interest
+      -- in yet. A description that kept more regions than it can start would stall.
+      covered d = case Map.lookup (a, demandRegion d) (mTargets m) >>= Map.lookup (OwnerView v) . tgInterests of
+        Just i → coverageSubset (demandCoverage d) (inCoverage i)
+        Nothing → False
+      leading = length (takeWhile covered normal)
+      unit = case drop leading normal of
+        (d : _) → interestRecordBytes + scratchBytes (demandCoverage d)
+        [] → 0
+      regionsFor room = if room >= descriptionBytes 0 then fromIntegral ((room - descriptionBytes 0) `div` 64) else 0 ∷ Int
+      most = min (length normal) (fromIntegral (limitCameraRegions limits))
+      withStart = if share >= unit then min most (regionsFor (share - unit)) else 0
+      keep = if withStart > leading then withStart else min leading (min most (regionsFor share))
       demands = take keep normal
       truncated = map demandRegion (drop keep normal)
   if null demands

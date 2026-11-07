@@ -941,7 +941,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- waits, holds nothing, and A is kept.
     let regionA = demand (reg 0 0 0) (cell 0 0 0)
         regionB = demand (reg 1 0 0) (cell 0 0 0)
-    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1500, specQueuedCommands = 8, specCameraRegions = 64})
+    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1500, specStagingBytes = 4096, specQueuedCommands = 8, specCameraRegions = 64})
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m2 ← fst <$> stepOk m1 (SetCameraDemand (ViewId 1) a1 [regionA])
     m2' ← foldM (\m i → loadCell m i (reg (i + 1) 0 0) (cell 0 0 0)) m2 [2, 3, 4]
@@ -981,7 +981,7 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- must not: A waits (busy).
     let regionA = demand (reg 0 0 0) (cell 0 0 0)
         regionB = demand (reg 1 0 0) (cell 0 0 0)
-    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1500, specQueuedCommands = 8, specCameraRegions = 64})
+    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1500, specStagingBytes = 4096, specQueuedCommands = 8, specCameraRegions = 64})
     m1 ← loadCell m0 1 (reg 1 0 0) (cell 0 0 0) >>= \m → withdraw m 1
     m1' ← foldM (\m i → loadCell m i (reg (i + 1) 0 0) (cell 0 0 0)) m1 [2, 3, 4]
     (m2, held) ← stepOk m1' (SetCameraDemand (ViewId 1) a1 [regionA, regionB])
@@ -1090,23 +1090,22 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     (_, removal) ← stepOk m1 (SubmitRemoval (RequestId 1) a1 rev0 (tileAt 16 0 0))
     length (admissionJobs (admission removal)) `shouldBe` 1
   it "withdraws the interest in the coverage a busy replacement replaced" $ do
-    -- 1,510 staging bytes: 994 stay free for explicit requests. View 1 holds level 0 of
-    -- region A (description 192 + interest 64 once the job's scratch is released) and a
-    -- borrower's record takes 64 more. The replacement, both levels of A, needs 258
-    -- bytes of scratch for level 1 beside the headroom and only 1,188 - 994 = 194 are
-    -- left: it is busy, and the old interest must not survive it.
+    -- Extent 1 x 1 x 2, 1,560 resident bytes: explicit work needs 1,032 and a camera job
+    -- 516, leaving the camera 528. View 1 holds level 0 of region A (338 of detail). View
+    -- 2's load of region B (400 reserved) is in flight, so view 1's replacement, both
+    -- levels of A (a 144-byte job in a region holding 338), would put 882 of the camera's
+    -- in flight: it is busy, and the old interest must not survive it.
     let both = demand (reg 0 0 0) (box 0 1 0 1 0 2)
-        limits = limitsWith $ \x → x {specResidentBytes = 4000, specStagingBytes = 1510, specExtentZ = 2, specHoldRegions = 1, specCameraRegions = 64}
+        limits = limitsWith $ \x → x {specResidentBytes = 1560, specStagingBytes = 4096, specExtentZ = 2, specCameraRegions = 64}
     m0 ← opened limits
-    m1a ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch, JobCompleted (JobId 0) oneCellCost]
-    -- A borrower's 64-byte record takes the room the replacement's scratch needs.
-    (m1, _) ← stepOk m1a (AcquireHold (HoldId 1) a1 Borrow [reg 0 0 0])
-    (m2, replaced) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [both])
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch, JobCompleted (JobId 0) oneCellCost]
+    m1b ← fst <$> stepOk m1 (SetCameraDemand (ViewId 2) a1 [demand (reg 1 0 0) (cell 0 0 0)])
+    (m2, replaced) ← stepOk m1b (SetCameraDemand (ViewId 1) a1 [both])
     case reportDecision replaced of
       CameraSet admitted waiting withdrawn _ _ _ _ → (length admitted, waiting, withdrawn) `shouldBe` (0, [reg 0 0 0], [reg 0 0 0])
       other → expectationFailure (show other)
     [o | InterestInfo o _ r _ ← modelInterests m2, r == reg 0 0 0] `shouldBe` []
-    map viewPending (modelViews m2) `shouldBe` [[reg 0 0 0]]
+    map viewPending (modelViews m2) `shouldBe` [[reg 0 0 0], []]
   it "admits explicit work however the camera pins and re-pins: pinned bytes never take the explicit headroom" $ do
     -- 1,664 resident bytes: 964 stay for explicit work, so pins and camera jobs in flight
     -- may take 700, and a held region is charged at its stored maximum (338). A camera
@@ -1275,6 +1274,24 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     let odds = foldr1 coverageUnion [cell 0 0 z | z ← [0, 2 .. 30]]
     (_, explicit) ← stepOk m4 (SubmitQuery (RequestId 9) a1 rev0 [demand (reg 5 0 0) odds])
     length (admissionJobs (admission explicit)) `shouldBe` 1
+  it "keeps a description no longer than the camera can start: the first region's interest and scratch fit beside it" $ do
+    -- 1,446 resident and 1,508 staging bytes, the least a camera-enabled configuration of
+    -- this extent allows (994 stay for explicit work, leaving a camera share of 514). One
+    -- region needs a 192-byte description, 64 of interest and 258 of scratch: 514. A
+    -- two-region description (256 bytes) would leave 258, too little to start its first
+    -- region, so it is cut to one region, the other reported, and the camera progresses.
+    let limits = limitsWith $ \x → x {specResidentBytes = 1446, specStagingBytes = 1508, specCameraRegions = 64}
+        two = [demand (reg i 0 0) (cell 0 0 0) | i ← [0, 1]]
+    mkLimits baseSpec {specResidentBytes = 1445, specStagingBytes = 1508, specCameraRegions = 64} `shouldBe` Left (BankBelowMinimum ResidentBank 1446 1445)
+    mkLimits baseSpec {specResidentBytes = 1446, specStagingBytes = 1507, specCameraRegions = 64} `shouldBe` Left (BankBelowMinimum StagingBank 1508 1507)
+    m0 ← opened limits
+    (m1, set) ← stepOk m0 (SetCameraDemand (ViewId 1) a1 two)
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ excluded truncated → (map (map snd . admissionJobs) admitted, waiting, excluded, truncated) `shouldBe` ([[reg 0 0 0]], [], [], [reg 1 0 0])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m1) `shouldBe` [[reg 0 0 0]]
+    m2 ← drainDemand m1
+    map viewPending (modelViews m2) `shouldBe` [[]]
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
