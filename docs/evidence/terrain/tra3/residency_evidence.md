@@ -208,4 +208,31 @@ it is alone. The fixed sequences assert workload floors so that a degenerate
 generator fails: for example under the roomy profile at least 4,000 accepted events,
 40 commits, 3 superseding commits, 20 acknowledgements and 20 camera replacements
 that cancel work.
+| A demand may evict its own regions | the accepted-demand-completes property |
+| Camera staging ignores interests held in later regions | the later-interests example and the property |
+| Camera resident ignores later resident regions | the replacement, own-region and property examples |
+| An explicit request ignores the resident regions it names | the complete-footprint example, the compressed-segment example and the quiescent property |
+| Promised work counted far above its least (unsound) | the promised-work example and shared-job examples |
+
+From non-empty states the properties found two further defects before the last review round: a demand evicting a resident region it names later (so that it could never complete), and a staging bound that ignored interests the view already held in later regions. Both are fixed and pinned by examples. The properties now start from models with resident leftovers and an earlier settled demand of the same view, run 2,000 cases each, and were repeated under ten fresh random seeds.
+| A job-slot refusal off by one | the brute-force oracle ("the model answered busy where the oracle says admit") |
+| A request may evict the regions it names | the brute-force oracle and the quiescent property |
+| A staging shortfall off by one byte | the scripted bank-full examples |
+| The oldest evictable region is never a victim | the least-recently-used and funded-eviction examples and the oracle |
+
+### Brute-force admission oracle
+
+`Test.Terrain.ResidencyOracle` re-derives the class of every explicit admission
+decision from the model's observations alone and the contract's charge table
+restated by hand, and the random-sequence property compares it with the model at
+every query and removal in every run: __permanently invalid__ exactly when the
+request's minimum final footprint (the resident regions it names, which it cannot
+evict, plus a job's whole reservation for every cell neither resident nor promised,
+plus the least that promised work leaves stored) exceeds a bank or slot;
+__admitted__ exactly when every slot and bank has room and the resident shortfall
+can be covered by some set of regions nothing needs, found by trying every subset
+of them rather than the model's least-recently-used walk; __busy__ otherwise (and
+__exhausted__ for a removal the retained-edit bank cannot take). Over the fixed
+sequences it checked hundreds of admitted, busy and invalid decisions and never
+disagreed with the model; it fails if the workload does not reach each class.
 
