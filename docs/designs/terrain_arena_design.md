@@ -55,6 +55,10 @@ D-38 makes sky and initially sky-connected cavities discovered from the start,
 without requiring their residency. Concurrent openings of a previously sealed
 cavity must share safe bounded discovery, never expand across the open sky.
 
+D-39 approves the shared discovery-work mechanism: distinguish unseen,
+pending and expanded regions; share overlapping fronts, seed new edit-created
+connections and stop only outward branches at known exterior.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1177,6 +1181,29 @@ engineering mechanism, not an owner-approved queue/source representation.
 Exact initial-knowledge derivation, publication/cancellation and capacity
 contracts remain for review before amendment readiness.
 
+### D-39. Share bounded discovery work across overlapping openings
+
+Owner, directly in this design pane on 2026-11-07, answered “that sounds good”
+to the proposed shared discovery queue and its two-opening explanation.
+
+Use shared arena-owned discovery work with distinct undiscovered,
+pending-exploration and fully-explored states. Each new excavation seeds the
+connections it creates, including connections adjacent to already-explored
+terrain. Pending regions retain their unfinished branches and boundary-load
+obligations. When two fronts meet, they share that work rather than duplicate
+it or cancel each other's remaining exploration.
+
+Already-known exterior ends the outward branch only; finding an exit does not
+finish the cavern. Prior knowledge and pending work remain distinguishable
+from the fact that a newly opened cavity now physically connects to sky.
+Process the work in bounded steps under the existing terrain-owner model,
+preserving whole-space discovery, retention and camera responsiveness.
+
+This approves the shared-work mechanism presented in P-7. It does not approve
+its still-open exact source-metadata compiler, shape/component encoding,
+capacity policy, disk backing, API result types or commit/cancellation details.
+Those remain concrete contract work under Q-16/Q-20 and the final Q-19 review.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2079,7 +2106,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-38 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-39 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2116,7 +2143,8 @@ D-37 resolves fog interaction: fog is unselectable, returns no player target
 and blocks screen picks/removal of the terrain it conceals.
 D-38 starts sky and initially exterior-connected spaces discovered and requires
 overlapping unsealing operations to preserve all pending discovery without
-expanding across the exterior. P-7 proposes the bounded shared-work mechanism.
+expanding across the exterior. D-39 approves the bounded shared-work mechanism
+in P-7; its remaining concrete representation/capacity choices are still open.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2152,11 +2180,14 @@ dependency insertion and existing-issue revisions await Q-16–Q-20; the ledger
 and delivery plan remain the original filed arc until those changes receive
 sign-off. No final issue bodies are drafted here.
 
-### P-7. Proposed bounded discovery mechanism for overlapping openings
+### P-7. Shared discovery mechanism — D-39 approved, concrete details open
 
-This is an engineering proposal implementing D-31–D-38, not a new D-number or
-a claim that the algorithm is implemented. It builds on P-5's existing single
-terrain owner, serialized edit commits and bounded round-robin work quanta.
+The high-level shared-work mechanism implementing D-31–D-38 is approved by
+D-39. The detailed engineering below still identifies representation,
+capacity, publication and source-compilation choices requiring a concrete
+contract; this is not a claim that the algorithm is implemented. It builds
+on P-5's existing single terrain owner, serialized edit commits and bounded
+round-robin work quanta.
 
 1. **Initial knowledge is a source property, not a global sky flood.** Derive
    or supply compact metadata for the immutable initial source's exterior-
@@ -2220,6 +2251,36 @@ layers); definition of completion for boundary loading with normal eviction;
 retained-discovery and pending-work capacity/refusal; API results and coherent
 publication. An enormous/infinite component cannot silently become an
 unbounded allocation, a completed partial reveal or an erased obligation.
+
+### P-8. Session retention backing — proposal, not yet approved
+
+The original P-5 keeps retained changes in memory, with a 32 MiB session-edit
+cap and new edits refused once that retention capacity is exhausted. Offloading
+reconstructible terrain does not free the authoritative changes it must retain.
+D-33 now adds retained discovery, including large connected cavities, making
+the backing policy an explicit amendment choice rather than a hidden extension
+of the old edit cap.
+
+Recommendation: introduce a temporary per-arena disk backing store for
+retained chunk edits and discovery, with a bounded RAM cache and asynchronous
+I/O. Keep only the active working set resident; committed retained records
+can be loaded and replayed when their chunks return. This is session storage,
+discarded on arena close/reset, not a user save or cross-run recovery feature.
+It would supersede the RAM-only retention policy if approved. It does not
+authorize unbounded disk consumption or silently store game saves.
+
+The tradeoff is additional storage/I/O lifecycle and failure handling now.
+The later concrete contract would need quotas, atomic offload, bounded queue
+and cache ownership, read/write errors, cleanup and pending-discovery recovery
+within the live arena. In particular, no acknowledged edit or revealed state
+may be evicted from RAM before the retained backing copy is safe to replay.
+
+Alternative: keep session retention RAM-only and expose its hard capacity
+limit. Under that policy, larger exploration can exhaust the knowledge/edit
+store even after resident chunks are evicted; discovery/edits then need an
+explicit refusal/paused-progress policy. Neither alternative makes an infinite
+region exhaustively materializable. This storage choice remains Q-20, and its
+scope must be incorporated in Q-19 before issue revisions are drafted.
 
 ## Open questions and review checkpoints
 
@@ -2399,7 +2460,7 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-38. Preserve fog over both solid and air until
+Partially resolved by D-31–D-39. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and loads the newly exposed
 boundary terrain, beyond the adjacent cells and across chunks, in bounded
@@ -2429,14 +2490,16 @@ continue through the cover; the temporary removal shortcut does nothing there.
 D-38 starts sky and initially sky-connected cavities discovered, without
 requiring all their detail resident. Later discovery applies to previously
 sealed space. Overlapping openings during progressive work must not flood the
-exterior, duplicate work or lose unprocessed branches. P-7 proposes shared
-claims/work and source-provided initial knowledge; it is not yet the final
-approved mechanism or concrete API contract.
+exterior, duplicate work or lose unprocessed branches. D-39 approves shared
+pending work, new-edit seeding and stopping only exterior branches. P-7's exact
+representations, source metadata and API/capacity contract remain open.
 
 Still open: specify and review the exact 16-shape solid/empty regions,
 openings and internal connectivity; derive/budget the initial exterior-connected
 knowledge metadata without scanning infinite sky. Specify completion and
-memory-pressure behavior for very large spaces, Lua/engine authority and concrete reset,
+memory-pressure behavior for very large spaces, including P-8's proposed
+temporary disk backing versus the earlier RAM-only retention cap. Specify
+Lua/engine authority and concrete reset,
 reveal-job resumability and replay/publication boundaries, including the API
 encoding of D-37's no-selectable-target fog result.
 
