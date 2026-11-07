@@ -171,7 +171,7 @@ locate polygon (px, py)
 
 -- | The pixel centres judged: every @stride@-th column and row, from an offset.
 sampled ∷ Int → (Int, Int) → [(Int, Int)]
-sampled step (w, h) = [(x, y) | y ← [1, 1 + step .. h - 1], x ← [1, 1 + step .. w - 1]]
+sampled step (w, h) = [(x, y) | y ← [2, 2 + step .. h - 1], x ← [2, 2 + step .. w - 1]]
 
 -- | The plane the hand-stated expectation finds at each covered pixel of a scene,
 -- on a stride: the scene's partition into faces, which two shapes with the same

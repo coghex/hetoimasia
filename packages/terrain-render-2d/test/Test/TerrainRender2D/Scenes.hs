@@ -68,7 +68,7 @@ spec = beforeAll loadEnv $ describe "Terrain scenes against the hand-stated expe
       it ("a staircase cut at level " <> show cut) $ \env → () <$ agrees env (staircase cut FaceSouth)
 
     it "the follow with its own 25-level headroom over authored varied heights" $ \env → () <$ agrees env (followHeadroom FaceSouth)
-    it "a floor 70 levels below the cut, deeper than a 32-level band and inside the 250-level cap" $ \env → () <$ agrees env (deepFloor FaceSouth)
+    it "a floor 34 levels below the cut, deeper than a 32-level band and inside the 250-level cap" $ \env → () <$ agrees env (deepFloor FaceSouth)
 
   describe "view variants" $ do
     forM_ [0.125, 0.5, 1, 1.5, 4, 8] $ \zoom →

@@ -6,7 +6,6 @@ module Test.TerrainRender2D.Art
   , loadApproved
   , loadFile
   , sha256Hex
-  , diagnosticSheet
   , artPixelsOf
   , Json (..)
   , parseJson
@@ -19,7 +18,6 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
 import Data.Char (isDigit, isSpace)
 import Data.Text (pack)
-import Data.Word (Word8)
 import Hetoimasia.Asset (Asset (..), AssetId (..), Provenance (..))
 import Hetoimasia.Asset.Image (DecodedImage (..), ImageKind (..))
 import Hetoimasia.Asset.Image.Png (decodePng)
@@ -89,21 +87,6 @@ artPixelsOf decoded =
       first : _ → first
       [] → ByteString.empty
     at i = ByteString.index level i
-
--- | A technical diagnostic sheet, not artwork: 96 × 64, every opaque texel
--- unique to its place (red grows with the column, green with the row, blue with
--- their sum), so a mirrored, flipped, shifted or transposed sampling cannot
--- agree with it; blocks of 6 × 6 texels on a lattice of 24 × 20 from (9, 5) are
--- transparent (binary alpha), the places a transparent part of a quad must
--- show what lies behind.
-diagnosticSheet ∷ ArtPixels
-diagnosticSheet = ArtPixels 96 64 texel
-  where
-    texel x y
-      | (x - 9) `mod` 24 < 6 && (y - 5) `mod` 20 < 6 && x >= 9 && y >= 5 = (0, 0, 0, 0)
-      | otherwise = (byte (2 * x + 20), byte (3 * y + 30), byte (x + y + 40), 255)
-    byte ∷ Int → Word8
-    byte = fromIntegral
 
 -- ---------------------------------------------------------------------------
 -- A small JSON reader for the provenance manifest

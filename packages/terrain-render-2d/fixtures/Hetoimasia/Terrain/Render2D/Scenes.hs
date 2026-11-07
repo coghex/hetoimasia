@@ -17,7 +17,7 @@
 -- * 'staircase': manual cutaways at several depths;
 -- * 'followHeadroom': the automatic follow with the separate 25-level
 --   headroom over authored varied heights;
--- * 'deepFloor': a surface 70 levels below the cut, deeper than a 32-level
+-- * 'deepFloor': a surface 34 levels below the cut, deeper than a 32-level
 --   storage band and inside the 250-level visibility cap, at zoom 1/8;
 -- * the view variants: zoom endpoints, intermediate and fractional camera
 --   settings, a viewport offset, a target's content scale and pixel snapping.
@@ -35,6 +35,8 @@ module Hetoimasia.Terrain.Render2D.Scenes
   , diagnosticOverlap
     -- * View variants
   , zoomEndpoint
+  , atZoom
+  , capTarget
   , fractionalCamera
   , viewportOffset
   , scaledTarget
@@ -91,7 +93,7 @@ singleShape shape facing =
 -- ---------------------------------------------------------------------------
 -- Occlusion and cutaway
 
--- | A 4 × 4 floor at level 0, a ring of walls around a 2 × 2 cavity at level 1
+-- | A 3 × 3 floor at level 0, a ring of walls around a 1 × 1 cavity at level 1
 -- and a roof over all of it at level 2, cut at the given level (2 shows the roof;
 -- 1 removes it and shows the walls' caps and the cavity's floor).
 roofOverCavity ∷ Integer → ViewFacing → Scene
@@ -103,10 +105,10 @@ roofOverCavity cut facing =
       , sceneAnchor = (1, 1)
       }
   where
-    square = [(x, y) | x ← [0 .. 3], y ← [0 .. 3]]
+    square = [(x, y) | x ← [0 .. 2], y ← [0 .. 2]]
     cells =
       [flat x y 0 1 loam | (x, y) ← square]
-        <> [flat x y 1 2 granite | (x, y) ← square, x `elem` [0, 3] || y `elem` [0, 3]]
+        <> [flat x y 1 2 granite | (x, y) ← square, x `elem` [0, 2] || y `elem` [0, 2]]
         <> [flat x y 2 3 loam | (x, y) ← square]
 
 -- | A column with solid levels 0..1 and 4..5 and air between, with columns
@@ -184,11 +186,10 @@ followHeadroom facing =
       , flat 2 1 0 40 granite
       , flat (-2) 1 0 12 loam
       , flat 1 (-2) 0 30 granite
-      , flat 3 0 0 26 loam
       ]
 
--- | A tower 70 levels high on a floor, cut at its top, seen with the vertical
--- reference on the floor at zoom 1/8: the floor is 70 levels below the cut, more
+-- | A tower 34 levels high on a floor, cut at its top, seen with the vertical
+-- reference on the floor at zoom 1/8: the floor is 34 levels below the cut, more
 -- than a 32-level storage band and inside the 250-level visibility cap.
 deepFloor ∷ ViewFacing → Scene
 deepFloor facing =
@@ -196,12 +197,12 @@ deepFloor facing =
     (newScene ("deep-" <> show facing) cells (64, 64))
       { sceneFacing = facing
       , sceneZoom = 0.125
-      , sceneMode = ManualAt 0 (-70)
+      , sceneMode = ManualAt 0 (-34)
       }
   where
     cells =
-      [flat x y (-70) (-69) granite | x ← [0 .. 3], y ← [0 .. 3]]
-        <> [flat 1 1 (-69) 1 loam]
+      [flat x y (-34) (-33) granite | x ← [0 .. 2], y ← [0 .. 2]]
+        <> [flat 1 1 (-33) 1 loam]
 
 -- | Four cells of the technical diagnostic sheet (not artwork) whose
 -- projections overlap with no two sharing a face, so a transparent part of a
@@ -227,9 +228,27 @@ diagnosticOverlap facing =
 -- View variants
 
 -- | The ramps and corners at the given zoom (the configured endpoints 0.125 and 8
--- and the values between).
+-- and the values between), the target no larger than 192 × 128 pixels so that a
+-- zoomed-in view shows the middle of the patch rather than all of it.
 zoomEndpoint ∷ Float → Scene
-zoomEndpoint zoom = fitScene 8 ((rampsCorners FaceSouth) {sceneName = "zoom-" <> show zoom, sceneZoom = zoom})
+zoomEndpoint zoom = capTarget (192, 128) (fitScene 8 ((rampsCorners FaceSouth) {sceneName = "zoom-" <> show zoom, sceneZoom = zoom, sceneMode = ManualAt 2 1}))
+
+-- | A scene's target no larger than this extent, aimed at its anchor tile (a
+-- fraction of a pixel off its centre, as 'fitScene' leaves it) rather than at the
+-- middle of its cells, so a zoomed-in view shows the tile it is anchored on.
+capTarget ∷ (Int, Int) → Scene → Scene
+capTarget (cw, ch) sc =
+  sc
+    { sceneTarget = (w, h)
+    , sceneLogical = (w `div` scaleOf, h `div` scaleOf)
+    , sceneViewport = (0, 0, fromIntegral w, fromIntegral h)
+    , scenePan = if sceneSnap sc then (0, 0) else (0.0048, 0.0226)
+    }
+  where
+    (w0, h0) = sceneTarget sc
+    scaleOf = round (sceneScale sc) ∷ Int
+    w = min w0 cw
+    h = min h0 ch
 
 -- | A pan that leaves the camera a fraction of a tile off the anchor's centre,
 -- at an intermediate zoom.
@@ -264,6 +283,10 @@ snapped = fitScene 8 ((rampsCorners FaceSouth) {sceneName = "snapped", sceneZoom
 
 -- ---------------------------------------------------------------------------
 -- Layout
+
+-- | A scene at another zoom, sized and aimed again from its own cells.
+atZoom ∷ Float → Scene → Scene
+atZoom zoom sc = fitScene 3 sc {sceneZoom = zoom, sceneName = sceneName sc <> "@" <> show zoom}
 
 -- | Size a scene's target, and aim its camera, from the hexagons of its own
 -- cells: the camera is panned so the union of the hexagons is centred, and the
