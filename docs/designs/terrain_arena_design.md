@@ -117,6 +117,8 @@ destination's top level unless its Lua command supplies a Z level (D-12).
 Normal panning, zooming and rotation automatically follow terrain height
 (D-13). Shift-scroll temporarily pins the slice during panning; a camera jump
 without explicit Z restores terrain following (D-14).
+The initial terrain foundation supports full blocks and slopes; the default
+arena remains flat (D-15).
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
@@ -134,11 +136,11 @@ from unloaded/unknown terrain and outside-world positions. A flat arena fills
 this same model procedurally; future elevation generation would populate it
 differently.
 
-Recommend a discrete `(x,y,z)` cell model as the logical contract, independently
-of physical storage. This can express cave floors, ceilings and overhangs.
-Cell shapes/slopes, terrain versus constructed structures, vertical chunking,
-exact data representation are separate decisions. D-5 selects compressed
-columns; exact cell/shape granularity and query semantics remain in Q-8.
+D-5 and D-15 establish compressed tile columns with full blocks and slopes,
+independently of dense physical allocation. This can express cave floors,
+ceilings and overhangs. The exact slope set, terrain versus constructed
+structures, vertical chunking and exact data representation remain separate
+decisions. Detailed shape and query semantics remain in Q-8.
 
 **Owner memory concern, 2026-11-06 — direction addressed by D-5:**
 
@@ -460,6 +462,20 @@ No UI toggle or additional reset shortcut is selected by this decision.
 Detailed zoom/rotation behavior during manual override remains part of the
 camera contract to specify; do not import Synarchy's zoom-map reset implicitly.
 
+### D-15. Full blocks and slopes in the initial terrain foundation
+
+Owner, directly in this pane on 2026-11-06, accepting the recommendation to
+include full blocks and slopes from the beginning:
+
+> yea sure, that's fine
+
+Include full blocks and slopes in the first terrain contract, with consistent
+shape meaning for rendering, mouse picking and terrain queries. The default
+arena remains flat. Use small authored slope cases to verify the contract;
+procedural hill generation remains deferred. The exact slope catalog and
+orientation rules, additional partial-height shapes and automatic reshaping
+after removal are not selected by this scope decision.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -580,29 +596,18 @@ claim or whole-game parity follows from a flat terrain demonstration.
 
 ### Q-8. What is the logical model of solid terrain and gaps?
 
-Recommend P-2's discrete 3D cell model: terrain at each `(x,y,z)` can be
-independently present or empty, allowing multiple solid spans and multiple
-surfaces in one vertical column. A cave/overhang is ordinary terrain geometry.
-This needs richer queries than a height field, but does not require dense
-per-cell storage: P-3 preserves a compressed column representation. A single
-height per column cannot express the owner's requested gaps. Another option is geometry
-defined by continuous surfaces/volumes; that would require different editing,
-intersection and rendering contracts.
+D-4/D-5/D-15 establish gap-capable compressed tile columns supporting full
+blocks and slopes. Multiple solid spans and surfaces may occur within one
+column, and no dense per-cell allocation is required. The flat arena uses
+full tiles; authored slope cases verify agreement between rendering, picking
+and terrain queries.
 
-After the logical choice, settle partial-cell shapes/slopes, whether constructed
-terrain shares that geometry authority, empty versus unavailable answers,
-coordinate limits and physical storage. D-11 selects no designed depth floor.
-A cell contract does not itself require
-a dense full-world allocation, cubic storage chunks or a particular array.
-
-Next owner-facing choice, proposed 2026-11-06: include full blocks and slopes
-in the initial terrain contract, while the default flat arena uses full tiles.
-This would establish shared shape meaning for rendering, picking and terrain
-queries before later elevation generation. Sloped authored verification cases
-could exercise that contract without adding procedural hills. A full-block-only
-first contract is the narrower alternative but leaves slope integration for a
-later arc. The recommendation is not yet accepted; the exact slope set,
-partial-height shapes and rules for creating/changing shapes remain open.
+Specify the finite slope catalog and orientations, shape intersections and
+exposed faces, whether constructed terrain shares that geometry authority,
+empty versus unavailable answers, coordinate limits and physical storage.
+Additional partial-height shapes and rules for creating or automatically
+changing shapes remain open. D-11 selects no designed depth floor. None of
+these decisions requires cubic storage chunks or a particular array.
 
 ### Q-9. How is terrain represented compactly, including unmaterialized depth?
 
@@ -623,6 +628,13 @@ generating every intervening tile, along with vertical residency, coordinate
 limits and bounded range queries. The initial material/layer recipe remains
 open.
 
+Next owner-facing proposal: a shallow soil layer over stone continuing
+downward on demand, described by a shared configurable recipe. This exercises
+a material transition while preserving flat terrain and top-only initial
+materialization. Soil thickness and material identifiers would be recipe
+parameters, not engine constants. A single uniform material is the simpler
+alternative. This recipe direction is not yet accepted.
+
 ## Verification strategy — proposal
 
 Use focused Hspec/model tests for identity, demand deduplication, bounded
@@ -632,6 +644,8 @@ content independently of chunk request order where that contract is selected.
 Include non-flat authored cases that exercise D-4 even though the initial arena
 generator is flat: a cavity with a solid ceiling, separated solid spans,
 completely empty columns and geometry crossing chunk boundaries. Require the
+full-block and authored slope cases selected by D-15 to agree across rendering,
+picking and terrain queries, including shape orientation. Require the
 agreed terrain reads, rendering/picking and reload behavior to describe the same
 geometry; no procedural cave generator is implied by these cases. Exact
 consumers and evidence remain Q-4/Q-6/Q-7 decisions.
