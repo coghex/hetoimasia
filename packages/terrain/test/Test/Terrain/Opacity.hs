@@ -316,7 +316,7 @@ residencyOutput =
   , "LimitUnrepresentable FieldResidentBytes 1099511627777"
   , "ArenaOpened"
   , "[JobId 0]"
-  , "(0,338)"
+  , "(0,400)"
   , "Invalid EmptyDemand"
   , "True"
   ]
