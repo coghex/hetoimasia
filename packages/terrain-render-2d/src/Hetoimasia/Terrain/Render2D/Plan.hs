@@ -244,6 +244,10 @@ data PlannedFace = PlannedFace
   , faceIndex ∷ !Int
   -- ^ Its index among the faces of the view-frame solid.
   , faceRole ∷ !FaceRole
+  , faceCellOrigin ∷ !(Rational, Rational)
+  -- ^ The render-world projection of the face's cell's own origin, the corner
+  -- @(0, 0, 0)@ of its unit cell (a cell's art sheet is placed from it: see
+  -- "Hetoimasia.Terrain.Render2D.Material"). Exact, in the view's frame.
   , facePolygon ∷ ![(Rational, Rational)]
   -- ^ Render-world polygon, exact.
   , faceMask ∷ ![(Rational, Rational)]
@@ -796,6 +800,7 @@ finish key built =
     , faceViewKind = faceKind (rawFace raw)
     , faceIndex = rawIndex raw
     , faceRole = rawRole raw
+    , faceCellOrigin = isoProject (fromInteger cx - 1 / 2, fromInteger cy - 1 / 2, fromInteger cz)
     , facePolygon = builtPolygon built
     , faceMask = builtMask built
     , faceQuad = builtQuad built
@@ -804,6 +809,7 @@ finish key built =
     }
   where
     raw = builtRaw built
+    (cx, cy, cz, _) = builtCanon built
 
 -- The unavailable cells of a layer as intervals per offset, and as wants.
 wantsOf ∷ CameraState → Layer → ([(Offset, Integer, Integer)], [(Column, Integer, Integer)])
