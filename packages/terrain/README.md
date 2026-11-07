@@ -1,24 +1,36 @@
 # hetoimasia-terrain
 
-Checked terrain tile identity and the canonical geometry of every terrain
-shape. This is the first slice of the terrain arena arc (TRA-1, epic #636): pure
-coordinates, region keys, a 16-shape catalog with exact rotation, and the one
-geometric authority that face generation, cutaway coverage and picking will
-share. It is not a world store: nothing here holds terrain, generates it, or
-answers what is at a position.
+Checked terrain tile identity, the canonical geometry of every terrain shape,
+and the pure source, storage and query kernel of the terrain arena arc (epic
+#636). TRA-1 supplied pure coordinates, region keys, a 16-shape catalog with
+exact rotation, and the one geometric authority that face generation, cutaway
+coverage and picking will share. TRA-2 adds the immutable layered source, the
+packed sparse resident-detail representation and the retained-removal overlay
+with the queries over them. It is a data and query kernel, not a world store:
+residency admission and eviction (TRA-3), transactional ownership, revisions and
+live offload (TRA-4), Lua copying (TRA-5), input, camera, rendering and arena
+assembly belong to later slices.
 
 | Module | Purpose |
 | --- | --- |
 | `Hetoimasia.Terrain.Coordinate` | Checked tile identity, region/local decomposition, cutaway |
 | `Hetoimasia.Terrain.Shape` | The 16-shape catalog, sides, quarter turns, view facings |
 | `Hetoimasia.Terrain.Geometry` | The canonical unit-cell solid, face coverage, membership, ray and segment queries |
+| `Hetoimasia.Terrain.Cell` | Authored materials, the air-or-solid cell value, half-open Z intervals, columns |
+| `Hetoimasia.Terrain.Source` | The declarative layered source: definition, validation, limits and byte accounting |
+| `Hetoimasia.Terrain.Changes` | Retained removals: canonical intervals, whole-cell removal, merge and restore |
+| `Hetoimasia.Terrain.Query` | Cell, complete column-range and highest-occupied queries over source plus changes |
+| `Hetoimasia.Terrain.Palette` | The 12-bit material palette and the 16-bit packed cell |
+| `Hetoimasia.Terrain.Segment` | One known segment of at most 32 levels in uniform, runs or dense encoding |
+| `Hetoimasia.Terrain.Resident` | Sparse resident detail: explicit coverage, materialization, discard, accounting |
 
 `Hetoimasia.Terrain.Internal.*` are private implementation modules; the package
 does not expose them, and the suite proves a client cannot import them.
 
 ## Dependencies and ownership
 
-The library depends on `base` and `containers` alone. It imports no other local
+The library depends on `base`, `containers` and `array` (a GHC boot library, for
+the unboxed segment payloads) alone. It imports no other local
 package, so no Lua host, window, GLFW, renderer, GPU, runtime or concrete game
 reaches it, and it reads no file and no asset. The independent math package is
 not used: its Float vectors and right-handed rotation do not fit exact integer
@@ -29,7 +41,11 @@ camera-relative floating point from the exact values this package returns.
 Terrain state does not live here. Every value is immutable and every function
 is pure, so there is no owner, writer, thread, lifetime, reset or disposal to
 document: constructing, translating or decomposing a coordinate allocates no
-terrain volume, scans no column and holds no resource.
+terrain volume, scans no column and holds no resource. The same holds for the
+source, the changes, the palette, the segments and the resident detail below:
+each is a value a later service owns, and every operation returns a new value
+and leaves the old one valid, so a refusal always preserves the previous one.
+No module starts a thread or a process.
 
 ## Coordinates
 
@@ -231,6 +247,185 @@ with `ZeroLengthDirection`. Integer tile identity stays exact at the extreme
 coordinates because `cellWorldPoint` adds the exact integer coordinates to the
 local point as rationals.
 
+## Layered source
+
+A `SourceSpec` is plain data: a list of unique authored material identifiers, a
+sorted list of non-overlapping half-open `[z_min, z_max)` layers shared by every
+column, and a list of `(x, y, z_min, z_max, value)` patches that override the
+base with air or a material and shape. A level no layer or patch covers is air.
+An omitted layer lower end is the lowest supported level and an omitted upper end
+is one past the highest, so the last supported cell is covered. There is no
+callback, Lua value, random stream or game-specific generator, and soil over
+stone is an ordinary pair of layers a caller supplies (the suite's fixture is
+stone `[-inf, -3)` under soil `[-3, 1)`, with thickness and identifiers as
+parameters of the same mechanism).
+
+`mkSource` validates the whole definition and returns a `Source` or the first
+refusal; no partial source exists. It refuses an overlapping layer
+(`OverlappingLayers`) and a layer that begins before its predecessor
+(`LayersOutOfOrder`: the format requires sorted layers), overlapping patches in
+one column, an invalid interval, a coordinate outside the supported range, a
+duplicate or unknown material, an invalid material identifier, a shape outside
+`0..15` and an oversized definition. Creating a source instantiates no column
+and no buried cell; it stores the authored records only.
+
+### Half-open limits
+
+The supported range is `[-2^62, 2^62 - 1]`. A `ZRange` is `[lo, hi)` with `lo` a
+supported level and `hi` at most one past the highest, `2^62`, so the last
+supported cell is reachable by a layer, a patch or a range request. A lower end
+outside the range (`LowerOutOfRange`), an exclusive end above `2^62`
+(`UpperOutOfRange`) and an empty or inverted interval (`EmptyInterval`, `lo >=
+hi`) are each refused, never clamped. The checks run in that order, so
+`[2^62, 2^62 + 1)` reports its lower end.
+
+### Material identifiers
+
+A `MaterialId` is nonempty text of at most **64 UTF-8 bytes** with no control
+character (Unicode category Cc) and no surrogate code point. Counting is in bytes:
+32 two-byte characters fit, 33 do not. `mkMaterialId` is the only way to make
+one.
+
+### Limits and conservative accounting
+
+`defaultSourceLimits` is the approved initial bound: **256 KiB** (262,144 bytes)
+and **8,192 authored runs** per definition. An *authored run* is every layer and
+every patch; materials are not runs. A source also holds at most **4,095
+materials**, the non-air indices of the 12-bit palette. The accounting is
+fixed and conservative; it is an admission figure, not heap or process memory:
+
+| Item | Charge |
+| --- | --- |
+| Definition | 64 bytes once |
+| Each material | 16 bytes plus its UTF-8 identifier length |
+| Each layer | 24 bytes |
+| Each patch | 40 bytes |
+
+Counts are taken by traversals that stop one past a bound, and the total is an
+`Integer`, so a limit is decided before any record is validated or stored and an
+oversized or endless definition costs work bounded by the limit. Each bound is
+tested accepting exactly at the limit and refusing one past it.
+
+## Queries
+
+`Hetoimasia.Terrain.Query` answers from a `Source` and a `Changes` only
+(`emptyChanges` for the source alone), so a query consults retained changes
+whether or not any cell is resident and does not depend on request order.
+
+- `cellAt` answers `Air` or `Solid material shape`.
+- `columnRuns` answers a complete finite half-open range of one column as
+  coalesced runs: the runs cover the whole interval, air included, with no gap
+  and no two adjacent equal runs. A range longer than `limitRangeLevels` (8,192
+  initially) or an answer with more than `limitReturnedRuns` (1,024 initially)
+  is refused with `RangeTooLarge` or `TooManyRuns`; it is never truncated, and
+  the run count is decided by pulling at most one run past the limit.
+- `highestOccupied` answers the highest solid cell, or `Nothing` for an empty
+  column.
+
+Every query steps from one interval boundary to the next across the source's
+layers, the column's patches and its removed intervals, so a long stretch of air,
+solid or removed cells is one step however many levels it spans: cost follows the
+intervals met, never the levels between them, and no cell is allocated for them.
+
+## Retained removals
+
+`Changes` holds, per column, a sorted, disjoint, coalesced set of removed-cell
+intervals. It is not an operation log. `removeCell` removes the whole cell,
+whatever shape it had (a ramp included), and reshapes no neighbour. Removing air
+or a cell already removed returns `removeChanged = False` and the very value that
+was passed in; any other removal grows or joins an interval, so adjacent removals
+coalesce whatever their order. A caller-supplied `ChangeLimits` bounds the
+retained intervals, and an excess is a typed refusal (`TooManyRemovedIntervals`)
+that leaves the previous value untouched. `emptyChanges` is a fresh session;
+`mergeChanges` is the symmetric, associative union an offload needs, and
+`changesFromIntervals` restores canonical changes from unordered, overlapping
+intervals. `changesBytes` accounts 16 bytes per interval and 48 per column index
+entry. The revision counter, admission reservation and cancellation arbitration
+around a commit belong to TRA-4.
+
+## Packed storage
+
+### Cell value and palette
+
+A packed cell is 16 bits: a 12-bit palette index over a 4-bit shape. Index 0 is
+air, canonically the all-zero value, so a solid of shape 0 is distinct from air;
+indices `1..4095` map to stable authored identifiers, and shapes 0 and 15 stay
+distinct. Packing refuses rather than truncates: a full palette
+(`PaletteFull`), a material not in the palette, an unassigned index and an air
+index carrying a nonzero shape (`NonCanonicalAir`). Assigned indices are never
+reassigned. This packing is internal: it is not a Lua numeric identifier or a
+save-format promise.
+
+### Segments and encodings
+
+A `Segment` covers `[start, start + length)` with `1 <= length <= 32`, entirely
+inside one 32-aligned vertical region. For `N` cells and `R` runs of equal
+adjacent values the encoding is chosen once, by:
+
+| Condition | Encoding | Payload bytes |
+| --- | --- | --- |
+| `R = 1` | Uniform: one 16-bit value | 2 |
+| otherwise `4R < 2N` | Runs: one 32-bit word per run, exclusive end offset in the high half and value in the low half, ascending and coalesced | `4R` |
+| otherwise | Dense: exactly `N` 16-bit values (a tie goes to direct indexing) | `2N` |
+
+Uniform and dense lookups index directly; runs use binary search, with at most 15
+runs in a nonuniform 32-cell segment. The suite pins one requested surface cell
+at 2 bytes, 32 identical cells at 2, two runs at 8, three runs at 12, 15 runs at
+60, and 16 runs or 32 alternating cells at 64. Payload bytes count the values
+only: the segment's start, length and tag are metadata (`segmentMetadataBytes`,
+32 accounted bytes), and the Haskell heap costs are neither, so they are
+measured, not read from these figures. `updateSegment` decodes at most 32 values
+into scratch, applies the changes and builds a fresh segment, choosing the new
+encoding once; it never expands unknown depth, and the previous segment is
+unchanged.
+
+### Sparse resident detail
+
+`Resident` maps a column to its known segments. Coverage is explicit: a level
+inside a segment is known (and may be air), a level in no segment is
+**unmaterialized, not air**, and a segment never crosses a region boundary. Two
+segments of one region are separate unless they are adjacent. `materialize`
+makes exactly the requested levels known: a top-only request creates one
+one-cell segment, widely separated requests leave their gap unmaterialized, and
+nothing fills buried source cells. Values come from the same immutable source
+plus all retained removals, so a cell removed while it was not resident is
+absent when materialized later, and `discardRange`, `discardRegion` and
+`discardColumn` drop resident detail only and never touch changes.
+Re-materializing over known levels recomputes the merged interval (at most 32
+values) from the authority, so a stale value cannot survive. A request is
+bounded by the caller's level limit. `residentStats` reports segments, known
+cells, payload bytes and metadata bytes separately.
+
+A region key is an index key, never an allocated 16 × 16 × 32 array. Residency
+admission, eviction eligibility and retained-edit reservations (TRA-3), the
+single writer, revisions and the live offload protocol (TRA-4) are not here.
+
+### Growth
+
+Absolute depth and gap width do not cause proportional allocation or traversal.
+The routine suite proves it with structural counts (known segments and cells)
+and by measuring allocation at two widely separated depths and gap widths with
+`GHC.Stats`, which separates a change in growth rate from a constant factor; no
+wall-clock threshold is asserted.
+
+### Measurement
+
+`terrain-measure` is a benchmark component, outside every required group:
+
+```sh
+cabal bench --project-file cabal.project.cpu hetoimasia-terrain:terrain-measure
+```
+
+For flat, layered, hollow and fragmented fixtures over a 16 × 16 block of columns,
+with a top-only and a 128-level demand, it prints segments, known cells, the
+encoding mix, payload bytes, accounted metadata, accounted source bytes, the
+heap the detail actually retains (the change in live bytes across major
+collections) and the bytes allocated building it, then lookup (coherent and
+scattered), bulk-scan, edit and encoding-transition costs in nanoseconds per
+operation. These are one run on one machine; they make no speedup, universal
+ratio or threshold claim, and the retained-heap figure is larger than the payload
+because it includes object headers and the indexing maps.
+
 ## Reference mapping
 
 The reference is Synarchy at `3777d437ea00e1302bf55162ad5693fee4879187`. It
@@ -305,7 +500,12 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --t
 
 It is deterministic, starts no thread of its own and sleeps nowhere. Expected geometry is an
 independently authored matrix of vertices and faces for all 16 identities, with
-exact rotation checked in four facings against the tests' own turn. No example's
+exact rotation checked in four facings against the tests' own turn. The source,
+storage and query examples compare the library with an independent naive model
+(`Test.Terrain.Model`) that scans every record for every level and shares no code
+with the library, and with literals; the encoding examples assert the approved
+payload table. The suite is built with `-with-rtsopts=-T` for the growth
+examples, and an example that finds the statistics disabled fails. No example's
 expected value is produced by the code it checks. `Test.Support.ExternalClient`
 compiles a client outside the package: one must link and run, and every attempt
 to name a private constructor, forge a value from one, or import a private module
@@ -313,6 +513,7 @@ must be refused for the specific diagnostic that names the cause.
 
 ## Consumers
 
-TRA-2 builds storage and source queries on this identity and shape contract.
-TRA-7 builds camera projection, picking and visible-face planning on `Solid`,
+TRA-3 and TRA-4 build residency policy and the transactional service on the
+sparse representation and the removal overlay. TRA-5 copies values across the Lua
+boundary. TRA-7 builds camera projection, picking and visible-face planning on `Solid`,
 `sideCoverage`, `castRay` and `castSegment`; TRA-8 compares the visual matrix.
