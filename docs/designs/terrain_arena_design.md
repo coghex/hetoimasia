@@ -600,6 +600,18 @@ no loading UI is introduced. Define concrete request/cancellation, snapshot
 and publication semantics in the technical contract. This choice does not
 decide the separate Q-10 general gameplay-state boundary, settled by D-20.
 
+Technical consequence authorized by verified `het-manager` in `#het-terrain`,
+message `am56vec4v3yevcyqfinijqiw72`, at 2026-11-07T02:46Z (2026-11-06 local):
+terrain requests use M1's `OptionalRequest` policy. Expected domain failures
+(`not_found`, `arena_closed`, `stale_view`, `definition`, `source_failure`)
+remain recoverable structured request results; they do not end the requesting
+instance, including when unread. Malformed arguments remain ordinary validation
+errors and provider/accounting defects remain fatal host failures. No Lua
+options are added. `busy` remains the existing immediate admission result with
+no request handle or provider work, rather than a terminal result of an accepted
+request. The manager authorized this as a consequence of D-19 and the routine
+stale-pick refusal, not a new owner design choice.
+
 ### D-20. Narrow terrain transactions; general gameplay state stays deferred
 
 Owner, directly in this pane on 2026-11-06, selected:
@@ -1009,8 +1021,13 @@ edit bound, new edits return busy until the arena ends; reads/navigation can
 continue within their own bounds. A session-wide failure ends arenas under
 the existing supervision policy; no error UI is introduced.
 
-Expected domain failures include `arena_closed`, `stale_view`, `definition`
-and `source_failure`; transient admission is `busy`. Malformed Lua types,
+Expected domain failures include `not_found`, `arena_closed`, `stale_view`,
+`definition` and `source_failure`. Terrain requests use M1's `OptionalRequest`
+policy: these failures are recoverable structured results and do not latch an
+instance failure, even when unread. This is the manager-authorized D-19
+clarification recorded above; no new Lua options are added. Transient admission
+is the existing immediate `busy` result with no request handle or provider work,
+not a terminal request failure. Malformed Lua types,
 foreign handles and out-of-range coordinates are ordinary validation errors
 before provider work. Unknown failures/provider contract defects remain host
 failures, not disguised empty terrain. Diagnostic records contain bounded
