@@ -88,6 +88,11 @@ D-46 selects Lua-supplied sun compass direction and elevation, fixed relative
 to the world as the camera rotates. Appearance defaults and depth effects
 remain Q-18; no UI or automatic cycle is added.
 
+D-47 keeps both depth darkening and blue haze, adjustable/disableable through
+Lua, and requires stronger numerical, offscreen and navigation regression
+coverage. The owner reports the reference behavior does not work well; a
+specific symptom/reproduction has been requested, not yet established.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1414,6 +1419,34 @@ dimming/haze remain concrete contract choices. D-44's evidence must include
 camera rotation at a fixed sun input and changing the sun at a fixed camera,
 so a light that accidentally follows the camera cannot pass the preview check.
 
+### D-47. Keep both depth effects and require better testing
+
+Owner, directly in this design pane on 2026-11-07, answered the choice between
+both adjustable depth effects, darkening alone and neither:
+
+> keep both, but this is something that doesnt really work well so we will
+> need to make sure we get better testing in place
+
+Retain gradual depth darkening and blue haze below the cutaway, with Lua
+controls to adjust or disable each. These are presentation effects, separate
+from directional face lighting and from the discovery/fog-of-war state. They
+must not change terrain knowledge, alpha cutout coverage or screen-pick targets.
+Turning both off provides a face-lit baseline for tile/geometry previews.
+
+The owner requires improved tests, not unquestioned reproduction of S's
+appearance. Its exact depth formula, strengths and colour mixing are therefore
+not approved merely by keeping both effects. Q-18 must define those numerical
+expectations; the evidence contract below requires isolated and combined
+effects, depth extremes, changing cutaway/camera/lighting, and streaming seams.
+
+The reported reference weakness has not yet been narrowed to a reproduced
+symptom. The owner has been asked what they remember seeing. Add that case
+to the solver's regression/evidence matrix when known; do not invent a root
+cause or claim that this design has diagnosed or fixed it. The general
+qualification work can still be specified without an exact reproduction.
+Q-19 must assign D-47's tests/evidence to the lighting and integration work,
+and carry the requirement into final TRA-12 acceptance.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2353,6 +2386,44 @@ the relevant follow-up slice and final TRA-12 qualification.
   satisfy this requirement. Unexplained mismatches block the affected renderer
   qualification and final arena acceptance until resolved.
 
+### Depth-effect qualification required — D-47
+
+Specify the numerical depth/colour contract under Q-18 before implementing
+its expected-result tests. The solver must then deliver the following evidence
+through the same retained, revision-pinned workflow as D-44:
+
+- A controlled scene with repeated soil/stone materials and slopes at known
+  depths, including adjoining chunk boundaries. Capture all four combinations:
+  neither effect, darkening only, haze only and both. Each disable control must
+  reproduce its defined baseline without changing alpha coverage or picking.
+- Independent reference calculations in the renderer's linear-colour contract
+  for depth zero, intermediate depth, the configured end of the effect range
+  and clamped out-of-range inputs. Check each curve's intended direction,
+  bounds and exact composition order with face lighting; visual approval alone
+  cannot detect a colour-space or clamp error reliably.
+- Offscreen comparisons at selected sun directions/elevations and all four
+  camera facings, sampling corresponding visible surfaces. Show that lighting
+  still follows D-46 while the depth effects follow their specified depth
+  measure. Include non-integer zoom and partially transparent/cutout edges
+  under D-45; darkening/haze must not create opaque fringes or select fog.
+- Controlled pan/zoom/rotation, manual slice changes, surface-following over
+  different heights, and jumps with/without explicit Z. Expected changes from
+  a changed depth must be distinguished from spurious resets, stale parameters
+  or changes caused solely by chunk boundaries. Camera/lighting/style and
+  retained terrain must publish coherently; no frame may combine incompatible
+  old and new settings.
+- Offload/reload and delayed chunk arrival in the same scene. Identical terrain
+  under the same adopted camera/style must regain the same depth treatment;
+  loading order must not create seams. Supply a side-by-side comparison of the
+  owner's reported bad case when it can be reproduced, documenting what
+  changed and any remaining limitation.
+
+The implementation handoff must include reviewable captures and the numerical
+results/reproduction commands, not only a passing test count. This is a
+required qualification matrix, not a claim that tests have run or that the
+unspecified reference complaint has already been reproduced. It adds no
+fluid, moon, day/night-cycle or UI testing scope.
+
 ### Existing material ABI and the remaining integration gap
 
 The manager's ABI reading is supported. H
@@ -2431,7 +2502,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-46 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-47 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2494,8 +2565,10 @@ it implied an unchangeable sun. The automatic cycle is deferred; selected
 sun positions can still change the lighting without a world clock, calendar
 or solar-page/time simulation. Eventual moon lighting is deferred too.
 D-46 selects Lua-supplied compass direction and elevation anchored in world
-space through camera rotation. Exact units/binding and initial appearance
-remain Q-18; this paragraph settles no other amendment proposal.
+space through camera rotation. D-47 retains both adjustable depth darkening
+and blue haze and requires improved numerical/visual/navigation coverage.
+Exact units/binding, depth/colour equations and initial strengths remain Q-18;
+this paragraph settles no other amendment proposal.
 
 Affected tracker work, for later approved revisions only:
 
@@ -2928,21 +3001,21 @@ is approved.
 
 ### Q-18. Exact initial appearance beyond the silhouette
 
-Partially resolved by D-29/D-46: Lua supplies sun compass direction and
+Partially resolved by D-29/D-46/D-47: Lua supplies sun compass direction and
 elevation, anchored in world space through camera rotation, without an automatic
 cycle or moon lighting. Settle exact angle conventions/units/ranges and binding,
-the initial light and ambient values, whether to carry S's depth dimming/haze,
-and which deviations are intentional.
+the initial light and ambient values, and the depth/colour equations and
+initial strengths for the selected darkening/haze. State intentional deviations.
 S's clock phase labels and shader sine disagree; full clock parity cannot be
 claimed from labels alone. Fluids, selection outlines, lifecycle sprites and
 zoom-map crossfade remain outside the approved arena unless explicitly changed.
 
-Current owner question: recommend retaining S's gradual darkening and blue
-haze with depth below the cutaway, adjustable/disableable through Lua so tile
-previews and geometry checks can inspect unmodified material colours. This
-remains a proposal, not an approved appearance choice. Alternatives are
-darkening alone or face lighting without either depth effect. These effects
-are presentation cues and must not change discovery, fog coverage or picking.
+D-47 resolves which depth effects to keep: both, adjustable/disableable through
+Lua, with stronger tests/evidence. Darkening-only and no-depth-effect defaults
+are not selected. The owner reports S's behavior does not work well; specific
+symptoms have been requested for regression cases but are not yet verified.
+The numerical contract and qualification described above remain to be filled
+out; do not copy the old curve and call the reported problem fixed.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
@@ -2956,6 +3029,8 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 The follow-up plan must explicitly assign D-44's reproducible defect/correction
 proof, all-16/four-facing captures and geometry/opening/picking checks to the
 owning correction and integration work; carry its evidence gate into TRA-12.
+Also assign D-47's numerical, isolated/combined depth-effect and navigation/
+streaming regression evidence to the lighting and integration slices.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
