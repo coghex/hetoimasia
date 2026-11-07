@@ -229,9 +229,10 @@ spec = describe "Residency over the real data layer" $ do
     -- The reservation covered it (and was larger, by the payload bound).
     reserved `shouldBe` [256 + 48 + 3 * 32 + 3 * 64]
   it "reserves the growth of a compressed segment and reconciles it with the real rebuilt segment" $ do
-    -- 400 resident bytes: one 32-cell uniform segment (338 stored of the 400
-    -- reserved) leaves exactly the 62 a removal reserves for its rebuilt segment.
-    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 400})
+    -- 462 resident bytes is the least a bank can have to edit at all (a 400-byte job
+    -- and the 62 a removal reserves for its rebuilt segment). One 32-cell uniform
+    -- segment stores 338, leaving 124: room for two removals' growth.
+    w0 ← initialWith (limitsWith $ \s → s {specResidentBytes = 462, specStagingBytes = 4096})
     -- Region (0,0,-2) is levels -64..-33: all stone, one uniform segment of 2 bytes.
     w1 ← submit w0 (SubmitQuery (RequestId 1) a1 rev0 [demand (reg 0 0 (-2)) (box 0 1 0 1 0 32)]) >>= drain >>= \w → settle w 1
     map regionBytes (modelRegions (wModel w1)) `shouldBe` [338]
@@ -242,27 +243,31 @@ spec = describe "Residency over the real data layer" $ do
     -- The cell is resident: no job, and the growth is reserved from the free 62.
     admissionJobs accepted `shouldBe` []
     ledgersOf (wModel w2) `shouldBe` Ledgers (338, 62) (0, 64) (224, 512)
-    -- With the bank full a second removal cannot be admitted: busy, not growth.
-    refusal ← stepRefused (wModel w2) (SubmitRemoval (RequestId 3) a1 rev0 (mustTile 0 0 (-51)))
+    -- A second removal takes the other 62; a third finds the bank full: busy (it fits
+    -- an empty model), not invalid.
+    (w2b, _) ← submitAdmission w2 (SubmitRemoval (RequestId 3) a1 rev0 (mustTile 0 0 (-51)))
+    ledgersOf (wModel w2b) `shouldBe` Ledgers (338, 124) (0, 128) (448, 1024)
+    refusal ← stepRefused (wModel w2b) (SubmitRemoval (RequestId 5) a1 rev0 (mustTile 0 0 (-52)))
     case refusal of
       Busy (NoEligibleEviction 62 0 _) → pure ()
       other → expectationFailure ("expected a busy refusal for the growth, got " <> show other)
+    -- Abandoning the second returns its reservations.
+    w2c ← settle w2b 3
     -- The real removal splits the uniform segment into three runs: 2 -> 12 bytes.
-    outcome ← either (fail . show) pure (removeCell changeLimits source tile (wChanges w2))
+    outcome ← either (fail . show) pure (removeCell changeLimits source tile (wChanges w2c))
     let changes' = removeResult outcome
-    (w3, _) ← realMaterialize w2 {wChanges = changes'} region cover
-    let regrown = realBytes w3 - realBytes w2
+    (w3, _) ← realMaterialize w2c {wChanges = changes'} region cover
+    let regrown = realBytes w3 - realBytes w2c
     regrown `shouldBe` 10
     (m4, committed) ← stepOk (wModel w3) (RemovalCommitted (RequestId 2) (Revision 1) (fromIntegral (changesBytes changes')) (fromIntegral regrown))
     reportDecision committed `shouldBe` Committed (Revision 1) 0 [] [] []
     -- Occupied now includes the growth; the unused 52 of the reservation returned.
     ledgersOf m4 `shouldBe` Ledgers (348, 0) (64, 0) (0, 0)
     assertCharged w3 {wModel = m4}
-    -- The segment now occupies 10 bytes more: 348 bytes, which a request naming the
-    -- region keeps pinned, plus another removal's 62 reserved bytes is 410 > 400.
-    -- No eviction or waiting can change that, so it is invalid, not busy.
-    refusal2 ← stepRefused m4 (SubmitRemoval (RequestId 4) a1 (Revision 1) (mustTile 0 0 (-51)))
-    refusal2 `shouldBe` Invalid (ExceedsBank ResidentBank 410 400)
+    -- The segment now occupies 348 bytes: another removal's 62 still fits (114 free).
+    (w4, again) ← submitAdmission w3 {wModel = m4, wChanges = changes'} (SubmitRemoval (RequestId 4) a1 (Revision 1) (mustTile 0 0 (-51)))
+    admissionJobs again `shouldBe` []
+    ledgersOf (wModel w4) `shouldBe` Ledgers (348, 62) (64, 64) (224, 512)
   it "keeps a surviving region charged for the shared column index after each individual release" $ do
     -- Two vertical regions of one column share one real column index entry; each
     -- is charged for its own column, so evicting either leaves the other charged.

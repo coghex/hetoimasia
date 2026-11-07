@@ -405,57 +405,66 @@ distinctDemands picks =
 limitsOf ∷ (Integer, Integer, Integer) → Maybe Limits
 limitsOf (resident, staging, jobs) = either (const Nothing) Just (mkLimits (LimitsSpec resident 192 staging jobs 3 2 4 3))
 
--- | A camera demand the model accepts completes when nothing else is happening,
--- from an empty model or from one with resident leftovers and an earlier
--- demand of the same view that it replaces. This is the feasibility bound checked
--- against the order in which admission actually reserves, over random tiny budgets
--- and random mixed demands.
-acceptedDemandCompletes ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → [(Int, Int)] → Property
-acceptedDemandCompletes triple leftovers firstPicks picks =
+-- | A camera demand the model accepts completes when it is alone in an empty
+-- model. The permanent check is exact for that case: it is the feasibility bound
+-- in the order regions are admitted, and the model admits them in that order. (From
+-- other states a shortfall may be busy for as long as other work holds the room, so
+-- nothing is claimed there.)
+acceptedDemandCompletes ∷ (Integer, Integer, Integer) → [(Int, Int)] → Property
+acceptedDemandCompletes triple picks =
   case limitsOf triple of
     Nothing → property True
     Just limits →
-      let base = withLeftovers limits leftovers
-          earlier = distinctDemands firstPicks
-          -- The view first holds an earlier demand, settled; nothing is left pending.
-          settledBase = case step base (SetCameraDemand (ViewId 1) (ArenaId 1) earlier) of
-            (m, Right _) | not (null earlier), Right done ← converge 200 m, all (null . viewPending) (modelViews done) → Just done
-            _ → Nothing
+      let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
           demands = distinctDemands picks
-       in case (null demands, settledBase) of
-            (True, _) → property True
-            (_, Nothing) → property True
-            (_, Just m0) → case step m0 (SetCameraDemand (ViewId 1) (ArenaId 1) demands) of
+       in if null demands
+            then property True
+            else case step start (SetCameraDemand (ViewId 1) (ArenaId 1) demands) of
               (_, Left _) → property True
               (m, Right _) → case converge 200 m of
                 Left why → counterexample why False
                 Right done →
                   counterexample
-                    ("replacement accepted but left pending: " <> show (map viewPending (modelViews done)) <> " with " <> show (earlier, demands, limits))
+                    ("demand accepted but left pending: " <> show (map viewPending (modelViews done)) <> " with " <> show (demands, limits))
                     (all (null . viewPending) (modelViews done))
 
--- | From a quiescent model (nothing pinned, running or promised), an explicit
--- query is admitted or permanently invalid; it is never merely busy, because
--- nothing is left to wait for.
-quiescentRequestNotBusy ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → Property
-quiescentRequestNotBusy triple leftovers picks =
+-- | Whether a request is permanently invalid: by the owner's rule only when its
+-- footprint cannot fit from an empty model, and so independent of the state the
+-- model is in.
+permanentlyInvalid ∷ Either Refusal a → Bool
+permanentlyInvalid r = case r of
+  Left (Invalid (ExceedsBank {})) → True
+  Left (Invalid (ExceedsSlot {})) → True
+  _ → False
+
+-- | The permanent classification of a query, a removal and a camera demand is the
+-- same from an empty model and from a model with resident leftovers and an earlier
+-- demand of the same view.
+permanentClassIsStateIndependent ∷ (Integer, Integer, Integer) → [(Int, Int)] → [(Int, Int)] → [(Int, Int)] → Property
+permanentClassIsStateIndependent triple leftovers firstPicks picks =
   case limitsOf triple of
     Nothing → property True
     Just limits →
-      let base = withLeftovers limits leftovers
+      let empty = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
+          loaded = withLeftovers limits leftovers
+          earlier = distinctDemands firstPicks
+          base = case step loaded (SetCameraDemand (ViewId 1) (ArenaId 1) earlier) of
+            (m, Right _) | not (null earlier) → either (const loaded) id (converge 200 m)
+            _ → loaded
           demands = distinctDemands picks
-          notBusy what event = case step base event of
-            (_, Left refusal@(Busy _)) → counterexample ("busy from a quiescent model (" <> what <> "): " <> show (refusal, demands, limits)) False
-            _ → property True
-          -- A removal also reserves growth for its rebuilt segment; it names one cell.
-          removalTile = case picks of
+          tile = case picks of
             ((x, j) : _) → either (const Nothing) Just (tileCoord (toInteger x * 16) 0 (toInteger (j `mod` 4)))
             [] → Nothing
-       in if null demands
-            then property True
-            else
-              notBusy "query" (SubmitQuery (RequestId 7) (ArenaId 1) (Revision 0) demands)
-                .&&. maybe (property True) (notBusy "removal" . SubmitRemoval (RequestId 8) (ArenaId 1) (Revision 0)) removalTile
+          requests =
+            [("query", SubmitQuery (RequestId 7) (ArenaId 1) (Revision 0) demands) | not (null demands)]
+              <> [("removal", SubmitRemoval (RequestId 8) (ArenaId 1) (Revision 0) t) | Just t ← [tile]]
+              <> [("camera", SetCameraDemand (ViewId 2) (ArenaId 1) demands) | not (null demands)]
+       in conjoin
+            [ counterexample
+                (what <> " is invalid from " <> (if permanentlyInvalid (snd (step empty event)) then "an empty model" else "the loaded model") <> " but not from the other: " <> show (event, limits))
+                (permanentlyInvalid (snd (step base event)) == permanentlyInvalid (snd (step empty event)))
+            | (what, event) ← requests
+            ]
 
 spec ∷ Spec
 spec = describe "Residency model properties" $ do
@@ -465,19 +474,18 @@ spec = describe "Residency model properties" $ do
         case runSequence seeds of
           (Left why, _) → counterexample why False
           (Right _, _) → property True
-  it "completes every camera demand the model accepts when nothing else happens, from non-empty states, under random tiny budgets" $
+  it "completes every camera demand the model accepts when it is alone in an empty model, under random tiny budgets" $
     withNumTests 2000 $
+      forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
+        forAll (vectorOf 4 pair) $ \picks →
+          acceptedDemandCompletes limitsTriple picks
+  it "classifies a request as permanently invalid only by an empty model, whatever the model holds" $
+    withNumTests 3000 $
       forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
         forAll (vectorOf 3 pair) $ \leftovers →
           forAll (vectorOf 4 pair) $ \firstPicks →
             forAll (vectorOf 4 pair) $ \picks →
-              acceptedDemandCompletes limitsTriple leftovers firstPicks picks
-  it "never answers busy to an explicit request from a quiescent model with resident leftovers" $
-    withNumTests 2000 $
-      forAll ((,,) <$> chooseInteger (300, 4000) <*> chooseInteger (300, 3000) <*> chooseInteger (1, 3)) $ \limitsTriple →
-        forAll (vectorOf 3 pair) $ \leftovers →
-          forAll (vectorOf 4 pair) $ \picks →
-            quiescentRequestNotBusy limitsTriple leftovers picks
+              permanentClassIsStateIndependent limitsTriple leftovers firstPicks picks
   it "exercises completion, eviction, commit, refusal and retirement in a fixed long sequence" $ do
     let (outcome, stats) = runSequence (lcg 7 12000)
     outcome `shouldSatisfy` either (const False) (const True)

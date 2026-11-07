@@ -9,10 +9,10 @@
 --
 -- The decisions it checks:
 --
--- * __permanently invalid__ exactly when the request's /minimum final footprint/
---   (the regions it names that are resident now, which it cannot evict, plus a
---   job's whole reservation for every cell neither resident nor promised, plus the
---   least that promised work leaves stored) exceeds a bank or slot;
+-- * __permanently invalid__ exactly when the request's minimum final footprint
+--   cannot fit a bank or slot /even from an empty model/: one job for each region's
+--   whole coverage, each with fresh region metadata (the owner's rule: everything
+--   else is busy). It does not depend on the model's state at all;
 -- * __admitted__ exactly when every slot and bank has room and the resident
 --   shortfall can be covered by some set of evictable regions, found here by
 --   trying /every subset/ of them (not by the model's least-recently-used walk);
@@ -35,8 +35,8 @@ data Verdict = Admit | NotNow | Never | Exhausted
 -- supported regions within the demand limit.
 oracle ∷ Model → ArenaId → [RegionDemand] → Bool → Verdict
 oracle m arena demands removal
+  | emptyResident > lim ResidentBank || emptyStaging > lim StagingBank || emptyJobs > slot LoadJobSlot = Never
   | any evicting demands = NotNow
-  | aloneResident > lim ResidentBank || aloneStaging > lim StagingBank || aloneJobs > slot LoadJobSlot = Never
   | removal && retainedBytes > lim EditBank = Never
   | removal && editOccupied + retainedBytes > lim EditBank = Exhausted
   | commandsUsed + 1 > slot CommandSlot = NotNow
@@ -100,15 +100,14 @@ oracle m arena demands removal
       (c : cs) → Just (foldr coverageUnion c cs)
 
     ps = map parts demands
-    pinnedSum = sum [p | (p, _, _, _, _) ← ps]
     reserveSum = sum [r | (_, r, _, _, _) ← ps]
-    promisedSum = sum [l | (_, _, l, _, _) ← ps]
     scratchSum = sum [s | (_, _, _, s, _) ← ps]
     newJobs = toInteger (length [() | (_, _, _, _, True) ← ps])
 
-    aloneResident = pinnedSum + reserveSum + promisedSum + growth
-    aloneStaging = interest * n + scratchSum + commandBytes + removalStaging
-    aloneJobs = newJobs
+    -- From an empty model: one fresh job per region for its whole coverage.
+    emptyResident = sum [metadata + 48 * toInteger (coverageColumns (demandCoverage d)) + 96 * toInteger (coverageSegments (demandCoverage d)) | d ← demands] + growth
+    emptyStaging = interest * n + sum [256 + 2 * toInteger (coverageCells (demandCoverage d)) | d ← demands] + commandBytes + removalStaging
+    emptyJobs = n
 
     ledgers = independentLedgers m
     (residentOcc, residentRes) = both (resident ledgers)
