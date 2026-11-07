@@ -279,13 +279,14 @@ viewportOffset zoom =
 scaledTarget ∷ Scene
 scaledTarget = fitScene 8 ((rampsCorners FaceEast) {sceneName = "scaled", sceneScale = 2})
 
--- | The ramps and corners with pixel snapping on at native scale (a whole multiple
--- of 1/8, which every face origin needs), the camera a fraction of a pixel off the
+-- | The ramps and corners with pixel snapping on at zoom 2 (a whole multiple of
+-- 1/8, which every face origin needs, and one at which no sample falls near a
+-- texel boundary), the camera a fraction of a pixel off the
 -- pixel grid ('capTarget' gives a snapping scene one), so that snapping moves the
 -- view's translation to the pixel grid and the image differs from the unsnapped
 -- one.
 snapped ∷ Scene
-snapped = capTarget (64, 48) (fitScene 3 ((rampsCorners FaceSouth) {sceneName = "snapped", sceneSnap = True, sceneMode = ManualAt 2 1}))
+snapped = capTarget (96, 64) (fitScene 3 ((rampsCorners FaceSouth) {sceneName = "snapped", sceneSnap = True, sceneZoom = 2, sceneMode = ManualAt 2 1}))
 
 -- ---------------------------------------------------------------------------
 -- Layout
