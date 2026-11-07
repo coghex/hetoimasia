@@ -161,7 +161,7 @@ accounting.
 | Eviction ignores interests | the resident-busy and multi-bank rollback examples, the random property |
 | A victim's credit promised twice | the shared-victim example and the long random sequence |
 | The validated-limits constructor exported | the external-client constructor examples |
-| Payload reserved per cell instead of the dense bound | the ledger, reconciliation and growth examples (28 examples) |
+| Payload reserved per cell instead of the dense bound | the ledger, reconciliation and growth examples |
 | A job does not reserve its columns | the column-independence example and the ledger examples |
 | No resident growth reserved for a removal | the edit-reservation, growth-contract and compressed-segment examples |
 | An older handoff clears newer changes | the handoff-interleaving example |
@@ -193,7 +193,7 @@ accounting.
 | A staging shortfall off by one byte | the scripted bank-full examples |
 | The oldest evictable region is never a victim | the least-recently-used and funded-eviction examples and the oracle |
 | An empty-model footprint that reads the model (resident regions subtracted) | the empty-model example, the state-independence property and the random sequences |
-| The empty-model footprint omits region metadata | seven examples including the accepted-demand-completes property |
+| The empty-model footprint omits region metadata | the empty-model, bank-boundary, camera and removal-boundary examples and the accepted-demand-completes property |
 | The empty-model footprint omits a removal growth | the removal boundary example (461 refuses, 462 admits) |
 
 ### Randomized properties
@@ -228,7 +228,7 @@ reads no state); __admitted__ exactly when every slot and bank has room and the
 resident shortfall can be covered by some set of regions nothing needs, found by
 trying every subset of them rather than the model's least-recently-used walk;
 __busy__ otherwise (and __exhausted__ for a removal the retained-edit bank cannot
-take). In the fixed sequences it checked 101 admitted, 1,626 busy, 18 invalid and 61
+take). In the fixed sequences it checked 101 admitted, 1,627 busy, 17 invalid and 61
 exhausted decisions under tight budgets and 194 admitted and 1,592 busy under room
 for concurrent work, and never disagreed with the model.
 
