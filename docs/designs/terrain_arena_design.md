@@ -6,7 +6,12 @@ testing arena is the concrete reference. The owner
 chooses behavior in this design conversation; existing Synarchy implementation
 choices are evidence, not automatically requirements for the new engine.
 
-Design state: `ready for issue processing`
+Design state: `exploring`
+
+Owner-requested face-map amendment opened 2026-11-07 (D-28). TRA-1–TRA-12
+remain filed; this reopens design readiness, not their filing ledger. The source
+audit and pending choices are in the face-map amendment below. No new tracker
+mutation or implementation is authorized by this amendment's draft proposals.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -740,6 +745,33 @@ neither an overlapping terrain umbrella. Searches across open/closed issues
 for terrain, arena and chunk streaming found no duplicate epic. Q-13 names
 the affected slices and their stop/ask behavior explicitly.
 
+### D-28. Correct face-map fidelity in a follow-up before TRA-12
+
+Owner, directly in the manager pane on 2026-11-07, selected option 2 for the
+#644 reference-silhouette finding: correct it as a follow-up before TRA-12.
+The manager's owner-request prompt for `user-het-terrain-20261106-1838`
+records the owner's words:
+
+> you need to implement the alpha cutout from the facemaps in the shaders, that
+> means implementing the full lighting system too i think, you tell me,
+> investigate how synarchy does it, then we will implement here
+
+The owner then requested this amendment and a proper Synarchy investigation
+before work. Verified `het-manager` also relayed this scope in `#het-terrain`,
+message `ye56izyasfrs3urdn95a6eqeuw` at 2026-11-07T14:26:50Z, explicitly
+holding PR #654 until the amendment determines what it keeps.
+This supersedes acceptance of the solids-only rendering route as
+sufficient final reference fidelity under D-25/P-5, and reopens D-27's readiness
+for the amendment. Preserve the earlier decisions and filed slices as history;
+do not silently rewrite their original contracts or call their measurements
+invalid for the geometry they actually measured.
+
+The required correction includes shader face-map alpha. The owner's statement
+about a full lighting system is a question, not approval of day/night, solar
+pages, new gameplay clocks or a particular static lighting policy. Exact
+render/pick authority, asset loading, remaining presentation scope and follow-up
+slice boundaries remain Q-15–Q-19. No new issue or code is created here.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1342,6 +1374,266 @@ Q-13's renderer proof gate and the narrow first-arena scope. Deferred migration
 concerns remain recorded without blocking this arena or pretending full-game
 compatibility has been implemented.
 
+## Face-map amendment — source audit, 2026-11-07
+
+This audit corrects the incomplete earlier migration comparison. Its evidence
+prefix **S** means Synarchy `3777d437ea00e1302bf55162ad5693fee4879187`;
+**H** means Hetoimasia `2a2a4a9ff9a709636dda9fa6621deb37a35ca6f6`.
+H file:line references, including this design's original sections, are to that
+pre-amendment revision. **P** means held, unmerged PR #654 at
+`57bd8a40c17fb4f62de895272f8081ade583f95a`. Source and image inspection only:
+no build, test, game launch or performance experiment was run for this audit.
+Synarchy was read from a temporary snapshot, never modified.
+
+### Verified path from cells to pixels
+
+1. **Cell data and material selection.** S stores 16×16 columns of material,
+   slope and vegetation IDs in contiguous arrays, including interior air
+   (`src/World/Chunk/Types.hs:72–109`). The arena initializes a flat material
+   stack and slope zero (`src/World/Generate/Arena.hs:126–149,212–232`).
+   Terrain edits replay before reloaded chunks are admitted
+   (`src/World/Thread/ChunkLoading.hs:170–189`). A material selects an ordinary
+   colour texture; a world slope ID is rotated for the camera and selects a
+   separate face-map texture (`src/World/Render/Textures.hs:17–57`). No
+   polyhedral mesh is constructed from that ID on this terrain draw path.
+
+2. **The loaded images, not just a generator name.** S
+   `scripts/world_view.lua:96–145` loads `isoface.png`, all 15
+   `isoface_slope_*.png`, left/right masks and `isoface_level_1..8.png`.
+   The inspected images are 96×64 RGBA with binary alpha; their RGB channels
+   encode right/top/left weights. Mixed RGB values in slopes describe weighted
+   lighting, not three independently textured geometric polygons. The
+   `isoface_slope_nesw.png` image is a lower flat diamond, with nonzero alpha
+   beginning at row 16 and no full-block side silhouette. It is visibly
+   different from ID 0's full three-face `isoface.png`.
+
+   S `src/World/Slope/FaceMaps.hs:33–47,65–119,128–161` contains procedural
+   helpers, but its `SlopeFaceMaps` record has only flat plus four cardinal
+   ramps, not the full shipped 16-image catalog. Its cardinal ramp helper
+   makes the entire canvas opaque, and its side helpers only fill rows 48–63;
+   the shipped side masks start at row 23. Runtime source/script inspection
+   found PNG loading, not calls generating the full catalog from those
+   helpers. Porting the helpers alone would not preserve the inspected art.
+   The level masks are fluid thicknesses: each adds two pixels of side below
+   the same diamond (`FaceMaps.hs:52–78`; `Textures.hs:80–90`). They are not
+   sixteen terrain slopes or authorization to add fluids.
+
+3. **Quad production, coverage and cutaway.** S walks loaded columns in the
+   visible slice/depth range and emits one full sprite quad for each non-air
+   terrain cell it visits (`src/World/Render/Quads.hs:211–265`). A quad uses
+   the whole colour image and whole selected face map with UV 0..1; its top,
+   sides and slope silhouette are pixels in that quad
+   (`src/World/Render/TileQuads.hs:42–113`). The projection uses the 96/48/16
+   proportions (`src/World/Grid.hs:47–109`), with vertical displacement
+   `(worldZ-zSlice)*tileSideHeight`. It does not emit one mesh face per solid
+   plane. Deeper terrain cells provide exposed stacked sides; neighboring
+   sprites hide overlap through draw order.
+
+   At the cut, S may emit a blank full-tile sprite when the terrain surface
+   is above the slice but no stored material exists at that slice
+   (`Quads.hs:292–311`; `TileQuads.hs:117–157`). This is not authoritative
+   generation of a cut surface. Additional left/right quads in
+   `src/World/Render/SideDecoQuads.hs:29–58,126–179` are fluid edge strips,
+   not proof that ordinary terrain uses split solid faces. The current
+   amendment must account for cavities, roofs and cutaways explicitly rather
+   than treating S's blank fallback as known solid terrain.
+
+4. **Ordering and cursor.** S tile painter keys are facing-adjusted `x+y`
+   plus relative Z × 0.001 (`TileQuads.hs:54–66`). The foreground/background
+   cursor adds/subtracts 0.0004, while fluid tops add 0.0005
+   (`TileQuads.hs:167–176,352–429,432–457`). Quads are grouped and sorted by
+   layer, with stable painter tie rules, then static and dynamic runs merge
+   (`src/Engine/Scene/Types/Batch.hs:130–160,187–212`). Its world pipeline uses
+   source-alpha blending (`src/Engine/Graphics/Vulkan/Pipeline/Bindless.hs:141–152`).
+   Thus matching a single silhouette does not by itself qualify the new
+   renderer's whole-quad depth order at roofs or overlapping cell sprites.
+
+5. **Vertex and fragment stages.** S
+   `src/Engine/Graphics/Vulkan/ShaderCode.hs:85–169` carries texture and
+   face-map handle IDs, render flags, facing, world U/V and solar-page slot.
+   Handles resolve through the slot table; an unresolved face map uses the
+   default face map (`:214–227,254–260`), whose texel is neutral top weight
+   `(0,255,0,255)` (`src/Engine/Graphics/Vulkan/Texture/DefaultFaceMap.hs:43–44`).
+   The fragment samples both images, normalizes RGB weights (zero sum means
+   top), swaps right/left weights for odd facings and rotates apparent sun
+   direction by facing × π/2 (`ShaderCode.hs:254–303`). It multiplies base
+   colour by tint, weighted face brightness and global brightness. Ordinary
+   alpha is colour alpha × face-map alpha (`:305–318`). S writes that alpha
+   for blending; it does not itself use Hetoimasia's 0.5 cutout discard.
+
+   Selection outline is a separate flag using four neighboring **colour
+   texture** alpha samples before face-map shading (`:235–251`). Lifecycle
+   flag bit 1 deliberately ignores the face-map alpha for partially built
+   structures while keeping its RGB lighting (`:307–317`). Neither feature
+   is required merely to mask a terrain tile; neither has been silently added
+   to this UI-free arena.
+
+6. **What the full lighting path actually contains.** The terrain shader has
+   weighted top/left/right directional shading and an ambient day/night
+   curve, not a terrain shadow-map/occlusion-light simulation. With
+   `h=sin(2*pi*phase)`, ambient is `0.5+0.2*h` for h≥0 and
+   `0.15+0.35*(1+h)` otherwise. Direct strength uses `max(0,h)`; side ambient
+   is ambient × 0.85, and side direct weight is `0.4+0.6*max(0,±direction)`
+   (`ShaderCode.hs:204–212,286–303`). A fixed phase and facing supply all
+   inputs needed for this face shading; advancing time is a separate system.
+
+   Full S day/night adds independently advancing visible-page clocks and
+   calendar/time-scale behavior (`src/World/Thread/Time.hs:35–69`;
+   `src/World/Time/Types.hs:91–115`), up to 16 solar-page entries
+   (`src/Engine/Graphics/Solar.hs:120–121`), each page's angle/circumference
+   (`src/World/Render.hs:393–413`), and a live global override applied at UBO
+   upload (`Solar.hs:138–171`; `src/Engine/Loop/Frame.hs:352–385`). The vertex
+   stage adds `(gx-gy)/circumference` to phase without wrapping before
+   interpolation (`ShaderCode.hs:126–165`); the fragment's periodic functions
+   give longitude-local lighting. It is not a stored light map per column.
+   The CPU local-sun query applies the same longitude concept
+   (`src/World/Time/Local.hs:26–37`). Nonpositive world size falls back to
+   one chunk's circumference, not an infinite-world lighting policy.
+
+   A further source discrepancy must stay explicit: clock comments label
+   phase 0 midnight and 0.5 noon (`Time/Types.hs:39–61`), but the shader's
+   sine puts maximal sun height at 0.25. Copying labels is not evidence of
+   astronomical parity. Separately, S applies depth dimming/blue haze and
+   underwater tint before lighting (`TileQuads.hs:68–98`), plus zoom-map
+   crossfade (`src/World/Render.hs:73–81`). Static face shading alone does
+   not imply those presentation effects have been ported.
+
+7. **Picking is not face-map accurate in S.** The per-frame cursor and Lua
+   picker share `pickWorldTile` (`src/World/Render/CursorQuads.hs:117–129`;
+   `src/Engine/Scripting/Lua/API/WorldQuery/Pick.hs:85` onward). It transforms
+   a screen point through the camera, descends Z from the slice, inverse-
+   projects a grid position and returns the first non-air stored tile in a
+   visible chunk (`src/World/Render/HitTest.hs:93–158`). It does not sample
+   face-map/colour alpha or use slope geometry. S's terrain data and cursor
+   agree on a cell convention, but this is not pixel-perfect silhouette
+   agreement. The new design's promise to pick what is actually drawn needs
+   explicit masked-quad coverage and ordering, not a blind copy of that picker.
+
+### Existing material ABI and the remaining integration gap
+
+The manager's ABI reading is supported. H
+`packages/render-2d-vulkan/src/Hetoimasia/Render/TwoD/Vulkan/MaterialSources.hs:11–36`
+defines the fragment function, per-instance parameter, full texture handles
+in records, secondary `sampleTexture` and application push fields. Its
+`Material/Sample.hs:34–51` already samples a second texture from a one-handle
+record. H `packages/render-2d/src/Hetoimasia/Render/TwoD/Material.hs:27–37`
+allows records in retained chunks and generation-checked handles.
+H `packages/render-2d-vulkan/src/Hetoimasia/Render/TwoD/Vulkan/ShaderSources.hs:353–375`
+discards alpha below 0.5 on the cutout path. A new face-map material can use
+these mechanisms without a new descriptor, vertex format or depth output;
+this is source feasibility, not a new GPU qualification result.
+
+Important conditions the amendment must resolve:
+
+- The material returns **premultiplied linear colour**. Applying mask alpha
+  must preserve that contract, including the ordered path; copying S's
+  straight-alpha output verbatim is wrong for H. Binary-alpha eligibility,
+  nearest/linear filtering and CPU pick threshold must agree.
+- Numeric face weights require a data-image policy. H's general decoder has
+  `DataImage` (`packages/asset-image/src/Hetoimasia/Asset/Image/Png.hs:3–19`),
+  but the production bounded Lua decoder is explicitly sRGB colour-only,
+  with no data-image option (`PngDecode.hs:14–25`;
+  `packages/lua-engine/texture/Hetoimasia/LuaEngine/Texture/Pipeline.hs:34–38,180`).
+  S uploads RGBA8 UNORM (`src/Engine/Graphics/Vulkan/Texture.hs:37–47`).
+  Passing a face map through the current Lua colour path would transform
+  intermediate RGB weights. The ABI supports another texture; that does not
+  mean the bounded asset/API path already preserves its intended data.
+- Picking needs CPU coverage from the same pinned artwork/mask identity and
+  sampling convention as the adopted draw. A full texture handle alone does
+  not supply CPU alpha. Its storage, budget, version and lifetime require
+  explicit ownership; no GPU readback per click or image-shaped world state
+  is implied.
+- The new whole-cell/face quads need their own ordering/occlusion proof.
+  Existing Q-13 results qualify the old solids and material, not automatically
+  the changed silhouettes. Keep the unchanged ABI and re-prove the affected
+  fixture matrix before claiming final acceptance.
+
+### Re-audit of the approved design and filed slices
+
+These are differences found across the approved terrain arc, not a claim of
+full-game Synarchy equivalence. Rows marked **intentional** record earlier
+owner choices; they do not reopen them. **Amendment** rows need decisions or
+contract corrections before the new path is qualified. Both sides use the
+pinned evidence revisions above.
+
+| Area and disposition | Synarchy evidence | Hetoimasia design / implementation evidence and consequence |
+| --- | --- | --- |
+| Shape IDs versus visible shape — amendment | S `Render/Textures.hs:24–57`, loaded masks in `scripts/world_view.lua:105–128`; ID 15 image is a lower diamond. `Slope/Compute.hs:153–166` normalizes some generated 15 cases to 0; it does not make their authored images equal. | H design D-25 `:689–701`, P-5 `:826–846`; `packages/terrain/src/Hetoimasia/Terrain/Geometry.hs:17–29,193–202` instead defines lower-envelope edge solids and makes 15 equal 0. #637's identities are reusable; its solid silhouettes are not Synarchy fidelity proof. |
+| Facing and projection convention — verified agreement, preserve it | S `Grid.hs:185–206,226–236` and `Render/Textures.hs:24–36` rotate positions and masks consistently. The shader separately numbers South/West/North/East as 0/1/2/3 (`Engine/Loop/Frame.hs:362–366`). | H `packages/terrain/src/Hetoimasia/Terrain/Shape.hs:54–76` selects the same view mask using positive turns 0/3/2/1; `Terrain/Render2D/Projection.hs:108–140` uses those turns and the same 96/48/16 proportions. Do not feed H's positive-turn count straight into S's differently numbered lighting-facing input. |
+| Cell sprite versus separate geometric faces — amendment | S `Render/Quads.hs:211–265`, `Render/TileQuads.hs:42–113`. | H design `:1175–1190`; `Terrain/Render2D/Plan.hs:682–714`; P `packages/terrain-render-2d/material/Hetoimasia/Terrain/Render2D/Material.hs:11–41`. #643/#644 draw polygons cut from shared solids, not the face-map sprite. |
+| Exposure, adjacency and cut surfaces — amendment | S non-air cell enumeration and blank slice fallback, `Render/Quads.hs:222–238,292–311`; fluid side strips are separate `SideDecoQuads.hs:29–58`. | H design D-7 `:368–371`, `:1183–1190`; Plan `:694–714` uses solid adjacency and flat caps. Changing silhouette alone leaves occlusion/cavity/cap differences unresolved; do not draw missing terrain as known solid. |
+| Ordering — amendment | S tile/cursor/fluid painter offsets, `TileQuads.hs:61–62,174–176,403–407,452–454`; `Engine/Scene/Types/Batch.hs:187–212`. | H Plan `:59–68` orders projected solid planes and assigns unique depth keys. Sprite ordering must be requalified; mathematical ray depth through the old solid is no longer the appearance oracle. |
+| Pick authority — amendment | S `Render/HitTest.hs:112–158`: inverse grid, descending Z, non-air; no slope or alpha test. | H `Terrain/Render2D/Pick.hs:1–28,81–109` picks planned solid polygons; design `:1192–1199` and #645/#646 demand adopted-view consistency. Preserve consistency while changing the coverage being tested to match rendered masks. |
+| Lighting and depth appearance — amendment/open | S ShaderCode `:204–212,254–318`, TileQuads `:68–98`, solar/time path above. | H D-18 `:576–587`, P-5 `:1175–1190` and #644 have no selected face-map lighting contract. Static shading, dynamic day/night and depth haze are different scope choices, not one mandatory package. |
+| Texture data, filtering and alpha — amendment | S loaded masks, UNORM upload `Engine/Graphics/Vulkan/Texture.hs:37–47`, source-alpha blend `Pipeline/Bindless.hs:141–152`, global world sampler `Texture/Policy.hs:23–41`. | H premultiplied linear material ABI, colour-only bounded decoder and 0.5 cutout above; P material `:35–41` forces nearest. New mask/data loading and CPU/GPU sample semantics need explicit agreement; exact raw framebuffer colour parity is not established by copying PNG bytes. |
+| Cache and resource ownership — intentional foundation, amend payload | S `Render.hs:115–149` caches page-wide sorted CPU quads by generation/camera/solar slot; `Render/Camera.hs:19–57` uses viewport margins. | H design `:1192–1199`, #645 requirements 3–8 use immutable retained regions, adopted revisions and completion-safe retirement. Keep this improvement; add mask/lighting identity, CPU coverage and secondary texture interests to the owned payload, rather than copying S's cache wholesale. |
+| Flat default source — intentional | S `Generate/Arena.hs:16–33,212–232`: finite initial stone stack, four soil cells, seeded surface vegetation. | H D-7/D-16, P-5 `:848–866`: implicit stone to supported lower bound, four soil cells, no vegetation or RNG. Face maps do not add geology/flora. |
+| Streaming and storage — intentional | S `Chunk/Types.hs:72–109` stores contiguous arrays and interior air; `Slope/EdgePatch.hs:95–110` extends bottoms by repetition. | H D-5/D-11/D-26, P-5 `:809–818,869–905,992–1036`: sparse adaptive segments, source-plus-removals, checked coordinates and explicit budgets. Keep lazy depth and gap semantics; no new per-cell light volume. |
+| Arena extent/startup — intentional | S `Generate/Arena.hs:70–104,120–149`, `scripts/test_arena.lua:188–207`: initial 5×5, optional finite rectangle, no arena wrapping. | H D-7/D-11 and P-5 `:811–818,994–1008`: camera demand, no designed edge/bottom within checked range. Do not import cylindrical longitude or finite-world solar circumference without an owner choice. |
+| Shape changes on edits — intentional | S `Slope/Compute.hs:130–169`, `Thread/ChunkLoading.hs:256` applies inferred slope edits. | H D-21/D-24 `:641–651,677–687`: authored IDs and only requested cell removal; walkability/speed/inference remain deferred. |
+| Edits, retention and authority — intentional | S `Edit/Apply.hs:298–343,412–438`, `Thread/ChunkLoading.hs:170–189,531–540`: broader edits/overlays, replay including saved edits. | H D-10/D-19/D-20 and P-5 `:958–990,1074–1089`: atomic bounded optional requests, session retention, no persistent saves or whole-tick rollback. Cell/material/shape records remain separate from texture pixels; any altered subcell geometry contract needs its own answer. |
+| Camera navigation — intentional extensions | S `Render.hs:49–64,282–317`, `scripts/test_arena.lua:265–293`, `Engine/Scripting/Lua/API/Camera.hs:223–318`: headroom, manual tracking off, reset action, two-coordinate jump. | H D-12–D-14/D-22/D-23 and P-5 `:1105–1115,1154–1173`: optional jump Z, exact manual level through local navigation, fractional scroll accumulation, atomic relative slice, preserved zoom/facing. Keep approved controls. |
+| Zoom/depth/crossfade — partly intentional, look still open | S `Render.hs:73–81`, `Grid.hs:148–154`: zoom-dependent depth and fading terrain into zoom-map rendering. | H P-5 `:1001–1009,1154–1163` has 250 maximum depth, own zoom units/range and no zoom map. Equivalent maximum is not identical depth curve or apparent zoom. No map/UI crossover is added by this amendment. |
+| Input, cursor and selection effects — intentional scope | S `CursorQuads.hs:56–129`, `TileQuads.hs:352–429`, ShaderCode `:235–251,307–317` includes visible cursors, outlines and structure lifecycle treatment. | H D-8/D-9/D-18, #647/#648: no UI, temporary F8 then Lua API only; ordered reset-safe input. Correct terrain masking does not require importing designation/selection/structure effects. |
+| Engine/game and scene composition — intentional | S `World/Render.hs:68–90,327–333` reads EngineEnv and assembles terrain plus game layers; page clocks feed rendering. | H D-17/D-20/D-24, P-5 `:791–807,1125–1150`: injected services, Lua rules, exclusive terrain window claim, deferred general scene/gameplay integration. Do not introduce a global clock/service registry for shading. |
+| Qualification and performance — amendment evidence, no speed claim | S sprite/mask/shader sources above are the reference, not the old solid model. | H TRA-8 evidence `docs/evidence/terrain/tra8/README.md:34–52,113–155` qualifies the old model and explicitly records mismatch; #648 final matrix must add actual face-map/lighting/coverage cases and changed resource costs. Existing bounds and all-16/four-facing coverage remain, with no unmeasured superiority claim. |
+
+In this table, shortened S paths begin at `src/World/` unless explicitly
+prefixed with `scripts/` or `Engine/` (the latter begins at `src/Engine/`).
+Shortened H `Terrain/Render2D/*` paths begin at
+`packages/terrain-render-2d/src/Hetoimasia/`. These aliases only abbreviate
+the citations; the revisions above remain the authority.
+Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
+the prose refer to the full S paths named in the corresponding trace above;
+H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
+
+### P-6. Amendment framing — proposals, not decisions
+
+The proposed correction is a terrain material that samples colour artwork and
+the selected face map on cell/visible-face quads, applies silhouette alpha and
+face lighting, and uses the existing material ABI. It replaces the claim that
+the current convex solid's projected polygons reproduce Synarchy's sprites.
+The exact emission/occlusion/cap contract is still open; the verified S path
+is one whole quad per non-air visible-range cell, not three separately meshed
+faces. Preserve sparse authoritative cell/material/shape state and atomic
+removal; do not infer world occupancy from camera-facing texture alpha.
+The relationship of existing subcell intersection APIs to that logical state
+must be explicitly settled, not called physically equivalent without proof.
+
+Recommended first lighting scope: face-map alpha and static directional
+top/left/right shading, including facing-dependent weights, with a fixed light
+configuration. This restores the shape-defining material without requiring a
+world clock, calendar, solar-page table or longitudinal day/night policy.
+The tradeoff is fixed illumination and no animated day/night yet. Full dynamic
+lighting is possible but expands this arena correction into time ownership,
+parameter publication and infinite-world lighting decisions. Q-15 is for the
+owner; nothing in this proposal settles it.
+
+Affected tracker work, for later approved revisions only:
+
+- **#637 and #643 are merged.** Preserve coordinate, ID, storage and camera
+  work. A follow-up must replace/supersede the inappropriate visual solid
+  assumptions, planned coverage/ordering and picking together. No reopening
+  or code change occurs in this design turn.
+- **#644 / PR #654 is open and held unmerged.** Its measured ABI result and
+  silhouette finding remain useful evidence. Its per-face material/model
+  is not the final face-map implementation. This design does not release
+  the hold or direct a merge; manager delivery coordination remains separate.
+- **#645:** revise region payload, mask/lighting/material versioning, CPU
+  coverage and secondary-texture holds, budgets and adoption tests.
+- **#646:** revise the bounded style/data loading and pick-result contract
+  where required, preserving role/lease and adopted-frame token authority.
+- **#647:** load/retain the approved masks alongside colour art, supply the
+  agreed light/style data and verify actual silhouette selection in content.
+- **#648:** final qualification must run the amended path, include all masks
+  and facings with lighting/cutout/pick controls, and measure the additional
+  data/texture ownership before shortcut removal and final acceptance.
+
+The owner chose a follow-up before TRA-12. Exact one-PR slice boundaries,
+dependency insertion and existing-issue revisions await Q-15–Q-19; the ledger
+and delivery plan remain the original filed arc until those changes receive
+sign-off. No final issue bodies are drafted here.
+
 ## Open questions and review checkpoints
 
 ### Q-1. What does flat terrain contain vertically?
@@ -1454,6 +1746,47 @@ composition. Select adaptive sparse storage using the stated payload/complexity
 analysis, with actual runtime costs qualified during implementation. Those
 deferred systems are not added readiness gates for the first arena. Q-12 is
 approved; the deliberately gated Q-13 remains for implementation.
+
+### Q-15. Static face shading now, or the full day/night path?
+
+Open; first owner decision for D-28. Recommendation: face-map silhouette alpha
+plus static, facing-aware directional shading now, day/night in a later arc.
+The full alternative also needs clock/calendar ownership, solar parameters,
+phase convention and a policy for longitude in an effectively infinite arena.
+The shader does not need those systems merely to use face-map RGB/alpha.
+
+### Q-16. Logical terrain, visual coverage and picking contract
+
+Open; discuss after Q-15. Settle what remains authoritative for cell queries
+and edits versus the visible sprite, the fate/meaning of #637's exact subcell
+solid APIs, full-cell versus isolated-face emission, hidden-face/cap behavior,
+and CPU picking using the adopted mask/colour alpha and order. Do not silently
+keep incompatible ray/coverage claims or copy S's non-alpha picker.
+
+### Q-17. Face-map data loading, sampling and ownership
+
+Open. Decide the bounded data-image route, approved asset catalog/provenance,
+filtering/cutout/premultiplication rules, CPU coverage retention and how style
+acquires/version-checks both texture kinds. General `DataImage` support is
+not proof that the current bounded Lua loader exposes it. Preserve protected
+leases and account for new storage; no temporary colour-decoding workaround
+is approved.
+
+### Q-18. Exact initial appearance beyond the silhouette
+
+Open. After lighting scope, fix the initial light values and facing convention,
+whether to carry S's depth dimming/haze, and which deviations are intentional.
+S's clock phase labels and shader sine disagree; full clock parity cannot be
+claimed from labels alone. Fluids, selection outlines, lifecycle sprites and
+zoom-map crossfade remain outside the approved arena unless explicitly changed.
+
+### Q-19. Follow-up slices, revisions and amendment readiness
+
+Open. After the behavior is settled, approve dependency-ordered follow-up
+slices and exact revision needs for #645–#648, with the owner-selected barrier
+before TRA-12 and explicit coordination of held PR #654. Mirror approved new
+slice IDs in the ledger and delivery plan; preserve earlier IDs. Readiness
+requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ## Verification strategy — approved through Q-12
 
