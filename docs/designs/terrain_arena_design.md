@@ -115,7 +115,8 @@ Depth should also extend on demand, with no designed bottom to the arena
 Shift-scroll controls the cutaway level. A camera jump defaults to the
 destination's top level unless its Lua command supplies a Z level (D-12).
 Normal panning, zooming and rotation automatically follow terrain height
-(D-13); the interaction with an explicit manual depth override remains open.
+(D-13). Shift-scroll temporarily pins the slice during panning; a camera jump
+without explicit Z restores terrain following (D-14).
 
 **P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
 that can be navigated, making camera demand and the resulting terrain
@@ -409,8 +410,8 @@ optional Z argument, so optional Z is a selected Hetoimasia requirement rather
 than a claim of existing Synarchy parity. D-13 subsequently selects normal
 terrain-following navigation and rejects the recommendation to keep the view
 at a fixed Z through ordinary navigation. The detailed meaning of top level at
-an edited or empty destination, scroll step/direction and transitions between
-manual depth and automatic tracking remain to be specified.
+an edited or empty destination and scroll step/direction remain to be
+specified. D-14 settles the manual-panning override and jump reset.
 
 ### D-13. Follow terrain during ordinary camera navigation
 
@@ -425,14 +426,39 @@ The previous fixed-Z navigation recommendation is withdrawn. Flat initial
 generation remains D-1; this camera behavior must also accommodate varied
 terrain heights and edits without requiring procedural hills in this arc.
 
-D-12's manual Shift-scroll and explicit jump Z still apply. Their interaction
-with subsequent navigation needs one clarification: should a manual selection
-temporarily disable tracking until reset, or should subsequent camera
-navigation resume terrain following? Synarchy's inspected implementation uses
-a tracking flag: Shift-scroll disables it, a reset action restores it, and a
-zoom-map transition can also restore it. Its ordinary pan/rotation paths do
-not unconditionally reset a manually selected slice. Do not silently adopt
-that exception or erase the owner's requested terrain-following behavior.
+D-12's manual Shift-scroll and explicit jump Z still apply. D-14 subsequently
+settles the manual-panning exception and reset on a camera jump. Synarchy's
+inspected implementation uses a tracking flag: Shift-scroll disables it, a
+reset action restores it, and a zoom-map transition can also restore it.
+That zoom-map transition is reference behavior, not an independently selected
+Hetoimasia feature.
+
+### D-14. Manual cutaway overrides panning until a camera jump
+
+Owner, directly in this pane on 2026-11-06:
+
+> in synarchy, if the z slice is set by custom shift scroll, then panning is temporarily overridden to allow for no changes, that is right, that works well, this then resets when we move the camera to a new spot
+
+Shift-scroll selects a manual cutaway level and temporarily disables automatic
+height following while panning. Panning still changes horizontal position;
+it does not change the selected slice. Moving the camera to a new spot here
+means the move/jump command discussed in D-12, distinct from ordinary panning.
+A jump without Z clears the manual override, selects the destination's top
+level and resumes terrain following. D-12's explicit Z argument takes
+precedence when supplied, so such a jump uses the requested depth rather than
+snapping to the surface.
+
+| Action | Selected behavior |
+| --- | --- |
+| Normal pan, zoom or rotation while following | Follow terrain height (D-13). |
+| Shift-scroll | Change cutaway Z and enter manual override. |
+| Pan with manual override | Preserve the chosen cutaway Z. |
+| Move/jump without Z | Clear override, select destination surface and follow terrain. |
+| Move/jump with Z | Honor requested depth rather than automatic surface selection. |
+
+No UI toggle or additional reset shortcut is selected by this decision.
+Detailed zoom/rotation behavior during manual override remains part of the
+camera contract to specify; do not import Synarchy's zoom-map reset implicitly.
 
 ## Design boundaries
 
@@ -514,9 +540,11 @@ terrain above is hidden, and jumps choose the destination's top level unless
 given explicit Z. Distinguish slice visibility from actual exposure caused by
 removal. Cut-face appearance, visible depth range, exact top-level semantics
 remain open. D-13 selects terrain following for normal pan/zoom/rotation;
-the previous fixed-Z recommendation is withdrawn. Clarify the transition
-back to following after manual Shift-scroll or an explicit jump Z, as recorded
-in D-13. No UI widgets are implied. The isometric/four-facing presentation and
+the previous fixed-Z recommendation for normal navigation is withdrawn.
+D-14 selects pinned Z during manual panning and restores following on a jump
+without Z; an explicit jump Z takes precedence. Remaining manual-mode zoom
+and rotation details must be specified without importing the reference's
+zoom-map feature. No UI widgets are implied. The isometric/four-facing presentation and
 remaining navigation proposal above are not independently settled by the
 cutaway decision.
 
@@ -619,8 +647,11 @@ cannot reset a newer view. Verify picking against the displayed cutaway and
 that viewing a deep slice does not materialize the intervening volume.
 For D-13, navigate varied-height authored terrain using pan/zoom/rotation and
 verify that normal terrain following keeps the relevant surface visible.
-Specify manual-override transition checks after that remaining choice is
-settled. These fixtures do not add a procedural hill generator to the arc.
+For D-14, Shift-scroll then pan over different heights and verify the slice
+stays fixed; jump without Z and verify surface following resumes; jump with Z
+and verify that requested depth wins. Include unloaded jump destinations and
+late surface results. These fixtures do not add a procedural hill generator
+to the arc.
 During development, exercise the D-8/D-9 shortcut through the agreed
 targeting/input path, including no valid target and focus/reset behavior.
 Capture its removal/reveal evidence before deleting the shortcut. Final
