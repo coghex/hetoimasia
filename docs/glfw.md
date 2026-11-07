@@ -2554,6 +2554,17 @@ production. Copies of a reader are the same consumer: they observe one reset and
 one acknowledgement. Concurrent handlers over one feed need the application's
 own coordination.
 
+### The Lua consumer
+
+The Lua engine's input adapter (`Hetoimasia.LuaEngine.Graphics.Input`, [its contract](../packages/lua-engine-graphics/README.md#the-lua-input-adapter-tra-6))
+is the one logical consumer of an input-enabled window's feed: not a second reader beside a background drain. It registers its
+consumer and enables the application's admission in one transaction at the instance's first `api.input.poll` of that window, and
+suspends admission in the transaction that removes the consumer when its instance ends, which is a reset of reason suspension and owes
+no warning. It reads a bounded prefix with `readInput` in one transaction together with the feed's statistics and the window's
+observation, and never calls `awaitInput`; it acknowledges with `acknowledgeReset` in a transaction of its own. The reader, the control
+and the observation reach it through the narrow `WindowInput` of the window host, never through the scene target. It adds no thread,
+no callback and no queue, and invokes no Lua from a native callback.
+
 ### Events and epochs
 
 A delivered `InputEvent` carries its window, its `InputEpoch`, and one payload:
