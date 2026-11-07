@@ -6,21 +6,24 @@
 -- "Test.Support.ExternalClient", exposing @base@ and @hetoimasia-terrain@ and
 -- hiding everything else.
 --
--- One client must be accepted, linked and run: it uses the public coordinate,
--- shape and geometry interfaces end to end, which is both the environment
--- control and the evidence that the supported operations stay usable. Every
+-- Two clients must be accepted, linked and run: one uses the public coordinate,
+-- shape and geometry interfaces end to end, the other validates limits and drives
+-- the residency model, which is both the environment control and the evidence that
+-- the supported operations stay usable. Every
 -- other client must be refused, each for the specific diagnostic that names its
 -- cause, so a missing package or an absent compiler can never pass for the
 -- boundary holding:
 --
 -- * the constructor of a checked value (an axis coordinate, a local offset, a
---   shape identity, a rotation count, a ray or a solid) cannot be named, so a
+--   shape identity, a rotation count, a ray, a solid, validated limits, the
+--   residency model or a coverage) cannot be named, so a
 --   client cannot build an out-of-range coordinate, an unsupported identity, an
 --   unnormalized turn, a ray with no direction or a forged solid: @GHC-10237@
 --   for an import, and @GHC-01928@ (an illegal term-level use of the type
 --   constructor) for a use of the constructor in an expression;
 -- * an exported accessor of a checked value (a solid or a ray) is a function,
---   never a field label, so record-update syntax cannot rewrite one;
+--   never a field label, and the fields of validated limits and of the model are
+--   not exported at all, so record-update syntax cannot rewrite one;
 -- * each private module is refused as a hidden module of the package's main
 --   library, @GHC-87110@.
 module Test.Terrain.Opacity (spec) where

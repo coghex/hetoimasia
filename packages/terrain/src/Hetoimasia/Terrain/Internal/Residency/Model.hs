@@ -54,6 +54,7 @@ module Hetoimasia.Terrain.Internal.Residency.Model
   , modelInvariants
   ) where
 
+import Control.Monad (foldM)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -1049,12 +1050,14 @@ setCamera m v a demands = do
       m1 = foldl' dropInterest m obsolete
       m2 = m1 {mViews = Map.insert v (View a demands Set.empty) (mViews m1)}
       (m3, gone, cancelling) = pruneJobs m2
+      -- Only pressure leaves a region pending; any other refusal fails the event.
       attempt (mm, done, waiting) d = case planAdmission mm a owner [d] noExtras of
         Right plan →
           let (mm', admission) = applyPlan mm a owner plan
-           in (mm', done <> [admission], waiting)
-        Left _ → (mm, done, waiting <> [demandRegion d])
-      (m4, admitted, pending) = foldl' attempt (m3, [], []) demands
+           in Right (mm', done <> [admission], waiting)
+        Left (Busy _) → Right (mm, done, waiting <> [demandRegion d])
+        Left other → Left other
+  (m4, admitted, pending) ← foldM attempt (m3, [], []) demands
   Right (m4, CameraSet admitted pending (map snd obsolete) gone cancelling)
 
 -- | Retry the pending part of every view's latest camera demand, in view order.
