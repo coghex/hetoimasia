@@ -6,21 +6,24 @@
 -- "Test.Support.ExternalClient", exposing @base@ and @hetoimasia-terrain@ and
 -- hiding everything else.
 --
--- One client must be accepted, linked and run: it uses the public coordinate,
--- shape and geometry interfaces end to end, which is both the environment
--- control and the evidence that the supported operations stay usable. Every
+-- Two clients must be accepted, linked and run: one uses the public coordinate,
+-- shape and geometry interfaces end to end, the other validates limits and drives
+-- the residency model, which is both the environment control and the evidence that
+-- the supported operations stay usable. Every
 -- other client must be refused, each for the specific diagnostic that names its
 -- cause, so a missing package or an absent compiler can never pass for the
 -- boundary holding:
 --
 -- * the constructor of a checked value (an axis coordinate, a local offset, a
---   shape identity, a rotation count, a ray or a solid) cannot be named, so a
+--   shape identity, a rotation count, a ray, a solid, validated limits, the
+--   residency model or a coverage) cannot be named, so a
 --   client cannot build an out-of-range coordinate, an unsupported identity, an
 --   unnormalized turn, a ray with no direction or a forged solid: @GHC-10237@
 --   for an import, and @GHC-01928@ (an illegal term-level use of the type
 --   constructor) for a use of the constructor in an expression;
 -- * an exported accessor of a checked value (a solid or a ray) is a function,
---   never a field label, so record-update syntax cannot rewrite one;
+--   never a field label, and the fields of validated limits and of the model are
+--   not exported at all, so record-update syntax cannot rewrite one;
 -- * each private module is refused as a hidden module of the package's main
 --   library, @GHC-87110@.
 module Test.Terrain.Opacity (spec) where
@@ -35,8 +38,9 @@ import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "Terrain opacity across the package boundary" $ do
-  it "accepts and runs a client using the public coordinate, shape and geometry interfaces" $
-    withClient "Main.hs" supportedClient $ \compile → do
+  forM_ accepted $ \(label, source, expected) →
+   it label $
+    withClient "Main.hs" source $ \compile → do
       outcome ← compile Link
       case clientStatus outcome of
         ExitSuccess → pure ()
@@ -54,7 +58,7 @@ spec = describe "Terrain opacity across the package boundary" $ do
           ""
       status `shouldBe` ExitSuccess
       err `shouldBe` ""
-      lines out `shouldBe` supportedOutput
+      lines out `shouldBe` expected
 
   forM_ constructors $ \(name, imports, source) →
     it ("rejects a client that names the constructor of " <> name) $
@@ -102,6 +106,13 @@ spec = describe "Terrain opacity across the package boundary" $ do
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 withClient = withPackageClient ["base", "hetoimasia-terrain"]
 
+-- | The clients that must be accepted, linked and run, with their output.
+accepted ∷ [(String, String, [String])]
+accepted =
+  [ ("accepts and runs a client using the public coordinate, shape and geometry interfaces", supportedClient, supportedOutput)
+  , ("accepts and runs a client that validates limits and drives the residency model through its public interface", residencyClient, residencyOutput)
+  ]
+
 -- | The modules hidden inside the main library.
 hidden ∷ [String]
 hidden =
@@ -112,6 +123,9 @@ hidden =
   , "Hetoimasia.Terrain.Internal.Interval"
   , "Hetoimasia.Terrain.Internal.Packed"
   , "Hetoimasia.Terrain.Internal.Polytope"
+  , "Hetoimasia.Terrain.Internal.Residency.Coverage"
+  , "Hetoimasia.Terrain.Internal.Residency.Limits"
+  , "Hetoimasia.Terrain.Internal.Residency.Model"
   , "Hetoimasia.Terrain.Internal.Shape"
   , "Hetoimasia.Terrain.Internal.Source"
   ]
@@ -137,6 +151,9 @@ constructors =
   , ("Changes", ["import Hetoimasia.Terrain.Changes (Changes (Changes))"], [])
   , ("Segment", ["import Hetoimasia.Terrain.Segment (Segment (Segment))"], [])
   , ("Resident", ["import Hetoimasia.Terrain.Resident (Resident (Resident))"], [])
+  , ("Limits", ["import Hetoimasia.Terrain.Residency (Limits (Limits))"], [])
+  , ("Model", ["import Hetoimasia.Terrain.Residency (Model (Model))"], [])
+  , ("Coverage", ["import Hetoimasia.Terrain.Residency (Coverage (Coverage))"], [])
   ]
 
 -- | A value forged by applying a private constructor the client never imported.
@@ -150,6 +167,9 @@ forged =
   , ("ZRange", ["import Hetoimasia.Terrain.Cell (ZRange)"], ["inverted :: ZRange", "inverted = ZRange 5 5"])
   , ("PackedCell", ["import Hetoimasia.Terrain.Palette (PackedCell)"], ["airWithShape :: PackedCell", "airWithShape = PackedCell 5"])
   , ("Source", ["import Hetoimasia.Terrain.Source (Source)"], ["unvalidated :: Source", "unvalidated = Source [] mempty mempty 0 0 0"])
+  , ("Limits", ["import Hetoimasia.Terrain.Residency (Limits)"], ["zeroed :: Limits", "zeroed = Limits 0 0 0 0 0 0 0 0"])
+  , ("Model", ["import Hetoimasia.Terrain.Residency (Model)"], ["empty :: Model", "empty = Model"])
+  , ("Coverage", ["import Hetoimasia.Terrain.Residency (Coverage)"], ["everything :: Coverage", "everything = Coverage undefined"])
   ]
 
 -- | A checked value rewritten through an exported accessor used as a field
@@ -162,6 +182,12 @@ recordUpdates =
   , ("solidShape", ["import Hetoimasia.Terrain.Geometry (Solid, solidShape)"], ["swapped :: Solid → Solid", "swapped s = s {solidShape = solidShape s}"])
   , ("rayDirection", ["import Hetoimasia.Terrain.Geometry (Ray, V3 (..), rayDirection)"], ["noDirection :: Ray → Ray", "noDirection r = r {rayDirection = V3 0 0 0}"])
   , ("rayOrigin", ["import Hetoimasia.Terrain.Geometry (Ray, V3 (..), rayOrigin)"], ["moved :: Ray → Ray", "moved r = r {rayOrigin = V3 0 0 0}"])
+  , -- A validated limit cannot be rewritten after validation: the fields of Limits
+    -- are not exported at all, so the update names no field.
+    ("lResident", ["import Hetoimasia.Terrain.Residency (Limits, defaultLimits)"], ["zeroed :: Limits", "zeroed = defaultLimits {lResident = 0}"])
+  , ("lJobs", ["import Hetoimasia.Terrain.Residency (Limits, defaultLimits)"], ["unlimited :: Limits", "unlimited = defaultLimits {lJobs = 1000000}"])
+  , ("mClock", ["import Hetoimasia.Terrain.Residency (Model, defaultLimits, newModel)"], ["rewound :: Model", "rewound = (newModel defaultLimits) {mClock = 0}"])
+  , ("mTargets", ["import Hetoimasia.Terrain.Residency (Model, defaultLimits, newModel)"], ["forged :: Model", "forged = (newModel defaultLimits) {mTargets = undefined}"])
   ]
 
 supportedClient ∷ String
@@ -244,4 +270,53 @@ supportedOutput =
   , "Just 0"
   , "2"
   , "[(5,8),(3,6)]"
+  ]
+
+-- | A client that validates limits (a zero or unrepresentable figure is refused,
+-- never clamped) and drives the model only through its public functions.
+residencyClient ∷ String
+residencyClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Hetoimasia.Terrain.Coordinate (RegionCoord (..))"
+    , "import Hetoimasia.Terrain.Residency"
+    , ""
+    , "main :: IO ()"
+    , "main = do"
+    , "  let spec0 = LimitsSpec 1000 192 2048 3 3 2 4 3"
+    , "  putStrLn (either show (const \"valid\") (mkLimits spec0))"
+    , "  putStrLn (either show (const \"valid\") (mkLimits spec0 {specLoadJobs = 0}))"
+    , "  putStrLn (either show (const \"valid\") (mkLimits spec0 {specResidentBytes = limitCeiling + 1}))"
+    , "  case mkLimits spec0 of"
+    , "    Left e -> print e"
+    , "    Right limits -> do"
+    , "      let (m1, r1) = step (newModel limits) (OpenArena (ArenaId 1) (Revision 0))"
+    , "      putStrLn (either show (show . reportDecision) r1)"
+    , "      case coverageBox 0 1 0 1 0 1 of"
+    , "        Left e -> print e"
+    , "        Right cov -> do"
+    , "          let (m2, r2) = step m1 (SubmitQuery (RequestId 1) (ArenaId 1) (Revision 0) [RegionDemand (RegionCoord 0 0 0) cov])"
+    , "          case r2 of"
+    , "            Right rep -> case reportDecision rep of"
+    , "              Accepted a -> print (map fst (admissionJobs a))"
+    , "              other -> print other"
+    , "            Left e -> print e"
+    , "          let l = bankLedger m2 ResidentBank"
+    , "          print (ledgerOccupied l, ledgerReserved l)"
+    , "          let (m3, r3) = step m2 (SubmitQuery (RequestId 2) (ArenaId 1) (Revision 0) [])"
+    , "          putStrLn (either show (const \"accepted\") r3)"
+    , "          print (m3 == m2)"
+    ]
+
+residencyOutput ∷ [String]
+residencyOutput =
+  [ "valid"
+  , "LimitNotPositive FieldLoadJobs 0"
+  , "LimitUnrepresentable FieldResidentBytes 1099511627777"
+  , "ArenaOpened"
+  , "[JobId 0]"
+  , "(0,400)"
+  , "Invalid EmptyDemand"
+  , "True"
   ]
