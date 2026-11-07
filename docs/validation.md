@@ -338,8 +338,10 @@ admission funded by a committed eviction whose release arrives later;
 least-recently-used selection that skips held, pinned, changed and in-use
 regions, with vertical and horizontal turnover under fixed caps; camera
 replacement storms and partial admission; foreground priority, caller turns and
-aging; worst-case edit reservation, handoff protection and failure,
-retained-edit exhaustion that still allows reads, and arena retirement; checked
+aging; worst-case edit and rebuilt-segment growth reservation, handoff
+protection by change generation and failure, retained-edit exhaustion that still
+allows reads, and arena retirement; unsupported region keys at the boundary of
+each axis; checked
 arithmetic and identity boundaries; repeated edit, handoff, evict and reconstruct
 cycles over the real TRA-2 values; and a randomized event property of the
 structural invariants. A client compiled outside the package shows its checked
