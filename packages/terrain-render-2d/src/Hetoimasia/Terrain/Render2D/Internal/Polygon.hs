@@ -64,14 +64,14 @@ centroidOf points = (sum (map fst points) / n, sum (map snd points) / n)
 
 -- | Whether a point lies in the closed polygon.
 containsClosed ∷ [P2] → P2 → Bool
-containsClosed polygon p = and [cross a b p >= 0 | (a, b) ← edges polygon]
+containsClosed polygon p = length polygon >= 3 && and [cross a b p >= 0 | (a, b) ← edges polygon]
 
 -- | Whether a point lies in the polygon under the half-open rule the viewport
 -- uses: left and top edges belong to it, right and bottom edges do not, with
 -- screen Y pointing down. Two polygons that share an edge therefore never
 -- both contain a point on it.
 containsHalfOpen ∷ [P2] → P2 → Bool
-containsHalfOpen polygon p = and [inside a b | (a, b) ← edges polygon]
+containsHalfOpen polygon p = length polygon >= 3 && and [inside a b | (a, b) ← edges polygon]
   where
     inside a@(_, ay) b@(bx, by) = case compare (cross a b p) 0 of
       GT → True

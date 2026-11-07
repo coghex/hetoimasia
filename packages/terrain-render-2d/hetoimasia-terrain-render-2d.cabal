@@ -61,6 +61,9 @@ test-suite terrain-render-2d-tests
     type: exitcode-stdio-1.0
     main-is: Main.hs
     hs-source-dirs: test
+    -- The pair-bound example reads the runtime's allocation counters, which exist
+    -- only when the program is started with -T.
+    ghc-options: -rtsopts "-with-rtsopts=-T"
     other-modules:
         Test.TerrainRender2D.Camera
         Test.TerrainRender2D.Fixtures

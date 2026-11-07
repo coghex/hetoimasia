@@ -70,11 +70,16 @@ candidatePairs limit indexed = go (Set.empty ∷ Set.Set (Int, Int)) (Map.elems 
       let (x1, x2, y1, y2) = boundingBox (ofPolygon f)
        in [(bx, by) | bx ← [floor (x1 / size) .. floor (x2 / size)], by ← [floor (y1 / size) .. floor (y2 / size)]] ∷ [(Integer, Integer)]
     go found [] = Right (Set.toAscList found)
-    go found (members : rest)
-      | Set.size found' > limit = Left (OrderTooManyPairs limit)
-      | otherwise = go found' rest
-      where
-        found' = foldl' (flip Set.insert) found (overlapping members)
+    go found (members : rest) = do
+      found' ← collect found (overlapping members)
+      go found' rest
+    -- One distinct pair past the limit proves insufficiency; stop there, so the
+    -- quadratic enumeration of a bucket never outruns the bound.
+    collect found [] = Right found
+    collect found (pair : pairs)
+      | pair `Set.member` found = collect found pairs
+      | Set.size found >= limit = Left (OrderTooManyPairs limit)
+      | otherwise = collect (Set.insert pair found) pairs
     overlapping members =
       [ (i, j)
       | (n, i) ← zip [0 ∷ Int ..] members

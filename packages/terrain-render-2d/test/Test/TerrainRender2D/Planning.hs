@@ -13,7 +13,12 @@ import Hetoimasia.Terrain.Geometry (FaceKind (..))
 import Hetoimasia.Terrain.Render2D.Camera
 import Hetoimasia.Terrain.Render2D.Facts
 import Hetoimasia.Terrain.Render2D.Plan
-import Hetoimasia.Terrain.Render2D.Projection (Rect (..), ViewSetup)
+import Hetoimasia.Terrain.Render2D.Projection (Rect (..), ViewSetup (..))
+import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
+import Control.Exception (evaluate)
+import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
+import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), ZoomMode (..), defaultViewSettings)
+import Hetoimasia.Render.TwoD.Snapshot ()
 import Hetoimasia.Terrain.Shape (Side (..), ViewFacing (..), shapeIdValue)
 import Hetoimasia.Terrain.Source
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
@@ -296,6 +301,25 @@ spec = describe "Planning" $ do
         length (demandRegions c) `shouldSatisfy` (<= limitRegionsPerChunk defaultPlanLimits)
         -- Within the band below the clip level and the cell above it.
         demandIntervals c `shouldSatisfy` all (\(lo, hi) → lo >= -250 && hi <= 2)
+    it "refuses an oversized margin at once, before generating its ring" $ do
+      let big = req {requestConfig = (requestConfig req) {pcChunkMargin = 1000000, pcLimits = (pcLimits (requestConfig req)) {limitDemandChunks = 0}}}
+          big' = req {requestConfig = (requestConfig req) {pcChunkMargin = 1000000}}
+      cameraDemand big known `shouldBe` Left (PlanInsufficient LimitDemandChunks)
+      cameraDemand big' known `shouldBe` Left (PlanInsufficient LimitDemandChunks)
+    it "includes the lowest supported chunk in the margin ring" $ do
+      let low = axisMinValue + 24
+          r = (request (setup 1 1) (manualCamera low low 0)) {requestConfig = defaultPlanConfig {pcDepth = 0}}
+          facts' = factsWith flatWorld emptyChanges (mkAvailability [])
+          chunks = map demandChunk (demandChunks (demandOf r facts'))
+          lowest = fromInteger (negate (2 ^ (58 ∷ Int)))
+      chunks `shouldSatisfy` (ChunkKey lowest lowest `elem`)
+      -- And the highest supported chunk keeps its bound: nothing beyond it.
+      let high = axisMaxValue - 24
+          rh = (request (setup 1 1) (manualCamera high high 0)) {requestConfig = defaultPlanConfig {pcDepth = 0}}
+          top = fromInteger (2 ^ (58 ∷ Int) - 1)
+          highChunks = map demandChunk (demandChunks (demandOf rh facts'))
+      highChunks `shouldSatisfy` (ChunkKey top top `elem`)
+      highChunks `shouldSatisfy` all (\(ChunkKey x y) → x <= top && y <= top)
     it "adds exactly the margin ring around the visible chunks" $ do
       let narrow = req {requestConfig = (requestConfig req) {pcChunkMargin = 0}}
           wide = demandOf req known
@@ -312,6 +336,18 @@ spec = describe "Planning" $ do
       limited (\l → l {limitFaces = 2}) `shouldBe'` PlanInsufficient LimitFaces
       limited (\l → l {limitPairs = 0}) `shouldBe'` PlanInsufficient LimitPairs
       limited (\l → l {limitKeys = 2}) `shouldBe'` PlanInsufficient LimitDepthKeys
+    it "stops collecting overlap pairs at the bound instead of finishing the enumeration" $ do
+      -- A dense stack of faces in one region: refusing at a tiny bound must cost
+      -- much less than ordering the same faces.
+      let dense = sceneSource [(x, y, z, 0) | x ← [-2 .. 2], y ← [-2 .. 2], z ← [0, 2, 4, 6]]
+          dfacts = factsOf dense
+          dcamera = manualCamera 0 0 7
+          run f = planWith (\r → r {requestConfig = (requestConfig r) {pcLimits = f (pcLimits (requestConfig r))}}) (setup 480 480) dcamera dfacts
+          force = either (const 0) (length . planFaces)
+      full ← allocatedBy (force (run id))
+      early ← allocatedBy (force (run (\l → l {limitPairs = 1})))
+      run (\l → l {limitPairs = 1}) `shouldBe'` PlanInsufficient LimitPairs
+      early `shouldSatisfy` (< full)
     it "accepts exactly at a bound" $ do
       limited (\l → l {limitFaces = 3, limitKeys = 3}) `shouldSatisfy` isRight'
       let examined = statLevelsEvaluated (planStats (plan (setup 288 144) camera facts))
@@ -325,6 +361,22 @@ spec = describe "Planning" $ do
       lim (\l → l {limitRegionsPerChunk = 0}) `shouldBe'` PlanInsufficient LimitRegionsPerChunk
     it "refuses a negative configured depth or margin" $ do
       planWith (\r → r {requestConfig = (requestConfig r) {pcDepth = -1}}) (setup 288 144) camera facts `shouldBe'` InvalidPlanConfig
+    it "enforces the approved visibility depth of 250 levels on a caller's configuration" $ do
+      let withDepth d = planWith (\r → r {requestConfig = (requestConfig r) {pcDepth = d}}) (setup 288 144) camera facts
+      withDepth 250 `shouldSatisfy` isRight'
+      withDepth 251 `shouldBe'` InvalidPlanConfig
+    it "plans nothing when the framebuffer or logical extent is zero, whatever the viewport says" $ do
+      let base = setup 288 144
+          zeroFramebuffer = base {setupMetrics = (setupMetrics base) {metricsFramebuffer = PixelExtent 0 0}}
+          zeroWidth = base {setupMetrics = (setupMetrics base) {metricsLogical = PixelExtent 0 144}}
+      forM_ [zeroFramebuffer, zeroWidth] $ \vs → do
+        let p = plan vs camera (factsWith (sceneSource [(0, 0, 0, 0)]) emptyChanges (mkAvailability []))
+        planFaces p `shouldBe` []
+        planDemand p `shouldBe` emptyDemand
+        planCompleteness p `shouldBe` Complete
+    it "refuses a face the view's mapping cannot place in the target, rather than planning it" $ do
+      let tiny = (setup 288 144) {setupSettings = defaultViewSettings {settingZoomMode = FixedHalfHeight 7.2e-37}}
+      planWith id tiny camera facts `shouldSatisfy` isLeft'
     it "refuses mixed versions and carries one coherent identity" $ do
       let mixed = planWith (\r → r {requestVersions = Versions 1 2 1}) (setup 288 144) camera facts
       mixed `shouldBe'` MixedVersions (Versions 1 2 1) versions
@@ -356,6 +408,19 @@ demandOf r f = either (error . show) id (cameraDemand r f)
 shouldBe' ∷ Either PlanError Plan → PlanError → IO ()
 shouldBe' (Left e) expected = e `shouldBe` expected
 shouldBe' (Right _) expected = fail ("expected the refusal " <> show expected <> " but a plan was returned")
+
+isLeft' ∷ Either a b → Bool
+isLeft' (Left _) = True
+isLeft' _ = False
+
+allocatedBy ∷ Int → IO Int
+allocatedBy value = do
+  enabled ← getRTSStatsEnabled
+  if not enabled then fail "the suite must run with -T" else pure ()
+  before ← getRTSStats
+  _ ← evaluate value
+  after ← getRTSStats
+  pure (fromIntegral (allocated_bytes after - allocated_bytes before))
 
 isRight' ∷ Either a b → Bool
 isRight' (Right _) = True

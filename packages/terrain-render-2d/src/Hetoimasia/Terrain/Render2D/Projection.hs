@@ -74,10 +74,14 @@ module Hetoimasia.Terrain.Render2D.Projection
   , ProjectionError (..)
   , mkRenderView
   , visibleRect
+  , snapCompatible
+  , drawnOutline
   ) where
 
+import Hetoimasia.Math.Affine2 (Affine2, applyPoint)
 import Hetoimasia.Math.Vector (V2 (..))
-import Hetoimasia.Render.TwoD.Mapping (ViewMapping, targetToWorld, viewMapping, viewportIsEmpty)
+import Data.Ratio (denominator)
+import Hetoimasia.Render.TwoD.Mapping (ViewMapping, mappingPixelSnap, snapPoint, targetToWorld, viewMapping, viewportIsEmpty, worldToTarget)
 import Hetoimasia.Render.TwoD.Metrics (TargetMetrics)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot (Camera (..), View (..), Viewport (..))
@@ -237,3 +241,31 @@ visibleRect margin view
       pure (Rect (minimum xs - margin) (maximum xs + margin) (minimum ys - margin) (maximum ys + margin))
   where
     viewport = setupViewport (vwSetup view)
+
+-- | Whether a zoom keeps every instance origin on the device pixel grid when the
+-- view snaps. Face origins lie on a lattice of 48 pixels horizontally and 8
+-- pixels vertically at native scale, so the origins land on whole pixels exactly
+-- when the zoom is a whole multiple of 1/8. Only then does the recorder's
+-- rounding of each instance's origin move every face alike (by nothing), so
+-- adjacent faces still meet; any other zoom would open cracks between them.
+snapCompatible ∷ Float → Bool
+snapCompatible zoom = denominator (toRational zoom * 8) == 1
+
+-- | A coverage polygon of a face in target pixels as drawing places it: each
+-- mask vertex through the instance quad and the world-to-target transform in
+-- 32-bit floating point, moved with the instance origin's pixel rounding when the
+-- view snaps. 'Nothing' if a vertex cannot be represented (the composed
+-- transform overflows), so an incomplete polygon is never used.
+drawnOutline ∷ ViewMapping → Affine2 → [(Rational, Rational)] → Maybe [(Rational, Rational)]
+drawnOutline mapping quad mask = do
+  corners ← traverse place mask
+  (sx, sy) ← shift
+  pure [(toRational x + sx, toRational y + sy) | V2 x y ← corners]
+  where
+    place (u, v) = worldToTarget mapping (applyPoint quad (V2 (fromRational u) (fromRational v)))
+    shift
+      | mappingPixelSnap mapping = do
+          origin@(V2 ox oy) ← place (0, 0)
+          let V2 rx ry = snapPoint origin
+          pure (toRational rx - toRational ox, toRational ry - toRational oy)
+      | otherwise = Just (0, 0)

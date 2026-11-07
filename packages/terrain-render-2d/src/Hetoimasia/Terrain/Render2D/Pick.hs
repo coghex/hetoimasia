@@ -37,17 +37,12 @@ module Hetoimasia.Terrain.Render2D.Pick
 
 import Data.List (sortOn)
 import Data.Ord (Down (..))
-import Hetoimasia.Math.Affine2 (applyPoint)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping
-  ( ViewMapping
-  , mappingPixelSnap
-  , snapPoint
-  , targetToWorld
+  ( targetToWorld
   , viewportContains
   , viewportIsEmpty
   , windowToTarget
-  , worldToTarget
   )
 import Hetoimasia.Terrain.Render2D.Internal.Polygon (containsHalfOpen)
 import Hetoimasia.Terrain.Render2D.Plan
@@ -78,6 +73,9 @@ data PickError
     PickStale
   | -- | The point is not finite.
     PickInvalidPoint
+  | -- | A face of the plan cannot be placed in the target by the plan's own
+    -- mapping; nothing is answered from an incomplete polygon.
+    PickUnrepresentable
   deriving stock (Eq, Show)
 
 -- | Pick the frontmost face under a window point.
@@ -86,39 +84,26 @@ pickPlan plan (PickQuery identity point@(V2 px py))
   | identity /= planIdentity plan = Left PickStale
   | any (\c → isNaN c || isInfinite c) [px, py] = Left PickInvalidPoint
   | viewportIsEmpty viewport = Right PickNoHit
-  | otherwise = Right $ case windowToTarget mapping point of
-      Nothing → PickNoHit
+  | otherwise = case windowToTarget mapping point of
+      Nothing → Right PickNoHit
       Just target
-        | not (viewportContains viewport target) → PickNoHit
+        | not (viewportContains viewport target) → Right PickNoHit
         | otherwise → resolve target
   where
     view = planView plan
     mapping = rvMapping view
     viewport = setupViewport (rvSetup view)
-    resolve target =
-      let candidate = case [face | face ← sortOn (Down . faceDepthKey) (planFaces plan), contains target face] of
+    resolve target = do
+      outlines ← maybe (Left PickUnrepresentable) Right (traverse outline (sortOn (Down . faceDepthKey) (planFaces plan)))
+      let V2 tx ty = target
+          candidate = case [face | (face, polygon) ← outlines, containsHalfOpen polygon (toRational tx, toRational ty)] of
             (face : _) → Just face
             [] → Nothing
           unknown = case targetToWorld mapping target of
             Just (V2 wx wy) → any (`rectContains` (toRational wx, toRational wy)) (planUnknown plan)
             Nothing → False
-       in case (unknown, candidate) of
-            (True, c) → PickIncomplete c
-            (False, Just face) → PickHit face
-            (False, Nothing) → PickNoHit
-    contains (V2 tx ty) face = containsHalfOpen (drawnPolygon mapping face) (toRational tx, toRational ty)
-
--- A face's coverage polygon in target pixels as it is drawn.
-drawnPolygon ∷ ViewMapping → PlannedFace → [(Rational, Rational)]
-drawnPolygon mapping face = [(toRational x + sx, toRational y + sy) | Just (V2 x y) ← corners]
-  where
-    quad = faceQuad face
-    place (u, v) = worldToTarget mapping (applyPoint quad (V2 (fromRational u) (fromRational v)))
-    corners = map place (faceMask face)
-    -- The recorder rounds the instance origin; the whole instance moves with it.
-    (sx, sy)
-      | mappingPixelSnap mapping = case place (0, 0) of
-          Just origin@(V2 ox oy) →
-            let V2 rx ry = snapPoint origin in (toRational rx - toRational ox, toRational ry - toRational oy)
-          Nothing → (0, 0)
-      | otherwise = (0, 0)
+      pure $ case (unknown, candidate) of
+        (True, c) → PickIncomplete c
+        (False, Just face) → PickHit face
+        (False, Nothing) → PickNoHit
+    outline face = (,) face <$> drawnOutline mapping (faceQuad face) (faceMask face)

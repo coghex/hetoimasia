@@ -108,6 +108,7 @@ module Hetoimasia.Terrain.Render2D.Plan
 
 import Control.Monad (foldM)
 import Data.List (sortOn)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
@@ -116,6 +117,8 @@ import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.TwoD.Material (defaultMaterial)
 import Hetoimasia.Render.TwoD.Mapping (viewportIsEmpty)
+import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
+import Hetoimasia.Render.TwoD.Settings (ViewSettings (..))
 import Hetoimasia.Render.TwoD.Snapshot
   ( Instance (..)
   , Sampler (..)
@@ -365,6 +368,9 @@ data PlanError
     QueryRefused !QueryError
   | -- | The faces cannot be ordered through the renderer's depth keys.
     PlanUnorderable !OrderingFailure
+  | -- | The view snaps to the pixel grid at a zoom that is not a whole multiple of
+    -- 1/8, which would move adjacent faces apart.
+    PixelSnapUnsupported !Float
   | -- | A value could not be represented.
     Unrepresentable !String
   deriving stock (Eq, Show)
@@ -387,7 +393,7 @@ prepare request = do
   let config = requestConfig request
       limits = pcLimits config
       camera = requestCamera request
-  if pcDepth config < 0 || pcMargin config < 0 || pcChunkMargin config < 0
+  if pcDepth config < 0 || pcDepth config > maxVisibleDepth || pcMargin config < 0 || pcChunkMargin config < 0
     then Left InvalidPlanConfig
     else pure ()
   view ←
@@ -396,13 +402,32 @@ prepare request = do
   let ref = camRef camera
       clip = toInteger (axisValue (camClip camera))
       bandLo = clip - pcDepth config
-      empty = viewportIsEmpty (setupViewport (requestSetup request))
-  if empty
+  if zeroDrawable (requestSetup request)
     then pure (Prepared view ref clip [])
     else do
+      -- Instance origins must stay on whole pixels when the view snaps, or the
+      -- recorder would move adjacent faces apart.
+      if settingPixelSnap (setupSettings (requestSetup request)) && not (snapCompatible (camZoom camera))
+        then Left (PixelSnapUnsupported (camZoom camera))
+        else pure ()
       rect ← maybe (Left (Unrepresentable "the visible rectangle")) Right (visibleRect (pcMargin config) view)
       cands ← candidates limits rect ref clip bandLo
       pure (Prepared view ref clip cands)
+
+-- | The greatest configurable visibility depth: the approved cap of 250 levels
+-- below the clip level.
+maxVisibleDepth ∷ Integer
+maxVisibleDepth = 250
+
+-- A target that draws nothing: an empty viewport, or a logical or framebuffer
+-- extent with a zero side, whatever the viewport says.
+zeroDrawable ∷ ViewSetup → Bool
+zeroDrawable setup =
+  viewportIsEmpty (setupViewport setup)
+    || any (<= 0) [pixelWidth logical, pixelHeight logical, pixelWidth framebuffer, pixelHeight framebuffer]
+  where
+    logical = metricsLogical (setupMetrics setup)
+    framebuffer = metricsFramebuffer (setupMetrics setup)
 
 -- The candidate columns and their absolute level windows.
 candidates ∷ PlanLimits → Rect → Integer → Integer → Integer → Either PlanError [Cand]
@@ -464,6 +489,10 @@ planTerrain request facts = do
   layer ← foldM (evaluateCandidate camera clip limits runs) emptyLayer cands
   rawFaces ← traverse (buildFace ref) (reverse (layerCells layer))
   let built = [face | Just face ← rawFaces]
+  -- Every face must be placeable in the target by the view's own mapping.
+  if all (\b → isJust (drawnOutline (rvMapping view) (builtQuad b) (builtMask b))) built
+    then pure ()
+    else Left (Unrepresentable "a face in the target")
   if length built > limitFaces limits then Left (PlanInsufficient LimitFaces) else pure ()
   if length built > min (limitKeys limits) (fromIntegral depthKeyLimit) then Left (PlanInsufficient LimitDepthKeys) else pure ()
   order ← either (Left . fromOrderError limits) Right (orderFaces (limitPairs limits) (map builtOrder built))
@@ -824,16 +853,35 @@ cameraDemand request facts = do
         , dy ← [negate margin .. margin]
         , let nx = toInteger cx + dx
         , let ny = toInteger cy + dy
-        , abs nx < 2 ^ (58 ∷ Int)
-        , abs ny < 2 ^ (58 ∷ Int)
+        , inChunkRange nx
+        , inChunkRange ny
         ]
-      ringKeys = Set.fromList (concatMap ring (Map.keys byChunk))
-      marginal = Map.fromList [(k, r) | k ← Set.toList ringKeys, Map.notMember k byChunk, Just r ← [overall]]
-      wanted = Map.union byChunk marginal
+      -- Chunk coordinates are floor quotients of the supported axis range by 16:
+      -- from -2^58 up to 2^58 - 1.
+      inChunkRange n = n >= negate (2 ^ (58 ∷ Int)) && n < 2 ^ (58 ∷ Int)
+      wantedFor keys = Map.fromList [(k, r) | k ← keys, Just r ← [Map.lookup k byChunk `orElse` overall]]
+      orElse a b = maybe b Just a
+  ringKeys ← collectRing (limitDemandChunks limits) (Map.keysSet byChunk) (concatMap ring (Map.keys byChunk))
+  let wanted = wantedFor (Set.toAscList ringKeys)
       unmet = [(key, a, b) | (key, (lo, hi)) ← Map.toAscList wanted, (a, b) ← unknownPieces (factsAvailability facts) key lo hi]
-  if Map.size wanted > limitDemandChunks limits then Left (PlanInsufficient LimitDemandChunks) else pure ()
   let demand = demandFrom unmet
   if demandIntervalCount demand > limitDemandIntervals limits then Left (PlanInsufficient LimitDemandIntervals) else pure ()
   if any ((> limitRegionsPerChunk limits) . length . demandRegions) (demandChunks demand)
     then Left (PlanInsufficient LimitRegionsPerChunk)
     else pure demand
+
+-- The visible chunks and the chunks of their margin, never more than the bound:
+-- the first key past it is a refusal, found before the rest of a large margin is
+-- generated.
+collectRing ∷ Int → Set.Set ChunkKey → [ChunkKey] → Either PlanError (Set.Set ChunkKey)
+collectRing limit visible = go visible'
+  where
+    visible' = visible
+    go acc keys
+      | Set.size acc > limit = Left (PlanInsufficient LimitDemandChunks)
+      | otherwise = case keys of
+          [] → Right acc
+          (k : rest)
+            | k `Set.member` acc → go acc rest
+            | Set.size acc >= limit → Left (PlanInsufficient LimitDemandChunks)
+            | otherwise → go (Set.insert k acc) rest

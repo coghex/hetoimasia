@@ -13,11 +13,15 @@ import Hetoimasia.Terrain.Render2D.Camera
 import Hetoimasia.Terrain.Render2D.Facts
 import Hetoimasia.Terrain.Render2D.Pick
 import Hetoimasia.Terrain.Render2D.Plan
-import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
+import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..), snapCompatible)
 import Hetoimasia.Terrain.Shape (Side (..))
-import Test.Hspec (Spec, describe, it, shouldBe)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.TerrainRender2D.Fixtures
 import Test.TerrainRender2D.Oracle (Cell3, sceneSource)
+
+isRight' ∷ Either a b → Bool
+isRight' (Right _) = True
+isRight' _ = False
 
 zr ∷ Integer → Integer → ZRange
 zr lo hi = either (\e → error (show e)) id (mkZRange lo hi)
@@ -67,21 +71,31 @@ spec = describe "Pick" $ do
     -- The shared edge runs from (48, 0) to (0, 24). It is the lower-right edge of
     -- the first cell's top and the upper-left edge of the second's.
     hit (pickAt two (at 24 12)) `shouldBe` Just (tileAt 1 0 0, TopFace)
-  it "agrees with the drawn, pixel-snapped quad, and not with the unsnapped one" $ do
-    let sized settings = (setup 288 144) {setupSettings = settings}
-        scene snap =
+  describe "pixel snapping" $ do
+    let sizedSnap = (setup 288 144) {setupSettings = defaultViewSettings {settingPixelSnap = True}}
+        camAt zoom dx =
           let base = manualCamera 0 0 0
-              moved = stepCamera (either (error . show) id (applyCommand defaultCameraConfig (factsOf flatWorld) (SetZoom 0.3125) base))
-              panned = stepCamera (either (error . show) id (applyCommand defaultCameraConfig (factsOf flatWorld) (Pan (1 / 96) 0) moved))
-           in plan (sized defaultViewSettings {settingPixelSnap = snap}) panned (factsOf (isolated 0))
-        snapped = scene True
-        loose = scene False
-    -- Snapped, the top diamond is drawn half a pixel lower, so a point just
-    -- above its upper-right edge is outside; unsnapped it is inside.
-    hit (pickAt snapped (V2 150 67.75)) `shouldBe` Nothing
-    hit (pickAt loose (V2 150 67.75)) `shouldBe` Just (tileAt 0 0 0, TopFace)
-    hit (pickAt snapped (V2 150 70)) `shouldBe` Just (tileAt 0 0 0, TopFace)
-    hit (pickAt loose (V2 150 70)) `shouldBe` Just (tileAt 0 0 0, TopFace)
+              zoomed = stepCamera (either (error . show) id (applyCommand defaultCameraConfig (factsOf flatWorld) (SetZoom zoom) base))
+           in stepCamera (either (error . show) id (applyCommand defaultCameraConfig (factsOf flatWorld) (Pan dx 0) zoomed))
+    it "refuses a snapped view at a zoom that would move adjacent faces apart" $ do
+      planTerrain (request sizedSnap (camAt 0.3125 (1 / 96))) (factsOf flatWorld) `shouldBe` Left (PixelSnapUnsupported 0.3125)
+      planTerrain (request sizedSnap (camAt 0.3 0)) (factsOf flatWorld) `shouldBe` Left (PixelSnapUnsupported 0.3)
+      -- The same zooms are fine when the view does not snap.
+      planTerrain (request (setup 288 144) (camAt 0.3125 (1 / 96))) (factsOf flatWorld) `shouldSatisfy` isRight'
+    it "keeps continuous terrain continuous under a snapped view: no point of the viewport falls through a seam" $
+      forM_ [0.125, 0.5, 1, 2.5, 8] $ \zoom → do
+        let p = either (error . show) id (planTerrain (request sizedSnap (camAt zoom (1 / 96))) (factsOf flatWorld))
+            points = [V2 (fromIntegral x / 2) (fromIntegral y / 2) | x ← [0 .. 575 ∷ Int], y ← [0 .. 287 ∷ Int], x `mod` 7 == 0, y `mod` 5 == 0]
+            holes = [pt | pt ← points, hit (pickAt p pt) == Nothing]
+        holes `shouldBe` []
+    it "places a snapped face where the drawn quad is, by its own rounding of the origin" $ do
+      -- Zoom 1/8 keeps every origin on a whole pixel, so the drawn face is the
+      -- exact quad: a point just inside the top diamond's right vertex hits it.
+      let p = either (error . show) id (planTerrain (request sizedSnap (camAt 0.125 0)) (factsOf (isolated 0)))
+      hit (pickAt p (V2 144 72)) `shouldBe` Just (tileAt 0 0 0, TopFace)
+      snapCompatible 0.125 `shouldBe` True
+      snapCompatible 0.3125 `shouldBe` False
+      snapCompatible 3 `shouldBe` True
   it "never picks terrain above the cut, and picks the cap the cut exposes" $ do
     let slab = sceneSource [(x, y, z, 0) | x ← [-2 .. 2], y ← [-2 .. 2], z ← [0 .. 5]]
         atCut c = plan (setup 288 144) (manualCamera 0 0 c) (factsOf slab)
