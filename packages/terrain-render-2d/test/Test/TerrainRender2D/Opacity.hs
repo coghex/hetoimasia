@@ -121,7 +121,7 @@ supportedClient =
     , "          setup = ViewSetup (offscreenMetrics (PixelExtent 288 144)) (Viewport (V2 0 0) (V2 288 144)) defaultViewSettings"
     , "      case newCamera defaultCameraConfig zero zero zero of"
     , "        Right fresh -> do"
-    , "          let camera = stepCamera (refollow defaultCameraConfig facts fresh)"
+    , "          let camera = either (error . show) stepCamera (refollow defaultCameraConfig facts fresh)"
     , "          print (camSurface camera, camZoom camera)"
     , "          case planTerrain (PlanRequest (Versions 1 1 1) 3 camera setup defaultPlanConfig) facts of"
     , "            Right plan -> do"

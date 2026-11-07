@@ -331,16 +331,20 @@ applyCommand config facts command camera
 
 -- | Re-resolve the followed surface with new facts (for example after the
 -- residency generation changes). A camera that is not following is unchanged.
-refollow ∷ CameraConfig → TerrainFacts → CameraState → Step
-refollow config facts camera = stamp camera (followIfFollowing config facts camera)
+refollow ∷ CameraConfig → TerrainFacts → CameraState → Either CameraError Step
+refollow config facts camera
+  | not (validCameraConfig config) = Left InvalidConfig
+  | otherwise = Right (stamp camera (followIfFollowing config facts camera))
 
 -- | Deliver a late jump completion with the facts now available. Only the
 -- current pending jump can move the camera.
-completeJump ∷ CameraConfig → TerrainFacts → JumpId → CameraState → Step
-completeJump config facts jump camera = case csPending camera of
-  Just PendingJump {pendingId = pid, pendingTarget = target}
-    | pid == jump → stamp camera (landOrWait config facts pid target camera)
-  _ → Step camera FollowNotApplied (JumpStale jump)
+completeJump ∷ CameraConfig → TerrainFacts → JumpId → CameraState → Either CameraError Step
+completeJump config facts jump camera
+  | not (validCameraConfig config) = Left InvalidConfig
+  | otherwise = Right $ case csPending camera of
+      Just PendingJump {pendingId = pid, pendingTarget = target}
+        | pid == jump → stamp camera (landOrWait config facts pid target camera)
+      _ → Step camera FollowNotApplied (JumpStale jump)
 
 -- | Cancel the pending jump with this identity; any other identity is ignored.
 cancelJump ∷ JumpId → CameraState → CameraState

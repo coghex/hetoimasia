@@ -102,7 +102,7 @@ followCamera ∷ TerrainFacts → Integer → Integer → CameraState
 followCamera facts x y =
   case newCamera defaultCameraConfig (axis x) (axis y) (axis 0) of
     Left e → error (show e)
-    Right camera → stepCamera (refollow defaultCameraConfig facts camera)
+    Right camera → either (\e → error (show e)) stepCamera (refollow defaultCameraConfig facts camera)
 
 request ∷ ViewSetup → CameraState → PlanRequest
 request vs camera =

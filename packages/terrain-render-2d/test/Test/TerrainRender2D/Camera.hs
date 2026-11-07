@@ -71,7 +71,7 @@ spec = describe "Camera" $ do
     it "separates the headroom from the surface: it is configurable" $ do
       let c = cfg {ccHeadroom = 7}
           s = case newCamera c (axis 1) (axis 0) (axis 0) of
-            Right camera → stepCamera (refollow c variedFacts camera)
+            Right camera → either (error . show) stepCamera (refollow c variedFacts camera)
             Left e → error (show e)
       level (camClip s) `shouldBe` 11
     it "follows an edited surface: a removed top cell lowers the followed level" $ do
@@ -92,7 +92,7 @@ spec = describe "Camera" $ do
       followed `shouldBe` FollowUnavailable (demandFrom [(ChunkKey 1 0, 0, 1)])
       (level (camClip moved), camRef moved, camSurface moved) `shouldBe` (level (camClip before), camRef before, camSurface before)
       -- The same column is not "empty": with the facts supplied it is adopted.
-      let Step adopted outcome _ = refollow cfg variedFacts moved
+      let Step adopted outcome _ = ok (refollow cfg variedFacts moved)
       outcome `shouldBe` FollowAdopted (axis 0)
       level (camClip adopted) `shouldBe` 25
     it "does not report a surface whose level is not ready, even in a published chunk" $ do
@@ -175,15 +175,15 @@ spec = describe "Camera" $ do
       (camAnchorX waiting, camClip waiting, camRef waiting, camMode waiting) `shouldBe` (camAnchorX start, camClip start, camRef start, camMode start)
       camPending waiting `shouldBe` Just (PendingJump (JumpId 1) (JumpTarget (axis 32) (axis 0) Nothing))
       -- Still not ready: still pending.
-      stepJump (completeJump cfg partial (JumpId 1) waiting) `shouldSatisfy` isPending
-      let Step landed _ done = completeJump cfg variedFacts (JumpId 1) waiting
+      stepJump (ok (completeJump cfg partial (JumpId 1) waiting)) `shouldSatisfy` isPending
+      let Step landed _ done = ok (completeJump cfg variedFacts (JumpId 1) waiting)
       done `shouldBe` JumpApplied (JumpId 1)
       (level (camAnchorX landed), camPending landed) `shouldBe` (32, Nothing)
     it "refuses a late completion of a cancelled jump" $ do
       let partial = factsWith variedSource emptyChanges (mkAvailability [(ChunkKey 0 0, [zr (-100) 100])])
           waiting = stepCamera (step (Jump (JumpTarget (axis 32) (axis 0) Nothing)) partial start)
           cancelled = cancelJump (JumpId 1) waiting
-          Step after _ event = completeJump cfg variedFacts (JumpId 1) cancelled
+          Step after _ event = ok (completeJump cfg variedFacts (JumpId 1) cancelled)
       camPending cancelled `shouldBe` Nothing
       event `shouldBe` JumpStale (JumpId 1)
       after `shouldBe` cancelled
@@ -191,25 +191,40 @@ spec = describe "Camera" $ do
       let partial = factsWith variedSource emptyChanges (mkAvailability [(ChunkKey 0 0, [zr (-100) 100])])
           first = stepCamera (step (Jump (JumpTarget (axis 32) (axis 0) Nothing)) partial start)
           second = stepCamera (step (Jump (JumpTarget (axis 48) (axis 0) (Just (axis 5)))) partial first)
-          Step unmoved _ stale = completeJump cfg variedFacts (JumpId 1) second
+          Step unmoved _ stale = ok (completeJump cfg variedFacts (JumpId 1) second)
       stale `shouldBe` JumpStale (JumpId 1)
       unmoved `shouldBe` second
-      let Step landed _ done = completeJump cfg variedFacts (JumpId 2) second
+      let Step landed _ done = ok (completeJump cfg variedFacts (JumpId 2) second)
       done `shouldBe` JumpApplied (JumpId 2)
       (level (camAnchorX landed), camMode landed) `shouldBe` (48, Manual (axis 5))
       -- And once the newer jump has landed the older identity still cannot move it.
-      stepCamera (completeJump cfg variedFacts (JumpId 1) landed) `shouldBe` landed
+      stepCamera (ok (completeJump cfg variedFacts (JumpId 1) landed)) `shouldBe` landed
     it "waits on a with-Z jump whose destination level is not ready" $ do
       let partial = factsWith variedSource emptyChanges (mkAvailability [(ChunkKey 0 0, [zr (-100) 100])])
           Step waiting _ event = step (Jump (JumpTarget (axis 0) (axis 0) (Just (axis 500)))) partial start
       event `shouldBe` JumpPending (JumpId 1) (demandFrom [(ChunkKey 0 0, 500, 501)])
       camMode waiting `shouldBe` camMode start
 
+  describe "configuration" $ do
+    it "refuses an invalid configuration in every transition, keeping the camera" $ do
+      let bad = cfg {ccHeadroom = -1}
+          partial = factsWith variedSource emptyChanges (mkAvailability [(ChunkKey 0 0, [zr (-100) 100])])
+          waiting = stepCamera (step (Jump (JumpTarget (axis 32) (axis 0) Nothing)) partial start)
+      applyCommand bad variedFacts (Pan 1 0) start `shouldBe` Left InvalidConfig
+      refollow bad variedFacts start `shouldBe` Left InvalidConfig
+      completeJump bad variedFacts (JumpId 1) waiting `shouldBe` Left InvalidConfig
+      -- The pending jump is untouched and still completes under a valid configuration.
+      camPending waiting `shouldSatisfy` (/= Nothing)
+      stepJump (ok (completeJump cfg variedFacts (JumpId 1) waiting)) `shouldBe` JumpApplied (JumpId 1)
+
   describe "revisions" $ do
     it "advances the camera revision on a change and not on a no-op" $ do
       camRevision (camera' (Pan 1 0) variedFacts start) `shouldSatisfy` (> camRevision start)
       camera' (ZoomBy 1) variedFacts start `shouldBe` start
       camera' (SetFacing FaceSouth) variedFacts start `shouldBe` start
+
+ok ∷ Either CameraError Step → Step
+ok = either (\e → error (show e)) id
 
 isRight ∷ Either a b → Bool
 isRight (Right _) = True
