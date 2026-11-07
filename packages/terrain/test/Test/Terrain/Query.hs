@@ -172,6 +172,14 @@ removalSpec = describe "removals" $ do
     cellAt source changes (mustTile 0 0 0) `shouldBe` Air
     cellAt source changes (mustTile 0 0 1) `shouldBe` cellOf "a" 12
     cellAt source changes (mustTile 1 0 0) `shouldBe` cellOf "a" 3
+  it "removes a cell of every one of the sixteen shape identities whole, and no other" $
+    forM_ [0 .. 15 ∷ Int] $ \i → do
+      let source = mustSource (SourceSpec ["a"] [layer (toInteger n) (toInteger n + 1) "a" n | n ← [0 .. 15 ∷ Int]] [])
+          changes = removeResult (remove source emptyChanges (0, 0, toInteger i))
+      removeChanged (remove source emptyChanges (0, 0, toInteger i)) `shouldBe` True
+      cellAt source changes (mustTile 0 0 (toInteger i)) `shouldBe` Air
+      [fromCell (cellAt source changes (mustTile 0 0 (toInteger j))) | j ← [0 .. 15 ∷ Int], j /= i]
+        `shouldBe` [Just ("a", j) | j ← [0 .. 15 ∷ Int], j /= i]
   it "coalesces adjacent removals into one interval, in any order" $ do
     let source = mustSource soilOverStone
         order zs = removeAll source [(0, 0, z) | z ← zs]
