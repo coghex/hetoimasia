@@ -26,6 +26,11 @@ underground solids and air gaps, and reaffirms lazy loading with gaps. Q-20
 tracks reveal rules, retention and the fog interaction contract; they are not
 settled by the earlier picking or cutaway proposals.
 
+D-32 chooses whole-cavity discovery: unsealing a connected empty space reveals
+that space and loads all newly exposed boundary terrain, including across
+chunks. Work proceeds in bounded steps; Q-20 retains connectivity, capacity,
+retention and fog interaction details.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -901,6 +906,42 @@ discovery spreads through connected space, whether it survives offload, or
 how Lua controls it. This decision adds the fog requirement without silently
 adding units, line-of-sight simulation or the deferred general gameplay-state
 system. Q-16 remains partially open; Q-20 is a new blocking design question.
+
+### D-32. Unsealing a cavity discovers and loads the whole connected space
+
+Owner, directly in this design pane on 2026-11-07, answered the choice between
+whole-cavity discovery and exposure limited to the opening:
+
+> yes we will need to consider more than just loading in the adjacent tiles,
+> when we unseal a empty space it needs to load in all the new tiles for the
+> whole space
+
+Unsealing a cavity starts discovery of its entire connected empty space and
+loads the newly exposed terrain surfaces throughout it: walls, floor, ceiling
+and other terrain bordering that connected space. Discovery must propagate
+beyond the immediately adjacent cells and across chunk boundaries; it is not
+silently restricted to the current viewport. The owner accepted the proposed
+bounded-step processing: discovery/loading may progress asynchronously while
+the camera remains responsive. This is whole-space discovery, not character
+line of sight, so the selected behavior can reveal around corners.
+
+Preserve D-31's separation of terrain, residency and knowledge. This does not
+require allocating one record for every empty cell or materializing solids
+deeper behind the newly exposed boundary. Empty ranges and discovered regions
+may remain compressed; a solid barrier still conceals separate sealed spaces.
+Do not interpret the requirement to load the whole cavity as permission to
+stop after one neighboring ring, skip off-screen boundary terrain or abandon
+the remaining discovery work silently.
+
+This resolves the propagation-scope part of Q-20 and supersedes the local-only
+reveal alternative. Exact connectivity (face versus edge/corner contact and
+partial openings around shaped cells), the boundary with the unbounded
+exterior, initial disclosure, work/residency budgets, completion/failure
+behavior, retention on offload and fog interactions remain open. In particular,
+the design still must reconcile a cavity larger than available resident memory
+with whole-space discovery/loading; no unlimited resident allocation or
+permanent pin of every discovered tile is silently authorized. Q-19 must
+account for the discovery/loading work in the amended slices and qualification.
 
 ## Design boundaries
 
@@ -1804,7 +1845,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-31 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-32 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1827,7 +1868,10 @@ terrain, including real air gaps. The generic blank is intentional gameplay
 concealment. The earlier proposal to expose real material/air at every cutaway
 is superseded; lazily loading terrain must not itself reveal it. Fog must
 occlude visual picking without becoming authoritative physical occupancy.
-Reveal rules, retention, API authority and exact fog hit behavior remain Q-20.
+D-32 selects whole-cavity discovery/loading on unsealing, including boundary
+terrain beyond adjacent cells and across chunks, processed in bounded steps.
+Exact connectivity, capacity/completion, retention, API authority and fog hit
+behavior remain Q-20.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2024,8 +2068,8 @@ zoom-map crossfade remain outside the approved arena unless explicitly changed.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
-Open. After the behavior, including D-31/Q-20 fog, is settled, approve
-dependency-ordered follow-up
+Open. After the behavior, including D-31/D-32/Q-20 fog and discovery, is
+settled, approve dependency-ordered follow-up
 slices and exact revision needs for #645–#648, with the owner-selected barrier
 before TRA-12 and explicit coordination of held PR #654. Mirror approved new
 slice IDs in the ledger and delivery plan; preserve earlier IDs. Readiness
@@ -2033,21 +2077,28 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Open after D-31. Preserve fog over both solid and air until discovery, distinct
-from residency and authoritative terrain. Decide how the first arena reveals
-terrain after excavation: only immediate exposure, propagation through a
-connected air space, or another explicit rule. Specify initial known surface,
-Lua/engine authority, whether knowledge survives offload/reload and how it is
-reset. Decide the fog pick result and whether the development removal action
-can operate on a concealed cell without leaking its contents.
+Partially resolved by D-31/D-32. Preserve fog over both solid and air until
+discovery, distinct from residency and authoritative terrain. Unsealing a
+cavity reveals its whole connected empty space and loads the newly exposed
+boundary terrain, beyond the adjacent cells and across chunks, in bounded
+steps. The local-only discovery alternative is rejected.
+
+Still open: define connectivity through faces, edge/corner contacts and partial
+openings around shaped cells; distinguish a cavity from unbounded exterior
+air; specify completion and memory-pressure behavior for very large spaces.
+Specify initial known surface, Lua/engine authority, whether knowledge survives
+offload/reload and how it is reset. Decide the fog pick result and whether the
+development removal action can operate on a concealed cell without leaking
+its contents.
 
 Proposed storage direction: implicit unknown plus sparse discovered spans or
 regions, budgeted separately from resident terrain and retained edits. Reveal
 work must be bounded; an enormous or exterior-connected air region cannot
 force an unbounded flood fill or eager underground allocation. Consider
 coherent terrain/reveal publication so a pending or failed edit/reveal cannot
-flash secret contents. These are requirements to resolve, not approved API,
-representation, propagation, failure or retention policies. Do not introduce
+flash secret contents. Beyond the D-32 whole-space propagation and bounded-step
+choice, these are requirements to resolve, not approved API, representation,
+connectivity, failure or retention policies. Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
 ## Verification strategy — approved through Q-12
