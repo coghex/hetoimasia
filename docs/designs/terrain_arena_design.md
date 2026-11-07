@@ -49,6 +49,7 @@ are pinned to these revisions. Synarchy has not been modified or launched.
 | The default arena starts with 5 × 5 chunks and expands on demand; that startup footprint is not a world boundary. | S `scripts/test_arena.lua:188–207`; `src/World/Generate/Arena.hs:70–104` |
 | Arena topology does not wrap. A caller may request finite dimensions; larger finite arenas also load their remaining chunks on demand, with absent cells outside their rectangle. | S `docs/engine_contracts.md:8200–8246` |
 | Arena controls include zoom, rotation and vertical slice selection; these are existing reference behaviors, not yet this arc's scope. | S `scripts/test_arena.lua:255–293` |
+| Synarchy projects a diamond grid and has four camera facings 90 degrees apart. Camera input includes keyboard panning and middle-button dragging. | S `src/World/Grid.hs:220–236`; `src/Engine/Graphics/Camera.hs:22–37`; `src/Engine/Loop/Camera.hs:116–181` |
 | Geological hydrology, settled-terrain processing, chunk composition and runtime fluid simulation are separate stages. Flat generation can avoid the geological work. | S `docs/hydrology_pipeline.md:24–43` |
 | Hetoimasia's reusable renderer has world/UI views, cameras, depth, retained chunks and application materials. M1's Lua scene exposes only simple rectangles with a fixed camera, default material and one UI layer. | H `packages/render-2d/README.md:3–17`, `:59–69`; `packages/lua-engine/README.md:941–968`, `:1002–1011` |
 | GLFW already supplies ordered input with explicit reset/acknowledgement, but the M1 Lua facade has no input binding. | H `packages/glfw/src/Hetoimasia/GLFW/Input.hs:1–26`; `packages/lua-engine/README.md:1042–1057`, `:1086–1101` |
@@ -445,6 +446,23 @@ Targeting is settled by D-9: point at an exposed tile with the mouse and press
 the temporary shortcut, removing one tile per press. The exact key remains
 open. Delete this development binding by completion; the final removal
 interface is the Lua API, not a persistent keyboard control.
+
+Camera proposal, 2026-11-06, following the owner's request to explain what is
+unclear: use Synarchy's isometric-style diamond view and four 90-degree
+facings as the initial presentation. Recommend keyboard pan, mouse drag and
+wheel zoom, with exact bindings adjustable during implementation. These are
+proposals; prior approval of camera-driven loading did not select projection,
+rotation or navigation behavior.
+
+The material underground-view choice is whether the owner can move a cutaway
+plane down through intact terrain, or only inspect openings made by removal.
+Recommend manual depth slices for inspecting gaps and ceilings, with terrain
+above the chosen plane hidden rather than deleted. Selecting such a slice
+would demand its visible terrain through D-6 while leaving intervening hidden
+depth unmaterialized. This is not yet approved; distinguish slice visibility
+from actual exposure caused by removal and keep picking consistent with the
+displayed geometry. Exact cut-face appearance, visible depth range and any
+automatic surface tracking also remain open. No UI widgets are implied.
 
 ### Q-5. What belongs to the reusable engine and what belongs to Ecce Homo?
 
