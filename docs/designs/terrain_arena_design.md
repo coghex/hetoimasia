@@ -1,7 +1,8 @@
 # Terrain arena design
 
 Begin recreating Ecce Homo on Hetoimasia with flat terrain and on-demand
-chunk loading. Synarchy's testing arena is the concrete reference. The owner
+chunk loading as the camera explores an expanding procedural arena. Synarchy's
+testing arena is the concrete reference. The owner
 chooses behavior in this design conversation; existing Synarchy implementation
 choices are evidence, not automatically requirements for the new engine.
 
@@ -21,7 +22,8 @@ only. No tracker items or implementation are authorized by this document.
 ## Epic contract
 
 - **Goal:** a real first terrain foundation for Ecce Homo: flat terrain,
-  loaded by chunk demand, using a complete terrain model that includes
+  procedurally generated and loaded by camera/query demand as exploration
+  extends the arena, using a complete terrain model that includes
   subsurface structure and gaps from the outset, with the engine/game boundary
   preserved. Flat describes the initial terrain source, not a surface-only model.
 - **Done when:** open; agree the terrain model, loading/lifetime contract,
@@ -97,12 +99,16 @@ belongs in the first version (D-4). Procedural elevation generation is deferred.
 Compressed columns with demand-driven materialization are the chosen direction
 (D-5). Rendering and game queries can both demand terrain; undemanded detail
 stays unmaterialized (D-6). The rejected Beacon example is not the consumer.
+The arena expands with exploration; camera loading initially materializes only
+the top tile of each untouched column. Removal demands newly exposed terrain
+without eagerly filling underground depth (D-7).
 
-**Proposal P-1:** a visible terrain arena that can be navigated, making chunk
-demand and the resulting terrain observable. Keep the first terrain source
-simple while designing proper publication and lifetime. Camera controls,
-exact vertical extent, world extent, appearance, editing and exact Lua APIs
-remain unapproved. No implementation or delivery order follows from this proposal.
+**P-1, navigation/loading direction accepted by D-7:** a visible terrain arena
+that can be navigated, making camera demand and the resulting terrain
+observable. Keep the first terrain source simple while designing proper
+publication and lifetime. Exact camera controls, vertical extent, appearance,
+editing controls and Lua APIs remain open. No implementation or delivery order
+follows from this direction alone.
 
 **Proposal P-2: one authoritative spatial terrain model.** Represent terrain
 occupancy and its material/shape at positions in three dimensions, with gaps
@@ -110,7 +116,8 @@ and multiple separated solid regions at the same horizontal position. Surface
 height, exposed faces and visibility are derived queries/caches with defined
 consistency, not substitute terrain authorities. Distinguish known empty space
 from unloaded/unknown terrain and outside-world positions. A flat arena fills
-this same model; a future procedural source would populate it differently.
+this same model procedurally; future elevation generation would populate it
+differently.
 
 Recommend a discrete `(x,y,z)` cell model as the logical contract, independently
 of physical storage. This can express cave floors, ceilings and overhangs.
@@ -144,8 +151,9 @@ materialized in memory, and which exposed faces are prepared for rendering.
 An exposed-surface cache may be small, but material omitted beneath it needs
 an explicit authoritative answer: a compact base definition, a deterministic
 source fetched/generated on demand, or an explicit unavailable state. It must
-not silently become air or lose a buried edit. These alternatives and the
-eviction/durable-edit boundary are still Q-3/Q-6/Q-9 decisions.
+not silently become air or lose a buried edit. D-7 selects a procedural source
+for the arena; its deep-terrain recipe and the eviction/durable-edit boundary
+are still Q-3/Q-6/Q-9 decisions.
 
 Span compression favors coherent layers. Highly fragmented materials/shapes
 or alternating solid/air can require many spans; queries and edits also need
@@ -254,6 +262,34 @@ depth. An unloaded region is not air, and reloading must preserve the meaning
 of the terrain source and any retained modifications. Specific gameplay
 systems, editing tools and save/load remain separate scope decisions.
 
+### D-7. Expanding procedural arena with camera demand and lazy exposure
+
+Owner, directly in this pane on 2026-11-06:
+
+> keep extending as you explore, this is how the testing arena works in synarchy (or should work according to my memory). the arena should be procedurally generated, and loaded in with the camera, so that only the top tile is defined and the rest underground remain not in memory until a tile above is removed
+
+Choose an arena that keeps extending horizontally with exploration, rather
+than the proposed finite rectangle. Camera movement requests new chunks from
+a procedural source. D-1's initial flat surface remains selected: procedural
+here means terrain supplied by a generation rule on demand; variable elevation
+generation remains deferred. Coordinate representation and practical limits
+still need specification; expansion is not a promise of infinite residency.
+
+For untouched columns loaded by the camera, materialize the top tile only.
+Do not allocate underground tile records or enumerate all buried spans.
+Removing a tile demands the newly exposed terrain from the same source;
+deeper untouched terrain remains unmaterialized. The complete gap-capable
+model remains D-4/D-5, and D-6 still allows explicit game queries to demand
+invisible terrain. A compact source definition supplies the meaning of
+unmaterialized terrain without allocating its individual tiles.
+
+Removal/reveal behavior is part of the terrain contract. The exact removal
+interaction, additional editing operations and disk persistence remain open.
+For gaps and openings, exposure must include relevant neighboring side faces,
+floors and ceilings rather than assume every removal merely lowers a single
+height value. This follows from the agreed full model; it does not require
+materializing the full surrounding underground volume.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -281,16 +317,10 @@ in Q-8; bounds, authorship and editing remain separate choices.
 
 ### Q-2. Finite arena or expandable terrain?
 
-Both can load on demand. Decide boundaries, nonwrapping versus other topology,
-coordinate conventions, chunk dimensions and behavior at absent/unloaded
-terrain. Synarchy's 5 × 5 startup footprint is not an approved extent or budget.
-
-Recommendation for the next owner choice: a finite, nonwrapping arena with
-configurable horizontal bounds, using the same demand loading within those
-bounds even when most of the arena is not resident. This makes its edges and
-outside-world answers explicit. An expandable arena is the alternative if
-unbounded exploration is part of the initial experience. Neither is selected
-yet; exact dimensions and vertical limits remain separate choices.
+Resolved in direction by D-7: keep extending as the camera explores. The finite
+arena recommendation was declined. Specify coordinate conventions and limits,
+chunk dimensions, vertical limits and absent/unloaded behavior. Synarchy's
+5 × 5 startup footprint is not an approved extent or budget.
 
 ### Q-3. How does demand become usable terrain and then retire?
 
@@ -306,7 +336,8 @@ open.
 
 ### Q-4. What can the owner see and control in the first version?
 
-Decide projection, terrain assets/materials, camera movement/zoom/rotation,
+Camera exploration/loading is selected by D-7. Decide projection, terrain
+assets/materials, camera movement/zoom/rotation controls,
 vertical slices, picking and any loading indication. Determine the narrow Lua
 rendering/input services required. Full UI, fonts, editors and Synarchy's debug
 tools are not implicitly approved. Input ordering, focus/reset and routing need
@@ -322,12 +353,17 @@ component store is the right representation for every terrain cell.
 
 ### Q-6. Mutation, persistence and state publication?
 
-Decide whether the first arena is read-only or editable, what survives chunk
-eviction, whether save/load or reset is included, and the relevant schema,
+D-7 requires removal to reveal newly materialized terrain. Decide its initial
+interaction and any additional edits, what survives chunk eviction, whether
+save/load or reset is included, and the relevant schema,
 snapshot, tick/failure and determinism guarantees. Generated base data,
 resident copies and durable edits need distinct meanings if all are included.
 The earlier state agenda remains reference material; no save migration,
 replay, mods or hot swap has been activated by D-1/D-2.
+For the next owner choice, recommend a simple arena tool to select and remove
+one exposed tile, making this loading contract directly observable. A
+script-only removal command is an alternative with less interaction work.
+Neither control choice is selected yet.
 
 ### Q-7. What proves this first terrain foundation complete?
 
@@ -354,7 +390,8 @@ a dense full-world allocation, cubic storage chunks or a particular array.
 ### Q-9. How is terrain represented compactly, including unmaterialized depth?
 
 D-5 selects P-3's compressed-column direction, retaining complete spatial
-meaning while materializing only demanded detail. Settle the source of deep terrain,
+meaning while materializing only demanded detail. D-7 selects a procedural
+arena source and top-tile-only initial materialization. Settle its deep-terrain recipe,
 uniform base/shared data, material and shape boundaries, edit overrides,
 fragmentation limits and any alternative dense representation for complicated
 regions. Do not equate a known air gap, an unstored solid interior, unavailable
@@ -375,6 +412,11 @@ completely empty columns and geometry crossing chunk boundaries. Require the
 agreed terrain reads, rendering/picking and reload behavior to describe the same
 geometry; no procedural cave generator is implied by these cases. Exact
 consumers and evidence remain Q-4/Q-6/Q-7 decisions.
+Exercise camera exploration beyond the startup footprint, top-only initial
+materialization, repeated removal revealing deeper terrain, and exposure of
+side faces and gaps. Inspect terrain allocations as well as rendered output
+to verify that untouched depth stays unmaterialized. Check explicit invisible
+queries separately under D-6 and returning to an edited, evicted region.
 Use captured rendering evidence for the agreed visible result and native input
 evidence for controls actually included. Select checks from Hetoimasia's
 validation catalog once slices exist (H `AGENTS.md`, Language and build;
