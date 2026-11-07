@@ -33,16 +33,30 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.Terrain.Cell
+        Hetoimasia.Terrain.Changes
         Hetoimasia.Terrain.Coordinate
         Hetoimasia.Terrain.Geometry
+        Hetoimasia.Terrain.Palette
+        Hetoimasia.Terrain.Query
+        Hetoimasia.Terrain.Resident
+        Hetoimasia.Terrain.Segment
         Hetoimasia.Terrain.Shape
+        Hetoimasia.Terrain.Source
     -- The checked representations and the exact polytope arithmetic the public
     -- modules share; a client cannot import them.
     other-modules:
+        Hetoimasia.Terrain.Internal.Cell
+        Hetoimasia.Terrain.Internal.Changes
+        Hetoimasia.Terrain.Internal.Column
         Hetoimasia.Terrain.Internal.Coordinate
+        Hetoimasia.Terrain.Internal.Interval
+        Hetoimasia.Terrain.Internal.Packed
         Hetoimasia.Terrain.Internal.Polytope
         Hetoimasia.Terrain.Internal.Shape
+        Hetoimasia.Terrain.Internal.Source
     build-depends:
+        array >=0.5 && <0.6,
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9
 
@@ -53,18 +67,43 @@ test-suite terrain-tests
     type: exitcode-stdio-1.0
     main-is: Main.hs
     hs-source-dirs: test
+    -- The growth examples read the runtime's allocation counters, which exist
+    -- only when the program is started with -T.
+    ghc-options: -rtsopts "-with-rtsopts=-T"
     other-modules:
         Test.Terrain.Coordinate
         Test.Terrain.Fixtures
         Test.Terrain.Geometry
+        Test.Terrain.Growth
+        Test.Terrain.Model
         Test.Terrain.Opacity
+        Test.Terrain.Query
+        Test.Terrain.Resident
+        Test.Terrain.Segment
         Test.Terrain.Shape
+        Test.Terrain.Source
         Test.Terrain.Spec
     build-depends:
         base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
         QuickCheck >=2.15 && <2.19,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0
+
+-- Storage measurement, run on request: `cabal bench --project-file
+-- cabal.project.cpu hetoimasia-terrain:terrain-measure`. It is not part of any
+-- required validation group and asserts no wall-clock figure.
+benchmark terrain-measure
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Measure.hs
+    hs-source-dirs: bench
+    -- Full laziness would hoist the loop-invariant updates out of the timed
+    -- repetitions and time nothing.
+    ghc-options: -fno-full-laziness -rtsopts "-with-rtsopts=-T"
+    build-depends:
+        base >=4.22 && <4.23,
+        hetoimasia-terrain ==0.1.0.0
