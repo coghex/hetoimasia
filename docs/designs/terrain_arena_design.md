@@ -91,7 +91,9 @@ remain Q-18; no UI or automatic cycle is added.
 D-47 keeps both depth darkening and blue haze, adjustable/disableable through
 Lua, and requires stronger numerical, offscreen and navigation regression
 coverage. The owner reports the reference behavior does not work well; a
-specific symptom/reproduction has been requested, not yet established.
+specific symptom is now recorded in P-10: expected hazed background terrain
+is absent outside the camera loading radius. Source inspection supports a
+load/view mismatch; no runtime reproduction is claimed.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -2825,6 +2827,112 @@ target to approve and test rather than asking the solver to invent the shape
 semantics while fixing artwork. An illustrated owner review of the catalog,
 especially ID 15, remains required before it becomes a decision.
 
+### P-10. Viewport-driven demand and missing hazed background — pending review
+
+**Owner's clarified symptom, 2026-11-07:**
+
+> since the haze happens over far away tiles, because of the isometric view
+> and the chunk loading limit around the camera, often the tiles that are
+> supposed to be hazed in the background are simply not loaded, and show up
+> blank. it looks ok, but i would like to look into the possibility of loading
+> the chunks needed based on what the camera sees, not just a flat radius
+
+This is a request to investigate viewport-based loading, not approval of an
+unbounded resident world or a larger arbitrary camera radius. It explains the
+D-47 complaint as missing terrain that the haze would have shaded, rather
+than establishing that its colour formula is wrong.
+
+**Verified reference mechanism.** At S `3777d437`,
+`src/World/Thread/ChunkLoading.hs:96–111` computes the camera chunk and demands
+the square `[-chunkLoadRadius..chunkLoadRadius]` in X/Y. The configured radius
+is 2 (`src/World/Generate/Constants.hs:12–13`): 5×5 chunks. The queue is sorted
+by camera-chunk distance and admits at most 8 new chunks per tick
+(`ChunkLoading.hs:62–63,151–154`); camera-driven eviction also receives that
+radius (`:219–222`). This camera demand is not derived from the viewport's
+projected extent or its vertical visibility band.
+
+S's render path independently inspects already-loaded chunks
+(`src/World/Render/Quads.hs:127,162–170`). Its view bounds include viewport
+aspect/zoom and a padding proportional to visible depth
+(`src/World/Render/ViewBounds.hs:32–50`), then test projected chunk extents
+(`src/World/Render/ChunkCulling.hs:58–73`). Thus the renderer can consider a
+region visible that the camera loader never requested. A larger culling bound
+cannot render an absent chunk. This source mismatch supports the owner's
+report; no exact camera/scene capture or runtime reproduction has been made.
+
+S's haze is specifically based on `zSlice - worldZ`, normalized by effective
+view depth (`src/World/Render/TileQuads.hs:68–75`), not a horizontal-distance
+fog formula. The loading correction is independent of any future choice of
+haze curve; do not silently change its distance/depth meaning on this report.
+
+**Existing Hetoimasia foundation.** The approved P-5 describes a visible region
+plus one chunk of prefetch, and D-42 preserves the full zoom/depth range with
+best-effort camera admission. At H revision
+`e61a1ec55284e7ec8aa71664878c89a38d2322c2`, the merged pure planner already derives
+the view rectangle from the viewport mapping
+(`packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Projection.hs:230–242`),
+uses the vertical band to enumerate candidate columns and per-column level
+windows (`Plan.hs:396–420,453–477`), and builds camera demand plus a margin
+(`Plan.hs:849–896`). It is not a flat-radius planner. Existing tests cover
+visible chunks/margins and bounds (`packages/terrain-render-2d/test/Test/TerrainRender2D/Planning.hs`,
+the `demand for the camera` group); they are not proof of this end-to-end
+background scene through the new face-map path.
+
+Two remaining integration issues must not be hidden: the planner's bounds
+were written for the old solid/face representation, and `prepare`/`cameraDemand`
+can refuse an oversized enumeration/demand (`Plan.hs:457–459,885,893–895`).
+The face-map follow-up must enclose the actual whole-tile sprites and reconcile
+bounded planning with D-42's best-effort camera policy. Do not turn a planning
+capacity refusal into a silent, permanently empty background or claim that
+runtime admission alone has fixed every upstream limit. The filed #645 view
+adapter connects this demand to runtime; that integration remains separate
+from a pure planner's existence. This turn changes no code or tracker item.
+
+**Recommendation for explicit owner review:**
+
+1. Derive demand from the current viewport, aspect, zoom, facing, cutaway and
+   allowed height range. Include any known/discovered terrain whose projected
+   tile bounds could contribute pixels, even when its horizontal chunk lies
+   far from the camera anchor. Determine potential coverage without relying on
+   which chunks are already resident; otherwise blank areas never request data.
+2. Use conservative projected bounds and per-column/region height intervals.
+   Do not project only the ground plane or materialize the whole underground
+   prism. Compressed source/discovery summaries prune air and hidden interior;
+   fog-covered undiscovered terrain stays concealed under D-31/D-37. Camera
+   demand alone does not grant discovery or load every buried cell.
+3. Prioritize current visible demand before the existing small prefetch margin,
+   while preserving explicit query/removal priority. Coalesce superseded
+   camera intents; old GPU frames retain their required resources. Eviction
+   must respect current view interests and capacity policy, not discard a
+   needed background chunk merely because it is beyond a camera radius.
+4. Keep bounded, progressive preparation/admission and D-42's budgets. At
+   sufficient capacity a settled view must not have holes caused by an omitted
+   demand footprint. At insufficient capacity, unresolved visible demand stays
+   pending and unloaded terrain remains absent as already approved; no promise
+   that every maximum-zoom view fits, no automatic budget increase and no LOD
+   system is introduced. Prefetch must not consume the capacity needed for
+   visible terrain or explicit work.
+
+**Required proposed regression coverage:** a controlled, discovered terrain
+scene with lower/distant background surfaces outside a camera-radius square
+but inside the projected viewport, with both depth effects enabled. With ample
+budgets, assert those chunks enter demand and remain available while needed,
+then capture the loaded/hazed result after streaming settles. A radius-based
+negative control must leave the expected background absent. Vary all four
+facings, zoom, portrait/wide aspect, resize and the manual/automatic cutaway;
+include sprite edges and elevation displacement, not only flat tile centres.
+With constrained budgets, show visible-before-prefetch admission and explicit
+request progress, with pending work distinguished from a missed footprint.
+Include pan/rotation away and back, delayed loads and eviction so the same
+background does not repeatedly disappear despite sufficient capacity. Preserve
+fog concealment and sparse underground allocation in those traces.
+
+Q-16 owns the amended projection/emission demand bounds, Q-18 the owner's
+visible haze/background qualification, and Q-19 the planner/view integration
+and final evidence assignment. The viewport-based direction already has P-5
+support; the explicit refinement and regression package above is now presented
+for owner approval. This does not settle Q-20's separate cavity discovery work.
+
 ## Open questions and review checkpoints
 
 ### Q-1. What does flat terrain contain vertically?
@@ -2983,6 +3091,10 @@ while preserving all 16 IDs and face-map rendering, and require solver proof
 of both defect and correction. The exact replacement catalog and sampling
 conventions still need review; approval of the correction direction does not
 select unspecified geometry.
+P-10 adds the owner's viewport-loading concern and source comparison. Preserve
+the existing view-aware direction when adapting demand bounds to whole-tile
+face maps, and reconcile planning limits with D-42. The proposed explicit
+coverage/admission/eviction contract remains under review.
 Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
 coverage resource contracts remain Q-17; the approved picking approach itself
 does not need another sign-off.
@@ -3013,7 +3125,9 @@ zoom-map crossfade remain outside the approved arena unless explicitly changed.
 D-47 resolves which depth effects to keep: both, adjustable/disableable through
 Lua, with stronger tests/evidence. Darkening-only and no-depth-effect defaults
 are not selected. The owner reports S's behavior does not work well; specific
-symptoms have been requested for regression cases but are not yet verified.
+symptoms are now recorded in P-10: hazed background tiles can be absent outside
+the camera loader's radius despite projecting into the viewport. Source
+inspection supports that mismatch, but no runtime reproduction is claimed.
 The numerical contract and qualification described above remain to be filled
 out; do not copy the old curve and call the reported problem fixed.
 
@@ -3031,6 +3145,9 @@ proof, all-16/four-facing captures and geometry/opening/picking checks to the
 owning correction and integration work; carry its evidence gate into TRA-12.
 Also assign D-47's numerical, isolated/combined depth-effect and navigation/
 streaming regression evidence to the lighting and integration slices.
+Include P-10's viewport-driven demand/eviction refinement and background
+regression once approved, preserving the existing D-42 capacity policy and
+reconciling the pure planner's limits with progressive camera preparation.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
