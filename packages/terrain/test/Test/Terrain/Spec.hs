@@ -8,6 +8,9 @@ import qualified Test.Terrain.Growth as Growth
 import qualified Test.Terrain.Opacity as Opacity
 import qualified Test.Terrain.Query as Query
 import qualified Test.Terrain.Resident as Resident
+import qualified Test.Terrain.Residency as Residency
+import qualified Test.Terrain.ResidencyCycle as ResidencyCycle
+import qualified Test.Terrain.ResidencyProperty as ResidencyProperty
 import qualified Test.Terrain.Segment as Segment
 import qualified Test.Terrain.Shape as Shape
 import qualified Test.Terrain.Source as Source
@@ -21,5 +24,8 @@ spec = describe "Terrain" $ do
   Segment.spec
   Query.spec
   Resident.spec
+  Residency.spec
+  ResidencyCycle.spec
+  ResidencyProperty.spec
   Growth.spec
   Opacity.spec
