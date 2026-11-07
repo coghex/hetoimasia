@@ -17,6 +17,10 @@ Lighting scope resolved by D-29: expose sun position to the face-map shader
 for previewing the tiles; defer the automatic day/night cycle and eventual
 moon lighting. Q-16–Q-19 still block amendment readiness.
 
+Picking scope resolved by D-30: select from the adopted drawn quads in
+front-to-back order using matching artwork/face-map coverage. Q-16 remains
+partially open for logical geometry, emission and cut-surface contracts.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -808,6 +812,43 @@ initial values, ambient/brightness behavior and any depth haze. Q-17 retains
 asset/sampling ownership, and Q-19 retains slice and readiness sign-off.
 No new issue, implementation or change to the held PR follows from this
 decision alone.
+
+### D-30. Pick the visible terrain through shared sprite coverage
+
+Owner, directly in this design pane on 2026-11-07, accepted the recommendation
+following the focused Synarchy picking investigation:
+
+> ok good investigation, note down your recommendation as what i want
+
+Terrain picking uses the actual adopted draw's candidate quads and transforms,
+examines them in front-to-back drawing order, and tests the same colour-artwork
+and face-map coverage at the cursor. A transparent part of a ramp does not
+capture the click; the visible covered tile behind it is eligible instead.
+Visible block sides and top edges belong to the quad that draws them, rather
+than to the rounded grid candidate or a lower/rear cell from Synarchy's picker.
+
+Keep spatial pruning and shared CPU coverage per asset/version. This does not
+require a CPU-side 3D mesh, a coverage copy per terrain cell or GPU readback
+on each pick. The adopted-view identity and ordering must match rendering;
+adding only alpha rejection to the old one-candidate-per-Z loop is insufficient.
+The returned hit identifies a logical terrain cell; removal still acts on
+that cell under the existing atomic edit contract. Texture coverage does not
+become authoritative world occupancy.
+
+This supersedes D-15/D-25 and P-5 wherever their shared analytic-solid coverage
+was the authority for visual terrain picking. It preserves the all-16-ID and
+four-facing requirements, coordinate/storage identity, and edit semantics.
+The new picker must be qualified with transparent-ramp, visible-side,
+top-edge and overlapping-tile cases from the focused audit, alongside the
+existing adopted-view and camera requirements.
+
+The picking approach in Q-16 is resolved by D-30. Remaining Q-16 choices are
+the meaning/fate of exact subcell-solid query APIs, tile/face emission,
+occlusion and cut-surface handling. Q-17 still owns exact sampling/threshold
+agreement and the coverage payload's budget, loading, version and lifetime;
+shared CPU coverage is now a chosen mechanism, not an open alternative.
+The amendment remains exploring; follow-up slices and issue revisions still
+require Q-19 sign-off.
 
 ## Design boundaries
 
@@ -1621,7 +1662,7 @@ race reproduced by this inspection. The inspected seam tests
 `solidChunk` and `pixelFor` helpers) exercise coordinate framing and center
 clicks with slope zero; they do not establish sprite-alpha agreement.
 
-**Recommendation, still open under Q-16:** use the adopted draw's candidate
+**Recommendation, subsequently approved as D-30:** use the adopted draw's candidate
 quads, transforms and front-to-back order, then test the same material/mask
 coverage at the cursor. Retain spatial pruning and shared coverage per asset;
 no per-cell copy or GPU readback is implied. Merely adding an alpha rejection
@@ -1708,7 +1749,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29 lighting decision, remaining proposals
+### P-6. Amendment framing — D-29/D-30 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1720,6 +1761,11 @@ faces. Preserve sparse authoritative cell/material/shape state and atomic
 removal; do not infer world occupancy from camera-facing texture alpha.
 The relationship of existing subcell intersection APIs to that logical state
 must be explicitly settled, not called physically equivalent without proof.
+
+D-30 selects the picking approach: use the adopted drawn quads, matching
+artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
+The former analytic-solid picker is not the visual authority. Exact emission,
+cut surfaces and the remaining sampling/ownership details are still open.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -1879,15 +1925,21 @@ and preview contract remain Q-18.
 
 ### Q-16. Logical terrain, visual coverage and picking contract
 
-Open; next after the resolved Q-15. Settle what remains authoritative for cell queries
-and edits versus the visible sprite, the fate/meaning of #637's exact subcell
-solid APIs, full-cell versus isolated-face emission, hidden-face/cap behavior,
-and CPU picking using the adopted mask/colour alpha and order. Do not silently
-keep incompatible ray/coverage claims or copy S's non-alpha picker.
+Partially resolved by D-30: picking uses the adopted drawn quads and matching
+artwork/mask coverage in front-to-back order, with shared CPU asset coverage.
+The result identifies the logical cell for the existing edit contract.
+
+Still open: the fate/meaning of #637's exact subcell-solid query APIs,
+full-cell versus isolated-face emission, hidden-face/cap behavior and the
+authority of those query results relative to the visible sprite. Do not
+silently retain incompatible ray/coverage claims. Exact sample/threshold and
+coverage resource contracts remain Q-17; the approved picking approach itself
+does not need another sign-off.
 
 ### Q-17. Face-map data loading, sampling and ownership
 
-Open. Decide the bounded data-image route, approved asset catalog/provenance,
+Open. D-30 selects shared CPU coverage per asset/version. Decide the bounded
+data-image route, approved asset catalog/provenance,
 filtering/cutout/premultiplication rules, CPU coverage retention and how style
 acquires/version-checks both texture kinds. General `DataImage` support is
 not proof that the current bounded Lua loader exposes it. Preserve protected
