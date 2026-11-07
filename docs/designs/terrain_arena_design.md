@@ -13,6 +13,10 @@ remain filed; this reopens design readiness, not their filing ledger. The source
 audit and pending choices are in the face-map amendment below. No new tracker
 mutation or implementation is authorized by this amendment's draft proposals.
 
+Lighting scope resolved by D-29: expose sun position to the face-map shader
+for previewing the tiles; defer the automatic day/night cycle and eventual
+moon lighting. Q-16–Q-19 still block amendment readiness.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -771,6 +775,39 @@ about a full lighting system is a question, not approval of day/night, solar
 pages, new gameplay clocks or a particular static lighting policy. Exact
 render/pick authority, asset loading, remaining presentation scope and follow-up
 slice boundaries remain Q-15–Q-19. No new issue or code is created here.
+
+### D-29. Parameterized sun lighting now; automatic day/night later
+
+Owner, directly in this design pane on 2026-11-07, approved the face-map
+cutout and facing-aware lighting scope, with this clarification:
+
+> we can defer day/night as a cycle, but the shaders are supposed to have a
+> value that indicates the position of the sun (and moon eventually) that
+> gives it 3d definition so that we can see what the tiles look like when we
+> preview it.
+
+The CPU submits ordinary isometric sprite quads; the selected face map's
+alpha supplies the ramp silhouette on the GPU, and its face weights plus
+the supplied sun position give the tile its apparent three-dimensional
+lighting. This preserves the owner's intended rendering mechanism instead
+of rebuilding the silhouette as CPU-side solid polygons. Exact tile emission,
+occlusion, cut surfaces and picking remain Q-16.
+
+Sun position is an explicit, adjustable shader input for previewing different
+lighting, not a permanently baked brightness per face or a hard-coded sun
+position. Facing-aware face shading is in scope now. An automatic day/night
+cycle, calendar/clock ownership and moon lighting are deferred; the future
+moon is an extension intent, not a second light implementation in this arc.
+This supersedes P-6's earlier recommendation of a fixed light configuration
+where that wording could imply that previews cannot change the sun position.
+No simulated passage of time is needed to preview a selected sun position.
+
+Q-15 is resolved by this decision. Q-18 still must settle the parameter's
+representation and coordinate convention, how preview callers supply it,
+initial values, ambient/brightness behavior and any depth haze. Q-17 retains
+asset/sampling ownership, and Q-19 retains slice and readiness sign-off.
+No new issue, implementation or change to the held PR follows from this
+decision alone.
 
 ## Design boundaries
 
@@ -1587,7 +1624,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — proposals, not decisions
+### P-6. Amendment framing — D-29 lighting decision, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -1600,14 +1637,14 @@ removal; do not infer world occupancy from camera-facing texture alpha.
 The relationship of existing subcell intersection APIs to that logical state
 must be explicitly settled, not called physically equivalent without proof.
 
-Recommended first lighting scope: face-map alpha and static directional
-top/left/right shading, including facing-dependent weights, with a fixed light
-configuration. This restores the shape-defining material without requiring a
-world clock, calendar, solar-page table or longitudinal day/night policy.
-The tradeoff is fixed illumination and no animated day/night yet. Full dynamic
-lighting is possible but expands this arena correction into time ownership,
-parameter publication and infinite-world lighting decisions. Q-15 is for the
-owner; nothing in this proposal settles it.
+D-29 resolves the first lighting scope: face-map alpha and facing-aware
+top/left/right shading with an adjustable sun-position input for previews.
+The earlier fixed-configuration recommendation is superseded to the extent
+it implied an unchangeable sun. The automatic cycle is deferred; selected
+sun positions can still change the lighting without a world clock, calendar
+or solar-page/time simulation. Eventual moon lighting is deferred too.
+Exact parameter representation, preview supply path and initial appearance
+remain Q-18; this paragraph settles no other amendment proposal.
 
 Affected tracker work, for later approved revisions only:
 
@@ -1630,7 +1667,7 @@ Affected tracker work, for later approved revisions only:
   data/texture ownership before shortcut removal and final acceptance.
 
 The owner chose a follow-up before TRA-12. Exact one-PR slice boundaries,
-dependency insertion and existing-issue revisions await Q-15–Q-19; the ledger
+dependency insertion and existing-issue revisions await Q-16–Q-19; the ledger
 and delivery plan remain the original filed arc until those changes receive
 sign-off. No final issue bodies are drafted here.
 
@@ -1749,15 +1786,16 @@ approved; the deliberately gated Q-13 remains for implementation.
 
 ### Q-15. Static face shading now, or the full day/night path?
 
-Open; first owner decision for D-28. Recommendation: face-map silhouette alpha
-plus static, facing-aware directional shading now, day/night in a later arc.
-The full alternative also needs clock/calendar ownership, solar parameters,
-phase convention and a policy for longitude in an effectively infinite arena.
-The shader does not need those systems merely to use face-map RGB/alpha.
+Resolved by D-29. The owner approved face-map silhouette alpha and
+facing-aware directional shading now, with an adjustable sun-position shader
+input so previews show the tile under selected lighting. Automatic day/night
+and eventual moon lighting are deferred. "Static" means no automatic cycle;
+it does not mean an unchangeable sun or baked face brightness. The exact input
+and preview contract remain Q-18.
 
 ### Q-16. Logical terrain, visual coverage and picking contract
 
-Open; discuss after Q-15. Settle what remains authoritative for cell queries
+Open; next after the resolved Q-15. Settle what remains authoritative for cell queries
 and edits versus the visible sprite, the fate/meaning of #637's exact subcell
 solid APIs, full-cell versus isolated-face emission, hidden-face/cap behavior,
 and CPU picking using the adopted mask/colour alpha and order. Do not silently
@@ -1774,7 +1812,9 @@ is approved.
 
 ### Q-18. Exact initial appearance beyond the silhouette
 
-Open. After lighting scope, fix the initial light values and facing convention,
+Open. D-29 requires an adjustable sun-position input and defers its automatic
+cycle and moon lighting. Settle that input's representation, world/facing
+convention and preview supply path, the initial light and ambient values,
 whether to carry S's depth dimming/haze, and which deviations are intentional.
 S's clock phase labels and shader sine disagree; full clock parity cannot be
 claimed from labels alone. Fluids, selection outlines, lifecycle sprites and
