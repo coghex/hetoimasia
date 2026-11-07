@@ -384,6 +384,32 @@ fundedEvictionSpec = describe "admission funded by a committed eviction" $ do
     map jobPhase (modelJobs m5) `shouldBe` [JobQueued]
     (_, next) ← stepOk m5 Dispatch
     reportDecision next `shouldBe` Dispatched (JobId 2) (a1, reg 2 0 0) (cell 0 0 0)
+  it "never promises a victim's bytes twice when several jobs of one admission share it" $ do
+    -- V1 holds two cells in two columns (338 + 82 = 420 bytes), V2 one cell (338):
+    -- 758 resident of 858, so 100 are free.
+    m0 ← opened (limitsWith $ \s → s {specResidentBytes = 858, specStagingBytes = 4096})
+    m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0)
+    (m2, extra) ← stepOk m1 (q 2 (reg 0 0 0) (cell 1 0 0))
+    jobsOf extra `shouldBe` [JobId 1]
+    m3 ← stepsOk m2 [Dispatch, JobCompleted (JobId 1) (Cost 1 1 2)]
+    m4 ← loadCell m3 3 (reg 1 0 0) (cell 0 0 0)
+    m5 ← foldM withdraw m4 [1, 2, 3]
+    ledgersOf m5 `shouldBe` Ledgers (758, 0) (0, 0) (0, 0)
+    -- Two 338-byte jobs: 100 free covers part of the first; the rest, 238 and 338,
+    -- is 576 bytes. V1 (the older) can give 420 in all, so V2 must give the other
+    -- 156: both are victims, and no byte is promised to two jobs.
+    let two = SubmitQuery (RequestId 4) a1 rev0 [demand (reg 2 0 0) (cell 0 0 0), demand (reg 3 0 0) (cell 0 0 0)]
+    (m6, accepted) ← stepOk m5 two
+    admission accepted `shouldBe` Admission [(JobId 3, reg 2 0 0), (JobId 4, reg 3 0 0)] [] [(a1, reg 0 0 0), (a1, reg 1 0 0)] 576
+    ledgersOf m6 `shouldBe` Ledgers (758, 100) (0, 0) (320, 2 * 258)
+    -- V1's release funds the first job and part of the second; the second job
+    -- is queued only when V2 has been released too.
+    (m7, firstRelease) ← stepOk m6 (VictimReleased a1 (reg 0 0 0))
+    reportFunded firstRelease `shouldBe` [JobId 3]
+    ledgersOf m7 `shouldBe` Ledgers (338, 520) (0, 0) (320, 516)
+    (m8, secondRelease) ← stepOk m7 (VictimReleased a1 (reg 1 0 0))
+    reportFunded secondRelease `shouldBe` [JobId 4]
+    ledgersOf m8 `shouldBe` Ledgers (0, 676) (0, 0) (320, 516)
   it "keeps a committed victim evicting when the admission it funded is cancelled" $ do
     m0 ← opened tiny
     m1 ← loadCell m0 1 (reg 0 0 0) (cell 0 0 0)
