@@ -314,7 +314,9 @@ spec = describe "Planning" $ do
       limited (\l → l {limitKeys = 2}) `shouldBe'` PlanInsufficient LimitDepthKeys
     it "accepts exactly at a bound" $ do
       limited (\l → l {limitFaces = 3, limitKeys = 3}) `shouldSatisfy` isRight'
-      limited (\l → l {limitLevels = 1}) `shouldSatisfy` isRight'
+      let examined = statLevelsEvaluated (planStats (plan (setup 288 144) camera facts))
+      limited (\l → l {limitLevels = examined}) `shouldSatisfy` isRight'
+      limited (\l → l {limitLevels = examined - 1}) `shouldBe'` PlanInsufficient LimitLevels
     it "refuses a demand that exceeds its bounds" $ do
       let partialFacts = factsWith (sceneSource [(15, 0, 0, 0), (16, 0, 0, 0)]) emptyChanges (mkAvailability [(ChunkKey 0 0, [zr (-10) 10])])
           lim f = planWith (\r → r {requestConfig = (requestConfig r) {pcLimits = f (pcLimits (requestConfig r))}}) (setup 288 144) (manualCamera 15 0 0) partialFacts

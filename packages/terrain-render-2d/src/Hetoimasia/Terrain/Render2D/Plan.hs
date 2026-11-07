@@ -106,6 +106,7 @@ module Hetoimasia.Terrain.Render2D.Plan
   , cameraDemand
   ) where
 
+import Control.Monad (foldM)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -139,7 +140,7 @@ data PlanLimits = PlanLimits
   { limitColumns ∷ !Int
   -- ^ Columns examined.
   , limitLevels ∷ !Int
-  -- ^ Cells evaluated for exposure.
+  -- ^ Levels examined for exposure.
   , limitFaces ∷ !Int
   -- ^ Faces emitted.
   , limitPairs ∷ !Int
@@ -460,9 +461,7 @@ planTerrain request facts = do
           }
       cands = prCands prepared
   runs ← fetchRuns config facts camera cands
-  let layer = foldl' (evaluateCandidate camera clip runs) emptyLayer cands
-  if layerLevels layer > limitLevels limits then Left (PlanInsufficient LimitLevels) else pure ()
-  if not (null (drop (limitFaces limits) (layerCells layer))) then Left (PlanInsufficient LimitFaces) else pure ()
+  layer ← foldM (evaluateCandidate camera clip limits runs) emptyLayer cands
   rawFaces ← traverse (buildFace ref) (reverse (layerCells layer))
   let built = [face | Just face ← rawFaces]
   if length built > limitFaces limits then Left (PlanInsufficient LimitFaces) else pure ()
@@ -530,13 +529,14 @@ fetchRuns config facts camera cands = Map.traverseWithKey fetch wants
 -- unavailable cells met.
 data Layer = Layer
   { layerCells ∷ ![RawFace]
+  , layerFaceCount ∷ !Int
   , layerLevels ∷ !Int
   , layerUnknownOwn ∷ ![(Offset, Integer, Integer)]
   , layerUnknownNear ∷ !(Map.Map Offset (Set.Set Integer))
   }
 
 emptyLayer ∷ Layer
-emptyLayer = Layer [] 0 [] Map.empty
+emptyLayer = Layer [] 0 0 [] Map.empty
 
 -- A face selected for building, before its geometry is projected.
 data RawFace = RawFace
@@ -554,8 +554,12 @@ isFlatShape ∷ ShapeId → Bool
 isFlatShape shape = shapeIdValue shape == 0 || shapeIdValue shape == 15
 
 -- Evaluate the cells of one candidate column.
-evaluateCandidate ∷ CameraState → Integer → Map.Map Offset [FRun] → Layer → Cand → Layer
-evaluateCandidate camera clip runs layer (Cand x y lo hi) = layer'
+evaluateCandidate ∷ CameraState → Integer → PlanLimits → Map.Map Offset [FRun] → Layer → Cand → Either PlanError Layer
+evaluateCandidate camera clip limits runs layer (Cand x y lo hi)
+  -- The levels this column would examine are known before any is examined.
+  | layerLevels layer + Set.size levels > limitLevels limits = Left (PlanInsufficient LimitLevels)
+  | otherwise =
+      foldM cell layer {layerUnknownOwn = unknownOwn <> layerUnknownOwn layer, layerLevels = layerLevels layer + Set.size levels} (Set.toAscList levels)
   where
     facing = camFacing camera
     own = Map.findWithDefault [] (x, y) runs
@@ -564,7 +568,6 @@ evaluateCandidate camera clip runs layer (Cand x y lo hi) = layer'
     ownClipped = [r | r@(FRun a b _) ← own, b > lo, a <= hi]
     unknownOwn = [((x, y), max a lo, min b (hi + 1)) | FRun a b FUnknown ← ownClipped]
     levels = interesting lo hi own east south
-    layer' = foldl' cell layer {layerUnknownOwn = unknownOwn <> layerUnknownOwn layer} (Set.toAscList levels)
     cell acc z = case (kindAt own z, tileOf z) of
       (FSolid material shape, Just tile) →
         let kindE = kindAt east z
@@ -579,12 +582,16 @@ evaluateCandidate camera clip runs layer (Cand x y lo hi) = layer'
               [((x + 1, y), z) | wantE]
                 <> [((x, y + 1), z) | wantS]
                 <> [((x, y), z + 1) | wantU]
-         in acc
-              { layerCells = reverse raws <> layerCells acc
-              , layerLevels = layerLevels acc + 1
-              , layerUnknownNear = foldl' (\m (k, l) → Map.insertWith Set.union k (Set.singleton l) m) (layerUnknownNear acc) near
-              }
-      _ → acc
+         in if layerFaceCount acc + length raws > limitFaces limits
+              then Left (PlanInsufficient LimitFaces)
+              else
+                Right
+                  acc
+                    { layerCells = reverse raws <> layerCells acc
+                    , layerFaceCount = layerFaceCount acc + length raws
+                    , layerUnknownNear = foldl' (\m (k, l) → Map.insertWith Set.union k (Set.singleton l) m) (layerUnknownNear acc) near
+                    }
+      _ → Right acc
     tileOf z = do
       column ← worldColumn camera (x, y)
       level ← either (const Nothing) Just (axisFromInteger z)
