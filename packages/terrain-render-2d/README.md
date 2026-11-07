@@ -106,7 +106,10 @@ known air (so a face at the last supported coordinate is exposed to the void).
 ## Camera
 
 `CameraState` is abstract (its accessors are plain functions, not record fields,
-so a client cannot rewrite one). `newCamera`, `applyCommand`, `refollow`,
+so a client cannot rewrite one). Every transition that takes a `CameraConfig`
+(`newCamera`, `applyCommand`, `refollow`, `completeJump`) validates it first and
+answers `Left InvalidConfig` without touching the camera: a negative headroom or
+an unordered zoom range is never installed as a cut. `newCamera`, `applyCommand`, `refollow`,
 `completeJump` and `cancelJump` are the transitions; each returns a new state or
 a typed refusal and changes nothing on refusal. There are no key bindings or
 gesture accumulators.

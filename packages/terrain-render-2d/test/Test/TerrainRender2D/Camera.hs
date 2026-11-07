@@ -2,6 +2,7 @@
 -- small authored terrain with hand-stated levels.
 module Test.TerrainRender2D.Camera (spec, variedSource, variedFacts) where
 
+import Control.Monad (forM_)
 import Hetoimasia.Terrain.Cell (ZRange, mkZRange)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..), RemoveOutcome (..), emptyChanges, removeCell)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisMaxValue, axisValue)
@@ -136,6 +137,9 @@ spec = describe "Camera" $ do
       camFacing (camera' (RotateBy 4) variedFacts start) `shouldBe` FaceSouth
       camFacing (camera' (RotateBy (-1)) variedFacts start) `shouldBe` FaceWest
       camFacing (camera' (RotateBy 2) variedFacts start) `shouldBe` FaceNorth
+      -- Extreme turn counts give the facing their residue modulo four.
+      camFacing (camera' (RotateBy maxBound) variedFacts start) `shouldBe` FaceWest
+      camFacing (camera' (RotateBy minBound) variedFacts start) `shouldBe` FaceSouth
 
   describe "panning" $ do
     it "carries whole tiles into the exact anchor and keeps the fraction" $ do
@@ -216,6 +220,21 @@ spec = describe "Camera" $ do
       -- The pending jump is untouched and still completes under a valid configuration.
       camPending waiting `shouldSatisfy` (/= Nothing)
       stepJump (ok (completeJump cfg variedFacts (JumpId 1) waiting)) `shouldBe` JumpApplied (JumpId 1)
+    it "bounds a camera's zoom by the configuration in force, in every transition" $ do
+      let wide = camera' (SetZoom 8) variedFacts start
+          narrow = cfg {ccZoomMax = 2}
+          zoomAfter = camZoom . stepCamera
+      camZoom wide `shouldBe` 8
+      zoomAfter (either (error . show) id (applyCommand narrow variedFacts (Pan 1 0) wide)) `shouldBe` 2
+      zoomAfter (ok (refollow narrow variedFacts wide)) `shouldBe` 2
+      zoomAfter (either (error . show) id (applyCommand narrow variedFacts (SetFacing FaceWest) wide)) `shouldBe` 2
+    it "refuses every unusable configuration" $ do
+      forM_ [cfg {ccHeadroom = -1}, cfg {ccZoomMin = 0}, cfg {ccZoomMin = 3}, cfg {ccZoomMax = 1 / 0}, cfg {ccZoomDefault = 0 / 0}] $ \bad → do
+        applyCommand bad variedFacts (SetZoom 1) start `shouldBe` Left InvalidConfig
+        applyCommand bad variedFacts (SliceBy 1) start `shouldBe` Left InvalidConfig
+        applyCommand bad variedFacts (Jump (JumpTarget (axis 1) (axis 0) Nothing)) start `shouldBe` Left InvalidConfig
+        refollow bad variedFacts start `shouldBe` Left InvalidConfig
+        newCamera bad (axis 0) (axis 0) (axis 0) `shouldBe` Left InvalidConfig
 
   describe "revisions" $ do
     it "advances the camera revision on a change and not on a no-op" $ do

@@ -304,7 +304,7 @@ data Step = Step
 
 -- | Apply one command with the current facts.
 applyCommand ∷ CameraConfig → TerrainFacts → Command → CameraState → Either CameraError Step
-applyCommand config facts command camera
+applyCommand config facts command camera0
   | not (validCameraConfig config) = Left InvalidConfig
   | otherwise = case command of
       Pan dx dy → do
@@ -318,7 +318,7 @@ applyCommand config facts command camera
         | otherwise → Right (plain (camera {csZoom = clampZoom config zoom}))
       SetFacing facing → Right (plain (camera {csFacing = facing}))
       RotateBy count →
-        Right (plain (camera {csFacing = facingFromTurns (turnCount (facingTurns (csFacing camera)) + count)}))
+        Right (plain (camera {csFacing = facingFromTurns (toInteger (turnCount (facingTurns (csFacing camera))) + toInteger count)}))
       SelectSlice level → Right (plain (camera {csMode = Manual level, csClip = level}))
       SliceBy delta → do
         let target = toInteger (axisValue (csClip camera)) + delta
@@ -326,6 +326,9 @@ applyCommand config facts command camera
         Right (plain (camera {csMode = Manual level, csClip = level}))
       Jump target → Right (stamp camera (beginJump config facts target camera))
   where
+    -- Whatever the zoom the camera was last given, the configuration in force now
+    -- bounds it.
+    camera = withinConfig config camera0
     bad x = isNaN x || isInfinite x || x <= 0
     plain next = stamp camera (Step next FollowNotApplied NoJump)
 
@@ -334,7 +337,7 @@ applyCommand config facts command camera
 refollow ∷ CameraConfig → TerrainFacts → CameraState → Either CameraError Step
 refollow config facts camera
   | not (validCameraConfig config) = Left InvalidConfig
-  | otherwise = Right (stamp camera (followIfFollowing config facts camera))
+  | otherwise = Right (stamp camera (followIfFollowing config facts (withinConfig config camera)))
 
 -- | Deliver a late jump completion with the facts now available. Only the
 -- current pending jump can move the camera.
@@ -343,7 +346,7 @@ completeJump config facts jump camera
   | not (validCameraConfig config) = Left InvalidConfig
   | otherwise = Right $ case csPending camera of
       Just PendingJump {pendingId = pid, pendingTarget = target}
-        | pid == jump → stamp camera (landOrWait config facts pid target camera)
+        | pid == jump → stamp camera (landOrWait config facts pid target (withinConfig config camera))
       _ → Step camera FollowNotApplied (JumpStale jump)
 
 -- | Cancel the pending jump with this identity; any other identity is ignored.
@@ -362,10 +365,14 @@ bump old new
   | new == old = old
   | otherwise = new {csRevision = csRevision old + 1}
 
+-- The camera with its zoom inside the configuration's range.
+withinConfig ∷ CameraConfig → CameraState → CameraState
+withinConfig config camera = camera {csZoom = clampZoom config (csZoom camera)}
+
 clampZoom ∷ CameraConfig → Float → Float
 clampZoom config = max (ccZoomMin config) . min (ccZoomMax config)
 
-facingFromTurns ∷ Int → ViewFacing
+facingFromTurns ∷ Integer → ViewFacing
 facingFromTurns count = case count `mod` 4 of
   0 → FaceSouth
   1 → FaceEast

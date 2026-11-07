@@ -394,7 +394,7 @@ prepare request = do
   let config = requestConfig request
       limits = pcLimits config
       camera = requestCamera request
-  if pcDepth config < 0 || pcDepth config > maxVisibleDepth || pcMargin config < 0 || pcChunkMargin config < 0
+  if pcDepth config < 0 || pcDepth config > maxVisibleDepth || pcMargin config < 0 || pcChunkMargin config < 0 || not (validLimits limits)
     then Left InvalidPlanConfig
     else pure ()
   view ←
@@ -414,6 +414,22 @@ prepare request = do
       rect ← maybe (Left (Unrepresentable "the visible rectangle")) Right (visibleRect (pcMargin config) view)
       cands ← candidates limits rect ref clip bandLo
       pure (Prepared view ref clip cands)
+
+-- Every bound nonnegative, and the key bound within the 24-bit key space.
+validLimits ∷ PlanLimits → Bool
+validLimits l =
+  all
+    (>= 0)
+    [ limitColumns l
+    , limitLevels l
+    , limitFaces l
+    , limitPairs l
+    , limitKeys l
+    , limitDemandChunks l
+    , limitDemandIntervals l
+    , limitRegionsPerChunk l
+    ]
+    && limitKeys l <= fromIntegral depthKeyLimit
 
 -- | The greatest configurable visibility depth: the approved cap of 250 levels
 -- below the clip level.

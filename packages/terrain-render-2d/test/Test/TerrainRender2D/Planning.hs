@@ -371,6 +371,11 @@ spec = describe "Planning" $ do
       -- Linear growth doubles the increment between successive doublings of n;
       -- quadratic growth would quadruple it.
       (a400 - a200) `shouldSatisfy` (< 3 * (a200 - a100))
+    it "refuses a negative bound or a key bound beyond the key space" $ do
+      limited (\l → l {limitColumns = -1}) `shouldBe'` InvalidPlanConfig
+      limited (\l → l {limitFaces = -1}) `shouldBe'` InvalidPlanConfig
+      limited (\l → l {limitDemandChunks = -1}) `shouldBe'` InvalidPlanConfig
+      limited (\l → l {limitKeys = 16777217}) `shouldBe'` InvalidPlanConfig
     it "accepts exactly at a bound" $ do
       limited (\l → l {limitFaces = 3, limitKeys = 3}) `shouldSatisfy` isRight'
       let examined = statLevelsEvaluated (planStats (plan (setup 288 144) camera facts))
