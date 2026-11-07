@@ -8,6 +8,11 @@ choices are evidence, not automatically requirements for the new engine.
 
 Design state: `exploring`
 
+Migration review: the comparison with Synarchy below identifies unresolved
+P-5 risks, including automatic-camera clipping. Resolve Q-14 before approving
+the technical contract or calling the design ready. The recorded owner
+decisions remain unchanged.
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
@@ -948,6 +953,141 @@ Retain a last coherent frame during preparation; missing new terrain stays
 blank. The temporary removal shortcut submits the picked cell/token through
 the public Lua API, then disappears before final qualification.
 
+## Synarchy migration comparison — 2026-11-06 review
+
+Requested by the owner after the complete draft: assess whether this preserves
+Synarchy's goals and is an improvement, rather than merely a different arena.
+Comparison baseline: S `3777d437ea00e1302bf55162ad5693fee4879187`, H design
+`233fcfcdd01b6b8a58cc61588ba90b4c9ec4fae0`. Read-only inspection; neither
+engine was launched or benchmarked. The following distinctions and concerns
+do not change accepted behavior or silently approve replacement proposals.
+
+### What carries over, and what changes
+
+| Area | Synarchy at the inspected revision | This design | Assessment |
+| --- | --- | --- | --- |
+| Arena identity | Flat loam over granite; starting 5 × 5 chunks are not a horizontal boundary (S `src/World/Generate/Arena.hs:2–33`, `:70–104`) | Same layering direction and exploration-driven chunks | Familiar first consumer, not a new gameplay goal |
+| Depth/storage | Arena base has 16 cells; columns have contiguous arrays, including interior air (S `src/World/Generate/Arena.hs:16–22`; `src/World/Chunk/Types.hs:72–94`) | Implicit deep stone, sparse runs, top-only initial detail and vertical eviction | Better fit for the owner's deep/gapped model; performance is unproved |
+| Reconstruction | A common source plus edits reconstructs evicted chunks; arena parameters/edits also participate in saves (S `src/World/Generate/Arena.hs:2–14`; `src/World/Edit/Types.hs:2–9`) | Source plus session changes, no disk saves | Reuses an existing good idea; session-only persistence is an intentional first-arc reduction |
+| Basic camera | Four facings, pan/drag/zoom, Shift-scroll, manual override (S `src/Engine/Graphics/Camera.hs:22–37`; `scripts/test_arena.lua:255–293`) | Same selected interaction direction | Similar feel, but numerical follow/depth defaults differ below |
+| Camera visibility | Follow target is surface + 25; depth band varies with zoom, capped at 250 (S `src/World/Render.hs:47–81`; `src/World/Generate/Constants.hs:15–18`) | P-5 follows exact surface and proposes a 32-level band | Not equivalent; automatic clipping is a migration risk |
+| Jump/zoom | `gotoTile(x,y)` sets tile-level zoom 0.5 and enables tracking; a zoom-map transition can restore tracking (S `src/Engine/Scripting/Lua/API/Camera.hs:223–318`; `src/World/Render.hs:282–288`) | Optional explicit Z, preserve zoom, no zoom-map reset in manual mode | Explicit-Z/manual behavior is approved; preserve-zoom/default range are proposed differences |
+| Shapes | Directional slope bits select 16 masks; slope bits also affect pathing (S `src/World/Render/Textures.hs:23–57`; `src/Unit/Pathing/Cost.hs:331–347`, `:453–474`, `:491–528`) | Thirteen analytic solid shapes, shared by geometry/render/picking | Cleaner geometric authority is plausible; no established shape/traversal parity yet |
+| Editing | Delete/add tile, set cell/material, set slope, structures and more (S `src/World/Edit/Types.hs:40–84`) | Removal-only public API and removed-span overlay | Appropriate demo scope, narrower than the eventual game |
+| World generation/topology | Geological/hydrological source; cylindrical normal worlds, nonwrapping arenas (S `README.md:42–44`; `src/World/Chunk/Types.hs:37–55`) | Layered source with finite authored patches, nonwrapping arena | Real world generation/topology is deferred; the source abstraction must allow replacement |
+| Rendering integration | Terrain, units, buildings and structures join one world render (S `src/World/Render.hs:40–45`, `:250–280`) | Terrain view exclusively claims the window's scene publication | Narrow initial path; composition with later entities/UI needs an explicit seam |
+
+### MR-1. Automatic camera mode currently risks hiding higher terrain
+
+P-5 clips at the highest occupied cell under the camera, with no headroom.
+That can hide a neighboring taller hill even though the user asked to move
+around hills naturally, and later hide buildings/units above the local ground.
+Synarchy explicitly adds 25 levels above the tracked surface and coordinates
+terrain/entity visibility (S `src/World/Render.hs:47–81`). This is an agent
+proposal mismatch, not an owner request for that clipping behavior.
+
+Recommend separating camera terrain following from an explicitly requested
+cutaway: automatic mode needs a defined headroom/visible-height policy, while
+manual Shift-scroll is an intentional cut plane. Compare full neighboring
+hills and tall-object fixtures before selecting the margin/band. The proposed
+32-level band and zoom limits are tuning hypotheses, not validated parity.
+Do not just add 25 to a 32-level band and accidentally leave only seven levels
+below the surface. A complete height-window rule is needed.
+
+### MR-2. Slopes need a behavioral migration mapping
+
+The thirteen-shape catalog was proposed for coherent geometry; it was not
+derived from all of Synarchy's masks or movement rules. Synarchy's masks
+include opposite-direction combinations, and its pathing tests directional
+ramp bits for one-level steps and uses them for movement grade. Its roughness
+logic deliberately preserves walkable downhill edges
+(S `src/World/Slope/Roughness.hs:80–88`; `src/Unit/Pathing/Cost.hs:491–528`).
+Therefore equal-looking sprites are insufficient evidence of equivalent
+terrain. Recommend a fixture table mapping each reachable Synarchy slope to
+surface shape, exposed faces and traversable edge connections; explicitly
+resolve unmatched shapes before freezing the catalog. This requires geometry
+and future-query compatibility tests, not implementing units/pathfinding now.
+No automatic neighbor reshaping remains the owner's D-21 choice.
+
+### MR-3. Arena recipes and removal records must not become permanent limits
+
+P-5's global layers and finite patches describe the arena well, but cannot
+alone express Synarchy's geological/hydrological world. Keep this as one source
+implementation behind bounded coordinate/range queries, not the sole lifetime
+world schema. Similarly, removed-cell intervals cannot represent future soil
+replacement, filling, slope edits or constructed terrain; Synarchy already
+has those edit varieties (S `src/World/Edit/Types.hs:40–84`).
+Recommend reserving an explicit source-provider boundary and a general sparse
+cell-value override contract, with removal represented efficiently as air.
+The first public API can remain removal-only, and the first source layered.
+No need to build geology, construction or disk persistence now. Define how
+those future mechanisms attach without changing coordinate identity, source
+queries or existing retained changes.
+
+### MR-4. Terrain transactions must remain compatible with gameplay ordering
+
+D-20 correctly defers general state/tick transactions. P-5 nevertheless lets
+either Lua role submit committed edits, with the terrain worker choosing their
+runtime processing order. Its same-ordered-trace guarantee does not establish
+H's required deterministic gameplay for tick-assigned inputs
+(H `docs/vision.md:212–222`). Later mining may need to change terrain, spend
+work/stamina, produce an item and invalidate movement as one game action;
+independent immediate terrain commits cannot alone supply that atomicity.
+Synarchy's delete handler already performs related flora/simulation/render
+updates (S `src/World/Thread/Command/Edit/Terrain.hs:35–87`).
+Recommend defining a sequenced command/commit boundary that a future gameplay
+owner can control, and treating presentation removal as a development adapter
+to it. Do not let provider timing or memory availability become simulation
+order. This does not require implementing whole-tick rollback now. Also review
+P-5's creator-instance-owned arena lifetime: a game's world may need to remain
+as a last committed snapshot after its logical Lua role fails, consistent with
+the intended healthy presentation behavior (H `docs/vision.md:201–222`).
+
+### MR-5. Terrain must compose with later scene content
+
+P-5's exclusive terrain scene attachment is convenient for this no-UI arena,
+but it is not a complete future scene composition contract. The renderer
+already has ordered views/world/UI layers (H `packages/render-2d/README.md:59–69`);
+Synarchy combines world entities and structures with terrain. Recommend a
+terrain scene contribution owned by the common presentation host, preserving
+later units, effects and UI layering. The first scene may contain only terrain;
+that should not require redefining the view API when other content arrives.
+Retain the existing exclusive native graphics attachment and GPU lifetime
+rules; the issue is scene composition, not allowing competing renderer owners.
+
+### MR-6. Sparse and asynchronous is not automatically faster or smaller
+
+Synarchy's packed arrays give direct indexing and cheap contiguous traversal.
+Runs avoid storing large empty or uniform volumes, but add indexing, split/
+merge and metadata costs. Fragmented columns can compress poorly. A single
+owner and individual asynchronous cell calls may bottleneck future fluid or
+navigation scans. Recommend range/snapshot/batch paths and measurement before
+choosing the final physical layout or expanding worker concurrency.
+
+The 32 MiB retained-edit cap is also not an eviction solution: retained edits
+cannot be discarded, so new edits can remain refused until reset, even with
+no chunks resident. This is an explicit P-5 policy, not observed Synarchy
+equivalence or a measured capacity requirement. Preserve the owner's session-
+only arena, but design configurable accounting and a future backing-store
+boundary; explain capacity exhaustion distinctly from short-lived queue
+pressure. No bounded-memory system can retain arbitrarily many unrelated
+edits indefinitely without another storage policy.
+
+### Assessment and proposed next action
+
+The selected direction is a credible improvement for the owner's desired
+gaps/depth model and for engine/game separation. The core arena experience is
+intended to stay familiar. It is not currently a drop-in Synarchy migration,
+and no performance, fidelity or completed implementation claim is supported.
+Synarchy's shared reconstruction authority and edit replay are strengths to
+preserve, not defects this design invented a solution for.
+
+Before final approval, revise or explicitly resolve MR-1–MR-5 and qualify
+MR-6's cost assumptions; keep the existing Q-13 renderer proof gate. Preserve
+all owner decisions and the narrow first arena scope. These are integration
+seams and migration fixtures, not a proposal to implement the whole game in
+this arc. The comparison is recorded for the owner's next design decision.
+
 ## Open questions and review checkpoints
 
 ### Q-1. What does flat terrain contain vertically?
@@ -1029,6 +1169,8 @@ promoted to an owner decision by inclusion in this draft.
 The document remains exploring until that contract and delivery plan are
 accepted and the owner explicitly calls it ready for issue processing.
 No issues or epic are created by this design task.
+The subsequent migration review in Q-14 must be resolved before that signoff;
+P-5 should not be approved unchanged on the assumption of Synarchy parity.
 
 ### Q-13. Can the current renderer represent the geometry correctly?
 
@@ -1042,6 +1184,16 @@ interfaces, substitute incorrect visuals or call the arc complete.
 The broader historical “full Synarchy port” memory reconciliation is not an
 implementation dependency for this explicitly approved first arena. Fidelity
 beyond this arc remains uncommitted; MEMORY.md is unchanged.
+
+### Q-14. Resolve the migration review before technical signoff
+
+The owner explicitly wants Synarchy migration compatibility, not a different
+game that merely resembles its arena. MR-1–MR-6 identify where P-5 needs
+correction, an extension seam or evidence. No new behavior is approved by this
+review request. Settle automatic-camera headroom, slope/traversal mapping,
+source/change extensibility, gameplay command/lifetime integration and scene
+composition; record which cost/budget choices remain measured implementation
+defaults. Amend affected TRA slices and Q-12 before declaring readiness.
 
 ## Verification strategy — proposal
 
