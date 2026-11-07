@@ -1057,6 +1057,7 @@ arena/request/revision context, not a per-cell stream.
 | Commands, request settlement | Request adapter plus terrain owner | Lua threads submit; owner executes; settlement arbitrated atomically | Bounded per request; cancel/close settles once |
 | Camera and input gestures | Presentation instance | Its Lua owner; copied view demand | Window/view; input reset clears held state before acknowledgement |
 | Terrain view/pick snapshots | Terrain view adapter | Immutable borrows by presentation/planning | Bounded revisions; release never mutates another snapshot |
+| Style texture interests | Terrain view adapter | Acquired at attachment; used by view preparation/publication | Held until view close; GPU uses may outlive the view's interests |
 | Retained chunks, textures, pending uploads | Existing graphics host/backend | Backend owner; adopted frames hold exact generations | CPU release marks retirement; free only after actual frame completion |
 
 Construct service resources through `withResource`. Closing first revokes new
@@ -1115,7 +1116,17 @@ View `style` maps the arena's material IDs to instance-owned texture handles,
 face tint/filter settings and the selected view zoom/band settings; missing
 material mappings are refused before attachment. It contains no shader source
 or arbitrary callback. The adapter validates the full mapping and acquires
-texture authority before it can publish a terrain view. Attaching a view
+its own protected texture interests at attachment, held until view close.
+Releasing the original Lua style handles revokes those handles for new caller
+work only; the attached view continues rebuilding and publishing under its
+already-acquired authority. Physical retirement waits for both the view's
+interests and actual GPU uses. M1's released-handle behavior is unchanged.
+
+This lifetime rule is a consequence of P-5's acquisition of texture authority
+at attachment, authorized by verified `het-manager` in `#het-terrain`, message
+`qfu3dq7r45vymbei4wuprummwn`, at 2026-11-07T03:23Z (2026-11-06 local).
+
+Attaching a view
 temporarily claims exclusive scene publication for that window; attempts to
 publish an M1 rectangle scene while attached fail without replacing either
 scene. Closing the view retires it and returns the target to normal use.
