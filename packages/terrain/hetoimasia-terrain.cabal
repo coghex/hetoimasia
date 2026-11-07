@@ -92,3 +92,18 @@ test-suite terrain-tests
         QuickCheck >=2.15 && <2.19,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0
+
+-- Storage measurement, run on request: `cabal bench --project-file
+-- cabal.project.cpu hetoimasia-terrain:terrain-measure`. It is not part of any
+-- required validation group and asserts no wall-clock figure.
+benchmark terrain-measure
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Measure.hs
+    hs-source-dirs: bench
+    -- Full laziness would hoist the loop-invariant updates out of the timed
+    -- repetitions and time nothing.
+    ghc-options: -fno-full-laziness -rtsopts "-with-rtsopts=-T"
+    build-depends:
+        base >=4.22 && <4.23,
+        hetoimasia-terrain ==0.1.0.0

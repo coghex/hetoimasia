@@ -105,9 +105,15 @@ withClient = withPackageClient ["base", "hetoimasia-terrain"]
 -- | The modules hidden inside the main library.
 hidden ∷ [String]
 hidden =
-  [ "Hetoimasia.Terrain.Internal.Coordinate"
+  [ "Hetoimasia.Terrain.Internal.Cell"
+  , "Hetoimasia.Terrain.Internal.Changes"
+  , "Hetoimasia.Terrain.Internal.Column"
+  , "Hetoimasia.Terrain.Internal.Coordinate"
+  , "Hetoimasia.Terrain.Internal.Interval"
+  , "Hetoimasia.Terrain.Internal.Packed"
   , "Hetoimasia.Terrain.Internal.Polytope"
   , "Hetoimasia.Terrain.Internal.Shape"
+  , "Hetoimasia.Terrain.Internal.Source"
   ]
 
 clientImporting ∷ [String] → [String] → String
@@ -123,6 +129,14 @@ constructors =
   , ("Turns", ["import Hetoimasia.Terrain.Shape (Turns (Turns))"], [])
   , ("Ray", ["import Hetoimasia.Terrain.Geometry (Ray (Ray))"], [])
   , ("Solid", ["import Hetoimasia.Terrain.Geometry (Solid (Solid))"], [])
+  , ("MaterialId", ["import Hetoimasia.Terrain.Cell (MaterialId (MaterialId))"], [])
+  , ("ZRange", ["import Hetoimasia.Terrain.Cell (ZRange (ZRange))"], [])
+  , ("PackedCell", ["import Hetoimasia.Terrain.Palette (PackedCell (PackedCell))"], [])
+  , ("Palette", ["import Hetoimasia.Terrain.Palette (Palette (Palette))"], [])
+  , ("Source", ["import Hetoimasia.Terrain.Source (Source (Source))"], [])
+  , ("Changes", ["import Hetoimasia.Terrain.Changes (Changes (Changes))"], [])
+  , ("Segment", ["import Hetoimasia.Terrain.Segment (Segment (Segment))"], [])
+  , ("Resident", ["import Hetoimasia.Terrain.Resident (Resident (Resident))"], [])
   ]
 
 -- | A value forged by applying a private constructor the client never imported.
@@ -132,6 +146,10 @@ forged =
   , ("ShapeId", ["import Hetoimasia.Terrain.Shape (ShapeId)"], ["unsupported :: ShapeId", "unsupported = ShapeId 99"])
   , ("Turns", ["import Hetoimasia.Terrain.Shape (Turns)"], ["unnormalized :: Turns", "unnormalized = Turns 7"])
   , ("Ray", ["import Hetoimasia.Terrain.Geometry (Ray, V3 (..))"], ["noDirection :: Ray", "noDirection = Ray (V3 0 0 0) (V3 0 0 0)"])
+  , ("MaterialId", ["import Hetoimasia.Terrain.Cell (MaterialId)"], ["unchecked :: MaterialId", "unchecked = MaterialId \"\""])
+  , ("ZRange", ["import Hetoimasia.Terrain.Cell (ZRange)"], ["inverted :: ZRange", "inverted = ZRange 5 5"])
+  , ("PackedCell", ["import Hetoimasia.Terrain.Palette (PackedCell)"], ["airWithShape :: PackedCell", "airWithShape = PackedCell 5"])
+  , ("Source", ["import Hetoimasia.Terrain.Source (Source)"], ["unvalidated :: Source", "unvalidated = Source [] mempty mempty 0 0 0"])
   ]
 
 -- | A checked value rewritten through an exported accessor used as a field
@@ -151,9 +169,16 @@ supportedClient =
   unlines
     [ "module Main (main) where"
     , ""
+    , "import Hetoimasia.Terrain.Cell"
+    , "import Hetoimasia.Terrain.Changes"
     , "import Hetoimasia.Terrain.Coordinate"
     , "import Hetoimasia.Terrain.Geometry"
+    , "import Hetoimasia.Terrain.Palette"
+    , "import Hetoimasia.Terrain.Query"
+    , "import Hetoimasia.Terrain.Resident"
+    , "import Hetoimasia.Terrain.Segment"
     , "import Hetoimasia.Terrain.Shape"
+    , "import Hetoimasia.Terrain.Source"
     , ""
     , "main :: IO ()"
     , "main = do"
@@ -172,6 +197,30 @@ supportedClient =
     , "      print (classifyPoint solid (V3 (1/4) (3/4) (1/4)))"
     , "      print (shapeName s, shapeName (rotateShape (turns 1) s))"
     , "      print (fmap (fmap hitParameter . castRay solid) (mkRay (V3 (1/4) (3/4) 2) (V3 0 0 (-1))))"
+    , "  let definition = SourceSpec [\"soil\", \"stone\"] [LayerSpec Nothing (Just (-3)) \"stone\" 0, LayerSpec (Just (-3)) (Just 1) \"soil\" 5] []"
+    , "  print (either show (const \"accepted\") (mkSource defaultSourceLimits definition {specMaterials = [\"a\", \"a\"]}))"
+    , "  print (mkZRange 5 5)"
+    , "  print (mkMaterialId \"\")"
+    , "  case (mkSource defaultSourceLimits definition, tileCoord 0 0 (-1), mkColumn 0 0, mkZRange (-5) 3) of"
+    , "    (Right source, Right t, Right column, Right range) -> do"
+    , "      case cellAt source emptyChanges t of"
+    , "        Solid m s -> print (materialIdString m, shapeIdValue s)"
+    , "        Air -> putStrLn \"air\""
+    , "      case removeCell (ChangeLimits 4) source t emptyChanges of"
+    , "        Right out -> do"
+    , "          print (removeChanged out)"
+    , "          print (cellAt source (removeResult out) t == Air)"
+    , "          print (fmap (map (\\r -> (zRangeLo (runRange r), zRangeHi (runRange r)))) (columnRuns defaultQueryLimits source (removeResult out) column range))"
+    , "        Left e -> print e"
+    , "      print (fmap (axisValue . occupiedLevel) (highestOccupied source emptyChanges column))"
+    , "      case internSourceMaterials source emptyPalette of"
+    , "        Right palette -> do"
+    , "          print (paletteSize palette)"
+    , "          case materialize 64 source emptyChanges palette emptyResident column range of"
+    , "            Right (_, resident) -> print (map (\\s -> (segmentLength s, segmentPayloadBytes s)) (residentSegments resident column))"
+    , "            Left e -> print e"
+    , "        Left e -> print e"
+    , "    _ -> putStrLn \"unexpected\""
     ]
 
 supportedOutput ∷ [String]
@@ -185,4 +234,14 @@ supportedOutput =
   , "Interior"
   , "(\"NE\",\"ES\")"
   , "Right (Just (5 % 4))"
+  , "\"DuplicateMaterialId 1 \\\"a\\\"\""
+  , "Left (EmptyInterval 5 5)"
+  , "Left EmptyMaterialId"
+  , "(\"soil\",5)"
+  , "True"
+  , "True"
+  , "Right [(-5,-3),(-3,-1),(-1,0),(0,1),(1,3)]"
+  , "Just 0"
+  , "2"
+  , "[(5,8),(3,6)]"
   ]
