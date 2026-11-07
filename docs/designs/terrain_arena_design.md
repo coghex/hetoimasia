@@ -6,12 +6,17 @@ testing arena is the concrete reference. The owner
 chooses behavior in this design conversation; existing Synarchy implementation
 choices are evidence, not automatically requirements for the new engine.
 
-Design state: `exploring`
+Design state: `ready for issue processing`
+
+Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
+`het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
+message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
+scope. Q-13 remains an in-delivery renderer-proof gate, not a readiness blocker.
 
 Migration review disposition: D-23–D-26 separate automatic headroom from
 manual cutaway, retain Synarchy's full mask set, explicitly defer later game
-integration, and select adaptive sparse storage. Q-12 still owns final
-technical-contract review; Q-13 retains the rendering proof gate.
+integration, and select adaptive sparse storage. Q-12 is resolved by D-27;
+Q-13 retains the rendering proof gate.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -33,8 +38,10 @@ concrete precondition
 - [ ] TRA-11. Assemble the authored terrain arena
 - [ ] TRA-12. Qualify the arena and remove the development shortcut
 
-The slices below are a concrete proposed delivery plan pending Q-12 review.
-This is design only; no tracker items or implementation are authorized here.
+The delivery plan is approved through Q-12/D-27. Process the EPIC first, then
+one child per invocation with separate filing sign-off. The manager authorized
+the EPIC draft only and requires its complete draft in `#het-terrain` before
+filing. Design approval does not itself create tracker items or authorize code.
 
 ## Epic contract
 
@@ -43,7 +50,7 @@ This is design only; no tracker items or implementation are authorized here.
   extends the arena, using a complete terrain model that includes
   subsurface structure and gaps from the outset, with the engine/game boundary
   preserved. Flat describes the initial terrain source, not a surface-only model.
-- **Done when (proposed acceptance):** the Lua-authored flat arena streams with
+- **Done when:** the Lua-authored flat arena streams with
   camera and explicit query demand, supports the agreed cutaway/follow modes,
   uses the approved artwork, removes tiles through the Lua API, retains edits
   through horizontal/vertical offload and starts fresh in a new session.
@@ -157,7 +164,7 @@ the shortcut by task completion; the Lua removal API remains.
 Changes survive chunk offload/reload within the current arena session, but
 the arena is not persistent across sessions (D-10).
 Depth should also extend on demand, with no designed bottom to the arena
-(D-11). Numeric limits and bounded residency still need explicit contracts.
+(D-11). P-5 supplies the approved numeric limits and bounded residency contract.
 Shift-scroll controls the cutaway level. A camera jump defaults to the
 destination's top level unless its Lua command supplies a Z level (D-12).
 Normal panning, zooming and rotation automatically follow terrain height
@@ -174,10 +181,10 @@ automatic headroom from manual cutaway (D-23), defer later-game integration
 that can be navigated, making camera demand and the resulting terrain
 observable. Keep the first terrain source simple while designing proper
 publication and lifetime. Exact camera controls, coordinate limits, appearance,
-temporary key binding and exact Lua APIs are specified provisionally in P-5.
-The proposed delivery order follows below and needs Q-12 review.
+temporary key binding and exact Lua APIs are specified in P-5, approved by
+Q-12/D-27 with the delivery order below.
 
-**Proposal P-2: one authoritative spatial terrain model.** Represent terrain
+**P-2, incorporated into the approved P-5 contract: one authoritative spatial terrain model.** Represent terrain
 occupancy and its material/shape at positions in three dimensions, with gaps
 and multiple separated solid regions at the same horizontal position. Surface
 height, exposed faces and visibility are derived queries/caches with defined
@@ -189,8 +196,8 @@ differently.
 D-5 and D-15 establish compressed tile columns with full blocks and slopes,
 independently of dense physical allocation. This can express cave floors,
 ceilings and overhangs. The exact slope set, terrain versus constructed
-structures, vertical chunking and exact data representation remain separate
-decisions. Detailed shape and query semantics remain in Q-8.
+structures, vertical chunking and exact data representation were separate
+decisions, now resolved for this arc in P-5/D-24–D-27 and Q-8/Q-9.
 
 **Owner memory concern, 2026-11-06 — direction addressed by D-5:**
 
@@ -199,8 +206,8 @@ decisions. Detailed shape and query semantics remain in Q-8.
 The logical ability to answer about `(x,y,z)` does not require allocating a
 record for each cell. P-2 must not be read as a recommendation for a dense
 full-depth voxel allocation. This concern led to P-3 and the owner's subsequent
-approval of its direction in D-5; P-5 supplies physical layout and budgets
-for review.
+approval of its direction in D-5; P-5 supplies the physical layout and budgets
+approved through Q-12.
 
 **Proposal P-3: compressed vertical spans with bounded materialization.** Keep
 columns, but describe solid/material intervals and gaps compactly. An
@@ -211,8 +218,8 @@ boundary conventions and representation are not selected by this example.
 Uniform solid interiors can be compact just as air can. Gaps, cave ceilings
 and separated spans remain queryable parts of the same model.
 
-D-5 accepts this direction. The illustrative layout and all detailed choices
-below remain proposals rather than an approved implementation specification.
+D-5 accepts this direction. This layout remains illustrative; P-5 contains the
+actual physical representation approved through Q-12/D-27.
 
 Distinguish three questions: what terrain exists, which terrain data is
 materialized in memory, and which exposed faces are prepared for rendering.
@@ -220,8 +227,8 @@ An exposed-surface cache may be small, but material omitted beneath it needs
 an explicit authoritative answer: a compact base definition, a deterministic
 source fetched/generated on demand, or an explicit unavailable state. It must
 not silently become air or lose a buried edit. D-7 selects a procedural source
-for the arena; its deep-terrain recipe and the eviction/durable-edit boundary
-are still Q-3/Q-6/Q-9 decisions.
+for the arena; P-5 resolves its deep-terrain recipe and the eviction/retained-edit
+boundary, as recorded in Q-3/Q-6/Q-9.
 
 Span compression favors coherent layers. Highly fragmented materials/shapes
 or alternating solid/air can require many spans; queries and edits also need
@@ -247,9 +254,9 @@ demand-producer rule; exact request APIs, budgets and scheduling are in P-5.
 
 ## Decisions
 
-The owner requested a fully filled design on 2026-11-06. Remaining technical
-contracts are being made concrete for review. That request does not itself
-approve proposals or call the design ready; accepted choices continue below.
+The owner requested a fully filled design on 2026-11-06 and subsequently
+approved the complete contract and delivery plan through Q-12/D-27. Earlier
+decisions retain their original scope; D-27 supplies the final readiness sign-off.
 
 ### D-1. Start with flat terrain for Ecce Homo
 
@@ -681,6 +688,32 @@ a claim that the owner approved a measured speedup. Unrequested underground
 remains implicit; dense fallback is restricted to already-materialized small
 segments and never expands into unknown cells.
 
+### D-27. Approve Q-12 and readiness for one-at-a-time issue processing
+
+The owner said “i sign off on this” directly in the manager pane. Verified
+`het-manager` relayed that approval in `#het-terrain`, message
+`39em862uwqaj3x3t4dn9kipeta`, at 2026-11-07T02:13Z (2026-11-06 local),
+explicitly binding it to Q-12 and the design at `398a58f35c`.
+
+P-5's technical contract, defaults and limitations, the epic done condition,
+verification strategy and TRA-1–TRA-12 delivery boundaries are approved.
+The design is ready for issue processing. Q-13 stays the in-delivery
+renderer-proof gate with its existing stop/ask behavior; this sign-off does
+not claim that proof or any implementation has run.
+
+The same manager post authorizes processing the EPIC draft only, delivered in
+`#het-terrain` for the manager's explicit filing sign-off before creation.
+Each later tracker artifact needs a separate invocation and approval; the
+manager arranges readiness reviews. No tracker or code mutation follows from
+this design sign-off alone.
+
+Readiness recheck, 2026-11-06 local: all 12 delivery IDs match the ledger and
+have an acyclic, dependency-valid order. The current open tracker contains
+#446 (deferred render-target sampling) and #563 (Lua test-failure triage),
+neither an overlapping terrain umbrella. Searches across open/closed issues
+for terrain, arena and chunk streaming found no duplicate epic. Q-13 names
+the affected slices and their stop/ask behavior explicitly.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -696,16 +729,16 @@ V-1. Do not silently update memory or equate recreation with source portability.
 Before selecting state or concurrency, document its owner, readers/writers,
 thread, lifetime, reset and disposal. CPU completion and GPU retirement remain
 distinct (H `AGENTS.md:14–35`). No terrain-specific ownership table or storage
-layout was approved by the earlier direction alone. P-5 now proposes these
-details explicitly for the final contract review.
+layout was approved by the earlier direction alone. P-5 supplies these details,
+now approved through the explicit Q-12/D-27 contract review.
 
-## Concrete technical contract — proposal P-5
+## Concrete technical contract — P-5, approved through Q-12/D-27
 
-This section fills the implementation contract for owner review. D-1–D-25
-record owner choices and D-26 records the explicitly delegated storage choice.
-The package names, API spellings, remaining numeric
-defaults and mechanisms below are a concrete proposal, not additional owner
-decisions. They require a single review checkpoint before readiness.
+This is the approved implementation contract. D-1–D-25 record the individual
+owner choices, D-26 the delegated storage selection, and D-27 the owner's
+approval of this complete contract and delivery plan. Numeric caps are initial
+implementation defaults to qualify, not measured performance claims. Q-13
+retains its explicit renderer-proof gate.
 
 ### Scope and compatibility
 
@@ -731,7 +764,7 @@ its 4,096-sprite cap to hide a missing terrain path.
 
 ### Components and dependency direction
 
-| Proposed component | Owns | Depends on |
+| Component | Owns | Depends on |
 | --- | --- | --- |
 | `hetoimasia-terrain` | Coordinates, shapes, source recipes, sparse spans, overlays, queries and pure residency/transaction decisions | Base/containers/packed data and math as used; no Lua, GLFW, graphics or game |
 | `hetoimasia-terrain-runtime` | Bounded requests, the single writer, arena lifetime, revisions and CPU snapshots | Terrain, runtime/resources/logging; no concrete game |
@@ -1005,11 +1038,12 @@ reuse; no explicit reset command is added in this arc.
 
 ### Lua surface and authority
 
-Proposed dot-call surface below. Operations that may load, edit or allocate
+Approved dot-call surface below. Operations that may load, edit or allocate
 return the existing `request,nil` / `nil,{code="busy",...}` convention and
 settle through `api.request`. The facade validates copied records with no
-metamethod execution. Names may be revised at review; semantics may not be
-left implicit. Result arrays are complete and bounded, never silently truncated.
+metamethod execution. Changes to this approved surface require explicit review;
+semantics may not be left implicit. Result arrays are complete and bounded,
+never silently truncated.
 
 | Call | Contract |
 | --- | --- |
@@ -1255,14 +1289,14 @@ these machine/resource limits do not introduce a gameplay terrain floor.
 
 Behavior resolved by D-2/D-6/D-10/D-19. P-5 supplies the concrete owner,
 request/cancellation protocol, revision checks, vertical residency, memory
-budgets, offload transfer and GPU retirement contract for review in Q-12.
+budgets, offload transfer and GPU retirement contract approved through Q-12.
 
 ### Q-4. What can the owner see and control in the first version?
 
 Behavior resolved by D-8/D-9/D-12–D-14/D-18/D-22: isometric four-facing view,
 pan/drag/zoom, Shift-scroll cutaway, follow/manual modes and optional jump Z.
 The removal shortcut is development-only. P-5 supplies exact bindings,
-surface selection, cutaway band, picking and artwork adaptation for Q-12.
+surface selection, cutaway band, picking and artwork adaptation approved through Q-12.
 
 ### Q-5. What belongs to the reusable engine and what belongs to Ecce Homo?
 
@@ -1274,12 +1308,12 @@ instance-owned Lua leases. Game recipe/artwork remain outside engine packages.
 Resolved in scope by D-9/D-10/D-19/D-20/D-21: atomic tile removal, session-only
 changes, no automatic neighboring shape edits, no whole-tick rollback. P-5
 specifies canonical removed spans, snapshots, request cancellation and
-arena replacement. General editing/reset tools are excluded in this proposal.
+arena replacement. General editing/reset tools are excluded from this arc.
 
 ### Q-7. What proves this first terrain foundation complete?
 
-The epic done condition, verification matrix and TRA-12 below give the proposed
-observable acceptance. Review these with the delivery boundaries in Q-12.
+The epic done condition, verification matrix and TRA-12 below give the
+observable acceptance approved with the delivery boundaries through Q-12.
 Actual runtime/visual/performance evidence belongs to implementation; none is
 claimed from this documentation turn.
 
@@ -1296,7 +1330,7 @@ Direction resolved by D-5/D-7/D-11/D-16/D-26. P-5 specifies implicit layered
 source, sparse adaptive uniform/run/dense segments, compressed removed
 intervals, vertical eviction and memory accounting. Its payload comparison
 selects the representation; runtime allocation/throughput remain implementation
-qualification. Review host-budget defaults and API boundaries in Q-12.
+qualification. Host-budget defaults and API boundaries are approved through Q-12.
 
 ### Q-10. Terrain transactions versus the deferred gameplay-state service?
 
@@ -1312,19 +1346,14 @@ reset, material-dependent slope inference or game managers.
 
 ### Q-12. Approve the concrete technical contract and delivery boundaries?
 
-Remaining owner checkpoint: review P-5, its explicit defaults/limitations, the
-epic done condition and TRA-1–TRA-12. In particular review the single-writer
-service, copied declarative recipes, content-scoped arena attachment, finite
-memory caps with busy admission, full 16-ID visual mapping, separate headroom
-and manual slice, finite visible depth band, API semantics and coherent
-scene/pick publication. None is silently
-promoted to an owner decision by inclusion in this draft.
+Resolved by D-27: the owner approved the complete design at `398a58f35c`,
+including P-5, its defaults/limitations, the epic done condition and
+TRA-1–TRA-12. Verified manager relay: `#het-terrain`, message
+`39em862uwqaj3x3t4dn9kipeta`, 2026-11-07T02:13Z.
 
-The document remains exploring until that contract and delivery plan are
-accepted and the owner explicitly calls it ready for issue processing.
-No issues or epic are created by this design task.
-Q-14 records the owner's migration-review dispositions. Review this updated
-P-5, not the earlier thirteen-shape/no-headroom proposal.
+The design is ready for issue processing. The current authorization is an
+EPIC draft for manager sign-off before creation, not approval to file it.
+Q-13 remains an in-delivery proof gate; Q-14's migration dispositions stand.
 
 ### Q-13. Can the current renderer represent the geometry correctly?
 
@@ -1346,10 +1375,10 @@ cutaway; preserve the full 16-ID visual mask catalog; defer walkability/speed,
 source/general-edit expansion, gameplay transaction integration and later scene
 composition. Select adaptive sparse storage using the stated payload/complexity
 analysis, with actual runtime costs qualified during implementation. Those
-deferred systems are not added readiness gates for the first arena. Q-12 and
-the deliberately gated Q-13 remain.
+deferred systems are not added readiness gates for the first arena. Q-12 is
+approved; the deliberately gated Q-13 remains for implementation.
 
-## Verification strategy — proposal
+## Verification strategy — approved through Q-12
 
 Use focused Hspec/model tests for identity, demand deduplication, bounded
 admission and refusal; causally controlled integration tests for late results,
@@ -1413,7 +1442,7 @@ validation catalog once slices exist (H `AGENTS.md`, Language and build;
 
 ## Delivery plan
 
-Proposed one-PR boundaries, pending Q-12. Phases express dependency barriers,
+Approved one-PR boundaries, Q-12/D-27. Phases express dependency barriers,
 not permission to create issues. The independent input and geometry work can
 be prepared earlier; the ledger lists a valid complete order. Every slice
 includes its owning contract/tests/catalog updates; documentation lands through
@@ -1431,7 +1460,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   boundary coordinates, all 16 mask IDs/four facings, shared coverage agreement
   and external-client boundary checks. Movement/pathing is deferred.
 - **Out of scope:** streaming, Lua and rendering effects.
-- **Open questions:** Q-12 approval of exact geometry/coordinate contract.
+- **Open questions:** none; Q-12 contract approved.
 
 ### TRA-2. Implement layered sources and compressed terrain changes
 
@@ -1445,7 +1474,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   and complete bounded range results; encoding round trips, cost-threshold
   transitions and allocation/work bounds without densifying unknown depth.
 - **Out of scope:** live service, persistence and automatic slopes.
-- **Open questions:** Q-12 approval of recipe/change encoding contract.
+- **Open questions:** none; Q-12 contract approved.
 
 ### TRA-3. Define bounded horizontal and vertical residency
 
@@ -1457,7 +1486,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
 - **Acceptance signals:** tiny-budget model traces, starvation/fairness cases,
   vertical descent, shared-interest cancellation and no eviction of borrowed data.
 - **Out of scope:** threads, GPU ownership and numeric performance claims.
-- **Open questions:** Q-12 approval of bounds/admission defaults.
+- **Open questions:** none; Q-12 contract approved.
 
 ### TRA-4. Implement the transactional terrain service
 
@@ -1470,7 +1499,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   repeated edit/offload/reload, stale revisions and failure cleanup; same ordered
   command trace yields identical terrain despite residency scheduling changes.
 - **Out of scope:** general gameplay-state transactions and Lua bindings.
-- **Open questions:** Q-12 approval of execution/lifetime contract.
+- **Open questions:** none; Q-12 contract approved.
 
 ### TRA-5. Expose terrain requests through Lua
 
@@ -1483,7 +1512,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   busy-before-action, duplicate names, cross-role own-lease attachment, canceled
   mutation and invalid recipes, plus existing M1 compatibility tests.
 - **Out of scope:** window/input/view bindings and general state schemas.
-- **Open questions:** Q-12 approval of named arena authority/API.
+- **Open questions:** none; Q-12 contract approved.
 
 ### TRA-6. Expose ordered window input to Lua
 
@@ -1494,7 +1523,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
 - **Acceptance signals:** synthetic ordered feed tests, overflow and focus
   reset, clear-before-acknowledge, window/instance authority and cursor metrics.
 - **Out of scope:** UI routing, action-rebinding UI and terrain mutation.
-- **Open questions:** Q-12 approval of public input contract.
+- **Open questions:** none; Q-12 contract approved.
 
 ### TRA-7. Implement isometric cutaway planning and picking
 
@@ -1508,7 +1537,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   far coordinates, manual/jump transitions, separate automatic headroom,
   all 16 mask forms, seam and occlusion fixtures. No movement-cost work.
 - **Out of scope:** Vulkan uploads and new renderer ABI.
-- **Open questions:** Q-12; Q-13 ordering feasibility. Escalate rather than
+- **Open questions:** Q-13 ordering feasibility. Escalate rather than
   approximate if the geometry cannot be ordered correctly.
 
 ### TRA-8. Qualify terrain materials and depth ordering offscreen
@@ -1536,7 +1565,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   refusal, superseded camera demand, retiring-version accounting, no mixed
   terrain/camera revision and no release before GPU completion.
 - **Out of scope:** Lua view facade and general scene schema expansion.
-- **Open questions:** Q-12; Q-13 must have passed.
+- **Open questions:** Q-13 must have passed.
 
 ### TRA-10. Expose terrain views and camera controls to Lua
 
@@ -1548,7 +1577,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   consecutive jumps, stale picks and view/window/arena teardown; old M1 scenes
   remain valid and cannot concurrently seize an attached terrain target.
 - **Out of scope:** UI widgets and camera behavior not selected here.
-- **Open questions:** Q-12; Q-13 must have passed.
+- **Open questions:** Q-13 must have passed.
 
 ### TRA-11. Assemble the authored terrain arena
 
@@ -1561,7 +1590,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   underground/cutaway demand, surface/manual navigation, soil-to-stone removal,
   revisit after offload and fresh state after session restart.
 - **Out of scope:** production editor, gameplay systems and UI.
-- **Open questions:** Q-12; Q-13 must have passed. Development shortcut removal
+- **Open questions:** Q-13 must have passed. Development shortcut removal
   is mandatory in TRA-12, not an optional follow-up.
 
 ### TRA-12. Qualify the arena and remove the development shortcut
@@ -1576,7 +1605,7 @@ processing is split/reviewed explicitly, never hidden inside a child.
   are reported honestly, shortcut is absent, and the public Lua removal path
   remains tested. Existing M1/native resource qualification stays green.
 - **Out of scope:** broader profiling campaigns, gameplay parity and new art.
-- **Open questions:** Q-12 acceptance scope; Q-13 must have passed.
+- **Open questions:** Q-13 must have passed; Q-12 acceptance scope approved.
 
 ### Acceptance matrix and evidence delivery
 
@@ -1601,7 +1630,7 @@ Use Hspec and controlled synchronization for CPU/contracts, the existing
 offscreen renderer path for image evidence, and the owning native suite for
 input/display integration. Select required groups using the repository's
 validation planner when each implementation slice exists. Numeric budgets are
-proposed caps, not benchmark results: measure representative flat/layered/
+initial caps, not benchmark results: measure representative flat/layered/
 hollow/sloped/fragmented fixtures and report allocation cost and refusal
 behavior. No arbitrary FPS claim is an acceptance criterion.
 
