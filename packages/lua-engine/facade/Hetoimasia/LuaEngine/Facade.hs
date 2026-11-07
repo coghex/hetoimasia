@@ -17,6 +17,7 @@
 -- > api.time.tick() / tick_seconds() / seconds() / wait_ticks(n) / wait_seconds(s) / yield()
 -- > api.session.status() / quit()    -- the session controls (LFE-26): a copied status, a returning normal stop
 -- > api.state(...)                   -- the unavailable-state guard (also the global @state(...)@)
+-- > api.input.poll(window, n) / acknowledgeReset(window, token)   -- only when the composition opted in to input (TRA-6)
 --
 -- Every call is a dot call with exactly its declared arguments: a mistaken colon call, an extra or
 -- missing argument (an explicit @nil@ counts as an argument), a value of the wrong type or a table
@@ -38,6 +39,11 @@
 -- * @time.wait_ticks@: a gameplay instance's update. @time.wait_seconds@: a presentation instance's update.
 -- * @session.status@: a presentation instance's, in @init@, an update and @shutdown@, answering the capture taken at the
 --   entry of the hook or resumed segment. @session.quit@: either role's instance, in any hook.
+-- * @input.poll@ (TRA-6): a presentation instance's, in @init@ and an update, while the session's admission is open; refused in
+--   @shutdown@ and to the logical role. @input.acknowledgeReset@: a presentation instance's, in any finite hook, shutdown and
+--   after a stop included (it is cleanup, and never reads the admission). Both are ordinary errors, before a single event is read,
+--   for a float or out-of-range count, a foreign or retired window and a token that is not the window's. See
+--   "Hetoimasia.LuaEngine.Facade.Input" for the packet and the encoding, and the package README for the contract.
 -- * @state(...)@ and @api.state(...)@: anywhere, and with any arguments: they latch the whole session's failure and
 --   raise (see "Hetoimasia.LuaEngine.Facade.Session"); no role, phase or arity check stands before them.
 --
@@ -93,6 +99,22 @@ module Hetoimasia.LuaEngine.Facade
   , graphicsWindowRequestType
   , graphicsTextureValueSchema
   , graphicsWindowValueSchema
+  , graphicsInputResetType
+  , InputServices (..)
+  , InputPoll (..)
+  , InputAck (..)
+  , InputPacket (..)
+  , InputDisposition (..)
+  , InputEventRecord (..)
+  , InputBody (..)
+  , InputKeyAction (..)
+  , InputButtonAction (..)
+  , InputModifiers (..)
+  , InputResetInfo (..)
+  , InputResetReason (..)
+  , InputObservation (..)
+  , pollMaximum
+  , packetSchema
   , AdmissionState (..)
   , FacadeEndpoints (..)
   , SessionEndpoints (..)
@@ -183,6 +205,7 @@ import Hetoimasia.LuaEngine.Facade.Caller
   , newRegistry
   )
 import Hetoimasia.LuaEngine.Facade.Graphics (graphicsBindings, graphicsHandleTypes)
+import Hetoimasia.LuaEngine.Facade.Input (inputBindings, packetSchema, pollMaximum)
 import Hetoimasia.LuaEngine.Facade.Content (contentBindings, dataHandleName, lexicalResolver, moduleHandleName, validRootId)
 import Hetoimasia.LuaEngine.Facade.Output
 import Hetoimasia.LuaEngine.Facade.Request (requestBindings)
@@ -466,13 +489,13 @@ facadeExportLimits facade = limits {exportMaxIdentities = exportMaxIdentities li
 -- module, and the export ceilings. The owner's other settings are the caller's.
 installFacade ∷ Facade → [Namespace] → [CapabilityType] → VmConfig → Either InstallRefused VmConfig
 installFacade facade others types config = do
-  registered ← either (Left . RegistrationRefused) Right (registration (handleTypes <> types) (facadeNamespace facade : others))
   limits ← either (Left . ValueLimitsRefused) Right (copiedValueLimits (fcProfile facade))
+  registered ← either (Left . RegistrationRefused) Right (registration (handleTypes <> types) (facadeNamespace facade limits : others))
   Right
     config
       { vmRegistration = registered
       , vmPolicy = nub (vmPolicy config <> [engineNamespaceName] <> [nameOf found | found ← others])
-      , vmInitialChunks = vmInitialChunks config <> [(engineChunkName, engineChunk (isJust (fcGraphics facade)) (limitPrintBytes (fcLimits facade)))]
+      , vmInitialChunks = vmInitialChunks config <> [(engineChunkName, engineChunk (isJust (fcGraphics facade)) (isJust (facadeInput facade)) (limitPrintBytes (fcLimits facade)))]
       , vmExports = vmExports config <> [builderSource]
       , vmExportLimits = facadeExportLimits facade
       , vmValueLimits = limits
@@ -481,6 +504,7 @@ installFacade facade others types config = do
     handleTypes =
       [m1HandleType (fcRequests facade) moduleHandleName, m1HandleType (fcRequests facade) dataHandleName]
         <> maybe [] (\graphics → graphicsHandleTypes facade <> gsTypes graphics) (fcGraphics facade)
+        <> maybe [] isTypes (facadeInput facade)
     nameOf = namespaceName
 
 -- | The copied-value ceilings of a profile as the limits on everything that crosses for an owner: 16 MiB
@@ -494,8 +518,8 @@ copiedValueLimits profile = valueLimits (fromIntegral bytes) (fromIntegral depth
     Count elements = countLimit profile CopiedValueElements
 
 -- | The namespace of the facade's bindings: hidden, read once by the initial chunk and removed.
-facadeNamespace ∷ Facade → Namespace
-facadeNamespace facade =
+facadeNamespace ∷ Facade → ValueLimits → Namespace
+facadeNamespace facade limits =
   namespace
     engineNamespaceName
     ( outputBindings facade
@@ -505,7 +529,12 @@ facadeNamespace facade =
         <> timeBindings facade
         <> sessionBindings facade
         <> maybe [] (graphicsBindings facade) (fcGraphics facade)
+        <> maybe [] (\input → inputBindings facade input limits) (facadeInput facade)
     )
+
+-- | The presentation-input operations of this facade, if the composition opted in.
+facadeInput ∷ Facade → Maybe InputServices
+facadeInput facade = fcGraphics facade >>= gsInput
 
 -- | A configuration of a VM's instances that tells the facade whenever a hook begins or resumes, after
 -- whatever the configuration already did.

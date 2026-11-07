@@ -7,6 +7,8 @@ import qualified Test.LuaEngine.Graphics.Composed as Composed
 import qualified Test.LuaEngine.Graphics.Configuration as Configuration
 import qualified Test.LuaEngine.Graphics.Facade as Facade
 import qualified Test.LuaEngine.Graphics.Faults as Faults
+import qualified Test.LuaEngine.Graphics.Input as Input
+import qualified Test.LuaEngine.Graphics.InputSession as InputSession
 import qualified Test.LuaEngine.Graphics.Integrated as Integrated
 import qualified Test.LuaEngine.Graphics.Lifecycle as Lifecycle
 import qualified Test.LuaEngine.Graphics.Owned as Owned
@@ -40,5 +42,7 @@ spec = do
   Facade.spec
   Peers.spec
   Owned.spec
+  Input.spec
+  InputSession.spec
   Integrated.spec
   PixelComparator.spec

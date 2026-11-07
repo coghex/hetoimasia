@@ -458,7 +458,8 @@ spec = describe "the package and import boundary" $ do
         || "Control." `isPrefixOf` name
         || "Hetoimasia.LuaEngine.Facade" `isPrefixOf` name
         || name
-          `elem` [ "Hetoimasia.LuaEngine.Behavior"
+          `elem` [ "Numeric.Natural"
+                 , "Hetoimasia.LuaEngine.Behavior"
                  , "Hetoimasia.LuaEngine.Boot"
                  , "Hetoimasia.LuaEngine.Data"
                  , "Hetoimasia.LuaEngine.Manifest"

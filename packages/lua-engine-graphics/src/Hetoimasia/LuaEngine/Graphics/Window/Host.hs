@@ -31,7 +31,12 @@ module Hetoimasia.LuaEngine.Graphics.Window.Host
   ( -- * The port
     hostPort
   , newHostPort
+  , newHostPorts
+  , HostPorts (..)
   , PortReading (..)
+
+    -- * The narrow input capability of a window (TRA-6)
+  , WindowInput (..)
 
     -- * The capability a ready window yields
   , WindowTarget (..)
@@ -65,6 +70,8 @@ import Hetoimasia.GLFW.Command
   , CommandStatistics (..)
   , WindowClient
   , WindowCommandPort
+  , clientInputControl
+  , clientInputReader
   , clientObservations
   , closeWindowCommand
   , createWindowCommand
@@ -72,8 +79,10 @@ import Hetoimasia.GLFW.Command
   , pollWindowClient
   , submitWindowCommand
   )
+import Hetoimasia.GLFW.Input (InputControl, InputReader)
 import Hetoimasia.GLFW.Window
   ( WindowId
+  , WindowObservation
   , WindowPhase (..)
   , closeRequestNumber
   , defaultWindowConfig
@@ -131,6 +140,19 @@ data WindowTarget scene = WindowTarget
     -- ^ Whether this incarnation's target is still the admitted, attached one.
   }
 
+-- | The input of one window incarnation, as the Lua input adapter may reach it: the window's one reader, its admission control
+-- and a transaction reading its latest observation, and nothing else. It carries no command port, no producer, no
+-- disposal and no scene authority, and is a different capability from 'WindowTarget': the scene target stays the right to
+-- publish, and input is reached through its own narrow port.
+--
+-- The host retains each window's client until the window has retired, so this is available for exactly that time; the
+-- reader and control it hands out keep answering (closed) after the window ends.
+data WindowInput = WindowInput
+  { windowInputReader ∷ !InputReader
+  , windowInputControl ∷ !InputControl
+  , windowInputObservation ∷ STM WindowObservation
+  }
+
 -- The state ------------------------------------------------------------------------------------------
 
 data Made = Made
@@ -164,11 +186,24 @@ hostPort vulkan = fst <$> newHostPort vulkan
 
 -- | The same, with a reading of the port's own bookkeeping.
 newHostPort ∷ ∀ scene. VulkanHost scene → IO (Port (WindowTarget scene), STM PortReading)
-newHostPort vulkan = do
+newHostPort vulkan = (\ports → (hostPortsPort ports, hostPortsReading ports)) <$> newHostPorts vulkan
+
+-- | Everything one host yields: the provider's port, a reading of its bookkeeping, and the window input lookup.
+data HostPorts scene = HostPorts
+  { hostPortsPort ∷ Port (WindowTarget scene)
+  , hostPortsReading ∷ STM PortReading
+  , hostPortsInput ∷ WindowToken → STM (Maybe WindowInput)
+    -- ^ The input capability of a window incarnation the port made and has not yet retired; 'Nothing' for any other.
+    -- A transaction, so a caller's registration and the lookup are one atomic step.
+  }
+
+-- | The port, its reading and the input lookup, over one bookkeeping. 'hostPort' and 'newHostPort' are views of this.
+newHostPorts ∷ ∀ scene. VulkanHost scene → IO (HostPorts scene)
+newHostPorts vulkan = do
   var ← newTVarIO (HostState 0 Map.empty Map.empty)
   let commands = hostCommandPort (vulkanWindowHost vulkan)
       reading = (\st → PortReading (Map.size (hsCreates st)) (Map.size (hsMade st))) <$> readTVar var
-  pure (port var commands, reading)
+  pure (HostPorts (port var commands) reading (windowInputOf var))
   where
    port var commands =
     Port
@@ -193,6 +228,19 @@ newHostPort vulkan = do
       , portQueueRoom = (\stats → commandsPending stats < commandsCapacity stats) <$> hostCommandStatistics (vulkanWindowHost vulkan)
       , portWakeMain = wakeGraphicsHost (vulkanGraphicsOwner vulkan)
       }
+
+-- Input ----------------------------------------------------------------------------------------------
+
+windowInputOf ∷ TVar HostState → WindowToken → STM (Maybe WindowInput)
+windowInputOf var token = do
+  found ← Map.lookup token . hsMade <$> readTVar var
+  pure $ found <&> \made →
+    let client = madeClient made
+     in WindowInput
+          { windowInputReader = clientInputReader client
+          , windowInputControl = clientInputControl client
+          , windowInputObservation = preparedValue . observedValue <$> readSnapshot (clientObservations client)
+          }
 
 -- Creation -------------------------------------------------------------------------------------------
 
