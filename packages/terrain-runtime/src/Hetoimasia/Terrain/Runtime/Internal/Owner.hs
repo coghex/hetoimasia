@@ -28,7 +28,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Owner
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (SomeAsyncException, SomeException, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (forM, forM_, void, when)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
@@ -101,6 +101,7 @@ ownerMain svc token = mask $ \restore → do
     -- exactly once and the owner is marked stopped. This is non-blocking
     -- bookkeeping, so it is safe under the uninterruptible mask.
     terminal = do
+      safePointSTM svc
       closeServiceSTM svc
       retireInFlightSTM svc
       modifySt svc (\st → st {stateOwner = OwnerStopped})
@@ -186,6 +187,8 @@ handoffCandidate st =
     , not (R.regionEvicting r)
     , Map.member (R.regionArena r) (stateArenas st)
     , Map.lookup (R.regionArena r, R.regionCoord r) (stateTransfers st) /= Just (R.regionGeneration r)
+    , -- refused for want of capacity at this very epoch: reconsidered when it moves
+      Map.lookup (R.regionArena r, R.regionCoord r) (stateHandoffBusy st) /= Just (stateCapacityEpoch st)
     ]
 
 -- | Work for the request table: stage whatever has its data, then commit the
@@ -344,6 +347,10 @@ handoff svc aid region = do
             duplicate = maybe 0 (fromIntegral . changesBytes) working
         applyEvent svc (R.BeginHandoff aid region duplicate) >>= \case
           Right _ → pure (Just working)
+          -- Capacity pressure is not a failed transfer: the region stays a candidate
+          -- and is reconsidered when capacity is returned (R2). Only a refusal that
+          -- can never clear ends the attempt.
+          Left (R.Busy _) → modifySt svc (\s → s {stateHandoffBusy = Map.insert (aid, region) (stateCapacityEpoch s) (stateHandoffBusy s)}) >> pure Nothing
           Left _ → tried >> pure Nothing
   forM_ started $ \working → do
     outcome <- tryNonAsync (probe svc (PointHandoff aid region))
@@ -426,28 +433,45 @@ prepareReq svc rid = do
   forM_ snapshot $ \(req, current) → case reqCmd req of
     COpen {} → stage svc rid Nothing (Revision 0) StagedControl
     CAttach {} → stage svc rid Nothing (Revision 0) StagedControl
-    CRemove tile _ → forM_ current $ \(aid, arena) → do
-      prepared <-
-        tryNonAsync $ do
-          probe svc (PointStaging rid)
-          -- Prepare the content change and prove the rebuild succeeds now; the
-          -- rebuild itself is repeated against the residency at commit.
-          pure $! prepareRemoval (changeLimitsOf config) (arenaSource arena) (arenaChanges arena) tile >>= \ready →
-            ready <$ rebuildCell (arenaSource arena) (preparedChanges ready) (arenaPalette arena) (arenaResident arena) tile
-      case prepared of
-        Left failure → fail' (HostFailure (Text.pack ("preparation failed: " <> show failure)))
-        Right (Left why) → fail' (HostFailure (Text.pack ("preparation refused: " <> why)))
-        Right (Right ready) → stage svc rid (Just aid) (arenaRevision arena) (StagedRemoval ready)
-    cmd → forM_ current $ \(aid, arena) → do
-      probe svc (PointCaptured rid aid (arenaRevision arena))
-      case readAnswer config aid (arenaRevision arena) arena cmd of
-        Left failure → fail' failure
-        Right (answer, demands)
+    CRemove tile _ → forM_ current $ \(aid, arena) →
+      running svc rid
+        ( tryNonAsync $ do
+            probe svc (PointStaging rid)
+            -- Prepare the content change and prove the rebuild succeeds now; the
+            -- rebuild itself is repeated against the residency at commit.
+            pure $! prepareRemoval (changeLimitsOf config) (arenaSource arena) (arenaChanges arena) tile >>= \ready →
+              ready <$ rebuildCell (arenaSource arena) (preparedChanges ready) (arenaPalette arena) (arenaResident arena) tile
+        )
+        >>= \case
+          Nothing → pure ()
+          Just (Left failure) → fail' (HostFailure (Text.pack ("preparation failed: " <> show failure)))
+          Just (Right (Left why)) → fail' (HostFailure (Text.pack ("preparation refused: " <> why)))
+          Just (Right (Right ready)) → stage svc rid (Just aid) (arenaRevision arena) (StagedRemoval ready)
+    cmd → forM_ current $ \(aid, arena) →
+      running svc rid (probe svc (PointCaptured rid aid (arenaRevision arena)) >> (pure $! readAnswer config aid (arenaRevision arena) arena cmd)) >>= \case
+        Nothing → pure ()
+        Just (Left failure) → fail' failure
+        Just (Right (answer, demands))
           | demands /= reqDemand req → atomically (resubmitSTM svc rid)
           | otherwise → stage svc rid (Just aid) (arenaRevision arena) (StagedAnswer answer)
   where
     config = serviceConfig svc
     fail' failure = atomically (terminate svc rid (Failed failure))
+
+-- | Run one request's preparation under its credits (R1). From here to the safe
+-- point at its end, nothing the request holds is released, whoever cancels it, releases
+-- its lease or closes its arena meanwhile; those releases are deferred and happen
+-- at the safe point, which is also reached when an exception ends the preparation.
+-- Nothing when the request was already gone.
+running ∷ Service → RequestId → IO a → IO (Maybe a)
+running svc rid work = do
+  began <- atomically (beginRunning svc rid)
+  if not began
+    then pure Nothing
+    else do
+      result <- work `onException` atomically (safePointSTM svc)
+      atomically (safePointSTM svc)
+      pure (Just result)
 
 -- | Publish staged work and tell the host it is ready. Work whose arena has moved
 -- on since it was computed is dropped; the owner computes it again. A readiness
@@ -655,7 +679,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
     isRemoval' q = case reqCmd q of CRemove {} → True; _ → False
     -- A settled result is kept, with its command slot, until its holder takes it.
     retainResult q = do
-      void (applyEvent svc (R.Withdraw rid))
+      withdrawRecord svc rid q
       modifySt svc (\s → s {stateRequests = Map.insert rid q {reqPhase = Done, reqModel = False} (stateRequests s)})
 
 -- | Admit a request's demand to the model again, at the arena's current
@@ -667,7 +691,7 @@ resubmitSTM svc rid = do
   st <- readSt svc
   forM_ (Map.lookup rid (stateRequests st)) $ \req →
     forM_ (reqArena req >>= \aid → (,) aid <$> Map.lookup aid (stateArenas st)) $ \(aid, arena) → do
-      when (reqModel req) (void (applyEvent svc (R.Withdraw rid)))
+      when (reqModel req) (withdrawRecord svc rid req)
       case demandFor arena (reqCmd req) of
         Left why → terminate svc rid (Failed (SourceFailure (Text.pack why)))
         Right demands → do

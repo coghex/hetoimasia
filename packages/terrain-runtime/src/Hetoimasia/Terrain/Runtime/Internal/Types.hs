@@ -74,6 +74,7 @@ import qualified Data.Map.Strict as Map
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Unique (Unique)
 import Data.Word (Word64)
@@ -519,6 +520,23 @@ data St = St
   , stateDefectCount ∷ !Word64
   , -- | Whose quantum is next when several kinds of work are ready.
     stateTurn ∷ !Turn
+  , -- | The request whose preparation the owner is running, with its arena. While
+    -- it runs, the credits it holds (and its arena's) are not released: a release
+    -- that would touch them waits for the owner's safe point.
+    stateRunning ∷ !(Maybe (RequestId, Maybe ArenaId))
+  , -- | Requests that ended while their preparation was running: the table no
+    -- longer has them, but the model still holds their record and every credit it
+    -- owns, and the service still holds their reserved record, until the safe point.
+    stateGhosts ∷ !(Map RequestId Req)
+  , -- | Arenas closed while a preparation of theirs was running: the model retires
+    -- them at the safe point.
+    stateDeferredRetire ∷ !(Set ArenaId)
+  , -- | Advances every time capacity may have been returned.
+    stateCapacityEpoch ∷ !Word64
+  , -- | The capacity epoch at which a region's transfer was refused for want of
+    -- capacity. That is not a failed transfer: the region is reconsidered as soon
+    -- as the epoch moves.
+    stateHandoffBusy ∷ !(Map RegionKey Word64)
   }
 
 initialState ∷ Config → Limits → St
@@ -550,6 +568,11 @@ initialState config limits =
     , stateDefects = []
     , stateDefectCount = 0
     , stateTurn = TurnPrepare
+    , stateRunning = Nothing
+    , stateGhosts = Map.empty
+    , stateDeferredRetire = Set.empty
+    , stateCapacityEpoch = 0
+    , stateHandoffBusy = Map.empty
     }
   where
     first = configFirstIdentity config

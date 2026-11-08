@@ -40,6 +40,9 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , terminate
   , terminateWith
   , releaseReq
+  , withdrawRecord
+  , beginRunning
+  , safePointSTM
   , cancelRequest
   , retireRequest
 
@@ -68,9 +71,10 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , modelLimitsFor
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent.STM
 import Control.Exception (SomeException)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM_, unless, when, void)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Sequence as Seq
@@ -100,7 +104,7 @@ modifySt svc = modifyTVar' (serviceState svc)
 
 -- | Something that may free capacity happened; the owner retries what waits.
 markFreed ∷ Service → STM ()
-markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False})
+markFreed svc = modifySt svc (\st → st {stateFreed = True, stateDispatchIdle = False, stateCapacityEpoch = stateCapacityEpoch st + 1})
 
 -- | The regions a decision committed as victims, for the owner to discard.
 decisionVictims ∷ R.Decision → [R.RegionKey]
@@ -120,7 +124,7 @@ applyEvent svc event = do
     Left _ → pure outcome
     Right report → do
       writeTVar (serviceState svc) $
-        (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False} else id)
+        (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False, stateCapacityEpoch = stateCapacityEpoch x + 1} else id)
         st
           { stateModel = model
           , stateVictims = stateVictims st <> Seq.fromList (decisionVictims (R.reportDecision report))
@@ -302,7 +306,7 @@ isDone ∷ Req → Bool
 isDone req = case reqPhase req of Done → True; _ → False
 
 countReqs ∷ (Req → Bool) → St → Int
-countReqs p st = Map.size (Map.filter p (stateRequests st))
+countReqs p st = Map.size (Map.filter p (stateRequests st)) + Map.size (Map.filter p (stateGhosts st))
 
 -- | The removals admitted for an arena and not yet settled.
 -- | Accounted bytes a settled removal result holds in the retained bank until it is
@@ -482,7 +486,49 @@ releaseReq svc rid req = do
           COpen name _ _ | Just (ClaimPending claimed) <- Map.lookup name (stateNames st), claimed == rid → Map.delete name (stateNames st)
           _ → stateNames st
       }
-  when (reqModel req) (() <$ applyEvent svc (R.Withdraw rid))
+  when (reqModel req) (withdrawRecord svc rid req)
+  markFreed svc
+
+-- | THE ONLY PLACE a request's model record, and every credit it owns, is given back
+-- (R1). While the owner is running that request's preparation, which computes with
+-- values captured under those credits, the release waits: the request leaves the
+-- table (its outcome is already decided) but stays a ghost holding everything, and
+-- 'safePointSTM' gives it back once the preparation has ended.
+withdrawRecord ∷ Service → RequestId → Req → STM ()
+withdrawRecord svc rid req = do
+  st <- readSt svc
+  case stateRunning st of
+    Just (running, _) | running == rid → modifySt svc (\s → s {stateGhosts = Map.insert rid req (stateGhosts s)})
+    _ → void (applyEvent svc (R.Withdraw rid))
+
+-- | Retire an arena in the model, which gives back every credit its requests and
+-- views hold. Deferred while a preparation of that arena is running (R1).
+retireArenaRecord ∷ Service → ArenaId → STM ()
+retireArenaRecord svc aid = do
+  st <- readSt svc
+  case stateRunning st of
+    Just (_, Just running) | running == aid → modifySt svc (\s → s {stateDeferredRetire = Set.insert aid (stateDeferredRetire s)})
+    _ → void (applyEvent svc (R.RetireArena aid))
+
+-- | The owner starts running a request's preparation, if the request is still
+-- there to prepare: from now until the safe point nothing it holds is released.
+beginRunning ∷ Service → RequestId → STM Bool
+beginRunning svc rid = do
+  st <- readSt svc
+  case Map.lookup rid (stateRequests st) of
+    Nothing → pure False
+    Just req → do
+      modifySt svc (\s → s {stateRunning = Just (rid, reqArena req)})
+      pure True
+
+-- | The owner's safe point: no preparation is running, so what was deferred is
+-- released now, requests first, then arenas.
+safePointSTM ∷ Service → STM ()
+safePointSTM svc = do
+  st <- readSt svc
+  modifySt svc (\s → s {stateRunning = Nothing, stateGhosts = Map.empty, stateDeferredRetire = Set.empty})
+  forM_ (Map.keys (stateGhosts st)) $ \rid → applyEvent svc (R.Withdraw rid)
+  forM_ (Set.toList (stateDeferredRetire st)) (applyEvent svc . R.RetireArena)
   markFreed svc
 
 -- | Deliver a request's terminal outcome and give back what it holds. A request
@@ -547,7 +593,7 @@ closeArena svc aid = do
         , stateLeases = foldr (Map.adjust (\l → l {leaseLive = False})) (stateLeases cur) (Set.toList (arenaLeases arena))
         , stateTransfers = Map.filterWithKey (\(owner, _) _ → owner /= aid) (stateTransfers cur)
         }
-    () <$ applyEvent svc (R.RetireArena aid)
+    retireArenaRecord svc aid
 
 -- | Release a lease. Idempotent. It cancels the requests made through it, and
 -- releasing the creator's final owner lease closes the arena.
@@ -742,13 +788,17 @@ invariants snapshotBank st =
   map ("model: " <>) (R.modelInvariants model)
     <> map (("charge: " <>) . show) (R.chargeCheck model)
     <> [ "request " <> show rid <> " claims a model record the model lacks"
-       | (rid, req) <- Map.toList (stateRequests st)
+       | (rid, req) <- Map.toList (stateRequests st) <> Map.toList (stateGhosts st)
        , reqModel req
        , rid `notElem` modelIds
        ]
     <> [ "model request " <> show rid <> " has no table entry holding it"
        | rid <- modelIds
-       , maybe True (not . reqModel) (Map.lookup rid (stateRequests st))
+       , maybe True (not . reqModel) (Map.lookup rid (stateRequests st) <|> Map.lookup rid (stateGhosts st))
+       ]
+    <> [ "a ghost or a deferred retirement exists while no preparation is running"
+       | stateRunning st == Nothing
+       , not (Map.null (stateGhosts st)) || not (Set.null (stateDeferredRetire st))
        ]
     <> [ "lease " <> show lid <> " is live but its arena is not"
        | (lid, ls) <- Map.toList (stateLeases st)
