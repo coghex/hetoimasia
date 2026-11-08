@@ -28,6 +28,8 @@ import Hetoimasia.Terrain.Render2D.Knowledge
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
 import Hetoimasia.Terrain.Shape (ViewFacing (..), mkShapeId)
 import qualified Data.Set as Set
+import Data.Bits (shiftR)
+import Data.Word (Word64)
 import Hetoimasia.Terrain.Source
 import System.FilePath ((</>))
 import Test.Hspec
@@ -367,3 +369,38 @@ fractionalOcclusion = describe "omission of hidden cells under the transforms as
     -- The shortcut still works where the rectangles are exact, and still declines elsewhere.
     any (not . snd) outcomes `shouldBe` True
     any snd outcomes `shouldBe` True
+
+  it "answers every sampled pixel as the plan that omits nothing does, over generated zooms, pans, facings, cuts and discovered sets" $ do
+    assets ← loadAssets 5
+    unproved ← loadAssetsWith 5 [(AssetMap (MapKey Ordinary (either (error . show) id (mkShapeId 5))), allOn)]
+    let cases = take 60 (generated 20261108)
+        outcome (facing, cut, zoom, (dx, dy), snap, cells) =
+          let scene0 = sceneOf facing cut [OCell x y z 0 KnownAll | (x, y, z) ← cells]
+              scene = (if snap then snapped else id) (panned dx dy (zoomed zoom scene0))
+              plan = planScene assets scene
+              kept = planScene unproved scene
+           in ( [px | px ← stridePixels 7, pickPixel plan px /= pickPixel kept px]
+              , length (cellPlanQuads kept) - length (cellPlanQuads plan)
+              )
+        outcomes = map outcome cases
+    [c | (c, (differences, _)) ← zip cases outcomes, not (null differences)] `shouldBe` []
+    -- The generated cases do hide cells in some views (the shortcut is not vacuous).
+    sum (map snd outcomes) `shouldSatisfy` (> 0)
+    any ((== 0) . snd) outcomes `shouldBe` True
+  where
+    generated seed = go (draws seed)
+      where
+        go (a : b : c : d : e : f : g : rest) =
+          let facing = [FaceSouth, FaceWest, FaceNorth, FaceEast] !! (a `mod` 4)
+              cut = toInteger (b `mod` 3)
+              zoom = zoomChoices !! (c `mod` length zoomChoices)
+              pan = (fromIntegral ((d `mod` 200) - 100) / 97, fromIntegral ((e `mod` 200) - 100) / 89)
+              snap = f `mod` 3 == 0 && zoom `elem` [0.5, 1, 2]
+              cells = [(x, y, z) | (n, (x, y, z)) ← zip [g ..] box, (n * 2654435761 `div` 7) `mod` 10 < 7]
+           in (facing, cut, zoom, pan, snap, cells) : go rest
+        go _ = []
+    box = [(x, y, z) | x ← [0 .. 2], y ← [0 .. 2], z ← [0 .. 2]]
+    zoomChoices = [0.5, 1, 2] <> [fromIntegral k / 16 | k ← [2 .. 128 ∷ Int]] <> [fromIntegral k / 10 | k ← [2 .. 80 ∷ Int]]
+    -- A fixed-seed generator: the cases are the same on every run.
+    draws ∷ Word64 → [Int]
+    draws s = let s' = s * 6364136223846793005 + 1442695040888963407 in fromIntegral (s' `shiftR` 33) : draws s'
