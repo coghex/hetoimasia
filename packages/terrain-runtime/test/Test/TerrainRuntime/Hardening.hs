@@ -510,25 +510,26 @@ spec = describe "Accounting and lifetime hardening" $ do
       inspectReadmissionWaits svc `shouldReturn` 0
       inspectInvariants svc >>= (`shouldBe` [])
 
-  it "keeps the retained bank within its limit when a read starts waiting to be admitted again" $ do
-    -- The bank holds exactly the surface query's record and one removal's: the
-    -- waiting read's record was reserved when it was admitted, so nothing is added.
+  it "reserves a read's record at admission, so a read that starts waiting to be admitted again cannot overfill the retained bank" $ do
+    -- The bank holds two records. The pending surface query holds one from admission and
+    -- a removal the other, so a second removal is refused rather than admitted into
+    -- room the waiting query will need.
     let probe = Probe $ \point → case point of
           PointHandoff _ _ → throwIO (ErrorCall "every transfer fails")
           _ → pure ()
-    withServiceUsing (microConfig {configRetainedBytes = 320}) alwaysAdmitting probe $ \svc → do
+    withServiceUsing ((microConfigSlots 6) {configRetainedBytes = 320}) alwaysAdmitting probe $ \svc → do
       client <- okOf (registerClient svc)
       let definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
       lease <- okOf (openArena svc client "full" definition) >>= await svc >>= expectSuccess
       surfaceHost <- newHost False
       _ <- okOf (surfaceWith svc (hostEndpoint svc Nothing surfaceHost) lease (column 0 0))
       waitFor (readTVar (hostReady surfaceHost) >>= \n → check (n >= 1))
-      _ <- removeCell' svc lease (tile 0 0 33)
-      _ <- removeCell' svc lease (tile 0 0 32)
-      waitFor (inspectReadmissionWaitsSTM svc >>= \n → check (n == 1))
+      first' <- okOf (removeAt svc lease (tile 0 0 33) Nothing)
+      removeAt svc lease (tile 0 0 32) Nothing >>= \r → refusedWith r `shouldSatisfy` \case Just (RefusedBusy _) → True; _ → False
       used <- inspectSnapshotBytes svc
       used `shouldSatisfy` \(inUse, bank) → inUse <= bank
       inspectInvariants svc >>= (`shouldBe` [])
+      void (cancelPending svc first')
       closeService svc
 
   it "never lets a failing logger replace the defect it was reporting" $ do

@@ -37,6 +37,7 @@ module Test.TerrainRuntime.Fixtures
     -- * Budgets and the independent model
   , tightConfig
   , microConfig
+  , microConfigSlots
   , layered
   , cellMaterial
   , expectedMaterial
@@ -247,7 +248,11 @@ tightConfig (ex, ey, ez) spare edit = defaultConfig {configLimits = limits, conf
 -- holds about one region, so a region that cannot be evicted leaves no room for
 -- another.
 microConfig ∷ Config
-microConfig = defaultConfig {configLimits = limits, configRetainedBytes = 2000}
+microConfig = microConfigSlots 2
+
+-- | The same with a given number of command slots.
+microConfigSlots ∷ Int → Config
+microConfigSlots slots = defaultConfig {configLimits = limits, configRetainedBytes = 2000}
   where
     spec resident staging =
       LimitsSpec
@@ -255,7 +260,7 @@ microConfig = defaultConfig {configLimits = limits, configRetainedBytes = 2000}
         , specEditBytes = 4096
         , specStagingBytes = staging
         , specLoadJobs = 1
-        , specQueuedCommands = 2
+        , specQueuedCommands = fromIntegral slots
         , specPinsPerView = 1
         , specAgingQuanta = 3
         , specQueryRegions = 1
