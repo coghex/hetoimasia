@@ -1,0 +1,17 @@
+{
+  "group": "validated data texture pixels (TRA-15)",
+  "image": "ramp-colour-route",
+  "route": "colour",
+  "technicalFixture": "TRA-15 technical test asset built byte by byte by the suite; not production art",
+  "input": {"file": "ramp.png", "bytes": 102, "sha256": "ebd9f2f3ad3aeff1909bcfc7cdd803558a819249400cea35e64d7dff61371729"},
+  "request": {"kind": "colour"},
+  "target": {"format": "R8G8B8A8_SRGB", "width": 32, "height": 16, "surfaceFree": true},
+  "windows": 0,
+  "completion": "read after the batch's own ticket completed",
+  "build": {"revision": "92330829cf57fc930af61ec1e8c17f256903057c (dirty)", "sourceDigest": "bbad521cf43f5f65d291fa7f6ba06128f0a7e216617667209949d99122da7821"},
+  "oracle": {"determinatePixels": 512, "failures": 0},
+  "handTolerance": 1,
+  "comparisons": [{"texel": [0, 0], "input": [32, 64, 96], "expected": [32, 64, 96], "read": [32, 64, 96]}, {"texel": [1, 0], "input": [128, 128, 128], "expected": [128, 128, 128], "read": [128, 128, 128]}, {"texel": [2, 0], "input": [160, 192, 224], "expected": [160, 192, 224], "read": [160, 192, 224]}, {"texel": [3, 0], "input": [16, 48, 240], "expected": [16, 48, 240], "read": [16, 48, 240]}, {"texel": [0, 1], "input": [64, 128, 192], "expected": [64, 128, 192], "read": [64, 128, 192]}, {"texel": [1, 1], "input": [200, 100, 50], "expected": [200, 100, 50], "read": [200, 100, 50]}, {"texel": [2, 1], "input": [1, 2, 3], "expected": [1, 2, 3], "read": [1, 2, 3]}, {"texel": [3, 1], "input": [250, 251, 252], "expected": [250, 251, 252], "read": [250, 251, 252]}],
+  "readbackSha256": "3bff7490026e7795f160f56ca9161afbd2358876488d879e7f7be6939fa9b14c",
+  "pngSha256": "7ed740e7097c74872dffc25fd35f64514a4caff6f327ae6937f096d521a62c03"
+}

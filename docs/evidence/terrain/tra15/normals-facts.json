@@ -1,0 +1,15 @@
+{
+  "group": "validated data texture pixels (TRA-15)",
+  "image": "normals-facts",
+  "technicalFixture": "TRA-15 technical test asset built byte by byte by the suite; not production art",
+  "input": {"file": "normals.png", "bytes": 92, "sha256": "a44a2efa69b156e306d7b98b5b4ca6f28b5ee8d8bbbe1ef34adc3fde48421243"},
+  "request": {"kind": "data", "coverage": "binary", "normal_encoding": "unit-normal-rgb-v1"},
+  "versionId": 0,
+  "coverageBitsHex": "fb",
+  "factsReachedThrough": "retainTexture (the public retention boundary)",
+  "windows": 0,
+  "build": {"revision": "92330829cf57fc930af61ec1e8c17f256903057c (dirty)", "sourceDigest": "bbad521cf43f5f65d291fa7f6ba06128f0a7e216617667209949d99122da7821"},
+  "oracle": {"determinatePixels": 512, "failures": 0},
+  "readbackSha256": "61349f596273ae647164d73e896f6011433c394dd4fd5381b82abe448630618c",
+  "pngSha256": "e50f53d0d7ed2b550c38afda9854afbfbcc0d572b00ad0b1c3fde34b246d09c6"
+}

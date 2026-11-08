@@ -107,6 +107,9 @@ committed. The failing assertion is the one that protects the behaviour.
 | NC5 | A failed transfer discards the working changes | `retains changes through a failed transfer and transfers them after the region changes again` | expected the region's changes retained, got none |
 | NC6 | Closing an arena leaves its requests unsettled | `settles a staged edit once when its arena closes and commits nothing` | expected `[Failed ArenaClosed]`, got `[]`: a request never reached a terminal outcome |
 | NC7 | A later eligible command may commit ahead of an earlier eligible, unstaged one | `commits the same ordered trace to the same results and terrain under different residency schedules` | the roomy and tight schedules answer different revisions for the same ordered trace |
+| NC8 | A column is measured once per interval of the load, not once per column | `demands several intervals of one column and measures the load once per column` | the owner ended on an over-reported cost and the wait for the loaded demand never completed |
+| NC6b | As NC6 | `randomized interleaving ... (seed 1)` | the request table claims model records the model lacks, found after the first mutated step |
+| NC9 | The drain does not wait for outstanding borrowers | `does not return while a borrower holds a snapshot after the owner failed` | expected the service not to have returned, got that it had |
 
 ## Acceptance commands
 
@@ -118,8 +121,8 @@ compile of every module, not an incremental one.
 
 | Command | Result |
 | --- | --- |
-| `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 66 examples, 0 failures |
+| `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning (package build directory removed first) |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 101 examples, 0 failures |
 | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 501 examples, 0 failures |
 | `cabal test --project-file cabal.project.cpu hetoimasia:workflow-tests --test-show-details=direct` | 965 examples, 0 failures |
 | `(cd packages/terrain-runtime && cabal check)` | No errors or warnings could be found in the package |
@@ -127,7 +130,12 @@ compile of every module, not an incremental one.
 | `python3 tools/validation/plan.py --base origin/master --head HEAD` | selects `test.terrain-runtime` and every affected predecessor and mandatory group (29 of 37; the catalog and workflow changes are policy inputs and widen the plan) |
 | `python3 tools/validation/owned_starts.py check` and `ratchet --base origin/master` | pass; the new package has no unowned start |
 
-The suite was also run eight times at `+RTS -N4` after the one example that raced its own
+After the first review the suite grew from 66 to 101 examples (24 seeds of a randomized interleaving, retained-size shrink on
+coalescing, residency kept across a delayed commit, several intervals of one column,
+the column length limit, a failing readiness callback, snapshot backing across
+revisions, the drain on the failure path and under cancellation, the owner's logging
+failures); it was then run six times at `+RTS -N4` and once at the default
+capability count, all passing. Before that it was run eight times at `+RTS -N4` after the one example that raced its own
 bookkeeping was corrected (it asserted the order of two events that nothing orders), and
 six more times after the owner was made to stop only when asked; every run passed.
 The native display groups the plan selects were not run locally: this slice opens no
