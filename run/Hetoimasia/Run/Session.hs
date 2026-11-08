@@ -110,8 +110,9 @@ productionEnvironment = Environment monotonicSource systemTimerBackend out err
     (out, err) = authoredSinks
 
 -- | The accepted-work records of the session's texture pipeline, and the slots of the pool its reads queue in. Both
--- are the M1 profile's sixteen textures of the one UI instance a role can hold (P-74 part 3), and the module
--- coordinator's reads share the pool's slots with the textures'.
+-- are the M1 profile's sixteen request places of the one UI instance a role can hold (`RequestsPerInstance`, P-74 part 3;
+-- they bound requests in flight, not the textures held, which only memory bounds), and the module coordinator's reads
+-- share the pool's slots with the textures'.
 textureJobs, ioQueueSlots ∷ Int
 textureJobs = 16
 ioQueueSlots = 16

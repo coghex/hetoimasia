@@ -18,7 +18,7 @@
 -- advances a job. Readers: any thread ('readBackend', the retirement reading). Nothing here is a
 -- global, a registry of instances or a cache: the maps hold exactly the jobs the pipeline has
 -- accepted and not yet answered the terminal event for, and the textures delivered and not yet
--- proved retired, and both are bounded by the pipeline's own banks (lanes, jobs, texture slots).
+-- proved retired, and both are bounded by the pipeline's own banks (lanes, jobs, texture bytes).
 --
 -- The /pump/ is one worker of a 'Hetoimasia.Foundation.Worker' group started by 'withBackend' and
 -- stopped by it, after the backend has drained. It does the work the owner's thread must not: it

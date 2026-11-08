@@ -858,7 +858,7 @@ publishRace =
     , "    end"
     ]
 
--- | A profile of two texture slots: the third request finds the bank full while a window is accepted.
+-- | A profile of two textures' bytes: the third request finds the bank full while a window is accepted.
 textureBank ∷ ByteString
 textureBank =
   presentationOnly
