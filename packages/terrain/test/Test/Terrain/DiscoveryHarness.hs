@@ -32,6 +32,7 @@ module Test.Terrain.DiscoveryHarness
   , Delay (..)
   , noDelay
   , delayedProvider
+  , countingProvider
   , Rig (..)
   , newRig
   , rigProvider
@@ -54,6 +55,7 @@ module Test.Terrain.DiscoveryHarness
 
     -- * Checks
   , invariants
+  , stateViolations
   , compareKnowledge
   , compareDrained
   , compareDrainedWith
@@ -61,7 +63,9 @@ module Test.Terrain.DiscoveryHarness
 
 import qualified Data.Map.Lazy as Lazy
 import qualified Data.Map.Strict as Map
+import Data.IORef (IORef, modifyIORef')
 import Data.Maybe (isJust)
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Hetoimasia.Terrain.Cell (Column (..), zRangeHi, zRangeLo)
@@ -252,6 +256,19 @@ delayedProvider d p =
             other → other
     }
 
+-- | A provider that counts every request made of it, independently of the
+-- model's own accounting.
+countingProvider ∷ IORef Int → Provider → Provider
+countingProvider ref p =
+  Provider
+    { fetchRecord = \k → tick ref (fetchRecord p k)
+    , fetchFloorRun = \c z → tick ref (fetchFloorRun p c z)
+    }
+
+tick ∷ IORef Int → a → a
+tick ref x = unsafePerformIO (modifyIORef' ref (+ 1) >> pure x)
+{-# NOINLINE tick #-}
+
 -- | A scene's running state.
 data Rig = Rig
   { rigScene ∷ Scene
@@ -340,7 +357,14 @@ batchRig allow rig = case stepDiscovery (rigEnv rig) (retainedHeader (rigRetaine
 
 -- | Run batches until the obligations are drained, at most a bounded number.
 drainRig ∷ Allowance → Rig → Rig
-drainRig = drainWith (const id)
+drainRig = drainWith checkedBatch
+
+-- | After every batch of a drain, check the retained state and the knowledge
+-- against the oracle's bounds, so an intermediate violation cannot hide behind
+-- a correct end state.
+checkedBatch ∷ Batch → Rig → Rig
+checkedBatch (BatchProgress _ _) rig = rig {rigLog = rigLog rig <> map ("during a drain: " <>) (stateViolations rig)}
+checkedBatch _ rig = rig
 
 -- | Drain, calling a hook after every batch.
 drainWith ∷ (Batch → Rig → Rig) → Allowance → Rig → Rig
@@ -362,9 +386,15 @@ pendingOf = toInteger . pendingObligations . retainedHeader . rigRetained
 -- records, the removed runs are exactly the removals applied, the header names
 -- exactly the obligations held and no violation was logged.
 invariants ∷ Rig → [String]
-invariants rig =
-  rigLog rig
-    <> case retainedFromRecords (retainedHeader retained) (retainedRecords retained) of
+invariants rig = rigLog rig <> stateViolations' rig
+
+-- | The invariants and the oracle bounds of the current state.
+stateViolations ∷ Rig → [String]
+stateViolations rig = stateViolations' rig <> compareKnowledge rig
+
+stateViolations' ∷ Rig → [String]
+stateViolations' rig =
+  case retainedFromRecords (retainedHeader retained) (retainedRecords retained) of
       Left e → ["retained state is not legitimate: " <> show e]
       Right _ → []
     <> [ "removed runs differ from the applied removals"

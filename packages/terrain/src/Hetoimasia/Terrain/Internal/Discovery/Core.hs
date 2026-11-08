@@ -91,7 +91,7 @@ import Data.Map.Strict (Map)
 import Data.Maybe (mapMaybe)
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Cell (..), Column (..), ZRange, mkZRange)
-import Hetoimasia.Terrain.Internal.Cell (topExclusive)
+import Hetoimasia.Terrain.Internal.Cell (bottomLevel, topExclusive)
 import Hetoimasia.Terrain.Changes (emptyChanges)
 import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
 import Hetoimasia.Terrain.Internal.Connectivity.Index
@@ -224,22 +224,66 @@ data Observed a = Observed
 data Stop
   = StopMissing !RecordKey
   | StopCorrupt !Integrity
-  | StopReads
+  | StopCapacity !Capacity
+  | -- | A sequence or revision that would wrap.
+    StopOverflow
+
+-- | A stop and the records the provider had been asked for when it happened, so
+-- an attempt that is rejected still shows what it cost.
+data Failure = Failure !Stop !Int
+
+-- | The resources one operation may use, each already the smaller of the
+-- validated limit and the caller's allowance. Every figure is checked before the
+-- read or the staged write it pays for.
+data Caps = Caps
+  { capReads ∷ !Int
+  , capWrites ∷ !Int
+  , capDelta ∷ !Int
+  , capScratch ∷ !Int
+  , capRetained ∷ !Int
+  , capBase ∷ !Int
+  -- ^ The accounted bytes retained before the operation, header included.
+  }
 
 -- | Scratch state of one operation: the staged writes, the records read (so a
--- repeated read costs nothing), the floor answers and the read count.
+-- repeated read costs nothing), the floor answers, the read count and the
+-- running accounted cost of the staged writes.
 data S = S
   { sOverlay ∷ !(Map RecordKey (Maybe Record))
   , sCache ∷ !(Map RecordKey (Maybe Record))
   , sFloor ∷ !(Map (Column, Int64) (Maybe (Int64, Int64)))
   , sReads ∷ !Int
-  , sReadLimit ∷ !Int
+  , sCost ∷ !Int
+  , sCaps ∷ !Caps
   }
 
-emptyS ∷ Int → S
-emptyS limit = S Map.empty Map.empty Map.empty 0 limit
+emptyS ∷ Caps → S
+emptyS = S Map.empty Map.empty Map.empty 0 0
 
-newtype M a = M (Env → Provider → S → Either Stop (a, S))
+-- | The accounted scratch: every provider read is charged the largest record
+-- before it is made, and every staged write its entry.
+scratchNow ∷ S → Int
+scratchNow s = sReads s * maxRecordBytes + sCost s
+
+-- | The accounted candidate payload so far: the header and the staged entries.
+payloadNow ∷ S → Int
+payloadNow s = headerBytes + sCost s
+
+-- | The first resource the staged state overflows, if any.
+overCap ∷ S → Maybe Capacity
+overCap s
+  | Map.size (sOverlay s) > capWrites caps = Just CapacityWrites
+  | payloadNow s > capDelta caps = Just CapacityDeltaBytes
+  | scratchNow s > capScratch caps = Just CapacityScratchBytes
+  | capBase caps + snd (settleWrites s) > capRetained caps = Just CapacityRetainedBytes
+  | otherwise = Nothing
+  where
+    caps = sCaps s
+
+overlayCost ∷ RecordKey → Maybe Record → Int
+overlayCost k = maybe (tombstoneBytes k) (entryBytes k)
+
+newtype M a = M (Env → Provider → S → Either Failure (a, S))
 
 instance Functor M where
   fmap f (M g) = M (\e p s → case g e p s of Left x → Left x; Right (a, s') → Right (f a, s'))
@@ -251,32 +295,42 @@ instance Applicative M where
 instance Monad M where
   M g >>= k = M (\e p s → case g e p s of Left x → Left x; Right (a, s') → let M h = k a in h e p s')
 
-runM ∷ M a → Env → Provider → S → Either Stop (a, S)
+runM ∷ M a → Env → Provider → S → Either Failure (a, S)
 runM (M f) = f
 
 askEnv ∷ M Env
 askEnv = M (\e _ s → Right (e, s))
 
 stopWith ∷ Stop → M a
-stopWith x = M (\_ _ _ → Left x)
+stopWith x = M (\_ _ s → Left (Failure x (sReads s)))
 
 corrupt ∷ Integrity → M a
 corrupt = stopWith . StopCorrupt
 
+-- | Refuse a read before it is made when it would overflow the read count or
+-- the scratch.
+beforeRead ∷ S → Either Failure ()
+beforeRead s
+  | sReads s + 1 > capReads caps = Left (Failure (StopCapacity CapacityReads) (sReads s))
+  | scratchNow s + maxRecordBytes > capScratch caps = Left (Failure (StopCapacity CapacityScratchBytes) (sReads s))
+  | otherwise = Right ()
+  where
+    caps = sCaps s
+
 -- | Read a retained record: the staged writes first, then what was already
 -- read, then the provider. Each distinct provider read counts once against the
--- read limit.
+-- read limit and is checked before the provider is asked.
 getRec ∷ RecordKey → M (Maybe Record)
 getRec key = M $ \_ p s → case Map.lookup key (sOverlay s) of
   Just r → Right (r, s)
   Nothing → case Map.lookup key (sCache s) of
     Just r → Right (r, s)
-    Nothing
-      | sReads s >= sReadLimit s → Left StopReads
-      | otherwise → case fetchRecord p key of
-          Found r → Right (Just r, s {sCache = Map.insert key (Just r) (sCache s), sReads = sReads s + 1})
-          Absent → Right (Nothing, s {sCache = Map.insert key Nothing (sCache s), sReads = sReads s + 1})
-          Unavailable k → Left (StopMissing k)
+    Nothing → do
+      beforeRead s
+      case fetchRecord p key of
+        Found r → Right (Just r, s {sCache = Map.insert key (Just r) (sCache s), sReads = sReads s + 1})
+        Absent → Right (Nothing, s {sCache = Map.insert key Nothing (sCache s), sReads = sReads s + 1})
+        Unavailable k → Left (Failure (StopMissing k) (sReads s + 1))
 
 -- | The removed run of a column with the greatest lower end at or below a level.
 -- Floor answers ignore staged writes: no operation stages a run before it has
@@ -284,28 +338,39 @@ getRec key = M $ \_ p s → case Map.lookup key (sOverlay s) of
 floorRun ∷ Column → Int64 → M (Maybe (Int64, Int64))
 floorRun col z = M $ \_ p s → case Map.lookup (col, z) (sFloor s) of
   Just r → Right (r, s)
-  Nothing
-    | sReads s >= sReadLimit s → Left StopReads
-    | otherwise → case fetchFloorRun p col z of
-        Found run@(lo, hi)
-          | lo <= z && lo < hi →
-              Right
-                ( Just run
-                , s
-                    { sFloor = Map.insert (col, z) (Just run) (sFloor s)
-                    , sCache = Map.insert (KeyRun col lo) (Just (RecRun hi)) (sCache s)
-                    , sReads = sReads s + 1
-                    }
-                )
-          | otherwise → Left (StopCorrupt (BadFloor col z))
-        Absent → Right (Nothing, s {sFloor = Map.insert (col, z) Nothing (sFloor s), sReads = sReads s + 1})
-        Unavailable k → Left (StopMissing k)
+  Nothing → do
+    beforeRead s
+    case fetchFloorRun p col z of
+      Found run@(lo, hi)
+        | lo <= z && lo < hi →
+            Right
+              ( Just run
+              , s
+                  { sFloor = Map.insert (col, z) (Just run) (sFloor s)
+                  , sCache = Map.insert (KeyRun col lo) (Just (RecRun hi)) (sCache s)
+                  , sReads = sReads s + 1
+                  }
+              )
+        | otherwise → Left (Failure (StopCorrupt (BadFloor col z)) (sReads s + 1))
+      Absent → Right (Nothing, s {sFloor = Map.insert (col, z) Nothing (sFloor s), sReads = sReads s + 1})
+      Unavailable k → Left (Failure (StopMissing k) (sReads s + 1))
+
+-- | Stage a write (or a deletion), refusing it before it is staged when the
+-- result would overflow a resource.
+stage ∷ RecordKey → Maybe Record → M ()
+stage key value = M $ \_ _ s →
+  let old = Map.lookup key (sOverlay s)
+      cost = sCost s - maybe 0 (overlayCost key) old + overlayCost key value
+      s' = s {sOverlay = Map.insert key value (sOverlay s), sCost = cost}
+   in case overCap s' of
+        Just cap → Left (Failure (StopCapacity cap) (sReads s))
+        Nothing → Right ((), s')
 
 putRec ∷ RecordKey → Record → M ()
-putRec key r = M (\_ _ s → Right ((), s {sOverlay = Map.insert key (Just r) (sOverlay s)}))
+putRec key r = stage key (Just r)
 
 delRec ∷ RecordKey → M ()
-delRec key = M (\_ _ s → Right ((), s {sOverlay = Map.insert key Nothing (sOverlay s)}))
+delRec key = stage key Nothing
 
 -- ---------------------------------------------------------------------------
 -- The forest
@@ -460,7 +525,10 @@ data Report = Report
   , reportRetired ∷ !Int
   -- ^ Obligations finished.
   , reportReads ∷ !Int
-  -- ^ Distinct records read from the provider.
+  -- ^ Distinct records read from the provider for the updates in the candidate.
+  , reportAttemptedReads ∷ !Int
+  -- ^ Every provider read made, including those of an inspection that was then
+  -- rejected for capacity or a missing record. Never above the read limit.
   , reportWrites ∷ !Int
   -- ^ Records written or deleted.
   , reportDeltaBytes ∷ !Int
@@ -532,11 +600,6 @@ settleWrites s = (writes, added - removed)
     added = sum [entryBytes k r | (k, Just r) ← writes]
     removed = sum [entryBytes k r | (k, _) ← writes, Just r ← [old k]]
 
--- | The accounted payload of a candidate: the new entries, a tombstone for each
--- deletion and the header.
-payloadBytes ∷ [(RecordKey, Maybe Record)] → Int
-payloadBytes writes = headerBytes + sum [maybe (tombstoneBytes k) (entryBytes k) v | (k, v) ← writes]
-
 -- | The accounted bytes of a deletion: charged as the largest record of its
 -- kind, so a candidate's size never shrinks as more updates are staged (a
 -- finished obligation costs what its last progress record did).
@@ -545,11 +608,29 @@ tombstoneBytes k = keyBytes k + entryOverheadBytes + case k of
   KeyTodo _ → 40
   _ → 8
 
-scratchOf ∷ S → Int
-scratchOf s =
-  sum [maybe (32 + entryOverheadBytes) (entryBytes k) v | (k, v) ← Map.toList (sCache s)]
-    + sum [maybe (tombstoneBytes k) (entryBytes k) v | (k, v) ← Map.toList (sOverlay s)]
-    + Map.size (sFloor s) * 32
+-- | The resources an operation may use: the smaller of each validated limit and
+-- the caller's allowance.
+capsOf ∷ DiscoveryLimits → Allowance → Header → Caps
+capsOf limits allow hdr =
+  Caps
+    { capReads = min (limitInspectedRecords limits) (allowReads allow)
+    , capWrites = min (limitDeltaRecords limits) (allowWrites allow)
+    , capDelta = min (limitDeltaBytes limits) (allowDeltaBytes allow)
+    , capScratch = min (limitScratchBytes limits) (allowScratchBytes allow)
+    , capRetained = limitRetainedBytes limits
+    , capBase = headerBytes + hBytes hdr
+    }
+
+-- | The figure a resource needs for one minimal step (an edit or one update) and
+-- the figure available, for a typed refusal.
+capacityFigures ∷ Bool → DiscoveryLimits → Caps → Capacity → (Int, Int)
+capacityFigures forEdit limits caps cap = case cap of
+  CapacityReads → (if forEdit then worstEditReads else worstEdgeReads, capReads caps)
+  CapacityWrites → (if forEdit then worstEditWrites else worstEdgeWrites, capWrites caps)
+  CapacityDeltaBytes → (if forEdit then minimumDeltaBytes else headerBytes + worstEdgeBytes, capDelta caps)
+  CapacityScratchBytes → (if forEdit then worstEditScratch else worstEdgeScratch, capScratch caps)
+  CapacityRetainedBytes → (minimumRetainedBytes, capRetained caps)
+  CapacityObligations → (1, limitPendingObligations limits)
 
 -- ---------------------------------------------------------------------------
 -- Staging a removal
@@ -570,20 +651,26 @@ data StageOutcome
 -- connection obligation. Removing air or a cell already removed is
 -- 'NoChange'. Merging with the runs above and below keeps every earlier alias
 -- valid: a run that loses its key is joined to the run that takes its place, in
--- the same candidate.
+-- the same candidate. Every read and every staged write is checked against the
+-- limits and the allowance before it is made.
 stageRemoval ∷ Env → Header → Provider → Allowance → TileCoord → Either Refusal StageOutcome
 stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
-  case runM editM env prov (emptyS readLimit) of
-    Left StopReads → Left (CapacityBlocked CapacityReads (worstEditReads) readLimit)
-    Left (StopMissing k) → Right (EditSuspended k)
-    Left (StopCorrupt i) → Left (Corrupt i)
+  case runM editM env prov (emptyS caps) of
+    Left (Failure (StopCapacity cap) _) → Left (uncurry (CapacityBlocked cap) (editFigures cap))
+    Left (Failure (StopMissing k) _) → Right (EditSuspended k)
+    Left (Failure (StopCorrupt i) _) → Left (Corrupt i)
+    Left (Failure StopOverflow _) → Left AuthorityOverflow
     Right (Nothing, _) → Right NoChange
     Right (Just (flips, joins), s) → finish s flips joins
   where
     limits = envLimitsField env
-    readLimit = min (limitInspectedRecords limits) (allowReads allow)
+    caps = capsOf limits allow hdr
+    -- The frontier needs one more obligation than it holds.
+    editFigures CapacityObligations = (fromIntegral (pendingObligations hdr) + 1, limitPendingObligations limits)
+    editFigures cap = capacityFigures True limits caps cap
     col = Column ax ay
     z = axisValue az
+    tailSeq = hTail hdr
     editM ∷ M (Maybe ([Node], Int))
     editM = do
       here ← floorRun col z
@@ -592,6 +679,12 @@ stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
         _ → case cellAt (envSource env) emptyChanges tile of
           Air → pure Nothing
           Solid {} → do
+            -- A real change: the frontier must have room and the sequence must
+            -- not wrap, before anything is read or staged for it.
+            if pendingObligations hdr >= fromIntegral (limitPendingObligations limits)
+              then stopWith (StopCapacity CapacityObligations)
+              else pure ()
+            if tailSeq == maxBound then stopWith StopOverflow else pure ()
             above ← if z + 1 < topExclusive then floorRun col (z + 1) else pure Nothing
             let below = case here of
                   Just (lo, hi) | hi == z → Just lo
@@ -605,7 +698,11 @@ stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
                 pure (z, ([], 0))
               (Just lo, Nothing) → do
                 putRec (KeyRun col lo) (RecRun (z + 1))
-                pure (lo, ([], 0))
+                -- The cell joins an existing run. When that run's class is
+                -- known the cell is new known space, a knowledge change even
+                -- though no class flips.
+                (root, ro) ← findRoot (RunNode col lo)
+                pure (lo, ([root | rootKnown ro], 0))
               (Nothing, Just hi) → do
                 delRec (KeyRun col (z + 1))
                 putRec (KeyRun col z) (RecRun hi)
@@ -621,20 +718,15 @@ stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
             (voidFlips, voidJoins) ← case lookupVoid (envConn env) tile 0 of
               InComponent key → joinFlips <$> unionNodes (RunNode col runKey) (SrcNode key)
               _ → pure ([], 0)
+            putRec (KeyTodo tailSeq) (RecTodo (Todo tile 1))
             pure (Just (fst merged <> voidFlips, snd merged + voidJoins))
     joinFlips AlreadyJoined = ([], 0)
     joinFlips (Joined ns) = (ns, 1)
     finish s flips joins = do
-      let tailSeq = hTail hdr
-      if pendingObligations hdr >= fromIntegral (limitPendingObligations limits)
-        then Left (CapacityBlocked CapacityObligations (limitPendingObligations limits) (limitPendingObligations limits))
-        else pure ()
-      if tailSeq == maxBound then Left AuthorityOverflow else pure ()
-      let staged = s {sOverlay = Map.insert (KeyTodo tailSeq) (Just (RecTodo (Todo tile 1))) (sOverlay s)}
       content ← bump (authContent (hAuthority hdr))
       store ← bump (authStore (hAuthority hdr))
       knowledge ← if null flips then Right (authKnowledge (hAuthority hdr)) else bump (authKnowledge (hAuthority hdr))
-      let (writes, grown) = settleWrites staged
+      let (writes, grown) = settleWrites s
           next =
             hdr
               { hAuthority = (hAuthority hdr) {authContent = content, authKnowledge = knowledge, authStore = store}
@@ -646,28 +738,15 @@ stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
               { reportUpdates = 1
               , reportJoins = joins
               , reportRetired = 0
-              , reportReads = sReads staged
-              , reportWrites = length writes
-              , reportDeltaBytes = payloadBytes writes
-              , reportScratchBytes = scratchOf staged
+              , reportReads = sReads s
+              , reportAttemptedReads = sReads s
+              , reportWrites = Map.size (sOverlay s)
+              , reportDeltaBytes = payloadNow s
+              , reportScratchBytes = scratchNow s
               , reportNewlyKnown = flips
               , reportPendingAfter = pendingObligations next
               }
-      fits limits allow hdr next report
       pure (Staged (Candidate (hAuthority hdr) next writes True (not (null flips)) report))
-
--- | Check a staged candidate against the limits and the allowance, naming the
--- first resource it overflows.
-fits ∷ DiscoveryLimits → Allowance → Header → Header → Report → Either Refusal ()
-fits limits allow _ next report = do
-  need CapacityWrites (reportWrites report) (min (limitDeltaRecords limits) (allowWrites allow))
-  need CapacityDeltaBytes (reportDeltaBytes report) (min (limitDeltaBytes limits) (allowDeltaBytes allow))
-  need CapacityScratchBytes (reportScratchBytes report) (min (limitScratchBytes limits) (allowScratchBytes allow))
-  need CapacityRetainedBytes (headerBytes + hBytes next) (limitRetainedBytes limits)
-  where
-    need cap used avail
-      | used > avail = Left (CapacityBlocked cap used avail)
-      | otherwise = Right ()
 
 -- ---------------------------------------------------------------------------
 -- Discovery batches
@@ -702,76 +781,52 @@ data Acc = Acc
   , accJoins ∷ !Int
   , accRetired ∷ !Int
   , accKnown ∷ [Node]
+  , accAttempted ∷ !Int
+  -- ^ Provider reads made, including those of an inspection that was then
+  -- rejected.
   }
 
 -- | Run one discovery batch: at most the validated batch limit of structural
 -- updates, each the inspection of one connection of the oldest unfinished
--- obligation. The batch stops early when the allowance is tighter or a record is
--- missing, and a batch that cannot make even one update because of capacity is
--- refused with the resource. Every connection is inspected exactly once; the
--- obligation record carries the progress.
+-- obligation. Every read and staged write is checked before it is made, so the
+-- batch stops early, with the work intact, when the allowance is tighter or a
+-- record is missing; a batch that cannot make even one update because of
+-- capacity is refused with the resource. Every connection is inspected exactly
+-- once; the obligation record carries the progress.
 stepDiscovery ∷ Env → Header → Provider → Allowance → Either Refusal Step
 stepDiscovery env hdr0 prov allow
   | pendingObligations hdr0 == 0 = Right Idle
-  | otherwise = loop (Acc (emptyS readLimit) hdr0 0 0 0 [])
+  | otherwise = loop (Acc (emptyS caps) hdr0 0 0 0 [] 0)
   where
     limits = envLimitsField env
-    readLimit = min (limitInspectedRecords limits) (allowReads allow)
+    caps = capsOf limits allow hdr0
     batch = limitBatchUpdates limits
     loop acc
       | accUpdates acc >= batch = conclude acc HaltBatchFull
       | pendingObligations (accHeader acc) == 0 = conclude acc HaltDrained
       | otherwise = case runM (inspectHead (accHeader acc)) env prov (accS acc) of
-          Left (StopMissing k) → conclude acc (HaltSuspended k)
-          Left StopReads → conclude acc (HaltCapacity CapacityReads)
-          Left (StopCorrupt i) → Left (Corrupt i)
+          Left (Failure (StopMissing k) n) → conclude (attempt n acc) (HaltSuspended k)
+          Left (Failure (StopCapacity cap) n) → conclude (attempt n acc) (HaltCapacity cap)
+          Left (Failure (StopCorrupt i) _) → Left (Corrupt i)
+          Left (Failure StopOverflow _) → Left AuthorityOverflow
           Right ((nextHeader, retired, result), s') →
-            let acc' =
-                  acc
-                    { accS = s'
-                    , accHeader = nextHeader
-                    , accUpdates = accUpdates acc + 1
-                    , accJoins = accJoins acc + (case edgeEffect result of EdgeJoined → 1; _ → 0)
-                    , accRetired = accRetired acc + (if retired then 1 else 0)
-                    , accKnown = accKnown acc <> edgeNewlyKnown result
-                    }
-             in case admit acc' of
-                  Nothing → loop acc'
-                  Just cap → conclude acc (HaltCapacity cap)
-    -- A candidate that would overflow a resource is not extended: the batch
-    -- stops at the previous update, whose size already fit.
-    admit acc =
-      let (writes, grown) = settleWrites (accS acc)
-          next = (accHeader acc) {hBytes = hBytes hdr0 + grown}
-       in firstOverflow
-            [ (CapacityWrites, length writes, min (limitDeltaRecords limits) (allowWrites allow))
-            , (CapacityDeltaBytes, payloadBytes writes, min (limitDeltaBytes limits) (allowDeltaBytes allow))
-            , (CapacityScratchBytes, scratchOf (accS acc), min (limitScratchBytes limits) (allowScratchBytes allow))
-            , (CapacityRetainedBytes, headerBytes + hBytes next, limitRetainedBytes limits)
-            ]
-    firstOverflow xs = case [cap | (cap, used, avail) ← xs, used > avail] of
-      (cap : _) → Just cap
-      [] → Nothing
+            loop
+              acc
+                { accS = s'
+                , accHeader = nextHeader
+                , accUpdates = accUpdates acc + 1
+                , accJoins = accJoins acc + (case edgeEffect result of EdgeJoined → 1; _ → 0)
+                , accRetired = accRetired acc + (if retired then 1 else 0)
+                , accKnown = accKnown acc <> edgeNewlyKnown result
+                , accAttempted = sReads s'
+                }
+    attempt n acc = acc {accAttempted = max n (accAttempted acc)}
     conclude acc halt
       | accUpdates acc == 0 = case halt of
           HaltSuspended k → Right (Stalled k)
-          HaltCapacity cap → Left (CapacityBlocked cap (needOf cap) (availOf cap))
+          HaltCapacity cap → Left (uncurry (CapacityBlocked cap) (capacityFigures False limits caps cap))
           _ → Right Idle
       | otherwise = build acc halt
-    needOf cap = case cap of
-      CapacityReads → worstEdgeReads
-      CapacityWrites → worstEdgeWrites
-      CapacityDeltaBytes → minimumDeltaBytes
-      CapacityScratchBytes → worstEdgeScratch
-      CapacityRetainedBytes → minimumRetainedBytes
-      CapacityObligations → 1
-    availOf cap = case cap of
-      CapacityReads → readLimit
-      CapacityWrites → min (limitDeltaRecords limits) (allowWrites allow)
-      CapacityDeltaBytes → min (limitDeltaBytes limits) (allowDeltaBytes allow)
-      CapacityScratchBytes → min (limitScratchBytes limits) (allowScratchBytes allow)
-      CapacityRetainedBytes → limitRetainedBytes limits
-      CapacityObligations → limitPendingObligations limits
     build acc halt = do
       let s = accS acc
           (writes, grown) = settleWrites s
@@ -790,9 +845,10 @@ stepDiscovery env hdr0 prov allow
               , reportJoins = accJoins acc
               , reportRetired = accRetired acc
               , reportReads = sReads s
-              , reportWrites = length writes
-              , reportDeltaBytes = payloadBytes writes
-              , reportScratchBytes = scratchOf s
+              , reportAttemptedReads = max (sReads s) (accAttempted acc)
+              , reportWrites = Map.size (sOverlay s)
+              , reportDeltaBytes = payloadNow s
+              , reportScratchBytes = scratchNow s
               , reportNewlyKnown = accKnown acc
               , reportPendingAfter = pendingObligations next
               }
@@ -908,7 +964,7 @@ retainedFromRecords h entries = do
   pure (Retained h m)
   where
     kindOk (k, r) = case (k, r) of
-      (KeyRun _ lo, RecRun hi) | lo < hi → Right ()
+      (KeyRun _ lo, RecRun hi) | lo >= bottomLevel && lo < hi && hi <= topExclusive → Right ()
       (KeyLink _, RecRoot (Root size _)) | size >= 1 → Right ()
       (KeyLink node, RecChild parent) | parent /= node → Right ()
       (KeyTodo _, RecTodo (Todo _ done)) | done >= 1 && done < edgeCount → Right ()
@@ -938,11 +994,23 @@ retainedFromRecords h entries = do
 -- Queries
 
 runQuery ∷ Env → Provider → M a → Observed a
-runQuery env prov m = case runM m env prov (emptyS (limitInspectedRecords (envLimitsField env))) of
+runQuery env prov m = case runM m env prov (emptyS caps) of
   Right (a, s) → Observed (Right a) (sReads s)
-  Left (StopMissing k) → Observed (Left (MissingRecord k)) 0
-  Left (StopCorrupt i) → Observed (Left (Inconsistent i)) 0
-  Left StopReads → Observed (Left (ReadLimit (limitInspectedRecords (envLimitsField env)))) (limitInspectedRecords (envLimitsField env))
+  Left (Failure (StopMissing k) n) → Observed (Left (MissingRecord k)) n
+  Left (Failure (StopCorrupt i) n) → Observed (Left (Inconsistent i)) n
+  Left (Failure (StopCapacity _) n) → Observed (Left (ReadLimit (capReads caps))) n
+  Left (Failure StopOverflow n) → Observed (Left (Inconsistent BadAccounting)) n
+  where
+    limits = envLimitsField env
+    caps =
+      Caps
+        { capReads = limitInspectedRecords limits
+        , capWrites = 0
+        , capDelta = 0
+        , capScratch = limitScratchBytes limits
+        , capRetained = limitRetainedBytes limits
+        , capBase = 0
+        }
 
 -- | Whether a node's class is known.
 nodeKnown ∷ Node → M Bool

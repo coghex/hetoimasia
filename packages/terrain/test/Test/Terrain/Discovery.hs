@@ -11,6 +11,7 @@
 module Test.Terrain.Discovery (spec) where
 
 import Control.Exception (evaluate)
+import Data.IORef (newIORef, readIORef)
 import Control.Monad (foldM, forM_, unless)
 import Data.Word (Word64)
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
@@ -189,6 +190,7 @@ spec = describe "Discovery" $ do
   replaySpecs
   authoritySpecs
   familySpecs
+  accountingSpecs
   controlSpecs
   evidenceSpecs
 
@@ -464,7 +466,7 @@ limitSpecs = describe "limits" $ do
         rig0 = newRig tinyPending twoOpenings
         (two, _) = runTrace rig0 [Edit (1, 0, 5), Edit (9, 0, 5)]
         (refusedRig, kind) = editRig fullAllowance (1, 0, 6) two
-    kind `shouldBe` EditRefused (CapacityBlocked CapacityObligations 2 2)
+    kind `shouldBe` EditRefused (CapacityBlocked CapacityObligations 3 2)
     retainedRecords (rigRetained refusedRig) `shouldBe` retainedRecords (rigRetained two)
     -- the committed edits are not reissued: after a drain the same edit fits.
     let drained = drainRig fullAllowance two
@@ -802,3 +804,159 @@ evidenceSpecs = describe "evidence" $ do
       , ("ramp family 2^20", newRig small (rampFamily (2 ^ (20 ∷ Int))), [Edit c | c ← familyEdits (2 ^ (20 ∷ Int))] <> [Drain fullAllowance])
       , ("ramp family 2^60", newRig small (rampFamily (2 ^ (60 ∷ Int))), [Edit c | c ← familyEdits (2 ^ (60 ∷ Int))] <> [Drain fullAllowance])
       ]
+
+-- ---------------------------------------------------------------------------
+-- Accounting before the work, authority of derived knowledge, restored runs,
+-- source structure and replay after every batch
+
+-- | A world with a flat ground at level 0 and the given extra patches.
+flatGround ∷ String → [PatchSpec] → Scene
+flatGround name patches = groundScene name 0 (-4, 8) (-4, 6) 6 patches
+
+accountingSpecs ∷ Spec
+accountingSpecs = describe "accounting before the work" $ do
+  it "never asks the provider for more than the allowance, on every exit" $ do
+    let limits = limitsWith 64
+        rig0 = newRig limits twoOpenings
+        (queued, _) = runTrace rig0 [Edit c | c ← openingA <> [(0, 3, 2)]]
+        header = retainedHeader (rigRetained queued)
+        grid =
+          [ fullAllowance {allowReads = r, allowScratchBytes = sc, allowWrites = w, allowDeltaBytes = d}
+          | r ← [1, 3, 4, 6, 9, 14, 40]
+          , sc ← [255, 392, 504, 900, 2500, 12000]
+          , w ← [1, 2, 5, 100]
+          , d ← [300, 700, 4000, 100000]
+          ]
+    forM_ grid $ \allow → do
+      ref ← newIORef 0
+      let result = stepDiscovery (rigEnv queued) header (countingProvider ref (rigProvider queued)) allow
+      _ ← evaluate (length (show result))
+      count ← readIORef ref
+      (show allow, count <= allowReads allow, count * maxRecordBytes <= allowScratchBytes allow) `shouldBe` (show allow, True, True)
+      case result of
+        Right (Progress c _) → do
+          let report = candidateReport c
+          (show allow, reportAttemptedReads report) `shouldBe` (show allow, count)
+          (show allow, reportScratchBytes report <= allowScratchBytes allow, reportWrites report <= allowWrites allow, reportDeltaBytes report <= allowDeltaBytes allow) `shouldBe` (show allow, True, True, True)
+        _ → pure ()
+    -- the same bound holds for an edit and for a suspended exit.
+    forM_ grid $ \allow → do
+      ref ← newIORef 0
+      let result = stageRemoval (rigEnv queued) header (countingProvider ref (rigProvider queued)) allow (mustTile 9 0 5)
+      _ ← evaluate (length (show result))
+      count ← readIORef ref
+      (show allow, count <= allowReads allow, count * maxRecordBytes <= allowScratchBytes allow) `shouldBe` (show allow, True, True)
+    let withheld = queued {rigDelay = Delay mempty (Set.singleton (KeyTodo 1))}
+    ref ← newIORef 0
+    let suspended = stepDiscovery (rigEnv withheld) (retainedHeader (rigRetained withheld)) (countingProvider ref (rigProvider withheld)) fullAllowance
+    _ ← evaluate (length (show suspended))
+    seen ← readIORef ref
+    seen `shouldSatisfy` (<= limitInspectedRecords limits)
+    case suspended of
+      Right (Progress c (HaltSuspended _)) → reportAttemptedReads (candidateReport c) `shouldBe` seen
+      other → expectationFailure ("expected a suspension after progress, got " <> show other)
+  it "reports the reads of a rejected inspection" $ do
+    let rig0 = newRig (limitsWith 64) twoOpenings
+        (queued, _) = runTrace rig0 [Edit (1, 0, 5)]
+        outcomes = [(sc, snd (batchRig fullAllowance {allowScratchBytes = sc} queued)) | sc ← [600, 650 .. 4000]]
+        rejected = [(sc, r) | (sc, BatchProgress r (HaltCapacity CapacityScratchBytes)) ← outcomes]
+    -- some allowance fits the first inspections and rejects a later one, and the
+    -- rejected inspection's reads are reported, never above what the scratch pays for.
+    rejected `shouldSatisfy` (not . null)
+    forM_ rejected $ \(sc, r) → do
+      (sc, reportScratchBytes r <= sc) `shouldBe` (sc, True)
+      (sc, reportAttemptedReads r * maxRecordBytes <= sc) `shouldBe` (sc, True)
+      (sc, reportAttemptedReads r >= reportReads r) `shouldBe` (sc, True)
+    any (\(_, r) → reportAttemptedReads r > reportReads r) rejected `shouldBe` True
+  it "advances the knowledge revision when a removal extends a known run" $ do
+    let scene = flatGround "extend a known run" []
+        rig0 = newRig (limitsWith 64) scene
+        (known, bad) = runTrace rig0 ([Edit c | c ← [(0, 0, -3), (1, 0, -3), (1, 0, -2), (1, 0, -1)]] <> [Drain fullAllowance])
+        header = retainedHeader (rigRetained known)
+    bad `shouldBe` []
+    case stageRemoval (rigEnv known) header (rigProvider known) fullAllowance (mustTile 0 0 (-2)) of
+      Right (Staged c) → do
+        candidateKnowledge c `shouldBe` True
+        authKnowledge (hAuthority (candidateNext c)) `shouldNotBe` authKnowledge (candidateBase c)
+        reportNewlyKnown (candidateReport c) `shouldSatisfy` (not . null)
+      other → expectationFailure ("expected a candidate, got " <> show other)
+    -- the edit exposes a wall that was not known before, so the revision was owed.
+    let (extended, _) = runTrace known [Edit (0, 0, -2), Drain fullAllowance]
+    compareDrained extended `shouldBe` []
+    -- the knowledge revision is checked like the others.
+    let atMax = header {hAuthority = (hAuthority header) {authKnowledge = Revision maxBound}}
+    stageRemoval (rigEnv known) atMax (rigProvider known) fullAllowance (mustTile 0 0 (-2)) `shouldBe` Left AuthorityOverflow
+  it "refuses restored runs outside the supported range and accepts the legal limits" $ do
+    let header0 = retainedHeader (newRetained (ArenaId 1))
+        column = either (error . show) id (mkColumn 0 0)
+        restored runs =
+          let records = [(KeyRun column lo, RecRun hi) | (lo, hi) ← runs]
+           in retainedFromRecords header0 {hBytes = sum [entryBytes k r | (k, r) ← records]} records
+        lowest' = negate (2 ^ (62 ∷ Int))
+        top = 2 ^ (62 ∷ Int)
+    restored [(lowest', 0)] `shouldSatisfy` isRight'
+    restored [(top - 1, top)] `shouldSatisfy` isRight'
+    restored [(lowest', top)] `shouldSatisfy` isRight'
+    restored [(lowest' - 1, 0)] `shouldSatisfy` isLeft'
+    restored [(0, top + 1)] `shouldSatisfy` isLeft'
+    restored [(top, top + 1)] `shouldSatisfy` isLeft'
+    -- discovery and the existing Changes consumers agree on every legal run.
+    case restored [(lowest', 0), (5, top)] of
+      Right r → length (retainedRemovals r) `shouldBe` 2
+      Left e → expectationFailure (show e)
+  it "does not charge the work of a class to a lookup: allocation is independent of the source's structure" $ do
+    let withPatches n =
+          Scene
+            { sceneName = "structure " <> show n
+            , sceneSpec = SourceSpec ["stone"] [LayerSpec Nothing (Just 0) "stone" 0] [PatchSpec (3 * i) 0 3 4 (SpecSolid "stone" 0) | i ← [1 .. n]]
+            , sceneWindow = Window (-1, 2) (-1, 2) (-3, 3)
+            , sceneSky = Just 0
+            }
+        work rig = evaluate (retainedBytes (rigRetained (drainRig fullAllowance (fst (editRig fullAllowance (400, 400, -1) rig)))))
+    rigs ← mapM (\n → let r = newRig (limitsWith 64) (withPatches n) in evaluate (envSharedBytes (rigEnv r)) >> pure r) [0, 200]
+    costs ← mapM (\r → allocatedBy (repeatN 20 (work r))) rigs
+    case costs of
+      [few, many] → do
+        putStrLn ("allocation, 20 repetitions, 0 patches: " <> show few <> " B; 200 patches: " <> show many <> " B")
+        sameCost "source structure" few many
+      _ → expectationFailure "two sources expected"
+  it "stays identical to an uninterrupted run when the records are rebuilt after every batch, a drain included" $ do
+    let scenes =
+          [ (newRig (limitsWith 2) twoOpenings, [Edit c | c ← openingA <> openingB])
+          , (newRig (limitsWith 1) pockets, [Edit c | c ← [(1, 0, 5), (1, 0, 6), (1, 0, 7), (4, 0, 5), (7, 0, 5)]])
+          , (newRig (limitsWith 3) (rampFamily (2 ^ (60 ∷ Int))), [Edit c | c ← familyEdits (2 ^ (60 ∷ Int))])
+          ]
+            <> [ (newRig (limitsWith 3) scene, [Edit c | c ← removals])
+               | origin ← [(0, 0, 8), (-3, -3, 32)]
+               , seed ← [1 .. 5 ∷ Int]
+               , let (scene, removals) = generatedScene origin seed
+               ]
+    forM_ scenes $ \(rig, edits) → lockstep rig edits `shouldBe` []
+  where
+    isRight' = either (const False) (const True)
+    isLeft' = either (const True) (const False)
+
+-- | Run the same edits on two rigs and drain them batch by batch. One rig is
+-- rebuilt from its own records (through a fresh provider) after every edit and
+-- every batch; the other is never interrupted. After each batch the two must
+-- hold the same records and header, and the replayed rig must satisfy every
+-- invariant and the oracle bounds.
+lockstep ∷ Rig → [Action] → [String]
+lockstep start edits = go (replayedStart, plainStart) (100000 ∷ Int)
+  where
+    editCells = [c | Edit c ← edits]
+    replayedStart = foldl (\rg c → apply Replay (apply (Edit c) rg)) start editCells
+    plainStart = foldl (\rg c → apply (Edit c) rg) start editCells
+    go (a, b) fuel
+      | fuel == 0 = ["lockstep did not finish"]
+      | otherwise =
+          let (a', ka) = batchRig fullAllowance' a
+              (b', kb) = batchRig fullAllowance' b
+              replayed = apply Replay a'
+              same = retainedRecords (rigRetained replayed) == retainedRecords (rigRetained b') && retainedHeader (rigRetained replayed) == retainedHeader (rigRetained b')
+              problems = [sceneName (rigScene a) <> ": replayed run differs from the uninterrupted one" | not same] <> map ((sceneName (rigScene a) <> " during lockstep: ") <>) (stateViolations replayed)
+           in case (ka, kb) of
+                (BatchProgress _ _, BatchProgress _ _) → problems <> go (replayed, b') (fuel - 1)
+                (BatchIdle, BatchIdle) → problems <> map ((sceneName (rigScene a) <> " at the end: ") <>) (compareDrained replayed)
+                other → [sceneName (rigScene a) <> ": the two runs diverged: " <> show other]
+    fullAllowance' = allowanceOf (envLimits (rigEnv start))

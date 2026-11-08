@@ -341,11 +341,28 @@ resolve c key@(ComponentKey origin _ _ _) = do
     then Just (rep, nodes)
     else Nothing
 
+-- | The representative node of a key's class, when the key names a component of
+-- this result. It validates the key against the representative alone: it does
+-- not visit the members of the class.
+resolveRep ∷ Connectivity → ComponentKey → Maybe Node
+resolveRep c key@(ComponentKey origin _ _ _) = do
+  (nid, rep) ← tileNode c origin
+  _ ← if nodeClass rep == nid then Just () else Nothing
+  range ← nodeRange c rep
+  let ok axis lo hi param
+        | nodeAxes rep .&. axisBit axis /= 0 = maybe False (\v → toInteger (axisValue v) >= lo && toInteger (axisValue v) < hi) param
+        | otherwise = param == Nothing
+      ComponentKey _ px py pz = key
+  if ok 0 (rangeXLo range) (rangeXHi range) px && ok 1 (rangeYLo range) (rangeYHi range) py && ok 2 (rangeZLo range) (rangeZHi range) pz
+    then Just rep
+    else Nothing
+
 -- | Whether the component is initially exterior: connected through positive-area
 -- openings to the upper Z boundary. 'Nothing' for a key that names no component.
+-- The lookup reads the representative only, never the members of the class.
 isExterior ∷ Connectivity → ComponentKey → Maybe Bool
 isExterior c key = do
-  (rep, _) ← resolve c key
+  rep ← resolveRep c key
   pure (IntSet.member (nodeClass rep) (cExterior c))
 
 -- | The member of a node under the key's parameters, as a range of cells.
