@@ -590,10 +590,13 @@ canvas, so it also needs the covering cells to be *drawn* exactly one canvas ste
 from the hidden one: every quad's rectangle is rounded through 32-bit floats on its
 own, so at a fractional zoom or pan neighbouring rectangles can miss an exact
 translation by a unit in the last place and a pixel centre can then fall on the wrong
-side of a shared edge. `startCells` therefore checks the rectangles as drawn, once
-per column origin and per row origin the envelope reaches (the view's transform has
-no rotation, so x and y are independent), and a cell is omitted only where both
-hold; elsewhere it is drawn. Runs, not levels, are walked,
+side of a shared edge. The planner therefore checks the rectangles as drawn, on
+demand: once per column that has something hidden for x, and per hidden level for y
+(the view's transform has no rotation, so the axes are independent), and a cell is
+omitted only where both hold; elsewhere it is drawn. The y verdicts are cached
+(`clProofs` entries at most, 4,096 by default, zero keeps none), so `startCells` does
+no per-view work and the retained scratch is bounded whatever the viewport or margin;
+the cache changes the work, never the plan. Runs, not levels, are walked,
 so cost follows run boundaries and exposed cells, not depth, and a column's
 knowledge runs are searched by interval, so a window never visits runs outside it.
 
@@ -624,6 +627,7 @@ camera, knowledge revision, asset version, target or configuration is refused
 | `clStepLevels` | 65,536 | `clPending` | 65,536 |
 | `clColumns` | 1,048,576 | demand chunks / intervals / regions per chunk | 1,024 / 8,192 / 16 |
 | `clLevels` | 16,777,216 | band, slack, prefetch margin | 250, 2, 1 |
+| `clProofs` | 4,096 | | |
 
 These are engineering defaults, not measured capacity.
 

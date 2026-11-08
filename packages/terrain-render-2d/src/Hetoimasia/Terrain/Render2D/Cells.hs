@@ -171,7 +171,8 @@ import Hetoimasia.Terrain.Shape (ViewFacing)
 -- candidate columns and 65,536 levels; a plan examines 1,048,576 columns and
 -- 16,777,216 levels, holds 1,048,576 instances (the whole key space is
 -- 16,777,216) and 65,536 pending spans, and a demand lists 1,024 chunks,
--- 8,192 intervals and 16 regions per chunk.
+-- 8,192 intervals and 16 regions per chunk; a preparation keeps at most 4,096
+-- drawn-rectangle verdicts (a cache: the plan does not depend on it).
 defaultCellLimits ∷ CellLimits
 defaultCellLimits =
   CellLimits
@@ -184,6 +185,7 @@ defaultCellLimits =
     , clDemandChunks = 1024
     , clDemandIntervals = 8192
     , clRegionsPerChunk = 16
+    , clProofs = 4096
     }
 
 -- | The approved defaults: a 250-level band, two pixels of slack, a

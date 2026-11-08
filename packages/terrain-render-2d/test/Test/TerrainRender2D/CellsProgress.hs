@@ -222,6 +222,28 @@ capacity = describe "capacity and atomic admission" $ do
     cellPlanProgress atLimit `shouldBe` Settled
     planSceneWith assets (withLimits (\l → l {clInstances = 2 ^ (24 ∷ Int) + 1}) scene) `shouldSatisfy` (\r → case r of Left CellInvalidConfig → True; _ → False)
 
+  it "does no per-view work when preparation starts, keeps at most clProofs drawn-rectangle verdicts, and plans the same at any cache size" $ \assets → do
+    let block = sceneOf FaceSouth 4 [OCell x y z 0 KnownAll | x ← [0 .. 4], y ← [0 .. 4], z ← [0 .. 4]]
+        starved = withLimits (\l → l {clColumns = 0, clLevels = 0, clInstances = 0, clPending = 0}) (withConfig (\c → c {ccMargin = 4800}) block)
+        proofsOf inputs prep = cellStatProofs (cellPlanStats (either (error . show) id (cellPlanOf inputs prep)))
+        startedFor sc = let inputs = inputsOf assets sc in (inputs, either (error . show) id (startCells inputs))
+        withProofs n = withLimits (\l → l {clProofs = n}) block
+        planWith n = planScene assets (withProofs n)
+        finish inputs prep = case cellPrepProgress prep of
+          Working → stepCells inputs prep >>= finish inputs
+          _ → Right prep
+        proofsAfter n = let (inputs, prep) = startedFor (withProofs n) in proofsOf inputs (either (error . show) id (finish inputs prep))
+        (starvedInputs, starvedStart) = startedFor starved
+    -- A huge margin and every capacity zero: nothing is enumerated or retained.
+    proofsOf starvedInputs starvedStart `shouldBe` 0
+    proofsOf starvedInputs (either (error . show) id (stepCells starvedInputs starvedStart)) `shouldBe` 0
+    cellPlanProgress (planScene assets starved) `shouldBe` Halted HaltColumns
+    -- The cache holds at most its limit, and the plan does not depend on it.
+    map proofsAfter [0, 1, 8] `shouldBe` [0, 1, 8]
+    proofsAfter 4096 `shouldSatisfy` (> 8)
+    forM_ [0, 1, 8] $ \n → map fullView (cellPlanQuads (planWith n)) `shouldBe` map fullView (cellPlanQuads (planWith 4096))
+    length (cellPlanQuads (planWith 4096)) `shouldSatisfy` (< 125)
+
 -- ---------------------------------------------------------------------------
 
 progress ∷ SpecWith AssetSnapshot

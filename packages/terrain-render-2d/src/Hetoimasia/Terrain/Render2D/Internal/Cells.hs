@@ -99,6 +99,9 @@ data CellLimits = CellLimits
   -- ^ Intervals one demand lists.
   , clRegionsPerChunk ∷ !Int
   -- ^ Vertical regions one demand lists for a chunk.
+  , clProofs ∷ !Int
+  -- ^ Drawn-rectangle verdicts a preparation keeps (zero keeps none): only a
+  -- cache, so the plan is the same at any value, only the work to reach it differs.
   }
   deriving stock (Eq, Show)
 
@@ -276,6 +279,8 @@ data CellStats = CellStats
   , cellStatInstances ∷ !Int
   , cellStatPending ∷ !Int
   , cellStatSteps ∷ !Int
+  , cellStatProofs ∷ !Int
+  -- ^ Drawn-rectangle verdicts the preparation holds, at most 'clProofs'.
   }
   deriving stock (Eq, Show)
 
@@ -337,11 +342,10 @@ data CellPrep = CellPrep
   , prSteps ∷ !Int
   , prChunks ∷ !(Map.Map ChunkKey (Integer, Integer))
   , prUsed ∷ !(Set.Set AssetKey)
-  , prExactX ∷ !(Map.Map Integer Bool)
-  -- ^ By a cell's left edge in render-world pixels: whether the cells to its
-  -- east and south are drawn exactly one canvas step away in x (see 'exactAlongX').
   , prExactY ∷ !(Map.Map Integer Bool)
-  -- ^ By a cell's top edge: the same for y, east, south and above.
+  -- ^ A cache, by a cell's top edge in render-world pixels, of whether the cells
+  -- south, east and above are drawn exactly one canvas step away in y (see
+  -- 'exactAlongY'), kept to at most 'clProofs' entries and filled on demand.
   }
 
 -- A quad before it is ranked.
@@ -403,6 +407,7 @@ validConfig config =
       , clDemandChunks l
       , clDemandIntervals l
       , clRegionsPerChunk l
+      , clProofs l
       ]
     && clInstances l <= fromIntegral depthKeyLimit
   where
@@ -461,8 +466,7 @@ startCells inputs = do
       , prSteps = 0
       , prChunks = Map.empty
       , prUsed = Set.empty
-      , prExactX = maybe Map.empty (exactColumnsX view) envelope
-      , prExactY = maybe Map.empty (exactRowsY view) envelope
+      , prExactY = Map.empty
       }
 
 -- The envelope of candidate columns. The column of view offset @(rx, ry)@ has
@@ -605,20 +609,11 @@ evaluateColumn inputs st env (v, u) budget
           -- A cell is omitted only where the cells that would cover it are drawn
           -- exactly one canvas step away, so the texel proof holds for the pixels
           -- actually sampled; elsewhere it is drawn.
-          proved =
-            if Map.findWithDefault False (48 * (rx - ry) - 48) (prExactX st)
-              then
-                mergeI
-                  [ (z, z + 1)
-                  | (a, b) ← hidden
-                  , z ← [a .. b - 1]
-                  , Map.findWithDefault False (24 * (rx + ry - 1) - 16 * (z - ref) - 16) (prExactY st)
-                  ]
-              else []
+          (proved, cache) = provedLevels (prView st) ref (rx, ry) (clProofs limits) (prExactY st) hidden
           visible = [(z, s) | SRun a b s ← ownWindow, emits s, (x, y) ← subtractI [(a, b)] proved, z ← [x .. y - 1]]
           pendings = [(a, b) | SRun a b SPend ← ownWindow]
           units = [UCell z s | (z, s) ← visible] <> [UPend a b | (a, b) ← pendings]
-      go units st (drop (prSkip st) units) 0
+      go units st {prExactY = cache} (drop (prSkip st) units) 0
   where
     rx = (u + v) `div` 2
     ry = (v - u) `div` 2
@@ -884,25 +879,28 @@ exactAlongY view y = case (rectAt view 0 y, rectAt view 0 (y + 24), rectAt view 
      in tn == t + 24 * texel && bn == b + 24 * texel && tu == t - 16 * texel && bu == b - 16 * texel
   _ → False
 
--- The verdicts of 'exactAlongX' for every column origin the envelope can reach
--- (cell @x@ is @48 * (rx - ry) - 48@, and @rx - ry@ is the candidate's @u@).
-exactColumnsX ∷ RenderView → Envelope → Map.Map Integer Bool
-exactColumnsX view env =
-  Map.fromList [(x, exactAlongX view x) | u ← [uLo - 1 .. uHi + 1], let x = 48 * u - 48]
+-- The levels of the hidden intervals whose covering cells are proved drawn
+-- exactly one canvas step away, with the verdict cache after the lookups. The
+-- column's x check runs once and only when something is hidden; each level's y
+-- verdict is read from the cache or computed (three rectangles) and kept while
+-- the cache holds fewer than @capacity@ entries, so the scratch is bounded and
+-- the work follows the levels examined, never the size of the view.
+provedLevels ∷ RenderView → Integer → Offset → Int → Map.Map Integer Bool → [(Integer, Integer)] → ([(Integer, Integer)], Map.Map Integer Bool)
+provedLevels view ref (rx, ry) capacity cache hidden
+  | null hidden = ([], cache)
+  | not (exactAlongX view (48 * (rx - ry) - 48)) = ([], cache)
+  | otherwise =
+      let (verdicts, cache') = foldl' look ([], cache) [z | (a, b) ← hidden, z ← [a .. b - 1]]
+       in (mergeI [(z, z + 1) | (z, True) ← verdicts], cache')
   where
-    (uLo, uHi) = envURange env
-
--- The verdicts of 'exactAlongY' for every row origin the envelope can reach: a
--- cell's top edge is @8 * m@ with @m = 3 * (v - 1) - 2 * k - 2@ for its row sum
--- @v@ and its level @k@ above the reference, so the range of @m@ covers them all.
-exactRowsY ∷ RenderView → Envelope → Map.Map Integer Bool
-exactRowsY view env =
-  Map.fromList [(y, exactAlongY view y) | m ← [mLo .. mHi], let y = 8 * m]
-  where
-    (vLo, vHi) = envVRange env
-    (kLo, kHi) = envZRel env
-    mLo = 3 * (vLo - 2) - 2 * (kHi + 2) - 2
-    mHi = 3 * vHi - 2 * (kLo - 1) - 2
+    look (acc, held) z = case Map.lookup y held of
+      Just verdict → verdict `seq` ((z, verdict) : acc, held)
+      Nothing →
+        let verdict = exactAlongY view y
+            held' = if Map.size held < capacity then Map.insert y verdict held else held
+         in verdict `seq` held' `seq` ((z, verdict) : acc, held')
+      where
+        y = 24 * (rx + ry - 1) - 16 * (z - ref) - 16
 
 -- The pending span of a window of one column.
 pendSpanOf ∷ RenderView → Envelope → Maybe Column → Offset → Integer → Integer → Either CellError PendSpan
@@ -995,6 +993,7 @@ cellPlanOf inputs prep = do
             , cellStatInstances = length quads
             , cellStatPending = length pendings
             , cellStatSteps = prSteps prep
+            , cellStatProofs = Map.size (prExactY prep)
             }
       }
 
