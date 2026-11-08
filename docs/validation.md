@@ -154,6 +154,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.math` | `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct` | no | no | any |
 | `test.terrain` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | no | no | any |
 | `test.terrain-render-2d` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct` | no | no | any |
+| `test.terrain-runtime` | `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | no | no | any |
 | `test.content` | `cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct` | no | no | any |
 | `test.asset-image` | `cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct` | no | no | any |
 | `test.render-api` | `cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct` | no | no | any |
@@ -392,6 +393,30 @@ because the owned-start guard scans every test suite of the packages
 `cabal.project` lists. It proves geometry, order and picking on the CPU, not what
 a GPU draws: that remains TRA-8's offscreen proof. See
 [the package's contract](../packages/terrain-render-2d/README.md).
+
+`test.terrain-runtime` runs the scoped transactional terrain service's own suite
+(TRA-4) through the production service and controlled gates, with no timing sleep:
+the cancel, stage and commit races in an arrival host and a delayed-eligibility
+host, with the disposition, the overlay and the revision agreeing and no partial
+commit after a preparation or settlement-callback failure; closure against a pending
+load, a staged edit, a pending open and attach and a retained result, with the
+ordinary queue full and the parent session's admission read inside the commit
+arbitration; the four-arena, 64-lease and eight-view limits and identity and
+revision exhaustion; bounded budgets, a held snapshot that stays coherent and
+charged, shared load interests whose credits return only at the owner's
+acknowledgement and bounded latest-value demand; offload and reload against an
+independent model, retained-edit exhaustion answering busy and a failed transfer
+that retains its changes; superseded work recomputed and never relabeled, a stale
+precondition answering `stale_view` and an ordered trace producing identical
+results under two residency schedules; startup, cancellation, unexpected-exit and
+borrower lifecycles; and, through external clients, that authorities, snapshots and
+private modules cannot be forged or reached. It is mandatory but outside the floor,
+like `test.terrain`, and runs through `cabal.project.cpu` on the `haskell-engine`
+worker, with a reusable receipt. Its package directory and Cabal file are inputs of
+`test.workflow` as well, because the owned-start guard scans every test suite of the
+packages `cabal.project` lists; the package starts no thread of its own, and its
+examples start theirs through `Test.Support.Owned`. See
+[the package's contract](../packages/terrain-runtime/README.md).
 
 `test.lua-engine` runs the Lua-first engine package's own suite, `lua-engine-tests`:
 the strict format-1 manifest parsed from supplied bytes -- its accepted examples, the
@@ -1288,7 +1313,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,test.terrain,test.terrain-render-2d,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,test.terrain,test.terrain-render-2d,test.terrain-runtime,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland,test.vulkan-lua-engine-native,test.vulkan-run-native
@@ -1453,7 +1478,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `test.terrain`, `test.terrain-render-2d`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `test.terrain`, `test.terrain-render-2d`, `test.terrain-runtime`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`, `test.vulkan-lua-engine-native`, `test.vulkan-run-native` |

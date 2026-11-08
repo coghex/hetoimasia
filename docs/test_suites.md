@@ -19,6 +19,7 @@ cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-detai
 cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct
+cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct
@@ -49,6 +50,26 @@ cabal test hetoimasia-tests --test-show-details=direct
   answer is `inconclusive`.
 
 ## Which suite owns what
+
+- `asset-image-tests` (`packages/asset-image/test/`, group `test.asset-image`, the CPU project) owns the image codecs and, for
+  the Lua texture profile, the bounded PNG preflight and decoder. Its data-map examples (TRA-15, `Test.Asset.Image.DataMap`) own
+  the decoder's `DecodeData` policy (every fixture's hand-stated straight texels, byte for byte the general decoder's data image,
+  the colour policy's charges), the generic binary-coverage plane (bits, partial bytes, row order, the first nonbinary texel), the
+  exact normalized sampling rule at representable boundaries, and the `unit-normal-rgb-v1` validator. A new decoder or data-map
+  rule belongs there.
+- `terrain-runtime-tests` (`packages/terrain-runtime/test/`, TRA-4) owns the
+  scoped transactional terrain service, composed by
+  `Test.TerrainRuntime.Spec`: the cancel, stage and commit races in the arrival and
+  delayed-eligibility host fixtures, closure against pending work and the parent
+  session's admission, the arena, lease and view limits and identity exhaustion,
+  bounded budgets against real resident detail, offload and reload against an
+  independent model, superseded work and the deterministic replay of an ordered
+  trace, startup, cancellation and unexpected-exit lifecycles, and the external-client
+  boundary. It drives the production service through controlled gates (`Probe`), so
+  no example sleeps; every thread it starts is owned through `Test.Support.Owned` and
+  its waits are bounded. It is the CPU group `test.terrain-runtime`, mandatory and
+  outside the floor, on the `haskell-engine` worker with a reusable receipt. See
+  [the package's contract](../packages/terrain-runtime/README.md).
 
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
@@ -141,7 +162,15 @@ cabal test hetoimasia-tests --test-show-details=direct
   a supervised owner with controlled fake providers. The owned texture pipeline (LFE-16, `Test.LuaEngine.Texture.*`) is
   covered over a real content root, inventory and shared read pool, the real bounded PNG decoder and a gated fake upload
   backend: the admission banks, the lanes, workers and queues, the stage-by-stage charges, cancellation at every stage,
-  failures, independent loads and release, the close and drain, and a separately compiled public client, The fixed M1 scene schema (LFE-19, `Test.LuaEngine.Scene.*`, `--match Scene`) is covered on real instances that own real textures behind the injected backend and a controlled sink: the schema's accepted and refused tables, the colour and geometry rules, the limits at the limit and one past under the fixed and smaller profiles, the calling instance's texture authority, refusals as ordinary Lua errors, and the translation to the renderer's snapshot under its validation, draw plan and oracle; the host's per-binding argument limits are `lua-host-tests`' (`Test.Lua.Boundary.ArgumentLimits`) and the non-throwing lease borrow `lua-runtime-tests`' (`Test.LuaRuntime.Instance.Lease.*`). The module coordinator (LFE-11, `Test.LuaEngine.Modules.*`, `--match Modules`): real modules through real VMs on supervised scheduled owners over a real content root, inventory and read pool, with the production reader behind gates and nothing slept, and a separately compiled client. The authoring facade (LFE-12, `Test.LuaEngine.Facade.*`, `--match Facade`): the accepted P-72 example, every call's schema table-driven in every role and phase, instance ownership, the lexical import and the instance-rooted requests, the request records, the role clocks and waits under an injected clock and fake timer, print and warn with their exact bound, the sinks under contention and failure, and a separately compiled client, on real instances over a real content root, inventory and read pool with recording sinks and nothing slept. It starts no window or GPU; its one example of the Lua host's
+  failures, independent loads and release, the close and drain, and a separately compiled public client; its data textures
+  and shared versioned coverage (TRA-15, `Test.LuaEngine.Texture.DataMaps`, `--match 'data textures and shared versioned
+  coverage'`: the image kind reaching the backend as the interpretation, the declared policies refused as `invalid_image`
+  before any upload, the injected 128 MiB account's reservation at the one admission at the worst case then exact, exact fit
+  and one byte short, another consumer's simultaneous charge, accepted work never turned busy, two overlapping versions, a Lua
+  release leaving a consumer's interest, GPU retirement and CPU coverage ending independently, handle reuse, and every end of
+  the work returning its reservation once), the facade's image options (`Test.LuaEngine.Facade.Graphics`) and a second
+  separately compiled client of the generic data-map boundary that cannot forge a retained texture, an account, a reservation
+  or a version. The fixed M1 scene schema (LFE-19, `Test.LuaEngine.Scene.*`, `--match Scene`) is covered on real instances that own real textures behind the injected backend and a controlled sink: the schema's accepted and refused tables, the colour and geometry rules, the limits at the limit and one past under the fixed and smaller profiles, the calling instance's texture authority, refusals as ordinary Lua errors, and the translation to the renderer's snapshot under its validation, draw plan and oracle; the host's per-binding argument limits are `lua-host-tests`' (`Test.Lua.Boundary.ArgumentLimits`) and the non-throwing lease borrow `lua-runtime-tests`' (`Test.LuaRuntime.Instance.Lease.*`). The module coordinator (LFE-11, `Test.LuaEngine.Modules.*`, `--match Modules`): real modules through real VMs on supervised scheduled owners over a real content root, inventory and read pool, with the production reader behind gates and nothing slept, and a separately compiled client. The authoring facade (LFE-12, `Test.LuaEngine.Facade.*`, `--match Facade`): the accepted P-72 example, every call's schema table-driven in every role and phase, instance ownership, the lexical import and the instance-rooted requests, the request records, the role clocks and waits under an injected clock and fake timer, print and warn with their exact bound, the sinks under contention and failure, and a separately compiled client, on real instances over a real content root, inventory and read pool with recording sinks and nothing slept. It starts no window or GPU; its one example of the Lua host's
   module loader under the fixed profile (`Test.LuaEngine.Loader`, LFE-9) starts an in-process Lua owner. A new
   manifest or profile example belongs there, in the component spec that owns it.
   Every helper thread `lua-engine-tests` starts is an owned start through `Test.Support.Owned` (#599): the scenario runners
@@ -508,7 +537,20 @@ cabal test hetoimasia-tests --test-show-details=direct
   and the oracle over the specification. It writes lossless PNG readbacks and a machine-readable
   record per image under `HETOIMASIA_VALIDATION_EVIDENCE`. The same consent and command, with
   `-- --match 'Lua offscreen pixels'`; an empty selection fails; its record reports `windows: 0`.
-  Its device-free half is the `Lua offscreen pixels comparator` group of `lua-engine-graphics-tests`
+  Its data-texture pixels (TRA-15) are the `validated data texture pixels (TRA-15)` group of the same executable, which also opens
+  no window: tiny explicitly labelled technical PNG fixtures built byte by byte are loaded through the real content pipeline
+  and the production texture adapter, the same file as colour and as data, drawn through the renderer's public path into a
+  surface-free sRGB colour target and read back after the batch's own ticket completed (an intermediate channel of 128 reads
+  128 through the colour route and 188 through the data route, judged by the render-2d oracle and by hand-stated
+  expectations); a data texture's coverage plane and checked profile are reached only through `retainTexture`; a zero-vector
+  normal map and a nonbinary alpha under `coverage = "binary"` leave no registration, live texture or charge. The same consent
+  and command, with `-- --match 'validated data texture pixels (TRA-15)'`; an empty selection fails; it retains lossless PNG
+  readbacks and a machine-readable record per image (input hashes, request, target, build identity, `windows: 0`, every
+  comparison) under `HETOIMASIA_VALIDATION_EVIDENCE`. It qualifies format routing, not the later terrain material or its
+  all-shape picking proof. Its device-free halves are the data-texture examples of `lua-engine-graphics-tests` (the
+  production injection over the fake owner: data allocates and registers linear, the default stays sRGB, the incompatible
+  combination reaches no owner).
+  The `Lua offscreen pixels` group's device-free half is the `Lua offscreen pixels comparator` group of `lua-engine-graphics-tests`
   (group `test.vulkan-headless`): the committed fixtures against their SHA-256 and the decoder, the
   hand-stated numbers against the oracle, and the comparator rejecting the representative defects
   on synthetic readbacks. The design's wording for the owner of these tests is "the Vulkan headless

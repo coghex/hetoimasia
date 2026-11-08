@@ -173,6 +173,28 @@ proved retired or failed; only then does the pump stop, and only then may the po
 cancellation delivered meanwhile is remembered and raised after the drain. Ending one instance neither closes the shared
 owner nor touches a peer's independent texture.
 
+## Image kinds and format routing (TRA-15)
+
+The pipeline hands the backend a level and its interpretation (`Upload.uploadFormat`); the adapter carries it end to end:
+
+| Request | `uploadFormat` | Native image (`deviceAllocate`) | Registry metadata (`Level.levelFormat`, the `DecodedImage` the cutout mark is read from) |
+| --- | --- | --- | --- |
+| `kind = "colour"` (the default, and every M1 request) | `TexelRgba8Srgb` | `Rgba8Srgb`, as before | `TexelRgba8Srgb` |
+| `kind = "data"` | `TexelRgba8Linear` | `Rgba8Linear`, linear UNORM | `TexelRgba8Linear` |
+
+The image keeps its native format for good: what is sampled is not reinterpreted. A texel format the pipeline never asks for
+(BC7) is a fatal `FaultFatal` of the allocation, not a guess. The `Port`'s `deviceAllocate` takes the `TexelFormat`, and the
+registration's `Level` records it, replacing the hard-coded `TexelRgba8Srgb`. Nothing else of the adapter changes: the job, its
+phases, the staging copy, the release lane and the retirement evidence are format-blind, and the CPU coverage plane and the
+checked profile of the loaded version are the pipeline's, never this adapter's (it neither sees nor keeps them, so there is
+nothing here to release for them).
+
+**Scene publication is unchanged.** `api.scene.publish` accepts any live texture lease through the existing protected-resource
+boundary, with no new refusal and no conversion. A published data texture is sampled from its linear UNORM image as numeric
+values and is **not** reinterpreted as premultiplied sRGB colour. Into a sRGB target the sampled number `v ÷ 255` is taken as
+linear light and stored encoded, so an intermediate channel of 128 reads back as 188 for data and as 128 for colour (the
+`validated data texture pixels (TRA-15)` group below).
+
 ## Tests
 
 * **`lua-engine-graphics-tests`** (headless; group `test.vulkan-headless`): the backend over an injected owner whose
@@ -199,6 +221,18 @@ owner nor touches a peer's independent texture.
   The run writes `lua-engine-graphics-native.md` into `HETOIMASIA_VALIDATION_EVIDENCE` when set: revision, source
   digest, command, platform and driver manifest, validation outcome and the accounting each example measured. A run
   without consent refuses and exits non-zero; a skipped run is not a pass.
+
+  Its `validated data texture pixels (TRA-15)` group (selected by `-- --match 'validated data texture pixels (TRA-15)'`) opens
+  no window and renders no screen: tiny explicitly labelled technical PNG fixtures, built byte by byte, are loaded through the
+  real content pipeline and this adapter and drawn through the renderer's public path into a surface-free sRGB colour target,
+  read back after the batch's own ticket completed. It judges the same ramp file requested as colour and as data (a mid-grey of
+  128 reads 128 through the colour route and 188 through the data route, every texel stated by hand from the transfer function and
+  judged by the render-2d oracle), reaches a data texture's coverage plane and checked profile **only** through the public
+  `retainTexture` boundary (no accessor into the pipeline or this adapter), and shows that a zero-vector normal map and a nonbinary
+  alpha under `coverage = "binary"` fail as `invalid_image` and leave no registration, no live texture and no charge. It retains
+  lossless PNG readbacks and machine-readable records (the SHA-256 of every input file, the request, the target, the runner's build
+  identity, the window count of 0, every comparison) under `HETOIMASIA_VALIDATION_EVIDENCE`. It qualifies format routing, not the
+  later terrain material or its all-shape picking proof.
 
   Its `Lua offscreen pixels` group (LFE-24) draws what Lua authored into a managed offscreen colour target with no window and
   judges every pixel; see [Lua offscreen pixels (LFE-24)](#lua-offscreen-pixels-lfe-24). Its device-free half, the `Lua

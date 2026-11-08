@@ -584,7 +584,8 @@ evidence that the upload completed **and** the registration is usable; a decoded
 allocated native handle is none of that. It promises no displayed frame and no window, and works before any window exists.
 An expected failure carries one of `textureCodes` with the root and path: `not_found`, `content_changed`, `io_error`,
 `too_large` (a file over 32 MiB, or a decode over a limit, the lane's workspace included), `unsupported_format` (not a PNG,
-or animated) and `invalid_image`. A malformed address, a wrong phase and a closed owner are ordinary Lua errors before any
+or animated) and `invalid_image` (a PNG that is not sound, a nonbinary alpha under `coverage = "binary"`, or a texel that breaks the
+declared `normal_encoding`; each carries a bounded reason that names the policy that failed). A malformed address, a wrong phase and a closed owner are ordinary Lua errors before any
 admission. Texture acquisition is **presentation-instance hook work**: each instance's `TextureOwner` carries the role its facade
 boundary declared for it (`newTextureOwner pipeline role`, from the instance's immutable metadata, never from Lua), and an owner
 for a logical instance is refused before any reservation. Required is the default and optional is explicit; there is no tick
@@ -602,6 +603,7 @@ One atomic admission (the host's `startAdmitted`) reserves, before the provider 
 | Result lease capacity | the instance's lease scope | with the instance's lease |
 | One texture slot | `texture slots`: 16 pending/live/retiring per UI instance | the texture proved retired |
 | 16 MiB of nominal RGBA8 bytes | `texture bytes`: 128 MiB per instance and 256 MiB per session, taken from both or neither | shrunk to `width * height * 4` once the decode validated the dimensions; the remainder returned when the texture is proved retired |
+| Coverage bytes, only for `coverage = "binary"` | `coverage bytes`: the session's one injected CPU render/staging account, 128 MiB (`RenderAccount`); the worst case the validated pixel limit allows, `ceil (4,194,304 ÷ 8)` = 524,288 plane bytes plus the fixed 128 bytes of metadata | shrunk to the exact plane and metadata once the decode validated the dimensions; returned with the last CPU interest in the loaded version, or by the credit release of a request that ended without a version |
 | One accepted-work record | `texture jobs`: the session's job capacity (`textureSpec`), which bounds every stage queue | the request taken and its work retired |
 | One queue slot of the shared read pool | `io queue` | the request taken and its read retired (only for a file that will be read) |
 
@@ -613,6 +615,51 @@ without a worker. The slot and the nominal bytes **transfer** to the texture whe
 when the request is taken, when the pipeline's CPU buffers retire or when Lua loses its handle, but when the backend proves
 the texture itself retired.
 
+### Image kinds, coverage and the shared CPU account (TRA-15)
+
+`TextureRequest` carries a `TexturePolicy`: the image `kind`, whether `coverage = "binary"` is required, and the
+`normal_encoding` the texels are declared to carry. The default is `colourPolicy` (premultiplied sRGB, no coverage, no
+encoding), which is every M1 request. `texturePolicy` refuses the one incompatible combination, a normal encoding on a
+colour image (never an implicit `kind = "data"`).
+
+* **Colour** is the existing path: `TexelRgba8Srgb`, premultiplied once in linear light. **Data** is linear numeric data:
+  the bounded decoder's `DecodeData` policy, uploaded and registered as `TexelRgba8Linear` (`Upload.uploadFormat`), with no
+  gamma conversion and no premultiplication, the RGB of a transparent texel kept. Exactly one tightly packed, top-row-first
+  level; no mip generation and no extra decoded image. The generic loader's dimension limits are untouched.
+* **Binary coverage.** The decode worker inspects the very alpha bytes that will be uploaded: only 0 and 255 are valid. A
+  nonbinary image is the expected failure `invalid_image` with a reason that names `coverage=binary` and the first offending
+  texel, before any upload or publication; nothing is thresholded. Otherwise one `CoveragePlane` (one bit per texel, see the
+  [asset package](../asset-image/README.md#data-maps-tra-15)) is kept with the loaded version. Without `coverage`, ordinary
+  translucent loading is valid and no binary authority is invented.
+* **Normal encoding.** `unit-normal-rgb-v1` is checked on the same bytes: every nontransparent texel's RGB in 1..255 and not
+  `(128, 128, 128)`; transparent RGB is ignored; accepted bytes are never changed. A failure is `invalid_image`, naming
+  `normal_encoding=unit-normal-rgb-v1` and the texel. The checked encoding is a fact of the loaded version, present only
+  when it was requested and every texel passed; an otherwise identical raw-data request does not gain it. Asking for the
+  encoding does not assert binary alpha.
+* **The shared account.** The plane and its fixed metadata are charged to the one injected `RenderAccount`, not to the lane
+  (the decoder's workspace is a distinct account, and the texture's nominal bytes are another). The charge is a credit
+  composed into the request's one STM admission, so a full account is the host's `busy` answer with nothing reserved, and
+  **no later stage reserves from it, refuses on it or waits for it**: accepted work is never converted to `busy`. It is
+  reserved at the worst case and shrunk, once, to the exact plane and metadata when the decode has validated the
+  dimensions (the 16 MiB nominal-byte precedent). Two loads of one path are two versions with two separately charged
+  planes, and the overlap of an old and a new version is charged twice until the old one's last interest ends.
+* **Interests and retention.** A loaded version lives as long as it has an interest: the pipeline's while it delivers
+  (the job's, then the cell's), the lease's once a lease adopts the texture, and one for every consumer that calls
+  `retainTexture` (or `withRetainedTexture`) through the same protected-resource boundary as `withTextureOr`. A
+  `TextureRequirement` states what the consumer needs (the kind, binary coverage, a checked encoding); a version without
+  it is a clear refusal, as data, before anything is retained. The retained value pairs the registration's identity, the
+  dimensions, the shared plane and the checked profile, all from the one version, so a path, a recycled registration slot or a
+  reused handle generation can never pair an old plane with a new texture. A Lua `release` stops the lease granting new
+  interests (and drops the lease's own, at once) and leaves the ones already taken. The CPU plane ends with its last
+  interest; the texture's slot, nominal bytes and GPU registration end on the backend's evidence of retirement; neither
+  event stands in for the other. `releaseRetained` is idempotent.
+* **Publication.** `api.scene.publish` accepts any live texture lease, unchanged. A published data texture is sampled from
+  its linear UNORM image as numbers and is not reinterpreted as premultiplied sRGB colour; the adapter registers it with the
+  matching texel format.
+
+A failure in the decode worker's policy checks settles the job through the same transition as any other refusal, so the lane's
+charges return, and the reservation is returned by the host's credit release, exactly once.
+
 ### The pieces and who owns them
 
 | State | Owner | Writers | Readers | Lifetime and disposal |
@@ -622,6 +669,9 @@ the texture itself retired.
 | A lane and its workspace bank (128 MiB) | the pipeline | the read sink, the decoder's account, the handoff, the backend's buffer retirement | `readingLanes` | a job holds it from the start of its read until the backend stops reading the level |
 | A job (stage, buffers, withdrawn/stopping flags) | the pipeline | the same | diagnostics | from admission until the host returns its record; entries exist only for admitted requests |
 | A texture's `Cell` | the pipeline until the answer offers it, then the host (adopt or drop), then the lease | the backend's sink, the answer's offer, the adoption recipe, the release | the retirement readings | one transition per decision on the cell (offer, adopt, claim); exactly one party calls the backend's release, once |
+| The session's CPU render/staging account (`RenderAccount`) | the composition root: `run/Hetoimasia/Run/Session.hs` makes exactly one per session, sized `m1RenderAccountBytes` (128 MiB), and passes it narrowly to `withTexturePipeline`; a test composition injects its own; the pipeline makes none | the request's reservation at its admission (`reserveHold`), the decode's one shrink (`shrinkHold`), the last release of a version's interests (`returnOwned`), the host's credit release (`returnHold`), and any other consumer through `accountReserve`/`accountRelease` | `accountCharged` | the session; never reset, never raised, no cache. Terrain's internal staging ledger (`packages/terrain/README.md`, the staging bank) is **not yet unified** with it: a later terrain service receives this same handle |
+| A request's reservation (`Reservation`) | the request: `prepareRequest` makes it with the prepared token | admission, the decode's shrink, the transfer to the version (`takeOwnership`, in the transaction that records the version) | `reservationReading` | `Unreserved → Held n → (Held m) → Owned m → Done`, or `Held → Done`; every state past `Done` is final, so the bytes go back exactly once |
+| A loaded `Version` (the checked kind, dimensions, normal encoding and the one shared coverage plane) | the pipeline, which makes it and holds the first interest | its interest count only: every operation is one STM transaction; the facts are immutable | any holder of an interest | from the decode that built it to its last interest; an interest is a token dropped exactly once |
 
 There are two session read workers (the shared pool, LFE-10), **one decode worker** and **two lanes**. No thread is made
 for a request, an instance or a VM.
@@ -706,7 +756,9 @@ housekeeping releases it and returns the charge only when the backend proves it 
 What a backend returns is evaluated inside the same guard that catches what it raises (the reading `textureRelease` answers, the
 work record `backendUpload` answers), and a cell's recorded state is built and forced before it is stored, so a value that throws
 when first looked at is the call failing, once, and never an exception loose in whoever inspects the cell later. `TextureSpec`'s numbers are read with accessors (`specLanes` and the rest); its record fields are not exported, so a client
-cannot build or update a specification of its own. `TextureBackend` has one operation, `backendUpload upload sink`, which must not block, and a sink with four calls: a usable
+cannot build or update a specification of its own. `TextureBackend` has one operation, `backendUpload upload sink`, which must not block, and an `Upload` that carries the level
+and its `uploadFormat` (`TexelRgba8Srgb` for colour, `TexelRgba8Linear` for data: the image the backend allocates, uploads and
+registers must carry exactly that interpretation), and a sink with four calls: a usable
 registration (`sinkReady`, carrying a `BackendTexture` whose `textureRelease` is called at most once and answers the
 backend's own reading of its retirement, which only reads and which the pipeline guards as the host does: a reading that
 throws or answers failed is a failed retirement, recorded once as the pipeline's failure, terminal for that texture, with its
@@ -729,7 +781,15 @@ backend that holds every upload and every release until the example says otherwi
 uploaded texels or GPU readiness: LFE-17 establishes those). Each bank is filled and refused with nothing left reserved,
 the fixed values are checked, the stages and cancellation windows are driven by gates and hooks, never by sleeping, and a
 separately compiled client composes the pipeline through public modules. `PipelineHooks` are this package's coordination
-points for those examples; production uses `noHooks`. Two rules keep the examples from hanging
+points for those examples; production uses `noHooks`. The data textures of TRA-15 (`Test.LuaEngine.Texture.DataMaps`) drive the
+same real pipeline, with the injected account shrunk so that a charge fits exactly or falls a byte short, and read the account,
+the interest counts and the owner's banks after each gated event: the interpretation handed to the backend, the policies refused
+before any upload, the reservation at worst case and then exact, a simultaneous charge from another consumer, accepted work never
+turned busy, two overlapping versions, a Lua release leaving a consumer's interest, GPU retirement and CPU coverage ending
+independently, handle reuse, and cancellation at decode, with the upload held, a refused hand-over and an instance ended, each
+returning its reservation once. A separately compiled client names the generic data-map boundary (policy, requirement, account,
+retained facts, coverage sampling) with no terrain or graphics import, and cannot forge a retained texture, an account, a
+reservation or a version. Two rules keep the examples from hanging
 or racing: an example acts on a result only after the host's own reply (the script waits for it with `wait_take`; the
 pipeline settling a job is not the host having the answer), and every exit of an example or of a nested scope, an assertion
 failure included, opens every gate and hook it can hold and lets every backend answer what it owes before anything waits for
@@ -1095,7 +1155,7 @@ instance's call is an ordinary error of the binding, never a missing field.
 
 | Call | Arguments | Successful result |
 | --- | --- | --- |
-| `api.content.texture(path [, options])` | `options` is `nil`, absent or a plain table with only `root` and `optional` (a boolean, default `false`; `nil` omits, `false` is a value). `tick_offset` is refused, `1` included | `request, nil`; the taken value is `{texture=HANDLE, width=INTEGER, height=INTEGER}` |
+| `api.content.texture(path [, options])` | `options` is `nil`, absent or a plain table with only `root`, `optional` (a boolean, default `false`; `nil` omits, `false` is a value), `kind` (`"colour"`, the default, or `"data"`), `coverage` (`"binary"`) and `normal_encoding` (`"unit-normal-rgb-v1"`, valid only with `kind = "data"`: with `kind` omitted or `"colour"` it is an ordinary argument error, never an implicit `"data"`). Unknown fields or values, wrong types, metatables and incompatible combinations are ordinary argument errors before any reservation, content access or native work. `tick_offset` is refused, `1` included | `request, nil`; the taken value is `{texture=HANDLE, width=INTEGER, height=INTEGER}` |
 | `api.window.open({title=TEXT, width=INTEGER, height=INTEGER})` | exactly the three fields, all required; `width` and `height` are Lua integers (`1.0` and `"1"` are refused) | `request, nil`; the taken value is the window handle itself |
 | `api.scene.publish(window, scene)` | the instance's own ready window and a scene of [the scene schema](#the-scene-schema-lfe-19) | no results, once the whole publication is accepted |
 | `api.texture.release(texture)` | the instance's own texture, including one already released. Another instance's texture is an ordinary error, with one exception below | `"done"`, `"retiring"` or `"already_released"` |
