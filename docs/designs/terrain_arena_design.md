@@ -290,11 +290,22 @@ verified after filing; approved body SHA-256:
 verified after filing; approved body SHA-256:
 `4b1d473dfb570a46617b7adcb5f91239b378403c2041590eea2fb7b3c96ea857`.
 
-**Amendment processing cursor:** new-child filing is complete. Continue the
-P-16 revisions of #645–#648 and any other named artifacts, one artifact at a
-time with a separately approved concrete tracker draft before each mutation. The manager arranges readiness reviews. Tracker
-processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after TRA-23:
-`5uymu8d9jy58dht8ikgrwgi6ea` in `#het-terrain`.
+**TRA-9 amendment revision applied 2026-11-08:** existing [#645] now carries
+P-16 revision v1, approved by `het-manager` in `#het-terrain` message
+`j4v9ma6x5misrmd92d2qhwifis` (reply to draft `s46k94ntu2z67twigqtd69myki`).
+The exact body-only replacement and unchanged tracker metadata were verified;
+approved body SHA-256:
+`c57fa768f2f962fcd892da31c3c47120d03f2d9905fa4645454eac5a086adb62`.
+The manager arranges fresh readiness review; this revision is not implementation
+or amended Q-13 qualification.
+
+**Amendment processing cursor:** new-child filing is complete and #645's P-16
+revision is applied. Draft the #646 revision next, then #647–#648 and any other
+remaining P-16 named artifacts, one artifact at a time with a separately
+approved concrete tracker draft before each mutation. The manager arranges
+readiness reviews. Tracker processing dispatch:
+`rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after #645 revision:
+`j4v9ma6x5misrmd92d2qhwifis` in `#het-terrain`.
 
 ## Epic contract
 
