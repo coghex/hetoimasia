@@ -76,6 +76,18 @@ cabal test hetoimasia-tests --test-show-details=direct
   `terrain-mapgen` through its command-line function (read-only `--check`, two temporary regenerations, negative controls).
   Every example reads committed files or writes temporary directories; none starts a thread, a process or a window. A new
   asset or generator rule belongs there; the loader that consumes the maps (TRA-15) and the GPU qualification (TRA-17) do not.
+  The cell-quad planner and coverage picker (TRA-16) are owned by `Test.TerrainRender2D.Cells` (the whole-cell
+  representation table for all 16 identities at all four facings in ordinary, fogged and mixed states from the committed
+  catalog; agreement of every frontmost classification and every known cell's exact order with the independent view-ray
+  oracle of `Test.TerrainRender2D.CellFixtures` over roofs, cavities, ramps, stacked spans, a steep separation, cutaways
+  through undiscovered air, chunk and region seams and both coordinate extremes; negative controls for reversed order, wrong
+  facing, swapped masks and a floating key), `CellsCoverage` (the raster and texel conventions with synthetic technical-fixture
+  planes), `CellsProgress` (pending ahead of and behind a hit, reveal, offload, reload and late knowledge, hidden-truth
+  alternatives, atomic mixed-part admission under capacity, bounded resumable steps and obsolete continuations, visible
+  demand before prefetch, viewport demand against a brute-force sprite enumeration, compressed summaries, refusals),
+  `CellsClient` (the package boundary) and `CellsEvidence` (the reproducible CPU evidence record under
+  `docs/evidence/terrain/tra16/`, written only when `HETOIMASIA_TRA16_EVIDENCE_DIR` names a directory). A new rule of the
+  cell-quad path belongs there; the device's raster, depth and sampling agreement is TRA-17's.
 - `terrain-runtime-tests` (`packages/terrain-runtime/test/`, TRA-4) owns the
   scoped transactional terrain service, composed by
   `Test.TerrainRuntime.Spec`: the cancel, stage and commit races in the arrival and
