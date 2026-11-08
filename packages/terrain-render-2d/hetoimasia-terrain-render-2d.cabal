@@ -11,7 +11,10 @@ description:
     candidates inside the 2D renderer's 24-bit depth keys, and CPU picking
     against the exact plan it was given. It depends on the pure terrain,
     math, render-2d and render-api packages only: no GPU, window, Lua, runtime
-    terrain service or game package. Every value is immutable and every function
+    terrain service or game package. Beside that per-face baseline, TRA-16 adds
+    the whole-cell quad planner (supplied discovery knowledge and coverage
+    assets, exact integer draw keys, bounded progressive demand) and the
+    coverage-based visual picker. Every value is immutable and every function
     pure; the package owns no state, thread or resource.
 license: GPL-3.0-only
 license-file: LICENSE
@@ -36,23 +39,30 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.Terrain.Render2D.Assets
         Hetoimasia.Terrain.Render2D.Camera
+        Hetoimasia.Terrain.Render2D.CellPick
+        Hetoimasia.Terrain.Render2D.Cells
         Hetoimasia.Terrain.Render2D.Facts
+        Hetoimasia.Terrain.Render2D.Knowledge
         Hetoimasia.Terrain.Render2D.Pick
         Hetoimasia.Terrain.Render2D.Plan
         Hetoimasia.Terrain.Render2D.Projection
     -- The exact planar polygon arithmetic and the overlap ordering the public
     -- modules share; a client cannot import them.
     other-modules:
+        Hetoimasia.Terrain.Render2D.Internal.Cells
         Hetoimasia.Terrain.Render2D.Internal.Order
         Hetoimasia.Terrain.Render2D.Internal.Polygon
     build-depends:
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9,
+        hetoimasia-asset-image ==0.1.0.0,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-api ==0.1.0.0,
-        hetoimasia-terrain ==0.1.0.0
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0
 
 -- The offline map bake (TRA-14): the frontmost-facet cutout and unit-normal map
 -- of every catalog shape, the complementary mixed-knowledge parts and the
@@ -170,6 +180,13 @@ test-suite terrain-render-2d-tests
     other-modules:
         Test.TerrainRender2D.Art
         Test.TerrainRender2D.Camera
+        Test.TerrainRender2D.CellFixtures
+        Test.TerrainRender2D.CellsClient
+        Test.TerrainRender2D.Cells
+        Test.TerrainRender2D.CellsCoverage
+        Test.TerrainRender2D.CellsEvidence
+        Test.TerrainRender2D.CellsProgress
+        Test.TerrainRender2D.CellsWork
         Test.TerrainRender2D.Fixtures
         Test.TerrainRender2D.Generated
         Test.TerrainRender2D.MapAssets

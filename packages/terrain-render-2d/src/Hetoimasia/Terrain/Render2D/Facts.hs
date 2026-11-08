@@ -108,7 +108,9 @@ data Availability
   | -- | Only the listed intervals of the listed chunks are ready. Built by
     -- 'mkAvailability', which keeps each list sorted, disjoint and coalesced
     -- so that a seam between two adjacent ready intervals is invisible.
-    KnownIntervals !(Map.Map ChunkKey [(Integer, Integer)])
+    -- Each chunk's intervals are keyed by their first level, so a query visits
+    -- only the intervals that meet its window, never the others.
+    KnownIntervals !(Map.Map ChunkKey (Map.Map Integer Integer))
   deriving stock (Eq, Show)
 
 -- | The availability of the listed intervals. A chunk listed with no interval
@@ -116,9 +118,10 @@ data Availability
 mkAvailability ∷ [(ChunkKey, [ZRange])] → Availability
 mkAvailability entries =
   KnownIntervals
-    ( Map.fromListWith
-        (\new old → merge (old <> new))
-        [(key, merge [(zRangeLo r, zRangeHi r) | r ← ranges]) | (key, ranges) ← entries]
+    ( Map.map Map.fromDistinctAscList $
+        Map.fromListWith
+          (\new old → merge (old <> new))
+          [(key, merge [(zRangeLo r, zRangeHi r) | r ← ranges]) | (key, ranges) ← entries]
     )
   where
     merge = coalesce . sortOn fst
@@ -135,8 +138,15 @@ unknownPieces availability key lo hi = [(a, b) | (a, b, False) ← pieces availa
 pieces ∷ Availability → ChunkKey → Integer → Integer → [(Integer, Integer, Bool)]
 pieces _ _ lo hi | lo >= hi = []
 pieces AllKnown _ lo hi = [(lo, hi, True)]
-pieces (KnownIntervals chunks) key lo hi = go lo (Map.findWithDefault [] key chunks)
+pieces (KnownIntervals chunks) key lo hi = go lo relevant
   where
+    -- The intervals meeting @[lo, hi)@: the one that starts before @lo@ and
+    -- reaches it, then those that start inside. The rest of the chunk's
+    -- intervals are never visited, however many there are.
+    intervals = Map.findWithDefault Map.empty key chunks
+    relevant =
+      [(a, b) | Just (a, b) ← [Map.lookupLT lo intervals], b > lo]
+        <> Map.toAscList (Map.takeWhileAntitone (< hi) (Map.dropWhileAntitone (< lo) intervals))
     go from _ | from >= hi = []
     go from [] = [(from, hi, False)]
     go from ((a, b) : rest)
