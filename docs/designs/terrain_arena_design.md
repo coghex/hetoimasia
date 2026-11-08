@@ -4264,8 +4264,11 @@ once its prerequisites exist; no numeric ID grants parallel edit authority.
 - **Outcome/scope:** implement P-9's complete logical catalog, including the
   ID-15 central half-height peak, exact rotated facet/portal geometry and
   closed-solid point/ray behavior. Keep coordinate/source identities intact.
-- **Phase:** amendment geometry. **Depends on:** TRA-1. **Ordering:** critical
-  prerequisite shared by rendering and discovery.
+- **Phase:** amendment geometry. **Depends on:** TRA-1 and the baseline TRA-8
+  completion. **Ordering:** critical prerequisite shared by rendering and
+  discovery. Complete the held baseline first so its review/evidence is not
+  changed underneath it by the ID-15 correction; this is a delivery dependency,
+  not a graphics import into the pure terrain library.
 - **Relevant decisions:** D-34–D-36, D-44, D-49; P-9.
 - **Acceptance:** independent all-16/four-facing solid and positive-area
   portal tests, diagonal paths versus edge/point contacts, exact boundaries
