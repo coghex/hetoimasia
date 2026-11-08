@@ -57,6 +57,11 @@ cabal test hetoimasia-tests --test-show-details=direct
   the colour policy's charges), the generic binary-coverage plane (bits, partial bytes, row order, the first nonbinary texel), the
   exact normalized sampling rule at representable boundaries, and the `unit-normal-rgb-v1` validator. A new decoder or data-map
   rule belongs there.
+- `terrain-tests` (`packages/terrain/test/`, group `test.terrain`, the CPU project) owns the pure terrain kernel. Its
+  connectivity examples (TRA-18: `Test.Terrain.Connectivity`, `Test.Terrain.ConnectivityBounds`, with the independent flood
+  oracle `Test.Terrain.ConnectivityOracle` and the deterministic generators `Test.Terrain.ConnectivityFixtures`) own the
+  symbolic source compiler's contract: exact component families, exterior, canonical keys, the six preparation limits, quanta,
+  typed refusal and scale-independence. A new connectivity rule belongs there, not in a parallel suite.
 - `terrain-runtime-tests` (`packages/terrain-runtime/test/`, TRA-4) owns the
   scoped transactional terrain service, composed by
   `Test.TerrainRuntime.Spec`: the cancel, stage and commit races in the arrival and

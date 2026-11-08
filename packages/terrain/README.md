@@ -8,8 +8,9 @@ coverage and picking will share; TRA-13 corrected identity 15 to the approved
 central peak and added the exact empty-space openings and their connections
 between neighboring cells. TRA-2 adds the immutable layered source, the
 packed sparse resident-detail representation and the retained-removal overlay
-with the queries over them, and TRA-3 the pure residency and admission model
-over them. It is a data, query and decision kernel, not a world store:
+with the queries over them, TRA-3 the pure residency and admission model
+over them, and TRA-18 the bounded symbolic compiler of the source's empty-space
+connectivity. It is a data, query and decision kernel, not a world store:
 transactional ownership, revisions and live offload (TRA-4), Lua copying
 (TRA-5), input, camera, rendering and arena assembly belong to later slices.
 
@@ -19,6 +20,7 @@ transactional ownership, revisions and live offload (TRA-4), Lua copying
 | `Hetoimasia.Terrain.Shape` | The 16-shape catalog, sides, quarter turns, view facings |
 | `Hetoimasia.Terrain.Geometry` | The canonical unit-cell solid, face coverage, membership, ray and segment queries |
 | `Hetoimasia.Terrain.Opening` | The exact empty components of a cell, their portals on the six faces, and the connections between neighbors |
+| `Hetoimasia.Terrain.Connectivity` | The exact, bounded, resumable compilation of a source's empty-space connectivity: component families, canonical keys, ranges, portal relations, compressed boundaries, initial upper-Z exterior |
 | `Hetoimasia.Terrain.Cell` | Authored materials, the air-or-solid cell value, half-open Z intervals, columns |
 | `Hetoimasia.Terrain.Source` | The declarative layered source: definition, validation, limits and byte accounting |
 | `Hetoimasia.Terrain.Changes` | Retained removals: canonical intervals, whole-cell removal, merge and restore |
@@ -423,6 +425,166 @@ that leaves the previous value untouched. `emptyChanges` is a fresh session;
 intervals. `changesBytes` accounts 16 bytes per interval and 48 per column index
 entry. The revision counter, admission reservation and cancellation arbitration
 around a commit belong to TRA-4.
+
+## Source connectivity
+
+`Hetoimasia.Terrain.Connectivity` compiles a validated `Source` into the exact
+connectivity of its empty space: which air spaces connect, which are initially
+exterior, and a canonical identity for every connected component. It is pure and
+CPU-only, instantiates no column, air cell or buried solid cell, and does not
+open an arena, discover sealed space, hold knowledge or apply edits (TRA-19 to
+TRA-22 do). Preparing connectivity needs only the source: the immutable result
+is what a later service keeps beside it.
+
+### What is exact
+
+Two empty spaces connect exactly when a chain of cells joins them in which every
+consecutive pair shares a face and their portals on it overlap over positive
+area, as [Openings and connections](#openings-and-connections) defines (shape 0
+the full block, identity 15 the central half-height peak, no nonflat shape with a
+bottom opening of positive area). Edge and point contact never connects, there is
+no tolerance and no blanket 26-neighbour rule, so a real diagonal path through
+shaped voids exists exactly where a face-by-face chain does. The compiler never
+asks about bounding boxes, shape bits or rendered alpha. It derives every fact
+from `Opening`: which pairs of the 17 content kinds (air and the 16 identities)
+connect along each axis, whether a kind has any void and whether its top face
+opens, by asking about a representative pair of tiles.
+
+### Representation: boxes, parameters and classes
+
+The compiler cuts each axis where the source can change: every layer and patch
+boundary and the cell below it, every patch column with its face neighbours on X
+and Y, and the supported extremes (the upper endpoint `2^62` kept separately, and
+the topmost level isolated). The cuts make a lattice whose boxes each hold one
+kind of content, so a box is described by its kind and extents, never by its
+cells. A box with void is a *node*; a full block is no node.
+
+A node has no parameter on an axis along which its cells connect. An axis along
+which they do not keeps the cell's coordinate as a *parameter* of the component.
+A covered uniform N-ramp layer is therefore one node whose components are
+indexed by row and by level (the south face is sealed and the north face open, so
+rows never join, and no nonflat shape opens at the bottom, so levels never join);
+the same layer of E ramps is indexed by column and level; a plane family of
+connected shapes by level alone. A parameter spanning many members never claims
+those members are mutually connected.
+
+Two nodes that share a whole face and connect across it form one *class* and are
+a *portal relation*. The join identifies the nodes' parameters, and removes a
+parameter when one side has none: an air shaft that joins a vast range of repeated
+layers removes their level parameter, so the shaft costs a few nodes and
+relations, not one per level. A full-block patch splits a channel into fragments
+the cuts already separate. A component is a class plus the values of its
+remaining parameters. The lattice is refined at each patch column so that every
+relation joins whole faces; a relation that would join part of a box would be a
+defect, and the compiler refuses it as `Inconsistent` instead of guessing.
+
+The lattice is a product of the per-axis cuts, so its size grows with the number
+of distinct patch columns and boundaries, polynomially, never with an interval's
+span or the number of identical members. That is the cost this design accepts: a
+source with many scattered patches in default void-bearing content exceeds the
+node, relation or work limit and is refused with the typed `source_complexity`
+refusal below, and no dense fallback exists. The required fixtures (the flat
+source, world-spanning and shafted air, all-16 cavities, and the huge ramp,
+channel and layer families with their patches) fit the approved defaults.
+
+### Identity, lookup and queries
+
+`ComponentKey` is the origin of the class's first box in (z, y, x) order and the
+parameter values the class keeps. It depends on the validated source and the
+member's parameters alone, never on chunk-load order, query order or how the
+preparation was divided into quanta, and the module promises no public encoding
+and no equivalence between differently authored but semantically equal recipes.
+`lookupVoid` addresses a void of a cell, so it stays correct for a future shape
+with more than one; a full block answers `NoVoid` explicitly, never air and
+never unknown, and an index the cell lacks answers `NoSuchVoid`. The compiler
+addresses one void per cell and refuses (`Unsupported`) a catalog with more.
+`componentRanges`, `componentRelations` and `componentBoundary` describe a
+component by the boxes of its class, with its parameters applied: a boundary is a
+set of rectangles of cells with the face and what lies across (a limit, solid
+tiles or tiles of another component), at most six per box, so later discovery can
+look up a component's or range's boundary without enumerating exposed tiles.
+
+### Initial exterior
+
+A component is initially exterior exactly when it connects through positive-area
+openings to the upper Z boundary, unobstructed sky included. The X and Y limits
+and the lower Z limit open nothing: a covered air slab that spans the horizontal
+limits stays sealed, a full block at the highest cell supplies no opening, and a
+shape's actual top portal reaches the outside. The classification is symbolic (a
+topmost node is exterior when its kind's top face opens) and floods no sky and
+allocates no boundary cell. Sealed components stay sealed whatever is queried or
+resident; the result is initial metadata, not a discovered-tile set.
+
+### Bounded, resumable preparation
+
+`startPreparation` returns a suspended `Preparation`; `resumePreparation q` runs
+at most `q` counted steps and returns `Pending`, `Complete` or `Refused`. A
+refusal exposes no partial index, dropping a `Preparation` discards it with no
+effect on any other value, and there are no threads, I/O or clocks. A request for
+zero, a negative count or more than the configured quantum is refused, never
+clamped. Fair scheduling, cancellation acknowledgment and the release of shared
+admission reservations belong to the later service.
+
+| Resource | Initial approved bound |
+| --- | --- |
+| Complete compiled connectivity per arena | 16 MiB |
+| Peak compilation, including its result | 48 MiB |
+| Structural nodes | 65,536 |
+| Portal relations | 262,144 |
+| Total compilation work | 8,388,608 counted steps |
+| One preparation quantum | at most 1,024 steps |
+
+A MiB is `2^20` bytes. The limits go through `mkConnectivityLimits`, whose
+constructor and fields are private (as for the residency limits): each field has a
+documented range (bytes in `[1, 2^40]`, nodes and relations in `[1, 2^32]`, work in
+`[1, 2^48]`, the quantum in `[1, 1024]`, the peak at least the result), and a
+figure outside it is refused by field with a `LimitError`, never clamped and never
+reported as `source_complexity`.
+
+A *step* is one of: forcing one entry of the 867-entry connection table (one exact
+portal comparison), adding one authored layer, patch column or patch interval to
+the cuts, classifying one lattice box, testing one node against one neighbour (and
+recording the relation, at most three union-find operations of at most `log2 nodes`
+hops), folding one mark or node into the canonical result, or assembling it. Each is
+a constant number of operations on containers the limits bound, so no step scans a
+coordinate extent, an unbounded container or an arbitrary recipe. Coordinates are
+`Int64` inside `[-2^62, 2^62]` or `Integer`; extents are compared without
+subtraction (`2^62 - (-2^62)` overflows `Int64`), and every sum that could leave a
+limit is formed in `Integer` and compared first. The lattice is refused up front,
+with the work it implies, when it alone exceeds the remaining work.
+
+Bytes are conservative admission figures, not heap or RSS, charged before the
+allocation or work they pay for: the constants `headerResultBytes` (512),
+`cutResultBytes` (48), `nodeResultBytes` (160), `memberResultBytes` (40),
+`classResultBytes` (96) and `relationResultBytes` (64) for the retained result, and
+`nodeTempBytes` (512) for the union-find state and marks that exist until
+canonicalization ends. The peak is the result plus those temporaries at any
+moment. The connection table is a constant shared by the process and is charged as
+work, not as bytes. A valid source whose connectivity needs more than a limit is
+refused with a typed `Refusal` naming the `Resource` (result bytes, peak bytes,
+structural nodes, portal relations or work steps) and the needed and limit
+figures; the later integration maps any such refusal to the Lua domain code
+`source_complexity`.
+
+### What is charged to whom
+
+The source definition (at most 256 KiB and 8,192 authored runs, enforced by
+`mkSource`) is shared immutable input. Its bytes stay governed by
+`sourceDefinitionBytes` and the existing independent source limit; they are
+excluded from this compiler's result and peak figures (declaring a thousand more
+materials changes none of them, and a test pins that), and this slice invents no
+resident-bank charge for them: any charge for the retained source itself is the
+arena-admission integration's choice. Only newly derived metadata is accounted:
+the compiled result is charged once per arena to the 256 MiB resident terrain bank
+by the later service, and the temporaries of the one compilation active per
+session are charged to the same bank while they exist. This module creates no
+bank, service, semaphore or session owner.
+
+### State, owner and lifetime
+
+None. A `Connectivity` is built whole and never mutated; a `Preparation` is a
+suspended pure computation; nothing here has an owner, thread, queue, reset or
+disposal.
 
 ## Packed storage
 
@@ -993,7 +1155,28 @@ the specific diagnostic that names the cause. The residency examples drive the m
 with controlled events (no thread, sleep or deadline), recompute every ledger from
 the model's records after each step, run the model beside the real source, changes
 and resident detail across repeated edit, handoff, evict and reconstruct cycles, and
-check the structural invariants over randomized event sequences.
+check the structural invariants over randomized event sequences. The connectivity
+examples (TRA-18) compare the compiler with an independent flood model
+(`Test.Terrain.ConnectivityOracle`) that shares no code with it: it re-derives each
+shape's top from the stated height rule, decides whether two cells connect by exact
+rational sampling of the shared face, and floods a finite window cell by cell. The
+generated comparisons (`Test.Terrain.ConnectivityFixtures`, SplitMix64 seeds named in
+each example) cover sealed rooms of every default kind (air and all 16 identities,
+hence all four rotations of each orientable shape) with random air, block and shape
+patches, covered open worlds whose window reproduces the unbounded plane around
+them, open-top worlds whose air reaches the real upper limit, and rooms at the
+coordinate extremes; each compares void against no-void, the partition into
+components as a bijection with the keys, exterior, range membership, portal relations
+(sound, and with each box's interior connections complete) and every boundary face.
+Hand-stated fixtures check the flat source, wholly air terrain, covered and shafted
+slabs, uniform ramp families in two rotations, patch splits and joins and negative
+seams at spans of `2^20` and `2^60`. Negative controls (a family merged into one
+component, a level dropped from a family, a side limit called exterior) must be
+rejected by the same comparison. `Test.Terrain.ConnectivityBounds` tests every
+configured bound at its exact boundary and one below it, quanta of 1, 17 and 1,024,
+refusals, scale-independence of the structure counts and accounted bytes, and the
+runtime's own allocation read with `GHC.Stats` (measured allocation, not admission
+bytes and not RSS).
 
 ## Consumers
 
