@@ -2,6 +2,7 @@
 module Test.Terrain.Spec (spec) where
 
 import Test.Hspec (Spec, describe)
+import qualified Test.Terrain.Connectivity as Connectivity
 import qualified Test.Terrain.Coordinate as Coordinate
 import qualified Test.Terrain.Geometry as Geometry
 import qualified Test.Terrain.Growth as Growth
@@ -27,6 +28,7 @@ spec = describe "Terrain" $ do
   Source.spec
   Segment.spec
   Query.spec
+  Connectivity.spec
   Resident.spec
   Residency.spec
   ResidencyCycle.spec
