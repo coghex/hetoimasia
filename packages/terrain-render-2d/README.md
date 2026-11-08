@@ -582,19 +582,28 @@ A quad is omitted only with a coverage proof: its east, south and upper neighbou
 are each drawn with coverage **proved**, from the adopted planes themselves, to be
 the whole hexagon (fog, or a full block whose colour and map both cover it). An
 unavailable neighbour is neither air nor a proof, a mixed neighbour is not a proof
-and a colour with a hole proves nothing. Runs, not levels, are walked, so cost
-follows run boundaries and exposed cells, not depth.
+and a colour with a hole proves nothing. The supplied full-block map is itself
+checked from the planes: it must cover itself translated to the three cells that
+can hide one (east, south, above) and contain every catalog map, otherwise no asset
+is a covering proof and nothing is omitted as hidden. Runs, not levels, are walked,
+so cost follows run boundaries and exposed cells, not depth, and a column's
+knowledge runs are searched by interval, so a window never visits runs outside it.
 
 ### Bounded, resumable preparation
 
 `startCells` reads nothing. `stepCells` examines at most `clStepCandidates`
-candidate columns (and stops between columns past `clStepLevels`), **nearest row
-first**; `cellPlanOf` returns the plan reached so far, publishable at any point.
-`planCells` runs to settled or to a bound. A column is admitted whole or not at
-all, so a mixed cell's fog and known parts are never split. Plan-wide bounds
-(`clColumns`, `clLevels`, `clInstances` at most 2^24, `clPending`) **halt** with the
-remainder explicitly unresolved (`Halted`); nothing is truncated and called
-complete. The unprocessed candidate columns are `cellPlanUnresolved`; a valid
+candidate columns and admits at most `clStepLevels` levels (a level is one drawn
+cell, with all its parts, or one pending span), **nearest row first**; both step
+bounds must be at least one (a zero bound is a refused configuration). The level
+bound may fall inside a column: the column then stays at the cursor with its
+admitted units counted and the next step resumes it, so one step never admits
+more than its bound however tall the column. `cellPlanOf` returns the plan reached
+so far, publishable at any point. `planCells` runs to settled or to a bound. A
+cell is admitted whole or not at all, so a mixed cell's fog and known parts are
+never split. Plan-wide bounds (`clColumns`, `clLevels`, `clInstances` at most 2^24,
+`clPending`) **halt** with the remainder explicitly unresolved (`Halted`), the
+halting column included from its first unadmitted unit; nothing is truncated and
+called complete. The unprocessed candidate columns are `cellPlanUnresolved`; a valid
 camera larger than one plan's capacity is therefore never an invalid camera. With
 sufficient capacity and unchanged inputs repeated steps reach `Settled` with the
 plan one unbounded pass gives. A continuation, or a plan, made under a different
