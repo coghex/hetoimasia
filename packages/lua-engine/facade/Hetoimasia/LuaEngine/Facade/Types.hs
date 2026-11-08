@@ -389,7 +389,10 @@ data GraphicsServices = GraphicsServices
   -- ^ The VM's lending, which its owner is configured with.
   , gsLeases ∷ !Leases
   -- ^ The VM's lease scope, which its owner is configured with: capacity above every texture and window the
-  -- instance's M1 reservations let coexist.
+  -- instance's reservations let coexist.
+  , gsLeaseCapacity ∷ !Int
+  -- ^ The capacity 'gsLeases' was made with, for one instance. The owner's collection must be able to hold every live
+  -- instance at it, so the session sizes the owner's member limit from this number.
   , gsTypes ∷ ![CapabilityType]
   -- ^ The lease handle types (@texture@, @window@) over 'gsLeases'.
   , gsEndpoints ∷ ![RequestEndpoint]

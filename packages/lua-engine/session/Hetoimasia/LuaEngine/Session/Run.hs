@@ -269,6 +269,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , unwatchScheduledAccounting
   , watchScheduledAccounting
   , cancelScheduled
+  , defaultMemberLimit
   , grantScheduledStep
   , grantScheduledStepSTM
   , retireScheduled
@@ -992,6 +993,8 @@ withRoleVm env info body = do
                 , scheduledRequestHandles = Just handles
                 , scheduledLending = gsLending <$> graphics
                 , scheduledLeases = gsLeases <$> graphics
+                , -- the collection holds every live instance at the lease capacity, which is derived from the byte limits
+                  scheduledMemberLimit = maximum (defaultMemberLimit : [liveBound * gsLeaseCapacity services | Just services ← [graphics]])
                 , scheduledRequests = Just (RequestGrant (facadeRequestEndpoints facade) (fromIntegral perVm) timing)
                 , scheduledLoader = Just (coordinatorPlan coordinator)
                 , scheduledClock = sxClock spec

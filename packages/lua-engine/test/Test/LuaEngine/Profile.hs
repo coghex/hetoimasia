@@ -49,8 +49,8 @@ expectedBytes =
   , (PngEncodedBytes, 32 * mib)
   , (PngInflatedScanlineBytes, 40 * mib)
   , (PngPipelineWorkspaceBytes, 128 * mib)
-  , (TextureBytesPerUiInstance, 128 * mib)
-  , (TextureBytesPerSession, 256 * mib)
+  , (TextureBytesPerUiInstance, 512 * mib)
+  , (TextureBytesPerSession, gib)
   , (WindowTitleBytes, 512)
   , (NativeAccountedBytes, 2 * gib)
   ]
@@ -77,7 +77,6 @@ expectedCounts =
   , (PngChunks, 4096)
   , (PngAxisMaximum, 2048)
   , (PngPixels, 4194304)
-  , (TextureLeasesPerUiInstance, 16)
   , (WindowSlotsPerUiInstance, 1)
   , (WindowExtentMaximum, 4096)
   , (CoordinateMagnitude, 1000000)

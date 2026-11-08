@@ -595,8 +595,8 @@ enters Lua, waits or keeps a registry that outlives the VM it was made for.
 
 **Lease headroom (the derivation).** Memory is the only bound on the textures a UI instance holds (owner decision 2026-11-08): there is
 no count of textures. A VM's lease scope has room for the most textures the instance's byte bank can hold, plus the window slots, for
-each instance (`facadeLeaseCapacity`): `TextureBytesPerUiInstance ÷ 4 KiB + WindowSlotsPerUiInstance` = 512 MiB ÷ 4 KiB + 1 = 131,073
-under the fixed M1 profile. Every texture is charged at least 4 KiB in the instance's bank (and the session's), so the bank holds at most
+each instance (`facadeLeaseCapacity`): `TextureBytesPerUiInstance ÷ 4 KiB + WindowSlotsPerUiInstance + 1` = 512 MiB ÷ 4 KiB + 1 + 1 = 131,074
+under the fixed M1 profile (the last lease is headroom: the host reserves a request's result lease before the provider's byte credit, so with every texture the bank holds and the window held, a capacity of exactly textures plus windows would refuse the next texture request on the lease; with the headroom the request reaches the bank and is refused on bytes). Every texture is charged at least 4 KiB in the instance's bank (and the session's), so the bank holds at most
 `TextureBytesPerUiInstance ÷ 4 KiB` textures, pending, live or retiring; both that bank and the window's one slot are charged by the
 providers in the same atomic admission as the host's lease charge, and answer `busy` when full. The bank therefore refuses first, for
 every validated profile, and the host's lease capacity, which would fault the invocation, cannot be the first bank to answer. The

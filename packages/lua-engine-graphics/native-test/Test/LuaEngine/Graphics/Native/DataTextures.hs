@@ -207,7 +207,7 @@ spec env = describe "validated data texture pixels (TRA-15)" $ do
           line `shouldSatisfy` Text.isInfixOf "code=invalid_image"
           line `shouldSatisfy` Text.isInfixOf policy
       owner ← ownerOf vm "a"
-      atomically (ownerReading owner >>= \reading → unless (ownerSlotsHeld reading == 0 && ownerNominalHeld reading == 0) retry)
+      atomically (ownerReading owner >>= \reading → unless (ownerTexturesHeld reading == 0 && ownerNominalHeld reading == 0) retry)
       -- Nothing was uploaded or registered, so nothing a draw could sample exists: the table's marks and the live count are
       -- what they were, and the shared CPU account holds nothing.
       retainedEntries (graphicsTextures (envGraphics env)) `shouldReturn` marksBefore
@@ -234,7 +234,7 @@ releaseAll comp vm who keys = do
     command comp vm who "release" key
     awaitNoteContaining comp (who <> " release " <> key) >>= \_ → pure ()
   owner ← ownerOf vm who
-  atomically (ownerReading owner >>= \reading → unless (ownerSlotsHeld reading == 0) retry)
+  atomically (ownerReading owner >>= \reading → unless (ownerTexturesHeld reading == 0) retry)
 
 -- | A composition over the session's production backend with these files.
 withComposition' ∷ Env → (Composition → Vm → IO a) → IO a

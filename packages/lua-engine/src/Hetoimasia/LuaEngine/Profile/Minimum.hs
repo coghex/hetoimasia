@@ -9,7 +9,7 @@
 -- be a promise the engine cannot keep: the whole-record cap of a failure (whose schema words, a code, a stage and a role,
 -- cannot be shortened), the bound on an instance identity (the first one the session issues must fit), the bound on one
 -- @print@ or @warn@ (a warning must still be able to name its writer), and the bound on a copied value (the engine's own
--- context record and texts must cross). A texture holds at least one RGBA8 pixel, and a scene of one sprite is its fixed
+-- context record and texts must cross). A texture holds at least one RGBA8 pixel and is charged at least 'textureMinimumChargeBytes', and a scene of one sprite is its fixed
 -- elements and one sprite's. Validation refuses a value below these ('LimitBelowMinimum'), after the ceilings and before
 -- the relations, so that a profile it accepts can be used by the engine without a second refusal at the point of use.
 --
@@ -66,8 +66,10 @@ minimumBytes spec = \case
   CopiedValueBytes → fromIntegral (minimumCopiedValueBytes identity (fromIntegral (rawOf (specBytes spec PrintWarnBytes))) texts)
   -- one RGBA8 pixel: the least output a texture has
   PngPipelineWorkspaceBytes → rgba8BytesPerPixel
-  TextureBytesPerUiInstance → rgba8BytesPerPixel
-  TextureBytesPerSession → rgba8BytesPerPixel
+  -- the least a texture is charged: a bank that cannot hold one cannot admit any texture. That the instance bank also
+  -- holds the admission's reservation (the largest legal level) is a relation, 'OutputWithinTextureBytesPerUi'.
+  TextureBytesPerUiInstance → textureMinimumChargeBytes
+  TextureBytesPerSession → textureMinimumChargeBytes
   -- every other byte limit is a cap on what comes in, or on a text cut visibly to it: the least positive value
   _ → 1
   where

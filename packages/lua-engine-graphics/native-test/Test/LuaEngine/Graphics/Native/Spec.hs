@@ -13,7 +13,8 @@
 module Test.LuaEngine.Graphics.Native.Spec (spec, within, withLoaded, load, decoded', release', noWindows) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
-import Control.Monad (unless)
+import Control.Monad (forM, forM_, unless)
+import Data.List (nub)
 import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.ByteString as ByteString
@@ -58,6 +59,20 @@ spec env = describe "the texture backend on a real device, with no window" $ do
 
   it "accepts the largest legal level, 2,048 by 2,048, through the configured staging and registers it" $
     within 120 . withLoaded env [("big.png", Png.solid 2048 2048 (200, 100, 50, 255))] $ \comp vm → do
+      -- The first level this large the session allocates may need a memory block of its own, because the table's lookup ring
+      -- (versions x capacity x 8 bytes, 20 MiB for the fixed profile) now fills the block the first allocations share; the
+      -- allocator keeps one emptied block for reuse (vendor/vma/vk_mem_alloc.h, "We now have one empty block - leave it. A
+      -- hysteresis to avoid allocating whole block back and forth"; docs/gpu_backend.md, "VMA's retained empty block stays
+      -- charged until VMA frees it"), and the model's bytes count it. A first load and release of an instance of its own
+      -- settles that, and the session's rest is read after it. The load and release below are then a SECOND cycle, and it must
+      -- return the bytes, objects and resources exactly to that rest: a leak would show there, and the banks' own returns are
+      -- asserted exact elsewhere (observed on the Linux software device without the warm-up: after the release the objects
+      -- and resources were at rest and the bytes one retained block, 128 MiB, above it).
+      restBefore ← restNow env
+      _ ← loadWith comp vm "warm" "w" "big.png" (\_ → pure ())
+      release' env comp vm "warm" "w"
+      awaitWithin env "the warm-up's objects and resources returning" (\now → usageObjects now == usageObjects restBefore && usageResources now == usageResources restBefore)
+      markRest env
       atRest ← restNow env
       identity ← loadWith comp vm "a" "k" "big.png" (\line → line `shouldSatisfy` Text.isInfixOf "width=2048")
       during ← usageNow env
@@ -67,7 +82,7 @@ spec env = describe "the texture backend on a real device, with no window" $ do
       registeredMark (graphicsTextures (envGraphics env)) (textureHandleOf (fromIntegral identity)) `shouldReturn` Just True
       evidence env ("2048x2048: accounting at rest " <> summarise atRest <> "; while live " <> summarise during <> "; the configuration budgets " <> tshow (accountingNativeBytes (configurationAccounting (graphicsConfiguration (envGraphics env)))) <> " native bytes of " <> tshow (accountingNativeLimit (configurationAccounting (graphicsConfiguration (envGraphics env)))))
       release' env comp vm "a" "k"
-      awaitUsage env (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
+      awaitWithin env "the second cycle returning to the warmed rest" (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
 
   it "loads the same content independently for two instances, and ending one leaves the other's texels" $
     within 90 . withLoaded env [("tiny.png", Png.asymmetric 8 4)] $ \comp vm → do
@@ -81,7 +96,7 @@ spec env = describe "the texture backend on a real device, with no window" $ do
       stopInstance comp vm "a"
       _ ← awaitFailure comp "a"
       ownerA ← ownerOf vm "a"
-      atomically (ownerReading ownerA >>= \reading → if ownerSlotsHeld reading == 0 then pure () else retry)
+      atomically (ownerReading ownerA >>= \reading → if ownerTexturesHeld reading == 0 then pure () else retry)
       second ← draw env two decoded
       shotFailed second `shouldBe` []
       shotDeterminate second `shouldSatisfy` (> 20)
@@ -104,10 +119,49 @@ spec env = describe "the texture backend on a real device, with no window" $ do
       taken ← awaitNoteContaining comp "a wait_take k"
       taken `shouldSatisfy` Text.isInfixOf "cancelled"
       owner ← ownerOf vm "a"
-      atomically (ownerReading owner >>= \reading → if ownerSlotsHeld reading == 0 && ownerNominalHeld reading == 0 then pure () else retry)
+      atomically (ownerReading owner >>= \reading → if ownerTexturesHeld reading == 0 && ownerNominalHeld reading == 0 then pure () else retry)
       awaitUsage env (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
       retainedEntries (graphicsTextures (envGraphics env)) `shouldReturn` marks
       evidence env "a request cancelled while its completed upload was still hidden from the backend registered nothing and drained"
+
+  it "registers well over the table's former 33 slots at once, 150 tiny textures held together, each registered in a slot of its own, from a table sized by the profile's bytes, and retires them all" $
+    within 170 . withLoaded env [("pixel.png", Png.solid 1 1 (10, 20, 30, 255))] $ \comp vm → do
+      noWindows env
+      atRest ← restNow env
+      let accounting = configurationAccounting (graphicsConfiguration (envGraphics env))
+      -- the table the host was built with is the fixed profile's derived capacity (1 GiB over 4 KiB, and slot 0), not the 33 of a count
+      accountingTableCapacity accounting `shouldBe` 262145
+      admit comp vm "a"
+      identities ← forM [0 .. 149 ∷ Int] $ \n → do
+        let key = "t" <> tshow n
+        commandLoad comp vm "a" key "pixel.png" False
+        command comp vm "a" "wait_take" key
+        line ← awaitNoteContaining comp ("a wait_take " <> key <> " ")
+        line `shouldSatisfy` Text.isInfixOf "status=success"
+        command comp vm "a" "use" key
+        used ← awaitNoteContaining comp ("a use " <> key <> " ")
+        case Text.decimal (last (Text.words used)) of
+          Right (identity, _) → pure (identity ∷ Integer)
+          Left reason → assertFailure ("the identity was not a number: " <> reason)
+      -- all 150 are held now: the owner counts them, each charged the minimum, and the table gave each its own slot
+      owner ← ownerOf vm "a"
+      reading ← atomically (ownerReading owner)
+      (ownerTexturesHeld reading, ownerNominalHeld reading) `shouldBe` (150, 150 * 4096)
+      let slots = [refIndex (textureRefOf (fromIntegral identity)) | identity ← identities]
+      length (nub slots) `shouldBe` 150
+      -- (the handle's index counts the table's registrations from zero: the placeholder is the table's own entry, not a handle)
+      marks ← mapM (registeredMark (graphicsTextures (envGraphics env)) . textureHandleOf . fromIntegral) identities
+      marks `shouldSatisfy` all (/= Nothing)
+      live ← atomically (graphicsReading (envGraphics env))
+      readingLiveTextures live `shouldSatisfy` (>= 150)
+      evidence env ("150 one-pixel textures held at once in slots " <> tshow (minimum slots) <> " to " <> tshow (maximum slots) <> " of a table of " <> tshow (accountingTableCapacity accounting) <> ", the former count's 33 passed")
+      forM_ [0 .. 149 ∷ Int] $ \n → do
+        let key = "t" <> tshow n
+        command comp vm "a" "release" key
+        _ ← awaitNoteContaining comp ("a release " <> key <> " ")
+        pure ()
+      atomically (ownerReading owner >>= \held → if ownerTexturesHeld held == 0 && ownerNominalHeld held == 0 then pure () else retry)
+      awaitUsage env (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
 
   it "returns the model's native accounting to what the session held at rest" $ do
     rest ← restNow env
@@ -211,7 +265,7 @@ release' _ comp vm who key = do
   command comp vm who "release" key
   _ ← awaitNoteContaining comp (who <> " release " <> key)
   owner ← ownerOf vm who
-  atomically (ownerReading owner >>= \reading → if ownerSlotsHeld reading == 0 then pure () else retry)
+  atomically (ownerReading owner >>= \reading → if ownerTexturesHeld reading == 0 then pure () else retry)
 
 noWindows ∷ Env → IO ()
 noWindows env = atomically (hostWindowIdentities (vulkanWindowHost (envHost env))) `shouldReturn` []
@@ -247,3 +301,14 @@ evidence env line = atomically (modifyTVar' (envEvidence env) (line :))
 
 tshow ∷ Show a ⇒ a → Text
 tshow = Text.pack . show
+
+-- | Wait, in STM on the owner's own evidence, for the model's accounting to read like this, but only so long: a reading that
+-- never comes fails the example here with what was measured, never at the group's own deadline.
+awaitWithin ∷ Env → Text → (Usage → Bool) → IO ()
+awaitWithin env what wanted =
+  timeout 20000000 (awaitUsage env wanted) >>= \case
+    Just () → pure ()
+    Nothing → do
+      rest ← restNow env
+      now ← usageNow env
+      assertFailure ("waited 20 s for " <> Text.unpack what <> "; rest read " <> Text.unpack (summarise rest) <> "; now " <> Text.unpack (summarise now))

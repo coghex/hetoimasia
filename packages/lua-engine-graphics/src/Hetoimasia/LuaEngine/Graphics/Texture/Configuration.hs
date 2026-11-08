@@ -24,16 +24,16 @@
 -- |                                    | for each texture lane (2): 32 MiB                              |
 -- | upload turn budget                 | a quarter of a maximum level: 4 MiB                            |
 -- | upload queue                       | four for each lane: 8                                          |
--- | texture table capacity             | instances times the texture leases of one instance, plus       |
--- |                                    | slot 0's placeholder: 2 x 16 + 1 = 33                          |
+-- | texture table capacity             | the session's texture bytes over the minimum charge of a       |
+-- |                                    | texture, plus slot 0's placeholder: 1 GiB / 4 KiB + 1 = 262,145 |
 -- | texture table lookup versions      | aggregate frame slots + frame-less batches + 2: 10             |
 -- | ring and region window             | see below                                                      |
 -- +------------------------------------+---------------------------------------------------------------+
 --
 -- The sample's own smaller configuration (a 1 MiB staging buffer, a table of 16 slots) is not the
 -- engine's: its staging cannot admit the approved 16 MiB level, which this configuration's can,
--- padded to the staging's granule (a power of two no larger than a page), and its table holds the
--- approved texture slots of two instances. A constrained device is still not promised every maximum
+-- padded to the staging's granule (a power of two no larger than a page), and its table has room for
+-- every texture the session's byte bank can hold. A constrained device is still not promised every maximum
 -- allocation at once; the native backend answers a budget it cannot give as backpressure, and the
 -- backend retains the work.
 --
@@ -46,12 +46,26 @@
 -- three times as many sprites as the scene limit, which leaves room for the material records.
 -- 'Hetoimasia.Render.TwoD.Vulkan.defaultConfiguration' is left as it is.
 --
+-- = The table's capacity is derived, not chosen
+--
+-- There is no count of textures to size the table from (owner decision 2026-11-08: memory is the only bound). The
+-- table's capacity is /derived/ from the byte bank: every texture is charged at least
+-- 'Hetoimasia.LuaEngine.Profile.textureMinimumChargeBytes' in the session's bank, so the bank cannot hold more than
+-- 'Hetoimasia.LuaEngine.Profile.textureRoomPerSession' textures, and the table has that many slots and slot 0's
+-- placeholder. The bank therefore always refuses before the table can be full (a texture admitted past the bank would be
+-- a defect of the pipeline, not a refusal here), and the table's startup checks against the device's update-after-bind
+-- limits ('validateTableConfig' and the native table's own) are what a profile that asks for more than a device
+-- offers meets, at startup. The initial size equals the capacity, as before; the table's growth is the native
+-- backend's and is unchanged. Owner: this configuration (immutable once derived); the table's owner is the native
+-- renderer, on its thread, for the life of the host.
+--
 -- = Native accounting
 --
 -- 'accountedNativeBytes' is the sum the configuration asks of the native byte budget at its most: the
 -- staging buffer, the ring, the lookup versions (eight bytes an entry), and the nominal bytes of every
--- texture the profile lets a session hold. It must fit the profile's accounted native bytes, and does
--- by a wide margin. These are the allocations the native accounting charges, once each: the decoded
+-- texture the profile lets a session hold. It must fit the profile's accounted native bytes, and does:
+-- for the fixed profile it is 1,132,462,160 bytes (32 MiB staging, 4 MiB ring, 20,971,600 bytes of lookup entries
+-- and 1 GiB of texture bytes) against 2 GiB. These are the allocations the native accounting charges, once each: the decoded
 -- level the pipeline charges to its lane is CPU payload, the staging copy of it is the native
 -- accounting's, and the texture's image is charged for its lifetime and no other; a view of a level is
 -- never charged again.
@@ -108,6 +122,7 @@ import Hetoimasia.LuaEngine.Profile
   , countLimit
   , durationLimit
   , pngOutputBytes
+  , textureRoomPerSession
   )
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceStride)
@@ -128,8 +143,9 @@ data Accounting = Accounting
   , accountingStagingBytes ∷ !Word64
   , accountingTurnBytes ∷ !Word64
   , accountingQueue ∷ !Word64
-  , accountingTextureSlots ∷ !Word64
-    -- ^ The non-placeholder slots of the approved texture leases.
+  , accountingTableSlots ∷ !Word64
+    -- ^ The non-placeholder slots: the textures the session's byte bank can hold at the minimum charge
+    -- ('textureRoomPerSession'). Derived from bytes; not a limit beside them.
   , accountingTableCapacity ∷ !Word64
     -- ^ Those, and slot 0's placeholder.
   , accountingTableVersions ∷ !Word64
@@ -181,14 +197,12 @@ configurationFor profile = do
         , requestedIdleBackoffMilliseconds = idleMilliseconds
         }
   let lanes = count TexturePipelineLanes
-      instances = count InstancesPerVm
-      leases = count TextureLeasesPerUiInstance
       sprites = count SceneSprites
       batches = count FrameSlotsAggregate + count FramelessBatches
       staging = lanes * level
       turn = level `div` 4
       queue = 4 * lanes
-      slots = instances * leases
+      slots = textureRoomPerSession profile
       capacity = slots + 1
       versions = count FrameSlotsAggregate + count FramelessBatches + 2
       ring = alignUp (2 * batches * sprites * fromIntegral instanceStride) mebibyte
@@ -223,7 +237,7 @@ configurationFor profile = do
                     , accountingStagingBytes = staging
                     , accountingTurnBytes = turn
                     , accountingQueue = queue
-                    , accountingTextureSlots = slots
+                    , accountingTableSlots = slots
                     , accountingTableCapacity = capacity
                     , accountingTableVersions = versions
                     , accountingRingBytes = ring

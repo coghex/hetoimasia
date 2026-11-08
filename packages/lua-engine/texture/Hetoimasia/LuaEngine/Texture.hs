@@ -24,8 +24,8 @@
 --   I/O workers, LFE-10) and the inventory, adds one CPU decode worker and two lanes, and is given the
 --   backend. It owns every queue and record below; its scope ends only after every started read, decode
 --   and upload has retired and every texture it still holds has been released and proved retired.
--- * A /texture owner/ ('newTextureOwner') is one UI instance's banks: its 16 texture slots and 128 MiB of
---   nominal bytes. The instance's bindings hold it. There is no registry of owners, no global instance
+-- * A /texture owner/ ('newTextureOwner') is one UI instance's banks: its nominal bytes (512 MiB, the only
+--   bound on the textures it holds, with no count of textures). The instance's bindings hold it. There is no registry of owners, no global instance
 --   table and no environment record: ownership is a value passed to the bindings that need it.
 -- * A /lane/ is one of two pipeline lanes. A job holds one from the moment its read is started until the
 --   backend stops reading the decoded level, with a workspace bank of 128 MiB of accounted CPU payload.
@@ -45,10 +45,10 @@
 -- | coverage bytes        | the session's one CPU account (128 MiB),  | the last CPU interest in the   |
 -- | (@coverage="binary"@  | injected; worst case ceil (4,194,304 / 8) | loaded version (shrunk to the  |
 -- | only)                 | plane bytes and the fixed metadata        | exact plane at the decode)     |
--- | texture slot          | 16 pending/live/retiring per UI instance  | texture proved retired         |
--- | nominal RGBA8 bytes   | 16 MiB reserved; 128 MiB per instance,    | texture proved retired         |
--- |                       | 256 MiB per session                       | (shrunk after the decode stage |
--- |                       |                                           | validated the dimensions)      |
+-- | nominal bytes         | 16 MiB reserved; 512 MiB per instance,    | texture proved retired         |
+-- |                       | 1 GiB per session; at least 4 KiB for     | (shrunk after the decode stage |
+-- |                       | each texture, however small it decodes    | validated the dimensions, never|
+-- |                       |                                           | below the 4 KiB minimum)       |
 -- | accepted-work record  | the pipeline's job capacity               | request taken, work retired    |
 -- | queue slot            | the read pool's                           | request taken, read retired    |
 -- +-----------------------+-------------------------------------------+--------------------------------+
@@ -61,7 +61,7 @@
 -- reservations: that is accepted behavior. A file the inventory does not hold, or one over the
 -- 32 MiB source limit, is accepted and fails as @not_found@ or @too_large@ without a worker.
 --
--- The slot and the nominal bytes /transfer/ to the texture when the lease adopts it. They are not
+-- The nominal bytes /transfer/ to the texture when the lease adopts it. They are not
 -- returned when the request is taken, or when the pipeline's CPU buffers retire, or when Lua loses its
 -- handle: they are returned when the backend proves the texture itself retired.
 --
@@ -87,7 +87,7 @@
 -- injected 'RenderAccount' by a reservation made at the request's atomic admission, shrunk at the decode and
 -- passed to the version, and returned exactly once when its last interest ends (or, for a request that ends
 -- without a version, by the host's credit release). That is the end of the CPU coverage and of nothing else:
--- the texture's slot and nominal bytes, and its GPU registration, are returned on the backend's evidence of
+-- the texture's nominal bytes, and its GPU registration, are returned on the backend's evidence of
 -- retirement, and neither event stands in for the other. A Lua release stops the lease from granting new
 -- interests and leaves the ones already taken.
 --
@@ -120,7 +120,6 @@ module Hetoimasia.LuaEngine.Texture
   , specWorkspace
   , specSourceLimit
   , specInitialNominal
-  , specInstanceSlots
   , specInstanceBytes
   , specSessionBytes
   , specMaxPixels
@@ -262,7 +261,7 @@ import Hetoimasia.LuaEngine.Texture.Banks
   , ownerIsOpen
   , ownerRole
   , ownerSession
-  , ownerSlotsCharged
+  , ownerTexturesCharged
   )
 import Hetoimasia.LuaEngine.Texture.Pipeline
 import Hetoimasia.LuaEngine.Texture.Version
@@ -641,11 +640,12 @@ closeTextureOwner = atomically . closeOwner
 
 -- | What one owner's banks hold.
 data OwnerReading = OwnerReading
-  { ownerSlotsHeld ∷ !Int
+  { ownerTexturesHeld ∷ !Int
+    -- ^ The textures held (pending, live and retiring): an observation, not a bound.
   , ownerNominalHeld ∷ !Word64
   }
   deriving (Eq, Show)
 
 -- | An owner's banks, in one transaction.
 ownerReading ∷ TextureOwner → STM OwnerReading
-ownerReading owner = OwnerReading <$> ownerSlotsCharged owner <*> ownerBytesCharged owner
+ownerReading owner = OwnerReading <$> ownerTexturesCharged owner <*> ownerBytesCharged owner

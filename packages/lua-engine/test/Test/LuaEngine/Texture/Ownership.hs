@@ -48,12 +48,12 @@ independence = describe "independent loads" $ do
       first `shouldNotBe` second
       startedPaths (ssProbe session) >>= (`shouldBe` ["a.png", "a.png"])
       uploadsSeen (ssFake session) `shouldReturn` 2
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 2 256)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 2 8192)
       command session vm "i" "release" "k0"
       awaitNote session "i release k0 done"
       command session vm "i" "use" "k1"
       awaitNote session ("i use k1 " <> showT second)
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
 
   it "gives two instances loading one path their own work and textures, and ending one leaves the other usable" $
     withSession (config small layout) $ \session _ runtime → do
@@ -68,7 +68,7 @@ independence = describe "independent loads" $ do
       releaseCalls (ssFake session) `shouldReturn` [first]
       command session vm "j" "use" "k0"
       awaitNote session ("j use k0 " <> showT second)
-      ownerNow vm "j" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "j" >>= (`shouldBe` OwnerReading 1 4096)
   where
     showT = Text.pack . show
 
@@ -108,8 +108,8 @@ releasing = describe "an explicit release" $ do
       line `shouldSatisfy` Text.isPrefixOf "i puse k0 error "
       command session vm "i" "prelease" "k0"
       awaitNote session "i prelease k0 retiring"
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
-      sessionNow session `shouldReturn` 128
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
+      sessionNow session `shouldReturn` 4096
       releaseCalls (ssFake session) `shouldReturn` [identity]
       retireTexture (ssFake session) identity
       awaitOwner vm "i" (== OwnerReading 0 0)
@@ -128,8 +128,8 @@ releasing = describe "an explicit release" $ do
       _ ← lineStarting session "i prelease k0 "
       -- The backend was asked once, and nothing was returned: the texture is not reclaimed.
       releaseCalls (ssFake session) `shouldReturn` [identity]
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
-      sessionNow session `shouldReturn` 128
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
+      sessionNow session `shouldReturn` 4096
       _ ← awaitEnd control vm
       pure ()
     pure ()
@@ -157,5 +157,5 @@ sharedHandles = describe "a handle passed through shared Lua state" $
       -- The owner still has it, and it is still charged to the owner.
       command session vm "i" "use" "k0"
       awaitNote session ("i use k0 " <> Text.pack (show identity))
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
       releaseCalls (ssFake session) `shouldReturn` []

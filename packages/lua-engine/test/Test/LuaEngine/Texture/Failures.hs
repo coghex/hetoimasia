@@ -216,7 +216,7 @@ workspace = describe "the lane's workspace bank" $
       awaitPipeline session ((== 1) . readingSettled)
       -- The dimensions were validated before the decode asked for its scratch: the charge shrank, then
       -- the workspace refused the decode.
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
       lanesCharged session `shouldReturn` [0, 0]
       command session vm "i" "wait_take" "k"
       line ← lineStarting session "i wait_take k "

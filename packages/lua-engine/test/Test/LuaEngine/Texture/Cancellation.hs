@@ -160,7 +160,7 @@ stages = describe "at each stage" $ do
       awaitUploadCancelled held
       takeCancelled session vm "i" "k0"
       -- The request is consumed, and nothing is free until the backend ends the work.
-      ownerNow vm "i" >>= \reading → ownerSlotsHeld reading `shouldBe` 1
+      ownerNow vm "i" >>= \reading → ownerTexturesHeld reading `shouldBe` 1
       lanesCharged session >>= \charged → sum charged `shouldBe` 128
       _ ← withdrawUpload (ssFake session) held
       awaitOwner vm "i" (== OwnerReading 0 0)
@@ -184,7 +184,7 @@ orders = describe "completion and cancellation in both orders" $ do
       releaseCalls (ssFake session) `shouldReturn` [identity]
       takeCancelled session vm "i" "k0"
       -- The request is consumed and retired; the texture is not, and still charges its slot and bytes.
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
       retireTexture (ssFake session) identity
       awaitOwner vm "i" (== OwnerReading 0 0)
       sessionNow session `shouldReturn` 0
@@ -261,7 +261,7 @@ orders = describe "completion and cancellation in both orders" $ do
       -- the charge until the backend proves it retired.
       awaitReleaseCalls (ssFake session) 1
       releaseCalls (ssFake session) `shouldReturn` [identity]
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
       retireTexture (ssFake session) identity
       awaitOwner vm "i" (== OwnerReading 0 0)
       leaseSummary session vm "i" >>= \summary → summaryLive summary `shouldBe` 0
@@ -292,7 +292,7 @@ events = describe "late and duplicate events" $
       -- and the first texture is the only one the engine owns.
       releaseCalls (ssFake session) `shouldReturn` []
       texturesLive (ssFake session) >>= (`shouldBe` [identity, second])
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
 
 ending ∷ Spec
 ending = describe "instance end" $ do
@@ -308,7 +308,7 @@ ending = describe "instance end" $ do
       stopInstance session vm "i"
       awaitReleaseCalls (ssFake session) 1
       releaseCalls (ssFake session) `shouldReturn` [identity]
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
       retireTexture (ssFake session) identity
       awaitOwner vm "i" (== OwnerReading 0 0)
       sessionNow session `shouldReturn` 0
@@ -336,7 +336,7 @@ ending = describe "instance end" $ do
       line `shouldBe` "j wait_take k0 {status=success,value={height=4,texture=<userdata>,width=8}}"
       command session vm "j" "use" "k0"
       awaitNote session ("j use k0 " <> Text.pack (show identity))
-      ownerNow vm "j" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "j" >>= (`shouldBe` OwnerReading 1 4096)
 
   it "releases a texture whose instance's shutdown hook raises: the engine's cleanup does not depend on the script" $
     withSession (config small layout) $ \session _ runtime → do
@@ -349,7 +349,7 @@ ending = describe "instance end" $ do
       stopInstance session vm "f"
       awaitReleaseCalls (ssFake session) 1
       releaseCalls (ssFake session) `shouldReturn` [identity]
-      ownerNow vm "f" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "f" >>= (`shouldBe` OwnerReading 1 4096)
       retireTexture (ssFake session) identity
       awaitOwner vm "f" (== OwnerReading 0 0)
       sessionNow session `shouldReturn` 0
