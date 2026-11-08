@@ -11,7 +11,10 @@ description:
     candidates inside the 2D renderer's 24-bit depth keys, and CPU picking
     against the exact plan it was given. It depends on the pure terrain,
     math, render-2d and render-api packages only: no GPU, window, Lua, runtime
-    terrain service or game package. Every value is immutable and every function
+    terrain service or game package. Beside that per-face baseline, TRA-16 adds
+    the whole-cell quad planner (supplied discovery knowledge and coverage
+    assets, exact integer draw keys, bounded progressive demand) and the
+    coverage-based visual picker. Every value is immutable and every function
     pure; the package owns no state, thread or resource.
 license: GPL-3.0-only
 license-file: LICENSE
