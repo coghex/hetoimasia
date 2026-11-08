@@ -17,9 +17,14 @@
 -- slot or the same dimensions never stand for it. It holds, immutably:
 --
 -- * the kind, the dimensions, and the normal encoding the pipeline /checked/ (never merely
---   declared, and absent for a request that did not ask);
--- * the shared coverage plane, when binary coverage was asked: the one bitplane of this version,
---   referenced by every reader and copied by none; and nothing of the decoded RGBA image.
+--   declared, and absent for a request that did not ask).
+--
+-- and, in a variable of its own, the shared coverage plane, when binary coverage was asked: the one
+-- bitplane of this version, referenced by every reader and copied by none, fully evaluated before the
+-- version exists and holding nothing of the decoded RGBA image. The variable is cleared by the last
+-- interest's drop, in the transaction that returns the charge, so a job, a cell or a lease record that
+-- still names the version (a texture awaiting its GPU retirement, say) no longer reaches the payload.
+-- A reader reaches the plane only through an interest ('interestPlane'), never through the version.
 --
 -- = Interests
 --
@@ -49,6 +54,7 @@ module Hetoimasia.LuaEngine.Texture.Version
   , Version
   , VersionFacts (..)
   , newVersion
+  , versionPlane
   , versionId
   , versionFacts
   , versionInterests
@@ -60,10 +66,12 @@ module Hetoimasia.LuaEngine.Texture.Version
   , takeInterest
   , dropInterest
   , interestHeld
+  , interestPlane
   ) where
 
 import Control.Concurrent.STM (STM, TVar, newTVar, readTVar, writeTVar)
 import Control.Monad (when)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Asset.Image.DataMap (CoveragePlane, NormalEncoding)
@@ -118,8 +126,6 @@ data VersionFacts = VersionFacts
   , factsNormal ∷ !(Maybe NormalEncoding)
     -- ^ The encoding the pipeline checked before the upload: set only when it was asked for and
     -- every texel passed.
-  , factsCoverage ∷ !(Maybe CoveragePlane)
-    -- ^ The version's one shared plane, when binary coverage was asked for and every texel passed.
   }
 
 -- | One loaded asset version.
@@ -128,6 +134,7 @@ data Version = Version
   , versionData ∷ !VersionFacts
   , versionCount ∷ !(TVar Int)
   , versionHold ∷ !(Maybe Reservation)
+  , versionPlaneVar ∷ !(TVar (Maybe CoveragePlane))
   }
 
 instance Eq Version where
@@ -149,13 +156,19 @@ versionInterests = readTVar . versionCount
 versionReservation ∷ Version → Maybe Reservation
 versionReservation = versionHold
 
--- | A version of these facts and, if it retains a plane, the reservation that pays for it, which
--- passes to the version in this transaction. The caller holds the first interest.
-newVersion ∷ Word64 → VersionFacts → Maybe Reservation → STM (Version, Interest)
-newVersion number facts hold = do
+-- | Whether the version still holds its plane: only while an interest does. For observation.
+versionPlane ∷ Version → STM Bool
+versionPlane = fmap isJust . readTVar . versionPlaneVar
+
+-- | A version of these facts and, if it retains a plane, that plane (already fully evaluated by the caller) and
+-- the reservation that pays for it, which passes to the version in this transaction. The caller holds the first
+-- interest.
+newVersion ∷ Word64 → VersionFacts → Maybe CoveragePlane → Maybe Reservation → STM (Version, Interest)
+newVersion number facts plane hold = do
   mapM_ takeOwnership hold
   count ← newTVar 1
-  let version = Version number facts count hold
+  planeVar ← newTVar plane
+  let version = Version number facts count hold planeVar
   held ← newTVar True
   pure (version, Interest version held)
 
@@ -186,7 +199,15 @@ takeInterest version = do
       writeTVar (versionCount version) (count + 1)
       Just . Interest version <$> newTVar True
 
--- | Drop an interest: once. The last one returns the version's reservation.
+-- | The version's plane, through an interest that is still held: 'Nothing' once the interest was dropped, and for
+-- a version that has no plane. The only way to a plane.
+interestPlane ∷ Interest → STM (Maybe CoveragePlane)
+interestPlane interest = do
+  live ← readTVar (interestLive interest)
+  if live then readTVar (versionPlaneVar (interestOf interest)) else pure Nothing
+
+-- | Drop an interest: once. The last one detaches the plane and returns the version's reservation in the same
+-- transaction, so the charge is never returned while the payload is still reachable from the version.
 dropInterest ∷ Interest → STM ()
 dropInterest interest = do
   live ← readTVar (interestLive interest)
@@ -195,4 +216,6 @@ dropInterest interest = do
     let version = interestOf interest
     count ← readTVar (versionCount version)
     writeTVar (versionCount version) (count - 1)
-    when (count == 1) $ mapM_ returnOwned (versionHold version)
+    when (count == 1) $ do
+      writeTVar (versionPlaneVar version) Nothing
+      mapM_ returnOwned (versionHold version)

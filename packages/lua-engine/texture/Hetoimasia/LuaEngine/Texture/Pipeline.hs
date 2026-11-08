@@ -196,6 +196,7 @@ import Hetoimasia.Asset.Image.DataMap
   ( CoveragePlane
   , buildBinaryCoverage
   , checkNormalEncoding
+  , coverageBits
   , coverageMetadataBytes
   , coverageRefusalText
   , coverageRetainedBytes
@@ -589,11 +590,15 @@ data PipelineHooks = PipelineHooks
   , hookOffering ∷ !(ContentKey → IO ())
     -- ^ The job settled with a delivered texture, and the answer that offers it to the host has not yet
     -- decided: nothing about the texture was recorded as offered, claimed or adopted.
+  , hookBuilt ∷ !(ContentKey → CoveragePlane → IO ())
+    -- ^ The version's coverage plane was built, fully evaluated and recorded with the version and the job's first
+    -- interest; the handoff to the backend is next. Given the very value the version holds, so that an example can
+    -- watch whether anything still reaches it.
   }
 
 -- | No hooks.
 noHooks ∷ PipelineHooks
-noHooks = PipelineHooks (\_ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ → pure ())
+noHooks = PipelineHooks (\_ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ _ → pure ())
 
 -- | The numbers the pipeline was built with.
 pipelineSpec ∷ TexturePipeline → TextureSpec
@@ -1481,10 +1486,16 @@ decodeStages tp restore jid job bytes lane = do
               case checked of
                 Left why → settleAs (ProviderExpected (attributed key "invalid_image" why))
                 Right plane → do
+                  -- The plane is forced here, in the guarded decode stage and before the level is handed over: a lazily
+                  -- built plane would close over the whole decoded RGBA level and keep it, uncharged, for as long as
+                  -- anyone held the version, and would be allocated on whichever thread read it first.
+                  restore (mapM_ (\built → evaluate (ByteString.length (coverageBits built))) plane)
                   built ← atomically (buildVersion tp jid (jPolicy job) width height plane)
                   case built of
                     Nothing → throwIO (TextureDefect "a decoded job's record was lost before its version was recorded")
-                    Just () → handoff tp jid level width height (formatOf (jPolicy job))
+                    Just () → do
+                      restore (mapM_ (hookBuilt (tpHooks tp) key) plane)
+                      handoff tp jid level width height (formatOf (jPolicy job))
   where
     settleAs reply = do
       effects ← atomically $ do
@@ -1533,9 +1544,8 @@ buildVersion tp jid policy width height plane = do
                   , factsWidth = width
                   , factsHeight = height
                   , factsNormal = policyNormalEncoding policy
-                  , factsCoverage = plane
                   }
-          (version, interest) ← newVersion (psVersions st) facts (jReservation job)
+          (version, interest) ← newVersion (psVersions st) facts plane (jReservation job)
           writeTVar (tpState tp) st {psVersions = psVersions st + 1, psJobs = Map.insert jid job {jVersion = Just version, jInterest = Just interest} (psJobs st)}
           pure (Just ())
 

@@ -172,7 +172,7 @@ spec env = describe "validated data texture pixels (TRA-15)" $ do
       retainedKind held `shouldBe` DataKind
       retainedNormal held `shouldBe` Just UnitNormalRgbV1
       -- Texels row by row: 1 1 0 1 / 1 1 1 1. Bit k is texel k, least significant first: 0b11111011 = 0xFB.
-      fmap coverageBits (retainedCoverage held) `shouldBe` Just (ByteString.pack [0xFB])
+      fmap (fmap coverageBits) (atomically (retainedCoverage held)) `shouldReturn` Just (ByteString.pack [0xFB])
       -- The very texture a draw resolves is the retained version's: the identity is the device registration's.
       shot ← shoot' identity (normalsDecoded)
       shotFailed shot `shouldBe` []

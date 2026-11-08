@@ -223,6 +223,7 @@ import Hetoimasia.Asset.Image.DataMap (CoveragePlane, NormalEncoding (..), norma
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.Functor ((<&>))
+import Data.Maybe (isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Encoding
@@ -508,35 +509,47 @@ noRequirement = TextureRequirement Nothing False Nothing
 -- that keeps those facts valid until 'releaseRetained'. The texture, the coverage plane and the checked
 -- profile are paired here by the version that produced all three: a path, a recycled registration slot or a
 -- reused handle generation never pairs an old plane with a new texture.
+--
+-- The fields are private and the identity is read through functions, so a client can neither build one nor update
+-- one with another texture's identity: no record syntax over it is exported.
 data RetainedTexture = RetainedTexture
-  { retainedView ∷ !TextureView
-  , retainedVersion ∷ !Word64
-    -- ^ The version's identity, issued once by the pipeline.
-  , retainedFacts ∷ !VersionFacts
-  , retainedHold ∷ !Interest
+  { retView ∷ !TextureView
+  , retVersion ∷ !Word64
+  , retFacts ∷ !VersionFacts
+  , retHold ∷ !Interest
   }
+
+-- | The live texture as a scene's publication borrows it.
+retainedView ∷ RetainedTexture → TextureView
+retainedView = retView
+
+-- | The version's identity, issued once by the pipeline.
+retainedVersion ∷ RetainedTexture → Word64
+retainedVersion = retVersion
 
 -- | The image kind of the retained version.
 retainedKind ∷ RetainedTexture → TextureKind
-retainedKind = factsKind . retainedFacts
+retainedKind = factsKind . retFacts
 
 -- | The normal encoding the pipeline checked before the upload, if one was asked for.
 retainedNormal ∷ RetainedTexture → Maybe NormalEncoding
-retainedNormal = factsNormal . retainedFacts
+retainedNormal = factsNormal . retFacts
 
--- | The version's one shared coverage plane, if binary coverage was asked for and passed. The very value
--- every reader of the version shares.
-retainedCoverage ∷ RetainedTexture → Maybe CoveragePlane
-retainedCoverage = factsCoverage . retainedFacts
+-- | The version's one shared coverage plane, if binary coverage was asked for and passed, read in a transaction
+-- through this retained value's own interest: the very value every reader of the version shares, and 'Nothing' once
+-- this interest was released. The last interest's release detaches the plane from the version, so nothing that
+-- still names the version (a texture awaiting its GPU retirement) reaches it.
+retainedCoverage ∷ RetainedTexture → STM (Maybe CoveragePlane)
+retainedCoverage = interestPlane . retHold
 
 -- | How many CPU interests the retained version holds now (the lease's, every consumer's and this one):
 -- a reading, for observation.
 retainedInterests ∷ RetainedTexture → STM Int
-retainedInterests = versionInterests . interestVersion . retainedHold
+retainedInterests = versionInterests . interestVersion . retHold
 
 retainedWidth, retainedHeight ∷ RetainedTexture → Word32
-retainedWidth = factsWidth . retainedFacts
-retainedHeight = factsHeight . retainedFacts
+retainedWidth = factsWidth . retFacts
+retainedHeight = factsHeight . retFacts
 
 -- | Retain the texture a lease names, with its version's facts, through the same protected-resource
 -- boundary as 'withTextureOr': refused, as data and before anything is retained, when the lease has ended,
@@ -557,15 +570,19 @@ retainTexture leases key need = withLeaseOr leases key (pure . Left) $ \resource
   case unmet need facts of
     Just why → pure (Left why)
     Nothing →
-      atomically (takeInterest version) <&> \case
-        Nothing -> Left "the texture's version has no CPU interest left to take"
-        Just interest -> Right (RetainedTexture view (versionId version) facts interest)
+      atomically $
+        takeInterest version >>= \case
+          Nothing -> pure (Left "the texture's version has no CPU interest left to take")
+          Just interest -> do
+            plane <- interestPlane interest
+            if requireCoverage need && isNothing plane
+              then dropInterest interest >> pure (Left "the texture has no binary coverage: it was not loaded with coverage=\"binary\"")
+              else pure (Right (RetainedTexture view (versionId version) facts interest))
 
 -- | Why a version does not meet a requirement, if it does not.
 unmet ∷ TextureRequirement → VersionFacts → Maybe Text
 unmet need facts
   | Just kind ← requireKind need, kind /= factsKind facts = Just ("the texture is not a " <> kindWord kind <> " texture")
-  | requireCoverage need, Nothing ← factsCoverage facts = Just "the texture has no binary coverage: it was not loaded with coverage=\"binary\""
   | Just encoding ← requireNormal need, factsNormal facts /= Just encoding =
       Just ("the texture's texels were not validated as normal_encoding=" <> normalEncodingName encoding)
   | otherwise = Nothing
@@ -576,7 +593,7 @@ unmet need facts
 
 -- | End a retained texture's CPU interest. Idempotent.
 releaseRetained ∷ RetainedTexture → IO ()
-releaseRetained = atomically . dropInterest . retainedHold
+releaseRetained = atomically . dropInterest . retHold
 
 -- | 'retainTexture' for the duration of an action: the interest is released when the action ends, however
 -- it ends, and a refusal is handed to the caller as data before the action.

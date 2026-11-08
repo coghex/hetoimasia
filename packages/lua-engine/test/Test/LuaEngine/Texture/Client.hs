@@ -57,6 +57,11 @@ spec = describe "composition from outside the packages" $ do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-01928"
     -- The reservation machine and the version are the pipeline's: not exported at all.
+    -- The identity of a retained texture is read through functions over private fields: no record update can pair
+    -- another texture's identity with a version's plane and interest.
+    withDataClient "Client.hs" updatedRetainedClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-22385"
     withDataClient "Client.hs" reservationClient $ \compile → do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-61689"
@@ -90,8 +95,8 @@ dataMapClient =
     , "charged = accountCharged"
     , ""
     , "-- The generic top-row-first sampling of a retained version's one shared plane."
-    , "sample ∷ RetainedTexture → Double → Double → Maybe Bool"
-    , "sample retained u v = retainedCoverage retained >>= \\plane → coverageSample plane u v"
+    , "sample ∷ RetainedTexture → Double → Double → STM (Maybe Bool)"
+    , "sample retained u v = fmap (>>= \\plane → coverageSample plane u v) (retainedCoverage retained)"
     , ""
     , "release ∷ RetainedTexture → IO ()"
     , "release = releaseRetained"
@@ -117,6 +122,17 @@ forgedAccountClient =
     , ""
     , "forged ∷ RenderAccount"
     , "forged = RenderAccount 1"
+    ]
+
+updatedRetainedClient ∷ String
+updatedRetainedClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Texture"
+    , ""
+    , "forged ∷ RetainedTexture → RetainedTexture → RetainedTexture"
+    , "forged old other = old {retainedView = retainedView other, retainedVersion = retainedVersion other}"
     ]
 
 reservationClient ∷ String

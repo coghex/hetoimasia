@@ -142,7 +142,7 @@ buildBinaryCoverage ∷ Word32 → Word32 → ByteString → Either CoverageRefu
 buildBinaryCoverage width height level
   | toInteger (ByteString.length level) /= texels * 4 = Left (CoverageLevelMismatch (ByteString.length level) (texels * 4))
   | Just offender ← firstNonBinary = Left (let (y, x) = offender `quotRem` w in CoverageNotBinary (fromIntegral x) (fromIntegral y) (ByteString.unsafeIndex level (4 * offender + 3)))
-  | otherwise = Right (CoveragePlane width height bits)
+  | otherwise = Right $! CoveragePlane width height bits
   where
     texels = toInteger width * toInteger height
     w = fromIntegral width ∷ Int

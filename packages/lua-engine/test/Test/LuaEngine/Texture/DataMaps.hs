@@ -15,12 +15,15 @@
 -- image (two plane bytes) and 129 for a 2×2 or a 2×1 image (one plane byte).
 module Test.LuaEngine.Texture.DataMaps (spec) where
 
-import Control.Concurrent.MVar (readMVar, tryPutMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, retry)
 import Control.Concurrent (yield)
 import Control.Monad (unless, void)
 import qualified Data.ByteString as BS
-import Data.IORef (readIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import GHC.Exts.Heap (Box, GenClosure (..), asBox, getBoxedClosureData)
+import System.Mem (performMajorGC)
+import System.Mem.Weak (deRefWeak, mkWeakPtr)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -28,6 +31,7 @@ import Data.Word (Word64, Word8)
 import Hetoimasia.Asset.Image (TexelFormat (..))
 import Hetoimasia.Asset.Image.DataMap (coverageBits, coverageRetainedBytes)
 import Test.Hspec
+import Test.Support.Owned (withOwnedThreadOpening)
 import Test.LuaEngine.Texture.Contract (small)
 import Test.LuaEngine.Texture.Png
 import Test.LuaEngine.Texture.Support
@@ -145,6 +149,24 @@ heldAs ∷ Vm → Text → IO RetainedTexture
 heldAs vm label = do
   found ← Map.lookup label <$> readIORef (vmRetained vm)
   maybe (expectationFailure ("nothing is retained as " <> Text.unpack label) >> fail "none") pure found
+
+-- | The bytes of the coverage plane a retained texture reaches through its own interest, if it reaches one.
+bitsOf ∷ RetainedTexture → IO (Maybe BS.ByteString)
+bitsOf retained = fmap coverageBits <$> atomically (retainedCoverage retained)
+
+-- | Whether a value is constructors all the way down: no thunk, indirection to a thunk or blackhole is reachable
+-- from it. A byte array is a leaf.
+fullyEvaluated ∷ a → IO Bool
+fullyEvaluated = go . asBox
+  where
+    go ∷ Box → IO Bool
+    go box =
+      getBoxedClosureData box >>= \case
+        IndClosure {indirectee = next} → go next
+        BlackholeClosure {indirectee = next} → go next
+        ConstrClosure {ptrArgs = fields} → and <$> mapM go fields
+        ArrWordsClosure {} → pure True
+        _ → pure False
 
 -- | How many CPU interests the version of a retained texture holds now.
 interestsOf ∷ RetainedTexture → IO Int
@@ -286,7 +308,7 @@ coverage = describe "binary coverage" $ do
       viewIdentity (retainedView first) `shouldBe` identity
       (retainedWidth first, retainedHeight first) `shouldBe` (3, 3)
       retainedKind first `shouldBe` ColourKind
-      fmap coverageBits (retainedCoverage first) `shouldBe` Just (BS.pack [0xD5, 0x00])
+      bitsOf first `shouldReturn` Just (BS.pack [0xD5, 0x00])
       -- The lease's interest, and this one.
       interestsOf first `shouldReturn` 2
       -- A second consumer shares the very plane: no copy, no second charge.
@@ -299,6 +321,57 @@ coverage = describe "binary coverage" $ do
       unretain session vm "i" "a" "r2"
       interestsOf first `shouldReturn` 1
       charged session `shouldReturn` 130
+
+  it "has the plane fully evaluated when the texture is delivered: no thunk closes over the decoded level, and nothing is built on the reader's thread" $
+    withSession (config small files) $ \session _ runtime → do
+      vm ← startVm session runtime "evaluated" OnArrival
+      admitDriver session vm "i"
+      _ ← loadLive session vm "i" "a" "binary3.png" ["coverage"]
+      retainAs session vm "i" "a" "r" ["coverage"] >>= (`shouldSatisfy` Text.isSuffixOf "retained")
+      held' ← heldAs vm "r"
+      plane ← atomically (retainedCoverage held')
+      evaluated ← fullyEvaluated plane
+      evaluated `shouldBe` True
+
+  it "detaches the plane at the last CPU interest although the GPU retirement is withheld: the job and cell a pending texture still names reach no payload" $ do
+    gate ← newGate
+    watched ← newIORef Nothing
+    let hooks =
+          noHooks
+            { hookBuilt = \_ plane → mkWeakPtr plane Nothing >>= writeIORef watched . Just
+            , hookOffering = hold gate
+            }
+    withSession ((config small files) {cfgHooks = hooks, cfgRelease = releaseHeldGate gate}) $ \session _ runtime → do
+      vm ← startVm session runtime "detached" OnArrival
+      admitDriver session vm "i"
+      startWords session vm "i" "a" "binary3.png" ["coverage"]
+      awaitUploads (ssFake session) 1
+      accepted ← uploadN (ssFake session) 0
+      registered ← newEmptyMVar
+      -- The backend's completion runs on a thread of its own: the held offering blocks the thread that delivers it.
+      withOwnedThreadOpening (releaseHeldGate gate) (finishUpload (ssFake session) accepted >>= putMVar registered) $ \_ _ → do
+        -- The texture is delivered and registered; the answer that offers it to the host is held, so the job and its cell
+        -- are still there, and the pipeline holds the version's only interest.
+        readMVar (arrived gate)
+        awaitCharged session 130
+        weak ← readIORef watched >>= maybe (expectationFailure "the plane was never built" >> fail "no plane") pure
+        collect
+        deRefWeak weak >>= \alive → fmap (const ()) alive `shouldBe` Just ()
+        -- The request is cancelled: the withdrawal claims the delivered cell and releases it, dropping that last interest.
+        -- Retirement is withheld, so the job and the cell stay, naming the version, until the backend proves it.
+        cancelled session vm "i" "a"
+        awaitCharged session 0
+        collect
+        deRefWeak weak >>= \gone → fmap (const ()) gone `shouldBe` Nothing
+        _ ← tryPutMVar (proceed gate) ()
+        identity ← readMVar registered
+        awaitReleaseCalls (ssFake session) 1
+        retireTexture (ssFake session) identity
+        command session vm "i" "take" "a"
+        awaitNote session "i take a {status=cancelled}"
+        awaitOwner vm "i" (== OwnerReading 0 0)
+  where
+    collect = performMajorGC >> performMajorGC
 
 -- The checked profile ----------------------------------------------------------------------------------------
 
@@ -316,7 +389,7 @@ profile = describe "unit-normal-rgb-v1" $ do
       retainedNormal fact `shouldBe` Just UnitNormalRgbV1
       retainedKind fact `shouldBe` DataKind
       -- Asking for the profile does not assert binary alpha.
-      fmap coverageBits (retainedCoverage fact) `shouldBe` Nothing
+      bitsOf fact `shouldReturn` Nothing
       charged session `shouldReturn` 0
 
   it "refuses the zero vector and a zero channel as invalid_image before any upload, and a transparent texel needs neither" $
@@ -409,16 +482,16 @@ versions = describe "loaded versions" $ do
       viewIdentity (retainedView newPair) `shouldBe` new
       -- Old 3×3 (130) and new 4×4 (130) overlap: two charges.
       charged session `shouldReturn` 260
-      fmap coverageBits (retainedCoverage oldPair) `shouldBe` Just (BS.pack [0xD5, 0x00])
+      bitsOf oldPair `shouldReturn` Just (BS.pack [0xD5, 0x00])
       -- 4×4 diagonal: bits 0, 5, 10, 15 = 0b00100001 (byte 0 = 0x21), 0b10000100 (byte 1 = 0x84).
-      fmap coverageBits (retainedCoverage newPair) `shouldBe` Just (BS.pack [0x21, 0x84])
+      bitsOf newPair `shouldReturn` Just (BS.pack [0x21, 0x84])
       -- Releasing the old lease keeps the old version alive for its consumer, and the new one is untouched.
       command session vm "i" "release" "old"
       awaitNote session "i release old retiring"
       charged session `shouldReturn` 260
       unretain session vm "i" "old" "o"
       charged session `shouldReturn` 130
-      fmap coverageBits (retainedCoverage newPair) `shouldBe` Just (BS.pack [0x21, 0x84])
+      bitsOf newPair `shouldReturn` Just (BS.pack [0x21, 0x84])
 
   it "leaves a previous retained pair usable when a later acquisition fails" $
     withSession (config small files) $ \session _ runtime → do
@@ -429,7 +502,7 @@ versions = describe "loaded versions" $ do
       startWords session vm "i" "bad" "nonbinary2.png" ["coverage"]
       takeLine session vm "i" "bad" >>= failureCode "invalid_image"
       kept ← heldAs vm "kept"
-      fmap coverageBits (retainedCoverage kept) `shouldBe` Just (BS.pack [0xD5, 0x00])
+      bitsOf kept `shouldReturn` Just (BS.pack [0xD5, 0x00])
       charged session `shouldReturn` 130
 
   it "keeps the CPU plane for a consumer after the Lua release and after the registration retired, and gives it back only with the last interest" $
@@ -450,7 +523,7 @@ versions = describe "loaded versions" $ do
       -- The registration's retirement did not stand in for the CPU interest.
       charged session `shouldReturn` 130
       kept ← heldAs vm "r"
-      fmap coverageBits (retainedCoverage kept) `shouldBe` Just (BS.pack [0xD5, 0x00])
+      bitsOf kept `shouldReturn` Just (BS.pack [0xD5, 0x00])
       unretain session vm "i" "a" "r"
       charged session `shouldReturn` 0
       -- A repeated release of a consumer's interest returns nothing twice.
@@ -486,7 +559,7 @@ versions = describe "loaded versions" $ do
       pair ← heldAs vm "r"
       viewIdentity (retainedView pair) `shouldBe` second
       (retainedWidth pair, retainedHeight pair) `shouldBe` (4, 4)
-      fmap coverageBits (retainedCoverage pair) `shouldBe` Just (BS.pack [0x21, 0x84])
+      bitsOf pair `shouldReturn` Just (BS.pack [0x21, 0x84])
 
 -- Ends of the work --------------------------------------------------------------------------------------------
 
