@@ -160,10 +160,21 @@ recordSpec = describe "the record" $ do
         recordsOf faces = [recordOf face | face ← faces]
     map recordWords (recordsOf other) `shouldBe` map recordWords (recordsOf flatCell)
 
-  it "keeps shapes 0 and 15 as distinct authored identities with the same flat faces" $ do
+  -- TRA-13 (D-49): identity 15 is the central half-height peak. It used to share
+  -- identity 0's three flat faces; these are the new expectations, not a weakened
+  -- compatibility check.
+  it "records identity 15 as the four triangular sloping faces of the peak, not the three flat faces of identity 0" $ do
     let facesOf shape = either (\e → error (show e)) planFaces (scenePlan ((newScene "ids" [Cell 0 0 0 1 shape "loam"] (96, 80)) {sceneMode = ManualAt 0 0}))
     map faceShape (facesOf 0) `shouldSatisfy` all (/= faceShape (head' (facesOf 15)))
-    map recordOf (facesOf 0) `shouldBe` map recordOf (facesOf 15)
+    length (facesOf 0) `shouldBe` 3
+    length (facesOf 15) `shouldBe` 4
+    map faceViewKind (facesOf 15) `shouldBe` replicate 4 TopFace
+    map recordOf (facesOf 0) `shouldSatisfy` (/= take 3 (map recordOf (facesOf 15)))
+    forM_ (facesOf 15) $ \face → do
+      let MaterialRecord _ ws = recordOf face
+      case drop 6 ws of
+        count : _ → count `shouldBe` 3
+        [] → expectationFailure "the record has no vertex count"
 
   it "refuses what it cannot represent, never approximating: a mask of too few or too many vertices" $ do
     let face = faceOfKind TopFace flatCell

@@ -225,16 +225,20 @@ wall, so a ramp, tent or pyramid neighbour exposes exactly what it leaves open.
 This is never a full-block occupancy shortcut. A face that depends on an
 unavailable fact is not emitted.
 
-The planner does not edit terrain or reshape a neighbour, and the 0 and 15 flat
-identities and opposite-direction masks stay distinct in every facing
-(`faceShape` is the authored world shape).
+The planner does not edit terrain or reshape a neighbour, and the authored
+identities stay distinct in every facing (`faceShape` is the authored world
+shape). Identity 0 is the only full block; identity 15 is the central half-height
+peak of the corrected catalog (TRA-13), so a cell of it has four sloping top faces
+and no East or South wall, and a flat cell's wall beside it is exposed because the
+peak's wall covers nothing. Whether a shape is a full block is read from its shared
+solid, never from its identity.
 
 ## Bounded work and outputs
 
 Candidate columns are enumerated from the visible rectangle, and for each column
 only the levels that can project into the rectangle inside the band. Only the
 levels at a run boundary of the column or its East and South neighbours, and the
-levels where a solid cell meets a neighbour that is not an identical flat solid,
+levels where a solid cell meets a neighbour that is not a full block of the same kind,
 are evaluated, so cost follows the intervals and exposed faces and not the depth;
 a deep slice or a long air gap enumerates nothing in between.
 

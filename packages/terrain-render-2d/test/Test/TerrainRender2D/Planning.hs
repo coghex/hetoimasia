@@ -43,11 +43,12 @@ turnMask ∷ Int → Int → Int
 turnMask t m = ((m `shiftL` t) .|. (m `shiftL` t `div` 16)) .&. 15
 
 -- | Expected number of faces of an isolated cell on air, from first
--- principles: one top face per ramp (one for a flat top), plus the East and
--- South walls unless that side is lowered to the base.
+-- principles: one top face per ramp (one for the flat top of mask 0 alone), plus
+-- the East and South walls unless that side is lowered to the base. Mask 15 lowers
+-- all four sides, so it is four sloping tops and no wall.
 expectedFaceCount ∷ Int → Int
 expectedFaceCount mask
-  | mask == 0 || mask == 15 = 3
+  | mask == 0 = 3
   | otherwise = popCount mask + (if mask .&. 2 == 0 then 1 else 0) + (if mask .&. 4 == 0 then 1 else 0)
 
 kinds ∷ Plan → [FaceKind]
@@ -92,12 +93,16 @@ spec = describe "Planning" $ do
           map faceRole (planFaces p) `shouldSatisfy` all (== RoleSurface)
           planCompleteness p `shouldBe` Complete
 
-  it "keeps the distinct identities 0 and 15 apart although both are flat" $ do
+  -- The intentional semantic change of TRA-13 (D-49): identity 15 was planned as
+  -- the flat block of identity 0 and is now the central half-height peak. The
+  -- alias's expectations (the same faces and polygons) are replaced, not kept.
+  it "plans identity 15 as four sloping tops and no wall, distinct from the flat identity 0" $ do
     let faces s = planFaces (plan (setup 288 144) (manualCamera 0 0 0) (factsOf (isolated s)))
-    map faceViewKind (faces 0) `shouldBe` map faceViewKind (faces 15)
-    map facePolygon (faces 0) `shouldBe` map facePolygon (faces 15)
+    map faceViewKind (faces 0) `shouldBe` [TopFace, WallFace East, WallFace South]
+    map faceViewKind (faces 15) `shouldBe` replicate 4 TopFace
+    map facePolygon (faces 0) `shouldSatisfy` (/= map facePolygon (faces 15))
     map (shapeIdValue . faceShape) (faces 0) `shouldBe` [0, 0, 0]
-    map (shapeIdValue . faceShape) (faces 15) `shouldBe` [15, 15, 15]
+    map (shapeIdValue . faceShape) (faces 15) `shouldBe` [15, 15, 15, 15]
 
   it "plans NS and EW as distinct opposite-direction forms that exchange under a single turn" $ do
     let faces s f = planFaces (plan (setup 288 144) (withFacing f (manualCamera 0 0 0)) (factsOf (isolated s)))
@@ -116,12 +121,12 @@ spec = describe "Planning" $ do
     let wallsOf cells = [faceViewKind f | f ← planFaces (plan (setup 288 144) (manualCamera 0 0 0) (factsOf (sceneSource cells))), faceCell f == tileAt 0 0 0]
     it "exposes a flat cell's East wall exactly when the neighbour's West wall does not cover it" $
       forM_ [0 .. 15] $ \s → do
-        let covered = s `elem` [0, 2, 15 ∷ Int]
+        let covered = s `elem` [0, 2 ∷ Int]
             east = length [() | WallFace East ← wallsOf [(0, 0, 0, 0), (1, 0, 0, s)]]
         (s, east) `shouldBe` (s, if covered then 0 else 1 ∷ Int)
     it "exposes a flat cell's South wall exactly when the neighbour's North wall does not cover it" $
       forM_ [0 .. 15] $ \s → do
-        let covered = s `elem` [0, 4, 15 ∷ Int]
+        let covered = s `elem` [0, 4 ∷ Int]
             south = length [() | WallFace South ← wallsOf [(0, 0, 0, 0), (0, 1, 0, s)]]
         (s, south) `shouldBe` (s, if covered then 0 else 1 ∷ Int)
     it "never reshapes a neighbour: every face keeps its authored shape" $ do

@@ -6,17 +6,21 @@
 -- "Test.Support.ExternalClient", exposing @base@ and @hetoimasia-terrain@ and
 -- hiding everything else.
 --
--- Two clients must be accepted, linked and run: one uses the public coordinate,
--- shape and geometry interfaces end to end, the other validates limits and drives
--- the residency model, which is both the environment control and the evidence that
--- the supported operations stay usable. Every
+-- Three clients must be accepted, linked and run: one uses the public coordinate,
+-- shape and geometry interfaces end to end, one uses the opening interface (the
+-- exact portals of a cell and the connections between neighbors, TRA-13), and the
+-- other validates limits and drives the residency model, which is both the
+-- environment control and the evidence that the supported operations stay usable.
+-- Every
 -- other client must be refused, each for the specific diagnostic that names its
 -- cause, so a missing package or an absent compiler can never pass for the
 -- boundary holding:
 --
 -- * the constructor of a checked value (an axis coordinate, a local offset, a
---   shape identity, a rotation count, a ray, a solid, validated limits, the
---   residency model or a coverage) cannot be named, so a
+--   shape identity, a rotation count, a ray, a solid, an opening region, a cell's
+--   openings, a component, a portal, a placed portal, a component reference, a
+--   portal connection, validated limits, the residency model or a coverage)
+--   cannot be named, so a
 --   client cannot build an out-of-range coordinate, an unsupported identity, an
 --   unnormalized turn, a ray with no direction or a forged solid: @GHC-10237@
 --   for an import, and @GHC-01928@ (an illegal term-level use of the type
@@ -110,6 +114,7 @@ withClient = withPackageClient ["base", "hetoimasia-terrain"]
 accepted ∷ [(String, String, [String])]
 accepted =
   [ ("accepts and runs a client using the public coordinate, shape and geometry interfaces", supportedClient, supportedOutput)
+  , ("accepts and runs a client using the public opening interface: portals, components and connections", openingClient, openingOutput)
   , ("accepts and runs a client that validates limits and drives the residency model through its public interface", residencyClient, residencyOutput)
   ]
 
@@ -122,6 +127,7 @@ hidden =
   , "Hetoimasia.Terrain.Internal.Coordinate"
   , "Hetoimasia.Terrain.Internal.Interval"
   , "Hetoimasia.Terrain.Internal.Packed"
+  , "Hetoimasia.Terrain.Internal.Polygon"
   , "Hetoimasia.Terrain.Internal.Polytope"
   , "Hetoimasia.Terrain.Internal.Residency.Coverage"
   , "Hetoimasia.Terrain.Internal.Residency.Limits"
@@ -143,6 +149,13 @@ constructors =
   , ("Turns", ["import Hetoimasia.Terrain.Shape (Turns (Turns))"], [])
   , ("Ray", ["import Hetoimasia.Terrain.Geometry (Ray (Ray))"], [])
   , ("Solid", ["import Hetoimasia.Terrain.Geometry (Solid (Solid))"], [])
+  , ("Opening", ["import Hetoimasia.Terrain.Opening (Opening (Opening))"], [])
+  , ("CellOpenings", ["import Hetoimasia.Terrain.Opening (CellOpenings (CellOpenings))"], [])
+  , ("Component", ["import Hetoimasia.Terrain.Opening (Component (Component))"], [])
+  , ("Portal", ["import Hetoimasia.Terrain.Opening (Portal (Portal))"], [])
+  , ("PlacedPortal", ["import Hetoimasia.Terrain.Opening (PlacedPortal (PlacedPortal))"], [])
+  , ("ComponentRef", ["import Hetoimasia.Terrain.Opening (ComponentRef (ComponentRef))"], [])
+  , ("PortalConnection", ["import Hetoimasia.Terrain.Opening (PortalConnection (PortalConnection))"], [])
   , ("MaterialId", ["import Hetoimasia.Terrain.Cell (MaterialId (MaterialId))"], [])
   , ("ZRange", ["import Hetoimasia.Terrain.Cell (ZRange (ZRange))"], [])
   , ("PackedCell", ["import Hetoimasia.Terrain.Palette (PackedCell (PackedCell))"], [])
@@ -166,6 +179,15 @@ forged =
   , ("MaterialId", ["import Hetoimasia.Terrain.Cell (MaterialId)"], ["unchecked :: MaterialId", "unchecked = MaterialId \"\""])
   , ("ZRange", ["import Hetoimasia.Terrain.Cell (ZRange)"], ["inverted :: ZRange", "inverted = ZRange 5 5"])
   , ("PackedCell", ["import Hetoimasia.Terrain.Palette (PackedCell)"], ["airWithShape :: PackedCell", "airWithShape = PackedCell 5"])
+  , -- A region that claims an opening a shape does not have, an air cell that
+    -- claims no component, and a connection that claims an overlap.
+    ("Opening", ["import Hetoimasia.Terrain.Opening (Opening)"], ["wholeFace :: Opening", "wholeFace = Opening [[(0, 0), (1, 0), (1, 1), (0, 1)]]"])
+  , ("CellOpenings", ["import Hetoimasia.Terrain.Opening (CellOpenings)"], ["sealed :: CellOpenings", "sealed = CellOpenings Nothing []"])
+  , ("Component", ["import Hetoimasia.Terrain.Opening (Component)"], ["second :: Component", "second = Component 1 []"])
+  , ("Portal", ["import Hetoimasia.Terrain.Opening (Portal)"], ["unowned :: Portal", "unowned = Portal undefined 9 undefined"])
+  , ("PlacedPortal", ["import Hetoimasia.Terrain.Opening (PlacedPortal)"], ["elsewhere :: PlacedPortal", "elsewhere = PlacedPortal undefined undefined"])
+  , ("ComponentRef", ["import Hetoimasia.Terrain.Opening (ComponentRef)"], ["nowhere :: ComponentRef", "nowhere = ComponentRef undefined 3"])
+  , ("PortalConnection", ["import Hetoimasia.Terrain.Opening (PortalConnection)"], ["overlap :: PortalConnection", "overlap = PortalConnection undefined undefined undefined 1 []"])
   , ("Source", ["import Hetoimasia.Terrain.Source (Source)"], ["unvalidated :: Source", "unvalidated = Source [] mempty mempty 0 0 0"])
   , ("Limits", ["import Hetoimasia.Terrain.Residency (Limits)"], ["zeroed :: Limits", "zeroed = Limits 0 0 0 0 0 0 0 0"])
   , ("Model", ["import Hetoimasia.Terrain.Residency (Model)"], ["empty :: Model", "empty = Model"])
@@ -180,6 +202,13 @@ recordUpdates =
   , ("solidFaces", ["import Hetoimasia.Terrain.Geometry (Solid, solidFaces)"], ["emptied :: Solid → Solid", "emptied s = s {solidFaces = []}"])
   , ("solidVertices", ["import Hetoimasia.Terrain.Geometry (Solid, solidVertices)"], ["emptied :: Solid → Solid", "emptied s = s {solidVertices = []}"])
   , ("solidShape", ["import Hetoimasia.Terrain.Geometry (Solid, solidShape)"], ["swapped :: Solid → Solid", "swapped s = s {solidShape = solidShape s}"])
+  , -- Opening values are read through functions only: no field label rewrites an
+    -- opening, a component, a portal or the area of a connection.
+    ("portalOpening", ["import Hetoimasia.Terrain.Opening (Portal, portalOpening)"], ["widened :: Portal → Portal", "widened p = p {portalOpening = undefined}"])
+  , ("componentPortals", ["import Hetoimasia.Terrain.Opening (Component, componentPortals)"], ["emptied :: Component → Component", "emptied c = c {componentPortals = []}"])
+  , ("cellComponents", ["import Hetoimasia.Terrain.Opening (CellOpenings, cellComponents)"], ["emptied :: CellOpenings → CellOpenings", "emptied o = o {cellComponents = []}"])
+  , ("connectionArea", ["import Hetoimasia.Terrain.Opening (PortalConnection, connectionArea)"], ["inflated :: PortalConnection → PortalConnection", "inflated c = c {connectionArea = 1}"])
+  , ("placedTile", ["import Hetoimasia.Terrain.Opening (PlacedPortal, placedTile)"], ["moved :: PlacedPortal → PlacedPortal", "moved p = p {placedTile = undefined}"])
   , ("rayDirection", ["import Hetoimasia.Terrain.Geometry (Ray, V3 (..), rayDirection)"], ["noDirection :: Ray → Ray", "noDirection r = r {rayDirection = V3 0 0 0}"])
   , ("rayOrigin", ["import Hetoimasia.Terrain.Geometry (Ray, V3 (..), rayOrigin)"], ["moved :: Ray → Ray", "moved r = r {rayOrigin = V3 0 0 0}"])
   , -- A validated limit cannot be rewritten after validation: the fields of Limits
@@ -270,6 +299,49 @@ supportedOutput =
   , "Just 0"
   , "2"
   , "[(5,8),(3,6)]"
+  ]
+
+-- | A client that reads the exact openings of the catalog, connects neighbors only
+-- through real shared-face openings and keeps the point and ray queries beside them,
+-- all through the public interface.
+openingClient ∷ String
+openingClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Hetoimasia.Terrain.Coordinate"
+    , "import Hetoimasia.Terrain.Geometry"
+    , "import Hetoimasia.Terrain.Opening"
+    , "import Hetoimasia.Terrain.Shape"
+    , ""
+    , "main :: IO ()"
+    , "main = do"
+    , "  let shape n = either (error . show) id (mkShapeId n)"
+    , "      tile x y z = either (error . show) id (tileCoord x y z)"
+    , "      faceArea ops face = sum [openingArea (portalOpening p) | p <- portalsOn face ops]"
+    , "      areas a b = map connectionArea (connectCells (tile 0 0 0) a (tile 1 0 0) b)"
+    , "  print (map (faceArea (shapeOpenings (shape 15))) cellFaces)"
+    , "  print (length (cellComponents (shapeOpenings (shape 0))), length (cellComponents (shapeOpenings (shape 15))))"
+    , "  print (areas (shapeOpenings (shape 1)) (shapeOpenings (shape 4)))"
+    , "  print (areas (shapeOpenings (shape 1)) (shapeOpenings (shape 0)))"
+    , "  print (map connectionArea (connectCells (tile 0 0 0) airOpenings (tile 1 1 0) airOpenings))"
+    , "  print (classifyPoint (shapeSolid (shape 15)) (V3 (1/2) (1/2) (1/2)))"
+    , "  print (fmap (fmap hitParameter . castRay (shapeSolid (shape 15))) (mkRay (V3 (1/2) (1/2) 2) (V3 0 0 (-1))))"
+    , "  print (rotateOpenings (turns 4) (shapeOpenings (shape 1)) == shapeOpenings (shape 1))"
+    , "  print (map componentIndex (cellComponents airOpenings))"
+    ]
+
+openingOutput ∷ [String]
+openingOutput =
+  [ "[1 % 1,1 % 1,1 % 1,1 % 1,1 % 1,0 % 1]"
+  , "(0,1)"
+  , "[1 % 4]"
+  , "[]"
+  , "[]"
+  , "Boundary"
+  , "Right (Just (3 % 2))"
+  , "True"
+  , "[0]"
   ]
 
 -- | A client that validates limits (a zero or unrepresentable figure is refused,
