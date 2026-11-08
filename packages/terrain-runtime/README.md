@@ -128,6 +128,10 @@ Retained-edit bytes are accounted monotonically by the model: a removal that
 *coalesces* two retained intervals shrinks the real changes, but the saving is not
 credited (the added bytes are reported as zero), so the account stays an upper bound.
 
+A settled removal's result (and a no-op's) is kept, with its command slot, until its
+holder takes it (`await`, or `retire` for a host): admission is busy once accepted
+commands and untaken results fill the slots, exactly as for a read's result.
+
 Removing air is a no-op: `changed = false` and the unchanged revision. A removal
 whose staged revision was superseded is recomputed against the current revision and
 committed in order; it is not rejected. A supplied content precondition (the
@@ -195,10 +199,25 @@ the stores only after the borrowers finish.
   the protected boundary around the body, outside that release: it waits for **both**
   proofs, the owner worker's own terminal acknowledgement (`OwnerControl`'s
   `awaitOwnerEnd`, so nothing of the owner, its logging included, still runs) and no
-  outstanding borrower, with no deadline, detach or timeout. It survives a
-  cancellation delivered while it waits (the interruption is remembered and
-  delivered after the drain) and the body's own failure, with its context, is the one
-  that propagates. The owner's cleanup is installed before its first fallible step. The owner returns only when the service is closed, no
+  outstanding borrower, with no deadline, detach or timeout. The owner's
+  start, the body and the drain are one masked region (the start's own wait is
+  interruptible, and the foundation's start drains a worker it could not
+  acknowledge), so there is no window between a started owner and the drain that
+  joins it. The drain survives *any* exception delivered while it waits, of whatever
+  type (a cancellation can deliver any): it is remembered with its context, not
+  obeyed, and delivered after the drain and the body's own failure, with its context, is the one
+  that propagates. The owner's cleanup is installed before its first fallible step and, whatever
+  ended the owner, retires every in-flight account at its terminal safe point:
+  each cancelling load is acknowledged, each outstanding transfer is abandoned and
+  each committed victim's release is finished, so no reservation outlives it (a
+  hold still outstanding keeps only its own arena retiring until released).
+* A defect recorded where nothing could throw (a host settlement callback that
+  failed inside a closing transaction) never hides: every settlement is still
+  attempted, and then the owner ends with the recorded defect, so supervision sees it.
+* Every release path steps the model through one function that says which events
+  may have returned credits (`freesCapacity`); what waits for capacity (pending
+  camera demand, a request waiting to be admitted again) is retried after each, so
+  a release can never be a missed wake-up. The owner returns only when the service is closed, no
   borrower is outstanding, nothing is left to settle and it has been asked to stop
   (`OwnerControl`, returned by the `Supervisor`): a supervised service that returned
   on its own would be an unexpected exit, so an orderly close ends only at a stop
@@ -272,6 +291,11 @@ retiring, and the borrower count against the model's holds.
 ```sh
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct
 ```
+
+`Test.TerrainRuntime.Hardening` includes an owner interrupted at each phase of
+its work (a load, a read's capture, staging, the commit boundary, a transfer, a
+victim's release), after which nothing may remain reserved, running, transferring or
+retiring.
 
 `Test.TerrainRuntime.Interleaving` runs a randomized interleaving of submit, cancel,
 grant, release, end, edit, borrow and view demand (24 seeds of 300 steps each, the
