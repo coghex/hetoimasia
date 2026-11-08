@@ -178,9 +178,11 @@ import Hetoimasia.Render.TwoD.Oracle.Material
 import Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
   ( ClipStanding (..)
   , Coverage (..)
+  , Footprint
   , Placement
   , clipStanding
-  , coverage
+  , coverageOf
+  , footprint
   , instanceIsSingular
   , inverseLinear
   , isDegenerate
@@ -377,7 +379,17 @@ data ModelData = ModelData
 
 -- | An instance in its layer's drawing order: where it is, the instance, the
 -- path the plan gave it and what its material is given.
-data Drawn = Drawn !Location !Instance !DrawPath !ModelData
+data Drawn = Drawn !Location !Instance !DrawPath !ModelData Placed
+
+-- | Where an instance lands in its view, worked out once and not at every pixel
+-- (it does not depend on the pixel; exact arithmetic gives the same values
+-- whenever it is computed): no placement the view's mapping can give, one that
+-- cannot be drawn, or the placement and its footprint. Lazy, so an instance that
+-- is never probed costs nothing.
+data Placed
+  = PlacedNowhere
+  | PlacedBad
+  | Placed Placement Footprint
 
 -- | Prepare a snapshot for probing, with no application material's model: an
 -- instance of one is unevaluable.
@@ -438,19 +450,21 @@ buildView chunksOf passIndex viewIndex resolved view planned =
     { ovLocation = AtView passIndex viewIndex
     , ovViewport = viewViewport view
     , ovSettings = viewSettings view
-    , ovMapping = either (const Nothing) (\spec → viewMapping (specMetrics spec) view) resolved
+    , ovMapping = mapping
     , ovClips = plannedClips planned
     , ovLayers =
-        [ buildLayer passIndex viewIndex layerIndex (viewMaterials view) (animated (viewAnimationTime view) (viewFrameTables view)) layer (Map.findWithDefault [] (passIndex, viewIndex, layerIndex) chunksOf) plannedLayer
+        [ buildLayer mapping passIndex viewIndex layerIndex (viewMaterials view) (animated (viewAnimationTime view) (viewFrameTables view)) layer (Map.findWithDefault [] (passIndex, viewIndex, layerIndex) chunksOf) plannedLayer
         | (layerIndex, layer, plannedLayer) ← zip3 [0 ..] (viewLayers view) (plannedLayers planned)
         ]
     }
+  where
+    mapping = either (const Nothing) (\spec → viewMapping (specMetrics spec) view) resolved
 
 -- | A layer's instances in the order the plan draws them: each run in turn, a
 -- chunk's cutout run read from the chunk and a ring run from the layer's ring
 -- entries, which are its dynamic instances and the chunks' ordered ones.
-buildLayer ∷ Int → Int → Int → Map MaterialRef MaterialData → (Instance → Instance) → Layer → [(ChunkRef, Chunk)] → PlannedLayer → OracleLayer
-buildLayer passIndex viewIndex layerIndex materials animate layer chunks planned =
+buildLayer ∷ Maybe ViewMapping → Int → Int → Int → Map MaterialRef MaterialData → (Instance → Instance) → Layer → [(ChunkRef, Chunk)] → PlannedLayer → OracleLayer
+buildLayer mapping passIndex viewIndex layerIndex materials animate layer chunks planned =
   OracleLayer
     { olSpace = plannedSpace planned
     , olDepth = plannedClearsDepth planned
@@ -469,10 +483,11 @@ buildLayer passIndex viewIndex layerIndex materials animate layer chunks planned
     drawn source path = case source of
       DynamicInstance index →
         let candidate = animate (dynamic ! index)
-         in Drawn (AtInstance passIndex viewIndex layerIndex index) candidate path (viewModelData candidate)
+         in Drawn (AtInstance passIndex viewIndex layerIndex index) candidate path (viewModelData candidate) (placedIn candidate)
       ChunkInstance position index → case nth position chunks >>= \(_, held) → fmap ((,) held . animate) (chunkInstanceAt held index) of
-        Just (held, candidate) → Drawn (AtChunkInstance passIndex viewIndex layerIndex position index) candidate path (chunkModelData held candidate)
+        Just (held, candidate) → Drawn (AtChunkInstance passIndex viewIndex layerIndex position index) candidate path (chunkModelData held candidate) (placedIn candidate)
         Nothing → error "the plan names a chunk instance the layer's chunks do not hold"
+    placedIn candidate = placedAt mapping (plannedSpace planned) candidate
     -- The record an instance's parameter word indexes: the view's records for a
     -- dynamic instance, the chunk's own for a chunk's.
     viewModelData candidate =
@@ -589,7 +604,7 @@ layerFragments oracle spec x y view mapping layer
   | olDepth layer =
       depthTested
         [ (path, nearness (instanceDepthKey instanceValue), fragment)
-        | drawn@(Drawn _ instanceValue path _) ← olInstances layer
+        | drawn@(Drawn _ instanceValue path _ _) ← olInstances layer
         , Just fragment ← [instanceFragment oracle spec x y view mapping (olSpace layer) drawn]
         ]
   | otherwise = mapMaybe (instanceFragment oracle spec x y view mapping (olSpace layer)) (olInstances layer)
@@ -616,7 +631,7 @@ depthTested = go 1
 
 -- | Whether an instance has area, so that drawing it needs the view's mapping.
 needsMapping ∷ Drawn → Bool
-needsMapping (Drawn _ instanceValue _ _) = not (instanceIsSingular (instanceTransform instanceValue))
+needsMapping (Drawn _ instanceValue _ _ _) = not (instanceIsSingular (instanceTransform instanceValue))
 
 -- | A viewport's four edges, exactly.
 viewportEdges ∷ Viewport → [((Rational, Rational), (Rational, Rational))]
@@ -632,23 +647,47 @@ viewportEdges (Viewport (V2 ox oy) (V2 width height)) =
     bottomRight = (right, bottom)
     bottomLeft = (left, bottom)
 
+-- | Where an instance lands under a view's mapping in a layer's space: the
+-- snapped origin when the view snaps, the plain composition otherwise.
+placedAt ∷ Maybe ViewMapping → LayerSpace → Instance → Placed
+placedAt Nothing _ _ = PlacedNowhere
+placedAt (Just mapping) space instanceValue = case placement of
+  Nothing → PlacedBad
+  Just placed
+    | isDegenerate placed || not (representable placed) → PlacedBad
+    | otherwise → Placed placed (footprint placed)
+  where
+    transform = instanceTransform instanceValue
+    (V2 _ _, V2 _ _, V2 originX originY) = columns transform
+    layerTransform = case space of
+      WorldSpace _ → worldTransform mapping
+      UiSpace → uiTransform mapping
+    toTarget = case space of
+      WorldSpace _ → worldToTarget mapping
+      UiSpace → uiToTarget mapping
+    placement
+      | mappingPixelSnap mapping = do
+          mapped ← toTarget (V2 originX originY)
+          let V2 snappedX snappedY = snapPoint mapped
+          Just (place layerTransform transform (Just (snappedX, snappedY)))
+      | otherwise = Just (place layerTransform transform Nothing)
+
 instanceFragment ∷ Oracle → TargetSpec → Int → Int → OracleView → ViewMapping → LayerSpace → Drawn → Maybe Fragment
-instanceFragment oracle spec x y view mapping space (Drawn location instanceValue path given)
+instanceFragment oracle spec x y view mapping space (Drawn location instanceValue path given placedValue)
   | instanceIsSingular transform = Nothing
-  | otherwise = case placement of
-      Nothing → Just (Bad (PlacementNotRepresentable location))
-      Just placed
-        | isDegenerate placed || not (representable placed) → Just (Bad (PlacementNotRepresentable location))
-        | otherwise → case clipStandingOf of
-            -- Outside its clip an instance gives nothing, whatever its quad does.
-            Just ClipOutside → Nothing
-            standing → case coverage placed centre of
-              Outside → Nothing
-              NearEdge → Just (Unsure (NearQuadEdge location))
-              Inside local
-                | standing == Just ClipNearEdge → Just (Unsure (NearClipEdge location))
-                | onCutoutPath → Just (cutoutSampled oracle spec view given instanceValue location placed local)
-                | otherwise → Just (sampled oracle spec view given instanceValue location placed local)
+  | otherwise = case placedValue of
+      PlacedNowhere → Just (Bad (PlacementNotRepresentable location))
+      PlacedBad → Just (Bad (PlacementNotRepresentable location))
+      Placed placed shape → case clipStandingOf of
+        -- Outside its clip an instance gives nothing, whatever its quad does.
+        Just ClipOutside → Nothing
+        standing → case coverageOf shape centre of
+          Outside → Nothing
+          NearEdge → Just (Unsure (NearQuadEdge location))
+          Inside local
+            | standing == Just ClipNearEdge → Just (Unsure (NearClipEdge location))
+            | onCutoutPath → Just (cutoutSampled oracle spec view given instanceValue location placed local)
+            | otherwise → Just (sampled oracle spec view given instanceValue location placed local)
   where
     -- How the pixel centre stands to the instance's clip, if it has one: the
     -- selected entry's resolved rectangle, an empty one holding no point and
@@ -669,19 +708,9 @@ instanceFragment oracle spec x y view mapping space (Drawn location instanceValu
     transform = instanceTransform instanceValue
     onCutoutPath = path == Cutout
     centre = (fromIntegral x + 1 / 2, fromIntegral y + 1 / 2)
-    (V2 _ _, V2 _ _, V2 originX originY) = columns transform
     layerTransform = case space of
       WorldSpace _ → worldTransform mapping
       UiSpace → uiTransform mapping
-    toTarget = case space of
-      WorldSpace _ → worldToTarget mapping
-      UiSpace → uiToTarget mapping
-    placement
-      | mappingPixelSnap mapping = do
-          mapped ← toTarget (V2 originX originY)
-          let V2 snappedX snappedY = snapPoint mapped
-          Just (place layerTransform transform (Just (snappedX, snappedY)))
-      | otherwise = Just (place layerTransform transform Nothing)
 
 -- | The fragment an ordered-path instance draws at a pixel its quad covers, at
 -- local coordinates @(lx, ly)@.
