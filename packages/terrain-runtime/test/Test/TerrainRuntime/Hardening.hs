@@ -5,7 +5,7 @@ module Test.TerrainRuntime.Hardening (spec) where
 import Control.Concurrent (killThread, throwTo, yield)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, fromException, throwIO, try)
+import Control.Exception (ErrorCall (..), ExceptionWithContext (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, fromException, throwIO, try)
 import Control.Monad (forM_, void, when)
 import qualified Data.Text as T
 import Hetoimasia.Foundation.Log (LogEntry (..), callbackSink, defaultLogFilter, mkLogger)
@@ -14,6 +14,7 @@ import Hetoimasia.Terrain.Changes (changesBytes)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Resident (residentCell)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailures)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (checkRuntime, withSupervision)
@@ -301,6 +302,87 @@ spec = describe "Accounting and lifetime hardening" $ do
           inspectInvariants svc >>= (`shouldBe` [])
         putMVar verdict checks
     readMVar verdict >>= either throwIO pure
+
+  it "attaches the cleanup's defects to the failure the owner already has" $ do
+    armed <- newTVarIO False
+    let probe = Probe $ \point → case point of
+          PointJob _ _ → do
+            fire <- atomically (readTVar armed >>= \a → writeTVar armed False >> pure a)
+            when fire (throwIO (ErrorCall "the owner failed first"))
+          _ → pure ()
+    outcome <- try $
+      withLoggingLifetime quiet $ \lifetime →
+        withSupervision lifetime $ \control →
+          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet probe) $ \svc → do
+            (_, lease) <- openMain svc "main"
+            bad <- newHost False
+            let failing = (hostEndpoint svc Nothing bad) {endpointSettle = \_ → throwSTM (ErrorCall "closure callback failed")}
+            _ <- okOf (cellWith svc failing lease (tile 1 1 1))
+            waitFor (readTVar (hostReady bad) >>= \n → check (n >= 1))
+            atomically (writeTVar armed True)
+            -- A new load fails the owner; closing then fails the pending request's callback too.
+            _ <- okOf (cellAt svc lease (tile 40 40 40))
+            awaitOwnerStopped svc
+            checkRuntime control
+    case outcome of
+      Left failure → do
+        fromException failure `shouldBe` Just (ErrorCall "the owner failed first")
+        let evidence = [fromException inner | f ← cleanupFailures failure, let ExceptionWithContext _ inner = cleanupFailureException f]
+        evidence `shouldSatisfy` any (\e → case e of Just (ProviderDefect _) → True; _ → False)
+      Right () → expectationFailure "the supervised run ended cleanly although the owner failed"
+
+  it "keeps an untaken removal result's bytes charged in the retained bank until it is taken" $
+    withService (defaultConfig {configRetainedBytes = 330}) $ \svc → do
+      (_, lease) <- openMain svc "main"
+      hostA <- newHost True
+      hostB <- newHost True
+      a <- okOf (removeWith svc (hostEndpoint svc Nothing hostA) lease (tile 1 1 1) Nothing)
+      b <- okOf (removeWith svc (hostEndpoint svc Nothing hostB) lease (tile 1 1 1) Nothing)
+      waitFor (readTVar (hostSettled hostA) >>= \x → check (not (null x)))
+      waitFor (readTVar (hostSettled hostB) >>= \x → check (not (null x)))
+      -- One result changed the cell, one was a no-op: both are held, 160 bytes each.
+      inspectSnapshotBytes svc >>= (`shouldBe` (320, 330))
+      removeAt svc lease (tile 2 2 2) Nothing >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True
+      model <- inspectModel svc
+      -- The model holds nothing for them; the retained bank does.
+      slotInUse model CommandSlot `shouldBe` 0
+      retire svc a
+      inspectSnapshotBytes svc >>= (`shouldBe` (160, 330))
+      next' <- okOf (removeAt svc lease (tile 2 2 2) Nothing)
+      _ <- await svc next'
+      retire svc b
+      inspectSnapshotBytes svc >>= (`shouldBe` (0, 330))
+      settleChecks svc
+
+  it "gives a queued load its turn while ready requests keep arriving elsewhere" $ do
+    gate <- newDisarmedGate
+    withGatedService defaultConfig alwaysAdmitting (\p -> case p of PointCaptured {} -> True; _ -> False) gate $ \svc -> do
+      (_, hot) <- openMain svc "hot"
+      cold <- do
+        client <- okOf (registerClient svc)
+        okOf (openArena svc client "cold" soilOverStone) >>= await svc >>= expectSuccess
+      _ <- readCell svc hot (tile 1 1 1)
+      order <- newTVarIO ([] :: [String])
+      let noting label = do
+            host <- newHost True
+            pure (host, (hostEndpoint svc Nothing host) {endpointSettle = \s -> modifyTVar' order (label :) >> modifyTVar' (hostSettled host) (s :)})
+      armGate gate
+      (_, firstEp) <- noting "hit"
+      _ <- okOf (cellWith svc firstEp hot (tile 1 1 1))
+      awaitReached gate
+      -- The owner is held while it prepares a cache hit. Now the cold query is
+      -- admitted, and a long run of further cache hits behind it in another arena.
+      (_, coldEp) <- noting "cold"
+      _ <- okOf (cellWith svc coldEp cold (tile 0 0 0))
+      forM_ [1 .. 40 :: Int] $ \_ -> do
+        (_, ep) <- noting "hit"
+        okOf (cellWith svc ep hot (tile 1 1 1))
+      openGate gate
+      waitFor (readTVar order >>= \o -> check (length o >= 42))
+      settledOrder <- reverse <$> readTVarIO order
+      -- The cold load is dispatched in its turn, not after the whole run of hits.
+      length (takeWhile (/= "cold") settledOrder) `shouldSatisfy` (< 41)
+      settleChecks svc
 
   it "reports a defect recorded during closure to supervision, after every request was settled" $ do
     outcome <- try $
