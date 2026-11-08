@@ -110,7 +110,7 @@ usageDisagreements census m =
 -- already forgotten the job is under-charging it.
 jobRunningDisagreements ∷ Model → ArenaId → RegionCoord → [String]
 jobRunningDisagreements m arena region =
-  [ "the owner is about to run the job for " <> show (arena, region) <> " but the model holds no running job for it"
+  [ "the owner is about to run the job for " <> show (arena, region) <> " but the model holds no running (or cancelling) job for it (its jobs: " <> show [jobPhase j | j ← modelJobs m, jobArena j == arena, jobRegion j == region] <> ")"
   | null running
   ]
     <> [ what <> ": the owner runs a job but the model counts " <> show counted
@@ -122,4 +122,6 @@ jobRunningDisagreements m arena region =
        , counted == 0
        ]
   where
-    running = [j | j ← modelJobs m, jobArena j == arena, jobRegion j == region, jobPhase j == JobRunningPhase]
+    -- A job cancelled while it waited for its turn still holds its slot and credits until
+    -- the owner acknowledges it.
+    running = [j | j ← modelJobs m, jobArena j == arena, jobRegion j == region, jobPhase j `elem` [JobRunningPhase, JobCancellingPhase]]
