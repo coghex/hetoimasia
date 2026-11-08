@@ -12,7 +12,7 @@ import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.Process (CreateProcess (cwd), proc)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain)
-import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withPackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withStorePackageClient)
 import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
@@ -73,9 +73,15 @@ spec = describe "Terrain render-2d opacity across the package boundary" $ do
 
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 withClient =
-  withPackageClient
+  -- The library's cell-quad path reads the asset package's coverage planes and
+  -- the map catalog's lookup (TRA-16), so both units, and the store the first
+  -- resolves its Hackage dependencies from, must be exposed for the unit to
+  -- load; a client still names only what it imports.
+  withStorePackageClient
     [ "base"
     , "hetoimasia-terrain-render-2d-0.1.0.0-inplace"
+    , "hetoimasia-terrain-render-2d-0.1.0.0-inplace-terrain-mapbake"
+    , "hetoimasia-asset-image-0.1.0.0-inplace"
     , "hetoimasia-terrain"
     , "hetoimasia-render-2d"
     , "hetoimasia-math"

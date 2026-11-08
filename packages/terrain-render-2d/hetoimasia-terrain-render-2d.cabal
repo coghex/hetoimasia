@@ -178,6 +178,7 @@ test-suite terrain-render-2d-tests
         Test.TerrainRender2D.Art
         Test.TerrainRender2D.Camera
         Test.TerrainRender2D.CellFixtures
+        Test.TerrainRender2D.CellsClient
         Test.TerrainRender2D.Cells
         Test.TerrainRender2D.CellsCoverage
         Test.TerrainRender2D.CellsProgress
