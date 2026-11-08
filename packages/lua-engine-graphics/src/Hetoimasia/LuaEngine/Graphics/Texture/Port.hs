@@ -58,6 +58,7 @@ import Data.ByteString (ByteString)
 import Data.Set (Set)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
+import Hetoimasia.Asset.Image (TexelFormat)
 
 -- | Everything the backend asks of the graphics owner, over the native image type and the upload
 -- ticket type of the owner it borrows.
@@ -128,8 +129,11 @@ data Outcome a
 
 -- | The operations an owner-thread action may perform, over the owner's native image type.
 data Device image = Device
-  { deviceAllocate ∷ Word32 → Word32 → IO (Either Fault image)
-    -- ^ A texture image for one RGBA8 sRGB level of this extent. Nothing is written.
+  { deviceAllocate ∷ TexelFormat → Word32 → Word32 → IO (Either Fault image)
+    -- ^ A texture image for one RGBA8 level of this extent, under this interpretation: premultiplied sRGB
+    -- colour ('Hetoimasia.Asset.Image.TexelRgba8Srgb') or linear numeric data
+    -- ('Hetoimasia.Asset.Image.TexelRgba8Linear'). The image's native format carries it for good: what is
+    -- sampled is not reinterpreted. Nothing is written.
   , deviceDiscard ∷ image → IO (Either Fault ())
     -- ^ Release an image that was never registered.
   , deviceRegister ∷ image → Level → IO (Either Fault Registration)
@@ -158,7 +162,9 @@ data Disposal
 
 -- | The facts about the uploaded level a registration needs.
 data Level = Level
-  { levelWidth ∷ !Word32
+  { levelFormat ∷ !TexelFormat
+    -- ^ The interpretation the image was allocated and uploaded under, recorded as the registry's metadata.
+  , levelWidth ∷ !Word32
   , levelHeight ∷ !Word32
   , levelBinaryAlpha ∷ !Bool
     -- ^ Every texel's alpha is 0 or 255, read from the decoded level while it was borrowed.

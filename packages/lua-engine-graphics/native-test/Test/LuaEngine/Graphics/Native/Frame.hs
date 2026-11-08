@@ -13,6 +13,7 @@ module Test.LuaEngine.Graphics.Native.Frame
   ( Shot (..)
   , shoot
   , shootWith
+  , shootRaw
   , Recording
   , sideWidth
   , sideHeight
@@ -114,7 +115,15 @@ shoot host = shootWith host constructFramelessBatch (pure ())
 -- | 'shoot', recording the batch the way the caller says and running an action once the batch has been recorded and
 -- before its completion is awaited.
 shootWith ∷ ∀ scene. VulkanHost scene → Recording → IO () → Render.Renderer → Api.TextureHandle → DecodedImage → (Int → Int → (Word8, Word8, Word8, Word8)) → IO (Either Text Shot)
-shootWith host record between renderer handle decoded straight =
+shootWith host record between renderer handle decoded straight = shootProbed host record between renderer handle decoded (Just straight)
+
+-- | 'shoot' judged by the oracle alone: no colour-fixture probes, for a texture whose numeric channels are not colours
+-- (a data texture), whose expectations the caller states by hand beside the shot.
+shootRaw ∷ ∀ scene. VulkanHost scene → Render.Renderer → Api.TextureHandle → DecodedImage → IO (Either Text Shot)
+shootRaw host renderer handle decoded = shootProbed host constructFramelessBatch (pure ()) renderer handle decoded Nothing
+
+shootProbed ∷ ∀ scene. VulkanHost scene → Recording → IO () → Render.Renderer → Api.TextureHandle → DecodedImage → Maybe (Int → Int → (Word8, Word8, Word8, Word8)) → IO (Either Text Shot)
+shootProbed host record between renderer handle decoded straight =
   case validateSnapshot snapshot of
     Left refused → pure (Left ("the snapshot was refused: " <> tshow refused))
     Right valid → do
@@ -237,7 +246,7 @@ shootWith host record between renderer handle decoded straight =
           , not (passes verdict)
           ]
             <> handFailures
-        (handProbes, handFailures) = hand bytes decoded straight
+        (handProbes, handFailures) = maybe ([], []) (hand bytes decoded) straight
 
 -- | Four probes read off the fixture's table by hand, apart from any decoder and oracle. The image is drawn
 -- one texel to a pixel, centred, over an opaque black clear; its four corners are found from what is drawn
