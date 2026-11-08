@@ -19,7 +19,7 @@ import System.Mem (performMajorGC)
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Hetoimasia.Terrain.Cell (Column (..), mkColumn)
-import Hetoimasia.Terrain.Connectivity (componentOf, defaultConnectivityLimits)
+import Hetoimasia.Terrain.Connectivity (BoundaryFace, ComponentKey, componentBoundary, componentOf, defaultConnectivityLimits)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesFromIntervals, removedIntervals)
 import Hetoimasia.Terrain.Coordinate (TileCoord, axisFromInteger)
 import Hetoimasia.Terrain.Discovery
@@ -90,6 +90,7 @@ baseSpec =
     , specScratchBytes = 4194304
     , specPendingObligations = 65536
     , specRetainedBytes = 50331648
+    , specBoundaryFaces = 1024
     }
 
 -- ---------------------------------------------------------------------------
@@ -191,6 +192,9 @@ spec = describe "Discovery" $ do
   authoritySpecs
   familySpecs
   accountingSpecs
+  revisionSpecs
+  windowSpecs
+  boundarySpecs
   controlSpecs
   evidenceSpecs
 
@@ -621,18 +625,16 @@ familySpecs = describe "huge families" $ do
           compiledFor = fst (mustCompile defaultConnectivityLimits (sceneSpec (rampFamily w)))
           keyAt' c = componentOf compiledFor (mustTile3 c)
           provider = rigProvider rig
-          boundary key = observedValue (queryKnownBoundary (rigEnv rig) provider key)
+          boundary key = observedValue (queryKnownBoundary (rigEnv rig) provider key 0)
           known key = observedValue (queryComponentKnown (rigEnv rig) provider key)
       case (keyAt' (1, 1, w - 1), keyAt' (1, 3, w - 2)) of
         (Just topRow, Just lowerRow) → do
           known topRow `shouldBe` Right True
           known lowerRow `shouldBe` Right False
           boundary lowerRow `shouldBe` Right Nothing
-          case boundary topRow of
-            Right (Just faces) → do
-              faces `shouldSatisfy` (not . null)
-              pure (length faces)
-            other → expectationFailure ("expected a boundary, got " <> show other) >> pure 0
+          pages <- allBoundaryPages (rigEnv rig) provider topRow
+          pages `shouldSatisfy` (not . null)
+          pure (length pages)
         other → expectationFailure ("components expected, got " <> show other) >> pure 0
     runFamily w = do
       let rig = newRig (limitsWith 64) (rampFamily w)
@@ -837,6 +839,7 @@ accountingSpecs = describe "accounting before the work" $ do
         Right (Progress c _) → do
           let report = candidateReport c
           (show allow, reportAttemptedReads report) `shouldBe` (show allow, count)
+          (show allow, reportScratchBytes report >= count * maxRecordBytes) `shouldBe` (show allow, True)
           (show allow, reportScratchBytes report <= allowScratchBytes allow, reportWrites report <= allowWrites allow, reportDeltaBytes report <= allowDeltaBytes allow) `shouldBe` (show allow, True, True, True)
         _ → pure ()
     -- the same bound holds for an edit and for a suspended exit.
@@ -868,6 +871,24 @@ accountingSpecs = describe "accounting before the work" $ do
       (sc, reportAttemptedReads r * maxRecordBytes <= sc) `shouldBe` (sc, True)
       (sc, reportAttemptedReads r >= reportReads r) `shouldBe` (sc, True)
     any (\(_, r) → reportAttemptedReads r > reportReads r) rejected `shouldBe` True
+  it "reports the peak scratch of a rejected inspection, independently counted" $ do
+    let rig0 = newRig (limitsWith 64) twoOpenings
+        (queued, _) = runTrace rig0 [Edit (1, 0, 5)]
+        header = retainedHeader (rigRetained queued)
+        allow = fullAllowance {allowScratchBytes = 1400}
+    ref ← newIORef 0
+    let result = stepDiscovery (rigEnv queued) header (countingProvider ref (rigProvider queued)) allow
+    _ ← evaluate (length (show result))
+    count ← readIORef ref
+    -- five requests reach the provider, each charged the largest record, plus the
+    -- staged obligation entry: 5 x 256 + 104 = 1384, and the sixth is refused.
+    count `shouldBe` 5
+    case result of
+      Right (Progress c (HaltCapacity CapacityScratchBytes)) → do
+        reportAttemptedReads (candidateReport c) `shouldBe` 5
+        reportScratchBytes (candidateReport c) `shouldBe` 1384
+        reportReads (candidateReport c) `shouldSatisfy` (< 5)
+      other → expectationFailure ("expected a scratch halt, got " <> show other)
   it "advances the knowledge revision when a removal extends a known run" $ do
     let scene = flatGround "extend a known run" []
         rig0 = newRig (limitsWith 64) scene
@@ -960,3 +981,251 @@ lockstep start edits = go (replayedStart, plainStart) (100000 ∷ Int)
                 (BatchIdle, BatchIdle) → problems <> map ((sceneName (rigScene a) <> " at the end: ") <>) (compareDrained replayed)
                 other → [sceneName (rigScene a) <> ": the two runs diverged: " <> show other]
     fullAllowance' = allowanceOf (envLimits (rigEnv start))
+
+-- ---------------------------------------------------------------------------
+-- The revision rule
+
+-- | A random action sequence over a scene's removals, always ending in a drain.
+data WAction = WEdit Cell3 | WBatch | WDrain | WForget | WReplay
+  deriving stock (Eq, Show)
+
+genActions ∷ [Cell3] → R [WAction]
+genActions cells = go cells (24 ∷ Int)
+  where
+    go cs 0 = pure (map WEdit cs <> [WDrain])
+    go cs n = do
+      r ← below 10
+      case (r, cs) of
+        (_, c : rest) | r < 4 → (WEdit c :) <$> go rest (n - 1)
+        _ | r < 7 → (WBatch :) <$> go cs (n - 1)
+        _ | r == 7 → (WForget :) <$> go cs (n - 1)
+        _ | r == 8 → (WReplay :) <$> go cs (n - 1)
+        _ → (WDrain :) <$> go cs (n - 1)
+
+-- | The void and solid cells reported known over the compared cells.
+knownFacts ∷ Rig → (Set.Set Cell3, Set.Set Cell3)
+knownFacts rig = (Set.fromList [c | (c, (True, _)) ← answers], Set.fromList [c | (c, (_, True)) ← answers])
+  where
+    provider = retainedProvider (rigRetained rig)
+    answers = [(c, r) | c ← innerCells (rigScene rig), Right r ← [modelKnowledge (rigEnv rig) provider c]]
+
+revisionSpecs ∷ Spec
+revisionSpecs = describe "the revision rule" $ do
+  it "advances the knowledge revision when a removal bridges runs of one known class, or extends a known run" $ do
+    let scene = flatGround "bridge known runs" []
+        rig0 = newRig (limitsWith 64) scene
+        (known, bad) = runTrace rig0 ([Edit c | c ← [(0, 0, -3), (1, 0, -3), (1, 0, -2), (1, 0, -1), (0, 0, -1)]] <> [Drain fullAllowance])
+        header = retainedHeader (rigRetained known)
+        staged tile = stageRemoval (rigEnv known) header (rigProvider known) fullAllowance tile
+    bad `shouldBe` []
+    -- the removal at (0,0,-2) bridges two runs already in the same known class.
+    case staged (mustTile 0 0 (-2)) of
+      Right (Staged c) → do
+        candidateKnowledge c `shouldBe` True
+        authKnowledge (hAuthority (candidateNext c)) `shouldNotBe` authKnowledge (candidateBase c)
+        reportNewlyKnown (candidateReport c) `shouldSatisfy` (not . null)
+      other → expectationFailure ("expected a candidate, got " <> show other)
+    let atMax = header {hAuthority = (hAuthority header) {authKnowledge = Revision maxBound}}
+    stageRemoval (rigEnv known) atMax (rigProvider known) fullAllowance (mustTile 0 0 (-2)) `shouldBe` Left AuthorityOverflow
+    -- a removal in an unrelated sealed place changes no knowledge and no revision of it.
+    case staged (mustTile 5 5 (-6)) of
+      Right (Staged c) → candidateKnowledge c `shouldBe` False
+      other → expectationFailure ("expected a candidate, got " <> show other)
+  it "holds over random edit, batch, forget, replay and drain sequences (generated property)" $ do
+    forM_ [(0, 0, 8), (-3, -3, 32), (-2, -2, -32)] $ \origin →
+      forM_ [1 .. 14 ∷ Int] $ \seed → do
+        let (scene, removals) = generatedScene origin seed
+            limits = limitsWith (case seed `mod` 4 of 0 → 1; 1 → 2; 2 → 3; _ → 64)
+            actions = runR (genActions removals) seed
+        revisionProperty (newRig limits scene) actions `shouldBe` []
+
+-- | Check the one revision rule over a sequence. After every action: content
+-- advances exactly with an applied removal; store with every applied candidate;
+-- knowledge never decreases, by at most one per candidate, and advances whenever
+-- known void or known solid space appeared in the compared cells; known voids
+-- never shrink and a known solid is lost only by removing it; and a candidate
+-- staged against the state before the action is refused afterwards if anything
+-- was applied.
+revisionProperty ∷ Rig → [WAction] → [String]
+revisionProperty rig0 = go rig0
+  where
+    label rig act = sceneName (rigScene rig) <> " after " <> show act <> ": "
+    go _ [] = []
+    go rig (act : rest) =
+      let oldHeader = retainedHeader (rigRetained rig)
+          authBefore = hAuthority oldHeader
+          (voidsBefore, solidsBefore) = knownFacts rig
+          staleEdit = case stepDiscovery (rigEnv rig) oldHeader (rigProvider rig) (allowanceOf (envLimits (rigEnv rig))) of
+            Right (Progress c _) → Just c
+            _ → Nothing
+          (rig', removedNow) = case act of
+            WEdit c → let (r, k) = editRig fullAllowance c rig in (r, [c | EditApplied _ ← [k]])
+            WBatch → (fst (batchRig (allowanceOf (envLimits (rigEnv rig))) rig), [])
+            WDrain → (drainRig (allowanceOf (envLimits (rigEnv rig))) rig, [])
+            WForget → (rig, [])
+            WReplay → (apply Replay rig, [])
+          newAuthority = hAuthority (retainedHeader (rigRetained rig'))
+          (voidsAfter, solidsAfter) = knownFacts rig'
+          applied = newAuthority /= authBefore
+          grew = not (Set.null (Set.difference voidsAfter voidsBefore)) || not (Set.null (Set.difference solidsAfter solidsBefore))
+          kRev (Revision n) = toInteger n
+          problems =
+            [ label rig act <> "content revision " <> show (authContent authBefore, authContent newAuthority) <> ", removal applied " <> show (not (null removedNow))
+            | (authContent newAuthority /= authContent authBefore) /= not (null removedNow)
+            ]
+              <> [label rig act <> "knowledge revision went backwards" | kRev (authKnowledge newAuthority) < kRev (authKnowledge authBefore)]
+              <> [ label rig act <> "knowledge revision advanced by more than one for a single candidate"
+                 | act /= WDrain, kRev (authKnowledge newAuthority) - kRev (authKnowledge authBefore) > 1
+                 ]
+              <> [label rig act <> "known space appeared without a knowledge revision" | grew, authKnowledge newAuthority == authKnowledge authBefore]
+              <> [label rig act <> "a known void was lost" | not (Set.null (Set.difference voidsBefore voidsAfter))]
+              <> [ label rig act <> "a known solid was lost without being removed"
+                 | c ← Set.toList (Set.difference solidsBefore solidsAfter)
+                 , c `notElem` removedNow
+                 ]
+              <> [label rig act <> "the store revision did not advance with an applied candidate" | applied && authStore newAuthority == authStore authBefore]
+              <> [ label rig act <> "a candidate staged oldHeader the action was not refused afterwards"
+                 | applied
+                 , Just c ← [staleEdit]
+                 , either (const False) (const True) (applyCandidate c (rigRetained rig'))
+                 ]
+              <> map (label rig act <>) (stateViolations rig')
+       in problems <> go rig' rest
+
+-- ---------------------------------------------------------------------------
+-- Replay through a bounded window
+
+data WStats = WStats {suspensions ∷ !Int, evictions ∷ !Int}
+
+-- | Run the actions with a provider that exposes only the @w@ most recently
+-- loaded records. A request outside the window suspends the operation (nothing
+-- is lost); the record is then loaded, evicting the oldest, and the operation
+-- retried. After every applied candidate the retained value is rebuilt from its
+-- own records, and after every batch the state and the oracle bounds are
+-- checked. A forget action empties the window.
+runWindowed ∷ Int → Rig → [WAction] → (Rig, WStats, [String])
+runWindowed w rig0 = go rig0 [] (WStats 0 0) []
+  where
+    full rig = allowanceOf (envLimits (rigEnv rig))
+    load k window stats =
+      let window' = take w (k : filter (/= k) window)
+          evicted = if length (k : filter (/= k) window) > w then 1 else 0
+       in (window', stats {suspensions = suspensions stats + 1, evictions = evictions stats + evicted})
+    windowed rig window = windowProvider window (retainedProvider (rigRetained rig))
+    check rig problems label = problems <> map (label <>) (stateViolations rig)
+    go rig _ stats problems [] = (rig, stats, problems)
+    go rig window stats problems (act : rest) = case act of
+      WForget → go rig [] stats problems rest
+      WReplay → go (apply Replay rig) window stats problems rest
+      WEdit c → editLoop rig window stats problems c (500 ∷ Int) rest
+      WBatch → batchLoop rig window stats problems (500 ∷ Int) False rest
+      WDrain → batchLoop rig window stats problems (100000 ∷ Int) True rest
+    editLoop rig window stats problems c fuel rest
+      | fuel == 0 = (rig, stats, problems <> ["window too small to finish an edit"])
+      | otherwise = case editRigP (windowed rig window) (full rig) c rig of
+          (rig', EditSuspendedOn k) → let (window', stats') = load k window stats in editLoop rig' window' stats' problems c (fuel - 1) rest
+          (rig', EditApplied _) → go (apply Replay rig') window stats (check (apply Replay rig') problems ("edit " <> show c <> ": ")) rest
+          (rig', EditNoOp) → go rig' window stats problems rest
+          (rig', EditRefused r) → (rig', stats, problems <> ["edit refused: " <> show r])
+    batchLoop rig window stats problems fuel drain rest
+      | fuel == 0 = (rig, stats, problems <> ["window too small to finish a batch"])
+      | otherwise = case batchRigP (windowed rig window) (full rig) rig of
+          (rig', BatchStalled k) → let (window', stats') = load k window stats in batchLoop rig' window' stats' problems (fuel - 1) drain rest
+          (rig', BatchProgress _ halt) →
+            let replayed = apply Replay rig'
+                (window', stats') = case halt of HaltSuspended k → load k window stats; _ → (window, stats)
+                problems' = check replayed problems "batch: "
+             in if drain then batchLoop replayed window' stats' problems' (fuel - 1) True rest else go replayed window' stats' problems' rest
+          (rig', BatchIdle) → go rig' window stats problems rest
+          (rig', BatchRefused r) → (rig', stats, problems <> ["batch refused: " <> show r])
+
+windowSpecs ∷ Spec
+windowSpecs = describe "replay through a bounded window" $ do
+  it "matches the uninterrupted run for generated scenes, windows, batch sizes and interleavings" $ do
+    results ←
+      sequence
+        [ do
+            let (scene, removals) = generatedScene origin seed
+                limits = limitsWith (case seed `mod` 4 of 0 → 1; 1 → 2; 2 → 3; _ → 64)
+                window = [16, 24, 40] !! (seed `mod` 3)
+                actions = runR (genActions removals) (seed + 1000)
+                start = newRig limits scene
+                (windowedEnd, stats, problems) = runWindowed window start actions
+                plainEnd = foldl (\rg act → case act of WEdit c → fst (editRig fullAllowance c rg); WBatch → fst (batchRig (allowanceOf limits) rg); WDrain → drainRig (allowanceOf limits) rg; WReplay → apply Replay rg; WForget → rg) start actions
+                runsOf rg = [(k, r) | (k@(KeyRun _ _), r) ← retainedRecords (rigRetained rg)]
+                headerOf rg = let h = retainedHeader (rigRetained rg) in (authArena (hAuthority h), authContent (hAuthority h), hHead h, hTail h)
+            (scene `seq` problems) `shouldBe` []
+            runsOf windowedEnd `shouldBe` runsOf plainEnd
+            headerOf windowedEnd `shouldBe` headerOf plainEnd
+            compareDrained windowedEnd `shouldBe` []
+            pure stats
+        | origin ← [(0, 0, 8), (-3, -3, 32)]
+        , seed ← [1 .. 12 ∷ Int]
+        ]
+    -- the window was small enough that operations really suspended and records
+    -- were really replaced.
+    sum (map suspensions results) `shouldSatisfy` (> 100)
+    sum (map evictions results) `shouldSatisfy` (> 0)
+  it "serves nothing outside its window" $ do
+    let rig = newRig (limitsWith 64) twoOpenings
+        (queued, _) = runTrace rig [Edit (1, 0, 5)]
+        provider = windowProvider [] (retainedProvider (rigRetained queued))
+    fetchRecord provider (KeyTodo 0) `shouldBe` Unavailable (KeyTodo 0)
+    case fetchFloorRun provider (Column (either (error . show) id (axisFromInteger 1)) (either (error . show) id (axisFromInteger 0))) 5 of
+      Unavailable _ → pure ()
+      other → expectationFailure ("expected Unavailable, got " <> show (const () <$> Just other))
+
+-- ---------------------------------------------------------------------------
+-- Bounded boundary queries
+
+-- | Every face of a known component, page by page.
+allBoundaryPages ∷ Env → Provider → ComponentKey → IO [BoundaryFace]
+allBoundaryPages env provider key = go 0 (1000000 ∷ Int)
+  where
+    go _ 0 = expectationFailure "boundary paging did not finish" >> pure []
+    go from fuel = case observedValue (queryKnownBoundary env provider key from) of
+      Right (Just page) → do
+        length (pageFaces page) `shouldSatisfy` (<= max (limitBoundaryFaces (envLimits env)) minimumBoundaryFaces)
+        rest ← maybe (pure []) (\next → go next (fuel - 1)) (pageNext page)
+        pure (pageFaces page <> rest)
+      other → expectationFailure ("unexpected page " <> show (const () <$> Just other)) >> pure []
+
+boundarySpecs ∷ Spec
+boundarySpecs = describe "bounded boundary queries" $ do
+  let patchedSource n =
+        SourceSpec ["stone"] [LayerSpec Nothing (Just 0) "stone" 0] [PatchSpec (3 * i) 0 3 4 (SpecSolid "stone" 0) | i ← [1 .. n]]
+      sceneOf n = Scene {sceneName = "patched " <> show n, sceneSpec = patchedSource n, sceneWindow = Window (-1, 2) (-1, 2) (-3, 3), sceneSky = Just 0}
+      small = either (error . show) id (mkDiscoveryLimits baseSpec {specBoundaryFaces = 64})
+  it "pages a vast boundary within the limit and reproduces the whole description" $ do
+    let rig = newRig small (sceneOf 200)
+        compiled = fst (mustCompile defaultConnectivityLimits (patchedSource 200))
+        provider = retainedProvider (rigRetained rig)
+    case componentOf compiled (mustTile3 (1, 5, 5)) of
+      Nothing → expectationFailure "no sky component"
+      Just key → do
+        faces ← allBoundaryPages (rigEnv rig) provider key
+        Just faces `shouldBe` componentBoundary compiled key
+        length faces `shouldSatisfy` (> 10000)
+        -- one page costs one read of the representative and a bounded charge.
+        let first = queryKnownBoundary (rigEnv rig) provider key 0
+        observedReads first `shouldSatisfy` (<= limitInspectedRecords small)
+  it "allocates alike for a full page of a source with 200 and with 400 patches" $ do
+    let page n = do
+          let rig = newRig small (sceneOf n)
+              compiled = fst (mustCompile defaultConnectivityLimits (patchedSource n))
+          _ ← evaluate (envSharedBytes (rigEnv rig))
+          pure (rig, componentOf compiled (mustTile3 (1, 5, 5)))
+    (few, keyFew) ← page 200
+    (many, keyMany) ← page 400
+    -- the keys are built before anything is timed.
+    _ ← evaluate (maybe 0 (const (1 ∷ Int)) keyFew + maybe 0 (const 1) keyMany)
+    let first rig key = evaluate (maybe 0 (\k → either (const 0) (maybe 0 (length . pageFaces)) (observedValue (queryKnownBoundary (rigEnv rig) (retainedProvider (rigRetained rig)) k 0))) key)
+    a ← allocatedBy (repeatN 20 (first few keyFew))
+    b ← allocatedBy (repeatN 20 (first many keyMany))
+    putStrLn ("allocation, 20 first boundary pages of 64 boxes, 200 patches: " <> show a <> " B; 400 patches: " <> show b <> " B")
+    sameCost "boundary page" a b
+  it "refuses a page the scratch cannot hold, at validation and never at the query" $ do
+    mkDiscoveryLimits baseSpec {specScratchBytes = 52224, specBoundaryFaces = 1024}
+      `shouldBe` Left (LimitBelowProgress FieldScratchBytes 52224 (toInteger (boundaryPageBytes 1024)))
+    mkDiscoveryLimits baseSpec {specBoundaryFaces = 5} `shouldBe` Left (LimitBelowProgress FieldBoundaryFaces 5 6)
+    mkDiscoveryLimits baseSpec {specBoundaryFaces = 65537} `shouldBe` Left (LimitUnrepresentable FieldBoundaryFaces 65537 65536)

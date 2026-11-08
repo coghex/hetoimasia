@@ -77,6 +77,7 @@ module Hetoimasia.Terrain.Internal.Discovery.Core
   , queryCell
   , queryRemoved
   , queryComponentKnown
+  , BoundaryPage (..)
   , queryKnownBoundary
   , queryNodeClass
   , ObligationState (..)
@@ -100,7 +101,7 @@ import Hetoimasia.Terrain.Internal.Connectivity.Index
   , Connectivity (..)
   , Stats (..)
   , VoidLookup (..)
-  , componentBoundary
+  , componentBoundaryPage
   , isExterior
   , lookupVoid
   )
@@ -209,6 +210,8 @@ data Unresolved
   = MissingRecord !RecordKey
   | Inconsistent !Integrity
   | ReadLimit !Int
+  | -- | A query's output or traversal state would overflow this resource.
+    QueryCapacity !Capacity
   deriving stock (Eq, Show)
 
 -- | A query answer and the records it read from the provider.
@@ -228,13 +231,14 @@ data Stop
   | -- | A sequence or revision that would wrap.
     StopOverflow
 
--- | A stop and the records the provider had been asked for when it happened, so
--- an attempt that is rejected still shows what it cost.
-data Failure = Failure !Stop !Int
+-- | A stop with what the attempt had cost when it happened: the records the
+-- provider had been asked for and the peak accounted scratch. Both are read from
+-- the one charging function ('charge'), so a rejected or suspended attempt shows
+-- exactly what it had been charged.
+data Failure = Failure !Stop !Int !Int
 
 -- | The resources one operation may use, each already the smaller of the
--- validated limit and the caller's allowance. Every figure is checked before the
--- read or the staged write it pays for.
+-- validated limit and the caller's allowance.
 data Caps = Caps
   { capReads ∷ !Int
   , capWrites ∷ !Int
@@ -246,24 +250,24 @@ data Caps = Caps
   }
 
 -- | Scratch state of one operation: the staged writes, the records read (so a
--- repeated read costs nothing), the floor answers, the read count and the
--- running accounted cost of the staged writes.
+-- repeated read costs nothing), the floor answers and the accounted resources.
+-- Every figure that is a resource changes through 'charge' alone.
 data S = S
   { sOverlay ∷ !(Map RecordKey (Maybe Record))
   , sCache ∷ !(Map RecordKey (Maybe Record))
   , sFloor ∷ !(Map (Column, Int64) (Maybe (Int64, Int64)))
   , sReads ∷ !Int
   , sCost ∷ !Int
+  -- ^ The accounted cost of the staged writes.
+  , sScratch ∷ !Int
+  -- ^ The accounted scratch now: reads, staged writes and query output.
+  , sPeak ∷ !Int
+  -- ^ The peak of 'sScratch'. It only rises, and only inside 'charge'.
   , sCaps ∷ !Caps
   }
 
 emptyS ∷ Caps → S
-emptyS = S Map.empty Map.empty Map.empty 0 0
-
--- | The accounted scratch: every provider read is charged the largest record
--- before it is made, and every staged write its entry.
-scratchNow ∷ S → Int
-scratchNow s = sReads s * maxRecordBytes + sCost s
+emptyS = S Map.empty Map.empty Map.empty 0 0 0 0
 
 -- | The accounted candidate payload so far: the header and the staged entries.
 payloadNow ∷ S → Int
@@ -272,9 +276,10 @@ payloadNow s = headerBytes + sCost s
 -- | The first resource the staged state overflows, if any.
 overCap ∷ S → Maybe Capacity
 overCap s
+  | sReads s > capReads caps = Just CapacityReads
   | Map.size (sOverlay s) > capWrites caps = Just CapacityWrites
   | payloadNow s > capDelta caps = Just CapacityDeltaBytes
-  | scratchNow s > capScratch caps = Just CapacityScratchBytes
+  | sScratch s > capScratch caps = Just CapacityScratchBytes
   | capBase caps + snd (settleWrites s) > capRetained caps = Just CapacityRetainedBytes
   | otherwise = Nothing
   where
@@ -282,6 +287,39 @@ overCap s
 
 overlayCost ∷ RecordKey → Maybe Record → Int
 overlayCost k = maybe (tombstoneBytes k) (entryBytes k)
+
+-- | Everything an operation can spend. This is the one place a resource is
+-- charged: a provider read, a staged write or the output and traversal state of
+-- a query each become a 'Charge', are checked against every cap before they
+-- happen, and raise the peak.
+data Charge
+  = -- | One provider read: one read and the largest record of scratch.
+    ChargeRead
+  | -- | A staged write or deletion of a key.
+    ChargeWrite !RecordKey !(Maybe Record)
+  | -- | Bytes of query output or traversal state.
+    ChargeOutput !Int
+
+-- | Apply a charge, or name the resource it would overflow. The state is
+-- returned unchanged on refusal, and the peak includes only charges made.
+charge ∷ Charge → S → Either Capacity S
+charge what s = case what of
+  ChargeRead → settle s {sReads = sReads s + 1, sScratch = sScratch s + maxRecordBytes}
+  ChargeOutput n → settle s {sScratch = sScratch s + n}
+  ChargeWrite key value →
+    let old = Map.lookup key (sOverlay s)
+        before = maybe 0 (overlayCost key) old
+        after = overlayCost key value
+     in settle
+          s
+            { sOverlay = Map.insert key value (sOverlay s)
+            , sCost = sCost s - before + after
+            , sScratch = sScratch s - before + after
+            }
+  where
+    settle s' = case overCap s' of
+      Just cap → Left cap
+      Nothing → Right s' {sPeak = max (sPeak s') (sScratch s')}
 
 newtype M a = M (Env → Provider → S → Either Failure (a, S))
 
@@ -302,35 +340,34 @@ askEnv ∷ M Env
 askEnv = M (\e _ s → Right (e, s))
 
 stopWith ∷ Stop → M a
-stopWith x = M (\_ _ s → Left (Failure x (sReads s)))
+stopWith x = M (\_ _ s → Left (failure x s))
+
+failure ∷ Stop → S → Failure
+failure x s = Failure x (sReads s) (sPeak s)
 
 corrupt ∷ Integrity → M a
 corrupt = stopWith . StopCorrupt
 
--- | Refuse a read before it is made when it would overflow the read count or
--- the scratch.
-beforeRead ∷ S → Either Failure ()
-beforeRead s
-  | sReads s + 1 > capReads caps = Left (Failure (StopCapacity CapacityReads) (sReads s))
-  | scratchNow s + maxRecordBytes > capScratch caps = Left (Failure (StopCapacity CapacityScratchBytes) (sReads s))
-  | otherwise = Right ()
-  where
-    caps = sCaps s
+-- | Charge, as a step of the monad.
+spend ∷ Charge → M ()
+spend what = M $ \_ _ s → case charge what s of
+  Left cap → Left (failure (StopCapacity cap) s)
+  Right s' → Right ((), s')
 
 -- | Read a retained record: the staged writes first, then what was already
--- read, then the provider. Each distinct provider read counts once against the
--- read limit and is checked before the provider is asked.
+-- read, then the provider. A distinct read is charged before the provider is
+-- asked.
 getRec ∷ RecordKey → M (Maybe Record)
 getRec key = M $ \_ p s → case Map.lookup key (sOverlay s) of
   Just r → Right (r, s)
   Nothing → case Map.lookup key (sCache s) of
     Just r → Right (r, s)
-    Nothing → do
-      beforeRead s
-      case fetchRecord p key of
-        Found r → Right (Just r, s {sCache = Map.insert key (Just r) (sCache s), sReads = sReads s + 1})
-        Absent → Right (Nothing, s {sCache = Map.insert key Nothing (sCache s), sReads = sReads s + 1})
-        Unavailable k → Left (Failure (StopMissing k) (sReads s + 1))
+    Nothing → case charge ChargeRead s of
+      Left cap → Left (failure (StopCapacity cap) s)
+      Right s1 → case fetchRecord p key of
+        Found r → Right (Just r, s1 {sCache = Map.insert key (Just r) (sCache s1)})
+        Absent → Right (Nothing, s1 {sCache = Map.insert key Nothing (sCache s1)})
+        Unavailable k → Left (failure (StopMissing k) s1)
 
 -- | The removed run of a column with the greatest lower end at or below a level.
 -- Floor answers ignore staged writes: no operation stages a run before it has
@@ -338,33 +375,26 @@ getRec key = M $ \_ p s → case Map.lookup key (sOverlay s) of
 floorRun ∷ Column → Int64 → M (Maybe (Int64, Int64))
 floorRun col z = M $ \_ p s → case Map.lookup (col, z) (sFloor s) of
   Just r → Right (r, s)
-  Nothing → do
-    beforeRead s
-    case fetchFloorRun p col z of
+  Nothing → case charge ChargeRead s of
+    Left cap → Left (failure (StopCapacity cap) s)
+    Right s1 → case fetchFloorRun p col z of
       Found run@(lo, hi)
         | lo <= z && lo < hi →
             Right
               ( Just run
-              , s
-                  { sFloor = Map.insert (col, z) (Just run) (sFloor s)
-                  , sCache = Map.insert (KeyRun col lo) (Just (RecRun hi)) (sCache s)
-                  , sReads = sReads s + 1
+              , s1
+                  { sFloor = Map.insert (col, z) (Just run) (sFloor s1)
+                  , sCache = Map.insert (KeyRun col lo) (Just (RecRun hi)) (sCache s1)
                   }
               )
-        | otherwise → Left (Failure (StopCorrupt (BadFloor col z)) (sReads s + 1))
-      Absent → Right (Nothing, s {sFloor = Map.insert (col, z) Nothing (sFloor s), sReads = sReads s + 1})
-      Unavailable k → Left (Failure (StopMissing k) (sReads s + 1))
+        | otherwise → Left (failure (StopCorrupt (BadFloor col z)) s1)
+      Absent → Right (Nothing, s1 {sFloor = Map.insert (col, z) Nothing (sFloor s1)})
+      Unavailable k → Left (failure (StopMissing k) s1)
 
 -- | Stage a write (or a deletion), refusing it before it is staged when the
 -- result would overflow a resource.
 stage ∷ RecordKey → Maybe Record → M ()
-stage key value = M $ \_ _ s →
-  let old = Map.lookup key (sOverlay s)
-      cost = sCost s - maybe 0 (overlayCost key) old + overlayCost key value
-      s' = s {sOverlay = Map.insert key value (sOverlay s), sCost = cost}
-   in case overCap s' of
-        Just cap → Left (Failure (StopCapacity cap) (sReads s))
-        Nothing → Right ((), s')
+stage key value = spend (ChargeWrite key value)
 
 putRec ∷ RecordKey → Record → M ()
 putRec key r = stage key (Just r)
@@ -534,7 +564,8 @@ data Report = Report
   , reportDeltaBytes ∷ !Int
   -- ^ Accounted bytes of the delta, header included.
   , reportScratchBytes ∷ !Int
-  -- ^ Accounted scratch bytes at the peak.
+  -- ^ Accounted scratch bytes at the peak, the request that was then rejected
+  -- or suspended included.
   , reportNewlyKnown ∷ [Node]
   -- ^ Roots of the classes that became known.
   , reportPendingAfter ∷ !Word64
@@ -584,6 +615,37 @@ candidateFrontierOnly c = not (cTerrain c) && not (cKnowledge c)
 -- | The candidate's accounting.
 candidateReport ∷ Candidate → Report
 candidateReport = cReport
+
+-- | THE revision rule, stated once; every candidate takes its next authority
+-- from 'nextAuthority' and nowhere else.
+--
+-- * __Content__ advances exactly when the candidate changes terrain: a removal
+--   that changed a cell. A discovery batch never changes it.
+-- * __Knowledge__ advances exactly when the candidate makes known space that was
+--   not known: a class becomes known, or a cell joins a class that is known
+--   (an extended or bridged run, a known old void). Retained knowledge never
+--   decreases, so it advances in one direction only.
+-- * __Store__ advances on every candidate: it counts frontier and maintenance
+--   commits (obligation progress, unions that change no knowledge).
+-- * __Invalidation.__ A reader that keyed a derived result by the knowledge
+--   revision it read (a fog plan, a picked cell) is stale as soon as the retained
+--   knowledge revision differs; one keyed by content is stale when terrain
+--   changed. Neither can see a candidate that is not applied.
+-- * __A stale holder__ of a candidate, or of an older header, is refused by
+--   'applyCandidate' against the whole authority (arena and all three
+--   revisions); a stale reader of knowledge gets the old, immutable value, which
+--   remains correct for the authority it names and never mixes in newer state.
+-- * Revision arithmetic is checked: an advance that would wrap is refused.
+-- | Whether newly known space was reported.
+gainsKnowledge ∷ [Node] → Bool
+gainsKnowledge = not . null
+
+nextAuthority ∷ Authority → Bool → [Node] → Either Refusal Authority
+nextAuthority base terrain gained = do
+  content ← if terrain then bump (authContent base) else Right (authContent base)
+  knowledge ← if gainsKnowledge gained then bump (authKnowledge base) else Right (authKnowledge base)
+  store ← bump (authStore base)
+  pure base {authContent = content, authKnowledge = knowledge, authStore = store}
 
 bump ∷ Revision → Either Refusal Revision
 bump (Revision n)
@@ -656,10 +718,10 @@ data StageOutcome
 stageRemoval ∷ Env → Header → Provider → Allowance → TileCoord → Either Refusal StageOutcome
 stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
   case runM editM env prov (emptyS caps) of
-    Left (Failure (StopCapacity cap) _) → Left (uncurry (CapacityBlocked cap) (editFigures cap))
-    Left (Failure (StopMissing k) _) → Right (EditSuspended k)
-    Left (Failure (StopCorrupt i) _) → Left (Corrupt i)
-    Left (Failure StopOverflow _) → Left AuthorityOverflow
+    Left (Failure (StopCapacity cap) _ _) → Left (uncurry (CapacityBlocked cap) (editFigures cap))
+    Left (Failure (StopMissing k) _ _) → Right (EditSuspended k)
+    Left (Failure (StopCorrupt i) _ _) → Left (Corrupt i)
+    Left (Failure StopOverflow _ _) → Left AuthorityOverflow
     Right (Nothing, _) → Right NoChange
     Right (Just (flips, joins), s) → finish s flips joins
   where
@@ -698,11 +760,7 @@ stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
                 pure (z, ([], 0))
               (Just lo, Nothing) → do
                 putRec (KeyRun col lo) (RecRun (z + 1))
-                -- The cell joins an existing run. When that run's class is
-                -- known the cell is new known space, a knowledge change even
-                -- though no class flips.
-                (root, ro) ← findRoot (RunNode col lo)
-                pure (lo, ([root | rootKnown ro], 0))
+                pure (lo, ([], 0))
               (Nothing, Just hi) → do
                 delRec (KeyRun col (z + 1))
                 putRec (KeyRun col z) (RecRun hi)
@@ -718,18 +776,23 @@ stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
             (voidFlips, voidJoins) ← case lookupVoid (envConn env) tile 0 of
               InComponent key → joinFlips <$> unionNodes (RunNode col runKey) (SrcNode key)
               _ → pure ([], 0)
+            -- The cell is now empty space of its run's class. When that class is
+            -- known the cell is new known space (and exposes new walls): a
+            -- knowledge change even when no class flips, whether the cell
+            -- extended a known run, bridged runs already in one known class or
+            -- joined a known old void.
+            (root, ro) ← findRoot (RunNode col runKey)
+            let gained = [root | rootKnown ro, root `notElem` (fst merged <> voidFlips)]
             putRec (KeyTodo tailSeq) (RecTodo (Todo tile 1))
-            pure (Just (fst merged <> voidFlips, snd merged + voidJoins))
+            pure (Just (fst merged <> voidFlips <> gained, snd merged + voidJoins))
     joinFlips AlreadyJoined = ([], 0)
     joinFlips (Joined ns) = (ns, 1)
     finish s flips joins = do
-      content ← bump (authContent (hAuthority hdr))
-      store ← bump (authStore (hAuthority hdr))
-      knowledge ← if null flips then Right (authKnowledge (hAuthority hdr)) else bump (authKnowledge (hAuthority hdr))
+      authority ← nextAuthority (hAuthority hdr) True flips
       let (writes, grown) = settleWrites s
           next =
             hdr
-              { hAuthority = (hAuthority hdr) {authContent = content, authKnowledge = knowledge, authStore = store}
+              { hAuthority = authority
               , hTail = tailSeq + 1
               , hBytes = hBytes hdr + grown
               }
@@ -742,11 +805,11 @@ stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
               , reportAttemptedReads = sReads s
               , reportWrites = Map.size (sOverlay s)
               , reportDeltaBytes = payloadNow s
-              , reportScratchBytes = scratchNow s
+              , reportScratchBytes = sPeak s
               , reportNewlyKnown = flips
               , reportPendingAfter = pendingObligations next
               }
-      pure (Staged (Candidate (hAuthority hdr) next writes True (not (null flips)) report))
+      pure (Staged (Candidate (hAuthority hdr) next writes True (gainsKnowledge flips) report))
 
 -- ---------------------------------------------------------------------------
 -- Discovery batches
@@ -784,6 +847,8 @@ data Acc = Acc
   , accAttempted ∷ !Int
   -- ^ Provider reads made, including those of an inspection that was then
   -- rejected.
+  , accPeak ∷ !Int
+  -- ^ Peak accounted scratch, including that of a rejected inspection.
   }
 
 -- | Run one discovery batch: at most the validated batch limit of structural
@@ -796,7 +861,7 @@ data Acc = Acc
 stepDiscovery ∷ Env → Header → Provider → Allowance → Either Refusal Step
 stepDiscovery env hdr0 prov allow
   | pendingObligations hdr0 == 0 = Right Idle
-  | otherwise = loop (Acc (emptyS caps) hdr0 0 0 0 [] 0)
+  | otherwise = loop (Acc (emptyS caps) hdr0 0 0 0 [] 0 0)
   where
     limits = envLimitsField env
     caps = capsOf limits allow hdr0
@@ -805,10 +870,10 @@ stepDiscovery env hdr0 prov allow
       | accUpdates acc >= batch = conclude acc HaltBatchFull
       | pendingObligations (accHeader acc) == 0 = conclude acc HaltDrained
       | otherwise = case runM (inspectHead (accHeader acc)) env prov (accS acc) of
-          Left (Failure (StopMissing k) n) → conclude (attempt n acc) (HaltSuspended k)
-          Left (Failure (StopCapacity cap) n) → conclude (attempt n acc) (HaltCapacity cap)
-          Left (Failure (StopCorrupt i) _) → Left (Corrupt i)
-          Left (Failure StopOverflow _) → Left AuthorityOverflow
+          Left (Failure (StopMissing k) n peak) → conclude (attempt n peak acc) (HaltSuspended k)
+          Left (Failure (StopCapacity cap) n peak) → conclude (attempt n peak acc) (HaltCapacity cap)
+          Left (Failure (StopCorrupt i) _ _) → Left (Corrupt i)
+          Left (Failure StopOverflow _ _) → Left AuthorityOverflow
           Right ((nextHeader, retired, result), s') →
             loop
               acc
@@ -819,8 +884,9 @@ stepDiscovery env hdr0 prov allow
                 , accRetired = accRetired acc + (if retired then 1 else 0)
                 , accKnown = accKnown acc <> edgeNewlyKnown result
                 , accAttempted = sReads s'
+                , accPeak = max (accPeak acc) (sPeak s')
                 }
-    attempt n acc = acc {accAttempted = max n (accAttempted acc)}
+    attempt n peak acc = acc {accAttempted = max n (accAttempted acc), accPeak = max peak (accPeak acc)}
     conclude acc halt
       | accUpdates acc == 0 = case halt of
           HaltSuspended k → Right (Stalled k)
@@ -830,13 +896,12 @@ stepDiscovery env hdr0 prov allow
     build acc halt = do
       let s = accS acc
           (writes, grown) = settleWrites s
-          knowledgeChanged = not (null (accKnown acc))
+          knowledgeChanged = gainsKnowledge (accKnown acc)
           base = hAuthority hdr0
-      store ← bump (authStore base)
-      knowledge ← if knowledgeChanged then bump (authKnowledge base) else Right (authKnowledge base)
+      authority ← nextAuthority base False (accKnown acc)
       let next =
             (accHeader acc)
-              { hAuthority = base {authKnowledge = knowledge, authStore = store}
+              { hAuthority = authority
               , hBytes = hBytes hdr0 + grown
               }
           report =
@@ -848,7 +913,7 @@ stepDiscovery env hdr0 prov allow
               , reportAttemptedReads = max (sReads s) (accAttempted acc)
               , reportWrites = Map.size (sOverlay s)
               , reportDeltaBytes = payloadNow s
-              , reportScratchBytes = scratchNow s
+              , reportScratchBytes = max (sPeak s) (accPeak acc)
               , reportNewlyKnown = accKnown acc
               , reportPendingAfter = pendingObligations next
               }
@@ -996,17 +1061,18 @@ retainedFromRecords h entries = do
 runQuery ∷ Env → Provider → M a → Observed a
 runQuery env prov m = case runM m env prov (emptyS caps) of
   Right (a, s) → Observed (Right a) (sReads s)
-  Left (Failure (StopMissing k) n) → Observed (Left (MissingRecord k)) n
-  Left (Failure (StopCorrupt i) n) → Observed (Left (Inconsistent i)) n
-  Left (Failure (StopCapacity _) n) → Observed (Left (ReadLimit (capReads caps))) n
-  Left (Failure StopOverflow n) → Observed (Left (Inconsistent BadAccounting)) n
+  Left (Failure (StopMissing k) n _) → Observed (Left (MissingRecord k)) n
+  Left (Failure (StopCorrupt i) n _) → Observed (Left (Inconsistent i)) n
+  Left (Failure (StopCapacity CapacityReads) n _) → Observed (Left (ReadLimit (capReads caps))) n
+  Left (Failure (StopCapacity cap) n _) → Observed (Left (QueryCapacity cap)) n
+  Left (Failure StopOverflow n _) → Observed (Left (Inconsistent BadAccounting)) n
   where
     limits = envLimitsField env
     caps =
       Caps
         { capReads = limitInspectedRecords limits
-        , capWrites = 0
-        , capDelta = 0
+        , capWrites = limitDeltaRecords limits
+        , capDelta = limitDeltaBytes limits
         , capScratch = limitScratchBytes limits
         , capRetained = limitRetainedBytes limits
         , capBase = 0
@@ -1032,15 +1098,37 @@ queryRemoved env prov tile = runQuery env prov $ do
 queryComponentKnown ∷ Env → Provider → ComponentKey → Observed Bool
 queryComponentKnown env prov key = runQuery env prov (nodeKnown (SrcNode key))
 
--- | The compressed exposed boundary of a source component, when the component
--- is known: the faces of its class's boxes, each a rectangle of cells with what
--- lies across, never an enumeration of exposed tiles. It describes the
--- immutable source; a removal's effect on it is read cell by cell with
--- 'queryCell'.
-queryKnownBoundary ∷ Env → Provider → ComponentKey → Observed (Maybe [BoundaryFace])
-queryKnownBoundary env prov key = runQuery env prov $ do
+-- | One page of a known component's compressed boundary. The description is
+-- paged so that neither the traversal nor the output is unbounded: a page holds
+-- whole boxes of the component's class: at most 'limitBoundaryFaces' boxes are
+-- scanned and as many faces returned (a page may hold fewer, or none, when the
+-- boxes it scans lie inside the class), and 'pageNext' is where the next page
+-- begins.
+data BoundaryPage = BoundaryPage
+  { pageFaces ∷ [BoundaryFace]
+  , pageNext ∷ !(Maybe Int)
+  }
+  deriving stock (Eq, Show)
+
+-- | The compressed exposed boundary of a source component, when the component is
+-- known, one bounded page at a time from a box position (start at 0): at most six
+-- faces per box of the class, each a rectangle of cells with what lies across,
+-- never an enumeration of exposed tiles. The page's accounted bytes are charged
+-- through the same function as every read and write, before the page is built; a
+-- limit too small for a page is refused ('QueryCapacity'). It describes the
+-- immutable source; a removal's effect on a boundary is read cell by cell with
+-- 'queryCell'. The whole description is the pages in order.
+queryKnownBoundary ∷ Env → Provider → ComponentKey → Int → Observed (Maybe BoundaryPage)
+queryKnownBoundary env prov key from = runQuery env prov $ do
   known ← nodeKnown (SrcNode key)
-  pure (if known then componentBoundary (envConn env) key else Nothing)
+  if not known
+    then pure Nothing
+    else do
+      let limit = limitBoundaryFaces (envLimitsField env)
+      spend (ChargeOutput (boundaryPageBytes limit))
+      case componentBoundaryPage (envConn env) key (max 0 from) limit of
+        Nothing → corrupt (UnknownComponent key)
+        Just (faces, next) → pure (Just (BoundaryPage faces next))
 
 -- | What is known of the empty space of a tile.
 data VoidKnowledge

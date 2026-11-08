@@ -66,6 +66,7 @@ module Hetoimasia.Terrain.Internal.Connectivity.Index
   , componentRanges
   , componentRelations
   , componentBoundary
+  , componentBoundaryPage
   , componentContains
   , portalRelations
   ) where
@@ -470,6 +471,29 @@ componentBoundary ∷ Connectivity → ComponentKey → Maybe [BoundaryFace]
 componentBoundary c key = do
   (_, nodes) ← resolve c key
   pure (concatMap (boundaryOf c key) nodes)
+
+-- | One page of a component's boundary: from the box at position @from@ of its
+-- class, at most @limit@ boxes are scanned and at most @limit@ faces returned
+-- (whole boxes only, and always at least one box), with the position of the next
+-- box when more remain. A page may hold fewer faces than the limit, or none: a box
+-- inside the class has no boundary face. Neither the members of the class nor the
+-- faces are materialized beyond the page; skipping to @from@ walks immutable
+-- shared metadata without allocating.
+componentBoundaryPage ∷ Connectivity → ComponentKey → Int → Int → Maybe ([BoundaryFace], Maybe Int)
+componentBoundaryPage c key from limit = do
+  rep ← resolveRep c key
+  ids ← IntMap.lookup (nodeClass rep) (cMembers c)
+  pure (go from (drop from ids) [] 0 (0 ∷ Int))
+  where
+    go _ [] acc _ _ = (concat (reverse acc), Nothing)
+    go i (nid : rest) acc count scanned
+      | scanned >= limit = (concat (reverse acc), Just i)
+      | otherwise =
+          let faces = maybe [] (boundaryOf c key) (IntMap.lookup nid (cNodes c))
+              total = count + length faces
+           in if total > limit && count > 0
+                then (concat (reverse acc), Just i)
+                else go (i + 1) rest (faces : acc) total (scanned + 1)
 
 boundaryOf ∷ Connectivity → ComponentKey → Node → [BoundaryFace]
 boundaryOf c key node = case (memberRange c key node, nodeRange c node) of

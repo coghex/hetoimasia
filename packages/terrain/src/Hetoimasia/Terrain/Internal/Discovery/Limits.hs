@@ -25,6 +25,7 @@ module Hetoimasia.Terrain.Internal.Discovery.Limits
   , limitScratchBytes
   , limitPendingObligations
   , limitRetainedBytes
+  , limitBoundaryFaces
   , Allowance (..)
   , allowanceOf
   , maxBatchUpdates
@@ -45,6 +46,10 @@ module Hetoimasia.Terrain.Internal.Discovery.Limits
   , minimumDeltaBytes
   , minimumScratchBytes
   , minimumRetainedBytes
+  , minimumBoundaryFaces
+  , boundaryFaceBytes
+  , traversalBytes
+  , boundaryPageBytes
   ) where
 
 -- | The most hops a union-find chain may take. Union by size bounds a chain by
@@ -117,6 +122,23 @@ minimumScratchBytes = max worstEditScratch worstEdgeScratch
 minimumRetainedBytes ∷ Int
 minimumRetainedBytes = headerBytes + worstEditBytes
 
+-- | The accounted bytes of one boundary face in a query page.
+boundaryFaceBytes ∷ Int
+boundaryFaceBytes = 128
+
+-- | The accounted bytes of a boundary page's traversal state.
+traversalBytes ∷ Int
+traversalBytes = 64
+
+-- | The fewest faces a boundary page may hold: one box of a class has up to six.
+minimumBoundaryFaces ∷ Int
+minimumBoundaryFaces = 6
+
+-- | The accounted scratch of a boundary page of at most @n@ faces, charged
+-- before the page is built.
+boundaryPageBytes ∷ Int → Int
+boundaryPageBytes n = n * boundaryFaceBytes + traversalBytes
+
 -- | The most structural updates one discovery batch performs: P-15 clause 4.
 maxBatchUpdates ∷ Int
 maxBatchUpdates = 64
@@ -138,6 +160,9 @@ data DiscoverySpec = DiscoverySpec
   -- ^ Unfinished obligations the frontier may hold.
   , specRetainedBytes ∷ !Integer
   -- ^ Accounted bytes of all retained records and the header.
+  , specBoundaryFaces ∷ !Integer
+  -- ^ Faces in one page of a boundary query, at least 6; the page's accounted
+  -- bytes must fit the scratch.
   }
   deriving stock (Eq, Show)
 
@@ -150,6 +175,7 @@ data LimitField
   | FieldScratchBytes
   | FieldPendingObligations
   | FieldRetainedBytes
+  | FieldBoundaryFaces
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | Why a limit configuration was refused. A configuration error is never a
@@ -176,6 +202,7 @@ data DiscoveryLimits = DiscoveryLimits
   , lScratch ∷ !Int
   , lPending ∷ !Int
   , lRetained ∷ !Int
+  , lBoundary ∷ !Int
   }
   deriving stock (Eq, Show)
 
@@ -184,6 +211,9 @@ countCeiling = 2 ^ (24 ∷ Int)
 
 byteCeiling ∷ Integer
 byteCeiling = 2 ^ (40 ∷ Int)
+
+boundaryCeiling ∷ Integer
+boundaryCeiling = 2 ^ (16 ∷ Int)
 
 pendingCeiling ∷ Integer
 pendingCeiling = 2 ^ (32 ∷ Int)
@@ -203,6 +233,7 @@ defaultDiscoveryLimits =
     , lScratch = 4 * 1024 * 1024
     , lPending = 65536
     , lRetained = 48 * 1024 * 1024
+    , lBoundary = 1024
     }
 
 -- | Validate a specification. The first refused field, in declaration order, is
@@ -220,7 +251,12 @@ mkDiscoveryLimits spec = do
   scratch ← check FieldScratchBytes byteCeiling (toInteger minimumScratchBytes) (specScratchBytes spec)
   pending ← check FieldPendingObligations pendingCeiling 1 (specPendingObligations spec)
   retained ← check FieldRetainedBytes byteCeiling (toInteger minimumRetainedBytes) (specRetainedBytes spec)
-  pure (DiscoveryLimits batch reads' records deltaBytes scratch pending retained)
+  boundary ← check FieldBoundaryFaces boundaryCeiling (toInteger minimumBoundaryFaces) (specBoundaryFaces spec)
+  -- A page must fit the scratch, or no boundary query could ever make progress.
+  if scratch < boundaryPageBytes boundary
+    then Left (LimitBelowProgress FieldScratchBytes (toInteger scratch) (toInteger (boundaryPageBytes boundary)))
+    else pure ()
+  pure (DiscoveryLimits batch reads' records deltaBytes scratch pending retained boundary)
   where
     check field top need n
       | n <= 0 = Left (LimitNotPositive field n)
@@ -255,6 +291,10 @@ limitPendingObligations = lPending
 -- | Accounted bytes of all retained records.
 limitRetainedBytes ∷ DiscoveryLimits → Int
 limitRetainedBytes = lRetained
+
+-- | Faces in one page of a boundary query.
+limitBoundaryFaces ∷ DiscoveryLimits → Int
+limitBoundaryFaces = lBoundary
 
 -- | What the caller can fund for one operation right now. It can only tighten
 -- the validated limits, never loosen them: a step uses the smaller of each. An

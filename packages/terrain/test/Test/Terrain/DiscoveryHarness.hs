@@ -25,6 +25,7 @@ module Test.Terrain.DiscoveryHarness
     Scene (..)
   , groundScene
   , cellsOfWindow
+  , innerCells
   , patchColumn
   , caveRow
 
@@ -33,13 +34,17 @@ module Test.Terrain.DiscoveryHarness
   , noDelay
   , delayedProvider
   , countingProvider
+  , windowProvider
+  , windowMarker
   , Rig (..)
   , newRig
   , rigProvider
   , EditKind (..)
   , editRig
+  , editRigP
   , Batch (..)
   , batchRig
+  , batchRigP
   , drainRig
   , drainWith
   , pendingOf
@@ -119,6 +124,12 @@ groundScene name sky (x0, x1) (y0, y1) depth patches =
 -- | The cells of the oracle window.
 cellsOfWindow ∷ Scene → [Cell3]
 cellsOfWindow = windowCells . sceneWindow
+
+-- | The cells compared: the window less its outer ring.
+innerCells ∷ Scene → [Cell3]
+innerCells scene = [c | c@(x, y, z) ← cellsOfWindow scene, x > x0, x < x1 - 1, y > y0, y < y1 - 1, z > z0, z < z1 - 1]
+  where
+    Window (x0, x1) (y0, y1) (z0, z1) = sceneWindow scene
 
 -- | A vertical column of one content from @lo@ to @hi@ (exclusive).
 patchColumn ∷ Integer → Integer → Integer → Integer → CellSpec → PatchSpec
@@ -269,6 +280,27 @@ tick ∷ IORef Int → a → a
 tick ref x = unsafePerformIO (modifyIORef' ref (+ 1) >> pure x)
 {-# NOINLINE tick #-}
 
+-- | A provider that serves only the records in a bounded window and answers
+-- every other request 'Unavailable', naming the key that would have to be
+-- loaded. A floor lookup that finds a run needs that run's key in the window; one
+-- that finds none needs the column's marker (see 'windowMarker').
+windowProvider ∷ [RecordKey] → Provider → Provider
+windowProvider window p =
+  Provider
+    { fetchRecord = \k → if k `elem` window then fetchRecord p k else Unavailable k
+    , fetchFloorRun = \c z → case fetchFloorRun p c z of
+        Found (lo, hi) | KeyRun c lo `elem` window → Found (lo, hi)
+        Found (lo, _) → Unavailable (KeyRun c lo)
+        Absent | windowMarker c `elem` window → Absent
+        Absent → Unavailable (windowMarker c)
+        other → other
+    }
+
+-- | The key that stands for "this column holds no run at or below a level" in a
+-- window.
+windowMarker ∷ Column → RecordKey
+windowMarker c = KeyRun c minBound
+
 -- | A scene's running state.
 data Rig = Rig
   { rigScene ∷ Scene
@@ -317,8 +349,12 @@ data EditKind
 
 -- | Stage and apply the removal of a cell.
 editRig ∷ Allowance → Cell3 → Rig → (Rig, EditKind)
-editRig allow cell rig =
-  case stageRemoval (rigEnv rig) (retainedHeader (rigRetained rig)) (rigProvider rig) allow (mustTile3 cell) of
+editRig allow cell rig = editRigP (rigProvider rig) allow cell rig
+
+-- | The same through an explicit provider (a bounded window, a counted one).
+editRigP ∷ Provider → Allowance → Cell3 → Rig → (Rig, EditKind)
+editRigP provider allow cell rig =
+  case stageRemoval (rigEnv rig) (retainedHeader (rigRetained rig)) provider allow (mustTile3 cell) of
     Left refusal → (rig, EditRefused refusal)
     Right NoChange → (rig, EditNoOp)
     Right (EditSuspended k) → (rig, EditSuspendedOn k)
@@ -347,7 +383,11 @@ data Batch
 
 -- | Run one discovery batch and apply its candidate.
 batchRig ∷ Allowance → Rig → (Rig, Batch)
-batchRig allow rig = case stepDiscovery (rigEnv rig) (retainedHeader (rigRetained rig)) (rigProvider rig) allow of
+batchRig allow rig = batchRigP (rigProvider rig) allow rig
+
+-- | The same through an explicit provider.
+batchRigP ∷ Provider → Allowance → Rig → (Rig, Batch)
+batchRigP provider allow rig = case stepDiscovery (rigEnv rig) (retainedHeader (rigRetained rig)) provider allow of
   Left refusal → (rig, BatchRefused refusal)
   Right Idle → (rig, BatchIdle)
   Right (Stalled k) → (rig, BatchStalled k)

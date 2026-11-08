@@ -159,6 +159,7 @@ module Hetoimasia.Terrain.Discovery
   , limitScratchBytes
   , limitPendingObligations
   , limitRetainedBytes
+  , limitBoundaryFaces
   , Allowance (..)
   , allowanceOf
   , maxBatchUpdates
@@ -174,6 +175,10 @@ module Hetoimasia.Terrain.Discovery
   , minimumDeltaBytes
   , minimumScratchBytes
   , minimumRetainedBytes
+  , minimumBoundaryFaces
+  , boundaryFaceBytes
+  , traversalBytes
+  , boundaryPageBytes
 
     -- * The environment
   , Env
@@ -240,6 +245,7 @@ module Hetoimasia.Terrain.Discovery
   , queryCell
   , queryRemoved
   , queryComponentKnown
+  , BoundaryPage (..)
   , queryKnownBoundary
   , queryNodeClass
   , ObligationState (..)

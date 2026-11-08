@@ -219,7 +219,7 @@ forged =
   , -- Validated discovery limits that claim no bound, a candidate that claims
     -- a delta nobody staged, retained state that claims a knowledge nobody
     -- earned and an environment built without its checked limits.
-    ("DiscoveryLimits", ["import Hetoimasia.Terrain.Discovery (DiscoveryLimits)"], ["zeroed :: DiscoveryLimits", "zeroed = DiscoveryLimits 0 0 0 0 0 0 0"])
+    ("DiscoveryLimits", ["import Hetoimasia.Terrain.Discovery (DiscoveryLimits)"], ["zeroed :: DiscoveryLimits", "zeroed = DiscoveryLimits 0 0 0 0 0 0 0 0"])
   , ("Env", ["import Hetoimasia.Terrain.Discovery (Env)"], ["bare :: Env", "bare = Env undefined undefined undefined"])
   , ("Candidate", ["import Hetoimasia.Terrain.Discovery (Candidate)"], ["claimed :: Candidate", "claimed = Candidate undefined undefined [] True True undefined"])
   , ("Retained", ["import Hetoimasia.Terrain.Discovery (Retained)"], ["claimed :: Retained", "claimed = Retained undefined undefined"])
@@ -515,7 +515,7 @@ discoveryClient =
     , ""
     , "main :: IO ()"
     , "main = do"
-    , "  let spec0 = DiscoverySpec 64 1000 100 100000 100000 100 100000"
+    , "  let spec0 = DiscoverySpec 64 1000 100 100000 100000 100 100000 64"
     , "  putStrLn (either show (const \"valid\") (mkDiscoveryLimits spec0))"
     , "  putStrLn (either show (const \"valid\") (mkDiscoveryLimits spec0 {specBatchUpdates = 0}))"
     , "  putStrLn (either show (const \"valid\") (mkDiscoveryLimits spec0 {specBatchUpdates = 65}))"
