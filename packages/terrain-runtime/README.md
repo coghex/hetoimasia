@@ -108,18 +108,25 @@ A removal is staged, then committed:
 2. **Load** (owner): the model's job loads the cell's region from source plus all
    retained removals.
 3. **Stage** (owner, pure): remove the whole cell (a slope included) from the
-   authority, rebuild the cell's resident segment, and compute the result. Nothing is
-   published. The staged work is tagged with the incarnation and revision it was
-   built for, and the host is told it is ready.
+   authority and prove the cell's resident segment can be rebuilt. Nothing is
+   published. The staged work carries only the content change, tagged with the
+   incarnation and revision it was built for, and the host is told it is ready.
+   (If that notification fails, nothing is staged: it is a provider defect.)
 4. **Commit** (owner, one transaction): read the parent session's admission, the
    request's presence in the table (a cancellation removes it), the arena's
    incarnation and revision, and the host's eligibility. Re-check a supplied
-   content precondition. If every check holds, apply the content, the revision, the
-   retained bytes and the model's `RemovalCommitted`, delete the request, admit
+   content precondition. If every check holds, rebuild the cell's resident segment
+   over the residency *as it is now* (loads and evictions may have changed it while
+   the commit waited for its grant, and none of that is overwritten), then apply the
+   content, the revision, the retained bytes and the model's `RemovalCommitted`, delete the request, admit
    again at the new revision every other pending removal and every reader that lost
    its work to the commit, and deliver the success settlement. Any failure before
    the host callback leaves nothing written; a failing callback abandons the whole
    transaction.
+
+Retained-edit bytes are accounted monotonically by the model: a removal that
+*coalesces* two retained intervals shrinks the real changes, but the saving is not
+credited (the added bytes are reported as zero), so the account stays an upper bound.
 
 Removing air is a no-op: `changed = false` and the unchanged revision. A removal
 whose staged revision was superseded is recomputed against the current revision and
@@ -157,8 +164,15 @@ and creates nothing; earlier edits, reads and demand are untouched.
 
 `withSnapshot` takes a borrow (`AcquireHold`, which charges one staging record per
 region and protects the regions from eviction) and builds an immutable `Snapshot`
-whose resident detail is restricted to exactly the held regions, so what it keeps
-alive is what the hold charges. It is coherent through later edits, eviction and the
+whose resident detail is restricted to exactly the held regions. Its **backing
+allocation is accounted**: each outstanding snapshot is charged the payload and
+metadata bytes of its restricted detail, conservatively per snapshot, against a
+snapshot bank (`configSnapshotBytes`, 16 MiB by default) that is carved out of the
+configured staging bank, which the accounting model is built without (so the two
+cannot overbook the approved 128 MiB). An edit rebuilds a segment while an earlier
+snapshot keeps the old one alive; a borrow that would retain a further version
+beyond the bank is refused `RefusedBusy BusySnapshots`, and the charge returns when
+the borrow is released. It is coherent through later edits, eviction and the
 arena's closure until released, and grants no authority: it cannot make a request or
 publish. Unknown detail is distinct from air (`NotHeld`, `Unloaded`, `Known`). The
 borrow is released on every exit.
@@ -177,9 +191,14 @@ the stores only after the borrowers finish.
   remain: other clients' requests settle `arena_closed` and their leases answer
   `arena_closed` until released. Replacement is close plus a fresh incarnation.
 * `withTerrainService` builds the service in a `withResource` scope whose release is
-  non-blocking bookkeeping (close admission, settle what is pending). The wait for the
-  owner and for every borrower is in the protected boundary around the body, with no
-  deadline, detach or timeout. The owner returns only when the service is closed, no
+  non-blocking bookkeeping (close admission, settle what is pending). The drain is in
+  the protected boundary around the body, outside that release: it waits for **both**
+  proofs, the owner worker's own terminal acknowledgement (`OwnerControl`'s
+  `awaitOwnerEnd`, so nothing of the owner, its logging included, still runs) and no
+  outstanding borrower, with no deadline, detach or timeout. It survives a
+  cancellation delivered while it waits (the interruption is remembered and
+  delivered after the drain) and the body's own failure, with its context, is the one
+  that propagates. The owner's cleanup is installed before its first fallible step. The owner returns only when the service is closed, no
   borrower is outstanding, nothing is left to settle and it has been asked to stop
   (`OwnerControl`, returned by the `Supervisor`): a supervised service that returned
   on its own would be an unexpected exit, so an orderly close ends only at a stop
@@ -197,13 +216,13 @@ the stores only after the borrowers finish.
 | Stale content precondition | `StaleView` (settled), nothing changed |
 | Invalid source definition | `Definition` (settled), no name claimed |
 | Column answer over 1,024 runs | `TooLarge` (settled), never truncated |
-| Column range over 8,192 levels, coordinates outside the extent | `RefusedInvalid` before admission |
+| Column range over 8,192 levels (refused in constant time, before any region is enumerated), a name that is empty or over 256 characters, a borrow naming more regions than a hold may, coordinates outside the extent | `RefusedInvalid` before admission |
 | Forged, foreign, released or wrong-service authority | `RefusedAuthority` before admission |
 | Bank, slot, arena, lease or view cap; retained edits full | `RefusedBusy`, nothing created |
 | An identity or content revision that would wrap | `RefusedExhausted` before admission |
 | Preparation failure (unexpected) | `HostFailure` (settled); the previous state is kept |
 | Accounting defect after valid admission | `HostFailure`, a recorded `AccountingDefect`, and the owner ends |
-| Provider (settlement callback) defect | A recorded `ProviderDefect`, nothing committed, and the owner ends |
+| Provider defect: a settlement, readiness or eligibility callback that throws | A recorded `ProviderDefect`, nothing committed or staged, every request settled once, and the owner ends |
 
 An accounting defect or a provider defect ends the owner, which surfaces through
 supervision; it is never reported as busy and never as air. Diagnostics carry
@@ -214,12 +233,13 @@ bounded arena, request and revision context, never a per-cell stream.
 The banks are those of the residency model (`defaultLimits`: 256 MiB resident,
 64 MiB retained edits, 128 MiB CPU staging, 128 load jobs, 256 queued commands).
 The service adds the approved caps of four arenas, 64 arena leases and eight views,
+a snapshot backing bank carved from the staging bank (see Snapshots),
 and uses the source (256 KiB, 8,192 authored runs) and query (1,024 runs, 8,192
 levels) limits of `hetoimasia-terrain`. All are configurable through `Config`
 within the model's minimum-budget rule.
 
-Identities (clients, leases, requests, arenas, views, holds) and content revisions are
-checked 64-bit counters. The last value is never issued, and an admission that would
+Identities (clients, leases, requests, the admission sequence, arenas, views, holds) and
+content revisions are checked 64-bit counters; the residency generation saturates. The last value is never issued, and an admission that would
 need it is refused before any work (`RefusedExhausted`).
 
 ## Invariants, traced from admission to release
@@ -240,7 +260,7 @@ retiring, and the borrower count against the model's holds.
 | Staged edit | The owner's staging transaction | The request's `Staged` phase, tagged with incarnation and revision | Commit, or recomputed when superseded, or terminated by cancellation or closure | Races, Revalidation |
 | Load job | `Dispatch` | The model's job record and slot | `JobCompleted` (published or discarded), `JobFailed`, or `JobAcknowledged` after its interests are gone | Budgets ("safe point"), Closure |
 | Victim | An admission's eviction set | The victim queue and the model | The owner discards the detail, then `VictimReleased` | Offload, Budgets |
-| Snapshot hold | `AcquireHold` | The model's hold and the borrower count | `ReleaseHold` on every exit of `withSnapshot`; closure waits for zero | Budgets (snapshot), Lifecycle (borrower) |
+| Snapshot hold | `AcquireHold` | The model's hold, the borrower count and the snapshot backing ledger | `ReleaseHold` on every exit of `withSnapshot`; closure waits for zero | Budgets (snapshot), Lifecycle (borrower) |
 | Handoff | `BeginHandoff` (reserves the duplicate in staging) | The region's handoff record | `HandoffConfirmed` or `HandoffFailed` | Offload |
 | Defect | Detection | The bounded defect record | Never; read by inspection | Races, Lifecycle |
 
@@ -252,6 +272,13 @@ retiring, and the borrower count against the model's holds.
 ```sh
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct
 ```
+
+`Test.TerrainRuntime.Interleaving` runs a randomized interleaving of submit, cancel,
+grant, release, end, edit, borrow and view demand (24 seeds of 300 steps each, the
+sequence a function of the seed) beside the running owner, checking after every step
+that the structural invariants and the model's charge rules hold and that no defect
+was recorded, and at the end that every accepted request reached exactly one terminal
+outcome and every bank is empty.
 
 The examples drive the production service. A **gate** is an `MVar` the owner blocks
 on at a named point (`Probe`), so an example decides which side of a race wins by
