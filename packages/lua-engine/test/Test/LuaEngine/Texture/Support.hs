@@ -90,6 +90,9 @@ module Test.LuaEngine.Texture.Support
   , commandWith
   , Load (..)
   , load
+  , loadWith
+  , policyFromWords
+  , requirementFromWords
   , vmDiagnostics
   , awaitVmDiagnostic
   , awaitEnd
@@ -138,7 +141,7 @@ import Control.Concurrent.STM
   , throwSTM
   , writeTVar
   )
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, rethrowIO, throwIO, toException, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, mask_, rethrowIO, throwIO, toException, tryWithContext)
 import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -233,12 +236,15 @@ data Config = Config
   , cfgExtra ∷ Vm → [Namespace]
     -- ^ Namespaces the example's own bindings add to every VM, granted to its owner. They may close over the
     -- VM's leases; the owner is not yet running when they are made.
+  , cfgAccountBytes ∷ !Word64
+    -- ^ The size of the session's one CPU render/staging account the pipeline is injected with: the approved
+    -- 128 MiB unless an example shrinks it to make a charge fit exactly or fall one byte short.
   }
 
 -- | The usual configuration: a pool of two workers and sixteen slots, room for sixteen jobs and
 -- sixteen leases, the real reader behind the probe's gates.
 config ∷ Profile → Layout → Config
-config profile layout = Config profile (2, 16) 16 realReader layout 16 noHooks (pure ()) (const [])
+config profile layout = Config profile (2, 16) 16 realReader layout 16 noHooks (pure ()) (const []) m1RenderAccountBytes
 
 -- | How the pool's reader is made from the real one and the session's probe.
 type ReaderOf = Probe → Inventory → (ContentKey → Int → IO (Either ReadFailure ByteString)) → ContentKey → Int → IO (Either ReadFailure ByteString)
@@ -282,6 +288,9 @@ data Session = Session
   , ssRace ∷ !(IORef Bool)
     -- ^ When set, the owner is closed right after its argument check passes: a closure that lands
     -- between the check and the admission.
+  , ssAccount ∷ !RenderAccount
+    -- ^ The session's one CPU render/staging account, which the pipeline (and any nested pipeline over the
+    -- same session) was injected with.
   }
 
 scanSpec ∷ InventorySpec
@@ -317,9 +326,10 @@ withSession cfg body =
       fake ← newFake
       spec ← either (\refused → assertFailure ("pool refused: " <> show refused)) pure (uncurry poolSpec (cfgPool cfg))
       fakes ← newTVarIO [fake]
+      account ← newRenderAccount (cfgAccountBytes cfg)
       withJanitor fakes $
         withReadPoolUsing spec (cfgReader cfg probe inventory (readVerified inventory root)) $ \pool →
-          withTexturePipelineWith (cfgHooks cfg) textureSpec' (fakeBackend fake) pool inventory $ \pipeline → do
+          withTexturePipelineWith (cfgHooks cfg) textureSpec' account (fakeBackend fake) pool inventory $ \pipeline → do
             session ←
               Session (cfgProfile cfg) tree inventory pool pipeline probe fake
                 <$> newIORef []
@@ -331,6 +341,7 @@ withSession cfg body =
                 <*> pure cfg
                 <*> pure fakes
                 <*> newIORef False
+                <*> pure account
             withLoggingLifetime quietLogger $ \lifetime →
               withSupervision lifetime $ \control → do
                 runtime ← newLuaRuntime control
@@ -400,7 +411,7 @@ withNested session body onClosed = do
           -- fails cannot leave the backend holding what the scope waits for.
           -- "nested scope returned" is recorded however the scope ended, the moment it did: whatever the helper has
           -- recorded by then, it recorded before the scope could end.
-          (`finally` note session "nested scope returned") . withTexturePipelineWith (cfgHooks (ssConfig session)) spec (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
+          (`finally` note session "nested scope returned") . withTexturePipelineWith (cfgHooks (ssConfig session)) spec (ssAccount session) (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
             let nested = session {ssPipeline = pipeline, ssFake = fake}
             putMVar made nested
             body nested
@@ -818,6 +829,10 @@ data Vm = Vm
   , vmService ∷ !TextureService
   , vmLeases ∷ !Leases
   , vmOwners ∷ !(IORef (Map Text TextureOwner))
+  , vmRetained ∷ !(IORef (Map Text RetainedTexture))
+    -- ^ The textures the example's @tex.retain@ holds a CPU interest in, by label: what a later consumer of a
+    -- version's coverage and checked profile would hold. Released by @tex.unretain@ or, at the end of the
+    -- example, by its owner.
   }
 
 requiredPolicy ∷ WorkerPolicy
@@ -842,7 +857,8 @@ startVmWith session wrap runtime label timing = do
   lending ← newLending
   leases ← newLeases lending (cfgLeases (ssConfig session))
   owners ← newIORef Map.empty
-  let vm' = Vm (error "owner not started") service leases owners
+  retained ← newIORef Map.empty
+  let vm' = Vm (error "owner not started") service leases owners retained
       registered =
         either (error . ("registration refused: " <>) . show) id $
           registration [admittedHandleType handles requestHandleType, leaseCapabilityType leases textureHandleType] (bindings session vm' requests <> extras)
@@ -897,7 +913,7 @@ ownerOf ∷ Vm → Text → IO TextureOwner
 ownerOf vm name = (Map.! name) <$> readIORef (vmOwners vm)
 
 -- | The bindings: @fx.record@ and @fx.block@, the common operations from the adapter, and
--- @tex.load(who, path [, optional])@, @tex.use(texture)@ and @tex.release(texture)@, written the way
+-- @tex.load(who, path [, optional [, policy]])@, @tex.use(texture)@ and @tex.release(texture)@, written the way
 -- the facade will write them from "Hetoimasia.LuaEngine.Texture". The @who@ names the texture owner:
 -- this is the example's own scaffolding, where the facade would hold the instance's owner in its
 -- binding. It is not an API of the engine.
@@ -905,7 +921,7 @@ bindings ∷ Session → Vm → M1Requests → [Namespace]
 bindings session vm _ =
   [ namespace "fx" [recording, blocking]
   , namespace "request" (m1RequestBindings (M1Service requestHandleType textureValueSchema))
-  , namespace "tex" [loading, using, releasing]
+  , namespace "tex" [loading, using, releasing, retaining, unretaining]
   ]
   where
     service = vmService vm
@@ -928,7 +944,7 @@ bindings session vm _ =
         pure []
     loading =
       withArgumentCheck check $
-        asynchronousNativeRequestIn "load" [SText, SText, SOptional SBoolean] (m1StartSchemas requestHandleType) $ \context values → do
+        asynchronousNativeRequestIn "load" [SText, SText, SOptional SBoolean, SOptional SText] (m1StartSchemas requestHandleType) $ \context values → do
           asked ← requestFrom values
           case asked of
             Left why → throwIO (userError (Text.unpack why))
@@ -954,6 +970,25 @@ bindings session vm _ =
             view ← withTexture (vmLeases vm) (capabilityKey handle) pure
             pure [VInteger (fromIntegral (viewIdentity view))]
           _ → pure []
+    retaining =
+      recoverableRefusals $
+        stateOperation "retain" [SCapability textureHandleType, SText, SText] [SText] $ \arguments → case arguments of
+          [VCapability handle, VText label, VText wanted] → do
+            let need = requirementFromWords (Text.words wanted)
+            -- The interest is taken with exceptions masked, so none can separate it from the table that holds it.
+            mask_ (retainTexture (vmLeases vm) (capabilityKey handle) need) >>= \case
+              Left why → pure [VText ("refused: " <> why)]
+              Right found → do
+                atomicModifyIORef' (vmRetained vm) (\held → (Map.insert label found held, ()))
+                pure [VText "retained"]
+          _ → pure []
+    unretaining =
+      stateOperation "unretain" [SText] [SText] $ \arguments → case arguments of
+        [VText label] → do
+          found ← atomicModifyIORef' (vmRetained vm) (\held → (Map.delete label held, Map.lookup label held))
+          mapM_ releaseRetained found
+          pure [VText (maybe "unknown" (const "unretained") found)]
+        _ → pure []
     releasing =
       recoverableRefusals . releaseOperation "release" textureHandleType [SText] $ \arguments → case arguments of
         [VCapability handle] → do
@@ -974,8 +1009,9 @@ bindings session vm _ =
                   { requestedOwner = owner
                   , requestedKey = key
                   , requestedNecessity = case rest of
-                      [VBoolean True] → OptionalRequest
+                      VBoolean True : _ → OptionalRequest
                       _ → RequiredRequest
+                  , requestedPolicy = policyFromWords (concatMap Text.words [word | VText word ← rest])
                   }
       _ → pure (Left "a texture owner and a path are required")
 
@@ -1066,10 +1102,10 @@ driverSource =
       , "  local key = p.key or 'a'"
       , "  local out = '?'"
       , "  if p.op == 'start' then"
-      , "    local r, err = tex.load(p.name, p.path or 'a.png', p.optional)"
+      , "    local r, err = tex.load(p.name, p.path or 'a.png', p.optional, p.policy)"
       , "    if r then self.hs[key] = r out = 'started' else out = 'busy:' .. err.code .. ':' .. err.message end"
       , "  elseif p.op == 'pstart' then"
-      , "    local ok, r, err = pcall(tex.load, p.name, p.path or 'a.png', p.optional)"
+      , "    local ok, r, err = pcall(tex.load, p.name, p.path or 'a.png', p.optional, p.policy)"
       , "    if not ok then out = 'error ' .. tostring(r)"
       , "    elseif r then self.hs[key] = r out = 'started'"
       , "    else out = 'busy:' .. err.code .. ':' .. err.message end"
@@ -1098,6 +1134,10 @@ driverSource =
       , "  elseif p.op == 'puse' then"
       , "    local ok, r = pcall(tex.use, self.ts[key])"
       , "    out = ok and tostring(r) or ('error ' .. tostring(r))"
+      , "  elseif p.op == 'retain' then"
+      , "    local ok, r = pcall(tex.retain, self.ts[key], p.path or key, p.policy or '')"
+      , "    out = ok and r or ('refused: ' .. tostring(r))"
+      , "  elseif p.op == 'unretain' then out = tex.unretain(p.path or key)"
       , "  elseif p.op == 'release' then out = tex.release(self.ts[key])"
       , "  elseif p.op == 'prelease' then"
       , "    local ok, r = pcall(tex.release, self.ts[key])"
@@ -1133,6 +1173,7 @@ commandSource =
         , ("name", SText)
         , ("path", SOptional SText)
         , ("optional", SOptional SBoolean)
+        , ("policy", SOptional SText)
         ]
     )
 
@@ -1145,7 +1186,7 @@ enderSource =
     source =
       [ "function init(self, api) end"
       , "function shutdown(self, reason)"
-      , "  local ok, err = pcall(tex.load, 'e', 'a.png', nil)"
+      , "  local ok, err = pcall(tex.load, 'e', 'a.png', nil, nil)"
       , "  fx.record('shutdown load ' .. tostring(ok) .. ' ' .. tostring(err))"
       , "end"
       ]
@@ -1158,7 +1199,7 @@ failingSource =
   where
     source =
       [ "function init(self, api)"
-      , "  self.r = tex.load('f', 'a.png', nil)"
+      , "  self.r = tex.load('f', 'a.png', nil, nil)"
       , "  fx.record('failing started')"
       , "end"
       , "function shutdown(self, reason) error('shutdown boom') end"
@@ -1194,15 +1235,35 @@ stopInstance session vm name = do
     InstanceControlAccepted _ → pure ()
     other → assertFailure ("expected the stop accepted, found " <> take 80 (show other))
 
--- | What a command starts.
-data Load = Load
-  { loadPath ∷ !Text
-  , loadOptional ∷ !Bool
-  }
+-- | What a command starts: a path and whether the load is optional, or an optional load that asks for the
+-- policy words of 'policyFromWords' (@data@, @coverage@, @normal@).
+data Load
+  = Load !Text !Bool
+  | LoadWith ![Text] !Text
+
+loadPath ∷ Load → Text
+loadPath = \case
+  Load path _ → path
+  LoadWith _ path → path
+
+loadOptional ∷ Load → Bool
+loadOptional = \case
+  Load _ optional → optional
+  LoadWith _ _ → True
+
+loadWords ∷ Load → [Text]
+loadWords = \case
+  Load _ _ → []
+  LoadWith wordsGiven _ → wordsGiven
 
 -- | A required load of this path.
 load ∷ Text → Load
 load path = Load path False
+
+-- | An optional load of this path asking for these policy words. Optional, so that an expected content failure is
+-- data the example takes and not a failure of the instance; a request that succeeds is the same either way.
+loadWith ∷ [Text] → Text → Load
+loadWith = LoadWith
 
 -- | Tell the instance of this name to do this with the request or texture it keeps under the key.
 command ∷ Session → Vm → Text → Text → Text → IO ()
@@ -1216,7 +1277,7 @@ commandWith session vm name op key asked = do
         VRecord $
           [("op", VText op), ("key", VText key), ("name", VText name)]
             <> concat
-              [ [("path", VText (loadPath found))] <> [("optional", VBoolean True) | loadOptional found]
+              [ [("path", VText (loadPath found))] <> [("optional", VBoolean True) | loadOptional found] <> [("policy", VText (Text.unwords (loadWords found))) | not (null (loadWords found))]
               | Just found ← [asked]
               ]
   deliverEvent (scheduledEndpoint (vmOwner vm)) identity "cmd" payload >>= \case
@@ -1346,3 +1407,23 @@ awaitPool session wanted = atomically $ do
 -- | What each lane's workspace is charged now.
 lanesCharged ∷ Session → IO [Word64]
 lanesCharged session = map laneReadingCharged . readingLanes <$> pipelineNow session
+
+-- | The policy a test request asks for, from words after its optional flag: @data@, @coverage@ and
+-- @normal@ (the @unit-normal-rgb-v1@ encoding). Anything else asks for the default, so the words are
+-- the whole of the test vocabulary.
+policyFromWords ∷ [Text] → TexturePolicy
+policyFromWords wordsGiven =
+  TexturePolicy
+    { policyKind = if "data" `elem` wordsGiven then DataKind else ColourKind
+    , policyBinaryCoverage = "coverage" `elem` wordsGiven
+    , policyNormalEncoding = if "normal" `elem` wordsGiven then Just UnitNormalRgbV1 else Nothing
+    }
+
+-- | What a consumer needs of a retained version, from words: @coverage@, @normal@, @data@ and @colour@.
+requirementFromWords ∷ [Text] → TextureRequirement
+requirementFromWords wordsGiven =
+  TextureRequirement
+    { requireKind = if "data" `elem` wordsGiven then Just DataKind else if "colour" `elem` wordsGiven then Just ColourKind else Nothing
+    , requireCoverage = "coverage" `elem` wordsGiven
+    , requireNormal = if "normal" `elem` wordsGiven then Just UnitNormalRgbV1 else Nothing
+    }

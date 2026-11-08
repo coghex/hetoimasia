@@ -184,11 +184,11 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permittedTexture name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
-  it "keeps the texture backend port free of the host: it imports the host's retirement state and nothing else of it" $ do
+  it "keeps the texture backend port free of the host: it imports the host's retirement state and the asset package's texel format, and nothing else of the project" $ do
     sources ← sourcesUnder "texture"
     imported ← importedBy sources
     sort (nub [name | (file, name) ← imported, file == "Backend.hs", "Hetoimasia." `isPrefixOf` name])
-      `shouldBe` ["Hetoimasia.Scripting.Lua.Provider"]
+      `shouldBe` ["Hetoimasia.Asset.Image", "Hetoimasia.Scripting.Lua.Provider"]
 
   it "has a scene sublibrary over the profile, the texture authority, the pure renderer packages and the host's public modules, and nothing else" $ do
     (sort <$> fieldEntries "library scene" "build-depends:")
@@ -428,6 +428,7 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Foundation.Worker"
                  , "Hetoimasia.Asset"
                  , "Hetoimasia.Asset.Image"
+                 , "Hetoimasia.Asset.Image.DataMap"
                  , "Hetoimasia.Asset.Image.PngDecode"
                  , "Hetoimasia.Asset.Image.PngPreflight"
                  , "Hetoimasia.Scripting.Lua.Admission"
@@ -515,6 +516,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Texture"
                , "Hetoimasia.LuaEngine.Scene"
                , "Hetoimasia.Asset.Image"
+               , "Hetoimasia.Asset.Image.DataMap"
                , "Hetoimasia.Math.Affine2"
                , "Hetoimasia.Math.Vector"
                , "Hetoimasia.Render.Api.Texture"

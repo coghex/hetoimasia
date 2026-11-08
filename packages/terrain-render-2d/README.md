@@ -25,6 +25,12 @@ keeps a cache.
 | `Hetoimasia.Terrain.Render2D.Plan` | Visible faces, exposure, bounds, demand, ordering and depth keys |
 | `Hetoimasia.Terrain.Render2D.Pick` | CPU picking against one plan |
 
+The package also owns the offline cutout and normal-map asset generator
+(TRA-14; see [the canonical maps](#the-canonical-cutout-and-normal-map-assets-tra-14)):
+the pure `hetoimasia-terrain-render-2d:terrain-mapbake` component, its file side
+`terrain-mapgen-core` and the `terrain-mapgen` executable. None depends on Vulkan,
+a window, Lua or the terrain service.
+
 Two further public components of the package have no GPU, window, Lua or game
 dependency either (they add the render-2d oracle):
 
@@ -384,6 +390,104 @@ and describes identity 15 as the old flat solid; TRA-13 superseded that geometry
 and in `Evidence` now takes all four ramps for 15, and the retained table is not
 rewritten. Amended offscreen proof of the corrected shapes belongs to TRA-17.
 
+## The canonical cutout and normal-map assets (TRA-14)
+
+`terrain-mapgen` bakes, offline and deterministically, the shared catalog of
+cutout and unit-normal maps the later amended renderer samples. It consumes the
+canonical solids of `hetoimasia-terrain` (`shapeSolid`, `castRay`): there is no
+second shape definition. It delivers assets and proof only; the bounded loader
+(TRA-15), the cell-quad planner and alpha picker (TRA-16) and the material,
+lighting and GPU qualification (TRA-17) are separate slices.
+
+| Component | Source dir | Role |
+| --- | --- | --- |
+| `terrain-mapbake` (public) | `mapbake/` | Pure: the frontmost-facet evaluation at a canvas position, the 96 x 64 RGBA8 maps, the `unit-normal-rgb-v1` codec and validator (`canvasProblems`), the catalog of 46 maps and the rotated lookup. Reads no file. |
+| `terrain-mapgen-core` (public) | `mapgen/` | The pinned inputs (SHA-256 checked), PNG and manifest bytes, writing and read-only checking of the committed catalog, the CPU evidence sheets and the command line as a function (`runCli`). |
+| `terrain-mapgen` (executable) | `tool/` | A thin shell over `runCli`. |
+
+```sh
+cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --check              # regenerate in temporary storage, compare, write nothing
+cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --output DIR          # generate the catalog and manifest into DIR
+cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --evidence DIR        # the CPU comparison sheets and index
+```
+
+`--sample DIR` names the `samples/ecce-homo` directory and `--catalog DIR` the
+committed catalog `--check` compares (defaults: the sample found at or above the
+working directory, and `content/textures/facemap` under it), so the command does
+not depend on where it is started. `--check` reports every missing, changed and
+unexpected file by path, and the first differing manifest line by identity; it
+never writes to the committed directory. Exactly one mode is accepted.
+
+**The maps.** Each is a full 96 x 64 RGBA8 PNG, top row first, under
+`samples/ecce-homo/content/textures/facemap/` (`manifest.json` describes them):
+the 16 ordinary shape maps (`shape_NN_name.png`) and, for each of the 15 nonflat
+shapes, a known-solid and a cover part (`mixed_NN_name_known.png`, `_fog.png`).
+That is at most 46 authored maps, never one per cell; generic full-cell fog is
+identity 0's ordinary map, and every authored identity is kept even where two maps
+share bytes (the cover of shapes 6, 7, 14 and 15, which have no visible known
+part). The canvas projects a unit-cell point `(x, y, z)` (X east, Y south, Z up)
+to `u = 48 + 48 (x - y)`, `v = 16 + 24 (x + y) - 16 z`, the planner's
+`isoProject` for a cell at `(48, 16)`; the frontmost surface along `(1, 1, 3)`
+(larger multiples are nearer) is baked at each texel centre. Outside the
+silhouette alpha is 0 and RGB is written as 0; inside it alpha is 255 and RGB is
+the unit outward normal of the facet shown, `round (128 + 127 n)` per component
+(flat-up `(128,128,255)`, the W ramp `(38,128,218)` = `(-1,0,1)/sqrt 2`), raw
+linear data with no gamma, no premultiplication and no averaging across creases.
+Consumers load them as `kind="data"`, `coverage="binary"`,
+`normal_encoding="unit-normal-rgb-v1"` (TRA-15). The legacy face-weight masks of
+Synarchy are never this encoding: they are retained only under
+`samples/ecce-homo/reference/` as reference-only fixtures (a face-weight `(0,255,0)`
+is refused as a normal because its R is 0).
+
+**The tie rule.** The solid is closed, so a ray that only touches it is covered. A
+point shared by several facets belongs to the first, of those facing the camera
+(outward normal with positive dot against `(1, 1, 3)`), in `castRay`'s canonical
+order: the top facets in the order of the shape's set bits N, E, S, W, then the
+walls North, East, South, West. A ray that touches without entering takes the
+first facet containing the contact in the same order. No tolerance is involved.
+By construction no baked texel centre lies on any projected facet, ridge, wall or
+silhouette edge: every vertex of every solid projects to a whole canvas point and
+every projected edge is vertical or has slope 1/2, 1/6 or 5/6 in magnitude through
+one, so `(k + 1/2) * slope` never has fractional part 1/2. The rule therefore
+decides no baked texel; the suite evaluates it at exact rational boundary points.
+
+**Mixed knowledge.** A cell whose solid is known but whose empty component above it
+is not yet discovered is the solid plus opaque cover filling that void to the cell's
+top, i.e. the unit cube. The known map holds the texels whose frontmost cube point
+lies in the closed solid, the fog map the rest, each with the cube facet's normal
+(the cover's own, never the hidden ramp's). They are disjoint and their union is
+identity 0's map. Along `(1, 1, 3)` the quantity `z - h(x, y)` grows by
+`3 - (h_x + h_y)`, which is 2, 3 or 4 for every catalog facet, so a ray cannot pass
+from void into nearer solid inside the cell. Removing the cover selects the ordinary
+sloped map; no cap is generated.
+
+**Rotation.** World shape identities never change when the view turns. The view at a
+facing selects the catalog entry of the shape turned by South 0, West 3, North 2,
+East 1 positive quarter turns (`viewShape`; North to East to South to West;
+`(x, y, z) -> (1 - y, x, z)`). `manifest.json` carries the checked lookup of all 16
+world identities under all four facings (ordinary, known, cover and full-fog
+entries); nothing is baked per camera.
+
+**Inputs and provenance.** `loam.png` and `granite.png` are unchanged; the generic
+`blanktexture.png` (the fog cover colour, opaque `(66,63,64)`) is a byte copy of
+Synarchy `3777d437ea00e1302bf55162ad5693fee4879187`. The generator verifies each
+input's SHA-256 and refuses a missing or altered one. PNG bytes come only from
+JuicyPixels over the project's bundled zlib (`cabal.project.common` forces
+`zlib +bundled-c-zlib -pkg-config`), so the committed hashes are the same on Linux
+and macOS. `samples/ecce-homo/content/textures/provenance.json` records the colour
+art, the sixteen reference-only masks with their Synarchy paths, git blobs and
+SHA-256 and how Synarchy selects each, and the generated maps.
+
+The colour art's silhouette is a superset of the exact cutout by 96 texels along the
+top diamond's two upper edges (art alpha 255 where the centre-sampled cutout is 0);
+every map lies inside the art, so the product of colour and map alpha equals the
+cutout. Nothing resizes, repaints or thresholds the art.
+
+The CPU suite's TRA-14 group (`Test.TerrainRender2D.MapAssets`) proves all of the
+above independently, and this is CPU and generated-image proof only: GPU sampling,
+raster-edge agreement, alpha picking, lighting, depth composition and offscreen
+readback are TRA-15 through TRA-17, and no performance claim is made.
+
 ## Tests
 
 `hetoimasia-terrain-render-2d:terrain-render-2d-tests` is the non-optional CPU
@@ -393,7 +497,7 @@ group `test.terrain-render-2d`:
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct
 ```
 
-It is deterministic, starts no thread and sleeps nowhere. Projection, camera and
+It is deterministic, starts no thread and sleeps nowhere; its TRA-14 group reads the committed assets from the repository and writes only to temporary directories. Projection, camera and
 planning expectations are hand-stated from the equations above and small explicit
 terrain. Visibility, ordering and picking are checked against an independent
 oracle that casts exact rays through the same cells with the terrain package's

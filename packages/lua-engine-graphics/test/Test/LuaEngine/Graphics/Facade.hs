@@ -91,10 +91,12 @@ data Shape = Shape
   -- ^ Where the fake texture owner's log is left when the run ends, for an example whose rig raises on its way out.
   , shapeInject ∷ ![Fake.Injection]
   -- ^ Faults the fake texture owner injects, taken by the next calls of their kinds.
+  , shapeFiles ∷ ![(FilePath, ByteString)]
+  -- ^ Content the example adds to the root beside the manifest, the entry and @images/quad.png@.
   }
 
 defaultShape ∷ ByteString → Shape
-defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig compositionProfile [] noPublishHooks False noProviderHooks Nothing id Nothing []
+defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig compositionProfile [] noPublishHooks False noProviderHooks Nothing id Nothing [] []
 
 -- | The fixed M1 profile with these counts changed, so that a bank is full after a few requests.
 profileWith ∷ [(CountLimit, Word64)] → Profile
@@ -118,6 +120,27 @@ spec = describe "graphics facade" $ do
     issuedSize full `shouldBe` 4096
     issuerOf 5904 full `shouldBe` Nothing
     issuerOf 5905 full `shouldBe` Just "inst-1"
+
+  it "carries the image kind a script asked for through the production injection to the owner: data allocates and registers linear, the default stays sRGB, and the incompatible combination is an ordinary error that reaches no owner" $ do
+    (attempted, logged) ←
+      runFacadeLogged ((defaultShape imageKinds) {shapeBoth = False, shapeFiles = [("images/normals.png", Png.solid 2 2 (128, 128, 255, 255))]}) $ \fs → do
+        let expectLine wanted =
+              timeout 4000000 (awaitLine fs wanted) >>= \case
+                Just () → pure ()
+                Nothing → readTVarIO (fsOut fs) >>= \seen → assertFailure ("no line " <> show wanted <> "; the script printed " <> show seen)
+        expectLine "combination\tfalse\ttrue"
+        expectLine "taken\t3"
+        Fake.awaitEvent (rigFake (fsRig fs)) "registered 2 "
+        requestStop (fsSession fs) StopQuit
+    outcome ← either (\failure → assertFailure ("the session raised: " <> show failure <> "; the owner saw " <> show logged)) pure attempted
+    outVerdict outcome `shouldBe` VerdictSuccess
+    -- Three requests reached the owner, not four: the refused combination was decided before any admission.
+    let allocations = filter (Text.isPrefixOf "allocated ") logged
+        registrations = filter (Text.isPrefixOf "registered ") logged
+    length allocations `shouldBe` 3
+    length (filter (Text.isSuffixOf " linear") allocations) `shouldBe` 2
+    length (filter (Text.isSuffixOf " linear") registrations) `shouldBe` 2
+    length (filter (not . Text.isSuffixOf " linear") allocations) `shouldBe` 1
 
   it "runs the common-entry quad example through the production injection, taking each request once and publishing then releasing" $ do
     outcome ← runFacade (defaultShape quadExample) $ \fs → do
@@ -516,6 +539,7 @@ runCore rig shape scenario = do
         , ("lua/main.lua", shapeEntry shape)
         , ("images/quad.png", Png.solid 2 2 (200, 100, 50, 255))
         ]
+          <> shapeFiles shape
   withComposition (shapeProfile shape) files (rigPort rig) $ \composition control runtime →
     withWindowProviderWith (shapeProviderHooks shape) config (retarget (WF.fakePort windows)) $ \provider →
       ( do
@@ -694,6 +718,29 @@ secondWindow =
     , "      print('second', ok, tostring(err):find('already has a window') ~= nil)"
     , "    end,"
     , "    update=function(self, dt) end"
+    ]
+
+-- | Three textures of one file under three requests (colour by default, data, and data with a checked normal encoding),
+-- and the one incompatible combination, which is an ordinary error.
+imageKinds ∷ ByteString
+imageKinds =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.c = api.content.texture('images/normals.png')"
+    , "      self.d = api.content.texture('images/normals.png', {kind = 'data'})"
+    , "      self.n = api.content.texture('images/normals.png', {kind = 'data', normal_encoding = 'unit-normal-rgb-v1'})"
+    , "      local ok, e = pcall(api.content.texture, 'images/normals.png', {normal_encoding = 'unit-normal-rgb-v1'})"
+    , "      print('combination', ok, tostring(e):find('valid only with kind') ~= nil)"
+    , "    end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.done then return end"
+    , "      if api.request.ready(self.c) and api.request.ready(self.d) and api.request.ready(self.n) then"
+    , "        local a, b, c = api.request.take(self.c), api.request.take(self.d), api.request.take(self.n)"
+    , "        self.done = true"
+    , "        print('taken', (a.status == 'success' and 1 or 0) + (b.status == 'success' and 1 or 0) + (c.status == 'success' and 1 or 0))"
+    , "      end"
+    , "    end"
     ]
 
 -- | A texture taken and released on every update: the answer changes as the retirement proceeds.

@@ -1,6 +1,6 @@
 {
   "schema": "hetoimasia.provenance/1",
-  "purpose": "The approved loam and granite artwork for the terrain arena (epic #636, TRA-8), copied byte for byte from Synarchy. Authored content for the later arena assembly; no engine library names it and nothing reads it at run time from Synarchy.",
+  "purpose": "The approved loam and granite artwork for the terrain arena (epic #636, TRA-8), copied byte for byte from Synarchy. Authored content for the later arena assembly; no engine library names it and nothing reads it at run time from Synarchy. TRA-14 extends this record with the imported generic blank, the reference-only legacy masks and the generated maps; the loam and granite entries above are unchanged.",
   "source": {
     "repository": "Synarchy (the owner's local checkout, ~/work/synarchy; no runtime or build dependency on it)",
     "revision": "3777d437ea00e1302bf55162ad5693fee4879187"
@@ -30,6 +30,206 @@
   "mapping": "Synarchy refers to these as mat_tile_56 (loam) and mat_tile_1 (granite) in scripts/test_arena.lua:117-133. Those references are recorded here only; they are not packed terrain palette indices and no engine constant. The authored material names are loam and granite.",
   "referenceSilhouettes": {
     "revision": "3777d437ea00e1302bf55162ad5693fee4879187",
-    "catalog": "src/World/Render/Textures.hs:23-57 maps the 16 world shape identities to the isoface / isoface_slope_* face-map images under assets/textures/facemap/. They are reference evidence for the silhouettes only; the shared solid geometry of hetoimasia-terrain and the TRA-7 coverage are authoritative. No face-map image is retained in this repository."
+    "catalog": "src/World/Render/Textures.hs:27-56 maps the 16 world shape identities to the isoface / isoface_slope_* face-map images under assets/textures/facemap/. They are reference evidence for the original comparison only; the shared solid geometry of hetoimasia-terrain is authoritative. TRA-14 retains them locally, labelled reference-only, under samples/ecce-homo/reference/synarchy-3777d437/facemap/ (see referenceOnlyMasks)."
+  },
+  "kinds": {
+    "importedColourArt": "loam, granite and blanktexture: authored colour art copied byte for byte from Synarchy, sRGB, binary alpha. Never normal data.",
+    "referenceOnlyMasks": "the sixteen legacy face-weight masks, retained only so the original comparison sheets and the N/E defect reproduce offline. Their RGB is a right/top/left brightness weight, not a normal: they are never listed in the generated catalog or resolved as unit-normal-rgb-v1.",
+    "generatedMaps": "the 46 cutout and unit-normal maps under content/textures/facemap/, produced by `terrain-mapgen` (recipe terrain-mapgen/1) from the shared canonical solids; described by facemap/manifest.json, which records each file's dimensions, role, SHA-256 and the profile unit-normal-rgb-v1."
+  },
+  "importedBlank": {
+    "name": "blanktexture",
+    "sourcePath": "assets/textures/utility/blanktexture.png",
+    "destination": "samples/ecce-homo/content/textures/blanktexture.png",
+    "width": 96,
+    "height": 64,
+    "sha256": "c747223e0f788c942d1e8699735ac4a26a011599b6442c707b91c29f42f2f90e",
+    "gitBlob": "ae1d9cfd99e7fdfd4deee2bad208c64fe41d6d0b",
+    "opaqueRgb": [
+      66,
+      63,
+      64
+    ],
+    "treatment": "colour data, sRGB; binary alpha (0 or 255); the generic fog cover colour (P-14). Colour art, separate from normal data."
+  },
+  "referenceOnlyMasks": {
+    "label": "reference only: legacy face-weight RGB, not unit-normal-rgb-v1; retained for the original comparison sheets and the N/E defect reproduction",
+    "revision": "3777d437ea00e1302bf55162ad5693fee4879187",
+    "directory": "samples/ecce-homo/reference/synarchy-3777d437/facemap/",
+    "selection": {
+      "world": "src/World/Render/Textures.hs:27-56 (viewSlopeId, getTileFaceMapTexture) with slopeToFaceMapIndex the identity (src/World/Slope/FaceMaps.hs:28-29): the stored world identity is turned for the camera facing (West shifts the mask right by 1, North by 2, East by 3, rotating E to N at West) and the result 0 selects isoface.png, 1..15 the isoface_slope_* image of that identity; any identity above 15 falls back to the flat isoface.",
+      "files": "scripts/startup_loader.lua:311 isoface.png and :320-334 isoface_slope_n, e, ne, s, ns, es, nes, w, nw, ew, new, sw, nsw, esw, nesw in identity order 1..15; bound by name through src/World/Thread/Command/Texture.hs.",
+      "equivalence": "the selected mask for world identity w at a facing is the file of the shape hetoimasia-terrain's viewShape gives (facing turns South 0, West 3, North 2, East 1)."
+    },
+    "masks": [
+      {
+        "identity": 0,
+        "file": "isoface.png",
+        "sourcePath": "assets/textures/facemap/isoface.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface.png",
+        "gitBlob": "a4a5c0585c66513083034a4891b742134b674e9c",
+        "sha256": "60fe5a0584255d8088eebdfbc20e39aa5ba18af7564f99a91a02dcf02ebfc5fe",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 1,
+        "file": "isoface_slope_n.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_n.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_n.png",
+        "gitBlob": "effc21564c7a653605dcbafca23ce7bc560e262d",
+        "sha256": "1e0d2e7e559a004821d3b02150ed650ebfa6360fd77648164010efb9fb3c6310",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 2,
+        "file": "isoface_slope_e.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_e.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_e.png",
+        "gitBlob": "5ed533b4d9467fa3b371a4cb489a87844fa64611",
+        "sha256": "b63967d34e447e487a504ddf97b723d4c4f7cd642b1a319f44fe88eb55ab2c1d",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 3,
+        "file": "isoface_slope_ne.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_ne.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_ne.png",
+        "gitBlob": "d2fa0656f8c1ed277ca4a155b7adadf81856a049",
+        "sha256": "320310fb5d93f26f63b7dcf5afcf8646dc3824c818e1e3ed5e99ad0ca3570192",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 4,
+        "file": "isoface_slope_s.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_s.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_s.png",
+        "gitBlob": "708fbd56d624dd44a5b5fe6cd3e23c2c8dea66ed",
+        "sha256": "d35c5ba917286f12143bcf872372dc80fd269e9fe5d988b87ceff449ae178b01",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 5,
+        "file": "isoface_slope_ns.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_ns.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_ns.png",
+        "gitBlob": "51456f8a31fddbf4d6b9bb12267625638e0c53d7",
+        "sha256": "d0e7fb355b743851d755be6d838f8a67d4a2152608928cadf1929bda13d8ae07",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 6,
+        "file": "isoface_slope_es.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_es.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_es.png",
+        "gitBlob": "87307362412726f8f9090d5b1a26ff1210dea901",
+        "sha256": "712b6709a6c1a5ed4ffc30e5f92f7750c003293a85ca5a1df0b8ec78845a44ea",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 7,
+        "file": "isoface_slope_nes.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_nes.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_nes.png",
+        "gitBlob": "ff3e46062421bae13bb84429a62d450d265e45a3",
+        "sha256": "d365d6685cc810ca2a5322be04b9b5a029da552f974387081dbbc37d7d30ef82",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 8,
+        "file": "isoface_slope_w.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_w.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_w.png",
+        "gitBlob": "ca32254f1e5d5236e4f888b96ddec789d10701d0",
+        "sha256": "278e8bcafbf0d4faf6ee6932c579507570e3e41d9dab364f7b630928c22b1668",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 9,
+        "file": "isoface_slope_nw.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_nw.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_nw.png",
+        "gitBlob": "038d24596344ac3d526c64dbed77f21a1edde0cb",
+        "sha256": "4e7ab264ac94df0cfd3639b2d26fd3184f677e91d4bb9b49a083d6875dcf741b",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 10,
+        "file": "isoface_slope_ew.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_ew.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_ew.png",
+        "gitBlob": "eaf29e314251b2970136ad47d9bc05efb81f559d",
+        "sha256": "ed3b977fc349d2d66debbc15f63fd9e55503c328169547b76f9f93b5254ef653",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 11,
+        "file": "isoface_slope_new.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_new.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_new.png",
+        "gitBlob": "4066ee35d1d4e224970dcb509bc4b8a4caf2a0d6",
+        "sha256": "0f35475c441804a8d95c7b4bd0b31ed0019f2826caa9a8620398e8f535308dcd",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 12,
+        "file": "isoface_slope_sw.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_sw.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_sw.png",
+        "gitBlob": "9ed0e0631f03df2b02052a6c119f370797c0065f",
+        "sha256": "9cceb34ba8aed3433e6ef7672aa6110efdfec0afbf154d40272913b12ef5908a",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 13,
+        "file": "isoface_slope_nsw.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_nsw.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_nsw.png",
+        "gitBlob": "6a8cca207f9d77309733aa8089a4b6f0fe295f52",
+        "sha256": "5e42db15a4f4f214507ef5845c8b47c82a6d26465cdd4a5be47088daa4512ed2",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 14,
+        "file": "isoface_slope_esw.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_esw.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_esw.png",
+        "gitBlob": "3253a6885d20604cccd6889737bfcec35c9fa24d",
+        "sha256": "fa9bf95a40dbcc6526d7b57934957c5cff52d2d1c42a8aba4efeca4663b2719d",
+        "width": 96,
+        "height": 64
+      },
+      {
+        "identity": 15,
+        "file": "isoface_slope_nesw.png",
+        "sourcePath": "assets/textures/facemap/isoface_slope_nesw.png",
+        "destination": "samples/ecce-homo/reference/synarchy-3777d437/facemap/isoface_slope_nesw.png",
+        "gitBlob": "2bec0d312710cb5aaa6e3d01998a90cf9c272122",
+        "sha256": "c5be1edd139438eebe7faf41864e56cf74152263224d39c19f41c2e70f92a749",
+        "width": 96,
+        "height": 64
+      }
+    ]
+  },
+  "generatedMaps": {
+    "directory": "samples/ecce-homo/content/textures/facemap/",
+    "manifest": "samples/ecce-homo/content/textures/facemap/manifest.json",
+    "recipe": "terrain-mapgen/1",
+    "profile": "unit-normal-rgb-v1",
+    "reproduce": "cabal run --project-file cabal.project.cpu exe:terrain-mapgen -- --check (from the repository root); --output DIR regenerates into an explicit directory",
+    "note": "at most 46 maps (16 ordinary + 2 per nonflat shape); every authored identity is kept even when bytes are shared"
   }
 }

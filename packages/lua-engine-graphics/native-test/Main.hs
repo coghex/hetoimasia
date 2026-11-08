@@ -42,6 +42,7 @@ import Test.LuaEngine.Graphics.Native.Loader (checkLoader)
 import Test.LuaEngine.Graphics.Native.Session (Facts (..), runSession)
 import qualified Test.LuaEngine.Graphics.Native.Spec as Native
 import qualified Test.LuaEngine.Graphics.Native.Facade as Facade
+import qualified Test.LuaEngine.Graphics.Native.DataTextures as DataTextures
 import qualified Test.LuaEngine.Graphics.Native.Pixels as Pixels
 import qualified Test.LuaEngine.Graphics.Native.Scenes as Scenes
 import qualified Test.LuaEngine.Graphics.Native.Targets as Targets
@@ -68,7 +69,7 @@ main = do
     case arguments of
       [flag] | flag == probeFlag → Facade.cancelProbe
       [flag] | flag == latchFlag → Facade.latchProbe
-      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> Facade.spec env
+      _ → \env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> DataTextures.spec env >> Facade.spec env
   finished ← getCurrentTime
   let problems = if probing then probeChecks expectedFailure facts else checks facts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double

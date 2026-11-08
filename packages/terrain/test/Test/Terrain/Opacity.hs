@@ -116,6 +116,7 @@ accepted =
   [ ("accepts and runs a client using the public coordinate, shape and geometry interfaces", supportedClient, supportedOutput)
   , ("accepts and runs a client using the public opening interface: portals, components and connections", openingClient, openingOutput)
   , ("accepts and runs a client that validates limits and drives the residency model through its public interface", residencyClient, residencyOutput)
+  , ("accepts and runs a client that validates limits and compiles source connectivity through its public interface", connectivityClient, connectivityOutput)
   ]
 
 -- | The modules hidden inside the main library.
@@ -124,6 +125,10 @@ hidden =
   [ "Hetoimasia.Terrain.Internal.Cell"
   , "Hetoimasia.Terrain.Internal.Changes"
   , "Hetoimasia.Terrain.Internal.Column"
+  , "Hetoimasia.Terrain.Internal.Connectivity.Index"
+  , "Hetoimasia.Terrain.Internal.Connectivity.Kind"
+  , "Hetoimasia.Terrain.Internal.Connectivity.Limits"
+  , "Hetoimasia.Terrain.Internal.Connectivity.Prepare"
   , "Hetoimasia.Terrain.Internal.Coordinate"
   , "Hetoimasia.Terrain.Internal.Interval"
   , "Hetoimasia.Terrain.Internal.Packed"
@@ -167,6 +172,10 @@ constructors =
   , ("Limits", ["import Hetoimasia.Terrain.Residency (Limits (Limits))"], [])
   , ("Model", ["import Hetoimasia.Terrain.Residency (Model (Model))"], [])
   , ("Coverage", ["import Hetoimasia.Terrain.Residency (Coverage (Coverage))"], [])
+  , ("ConnectivityLimits", ["import Hetoimasia.Terrain.Connectivity (ConnectivityLimits (ConnectivityLimits))"], [])
+  , ("Connectivity", ["import Hetoimasia.Terrain.Connectivity (Connectivity (Connectivity))"], [])
+  , ("ComponentKey", ["import Hetoimasia.Terrain.Connectivity (ComponentKey (ComponentKey))"], [])
+  , ("Preparation", ["import Hetoimasia.Terrain.Connectivity (Preparation (Preparation))"], [])
   ]
 
 -- | A value forged by applying a private constructor the client never imported.
@@ -192,6 +201,13 @@ forged =
   , ("Limits", ["import Hetoimasia.Terrain.Residency (Limits)"], ["zeroed :: Limits", "zeroed = Limits 0 0 0 0 0 0 0 0"])
   , ("Model", ["import Hetoimasia.Terrain.Residency (Model)"], ["empty :: Model", "empty = Model"])
   , ("Coverage", ["import Hetoimasia.Terrain.Residency (Coverage)"], ["everything :: Coverage", "everything = Coverage undefined"])
+  , -- A validated limit that claims no bound at all, a result that claims a
+    -- component it never compiled, a component key for a cell that has no such
+    -- void, and a suspended preparation that claims to be finished.
+    ("ConnectivityLimits", ["import Hetoimasia.Terrain.Connectivity (ConnectivityLimits)"], ["zeroed :: ConnectivityLimits", "zeroed = ConnectivityLimits 0 0 0 0 0 0"])
+  , ("Connectivity", ["import Hetoimasia.Terrain.Connectivity (Connectivity)"], ["claimed :: Connectivity", "claimed = Connectivity undefined undefined undefined undefined undefined undefined undefined undefined undefined"])
+  , ("ComponentKey", ["import Hetoimasia.Terrain.Connectivity (ComponentKey)"], ["forgedKey :: ComponentKey", "forgedKey = ComponentKey undefined Nothing Nothing Nothing"])
+  , ("Preparation", ["import Hetoimasia.Terrain.Connectivity (Preparation)"], ["finished :: Preparation", "finished = Preparation undefined undefined undefined"])
   ]
 
 -- | A checked value rewritten through an exported accessor used as a field
@@ -217,6 +233,11 @@ recordUpdates =
   , ("lJobs", ["import Hetoimasia.Terrain.Residency (Limits, defaultLimits)"], ["unlimited :: Limits", "unlimited = defaultLimits {lJobs = 1000000}"])
   , ("mClock", ["import Hetoimasia.Terrain.Residency (Model, defaultLimits, newModel)"], ["rewound :: Model", "rewound = (newModel defaultLimits) {mClock = 0}"])
   , ("mTargets", ["import Hetoimasia.Terrain.Residency (Model, defaultLimits, newModel)"], ["forged :: Model", "forged = (newModel defaultLimits) {mTargets = undefined}"])
+  , -- A validated connectivity limit cannot be rewritten either: its accessors
+    -- are functions and its fields are not exported.
+    ("limitWorkSteps", ["import Hetoimasia.Terrain.Connectivity (ConnectivityLimits, defaultConnectivityLimits, limitWorkSteps)"], ["unbounded :: ConnectivityLimits", "unbounded = defaultConnectivityLimits {limitWorkSteps = 1000000000}"])
+  , ("lQuantum", ["import Hetoimasia.Terrain.Connectivity (ConnectivityLimits, defaultConnectivityLimits)"], ["greedy :: ConnectivityLimits", "greedy = defaultConnectivityLimits {lQuantum = 1000000}"])
+  , ("lNodes", ["import Hetoimasia.Terrain.Connectivity (ConnectivityLimits, defaultConnectivityLimits)"], ["greedy :: ConnectivityLimits", "greedy = defaultConnectivityLimits {lNodes = 1000000}"])
   ]
 
 supportedClient ∷ String
@@ -393,4 +414,65 @@ residencyOutput =
   , "(0,400)"
   , "Invalid EmptyDemand"
   , "True"
+  ]
+
+-- | A client that validates connectivity limits (a zero, unrepresentable or
+-- inconsistent figure is refused by field, never clamped), refuses a resume
+-- request outside the quantum, compiles the default flat source and reads the
+-- component, exterior and range answers, and meets a typed refusal, all through
+-- the public interface.
+connectivityClient ∷ String
+connectivityClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Hetoimasia.Terrain.Connectivity"
+    , "import Hetoimasia.Terrain.Coordinate"
+    , "import Hetoimasia.Terrain.Source"
+    , ""
+    , "main :: IO ()"
+    , "main = do"
+    , "  let spec0 = LimitsSpec 1000 2000 10 10 1000 8"
+    , "  putStrLn (either show (const \"valid\") (mkConnectivityLimits spec0))"
+    , "  putStrLn (either show (const \"valid\") (mkConnectivityLimits spec0 {specNodes = 0}))"
+    , "  putStrLn (either show (const \"valid\") (mkConnectivityLimits spec0 {specQuantumSteps = 1025}))"
+    , "  putStrLn (either show (const \"valid\") (mkConnectivityLimits spec0 {specPeakBytes = 999}))"
+    , "  let definition = SourceSpec [\"soil\", \"stone\"] [LayerSpec Nothing (Just (-3)) \"stone\" 0, LayerSpec (Just (-3)) (Just 1) \"soil\" 0] []"
+    , "  case (mkSource defaultSourceLimits definition, tileCoord 0 0 1, tileCoord 0 0 0) of"
+    , "    (Right source, Right air, Right solid) -> do"
+    , "      let start = startPreparation defaultConnectivityLimits source"
+    , "      putStrLn (either show (const \"resumed\") (resumePreparation 0 start))"
+    , "      putStrLn (either show (const \"resumed\") (resumePreparation 1025 start))"
+    , "      case prepareConnectivity defaultConnectivityLimits source of"
+    , "        Left e -> print e"
+    , "        Right (c, stats) -> do"
+    , "          print (statNodes (connectivityStats c), statRelations (connectivityStats c), workMaxQuantum stats <= 1024)"
+    , "          print (lookupVoid c solid 0)"
+    , "          print (lookupVoid c air 1)"
+    , "          print (fmap (isExterior c) (componentOf c air))"
+    , "          print (fmap keyParameters (componentOf c air))"
+    , "          print (fmap length (componentRanges c =<< componentOf c air))"
+    , "      case mkConnectivityLimits (LimitsSpec 16777216 50331648 1 262144 8388608 1024) of"
+    , "        Left e -> print e"
+    , "        Right one -> case prepareConnectivity one source of"
+    , "          Left (Complexity r) -> print r"
+    , "          _ -> putStrLn \"unexpected\""
+    , "    _ -> putStrLn \"unexpected\""
+    ]
+
+connectivityOutput ∷ [String]
+connectivityOutput =
+  [ "valid"
+  , "LimitNotPositive FieldNodes 0"
+  , "LimitUnrepresentable FieldQuantumSteps 1025 1024"
+  , "PeakBelowResult 999 1000"
+  , "QuantumNotPositive 0"
+  , "QuantumAboveLimit 1025 1024"
+  , "(2,1,True)"
+  , "NoVoid"
+  , "NoSuchVoid"
+  , "Just (Just True)"
+  , "Just []"
+  , "Just 2"
+  , "Refusal {refusedResource = StructuralNodes, refusedNeeded = 2, refusedLimit = 1}"
   ]

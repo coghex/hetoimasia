@@ -8,8 +8,10 @@ coverage and picking will share; TRA-13 corrected identity 15 to the approved
 central peak and added the exact empty-space openings and their connections
 between neighboring cells. TRA-2 adds the immutable layered source, the
 packed sparse resident-detail representation and the retained-removal overlay
-with the queries over them, and TRA-3 the pure residency and admission model
-over them. It is a data, query and decision kernel, not a world store:
+with the queries over them, TRA-3 the pure residency and admission model
+over them, TRA-18 the bounded symbolic compiler of the source's empty-space
+connectivity, and TRA-19 the pure model of compressed player knowledge and resumable
+discovery after removal. It is a data, query and decision kernel, not a world store:
 transactional ownership, revisions and live offload (TRA-4), Lua copying
 (TRA-5), input, camera, rendering and arena assembly belong to later slices.
 
@@ -19,6 +21,8 @@ transactional ownership, revisions and live offload (TRA-4), Lua copying
 | `Hetoimasia.Terrain.Shape` | The 16-shape catalog, sides, quarter turns, view facings |
 | `Hetoimasia.Terrain.Geometry` | The canonical unit-cell solid, face coverage, membership, ray and segment queries |
 | `Hetoimasia.Terrain.Opening` | The exact empty components of a cell, their portals on the six faces, and the connections between neighbors |
+| `Hetoimasia.Terrain.Connectivity` | The exact, bounded, resumable compilation of a source's empty-space connectivity: component families, canonical keys, ranges, portal relations, compressed boundaries, initial upper-Z exterior |
+| `Hetoimasia.Terrain.Discovery` | The pure discovery model: retained removed runs, a connectivity forest with known/unknown classes, paired removal-plus-obligation candidates, bounded resumable discovery batches, knowledge queries, replay from records, validated limits and allowances |
 | `Hetoimasia.Terrain.Cell` | Authored materials, the air-or-solid cell value, half-open Z intervals, columns |
 | `Hetoimasia.Terrain.Source` | The declarative layered source: definition, validation, limits and byte accounting |
 | `Hetoimasia.Terrain.Changes` | Retained removals: canonical intervals, whole-cell removal, merge and restore |
@@ -423,6 +427,348 @@ that leaves the previous value untouched. `emptyChanges` is a fresh session;
 intervals. `changesBytes` accounts 16 bytes per interval and 48 per column index
 entry. The revision counter, admission reservation and cancellation arbitration
 around a commit belong to TRA-4.
+
+## Source connectivity
+
+`Hetoimasia.Terrain.Connectivity` compiles a validated `Source` into the exact
+connectivity of its empty space: which air spaces connect, which are initially
+exterior, and a canonical identity for every connected component. It is pure and
+CPU-only, instantiates no column, air cell or buried solid cell, and does not
+open an arena, discover sealed space, hold knowledge or apply edits (TRA-19 to
+TRA-22 do). Preparing connectivity needs only the source: the immutable result
+is what a later service keeps beside it.
+
+### What is exact
+
+Two empty spaces connect exactly when a chain of cells joins them in which every
+consecutive pair shares a face and their portals on it overlap over positive
+area, as [Openings and connections](#openings-and-connections) defines (shape 0
+the full block, identity 15 the central half-height peak, no nonflat shape with a
+bottom opening of positive area). Edge and point contact never connects, there is
+no tolerance and no blanket 26-neighbour rule, so a real diagonal path through
+shaped voids exists exactly where a face-by-face chain does. The compiler never
+asks about bounding boxes, shape bits or rendered alpha. It derives every fact
+from `Opening`: which pairs of the 17 content kinds (air and the 16 identities)
+connect along each axis, whether a kind has any void and whether its top face
+opens, by asking about a representative pair of tiles.
+
+### Representation: boxes, parameters and classes
+
+The compiler cuts each axis where the source can change: every layer and patch
+boundary and the cell below it, every patch column with its face neighbours on X
+and Y, and the supported extremes (the upper endpoint `2^62` kept separately, and
+the topmost level isolated). The cuts make a lattice whose boxes each hold one
+kind of content, so a box is described by its kind and extents, never by its
+cells. A box with void is a *node*; a full block is no node.
+
+A node has no parameter on an axis along which its cells connect. An axis along
+which they do not keeps the cell's coordinate as a *parameter* of the component.
+A covered uniform N-ramp layer is therefore one node whose components are
+indexed by row and by level (the south face is sealed and the north face open, so
+rows never join, and no nonflat shape opens at the bottom, so levels never join);
+the same layer of E ramps is indexed by column and level; a plane family of
+connected shapes by level alone. A parameter spanning many members never claims
+those members are mutually connected.
+
+Two nodes that share a whole face and connect across it form one *class* and are
+a *portal relation*. The join identifies the nodes' parameters, and removes a
+parameter when one side has none: an air shaft that joins a vast range of repeated
+layers removes their level parameter, so the shaft costs a few nodes and
+relations, not one per level. A full-block patch splits a channel into fragments
+the cuts already separate. A component is a class plus the values of its
+remaining parameters. The lattice is refined at each patch column so that every
+relation joins whole faces; a relation that would join part of a box would be a
+defect, and the compiler refuses it as `Inconsistent` instead of guessing.
+
+The lattice is a product of the per-axis cuts, so its size grows with the number
+of distinct patch columns and boundaries, polynomially, never with an interval's
+span or the number of identical members. That is the cost this design accepts: a
+source with many scattered patches in default void-bearing content exceeds the
+node, relation or work limit and is refused with the typed `source_complexity`
+refusal below, and no dense fallback exists. The required fixtures (the flat
+source, world-spanning and shafted air, all-16 cavities, and the huge ramp,
+channel and layer families with their patches) fit the approved defaults.
+
+### Identity, lookup and queries
+
+`ComponentKey` is the origin of the class's first box in (z, y, x) order and the
+parameter values the class keeps. It depends on the validated source and the
+member's parameters alone, never on chunk-load order, query order or how the
+preparation was divided into quanta, and the module promises no public encoding
+and no equivalence between differently authored but semantically equal recipes.
+`lookupVoid` addresses a void of a cell, so it stays correct for a future shape
+with more than one; a full block answers `NoVoid` explicitly, never air and
+never unknown, and an index the cell lacks answers `NoSuchVoid`. The compiler
+addresses one void per cell and refuses (`Unsupported`) a catalog with more.
+`componentRanges`, `componentRelations` and `componentBoundary` describe a
+component by the boxes of its class, with its parameters applied: a boundary is a
+set of rectangles of cells with the face and what lies across (a limit, solid
+tiles or tiles of another component), at most six per box, so later discovery can
+look up a component's or range's boundary without enumerating exposed tiles.
+
+### Initial exterior
+
+A component is initially exterior exactly when it connects through positive-area
+openings to the upper Z boundary, unobstructed sky included. The X and Y limits
+and the lower Z limit open nothing: a covered air slab that spans the horizontal
+limits stays sealed, a full block at the highest cell supplies no opening, and a
+shape's actual top portal reaches the outside. The classification is symbolic (a
+topmost node is exterior when its kind's top face opens) and floods no sky and
+allocates no boundary cell. Sealed components stay sealed whatever is queried or
+resident; the result is initial metadata, not a discovered-tile set.
+
+### Bounded, resumable preparation
+
+`startPreparation` returns a suspended `Preparation`; `resumePreparation q` runs
+at most `q` counted steps and returns `Pending`, `Complete` or `Refused`. A
+refusal exposes no partial index, dropping a `Preparation` discards it with no
+effect on any other value, and there are no threads, I/O or clocks. A request for
+zero, a negative count or more than the configured quantum is refused, never
+clamped. Fair scheduling, cancellation acknowledgment and the release of shared
+admission reservations belong to the later service.
+
+| Resource | Initial approved bound |
+| --- | --- |
+| Complete compiled connectivity per arena | 16 MiB |
+| Peak compilation, including its result | 48 MiB |
+| Structural nodes | 65,536 |
+| Portal relations | 262,144 |
+| Total compilation work | 8,388,608 counted steps |
+| One preparation quantum | at most 1,024 steps |
+
+A MiB is `2^20` bytes. The limits go through `mkConnectivityLimits`, whose
+constructor and fields are private (as for the residency limits): each field has a
+documented range (bytes in `[1, 2^40]`, nodes and relations in `[1, 2^32]`, work in
+`[1, 2^48]`, the quantum in `[1, 1024]`, the peak at least the result), and a
+figure outside it is refused by field with a `LimitError`, never clamped and never
+reported as `source_complexity`.
+
+A *step* is one of: forcing one entry of the 867-entry connection table (one exact
+portal comparison), adding one authored layer, patch column or patch interval to
+the cuts, classifying one lattice box, testing one node against one neighbour (and
+recording the relation, at most three union-find operations of at most `log2 nodes`
+hops), folding one mark or node into the canonical result, or assembling it. Each is
+a constant number of operations on containers the limits bound, so no step scans a
+coordinate extent, an unbounded container or an arbitrary recipe. Coordinates are
+`Int64` inside `[-2^62, 2^62]` or `Integer`; extents are compared without
+subtraction (`2^62 - (-2^62)` overflows `Int64`), and every sum that could leave a
+limit is formed in `Integer` and compared first. The lattice is refused up front,
+with the work it implies, when it alone exceeds the remaining work.
+
+Bytes are conservative admission figures, not heap or RSS, charged before the
+allocation or work they pay for: the constants `headerResultBytes` (512),
+`cutResultBytes` (48), `nodeResultBytes` (160), `memberResultBytes` (40),
+`classResultBytes` (96) and `relationResultBytes` (64) for the retained result, and
+`nodeTempBytes` (512) for the union-find state and marks that exist until
+canonicalization ends. The peak is the result plus those temporaries at any
+moment. The connection table is a constant shared by the process and is charged as
+work, not as bytes. A valid source whose connectivity needs more than a limit is
+refused with a typed `Refusal` naming the `Resource` (result bytes, peak bytes,
+structural nodes, portal relations or work steps) and the needed and limit
+figures; the later integration maps any such refusal to the Lua domain code
+`source_complexity`.
+
+### What is charged to whom
+
+The source definition (at most 256 KiB and 8,192 authored runs, enforced by
+`mkSource`) is shared immutable input. Its bytes stay governed by
+`sourceDefinitionBytes` and the existing independent source limit; they are
+excluded from this compiler's result and peak figures (declaring a thousand more
+materials changes none of them, and a test pins that), and this slice invents no
+resident-bank charge for them: any charge for the retained source itself is the
+arena-admission integration's choice. Only newly derived metadata is accounted:
+the compiled result is charged once per arena to the 256 MiB resident terrain bank
+by the later service, and the temporaries of the one compilation active per
+session are charged to the same bank while they exist. This module creates no
+bank, service, semaphore or session owner.
+
+### State, owner and lifetime
+
+None. A `Connectivity` is built whole and never mutated; a `Preparation` is a
+suspended pure computation; nothing here has an owner, thread, queue, reset or
+disposal.
+
+## Discovery and knowledge
+
+`Hetoimasia.Terrain.Discovery` (TRA-19) models what the player has discovered of
+the empty space, over the immutable source plus retained removals. It is a pure
+model of records, bounded candidate deltas and queries. It performs no I/O,
+starts no thread, keeps no mutable registry and has no Lua, graphics or game
+dependency. The page codec and copy-on-write store (TRA-20), the file and
+asynchronous I/O (TRA-21) and the live owner that holds the committed value and
+publishes candidates (TRA-22) are later slices; nothing here is a terrain
+service, a file backend or a persistent-save promise.
+
+### Three separate meanings
+
+* **Terrain** is what a cell holds: the source plus the removals this model
+  retains. A removal only enlarges empty space, so a source component stays a
+  connected subset of the larger space after any removal. Placement, reshaping
+  and any change that could split a space need a split-capable contract and are
+  outside this one. The existing `Changes`, `Query`, `Resident` and `Residency`
+  functions are unchanged; `retainedRemovals` converts the retained runs back
+  for the consumers that read `Changes`, and a removal's `Changes` built through
+  `removeCell` or `changesFromIntervals` is not this model's authority.
+* **Residency** is which detail is materialized. Loading, eviction, camera
+  motion and cutaway changes grant no knowledge, and knowledge never pins detail.
+  Generic fog is presentation only: it never changes occupancy, a logical query
+  or connectivity.
+* **Knowledge** belongs to a connected class of empty space and is retained by
+  compressed identity. Known **solid** and known **void** are separate facts: the
+  solid face of a ramp is known when it is exposed to known empty space, the
+  empty space above the ramp only when its own class is known. `queryCell`
+  returns the two facts and `presentation` maps them to ordinary, fully unknown
+  and known-solid/unknown-void.
+
+### Initial knowledge
+
+The initial known set is exactly the compiled source's exterior classification
+(`Connectivity.isExterior`: connection through positive-area openings to the
+upper Z boundary). It is derived from the compiled source without flooding sky,
+preloading an exterior cave or using a fixed Z threshold. Every other component
+starts unknown and a sealed space stays unknown whatever is queried, resident or
+raw-edited.
+
+### Records, the forest and removed runs
+
+All retained state is four plain-data records under an ordered key and a small
+resident header (`Header`: the authority, the oldest unfinished and next
+obligation sequence, and the accounted bytes). There is no closure, pointer
+identity or auxiliary heap index.
+
+| Key | Record | Meaning |
+| --- | --- | --- |
+| `KeyRun column lo` | `RecRun hi` | a canonical coalesced removed run `[lo, hi)` of one column |
+| `KeyLink node` | `RecRoot (Root size known)` | a union-find root: members and whether the class is known |
+| `KeyLink node` | `RecChild parent` | a member pointing toward its root |
+| `KeyTodo sequence` | `RecTodo (Todo tile done)` | one removal's unfinished connections |
+
+A `Node` is a source component (`SrcNode`, a canonical `ComponentKey` with its
+row, column and level parameters) or a removed run (`RunNode`, named by the lowest
+level it had when the node was made). A node with no `KeyLink` record is an
+implicit singleton root: a source component is known exactly when the compiled
+source calls it exterior, a run is unknown. **Absent is confirmed unknown**, which
+is a different fact from a record the provider has not supplied (below).
+
+Joining two classes writes a child pointer and rewrites the larger class's root;
+the new root is known when either was. Joining a known class to an unknown one
+therefore makes every member of the unknown class known in one record: a source
+range, a family of parameters joined by an earlier removal, many removed runs. A
+range of repeated components is never enumerated and uninvolved members of a
+family are never merged because their bounds overlap; only the components a
+removal's faces reach are joined. Union by size bounds a chain by `maxLinkChain`
+(64). A run whose lower end moves, or two runs a removal bridges, are joined to
+the run that takes their place in the same candidate, so no alias names a
+vanished run and unfinished work survives intervening removals.
+
+### A removal and its obligation
+
+`stageRemoval` produces one complete candidate delta: the canonical removal, the
+joins that follow from the cell itself (the new full-air cell contains its old
+void, so a cell that was known stays known), and a retained obligation naming the
+cell. Neither half applies alone: the candidate is one value. The obligation holds
+the six face connections, where the full-air cell meets a neighbour's portals over
+positive area (the geometry of `Opening`; edge and point contact never connects)
+and the upper boundary of the world (a removal at the top level reaches the
+exterior). Removing air or an already removed cell is `NoChange`: no history, no
+obligation and no revision.
+
+A raw removal inside a sealed unknown space records its connections and joins its
+own classes but joins no known class, so it reveals nothing. A later opening from
+known space joins the whole modified class and discovers it. A removal of a known
+solid beside an unknown void discovers it only through actual new connectivity.
+
+### Discovery batches
+
+`stepDiscovery` inspects the connections of the oldest unfinished obligation, one
+**structural update** per connection: one neighbour found by exact geometry, at
+most one pair of classes joined and the obligation's progress. A batch performs at
+most the validated `limitBatchUpdates` (1 to 64) updates. Each connection is
+inspected exactly once and against the state at inspection time, so a connection
+beside an already known or expanded region is joined, a class reached by two
+fronts is joined once, and reaching sky ends only the outward branch. An
+obligation is **unseen** before its first face, **pending** while partly inspected
+and **expanded** (its record deleted) when finished (`queryObligation`); none is
+the same fact as the knowledge of the class it touches, and an unfinished
+obligation inside a known class is still inspected. Completion means no unfinished
+obligation: the connected space and its exposed boundary are then known by
+identity with no cell, boundary tile or resident detail enumerated or required.
+
+A batch stops with a `Halt`: the batch limit, a drained queue, a record the provider
+has not supplied, or a resource the allowance cannot fund. A first update that
+cannot fit is refused with the resource and the work stays queued; pending capacity
+never reads as completion.
+
+### Exposed boundary and presentation
+
+Exposed boundary knowledge is derived, not copied per chunk. `queryCell` resolves a
+solid from exact contact geometry: a known void whose portal lies over the cell's
+solid face section by positive area, the cell's own known void, or the sky above the
+top level. `queryKnownBoundary` returns a known source component's compressed
+boundary faces (at most six per box of its class, never an enumeration of tiles; a
+removal's effect on a boundary is read cell by cell). A chunk reloaded later resolves
+the same answers from the retained records alone.
+
+### Missing data and replay
+
+An operation reads through a `Provider`, a bounded window, never the whole history:
+an exact record lookup and a floor lookup of the removed run at or below a level. A
+record the provider answers `Unavailable` suspends the operation with its obligation
+intact (`EditSuspended`, `Stalled`, `HaltSuspended`, `MissingRecord`). It is never
+read as absent, as air, as newly forgotten fog or as proof that no connection exists,
+and pristine source state is never regenerated in place of a record the model was not
+given. `retainedFromRecords` rebuilds a `Retained` value from a header and its records
+after checking that they are a legitimate state; resuming from those records alone
+gives the same knowledge and the same remaining work.
+
+### Authority and candidates
+
+A `Candidate` names the `Authority` it read: the arena incarnation (an
+`ArenaId`) and the content, knowledge and store `Revision`s. `applyCandidate`
+accepts it only against exactly that authority, so a candidate from a closed
+incarnation, or one made stale by an applied candidate (a frontier-only one included),
+is refused and applied nowhere, and a rejected or discarded candidate leaks neither
+terrain nor knowledge. A candidate says whether it changes terrain (content revision),
+knowledge (knowledge revision) or neither (frontier or union maintenance, store
+revision only). Revision and sequence arithmetic is checked and refuses on overflow.
+Staging is not publication: the atomic write, cancellation and settlement protocol
+belong to TRA-20 to TRA-22. Retention is session semantics, not a save or crash
+recovery.
+
+### Limits and accounting
+
+`DiscoveryLimits` are validated by `mkDiscoveryLimits`: a figure outside its range, or
+too small for one minimal progress step (one removal with its continuation, or one
+structural update with its worst-case inspected input), is refused by field and never
+clamped, so a limit that can never fit gives a typed refusal and not an indefinite
+pending state. An `Allowance` can only tighten them per call.
+
+| Field | Range | Default |
+| --- | --- | --- |
+| batch updates | 1 to 64 | 64 |
+| inspected records | `worstEditReads` (197) to 2^24 | 64 × `worstEdgeReads` |
+| delta records | `worstEditWrites` (7) to 2^24 | 64 × `worstEdgeWrites` |
+| delta bytes | `minimumDeltaBytes` to 2^40 | 1 MiB |
+| scratch bytes | `minimumScratchBytes` to 2^40 | 4 MiB |
+| unfinished obligations | 1 to 2^32 | 65,536 |
+| retained bytes | `minimumRetainedBytes` to 2^40 | 48 MiB |
+
+Bytes and counts are conservative accounted figures (keys, aliases, obligations,
+container overhead and scratch; a deletion is charged as the largest record of its
+kind), not heap or process RSS, and not final encoded pages. The shared compiled
+source is charged once to the arena (`envSharedBytes`), never to a candidate. The
+integration envelope is P-15's 64 MiB edit bank (48 MiB record caches, 8 MiB staging,
+8 MiB control), at most 4 MiB of RAM and 1 MiB of encoded pages per later store
+transaction and at most 64 structural updates per batch; the model can stop below 64
+when its allowance is tighter, and exact page charges and bank enforcement are TRA-20
+and TRA-22.
+
+### State, owner and lifetime
+
+None. Every value is immutable and every function pure. The later owner holds the
+`Retained` value (or the store that replaces it), supplies the arena and revision
+authority, applies candidates on its single owner thread and decides when to schedule
+a batch. This module starts no thread, allocates no identity and owns no resource.
 
 ## Packed storage
 
@@ -993,7 +1339,49 @@ the specific diagnostic that names the cause. The residency examples drive the m
 with controlled events (no thread, sleep or deadline), recompute every ledger from
 the model's records after each step, run the model beside the real source, changes
 and resident detail across repeated edit, handoff, evict and reconstruct cycles, and
-check the structural invariants over randomized event sequences.
+check the structural invariants over randomized event sequences. The connectivity
+examples (TRA-18) compare the compiler with an independent flood model
+(`Test.Terrain.ConnectivityOracle`) that shares no code with it: it re-derives each
+shape's top from the stated height rule, decides whether two cells connect by exact
+rational sampling of the shared face, and floods a finite window cell by cell. The
+generated comparisons (`Test.Terrain.ConnectivityFixtures`, SplitMix64 seeds named in
+each example) cover sealed rooms of every default kind (air and all 16 identities,
+hence all four rotations of each orientable shape) with random air, block and shape
+patches, covered open worlds whose window reproduces the unbounded plane around
+them, open-top worlds whose air reaches the real upper limit, and rooms at the
+coordinate extremes; each compares void against no-void, the partition into
+components as a bijection with the keys, exterior, range membership, portal relations
+(sound, and with each box's interior connections complete) and every boundary face.
+Hand-stated fixtures check the flat source, wholly air terrain, covered and shafted
+slabs, uniform ramp families in two rotations, patch splits and joins and negative
+seams at spans of `2^20` and `2^60`. Negative controls (a family merged into one
+component, a level dropped from a family, a side limit called exterior) must be
+rejected by the same comparison. `Test.Terrain.ConnectivityBounds` tests every
+configured bound at its exact boundary and one below it, quanta of 1, 17 and 1,024,
+refusals, scale-independence of the structure counts and accounted bytes, and the
+runtime's own allocation read with `GHC.Stats` (measured allocation, not admission
+bytes and not RSS).
+
+The discovery examples (TRA-19, `Test.Terrain.Discovery` with the driver and explicit
+oracle `Test.Terrain.DiscoveryHarness`) run ordered traces of removals, discovery
+batches, drains and record replays over small authored worlds and, after every event,
+check the retained state for legitimacy (it rebuilds from its own records, its removed
+runs are exactly the removals applied, each connection was inspected exactly once, every
+report is within its limit) and compare production knowledge with an independent
+explicit model that shares no code with the overlay. The model reads the source as plain
+data, decides which neighbours connect by exact rational sampling of the shared face
+(reusing `Test.Terrain.ConnectivityOracle`), floods the window cell by cell and derives
+known voids and known solids from first principles. Production knowledge must lie
+between the oracle after the removals whose obligations are finished and the oracle
+after every removal, and equal the latter when the obligations are drained. The cases
+cover both opening orders and every interleaving of two openings with batches of 1, 2,
+3 and 64 updates, raw buried and long coalesced removals, known solid against unknown
+void, edge-only and point-only controls, 48 generated traces (all 16 identities, four
+origins across negative region seams), huge ramp families at `2^20` and `2^60`, a
+bounded working window while retained history grows, a record withheld and restored,
+exact and insufficient allowances, stale and foreign candidates, overflow, and
+negative controls that the oracle must reject. A client compiled outside the package
+shows the discovery state unforgeable.
 
 ## Consumers
 

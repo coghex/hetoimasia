@@ -60,6 +60,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.Asset.Image.Bc7
+        Hetoimasia.Asset.Image.DataMap
         Hetoimasia.Asset.Image.Ktx2
         Hetoimasia.Asset.Image.Mips
         Hetoimasia.Asset.Image.Png
@@ -102,6 +103,7 @@ test-suite asset-image-tests
     other-modules:
         Test.Asset.Image.Bc7
         Test.Asset.Image.Bc7Opacity
+        Test.Asset.Image.DataMap
         Test.Asset.Image.DecodeSupport
         Test.Asset.Image.Fixtures
         Test.Asset.Image.Ktx2
