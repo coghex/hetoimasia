@@ -373,7 +373,7 @@ fractionalOcclusion = describe "omission of hidden cells under the transforms as
   it "answers every sampled pixel as the plan that omits nothing does, over generated zooms, pans, facings, cuts and discovered sets" $ do
     assets ← loadAssets 5
     unproved ← loadAssetsWith 5 [(AssetMap (MapKey Ordinary (either (error . show) id (mkShapeId 5))), allOn)]
-    let cases = take 80 (generated 20261108)
+    let cases = take 160 (generated 20261108)
         outcome (facing, cut, zoom, (dx, dy), snap, cells) =
           let scene0 = sceneOf facing cut [OCell x y z 0 KnownAll | (x, y, z) ← cells]
               scene = (if snap then snapped else id) (panned dx dy (zoomed zoom scene0))
@@ -404,8 +404,16 @@ fractionalOcclusion = describe "omission of hidden cells under the transforms as
         go (a : b : c : d : e : f : g : rest) =
           let facing = [FaceSouth, FaceWest, FaceNorth, FaceEast] !! (a `mod` 4)
               cut = toInteger (b `mod` 3)
-              zoom = zoomChoices !! (c `mod` length zoomChoices)
-              pan = (fromIntegral ((d `mod` 200) - 100) / 97, fromIntegral ((e `mod` 200) - 100) / 89)
+              -- Half the cases use zooms and pans that are exact rationals, so that
+              -- rectangle edges can land exactly on pixel centres, where rounding can
+              -- change an answer; the rest use arbitrary values.
+              structured = even (c `div` 7)
+              zoom
+                | structured = fromIntegral (1 + c `mod` 40) * 3 / 20
+                | otherwise = zoomChoices !! (c `mod` length zoomChoices)
+              pan
+                | structured = (fromIntegral ((d `mod` 49) - 24) / 48, fromIntegral ((e `mod` 49) - 24) / 144)
+                | otherwise = (fromIntegral ((d `mod` 200) - 100) / 97, fromIntegral ((e `mod` 200) - 100) / 89)
               snap = f `mod` 3 == 0 && zoom `elem` [0.5, 1, 2]
               cells = [(x, y, z) | (n, (x, y, z)) ← zip [g ..] box, (n * 2654435761 `div` 7) `mod` 10 < 7]
            in (facing, cut, zoom, pan, snap, cells) : go rest
