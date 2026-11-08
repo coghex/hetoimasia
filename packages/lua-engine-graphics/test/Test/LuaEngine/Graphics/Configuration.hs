@@ -96,7 +96,7 @@ spec = describe "the native configuration the profile maps to" $ do
     accountingTableSlots accounting `shouldBe` 5
     accountingTableCapacity accounting `shouldBe` 6
 
-  it "gives every validated profile a table with a slot for each texture its session bytes can hold, and a lease scope with room for each its instance bytes can hold and its windows (property)" $
+  it "gives every validated profile a table with a slot for each texture its session bytes can hold, and a lease scope with room for each its instance bytes can hold, its windows and one more (property)" $
     withNumTests 200 $
       forAll generatedProfile $ \profile →
         case configurationFor profile of
@@ -110,7 +110,7 @@ spec = describe "the native configuration the profile maps to" $ do
             conjoin
               [ counterexample "table slots are session bytes over the minimum charge" (accountingTableSlots accounting === sessionBytes `div` textureMinimumChargeBytes)
               , counterexample "slot 0 is the placeholder" (accountingTableCapacity accounting === accountingTableSlots accounting + 1)
-              , counterexample "the lease scope holds every texture the instance bytes can, and its windows" (fromIntegral (facadeLeaseCapacity profile) === instanceBytes `div` textureMinimumChargeBytes + windows)
+              , counterexample "the lease scope holds every texture the instance bytes can, its windows and one lease of headroom, so bytes answer first with a window held" (fromIntegral (facadeLeaseCapacity profile) === instanceBytes `div` textureMinimumChargeBytes + windows + 1)
               , counterexample "the table never fills before the session bytes do" (instanceBytes `div` textureMinimumChargeBytes <= accountingTableSlots accounting)
               , counterexample "the ring is counted" (accountingNativeBytes accounting >= accountingTableVersions accounting * accountingTableCapacity accounting * 8 + accountingTextureBytes accounting)
               ]

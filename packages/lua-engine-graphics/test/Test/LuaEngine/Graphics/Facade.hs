@@ -303,6 +303,13 @@ spec = describe "graphics facade" $ do
     outVerdict outcome `shouldBe` VerdictSuccess
     outFailures outcome `shouldBe` []
 
+  it "answers a texture request naming bytes, never the lease capacity, when the bank is full of retained textures and the window holds its lease: 8,192 bytes at a 4,096-byte reservation, two one-pixel textures and a window" $ do
+    outcome ← runFacade ((defaultShape heldWindowBank) {shapeBoth = False, shapeProfile = twoTextures}) $ \fs → do
+      awaitLine fs "bound\tbusy\ttrue\ttrue"
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outFailures outcome `shouldBe` []
+
   it "retains a thousand one-pixel textures at once in one instance through the production facade: each is charged the 4 KiB minimum, nothing is refused on a count, and every byte comes back when they are released" $ do
     outcome ← runFacade ((defaultShape thousandPixels) {shapeBoth = False, shapeParkOutput = True, shapeTexture = Fake.defaultFakeConfig {Fake.fcSlots = 1024, Fake.fcImages = 1024}, shapeFiles = [("images/pixel.png", Png.solid 1 1 (10, 20, 30, 255))]}) $ \fs → do
       -- The role prints nothing until it holds all thousand, and parks in the print: they are all held while this reads. (The
@@ -882,6 +889,33 @@ textureBank =
     , "        local t4, e4 = api.content.texture('images/quad.png')"
     , "        print('retry', t4 ~= nil, e4 == nil)"
     , "      end"
+    , "    end"
+    ]
+
+-- | Two textures taken and kept, and a window request in hand: its lease is held while the third texture request, with the
+-- bank full, is refused. The refusal must name the texture bytes and not the lease capacity.
+heldWindowBank ∷ ByteString
+heldWindowBank =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.t1 = api.content.texture('images/quad.png')"
+    , "      self.t2 = api.content.texture('images/quad.png')"
+    , "      self.w = api.window.open({title='w', width=64, height=64})"
+    , "    end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.done then return end"
+    , "      if not self.tex1 then"
+    , "        if not api.request.ready(self.t1) then return end"
+    , "        self.tex1 = api.request.take(self.t1).value.texture"
+    , "      end"
+    , "      if not self.tex2 then"
+    , "        if not api.request.ready(self.t2) then return end"
+    , "        self.tex2 = api.request.take(self.t2).value.texture"
+    , "      end"
+    , "      self.done = true"
+    , "      local r, e = api.content.texture('images/quad.png')"
+    , "      print('bound', r == nil and e.code, r == nil and e.message:find('texture bytes', 1, true) ~= nil, r == nil and e.message:find('lease', 1, true) == nil)"
     , "    end"
     ]
 

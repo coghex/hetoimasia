@@ -17,7 +17,10 @@
 -- * A VM's /lending and lease scope/ are made here, one for each VM, and handed to the VM's scheduled owner. Their
 --   capacity ('facadeLeaseCapacity') is /derived/ from the byte limit, not chosen: the instance's byte bank holds at
 --   most @TextureBytesPerUiInstance `div` 4096@ textures (every texture is charged at least 4 KiB), plus its window
---   slots (131,072 + 1 = 131,073 for the fixed profile). Every texture and window a UI instance can hold, pending,
+--   slots, plus one lease of headroom (131,072 + 1 + 1 = 131,074 for the fixed profile). The headroom is what lets the
+--   bytes answer first at double saturation: the host reserves a request's result lease /before/ the provider's byte credit,
+--   so with every texture the bank holds and the instance's window held, a capacity of exactly textures plus windows would
+--   have its lease charge refuse the next texture request, naming the lease, where the bytes are what is unavailable. Every texture and window a UI instance can hold, pending,
 --   live or retiring, is charged by the provider's bank before the host's lease charge is reached, so a lease the host
 --   would refuse is a lease an admission would already have refused as @busy@, on bytes. The host's lease capacity is
 --   therefore never the first bank to answer, and the generic host's faulting refusal cannot be reached by an
@@ -134,10 +137,13 @@ newtype GraphicsCompositionRefused = GraphicsCompositionRefused Text
 instance Exception GraphicsCompositionRefused
 
 -- | The lease capacity of one UI instance, derived from memory: the most textures its byte bank can hold at the
--- minimum charge ('textureRoomPerInstance', 131,072 for the fixed profile) and the window slots the profile gives it.
--- The bank refuses before this capacity can, for every validated profile.
+-- minimum charge ('textureRoomPerInstance', 131,072 for the fixed profile), the window slots the profile gives it, and one
+-- lease of headroom. The bank refuses before this capacity can, for every validated profile, a held window included: the
+-- host reserves the result lease before the provider's byte credit, so the request that finds the bank full must still find
+-- a lease free to be refused on bytes (manager decision, request user-het-texmem-20261108-1656: the derivation is one short
+-- of requirement 6 without the headroom).
 facadeLeaseCapacity ∷ Profile → Int
-facadeLeaseCapacity profile = fromIntegral (textureRoomPerInstance profile) + fromIntegral windowSlots
+facadeLeaseCapacity profile = fromIntegral (textureRoomPerInstance profile) + fromIntegral windowSlots + 1
   where
     Count windowSlots = countLimit profile WindowSlotsPerUiInstance
 

@@ -6,7 +6,8 @@
 --
 -- Two examples: an instance holds far more than sixteen textures with no refusal of any kind, and a property over
 -- generated validated profiles shows that bytes alone decide every admission through pending, live and retiring
--- holdings, that a refusal names bytes and never a lease capacity, and that the banks come back to zero.
+-- holdings, with and without the instance's window holding its lease, that a refusal names bytes and never a lease capacity,
+-- and that the banks come back to zero.
 module Test.LuaEngine.Texture.Capacity (spec) where
 
 import Control.Monad (forM_, unless, void)
@@ -69,6 +70,8 @@ data Shape = Shape
   { shPixels ∷ !Word64
   , shInstance ∷ !Word64
   , shSession ∷ !Word64
+  , shWindowHeld ∷ !Bool
+  -- ^ Whether the instance's window holds one of the lease scope's leases for the whole run.
   }
   deriving (Show)
 
@@ -82,7 +85,8 @@ generated = do
   extra ← choose (0, 5 * reservation + 4095)
   more ← choose (0, 4 * reservation + 4095)
   let bank = reservation + extra
-  pure (Shape pixels bank (bank + more))
+  held ← elements [False, True]
+  pure (Shape pixels bank (bank + more) held)
 
 profileOf ∷ Word64 → Word64 → Word64 → Word64 → Profile
 profileOf _ pixels instanceBytes sessionBytes =
@@ -111,14 +115,16 @@ data Used = Used !Word64 !Word64 !Word64
 -- whole reservation), the decodes settle them live at the minimum charge, the room that frees up is filled again, and
 -- every texture is released (retiring until the backend proves it) and retired.
 runShape ∷ Shape → IO ()
-runShape (Shape pixels instanceBytes sessionBytes) = do
+runShape (Shape pixels instanceBytes sessionBytes windowHeld) = do
   let profile = profileOf 0 pixels instanceBytes sessionBytes
       Bytes reservation = textureReservationBytes profile
       Bytes instanceLimit = bytesLimit profile TextureBytesPerUiInstance
       Bytes sessionLimit = bytesLimit profile TextureBytesPerSession
       Count windowSlots = countLimit profile WindowSlotsPerUiInstance
-      -- the facade's derivation: the room the instance's bytes leave, and its window slots
-      leaseCapacity = fromIntegral (textureRoomPerInstance profile + windowSlots)
+      -- the facade's derivation: the room the instance's bytes leave, its window slots and one lease of headroom; a held
+      -- window has taken its slots from it, which is what is left to the textures (the host reserves a request's lease before
+      -- the provider's byte credit, so a full bank must still find a lease free to be refused on bytes)
+      leaseCapacity = fromIntegral (textureRoomPerInstance profile + windowSlots + 1) - (if windowHeld then fromIntegral windowSlots else 0)
       attempts = 2 * (fromIntegral (sessionLimit `div` 4096) + 2) ∷ Int
   withSession ((config profile pictures) {cfgLeases = leaseCapacity, cfgJobs = 64, cfgPool = (2, 64)}) $ \session _ runtime → do
     vm ← startVm session runtime "property" OnArrival
