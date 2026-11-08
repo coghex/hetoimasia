@@ -4,8 +4,8 @@ vulkan: VK_DRIVER_FILES=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulk
 vulkan: VK_LAYER_PATH=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
 vulkan: validation features synchronization
 vulkan: VMA binding calls unsafe (VulkanMemoryAllocator -safe-foreign-calls), build directory /Users/vincentcoghlan/worktrees/coghex/hetoimasia/issue-644-terrain-materials-offscreen/dist-vulkan
-vulkan: repository revision 23a44e1cdb8eeca329dfb6573624e5a9b2028657
-vulkan: source digest c2ed8205fb084bf1ee3504518736b19a5ea0df4c412cac8ea40cd3ceb27d0730
+vulkan: repository revision fc7125ee32d5f36bb1005b3488c981c3f48e9f21
+vulkan: source digest bad3d131e784aa4e968aafb275dd7bb9ca60f8cc5e8ad5e09042a40dc1705380
 vulkan-native-tests: implicit-layer policy: VK_LOADER_LAYERS_DISABLE=~implicit~, so no implicit layer joins the chain and the explicit layers below are all of it
 vulkan-native-tests: layer settings: VK_LAYER_SETTINGS_PATH=/dev/null, so no settings file decides what the layer validates
 
@@ -196,6 +196,11 @@ Vulkan native
       negative control: an interruptible cleanup is abandoned by that cancellation and leaves the worker alive [✔]
       unwinds by itself, its worker ended, when the example is cancelled after the kill blocks and before the worker is let go [✔]
       negative control: without the gate opened by the runner's scope and the independent stop, that cancellation leaves the example unable to unwind [✔]
+    judging a readback that is not there (the terrain scenario)
+      looks a pixel up as nothing, in or out of the extent, rather than failing [✔]
+      says a readback is incomplete unless it holds every pixel of every target [✔]
+      splits the probes by pass without failing on too few [✔]
+      judges an empty readback as every pixel unread, without an exception [✔]
   the shared roots
     entered GLFW on the backend the run's consent names, before any example renders [✔]
     runs every dispatched operation on the process main thread that entered the session [✔]
@@ -254,51 +259,51 @@ Vulkan native
     records the native pump, the callbacks inside it, owner turns, and the graphics owner's present requests and present-fence completions while a person moves, resizes, and uses the menu bar [‐]
       # PENDING: the graphics-owner interaction probe runs only when HETOIMASIA_INTERACTION_PROBE_SECONDS names the seconds each phase lasts, and it needs a person at the desktop
 
-Finished in 21.9473 seconds
-199 examples, 0 failures, 2 pending
+Finished in 15.8713 seconds
+203 examples, 0 failures, 2 pending
 vulkan-native-tests: shared session acquisitions: 1
 vulkan-native-tests: shared session native calls: 145
 vulkan-native-tests: shared session destruction: vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroyImageView, vkDestroyImageView, vkDestroyImageView, vkDestroySwapchainKHR, vkDestroySurfaceKHR, vkDestroySurfaceKHR, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
 vulkan-native-tests: shared session verdict: clean, 70 records delivered
-vulkan-native-tests: private debug-names: ExitSuccess in 0.19101s
-vulkan-native-tests: private grs10-scene3d: ExitSuccess in 0.159292s
-vulkan-native-tests: private grs12-frameless: ExitSuccess in 0.125993s
-vulkan-native-tests: private grs13-window-depth: ExitSuccess in 0.705315s
-vulkan-native-tests: private grs14-table-growth: ExitSuccess in 0.175208s
-vulkan-native-tests: private grs15-surface-free: ExitSuccess in 0.10253s
-vulkan-native-tests: private grs15-surface-free-window: ExitSuccess in 0.203892s
-vulkan-native-tests: private grs3-ordering: ExitSuccess in 0.190915s
-vulkan-native-tests: private grs4-drawing: ExitSuccess in 0.135873s
-vulkan-native-tests: private grs5-offscreen: ExitSuccess in 0.14718s
-vulkan-native-tests: private grs6-uploads: ExitSuccess in 0.1622s
-vulkan-native-tests: private grs7-texture-table: ExitSuccess in 0.183953s
-vulkan-native-tests: private grs8-sprites: ExitSuccess in 0.166139s
-vulkan-native-tests: private grs9-swap: ExitSuccess in 0.221787s
-vulkan-native-tests: private r2d10-retained: ExitSuccess in 0.619256s
-vulkan-native-tests: private r2d11-materials: ExitSuccess in 0.353418s
-vulkan-native-tests: private r2d12-clip: ExitSuccess in 0.311495s
-vulkan-native-tests: private r2d14-window-scenes: ExitSuccess in 0.210384s
-vulkan-native-tests: private r2d15-storage-tables: ExitSuccess in 0.165723s
-vulkan-native-tests: private r2d16-shader-samplers: ExitSuccess in 0.158702s
-vulkan-native-tests: private r2d17-depth-rect: ExitSuccess in 0.136149s
-vulkan-native-tests: private r2d18-animation: ExitSuccess in 0.330199s
-vulkan-native-tests: private r2d7-ordered-path: ExitSuccess in 0.414462s
-vulkan-native-tests: private r2d8-image: ExitSuccess in 1.802188s
-vulkan-native-tests: private r2d9-cutout-depth: ExitSuccess in 0.308638s
-vulkan-native-tests: private synchronization-hazard: ExitSuccess in 5.2327e-2s
-vulkan-native-tests: private tra8-terrain: ExitSuccess in 9.403724s
-vulkan-native-tests: private vk11-recording: ExitSuccess in 0.183676s
-vulkan-native-tests: private vk12-frames: ExitSuccess in 0.190736s
-vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.250776s
-vulkan-native-tests: private vk14-recovery: ExitSuccess in 0.265278s
-vulkan-native-tests: private vk15-retention: ExitSuccess in 0.129192s
-vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 0.205216s
-vulkan-native-tests: private vk16-composed: ExitSuccess in 0.251721s
-vulkan-native-tests: private vk17-one-slot: ExitSuccess in 0.289626s
-vulkan-native-tests: private vk17-two-slots: ExitSuccess in 0.289549s
-vulkan-native-tests: private vk19-capture: ExitSuccess in 0.196516s
-vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.276426s
-vulkan-native-tests: private vk5-bridge: ExitSuccess in 0.136342s
-vulkan-native-tests: private vk6-capture: ExitSuccess in 5.9623e-2s
-vulkan-native-tests: private vk7-roots: ExitSuccess in 0.163337s
-vulkan-native-tests: the process ran for 21.970181s, fixtures, examples and teardown included
+vulkan-native-tests: private debug-names: ExitSuccess in 0.176611s
+vulkan-native-tests: private grs10-scene3d: ExitSuccess in 0.148132s
+vulkan-native-tests: private grs12-frameless: ExitSuccess in 0.12164s
+vulkan-native-tests: private grs13-window-depth: ExitSuccess in 0.722467s
+vulkan-native-tests: private grs14-table-growth: ExitSuccess in 0.164694s
+vulkan-native-tests: private grs15-surface-free: ExitSuccess in 0.108241s
+vulkan-native-tests: private grs15-surface-free-window: ExitSuccess in 0.187538s
+vulkan-native-tests: private grs3-ordering: ExitSuccess in 0.195109s
+vulkan-native-tests: private grs4-drawing: ExitSuccess in 0.124497s
+vulkan-native-tests: private grs5-offscreen: ExitSuccess in 0.146843s
+vulkan-native-tests: private grs6-uploads: ExitSuccess in 0.162035s
+vulkan-native-tests: private grs7-texture-table: ExitSuccess in 0.180067s
+vulkan-native-tests: private grs8-sprites: ExitSuccess in 0.174922s
+vulkan-native-tests: private grs9-swap: ExitSuccess in 0.222113s
+vulkan-native-tests: private r2d10-retained: ExitSuccess in 0.565087s
+vulkan-native-tests: private r2d11-materials: ExitSuccess in 0.297645s
+vulkan-native-tests: private r2d12-clip: ExitSuccess in 0.29208s
+vulkan-native-tests: private r2d14-window-scenes: ExitSuccess in 0.214109s
+vulkan-native-tests: private r2d15-storage-tables: ExitSuccess in 0.163922s
+vulkan-native-tests: private r2d16-shader-samplers: ExitSuccess in 0.163392s
+vulkan-native-tests: private r2d17-depth-rect: ExitSuccess in 0.134916s
+vulkan-native-tests: private r2d18-animation: ExitSuccess in 0.303256s
+vulkan-native-tests: private r2d7-ordered-path: ExitSuccess in 0.359708s
+vulkan-native-tests: private r2d8-image: ExitSuccess in 1.198539s
+vulkan-native-tests: private r2d9-cutout-depth: ExitSuccess in 0.267697s
+vulkan-native-tests: private synchronization-hazard: ExitSuccess in 4.7336e-2s
+vulkan-native-tests: private tra8-terrain: ExitSuccess in 4.082664s
+vulkan-native-tests: private vk11-recording: ExitSuccess in 0.179427s
+vulkan-native-tests: private vk12-frames: ExitSuccess in 0.205587s
+vulkan-native-tests: private vk13-presentation: ExitSuccess in 0.264568s
+vulkan-native-tests: private vk14-recovery: ExitSuccess in 0.269255s
+vulkan-native-tests: private vk15-retention: ExitSuccess in 0.135095s
+vulkan-native-tests: private vk15-validation-stop: ExitSuccess in 0.193945s
+vulkan-native-tests: private vk16-composed: ExitSuccess in 0.254545s
+vulkan-native-tests: private vk17-one-slot: ExitSuccess in 0.37663s
+vulkan-native-tests: private vk17-two-slots: ExitSuccess in 0.292573s
+vulkan-native-tests: private vk19-capture: ExitSuccess in 0.203459s
+vulkan-native-tests: private vk2-compatibility: ExitSuccess in 0.269438s
+vulkan-native-tests: private vk5-bridge: ExitSuccess in 0.127443s
+vulkan-native-tests: private vk6-capture: ExitSuccess in 5.8933e-2s
+vulkan-native-tests: private vk7-roots: ExitSuccess in 0.151638s
+vulkan-native-tests: the process ran for 15.89328s, fixtures, examples and teardown included
