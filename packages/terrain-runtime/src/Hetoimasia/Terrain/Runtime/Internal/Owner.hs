@@ -94,10 +94,7 @@ ownerMain svc token = mask $ \restore → do
         Left failure → do
           -- Choosing work reads every host's eligibility: a callback that throws
           -- is a provider defect, recorded, and the owner ends.
-          let why = Text.pack ("eligibility callback failed: " <> show failure)
-          atomically (recordFatalDefect svc (ProviderDefect why))
-          logError logger terrainComponent "provider defect" []
-          throwIO (ProviderDefect why)
+          failWith svc (ProviderDefect (Text.pack ("eligibility callback failed: " <> show failure))) []
       continue <- perform svc work
       when continue loop
     -- Whatever ended the loop, every accepted request leaves the table settled
@@ -144,20 +141,23 @@ nextWork svc token = do
           Nothing
             | closing && stateBorrowers st == 0 && stopping → pure WStop
             | otherwise →
-                pickRequestWork st >>= \mWork → do
-                  -- Request work (staging, commits) and the rest (loads, retries) take
-                  -- turns whenever both are ready, so neither can starve the other
-                  -- under a continuous stream of the first; the model's own
-                  -- round-robin and aging then decide among loads.
-                  let others =
-                        [WRetry | stateFreed st && retryUseful st]
-                          <> [WDispatch | not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model)]
-                  case (mWork, others) of
-                    (Just work, other : _) | stateFavorOthers st → pure other
-                                           | otherwise → pure work
-                    (Just work, []) → pure work
-                    (Nothing, other : _) → pure other
-                    (Nothing, []) → retry
+                pickRequestWork st >>= \(prepareWork, commitWork) → do
+                  -- THE FAIRNESS RULE. Staging, commits, and loads/retries take
+                  -- turns whenever two or more are ready: each ready kind gets
+                  -- one quantum in every three, whatever the others are being
+                  -- fed, so a continuous stream of one (new reads, replacements,
+                  -- cache hits elsewhere) cannot starve another. Within commits
+                  -- the per-arena admission order is unchanged, and the model's
+                  -- own round-robin and aging decide among loads.
+                  let otherWork =
+                        listToMaybe $
+                          [WRetry | stateFreed st && retryUseful st]
+                            <> [WDispatch | not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model)]
+                      inTurn = case stateTurn st of
+                        TurnPrepare → [prepareWork, commitWork, otherWork]
+                        TurnCommit → [commitWork, otherWork, prepareWork]
+                        TurnOther → [otherWork, prepareWork, commitWork]
+                  maybe retry pure (listToMaybe (catMaybes inTurn))
 
 retryUseful ∷ St → Bool
 retryUseful st = not (Map.null (stateViews st)) || any needsResubmit (Map.elems (stateRequests st))
@@ -171,9 +171,7 @@ isDataCmd = \case
   _ → False
 
 needsResubmit ∷ Req → Bool
-needsResubmit req = isDataCmd (reqCmd req) && not (reqModel req) && isWaiting
-  where
-    isWaiting = case reqPhase req of Waiting → True; _ → False
+needsResubmit req = isDataCmd (reqCmd req) && waitingReadmission req
 
 -- | A changed region whose retained changes are not yet transferred, and whose
 -- transfer has not already been tried at its current generation.
@@ -191,12 +189,13 @@ handoffCandidate st =
 
 -- | Work for the request table: stage whatever has its data, then commit the
 -- next eligible command of each arena in admission order.
-pickRequestWork ∷ St → STM (Maybe Work)
-pickRequestWork st = case filter needsPrepare ordered of
-  (rid, _) : _ → pure (Just (WPrepare rid))
-  [] → do
-    candidates <- fmap catMaybes (forM (Map.elems groups) firstEligible)
-    pure (case sortOn fst candidates of (_, rid) : _ → Just (WCommit rid); [] → Nothing)
+pickRequestWork ∷ St → STM (Maybe Work, Maybe Work)
+pickRequestWork st = do
+  candidates <- fmap catMaybes (forM (Map.elems groups) firstEligible)
+  pure
+    ( case filter needsPrepare ordered of (rid, _) : _ → Just (WPrepare rid); [] → Nothing
+    , case sortOn fst candidates of (_, rid) : _ → Just (WCommit rid); [] → Nothing
+    )
   where
     model = stateModel st
     regionCov = Map.fromList [((R.regionArena r, R.regionCoord r), (R.regionCoverage r, R.regionEvicting r)) | r <- R.modelRegions model]
@@ -245,10 +244,10 @@ perform svc = \case
     atomically (void (applyEvent svc (R.JobAcknowledged jid)) >> markFreed svc)
     pure True
   WHandoff aid region → handoff svc aid region >> pure True
-  WPrepare rid → favorOthers svc True >> prepareReq svc rid >> pure True
-  WCommit rid → favorOthers svc True >> commitReq svc rid >> pure True
-  WRetry → favorOthers svc False >> retryPass svc >> pure True
-  WDispatch → favorOthers svc False >> dispatchJob svc >> pure True
+  WPrepare rid → takeTurn svc TurnCommit >> prepareReq svc rid >> pure True
+  WCommit rid → takeTurn svc TurnOther >> commitReq svc rid >> pure True
+  WRetry → takeTurn svc TurnPrepare >> retryPass svc >> pure True
+  WDispatch → takeTurn svc TurnPrepare >> dispatchJob svc >> pure True
   WReport → do
     -- A defect was recorded where nothing could throw (a host callback that failed
     -- inside a closing transaction). The cleanup is committed; now the owner ends
@@ -262,9 +261,31 @@ perform svc = \case
     forM_ combined rethrowIO
     pure True
 
--- | Record whose turn is next: request work, or loads and retries.
-favorOthers ∷ Service → Bool → IO ()
-favorOthers svc value = atomically (modifySt svc (\st → st {stateFavorOthers = value}))
+-- | End the owner with a defect of the host or its accounting. The defect is
+-- recorded as the one being thrown, the diagnostic is logged under protection,
+-- and a failing logger can never replace it: the defect is thrown with the
+-- logging failure attached as cleanup evidence.
+failWith ∷ Service → Defect → [(Text, Text)] → IO a
+failWith svc defect fields = do
+  atomically (recordFatalDefect svc defect)
+  logged <- tryWithContext @SomeException (logError (serviceLogger svc) terrainComponent "defect" fields)
+  thrown <- tryWithContext @SomeException (throwIO defect)
+  let primary = either Just (const Nothing) thrown
+      evidence = [("diagnostic logging", e) | Left e <- [logged]]
+  combined <- composeCleanup primary evidence
+  maybe (throwIO defect) rethrowIO combined
+
+-- | Log a diagnostic that must not decide anything: if the logger fails, that is
+-- recorded as an unreported defect (so supervision hears of it) and the work goes on.
+safeLog ∷ Service → IO () → IO ()
+safeLog svc action =
+  tryNonAsync action >>= \case
+    Right () → pure ()
+    Left failure → atomically (recordDefect svc (OwnerDefect (Text.pack ("diagnostic logging failed: " <> show failure))))
+
+-- | Record whose turn is next.
+takeTurn ∷ Service → Turn → IO ()
+takeTurn svc next = atomically (modifySt svc (\st → st {stateTurn = next}))
 
 probe ∷ Service → Point → IO ()
 probe svc = probePoint (serviceProbe svc)
@@ -436,10 +457,7 @@ stage svc rid aid rev work =
   tryNonAsync (atomically publish) >>= \case
     Right () → pure ()
     Left failure → do
-      let why = Text.pack ("readiness callback failed: " <> show failure)
-      atomically (recordFatalDefect svc (ProviderDefect why))
-      logError (serviceLogger svc) terrainComponent "provider defect" [("request", Text.pack (show rid))]
-      throwIO (ProviderDefect why)
+      failWith svc (ProviderDefect (Text.pack ("readiness callback failed: " <> show failure))) [("request", Text.pack (show rid))]
   where
     publish = do
         st <- readSt svc
@@ -462,25 +480,21 @@ commitReq svc rid = do
   case attempt of
     Right (CommitDone aid rev) → do
       forM_ rev (probe svc . PointCommitted rid)
-      forM_ aid $ \a → logInfo (serviceLogger svc) terrainComponent "arena opened" [("arena", Text.pack (show a))]
+      forM_ aid $ \a → safeLog svc (logInfo (serviceLogger svc) terrainComponent "arena opened" [("arena", Text.pack (show a))])
     Right (CommitDefect why) → do
       -- The model refused something a valid commit reported: the previous state
       -- was kept, the request fails, and the defect reaches supervision.
-      atomically (terminate svc rid (Failed (HostFailure why)) >> recordFatalDefect svc (AccountingDefect why))
-      logError (serviceLogger svc) terrainComponent "accounting defect" [("request", Text.pack (show rid))]
-      throwIO (AccountingDefect why)
+      atomically (terminate svc rid (Failed (HostFailure why)))
+      failWith svc (AccountingDefect why) [("request", Text.pack (show rid))]
     Right CommitWaiting → pure ()
     Left failure → do
       -- A host callback failed inside the arbitration. Nothing was committed
       -- (the transaction was abandoned); the request ends without a second
       -- call into the host and the defect reaches supervision.
-      let why = Text.pack ("settlement callback failed: " <> show failure)
       atomically $ do
         st <- readSt svc
         forM_ (Map.lookup rid (stateRequests st)) (releaseReq svc rid)
-        recordFatalDefect svc (ProviderDefect why)
-      logError (serviceLogger svc) terrainComponent "provider defect" [("request", Text.pack (show rid))]
-      throwIO (ProviderDefect why)
+      failWith svc (ProviderDefect (Text.pack ("settlement callback failed: " <> show failure))) [("request", Text.pack (show rid))]
 
 data CommitResult
   = CommitDone !(Maybe ArenaId) !(Maybe Revision)
@@ -663,11 +677,19 @@ resubmitSTM svc rid = do
           let admitted = either (const False) (const True) outcome
           modifySt svc $ \s →
             s {stateRequests = Map.insert rid req {reqModel = admitted, reqDemand = demands, reqPhase = Waiting} (stateRequests s)}
+          -- Every refusal is either temporary pressure, which keeps the request
+          -- waiting (charged) to be admitted again, or permanent, which ends it
+          -- with a typed failure; nothing can wait on a refusal that will not clear.
           case outcome of
-            Left (R.ContractFailure why) → do
-              recordDefect svc (AccountingDefect (Text.pack (show why)))
-              terminate svc rid (Failed (HostFailure (Text.pack ("resubmission: " <> show why))))
-            _ → pure ()
+            Right _ → pure ()
+            Left refusal → case refusal of
+              R.Busy _ → pure ()
+              R.RetainedEditsExhausted {} → terminate svc rid (Failed (Superseded "the retained edits are full"))
+              R.Invalid reason → terminate svc rid (Failed (Superseded (Text.pack ("no longer admissible: " <> show reason))))
+              R.Stale _ → terminate svc rid (Failed ArenaClosed)
+              R.ContractFailure why → do
+                recordDefect svc (AccountingDefect (Text.pack (show why)))
+                terminate svc rid (Failed (HostFailure (Text.pack ("resubmission: " <> show why))))
 
 -- | Retry what waits for capacity: pending camera demand, then requests that
 -- are waiting to be admitted again, in admission order.

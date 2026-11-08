@@ -61,6 +61,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , ViewRec (..)
   , NameClaim (..)
   , Phase (..)
+  , Turn (..)
   , OwnerPhase (..)
   , St (..)
   , initialState
@@ -219,6 +220,9 @@ data Failure
   = NotFound
   | ArenaClosed
   | StaleView
+  | -- | The request was overtaken by a committed edit and can no longer be admitted
+    -- (its demand left the configured extent, or the retained edits are full).
+    Superseded !Text
   | NameInUse
   | Definition !SourceError
   | TooLarge !QueryError
@@ -469,6 +473,13 @@ data ViewRec = ViewRec
 
 data NameClaim = ClaimPending !RequestId | ClaimLive !ArenaId
 
+-- | The three kinds of owner work that take turns: staging, commits, and
+-- loads/retries. When two or more are ready they are served in rotation, so a
+-- continuous supply of any one cannot starve another; within commits the
+-- per-arena admission order is kept.
+data Turn = TurnPrepare | TurnCommit | TurnOther
+  deriving stock (Eq, Show)
+
 data Phase = Running | Closing
   deriving stock (Eq, Show)
 
@@ -506,8 +517,8 @@ data St = St
     stateTransfers ∷ !(Map RegionKey Word64)
   , stateDefects ∷ ![DefectRecord]
   , stateDefectCount ∷ !Word64
-  , -- | The owner's last quantum was request work: the next one goes to a load or a retry.
-    stateFavorOthers ∷ !Bool
+  , -- | Whose quantum is next when several kinds of work are ready.
+    stateTurn ∷ !Turn
   }
 
 initialState ∷ Config → Limits → St
@@ -538,7 +549,7 @@ initialState config limits =
     , stateTransfers = Map.empty
     , stateDefects = []
     , stateDefectCount = 0
-    , stateFavorOthers = False
+    , stateTurn = TurnPrepare
     }
   where
     first = configFirstIdentity config

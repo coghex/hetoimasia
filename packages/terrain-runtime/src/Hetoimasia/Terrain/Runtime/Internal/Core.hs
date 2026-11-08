@@ -62,6 +62,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
     -- * Invariants
   , invariants
   , bumpGeneration
+  , waitingReadmission
   , retainedBankUse
   , retireInFlightSTM
   , modelLimitsFor
@@ -320,12 +321,12 @@ retainedBankUse st = sum (Map.elems (stateSnapshots st)) + resultRecordBytes * f
 -- cancellation: a removal (pending, or settled and untaken) and a pending open or
 -- attach. A read's record is charged by the model.
 retainedRecords ∷ St → Int
-retainedRecords = countReqs (\req → isRemoval req || isAcquisition req)
+retainedRecords = countReqs (\req → isRemoval req || isAcquisition req || waitingReadmission req)
 
 -- | Command slots the service holds for requests the model has no record of: a
 -- settled result not yet taken, and a pending open or attach.
 slotsHeldHere ∷ St → Int
-slotsHeldHere st = retainedResults st + countReqs isAcquisition st
+slotsHeldHere st = retainedResults st + countReqs (\req → isAcquisition req || waitingReadmission req) st
 
 -- | Why one more request cannot be admitted for want of command slots or retained
 -- bytes, if it cannot. Every admission consults this, so no kind bypasses it.
@@ -339,6 +340,17 @@ capacityRefusal config st producesRecord
     model = stateModel st
     limit = R.limitSlot (R.modelLimits model) R.CommandSlot
     held = R.slotInUse model R.CommandSlot + fromIntegral (slotsHeldHere st)
+
+-- | A read or removal that was withdrawn from the model to be admitted again at a
+-- newer revision and has not been: the service still holds its request, endpoint
+-- and demand, so it stays charged, like any record the service holds for a request,
+-- until it is readmitted or ends.
+waitingReadmission ∷ Req → Bool
+waitingReadmission req = case (reqCmd req, reqPhase req) of
+  (COpen {}, _) → False
+  (CAttach {}, _) → False
+  (_, Waiting) → not (reqModel req)
+  _ → False
 
 -- | Settled results the model no longer records but their holder has not taken.
 retainedResults ∷ St → Int
