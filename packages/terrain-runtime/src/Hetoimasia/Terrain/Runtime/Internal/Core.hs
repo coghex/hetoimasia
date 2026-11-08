@@ -149,22 +149,35 @@ freesCapacity = \case
 -- | Record a defect that the caller is about to throw itself: it is counted as
 -- reported, so the owner does not report it a second time as cleanup evidence.
 recordFatalDefect ∷ Service → Defect → STM ()
-recordFatalDefect svc defect = do
-  recordDefect svc defect
-  modifySt svc (\st → st {stateDefectsReported = stateDefectCount st})
+recordFatalDefect svc = addDefect svc True
 
 -- | The defects recorded and not yet reported, oldest first, now marked reported.
+-- Reporting is tracked per defect, so a defect the caller is about to throw never
+-- hides another one recorded earlier.
 takeUnreportedSTM ∷ Service → STM [Defect]
 takeUnreportedSTM svc = do
   st <- readSt svc
-  let unreported = fromIntegral (stateDefectCount st - stateDefectsReported st) ∷ Int
-  writeTVar (serviceState svc) st {stateDefectsReported = stateDefectCount st}
-  pure (reverse (take unreported (stateDefects st)))
+  let unreported = [defectOf r | r <- reverse (stateDefects st), not (defectReported r)]
+  writeTVar (serviceState svc) st {stateDefects = [r {defectReported = True} | r <- stateDefects st]}
+  pure unreported
 
 -- | Keep a bounded record of an unexpected defect.
 recordDefect ∷ Service → Defect → STM ()
-recordDefect svc defect =
-  modifySt svc (\st → st {stateDefects = take 16 (defect : stateDefects st), stateDefectCount = stateDefectCount st + 1})
+recordDefect svc = addDefect svc False
+
+-- | Record a defect. Every unreported one is kept; of the reported ones the latest
+-- sixteen are.
+addDefect ∷ Service → Bool → Defect → STM ()
+addDefect svc reported defect =
+  modifySt svc $ \st →
+    let record = DefectRecord (stateDefectCount st) reported defect
+        kept = keep (16 ∷ Int) (record : stateDefects st)
+        keep _ [] = []
+        keep n (r : rest)
+          | not (defectReported r) = r : keep n rest
+          | n > 0 = r : keep (n - 1) rest
+          | otherwise = keep n rest
+     in st {stateDefects = kept, stateDefectCount = stateDefectCount st + 1}
 
 -- ---------------------------------------------------------------------------
 -- Authorities
@@ -298,7 +311,32 @@ resultRecordBytes = 160
 -- | Bytes the retained bank holds: outstanding snapshots' backing and untaken
 -- results.
 retainedBankUse ∷ St → Word64
-retainedBankUse st = sum (Map.elems (stateSnapshots st)) + resultRecordBytes * fromIntegral (retainedResults st)
+retainedBankUse st = sum (Map.elems (stateSnapshots st)) + resultRecordBytes * fromIntegral (retainedRecords st)
+
+-- | The records the service itself holds for a request, each charged
+-- 'resultRecordBytes' in the retained bank from admission to take, discard or
+-- cancellation: a removal (pending, or settled and untaken) and a pending open or
+-- attach. A read's record is charged by the model.
+retainedRecords ∷ St → Int
+retainedRecords = countReqs (\req → isRemoval req || isAcquisition req)
+
+-- | Command slots the service holds for requests the model has no record of: a
+-- settled result not yet taken, and a pending open or attach.
+slotsHeldHere ∷ St → Int
+slotsHeldHere st = retainedResults st + countReqs isAcquisition st
+
+-- | Why one more request cannot be admitted for want of command slots or retained
+-- bytes, if it cannot. Every admission consults this, so no kind bypasses it.
+capacityRefusal ∷ Config → St → Bool → Maybe R.Refusal
+capacityRefusal config st producesRecord
+  | held >= limit = Just (R.Busy (R.SlotFull R.CommandSlot limit held 1))
+  | producesRecord && retainedBankUse st + resultRecordBytes > configRetainedBytes config =
+      Just (R.Busy (R.BankFull R.StagingBank (configRetainedBytes config) (retainedBankUse st) resultRecordBytes))
+  | otherwise = Nothing
+  where
+    model = stateModel st
+    limit = R.limitSlot (R.modelLimits model) R.CommandSlot
+    held = R.slotInUse model R.CommandSlot + fromIntegral (slotsHeldHere st)
 
 -- | Settled results the model no longer records but their holder has not taken.
 retainedResults ∷ St → Int
@@ -344,6 +382,7 @@ decide svc st rid = \case
     when (Map.member name (stateNames st)) (Left (ShortFailed NameInUse))
     when (Map.size (stateArenas st) + countReqs isOpenCmd st >= configMaxArenas config) (Left (ShortRefused (RefusedBusy BusyArenas)))
     when (leaseUse >= configMaxLeases config) (Left (ShortRefused (RefusedBusy BusyLeases)))
+    forM_ (capacityRefusal config st True) (Left . busyWhy)
     Right (Insertion (COpen name source cid) Nothing cid Nothing False [] (Just name))
   SubOpenInvalid client err → pure $ do
     _ <- first' ShortRefused (clientOf svc client st)
@@ -352,6 +391,7 @@ decide svc st rid = \case
     cid <- first' ShortRefused (clientOf svc client st)
     checkName name
     when (leaseUse >= configMaxLeases config) (Left (ShortRefused (RefusedBusy BusyLeases)))
+    forM_ (capacityRefusal config st True) (Left . busyWhy)
     Right (Insertion (CAttach name cid) Nothing cid Nothing False [] Nothing)
   SubCell lease tile → dataCommand lease (CCell tile)
   SubColumn lease column range
@@ -379,18 +419,7 @@ decide svc st rid = \case
     -- A settled result that has not been taken occupies a command slot until it is
     -- (a removal's result no longer has a model record, so it is counted here):
     -- admission is busy once accepted commands and untaken results fill the slots.
-    slotRefusal producesResult = do
-      let model = stateModel st
-          limit = R.limitSlot (R.modelLimits model) R.CommandSlot
-          held = R.slotInUse model R.CommandSlot + fromIntegral (retainedResults st)
-      pure
-        ( if held >= limit
-            then Just (R.Busy (R.SlotFull R.CommandSlot limit held 1))
-            else
-              if producesResult && retainedBankUse st + resultRecordBytes > configRetainedBytes config
-                then Just (R.Busy (R.BankFull R.StagingBank (configRetainedBytes config) (retainedBankUse st) resultRecordBytes))
-                else Nothing
-        )
+    slotRefusal producesRecord = pure (capacityRefusal config st producesRecord)
     leaseUse = Map.size (stateLeases st) + countReqs isAcquisition st
     first' f = either (Left . f) Right
     -- A name is held in the name map, so it is bounded: nonempty, 256 characters.
@@ -724,6 +753,9 @@ invariants snapshotBank st =
        ]
     <> [ "snapshot ledger " <> show (Map.keys (stateSnapshots st)) <> " disagrees with the model's borrows"
        | Set.fromList (Map.keys (stateSnapshots st)) /= Set.fromList [h | (h, _, R.Borrow, _) <- R.modelHolds model]
+       ]
+    <> [ "command slots " <> show (R.slotInUse model R.CommandSlot) <> " + " <> show (slotsHeldHere st) <> " beyond the limit"
+       | fromIntegral (R.slotInUse model R.CommandSlot) + slotsHeldHere st > fromIntegral (R.limitSlot (R.modelLimits model) R.CommandSlot ∷ Word64)
        ]
     <> [ "retained bank holds " <> show (retainedBankUse st) <> " beyond its limit " <> show snapshotBank
        | retainedBankUse st > snapshotBank

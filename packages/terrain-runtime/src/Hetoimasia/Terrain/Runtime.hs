@@ -361,7 +361,7 @@ inspectModelSTM svc = stateModel <$> readSt svc
 
 -- | The unexpected defects recorded, newest first.
 inspectDefects ∷ Service → IO [Defect]
-inspectDefects svc = stateDefects <$> readTVarIO (serviceState svc)
+inspectDefects svc = map defectOf . stateDefects <$> readTVarIO (serviceState svc)
 
 -- | The accounted bytes the retained bank holds (outstanding snapshots' backing and
 -- untaken removal results), and the bank.

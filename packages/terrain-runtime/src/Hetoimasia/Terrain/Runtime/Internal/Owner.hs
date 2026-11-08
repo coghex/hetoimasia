@@ -131,7 +131,7 @@ nextWork svc token = do
   stopping <- stopRequested token
   let model = stateModel st
       closing = statePhase st == Closing
-  if stateDefectCount st > stateDefectsReported st
+  if any (not . defectReported) (stateDefects st)
     then pure WReport
     else if (not open || stopping) && not closing
     then pure WCloseSession

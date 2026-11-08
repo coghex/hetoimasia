@@ -42,6 +42,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , Point (..)
   , noProbe
   , Defect (..)
+  , DefectRecord (..)
 
     -- * Service
   , Service (..)
@@ -350,6 +351,14 @@ data Point
   deriving stock (Eq, Show)
 
 -- | An unexpected defect, kept with bounded context.
+-- | A recorded defect and whether the owner has already reported it to supervision
+-- (by ending with it, or by being about to throw it).
+data DefectRecord = DefectRecord
+  { defectSeq ∷ !Word64
+  , defectReported ∷ !Bool
+  , defectOf ∷ !Defect
+  }
+
 data Defect
   = ProviderDefect !Text
   | AccountingDefect !Text
@@ -492,10 +501,8 @@ data St = St
     stateDispatchIdle ∷ !Bool
   , -- | The generation each region's last transfer was tried at.
     stateTransfers ∷ !(Map RegionKey Word64)
-  , stateDefects ∷ ![Defect]
+  , stateDefects ∷ ![DefectRecord]
   , stateDefectCount ∷ !Word64
-  , -- | How many of those the owner has reported by ending (so that supervision sees them).
-    stateDefectsReported ∷ !Word64
   , -- | The owner's last quantum was request work: the next one goes to a load or a retry.
     stateFavorOthers ∷ !Bool
   }
@@ -528,7 +535,6 @@ initialState config limits =
     , stateTransfers = Map.empty
     , stateDefects = []
     , stateDefectCount = 0
-    , stateDefectsReported = 0
     , stateFavorOthers = False
     }
   where
