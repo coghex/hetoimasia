@@ -4,6 +4,7 @@ module Test.TerrainRender2D.Spec (spec) where
 import Test.Hspec (Spec, describe)
 import qualified Test.TerrainRender2D.Camera as Camera
 import qualified Test.TerrainRender2D.Generated as Generated
+import qualified Test.TerrainRender2D.MapAssets as MapAssets
 import qualified Test.TerrainRender2D.Material as Material
 import qualified Test.TerrainRender2D.Opacity as Opacity
 import qualified Test.TerrainRender2D.Ordering as Ordering
@@ -23,3 +24,4 @@ spec = describe "TerrainRender2D" $ do
   Opacity.spec
   Material.spec
   Scenes.spec
+  MapAssets.spec

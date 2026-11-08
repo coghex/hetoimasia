@@ -52,9 +52,9 @@ data MapRole
   = -- | A whole shape's frontmost surface.
     Ordinary
   | -- | The visible known solid of a cell whose empty component is undiscovered.
-    MixedKnown
+    KnownPart
   | -- | The visible cover over such a cell's undiscovered empty component.
-    MixedFog
+    FogPart
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | A catalog map: its role and the catalog shape it belongs to.
@@ -73,13 +73,13 @@ catalogBound = 16 + 2 * 15
 catalogKeys ∷ [MapKey]
 catalogKeys =
   [MapKey Ordinary shape | shape ← allShapeIds]
-    <> concat [[MapKey MixedKnown shape, MapKey MixedFog shape] | shape ← allShapeIds, shapeIdValue shape /= 0]
+    <> concat [[MapKey KnownPart shape, MapKey FogPart shape] | shape ← allShapeIds, shapeIdValue shape /= 0]
 
 -- | The role as the manifest spells it.
 roleName ∷ MapRole → String
 roleName Ordinary = "ordinary"
-roleName MixedKnown = "mixed-known"
-roleName MixedFog = "mixed-fog"
+roleName KnownPart = "mixed-known"
+roleName FogPart = "mixed-fog"
 
 two ∷ Int → String
 two n = (if n < 10 then "0" else "") <> show n
@@ -88,8 +88,8 @@ two n = (if n < 10 then "0" else "") <> show n
 mapIdentifier ∷ MapKey → String
 mapIdentifier (MapKey role shape) = case role of
   Ordinary → "shape." <> two (shapeIdValue shape)
-  MixedKnown → "mixed." <> two (shapeIdValue shape) <> ".known"
-  MixedFog → "mixed." <> two (shapeIdValue shape) <> ".fog"
+  KnownPart → "mixed." <> two (shapeIdValue shape) <> ".known"
+  FogPart → "mixed." <> two (shapeIdValue shape) <> ".fog"
 
 -- | The map's file name, e.g. @shape_15_nesw.png@ or @mixed_03_ne_fog.png@.
 mapFileName ∷ MapKey → FilePath
@@ -98,15 +98,15 @@ mapFileName (MapKey role shape) =
   where
     (prefix, suffix) = case role of
       Ordinary → ("shape", "")
-      MixedKnown → ("mixed", "_known")
-      MixedFog → ("mixed", "_fog")
+      KnownPart → ("mixed", "_known")
+      FogPart → ("mixed", "_fog")
 
 -- | The baked RGBA8 canvas of a map.
 mapBytes ∷ MapKey → RgbaBytes
 mapBytes (MapKey role shape) = case role of
   Ordinary → ordinaryBytes shape
-  MixedKnown → knownBytes shape
-  MixedFog → fogBytes shape
+  KnownPart → knownBytes shape
+  FogPart → fogBytes shape
 
 -- | The catalog entries a world shape selects at one view facing.
 data Lookup = Lookup
@@ -139,7 +139,7 @@ lookupFor facing world =
     view = viewShape facing world
     lookupMixed
       | shapeIdValue view == 0 = Nothing
-      | otherwise = Just (MapKey MixedKnown view, MapKey MixedFog view)
+      | otherwise = Just (MapKey KnownPart view, MapKey FogPart view)
 
 -- | Every world shape at every facing, facing-major.
 allLookups ∷ [Lookup]

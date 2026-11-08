@@ -77,6 +77,8 @@ module Hetoimasia.Terrain.MapBake.Bake
   , facetBytes
   , decodeNormal
   , opaqueNormalValid
+  , MapProblem (..)
+  , canvasProblems
 
     -- * Baked maps
   , RgbaBytes
@@ -205,6 +207,35 @@ decodeNormal (r, g, b)
 -- @1..255@ and a nonzero decoded vector.
 opaqueNormalValid ∷ (Word8, Word8, Word8) → Bool
 opaqueNormalValid rgb@(r, g, b) = all (>= 1) [r, g, b] && decodeNormal rgb /= Nothing
+
+-- | Why a canvas is not a valid catalog map.
+data MapProblem
+  = -- | The byte count is not @96 * 64 * 4@.
+    WrongLength !Int
+  | -- | A texel (x, y) whose alpha is neither 0 nor 255.
+    NonBinaryAlpha !Int !Int !Word8
+  | -- | An opaque texel (x, y) whose RGB is not a valid profile normal.
+    InvalidNormal !Int !Int !(Word8, Word8, Word8)
+  deriving stock (Eq, Show)
+
+-- | Every way a canvas breaks the cutout and normal contract: the length, binary
+-- alpha, and, for each opaque texel, a profile-valid normal. Transparent RGB is
+-- ignored.
+canvasProblems ∷ ByteString → [MapProblem]
+canvasProblems bytes
+  | ByteString.length bytes /= 4 * canvasWidth * canvasHeight = [WrongLength (ByteString.length bytes)]
+  | otherwise =
+      concat
+        [ problem x y
+        | y ← [0 .. canvasHeight - 1]
+        , x ← [0 .. canvasWidth - 1]
+        ]
+  where
+    at x y channel = ByteString.index bytes (4 * (y * canvasWidth + x) + channel)
+    problem x y = case at x y 3 of
+      0 → []
+      255 → [InvalidNormal x y rgb | not (opaqueNormalValid rgb)] where rgb = (at x y 0, at x y 1, at x y 2)
+      alpha → [NonBinaryAlpha x y alpha]
 
 -- | A whole canvas, 'canvasWidth' × 'canvasHeight' RGBA8 texels, top row first.
 type RgbaBytes = ByteString

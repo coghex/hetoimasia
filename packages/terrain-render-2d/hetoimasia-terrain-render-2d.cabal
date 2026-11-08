@@ -172,6 +172,8 @@ test-suite terrain-render-2d-tests
         Test.TerrainRender2D.Camera
         Test.TerrainRender2D.Fixtures
         Test.TerrainRender2D.Generated
+        Test.TerrainRender2D.MapAssets
+        Test.TerrainRender2D.MapAssets.Reference
         Test.TerrainRender2D.Material
         Test.TerrainRender2D.Oracle
         Test.TerrainRender2D.Opacity
@@ -191,6 +193,7 @@ test-suite terrain-render-2d-tests
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
         QuickCheck >=2.15 && <2.19,
+        temporary >=1.3 && <1.4,
         text >=2.1 && <2.2,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-asset-image ==0.1.0.0,
@@ -201,5 +204,7 @@ test-suite terrain-render-2d-tests
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-render-2d ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-mapgen-core ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0
