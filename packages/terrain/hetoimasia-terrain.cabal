@@ -40,6 +40,7 @@ library
         Hetoimasia.Terrain.Changes
         Hetoimasia.Terrain.Coordinate
         Hetoimasia.Terrain.Geometry
+        Hetoimasia.Terrain.Opening
         Hetoimasia.Terrain.Palette
         Hetoimasia.Terrain.Query
         Hetoimasia.Terrain.Residency
@@ -56,6 +57,7 @@ library
         Hetoimasia.Terrain.Internal.Coordinate
         Hetoimasia.Terrain.Internal.Interval
         Hetoimasia.Terrain.Internal.Packed
+        Hetoimasia.Terrain.Internal.Polygon
         Hetoimasia.Terrain.Internal.Polytope
         Hetoimasia.Terrain.Internal.Residency.Coverage
         Hetoimasia.Terrain.Internal.Residency.Limits
@@ -84,7 +86,9 @@ test-suite terrain-tests
         Test.Terrain.Growth
         Test.Terrain.Model
         Test.Terrain.Opacity
+        Test.Terrain.Opening
         Test.Terrain.Query
+        Test.Terrain.Reference
         Test.Terrain.Residency
         Test.Terrain.ResidencyCycle
         Test.Terrain.ResidencyOracle
