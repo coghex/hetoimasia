@@ -493,7 +493,12 @@ at the end, lowest priority first, and the remainder reported (`cameraTruncated`
 staging the camera may use must hold the description and, beside it, the interest and
 scratch of the first region, so a description is never kept longer than the camera can
 start: whatever is retained, its first region is admitted at once (when nothing else
-holds the room). A replacement is not a special case: replacing a view's demand is
+holds the room). When that room is missing only because work already cancelled still
+holds its scratch until its owner acknowledges it (a replacement while a load runs), the
+description that fits now and would start once those charges are released is kept
+pending, and `Service` admits its first region after the acknowledgement; cancelled work
+keeps its charges until then, and only a description that cannot fit, or could not start
+even then, is cut away. A replacement is not a special case: replacing a view's demand is
 withdrawing the old one and admitting the new one as a fresh demand, through this same
 path (a property checks that the two produce the same model at every state random
 sequences reach).
