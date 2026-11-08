@@ -345,7 +345,7 @@ withSnapshot svc lease regions body =
 -- | Every structural rule tying the request table, leases, names, arenas and
 -- holds to the accounting model; empty when coherent.
 inspectInvariants ∷ Service → IO [String]
-inspectInvariants svc = invariants <$> readTVarIO (serviceState svc)
+inspectInvariants svc = invariants (configSnapshotBytes (serviceConfig svc)) <$> readTVarIO (serviceState svc)
 
 -- | The accounting model as it is now.
 inspectModel ∷ Service → IO Model

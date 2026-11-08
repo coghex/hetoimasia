@@ -7,6 +7,7 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), SomeException, catch, throwIO)
 import Control.Monad (forM_, void)
+import qualified Data.Text as T
 import Hetoimasia.Foundation.Log (LogEntry (..), callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Terrain.Cell (zRangeLo)
 import Hetoimasia.Terrain.Changes (changesBytes)
@@ -101,6 +102,28 @@ spec = describe "Accounting and lifetime hardening" $ do
       case outcome of
         Right (ProviderDefect _ : _) → pure ()
         other → expectationFailure ("expected a provider defect first, got " <> show other)
+
+  it "refuses an unbounded name and a borrow that names more regions than a hold may, before enumerating them" $
+    withService defaultConfig $ \svc → do
+      (client, lease) <- openMain svc "main"
+      openArena svc client "" soilOverStone >>= \r → refusedWith r `shouldSatisfy` isInvalid
+      openArena svc client (T.replicate 257 "x") soilOverStone >>= \r → refusedWith r `shouldSatisfy` isInvalid
+      attachArena svc client (T.replicate 100000 "y") >>= \r → refusedWith r `shouldSatisfy` isInvalid
+      okOf (openArena svc client (T.replicate 256 "z") soilOverStone) >>= void . await svc
+      let regions = [RegionCoord (fromIntegral x) 0 0 | x ← [0 .. 100000 ∷ Int]]
+      withSnapshot svc lease regions (\_ → pure ()) >>= \r → r `shouldSatisfy` either (const True) (const False)
+      settleChecks svc
+
+  it "ends the owner and settles everything once when an eligibility callback fails" $
+    withService defaultConfig $ \svc → do
+      (_, lease) <- openMain svc "main"
+      host <- newHost True
+      let failing = (hostEndpoint svc Nothing host) {endpointEligible = throwSTM (ErrorCall "eligibility failed")}
+      _ <- okOf (cellWith svc failing lease (tile 1 1 1))
+      awaitOwnerStopped svc
+      settledOf host `shouldReturn` [Failed ArenaClosed]
+      inspectDefects svc >>= \d → d `shouldSatisfy` \found → case found of ProviderDefect _ : _ → True; _ → False
+      inspectInvariants svc >>= (`shouldBe` [])
 
   it "charges every outstanding snapshot's backing, across revisions, until it is released" $ do
     let config = (tightConfig (2, 1, 2) 2 4096) {configSnapshotBytes = 100}
@@ -228,5 +251,6 @@ spec = describe "Accounting and lifetime hardening" $ do
     chronological <- reverse <$> readMVar events
     chronological `shouldBe` ["owner log done", "service returned"]
   where
+    isInvalid = \case Just (RefusedInvalid _) → True; _ → False
     readIORef' events = readMVar events
     catchAny = \action handler → action `catch` (\e → handler (e ∷ SomeException))

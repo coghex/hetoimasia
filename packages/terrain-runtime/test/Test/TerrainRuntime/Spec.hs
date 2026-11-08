@@ -4,6 +4,7 @@ import qualified Test.TerrainRuntime.Basic as Basic
 import qualified Test.TerrainRuntime.Budgets as Budgets
 import qualified Test.TerrainRuntime.Closure as Closure
 import qualified Test.TerrainRuntime.Hardening as Hardening
+import qualified Test.TerrainRuntime.Interleaving as Interleaving
 import qualified Test.TerrainRuntime.Lifecycle as Lifecycle
 import qualified Test.TerrainRuntime.Offload as Offload
 import qualified Test.TerrainRuntime.Opacity as Opacity
@@ -21,4 +22,5 @@ spec = do
   Opacity.spec
   Lifecycle.spec
   Hardening.spec
+  Interleaving.spec
   Closure.spec

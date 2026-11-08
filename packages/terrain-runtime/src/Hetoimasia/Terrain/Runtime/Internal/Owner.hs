@@ -78,7 +78,15 @@ ownerMain svc token =
   where
     logger = serviceLogger svc
     loop = do
-      work <- atomically (nextWork svc token)
+      work <- tryNonAsync (atomically (nextWork svc token)) >>= \case
+        Right chosen → pure chosen
+        Left failure → do
+          -- Choosing work reads every host's eligibility: a callback that throws
+          -- is a provider defect, recorded, and the owner ends.
+          let why = Text.pack ("eligibility callback failed: " <> show failure)
+          atomically (recordDefect svc (ProviderDefect why))
+          logError logger terrainComponent "provider defect" []
+          throwIO (ProviderDefect why)
       continue <- perform svc work
       when continue loop
     -- Whatever ended the loop, every accepted request leaves the table settled
@@ -249,7 +257,7 @@ releaseVictim svc key@(aid, region) = do
     void (applyEvent svc (R.VictimReleased aid region))
     markFreed svc
   where
-    discard a = a {arenaResident = discardRegion region (arenaResident a), arenaGeneration = arenaGeneration a + 1}
+    discard a = a {arenaResident = discardRegion region (arenaResident a), arenaGeneration = bumpGeneration (arenaGeneration a)}
 
 regionGeneration ∷ St → ArenaId → RegionCoord → Maybe Word
 regionGeneration st aid region =
@@ -336,7 +344,7 @@ finishJob svc jid aid result = do
             Right report
               | R.Published {} <- R.reportDecision report → do
                   modifySt svc $ \s →
-                    s {stateArenas = Map.adjust (\a → a {arenaPalette = palette, arenaResident = resident, arenaGeneration = arenaGeneration a + 1}) aid (stateArenas s)}
+                    s {stateArenas = Map.adjust (\a → a {arenaPalette = palette, arenaResident = resident, arenaGeneration = bumpGeneration (arenaGeneration a)}) aid (stateArenas s)}
                   pure Nothing
               | otherwise → pure Nothing
             Left refusal → do
@@ -561,7 +569,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
                               , arenaChanges = preparedChanges prepared
                               , arenaWorking = Map.insertWith mergeChanges region (preparedWorking prepared) (arenaWorking a)
                               , arenaRevision = newRevision
-                              , arenaGeneration = arenaGeneration a + 1
+                              , arenaGeneration = bumpGeneration (arenaGeneration a)
                               }
                         )
                         aid

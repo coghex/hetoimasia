@@ -59,6 +59,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
 
     -- * Invariants
   , invariants
+  , bumpGeneration
   , modelLimitsFor
   ) where
 
@@ -260,7 +261,7 @@ admit svc ep sub =
   admitting svc >>= \case
     Left refused → pure (Left refused)
     Right st0
-      | stateNextRequest st0 == maxBound → pure (Left RefusedExhausted)
+      | stateNextRequest st0 == maxBound || stateNextSeq st0 == maxBound → pure (Left RefusedExhausted)
       | otherwise → do
           let rid = stateNextRequest st0
               request = Request (serviceTag svc) (RequestId rid)
@@ -285,6 +286,7 @@ decide ∷ Service → St → RequestId → Submission → STM (Either Short Ins
 decide svc st rid = \case
   SubOpen client name source → pure $ do
     cid <- first' ShortRefused (clientOf svc client st)
+    checkName name
     when (Map.member name (stateNames st)) (Left (ShortFailed NameInUse))
     when (Map.size (stateArenas st) + countReqs isOpenCmd st >= configMaxArenas config) (Left (ShortRefused (RefusedBusy BusyArenas)))
     when (leaseUse >= configMaxLeases config) (Left (ShortRefused (RefusedBusy BusyLeases)))
@@ -294,6 +296,7 @@ decide svc st rid = \case
     Left (ShortFailed (Definition err))
   SubAttach client name → pure $ do
     cid <- first' ShortRefused (clientOf svc client st)
+    checkName name
     when (leaseUse >= configMaxLeases config) (Left (ShortRefused (RefusedBusy BusyLeases)))
     Right (Insertion (CAttach name cid) Nothing cid Nothing False [] Nothing)
   SubCell lease tile → dataCommand lease (CCell tile)
@@ -319,6 +322,11 @@ decide svc st rid = \case
     config = serviceConfig svc
     leaseUse = Map.size (stateLeases st) + countReqs isAcquisition st
     first' f = either (Left . f) Right
+    -- A name is held in the name map, so it is bounded: nonempty, 256 characters.
+    checkName name
+      | Text.null name = Left (ShortRefused (RefusedInvalid "an arena name is empty"))
+      | Text.compareLength name 256 == GT = Left (ShortRefused (RefusedInvalid "an arena name is longer than 256 characters"))
+      | otherwise = Right ()
     liveArena lease = do
       (lid, ls) <- first' ShortRefused (leaseOf svc lease st)
       if not (leaseLive ls)
@@ -567,6 +575,9 @@ acquireSnapshotSTM svc lease regions =
       Left refused → pure (Left refused)
       Right (_, ls)
         | not (leaseLive ls) → pure (Left RefusedAuthority)
+        | length (take (fromIntegral (R.limitHoldRegions (R.modelLimits (stateModel st))) + 1) regions) > fromIntegral (R.limitHoldRegions (R.modelLimits (stateModel st))) →
+            -- Refused before any region is enumerated or restricted.
+            pure (Left (RefusedInvalid "a borrow names more regions than a hold may"))
         | otherwise → case (Map.lookup (leaseArena ls) (stateArenas st), allocate (stateNextHold st)) of
             (Nothing, _) → pure (Left RefusedAuthority)
             (_, Left refused) → pure (Left refused)
@@ -608,8 +619,8 @@ releaseSnapshotSTM svc hid =
 
 -- | Every structural rule that ties the request table, leases, names, arenas
 -- and holds to the accounting model. An empty list means the state is coherent.
-invariants ∷ St → [String]
-invariants st =
+invariants ∷ Word64 → St → [String]
+invariants snapshotBank st =
   map ("model: " <>) (R.modelInvariants model)
     <> map (("charge: " <>) . show) (R.chargeCheck model)
     <> [ "request " <> show rid <> " claims a model record the model lacks"
@@ -640,6 +651,9 @@ invariants st =
        ]
     <> [ "snapshot ledger " <> show (Map.keys (stateSnapshots st)) <> " disagrees with the model's borrows"
        | Set.fromList (Map.keys (stateSnapshots st)) /= Set.fromList [h | (h, _, R.Borrow, _) <- R.modelHolds model]
+       ]
+    <> [ "snapshot ledger holds " <> show (sum (Map.elems (stateSnapshots st))) <> " beyond its bank"
+       | sum (Map.elems (stateSnapshots st)) > snapshotBank
        ]
     <> [ "borrowers " <> show (stateBorrowers st) <> " but the model holds " <> show borrows
        | stateBorrowers st /= borrows
@@ -676,3 +690,8 @@ modelLimitsFor config =
     bytes = toInteger . R.limitBytes limits
     slot = toInteger . R.limitSlot limits
     (ex, ey, ez) = R.limitExtent limits
+
+-- | The next residency generation. It saturates rather than wraps: a generation is
+-- only compared for change, and two states are never confused by its end.
+bumpGeneration ∷ Word64 → Word64
+bumpGeneration g = if g == maxBound then g else g + 1

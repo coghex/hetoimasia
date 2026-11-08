@@ -71,6 +71,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Closure
         Test.TerrainRuntime.Fixtures
         Test.TerrainRuntime.Hardening
+        Test.TerrainRuntime.Interleaving
         Test.TerrainRuntime.Lifecycle
         Test.TerrainRuntime.Offload
         Test.TerrainRuntime.Opacity
