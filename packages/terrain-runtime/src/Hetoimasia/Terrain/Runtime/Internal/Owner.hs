@@ -102,6 +102,7 @@ ownerMain svc token = mask $ \restore → do
     -- bookkeeping, so it is safe under the uninterruptible mask.
     terminal = do
       safePointSTM svc
+      modifySt svc (\st → st {stateTransfers = Map.empty, stateHandoffBusy = Map.empty})
       closeServiceSTM svc
       retireInFlightSTM svc
       modifySt svc (\st → st {stateOwner = OwnerStopped})
@@ -316,8 +317,8 @@ releaseVictim svc key@(aid, region) = do
             _ → stateVictims st
         , stateArenas = Map.adjust discard aid (stateArenas st)
         , stateRetiring = Map.adjust discard aid (stateRetiring st)
-        , stateTransfers = Map.delete key (stateTransfers st)
         }
+        `forgetRegionRetry` key
     void (applyEvent svc (R.VictimReleased aid region))
     markFreed svc
   where
@@ -362,14 +363,15 @@ handoff svc aid region = do
       case outcome of
         Right () → do
           modifySt svc $ \s →
-            s
-              { stateTransfers = Map.delete (aid, region) (stateTransfers s)
-              , stateArenas =
-                  Map.adjust
-                    (\a → a {arenaStore = maybe (arenaStore a) (mergeChanges (arenaStore a)) working, arenaWorking = Map.delete region (arenaWorking a)})
-                    aid
-                    (stateArenas s)
-              }
+            ( s
+                { stateArenas =
+                    Map.adjust
+                      (\a → a {arenaStore = maybe (arenaStore a) (mergeChanges (arenaStore a)) working, arenaWorking = Map.delete region (arenaWorking a)})
+                      aid
+                      (stateArenas s)
+                }
+            )
+              `forgetRegionRetry` (aid, region)
           void (applyEvent svc (R.HandoffConfirmed aid region))
         Left _ → void (applyEvent svc (R.HandoffFailed aid region))
       markFreed svc

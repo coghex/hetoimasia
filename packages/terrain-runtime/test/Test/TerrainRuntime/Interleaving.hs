@@ -113,6 +113,8 @@ runSeed config inject seed = do
           (request, length settled) `shouldBe` (request, 1)
         outcomes <- mapM (settledOf . snd) requests
         readIORef (wTrouble world) >>= (`shouldBe` [])
+        -- Every region and arena has ended: nothing is remembered about retrying them.
+        inspectRetryMemory svc `shouldReturn` 0
         settleChecks svc
         pure (length [() | [Succeeded _] <- outcomes])
   where

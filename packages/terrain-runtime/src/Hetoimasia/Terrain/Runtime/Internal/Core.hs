@@ -41,6 +41,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , terminateWith
   , releaseReq
   , withdrawRecord
+  , forgetRegionRetry
+  , forgetArenaRetry
   , beginRunning
   , safePointSTM
   , cancelRequest
@@ -489,6 +491,22 @@ releaseReq svc rid req = do
   when (reqModel req) (withdrawRecord svc rid req)
   markFreed svc
 
+-- | Forget everything the owner remembers about retrying one region's transfer: that
+-- it was tried at some generation, and that it was refused for want of capacity at
+-- some epoch. This and 'forgetArenaRetry' are the only places either is dropped, and
+-- every place a region or an arena ends calls one of them, so the memory is bounded
+-- by the regions the model holds.
+forgetRegionRetry ∷ St → R.RegionKey → St
+forgetRegionRetry st key = st {stateTransfers = Map.delete key (stateTransfers st), stateHandoffBusy = Map.delete key (stateHandoffBusy st)}
+
+-- | The same for every region of an arena.
+forgetArenaRetry ∷ St → ArenaId → St
+forgetArenaRetry st aid =
+  st
+    { stateTransfers = Map.filterWithKey (\(owner, _) _ → owner /= aid) (stateTransfers st)
+    , stateHandoffBusy = Map.filterWithKey (\(owner, _) _ → owner /= aid) (stateHandoffBusy st)
+    }
+
 -- | THE ONLY PLACE a request's model record, and every credit it owns, is given back
 -- (R1). While the owner is running that request's preparation, which computes with
 -- values captured under those credits, the release waits: the request leaves the
@@ -591,8 +609,8 @@ closeArena svc aid = do
             Just (ClaimLive claimed) | claimed == aid → Map.delete (arenaName arena) (stateNames cur)
             _ → stateNames cur
         , stateLeases = foldr (Map.adjust (\l → l {leaseLive = False})) (stateLeases cur) (Set.toList (arenaLeases arena))
-        , stateTransfers = Map.filterWithKey (\(owner, _) _ → owner /= aid) (stateTransfers cur)
         }
+        `forgetArenaRetry` aid
     retireArenaRecord svc aid
 
 -- | Release a lease. Idempotent. It cancels the requests made through it, and
@@ -800,6 +818,10 @@ invariants snapshotBank st =
        | Just (rid, _) <- [stateRunning st]
        , rid `notElem` modelIds
        ]
+    <> [ "transfer-retry memory for " <> show key <> " outlives its region"
+       | key <- Map.keys (stateTransfers st) <> Map.keys (stateHandoffBusy st)
+       , key `notElem` [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions model]
+       ]
     <> [ "a ghost or a deferred retirement exists while no preparation is running"
        | stateRunning st == Nothing
        , not (Map.null (stateGhosts st)) || not (Set.null (stateDeferredRetire st))
@@ -888,8 +910,8 @@ retireInFlightSTM svc = do
       cur
         { stateArenas = Map.adjust (discardOf region) aid (stateArenas cur)
         , stateRetiring = Map.adjust (discardOf region) aid (stateRetiring cur)
-        , stateTransfers = Map.delete key (stateTransfers cur)
         }
+        `forgetRegionRetry` key
     applyEvent svc (R.VictimReleased aid region)
   modifySt svc (\cur → cur {stateVictims = Seq.empty})
   after <- readSt svc

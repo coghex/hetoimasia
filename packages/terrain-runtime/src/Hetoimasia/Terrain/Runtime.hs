@@ -97,6 +97,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectModelSTM
   , inspectDefects
   , inspectSnapshotBytes
+  , inspectRetryMemory
   , inspectReadmissionWaits
   , inspectReadmissionWaitsSTM
   , inspectArena
@@ -379,6 +380,13 @@ inspectReadmissionWaitsSTM svc = do
 
 -- | The accounted bytes the retained bank holds (outstanding snapshots' backing and
 -- untaken removal results), and the bank.
+-- | How many regions the owner remembers a transfer attempt or a capacity refusal
+-- for. It returns to zero when the regions and arenas involved end.
+inspectRetryMemory ∷ Service → IO Int
+inspectRetryMemory svc = do
+  st <- readTVarIO (serviceState svc)
+  pure (Map.size (stateTransfers st) + Map.size (stateHandoffBusy st))
+
 inspectSnapshotBytes ∷ Service → IO (Word64, Word64)
 inspectSnapshotBytes svc = do
   st <- readTVarIO (serviceState svc)

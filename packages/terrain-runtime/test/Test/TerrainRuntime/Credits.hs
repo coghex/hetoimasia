@@ -11,6 +11,8 @@ module Test.TerrainRuntime.Credits (spec) where
 
 import Control.Concurrent.STM
 import Control.Monad (forM, forM_, void)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Text (pack)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
@@ -59,42 +61,54 @@ spec = describe "R1 and R2: credits are released at the safe point, capacity ref
           check (and [ledgerReserved (bankLedger model b) == 0 | b ← [ResidentBank, EditBank, StagingBank]] && slotInUse model CommandSlot == 0)
         settleChecks svc
 
-  it "reconsiders a transfer refused for want of capacity as soon as capacity is returned" $ do
+  it "reconsiders a transfer refused for want of capacity as soon as capacity is returned, and forgets it when the arena ends" $ do
     exercised <- forM [2000, 2008 .. 2448] $ \headroom → do
-      gate <- newDisarmedGate
+      gateRef <- newIORef =<< newDisarmedGate
       busy <- newTVarIO False
-      let hold = gatedProbe (\p → case p of PointCommitted {} → True; _ → False) gate
-          probe = Probe $ \point → do
+      let probe = Probe $ \point → do
             case point of
               PointHandoffBusy {} → atomically (writeTVar busy True)
               _ → pure ()
-            probePoint hold point
+            gate <- readIORef gateRef
+            probePoint (gatedProbe (\p → case p of PointCommitted {} → True; _ → False) gate) point
           definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
       withServiceUsing (microConfigWith 12 headroom) alwaysAdmitting probe $ \svc → do
         client <- okOf (registerClient svc)
-        lease <- okOf (openArena svc client "pressure" definition) >>= await svc >>= expectSuccess
-        _ <- readCell svc lease (tile 0 0 1)
-        armGate gate
-        edit <- newHost True
-        _ <- okOf (removeWith svc (hostEndpoint svc Nothing edit) lease (tile 0 0 1) Nothing)
-        awaitReached gate
-        -- Pending reads fill the staging bank while the owner is held after the edit.
-        reads' <- fillWithReads svc lease
-        openGate gate
-        sawBusy <-
+        -- Several incarnations on one service: the retry memory must not accumulate.
+        saw <- forM [1 .. 3 ∷ Int] $ \cycle' → do
+          gate <- newDisarmedGate
+          writeIORef gateRef gate
+          lease <- okOf (openArena svc client (pack ("pressure" <> show cycle')) definition) >>= await svc >>= expectSuccess
+          _ <- readCell svc lease (tile 0 0 1)
+          armGate gate
+          edit <- newHost True
+          _ <- okOf (removeWith svc (hostEndpoint svc Nothing edit) lease (tile 0 0 1) Nothing)
+          awaitReached gate
+          -- Pending reads fill the staging bank while the owner is held after the edit.
+          reads' <- fillWithReads svc lease
+          openGate gate
+          sawBusy <-
+            waitFor $ do
+              model <- inspectModelSTM svc
+              b <- readTVar busy
+              let clean = not (any regionDirty (modelRegions model))
+              check (b || clean)
+              pure b
+          -- Capacity returns: the pending reads end. The transfer must then be done.
+          forM_ reads' (void . cancel svc)
           waitFor $ do
             model <- inspectModelSTM svc
-            b <- readTVar busy
-            let clean = not (any regionDirty (modelRegions model))
-            check (b || clean)
-            pure b
-        -- Capacity returns: the pending reads end. The transfer must then be done.
-        forM_ reads' (void . cancel svc)
-        waitFor $ do
-          model <- inspectModelSTM svc
-          check (not (any regionDirty (modelRegions model)))
-        settleChecks svc
-        pure sawBusy
+            check (not (any regionDirty (modelRegions model)))
+          settleChecks svc
+          -- The incarnation ends: nothing about it is remembered.
+          _ <- releaseLease svc lease
+          waitFor $ do
+            model <- inspectModelSTM svc
+            check (null (modelArenas model))
+          inspectRetryMemory svc `shouldReturn` 0
+          settleChecks svc
+          pure sawBusy
+        pure (or saw)
     -- The scan found staging sizes at which the transfer really was refused.
     length (filter id exercised) `shouldSatisfy` (>= 1)
 
