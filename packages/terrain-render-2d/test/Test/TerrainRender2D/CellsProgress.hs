@@ -475,6 +475,8 @@ refusals = describe "explicit refusals" $ do
       `shouldSatisfy` (\r → case r of Left (CellMissingMaterialColour _) → True; _ → False)
   it "refuses an unusable configuration and a snap view that would crack the quads" $ \assets → do
     forM_ [withConfig (\c → c {ccDepth = 251}), withConfig (\c → c {ccDepth = -1}), withConfig (\c → c {ccMargin = -1}), withLimits (\l → l {clColumns = -1}), withLimits (\l → l {clStepLevels = 0}), withLimits (\l → l {clStepCandidates = 0})] $ \f →
+      -- The configuration is checked when preparation starts, before any step.
+      startCells (inputsOf assets (f base)) `shouldSatisfy` (\r → case r of Left CellInvalidConfig → True; _ → False)
       planSceneWith assets (f base) `shouldSatisfy` (\r → case r of Left CellInvalidConfig → True; _ → False)
     let snapping = base {sceneSetup = (sceneSetup base) {setupSettings = (setupSettings (sceneSetup base)) {settingPixelSnap = True}}, sceneCamera = either (error . show) stepCamera (applyCommand defaultCameraConfig (factsOf flatWorld) (SetZoom 1.01) (sceneCamera base))}
     planSceneWith assets snapping `shouldSatisfy` (\r → case r of Left (CellPixelSnapUnsupported _) → True; _ → False)
