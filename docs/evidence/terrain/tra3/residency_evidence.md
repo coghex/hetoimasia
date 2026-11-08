@@ -202,11 +202,12 @@ repeats what hold acquisition enforces.
 | A job does not reserve its columns | 35 examples, including the largest-request boundary |
 | No resident growth reserved for a removal | the edit-reservation, growth-contract and compressed-segment examples (9) |
 | An older handoff clears newer changes | the handoff-interleaving example |
-| An obsolete camera interest survives a busy replacement | the busy-replacement example and a random property |
+| A replacement does not withdraw the view first | the replacement examples, the storm example and the withdraw-then-admit property |
+| A fresh camera description is not left room for its first region | the minimum-budget examples and the starts-what-it-keeps properties |
 | Unsupported region keys accepted | the region-boundary examples |
 | A removal commit does not add the rebuilt segment growth | the growth-contract and compressed-segment examples |
 | Retirement settles with a victim release outstanding | the cross-arena retirement example and a random property |
-| A successful replacement drops its cancellation lists | the same-region replacement report example |
+| A replacement drops the withdrawal's cancellation lists | the same-region replacement report example |
 | A commit does not report the changed region's jobs | the commit-report example |
 | A failure does not report the jobs it leaves unneeded | the failure-report example |
 | A superseded running job is not cancelling | the late-failure and acknowledgement-after-commit examples |
@@ -240,11 +241,6 @@ repeats what hold acquisition enforces.
 | The camera unit is left out of the resident minimum | the re-admission example (1,025 refused) and the minimum property (1) |
 | The largest hold is left out of the resident minimum | the defaults, below-minimum and hold examples and the minimum property (4) |
 | A camera description is not cut to the staging it may use | the truncation example and two random properties |
-| The fit of a camera prefix is not monotone in its length | the bisection-versus-scan property |
-| A replacement is cut before the interests it drops are credited | the pan-after-load example |
-| A replacement is cut before the queued work it prunes is credited | the pan-before-dispatch example |
-| A replacement is cut without the headroom explicit work needs | the truncation examples |
-| A camera description is not left room for its first region to start | the minimum-budget example and the starts-what-it-keeps property |
 | A camera description is not cut to its structural maximum | the structural-maximum example |
 | Repeated camera keys are not coalesced | the normalization example |
 | Cells outside the extent are not clipped from a camera description | the normalization and over-cap examples |
@@ -385,21 +381,16 @@ progress and a configuration that cannot is refused at construction. The propert
   description, 64 of interest, 258 of scratch) but not a two-region description (256)
   beside the first job, so it is cut to one region, the other reported, and the first is
   admitted at once; whatever description is retained has its first region admitted.
-- **A pan is cut against the state it produces** (examples at the minimum budgets, and
-  two properties over 2,000 random replacements each, one after the first description
-  settled and one while its work is still queued): a view that has loaded region A, or
-  queued its load, and pans to B has B's description, interest and scratch fit exactly
-  once A's 64-byte interest (and A's 258 bytes of queued scratch) are released, so B is
-  kept and admitted; the cut is computed on the replacement state, never before the
-  release the replacement is about to perform. Any non-empty replacement of a camera in a
-  model with no explicit work retains a non-empty description and starts its first region.
-- **Bisection equals a linear scan** (property, 300 sequences under random budgets from
-  the minimum, compared for two views and two random descriptions after every event):
-  the kept prefix is found by bisection, which is sound because the fit is monotone in
-  the prefix length (a longer prefix adds description, drops fewer interests and keeps a
-  superset of the jobs; the first uncovered region's need does not depend on the length).
-  The scan is the largest fitting length, so the comparison also fails if monotonicity
-  does.
+- **Replacement is withdraw-then-admit** (property, 300 sequences under random budgets
+  from the minimum, compared for each view with a demand and a random description after
+  every event): the model after replacing a view's demand equals, in everything it
+  exposes except its logical clock, the model after withdrawing the view and then
+  admitting the description fresh. The same operation therefore makes the same progress:
+  the examples at the minimum budgets (a pan after a completed load, a pan before the
+  load was dispatched, and a different cell of the same region, loaded and queued) and
+  two properties over 2,000 random replacements each (one after the first description
+  settled, one while its work is still queued) require the view to survive with a
+  non-empty description whose first region is admitted, in a model with no explicit work.
 - **Normalized descriptions** (examples): an empty description withdraws the demand,
   repeated keys coalesce into the first occurrence, an unsupported key and a region
   wholly outside the extent are excluded and reported while the valid entries are

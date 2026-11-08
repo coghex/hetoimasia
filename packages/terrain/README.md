@@ -490,19 +490,13 @@ cells outside the configured extent are excluded and reported (`cameraExcluded`)
 and a description longer than its structural maximum (`specCameraRegions`, 16,384:
 more than the approved envelope needs) or than the staging the camera may use is cut
 at the end, lowest priority first, and the remainder reported (`cameraTruncated`). The
-cut is made against the state the replacement produces (`replaceView`, the function
-that also applies it): that state has the view's old description gone, the interests it no
-longer needs dropped and the queued work nothing needs pruned, and beside the kept
-description it must hold the interest and scratch of the first region of the kept prefix
-that the view has no interest in yet. A description is therefore never kept longer than
-the camera can start, and a pan is never cut to nothing by what it is about to release:
-whatever is retained, its first region is admitted at once (when nothing else holds the
-room). The longest prefix that fits is found by bisection, which is sound
-because fitting is monotone in the prefix length: a longer prefix adds description, drops
-fewer interests and keeps a superset of the jobs, and the first uncovered region's need
-does not depend on the prefix length. A property compares the bisected prefix with a
-linear scan of the same predicate (`cameraKeepBoth`, the seam it reads) at every state
-random sequences reach.
+staging the camera may use must hold the description and, beside it, the interest and
+scratch of the first region, so a description is never kept longer than the camera can
+start: whatever is retained, its first region is admitted at once (when nothing else
+holds the room). A replacement is not a special case: replacing a view's demand is
+withdrawing the old one and admitting the new one as a fresh demand, through this same
+path (a property checks that the two produce the same model at every state random
+sequences reach).
 
 What camera work can occupy, and why it cannot starve explicit work. The mechanism is
 a reserve of room, not a race: camera admission and hold acquisition are refused
@@ -694,19 +688,19 @@ jobs it dropped at once and the running ones awaiting acknowledgement.
 
 Camera demand is latest-value state per view: best effort and uncapped (its
 description is charged to staging, beside the headroom explicit work keeps), replaced
-as a whole, never a queue of pan events. Replacing it withdraws only that view's obsolete interests, in a retained
-region as well as in a dropped one: a region whose new coverage cannot be admitted
-yet keeps no interest in the coverage it replaced, and what the withdrawal freed is
-offered to the pending regions in the same step. Shared work is kept; the jobs the
-replacement made obsolete are reported (dropped at once if queued, awaiting their
-acknowledgement if running), whether or not the replacement was admitted. Each region
-is admitted as its own unit, strictly in the order of the demand: the first region
-that cannot be admitted holds back the regions after it, so a later region never
-takes room an earlier one needs. A replacement's staging counts the interests it
-retains in the regions it keeps, beside its new description and the interest and
-scratch of the region being admitted, all drawn from the staging beyond the headroom
-kept for explicit work; a description that does not fit is cut at its lowest-priority
-end and the remainder reported, so an accepted replacement can always be staged. What is not admitted stays as coalesced pending demand, holds nothing,
+as a whole, never a queue of pan events. Replacing it is exactly withdrawing the view's
+current demand (its description and all its interests, through the ordinary withdrawal)
+and admitting the new demand as a fresh one; there is no replacement-specific path. Work
+only this view needed that is still queued is dropped, and running work is cancelled and
+freed only when its owner acknowledges it; work another caller needs is untouched, and
+the jobs the withdrawal made obsolete are reported (dropped at once if queued, awaiting
+their acknowledgement if running). Each region is admitted as its own unit, strictly in
+the order of the demand: the first region that cannot be admitted holds back the regions
+after it, so a later region never takes room an earlier one needs. The demand's staging
+(its description and the interest and scratch of the first region) is drawn from the
+staging beyond the headroom kept for explicit work; a description that does not fit is
+cut at its lowest-priority end and the remainder reported, so an accepted demand can
+always be staged. What is not admitted stays as coalesced pending demand, holds nothing,
 and is retried in the same order by the owner's `Service` quantum.
 
 ### One charge function
