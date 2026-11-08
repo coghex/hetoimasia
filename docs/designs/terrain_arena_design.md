@@ -27,9 +27,10 @@ tracks reveal rules, retention and the fog interaction contract; they are not
 settled by the earlier picking or cutaway proposals.
 
 D-32 chooses whole-cavity discovery: unsealing a connected empty space reveals
-that space and loads all newly exposed boundary terrain, including across
-chunks. Work proceeds in bounded steps; Q-20 retains connectivity, capacity,
-retention and fog interaction details.
+that space and its newly exposed boundary terrain, including across chunks.
+D-51 refines its original exhaustive-loading requirement: retain compressed
+whole-space knowledge and load tile detail only on camera or explicit demand.
+Work proceeds in bounded steps; Q-20 retains concrete execution/storage details.
 
 D-33 resolves discovery retention: record revealed state as chunk changes,
 retain it on offload and replay it before publishing the reloaded chunk.
@@ -64,8 +65,8 @@ with a bounded RAM cache and asynchronous I/O. The store is session-only and
 discarded on arena close/reset; exact quota/failure/lifecycle details remain open.
 
 D-41 approves pausing new edits/discovery on storage exhaustion or write
-failure, retaining acknowledged changes and unfinished work. Startup space
-checks, reservation and a hard disk allowance are proposed below, not yet chosen.
+failure, retaining acknowledged changes and unfinished work. D-43 subsequently
+selects startup reservation and a hard disk allowance; exact recovery remains open.
 D-42 records the manager-relayed CPU budget increase and best-effort camera
 demand; it does not select the temporary store's disk quota.
 
@@ -107,6 +108,11 @@ target for corrected masks, discovery and queries; solver proof remains required
 D-50 resolves cutaway caps: hide levels above the selected slice, preserve
 remaining known tiles' actual shapes/materials, and add no flat caps. Unknown
 regions keep generic blank fog; moving the slice does not discover them.
+
+D-51 separates whole-cavern knowledge from detail residency. Discover and
+retain the connected space and exposed boundary in compressed form; materialize
+tile/render detail on demand. Completion does not require visiting every
+boundary tile, and unproved connections remain pending.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -1543,6 +1549,39 @@ their visible behavior, not whole-cell emission, hidden-cell culling, painter
 ordering or their qualification. Those remain Q-16/Q-19 work; automatic
 headroom and manual camera navigation retain their earlier decisions.
 
+### D-51. Discover whole caverns without exhaustively loading their detail
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that fits”
+to the recommendation to remember the entire connected cavern and its exposed
+boundary as discovered in compressed form, while loading actual tile/render
+detail only when the camera or an explicit request needs it. The question
+explicitly identified this as a refinement of the earlier requirement to load
+every boundary tile, including in enormous/world-spanning spaces.
+
+Whole-space discovery remains the behavior: it crosses chunks, includes the
+exposed solid boundary and is not restricted to the current view. Represent
+that knowledge with exact compressed regions. Finite caverns use the same
+rule as enormous or world-spanning ones. Materialize their boundary detail
+only for camera or explicit query/edit demand, with normal bounded streaming.
+There is no requirement to instantiate every boundary tile once before the
+discovery can finish.
+
+Completion means the connected space and its boundary are known, with the
+required connectivity work accounted for, not that all detail is resident or
+has been loaded. Do not guess across unresolved connections or label a partial
+reveal complete: unprocessed obligations stay pending under D-39. Compact
+source connectivity and its limits still require a concrete implementation
+contract and proof; this decision promises neither constant-size encoding nor
+instant discovery of arbitrary terrain.
+
+This supersedes D-32's exhaustive boundary-loading requirement and that
+requirement's restatement in D-33. It preserves their whole-cavity scope and
+D-33's session retention/replay: compressed knowledge must survive normal
+offload, apply before chunk publication and disappear only with arena
+close/reset. Detail eviction cannot erase discovery. D-41/D-43 still govern
+capacity and I/O failure. Q-20 retains exact representation, publication,
+source-compilation, capacity and API mechanics; Q-19 must assign their proof.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2603,7 +2642,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-50 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-51 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2638,8 +2677,10 @@ terrain, including real air gaps. The generic blank is intentional gameplay
 concealment. The earlier proposal to expose real material/air at every cutaway
 is superseded; lazily loading terrain must not itself reveal it. Fog must
 occlude visual picking without becoming authoritative physical occupancy.
-D-32 selects whole-cavity discovery/loading on unsealing, including boundary
-terrain beyond adjacent cells and across chunks, processed in bounded steps.
+D-32 selects whole-cavity discovery on unsealing, including boundary terrain
+beyond adjacent cells and across chunks, processed in bounded steps. D-51
+refines exhaustive boundary loading into compressed whole-space knowledge
+with tile/render detail materialized on camera or explicit demand.
 D-33 retains discovery as chunk changes across normal offload/reload for the
 arena session, replayed before render/pick publication. Revealing terrain is
 distinct from editing its contents; discovered chunks need not stay resident.
@@ -2703,10 +2744,11 @@ dependency insertion and existing-issue revisions await Q-16–Q-20; the ledger
 and delivery plan remain the original filed arc until those changes receive
 sign-off. No final issue bodies are drafted here.
 
-### P-7. Shared discovery mechanism — D-39 approved, concrete details open
+### P-7. Shared discovery mechanism — D-39/D-51 approved, concrete details open
 
 The high-level shared-work mechanism implementing D-31–D-38 is approved by
-D-39. The detailed engineering below still identifies representation,
+D-39, with D-51 separating whole-space knowledge from detail loading. The
+detailed engineering below still identifies representation,
 capacity, publication and source-compilation choices requiring a concrete
 contract; this is not a claim that the algorithm is implemented. It builds
 on P-5's existing single terrain owner, serialized edit commits and bounded
@@ -2729,7 +2771,7 @@ round-robin work quanta.
    discovered component cannot expose another disconnected part. Claims and
    their queue/continuation obligations are installed together by the terrain
    owner. Discovering/claiming a region is not proof that all of its exits or
-   boundary terrain loads have been processed. Use compressed spans/regions
+   boundary discovery has been processed. Use compressed spans/regions
    where valid; do not turn this into a dense visited-cell array.
 3. **Edits seed new connectivity in the same commit boundary.** Each accepted
    removal installs the obligation to inspect its new empty regions and open
@@ -2741,7 +2783,7 @@ round-robin work quanta.
    discovery capacity/failure behavior remains an explicit open contract.
 4. **Process bounded batches, share claims and stop at known exterior.** An
    unseen reachable region is claimed once and queued. A pending region joins
-   existing work without dropping its queued exits/boundary loads. A completed
+   existing work without dropping its queued exits/boundary discovery. A completed
    known region or implicit initial exterior needs no traversal through it;
    edits that change its connectivity must have supplied new obligations as
    above. Reaching sky ends that branch, not the entire reveal. The queue is
@@ -2754,14 +2796,15 @@ round-robin work quanta.
    knowledge uses D-33 retention. Pending work is separately arena-owned and
    must survive ordinary chunk offload; its cancellation/close/reset and
    publication rules must be specified. A component is complete only when its
-   discovery and required boundary-load obligations are fulfilled, never just
-   because two fronts met.
+   connectivity and boundary-knowledge obligations are fulfilled, never just
+   because two fronts met. D-51 removes exhaustive detail loading from that
+   completion condition; view/query-driven detail work remains separate.
 
 For the owner's two-opening example: opening A queues one end of the cave;
 opening B queues the other end. Each meets already-known sky at its entrance
 and stops only that outward branch. They traverse the cave until their claims
 meet, reuse the same pending work, and finish all remaining branches and
-boundary loads. A small abstract graph check exercised immediate and delayed
+boundary discovery. A small abstract graph check exercised immediate and delayed
 second openings in both directions, including a side branch: each of eight
 unknown nodes expanded once and sky expanded zero times. This is a design-
 model sanity check, not a repository test, a geometric proof or performance
@@ -2771,12 +2814,12 @@ capacity, later-edit and partial-shape cases before its claims are qualified.
 **Still unresolved:** implementation/encoding of D-49's regions/portals;
 source metadata
 for initially exterior-connected spaces (including unbounded authored air
-layers); definition of completion for boundary loading with normal eviction;
+layers); exact completion/publication of compressed discovery with normal eviction;
 retained-discovery and pending-work capacity/refusal; API results and coherent
 publication. An enormous/infinite component cannot silently become an
 unbounded allocation, a completed partial reveal or an erased obligation.
 
-**Next owner choice — discovery versus materialization (proposal, not approved).**
+**Discovery versus materialization — approved by D-51.**
 The current source can describe a world-spanning underground air layer with
 just a gap between two base layers: those layers apply to every column, and
 uncovered levels are air (H `packages/terrain/src/Hetoimasia/Terrain/Source.hs:1–19`
@@ -2784,23 +2827,32 @@ at `3ce8bf411f`). Its description is small even though enumerating all exposed
 floor/ceiling tiles is infeasible. Bounded batches alone do not make such an
 enumeration finish; a larger disk allowance does not solve this either.
 
-Recommend refining D-32's boundary-loading requirement: discover the whole
+D-51 refines D-32's boundary-loading requirement: discover the whole
 connected space and its exposed boundary using exact compressed knowledge
 regions, while materializing boundary tile/render data only for camera or
-explicit query/edit demand. Completion would mean the connected space and
+explicit query/edit demand. Completion means the connected space and
 boundary are known, not that every boundary tile has been instantiated once.
-Finite caverns would follow the same rule. D-33 retention/replay still applies
+Finite caverns follow the same rule. D-33 retention/replay still applies
 to the compressed knowledge, and ordinary detail eviction cannot undo it.
 
-This is a meaningful change to D-32's requirement to load all boundary tiles,
-so it requires owner approval. It is not permission to mark an unexplored
+The owner approved this change to D-32's requirement to load all boundary
+tiles. It is not permission to mark an unexplored
 region complete by guessing: compact source connectivity must be proved, and
 work not yet established stays pending. Exact source compilation, limits,
 refusal and integration with edit-created connections remain to specify; no
 constant-size representation or instant discovery of arbitrary terrain is
-claimed. Retaining exhaustive boundary loading instead would require an
-explicit restriction on supported cavern sizes/topologies or accepting work
-that cannot finish at the available capacity.
+claimed. The rejected exhaustive-loading alternative would require an explicit
+restriction on supported cavern sizes/topologies or accepting work that cannot
+finish at the available capacity.
+
+Qualification must distinguish known regions from resident detail: use a small
+finite cavern, a world-spanning authored air layer and a fragmented connected
+cavity. Whole-space knowledge must survive eviction/reload without enumerating
+each boundary tile; camera demand must materialize newly viewed known detail.
+Exercise unresolved branches, two openings, edits merging regions, offload and
+capacity interruption without false completion, lost obligations or accidental
+discovery of sealed controls. Record work/storage scaling rather than claiming
+compression alone proves bounded behavior.
 
 ### P-8. Session retention backing — D-40/D-41/D-43 approved, concrete details open
 
@@ -2854,6 +2906,20 @@ terrain need not grow retained history. For a large cavity, do not promise a
 whole reveal fits based on its opening tile: continuation and its capacity
 must remain bounded and resumable. Exact default size, reservations, platform
 support and admission/recovery protocol remain open.
+
+**Next owner choice — increasing a live arena's allowance (proposal, not approved).**
+A full retained-history allowance is distinct from a temporary device write
+failure: freeing reconstructible resident chunks does not remove the edits
+and discovery the session must remember. Recommend an explicit asynchronous
+Lua operation to request a larger allowance for the same live arena. Establish
+the additional reservation before raising the cap or resuming capacity-paused
+work; on failure retain the old cap, stored state and pending obligations.
+This would permit continued exploration without discarding the arena, while
+keeping storage growth explicit and bounded. It adds no UI, automatic quota
+growth, shrinking or cross-run persistence. D-43 currently approves a
+configurable startup allowance only; live increases require a separate owner
+decision. Exact operation/results, reservation accounting and recovery from
+non-capacity I/O errors remain part of the concrete storage contract.
 
 A free-space query is a snapshot, not a reservation against other writers.
 [Apple's file-control documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html)
@@ -3293,11 +3359,12 @@ reconciling the pure planner's limits with progressive camera preparation.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-41/D-43. Preserve fog over both solid and air until
+Partially resolved by D-31–D-41/D-43/D-51. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
-cavity reveals its whole connected empty space and loads the newly exposed
-boundary terrain, beyond the adjacent cells and across chunks, in bounded
-steps. The local-only discovery alternative is rejected.
+cavity reveals its whole connected empty space and exposed boundary terrain,
+beyond the adjacent cells and across chunks, in bounded steps. D-51 replaces
+exhaustive boundary loading with compressed whole-space knowledge; detail loads
+on camera or explicit demand. The local-only discovery alternative is rejected.
 
 D-33 records revealed state as retained chunk changes, preserved on offload
 and replayed before reload publication alongside terrain edits. Discovery
@@ -3348,8 +3415,9 @@ Lua/engine authority and concrete reset,
 reveal-job resumability and replay/publication boundaries, including the API
 encoding of D-37's no-selectable-target fog result.
 
-Proposed storage direction: implicit unknown plus sparse discovered spans or
-regions, budgeted separately from resident terrain and retained edits. Reveal
+D-51 selects compressed whole-space knowledge, distinct from resident detail.
+Its exact encoding/accounting remains open: implicit unknown plus sparse
+discovered spans or regions is the storage direction to specify. Reveal
 work must be bounded; an enormous or exterior-connected air region cannot
 force an unbounded flood fill or eager underground allocation. Consider
 coherent terrain/reveal publication so a pending or failed edit/reveal cannot
@@ -3358,11 +3426,11 @@ D-33 settles session retention/replay with normal streaming; D-34 settles
 whole-empty-cell face adjacency. D-35 includes partial-shape/diagonal openings.
 Exact API, representation, per-shape geometric rules, failure and capacity
 policies remain open.
-Current owner question: P-7 proposes refining D-32 so whole-cavern discovery
-records compressed knowledge of the connected space and boundary, while tile
-detail loads on camera or explicit demand. This separates completion from
-exhaustive boundary materialization for enormous/world-spanning spaces; it is
-not approved yet.
+The whole-cavern knowledge/detail question is resolved by D-51. Current owner
+question: P-8 proposes explicit Lua-requested increases of the live arena's
+reserved storage allowance, preserving the old cap/state on failure and
+resuming capacity-paused work only after the larger reservation succeeds.
+Live quota increases are not approved yet.
 Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
