@@ -21,6 +21,9 @@ module Test.TerrainRender2D.CellFixtures
   , OCell (..)
   , Scene (..)
   , sceneOf
+  , sceneOfAt
+  , sourceOf
+  , stateOf
   , sceneFrom
   , knowledgeOf
   , camera0
@@ -36,7 +39,10 @@ module Test.TerrainRender2D.CellFixtures
     -- * The oracle
   , OResult (..)
   , oracleAt
+  , oracleHits
+  , turn
   , oracleAtPixel
+  , pixelWorld
   , stableOracleAtPixel
   , turnsOf
   , expectedViewShape
@@ -44,7 +50,7 @@ module Test.TerrainRender2D.CellFixtures
 
 import Control.Monad (forM)
 import qualified Data.ByteString as ByteString
-import Data.List (minimumBy)
+import Data.List (minimumBy, sortOn)
 import Data.Ord (comparing)
 import qualified Data.Set as Set
 import Data.Word (Word64)
@@ -176,7 +182,11 @@ camera0 facing x y level = case applyCommand defaultCameraConfig (factsOf flatWo
 -- truth is its own, which is never read), the knowledge their states, and the
 -- camera looks from a facing, cut at a level, at the origin column.
 sceneOf ∷ ViewFacing → Integer → [OCell] → Scene
-sceneOf facing cut cells = sceneFrom facing cut 0 0 (sourceOf cells) (knowledgeOf 1 CellDiscovered (concatMap entry cells)) AllKnown
+sceneOf facing = sceneOfAt facing (0, 0)
+
+-- | The same about an anchor column.
+sceneOfAt ∷ ViewFacing → (Integer, Integer) → Integer → [OCell] → Scene
+sceneOfAt facing (ax, ay) cut cells = sceneFrom facing cut ax ay (sourceOf cells) (knowledgeOf 1 CellDiscovered (concatMap entry cells)) AllKnown
   where
     entry (OCell x y z _ know) = [(x, y, z, stateOf know)]
 
@@ -286,9 +296,18 @@ expectedViewShape facing world = shapeFromSides (map rot (shapeSides world))
 -- is the whole cube; a known solid whose empty component is undiscovered is the
 -- solid where the line meets it first and the cube's cover otherwise.
 oracleAt ∷ ViewFacing → (Integer, Integer) → Integer → Integer → [OCell] → (Rational, Rational) → OResult
-oracleAt facing (ax, ay) ref cut cells (sx, sy) = case hits of
+oracleAt facing anchor ref cut cells point = case rawHits facing anchor ref cut cells point of
   [] → ONothing
-  _ → let (_, result) = minimumBy (comparing fst) hits in result
+  hits → let (_, result) = minimumBy (comparing fst) hits in result
+
+-- | Every known cell the line of sight meets, nearest first: the independent
+-- order the picker's keys are held to.
+oracleHits ∷ ViewFacing → (Integer, Integer) → Integer → Integer → [OCell] → (Rational, Rational) → [TileCoord]
+oracleHits facing anchor ref cut cells point =
+  [tile | (_, OKnown tile) ← sortOn fst (rawHits facing anchor ref cut cells point)]
+
+rawHits ∷ ViewFacing → (Integer, Integer) → Integer → Integer → [OCell] → (Rational, Rational) → [(Rational, OResult)]
+rawHits facing (ax, ay) ref cut cells (sx, sy) = hits
   where
     a = (sx / 48 + sy / 24) / 2
     b = (sy / 24 - sx / 48) / 2
@@ -341,3 +360,10 @@ stableOracleAtPixel plan facing anchor ref cut cells pixel = case traverse (\j �
   _ → Nothing
   where
     jitters = [(0, 0), (1 / 32, 0), (0, 1 / 32), (-1 / 32, -1 / 32)]
+
+-- | The render-world point at the centre of a target pixel, through the plan's
+-- own view mapping.
+pixelWorld ∷ CellPlan → (Int, Int) → Maybe (Rational, Rational)
+pixelWorld plan (px, py) = do
+  V2 wx wy ← targetToWorld (rvMapping (cellPlanView plan)) (V2 (fromIntegral px + 0.5) (fromIntegral py + 0.5))
+  pure (toRational wx, toRational wy)

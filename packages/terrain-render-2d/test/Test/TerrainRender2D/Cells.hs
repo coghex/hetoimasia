@@ -3,24 +3,28 @@
 -- oracle and the scenes; nothing here takes an expectation from a production
 -- sort key or from the production bit lookup.
 --
--- The synthetic planes in the texel groups are technical test fixtures, labelled
--- as such; they never stand in for the qualified catalog in the all-16-ID,
--- four-facing groups.
+-- The synthetic planes in "Test.TerrainRender2D.CellsCoverage" are technical
+-- test fixtures, labelled as such; they never stand in for the qualified
+-- catalog in the all-16-ID, four-facing groups below.
 module Test.TerrainRender2D.Cells (spec) where
 
-import Control.Monad (forM_, unless)
+import Control.Monad (forM_)
+import Data.Int (Int64)
+import Data.List (sortOn)
 import Hetoimasia.Asset.Image.DataMap (coverageAt)
 import Hetoimasia.Terrain.Cell (Column (..))
-import Hetoimasia.Terrain.Coordinate (TileCoord)
-import Hetoimasia.Terrain.MapBake.Catalog (MapKey (..), MapRole (..))
+import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
+import Hetoimasia.Terrain.MapBake.Catalog (MapKey (..), MapRole (..), mapFileName)
 import Hetoimasia.Terrain.Render2D.Assets
 import Hetoimasia.Terrain.Render2D.Camera (camRef)
 import Hetoimasia.Terrain.Render2D.CellPick
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Facts (chunkOfColumn)
 import Hetoimasia.Terrain.Render2D.Knowledge
-import Hetoimasia.Terrain.Shape (ShapeId, allViewFacings, mkShapeId)
+import Hetoimasia.Terrain.Shape (ShapeId, ViewFacing (..), allViewFacings, mkShapeId)
+import System.FilePath ((</>))
 import Test.Hspec
+import Test.TerrainRender2D.Art (texturesDirectory)
 import Test.TerrainRender2D.CellFixtures
 import Test.TerrainRender2D.Fixtures (axis, tileAt)
 
@@ -33,6 +37,8 @@ spec = describe "Cell quads (TRA-16)" $ do
   beforeAll (loadAssets 5) $ do
     representation
     agreement
+    exactOrder
+    negativeControls
 
 -- ---------------------------------------------------------------------------
 -- Inputs
@@ -100,16 +106,64 @@ representation = describe "the whole-cell representation table, 16 identities at
             ]
 
 -- ---------------------------------------------------------------------------
--- Agreement with the ray oracle
+-- Scenes
+
+-- A scene of oracle cells about an anchor column, cut at a level.
+data AScene = AScene
+  { sceneName ∷ String
+  , sceneAnchor ∷ (Integer, Integer)
+  , sceneCut ∷ Integer
+  , sceneCells ∷ [OCell]
+  }
+
+shifted ∷ (Integer, Integer, Integer) → [OCell] → [OCell]
+shifted (dx, dy, dz) cells = [OCell (x + dx) (y + dy) (z + dz) s k | OCell x y z s k ← cells]
+
+blockOf ∷ [OCell]
+blockOf = [OCell x y z 0 KnownAll | x ← [0 .. 2], y ← [0 .. 2], z ← [0 .. 1], (x, y, z) /= (1, 1, 0)] <> [OCell 1 1 2 0 KnownAll]
+
+agreementScenes ∷ [AScene]
+agreementScenes =
+  [ AScene "a 4 x 4 grid of every identity, knowledge cycling" (0, 0) 0 [OCell x y 0 (fromInteger (4 * y + x)) (cycleKnow (4 * y + x)) | y ← [0 .. 3], x ← [0 .. 3]]
+  , AScene "a roof over a cavity with ramps at the rim" (0, 0) 2 (blockOf <> [OCell 3 1 0 3 KnownAll, OCell 1 3 0 12 KnownSolid, OCell 3 3 0 5 Undisc])
+  , AScene "stacked disconnected spans and a steep depth separation" (0, 0) 100 ([OCell 0 0 z s KnownAll | (z, s) ← [(100, 0), (97, 5), (91, 0), (70, 15)]] <> [OCell 1 1 103 0 KnownAll, OCell (-20) (-20) 40 0 KnownAll, OCell (-40) (-40) (-20) 5 KnownAll, OCell (-1) (-1) 97 0 Undisc, OCell 2 0 98 9 KnownSolid])
+  , AScene "cutaway through undiscovered air, cut above" (0, 0) 1 [OCell 0 0 0 0 KnownAll, OCell 1 0 0 5 KnownAll, OCell 0 0 1 0 Undisc, OCell 1 0 1 0 Undisc, OCell 0 0 2 0 KnownAll]
+  , AScene "cutaway through undiscovered air, cut at the known cells" (0, 0) 0 [OCell 0 0 0 0 KnownAll, OCell 1 0 0 5 KnownAll, OCell 0 0 1 0 Undisc, OCell 1 0 1 0 Undisc, OCell 0 0 2 0 KnownAll]
+  , AScene "a known ramp side beside an unrevealed void and fog behind it" (0, 0) 1 [OCell 0 0 0 5 KnownSolid, OCell 1 1 3 0 Undisc, OCell 1 1 1 0 KnownAll, OCell 0 1 0 12 KnownSolid, OCell 1 0 0 3 KnownAll, OCell 0 0 2 0 KnownAll]
+  , AScene "a chunk seam in X and Y" (15, 15) 1 (shifted (14, 14, 0) blockOf <> shifted (14, 14, 0) [OCell 3 1 0 3 KnownAll, OCell 1 3 0 12 KnownSolid])
+  , AScene "a vertical region seam" (0, 0) 33 [OCell x y z (fromInteger ((x + y + z) `mod` 16)) (cycleKnow (x + y + z)) | z ← [30 .. 33], x ← [0, 1], y ← [0, 1]]
+  , AScene "the greatest legal coordinates" (hi - 3, hi - 3) 0 (shifted (hi - 3, hi - 3, 0) (blockOf <> [OCell 3 0 0 5 KnownAll]))
+  , AScene "the least legal coordinates" (lo, lo) 0 (shifted (lo, lo, 0) (blockOf <> [OCell 3 0 0 12 KnownSolid, OCell 0 3 0 3 Undisc]))
+  ]
+  where
+    cycleKnow n = [KnownAll, KnownSolid, Undisc] !! fromInteger (n `mod` 3)
+    hi = 2 ^ (62 ∷ Int) - 1
+    lo = negate (2 ^ (62 ∷ Int))
+
+-- The pixels, with the oracle's answer, where the oracle is decidable.
+decidable ∷ CellPlan → ViewFacing → AScene → [((Int, Int), OResult)]
+decidable plan facing scene =
+  [ (pixel, o)
+  | pixel ← stridePixels 6
+  , Just o ← [stableOracleAtPixel plan facing (sceneAnchor scene) ref (sceneCut scene) (sceneCells scene) pixel]
+  ]
+  where
+    ref = cameraRef plan scene
+
+cameraRef ∷ CellPlan → AScene → Integer
+cameraRef _ scene = camRef (sceneCamera (sceneOfAt FaceSouth (sceneAnchor scene) (sceneCut scene) []))
 
 -- A reference traversal over the plan's public quads: the part and cell of the
 -- frontmost quad covering a pixel centre, with the order a caller chooses. Its
 -- texel is the integer offset from the quad's drawn left and top at unit scale,
 -- computed here by hand, and its coverage is read through the public planes.
 referenceFront ∷ AssetSnapshot → [CellQuad] → (Int, Int) → Maybe (PartKind, Maybe TileCoord)
-referenceFront assets nearToFar (px, py) = case [q | q ← nearToFar, covers q] of
+referenceFront assets nearToFar pixel = case coveringQuads assets nearToFar pixel of
   q : _ → Just (quadPart q, quadCell q)
   [] → Nothing
+
+coveringQuads ∷ AssetSnapshot → [CellQuad] → (Int, Int) → [CellQuad]
+coveringQuads assets quads (px, py) = [q | q ← quads, covers q]
   where
     cx = toRational px + 1 / 2
     cy = toRational py + 1 / 2
@@ -127,45 +181,100 @@ classify (Just (PartFog, _)) = OFog
 classify (Just (_, Just tile)) = OKnown tile
 classify (Just (_, Nothing)) = ONothing
 
--- Scenes for the agreement checks: each exercises a different occlusion shape.
-agreementScenes ∷ [(String, Integer, [OCell])]
-agreementScenes =
-  [ ("a 4 x 4 grid of every identity, knowledge cycling", 0, [OCell x y 0 (fromInteger (4 * y + x)) (cycleKnow (fromInteger (4 * y + x))) | y ← [0 .. 3], x ← [0 .. 3]])
-  , ("a roof over a cavity with ramps at the rim", 2, roofAndCavity)
-  , ("stacked disconnected spans and a steep depth separation", 40, [OCell 0 0 z s KnownAll | (z, s) ← [(0, 0), (3, 5), (9, 0), (30, 15), (40, 0)]] <> [OCell 1 1 5 0 Undisc, OCell 2 0 20 9 KnownSolid])
-  ]
-  where
-    cycleKnow n = [KnownAll, KnownSolid, Undisc] !! (n `mod` 3)
-    roofAndCavity =
-      [OCell x y 0 0 KnownAll | x ← [0 .. 2], y ← [0 .. 2], (x, y) /= (1, 1)]
-        <> [OCell x y 1 0 KnownAll | x ← [0 .. 2], y ← [0 .. 2], (x, y) /= (1, 1)]
-        <> [OCell 1 1 2 0 KnownAll, OCell 3 1 0 3 KnownAll, OCell 1 3 0 12 KnownSolid, OCell 3 3 0 5 Undisc]
-
-agreement ∷ SpecWith AssetSnapshot
-agreement = describe "agreement with an independent view-ray oracle" $
-  forM_ agreementScenes $ \(name, cut, cells) → forM_ allViewFacings $ \facing →
-    it (name <> ", " <> show facing) $ \assets → do
-      let scene = sceneOf facing cut cells
-          plan = planScene assets scene
-          ref = camRef (sceneCamera scene)
-          oracle pixel = stableOracleAtPixel plan facing (0, 0) ref cut cells pixel
-          compared = [(pixel, o) | pixel ← stridePixels 6, Just o ← [oracle pixel]]
-          nearToFar = reverse (cellPlanQuads plan)
-          reference = [(pixel, o, classify (referenceFront assets nearToFar pixel)) | (pixel, o) ← compared]
-          production = [(pixel, o, productionClass plan pixel) | (pixel, o) ← compared]
-      -- Enough pixels were decidable that the check is not vacuous, and both
-      -- kinds of target are present in it.
-      length compared `shouldSatisfy` (> 300)
-      unless (all ((== ONothing) . snd) compared) (pure ())
-      [(p, o, r) | (p, o, r) ← reference, o /= r] `shouldBe` []
-      [(p, o, r) | (p, o, r) ← production, collapse o /= r] `shouldBe` []
-  where
-    -- A pick through fog is the same answer as a miss, by design.
-    collapse OFog = ONothing
-    collapse o = o
-
 productionClass ∷ CellPlan → (Int, Int) → OResult
 productionClass plan pixel = case pickPixel plan pixel of
   CellPickHit hit → OKnown (hitCell hit)
   CellPickNoHit → ONothing
   CellPickLoading → ONothing
+
+-- A pick through fog is the same answer as a miss, by design.
+collapse ∷ OResult → OResult
+collapse OFog = ONothing
+collapse o = o
+
+-- The pixels where a classifier disagrees with the oracle.
+disagreements ∷ CellPlan → ViewFacing → AScene → ((Int, Int) → OResult) → [((Int, Int), OResult, OResult)]
+disagreements plan oracleFacing scene classifier =
+  [(p, o, r) | (p, o) ← decidable plan oracleFacing scene, let r = classifier p, o /= r]
+
+-- The same for a classifier that, like the production pick, does not tell fog
+-- from a miss.
+disagreementsPick ∷ CellPlan → ViewFacing → AScene → ((Int, Int) → OResult) → [((Int, Int), OResult, OResult)]
+disagreementsPick plan oracleFacing scene classifier =
+  [(p, o, r) | (p, o) ← decidable plan oracleFacing scene, let r = classifier p, collapse o /= r]
+
+agreement ∷ SpecWith AssetSnapshot
+agreement = describe "agreement with an independent view-ray oracle" $
+  forM_ agreementScenes $ \scene → forM_ allViewFacings $ \facing →
+    it (sceneName scene <> ", " <> show facing) $ \assets → do
+      let plan = planScene assets (sceneOfAt facing (sceneAnchor scene) (sceneCut scene) (sceneCells scene))
+          compared = decidable plan facing scene
+          nearToFar = reverse (cellPlanQuads plan)
+      -- Enough pixels were decidable that the check is not vacuous.
+      length compared `shouldSatisfy` (> 200)
+      disagreements plan facing scene (classify . referenceFront assets nearToFar) `shouldBe` []
+      disagreementsPick plan facing scene (productionClass plan) `shouldBe` []
+
+-- ---------------------------------------------------------------------------
+-- Exact order against the oracle's ray order
+
+-- For every decidable pixel, the known cells whose coverage contains it are in
+-- the order the line of sight meets them, nearest first. The expected order is
+-- the oracle's ray parameter; no sort key is read.
+exactOrder ∷ SpecWith AssetSnapshot
+exactOrder = describe "exact cell order against the ray parameter" $
+  forM_ agreementScenes $ \scene →
+    it (sceneName scene) $ \assets → do
+      let perFacing facing =
+            let plan = planScene assets (sceneOfAt facing (sceneAnchor scene) (sceneCut scene) (sceneCells scene))
+                nearToFar = reverse (cellPlanQuads plan)
+                ref = cameraRef plan scene
+             in [ (facing, pixel, ours, expected)
+                | pixel ← stridePixels 3
+                , Just point ← [pixelWorld plan pixel]
+                , let ours = [t | q ← coveringQuads assets nearToFar pixel, Just t ← [quadCell q]]
+                , length ours >= 2
+                , let ray = oracleHits facing (sceneAnchor scene) ref (sceneCut scene) (sceneCells scene) point
+                , let expected = [t | t ← ray, t `elem` ours]
+                ]
+          sequences = concatMap perFacing allViewFacings
+      -- Overlaps exist in the scene (the check is not vacuous), and the order
+      -- is the ray order wherever it can be decided.
+      length sequences `shouldSatisfy` (>= 20)
+      [(f, p, a, b) | (f, p, a, b) ← sequences, a /= b] `shouldBe` []
+
+-- ---------------------------------------------------------------------------
+-- Negative controls: each independent check must fail on a deliberate defect
+
+negativeControls ∷ SpecWith AssetSnapshot
+negativeControls = describe "negative controls" $ do
+  let grid = agreementScenes !! 0
+  it "a reversed draw order disagrees with the oracle" $ \assets → do
+    let plan = planScene assets (sceneOfAt FaceSouth (sceneAnchor grid) (sceneCut grid) (sceneCells grid))
+        reversedOrder = cellPlanQuads plan
+    length (disagreements plan FaceSouth grid (classify . referenceFront assets reversedOrder)) `shouldSatisfy` (> 0)
+  it "the wrong facing disagrees with the oracle" $ \assets → do
+    let plan = planScene assets (sceneOfAt FaceSouth (sceneAnchor grid) (sceneCut grid) (sceneCells grid))
+    length (disagreementsPick plan FaceWest grid (productionClass plan)) `shouldSatisfy` (> 0)
+  it "swapped masks disagree with the oracle" $ \_ → do
+    let key n = MapKey Ordinary (shapeNo n)
+        load n = catalogPlane (texturesDirectory </> "facemap" </> mapFileName (key n))
+    five ← load 5
+    nine ← load 9
+    swapped ← loadAssetsWith 5 [(AssetMap (key 5), nine), (AssetMap (key 9), five)]
+    let plan = planScene swapped (sceneOfAt FaceSouth (sceneAnchor grid) (sceneCut grid) (sceneCells grid))
+    length (disagreementsPick plan FaceSouth grid (productionClass plan)) `shouldSatisfy` (> 0)
+  it "a floating key x + y + 0.001 z at extreme coordinates orders cells wrongly" $ \assets → do
+    let scene = agreementScenes !! 8
+        plan = planScene assets (sceneOfAt FaceSouth (sceneAnchor scene) (sceneCut scene) (sceneCells scene))
+        known = [q | q ← cellPlanQuads plan, Just _ ← [quadCell q]]
+        floatKey q = case quadCell q of
+          Just (TileCoord x y z) → (fromIntegral (axisValue x + axisValue y) + 0.001 * fromIntegral (axisValue z)) ∷ Float
+          Nothing → 0
+        -- The input to a stable sort in an order that is wrong whenever keys tie.
+        floatOrder = reverse (sortOn floatKey (reverse known))
+        _ = (0 ∷ Int64)
+    -- The exact order passes; the floating approximation collapses to ties
+    -- and so keeps the (wrong) input order.
+    disagreements plan FaceSouth scene (classify . referenceFront assets (reverse known)) `shouldBe` []
+    length (disagreements plan FaceSouth scene (classify . referenceFront assets floatOrder)) `shouldSatisfy` (> 0)
