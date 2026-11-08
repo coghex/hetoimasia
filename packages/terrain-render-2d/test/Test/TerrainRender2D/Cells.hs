@@ -6,7 +6,16 @@
 -- The synthetic planes in "Test.TerrainRender2D.CellsCoverage" are technical
 -- test fixtures, labelled as such; they never stand in for the qualified
 -- catalog in the all-16-ID, four-facing groups below.
-module Test.TerrainRender2D.Cells (spec) where
+module Test.TerrainRender2D.Cells
+  ( spec
+  , AScene (..)
+  , agreementScenes
+  , decidable
+  , productionClass
+  , classify
+  , referenceFront
+  , collapse
+  ) where
 
 import Control.Monad (forM_)
 import Data.Int (Int64)

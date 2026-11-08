@@ -6,6 +6,7 @@ import qualified Test.TerrainRender2D.Camera as Camera
 import qualified Test.TerrainRender2D.Cells as Cells
 import qualified Test.TerrainRender2D.CellsClient as CellsClient
 import qualified Test.TerrainRender2D.CellsCoverage as CellsCoverage
+import qualified Test.TerrainRender2D.CellsEvidence as CellsEvidence
 import qualified Test.TerrainRender2D.CellsProgress as CellsProgress
 import qualified Test.TerrainRender2D.Generated as Generated
 import qualified Test.TerrainRender2D.MapAssets as MapAssets
@@ -33,3 +34,4 @@ spec = describe "TerrainRender2D" $ do
   CellsCoverage.spec
   CellsProgress.spec
   CellsClient.spec
+  CellsEvidence.spec
