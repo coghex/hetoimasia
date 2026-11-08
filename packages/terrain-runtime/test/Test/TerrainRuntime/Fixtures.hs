@@ -32,6 +32,13 @@ module Test.TerrainRuntime.Fixtures
   , settledOf
   , seenAtSettle
 
+    -- * Budgets and the independent model
+  , tightConfig
+  , layered
+  , cellMaterial
+  , expectedMaterial
+  , localCells
+
     -- * Doing things
   , openMain
   , readCell
@@ -54,13 +61,15 @@ import Control.Exception (finally)
 import Control.Concurrent.STM
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
-import Hetoimasia.Terrain.Cell (Cell (..), Column, ZRange, mkColumn, mkZRange)
+import Hetoimasia.Terrain.Cell (Cell (..), Column, ZRange, mkColumn, mkZRange, materialIdString)
+import Hetoimasia.Terrain.Shape (shapeIdValue)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, tileCoord)
 import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
-import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
+import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import Test.Hspec (HasCallStack, expectationFailure, shouldBe)
 import Test.Support.Bounded (bounded)
 
@@ -187,6 +196,71 @@ settledOf host = reverse <$> readTVarIO (hostSettled host)
 
 seenAtSettle ∷ Host → IO [Maybe (Integer, Bool)]
 seenAtSettle host = reverse <$> readTVarIO (hostSeen host)
+
+-- ---------------------------------------------------------------------------
+-- Budgets and the independent model
+
+-- | Validated tight limits for a small extent: the smallest resident bank the
+-- approved minimum-budget rule accepts, plus room for @spare@ one-cell regions,
+-- and a staging bank twice its minimum. The edit bank is a parameter. Queries
+-- name at most four regions, holds two and camera descriptions four.
+tightConfig ∷ (Integer, Integer, Integer) → Integer → Integer → Config
+tightConfig (ex, ey, ez) spare edit = defaultConfig {configLimits = limits}
+  where
+    spec bytes staging =
+      LimitsSpec
+        { specResidentBytes = bytes
+        , specEditBytes = edit
+        , specStagingBytes = staging
+        , specLoadJobs = 4
+        , specQueuedCommands = 6
+        , specPinsPerView = 2
+        , specAgingQuanta = 3
+        , specQueryRegions = 4
+        , specExtentX = ex
+        , specExtentY = ey
+        , specExtentZ = ez
+        , specHoldRegions = 2
+        , specCameraRegions = 4
+        }
+    valid bytes staging = either (const Nothing) Just (mkLimits (spec bytes staging))
+    smallest = fromMaybe (error "no resident bank satisfies the minimum budgets") (listToMaybe [r | r <- [100, 200 .. 4000000], Just _ <- [valid r 1000000]])
+    stagingFor bytes = fromMaybe (error "no staging bank satisfies the minimum budgets") (listToMaybe [t | t <- [1000, 2000 .. 4000000], Just _ <- [valid bytes t]])
+    residentBank = smallest + spare * 400
+    limits = fromMaybe (error "tight limits are invalid") (valid residentBank (2 * stagingFor residentBank))
+
+-- | A source from layers @(min, max, material, shape)@ and patches, for an
+-- independent expectation.
+layered ∷ [(Maybe Integer, Maybe Integer, String, Int)] → [PatchSpec] → SourceSpec
+layered layers patches =
+  SourceSpec
+    { specMaterials = foldr (\m acc → if m `elem` acc then acc else m : acc) [] [m | (_, _, m, _) ← layers]
+    , specLayers = [LayerSpec lo hi m shape | (lo, hi, m, shape) ← layers]
+    , specPatches = patches
+    }
+
+-- | The material and shape of a cell, or nothing for air.
+cellMaterial ∷ Cell → Maybe (String, Int)
+cellMaterial = \case
+  Air → Nothing
+  Solid m s → Just (materialIdString m, shapeIdValue s)
+
+-- | What a cell should hold, worked out from the definition and the removed
+-- cells alone, sharing no code with the library.
+expectedMaterial ∷ SourceSpec → [(Integer, Integer, Integer)] → (Integer, Integer, Integer) → Maybe (String, Int)
+expectedMaterial spec removed at'@(x, y, z)
+  | at' `elem` removed = Nothing
+  | otherwise = case [value | PatchSpec px py lo hi value ← specPatches spec, px == x, py == y, lo <= z, z < hi] of
+      (SpecAir : _) → Nothing
+      (SpecSolid m shape : _) → Just (m, shape)
+      [] → case [(m, shape) | LayerSpec lo hi m shape ← specLayers spec, maybe True (<= z) lo, maybe True (z <) hi] of
+        (found : _) → Just found
+        [] → Nothing
+
+-- | The four cells a tight extent of 2 x 1 x 2 allows in a region, as world tiles.
+localCells ∷ RegionCoord → [(Integer, Integer, Integer)]
+localCells (RegionCoord rx ry rz) =
+  [(toInteger rx * 16 + lx, toInteger ry * 16, toInteger rz * 32 + lz) | lx ← [0, 1], lz ← [0, 1]]
 
 -- ---------------------------------------------------------------------------
 -- Doing things
