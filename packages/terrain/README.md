@@ -707,8 +707,11 @@ Exposed boundary knowledge is derived, not copied per chunk. `queryCell` resolve
 solid from exact contact geometry: a known void whose portal lies over the cell's
 solid face section by positive area, the cell's own known void, or the sky above the
 top level. `queryKnownBoundary` returns a known source component's compressed
-boundary faces (at most six per box of its class, never an enumeration of tiles; a
-removal's effect on a boundary is read cell by cell). A chunk reloaded later resolves
+boundary faces one bounded **page** at a time (at most six per box of its class, never an
+enumeration of tiles): a page scans at most `limitBoundaryFaces` boxes of the class and returns
+at most as many faces, possibly none when the boxes it scans lie inside the class, with the
+position where the next page begins; its bytes are charged before it is built, and the pages
+in order are the whole description. A removal's effect on a boundary is read cell by cell. A chunk reloaded later resolves
 the same answers from the retained records alone.
 
 ### Missing data and replay
@@ -728,9 +731,16 @@ gives the same knowledge and the same remaining work.
 
 ### Authority and candidates
 
-A removal that extends a run whose class is already known adds known space (a new
-void and the walls it exposes), so it advances the knowledge revision although no class
-changes state; so does every join that makes a class known. A `Candidate` names the `Authority` it read: the arena incarnation (an
+**The revision rule**, stated once (`nextAuthority`; every candidate takes its next
+authority from it): *content* advances exactly when a candidate changes terrain (an
+applied removal); *knowledge* advances exactly when a candidate makes known space that was
+not known (a class becomes known, or a cell joins a known class: an extended or bridged
+run, a known old void) and never decreases; *store* advances on every candidate
+(obligation progress and unions that change no knowledge). A reader that keyed a derived
+result (a fog plan, a picked cell) by the knowledge revision it read is stale as soon as the
+retained revision differs, and one keyed by content when terrain changed; a stale reader
+keeps the old immutable value, correct for the authority it names, and never sees a
+candidate that is not applied. A stale holder of a candidate is refused. A `Candidate` names the `Authority` it read: the arena incarnation (an
 `ArenaId`) and the content, knowledge and store `Revision`s. `applyCandidate`
 accepts it only against exactly that authority, so a candidate from a closed
 incarnation, or one made stale by an applied candidate (a frontier-only one included),
@@ -759,15 +769,19 @@ pending state. An `Allowance` can only tighten them per call.
 | scratch bytes | `minimumScratchBytes` to 2^40 | 4 MiB |
 | unfinished obligations | 1 to 2^32 | 65,536 |
 | retained bytes | `minimumRetainedBytes` to 2^40 | 48 MiB |
+| boundary page | 6 to 2^16 boxes and faces (its accounted bytes must fit the scratch) | 1,024 |
 
 Bytes and counts are conservative accounted figures (keys, aliases, obligations,
 container overhead and scratch; a deletion is charged as the largest record of its
 kind), not heap or process RSS, and not final encoded pages. Every bound is checked
-**before** the work it pays for: a provider read is charged the largest record
-(`maxRecordBytes`) of scratch and one read before the provider is asked, and a staged
-write is charged its entry before it is staged, so a request that would overflow the read
-count, the scratch, the candidate records or bytes, or the retained bytes never reaches
-the provider or the overlay. An inspection rejected part way is discarded whole, and the
+**before** the work it pays for, through **one function** (`charge`): a provider read is
+charged one read and the largest record (`maxRecordBytes`) of scratch before the provider is
+asked, a staged write is charged its entry before it is staged, and the output and
+traversal state of a boundary page is charged before the page is built, so a request that
+would overflow the read count, the scratch, the candidate records or bytes, or the retained
+bytes never reaches the provider, the overlay or the page. The peak scratch a report shows is
+read from the same state the charges update, so a rejected or suspended attempt reports what
+it had been charged. An inspection rejected part way is discarded whole, and the
 reads it had already made are reported as `reportAttemptedReads` (never above the read
 limit), so the report cannot understate the provider's work. The shared compiled
 source is charged once to the arena (`envSharedBytes`), never to a candidate. The
@@ -1399,7 +1413,15 @@ negative controls that the oracle must reject. A lockstep example rebuilds one r
 records alone after every edit and every batch of a drain and compares it with an
 uninterrupted run record for record. A counting provider, independent of the model's
 accounting, shows no request is made beyond an allowance on any exit, and an allocation
-example shows a class lookup costs the same for a source with 0 and with 200 patches. A
+example shows a class lookup costs the same for a source with 0 and with 200 patches. Generated
+properties cover the rest: a **revision property** over random edit, batch, forget, replay and
+drain sequences (content advances with an applied removal only, knowledge never decreases and
+advances whenever known space appeared, known voids never shrink, a known solid is lost only by
+removing it, and a candidate staged before an action is refused after it); and a **windowed
+replay property** that runs the same sequences through a provider exposing only the 16, 24 or 40
+most recently loaded records, suspends and resumes on every missing record, evicts and reloads,
+rebuilds the retained value from its records after every applied candidate and compares the
+logical result (runs, removals, remaining work, knowledge) with the uninterrupted run. A
 client compiled outside the package shows the discovery state unforgeable.
 
 ## Consumers
