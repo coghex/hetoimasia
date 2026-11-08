@@ -566,6 +566,51 @@ spec = describe "Accounting and lifetime hardening" $ do
       readIORef committedAfter >>= \c → c `shouldSatisfy` maybe False (<= 3)
       settleChecks svc
 
+  it "serves an eligible staged commit while a producer keeps cancelling and replacing cache-hit reads" $ do
+    gate <- newDisarmedGate
+    counting <- newIORef False
+    captured <- newIORef (0 ∷ Int)
+    committedAfter <- newIORef (Nothing ∷ Maybe Int)
+    stop <- newTVarIO False
+    let holding = gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate
+        probe = Probe $ \point → do
+          active <- readIORef counting
+          when active $ case point of
+            PointCaptured {} → modifyIORef' captured (+ 1)
+            PointBeforeCommit _ → readIORef captured >>= \seen → modifyIORef' committedAfter (Just . maybe seen id)
+            _ → pure ()
+          probePoint holding point
+    withGatedServiceUsing probe gate $ \svc → do
+      (_, lease) <- openMain svc "main"
+      _ <- readCell svc lease (tile 1 1 1)
+      removal <- newHost False
+      _ <- okOf (removeWith svc (hostEndpoint svc Nothing removal) lease (tile 0 1 1) Nothing)
+      waitFor (readTVar (hostReady removal) >>= \n → check (n >= 1))
+      writeIORef counting True
+      armGate gate
+      first' <- newHost True
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing first') lease (tile 1 1 1))
+      awaitReached gate
+      grant removal
+      -- A producer replaces a cache-hit read with another, over and over, until told to stop.
+      let produce previous = do
+            stopped <- readTVarIO stop
+            if stopped
+              then pure ()
+              else do
+                host <- newHost True
+                fresh <- cellWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1)
+                forM_ previous (void . cancel svc)
+                yield
+                produce (either (const Nothing) Just fresh)
+      withOwnedThread (produce Nothing) $ \_ stopProducer -> do
+        openGate gate
+        waitFor (readTVar (hostSettled removal) >>= \x → check (not (null x)))
+        atomically (writeTVar stop True)
+        stopProducer
+      readIORef committedAfter >>= \c → c `shouldSatisfy` maybe False (<= 3)
+      settleChecks svc
+
   it "gives a queued load its turn while ready requests keep arriving elsewhere" $ do
     gate <- newDisarmedGate
     withGatedService defaultConfig alwaysAdmitting (\p -> case p of PointCaptured {} -> True; _ -> False) gate $ \svc -> do
