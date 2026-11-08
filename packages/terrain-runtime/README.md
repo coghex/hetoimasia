@@ -274,6 +274,14 @@ the stores only after the borrowers finish.
   and never retried. Only a transfer that ran and failed is suppressed until the region
   changes again, and only refusals that can never clear (the arena is gone, the demand left
   the extent) end an item.
+* **Retry memory is bounded by the regions the model holds.** What the owner remembers
+  about retrying a region's transfer (tried at a generation; refused for want of capacity
+  at an epoch) is written only by `rememberTried` and `rememberBusy`, and only for a region
+  the model still holds in a live arena, so a transfer in flight when its arena ends leaves
+  nothing behind. It is dropped only by `forgetRegionRetry` (a completed transfer, a
+  released victim) and `forgetArenaRetry` (an arena's closure), and wholesale by the owner's
+  terminal step; an invariant checks that no memory outlives its region, and
+  `inspectRetryMemory` is zero once the regions and arenas have ended.
 * **Diagnostics never decide.** A defect is thrown with a failing logger's failure attached
   as cleanup evidence, never replaced by it; a logger that fails on a routine record is
   itself recorded as a defect and the work goes on.
