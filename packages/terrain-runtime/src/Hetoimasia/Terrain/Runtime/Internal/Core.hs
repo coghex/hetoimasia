@@ -59,6 +59,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
 
     -- * Invariants
   , invariants
+  , modelLimitsFor
   ) where
 
 import Control.Concurrent.STM
@@ -78,6 +79,7 @@ import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), HoldId (..), RegionDemand, RequestId (..), Revision (..), ViewId (..))
 import Hetoimasia.Terrain.Runtime.Internal.Content
 import Hetoimasia.Terrain.Runtime.Internal.Snapshot
+import Hetoimasia.Terrain.Resident (residentStats, ResidentStats (..))
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Source (Source, SourceError)
 
@@ -295,7 +297,12 @@ decide svc st rid = \case
     when (leaseUse >= configMaxLeases config) (Left (ShortRefused (RefusedBusy BusyLeases)))
     Right (Insertion (CAttach name cid) Nothing cid Nothing False [] Nothing)
   SubCell lease tile → dataCommand lease (CCell tile)
-  SubColumn lease column range → dataCommand lease (CColumn column range)
+  SubColumn lease column range
+    -- Before any region is enumerated: a range of any length is refused here, in
+    -- constant time, however many levels it names.
+    | zRangeLevels range > toInteger (Q.limitRangeLevels (configQueryLimits config)) →
+        pure (Left (ShortRefused (RefusedInvalid "column range exceeds the level limit")))
+    | otherwise → dataCommand lease (CColumn column range)
   SubSurface lease column → dataCommand lease (CSurface column)
   SubRemove lease tile precondition → case liveArena lease of
     Left short → pure (Left short)
@@ -564,27 +571,36 @@ acquireSnapshotSTM svc lease regions =
             (Nothing, _) → pure (Left RefusedAuthority)
             (_, Left refused) → pure (Left refused)
             (Just arena, Right hid) → do
-              outcome <- applyEvent svc (R.AcquireHold (HoldId hid) (leaseArena ls) R.Borrow regions)
-              case outcome of
-                Left refusal → pure (Left (either id (const RefusedAuthority) (case busyWhy refusal of ShortRefused r → Left r; ShortFailed _ → Right ())))
-                Right _ → do
-                  modifySt svc (\cur → cur {stateNextHold = hid + 1, stateBorrowers = stateBorrowers cur + 1})
-                  let snapshot =
-                        Snapshot
-                          { snapArena = leaseArena ls
-                          , snapRevision = arenaRevision arena
-                          , snapGeneration = arenaGeneration arena
-                          , snapRegions = regions
-                          , snapPalette = arenaPalette arena
-                          , snapResident = restrictResident regions (arenaResident arena)
-                          }
-                  pure (Right (HoldId hid, snapshot))
+              let snapshot =
+                    Snapshot
+                      { snapArena = leaseArena ls
+                      , snapRevision = arenaRevision arena
+                      , snapGeneration = arenaGeneration arena
+                      , snapRegions = regions
+                      , snapPalette = arenaPalette arena
+                      , snapResident = restrictResident regions (arenaResident arena)
+                      }
+                  stats = residentStats (snapResident snapshot)
+                  backing = fromIntegral (statPayloadBytes stats + statMetadataBytes stats) ∷ Word64
+                  outstanding = sum (Map.elems (stateSnapshots st))
+              -- Backing is charged conservatively per snapshot (a version two
+              -- snapshots share is counted for each) and refused, before the model
+              -- is touched, when the snapshot bank cannot hold it.
+              if backing > configSnapshotBytes (serviceConfig svc) - min (configSnapshotBytes (serviceConfig svc)) outstanding
+                then pure (Left (RefusedBusy BusySnapshots))
+                else do
+                  outcome <- applyEvent svc (R.AcquireHold (HoldId hid) (leaseArena ls) R.Borrow regions)
+                  case outcome of
+                    Left refusal → pure (Left (either id (const RefusedAuthority) (case busyWhy refusal of ShortRefused r → Left r; ShortFailed _ → Right ())))
+                    Right _ → do
+                      modifySt svc (\cur → cur {stateNextHold = hid + 1, stateBorrowers = stateBorrowers cur + 1, stateSnapshots = Map.insert (HoldId hid) backing (stateSnapshots cur)})
+                      pure (Right (HoldId hid, snapshot))
 
 -- | Return a borrow. Idempotent.
 releaseSnapshotSTM ∷ Service → HoldId → STM ()
 releaseSnapshotSTM svc hid =
   applyEvent svc (R.ReleaseHold hid) >>= \case
-    Right _ → modifySt svc (\st → st {stateBorrowers = stateBorrowers st - 1})
+    Right _ → modifySt svc (\st → st {stateBorrowers = stateBorrowers st - 1, stateSnapshots = Map.delete hid (stateSnapshots st)})
     Left _ → pure ()
 
 -- ---------------------------------------------------------------------------
@@ -622,6 +638,9 @@ invariants st =
        | aid <- Map.keys (stateArenas st)
        , Map.member aid (stateRetiring st)
        ]
+    <> [ "snapshot ledger " <> show (Map.keys (stateSnapshots st)) <> " disagrees with the model's borrows"
+       | Set.fromList (Map.keys (stateSnapshots st)) /= Set.fromList [h | (h, _, R.Borrow, _) <- R.modelHolds model]
+       ]
     <> [ "borrowers " <> show (stateBorrowers st) <> " but the model holds " <> show borrows
        | stateBorrowers st /= borrows
        ]
@@ -629,3 +648,31 @@ invariants st =
     model = stateModel st
     modelIds = [R.requestId info | info <- R.modelRequests model]
     borrows = length [() | (_, _, R.Borrow, _) <- R.modelHolds model]
+
+-- | The accounting model's limits: the configured profile with the snapshot
+-- bank taken out of its staging bank. Rebuilt through the validating
+-- constructor, so a carve-out that leaves staging below the minimum budgets is a
+-- typed configuration error.
+modelLimitsFor ∷ Config → Either R.LimitError R.Limits
+modelLimitsFor config =
+  R.mkLimits
+    R.LimitsSpec
+      { R.specResidentBytes = bytes R.ResidentBank
+      , R.specEditBytes = bytes R.EditBank
+      , R.specStagingBytes = bytes R.StagingBank - toInteger (configSnapshotBytes config)
+      , R.specLoadJobs = slot R.LoadJobSlot
+      , R.specQueuedCommands = slot R.CommandSlot
+      , R.specPinsPerView = slot R.ViewPinSlot
+      , R.specAgingQuanta = toInteger (R.limitAgingQuanta limits)
+      , R.specQueryRegions = toInteger (R.limitQueryRegions limits)
+      , R.specExtentX = toInteger ex
+      , R.specExtentY = toInteger ey
+      , R.specExtentZ = toInteger ez
+      , R.specHoldRegions = toInteger (R.limitHoldRegions limits)
+      , R.specCameraRegions = toInteger (R.limitCameraRegions limits)
+      }
+  where
+    limits = configLimits config
+    bytes = toInteger . R.limitBytes limits
+    slot = toInteger . R.limitSlot limits
+    (ex, ey, ez) = R.limitExtent limits

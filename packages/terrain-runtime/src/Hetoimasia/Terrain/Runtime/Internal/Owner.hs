@@ -64,11 +64,17 @@ ownerDefinition svc =
   workerDefinition "terrain.runtime.owner" (\_ → pure () ∷ Scoped ()) $ \token () → ownerMain svc token
 
 ownerMain ∷ Service → StopToken → IO ()
-ownerMain svc token = do
-  atomically (modifySt svc (\st → st {stateOwner = OwnerRunning}))
-  logInfo logger terrainComponent "terrain owner started" []
-  loop `finally` uninterruptibleMask_ (atomically terminal)
-  logInfo logger terrainComponent "terrain owner stopped" []
+ownerMain svc token =
+  -- The cleanup covers the owner's whole execution, startup logging included, and
+  -- is the last thing it does: nothing of the owner runs after it publishes that
+  -- it stopped, so a logger is never used after the service has returned.
+  ( do
+      atomically (modifySt svc (\st → st {stateOwner = OwnerRunning}))
+      logInfo logger terrainComponent "terrain owner started" []
+      loop
+      logInfo logger terrainComponent "terrain owner stopped" []
+  )
+    `finally` uninterruptibleMask_ (atomically terminal)
   where
     logger = serviceLogger svc
     loop = do
@@ -355,7 +361,10 @@ prepareReq svc rid = do
       prepared <-
         tryNonAsync $ do
           probe svc (PointStaging rid)
-          pure $! prepareRemoval (changeLimitsOf config) (arenaSource arena) (arenaChanges arena) (arenaPalette arena) (arenaResident arena) tile
+          -- Prepare the content change and prove the rebuild succeeds now; the
+          -- rebuild itself is repeated against the residency at commit.
+          pure $! prepareRemoval (changeLimitsOf config) (arenaSource arena) (arenaChanges arena) tile >>= \ready →
+            ready <$ rebuildCell (arenaSource arena) (preparedChanges ready) (arenaPalette arena) (arenaResident arena) tile
       case prepared of
         Left failure → fail' (HostFailure (Text.pack ("preparation failed: " <> show failure)))
         Right (Left why) → fail' (HostFailure (Text.pack ("preparation refused: " <> why)))
@@ -372,19 +381,31 @@ prepareReq svc rid = do
     fail' failure = atomically (terminate svc rid (Failed failure))
 
 -- | Publish staged work and tell the host it is ready. Work whose arena has moved
--- on since it was computed is dropped; the owner computes it again.
+-- on since it was computed is dropped; the owner computes it again. A readiness
+-- callback that fails is a provider defect: nothing is staged, the defect is
+-- recorded, and the owner ends, settling every request once.
 stage ∷ Service → RequestId → Maybe ArenaId → Revision → StagedWork → IO ()
-stage svc rid aid rev work = atomically $ do
-  st <- readSt svc
-  forM_ (Map.lookup rid (stateRequests st)) $ \req → do
-    let fresh = case aid of
-          Nothing → True
-          Just a → maybe False ((== rev) . arenaRevision) (Map.lookup a (stateArenas st))
-        pending = case reqPhase req of Done → False; _ → True
-    when (fresh && pending) $ do
-      modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev work)} (stateRequests s)})
-      endpointReady (reqEndpoint req) `catchSTM` \(failure ∷ SomeException) →
-        recordDefect svc (ProviderDefect (Text.pack ("ready callback failed: " <> show failure)))
+stage svc rid aid rev work =
+  tryNonAsync (atomically publish) >>= \case
+    Right () → pure ()
+    Left failure → do
+      let why = Text.pack ("readiness callback failed: " <> show failure)
+      atomically (recordDefect svc (ProviderDefect why))
+      logError (serviceLogger svc) terrainComponent "provider defect" [("request", Text.pack (show rid))]
+      throwIO (ProviderDefect why)
+  where
+    publish = do
+        st <- readSt svc
+        forM_ (Map.lookup rid (stateRequests st)) $ \req → do
+          let fresh = case aid of
+                Nothing → True
+                Just a → maybe False ((== rev) . arenaRevision) (Map.lookup a (stateArenas st))
+              pending = case reqPhase req of Done → False; _ → True
+          when (fresh && pending) $ do
+            modifySt svc (\s → s {stateRequests = Map.insert rid req {reqPhase = StagedPhase (Staged aid rev work)} (stateRequests s)})
+            -- A failing readiness callback abandons this transaction: the work stays
+            -- unstaged and cannot commit. The caller treats it as a provider defect.
+            endpointReady (reqEndpoint req)
 
 -- | Offer staged work to the arbitration.
 commitReq ∷ Service → RequestId → IO ()
@@ -520,11 +541,13 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
           endpointSettle ep (Succeeded (ARemoved (RemoveAnswer aid (arenaRevision arena) False)))
           pure (CommitDone (Just aid) (Just (arenaRevision arena)))
       | Revision n <- arenaRevision arena, n == maxBound = pure (CommitDefect "content revision exhausted after admission")
-      | otherwise = do
-          let Revision n = arenaRevision arena
-              newRevision = Revision (n + 1)
-              (region, _) = decomposeTile tile
-          applyEvent svc (R.RemovalCommitted rid newRevision (preparedRetained prepared) (preparedGrowth prepared)) >>= \case
+      | otherwise = case rebuildCell (arenaSource arena) (preparedChanges prepared) (arenaPalette arena) (arenaResident arena) tile of
+          Left why → pure (CommitDefect (Text.pack ("resident rebuild refused: " <> why)))
+          Right (palette', resident', growth) → do
+           let Revision n = arenaRevision arena
+               newRevision = Revision (n + 1)
+               (region, _) = decomposeTile tile
+           applyEvent svc (R.RemovalCommitted rid newRevision (preparedRetained prepared) growth) >>= \case
             Left refusal → pure (CommitDefect (Text.pack ("removal commit refused: " <> show refusal)))
             Right report → do
               modifySt svc $ \s →
@@ -533,8 +556,8 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
                       Map.adjust
                         ( \a →
                             a
-                              { arenaPalette = preparedPalette prepared
-                              , arenaResident = preparedResident prepared
+                              { arenaPalette = palette'
+                              , arenaResident = resident'
                               , arenaChanges = preparedChanges prepared
                               , arenaWorking = Map.insertWith mergeChanges region (preparedWorking prepared) (arenaWorking a)
                               , arenaRevision = newRevision

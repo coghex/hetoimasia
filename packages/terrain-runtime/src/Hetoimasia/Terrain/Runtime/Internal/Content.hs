@@ -17,6 +17,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Content
     -- * Removal
   , Prepared (..)
   , prepareRemoval
+  , rebuildCell
 
     -- * Snapshots
   , restrictResident
@@ -26,6 +27,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Content
   ) where
 
 import Data.List (sort)
+import qualified Data.Set as Set
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell
 import Hetoimasia.Terrain.Changes
@@ -92,7 +94,7 @@ columnsSegmentStats resident columns =
 runJob ∷ Source → Changes → Palette → Resident → RegionCoord → Coverage → Either String (Palette, Resident, Cost)
 runJob source changes palette0 resident0 region cover = do
   pieces ← realPieces region cover
-  let columns = [c | (c, _) ← pieces]
+  let columns = Set.toList (Set.fromList [c | (c, _) ← pieces])
       (segmentsBefore, payloadBefore, _) = columnsSegmentStats resident0 columns
   (palette, resident) ← foldlE materializePiece (palette0, resident0) pieces
   let (segmentsAfter, payloadAfter, _) = columnsSegmentStats resident columns
@@ -105,30 +107,29 @@ runJob source changes palette0 resident0 region cover = do
 
 -- | The staged result of a removal, ready to publish. Nothing in it has been
 -- published: the owner publishes it, with the success settlement, in one
--- transaction.
+-- transaction. It holds the content change only. The resident detail is rebuilt
+-- from the current residency inside the commit ('rebuildCell'), because loads
+-- and evictions may change residency while the commit waits for its grant.
 data Prepared = Prepared
   { preparedChanged ∷ !Bool
   , preparedChanges ∷ !Changes
-  , preparedPalette ∷ !Palette
-  , preparedResident ∷ !Resident
   , -- | The removed interval as retained changes of its own, to join the changed
     -- region's working set. Built here, where a failure is an ordinary refusal,
     -- so that nothing fallible is left for after the commit has mutated.
     preparedWorking ∷ !Changes
-  , -- | The retained-edit bytes the removal adds.
+  , -- | The retained-edit bytes the removal adds. Coalescing can make the real
+    -- retained size shrink; the model accounts retained bytes monotonically, so
+    -- a decrease is reported as zero added bytes (conservative).
     preparedRetained ∷ !Word64
-  , -- | The bytes the rebuilt segment now accounts beyond the old one.
-    preparedGrowth ∷ !Word64
   }
 
--- | Remove a whole cell from source plus changes and rebuild the resident
--- detail of the cell's column from the new authority. Removing air changes
--- nothing. Total: it returns a typed refusal and builds no partial value.
-prepareRemoval ∷ ChangeLimits → Source → Changes → Palette → Resident → TileCoord → Either String Prepared
-prepareRemoval limits source changes palette resident tile = do
+-- | Remove a whole cell from source plus changes. Removing air changes nothing.
+-- Total: it returns a typed refusal and builds no partial value.
+prepareRemoval ∷ ChangeLimits → Source → Changes → TileCoord → Either String Prepared
+prepareRemoval limits source changes tile = do
   outcome ← either (Left . show) Right (removeCell limits source tile changes)
   if not (removeChanged outcome)
-    then Right (Prepared False changes palette resident emptyChanges 0 0)
+    then Right (Prepared False changes emptyChanges 0)
     else do
       let TileCoord x y z = tile
           column = Column x y
@@ -136,22 +137,32 @@ prepareRemoval limits source changes palette resident tile = do
       range ← either (Left . show) Right (mkZRange level (level + 1))
       working ← either (Left . show) Right (changesFromIntervals limits [(column, range)])
       let changes' = removeResult outcome
-          bytesOf r = let (_, payload, metadata) = columnsSegmentStats r [column] in payload + metadata
-          before = bytesOf resident
-      (palette', resident') ←
-        either (Left . show) Right (materialize (fromInteger regionLevelsInteger) source changes' palette resident column range)
-      let after = bytesOf resident'
-          grown = fromIntegral (changesBytes changes' - changesBytes changes)
+          before = changesBytes changes
+          after = changesBytes changes'
       Right
         Prepared
           { preparedChanged = True
           , preparedChanges = changes'
-          , preparedPalette = palette'
-          , preparedResident = resident'
           , preparedWorking = working
-          , preparedRetained = grown
-          , preparedGrowth = if after > before then after - before else 0
+          , preparedRetained = if after > before then fromIntegral (after - before) else 0
           }
+
+-- | Rebuild the resident detail of a removed cell's column from the new
+-- authority, over the residency as it is now, and measure what the rebuilt
+-- segment accounts beyond the old one. Bounded (one cell, at most one vertical
+-- region) and pure.
+rebuildCell ∷ Source → Changes → Palette → Resident → TileCoord → Either String (Palette, Resident, Word64)
+rebuildCell source changes' palette resident tile = do
+  let TileCoord x y z = tile
+      column = Column x y
+      level = toInteger (axisValue z)
+      bytesOf r = let (_, payload, metadata) = columnsSegmentStats r [column] in payload + metadata
+  range ← either (Left . show) Right (mkZRange level (level + 1))
+  (palette', resident') ←
+    either (Left . show) Right (materialize (fromInteger regionLevelsInteger) source changes' palette resident column range)
+  let before = bytesOf resident
+      after = bytesOf resident'
+  Right (palette', resident', if after > before then after - before else 0)
 
 -- | Keep only the resident detail inside the given regions. The result shares no
 -- unaccounted detail with the original: a snapshot built from it holds exactly

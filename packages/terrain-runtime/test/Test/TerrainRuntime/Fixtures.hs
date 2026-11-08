@@ -7,6 +7,7 @@ module Test.TerrainRuntime.Fixtures
   ( -- * Services
     withService
   , withServiceUsing
+  , withServiceLogged
   , quiet
   , soilOverStone
   , tile
@@ -81,8 +82,12 @@ withService ∷ Config → (Service → IO a) → IO a
 withService config = withServiceUsing config alwaysAdmitting noProbe
 
 withServiceUsing ∷ Config → SessionAdmission → Probe → (Service → IO a) → IO a
-withServiceUsing config admission probe body =
-  withWorkerGroup $ \group → withTerrainService config (Ports admission (standaloneSupervisor group) quiet probe) body
+withServiceUsing = withServiceLogged quiet
+
+-- | A service whose logger is the given one.
+withServiceLogged ∷ Logger → Config → SessionAdmission → Probe → (Service → IO a) → IO a
+withServiceLogged logger config admission probe body =
+  withWorkerGroup $ \group → withTerrainService config (Ports admission (standaloneSupervisor group) logger probe) body
 
 -- | Stone below level -3, soil from -3 to 40: cells of the first two vertical
 -- regions are solid, the rest air.
@@ -205,7 +210,7 @@ seenAtSettle host = reverse <$> readTVarIO (hostSeen host)
 -- and a staging bank twice its minimum. The edit bank is a parameter. Queries
 -- name at most four regions, holds two and camera descriptions four.
 tightConfig ∷ (Integer, Integer, Integer) → Integer → Integer → Config
-tightConfig (ex, ey, ez) spare edit = defaultConfig {configLimits = limits}
+tightConfig (ex, ey, ez) spare edit = defaultConfig {configLimits = limits, configSnapshotBytes = 600}
   where
     spec bytes staging =
       LimitsSpec

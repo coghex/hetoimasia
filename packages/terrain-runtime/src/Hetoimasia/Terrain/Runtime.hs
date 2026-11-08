@@ -24,6 +24,7 @@ module Hetoimasia.Terrain.Runtime
   ( -- * The service
     Service
   , Config (..)
+  , ConfigError (..)
   , defaultConfig
   , Ports (..)
   , SessionAdmission (..)
@@ -95,26 +96,29 @@ module Hetoimasia.Terrain.Runtime
   , inspectModel
   , inspectModelSTM
   , inspectDefects
+  , inspectSnapshotBytes
   , inspectArena
   , inspectArenaSTM
   , ArenaView (..)
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (Exception, SomeException, finally, throwIO, try)
+import Control.Exception (Exception, ExceptionWithContext, SomeAsyncException, SomeException, mask, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (when)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Unique (newUnique)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Resource (withResource)
-import Hetoimasia.Foundation.Worker (StartOutcome (..), WorkerGroup, requestStop, startWorker)
+import Hetoimasia.Foundation.Worker (StartOutcome (..), WorkerGroup, awaitCompletion, requestStop, startWorker)
 import Hetoimasia.Terrain.Cell (Column, ZRange)
 import Hetoimasia.Terrain.Changes (Changes)
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord)
 import Hetoimasia.Terrain.Query (defaultQueryLimits)
 import qualified Hetoimasia.Terrain.Residency as R
+import Data.Word (Word64)
 import Hetoimasia.Terrain.Residency (ArenaId, Model, RegionDemand, Revision)
+import Hetoimasia.Terrain.Palette (Palette)
 import Hetoimasia.Terrain.Resident (Resident)
 import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Owner (ownerDefinition)
@@ -136,6 +140,7 @@ defaultConfig =
     , configQueryLimits = defaultQueryLimits
     , configFirstIdentity = 0
     , configFirstRevision = 0
+    , configSnapshotBytes = 16 * 1024 * 1024
     }
 
 -- | What the service borrows. Each is narrow: the parent session's admission as
@@ -164,7 +169,7 @@ instance Exception OwnerNotStarted
 standaloneSupervisor ∷ WorkerGroup → Supervisor
 standaloneSupervisor group = Supervisor $ \definition →
   startWorker group definition >>= \case
-    Started worker → pure (OwnerControl (atomically (requestStop worker)))
+    Started worker → pure (OwnerControl (atomically (requestStop worker)) (() <$ awaitCompletion worker))
     StartupFailed _ _ → throwIO OwnerNotStarted
     StartRejected _ → throwIO OwnerNotStarted
 
@@ -184,21 +189,39 @@ withTerrainService config ports body =
         atomically (modifySt svc (\st → st {stateOwner = OwnerStopped}))
         throwIO failure
       Right control → pure control
-    body svc `finally` drain svc owner
+    -- The body runs to its end or its failure; the drain then runs whatever
+    -- happened, and survives a cancellation delivered while it waits: it keeps
+    -- waiting and delivers the cancellation afterwards. The body's own failure,
+    -- with its context, is the one that propagates.
+    mask $ \restore → do
+      outcome <- tryWithContext (restore (body svc))
+      late <- drain svc owner
+      case outcome of
+        Right result → maybe (pure result) throwIO late
+        Left primary → rethrowIO (primary ∷ ExceptionWithContext SomeException)
   where
     acquire = do
       tag <- newUnique
-      var <- newTVarIO (initialState config)
+      limits <- either (throwIO . ConfigError) pure (modelLimitsFor config)
+      var <- newTVarIO (initialState config limits)
       pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports))
-    -- Close admission, ask the owner to stop, and wait until it has: it stops
-    -- only once the service is closed, nothing is left to settle and no
-    -- borrower is outstanding.
+    -- Close admission, ask the owner to stop, and wait for both proofs: the
+    -- owner's worker has published its terminal outcome, and no borrower is
+    -- outstanding. There is no deadline and no detach. An asynchronous exception
+    -- received while waiting is remembered, not obeyed, and returned.
     drain svc owner = do
       atomically (closeServiceSTM svc)
       stopOwner owner
-      atomically $ do
-        st <- readSt svc
-        check (stateOwner st == OwnerStopped)
+      wait Nothing
+      where
+        retired = do
+          awaitOwnerEnd owner
+          st <- readSt svc
+          check (stateBorrowers st == 0)
+        wait late =
+          try (atomically retired) >>= \case
+            Right () → pure late
+            Left (interruption ∷ SomeAsyncException) → wait (maybe (Just interruption) Just late)
 
 -- | Wait until the owner has ended, however it ended. There is no deadline.
 awaitOwnerStopped ∷ Service → IO ()
@@ -336,6 +359,12 @@ inspectModelSTM svc = stateModel <$> readSt svc
 inspectDefects ∷ Service → IO [Defect]
 inspectDefects svc = stateDefects <$> readTVarIO (serviceState svc)
 
+-- | The accounted backing bytes of every outstanding snapshot, and the bank.
+inspectSnapshotBytes ∷ Service → IO (Word64, Word64)
+inspectSnapshotBytes svc = do
+  st <- readTVarIO (serviceState svc)
+  pure (sum (Map.elems (stateSnapshots st)), configSnapshotBytes (serviceConfig svc))
+
 -- | A read-only view of an arena's contents.
 data ArenaView = ArenaView
   { viewIncarnation ∷ !ArenaId
@@ -343,6 +372,7 @@ data ArenaView = ArenaView
   , viewGeneration ∷ !Word
   , viewChanges ∷ !Changes
   , viewResident ∷ !Resident
+  , viewPalette ∷ !Palette
   , -- | The retained store: changes whose transfer succeeded.
     viewStore ∷ !Changes
   , -- | The regions whose changes are committed but not yet transferred.
@@ -359,6 +389,6 @@ inspectArenaSTM svc lease = do
   st <- readSt svc
   pure $ case leaseOf svc lease st of
     Right (_, ls) →
-      (\a → ArenaView (leaseArena ls) (arenaRevision a) (fromIntegral (arenaGeneration a)) (arenaChanges a) (arenaResident a) (arenaStore a) (Map.keys (arenaWorking a)))
+      (\a → ArenaView (leaseArena ls) (arenaRevision a) (fromIntegral (arenaGeneration a)) (arenaChanges a) (arenaResident a) (arenaPalette a) (arenaStore a) (Map.keys (arenaWorking a)))
         <$> Map.lookup (leaseArena ls) (stateArenas st)
     Left _ → Nothing

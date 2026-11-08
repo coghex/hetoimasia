@@ -34,6 +34,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
 
     -- * Configuration and ports
   , Config (..)
+  , ConfigError (..)
   , SessionAdmission (..)
   , Supervisor (..)
   , OwnerControl (..)
@@ -84,6 +85,8 @@ import Hetoimasia.Terrain.Query (Occupied, QueryError, QueryLimits, Run)
 import Hetoimasia.Terrain.Residency
   ( ArenaId (..)
   , BusyReason
+  , HoldId
+  , LimitError
   , Limits
   , Model
   , RegionDemand
@@ -245,6 +248,7 @@ data BusyWhy
   | BusyArenas
   | BusyLeases
   | BusyViews
+  | BusySnapshots
   deriving stock (Eq, Show)
 
 -- | What a cancellation found.
@@ -278,7 +282,20 @@ data Config = Config
     configFirstIdentity ∷ !Word64
   , -- | The content revision a new arena starts at, likewise for exhaustion tests.
     configFirstRevision ∷ !Word64
+  , -- | The CPU snapshot backing bank, in accounted bytes, carved out of the
+    -- configured staging bank: the accounting model is built with the rest. Every
+    -- outstanding snapshot is charged its own restricted backing against it until
+    -- its last borrower releases it, so retained old versions of an edited region
+    -- stay accounted.
+    configSnapshotBytes ∷ !Word64
   }
+
+-- | The configuration cannot be built: the limits, with the snapshot bank taken
+-- out of the staging bank, do not satisfy the residency model's minimum budgets.
+newtype ConfigError = ConfigError LimitError
+  deriving stock (Show)
+
+instance Exception ConfigError
 
 -- | The parent session's admission, readable inside the arbitration.
 newtype SessionAdmission = SessionAdmission
@@ -295,8 +312,11 @@ newtype Supervisor = Supervisor
 -- | What the service may do to the owner it started: ask it to stop. The owner
 -- stops only when asked, so that its orderly return after the service closed is
 -- never mistaken for an unexpected exit of a supervised service.
-newtype OwnerControl = OwnerControl
+data OwnerControl = OwnerControl
   { stopOwner ∷ IO ()
+  , -- | Succeeds only once the owner's worker has published its terminal
+    -- outcome: the proof that nothing of the owner is still running.
+    awaitOwnerEnd ∷ STM ()
   }
 
 -- | Controlled gates and fault points on the owner thread, called outside any
@@ -464,6 +484,8 @@ data St = St
   , stateVictims ∷ !(Seq RegionKey)
   , stateViews ∷ !(Map ViewId ViewRec)
   , stateBorrowers ∷ !Int
+  , -- | The accounted backing bytes each outstanding snapshot holds.
+    stateSnapshots ∷ !(Map HoldId Word64)
   , -- | Something that may free capacity happened since the last retry pass.
     stateFreed ∷ !Bool
   , -- | A dispatch found nothing to run since the last time capacity freed.
@@ -474,12 +496,12 @@ data St = St
   , stateDefectCount ∷ !Word64
   }
 
-initialState ∷ Config → St
-initialState config =
+initialState ∷ Config → Limits → St
+initialState config limits =
   St
     { statePhase = Running
     , stateOwner = OwnerStarting
-    , stateModel = newModel (configLimits config)
+    , stateModel = newModel limits
     , stateNextClient = first
     , stateNextLease = first
     , stateNextRequest = first
@@ -496,6 +518,7 @@ initialState config =
     , stateVictims = Seq.empty
     , stateViews = Map.empty
     , stateBorrowers = 0
+    , stateSnapshots = Map.empty
     , stateFreed = False
     , stateDispatchIdle = False
     , stateTransfers = Map.empty
