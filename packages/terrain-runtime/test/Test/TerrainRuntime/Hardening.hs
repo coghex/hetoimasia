@@ -153,27 +153,31 @@ spec = describe "Accounting and lifetime hardening" $ do
       inspectInvariants svc >>= (`shouldBe` [])
 
   it "charges every outstanding snapshot's backing, across revisions, until it is released" $ do
-    let config = (tightConfig (2, 1, 2) 2 4096) {configSnapshotBytes = 100}
+    -- A one-cell region's backing is 82 accounted bytes; an edit's untaken result 160.
+    -- The bank holds three snapshots and the edits between them, not a fourth.
+    let config = (tightConfig (2, 1, 2) 2 4096) {configRetainedBytes = 325}
     withService config $ \svc → do
       (_, lease) <- openMain svc "main"
       let (held, _) = decomposeTile (tile 0 0 0)
+          borrow k = withSnapshot svc lease [held] k
       _ <- readCell svc lease (tile 0 0 0)
-      outcome <- withSnapshot svc lease [held] $ \first' → do
-        (oneVersion, bank) <- inspectSnapshotBytes svc
-        bank `shouldBe` 100
-        oneVersion `shouldSatisfy` (> 0)
+      outcome <- borrow $ \first' → do
+        inspectRetained svc >>= (`shouldBe` (82, 325))
         removeCell' svc lease (tile 0 0 0) >>= (`shouldSatisfy` removeChangedFlag)
-        -- A second borrow, now of revision 1, would retain a second version
-        -- beside the first: refused, not silently retained.
-        second <- withSnapshot svc lease [held] (\_ → pure ())
-        second `shouldBe` Left (RefusedBusy BusySnapshots)
-        snapshotRevision first' `shouldBe` Revision 0
-        inspectSnapshotBytes svc >>= (`shouldBe` (oneVersion, 100))
+        _ <- borrow $ \second → do
+          inspectRetained svc >>= (`shouldBe` (164, 325))
+          removeCell' svc lease (tile 1 0 0) >>= (`shouldSatisfy` removeChangedFlag)
+          _ <- borrow $ \third → do
+            inspectRetained svc >>= (`shouldBe` (246, 325))
+            -- A fourth borrow would retain a further version beside three: refused.
+            fourth <- borrow (\_ → pure ())
+            fourth `shouldBe` Left (RefusedBusy BusyRetained)
+            map snapshotRevision [first', second, third] `shouldBe` [Revision 0, Revision 1, Revision 2]
+          pure ()
+        pure ()
       outcome `shouldBe` Right ()
-      -- Released: the backing is returned and the new revision can be borrowed.
-      inspectSnapshotBytes svc >>= (`shouldBe` (0, 100))
-      third <- withSnapshot svc lease [held] $ \s → pure (snapshotRevision s)
-      third `shouldBe` Right (Revision 1)
+      -- Everything released: nothing is charged.
+      inspectRetained svc >>= (`shouldBe` (0, 325))
       settleChecks svc
 
   it "does not return while a borrower holds a snapshot after the owner failed" $ do
@@ -362,6 +366,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     chronological <- reverse <$> readMVar events
     chronological `shouldBe` ["owner log done", "service returned"]
   where
+    inspectRetained svc = inspectSnapshotBytes svc
     killIt thread = killThread thread
     errorIt thread = throwTo thread (ErrorCall "delivered asynchronously")
     isBusy = \case RefusedBusy _ → True; _ → False

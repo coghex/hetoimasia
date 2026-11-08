@@ -28,7 +28,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Owner
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (SomeAsyncException, SomeException, finally, fromException, throwIO, try, uninterruptibleMask_)
+import Control.Exception (SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (forM, forM_, void, when)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
@@ -38,7 +38,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (Component, logError, logInfo, unsafeComponent)
-import Hetoimasia.Foundation.Resource (Scoped)
+import Hetoimasia.Foundation.Resource (Scoped, composeCleanup)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, stopRequested, workerDefinition)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesBytes, emptyChanges, mergeChanges)
 import Hetoimasia.Terrain.Coordinate (RegionCoord, decomposeTile)
@@ -64,31 +64,29 @@ ownerDefinition svc =
   workerDefinition "terrain.runtime.owner" (\_ → pure () ∷ Scoped ()) $ \token () → ownerMain svc token
 
 ownerMain ∷ Service → StopToken → IO ()
-ownerMain svc token =
+ownerMain svc token = mask $ \restore → do
   -- The cleanup covers the owner's whole execution, startup logging included, and
   -- is the last thing it does: nothing of the owner runs after it publishes that
   -- it stopped, so a logger is never used after the service has returned.
-  ( do
+  outcome <-
+    tryWithContext @SomeException . restore $ do
       atomically (modifySt svc (\st → st {stateOwner = OwnerRunning}))
       logInfo logger terrainComponent "terrain owner started" []
       loop
       logInfo logger terrainComponent "terrain owner stopped" []
-  )
-    `finally` uninterruptibleMask_ (atomically terminal)
-    >> reportUnreported
+  uninterruptibleMask_ (atomically terminal)
+  -- Whatever the owner ended with, any defect the cleanup recorded (a host
+  -- callback that failed while every settlement was still being delivered) is
+  -- attached to it as cleanup evidence, or becomes the failure itself when the
+  -- owner would have returned: supervision sees all of it.
+  pending <- atomically (takeUnreportedSTM svc)
+  evidence <- forM pending $ \defect →
+    tryWithContext @SomeException (throwIO defect) >>= \case
+      Left caught → pure ("terrain owner cleanup", caught)
+      Right () → throwIO (OwnerDefect "a defect was not thrown")
+  combined <- composeCleanup (either Just (const Nothing) outcome) evidence
+  forM_ combined rethrowIO
   where
-    -- A defect recorded while the owner was closing (a host callback that failed
-    -- during closure, after every settlement was still delivered) reaches
-    -- supervision as the owner's own failure, after the cleanup has committed.
-    reportUnreported = do
-      pending <- atomically $ do
-        st <- readSt svc
-        if stateDefectCount st > stateDefectsReported st
-          then do
-            writeTVar (serviceState svc) st {stateDefectsReported = stateDefectCount st}
-            pure (listToMaybe (reverse (stateDefects st)))
-          else pure Nothing
-      forM_ pending throwIO
     logger = serviceLogger svc
     loop = do
       work <- tryNonAsync (atomically (nextWork svc token)) >>= \case
@@ -97,7 +95,7 @@ ownerMain svc token =
           -- Choosing work reads every host's eligibility: a callback that throws
           -- is a provider defect, recorded, and the owner ends.
           let why = Text.pack ("eligibility callback failed: " <> show failure)
-          atomically (recordDefect svc (ProviderDefect why))
+          atomically (recordFatalDefect svc (ProviderDefect why))
           logError logger terrainComponent "provider defect" []
           throwIO (ProviderDefect why)
       continue <- perform svc work
@@ -146,12 +144,20 @@ nextWork svc token = do
           Nothing
             | closing && stateBorrowers st == 0 && stopping → pure WStop
             | otherwise →
-                pickRequestWork st >>= \case
-                  Just work → pure work
-                  Nothing
-                    | stateFreed st && retryUseful st → pure WRetry
-                    | not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model) → pure WDispatch
-                    | otherwise → retry
+                pickRequestWork st >>= \mWork → do
+                  -- Request work (staging, commits) and the rest (loads, retries) take
+                  -- turns whenever both are ready, so neither can starve the other
+                  -- under a continuous stream of the first; the model's own
+                  -- round-robin and aging then decide among loads.
+                  let others =
+                        [WRetry | stateFreed st && retryUseful st]
+                          <> [WDispatch | not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model)]
+                  case (mWork, others) of
+                    (Just work, other : _) | stateFavorOthers st → pure other
+                                           | otherwise → pure work
+                    (Just work, []) → pure work
+                    (Nothing, other : _) → pure other
+                    (Nothing, []) → retry
 
 retryUseful ∷ St → Bool
 retryUseful st = not (Map.null (stateViews st)) || any needsResubmit (Map.elems (stateRequests st))
@@ -239,20 +245,26 @@ perform svc = \case
     atomically (void (applyEvent svc (R.JobAcknowledged jid)) >> markFreed svc)
     pure True
   WHandoff aid region → handoff svc aid region >> pure True
-  WPrepare rid → prepareReq svc rid >> pure True
-  WCommit rid → commitReq svc rid >> pure True
-  WRetry → retryPass svc >> pure True
-  WDispatch → dispatchJob svc >> pure True
+  WPrepare rid → favorOthers svc True >> prepareReq svc rid >> pure True
+  WCommit rid → favorOthers svc True >> commitReq svc rid >> pure True
+  WRetry → favorOthers svc False >> retryPass svc >> pure True
+  WDispatch → favorOthers svc False >> dispatchJob svc >> pure True
   WReport → do
     -- A defect was recorded where nothing could throw (a host callback that failed
     -- inside a closing transaction). The cleanup is committed; now the owner ends
     -- with it, so supervision sees it.
-    first' <- atomically $ do
-      st <- readSt svc
-      writeTVar (serviceState svc) st {stateDefectsReported = stateDefectCount st}
-      pure (listToMaybe (reverse (stateDefects st)))
-    forM_ first' throwIO
+    pending <- atomically (takeUnreportedSTM svc)
+    evidence <- forM pending $ \defect →
+      tryWithContext @SomeException (throwIO defect) >>= \case
+        Left caught → pure ("terrain owner defect", caught)
+        Right () → throwIO (OwnerDefect "a defect was not thrown")
+    combined <- composeCleanup Nothing evidence
+    forM_ combined rethrowIO
     pure True
+
+-- | Record whose turn is next: request work, or loads and retries.
+favorOthers ∷ Service → Bool → IO ()
+favorOthers svc value = atomically (modifySt svc (\st → st {stateFavorOthers = value}))
 
 probe ∷ Service → Point → IO ()
 probe svc = probePoint (serviceProbe svc)
@@ -376,7 +388,7 @@ finishJob svc jid aid result = do
               | otherwise → pure Nothing
             Left refusal → do
               let why = Text.pack ("job completion refused: " <> show refusal)
-              recordDefect svc (AccountingDefect why)
+              recordFatalDefect svc (AccountingDefect why)
               pure (Just why)
   markFreed svc
   pure outcome
@@ -425,7 +437,7 @@ stage svc rid aid rev work =
     Right () → pure ()
     Left failure → do
       let why = Text.pack ("readiness callback failed: " <> show failure)
-      atomically (recordDefect svc (ProviderDefect why))
+      atomically (recordFatalDefect svc (ProviderDefect why))
       logError (serviceLogger svc) terrainComponent "provider defect" [("request", Text.pack (show rid))]
       throwIO (ProviderDefect why)
   where
@@ -454,7 +466,7 @@ commitReq svc rid = do
     Right (CommitDefect why) → do
       -- The model refused something a valid commit reported: the previous state
       -- was kept, the request fails, and the defect reaches supervision.
-      atomically (terminate svc rid (Failed (HostFailure why)) >> recordDefect svc (AccountingDefect why))
+      atomically (terminate svc rid (Failed (HostFailure why)) >> recordFatalDefect svc (AccountingDefect why))
       logError (serviceLogger svc) terrainComponent "accounting defect" [("request", Text.pack (show rid))]
       throwIO (AccountingDefect why)
     Right CommitWaiting → pure ()
@@ -466,7 +478,7 @@ commitReq svc rid = do
       atomically $ do
         st <- readSt svc
         forM_ (Map.lookup rid (stateRequests st)) (releaseReq svc rid)
-        recordDefect svc (ProviderDefect why)
+        recordFatalDefect svc (ProviderDefect why)
       logError (serviceLogger svc) terrainComponent "provider defect" [("request", Text.pack (show rid))]
       throwIO (ProviderDefect why)
 

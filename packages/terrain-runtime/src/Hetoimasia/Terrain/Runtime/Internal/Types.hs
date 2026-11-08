@@ -248,7 +248,7 @@ data BusyWhy
   | BusyArenas
   | BusyLeases
   | BusyViews
-  | BusySnapshots
+  | BusyRetained
   deriving stock (Eq, Show)
 
 -- | What a cancellation found.
@@ -287,7 +287,7 @@ data Config = Config
     -- outstanding snapshot is charged its own restricted backing against it until
     -- its last borrower releases it, so retained old versions of an edited region
     -- stay accounted.
-    configSnapshotBytes ∷ !Word64
+    configRetainedBytes ∷ !Word64
   }
 
 -- | The configuration cannot be built: the limits, with the snapshot bank taken
@@ -496,6 +496,8 @@ data St = St
   , stateDefectCount ∷ !Word64
   , -- | How many of those the owner has reported by ending (so that supervision sees them).
     stateDefectsReported ∷ !Word64
+  , -- | The owner's last quantum was request work: the next one goes to a load or a retry.
+    stateFavorOthers ∷ !Bool
   }
 
 initialState ∷ Config → Limits → St
@@ -527,6 +529,7 @@ initialState config limits =
     , stateDefects = []
     , stateDefectCount = 0
     , stateDefectsReported = 0
+    , stateFavorOthers = False
     }
   where
     first = configFirstIdentity config

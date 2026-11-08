@@ -140,7 +140,7 @@ defaultConfig =
     , configQueryLimits = defaultQueryLimits
     , configFirstIdentity = 0
     , configFirstRevision = 0
-    , configSnapshotBytes = 16 * 1024 * 1024
+    , configRetainedBytes = 16 * 1024 * 1024
     }
 
 -- | What the service borrows. Each is narrow: the parent session's admission as
@@ -349,7 +349,7 @@ withSnapshot svc lease regions body =
 -- | Every structural rule tying the request table, leases, names, arenas and
 -- holds to the accounting model; empty when coherent.
 inspectInvariants ∷ Service → IO [String]
-inspectInvariants svc = invariants (configSnapshotBytes (serviceConfig svc)) <$> readTVarIO (serviceState svc)
+inspectInvariants svc = invariants (configRetainedBytes (serviceConfig svc)) <$> readTVarIO (serviceState svc)
 
 -- | The accounting model as it is now.
 inspectModel ∷ Service → IO Model
@@ -363,11 +363,12 @@ inspectModelSTM svc = stateModel <$> readSt svc
 inspectDefects ∷ Service → IO [Defect]
 inspectDefects svc = stateDefects <$> readTVarIO (serviceState svc)
 
--- | The accounted backing bytes of every outstanding snapshot, and the bank.
+-- | The accounted bytes the retained bank holds (outstanding snapshots' backing and
+-- untaken removal results), and the bank.
 inspectSnapshotBytes ∷ Service → IO (Word64, Word64)
 inspectSnapshotBytes svc = do
   st <- readTVarIO (serviceState svc)
-  pure (sum (Map.elems (stateSnapshots st)), configSnapshotBytes (serviceConfig svc))
+  pure (retainedBankUse st, configRetainedBytes (serviceConfig svc))
 
 -- | A read-only view of an arena's contents.
 data ArenaView = ArenaView

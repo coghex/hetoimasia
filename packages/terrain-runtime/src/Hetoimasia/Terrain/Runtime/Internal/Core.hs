@@ -21,6 +21,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , modifySt
   , applyEvent
   , recordDefect
+  , recordFatalDefect
+  , takeUnreportedSTM
   , markFreed
 
     -- * Authorities
@@ -60,6 +62,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
     -- * Invariants
   , invariants
   , bumpGeneration
+  , retainedBankUse
   , retireInFlightSTM
   , modelLimitsFor
   ) where
@@ -142,6 +145,21 @@ freesCapacity = \case
   R.HandoffFailed {} → True
   R.RemovalCommitted {} → True
   _ → False
+
+-- | Record a defect that the caller is about to throw itself: it is counted as
+-- reported, so the owner does not report it a second time as cleanup evidence.
+recordFatalDefect ∷ Service → Defect → STM ()
+recordFatalDefect svc defect = do
+  recordDefect svc defect
+  modifySt svc (\st → st {stateDefectsReported = stateDefectCount st})
+
+-- | The defects recorded and not yet reported, oldest first, now marked reported.
+takeUnreportedSTM ∷ Service → STM [Defect]
+takeUnreportedSTM svc = do
+  st <- readSt svc
+  let unreported = fromIntegral (stateDefectCount st - stateDefectsReported st) ∷ Int
+  writeTVar (serviceState svc) st {stateDefectsReported = stateDefectCount st}
+  pure (reverse (take unreported (stateDefects st)))
 
 -- | Keep a bounded record of an unexpected defect.
 recordDefect ∷ Service → Defect → STM ()
@@ -271,6 +289,17 @@ countReqs ∷ (Req → Bool) → St → Int
 countReqs p st = Map.size (Map.filter p (stateRequests st))
 
 -- | The removals admitted for an arena and not yet settled.
+-- | Accounted bytes a settled removal result holds in the retained bank until it is
+-- taken: the request, its endpoint and its demand are kept (the size of a one-region
+-- command record).
+resultRecordBytes ∷ Word64
+resultRecordBytes = 160
+
+-- | Bytes the retained bank holds: outstanding snapshots' backing and untaken
+-- results.
+retainedBankUse ∷ St → Word64
+retainedBankUse st = sum (Map.elems (stateSnapshots st)) + resultRecordBytes * fromIntegral (retainedResults st)
+
 -- | Settled results the model no longer records but their holder has not taken.
 retainedResults ∷ St → Int
 retainedResults = countReqs (\req → isDone req && not (reqModel req))
@@ -339,7 +368,7 @@ decide svc st rid = \case
       | revisionExhausted aid arena → pure (Left (ShortRefused RefusedExhausted))
       | otherwise → do
           let cmd = CRemove tile precondition
-          outcome <- slotRefusal >>= \case
+          outcome <- slotRefusal True >>= \case
             Just refusal → pure (Left refusal)
             Nothing → applyEvent svc (R.SubmitRemoval rid aid (arenaRevision arena) tile)
           pure $ case outcome of
@@ -350,11 +379,18 @@ decide svc st rid = \case
     -- A settled result that has not been taken occupies a command slot until it is
     -- (a removal's result no longer has a model record, so it is counted here):
     -- admission is busy once accepted commands and untaken results fill the slots.
-    slotRefusal = do
+    slotRefusal producesResult = do
       let model = stateModel st
           limit = R.limitSlot (R.modelLimits model) R.CommandSlot
           held = R.slotInUse model R.CommandSlot + fromIntegral (retainedResults st)
-      pure (if held >= limit then Just (R.Busy (R.SlotFull R.CommandSlot limit held 1)) else Nothing)
+      pure
+        ( if held >= limit
+            then Just (R.Busy (R.SlotFull R.CommandSlot limit held 1))
+            else
+              if producesResult && retainedBankUse st + resultRecordBytes > configRetainedBytes config
+                then Just (R.Busy (R.BankFull R.StagingBank (configRetainedBytes config) (retainedBankUse st) resultRecordBytes))
+                else Nothing
+        )
     leaseUse = Map.size (stateLeases st) + countReqs isAcquisition st
     first' f = either (Left . f) Right
     -- A name is held in the name map, so it is bounded: nonempty, 256 characters.
@@ -380,7 +416,7 @@ decide svc st rid = \case
       Right (lid, ls, aid, arena) → case demandFor arena cmd of
         Left why → pure (Left (ShortFailed (SourceFailure (Text.pack why))))
         Right demands → do
-          outcome <- slotRefusal >>= \case
+          outcome <- slotRefusal False >>= \case
             Just refusal → pure (Left refusal)
             Nothing → applyEvent svc (R.SubmitQuery rid aid (arenaRevision arena) demands)
           pure $ case outcome of
@@ -630,12 +666,12 @@ acquireSnapshotSTM svc lease regions =
                       }
                   stats = residentStats (snapResident snapshot)
                   backing = fromIntegral (statPayloadBytes stats + statMetadataBytes stats) ∷ Word64
-                  outstanding = sum (Map.elems (stateSnapshots st))
+                  outstanding = retainedBankUse st
               -- Backing is charged conservatively per snapshot (a version two
               -- snapshots share is counted for each) and refused, before the model
               -- is touched, when the snapshot bank cannot hold it.
-              if backing > configSnapshotBytes (serviceConfig svc) - min (configSnapshotBytes (serviceConfig svc)) outstanding
-                then pure (Left (RefusedBusy BusySnapshots))
+              if backing > configRetainedBytes (serviceConfig svc) - min (configRetainedBytes (serviceConfig svc)) outstanding
+                then pure (Left (RefusedBusy BusyRetained))
                 else do
                   outcome <- applyEvent svc (R.AcquireHold (HoldId hid) (leaseArena ls) R.Borrow regions)
                   case outcome of
@@ -689,8 +725,8 @@ invariants snapshotBank st =
     <> [ "snapshot ledger " <> show (Map.keys (stateSnapshots st)) <> " disagrees with the model's borrows"
        | Set.fromList (Map.keys (stateSnapshots st)) /= Set.fromList [h | (h, _, R.Borrow, _) <- R.modelHolds model]
        ]
-    <> [ "snapshot ledger holds " <> show (sum (Map.elems (stateSnapshots st))) <> " beyond its bank"
-       | sum (Map.elems (stateSnapshots st)) > snapshotBank
+    <> [ "retained bank holds " <> show (retainedBankUse st) <> " beyond its limit " <> show snapshotBank
+       | retainedBankUse st > snapshotBank
        ]
     <> [ "borrowers " <> show (stateBorrowers st) <> " but the model holds " <> show borrows
        | stateBorrowers st /= borrows
@@ -710,7 +746,7 @@ modelLimitsFor config =
     R.LimitsSpec
       { R.specResidentBytes = bytes R.ResidentBank
       , R.specEditBytes = bytes R.EditBank
-      , R.specStagingBytes = bytes R.StagingBank - toInteger (configSnapshotBytes config)
+      , R.specStagingBytes = bytes R.StagingBank - toInteger (configRetainedBytes config)
       , R.specLoadJobs = slot R.LoadJobSlot
       , R.specQueuedCommands = slot R.CommandSlot
       , R.specPinsPerView = slot R.ViewPinSlot
