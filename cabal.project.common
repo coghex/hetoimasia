@@ -34,6 +34,12 @@ package hetoimasia-terrain
 package hetoimasia-terrain-render-2d
   ghc-options: -Werror -j
 
+-- The scoped transactional terrain service (TRA-4) is held to the same policy.
+-- It needs no GLFW or Vulkan, so both `cabal.project` and `cabal.project.cpu`
+-- list it.
+package hetoimasia-terrain-runtime
+  ghc-options: -Werror -j
+
 package hetoimasia-asset
   ghc-options: -Werror -j
 

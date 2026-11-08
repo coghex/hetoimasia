@@ -1,0 +1,81 @@
+cabal-version: 3.16
+name: hetoimasia-terrain-runtime
+version: 0.1.0.0
+synopsis: The scoped transactional terrain service for Hetoimasia
+description:
+    The terrain arena's service (TRA-4): one dedicated owner thread that is
+    the sole writer of arena contents, bounded asynchronous loading and eviction
+    that execute the residency model's decisions against real resident detail,
+    atomic whole-cell removal that commits its content, revision and successful
+    settlement in one arbitration with cancellation and the parent session's
+    admission, immutable borrowed snapshots, offload and reload from the
+    immutable source plus canonical retained removals, and an orderly close. It
+    depends on the pure terrain package and the foundation and runtime services;
+    it has no Lua, window, renderer, GPU, native or game dependency.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/terrain-runtime
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Terrain.Runtime
+        Hetoimasia.Terrain.Runtime.Settlement
+        Hetoimasia.Terrain.Runtime.Supervised
+    -- The state, the transactions and the owner behind the public interface; a
+    -- client cannot import them.
+    other-modules:
+        Hetoimasia.Terrain.Runtime.Internal.Content
+        Hetoimasia.Terrain.Runtime.Internal.Core
+        Hetoimasia.Terrain.Runtime.Internal.Owner
+        Hetoimasia.Terrain.Runtime.Internal.Snapshot
+        Hetoimasia.Terrain.Runtime.Internal.Types
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0
+
+-- This package's own contracts, registered as the CPU validation group
+-- `test.terrain-runtime`. The suite drives the production service with
+-- controlled gates and no timing sleep; every thread it starts is owned through
+-- `Test.Support.Owned`.
+test-suite terrain-runtime-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    ghc-options: -threaded -rtsopts
+    other-modules:
+        Test.TerrainRuntime.Basic
+        Test.TerrainRuntime.Fixtures
+        Test.TerrainRuntime.Spec
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        hspec >=2.11 && <3,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-runtime ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0
