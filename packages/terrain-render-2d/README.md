@@ -596,7 +596,11 @@ demand: once per column that has something hidden for x, and per hidden level fo
 omitted only where both hold; elsewhere it is drawn. The y verdicts are cached
 (`clProofs` entries at most, 4,096 by default, zero keeps none), so `startCells` does
 no per-view work and the retained scratch is bounded whatever the viewport or margin;
-the cache changes the work, never the plan. Runs, not levels, are walked,
+the cache changes the work, never the plan. The proof work of a step is bounded by
+what the step already bounds: at most `clStepCandidates` columns, each with a
+window of at most 251 levels (the 250-level band and its top), and three rectangle
+computations per level examined; it is not charged to `clStepLevels`, which counts the
+cells and pending spans a step admits. Runs, not levels, are walked,
 so cost follows run boundaries and exposed cells, not depth, and a column's
 knowledge runs are searched by interval, so a window never visits runs outside it.
 
