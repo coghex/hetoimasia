@@ -208,9 +208,11 @@ registerClientSTM ∷ Service → STM (Either Refused Client)
 registerClientSTM svc =
   admitting svc >>= \case
     Left refused → pure (Left refused)
-    Right st → case allocate (stateNextClient st) of
-      Left refused → pure (Left refused)
-      Right cid → do
+    Right st
+      | Map.size (stateClients st) >= configMaxClients (serviceConfig svc) → pure (Left (RefusedBusy BusyClients))
+      | otherwise → case allocate (stateNextClient st) of
+       Left refused → pure (Left refused)
+       Right cid → do
         writeTVar (serviceState svc) st {stateNextClient = cid + 1, stateClients = Map.insert cid (ClientRec Set.empty Set.empty) (stateClients st)}
         pure (Right (Client (serviceTag svc) cid))
 

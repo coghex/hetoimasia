@@ -136,6 +136,7 @@ defaultConfig =
     , configMaxArenas = 4
     , configMaxLeases = 64
     , configMaxViews = 8
+    , configMaxClients = 256
     , configSourceLimits = defaultSourceLimits
     , configQueryLimits = defaultQueryLimits
     , configFirstIdentity = 0

@@ -354,6 +354,105 @@ spec = describe "Accounting and lifetime hardening" $ do
       inspectSnapshotBytes svc >>= (`shouldBe` (0, 330))
       settleChecks svc
 
+  it "reserves a removal's result bytes at admission, so pending removals and snapshots cannot overfill the retained bank" $
+    withService (defaultConfig {configRetainedBytes = 330}) $ \svc → do
+      (_, lease) <- openMain svc "main"
+      h1 <- newHost False
+      h2 <- newHost False
+      h3 <- newHost False
+      let air (x, y, z) host = removeWith svc (hostEndpoint svc Nothing host) lease (tile x y z) Nothing
+      -- Two delayed removals reserve 320 bytes; a third does not fit.
+      r1 <- okOf (air (1, 1, 100) h1)
+      r2 <- okOf (air (1, 1, 101) h2)
+      air (1, 1, 102) h3 >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True
+      inspectSnapshotBytes svc >>= (`shouldBe` (320, 330))
+      -- A snapshot cannot take space promised to them.
+      let (held, _) = decomposeTile (tile 1 1 100)
+      _ <- readCell svc lease (tile 1 1 100)
+      withSnapshot svc lease [held] (\_ → pure ()) >>= (`shouldBe` Left (RefusedBusy BusyRetained))
+      -- Granting both settles them; the bank was never over its limit.
+      forM_ [h1, h2] grant
+      forM_ [h1, h2] $ \host → waitFor (readTVar (hostSettled host) >>= \x → check (not (null x)))
+      inspectInvariants svc >>= (`shouldBe` [])
+      inspectSnapshotBytes svc >>= (`shouldBe` (320, 330))
+      retire svc r1
+      retire svc r2
+      inspectSnapshotBytes svc >>= (`shouldBe` (0, 330))
+      settleChecks svc
+
+  it "charges pending opens and attaches against the command slots and the retained bank" $ do
+    -- Command slots: two, held by reads, leave none for an attachment.
+    withService (configWith (\limits → limits {specQueuedCommands = 2})) $ \svc → do
+      (_, lease) <- openMain svc "main"
+      other <- okOf (registerClient svc)
+      held1 <- newHost False
+      held2 <- newHost False
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing held1) lease (tile 0 0 0))
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing held2) lease (tile 1 0 0))
+      attachArena svc (other) "main" >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True
+      settleChecks svc
+    -- Delayed attachments hold a slot and a record each: only two fit two slots.
+    withService (configWith (\limits → limits {specQueuedCommands = 2})) $ \svc → do
+      (_, _) <- openMain svc "main"
+      other <- okOf (registerClient svc)
+      hosts <- mapM (const (newHost False)) [1 .. 8 ∷ Int]
+      results <- mapM (\host → attachArenaWith svc (hostEndpoint svc Nothing host) other "main") hosts
+      length [() | Right _ ← results] `shouldBe` 2
+      inspectInvariants svc >>= (`shouldBe` [])
+      forM_ hosts grant
+      settleChecks svc
+    -- And bytes: a 330-byte bank holds two records.
+    withService (defaultConfig {configRetainedBytes = 330}) $ \svc → do
+      (_, _) <- openMain svc "main"
+      other <- okOf (registerClient svc)
+      hosts <- mapM (const (newHost False)) [1 .. 5 ∷ Int]
+      results <- mapM (\host → attachArenaWith svc (hostEndpoint svc Nothing host) other "main") hosts
+      length [() | Right _ ← results] `shouldBe` 2
+      inspectSnapshotBytes svc >>= (`shouldBe` (320, 330))
+      forM_ hosts grant
+      settleChecks svc
+
+  it "bounds the registered clients" $
+    withService (defaultConfig {configMaxClients = 3}) $ \svc → do
+      clients <- mapM (const (registerClient svc)) [1 .. 5 ∷ Int]
+      length [() | Right _ ← clients] `shouldBe` 3
+      mapM_ (\r → refusedWith r `shouldSatisfy` \found → found == Nothing || found == Just (RefusedBusy BusyClients)) clients
+      forM_ [c | Right c ← clients] (endClient svc)
+      okOf (registerClient svc) >>= \_ → pure ()
+      settleChecks svc
+
+  it "reports an earlier unreported defect beside a later fatal one" $ do
+    gate <- newDisarmedGate
+    outcome <- try $
+      withLoggingLifetime quiet $ \lifetime →
+        withSupervision lifetime $ \control →
+          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet (gatedProbe (\p → case p of PointStaging _ → True; _ → False) gate)) (\svc → (do
+            (creatorA, leaseA) <- openMain svc "a"
+            (_, leaseB) <- openMain svc "b"
+            other <- okOf (registerClient svc)
+            attachedA <- okOf (attachArena svc other "a") >>= await svc >>= expectSuccess
+            badClosure <- newHost False
+            let failingClosure = (hostEndpoint svc Nothing badClosure) {endpointSettle = \_ → throwSTM (ErrorCall "closure callback failed")}
+            _ <- okOf (cellWith svc failingClosure attachedA (tile 1 1 1))
+            waitFor (readTVar (hostReady badClosure) >>= \n → check (n >= 1))
+            _ <- pure leaseA
+            armGate gate
+            badReady <- newHost True
+            let failingReady = (hostEndpoint svc Nothing badReady) {endpointReady = throwSTM (ErrorCall "readiness callback failed")}
+            _ <- okOf (removeWith svc failingReady leaseB (tile 1 1 1) Nothing)
+            awaitReached gate
+            -- With the owner held mid-preparation, arena A closes and its callback fails.
+            endClient svc creatorA
+            openGate gate
+            awaitOwnerStopped svc
+            checkRuntime control) `finally'` openGate gate)
+    case outcome of
+      Left failure → do
+        let texts = [show inner | f ← cleanupFailures failure, let ExceptionWithContext _ inner = cleanupFailureException f]
+        show failure `shouldContain` "readiness callback failed"
+        concat texts `shouldContain` "closure callback failed"
+      Right () → expectationFailure "the supervised run ended cleanly"
+
   it "gives a queued load its turn while ready requests keep arriving elsewhere" $ do
     gate <- newDisarmedGate
     withGatedService defaultConfig alwaysAdmitting (\p -> case p of PointCaptured {} -> True; _ -> False) gate $ \svc -> do
@@ -448,6 +547,7 @@ spec = describe "Accounting and lifetime hardening" $ do
     chronological <- reverse <$> readMVar events
     chronological `shouldBe` ["owner log done", "service returned"]
   where
+    finally' action cleanup = (action `catch` (\e → cleanup >> throwIO (e ∷ SomeException))) <* cleanup
     inspectRetained svc = inspectSnapshotBytes svc
     killIt thread = killThread thread
     errorIt thread = throwTo thread (ErrorCall "delivered asynchronously")

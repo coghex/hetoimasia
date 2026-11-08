@@ -249,6 +249,7 @@ data BusyWhy
   | BusyArenas
   | BusyLeases
   | BusyViews
+  | BusyClients
   | BusyRetained
   deriving stock (Eq, Show)
 
@@ -276,6 +277,8 @@ data Config = Config
   , configMaxArenas ∷ !Int
   , configMaxLeases ∷ !Int
   , configMaxViews ∷ !Int
+  , -- | Registered clients: a client record is state the service holds, so it is bounded.
+    configMaxClients ∷ !Int
   , configSourceLimits ∷ !SourceLimits
   , configQueryLimits ∷ !QueryLimits
   , -- | The first identity every counter issues. The default is zero; a test
