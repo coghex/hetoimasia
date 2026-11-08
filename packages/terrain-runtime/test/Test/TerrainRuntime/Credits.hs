@@ -10,6 +10,7 @@
 module Test.TerrainRuntime.Credits (spec) where
 
 import Control.Concurrent.STM
+import Control.Exception (ErrorCall (..), finally, throwIO)
 import Control.Monad (forM, forM_, void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (pack)
@@ -114,7 +115,15 @@ spec = describe "R1 and R2: credits are released at the safe point, capacity ref
 
   it "remembers nothing about a transfer whose arena ended while it was in flight" $ do
     gate <- newDisarmedGate
-    withGatedService defaultConfig alwaysAdmitting (\p → case p of PointHandoff {} → True; _ → False) gate $ \svc → do
+    -- The transfer is held in flight and then fails, which is what leaves a memory
+    -- (a transfer that succeeds forgets its region).
+    let hold = gatedProbe (\p → case p of PointHandoff {} → True; _ → False) gate
+        probe = Probe $ \point → do
+          probePoint hold point
+          case point of
+            PointHandoff {} → throwIO (ErrorCall "the transfer fails")
+            _ → pure ()
+    withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → (\act → act `finally` openGate gate) $ do
       (_, lease) <- openMain svc "main"
       _ <- readCell svc lease (tile 1 1 1)
       armGate gate
