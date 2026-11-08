@@ -490,18 +490,21 @@ cells outside the configured extent are excluded and reported (`cameraExcluded`)
 and a description longer than its structural maximum (`specCameraRegions`, 16,384:
 more than the approved envelope needs) or than the staging the camera may use is cut
 at the end, lowest priority first, and the remainder reported (`cameraTruncated`). The
-staging the camera may use must hold the description and, beside it, the interest and
-scratch of the first region, so a description is never kept longer than the camera can
-start: whatever is retained, its first region is admitted at once (when nothing else
-holds the room). When that room is missing only because work already cancelled still
-holds its scratch until its owner acknowledges it (a replacement while a load runs), the
-description that fits now and would start once those charges are released is kept
-pending, and `Service` admits its first region after the acknowledgement; cancelled work
-keeps its charges until then, and only a description that cannot fit, or could not start
-even then, is cut away. A replacement is not a special case: replacing a view's demand is
-withdrawing the old one and admitting the new one as a fresh demand, through this same
-path (a property checks that the two produce the same model at every state random
-sequences reach).
+staging the camera may use must hold the description; how much of a description is kept
+is decided by the ordinary admission, never by a separate estimate. The model walks the
+regions in priority order on the state the withdrawal left, growing the view's description
+by one region at a time and asking `planAdmission` (the code `Service` runs later) for each.
+A region that fits is admitted. The first that does not fit now is kept, pending, with the
+regions behind it, when it would be admitted once the pressure that is the owner's to
+release has been released (jobs finished or acknowledged, pins and explicit requests
+withdrawn, regions evicted for them gone); its turn comes on a later `Service`, and cancelled
+work keeps its charges until its owner acknowledges it. The walk stops, and the rest is cut
+and reported, at the first region whose description no longer fits the staging the camera
+may use, or that would not be admitted even after the release, so a kept description can
+always be started. Replacing a view's demand is withdrawing the old one and admitting the
+new one through this same path (a property checks that the two produce the same model at
+every state random sequences reach, and another that the kept prefix is what the ordinary
+path leaves).
 
 What camera work can occupy, and why it cannot starve explicit work. The mechanism is
 a reserve of room, not a race: camera admission and hold acquisition are refused
