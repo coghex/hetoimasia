@@ -615,7 +615,7 @@ even when it decodes to fewer bytes: the reservation is the larger of the larges
 larger of the decoded size and 4 KiB. Without that floor 1 GiB would admit 268,435,456 one-pixel textures, far more than any
 device's descriptor array, and a full table could bind before bytes did. With it, a bank of *n* bytes holds at most *n* ÷ 4 KiB
 textures, and every structural capacity that holds textures is *derived* from the byte limits and so never answers first: the
-native texture table (1 GiB ÷ 4 KiB + slot 0 = 262,145) and the facade's lease scope (512 MiB ÷ 4 KiB + the window slot = 131,073).
+native texture table (1 GiB ÷ 4 KiB + slot 0 = 262,145) and the facade's lease scope (512 MiB ÷ 4 KiB + the window slot + one lease of headroom = 131,074, the headroom being what lets the bytes answer before the lease at double saturation with a window held).
 Validation requires each byte limit to be at least 4 KiB and the instance bank to hold the reservation (the larger of
 `pngOutputBytes` and 4 KiB), so a validated profile always admits at least one maximum-size texture. The per-owner number of held
 textures remains only as the read-only `ownerTexturesHeld` observation: nothing compares it with anything. The request bounds
