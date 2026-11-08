@@ -23,6 +23,7 @@ module Test.Terrain.ConnectivityFixtures
   , draw
   , R
   , runR
+  , below
 
     -- * Cases
   , Case (..)
