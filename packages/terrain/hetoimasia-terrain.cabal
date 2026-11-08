@@ -88,6 +88,7 @@ test-suite terrain-tests
     ghc-options: -rtsopts "-with-rtsopts=-T"
     other-modules:
         Test.Terrain.Connectivity
+        Test.Terrain.ConnectivityBounds
         Test.Terrain.ConnectivityFixtures
         Test.Terrain.ConnectivityOracle
         Test.Terrain.Coordinate
