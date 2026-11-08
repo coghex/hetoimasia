@@ -731,8 +731,8 @@ observed m =
 --   deterministic and stable); and
 -- * growing the description one region at a time from the same state keeps
 --   @min i k@ regions for @i@ (admitting regions one by one reaches the same prefix),
---   compared where none of the regions is resident, so no eviction can differ with the
---   protected set.
+--   compared at every state (nothing is protected from eviction but the regions an
+--   admission names, so a prefix is admitted the same way whatever follows it).
 keptPrefixIsOrdinary ∷ Limits → [(Int, Int, Int)] → Property
 keptPrefixIsOrdinary limits seeds = go (newModel limits) seeds (0 ∷ Int)
   where
@@ -744,7 +744,6 @@ keptPrefixIsOrdinary limits seeds = go (newModel limits) seeds (0 ∷ Int)
           setOn mm d = case step mm (SetCameraDemand vid (ArenaId 1) d) of
             (r, Right _) → Just (r, maybe [] (map demandRegion . viewDemand) (find ((== vid) . viewId) (modelViews r)))
             _ → Nothing
-          resident = [regionCoord r | r ← modelRegions m']
        in case setOn m' description of
             Nothing → go m' rest n
             Just (r, kept) →
@@ -759,11 +758,40 @@ keptPrefixIsOrdinary limits seeds = go (newModel limits) seeds (0 ∷ Int)
                   head' vs = fromMaybe (error "no view") (find ((== vid) . viewId) vs)
                   grown = [(i, fmap (length . snd) (setOn m' (take i description))) | i ← [1 .. length description]]
                   growsOneByOne = and [got == Just (min i k) | (i, got) ← grown]
-                  disjoint = null [() | d ← description, demandRegion d `elem` resident]
                in counterexample ("kept " <> show k <> " of " <> show (length description) <> "; service admitted more: " <> show (not servicesNone)) servicesNone
                     .&&. counterexample "asking for exactly the kept prefix did not keep all of it" (null keptDemands || stable)
-                    .&&. counterexample ("growing the description one region at a time kept " <> show (map snd grown) <> " where " <> show k <> " were kept at once") (not disjoint || growsOneByOne)
+                    .&&. counterexample ("growing the description one region at a time kept " <> show (map snd grown) <> " where " <> show k <> " were kept at once") growsOneByOne
                     .&&. go m' rest (n + 1)
+
+-- | Liveness of the stored demand: with no explicit work and no new camera calls, repeated
+-- 'Service' and acknowledgements eventually admit every stored region when the regions
+-- fit an empty camera share (here: at most two regions, under budgets that hold two
+-- whole regions beside the camera's reserve). A view is never dropped for capacity once
+-- stored, and its first pending region is admitted whenever it fits.
+storedDemandCompletes ∷ Integer → Integer → [(Int, Int)] → Property
+storedDemandCompletes resident staging picks = case limitsNear resident staging of
+  Nothing → counterexample ("a configuration at the minimum was refused: " <> show (resident, staging)) False
+  Just limits →
+    let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
+        distinct = take 2 (foldr (\d acc → if demandRegion d `elem` map demandRegion acc then acc else d : acc) [] [demandAt x j | (x, j) ← picks])
+        settle ∷ Int → Model → Maybe Model
+        settle 0 _ = Nothing
+        settle n m = case events m of
+          (ev : _) → case step m ev of (m', Right _) → settle (n - 1) m'; _ → Nothing
+          [] → case step m Service of
+            (m', Right r) | reportDecision r /= Serviced [] → settle (n - 1) m'
+            _ → Just m
+        events m =
+          [VictimReleased (regionArena r) (regionCoord r) | r ← modelRegions m, regionEvicting r]
+            <> [JobCompleted (jobId j) (honestCost m j) | j ← modelJobs m, jobPhase j `elem` [JobRunningPhase, JobCancellingPhase]]
+            <> [Dispatch | any ((== JobQueued) . jobPhase) (modelJobs m)]
+     in case step start (SetCameraDemand (ViewId 1) (ArenaId 1) distinct) of
+          (m1, Right _) → case settle 200 m1 of
+            Nothing → counterexample "the stored demand did not settle" False
+            Just m2 → case modelViews m2 of
+              [v] → counterexample ("stored " <> show (length (viewDemand v)) <> " regions, " <> show (length (viewPending v)) <> " still pending after settling") (null (viewPending v) && length (viewDemand v) == length distinct)
+              vs → counterexample ("the stored view was dropped: " <> show (length vs) <> " views") (null distinct)
+          (_, Left r) → counterexample ("the demand was refused: " <> show r) False
 
 -- | A request over its caps is invalid from every state, with a typed reason.
 overCapAlwaysInvalid ∷ [(Int, Int, Int)] → Property
@@ -889,6 +917,9 @@ spec = describe "Residency model properties" $ do
         forAll seedsOf $ \seeds → case limitsNear resident staging of
           Nothing → counterexample ("a configuration at or above the minimum was refused: " <> show (resident, staging)) False
           Just limits → keptPrefixIsOrdinary limits seeds
+  it "admits every stored region of a camera demand that fits an empty camera share, by Service and acknowledgements alone" $
+    withNumTests 2000 $
+      forAll ((,) <$> chooseInteger (6400, 9000) <*> chooseInteger (2400, 4000)) $ \(resident, staging) → forAll (vectorOf 4 pair) $ \picks → storedDemandCompletes resident staging picks
   it "never reserves more for an explicit request than the construction-time worst case" $
     withNumTests 2000 $
       forAll (vectorOf 3 pair) reservationWithinMinimum

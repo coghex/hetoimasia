@@ -832,23 +832,30 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       Serviced [(ViewId 1, a')] → admissionJobs a' `shouldBe` [(JobId 2, reg 2 0 0)]
       other → expectationFailure (show other)
     map viewPending (modelViews m4) `shouldBe` [[reg 3 0 0]]
-  it "cuts the end of a description that does not fit the camera's staging, reports it and still serves the rest" $ do
+  it "stores a longer description while an explicit request holds the staging, and admits its regions in order once the request is withdrawn" $ do
     -- 2,000 staging bytes, of which camera work leaves 994 for explicit requests: the
     -- view's 192-byte description, its interest (64) and the region job's scratch (258)
-    -- are 514; an open request holds 482 more, which leaves camera work 10.
+    -- are 514; an open request holds 482 more.
     m0 ← opened (limitsWith $ \s → s {specStagingBytes = 2000, specResidentBytes = 4000, specLoadJobs = 5, specCameraRegions = 64})
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
     ledgersOf m1 `shouldBe` Ledgers (0, 400) (0, 0) (192 + 64, 258)
     (m2, _) ← stepOk m1 (q 1 (reg 5 0 0) (cell 0 0 0))
     ledgersOf m2 `shouldBe` Ledgers (0, 800) (0, 0) (256 + 224, 516)
-    -- A description of two regions needs 256 bytes, 64 more than is held; the camera
-    -- may use 10 more, so the second region is cut (the lowest priority), reported, and
-    -- the first keeps being served: the description stays one region.
+    -- The replacement withdraws the old demand and stores the new description (256 bytes,
+    -- cut only by its own bytes): both regions are kept, nothing is cut. With the
+    -- request in the way the first region does not fit yet (322 of the 268 left), so
+    -- both wait, pending, and nothing is predicted about them.
     (m3, replaced) ← stepOk m2 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0), demand (reg 1 0 0) (cell 0 0 0)])
     case reportDecision replaced of
-      CameraSet _ _ _ _ _ excluded truncated → (excluded, truncated) `shouldBe` ([], [reg 1 0 0])
+      CameraSet admitted waiting _ _ _ excluded truncated → (length admitted, waiting, excluded, truncated) `shouldBe` (0, [reg 0 0 0, reg 1 0 0], [], [])
       other → expectationFailure (show other)
-    map (map demandRegion . viewDemand) (modelViews m3) `shouldBe` [[reg 0 0 0]]
+    map (map demandRegion . viewDemand) (modelViews m3) `shouldBe` [[reg 0 0 0, reg 1 0 0]]
+    -- Every Service admits the next pending regions in order whenever they fit: once the
+    -- request is withdrawn both are admitted and load.
+    m4 ← withdraw m3 1
+    m5 ← drainDemand m4
+    map viewPending (modelViews m5) `shouldBe` [[]]
+    sort (map regionCoord (modelRegions m5)) `shouldBe` [reg 0 0 0, reg 1 0 0]
   it "ignores a late failure of work a commit superseded, and keeps the replacement work" $ do
     m0 ← opened roomy2
     -- A camera load is running when a removal commits in its region.
@@ -975,11 +982,12 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     ledgersOf m3 `shouldBe` Ledgers (338, 400) (0, 0) (256 + 2 * 64, 258)
     m4 ← drainDemand m3
     map viewPending (modelViews m4) `shouldBe` [[]]
-  it "never evicts a region of its own demand to load an earlier one" $ do
+  it "may evict a resident region of its own demand that nothing needs yet, and loads it again in order" $ do
     -- 1,500 resident bytes (a camera job may reserve 536). B is resident (338) and named
     -- second; three requests pin three more regions (1,014), leaving 148. Loading A (400)
-    -- needs 252 more. Evicting B would make room, but the demand needs B, so the model
-    -- must not: A waits (busy).
+    -- needs 252 more. The demand is stored whole and admitted by the ordinary admission
+    -- region by region: nothing protects B, which has no interest, hold or job, so A is
+    -- funded by evicting it, and B waits behind A and is loaded when its turn comes.
     let regionA = demand (reg 0 0 0) (cell 0 0 0)
         regionB = demand (reg 1 0 0) (cell 0 0 0)
     m0 ← opened (limitsWith $ \s → s {specResidentBytes = 1500, specStagingBytes = 4096, specQueuedCommands = 8, specCameraRegions = 64})
@@ -987,10 +995,10 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     m1' ← foldM (\m i → loadCell m i (reg (i + 1) 0 0) (cell 0 0 0)) m1 [2, 3, 4]
     (m2, held) ← stepOk m1' (SetCameraDemand (ViewId 1) a1 [regionA, regionB])
     case reportDecision held of
-      CameraSet admitted waiting _ _ _ _ _ → (concatMap admissionVictims admitted, waiting) `shouldBe` ([], [reg 0 0 0, reg 1 0 0])
+      CameraSet admitted waiting _ _ _ _ _ → (concatMap admissionVictims admitted, waiting) `shouldBe` ([(a1, reg 1 0 0)], [reg 1 0 0])
       other → expectationFailure (show other)
-    [regionCoord r | r ← modelRegions m2, regionEvicting r] `shouldBe` []
-    -- With the pins gone, A is funded from one of those regions, not from B.
+    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0, reg 1 0 0]]
+    -- The owner releases the victim, the pins go, and Service admits B in its turn.
     m3 ← foldM withdraw m2 [2, 3, 4]
     m4 ← drainDemand m3
     map viewPending (modelViews m4) `shouldBe` [[]]
@@ -1430,6 +1438,45 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       other → expectationFailure (show other)
     map (map demandRegion . viewDemand) (modelViews m3) `shouldBe` [[reg 0 0 0], [reg 0 0 0]]
     map viewPending (modelViews m3) `shouldBe` [[], []]
+  it "keeps a second view's demand for coverage a running load will publish pending, and admits it with no job once the load completes" $ do
+    -- 1,548 resident and 1,702 staging bytes, extent 1 x 1 x 2, one-region holds. View 1's
+    -- load of both cells is running. View 2 names the same coverage: its description fits
+    -- beside the running job, its interest does not yet (the job's scratch is charged), so
+    -- it stays, pending, and nothing is predicted about it. When the job completes the
+    -- coverage is resident, and Service admits view 2 without a load.
+    let limits = limitsWith $ \x → x {specResidentBytes = 1548, specStagingBytes = 1702, specExtentZ = 2, specHoldRegions = 1, specCameraRegions = 64}
+        both = [demand (reg 0 0 0) (box 0 1 0 1 0 2)]
+    m0 ← opened limits
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 both, Dispatch]
+    (m2, set) ← stepOk m1 (SetCameraDemand (ViewId 2) a1 both)
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ excluded truncated → (length admitted, waiting, excluded, truncated) `shouldBe` (0, [reg 0 0 0], [], [])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0], [reg 0 0 0]]
+    m3 ← fst <$> stepOk m2 (JobCompleted (JobId 0) (Cost 1 1 4))
+    (m4, serviced) ← stepOk m3 Service
+    case reportDecision serviced of
+      Serviced adm → [(w, length (admissionJobs x)) | (w, x) ← adm] `shouldBe` [(ViewId 2, 0)]
+      other → expectationFailure (show other)
+    map viewPending (modelViews m4) `shouldBe` [[], []]
+  it "funds a camera region from unreferenced resident regions the rest of the demand names, instead of cutting the demand" $ do
+    -- 1,446 resident and 1,508 staging bytes, one-cell extent, no holds. Four separate
+    -- regions B to E (338 each) are resident and nothing refers to them. The demand
+    -- [A, B, C, D, E] keeps its first region (the description budget is one region
+    -- beside that region's interest and scratch) and loads A by evicting B for the 306-byte
+    -- shortfall: nothing protects a region the demand merely names.
+    let limits = limitsWith $ \x → x {specResidentBytes = 1446, specStagingBytes = 1508, specCameraRegions = 64}
+        names = [demand (reg i 0 0) (cell 0 0 0) | i ← [0 .. 4]]
+    m0 ← opened limits
+    m1 ← foldM (\m i → loadCell m i (reg i 0 0) (cell 0 0 0) >>= \m' → withdraw m' i) m0 [1 .. 4]
+    (m2, set) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 names)
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ _ truncated → (length admitted, waiting, truncated, concatMap admissionVictims admitted) `shouldBe` (1, [], [reg 1 0 0, reg 2 0 0, reg 3 0 0, reg 4 0 0], [(a1, reg 1 0 0)])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0]]
+    m3 ← drainDemand m2
+    map viewPending (modelViews m3) `shouldBe` [[]]
+    reg 0 0 0 `elem` map regionCoord (modelRegions m3) `shouldBe` True
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])

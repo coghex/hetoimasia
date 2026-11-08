@@ -27,6 +27,7 @@ module Hetoimasia.Terrain.Internal.Residency.Limits
   , limitQueryRegions
   , limitExtent
   , limitExplicitStagingBytes
+  , limitCameraRegionStagingBytes
   , limitExplicitResidentBytes
   , limitHoldRegions
   , limitCameraRegions
@@ -293,7 +294,7 @@ minimumBytes spec bank = case bank of
       + maximum [specHoldRegions spec * stored, if cameraOn then stored + job else 0]
   StagingBank →
     explicitMinimumBytes spec StagingBank
-      + maximum [toInteger holdRecordBytes * specHoldRegions spec, if cameraOn then toInteger (descriptionBytes 1) + toInteger interestRecordBytes + 256 + 2 * x * y * z else 0]
+      + maximum [toInteger holdRecordBytes * specHoldRegions spec, if cameraOn then toInteger (descriptionBytes 1) + cameraRegionStagingBytes x y z else 0]
   _ → explicitMinimumBytes spec bank
   where
     cameraOn = specCameraRegions spec > 0
@@ -345,6 +346,18 @@ limitSlot l ViewPinSlot = lPins l
 -- | The most regions one explicit query may name.
 limitQueryRegions ∷ Limits → Word64
 limitQueryRegions = lQuery
+
+-- | The staging one camera region needs beyond its entry in a description: its interest
+-- and the scratch of a load of the whole extent.
+cameraRegionStagingBytes ∷ Integer → Integer → Integer → Integer
+cameraRegionStagingBytes x y z = toInteger interestRecordBytes + 256 + 2 * x * y * z
+
+-- | What a camera region needs of staging beyond its entry in a description (its
+-- interest and the scratch of a load of the whole extent). A description is bounded so
+-- that this always fits beside it in the camera share, or the camera could never start
+-- its first region.
+limitCameraRegionStagingBytes ∷ Limits → Word64
+limitCameraRegionStagingBytes l = let (x, y, z) = lExtent l in fromInteger (cameraRegionStagingBytes (toInteger x) (toInteger y) (toInteger z))
 
 -- | The staging bytes camera work and holds always leave free, so that an explicit
 -- request is never starved of staging by camera interests: the staging minimum for

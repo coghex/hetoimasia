@@ -132,6 +132,7 @@ module Hetoimasia.Terrain.Residency
   , limitQueryRegions
   , limitExtent
   , limitExplicitStagingBytes
+  , limitCameraRegionStagingBytes
   , limitExplicitResidentBytes
   , limitHoldRegions
   , limitCameraRegions
