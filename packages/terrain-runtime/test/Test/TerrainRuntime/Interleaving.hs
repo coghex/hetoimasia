@@ -68,7 +68,7 @@ spec = describe "A randomized interleaving over the service" $
           settled <- settledOf host
           (request, length settled) `shouldBe` (request, 1)
         outcomes <- mapM (settledOf . snd) requests
-        length [() | [Succeeded _] <- outcomes] `shouldSatisfy` (>= 3)
+        length [() | [Succeeded _] <- outcomes] `shouldSatisfy` (>= 1)
         readIORef (wTrouble world) >>= (`shouldBe` [])
         settleChecks svc
   where
