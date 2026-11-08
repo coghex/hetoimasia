@@ -41,6 +41,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , terminateWith
   , releaseReq
   , withdrawRecord
+  , rememberTried
+  , rememberBusy
   , forgetRegionRetry
   , forgetArenaRetry
   , beginRunning
@@ -490,6 +492,25 @@ releaseReq svc rid req = do
       }
   when (reqModel req) (withdrawRecord svc rid req)
   markFreed svc
+
+-- | Remember that a region's transfer was tried at a generation, or was refused for want
+-- of capacity at an epoch. These two are the only places either is written, and they
+-- write only for a region the model still holds in a live arena, so an arena or a
+-- region that ended while a transfer was in flight is never given a memory it could not
+-- be rid of.
+rememberTried ∷ R.RegionKey → Word64 → St → St
+rememberTried key generation st
+  | remembered st key = st {stateTransfers = Map.insert key generation (stateTransfers st)}
+  | otherwise = st
+
+rememberBusy ∷ R.RegionKey → St → St
+rememberBusy key st
+  | remembered st key = st {stateHandoffBusy = Map.insert key (stateCapacityEpoch st) (stateHandoffBusy st)}
+  | otherwise = st
+
+remembered ∷ St → R.RegionKey → Bool
+remembered st key@(aid, _) =
+  Map.member aid (stateArenas st) && key `elem` [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions (stateModel st)]
 
 -- | Forget everything the owner remembers about retrying one region's transfer: that
 -- it was tried at some generation, and that it was refused for want of capacity at

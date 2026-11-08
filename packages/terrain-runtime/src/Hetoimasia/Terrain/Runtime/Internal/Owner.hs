@@ -340,7 +340,7 @@ handoff svc aid region = do
   (busy, started) <- atomically $ do
     st <- readSt svc
     let generation = maybe 0 fromIntegral (regionGeneration st aid region)
-        tried = modifySt svc (\s → s {stateTransfers = Map.insert (aid, region) generation (stateTransfers s)})
+        tried = modifySt svc (rememberTried (aid, region) generation)
     case Map.lookup aid (stateArenas st) of
       Nothing → tried >> pure (False, Nothing)
       Just arena → do
@@ -351,7 +351,7 @@ handoff svc aid region = do
           -- Capacity pressure is not a failed transfer: the region stays a candidate
           -- and is reconsidered when capacity is returned (R2). Only a refusal that
           -- can never clear ends the attempt.
-          Left (R.Busy _) → modifySt svc (\s → s {stateHandoffBusy = Map.insert (aid, region) (stateCapacityEpoch s) (stateHandoffBusy s)}) >> pure (True, Nothing)
+          Left (R.Busy _) → modifySt svc (rememberBusy (aid, region)) >> pure (True, Nothing)
           Left _ → tried >> pure (False, Nothing)
   when busy (probe svc (PointHandoffBusy aid region))
   forM_ started $ \working → do
@@ -359,7 +359,7 @@ handoff svc aid region = do
     atomically $ do
       st <- readSt svc
       let generation = maybe 0 fromIntegral (regionGeneration st aid region)
-      modifySt svc (\s → s {stateTransfers = Map.insert (aid, region) generation (stateTransfers s)})
+      modifySt svc (rememberTried (aid, region) generation)
       case outcome of
         Right () → do
           modifySt svc $ \s →

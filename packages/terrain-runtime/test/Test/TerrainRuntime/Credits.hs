@@ -112,6 +112,23 @@ spec = describe "R1 and R2: credits are released at the safe point, capacity ref
     -- The scan found staging sizes at which the transfer really was refused.
     length (filter id exercised) `shouldSatisfy` (>= 1)
 
+  it "remembers nothing about a transfer whose arena ended while it was in flight" $ do
+    gate <- newDisarmedGate
+    withGatedService defaultConfig alwaysAdmitting (\p → case p of PointHandoff {} → True; _ → False) gate $ \svc → do
+      (_, lease) <- openMain svc "main"
+      _ <- readCell svc lease (tile 1 1 1)
+      armGate gate
+      _ <- removeCell' svc lease (tile 1 1 1)
+      -- The owner is in the middle of the region's transfer.
+      awaitReached gate
+      _ <- releaseLease svc lease
+      openGate gate
+      waitFor $ do
+        model <- inspectModelSTM svc
+        check (null (modelArenas model) && null (modelRegions model))
+      inspectRetryMemory svc `shouldReturn` 0
+      settleChecks svc
+
 -- | Admit reads that cannot be prepared yet until the model refuses another.
 fillWithReads ∷ Service → ArenaLease → IO [Request]
 fillWithReads svc lease = go (0 ∷ Int) []
