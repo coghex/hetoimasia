@@ -15,9 +15,10 @@ mutation or implementation is authorized by this amendment's draft proposals.
 
 Lighting scope resolved by D-29: expose sun position to the face-map shader
 for previewing the tiles; defer the automatic day/night cycle and eventual
-moon lighting. Q-19/Q-20 still block amendment readiness; D-55/D-57/D-58
-specify sampling, lighting and cell-quad presentation. P-15 is the remaining
-storage/discovery contract proposal, awaiting its own owner checkpoint.
+moon lighting. Q-19 remains the amendment readiness checkpoint: delivery
+boundaries, issue revisions and fresh owner sign-off. D-55/D-57/D-58 specify
+sampling, lighting and cell-quad presentation; D-59 approves the concrete
+storage/discovery contract in P-15 and resolves Q-20's specification.
 
 Picking scope resolved by D-30: select from the adopted drawn quads in
 front-to-back order using matching artwork/face-map coverage. D-49/D-50/D-58
@@ -147,8 +148,13 @@ qualification and owner visual acceptance remain required.
 D-58 approves P-14's whole-cell emission, complementary ramp/fog masks,
 exact ordering, conservative demand/culling and visual picking contract.
 Fog stops picking with `no_hit`; unavailable knowledge remains `loading`.
-Q-16 is specified. P-15 proposes how edits and discovery become retained,
-coherent state; it is not approved by the P-14 answer.
+Q-16 is specified. The separate P-15 storage/discovery contract is now
+approved by D-59.
+
+D-59 approves P-15's exact compressed connectivity, bounded preparation and
+temporary-store transactions, including the configurable 1 GiB reservation,
+write-before-acknowledgement, Lua status/growth/retry and failure/teardown
+contract. Q-20 is specified; solver qualification remains mandatory.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -1789,6 +1795,34 @@ implemented or proved. Storage, discovery transactions and recovery remain
 Q-20; delivery and fresh amendment readiness remain Q-19. No code or tracker
 mutation occurs in this design turn.
 
+### D-59. Adopt P-15's compressed discovery and temporary-store contract
+
+Owner, directly in this design pane on 2026-11-08, answered “approved” to
+P-15 as written at `d527957369`. The checkpoint named the configurable
+1 GiB reservation per arena, writing edits and their pending discovery work
+before reporting success, bounded compressed connectivity/preparation/cache
+work, Lua status/growth/retry and preservation of committed history on failure.
+It explicitly stated the edit-latency and admission-refusal tradeoffs and
+that a raw buried removal does not reveal a sealed space until it connects
+to known air.
+
+Adopt all seven P-15 clauses: exact parameterized source components and
+upper-boundary exterior semantics; monotonic removal/connectivity overlays
+and retained discovery obligations; the reserved private temporary-file and
+copy-on-write page contract; numeric preparation/cache/I/O/transaction limits;
+one publication/settlement arbitration after writes; the exact Lua surface,
+authority and expected result classes; and resource ownership/qualification.
+The stated defaults are initial limits requiring proof, not performance
+measurements or a guarantee against external filesystem/device failures.
+
+This resolves Q-20's concrete storage, discovery, API and lifecycle
+specification alongside D-58's fog/picking contract. It does not claim that
+the symbolic compiler, backing store or amended runtime exists or has passed
+its independent tests. No cross-run save/recovery, general terrain placement,
+gameplay-state/ECS or whole-tick rollback is added. Q-19 still requires the
+follow-up delivery plan, existing-issue revision plan and fresh amendment
+readiness sign-off. No tracker or implementation change occurs here.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2849,7 +2883,12 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-57 decisions, remaining proposals
+### P-6. Amendment framing — historical framing, resolved through D-59
+
+The investigation below records how the amendment developed. Its earlier
+open emission/API/storage questions are now specified by P-9–P-15 and
+D-49–D-59. Those later approved contracts govern where this framing still
+says “open” or “proposed”; Q-19 alone retains delivery/readiness decisions.
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2963,7 +3002,12 @@ dependency insertion and existing-issue revisions await Q-16–Q-20; the ledger
 and delivery plan remain the original filed arc until those changes receive
 sign-off. No final issue bodies are drafted here.
 
-### P-7. Shared discovery — D-39/D-51/D-53 approved, concrete details open
+### P-7. Shared discovery — framing completed by D-59/P-15
+
+Historical mechanism discussion below; D-59 approves P-15's concrete source,
+overlay, accounting, transaction, API and proof contract. References here to
+details still needing specification are resolved there, not delegated to an
+implementation's discretion.
 
 The high-level shared-work mechanism implementing D-31–D-38 is approved by
 D-39, with D-51 separating whole-space knowledge from detail loading. The
@@ -3101,7 +3145,11 @@ visible. Exact symbolic representation, numeric bounds and edit-time updates
 still need specification and proof. No arbitrary procedural callback or
 general finite-cost topology oracle is implied by this decision.
 
-### P-8. Session retention backing — D-40/D-41/D-43/D-52 approved, details open
+### P-8. Session retention backing — framing completed by D-59/P-15
+
+Historical tradeoff discussion below; the exact quota, format, reservation,
+cache/staging, commit, failure/recovery and lifecycle choices are now approved
+by D-59/P-15. The earlier open questions here are preserved as design history.
 
 The original P-5 keeps retained changes in memory, with an initial 32 MiB
 session-edit cap (raised to 64 MiB by D-42) and new edits refused once that
@@ -3819,10 +3867,12 @@ transparent colour/mask holes, loading in front/behind a candidate, camera
 capacity pressure and generation reuse. Retain captures, counts and commands
 under D-44/D-47/D-48, not only mathematical reasoning or passing headless tests.
 
-### P-15. Compressed discovery and temporary-store transactions — proposal
+### P-15. Compressed discovery and temporary-store transactions — approved by D-59
 
-**Owner checkpoint, not yet approved.** This completes Q-20's proposed
-mechanism for D-38–D-43/D-51–D-53. The principal tradeoff is that an edit is
+**Owner checkpoint completed by D-59 at `d527957369`.** All seven clauses
+below are approved; “proposed” describes their drafting history, not remaining
+implementation discretion. This completes Q-20's specification for
+D-38–D-43/D-51–D-53. The principal tradeoff is that an edit is
 acknowledged only after its changed records and discovery continuation have
 been written to the temporary store. The camera remains asynchronous, but
 edit completion includes disk latency. This is a session store, not a game
@@ -4227,8 +4277,10 @@ including P-5, its defaults/limitations, the epic done condition and
 TRA-1–TRA-12. Verified manager relay: `#het-terrain`, message
 `39em862uwqaj3x3t4dn9kipeta`, 2026-11-07T02:13Z.
 
-The design is ready for issue processing. The current authorization is an
+This was the original design's readiness sign-off and authorization for an
 EPIC draft for manager sign-off before creation, not approval to file it.
+The original arc was subsequently filed. D-28 reopened readiness for the
+amendment; its new sign-off remains Q-19 and the design is `exploring`.
 Q-13 remains an in-delivery proof gate; Q-14's migration dispositions stand.
 
 ### Q-13. Can the current renderer represent the geometry correctly?
@@ -4257,6 +4309,13 @@ affected qualification and final arena acceptance can pass.
 The broader historical “full Synarchy port” memory reconciliation is not an
 implementation dependency for this explicitly approved first arena. Fidelity
 beyond this arc remains uncommitted; MEMORY.md is unchanged.
+
+Readiness refresh, 2026-11-08: PR #654 remains open at `734a8543ab9b`.
+Its body records fixes after CHANGES_REQUESTED, unreconciled snapping proof
+and stale captures for several earlier fixtures; the fixes have not been
+reviewed. The linked historical outcome above is not current-head approval,
+release of the manager's hold or qualification of P-9–P-15. The new delivery
+plan must retain those limitations and assign fresh amended-path evidence.
 
 ### Q-14. Migration-review disposition
 
@@ -4404,93 +4463,50 @@ reconciling the pure planner's limits with progressive camera preparation.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-41/D-43/D-51–D-53. Preserve fog over both solid and air until
-discovery, distinct from residency and authoritative terrain. Unsealing a
-cavity reveals its whole connected empty space and exposed boundary terrain,
-beyond the adjacent cells and across chunks, in bounded steps. D-51 replaces
-exhaustive boundary loading with compressed whole-space knowledge; detail loads
-on camera or explicit demand. The local-only discovery alternative is rejected.
+Resolved as a specification by D-31–D-41/D-43/D-49–D-53/D-58/D-59 and
+P-9/P-14/P-15. Preserve the decisions' history; the exact current contract
+is P-15, approved as written at `d527957369`, together with P-14's visual
+knowledge and fog-result contract.
 
-D-33 records revealed state as retained chunk changes, preserved on offload
-and replayed before reload publication alongside terrain edits. Discovery
-persists for the arena session while off-screen chunks may unload normally;
-closing/resetting the arena discards it. Both revealed air and exposed solid
-boundary tiles retain their known state.
+Knowledge, truth and residency remain separate. Sky and initially
+sky-connected spaces begin known; sealed spaces become known through real
+positive-area connections under the shared logical shape catalog. Whole-space
+discovery includes exposed solid boundaries and crosses chunks, in bounded
+steps. It retains compressed component/range knowledge and pending obligations;
+it does not require loading every boundary tile. Two openings share work
+without losing newly added connections or flooding the exterior.
 
-D-34 resolves whole-empty-cell connectivity: six shared-face neighbors,
-including across chunks, with edge/corner-only contacts excluded.
+P-15 fixes exact source component families and exceptions, upper-boundary
+exterior semantics, startup work/memory limits and expected complexity
+refusal. Required flat, world-spanning gap and shape/channel cases must be
+proved. Removal enlarges air and records its connection-inspection obligation
+atomically; an isolated raw buried edit does not itself discover that space.
+Queries and residency alone still do not grant knowledge.
 
-D-35 requires discovery through explicit partial-shape openings, including
-real diagonal openings from ramps into unrevealed spaces. It excludes both
-the shortcut of treating all shaped cells as sealed blocks and the shortcut
-of treating every diagonal neighbor as connected.
+The reserved temporary store replaces the original RAM-only history cap:
+default 1 GiB per arena, configurable at open with explicit creator-authorized
+growth. P-15 fixes the private file/page/index format, cache/staging/I/O bounds,
+peak-space reservations, reader retirement and one commit/settlement
+arbitration after backing writes. Offload evicts reconstructible caches;
+reload reapplies source, edits and knowledge coherently before publication.
 
-D-36 makes those logical shape definitions the common authority for discovery
-and terrain point/ray queries, correcting the previous solid definitions.
+Storage capacity, I/O and integrity failures preserve committed state and
+pending obligations, pause affected mutations/discovery and return the
+specified expected results. Exact Lua status/growth/retry authority,
+cancellation, recovery and close/reset behavior are approved. A new arena
+starts fresh; no save or cross-run recovery is added.
 
-D-37 resolves fog interaction: generic blanks are non-interactive and
-unselectable. A fog-covered screen pick gives no player target and does not
-continue through the cover; the temporary removal shortcut does nothing there.
+D-58/P-14 resolves player interaction: confirmed generic fog is unselectable,
+stops traversal and returns `no_hit`; unavailable authoritative information
+remains `loading`. Mixed known-solid/unknown-void presentation is coherent
+and does not expose hidden contents.
 
-D-38 starts sky and initially sky-connected cavities discovered, without
-requiring all their detail resident. Later discovery applies to previously
-sealed space. Overlapping openings during progressive work must not flood the
-exterior, duplicate work or lose unprocessed branches. D-39 approves shared
-pending work, new-edit seeding and stopping only exterior branches. P-7's exact
-representations, source metadata and API/capacity contract remain open. D-53
-requires bounded exact preparation of source connectivity before arena opening,
-with clear over-budget refusal; it does not select the precise encoding/limits.
-
-D-40 chooses temporary per-arena disk backing for retained edits/discovery,
-with bounded RAM caching and asynchronous I/O, discarded on arena close/reset.
-The earlier RAM-only total-history cap is superseded. Exact record/index,
-quota and lifecycle rules remain open. D-41 selects pause/preserve/recover
-on storage exhaustion or write failure; exact read/write results, admission
-and recovery triggers remain open. D-43 resolves startup reservation and a
-hard allowance: reserve before opening the arena, refuse opening if that is
-not possible, and pause at capacity while preserving the expandable world.
-The numeric allowance and qualified reservation mechanism remain open. D-42
-raises the CPU banks independently; it does not choose the disk allowance.
-
-The logical 16-shape regions and their openings are now specified by D-49/P-9;
-their implementation still requires D-44 qualification. Still open: derive and
-budget the initial exterior-connected
-knowledge metadata without scanning infinite sky. Specify completion and
-memory-pressure behavior for very large spaces, including P-8/D-40's concrete
-temporary-store cache/staging/disk quotas and write/read failure behavior. Specify
-Lua/engine authority and concrete reset,
-reveal-job resumability and replay/publication boundaries, including the API
-encoding of D-37's no-selectable-target fog result.
-
-D-51 selects compressed whole-space knowledge, distinct from resident detail.
-Its exact encoding/accounting remains open: implicit unknown plus sparse
-discovered spans or regions is the storage direction to specify. Reveal
-work must be bounded; an enormous or exterior-connected air region cannot
-force an unbounded flood fill or eager underground allocation. Consider
-coherent terrain/reveal publication so a pending or failed edit/reveal cannot
-flash secret contents. D-32 settles whole-space propagation in bounded steps;
-D-33 settles session retention/replay with normal streaming; D-34 settles
-whole-empty-cell face adjacency. D-35 includes partial-shape/diagonal openings.
-Exact API, representation, per-shape geometric rules, failure and capacity
-policies remain open.
-The whole-cavern knowledge/detail question is resolved by D-51. D-52 resolves
-live allowance increases: explicit Lua requests may obtain a larger reservation,
-preserving the old cap/state on failure and resuming capacity-paused work only
-after success. Exact request and recovery mechanics remain open.
-The startup-preparation question is resolved by D-53: bounded exact connectivity
-preparation precedes successful arena opening, with clear over-budget refusal
-and no dense hidden-cell enumeration. Concrete encoding, limits and proof
-remain to specify alongside the other storage/publication mechanisms.
-D-58/P-14 resolves the concrete player-facing fog result (`no_hit`,
-with traversal stopped) and distinguishes pending knowledge from confirmed
-undiscovered space, including mixed known-ramp/unknown-void rendering. Those
-details are approved; the storage/commit contract remains open. P-15 is its
-concrete proposal: compressed component families and edit overlays, bounded
-preparation, reserved temporary storage, commit-before-acknowledgement,
-Lua status/growth/retry and failure/lifecycle qualification. All new P-15
-choices await the owner's separate checkpoint; D-58 does not approve them.
-Do not introduce
-full unit vision/day-night visibility or general gameplay state by inference.
+Qualification remains implementation work: independent connectivity oracles,
+compressed-space/limit evidence, I/O and publication fault interleavings,
+retention/replay, native reservation/lifecycle checks and visual fog/picking
+proof. Q-19 must assign those obligations to reviewable slices and final
+TRA-12 acceptance. Approval supplies no test result and does not introduce
+unit vision, automatic day/night, general gameplay state or placement.
 
 ## Verification strategy — approved through Q-12
 
