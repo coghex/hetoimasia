@@ -24,6 +24,7 @@ module Test.TerrainRuntime.Fixtures
   , gatedProbe
   , awaitReached
   , withGatedService
+  , withGatedServiceUsing
 
     -- * Hosts
   , Host (..)
@@ -149,6 +150,12 @@ gatedProbe selects gate = Probe $ \point → do
       _ <- tryPutMVar (gateArrived gate) ()
       readMVar (gateOpen gate)
     else pure ()
+
+-- | A service with the given probe whose gate is opened on every exit from the
+-- body, before the service drains its owner.
+withGatedServiceUsing ∷ Probe → Gate → (Service → IO a) → IO a
+withGatedServiceUsing probe gate body =
+  withServiceUsing defaultConfig alwaysAdmitting probe (\svc → body svc `finally` openGate gate)
 
 -- | A service whose owner is held at the points a predicate selects, until the
 -- gate opens. The gate is opened on every exit from the body, before the

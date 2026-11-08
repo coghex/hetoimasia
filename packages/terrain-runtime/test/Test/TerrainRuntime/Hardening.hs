@@ -6,6 +6,7 @@ import Control.Concurrent (killThread, throwTo, yield)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), ExceptionWithContext (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, fromException, throwIO, try)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Control.Monad (forM_, void, when)
 import qualified Data.Text as T
 import Hetoimasia.Foundation.Log (LogEntry (..), callbackSink, defaultLogFilter, mkLogger)
@@ -452,6 +453,85 @@ spec = describe "Accounting and lifetime hardening" $ do
         show failure `shouldContain` "readiness callback failed"
         concat texts `shouldContain` "closure callback failed"
       Right () → expectationFailure "the supervised run ended cleanly"
+
+  it "ends a superseded request with a typed failure when its readmission is permanently refused" $
+    withService (tightConfig (2, 1, 2) 3 4096) $ \svc → do
+      client <- okOf (registerClient svc)
+      let definition = layered [(Just (-5), Just 0, "stone", 0), (Just 0, Just 2, "soil", 0)] []
+      lease <- okOf (openArena svc client "edge" definition) >>= await svc >>= expectSuccess
+      host <- newHost False
+      _ <- okOf (surfaceWith svc (hostEndpoint svc Nothing host) lease (column 0 0))
+      waitFor (readTVar (hostReady host) >>= \n → check (n >= 1))
+      -- Two edits move the column's top to level -1, outside the configured extent.
+      _ <- removeCell' svc lease (tile 0 0 1)
+      _ <- removeCell' svc lease (tile 0 0 0)
+      grant host
+      settled <- waitFor (readTVar (hostSettled host) >>= \x → if null x then retry else pure x)
+      case settled of
+        [Failed (Superseded _)] → pure ()
+        other → expectationFailure ("expected a typed superseded failure, got " <> show other)
+      inspectReadmissionWaits svc `shouldReturn` 0
+      -- It no longer blocks the arena: a later edit commits.
+      later <- removeCell' svc lease (tile 1 0 1)
+      removeChangedFlag later `shouldBe` True
+      settleChecks svc
+
+  it "never lets a failing logger replace the defect it was reporting" $ do
+    let sink entry = if entryMessage entry == "defect" then throwIO (ErrorCall "the sink failed") else pure ()
+        failingLogger = mkLogger defaultLogFilter (callbackSink sink)
+    outcome <- try $
+      withLoggingLifetime quiet $ \lifetime →
+        withSupervision lifetime $ \control →
+          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) failingLogger noProbe) $ \svc → do
+            (_, lease) <- openMain svc "main"
+            host <- newHost True
+            let failing = (hostEndpoint svc Nothing host) {endpointReady = throwSTM (ErrorCall "readiness callback failed")}
+            _ <- okOf (removeWith svc failing lease (tile 1 1 1) Nothing)
+            awaitOwnerStopped svc
+            checkRuntime control
+    case outcome of
+      Left failure → do
+        show failure `shouldContain` "readiness callback failed"
+        let evidence = concat [show inner | f ← cleanupFailures failure, let ExceptionWithContext _ inner = cleanupFailureException f]
+        evidence `shouldContain` "the sink failed"
+      Right () → expectationFailure "the supervised run ended cleanly"
+
+  forM_ [5, 20, 60 ∷ Int] $ \hits →
+   it ("serves an eligible staged commit within a bounded number of preparations, however many requests keep arriving (" <> show hits <> ")") $ do
+    gate <- newDisarmedGate
+    counting <- newIORef False
+    captured <- newIORef (0 ∷ Int)
+    committedAfter <- newIORef (Nothing ∷ Maybe Int)
+    let holding = gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate
+        probe = Probe $ \point → do
+          active <- readIORef counting
+          when active $ case point of
+            PointCaptured {} → modifyIORef' captured (+ 1)
+            PointBeforeCommit _ → readIORef captured >>= \seen → modifyIORef' committedAfter (Just . maybe seen id)
+            _ → pure ()
+          probePoint holding point
+    withGatedServiceUsing probe gate $ \svc → do
+      (_, lease) <- openMain svc "main"
+      _ <- readCell svc lease (tile 1 1 1)
+      removal <- newHost False
+      _ <- okOf (removeWith svc (hostEndpoint svc Nothing removal) lease (tile 0 1 1) Nothing)
+      waitFor (readTVar (hostReady removal) >>= \n → check (n >= 1))
+      writeIORef counting True
+      armGate gate
+      -- A cache hit holds the owner mid-preparation; behind it the removal is granted
+      -- and a long run of further cache hits arrives.
+      first' <- newHost True
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing first') lease (tile 1 1 1))
+      awaitReached gate
+      grant removal
+      forM_ [1 .. hits] $ \_ → do
+        host <- newHost True
+        okOf (cellWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1))
+      openGate gate
+      waitFor (readTVar (hostSettled removal) >>= \x → check (not (null x)))
+      -- However long the run behind it, the commit came after at most a few preparations.
+      readIORef committedAfter >>= \c → c `shouldSatisfy` maybe False (<= 3)
+      settleChecks svc
 
   it "gives a queued load its turn while ready requests keep arriving elsewhere" $ do
     gate <- newDisarmedGate

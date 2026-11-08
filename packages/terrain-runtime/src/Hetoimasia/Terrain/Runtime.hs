@@ -97,6 +97,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectModelSTM
   , inspectDefects
   , inspectSnapshotBytes
+  , inspectReadmissionWaits
   , inspectArena
   , inspectArenaSTM
   , ArenaView (..)
@@ -363,6 +364,13 @@ inspectModelSTM svc = stateModel <$> readSt svc
 -- | The unexpected defects recorded, newest first.
 inspectDefects ∷ Service → IO [Defect]
 inspectDefects svc = map defectOf . stateDefects <$> readTVarIO (serviceState svc)
+
+-- | How many requests are waiting to be admitted again after a commit superseded their
+-- revision (each stays charged until it is readmitted or ends).
+inspectReadmissionWaits ∷ Service → IO Int
+inspectReadmissionWaits svc = do
+  st <- readTVarIO (serviceState svc)
+  pure (Map.size (Map.filter waitingReadmission (stateRequests st)))
 
 -- | The accounted bytes the retained bank holds (outstanding snapshots' backing and
 -- untaken removal results), and the bank.
