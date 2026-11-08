@@ -145,6 +145,11 @@ committed. The failing assertion is the one that protects the behaviour.
 | NC49 | The staging bank ignores request records | `randomized interleaving` (93 of 93) | `staging bank occupied: the model counts 64 but the service holds 224` |
 | NC50 | The staging bank ignores a removal's staging reservation | `randomized interleaving` (89 of 93) | `staging bank reserved: the model counts 258 but the service holds 770` |
 | Reviewer's control | The model is rebuilt without the arena while the service keeps it | `notices a model that dropped its records while the service still holds the resources, in every bank` | disagreements in the resident, edit (occupied and reserved), staging, command-slot and snapshot-hold rows |
+| NC51 | A removal reserves no resident growth (the reviewer's control) | `randomized interleaving` (90 of 94) | `resident growth reserved for the removals the service holds ...: the model counts 0 but the service holds 62` |
+| NC52 | The load-job slot is not held while a job runs | `randomized interleaving` (91 of 94, at the `PointJob` probe) | `load-job slots: the owner runs a job but the model counts 0` |
+| NC53 | A running job reserves nothing in the resident bank | `randomized interleaving` (46 of 94, at the `PointJob` probe) | `resident bank reserved: the owner runs a job but the model counts 0` |
+| Early-ack control | The model forgets the load job the owner is about to run | `notices a model that forgot a load job the owner is about to run` | no running (or cancelling) job for the region |
+| Swap control | Two arenas' retained charges are swapped | `notices retained charges swapped between two arenas` | `retained bytes of arena ...: the model counts 64 but the service holds 128` |
 | NC9 | The drain does not wait for outstanding borrowers | `does not return while a borrower holds a snapshot after the owner failed` | expected the service not to have returned, got that it had |
 
 ## Acceptance commands
@@ -158,7 +163,7 @@ compile of every module, not an incremental one.
 | Command | Result |
 | --- | --- |
 | `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning (package build directory removed first) |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 208 examples, 0 failures |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 212 examples, 0 failures |
 | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 669 examples, 0 failures (on the merged head; passes at the round-10 head) |
 | `cabal test --project-file cabal.project.cpu hetoimasia:workflow-tests --test-show-details=direct` | 965 examples, 0 failures |
 | `(cd packages/terrain-runtime && cabal check)` | No errors or warnings could be found in the package |
@@ -200,3 +205,10 @@ more. One run in the 170 failed in `Closure ... lets cancel, release and close p
 ordinary queue full` (`cancel` answered `AlreadySettled` instead of `CancelWon`); that example is
 untouched in these rounds, does not touch the census, and was not reproduced in 400 runs alone or
 600 runs of its group in four parallel workers.
+
+Round 13 (owner directive; owner rulings on the issue amendment: a read-only test inspector is allowed, and the
+accounting rule is never under-charged, exact only where the issue states an exact charge): the usage oracle
+compares at-least for resident bytes (per region), resident growth, each arena's retained bytes and the edit bank,
+exactly for the request records, reservations, slots and holds; it also runs at every job and inside the
+preparation hook after each injected release; the coalescing sequence (remove levels 0, 2, then 1) is charged
+80 where the arena holds 64. The suite is 212 examples, run 90 and 200 more times at `+RTS -N4`.
