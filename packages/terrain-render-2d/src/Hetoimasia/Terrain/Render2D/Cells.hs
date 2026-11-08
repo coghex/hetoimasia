@@ -142,6 +142,7 @@ module Hetoimasia.Terrain.Render2D.Cells
   , startCells
   , stepCells
   , cellPlanOf
+  , cellPrepProgress
   , planCells
   ) where
 
@@ -322,6 +323,10 @@ cellPlanAssets = cpUsed
 
 cellPlanStats ∷ CellPlan → CellStats
 cellPlanStats = cpStats
+
+-- | Where a preparation stands.
+cellPrepProgress ∷ CellPrep → Progress
+cellPrepProgress = cellProgressOf
 
 -- | Prepare to completion or to a plan-wide bound: start, then step until
 -- settled or halted, and return the plan. Equivalent to the stepwise path.

@@ -968,3 +968,29 @@ cellProgressOf prep = case (prHalt prep, prCursor prep) of
   (Just reason, _) → Halted reason
   (Nothing, Nothing) → Settled
   (Nothing, Just _) → Working
+
+-- A plan and a preparation show their shape, never the asset planes: a
+-- diagnostic, not a serialization.
+instance Show CellPlan where
+  showsPrec _ plan =
+    showString "CellPlan {quads = "
+      . shows (length (cpQuads plan))
+      . showString ", pending = "
+      . shows (length (cpPendings plan))
+      . showString ", progress = "
+      . shows (cpProgress plan)
+      . showString ", stats = "
+      . shows (cpStats plan)
+      . showString "}"
+
+instance Show CellPrep where
+  showsPrec _ prep =
+    showString "CellPrep {columns = "
+      . shows (prColumns prep)
+      . showString ", instances = "
+      . shows (prCount prep)
+      . showString ", cursor = "
+      . shows (prCursor prep)
+      . showString ", halt = "
+      . shows (prHalt prep)
+      . showString "}"
