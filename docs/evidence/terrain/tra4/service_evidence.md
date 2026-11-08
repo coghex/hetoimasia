@@ -116,6 +116,13 @@ committed. The failing assertion is the one that protects the behaviour.
 | NC18 | A fatal defect marks every earlier unreported one as reported | `reports an earlier unreported defect beside a later fatal one` | the earlier closure-callback failure never reached supervision |
 | NC19 | Pending opens and attaches are not charged | `charges pending opens and attaches against the command slots and the retained bank` | a third delayed attachment was admitted into two slots |
 | NC20 | A pending removal reserves nothing in the retained bank | `reserves a removal's result bytes at admission ...` | a third pending removal was admitted into a 330-byte bank |
+| NC21 | Every readmission refusal is treated as temporary | `ends a superseded request with a typed failure when its readmission is permanently refused` | the request waited forever (bounded wait never returned) |
+| NC22 | A failing logger replaces the defect it was reporting | `never lets a failing logger replace the defect it was reporting` | supervision saw only the sink's failure |
+| NC23 | Staging keeps unconditional precedence over commits | `serves an eligible staged commit within a bounded number of preparations ...` (3 of 4 fairness examples fail; the sustained cancel/replace one does not, because replaced reads are cancelled before they are prepared) | the commit followed 6 preparations (5 hits), growing with the run |
+| NC24 | A request waiting to be admitted again is not charged | `keeps a request that waits to be admitted again charged ...` | a second read was admitted into two full slots |
+| NC25 | Only removals and acquisitions reserve a retained record at admission | `reserves a read's record at admission, so a read that starts waiting to be admitted again cannot overfill the retained bank` | a second removal was admitted into room the waiting read would need |
+| NC28 | Retries (useful whenever a view exists) always ahead of dispatch, no dispatch turn | `dispatches a queued load while every preparation is followed by a cancellation and a replacement, with a view registered` | the load ran only after the stream ended (60 preparations) |
+| NC29 | Same ordering with the old retry trigger | same example | same |
 | NC9 | The drain does not wait for outstanding borrowers | `does not return while a borrower holds a snapshot after the owner failed` | expected the service not to have returned, got that it had |
 
 ## Acceptance commands
@@ -129,7 +136,7 @@ compile of every module, not an incremental one.
 | Command | Result |
 | --- | --- |
 | `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning (package build directory removed first) |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 119 examples, 0 failures |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 128 examples, 0 failures |
 | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 669 examples, 0 failures (on the merged head) |
 | `cabal test --project-file cabal.project.cpu hetoimasia:workflow-tests --test-show-details=direct` | 965 examples, 0 failures |
 | `(cd packages/terrain-runtime && cabal check)` | No errors or warnings could be found in the package |
@@ -137,7 +144,7 @@ compile of every module, not an incremental one.
 | `python3 tools/validation/plan.py --base origin/master --head HEAD` | selects `test.terrain-runtime` and every affected predecessor and mandatory group (29 of 37; the catalog and workflow changes are policy inputs and widen the plan) |
 | `python3 tools/validation/owned_starts.py check` and `ratchet --base origin/master` | pass; the new package has no unowned start |
 
-After the first four reviews the suite grew from 66 to 119 examples (24 seeds of a randomized interleaving, retained-size shrink on
+After the first six review rounds the suite grew from 66 to 128 examples (24 seeds of a randomized interleaving, retained-size shrink on
 coalescing, residency kept across a delayed commit, several intervals of one column,
 the column length limit, a failing readiness callback, snapshot backing across
 revisions, the drain on the failure path and under cancellation, the owner's logging
@@ -150,3 +157,5 @@ bookkeeping was corrected (it asserted the order of two events that nothing orde
 six more times after the owner was made to stop only when asked; every run passed.
 The native display groups the plan selects were not run locally: this slice opens no
 window, and CI runs them.
+
+NC26 (the retry trigger alone, a registered view with no pending demand) and NC27 (a retry pass handing the next turn to staging instead of dispatch) are not independently pinned by an example: the four-way rotation gives dispatch its turn anyway, so each is redundant with it and is disclosed as such rather than counted as a control.

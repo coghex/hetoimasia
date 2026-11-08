@@ -3,7 +3,7 @@
 Evidence for [#661](https://github.com/coghex/hetoimasia/issues/661) (TRA-19 of #636),
 delivered by pull request [#671](https://github.com/coghex/hetoimasia/pull/671).
 
-**Revision.** Implementation head `e6e5b19cd776` (branch `issue-661-discovery-model`, based on
+**Revision.** Implementation head `65d49cb11f61` (branch `issue-661-discovery-model`, based on
 `origin/master` `d8b2aa7b1b78`, with the landed docs merged; round 1 of the review repaired). Every figure below was produced at that revision with the
 qualified toolchain (GHC 9.14.1, Cabal 3.18.1.0). The suite's own output is the primary record;
 this document restates it with the commands that reproduce it. It qualifies a **pure model and
@@ -29,7 +29,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --t
   --test-option=--match --test-option="Discovery"
 ```
 
-Results at the revision: `terrain-tests` 886 examples, 0 failures (49 are the `Discovery` group);
+Results at the revision: `terrain-tests` 894 examples, 0 failures (57 are the `Discovery` group);
 `terrain-render-2d-tests` 298 and `workflow-tests` 965, 0 failures; `cabal check` clean;
 catalog valid (36 groups); clean rebuild of the terrain package without a warning.
 
@@ -122,10 +122,12 @@ repetitions of the three edits and a drain; measured allocation, not accounted b
 
 | Variation | Allocated bytes |
 | --- | --- |
-| span `2^20` | 7,005,096 |
-| span `2^60` | 7,009,720 |
-| history of 100 runs | 7,096,224 |
-| history of 100,000 runs | 7,264,224 |
+| span `2^20` | 7,776,296 |
+| span `2^60` | 7,780,288 |
+| history of 100 runs | 7,867,424 |
+| history of 100,000 runs | 8,035,424 |
+| first boundary page of 64 boxes, source with 200 patches | 3,208,288 |
+| first boundary page of 64 boxes, source with 400 patches | 3,204,296 |
 | source with 0 patches (one removal and drain, 20 repetitions) | 50,904 |
 | source with 200 separated patches | 50,904 |
 
@@ -196,6 +198,32 @@ The first canonical review (Codex) requested changes on five points, all valid, 
 | replay and invariants were not applied after every batch of a drain | drains check state and oracle bounds after each batch; a lockstep example rebuilds a run from its records after every edit and batch and compares it record for record with an uninterrupted run | 3 authored and 10 generated scenes |
 
 Each repair was reverted locally and the examples run (never committed): the enumerating `isExterior` fails the structure example, an extension that reports no knowledge fails the revision example, a scratch check that follows the read fails the counting-provider and rejected-inspection examples, and unchecked run endpoints fail the range example.
+
+## Round 2 of the review and its repairs
+
+The second canonical review (Codex) requested changes on four points and the manager asked for them to be fixed as families. All were repaired at the head above.
+
+| Family | Repair | Evidence |
+| --- | --- | --- |
+| **One accounting path.** Peak scratch of a rejected inspection was lost; a boundary query traversed and allocated outside the accounting | every provider read, staged write and query page output is a `Charge` applied by `charge` and checked against every cap before it happens; the peak is `sPeak` of the same state, carried by every failure; a boundary query is paged and its page charged first | the counting provider asserts requests and the reported peak (`1384` bytes = 5 reads x 256 + 104 staged, for the reviewer's case) over a grid of allowances, for batches, edits and suspensions |
+| **One revision rule.** Bridging runs of one known class advanced no knowledge revision | `nextAuthority` is the only place a candidate's authority is computed; the knowledge test is one function (`gainsKnowledge`); the removal reports the cell as newly known space whenever its final class is known | the reviewer's sequence (five removals then the bridge) and its overflow; a generated property over random edit/batch/forget/replay/drain sequences (3 origins x 14 seeds) checking content, store and knowledge revisions, monotone known voids, known solids lost only by removal and staleness of earlier candidates |
+| **Replay as a bounded property.** Replay was a few hand-picked traces on a provider holding everything | a window provider serves only the 16, 24 or 40 most recently loaded records and answers every other request `Unavailable`; the driver loads the named record (evicting the oldest) and retries; the retained value is rebuilt from its records after every applied candidate; the result is compared with the uninterrupted run | 24 generated runs (two origins x 12 seeds, batch limits 1, 2, 3 and 64, random forget/replay/drain): 1,422 suspensions and 322 evicted records; runs, removals, remaining work and knowledge equal the uninterrupted run, the state and the oracle bounds hold after every batch |
+
+Every former site that charged or measured a resource directly, and what replaced it:
+
+| Former site | Now |
+| --- | --- |
+| `getRec` read-limit and scratch pre-check | `charge ChargeRead` |
+| `floorRun` read-limit and scratch pre-check | `charge ChargeRead` |
+| `stage` (put and delete) checking a hypothetical state | `charge (ChargeWrite key value)` |
+| `scratchNow`, `scratchOf` and `payloadBytes` recomputed for reports | `sScratch`, `sPeak` and `sCost` of the one state |
+| the failure's ad hoc peak (`scratch + maxRecordBytes`) | `sPeak`, read in `failure` |
+| `fits` and `admit` checks after an inspection or an edit (round 1) | removed: every check is inside `charge` |
+| `runQuery` with zero write caps | real caps from the limits |
+| `queryKnownBoundary` calling `componentBoundary` | `charge (ChargeOutput (boundaryPageBytes n))` then `componentBoundaryPage` (at most `n` boxes scanned) |
+| `isExterior` enumerating members (round 1) | `resolveRep`, the representative only |
+
+Each repair was reverted locally and the discovery group run (never committed): no knowledge gain for a join into a known class fails the two bridging/extension examples; forgetting the rejected attempt's peak fails the counting-provider and peak examples; an unbounded page scan fails the page-bound example; treating an unavailable record as absent fails four examples (suspension, withheld record, counting provider, windowed replay); no knowledge revision at all fails four (frontier work, extension, bridging, the generated revision property).
 
 ## Defect found by the oracle and fixed
 

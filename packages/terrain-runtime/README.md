@@ -225,9 +225,29 @@ the stores only after the borrowers finish.
   attempted, and then it reaches supervision whatever the owner ended with: as the
   owner's failure when it would have returned, or attached to its failure as cleanup
   evidence (`composeCleanup`) when it had already failed.
-* The owner's turns are shared: staging and commits take turns with loads and retries
-  whenever both are ready, so a continuous stream of ready requests cannot starve a
-  queued load (the model's round-robin and aging then choose among loads).
+* **The fairness rule.** Staging, commits, retries and load dispatches take turns
+  whenever two or more are ready: each ready kind gets one quantum in every four,
+  whatever the others are being fed (`stateTurn` hands the next choice to the kind after
+  the one that just ran). A continuous stream of new, cancelled or replaced reads cannot
+  starve an eligible commit or a queued load. A retry pass is run only when it can matter
+  (a registered view has pending demand, or a request waits to be admitted again); a
+  freed credit alone does not make one. Within commits the per-arena admission order is
+  unchanged, and the model's round-robin and aging choose among loads.
+* **The retained-bank reservation.** Every request reserves one result record
+  (`resultRecordBytes`) in the retained bank when it is admitted, because every request can
+  come to hold a record the model does not charge (a result not yet taken, a wait to be
+  admitted again). The reservation is simply kept through such a transition, so a wait
+  never adds to a full bank; only a settled read, whose record the model still charges,
+  holds none.
+* **Readmission.** When a commit supersedes a pending request's revision it is admitted
+  to the model again. Every refusal is classified: temporary pressure keeps the request
+  waiting, and it stays charged (a command slot and a retained record) until it is
+  readmitted or ends; a permanent refusal (its demand left the configured extent, the
+  retained edits are full, its arena ended) ends it at once with a typed failure
+  (`Superseded`, or `ArenaClosed`). Nothing waits on a refusal that will not clear.
+* **Diagnostics never decide.** A defect is thrown with a failing logger's failure attached
+  as cleanup evidence, never replaced by it; a logger that fails on a routine record is
+  itself recorded as a defect and the work goes on.
 * Every release path steps the model through one function that says which events
   may have returned credits (`freesCapacity`); what waits for capacity (pending
   camera demand, a request waiting to be admitted again) is retried after each, so
