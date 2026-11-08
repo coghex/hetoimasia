@@ -139,6 +139,12 @@ committed. The failing assertion is the one that protects the behaviour.
 | NC43 | The resident bank forgets a removal's reserved growth | `randomized interleaving` (89 of 93) | `resident bank reserved: the model counts 400 but the entities hold 462` |
 | NC44 | A handed-off duplicate is not charged to staging | `derives every bank from the entities while a transfer holds its duplicate ...` (the randomized property did not catch it: a transfer is rarely in flight at a check) | `staging bank occupied: the model counts 64 but the entities hold 128` |
 | NC45 | A commit adds nothing to the arena's retained bytes | `randomized interleaving` (54 of 93) | `arena ArenaId 0: the model retains 0 bytes but its changes are 64` (service against model) |
+| NC46 | The resident bank is charged nothing for resident detail | `randomized interleaving` (77 of 93) | `resident bank occupied ...: the model counts 0 but the service holds 676` (the service's own measure of the detail) |
+| NC47 | The edit bank ignores every arena's retained changes | `randomized interleaving` (53 of 93) | `edit bank occupied ...: the model counts 0 but the service holds 64` |
+| NC48 | The edit bank ignores a removal's reservation | `randomized interleaving` (89 of 93) | `edit bank reserved by removals: the model counts 0 but the service holds 64` |
+| NC49 | The staging bank ignores request records | `randomized interleaving` (93 of 93) | `staging bank occupied: the model counts 64 but the service holds 224` |
+| NC50 | The staging bank ignores a removal's staging reservation | `randomized interleaving` (89 of 93) | `staging bank reserved: the model counts 258 but the service holds 770` |
+| Reviewer's control | The model is rebuilt without the arena while the service keeps it | `notices a model that dropped its records while the service still holds the resources, in every bank` | disagreements in the resident, edit (occupied and reserved), staging, command-slot and snapshot-hold rows |
 | NC9 | The drain does not wait for outstanding borrowers | `does not return while a borrower holds a snapshot after the owner failed` | expected the service not to have returned, got that it had |
 
 ## Acceptance commands
@@ -152,7 +158,7 @@ compile of every module, not an incremental one.
 | Command | Result |
 | --- | --- |
 | `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning (package build directory removed first) |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 207 examples, 0 failures |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 208 examples, 0 failures |
 | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 669 examples, 0 failures (on the merged head; passes at the round-10 head) |
 | `cabal test --project-file cabal.project.cpu hetoimasia:workflow-tests --test-show-details=direct` | 965 examples, 0 failures |
 | `(cd packages/terrain-runtime && cabal check)` | No errors or warnings could be found in the package |
@@ -185,9 +191,12 @@ NC37 (counting a settled acquisition twice) was reasoned equivalent and not coun
 control: an open or attach is removed from the table when it settles or ends, so the
 `not (isDone ..)` guard on an acquisition is defensive and unreachable.
 
-Round 11 (owner directive, tests only; no production file changed): `Test.TerrainRuntime.Usage`
-derives every bank (resident, edit and staging, occupied and reserved) and the command and
-load-job slots from the entities alone and the property compares it with the model's ledgers
-after every step, including inside held borrows; the one-borrow-release regression was rewritten
-to the exact scenario; the suite is 207 examples, run 50 times at `+RTS -N4` on a clean
-rebuild of the package, all passing.
+Round 11 (owner directive, tests only) derived each bank from the model's own entity lists, which the
+reviewer showed cannot see a model record that disappears while the service still holds the
+resource; round 12 (owner directive, tests only) replaced that with expectations from the service's own
+data (`inspectCensusSTM`, a read-only diagnostic added in round 12; no existing code path changed).
+The suite is 208 examples; it was run 60 times at `+RTS -N4` on a clean rebuild, then 110 times
+more. One run in the 170 failed in `Closure ... lets cancel, release and close proceed with the
+ordinary queue full` (`cancel` answered `AlreadySettled` instead of `CancelWon`); that example is
+untouched in these rounds, does not touch the census, and was not reproduced in 400 runs alone or
+600 runs of its group in four parallel workers.
