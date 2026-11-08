@@ -5,7 +5,7 @@ references on fixed scenes. It does not show that a device rasterizer, depth tes
 TRA-17 owns that proof (Q-13), and a disagreement found there is a counterexample, not a reason to
 change an order, threshold or rule here.
 
-- Pinned to commit: `d06006fed813847f2b87bd35328d3e2ca7582e15`
+- Pinned to commit: `2e5b685fc79af17aa34db92aeedb60a760baa98e`
 - Reproduce: `HETOIMASIA_TRA16_EVIDENCE_DIR=<dir> HETOIMASIA_TRA16_COMMIT=<commit> cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct --test-options='--match "TRA-16 evidence record"'`
 - Seeds: none. Every scene, facing and sample pixel is enumerated in `packages/terrain-render-2d/test/Test/TerrainRender2D/Cells.hs`;
   the run is deterministic (Hspec's seed affects only example order).
@@ -82,16 +82,16 @@ Limits are the defaults of `defaultCellLimits` unless stated (engineering defaul
 
 | Scene (South) | Columns | Levels evaluated | Instances | Pending spans | Distinct assets | Progress |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| a 4 x 4 grid of every identity, knowledge cycling | 810 | 841 | 21 | 0 | 18 | Settled |
-| a roof over a cavity with ramps at the rim | 810 | 849 | 19 | 0 | 6 | Settled |
-| stacked disconnected spans and a steep depth separation | 810 | 829 | 8 | 0 | 6 | Settled |
-| cutaway through undiscovered air, cut above | 810 | 818 | 4 | 0 | 4 | Settled |
-| cutaway through undiscovered air, cut at the known cells | 810 | 814 | 2 | 0 | 3 | Settled |
-| a known ramp side beside an unrevealed void and fog behind it | 810 | 821 | 6 | 0 | 8 | Settled |
-| a chunk seam in X and Y | 810 | 841 | 19 | 0 | 6 | Settled |
-| a vertical region seam | 810 | 841 | 20 | 0 | 9 | Settled |
-| the greatest legal coordinates | 810 | 828 | 9 | 0 | 3 | Settled |
-| the least legal coordinates | 810 | 830 | 11 | 0 | 5 | Settled |
+| a 4 x 4 grid of every identity, knowledge cycling | 810 | 16 | 21 | 0 | 18 | Settled |
+| a roof over a cavity with ramps at the rim | 810 | 18 | 19 | 0 | 6 | Settled |
+| stacked disconnected spans and a steep depth separation | 810 | 7 | 8 | 0 | 6 | Settled |
+| cutaway through undiscovered air, cut above | 810 | 4 | 4 | 0 | 4 | Settled |
+| cutaway through undiscovered air, cut at the known cells | 810 | 2 | 2 | 0 | 3 | Settled |
+| a known ramp side beside an unrevealed void and fog behind it | 810 | 4 | 6 | 0 | 8 | Settled |
+| a chunk seam in X and Y | 810 | 18 | 19 | 0 | 6 | Settled |
+| a vertical region seam | 810 | 15 | 20 | 0 | 9 | Settled |
+| the greatest legal coordinates | 810 | 9 | 9 | 0 | 3 | Settled |
+| the least legal coordinates | 810 | 10 | 11 | 0 | 5 | Settled |
 
 ## Capacity pressure
 
