@@ -537,7 +537,12 @@ differs from its coverage version, a map without the checked
 `unit-normal-rgb-v1` profile, a catalog that lacks any of the 46 authored maps and
 a duplicate; a plan additionally refuses a material with no colour
 (`CellMissingMaterialColour`). Nothing is thresholded, resized or substituted.
-`assetIdentity` is the snapshot's version with every texture and coverage version.
+`assetIdentity` is the snapshot's version with every texture and coverage version, as
+a fixed-size digest taken once when the snapshot is built, so comparing identities
+costs the same however many materials exist. A snapshot holds at most
+`maxAssetMaterials` (4,096) materials and `maxAssetMaps` (4,096) maps, refused
+before anything is walked: it is validated once, at construction, with that stated
+bound, and no step of a plan walks it again.
 How textures are bound, counted or packed for the device is not decided here:
 `cellPlanAssets` names the distinct colour and map assets a plan references, which
 is the unit a caller's own account counts.
@@ -596,11 +601,22 @@ demand: once per column that has something hidden for x, and per hidden level fo
 omitted only where both hold; elsewhere it is drawn. The y verdicts are cached
 (`clProofs` entries at most, 4,096 by default, zero keeps none), so `startCells` does
 no per-view work and the retained scratch is bounded whatever the viewport or margin;
-the cache changes the work, never the plan. The proof work of a step is bounded by
-what the step already bounds: at most `clStepCandidates` columns, each with a
-window of at most 251 levels (the 250-level band and its top), and three rectangle
-computations per level examined; it is not charged to `clStepLevels`, which counts the
-cells and pending spans a step admits. Runs, not levels, are walked,
+the cache changes the work, never the plan.
+
+**The work meter.** Everything a step examines of the caller's inputs is charged to
+one meter, and a step never charges more than `clStepWork` (8,388,608 by default;
+at least `columnWorkBound`, 8,192, the most one column can charge, so every step
+progresses). The loop checks before beginning a column that its worst case still
+fits, so a step cannot overshoot. The charges: one for each candidate column; for
+each of the column's three state reads (knowledge runs, readiness intervals and
+terrain steps, each of which covers at least one level) the window's levels plus one;
+one per hidden level examined for omission plus three per drawn-rectangle verdict
+computed; and one per admitted cell or pending span plus two asset lookups per quad.
+`cellStatStepWork` reports the last step, `cellStatWork` all of them and
+`cellStatDemandWork` the prefetch demand (the ring keys examined and one window read
+per chunk listed, at most `clDemandChunks`). Nothing the planner or the picker reads
+of the caller's inputs is read outside the meter; the plan's own quads and pending
+spans are its output, bounded by `clInstances` and `clPending`, not input. Runs, not levels, are walked,
 so cost follows run boundaries and exposed cells, not depth, and a column's
 knowledge runs and a chunk's readiness intervals (`Facts.pieces`, shared with the
 baseline planner and the camera, which return exactly what they did) are searched by
@@ -633,6 +649,7 @@ camera, knowledge revision, asset version, target or configuration is refused
 | --- | ---: | --- | ---: |
 | `clStepCandidates` | 4,096 | `clInstances` | 1,048,576 (at most 16,777,216) |
 | `clStepLevels` | 65,536 | `clPending` | 65,536 |
+| `clStepWork` | 8,388,608 | | |
 | `clColumns` | 1,048,576 | demand chunks / intervals / regions per chunk | 1,024 / 8,192 / 16 |
 | `clLevels` | 16,777,216 | band, slack, prefetch margin | 250, 2, 1 |
 | `clProofs` | 4,096 | | |
@@ -674,7 +691,10 @@ darkening play no part; nothing is sampled outside the rectangle because UVs cla
   quad, any such information is loading. Information proved **behind** the covering
   quad does not change a hit.
 * A stale identity is `CellPickStale`; a non-finite point `CellPickInvalidPoint`;
-  outside the viewport or a zero extent, no hit. The result issues no Lua token and
+  outside the intersection of the viewport and the framebuffer, or in a zero
+  extent, no hit: the renderer clamps drawing to the attachment, so a viewport that
+  reaches past it shows nothing there, and the pixel is refused before coverage or
+  pending information is resolved. The result issues no Lua token and
   edits nothing; the logical point and ray queries of `hetoimasia-terrain` remain
   the separate terrain-truth API, and fog or cutouts never replace occupancy or
   discover anything.
@@ -713,7 +733,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain
 ```
 
 Its TRA-16 groups (`Test.TerrainRender2D.Cells`, `CellsCoverage`, `CellsProgress`,
-`CellsClient`, `CellsEvidence`) check the cell-quad path against an independent
+`CellsWork`, `CellsClient`, `CellsEvidence`) check the cell-quad path against an independent
 exact view-ray oracle (`CellFixtures`) that shares no code with the planner or the
 picker, over the committed catalog for all 16 identities at all four facings in
 ordinary, fogged and mixed states, with synthetic technical-fixture planes for the
