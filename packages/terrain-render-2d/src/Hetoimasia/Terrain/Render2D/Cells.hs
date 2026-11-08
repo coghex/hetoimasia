@@ -125,16 +125,16 @@ module Hetoimasia.Terrain.Render2D.Cells
   , CellDemand (..)
   , CellStats (..)
   , CellPlan
-  , planIdentity
-  , planView
-  , planQuads
-  , planPending
-  , planUnresolved
-  , planProgress
-  , planDemand
-  , planBounds
-  , planAssets
-  , planStats
+  , cellPlanIdentity
+  , cellPlanView
+  , cellPlanQuads
+  , cellPlanPending
+  , cellPlanUnresolved
+  , cellPlanProgress
+  , cellPlanDemand
+  , cellPlanBounds
+  , cellPlanAssets
+  , cellPlanStats
 
     -- * Preparation
   , CellError (..)
@@ -174,15 +174,15 @@ import Hetoimasia.Terrain.Shape (ViewFacing)
 defaultCellLimits ∷ CellLimits
 defaultCellLimits =
   CellLimits
-    { limitStepCandidates = 4096
-    , limitStepLevels = 65536
-    , limitColumns = 1048576
-    , limitLevels = 16777216
-    , limitInstances = 1048576
-    , limitPending = 65536
-    , limitDemandChunks = 1024
-    , limitDemandIntervals = 8192
-    , limitRegionsPerChunk = 16
+    { clStepCandidates = 4096
+    , clStepLevels = 65536
+    , clColumns = 1048576
+    , clLevels = 16777216
+    , clInstances = 1048576
+    , clPending = 65536
+    , clDemandChunks = 1024
+    , clDemandIntervals = 8192
+    , clRegionsPerChunk = 16
     }
 
 -- | The approved defaults: a 250-level band, two pixels of slack, a
@@ -289,39 +289,39 @@ pendingKey = pendKey
 unresolvedCursor ∷ Unresolved → (Integer, Integer)
 unresolvedCursor = unrCursor
 
-planIdentity ∷ CellPlan → CellIdentity
-planIdentity = cpIdentity
+cellPlanIdentity ∷ CellPlan → CellIdentity
+cellPlanIdentity = cpIdentity
 
-planView ∷ CellPlan → RenderView
-planView = cpView
+cellPlanView ∷ CellPlan → RenderView
+cellPlanView = cpView
 
 -- | The admitted quads, ascending by key: far to near.
-planQuads ∷ CellPlan → [CellQuad]
-planQuads = cpQuads
+cellPlanQuads ∷ CellPlan → [CellQuad]
+cellPlanQuads = cpQuads
 
-planPending ∷ CellPlan → [PendSpan]
-planPending = cpPendings
+cellPlanPending ∷ CellPlan → [PendSpan]
+cellPlanPending = cpPendings
 
-planUnresolved ∷ CellPlan → Maybe Unresolved
-planUnresolved = cpUnresolved
+cellPlanUnresolved ∷ CellPlan → Maybe Unresolved
+cellPlanUnresolved = cpUnresolved
 
-planProgress ∷ CellPlan → Progress
-planProgress = cpProgress
+cellPlanProgress ∷ CellPlan → Progress
+cellPlanProgress = cpProgress
 
-planDemand ∷ CellPlan → CellDemand
-planDemand = cpDemand
+cellPlanDemand ∷ CellPlan → CellDemand
+cellPlanDemand = cpDemand
 
-planBounds ∷ CellPlan → Maybe Rect
-planBounds = cpBounds
+cellPlanBounds ∷ CellPlan → Maybe Rect
+cellPlanBounds = cpBounds
 
 -- | The distinct assets the admitted quads reference: the set a caller must
 -- hold interests on, and the unit its own budgets count, without any
 -- assumption here about how textures are bound or packed.
-planAssets ∷ CellPlan → Set.Set AssetKey
-planAssets = cpUsed
+cellPlanAssets ∷ CellPlan → Set.Set AssetKey
+cellPlanAssets = cpUsed
 
-planStats ∷ CellPlan → CellStats
-planStats = cpStats
+cellPlanStats ∷ CellPlan → CellStats
+cellPlanStats = cpStats
 
 -- | Prepare to completion or to a plan-wide bound: start, then step until
 -- settled or halted, and return the plan. Equivalent to the stepwise path.

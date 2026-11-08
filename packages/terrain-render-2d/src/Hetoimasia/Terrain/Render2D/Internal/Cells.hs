@@ -81,23 +81,23 @@ import Hetoimasia.Terrain.Shape (ShapeId, ViewFacing, mkShapeId)
 -- remainder explicitly unresolved; it never truncates and calls the result
 -- complete.
 data CellLimits = CellLimits
-  { limitStepCandidates ∷ !Int
+  { clStepCandidates ∷ !Int
   -- ^ Candidate columns one step examines (a step always examines at least one).
-  , limitStepLevels ∷ !Int
+  , clStepLevels ∷ !Int
   -- ^ Cell levels one step evaluates, checked between columns.
-  , limitColumns ∷ !Int
+  , clColumns ∷ !Int
   -- ^ Candidate columns a plan examines.
-  , limitLevels ∷ !Int
+  , clLevels ∷ !Int
   -- ^ Cell levels a plan evaluates.
-  , limitInstances ∷ !Int
+  , clInstances ∷ !Int
   -- ^ Instances a plan may hold, at most the 24-bit key space.
-  , limitPending ∷ !Int
+  , clPending ∷ !Int
   -- ^ Pending spans a plan retains.
-  , limitDemandChunks ∷ !Int
+  , clDemandChunks ∷ !Int
   -- ^ Chunks one demand lists.
-  , limitDemandIntervals ∷ !Int
+  , clDemandIntervals ∷ !Int
   -- ^ Intervals one demand lists.
-  , limitRegionsPerChunk ∷ !Int
+  , clRegionsPerChunk ∷ !Int
   -- ^ Vertical regions one demand lists for a chunk.
   }
   deriving stock (Eq, Show)
@@ -117,10 +117,10 @@ data CellConfig = CellConfig
 
 -- | One coherent request.
 data CellRequest = CellRequest
-  { requestVersions ∷ !Versions
-  , requestCamera ∷ !CameraState
-  , requestSetup ∷ !ViewSetup
-  , requestConfig ∷ !CellConfig
+  { crVersions ∷ !Versions
+  , crCamera ∷ !CameraState
+  , crSetup ∷ !ViewSetup
+  , crConfig ∷ !CellConfig
   }
 
 -- | Everything one plan is a function of: the request, the terrain facts, the
@@ -271,11 +271,11 @@ data CellDemand = CellDemand
 
 -- | Counts of the work a plan did.
 data CellStats = CellStats
-  { statColumns ∷ !Int
-  , statLevels ∷ !Int
-  , statInstances ∷ !Int
-  , statPending ∷ !Int
-  , statSteps ∷ !Int
+  { cellStatColumns ∷ !Int
+  , cellStatLevels ∷ !Int
+  , cellStatInstances ∷ !Int
+  , cellStatPending ∷ !Int
+  , cellStatSteps ∷ !Int
   }
   deriving stock (Eq, Show)
 
@@ -298,24 +298,24 @@ data CellPlan = CellPlan
 -- | Why a plan, a step or a continuation was refused.
 data CellError
   = -- | The request's versions and the facts' versions differ.
-    MixedVersions !Versions !Versions
+    CellMixedVersions !Versions !Versions
   | -- | The knowledge or the assets are not the ones the continuation was
     -- started with, or the request changed: obsolete work is never resumed.
-    StaleContinuation
+    CellStaleContinuation
   | -- | The view or camera cannot be built.
-    InvalidView !ProjectionError
+    CellInvalidView !ProjectionError
   | -- | The configuration is unusable.
-    InvalidCellConfig
+    CellInvalidConfig
   | -- | The snap view's scale would move adjacent quads apart.
-    PixelSnapUnsupported !Float
+    CellPixelSnapUnsupported !Float
   | -- | A column query was refused.
-    QueryRefused !QueryError
+    CellQueryRefused !QueryError
   | -- | A material the terrain shows has no colour in the adopted assets.
-    MissingMaterialColour !MaterialId
+    CellMissingMaterialColour !MaterialId
   | -- | Knowledge says a solid is known where the terrain holds air.
-    InconsistentKnowledge !Column !Integer
+    CellInconsistentKnowledge !Column !Integer
   | -- | A value could not be represented in the target.
-    Unrepresentable !String
+    CellUnrepresentable !String
   deriving stock (Eq, Show)
 
 -- | The resumable state of preparation. The constructor is private.
@@ -358,14 +358,14 @@ type Offset = (Integer, Integer)
 cellIdentityOf ∷ CellInputs → Either CellError CellIdentity
 cellIdentityOf inputs = do
   let request = inputsRequest inputs
-      camera = requestCamera request
-      config = requestConfig request
-  when (requestVersions request /= factsVersions (inputsFacts inputs)) $
-    Left (MixedVersions (requestVersions request) (factsVersions (inputsFacts inputs)))
-  unless (validConfig config) (Left InvalidCellConfig)
+      camera = crCamera request
+      config = crConfig request
+  when (crVersions request /= factsVersions (inputsFacts inputs)) $
+    Left (CellMixedVersions (crVersions request) (factsVersions (inputsFacts inputs)))
+  unless (validConfig config) (Left CellInvalidConfig)
   pure
     CellIdentity
-      { idVersions = requestVersions request
+      { idVersions = crVersions request
       , idKnowledge = knowledgeRevision (inputsKnowledge inputs)
       , idCameraRevision = camRevision camera
       , idAnchor = (camAnchorX camera, camAnchorY camera)
@@ -374,7 +374,7 @@ cellIdentityOf inputs = do
       , idZoom = camZoom camera
       , idFacing = camFacing camera
       , idCut = camClip camera
-      , idSetup = requestSetup request
+      , idSetup = crSetup request
       , idAssets = assetIdentity (inputsAssets inputs)
       , idConfig = config
       }
@@ -387,17 +387,17 @@ validConfig config =
     && ccChunkMargin config >= 0
     && all
       (>= 0)
-      [ limitStepCandidates l
-      , limitStepLevels l
-      , limitColumns l
-      , limitLevels l
-      , limitInstances l
-      , limitPending l
-      , limitDemandChunks l
-      , limitDemandIntervals l
-      , limitRegionsPerChunk l
+      [ clStepCandidates l
+      , clStepLevels l
+      , clColumns l
+      , clLevels l
+      , clInstances l
+      , clPending l
+      , clDemandChunks l
+      , clDemandIntervals l
+      , clRegionsPerChunk l
       ]
-    && limitInstances l <= fromIntegral depthKeyLimit
+    && clInstances l <= fromIntegral depthKeyLimit
   where
     l = ccLimits config
 
@@ -421,21 +421,21 @@ startCells ∷ CellInputs → Either CellError CellPrep
 startCells inputs = do
   identity ← cellIdentityOf inputs
   let request = inputsRequest inputs
-      camera = requestCamera request
-      config = requestConfig request
+      camera = crCamera request
+      config = crConfig request
   view ←
-    either (Left . InvalidView) Right $
-      mkRenderView (requestSetup request) (camZoom camera) (camFacing camera) (camFrac camera)
+    either (Left . CellInvalidView) Right $
+      mkRenderView (crSetup request) (camZoom camera) (camFacing camera) (camFrac camera)
   let ref = camRef camera
       clip = toInteger (axisValue (camClip camera))
       bandLo = clip - ccDepth config
   envelope ←
-    if zeroDrawable (requestSetup request) || bandLo > clip
+    if zeroDrawable (crSetup request) || bandLo > clip
       then pure Nothing
       else do
-        when (settingPixelSnap (setupSettings (requestSetup request)) && not (snapCompatible view)) $
-          Left (PixelSnapUnsupported (viewScale view))
-        rect ← maybe (Left (Unrepresentable "the visible rectangle")) Right (visibleRect (ccMargin config) view)
+        when (settingPixelSnap (setupSettings (crSetup request)) && not (snapCompatible view)) $
+          Left (CellPixelSnapUnsupported (viewScale view))
+        rect ← maybe (Left (CellUnrepresentable "the visible rectangle")) Right (visibleRect (ccMargin config) view)
         pure (Just (envelopeOf rect ref clip bandLo))
   pure
     CellPrep
@@ -516,15 +516,15 @@ nextCursor env (v, u)
 stepCells ∷ CellInputs → CellPrep → Either CellError CellPrep
 stepCells inputs prep = do
   identity ← cellIdentityOf inputs
-  when (identity /= prIdentity prep) (Left StaleContinuation)
+  when (identity /= prIdentity prep) (Left CellStaleContinuation)
   case (prHalt prep, prCursor prep, prEnvelope prep) of
     (Nothing, Just cursor, Just env) →
       loop (ccLimits (idConfig identity)) env cursor (0 ∷ Int) (0 ∷ Int) prep {prSteps = prSteps prep + 1}
     _ → Right prep
   where
     loop limits env cursor scanned levelsDone st
-      | scanned >= max 1 (limitStepCandidates limits) = Right st {prCursor = Just cursor}
-      | scanned > 0 && levelsDone >= limitStepLevels limits = Right st {prCursor = Just cursor}
+      | scanned >= max 1 (clStepCandidates limits) = Right st {prCursor = Just cursor}
+      | scanned > 0 && levelsDone >= clStepLevels limits = Right st {prCursor = Just cursor}
       | otherwise = do
           result ← evaluateColumn inputs st env cursor
           case result of
@@ -553,7 +553,7 @@ data SRun = SRun !Integer !Integer !CState
 evaluateColumn ∷ CellInputs → CellPrep → Envelope → (Integer, Integer) → Either CellError (Either HaltReason (CellPrep, Int))
 evaluateColumn inputs st env (v, u)
   | lo > hi = Right (Right (st, 0))
-  | prColumns st + 1 > limitColumns limits = Right (Left HaltColumns)
+  | prColumns st + 1 > clColumns limits = Right (Left HaltColumns)
   | otherwise = do
       -- Own states one level above the window (what covers its top), the
       -- columns nearer to the camera over the window itself.
@@ -576,9 +576,9 @@ evaluateColumn inputs st env (v, u)
       spans ← traverse (uncurry (pendSpanOf (prView st) env column (rx, ry))) pendings
       pure $
         if
-          | prLevels st + levelsHere > limitLevels limits → Left HaltLevels
-          | prCount st + length quads > limitInstances limits → Left HaltInstances
-          | prPendCount st + length spans > limitPending limits → Left HaltPending
+          | prLevels st + levelsHere > clLevels limits → Left HaltLevels
+          | prCount st + length quads > clInstances limits → Left HaltInstances
+          | prPendCount st + length spans > clPending limits → Left HaltPending
           | otherwise →
               Right
                 ( st
@@ -599,9 +599,9 @@ evaluateColumn inputs st env (v, u)
     rx = (u + v) `div` 2
     ry = (v - u) `div` 2
     request = inputsRequest inputs
-    camera = requestCamera request
+    camera = crCamera request
     facing = camFacing camera
-    limits = ccLimits (requestConfig request)
+    limits = ccLimits (crConfig request)
     (zLoRel, zHiRel) = envZRel env
     ref = envRef env
     clip = envClip env
@@ -676,7 +676,7 @@ statesOf inputs camera offset lo hi
       Just column → coalesceStates . concat <$> traverse (inWorld column) bounded
   where
     facing = camFacing camera
-    config = requestConfig (inputsRequest inputs)
+    config = crConfig (inputsRequest inputs)
     worldLo = negate (2 ^ (62 ∷ Int))
     worldHi = 2 ^ (62 ∷ Int)
     -- Levels outside the supported range hold nothing: known air, whatever
@@ -690,11 +690,11 @@ statesOf inputs camera offset lo hi
     known _ (KnowRun a b CellUndiscovered) = Right [SRun a b SFog]
     known _ (KnowRun a b CellPending) = Right [SRun a b SPend]
     known column (KnowRun a b state) = do
-      runs ← either (Left . QueryRefused) Right (columnFacts (ccQueryLimits config) (inputsFacts inputs) column a b)
+      runs ← either (Left . CellQueryRefused) Right (columnFacts (ccQueryLimits config) (inputsFacts inputs) column a b)
       traverse (classify column state) runs
     classify _ _ (FRun a b FUnknown) = Right (SRun a b SPend)
     classify _ CellDiscovered (FRun a b FAir) = Right (SRun a b SAir)
-    classify column _ (FRun a _ FAir) = Left (InconsistentKnowledge column a)
+    classify column _ (FRun a _ FAir) = Left (CellInconsistentKnowledge column a)
     classify _ CellDiscovered (FRun a b (FSolid m s)) = Right (SRun a b (SOrd m s))
     classify _ _ (FRun a b (FSolid m s)) =
       Right (SRun a b (if isJust (lookupMixed (lookupFor facing s)) then SMix m s else SOrd m s))
@@ -730,11 +730,11 @@ partsOf inputs st env (rx, ry) (z, state) = case state of
         pure [cover, known]
   _ → Right []
   where
-    camera = requestCamera (inputsRequest inputs)
+    camera = crCamera (inputsRequest inputs)
     facing = camFacing camera
     one part material colour mapKey order = (: []) <$> quad part material colour mapKey order
     origin = (48 * (rx - ry), 24 * (rx + ry - 1) - 16 * (z - envRef env))
-    needColour m = unless (isJust (colourCoverage (inputsAssets inputs) (ColourMaterial m))) (Left (MissingMaterialColour m))
+    needColour m = unless (isJust (colourCoverage (inputsAssets inputs) (ColourMaterial m))) (Left (CellMissingMaterialColour m))
     tile = do
       column ← worldColumn camera (rx, ry)
       level ← either (const Nothing) Just (axisFromInteger z)
@@ -761,18 +761,18 @@ partsOf inputs st env (rx, ry) (z, state) = case state of
 transformOf ∷ Integer → Integer → Integer → Integer → Either CellError Affine2
 transformOf x y w h = case traverse (rationalToFloat . fromInteger) [w, h, x, y] of
   Just [fw, fh, fx, fy] → Right (fromColumns (V2 fw 0) (V2 0 fh) (V2 fx fy))
-  _ → Left (Unrepresentable "a cell transform")
+  _ → Left (CellUnrepresentable "a cell transform")
 
 -- The rectangle a transform covers in the target, as drawing places it.
 targetOf ∷ ViewMapping → Affine2 → Either CellError TargetRect
 targetOf mapping transform = case drawnOutline mapping transform [(0, 0), (1, 0), (1, 1), (0, 1)] of
-  Nothing → Left (Unrepresentable "a cell in the target")
+  Nothing → Left (CellUnrepresentable "a cell in the target")
   Just corners →
     let xs = map fst corners
         ys = map snd corners
      in if aligned corners
           then Right (TargetRect (minimum xs) (minimum ys) (maximum xs) (maximum ys))
-          else Left (Unrepresentable "a cell that is not axis-aligned in the target")
+          else Left (CellUnrepresentable "a cell that is not axis-aligned in the target")
   where
     aligned [(ax, ay), (bx, by), (cx, cy), (dx, dy)] = ay == by && bx == cx && cy == dy && dx == ax
     aligned _ = False
@@ -806,9 +806,9 @@ pendSpanOf view env column (rx, ry) lo hi = do
 cellPlanOf ∷ CellInputs → CellPrep → Either CellError CellPlan
 cellPlanOf inputs prep = do
   identity ← cellIdentityOf inputs
-  when (identity /= prIdentity prep) (Left StaleContinuation)
+  when (identity /= prIdentity prep) (Left CellStaleContinuation)
   let request = inputsRequest inputs
-      config = requestConfig request
+      config = crConfig request
       limits = ccLimits config
       raw = sortOn rawKey (prRaw prep)
       quads =
@@ -863,11 +863,11 @@ cellPlanOf inputs prep = do
       , cpUsed = prUsed prep
       , cpStats =
           CellStats
-            { statColumns = prColumns prep
-            , statLevels = prLevels prep
-            , statInstances = length quads
-            , statPending = length pendings
-            , statSteps = prSteps prep
+            { cellStatColumns = prColumns prep
+            , cellStatLevels = prLevels prep
+            , cellStatInstances = length quads
+            , cellStatPending = length pendings
+            , cellStatSteps = prSteps prep
             }
       }
 
@@ -881,9 +881,9 @@ fitDemand limits = go [] (0 ∷ Int) False
   where
     go acc _ cut [] = (Demand (reverse acc), cut)
     go acc intervals cut (chunk : rest)
-      | length acc >= limitDemandChunks limits = (Demand (reverse acc), True)
-      | length (demandRegions chunk) > limitRegionsPerChunk limits = go acc intervals True rest
-      | intervals + length (demandIntervals chunk) > limitDemandIntervals limits = go acc intervals True rest
+      | length acc >= clDemandChunks limits = (Demand (reverse acc), True)
+      | length (demandRegions chunk) > clRegionsPerChunk limits = go acc intervals True rest
+      | intervals + length (demandIntervals chunk) > clDemandIntervals limits = go acc intervals True rest
       | otherwise = go (chunk : acc) (intervals + length (demandIntervals chunk)) cut rest
 
 -- The horizontal margin around the processed chunks: the levels of their
@@ -901,11 +901,11 @@ prefetchDemand config availability visible windows
               | key ← Set.toAscList keys
               , (a, b) ← unknownPieces availability key (max lo worldLo) (min hi worldHi)
               ]
-            (demand, cut) = fitDemand limits {limitDemandChunks = room, limitDemandIntervals = limitDemandIntervals limits - demandIntervalCount visible} (demandChunks (demandFrom unmet))
+            (demand, cut) = fitDemand limits {clDemandChunks = room, clDemandIntervals = clDemandIntervals limits - demandIntervalCount visible} (demandChunks (demandFrom unmet))
          in (demand, cut)
   where
     limits = ccLimits config
-    room = max 0 (limitDemandChunks limits - length (demandChunks visible))
+    room = max 0 (clDemandChunks limits - length (demandChunks visible))
     margin = ccChunkMargin config
     (lo, hi) = case Map.elems windows of
       [] → (0, 0)

@@ -160,7 +160,7 @@ pickCells plan (CellPickQuery presented point@(V2 px py))
         (Just a, Just b') → Right (a && b')
         _ → Left CellPickUnrepresentable
 
-    texel ∷ Integer → Rational → Word32'
+    texel ∷ Integer → Rational → Word32
     texel n u = fromInteger (min (n - 1) (floor (max 0 (min 1 u) * fromInteger n)))
 
     isLoading centre front = pendingAhead || unresolvedAheadOf centre
@@ -179,5 +179,3 @@ pickCells plan (CellPickQuery presented point@(V2 px py))
 
 contains ∷ TargetRect → (Rational, Rational) → Bool
 contains (TargetRect l t r b) (cx, cy) = l <= cx && cx < r && t <= cy && cy < b
-
-type Word32' = Word32
