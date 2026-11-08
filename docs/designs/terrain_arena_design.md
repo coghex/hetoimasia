@@ -10,9 +10,9 @@ Design state: `ready for issue processing`
 
 Owner-requested face-map amendment opened 2026-11-07 (D-28) and signed off
 2026-11-08 (D-60), approving P-16 at `b012fabbfc`. TRA-1–TRA-12 remain filed;
-TRA-13–TRA-21 are now [#655], [#656], [#657], [#658], [#659], [#660], [#661], [#662] and [#663].
-TRA-22–TRA-23 remain approved
-unprocessed follow-ups in the ledger below. The
+TRA-13–TRA-22 are now [#655], [#656], [#657], [#658], [#659], [#660], [#661], [#662], [#663] and [#665].
+TRA-23 remains an approved
+unprocessed follow-up in the ledger below. The
 amendment is ready for issue processing. Each tracker draft still requires
 separate sign-off; no tracker mutation, implementation or PR-hold release
 is authorized by this design sign-off.
@@ -199,7 +199,7 @@ concrete precondition
 - [x] TRA-19. Model compressed knowledge and resumable discovery after removal — [#661]
 - [x] TRA-20. Define bounded copy-on-write store records and transactions — [#662]
 - [x] TRA-21. Own reserved backing files and bounded asynchronous storage I/O — [#663]
-- [ ] TRA-22. Commit terrain edits and discovery through the temporary store
+- [x] TRA-22. Commit terrain edits and discovery through the temporary store — [#665]
 - [ ] TRA-23. Expose terrain storage status, growth and recovery through Lua
 - [x] TRA-9. Publish retained terrain views with safe GPU retirement — [#645]
 - [x] TRA-10. Expose terrain views and camera controls to Lua — [#646]
@@ -208,7 +208,7 @@ concrete precondition
 
 D-60 approves the amended delivery plan and readiness. Checked entries mean
 already filed, not implemented; their original issue links are preserved.
-The two unchecked follow-ups are unprocessed. P-16 records the approved
+The one unchecked follow-up is unprocessed. P-16 records the approved
 revisions to existing artifacts, including #645–#648 despite their filed marks.
 
 **Amendment EPIC revision applied 2026-11-08:** existing [#636] now carries
@@ -276,12 +276,17 @@ verified after filing; approved body SHA-256:
 verified after filing; approved body SHA-256:
 `ad57d8ca975737e2bda988ca088a53ff978619326ee3ab63ff762b36270225d5`.
 
-**Amendment processing cursor:** draft TRA-22 next. Process TRA-22–TRA-23
-in ledger order, then the P-16 revisions of #645–#648 and any other named
+**TRA-22 filed 2026-11-08:** [#665], approved by `het-manager` in
+`#het-terrain` message `p8r8fjsu38z92er2my73q55xh2` (reply to draft
+`phgxf72qwkzneb8hirrmds3ig2`). The issue body and EPIC checklist link were
+verified after filing; approved body SHA-256:
+`9e48e5526a130dd92e609623aed926d0423834f4ace05a8f34c18b93ac1f48b5`.
+
+**Amendment processing cursor:** draft TRA-23 next, then the P-16 revisions of #645–#648 and any other named
 artifacts, one artifact at a time with a separately approved concrete tracker
 draft before each mutation. The manager arranges readiness reviews. Tracker
-processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after TRA-21:
-`ie9dpn2fim377epha74cgwhcc2` in `#het-terrain`.
+processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after TRA-22:
+`p8r8fjsu38z92er2my73q55xh2` in `#het-terrain`.
 
 ## Epic contract
 
