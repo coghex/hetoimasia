@@ -28,6 +28,8 @@ module Test.Terrain.ConnectivityOracle
   , connectsAlong
   , topOpens
   , hasVoid
+  , openOn
+  , samples
 
     -- * Flood
   , Cell3

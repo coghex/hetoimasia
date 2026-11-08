@@ -3,7 +3,7 @@
 Evidence for [#661](https://github.com/coghex/hetoimasia/issues/661) (TRA-19 of #636),
 delivered by pull request [#671](https://github.com/coghex/hetoimasia/pull/671).
 
-**Revision.** Implementation head `65d49cb11f61` (branch `issue-661-discovery-model`, based on
+**Revision.** Implementation head `1fe50c0a678b` (branch `issue-661-discovery-model`, based on
 `origin/master` `d8b2aa7b1b78`, with the landed docs merged; round 1 of the review repaired). Every figure below was produced at that revision with the
 qualified toolchain (GHC 9.14.1, Cabal 3.18.1.0). The suite's own output is the primary record;
 this document restates it with the commands that reproduce it. It qualifies a **pure model and
@@ -29,7 +29,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --t
   --test-option=--match --test-option="Discovery"
 ```
 
-Results at the revision: `terrain-tests` 894 examples, 0 failures (57 are the `Discovery` group);
+Results at the revision: `terrain-tests` 896 examples, 0 failures (59 are the `Discovery` group);
 `terrain-render-2d-tests` 298 and `workflow-tests` 965, 0 failures; `cabal check` clean;
 catalog valid (36 groups); clean rebuild of the terrain package without a warning.
 
@@ -122,12 +122,12 @@ repetitions of the three edits and a drain; measured allocation, not accounted b
 
 | Variation | Allocated bytes |
 | --- | --- |
-| span `2^20` | 7,776,296 |
-| span `2^60` | 7,780,288 |
-| history of 100 runs | 7,867,424 |
-| history of 100,000 runs | 8,035,424 |
-| first boundary page of 64 boxes, source with 200 patches | 3,208,288 |
-| first boundary page of 64 boxes, source with 400 patches | 3,204,296 |
+| span `2^20` | 7,776,824 |
+| span `2^60` | 7,780,816 |
+| history of 100 runs | 7,867,904 |
+| history of 100,000 runs | 8,035,904 |
+| first boundary page of 64 boxes, source with 200 patches | 3,307,648 |
+| first boundary page of 64 boxes, source with 400 patches | 3,304,936 |
 | source with 0 patches (one removal and drain, 20 repetitions) | 50,904 |
 | source with 200 separated patches | 50,904 |
 
@@ -224,6 +224,15 @@ Every former site that charged or measured a resource directly, and what replace
 | `isExterior` enumerating members (round 1) | `resolveRep`, the representative only |
 
 Each repair was reverted locally and the discovery group run (never committed): no knowledge gain for a join into a known class fails the two bridging/extension examples; forgetting the rejected attempt's peak fails the counting-provider and peak examples; an unbounded page scan fails the page-bound example; treating an unavailable record as absent fails four examples (suspension, withheld record, counting provider, windowed replay); no knowledge revision at all fails four (frontier work, extension, bridging, the generated revision property).
+
+## Round 3 of the review and its repairs
+
+The third canonical review (Codex) requested changes on two points, repaired at the head above.
+
+| Finding | Repair | Evidence |
+| --- | --- | --- |
+| a boundary page resumed with `drop from ids`, walking every member before it, so a late page's work grew with the source | the cursor is a box identity; resuming is a seek in an ordered member index (`IntSet`) built once with the environment and charged once in `envSharedBytes`; each page reports `pageVisited` | every page of a 200-patch class (about 14,850 members) visits at most 64 entries, the last page included, and moves forward; the pages together reproduce the whole description set for set; with a prefix-walking resume (honestly counted) the page-bound and last-page examples fail |
+| validation sized a page alone, but a query first reads the class (up to `findReadsBound` records), so a configuration with exactly the page's bytes accepted at validation refused every query | `boundaryQueryScratch n = findReadsBound x maxRecordBytes + boundaryPageBytes n` is required of the scratch limit | exact-limit examples answer a singleton class and a class linked by a removal under exactly `boundaryQueryScratch 1024` (147,776 bytes); one byte less, and the page alone (131,136), are refused at validation by field; validating only the page fails the validation example |
 
 ## Defect found by the oracle and fixed
 

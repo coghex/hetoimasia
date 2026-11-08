@@ -66,6 +66,8 @@ module Hetoimasia.Terrain.Internal.Connectivity.Index
   , componentRanges
   , componentRelations
   , componentBoundary
+  , componentBoundaryPage
+  , memberIndex
   , componentContains
   , portalRelations
   ) where
@@ -341,11 +343,28 @@ resolve c key@(ComponentKey origin _ _ _) = do
     then Just (rep, nodes)
     else Nothing
 
+-- | The representative node of a key's class, when the key names a component of
+-- this result. It validates the key against the representative alone: it does
+-- not visit the members of the class.
+resolveRep ∷ Connectivity → ComponentKey → Maybe Node
+resolveRep c key@(ComponentKey origin _ _ _) = do
+  (nid, rep) ← tileNode c origin
+  _ ← if nodeClass rep == nid then Just () else Nothing
+  range ← nodeRange c rep
+  let ok axis lo hi param
+        | nodeAxes rep .&. axisBit axis /= 0 = maybe False (\v → toInteger (axisValue v) >= lo && toInteger (axisValue v) < hi) param
+        | otherwise = param == Nothing
+      ComponentKey _ px py pz = key
+  if ok 0 (rangeXLo range) (rangeXHi range) px && ok 1 (rangeYLo range) (rangeYHi range) py && ok 2 (rangeZLo range) (rangeZHi range) pz
+    then Just rep
+    else Nothing
+
 -- | Whether the component is initially exterior: connected through positive-area
 -- openings to the upper Z boundary. 'Nothing' for a key that names no component.
+-- The lookup reads the representative only, never the members of the class.
 isExterior ∷ Connectivity → ComponentKey → Maybe Bool
 isExterior c key = do
-  (rep, _) ← resolve c key
+  rep ← resolveRep c key
   pure (IntSet.member (nodeClass rep) (cExterior c))
 
 -- | The member of a node under the key's parameters, as a range of cells.
@@ -453,6 +472,37 @@ componentBoundary ∷ Connectivity → ComponentKey → Maybe [BoundaryFace]
 componentBoundary c key = do
   (_, nodes) ← resolve c key
   pure (concatMap (boundaryOf c key) nodes)
+
+-- | The members of every class as an ordered set of node identities, built once
+-- (by the owner, with the other shared metadata) so a boundary page can resume at
+-- a box without walking the boxes before it.
+memberIndex ∷ Connectivity → IntMap IntSet
+memberIndex c = IntMap.map IntSet.fromList (cMembers c)
+
+-- | One page of a component's boundary, resumed at the box with identity @from@
+-- (the first box at or after it): at most @limit@ boxes are scanned and at most
+-- @limit@ faces returned (whole boxes only, and always at least one box). The result
+-- is the faces, the identity of the next box when more remain, and the number of
+-- member entries the page visited. Resuming is an ordered-set seek, so a page never
+-- walks the boxes before it; a page may hold fewer faces than the limit, or none,
+-- when the boxes it scans lie inside the class.
+componentBoundaryPage ∷ Connectivity → IntMap IntSet → ComponentKey → Int → Int → Maybe ([BoundaryFace], Maybe Int, Int)
+componentBoundaryPage c index key from limit = do
+  rep ← resolveRep c key
+  members ← IntMap.lookup (nodeClass rep) index
+  let (_, present, above) = IntSet.splitMember from members
+      ids = [from | present] <> IntSet.toAscList above
+  pure (go ids [] 0 (0 ∷ Int))
+  where
+    go [] acc _ visited = (concat (reverse acc), Nothing, visited)
+    go (nid : rest) acc count visited
+      | visited >= limit = (concat (reverse acc), Just nid, visited)
+      | otherwise =
+          let faces = maybe [] (boundaryOf c key) (IntMap.lookup nid (cNodes c))
+              total = count + length faces
+           in if total > limit && count > 0
+                then (concat (reverse acc), Just nid, visited)
+                else go rest (faces : acc) total (visited + 1)
 
 boundaryOf ∷ Connectivity → ComponentKey → Node → [BoundaryFace]
 boundaryOf c key node = case (memberRange c key node, nodeRange c node) of

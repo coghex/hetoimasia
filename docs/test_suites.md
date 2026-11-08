@@ -62,6 +62,12 @@ cabal test hetoimasia-tests --test-show-details=direct
   oracle `Test.Terrain.ConnectivityOracle` and the deterministic generators `Test.Terrain.ConnectivityFixtures`) own the
   symbolic source compiler's contract: exact component families, exterior, canonical keys, the six preparation limits, quanta,
   typed refusal and scale-independence. A new connectivity rule belongs there, not in a parallel suite.
+  Its discovery examples (TRA-19: `Test.Terrain.Discovery`, with the explicit flood-and-knowledge oracle and driver
+  `Test.Terrain.DiscoveryHarness`, which reuses `Test.Terrain.ConnectivityOracle`) own the knowledge model's contract:
+  initial knowledge, paired removal and obligation candidates, bounded resumable batches, knowledge queries, replay from
+  retained records, validated limits and allowances, stale and foreign candidates, and the negative controls. A new discovery
+  rule belongs there, and a domain fixture such as the bounded record provider stays beside it, not in
+  `hetoimasia-test-support`.
 - `terrain-render-2d-tests` (`packages/terrain-render-2d/test/`, group `test.terrain-render-2d`, the CPU project) owns the
   pure planner and picker (TRA-7), the terrain material's CPU model (TRA-8) and, in `Test.TerrainRender2D.MapAssets` (TRA-14),
   the canonical cutout and unit-normal map assets: the committed catalog under `samples/ecce-homo/content/textures/facemap/`

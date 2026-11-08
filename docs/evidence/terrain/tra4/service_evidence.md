@@ -127,6 +127,8 @@ committed. The failing assertion is the one that protects the behaviour.
 | NC31 | A closed arena is retired while a preparation of it runs | the same examples (lease release, close) | the same |
 | NC32 | A capacity-refused transfer is suppressed like a failed one | `reconsiders a transfer refused for want of capacity as soon as capacity is returned` | the region stayed dirty after capacity returned (bounded wait never returned) |
 | NC33 | Credits released while a preparation runs, caught by the randomized property | `keeps every invariant when releases arrive while a preparation runs` | 18 of 24 seeds: the request being prepared had no model record |
+| NC34 | The capacity-refusal memory is never forgotten (the round-8 defect) | `reconsiders a transfer refused for want of capacity ... and forgets it when the arena ends` (three incarnations on one service) | the retry memory held 1 entry after the arena ended |
+| NC35 | A transfer in flight when its arena ends leaves a memory behind | `remembers nothing about a transfer whose arena ended while it was in flight` | the retry memory held 1 entry (also found by two flaky seeds of the randomized property before the guard) |
 | NC9 | The drain does not wait for outstanding borrowers | `does not return while a borrower holds a snapshot after the owner failed` | expected the service not to have returned, got that it had |
 
 ## Acceptance commands
@@ -140,7 +142,7 @@ compile of every module, not an incremental one.
 | Command | Result |
 | --- | --- |
 | `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning (package build directory removed first) |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 175 examples, 0 failures |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 176 examples, 0 failures |
 | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 669 examples, 0 failures (on the merged head) |
 | `cabal test --project-file cabal.project.cpu hetoimasia:workflow-tests --test-show-details=direct` | 965 examples, 0 failures |
 | `(cd packages/terrain-runtime && cabal check)` | No errors or warnings could be found in the package |
@@ -148,7 +150,7 @@ compile of every module, not an incremental one.
 | `python3 tools/validation/plan.py --base origin/master --head HEAD` | selects `test.terrain-runtime` and every affected predecessor and mandatory group (29 of 37; the catalog and workflow changes are policy inputs and widen the plan) |
 | `python3 tools/validation/owned_starts.py check` and `ratchet --base origin/master` | pass; the new package has no unowned start |
 
-After the first six review rounds the suite grew from 66 to 175 examples (24 seeds of a randomized interleaving, retained-size shrink on
+After the first six review rounds the suite grew from 66 to 176 examples (24 seeds of a randomized interleaving, retained-size shrink on
 coalescing, residency kept across a delayed commit, several intervals of one column,
 the column length limit, a failing readiness callback, snapshot backing across
 revisions, the drain on the failure path and under cancellation, the owner's logging
