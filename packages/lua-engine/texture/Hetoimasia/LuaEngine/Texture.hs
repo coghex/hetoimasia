@@ -7,7 +7,10 @@
 -- decode, an upload and a registration, and it succeeds only when the backend reports the upload
 -- complete and the registration usable. The result carries the instance's opaque texture lease and the
 -- source dimensions, ready for the later @{texture = HANDLE, width = INTEGER, height = INTEGER}@
--- ('textureValueSchema'). It does not promise a displayed frame, a window or a CPU image.
+-- ('textureValueSchema'). It does not promise a displayed frame, a window or a CPU image. What it may
+-- additionally keep on the CPU, and only when the request's 'TexturePolicy' asked for it, is the one
+-- shared binary-coverage plane and the checked normal-encoding fact of the loaded version (see
+-- /Image kinds and the shared account/ below); never a decoded RGBA image.
 --
 -- It is a /composable typed endpoint/, not a Lua API. The eventual graphics facade (LFE-21) parses its
 -- arguments into a 'TextureRequest' with 'textureKey', builds its binding from 'startTexture' beside
@@ -39,6 +42,9 @@
 -- +=======================+===========================================+================================+
 -- | request and result    | 16 per instance, 64 per VM (the host's)   | result taken and work retired  |
 -- | result lease capacity | the instance's lease scope                | with the instance's lease      |
+-- | coverage bytes        | the session's one CPU account (128 MiB),  | the last CPU interest in the   |
+-- | (@coverage="binary"@  | injected; worst case ceil (4,194,304 / 8) | loaded version (shrunk to the  |
+-- | only)                 | plane bytes and the fixed metadata        | exact plane at the decode)     |
 -- | texture slot          | 16 pending/live/retiring per UI instance  | texture proved retired         |
 -- | nominal RGBA8 bytes   | 16 MiB reserved; 128 MiB per instance,    | texture proved retired         |
 -- |                       | 256 MiB per session                       | (shrunk after the decode stage |
@@ -47,8 +53,9 @@
 -- | queue slot            | the read pool's                           | request taken, read retired    |
 -- +-----------------------+-------------------------------------------+--------------------------------+
 --
--- A bank without room is the host's busy answer, with no file open, no decode, no backend call and
--- nothing reserved. A malformed address, a wrong role or phase, a closed owner or a stopping pipeline
+-- A bank without room (the coverage account included) is the host's busy answer, with no file open, no
+-- decode, no backend call and nothing reserved; the account is read only at that admission, so accepted work
+-- is never turned busy by it later and no stage waits on it. A malformed address, a wrong role or phase, a closed owner or a stopping pipeline
 -- are permanent and refused as ordinary Lua errors before any admission. The maximum 16 MiB output is
 -- reserved without reading a header, so a small image can be refused busy while the banks hold large
 -- reservations: that is accepted behavior. A file the inventory does not hold, or one over the
@@ -58,11 +65,38 @@
 -- returned when the request is taken, or when the pipeline's CPU buffers retire, or when Lua loses its
 -- handle: they are returned when the backend proves the texture itself retired.
 --
+-- = Image kinds and the shared account
+--
+-- A request's 'TexturePolicy' chooses how the decoded level is read and what is checked before it is uploaded:
+--
+-- * @kind@ 'ColourKind' (the default): premultiplied sRGB, uploaded and registered as 'TexelRgba8Srgb'.
+--   'DataKind': linear numeric data exactly as decoded (no gamma, no premultiplication, the RGB of a
+--   transparent texel kept), uploaded and registered as 'TexelRgba8Linear' ('uploadFormat').
+-- * @coverage = "binary"@: only alpha 0 and 255 are valid. One bit per texel is kept, as one immutable plane
+--   shared by every reader of that loaded version.
+-- * @normal_encoding@ 'UnitNormalRgbV1' (data only): every nontransparent texel's RGB in 1..255 and not
+--   (128,128,128). Checked, never rewritten.
+--
+-- Both checks read the very bytes that will be uploaded, in the decode worker while the accounted decode
+-- buffer exists, and a failure is the expected content failure @invalid_image@ with a bounded reason that names
+-- the policy: nothing is uploaded, registered or published, and every charge returns once the request ends.
+--
+-- The plane is the /version/'s ("Hetoimasia.LuaEngine.Texture.Version"), kept alive by /interests/: the
+-- pipeline's while it delivers, the lease's once a lease adopts the texture, and one for each consumer that
+-- retains it through 'retainTexture'. Its bytes (plane and fixed metadata) are charged to the session's one
+-- injected 'RenderAccount' by a reservation made at the request's atomic admission, shrunk at the decode and
+-- passed to the version, and returned exactly once when its last interest ends (or, for a request that ends
+-- without a version, by the host's credit release). That is the end of the CPU coverage and of nothing else:
+-- the texture's slot and nominal bytes, and its GPU registration, are returned on the backend's evidence of
+-- retirement, and neither event stands in for the other. A Lua release stops the lease from granting new
+-- interests and leaves the ones already taken.
+--
 -- = Failures
 --
 -- An expected failure carries one of 'textureCodes' with the root and path: @not_found@,
 -- @content_changed@, @io_error@, @too_large@ (a file or a decode over a limit, the workspace bank
--- included), @unsupported_format@ (not a PNG, or animated) and @invalid_image@. A required request's
+-- included), @unsupported_format@ (not a PNG, or animated) and @invalid_image@ (a PNG that is not sound, a
+-- nonbinary alpha under @coverage = "binary"@, or a texel that breaks the declared normal encoding). A required request's
 -- failure latches at its eligible settlement whether or not it is read; an optional one is data.
 -- A defect of the reader, the pool, the decode worker, the backend, the allocator or a release is a
 -- provider defect: it fails the owner at its next boundary, required or optional alike, and is latched
@@ -71,8 +105,9 @@
 -- = Independent loads
 --
 -- Every request has its own verified read, decode, upload and texture, even for the same path from the
--- same instance. There is no cache, no coalescing of work in flight and no sharing between instances;
--- only the pool, the decode worker, the lanes and the device are shared. An instance may use one live
+-- same instance, and so its own loaded version and its own separately charged plane. There is no cache, no
+-- coalescing of work in flight and no sharing between instances; only the pool, the decode worker, the lanes,
+-- the device and the session's CPU account are shared. An instance may use one live
 -- texture in many sprites, and cannot use or release another instance's.
 module Hetoimasia.LuaEngine.Texture
   ( -- * The pipeline

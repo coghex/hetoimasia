@@ -64,6 +64,20 @@
 -- hands the cell to the pipeline's own housekeeping, which releases it and returns the charge only
 -- when the backend proves the texture retired.
 --
+-- = The loaded version and its interests
+--
+-- The decode that passed its request's policy builds one 'Version' ("Hetoimasia.LuaEngine.Texture.Version"): the
+-- checked facts and, for @coverage = "binary"@, the one shared coverage plane. The job holds its first
+-- /interest/ in it ('jInterest') until the backend's registration is delivered, when the 'Cell' takes it over in
+-- the transaction that creates the cell ('cellInterest'). From there exactly one thing drops it: the pipeline
+-- claiming the cell for release ('dropPipelineInterest'), or the lease that adopts the cell, which takes its own
+-- interest first and then lets the pipeline's go, in one transaction ('adoptionFor'), and drops its own when it is
+-- released, at once and whatever the backend answers ('releaseResource'). A job that settles holding its first
+-- interest (the upload failed, was withdrawn or never started) drops it in 'settleJob'. The version's reservation
+-- on the shared CPU account is returned by the last interest, once; a request that ended before a version existed
+-- returns it from the host's credit release. The account is read at the one admission ('requestCredits') and
+-- shrunk once at the decode; no later stage reserves from it or waits for it.
+--
 -- = Housekeeping
 --
 -- A transition that no event drives has to be driven by somebody: a read cancelled after its worker took
