@@ -113,6 +113,9 @@ committed. The failing assertion is the one that protects the behaviour.
 | NC15 | Loads and retries starve behind a stream of ready requests | `gives a queued load its turn while ready requests keep arriving elsewhere` | the cold load settled after all 41 cache hits |
 | NC16 | The owner drops the cleanup's defects when it had already failed | `attaches the cleanup's defects to the failure the owner already has` | no cleanup evidence reached supervision |
 | NC17 | An untaken removal result is not charged bytes | `keeps an untaken removal result's bytes charged in the retained bank until it is taken` | expected 320 bytes charged, got 0 |
+| NC18 | A fatal defect marks every earlier unreported one as reported | `reports an earlier unreported defect beside a later fatal one` | the earlier closure-callback failure never reached supervision |
+| NC19 | Pending opens and attaches are not charged | `charges pending opens and attaches against the command slots and the retained bank` | a third delayed attachment was admitted into two slots |
+| NC20 | A pending removal reserves nothing in the retained bank | `reserves a removal's result bytes at admission ...` | a third pending removal was admitted into a 330-byte bank |
 | NC9 | The drain does not wait for outstanding borrowers | `does not return while a borrower holds a snapshot after the owner failed` | expected the service not to have returned, got that it had |
 
 ## Acceptance commands
@@ -126,7 +129,7 @@ compile of every module, not an incremental one.
 | Command | Result |
 | --- | --- |
 | `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning (package build directory removed first) |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 115 examples, 0 failures |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 119 examples, 0 failures |
 | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 669 examples, 0 failures (on the merged head) |
 | `cabal test --project-file cabal.project.cpu hetoimasia:workflow-tests --test-show-details=direct` | 965 examples, 0 failures |
 | `(cd packages/terrain-runtime && cabal check)` | No errors or warnings could be found in the package |
@@ -134,7 +137,7 @@ compile of every module, not an incremental one.
 | `python3 tools/validation/plan.py --base origin/master --head HEAD` | selects `test.terrain-runtime` and every affected predecessor and mandatory group (29 of 37; the catalog and workflow changes are policy inputs and widen the plan) |
 | `python3 tools/validation/owned_starts.py check` and `ratchet --base origin/master` | pass; the new package has no unowned start |
 
-After the first three reviews the suite grew from 66 to 115 examples (24 seeds of a randomized interleaving, retained-size shrink on
+After the first four reviews the suite grew from 66 to 119 examples (24 seeds of a randomized interleaving, retained-size shrink on
 coalescing, residency kept across a delayed commit, several intervals of one column,
 the column length limit, a failing readiness callback, snapshot backing across
 revisions, the drain on the failure path and under cancellation, the owner's logging
