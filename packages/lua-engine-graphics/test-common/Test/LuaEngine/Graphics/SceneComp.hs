@@ -337,7 +337,7 @@ bindings comp limits vm =
           Nothing → Left ("no texture owner named " <> who)
           Just owner → case textureKey (vmTexture vm) (Text.encodeUtf8 path) of
             Left refused → Left ("address refused: " <> Text.pack (show refused))
-            Right key → Right (TextureRequest owner key RequiredRequest)
+            Right key → Right (TextureRequest owner key RequiredRequest colourPolicy)
       _ → pure (Left "a texture owner and a path are required")
     openFrom ∷ [Value] → IO (Either Text WindowAsk)
     openFrom = \case

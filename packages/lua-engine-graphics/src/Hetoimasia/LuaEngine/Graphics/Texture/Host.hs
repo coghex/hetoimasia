@@ -44,7 +44,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.Asset.Image (DecodedImage (..), TexelFormat (TexelRgba8Srgb))
+import Hetoimasia.Asset.Image (DecodedImage (..), TexelFormat (..))
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , ActionRefusal (..)
@@ -54,7 +54,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , CancelRefusal (..)
   , Construction
   , ImageDescription (..)
-  , ImageFormat (Rgba8Srgb)
+  , ImageFormat (Rgba8Linear, Rgba8Srgb)
   , ImageKind (TextureImage)
   , LookupEntry (..)
   , Readiness (..)
@@ -269,8 +269,9 @@ admissionRefusal = \case
 deviceOf ∷ VulkanHost scene → HostSession → Construction q inst msgr phys dev cmd → Device Image
 deviceOf host session construction =
   Device
-    { deviceAllocate = \width height →
-        constructImage construction (ImageDescription TextureImage Rgba8Srgb width height 1) <&> either (Left . faultOf) Right
+    { deviceAllocate = \format width height → case nativeFormat format of
+        Nothing → pure (Left (FaultFatal ("the texture adapter has no native format for the texel format " <> Text.pack (show format))))
+        Just native → constructImage construction (ImageDescription TextureImage native width height 1) <&> either (Left . faultOf) Right
     , deviceDiscard = \image → releaseConstructed construction image <&> either (Left . faultOf) Right
     , deviceRegister = \image level → do
         view ← readConstructedTable construction
@@ -294,7 +295,7 @@ deviceOf host session construction =
     -- bytes alive for no reader.
     decodedFor level =
       DecodedImage
-        { decodedFormat = TexelRgba8Srgb
+        { decodedFormat = levelFormat level
         , decodedWidth = levelWidth level
         , decodedHeight = levelHeight level
         , decodedLevels = []
@@ -317,6 +318,15 @@ deviceOf host session construction =
               pure . Left . FaultFatal $
                 "the registration did not resolve to the image's own slot"
                   <> either (\refusal → ", and releasing it failed: " <> Text.pack (show refusal)) (const "") undone
+
+-- | The native format that carries a texel interpretation for good: premultiplied sRGB colour is
+-- 'Rgba8Srgb', numeric data is the linear UNORM 'Rgba8Linear'. The pipeline asks for no other.
+nativeFormat ∷ TexelFormat → Maybe ImageFormat
+nativeFormat = \case
+  TexelRgba8Srgb → Just Rgba8Srgb
+  TexelRgba8Linear → Just Rgba8Linear
+  TexelBc7Srgb → Nothing
+  TexelBc7Linear → Nothing
 
 faultOf ∷ Refusal → Fault
 faultOf = \case

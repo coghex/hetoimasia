@@ -78,6 +78,8 @@ import Hetoimasia.LuaEngine.Session
   )
 import Hetoimasia.LuaEngine.Texture
   ( TexturePipeline
+  , m1RenderAccountBytes
+  , newRenderAccount
   , specIoWorkers
   , textureSpec
   , withTexturePipeline
@@ -213,8 +215,12 @@ runPrepared environment lifetime stop link prepared graphics hook =
               Left refusal → ioError (userError ("the texture pipeline was refused: " <> show refusal))
               Right spec
                 | specIoWorkers spec /= ioWorkers → ioError (userError "the pipeline and the pool disagree on the I/O workers")
-                | otherwise →
-                    withTexturePipeline spec (graphicsTextureBackend production) readPool (preparedInventory prepared) $ \pipeline →
+                | otherwise → do
+                    -- The session's one CPU render/staging allowance (design D-55–D-57, TRA-15), sized at the
+                    -- approved 128 MiB and handed narrowly to the pipeline: this composition root is its owner,
+                    -- and the pipeline makes none of its own. A later terrain service receives this same handle.
+                    renderAccount ← newRenderAccount m1RenderAccountBytes
+                    withTexturePipeline spec renderAccount (graphicsTextureBackend production) readPool (preparedInventory prepared) $ \pipeline →
                       graphicsMount production pipeline link $ \injection →
                         compose readPool (Just injection)
   where

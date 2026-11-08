@@ -89,7 +89,10 @@
 -- from Lua.
 module Hetoimasia.LuaEngine.Facade
   ( -- * The services a facade is injected with
-    GraphicsStart (..)
+    TextureImageKind (..)
+  , TextureOptions (..)
+  , defaultTextureOptions
+  , GraphicsStart (..)
   , GraphicsVm (..)
   , GraphicsInjection (..)
   , GraphicsServices (..)

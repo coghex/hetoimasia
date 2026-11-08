@@ -43,6 +43,10 @@ module Hetoimasia.LuaEngine.Facade.Types
   , StatusState (..)
   , FacadeLimits (..)
     -- * Injected graphics
+  , TextureImageKind (..)
+  , TextureOptions (..)
+  , defaultTextureOptions
+  , textureNormalEncodingNames
   , GraphicsStart (..)
   , GraphicsVm (..)
   , GraphicsInjection (..)
@@ -325,6 +329,33 @@ graphicsTextureValueSchema = SRecord [("texture", SCapability graphicsTextureTyp
 graphicsWindowValueSchema ∷ Schema
 graphicsWindowValueSchema = SCapability graphicsWindowType
 
+-- | The image kind a texture request asks for: @kind = "colour"@ (the default) or @kind = "data"@.
+data TextureImageKind
+  = ImageColour
+  | ImageData
+  deriving (Eq, Show)
+
+-- | What @api.content.texture(path, options)@ asked beyond the root and the optional flag, as the facade
+-- parsed and checked it before any provider is asked. The facade validates the spelling and the one
+-- incompatible combination (a normal encoding on a colour image); what the options mean to the load is the
+-- injected service's.
+data TextureOptions = TextureOptions
+  { optionKind ∷ !TextureImageKind
+  , optionBinaryCoverage ∷ !Bool
+    -- ^ @coverage = "binary"@.
+  , optionNormalEncoding ∷ !(Maybe Text)
+    -- ^ The checked name of @normal_encoding@, one of 'textureNormalEncodingNames'. Only with data.
+  }
+  deriving (Eq, Show)
+
+-- | The options of a request that gave none: premultiplied sRGB colour, no coverage, no encoding.
+defaultTextureOptions ∷ TextureOptions
+defaultTextureOptions = TextureOptions ImageColour False Nothing
+
+-- | The normal encodings @normal_encoding@ names: exactly these spellings, case-sensitive.
+textureNormalEncodingNames ∷ [Text]
+textureNormalEncodingNames = ["unit-normal-rgb-v1"]
+
 -- | What a request-producing graphics service answered once the facade's checks passed.
 data GraphicsStart
   = -- | The host's answer: the request, or busy with nothing reserved.
@@ -367,8 +398,8 @@ data GraphicsServices = GraphicsServices
   -- ^ An instance was declared: make its owners.
   , gsForget ∷ Text → IO ()
   -- ^ An instance was forgotten, once its settlement was observed: end its owners.
-  , gsTextureCheck ∷ Text → ContentKey → Bool → ArgumentCheck
-  , gsTextureStart ∷ Text → ContentKey → Bool → RequestContext → IO GraphicsStart
+  , gsTextureCheck ∷ Text → ContentKey → Bool → TextureOptions → ArgumentCheck
+  , gsTextureStart ∷ Text → ContentKey → Bool → TextureOptions → RequestContext → IO GraphicsStart
   , gsWindowCheck ∷ Text → ByteString → Int64 → Int64 → ArgumentCheck
   , gsWindowStart ∷ Text → ByteString → Int64 → Int64 → RequestContext → IO GraphicsStart
   , gsPublish ∷ Text → ArgumentCheck → Binding

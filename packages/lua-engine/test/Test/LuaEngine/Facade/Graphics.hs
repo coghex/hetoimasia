@@ -49,10 +49,12 @@ data Gfx = Gfx
   , gxHanded ∷ !(TVar [(Text, Completion, TVar RetirementState)])
   , gxIssued ∷ !(TVar (Map.Map Word64 Text))
   , gxInput ∷ !Inp
+  , gxOptions ∷ !(IORef [TextureOptions])
+    -- ^ The image options each started texture request reached the service with, oldest last.
   }
 
 newGfx ∷ IO Gfx
-newGfx = Gfx <$> newIORef [] <*> newIORef False <*> newTVarIO [] <*> newTVarIO Map.empty <*> newInp
+newGfx = Gfx <$> newIORef [] <*> newIORef False <*> newTVarIO [] <*> newTVarIO Map.empty <*> newInp <*> newIORef []
 
 -- | The injected ordered input port: a feed the example loads, with the disposition it is in, the observation a read
 -- takes and the answers an acknowledgement is told to give. Every operation it is asked to do is logged, so a refused call
@@ -148,8 +150,8 @@ injectionOpt withInput gx = GraphicsInjection $ \vm → do
       , gsEndpoints = [endpointOf "texture" (SRecord [("width", SInteger), ("height", SInteger)]), endpointOf "window" SNil]
       , gsDeclare = \identity → note gx ("declare " <> identity)
       , gsForget = \identity → note gx ("forget " <> identity)
-      , gsTextureCheck = \_ _ _ _ _ → note gx "check texture" >> pure Nothing
-      , gsTextureStart = \_ _ _ ctx → start vm ctx "texture" (Just textureCompose)
+      , gsTextureCheck = \_ _ _ _ _ _ → note gx "check texture" >> pure Nothing
+      , gsTextureStart = \_ _ _ options ctx → atomicModifyIORef' (gxOptions gx) (\held → (options : held, ())) >> start vm ctx "texture" (Just textureCompose)
       , gsWindowCheck = \_ _ _ _ _ _ → note gx "check window" >> pure Nothing
       , gsWindowStart = \_ _ _ _ ctx → start vm ctx "window" (Just windowCompose)
       , gsPublish = \name precondition →
@@ -300,6 +302,17 @@ spec = describe "graphics calls" $ do
       , Case "texture unknown option" "api.content.texture('images/quad.png', {bogus = 1})" (Refused ["unknown field bogus"])
       , Case "texture optional string" "api.content.texture('images/quad.png', {optional = 'yes'})" (Refused ["expected boolean"])
       , Case "texture options metatable" "api.content.texture('images/quad.png', setmetatable({}, {__index = function() error('boom') end}))" (Refused ["metatable"])
+      , Case "texture kind unknown" "api.content.texture('images/quad.png', {kind = 'video'})" (Refused ["kind must be"])
+      , Case "texture kind case" "api.content.texture('images/quad.png', {kind = 'Data'})" (Refused ["kind must be"])
+      , Case "texture kind number" "api.content.texture('images/quad.png', {kind = 1})" (Refused ["expected text"])
+      , Case "texture coverage unknown" "api.content.texture('images/quad.png', {coverage = 'alpha'})" (Refused ["coverage must be"])
+      , Case "texture coverage boolean" "api.content.texture('images/quad.png', {coverage = true})" (Refused ["expected text"])
+      , Case "texture encoding unknown" "api.content.texture('images/quad.png', {kind = 'data', normal_encoding = 'bogus'})" (Refused ["normal_encoding must be"])
+      , Case "texture encoding version" "api.content.texture('images/quad.png', {kind = 'data', normal_encoding = 'unit-normal-rgb-v2'})" (Refused ["normal_encoding must be"])
+      , Case "texture encoding number" "api.content.texture('images/quad.png', {kind = 'data', normal_encoding = 5})" (Refused ["expected text"])
+      , Case "texture encoding without kind" "api.content.texture('images/quad.png', {normal_encoding = 'unit-normal-rgb-v1'})" (Refused ["valid only with kind"])
+      , Case "texture encoding with colour" "api.content.texture('images/quad.png', {kind = 'colour', normal_encoding = 'unit-normal-rgb-v1'})" (Refused ["valid only with kind"])
+      , Case "texture encoding with nil kind" "api.content.texture('images/quad.png', {kind = nil, normal_encoding = 'unit-normal-rgb-v1'})" (Refused ["valid only with kind"])
       , Case "texture root number" "api.content.texture('images/quad.png', {root = 5})" (Refused ["expected text"])
       , Case "texture root not enabled" "api.content.texture('images/quad.png', {root = 'other'})" (Refused ["is not enabled"])
       , Case "texture root uppercase" "api.content.texture('images/quad.png', {root = 'Game'})" (Refused ["is not a content identifier"])
@@ -326,6 +339,35 @@ spec = describe "graphics calls" $ do
         -- Nothing a refused call did reached a provider: not a check, not a start.
         seen ← calls gx
         filter (\entry → any (`Text.isPrefixOf` entry) ["check", "start", "busy", "publish", "release"]) seen `shouldBe` []
+
+  it "takes the image options of a texture request, parses them once, and starts each request with exactly the options asked for" $ do
+    gx ← newGfx
+    let cases =
+          [ Case "default" "api.content.texture('images/quad.png')" Accepted
+          , Case "colour" "api.content.texture('images/quad.png', {kind = 'colour'})" Accepted
+          , Case "data" "api.content.texture('images/quad.png', {kind = 'data'})" Accepted
+          , Case "coverage" "api.content.texture('images/quad.png', {coverage = 'binary'})" Accepted
+          , Case "data coverage" "api.content.texture('images/quad.png', {kind = 'data', coverage = 'binary'})" Accepted
+          , Case "encoding alone" "api.content.texture('images/quad.png', {kind = 'data', normal_encoding = 'unit-normal-rgb-v1'})" Accepted
+          , Case "all" "api.content.texture('images/quad.png', {kind = 'data', coverage = 'binary', normal_encoding = 'unit-normal-rgb-v1', optional = true})" Accepted
+          , Case "nil fields" "api.content.texture('images/quad.png', {kind = nil, coverage = nil, normal_encoding = nil})" Accepted
+          ]
+    ( withOneGraphics (injection gx) Presentation script {scInit = map caseLua cases} files $ \world _ _ _ → do
+        outLines world >>= checkCases cases
+        countOf gx "start texture" `shouldReturn` length cases
+        reverse <$> readIORef (gxOptions gx)
+          `shouldReturn` [ TextureOptions ImageColour False Nothing
+                         , TextureOptions ImageColour False Nothing
+                         , TextureOptions ImageData False Nothing
+                         , TextureOptions ImageColour True Nothing
+                         , TextureOptions ImageData True Nothing
+                         , TextureOptions ImageData False (Just "unit-normal-rgb-v1")
+                         , TextureOptions ImageData True (Just "unit-normal-rgb-v1")
+                         , TextureOptions ImageColour False Nothing
+                         ]
+        finishAll gx
+      )
+      `finally` finishAll gx
 
   it "takes a valid texture and window call, nil and absent options alike, with false a value, and starts each once" $ do
     gx ← newGfx

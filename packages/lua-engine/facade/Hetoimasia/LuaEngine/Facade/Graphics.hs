@@ -72,7 +72,13 @@ graphicsBindings facade services =
         recoverableRefusals (releaseOperation "texture_release" graphicsTextureType [SText] releaseAct)
   ]
   where
-    textureOptions = [("root", SOptional SText), ("optional", SOptional SBoolean)]
+    textureOptions =
+      [ ("root", SOptional SText)
+      , ("optional", SOptional SBoolean)
+      , ("kind", SOptional SText)
+      , ("coverage", SOptional SText)
+      , ("normal_encoding", SOptional SText)
+      ]
     windowFields = [("title", SBytes), ("width", SInteger), ("height", SInteger)]
 
     instanceRule owner rule = do
@@ -116,7 +122,7 @@ graphicsBindings facade services =
             Just why → pure (Just why)
             Nothing → case textureTarget facade caller values of
               Left why → pure (refuseText why)
-              Right (key, optional) → gsTextureCheck services (identityOf caller) key optional owner values
+              Right (key, optional, options) → gsTextureCheck services (identityOf caller) key optional options owner values
 
     textureAct context values = do
       calling ← callingIn facade context
@@ -124,8 +130,8 @@ graphicsBindings facade services =
         Left why → failEngine facade ("a texture request was made with no instance running: " <> why)
         Right caller → case textureTarget facade caller values of
           Left why → failEngine facade ("a texture request was valid at its check and is not at its action: " <> why)
-          Right (key, optional) →
-            gsTextureStart services (identityOf caller) key optional context >>= \case
+          Right (key, optional, options) →
+            gsTextureStart services (identityOf caller) key optional options context >>= \case
               GraphicsStarted started → pure (m1StartResults graphicsTextureRequestType started)
               GraphicsRefused why → refuseOrdinarily (clipText 200 why)
 
@@ -168,9 +174,12 @@ graphicsBindings facade services =
       _ → pure []
 
 -- | The texture the copied arguments name for this caller, or why not: the checked root (defaulting to the
--- instance's content identifier) and path, and whether the request is optional. Pure: the check and the action read
--- it the same way. A field the script left out may arrive as nil, which is absent.
-textureTarget ∷ Facade → Caller → [Value] → Either Text (ContentKey, Bool)
+-- instance's content identifier) and path, whether the request is optional, and the image options (@kind@,
+-- @coverage@, @normal_encoding@). Pure: the check and the action read it the same way. A field the script left
+-- out may arrive as nil, which is absent; an unknown field or value, a field of the wrong type and the one
+-- incompatible combination (a normal encoding on a colour image, which is never an implicit @kind = "data"@) are
+-- ordinary argument errors, decided before any reservation, content access or provider.
+textureTarget ∷ Facade → Caller → [Value] → Either Text (ContentKey, Bool, TextureOptions)
 textureTarget facade caller = \case
   [VBytes path, options] → do
     fields ← case options of
@@ -185,9 +194,32 @@ textureTarget facade caller = \case
       Nothing → Right (recordContent (callerRecord caller))
       Just (VText given) → Right given
       Just _ → Left "root must be text"
+    kind ← case lookup "kind" fields of
+      Nothing → Right ImageColour
+      Just (VText "colour") → Right ImageColour
+      Just (VText "data") → Right ImageData
+      Just (VText _) → Left "kind must be \"colour\" or \"data\""
+      Just _ → Left "kind must be text"
+    coverage ← case lookup "coverage" fields of
+      Nothing → Right False
+      Just (VText "binary") → Right True
+      Just (VText _) → Left "coverage must be \"binary\""
+      Just _ → Left "coverage must be text"
+    encoding ← case lookup "normal_encoding" fields of
+      Nothing → Right Nothing
+      Just (VText name)
+        | name `elem` textureNormalEncodingNames → Right (Just name)
+        | otherwise → Left "normal_encoding must be \"unit-normal-rgb-v1\""
+      Just _ → Left "normal_encoding must be text"
+    case (kind, encoding) of
+      (ImageColour, Just _) → Left "normal_encoding is valid only with kind=\"data\""
+      _ → Right ()
+    case [name | (name, _) ← fields, name `notElem` ["root", "optional", "kind", "coverage", "normal_encoding"]] of
+      [] → Right ()
+      unknown : _ → Left ("unknown texture option " <> clipText 40 unknown)
     checkRoot facade root
     key ← either (Left . describeRefusal) Right (parse path)
-    Right (key, optional)
+    Right (key, optional, TextureOptions kind coverage encoding)
   _ → Left "a path and options are required"
   where
     inventory = fcInventory facade

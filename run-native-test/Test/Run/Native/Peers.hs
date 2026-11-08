@@ -150,7 +150,7 @@ import Hetoimasia.LuaEngine.Modules
   )
 import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (IoWorkers), countLimit, fixedM1Profile)
 import Hetoimasia.LuaEngine.Request (m1Requests)
-import Hetoimasia.LuaEngine.Texture (specIoWorkers, textureSpec, withTexturePipeline)
+import Hetoimasia.LuaEngine.Texture (m1RenderAccountBytes, newRenderAccount, specIoWorkers, textureSpec, withTexturePipeline)
 import Hetoimasia.Run.Boot (Prepared (..), withPrepared)
 import Hetoimasia.Run.Serve (Owner (..), serveSpawned, runOwned)
 import Hetoimasia.Run.Settle (answering, combine, isAsynchronous)
@@ -452,8 +452,9 @@ compose lifetime folder graphics vulkan frames disposals jobs providerStep scena
             forM_ serial $ \mine → atomically (readTVar heldNow >>= \now → when (mine `elem` map fst now) retry)
             readVerified inventory root key allowance
               `finally` atomically (modifyTVar' finished (<> [path]))
+      account ← newRenderAccount m1RenderAccountBytes
       withReadPoolUsing pool gated $ \readPool →
-        withTexturePipeline spec (graphicsBackend graphics) readPool inventory $ \pipeline →
+        withTexturePipeline spec account (graphicsBackend graphics) readPool inventory $ \pipeline →
           withSupervision lifetime $ \control → do
             runtime ← newLuaRuntime control
             let windowConfig =

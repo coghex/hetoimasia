@@ -25,6 +25,10 @@ module Test.LuaEngine.Graphics.Composition
   , stopInstance
   , command
   , commandLoad
+  , commandLoadPolicy
+  , commandRetain
+  , commandUnretain
+  , heldRetained
   , ownerOf
 
     -- * What scripts recorded
@@ -39,7 +43,7 @@ module Test.LuaEngine.Graphics.Composition
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (finally)
+import Control.Exception (finally, mask_)
 import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -114,6 +118,8 @@ data Composition = Composition
   , cpInventory ∷ !Inventory
   , cpPool ∷ !ReadPool
   , cpPipeline ∷ !TexturePipeline
+  , cpAccount ∷ !RenderAccount
+  -- ^ The session's one CPU render/staging account the pipeline was injected with.
   , cpLog ∷ !(TVar [Text])
   , cpIds ∷ !(IORef (Map Text InstanceId))
   , cpTickets ∷ !(IORef (Map Text InstanceTicket))
@@ -165,9 +171,10 @@ withComposition profile files backend body =
             atomically (readTVar held >>= \paths → when (logicalPathBytes (contentKeyPath key) `Set.member` paths) retry)
             readVerified inventory root key allowance
               `finally` atomically (modifyTVar' finished (<> [logicalPathBytes (contentKeyPath key)]))
+      account ← newRenderAccount m1RenderAccountBytes
       withReadPoolUsing pool gated $ \readPool →
-        withTexturePipeline spec backend readPool inventory $ \pipeline → do
-          composition ← Composition tree root inventory readPool pipeline <$> newTVarIO [] <*> newIORef Map.empty <*> newIORef Map.empty <*> pure entered <*> pure finished <*> pure held
+        withTexturePipeline spec account backend readPool inventory $ \pipeline → do
+          composition ← Composition tree root inventory readPool pipeline account <$> newTVarIO [] <*> newIORef Map.empty <*> newIORef Map.empty <*> pure entered <*> pure finished <*> pure held
           withLoggingLifetime quietLogger $ \lifetime →
             withSupervision lifetime $ \control → do
               runtime ← newLuaRuntime control
@@ -211,6 +218,9 @@ data Vm = Vm
   , vmService ∷ !TextureService
   , vmLeases ∷ !Leases
   , vmOwners ∷ !(IORef (Map Text TextureOwner))
+  , vmRetained ∷ !(IORef (Map Text RetainedTexture))
+    -- ^ The textures the example's @tex.retain@ holds a CPU interest in, by label: what a consumer of a version's coverage
+    -- and checked profile holds, taken through the public retention boundary and nowhere else.
   }
 
 requiredPolicy ∷ WorkerPolicy
@@ -229,7 +239,8 @@ startVm composition runtime label = do
   lending ← newLending
   leases ← newLeases lending 16
   owners ← newIORef Map.empty
-  let vm' = Vm (error "owner not started") service leases owners
+  retained ← newIORef Map.empty
+  let vm' = Vm (error "owner not started") service leases owners retained
       registered =
         either (error . ("registration refused: " <>) . show) id $
           registration [admittedHandleType handles requestHandleType, leaseCapabilityType leases textureHandleType] (bindings composition vm')
@@ -283,7 +294,7 @@ bindings ∷ Composition → Vm → [Namespace]
 bindings composition vm =
   [ namespace "fx" [recording]
   , namespace "request" (m1RequestBindings (M1Service requestHandleType textureValueSchema))
-  , namespace "tex" [loading, using, releasing]
+  , namespace "tex" [loading, using, releasing, retaining, unretaining]
   ]
   where
     service = vmService vm
@@ -295,7 +306,7 @@ bindings composition vm =
         pure []
     loading =
       withArgumentCheck check $
-        asynchronousNativeRequestIn "load" [SText, SText, SOptional SBoolean] (m1StartSchemas requestHandleType) $ \context values → do
+        asynchronousNativeRequestIn "load" [SText, SText, SOptional SBoolean, SOptional SText] (m1StartSchemas requestHandleType) $ \context values → do
           asked ← requestFrom values
           case asked of
             Left why → ioError (userError (Text.unpack why))
@@ -314,6 +325,24 @@ bindings composition vm =
             view ← withTexture (vmLeases vm) (capabilityKey handle) pure
             pure [VInteger (fromIntegral (viewIdentity view))]
           _ → pure []
+    retaining =
+      recoverableRefusals $
+        stateOperation "retain" [SCapability textureHandleType, SText, SText] [SText] $ \arguments → case arguments of
+          [VCapability handle, VText label, VText wanted] → do
+            -- The interest is taken with exceptions masked, so none can separate it from the table that holds it.
+            mask_ (retainTexture (vmLeases vm) (capabilityKey handle) (requirementFromWords (Text.words wanted))) >>= \case
+              Left why → pure [VText ("refused: " <> why)]
+              Right found → do
+                atomicModifyIORef' (vmRetained vm) (\held → (Map.insert label found held, ()))
+                pure [VText "retained"]
+          _ → pure []
+    unretaining =
+      stateOperation "unretain" [SText] [SText] $ \arguments → case arguments of
+        [VText label] → do
+          found ← atomicModifyIORef' (vmRetained vm) (\held → (Map.delete label held, Map.lookup label held))
+          mapM_ releaseRetained found
+          pure [VText (maybe "unknown" (const "unretained") found)]
+        _ → pure []
     releasing =
       recoverableRefusals . releaseOperation "release" textureHandleType [SText] $ \arguments → case arguments of
         [VCapability handle] → do
@@ -334,8 +363,9 @@ bindings composition vm =
                   { requestedOwner = owner
                   , requestedKey = key
                   , requestedNecessity = case rest of
-                      [VBoolean True] → OptionalRequest
+                      VBoolean True : _ → OptionalRequest
                       _ → RequiredRequest
+                  , requestedPolicy = policyFromWords (concatMap Text.words [word | VText word ← rest])
                   }
       _ → pure (Left "a texture owner and a path are required")
 
@@ -363,7 +393,7 @@ driverSource =
       , "  local key = p.key or 'a'"
       , "  local out = '?'"
       , "  if p.op == 'start' then"
-      , "    local r, err = tex.load(p.name, p.path or 'a.png', p.optional)"
+      , "    local r, err = tex.load(p.name, p.path or 'a.png', p.optional, p.policy)"
       , "    if r then self.hs[key] = r out = 'started' else out = 'busy:' .. err.code .. ':' .. err.message end"
       , "  elseif p.op == 'take' then"
       , "    local r = request.take(self.hs[key])"
@@ -382,6 +412,10 @@ driverSource =
       , "  elseif p.op == 'puse' then"
       , "    local ok, r = pcall(tex.use, self.ts[key])"
       , "    out = ok and tostring(r) or ('error ' .. tostring(r))"
+      , "  elseif p.op == 'retain' then"
+      , "    local ok, r = pcall(tex.retain, self.ts[key], p.path or key, p.policy or '')"
+      , "    out = ok and r or ('refused: ' .. tostring(r))"
+      , "  elseif p.op == 'unretain' then out = tex.unretain(p.path or key)"
       , "  elseif p.op == 'release' then out = tex.release(self.ts[key])"
       , "  end"
       , "  fx.record(p.name .. ' ' .. p.op .. ' ' .. key .. ' ' .. out)"
@@ -404,6 +438,7 @@ commandSource =
         , ("name", SText)
         , ("path", SOptional SText)
         , ("optional", SOptional SBoolean)
+        , ("policy", SOptional SText)
         ]
     )
 
@@ -434,15 +469,28 @@ command composition vm name op key = commandWith composition vm name op key Noth
 
 -- | The same, starting a load of this path, optionally.
 commandLoad ∷ Composition → Vm → Text → Text → Text → Bool → IO ()
-commandLoad composition vm name key path optional = commandWith composition vm name "start" key (Just (path, optional))
+commandLoad composition vm name key path optional = commandWith composition vm name "start" key (Just (path, optional, []))
 
-commandWith ∷ Composition → Vm → Text → Text → Text → Maybe (Text, Bool) → IO ()
+-- | The same, asking for these policy words: @data@, @coverage@ and @normal@ (the @unit-normal-rgb-v1@ encoding).
+commandLoadPolicy ∷ Composition → Vm → Text → Text → Text → Bool → [Text] → IO ()
+commandLoadPolicy composition vm name key path optional wordsGiven = commandWith composition vm name "start" key (Just (path, optional, wordsGiven))
+
+-- | Tell the instance to retain its texture under the key as a consumer would, wanting these words of the version:
+-- @coverage@, @normal@, @data@, @colour@. The answer is the instance's note, @retained@ or @refused: …@.
+commandRetain ∷ Composition → Vm → Text → Text → Text → [Text] → IO ()
+commandRetain composition vm name key label wantedWords = commandWith composition vm name "retain" key (Just (label, False, wantedWords))
+
+-- | Tell the instance to let go of a retained texture.
+commandUnretain ∷ Composition → Vm → Text → Text → Text → IO ()
+commandUnretain composition vm name key label = commandWith composition vm name "unretain" key (Just (label, False, []))
+
+commandWith ∷ Composition → Vm → Text → Text → Text → Maybe (Text, Bool, [Text]) → IO ()
 commandWith composition vm name op key asked = do
   identity ← (Map.! name) <$> readIORef (cpIds composition)
   let payload =
         VRecord $
           [("op", VText op), ("key", VText key), ("name", VText name)]
-            <> concat [[("path", VText path)] <> [("optional", VBoolean True) | optional] | Just (path, optional) ← [asked]]
+            <> concat [[("path", VText path)] <> [("optional", VBoolean True) | optional] <> [("policy", VText (Text.unwords wordsGiven)) | not (null wordsGiven)] | Just (path, optional, wordsGiven) ← [asked]]
   deliverEvent (scheduledEndpoint (vmOwner vm)) identity "cmd" payload >>= \case
     DeliveryAccepted _ → pure ()
     other → assertFailure ("expected the command accepted, found " <> take 80 (show other))
@@ -506,3 +554,25 @@ instanceFailure ∷ Maybe InstanceFailure → Maybe (Text, Text)
 instanceFailure failure = case fmap failureError failure of
   Just (ErrorRequest endpoint why) → Just (endpoint, why)
   _ → Nothing
+
+-- | The texture the instance retained under this label, if any.
+heldRetained ∷ Vm → Text → IO (Maybe RetainedTexture)
+heldRetained vm label = Map.lookup label <$> readIORef (vmRetained vm)
+
+-- | The policy a test request asks for, from words after its optional flag: @data@, @coverage@ and @normal@.
+policyFromWords ∷ [Text] → TexturePolicy
+policyFromWords wordsGiven =
+  TexturePolicy
+    { policyKind = if "data" `elem` wordsGiven then DataKind else ColourKind
+    , policyBinaryCoverage = "coverage" `elem` wordsGiven
+    , policyNormalEncoding = if "normal" `elem` wordsGiven then Just UnitNormalRgbV1 else Nothing
+    }
+
+-- | What a consumer needs of a retained version, from words: @coverage@, @normal@, @data@ and @colour@.
+requirementFromWords ∷ [Text] → TextureRequirement
+requirementFromWords wordsGiven =
+  TextureRequirement
+    { requireKind = if "data" `elem` wordsGiven then Just DataKind else if "colour" `elem` wordsGiven then Just ColourKind else Nothing
+    , requireCoverage = "coverage" `elem` wordsGiven
+    , requireNormal = if "normal" `elem` wordsGiven then Just UnitNormalRgbV1 else Nothing
+    }

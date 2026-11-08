@@ -88,6 +88,7 @@ module Hetoimasia.LuaEngine.Texture
   , specInstanceSlots
   , specInstanceBytes
   , specSessionBytes
+  , specMaxPixels
   , TextureSpecRefused (..)
   , textureSpec
   , TexturePipeline
@@ -104,6 +105,16 @@ module Hetoimasia.LuaEngine.Texture
   , awaitPipelineFailure
   , pipelineFailureEvidence
   , TextureDefect (..)
+
+    -- * The shared CPU account
+  , RenderAccount
+  , newRenderAccount
+  , m1RenderAccountBytes
+  , accountLimit
+  , accountCharged
+  , accountReserve
+  , accountRelease
+  , AccountDefect (..)
 
     -- * The backend
   , module Hetoimasia.LuaEngine.Texture.Backend
@@ -131,6 +142,15 @@ module Hetoimasia.LuaEngine.Texture
 
     -- * What is asked
   , textureKey
+  , TextureKind (..)
+  , NormalEncoding (..)
+  , normalEncodingName
+  , parseNormalEncoding
+  , TexturePolicy (..)
+  , colourPolicy
+  , texturePolicy
+  , PolicyRefused (..)
+  , policyRefusalText
   , TextureRequest (..)
   , textureAsk
   , TextureStart (..)
@@ -141,6 +161,22 @@ module Hetoimasia.LuaEngine.Texture
   , TextureView (..)
   , withTexture
   , withTextureOr
+
+    -- * Retaining a version's facts
+  , TextureRequirement (..)
+  , noRequirement
+  , RetainedTexture
+  , retainedView
+  , retainedVersion
+  , retainedKind
+  , retainedNormal
+  , retainedCoverage
+  , retainedWidth
+  , retainedHeight
+  , retainedInterests
+  , retainTexture
+  , releaseRetained
+  , withRetainedTexture
   , TextureRelease (..)
   , releaseTexture
   , releaseWord
@@ -148,6 +184,7 @@ module Hetoimasia.LuaEngine.Texture
 
 import Control.Concurrent.STM (STM, atomically)
 import Control.Exception (finally, mask, throwIO)
+import Hetoimasia.Asset.Image.DataMap (CoveragePlane, NormalEncoding (..), normalEncodingName, parseNormalEncoding)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.Functor ((<&>))
@@ -178,6 +215,7 @@ import Hetoimasia.LuaEngine.Request
   , m1Profile
   , startM1
   )
+import Hetoimasia.LuaEngine.Texture.Account
 import Hetoimasia.LuaEngine.Texture.Backend
 import Hetoimasia.LuaEngine.Texture.Banks
   ( BankDefect (..)
@@ -191,6 +229,7 @@ import Hetoimasia.LuaEngine.Texture.Banks
   , ownerSlotsCharged
   )
 import Hetoimasia.LuaEngine.Texture.Pipeline
+import Hetoimasia.LuaEngine.Texture.Version
 import Hetoimasia.Scripting.Lua.Admission (Necessity)
 import Hetoimasia.Scripting.Lua.Lease
   ( Leases
@@ -271,6 +310,9 @@ data TextureRequest = TextureRequest
   { requestedOwner ∷ !TextureOwner
   , requestedKey ∷ !ContentKey
   , requestedNecessity ∷ !Necessity
+  , requestedPolicy ∷ !TexturePolicy
+    -- ^ The image kind, binary coverage and normal encoding it asks for; 'colourPolicy' is the default
+    -- every M1 request has.
   }
 
 -- | The ask the host admits for a prepared request: its requirement, source, codes, credits and the
@@ -318,7 +360,7 @@ startTexture service request context = mask $ \restore → do
       owner = requestedOwner request
   when (ownerRole owner /= PresentationRole) $
     throwIO (TextureDefect "texture acquisition is presentation-instance hook work")
-  prepared ← prepareRequest pipeline owner (requestedKey request)
+  prepared ← prepareRequest pipeline owner (requestedKey request) (requestedPolicy request)
   started ←
     restore
       ( startM1
@@ -408,6 +450,106 @@ withTexture leases key use = withLease leases key $ \resource →
 withTextureOr ∷ HasCallStack ⇒ Leases → Word64 → (Text → IO r) → (TextureView → IO r) → IO r
 withTextureOr leases key refused use = withLeaseOr leases key refused $ \resource →
   use (TextureView (textureIdentity (resourceTexture resource)) (resourceWidth resource) (resourceHeight resource))
+
+-- Retaining a version's facts ---------------------------------------------------------------------------
+
+-- | What a consumer needs of the texture it retains. Anything less than this is a clear refusal, never a
+-- partial grant.
+data TextureRequirement = TextureRequirement
+  { requireKind ∷ !(Maybe TextureKind)
+    -- ^ The image kind the consumer needs, if it needs one.
+  , requireCoverage ∷ !Bool
+    -- ^ Binary coverage: the version must have been loaded with @coverage = "binary"@ and passed.
+  , requireNormal ∷ !(Maybe NormalEncoding)
+    -- ^ A checked normal encoding: the version must have been loaded with it and passed.
+  }
+  deriving (Eq, Show)
+
+-- | A consumer that needs only the texture.
+noRequirement ∷ TextureRequirement
+noRequirement = TextureRequirement Nothing False Nothing
+
+-- | A live texture together with the facts of the one loaded version it belongs to, and the CPU interest
+-- that keeps those facts valid until 'releaseRetained'. The texture, the coverage plane and the checked
+-- profile are paired here by the version that produced all three: a path, a recycled registration slot or a
+-- reused handle generation never pairs an old plane with a new texture.
+data RetainedTexture = RetainedTexture
+  { retainedView ∷ !TextureView
+  , retainedVersion ∷ !Word64
+    -- ^ The version's identity, issued once by the pipeline.
+  , retainedFacts ∷ !VersionFacts
+  , retainedHold ∷ !Interest
+  }
+
+-- | The image kind of the retained version.
+retainedKind ∷ RetainedTexture → TextureKind
+retainedKind = factsKind . retainedFacts
+
+-- | The normal encoding the pipeline checked before the upload, if one was asked for.
+retainedNormal ∷ RetainedTexture → Maybe NormalEncoding
+retainedNormal = factsNormal . retainedFacts
+
+-- | The version's one shared coverage plane, if binary coverage was asked for and passed. The very value
+-- every reader of the version shares.
+retainedCoverage ∷ RetainedTexture → Maybe CoveragePlane
+retainedCoverage = factsCoverage . retainedFacts
+
+-- | How many CPU interests the retained version holds now (the lease's, every consumer's and this one):
+-- a reading, for observation.
+retainedInterests ∷ RetainedTexture → STM Int
+retainedInterests = versionInterests . interestVersion . retainedHold
+
+retainedWidth, retainedHeight ∷ RetainedTexture → Word32
+retainedWidth = factsWidth . retainedFacts
+retainedHeight = factsHeight . retainedFacts
+
+-- | Retain the texture a lease names, with its version's facts, through the same protected-resource
+-- boundary as 'withTextureOr': refused, as data and before anything is retained, when the lease has ended,
+-- is another instance's or holds another type, and when the version lacks what the requirement needs
+-- (missing or incompatible authority is a clear refusal), or no longer has a CPU interest to take.
+--
+-- The retained value holds an explicit CPU interest in its exact version. It survives the lease's release:
+-- a Lua release prevents new authority from this boundary and leaves the interests already taken. It
+-- releases nothing on the GPU side and is no evidence about it: registration, nominal charges and
+-- retirement follow the backend's actual completion, whatever consumers hold. Call it with asynchronous
+-- exceptions masked, or use 'withRetainedTexture', so that no exception can separate the interest from the
+-- caller that must release it; 'releaseRetained' is idempotent.
+retainTexture ∷ HasCallStack ⇒ Leases → Word64 → TextureRequirement → IO (Either Text RetainedTexture)
+retainTexture leases key need = withLeaseOr leases key (pure . Left) $ \resource → do
+  let version = resourceVersion resource
+      facts = versionFacts version
+      view = TextureView (textureIdentity (resourceTexture resource)) (resourceWidth resource) (resourceHeight resource)
+  case unmet need facts of
+    Just why → pure (Left why)
+    Nothing →
+      atomically (takeInterest version) <&> \case
+        Nothing -> Left "the texture's version has no CPU interest left to take"
+        Just interest -> Right (RetainedTexture view (versionId version) facts interest)
+
+-- | Why a version does not meet a requirement, if it does not.
+unmet ∷ TextureRequirement → VersionFacts → Maybe Text
+unmet need facts
+  | Just kind ← requireKind need, kind /= factsKind facts = Just ("the texture is not a " <> kindWord kind <> " texture")
+  | requireCoverage need, Nothing ← factsCoverage facts = Just "the texture has no binary coverage: it was not loaded with coverage=\"binary\""
+  | Just encoding ← requireNormal need, factsNormal facts /= Just encoding =
+      Just ("the texture's texels were not validated as normal_encoding=" <> normalEncodingName encoding)
+  | otherwise = Nothing
+  where
+    kindWord = \case
+      ColourKind -> "colour"
+      DataKind -> "data"
+
+-- | End a retained texture's CPU interest. Idempotent.
+releaseRetained ∷ RetainedTexture → IO ()
+releaseRetained = atomically . dropInterest . retainedHold
+
+-- | 'retainTexture' for the duration of an action: the interest is released when the action ends, however
+-- it ends, and a refusal is handed to the caller as data before the action.
+withRetainedTexture ∷ HasCallStack ⇒ Leases → Word64 → TextureRequirement → (Text → IO r) → (RetainedTexture → IO r) → IO r
+withRetainedTexture leases key need refused use = mask $ \restore →
+  retainTexture leases key need >>= \case
+    Left why -> restore (refused why)
+    Right retained -> restore (use retained) `finally` releaseRetained retained
 
 -- | What an explicit release answered, in the words the later binding uses.
 data TextureRelease

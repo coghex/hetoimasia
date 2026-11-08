@@ -210,8 +210,10 @@ library texture
         Hetoimasia.LuaEngine.Texture.Backend
     -- The per-texture banks and the pipeline's state machine, behind the facade.
     other-modules:
+        Hetoimasia.LuaEngine.Texture.Account
         Hetoimasia.LuaEngine.Texture.Banks
         Hetoimasia.LuaEngine.Texture.Pipeline
+        Hetoimasia.LuaEngine.Texture.Version
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -418,6 +420,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Texture.Cancellation
         Test.LuaEngine.Texture.Client
         Test.LuaEngine.Texture.Contract
+        Test.LuaEngine.Texture.DataMaps
         Test.LuaEngine.Texture.Failures
         Test.LuaEngine.Texture.Lifecycle
         Test.LuaEngine.Texture.Limits
@@ -438,6 +441,7 @@ test-suite lua-engine-tests
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
         hetoimasia-asset ==0.1.0.0,
+        hetoimasia-asset-image ==0.1.0.0,
         hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
