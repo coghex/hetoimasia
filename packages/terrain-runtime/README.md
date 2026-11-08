@@ -401,8 +401,19 @@ service-wide limits (two arenas, five leases, two views, three clients) and, aft
 every step including those taken inside a held borrow, requires each limit's count to
 equal the entities of every state that hold it (a closed arena whose snapshot is still
 borrowed included) and never to exceed the limit; the group asserts that it saw
-retiring arenas. `Test.TerrainRuntime.Limits` pins the examples: outstanding
-borrowers block a further open and releasing one permits progress.
+retiring arenas. The model-backed banks are checked too, in every run: after every
+step, including inside a held borrow, `Test.TerrainRuntime.Usage` states what the
+resident, edit and staging banks (occupied and reserved) and the command and load-job
+slots must hold, derived only from the entities that hold resources (every arena, live
+and retiring; regions; jobs; requests and what a removal reserves; interests; holds;
+views; handed-off duplicates; and no entity may belong to an arena the model has
+released), and the model's own ledgers must agree; each live arena's retained bytes must
+also equal its changes as the service sees them, read in the same transaction.
+`Test.TerrainRuntime.Limits` pins the examples: with the default limits, four closed
+incarnations each held by a snapshot refuse a fifth admission; exactly one borrow is
+released, three stay outstanding, and a replacement is admitted (and a further one is
+refused again); and a transfer's duplicate, a removal's reservation and a borrow are
+all accounted while the owner is held mid-transfer.
 
 The examples drive the production service. A **gate** is an `MVar` the owner blocks
 on at a named point (`Probe`), so an example decides which side of a race wins by
