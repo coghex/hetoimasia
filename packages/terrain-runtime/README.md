@@ -402,13 +402,25 @@ every step including those taken inside a held borrow, requires each limit's cou
 equal the entities of every state that hold it (a closed arena whose snapshot is still
 borrowed included) and never to exceed the limit; the group asserts that it saw
 retiring arenas. The model-backed banks are checked too, in every run: after every
-step, including inside a held borrow, `Test.TerrainRuntime.Usage` states what the
-resident, edit and staging banks (occupied and reserved) and the command and load-job
-slots must hold, derived only from the entities that hold resources (every arena, live
-and retiring; regions; jobs; requests and what a removal reserves; interests; holds;
-views; handed-off duplicates; and no entity may belong to an arena the model has
-released), and the model's own ledgers must agree; each live arena's retained bytes must
-also equal its changes as the service sees them, read in the same transaction.
+step, including inside a held borrow, `Test.TerrainRuntime.Usage` states what each bank
+and slot must hold from **the service's own data**, never from the accounting model's
+fields. `inspectCensusSTM` (a read-only diagnostic, read in one transaction with the
+model) reports, from the service's own structures, the bytes each arena's resident detail
+holds in every vertical region (a region's fixed metadata, an index entry per column and
+each segment's metadata and payload, measured on the `Resident` value), each arena's
+retained-changes bytes, live or retiring, every request the service holds (table and
+withdrawn ghosts) with whether it holds a removal reservation, and its outstanding
+snapshots. The check requires: the resident bytes of each region equal what its detail
+holds (a region that has had removals may be charged up to 64 bytes per removal above it,
+the model's conservative worst case), no region held on one side and absent on the other
+(an evicting region excepted until its victim is released), the edit bank's occupied bytes
+equal the arenas' retained changes and its reservation the service's removals, the staging
+bank's request records and removal reservations equal what the service's requests hold,
+the command slots equal the service's requests that hold a model record, and the snapshot
+holds equal the service's outstanding snapshots. Only what exists nowhere but in the model
+(the load jobs it dispatches, interests, hold and view records, a transfer's duplicate) is
+taken from the model's entity lists. The reviewer's control is an example: a model rebuilt
+without the arena beside the service's real census must disagree in every bank.
 `Test.TerrainRuntime.Limits` pins the examples: with the default limits, four closed
 incarnations each held by a snapshot refuse a fifth admission; exactly one borrow is
 released, three stay outstanding, and a replacement is admitted (and a further one is
