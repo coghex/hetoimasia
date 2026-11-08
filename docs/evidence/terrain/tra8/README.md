@@ -14,7 +14,7 @@ a renderer inability.
 - Command (macOS, under the desktop-consent policy; the scenario creates no window):
   `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --private-roots tra8-terrain`
   (Linux: the same command without the variable, through the runner's isolated display.)
-- Source revision `726c4c2d97e832340b4f3c503ae7cc64e541d8e8` (clean tree), source digest `f38fe2fdcb6ec07892a886231a936ba3382b84f9ac65f5b4d6a0582aee7bb564`; device
+- Source revision `23a44e1cdb8eeca329dfb6573624e5a9b2028657` (clean tree), source digest `c2ed8205fb084bf1ee3504518736b19a5ea0df4c412cac8ea40cd3ceb27d0730`; device
   `Apple M3 Max` (MoltenVK); depth format `Depth32Float`, target `Rgba8Srgb`; validation and
   synchronization validation clean through teardown.
 - Shader identity (SPIR-V SHA-256 of the checked fragment variants): cutout
@@ -26,8 +26,8 @@ a renderer inability.
   (all `true`, the decoded default) and the draw path its faces took: **every face of every fixture
   took the cutout path**, so the conclusion holds for the path the approved art takes with its decoded
   mark; no mark override was used.
-- Budget: scenario body 6.54 s; the child ran 6.75 s against the 20 s child deadline; the whole
-  `--complete` profile ran 21.1 s against its 30 s watchdog (`complete-profile-transcript.txt`). Every
+- Budget: scenario body 9.08 s; the child ran 9.4 s against the 20 s child deadline; the whole
+  `--complete` profile ran 22.0 s against its 30 s watchdog (`complete-profile-transcript.txt`). Every
   batch's completion was awaited before its readback; the oracle's per-pixel judging dominates the
   time, recording and readback of all fixtures together taking about 1.2 s.
 
@@ -46,7 +46,7 @@ a renderer inability.
    transparent-texel fall-through, and pick = geometric frontmost).
 
 No expectation is derived from the observed image and nothing updates a golden image. Across all
-fixtures: 102393 oracle-determinate pixels and 7311 reported indeterminate; 107888 pixels compared
+fixtures: 106206 oracle-determinate pixels and 8514 reported indeterminate; 112904 pixels compared
 with the independent expectation and 1816 ambiguous. The indeterminate and ambiguous pixels are
 platform-sensitive boundaries (a pixel centre within 1/16 pixel of a quad or mask edge, or of a texel
 boundary at the fractional zooms); nothing here claims cross-platform bit identity.
@@ -79,14 +79,14 @@ dynamic remainder) must draw one image.
 | stairs-cut1-FaceSouth@0.125 | Dynamic/Plain | 1440 | 0 | 1440 / 0 / 0 | 322 / 0 | pass |
 | stairs-cut3-FaceSouth@0.125 | Dynamic/Plain | 1440 | 0 | 1440 / 0 / 0 | 322 / 0 | pass |
 | stairs-cut5-FaceSouth@0.125 | Dynamic/Plain | 1440 | 0 | 1440 / 0 / 0 | 322 / 0 | pass |
-| follow-FaceSouth@0.125 | Dynamic/Plain | 4428 | 0 | 4428 / 0 / 0 | 486 / 0 | pass |
+| follow-FaceSouth@0.125 | Dynamic/Plain | 6372 | 0 | 6372 / 0 / 0 | 377 / 0 | pass |
 | deep-FaceSouth | Dynamic/Plain | 5096 | 0 | 5096 / 0 / 0 | 544 / 0 | pass |
 | zoom-0.125 | Dynamic/Plain | 2349 | 43 | 2392 / 0 / 0 | 550 / 0 | pass |
 | zoom-8.0 | Dynamic/Plain | 4325 | 1819 | 4700 / 1444 / 0 | 96 / 0 | pass |
 | fractional@0.1875 | Dynamic/Plain | 2463 | 345 | 2484 / 324 / 0 | 312 / 0 | pass |
-| viewport@0.125 | Dynamic/Plain | 1304 | 40 | 1344 / 0 / 0 | 300 / 0 | pass |
+| viewport@0.125 | Dynamic/Plain | 1271 | 73 | 1344 / 0 / 0 | 300 / 0 | pass |
 | scaled@0.125 | Dynamic/Plain | 4921 | 71 | 4980 / 12 / 0 | 542 / 0 | pass |
-| snapped@1.0 | Dynamic/Plain | 2817 | 255 | 3072 / 0 / 0 | 336 / 0 | pass |
+| snapped | Dynamic/Plain | 4719 | 1425 | 6144 / 0 / 0 | 384 / 0 | pass |
 | diagnostic-FaceSouth@0.25 | Dynamic/Tinted | 2795 | 169 | 2964 / 0 / 0 | 312 / 0 | pass |
 | diagnostic-FaceWest@0.25 | Dynamic/Tinted | 2368 | 332 | 2700 / 0 / 0 | 288 / 0 | pass |
 | spans-FaceSouth@0.125-control-reversed-overlap | ReversedKeys/Plain | 1008 | 0 | 1008 / 0 / 137 | 220 / 0 | rejected (expected) |
@@ -142,6 +142,26 @@ reference is smaller than the flat hexagon the solid gives). The reference sprit
 carry context a single-cell solid does not. The design makes the shared solids, not the face maps,
 authoritative, and the renderer draws those solids correctly; this table is evidence for the owner's
 decision on whether the reference silhouettes are to be matched, and no renderer change is implied.
+
+## View-variant fixtures and a known gap
+
+- **Follow headroom** stays on its anchor column: the camera is asserted by hand (surface 3, cut 28, reference 4) on the CPU
+  and in the scenario, and a cap probe shows the tall columns cut flat at level 28.
+- **Viewport offset** is set after the target is fitted (it starts away from the target's corner and stops short of its far
+  edges); a probe pairs a pixel the viewport clips away (clear, though the scene would cover it) with a covered one.
+- **Pixel snapping** runs at native scale with the camera about 0.3 pixel off the pixel grid. The fixture fails unless at least
+  20 pixels read as the snapped view and not as the same snapshot with snapping off (judged by the oracle's own snapped and
+  unsnapped expectations); this run read 53.
+- **Known gap.** My independent line-of-sight texel model did not agree with the recorder under snapping where the technical
+  diagnostic sheet has transparent blocks (192 mismatches in an earlier run, all at texel/hole boundaries; silhouettes and the
+  pick agreed). The cause was not found. The snapped fixture therefore uses the approved art, and the pure CPU judge compares only
+  the pick for a snapped scene (it models unsnapped faces).
+
+## Baseline status
+
+Per design P-16 this per-face material is the baseline, retained for its artwork provenance, material registration and package
+separation, offscreen harness and this measured evidence; face-mapped quads are TRA-17, which replaces the per-face renderer and
+carries the amended Q-13 gate. Nothing here qualifies the amended path.
 
 ## Remaining limits
 
