@@ -99,8 +99,9 @@ renderer index never names a later texture; `textureHandleOf` is its inverse for
 | staging buffer | one maximum level for each lane (the largest legal RGBA8 level, 2,048 × 2,048 × 4 = 16 MiB, times 2 lanes) | 32 MiB |
 | upload turn budget | a quarter of a maximum level; at least four bytes a texel of the widest image any device allows (128 KiB) | 4 MiB |
 | upload queue | four for each lane | 8 |
-| texture table capacity (initial = capacity) | instances × texture leases of one instance + slot 0's placeholder | 2 × 16 + 1 = 33 |
+| texture table capacity (initial = capacity); derived, not a count | the session's texture bytes over the 4 KiB minimum charge of a texture (`textureRoomPerSession`) + slot 0's placeholder | 1 GiB / 4 KiB + 1 = 262,145 |
 | lookup versions | aggregate frame slots + frame-less batches + 2 | 10 |
+| lookup ring (counted in the native accounting) | lookup versions × table capacity × 8 bytes | 10 × 262,145 × 8 = 20,971,600 bytes |
 | ring; region window | twice the instance bytes (64 each) of every batch that can be in flight at 4,096 sprites; 3 × the scene sprite limit × 16-byte clip entries | 4 MiB; 192 KiB |
 
 The sample's smaller configuration (a 1 MiB staging buffer, a 16-slot table) is not the engine's: it cannot admit the
@@ -592,11 +593,17 @@ enters Lua, waits or keeps a registry that outlives the VM it was made for.
 | `api.scene.publish` | `graphicsPublishBinding` | the facade's precondition first; the commit is one transaction |
 | `api.texture.release` | `releaseTexture` over the host's special release path | `done`, `retiring`, `already_released`; repeated release repeats no cleanup |
 
-**Lease headroom (the derivation).** A VM's lease scope has room for `TextureLeasesPerUiInstance + WindowSlotsPerUiInstance` leases for
-each instance: 16 + 1 = 17 under the fixed M1 profile (`facadeLeaseCapacity`). Every texture a UI instance can hold, pending, live or
-retiring, takes one of its 16 texture slots, and its window takes the one window slot; both are charged by the providers' banks in the
-same atomic admission as the host's lease charge, and answer `busy` when full. The most leases that can coexist are therefore 17, and the
-host's lease capacity, which would fault the invocation, cannot be the first bank to answer. No authored M1 ceiling is increased.
+**Lease headroom (the derivation).** Memory is the only bound on the textures a UI instance holds (owner decision 2026-11-08): there is
+no count of textures. A VM's lease scope has room for the most textures the instance's byte bank can hold, plus the window slots, for
+each instance (`facadeLeaseCapacity`): `TextureBytesPerUiInstance ÷ 4 KiB + WindowSlotsPerUiInstance` = 512 MiB ÷ 4 KiB + 1 = 131,073
+under the fixed M1 profile. Every texture is charged at least 4 KiB in the instance's bank (and the session's), so the bank holds at most
+`TextureBytesPerUiInstance ÷ 4 KiB` textures, pending, live or retiring; both that bank and the window's one slot are charged by the
+providers in the same atomic admission as the host's lease charge, and answer `busy` when full. The bank therefore refuses first, for
+every validated profile, and the host's lease capacity, which would fault the invocation, cannot be the first bank to answer. The
+capacity is a number the scope never allocates; it grows with what is leased. The owner's collection must hold every live instance at that
+capacity, so the session sizes the owner's member limit from `gsLeaseCapacity` (instances × capacity). The recent-issuer history
+(`defaultIssuedMemory`, 4,096) is a bounded history of issuers, not a held-texture capacity: an evicted entry is not necessarily a
+retired texture's, and a handle whose lease is still present is checked against its lease's own owner independently of it.
 
 **Owners.** A UI instance's texture owner and window owner are made when the facade declares the instance and closed when it forgets the
 instance (its settlement observed). They are held in one STM map per VM, written by the declaring thread and read by the instance's owner
