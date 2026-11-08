@@ -4,6 +4,7 @@ import qualified Test.TerrainRuntime.Basic as Basic
 import qualified Test.TerrainRuntime.Budgets as Budgets
 import qualified Test.TerrainRuntime.Closure as Closure
 import qualified Test.TerrainRuntime.Offload as Offload
+import qualified Test.TerrainRuntime.Opacity as Opacity
 import qualified Test.TerrainRuntime.Races as Races
 import qualified Test.TerrainRuntime.Revalidation as Revalidation
 import Test.Hspec (Spec)
@@ -15,4 +16,5 @@ spec = do
   Budgets.spec
   Offload.spec
   Revalidation.spec
+  Opacity.spec
   Closure.spec

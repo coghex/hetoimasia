@@ -569,12 +569,12 @@ acquireSnapshotSTM svc lease regions =
                   modifySt svc (\cur → cur {stateNextHold = hid + 1, stateBorrowers = stateBorrowers cur + 1})
                   let snapshot =
                         Snapshot
-                          { snapshotIncarnation = leaseArena ls
-                          , snapshotRevision = arenaRevision arena
-                          , snapshotGeneration = arenaGeneration arena
-                          , snapshotRegions = regions
-                          , snapshotPalette = arenaPalette arena
-                          , snapshotResident = restrictResident regions (arenaResident arena)
+                          { snapArena = leaseArena ls
+                          , snapRevision = arenaRevision arena
+                          , snapGeneration = arenaGeneration arena
+                          , snapRegions = regions
+                          , snapPalette = arenaPalette arena
+                          , snapResident = restrictResident regions (arenaResident arena)
                           }
                   pure (Right (HoldId hid, snapshot))
 

@@ -71,13 +71,16 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Closure
         Test.TerrainRuntime.Fixtures
         Test.TerrainRuntime.Offload
+        Test.TerrainRuntime.Opacity
         Test.TerrainRuntime.Races
         Test.TerrainRuntime.Revalidation
         Test.TerrainRuntime.Spec
     build-depends:
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9,
+        filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,

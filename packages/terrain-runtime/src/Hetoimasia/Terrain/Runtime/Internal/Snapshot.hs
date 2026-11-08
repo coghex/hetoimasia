@@ -10,6 +10,9 @@ module Hetoimasia.Terrain.Runtime.Internal.Snapshot
   ( Snapshot (..)
   , SnapshotCell (..)
   , snapshotCell
+  , snapshotIncarnation
+  , snapshotRevision
+  , snapshotGeneration
   ) where
 
 import Data.Word (Word64)
@@ -21,13 +24,26 @@ import Hetoimasia.Terrain.Resident (Resident, residentCell)
 
 -- | A held, immutable view of some regions. The constructor is private.
 data Snapshot = Snapshot
-  { snapshotIncarnation ∷ !ArenaId
-  , snapshotRevision ∷ !Revision
-  , snapshotGeneration ∷ !Word64
-  , snapshotRegions ∷ ![RegionCoord]
-  , snapshotPalette ∷ !Palette
-  , snapshotResident ∷ !Resident
+  { snapArena ∷ !ArenaId
+  , snapRevision ∷ !Revision
+  , snapGeneration ∷ !Word64
+  , snapRegions ∷ ![RegionCoord]
+  , snapPalette ∷ !Palette
+  , snapResident ∷ !Resident
   }
+
+-- | The incarnation the snapshot was taken at. These are plain functions, never
+-- field labels, so a client cannot rewrite a snapshot with record-update syntax.
+snapshotIncarnation ∷ Snapshot → ArenaId
+snapshotIncarnation = snapArena
+
+-- | The content revision the snapshot was taken at.
+snapshotRevision ∷ Snapshot → Revision
+snapshotRevision = snapRevision
+
+-- | The residency generation the snapshot was taken at.
+snapshotGeneration ∷ Snapshot → Word64
+snapshotGeneration = snapGeneration
 
 -- | What a snapshot says about a cell. Unknown detail is distinct from air.
 data SnapshotCell
@@ -42,8 +58,8 @@ data SnapshotCell
 -- | The cell at a tile as of the snapshot.
 snapshotCell ∷ Snapshot → TileCoord → SnapshotCell
 snapshotCell snapshot tile
-  | region `notElem` snapshotRegions snapshot = NotHeld
-  | otherwise = case residentCell (snapshotPalette snapshot) (snapshotResident snapshot) tile of
+  | region `notElem` snapRegions snapshot = NotHeld
+  | otherwise = case residentCell (snapPalette snapshot) (snapResident snapshot) tile of
       Right (Just cell) → Known cell
       _ → Unloaded
   where
