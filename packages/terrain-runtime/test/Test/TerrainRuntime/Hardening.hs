@@ -359,6 +359,8 @@ spec = describe "Accounting and lifetime hardening" $ do
   it "reserves a removal's result bytes at admission, so pending removals and snapshots cannot overfill the retained bank" $
     withService (defaultConfig {configRetainedBytes = 330}) $ \svc → do
       (_, lease) <- openMain svc "main"
+      -- The region is loaded first: every request reserves a record, the read included.
+      _ <- readCell svc lease (tile 1 1 100)
       h1 <- newHost False
       h2 <- newHost False
       h3 <- newHost False
@@ -370,7 +372,6 @@ spec = describe "Accounting and lifetime hardening" $ do
       inspectSnapshotBytes svc >>= (`shouldBe` (320, 330))
       -- A snapshot cannot take space promised to them.
       let (held, _) = decomposeTile (tile 1 1 100)
-      _ <- readCell svc lease (tile 1 1 100)
       withSnapshot svc lease [held] (\_ → pure ()) >>= (`shouldBe` Left (RefusedBusy BusyRetained))
       -- Granting both settles them; the bank was never over its limit.
       forM_ [h1, h2] grant
@@ -509,6 +510,27 @@ spec = describe "Accounting and lifetime hardening" $ do
       inspectReadmissionWaits svc `shouldReturn` 0
       inspectInvariants svc >>= (`shouldBe` [])
 
+  it "keeps the retained bank within its limit when a read starts waiting to be admitted again" $ do
+    -- The bank holds exactly the surface query's record and one removal's: the
+    -- waiting read's record was reserved when it was admitted, so nothing is added.
+    let probe = Probe $ \point → case point of
+          PointHandoff _ _ → throwIO (ErrorCall "every transfer fails")
+          _ → pure ()
+    withServiceUsing (microConfig {configRetainedBytes = 320}) alwaysAdmitting probe $ \svc → do
+      client <- okOf (registerClient svc)
+      let definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
+      lease <- okOf (openArena svc client "full" definition) >>= await svc >>= expectSuccess
+      surfaceHost <- newHost False
+      _ <- okOf (surfaceWith svc (hostEndpoint svc Nothing surfaceHost) lease (column 0 0))
+      waitFor (readTVar (hostReady surfaceHost) >>= \n → check (n >= 1))
+      _ <- removeCell' svc lease (tile 0 0 33)
+      _ <- removeCell' svc lease (tile 0 0 32)
+      waitFor (inspectReadmissionWaitsSTM svc >>= \n → check (n == 1))
+      used <- inspectSnapshotBytes svc
+      used `shouldSatisfy` \(inUse, bank) → inUse <= bank
+      inspectInvariants svc >>= (`shouldBe` [])
+      closeService svc
+
   it "never lets a failing logger replace the defect it was reporting" $ do
     let sink entry = if entryMessage entry == "defect" then throwIO (ErrorCall "the sink failed") else pure ()
         failingLogger = mkLogger defaultLogFilter (callbackSink sink)
@@ -565,6 +587,32 @@ spec = describe "Accounting and lifetime hardening" $ do
       -- However long the run behind it, the commit came after at most a few preparations.
       readIORef committedAfter >>= \c → c `shouldSatisfy` maybe False (<= 3)
       settleChecks svc
+
+  it "dispatches a queued load while a producer keeps cancelling and replacing reads, with a view registered" $ do
+    withService defaultConfig $ \svc → do
+      (client, hot) <- openMain svc "hot"
+      cold <- okOf (openArena svc client "cold" soilOverStone) >>= await svc >>= expectSuccess
+      _ <- okOf (openView svc client)
+      _ <- readCell svc hot (tile 1 1 1)
+      coldHost <- newHost True
+      stop <- newTVarIO False
+      let produce previous = do
+            stopped <- readTVarIO stop
+            if stopped
+              then pure ()
+              else do
+                host <- newHost True
+                fresh <- cellWith svc (hostEndpoint svc Nothing host) hot (tile 1 1 1)
+                forM_ previous (void . cancel svc)
+                yield
+                produce (either (const Nothing) Just fresh)
+      withOwnedThread (produce Nothing) $ \_ stopProducer → do
+        _ <- okOf (cellWith svc (hostEndpoint svc Nothing coldHost) cold (tile 0 0 0))
+        -- The cold query needs a load; it is served while the stream is still running.
+        waitFor (readTVar (hostSettled coldHost) >>= \x → check (not (null x)))
+        atomically (writeTVar stop True)
+        stopProducer
+      settledOf coldHost >>= \x → x `shouldSatisfy` \case [Succeeded _] → True; _ → False
 
   it "serves an eligible staged commit while a producer keeps cancelling and replacing cache-hit reads" $ do
     gate <- newDisarmedGate

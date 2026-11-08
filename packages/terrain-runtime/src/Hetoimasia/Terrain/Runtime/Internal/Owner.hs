@@ -142,25 +142,26 @@ nextWork svc token = do
             | closing && stateBorrowers st == 0 && stopping → pure WStop
             | otherwise →
                 pickRequestWork st >>= \(prepareWork, commitWork) → do
-                  -- THE FAIRNESS RULE. Staging, commits, and loads/retries take
-                  -- turns whenever two or more are ready: each ready kind gets
-                  -- one quantum in every three, whatever the others are being
+                  -- THE FAIRNESS RULE. Staging, commits, retries and load
+                  -- dispatches take turns whenever two or more are ready: each
+                  -- ready kind gets one quantum in every four, whatever the others are being
                   -- fed, so a continuous stream of one (new reads, replacements,
                   -- cache hits elsewhere) cannot starve another. Within commits
                   -- the per-arena admission order is unchanged, and the model's
                   -- own round-robin and aging decide among loads.
-                  let otherWork =
-                        listToMaybe $
-                          [WRetry | stateFreed st && retryUseful st]
-                            <> [WDispatch | not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model)]
+                  let retryWork = if stateFreed st && retryUseful st then Just WRetry else Nothing
+                      dispatchWork = if not (stateDispatchIdle st) && any ((== R.JobQueued) . R.jobPhase) (R.modelJobs model) then Just WDispatch else Nothing
                       inTurn = case stateTurn st of
-                        TurnPrepare → [prepareWork, commitWork, otherWork]
-                        TurnCommit → [commitWork, otherWork, prepareWork]
-                        TurnOther → [otherWork, prepareWork, commitWork]
+                        TurnPrepare → [prepareWork, commitWork, retryWork, dispatchWork]
+                        TurnCommit → [commitWork, retryWork, dispatchWork, prepareWork]
+                        TurnRetry → [retryWork, dispatchWork, prepareWork, commitWork]
+                        TurnDispatch → [dispatchWork, prepareWork, commitWork, retryWork]
                   maybe retry pure (listToMaybe (catMaybes inTurn))
 
 retryUseful ∷ St → Bool
-retryUseful st = not (Map.null (stateViews st)) || any needsResubmit (Map.elems (stateRequests st))
+retryUseful st =
+  any (not . null . R.viewPending) (R.modelViews (stateModel st))
+    || any needsResubmit (Map.elems (stateRequests st))
 
 isDataCmd ∷ Cmd → Bool
 isDataCmd = \case
@@ -245,8 +246,8 @@ perform svc = \case
     pure True
   WHandoff aid region → handoff svc aid region >> pure True
   WPrepare rid → takeTurn svc TurnCommit >> prepareReq svc rid >> pure True
-  WCommit rid → takeTurn svc TurnOther >> commitReq svc rid >> pure True
-  WRetry → takeTurn svc TurnPrepare >> retryPass svc >> pure True
+  WCommit rid → takeTurn svc TurnRetry >> commitReq svc rid >> pure True
+  WRetry → takeTurn svc TurnDispatch >> retryPass svc >> pure True
   WDispatch → takeTurn svc TurnPrepare >> dispatchJob svc >> pure True
   WReport → do
     -- A defect was recorded where nothing could throw (a host callback that failed

@@ -473,11 +473,11 @@ data ViewRec = ViewRec
 
 data NameClaim = ClaimPending !RequestId | ClaimLive !ArenaId
 
--- | The three kinds of owner work that take turns: staging, commits, and
--- loads/retries. When two or more are ready they are served in rotation, so a
+-- | The four kinds of owner work that take turns: staging, commits, retries and
+-- load dispatches. When two or more are ready they are served in rotation, so a
 -- continuous supply of any one cannot starve another; within commits the
 -- per-arena admission order is kept.
-data Turn = TurnPrepare | TurnCommit | TurnOther
+data Turn = TurnPrepare | TurnCommit | TurnRetry | TurnDispatch
   deriving stock (Eq, Show)
 
 data Phase = Running | Closing

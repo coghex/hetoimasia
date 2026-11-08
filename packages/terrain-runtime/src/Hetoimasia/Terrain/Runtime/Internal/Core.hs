@@ -318,10 +318,12 @@ retainedBankUse st = sum (Map.elems (stateSnapshots st)) + resultRecordBytes * f
 
 -- | The records the service itself holds for a request, each charged
 -- 'resultRecordBytes' in the retained bank from admission to take, discard or
--- cancellation: a removal (pending, or settled and untaken) and a pending open or
--- attach. A read's record is charged by the model.
+-- cancellation. Every request reserves one when it is admitted, because every
+-- request can come to hold a record the model does not charge (a result not yet
+-- taken, a wait to be admitted again), and the reservation is then simply kept.
+-- Only a settled read, whose record the model still charges, holds none.
 retainedRecords ∷ St → Int
-retainedRecords = countReqs (\req → isRemoval req || isAcquisition req || waitingReadmission req)
+retainedRecords = countReqs (\req → not (isDone req && reqModel req))
 
 -- | Command slots the service holds for requests the model has no record of: a
 -- settled result not yet taken, and a pending open or attach.
@@ -459,7 +461,7 @@ decide svc st rid = \case
       Right (lid, ls, aid, arena) → case demandFor arena cmd of
         Left why → pure (Left (ShortFailed (SourceFailure (Text.pack why))))
         Right demands → do
-          outcome <- slotRefusal False >>= \case
+          outcome <- slotRefusal True >>= \case
             Just refusal → pure (Left refusal)
             Nothing → applyEvent svc (R.SubmitQuery rid aid (arenaRevision arena) demands)
           pure $ case outcome of
