@@ -413,44 +413,38 @@ data EdgeResult = EdgeResult
   , edgeNewlyKnown ∷ [Node]
   }
 
--- | Inspect connection @slot@ of a removal: 0 the cell's own old void, then the
--- six faces in 'cellFaces' order. A face joins the cell's run to every
--- component of the neighbour whose portal overlaps the full face over positive
--- area, or marks the class known when the face is the upper boundary of the
--- world. The X and Y limits and the lower boundary open nothing.
+-- | Inspect connection @slot@ (1 to 6, in 'cellFaces' order) of a removal. A
+-- face joins the cell's run to every component of the neighbour whose portal
+-- overlaps the full face over positive area, or marks the class known when the
+-- face is the upper boundary of the world. The X and Y limits and the lower
+-- boundary open nothing. Slot 0, the cell's own old void, is joined when the
+-- removal is staged.
 inspectEdge ∷ TileCoord → Int → M EdgeResult
 inspectEdge tile slot = do
   env ← askEnv
   me ← runNodeOf tile
-  if slot == 0
-    then case lookupVoid (envConn env) tile 0 of
-      InComponent key → joinWith me [SrcNode key]
-      _ → pure (EdgeResult EdgeNone [])
-    else do
-      let face = cellFaces !! (slot - 1)
-      case neighbourTile face tile of
-        Left _
-          | face == TopFace → do
-              newly ← markKnown me
-              pure (EdgeResult (if null newly then EdgeAlready else EdgeMarked) newly)
-          | otherwise → pure (EdgeResult EdgeNone [])
-        Right nb → do
-          now ← cellNow nb
-          let connections = connectCells tile airOpenings nb (openingsOf now)
-              indices = nub [componentRefIndex (connectionTo c) | c ← connections]
-              nodes = mapMaybe (nodeOf env nb now) indices
-          if length nodes /= length indices
-            then corrupt (ConnectionWithoutComponent nb)
-            else joinWith me nodes
-  where
-    joinWith me nodes = do
-      results ← mapM (unionNodes me) nodes
-      let flips = concat [ns | Joined ns ← results]
-          joined = not (null [() | Joined _ ← results])
-      pure $
-        if null nodes
-          then EdgeResult EdgeNone []
-          else if joined then EdgeResult EdgeJoined flips else EdgeResult EdgeAlready []
+  let face = cellFaces !! (slot - 1)
+  case neighbourTile face tile of
+    Left _
+      | face == TopFace → do
+          newly ← markKnown me
+          pure (EdgeResult (if null newly then EdgeAlready else EdgeMarked) newly)
+      | otherwise → pure (EdgeResult EdgeNone [])
+    Right nb → do
+      now ← cellNow nb
+      let connections = connectCells tile airOpenings nb (openingsOf now)
+          indices = nub [componentRefIndex (connectionTo c) | c ← connections]
+          nodes = mapMaybe (nodeOf env nb now) indices
+      if length nodes /= length indices
+        then corrupt (ConnectionWithoutComponent nb)
+        else do
+          results ← mapM (unionNodes me) nodes
+          let flips = concat [ns | Joined ns ← results]
+              joined = not (null [() | Joined _ ← results])
+          pure $
+            if null nodes
+              then EdgeResult EdgeNone []
+              else if joined then EdgeResult EdgeJoined flips else EdgeResult EdgeAlready []
 
 -- ---------------------------------------------------------------------------
 -- Candidates
@@ -595,23 +589,29 @@ stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
                 up = case above of
                   Just (lo, hi) | lo == z + 1 → Just hi
                   _ → Nothing
-            case (below, up) of
+            (runKey, merged) ← case (below, up) of
               (Nothing, Nothing) → do
                 putRec (KeyRun col z) (RecRun (z + 1))
-                pure (Just ([], 0))
+                pure (z, ([], 0))
               (Just lo, Nothing) → do
                 putRec (KeyRun col lo) (RecRun (z + 1))
-                pure (Just ([], 0))
+                pure (lo, ([], 0))
               (Nothing, Just hi) → do
                 delRec (KeyRun col (z + 1))
                 putRec (KeyRun col z) (RecRun hi)
                 joined ← unionNodes (RunNode col z) (RunNode col (z + 1))
-                pure (Just (joinFlips joined))
+                pure (z, joinFlips joined)
               (Just lo, Just hi) → do
                 putRec (KeyRun col lo) (RecRun hi)
                 delRec (KeyRun col (z + 1))
                 joined ← unionNodes (RunNode col lo) (RunNode col (z + 1))
-                pure (Just (joinFlips joined))
+                pure (lo, joinFlips joined)
+            -- The new full-air cell contains the cell's old void, so the two
+            -- are one space from the start: a cell that was known stays known.
+            (voidFlips, voidJoins) ← case lookupVoid (envConn env) tile 0 of
+              InComponent key → joinFlips <$> unionNodes (RunNode col runKey) (SrcNode key)
+              _ → pure ([], 0)
+            pure (Just (fst merged <> voidFlips, snd merged + voidJoins))
     joinFlips AlreadyJoined = ([], 0)
     joinFlips (Joined ns) = (ns, 1)
     finish s flips joins = do
@@ -620,7 +620,7 @@ stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
         then Left (CapacityBlocked CapacityObligations (limitPendingObligations limits) (limitPendingObligations limits))
         else pure ()
       if tailSeq == maxBound then Left AuthorityOverflow else pure ()
-      let staged = s {sOverlay = Map.insert (KeyTodo tailSeq) (Just (RecTodo (Todo tile 0))) (sOverlay s)}
+      let staged = s {sOverlay = Map.insert (KeyTodo tailSeq) (Just (RecTodo (Todo tile 1))) (sOverlay s)}
       content ← bump (authContent (hAuthority hdr))
       store ← bump (authStore (hAuthority hdr))
       knowledge ← if null flips then Right (authKnowledge (hAuthority hdr)) else bump (authKnowledge (hAuthority hdr))
@@ -795,7 +795,7 @@ inspectHead hdr = do
   let seqNo = hHead hdr
   r ← getRec (KeyTodo seqNo)
   case r of
-    Just (RecTodo (Todo tile done)) | done < edgeCount → do
+    Just (RecTodo (Todo tile done)) | done >= 1 && done < edgeCount → do
       result ← inspectEdge tile (fromIntegral done)
       if done + 1 == edgeCount
         then do
@@ -901,7 +901,7 @@ retainedFromRecords h entries = do
       (KeyRun _ lo, RecRun hi) | lo < hi → Right ()
       (KeyLink _, RecRoot (Root size _)) | size >= 1 → Right ()
       (KeyLink node, RecChild parent) | parent /= node → Right ()
-      (KeyTodo _, RecTodo (Todo _ done)) | done < edgeCount → Right ()
+      (KeyTodo _, RecTodo (Todo _ done)) | done >= 1 && done < edgeCount → Right ()
       _ → Left (MalformedRecord k)
     runsOk m =
       let runs = [(col, lo, hi) | (KeyRun col lo, RecRun hi) ← Map.toAscList m]

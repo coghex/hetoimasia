@@ -70,8 +70,10 @@ data Root = Root
   deriving stock (Eq, Show)
 
 -- | One removal's unfinished connections: its cell and how many of the
--- 'edgeCount' connections have been inspected. Zero is unseen, a number between
--- is pending, and a finished obligation is deleted (expanded).
+-- 'edgeCount' connection slots are finished. Slot 0, the cell's own old void,
+-- is joined by the removal itself (the new full-air cell contains it), so a
+-- stored obligation starts at 1 (unseen), a number between 1 and 6 is pending
+-- and a finished obligation is deleted (expanded).
 data Todo = Todo
   { todoTile ∷ !TileCoord
   , todoDone ∷ !Word8

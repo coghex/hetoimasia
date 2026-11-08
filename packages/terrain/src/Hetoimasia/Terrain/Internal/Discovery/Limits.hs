@@ -68,15 +68,16 @@ worstEdgeWrites ∷ Int
 worstEdgeWrites = 3
 
 -- | The most records one removal reads: the floor lookup that finds the cell and
--- the run below it, the lookup of the run above and two root lookups when the
--- removal joins two runs.
+-- the run below it, the lookup of the run above, the root lookups when the
+-- removal joins two runs and the root lookup that joins the new run to the
+-- cell's own old void.
 worstEditReads ∷ Int
-worstEditReads = 2 + 2 * findReadsBound
+worstEditReads = 2 + 3 * findReadsBound
 
 -- | The most records one removal writes: the merged run, the absorbed run's
--- deletion, the union's two records and the new obligation.
+-- deletion, the two unions' four records and the new obligation.
 worstEditWrites ∷ Int
-worstEditWrites = 5
+worstEditWrites = 7
 
 -- | A conservative accounted size of the largest single record entry: the key,
 -- the value and the container overhead.

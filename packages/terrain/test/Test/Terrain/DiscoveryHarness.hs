@@ -50,11 +50,13 @@ module Test.Terrain.DiscoveryHarness
   , oracleKnownVoid
   , oracleKnownSolid
   , modelKnowledge
+  , modelKnowledgeWith
 
     -- * Checks
   , invariants
   , compareKnowledge
   , compareDrained
+  , compareDrainedWith
   ) where
 
 import qualified Data.Map.Lazy as Lazy
@@ -213,9 +215,14 @@ exposedTable =
 
 -- | What the production queries say of a cell: void known, solid known.
 modelKnowledge ∷ Env → Provider → Cell3 → Either String (Bool, Bool)
-modelKnowledge env provider cell = case observedValue (queryCell env provider (mustTile3 cell)) of
+modelKnowledge = modelKnowledgeWith id
+
+-- | The same through a transformation of the answer, which a negative control
+-- uses to model a wrong implementation of one query.
+modelKnowledgeWith ∷ (CellKnowledge → CellKnowledge) → Env → Provider → Cell3 → Either String (Bool, Bool)
+modelKnowledgeWith f env provider cell = case observedValue (queryCell env provider (mustTile3 cell)) of
   Left u → Left (show u)
-  Right ck → Right (cellVoid ck == VoidKnown, cellSolid ck == SolidKnown)
+  Right ck0 → let ck = f ck0 in Right (cellVoid ck == VoidKnown, cellSolid ck == SolidKnown)
   where
     mustTile3 (x, y, z) = mustTile x y z
 
@@ -363,7 +370,25 @@ invariants rig =
     <> [ "removed runs differ from the applied removals"
        | expandedRuns /= Set.fromList (rigRemovals rig)
        ]
+    <> concatMap reportBounds (rigReports rig)
+    <> [ "connections inspected " <> show inspected <> ", expected " <> show expectedInspected <> ": a connection was inspected twice or lost"
+       | inspected /= expectedInspected
+       ]
   where
+    limits = envLimits (rigEnv rig)
+    reportBounds r =
+      [ "a report exceeds a limit: " <> show r
+      | reportUpdates r > max 1 (limitBatchUpdates limits)
+          || reportWrites r > limitDeltaRecords limits
+          || reportReads r > limitInspectedRecords limits
+          || reportDeltaBytes r > limitDeltaBytes limits
+          || reportScratchBytes r > limitScratchBytes limits
+      ]
+    edits = length (rigRemovals rig)
+    inspected = sum (map reportUpdates (rigReports rig)) - edits
+    header = retainedHeader (rigRetained rig)
+    partial = sum [fromIntegral done - 1 | (KeyTodo _, RecTodo (Todo _ done)) ← retainedRecords (rigRetained rig)] ∷ Int
+    expectedInspected = (fromIntegral edgeCount - 1) * fromIntegral (hHead header) + partial
     retained = rigRetained rig
     expandedRuns =
       Set.fromList
@@ -397,7 +422,11 @@ compareKnowledge rig = concatMap check inner
 -- | Compare production knowledge with the oracle exactly; use it when the
 -- obligations are drained.
 compareDrained ∷ Rig → [String]
-compareDrained rig =
+compareDrained = compareDrainedWith id
+
+-- | The exact comparison through a transformation of the production answers.
+compareDrainedWith ∷ (CellKnowledge → CellKnowledge) → Rig → [String]
+compareDrainedWith f rig =
   [ "obligations remain: " <> show (pendingOf rig) | pendingOf rig /= 0 ]
     <> concatMap check inner
   where
@@ -407,7 +436,7 @@ compareDrained rig =
     Window (x0, x1) (y0, y1) (z0, z1) = sceneWindow scene
     inner = [c | c@(x, y, z) ← cellsOfWindow scene, x > x0, x < x1 - 1, y > y0, y < y1 - 1, z > z0, z < z1 - 1]
     provider = retainedProvider (rigRetained rig)
-    check c = case modelKnowledge (rigEnv rig) provider c of
+    check c = case modelKnowledgeWith f (rigEnv rig) provider c of
       Left e → [show c <> ": query unresolved " <> e]
       Right (v, s) →
         [show c <> ": void known " <> show v <> ", oracle " <> show (Set.member c knownV) | v /= Set.member c knownV]

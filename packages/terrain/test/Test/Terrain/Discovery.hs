@@ -10,10 +10,14 @@
 -- printed seed.
 module Test.Terrain.Discovery (spec) where
 
-import Control.Monad (forM_)
+import Control.Exception (evaluate)
+import Control.Monad (forM_, unless)
+import Data.Word (Word64)
+import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
+import System.Mem (performMajorGC)
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
-import Hetoimasia.Terrain.Cell (Column (..))
+import Hetoimasia.Terrain.Cell (Column (..), mkColumn)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesFromIntervals, removedIntervals)
 import Hetoimasia.Terrain.Coordinate (TileCoord, axisFromInteger)
 import Hetoimasia.Terrain.Discovery
@@ -117,33 +121,48 @@ ramps =
       <> [PatchSpec 4 0 6 7 (SpecSolid "stone" 0)]
       <> [PatchSpec 2 (-3) 5 6 SpecAir, PatchSpec 2 (-2) 5 6 SpecAir]
 
+-- | A cave opened to the sky beside two sealed pockets that touch it along an
+-- edge and at a corner only.
+diagonal ∷ Scene
+diagonal =
+  groundScene "edge and point contact" 8 (-3, 10) (-4, 5) 6 $
+    caveRow 0 5 2 4 <> [PatchSpec 5 0 5 6 (SpecSolid "stone" 0), PatchSpec 5 1 5 6 SpecAir, PatchSpec 5 (-1) 6 7 SpecAir]
+
+-- | An N ramp beside an S ramp (a quarter-face overlap), reached by a shaft.
+rampPair ∷ Scene
+rampPair =
+  groundScene "ramp pair" 8 (-3, 6) (-3, 4) 6 $
+    [PatchSpec 1 0 5 6 (SpecSolid "slab" 1), PatchSpec 2 0 5 6 (SpecSolid "slab" 4)]
+
 -- ---------------------------------------------------------------------------
 -- Generated scenes
 
 -- | A random 4 × 4 core of patches and a random removal sequence inside and
--- around it. All sixteen shape identities, and so all four rotations of every
--- orientable one, occur as patch content.
-generatedScene ∷ Int → (Scene, [Cell3])
-generatedScene seed = runR build seed
+-- around it, placed at an origin and a sky level so that the traces cross the
+-- negative region seams (X and Y at zero, Z at multiples of 32). All sixteen
+-- shape identities, and so all four rotations of every orientable one, occur
+-- as patch content.
+generatedScene ∷ (Integer, Integer, Integer) → Int → (Scene, [Cell3])
+generatedScene (ox, oy, sky) seed = runR build seed
   where
     build = do
       patches ← concat <$> mapM column [(x, y) | x ← [0 .. 3], y ← [0 .. 3]]
       removals ← mapM (const removal) [1 .. 9 ∷ Int]
-      pure (groundScene ("generated " <> show seed) 8 (-2, 6) (-2, 6) 6 patches, removals)
+      pure (groundScene ("generated " <> show (ox, oy, sky, seed)) sky (ox - 2, ox + 6) (oy - 2, oy + 6) 6 patches, removals)
     column (x, y) = do
       present ← pick 4
       if present == 0
         then pure []
         else do
-          lo ← (+ 3) <$> pick 3
-          len ← (+ 1) <$> pick 2
+          lo ← (+ (sky - 5)) . toInteger <$> pick 3
+          len ← (+ 1) . toInteger <$> pick 2
           content ← randomContent
-          pure [PatchSpec x y (toInteger lo) (toInteger (lo + len)) content]
+          pure [PatchSpec (ox + x) (oy + y) lo (lo + len) content]
     removal = do
       x ← pick 4
       y ← pick 4
-      z ← (+ 3) <$> pick 6
-      pure (toInteger x, toInteger y, toInteger z)
+      z ← pick 6
+      pure (ox + toInteger x, oy + toInteger y, sky - 5 + toInteger z)
 
 pick ∷ Int → R Int
 pick = below
@@ -168,6 +187,9 @@ spec = describe "Discovery" $ do
   shapeSpecs
   replaySpecs
   authoritySpecs
+  familySpecs
+  controlSpecs
+  evidenceSpecs
 
 -- ---------------------------------------------------------------------------
 
@@ -276,12 +298,26 @@ sealedSpecs = describe "raw buried removals" $ do
 
 shapeSpecs ∷ Spec
 shapeSpecs = describe "geometry" $ do
-  it "agrees with the oracle over generated traces (all sixteen identities)" $ do
-    forM_ [1 .. 40 ∷ Int] $ \seed → do
-      let (scene, removals) = generatedScene seed
-          rig = newRig (limitsWith 3) scene
-          events = concat [[Edit c, Batch (allowanceOf (limitsWith 3))] | c ← removals] <> [Drain fullAllowance]
-      cleanly rig events
+  it "agrees with the oracle over generated traces (all sixteen identities, across the negative seams)" $ do
+    forM_ [(0, 0, 8), (-2, -2, 8), (-3, -3, 32), (-2, -2, -32)] $ \origin →
+      forM_ [1 .. 12 ∷ Int] $ \seed → do
+        let (scene, removals) = generatedScene origin seed
+            rig = newRig (limitsWith 3) scene
+            events = concat [[Edit c, Batch (allowanceOf (limitsWith 3))] | c ← removals] <> [Drain fullAllowance]
+        cleanly rig events
+  it "does not connect edge-only or point-only contacts" $ do
+    let rig = newRig (limitsWith 64) diagonal
+        (end, bad) = runTrace rig ([Edit c | c ← [(1, 0, z) | z ← [5 .. 7]]] <> [Drain fullAllowance])
+        known c = fmap cellVoid (observedValue (queryCell (rigEnv end) (retainedProvider (rigRetained end)) (mustTile3 c)))
+    bad `shouldBe` []
+    known (3, 0, 5) `shouldBe` Right VoidKnown
+    -- an edge contact and a point contact with the known cave stay sealed.
+    known (5, 1, 5) `shouldBe` Right VoidUnknown
+    known (5, -1, 6) `shouldBe` Right VoidUnknown
+  it "discovers through a real diagonal opening of shaped cells and not through a sealed one" $ do
+    -- an N ramp and an S ramp across X each open half of the shared face but
+    -- overlap over a quarter of it, so the two voids connect.
+    cleanly (newRig (limitsWith 64) rampPair) ([Edit c | c ← [(0, 0, z) | z ← [5 .. 7]]] <> [Drain fullAllowance])
 
 -- ---------------------------------------------------------------------------
 
@@ -343,7 +379,7 @@ limitSpecs = describe "limits" $ do
     mkDiscoveryLimits baseSpec {specScratchBytes = 2 ^ (41 ∷ Int)} `shouldBe` Left (LimitUnrepresentable FieldScratchBytes (2 ^ (41 ∷ Int)) (2 ^ (40 ∷ Int)))
     forM_ [1, 64] $ \n → mkDiscoveryLimits baseSpec {specBatchUpdates = n} `shouldSatisfy` either (const False) (const True)
   it "stops at the batch limit and continues an operation of more than 64 updates" $ do
-    -- twelve removals queue 84 connections, more than one batch of 64.
+    -- twelve removals queue 72 face connections, more than one batch of 64.
     let rig0 = newRig (limitsWith 64) twoOpenings
         cells = openingA <> openingB <> [(0, 3, z) | z ← [1 .. 6]]
         (queued, _) = runTrace rig0 [Edit c | c ← cells]
@@ -354,7 +390,7 @@ limitSpecs = describe "limits" $ do
     pendingOf rig1 `shouldSatisfy` (> 0)
     let (rig2, second) = batchRig fullAllowance rig1
     case second of
-      BatchProgress report HaltDrained → reportUpdates report `shouldBe` 20
+      BatchProgress report HaltDrained → reportUpdates report `shouldBe` 8
       other → expectationFailure ("expected the last batch, got " <> show other)
     pendingOf rig2 `shouldBe` 0
     compareDrained rig2 `shouldBe` []
@@ -451,3 +487,199 @@ authoritySpecs = describe "authority" $ do
     isStale _ = False
     isWrongArena (Left (WrongArena _ _)) = True
     isWrongArena _ = False
+
+-- ---------------------------------------------------------------------------
+-- Huge families, bounded windows and allocation
+
+-- | A uniform N-ramp layer on @[0, w)@ under open sky, with a patch exception:
+-- every row and every level is its own component.
+rampFamily ∷ Integer → Scene
+rampFamily w =
+  Scene
+    { sceneName = "ramp family " <> show w
+    , sceneSpec =
+        SourceSpec
+          ["stone", "slab"]
+          [LayerSpec Nothing (Just 0) "stone" 0, LayerSpec (Just 0) (Just w) "slab" 1]
+          [PatchSpec 3 1 (w - 3) (w - 2) (SpecSolid "stone" 0)]
+    , sceneWindow = Window (-1, 5) (-1, 5) (w - 6, w + 3)
+    , sceneSky = Just w
+    }
+
+familyEdits ∷ Integer → [Cell3]
+familyEdits w = [(1, 1, w - 2), (2, 1, w - 3), (1, 1, w - 1)]
+
+spans ∷ [Integer]
+spans = [2 ^ (20 ∷ Int), 2 ^ (60 ∷ Int)]
+
+familySpecs ∷ Spec
+familySpecs = describe "huge families" $ do
+  it "joins only the components a removal reaches, at 2^20 and 2^60 alike" $ do
+    reports ← mapM runFamily spans
+    case reports of
+      [small, large] → small `shouldBe` large
+      _ → expectationFailure "two spans expected"
+  it "keeps a bounded working window while the retained history grows" $ do
+    let base = newRig (limitsWith 64) (rampFamily (2 ^ (60 ∷ Int)))
+        with n = base {rigRetained = historyOf n}
+        trace rig = map reportCost (rigReports (drainRig fullAllowance (foldl (\r c → fst (editRig fullAllowance c r)) rig (familyEdits (2 ^ (60 ∷ Int))))))
+    trace (with 0) `shouldBe` trace (with 100000)
+    trace (with 0) `shouldSatisfy` all (\(reads', writes, bytes) → reads' <= limitInspectedRecords defaultDiscoveryLimits && writes <= limitDeltaRecords defaultDiscoveryLimits && bytes <= limitDeltaBytes defaultDiscoveryLimits)
+  it "allocates alike for spans of 2^20 and 2^60 and for short and long histories" $ do
+    rigs ← mapM (\w → let r = newRig (limitsWith 64) (rampFamily w) in evaluate (envSharedBytes (rigEnv r)) >> pure r) spans
+    let work rig = evaluate (retainedBytes (rigRetained (drainRig fullAllowance (foldl (\r c → fst (editRig fullAllowance c r)) rig (familyEdits (sceneTop rig))))))
+    costs ← mapM (\r → allocatedBy (repeatN 20 (work r))) rigs
+    case costs of
+      [small, large] → sameCost "span" small large
+      _ → expectationFailure "two spans expected"
+    let base = newRig (limitsWith 64) (rampFamily (2 ^ (60 ∷ Int)))
+        shortRig = base {rigRetained = historyOf 100}
+        longRig = base {rigRetained = historyOf 100000}
+    _ ← evaluate (retainedBytes (rigRetained shortRig) + retainedBytes (rigRetained longRig))
+    short ← allocatedBy (repeatN 20 (work shortRig))
+    long ← allocatedBy (repeatN 20 (work longRig))
+    sameCost "history" short long
+  where
+    sceneTop rig = case sceneSky (rigScene rig) of Just w → w; Nothing → 0
+    reportCost r = (reportReads r, reportWrites r, reportDeltaBytes r)
+    runFamily w = do
+      let rig = newRig (limitsWith 64) (rampFamily w)
+          events = [Edit c | c ← familyEdits w] <> [Drain fullAllowance]
+          (end, bad) = runTrace rig events
+      bad `shouldBe` []
+      compareDrained end `shouldBe` []
+      -- the top row's neighbours stay unknown: only the reached components joined.
+      let known c = fmap cellVoid (observedValue (queryCell (rigEnv end) (retainedProvider (rigRetained end)) (mustTile3 c)))
+      known (1, 3, w - 2) `shouldBe` Right VoidUnknown
+      known (1, 1, w - 3) `shouldBe` Right VoidKnown
+      known (1, 2, w - 2) `shouldBe` Right VoidKnown
+      pure (map reportShape (reverse (rigReports end)))
+    reportShape r = (reportUpdates r, reportJoins r, reportRetired r, reportReads r, reportWrites r, reportDeltaBytes r, reportScratchBytes r, length (reportNewlyKnown r))
+
+-- | A retained value holding @n@ unrelated removed runs far from the scene.
+historyOf ∷ Int → Retained
+historyOf n =
+  either (error . show) id (retainedFromRecords header records)
+  where
+    records = [(KeyRun col 1000, RecRun 1001) | i ← [0 .. n - 1], Right col ← [mkColumn (1000 + toInteger i) 1000]]
+    header = (retainedHeader (newRetained (ArenaId 1))) {hBytes = sum [entryBytes k r | (k, r) ← records]}
+
+-- | Bytes the runtime allocated while an action ran, measured across major
+-- collections, exactly as the growth specs measure it.
+allocatedBy ∷ IO a → IO Word64
+allocatedBy action = do
+  enabled ← getRTSStatsEnabled
+  unless enabled $ expectationFailure "GHC runtime statistics are disabled; build the suite with -with-rtsopts=-T"
+  performMajorGC
+  began ← allocated_bytes <$> getRTSStats
+  _ ← action
+  performMajorGC
+  ended ← allocated_bytes <$> getRTSStats
+  pure (ended - began)
+
+repeatN ∷ Int → IO a → IO ()
+repeatN n action = forM_ [1 .. n] (const action)
+
+sameCost ∷ String → Word64 → Word64 → Expectation
+sameCost label a b = do
+  (label, a <= 64 * 1024 * 1024) `shouldBe` (label, True)
+  (label, b <= 64 * 1024 * 1024) `shouldBe` (label, True)
+  (label, a <= 2 * b + 65536) `shouldBe` (label, True)
+  (label, b <= 2 * a + 65536) `shouldBe` (label, True)
+
+-- ---------------------------------------------------------------------------
+-- Negative controls
+
+-- | The independent expectations must reject three wrong behaviours that keep
+-- each scenario's premise. A mutant here is a transformation applied to the
+-- real result; the production code is mutated separately, locally, and the
+-- results recorded with the evidence.
+controlSpecs ∷ Spec
+controlSpecs = describe "negative controls" $ do
+  it "reject ending the whole reveal on reaching the sky" $ do
+    let rig = newRig (limitsWith 1) pockets
+        queued = fst (runTrace rig ([Edit c | c ← [(1, 0, z) | z ← [5 .. 7]]] <> [Edit (4, 0, 5), Edit (7, 0, 5)]))
+        stopAtSky batch r = case batch of
+          BatchProgress report _ | not (null (reportNewlyKnown report)) → forgetObligations r
+          _ → r
+        mutant = drainWith stopAtSky (allowanceOf (limitsWith 1)) queued
+        honest = drainRig (allowanceOf (limitsWith 1)) queued
+    compareDrained honest `shouldBe` []
+    compareDrained mutant `shouldNotBe` []
+  it "reject treating pending work as complete" $ do
+    let rig = newRig (limitsWith 1) twoOpenings
+        (queued, _) = runTrace rig [Edit c | c ← openingA]
+        (partial, _) = batchRig (allowanceOf (limitsWith 1)) queued
+    pendingOf partial `shouldSatisfy` (> 0)
+    -- a model that called this complete would claim knowledge the oracle
+    -- already has and the state lacks.
+    filter (\m → "void known" `isInfixOfS` m || "solid known" `isInfixOfS` m) (compareDrained partial) `shouldNotBe` []
+  it "reject deriving a known void from a known solid" $ do
+    let rig = newRig (limitsWith 64) ramps
+        (end, _) = runTrace rig ([Edit c | c ← [(0, 1, z) | z ← [5 .. 7]]] <> [Drain fullAllowance])
+        mutant ck = if cellSolid ck == SolidKnown then ck {cellVoid = if cellVoid ck == NoVoidHere then NoVoidHere else VoidKnown} else ck
+    compareDrained end `shouldBe` []
+    compareDrainedWith mutant end `shouldNotBe` []
+  where
+    isInfixOfS needle hay = any (\i → take (length needle) (drop i hay) == needle) [0 .. length hay - length needle]
+
+-- | The mutant: forget every unfinished obligation.
+forgetObligations ∷ Rig → Rig
+forgetObligations rig =
+  rig
+    { rigRetained =
+        either (error . show) id $
+          retainedFromRecords
+            header {hHead = hTail header, hBytes = sum [entryBytes k r | (k, r) ← records]}
+            records
+    }
+  where
+    header = retainedHeader (rigRetained rig)
+    records = [(k, r) | (k, r) ← retainedRecords (rigRetained rig), notTodo k]
+    notTodo (KeyTodo _) = False
+    notTodo _ = True
+
+-- ---------------------------------------------------------------------------
+-- Evidence
+
+-- | Print the measured figures of the required traces, for the retained
+-- evidence. These are accounting counts, not heap or process memory.
+evidenceSpecs ∷ Spec
+evidenceSpecs = describe "evidence" $ do
+  it "reports bounds for the required traces" $ do
+    forM_ traces $ \(label, rig, events) → do
+      let (end, bad) = runTrace rig events
+          reports = reverse (rigReports end)
+          batches = [r | r ← reports, reportUpdates r > 0]
+      bad `shouldBe` []
+      putStrLn $
+        label
+          <> ": edits "
+          <> show (length (rigRemovals end))
+          <> ", reports "
+          <> show (length batches)
+          <> ", max updates "
+          <> show (maximum (0 : map reportUpdates batches))
+          <> ", max reads "
+          <> show (maximum (0 : map reportReads batches))
+          <> ", max writes "
+          <> show (maximum (0 : map reportWrites batches))
+          <> ", max delta bytes "
+          <> show (maximum (0 : map reportDeltaBytes batches))
+          <> ", max scratch bytes "
+          <> show (maximum (0 : map reportScratchBytes batches))
+          <> ", retained records "
+          <> show (length (retainedRecords (rigRetained end)))
+          <> ", retained bytes "
+          <> show (retainedBytes (rigRetained end))
+          <> ", pending "
+          <> show (pendingOf end)
+          <> ", resident detail 0"
+  where
+    small = limitsWith 64
+    traces =
+      [ ("two openings", newRig small twoOpenings, [Edit c | c ← openingA <> openingB] <> [Drain fullAllowance])
+      , ("sealed pockets", newRig small pockets, [Edit c | c ← [(4, 0, 5), (7, 0, 5)] <> [(0, 3, z) | z ← [1 .. 6]] <> [(1, 0, z) | z ← [5 .. 7]]] <> [Drain fullAllowance])
+      , ("ramp family 2^20", newRig small (rampFamily (2 ^ (20 ∷ Int))), [Edit c | c ← familyEdits (2 ^ (20 ∷ Int))] <> [Drain fullAllowance])
+      , ("ramp family 2^60", newRig small (rampFamily (2 ^ (60 ∷ Int))), [Edit c | c ← familyEdits (2 ^ (60 ∷ Int))] <> [Drain fullAllowance])
+      ]
