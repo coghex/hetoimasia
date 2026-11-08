@@ -19,6 +19,7 @@ cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-detai
 cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct
+cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct
@@ -49,6 +50,20 @@ cabal test hetoimasia-tests --test-show-details=direct
   answer is `inconclusive`.
 
 ## Which suite owns what
+
+- `terrain-runtime-tests` (`packages/terrain-runtime/test/`, TRA-4) owns the
+  scoped transactional terrain service, composed by
+  `Test.TerrainRuntime.Spec`: the cancel, stage and commit races in the arrival and
+  delayed-eligibility host fixtures, closure against pending work and the parent
+  session's admission, the arena, lease and view limits and identity exhaustion,
+  bounded budgets against real resident detail, offload and reload against an
+  independent model, superseded work and the deterministic replay of an ordered
+  trace, startup, cancellation and unexpected-exit lifecycles, and the external-client
+  boundary. It drives the production service through controlled gates (`Probe`), so
+  no example sleeps; every thread it starts is owned through `Test.Support.Owned` and
+  its waits are bounded. It is the CPU group `test.terrain-runtime`, mandatory and
+  outside the floor, on the `haskell-engine` worker with a reusable receipt. See
+  [the package's contract](../packages/terrain-runtime/README.md).
 
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
