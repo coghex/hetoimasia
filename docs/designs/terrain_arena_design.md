@@ -209,12 +209,21 @@ already filed, not implemented; their original issue links are preserved.
 The eleven unchecked follow-ups are unprocessed. P-16 records the approved
 revisions to existing artifacts, including #645–#648 despite their filed marks.
 
-**Amendment processing cursor:** draft the revision of existing EPIC #636
-first; do not create another epic. Then process exactly one new child or
-existing-issue revision per invocation, with a separately approved concrete
-tracker draft before each mutation. No tracker body is changed by this
-ledger promotion. The amendment's design-only assignment ends with publication
-and manager handoff; dispatch for tracker processing is a separate step.
+**Amendment EPIC revision applied 2026-11-08:** existing [#636] now carries
+revision v1, approved by `het-manager` in `#het-terrain` message
+`wwkfu39cnxfmw3ttbhtx22vg7n` (reply to draft `566cjfrmaw8t29thusvzu67vps`).
+The exact replacement body was verified after editing; SHA-256:
+`d34f0dc7bbab4a54facf05d25d3ca92a4edd9e058be24746e7238f947846c90f`.
+Title, labels, state and other issue metadata are unchanged. All existing
+child links and ledger markers are preserved; eleven new children remain
+unprocessed. This revision releases no PR hold and grants no readiness review.
+
+**Amendment processing cursor:** draft TRA-13 next. Process TRA-13–TRA-23
+in ledger order, then the P-16 revisions of #645–#648 and any other named
+artifacts, one artifact at a time with a separately approved concrete tracker
+draft before each mutation. The manager arranges readiness reviews. Tracker
+processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after this
+revision: `wwkfu39cnxfmw3ttbhtx22vg7n` in `#het-terrain`.
 
 ## Epic contract
 
