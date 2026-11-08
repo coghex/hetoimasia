@@ -21,8 +21,6 @@ import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Read as Text
-import GHC.Clock (getMonotonicTime)
-import System.IO (hFlush, stdout)
 import System.Timeout (timeout)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
@@ -61,24 +59,27 @@ spec env = describe "the texture backend on a real device, with no window" $ do
 
   it "accepts the largest legal level, 2,048 by 2,048, through the configured staging and registers it" $
     within 120 . withLoaded env [("big.png", Png.solid 2048 2048 (200, 100, 50, 255))] $ \comp vm → do
-      stamp "ex2 start"
+      -- The first level this large the session allocates may need a memory block of its own, because the table's lookup ring
+      -- (versions x capacity x 8 bytes, 20 MiB for the fixed profile) now fills the block the first allocations share; the
+      -- allocator keeps one emptied block for reuse, and the model's bytes count it. A first load and release of an instance
+      -- of its own settles that, and the session's rest is read after it: the example then shows the accounting returning, in
+      -- bytes, objects and resources, to what it was with the level's block in place (observed on the Linux software device:
+      -- after the release the objects and resources were at rest and the bytes one retained block above it).
+      restBefore ← restNow env
+      _ ← loadWith comp vm "warm" "w" "big.png" (\_ → pure ())
+      release' env comp vm "warm" "w"
+      awaitUsage env (\now → usageObjects now == usageObjects restBefore && usageResources now == usageResources restBefore)
+      markRest env
       atRest ← restNow env
-      stamp ("ex2 rest read: " <> summarise atRest)
       identity ← loadWith comp vm "a" "k" "big.png" (\line → line `shouldSatisfy` Text.isInfixOf "width=2048")
-      stamp "ex2 loaded"
       during ← usageNow env
-      stamp ("ex2 usage while live: " <> summarise during)
       -- The texture is a native resource for as long as it lives, and its staging copy is the configured
       -- staging's, charged once, so the session holds one resource more and no second copy of the level.
       usageResources during `shouldSatisfy` (> usageResources atRest)
       registeredMark (graphicsTextures (envGraphics env)) (textureHandleOf (fromIntegral identity)) `shouldReturn` Just True
       evidence env ("2048x2048: accounting at rest " <> summarise atRest <> "; while live " <> summarise during <> "; the configuration budgets " <> tshow (accountingNativeBytes (configurationAccounting (graphicsConfiguration (envGraphics env)))) <> " native bytes of " <> tshow (accountingNativeLimit (configurationAccounting (graphicsConfiguration (envGraphics env)))))
-      stamp "ex2 releasing"
       release' env comp vm "a" "k"
-      stamp "ex2 released"
-      timeout 20000000 (awaitUsage env (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)) >>= \case
-        Just () → stamp "ex2 usage back at rest"
-        Nothing → usageNow env >>= \now → assertFailure ("ex2: usage never returned to rest; rest " <> Text.unpack (summarise atRest) <> "; now " <> Text.unpack (summarise now))
+      awaitUsage env (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
 
   it "loads the same content independently for two instances, and ending one leaves the other's texels" $
     within 90 . withLoaded env [("tiny.png", Png.asymmetric 8 4)] $ \comp vm → do
@@ -297,10 +298,3 @@ evidence env line = atomically (modifyTVar' (envEvidence env) (line :))
 
 tshow ∷ Show a ⇒ a → Text
 tshow = Text.pack . show
-
--- | A diagnostic line with the monotonic clock, flushed at once (a stalled example is read from the last one it printed).
-stamp ∷ Text → IO ()
-stamp line = do
-  now ← getMonotonicTime
-  putStrLn ("[t=" <> show now <> "] " <> Text.unpack line)
-  hFlush stdout
