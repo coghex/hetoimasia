@@ -1188,13 +1188,12 @@ setCamera m v a demands0 = do
 -- strictly in demand order: nothing behind a pending region is admitted. Only pressure
 -- leaves a region pending: any other refusal fails the event.
 admitWhileFits ∷ Model → ViewId → ArenaId → [RegionDemand] → Either Refusal (Model, [Admission], [RegionCoord])
-admitWhileFits m v a demands = go (m {mViews = Map.insert v (View a demands Set.empty) (mViews m)}) [] False demands
+admitWhileFits m v a demands = go (m {mViews = Map.insert v (View a demands Set.empty) (mViews m)}) [] demands
   where
     owner = OwnerView v
-    go mm done _ [] = Right (mm, done, [])
-    go mm done True ds = Right (mm, done, map demandRegion ds)
-    go mm done False (d : ds) = case planAdmission mm a owner [d] noExtras of
-      Right plan → let (m1, admission, _) = applyPlan mm a owner plan in go m1 (done <> [admission]) False ds
+    go mm done [] = Right (mm, done, [])
+    go mm done (d : ds) = case planAdmission mm a owner [d] noExtras of
+      Right plan → let (m1, admission, _) = applyPlan mm a owner plan in go m1 (done <> [admission]) ds
       Left (Busy _) → Right (mm, done, map demandRegion (d : ds))
       Left other → Left other
 
