@@ -8,7 +8,7 @@
   "target": {"format": "R8G8B8A8_SRGB", "width": 32, "height": 16, "surfaceFree": true},
   "windows": 0,
   "completion": "read after the batch's own ticket completed",
-  "build": {"revision": "92330829cf57fc930af61ec1e8c17f256903057c (dirty)", "sourceDigest": "bbad521cf43f5f65d291fa7f6ba06128f0a7e216617667209949d99122da7821"},
+  "build": {"revision": "9752b786dbcb44c2752c985a563e38771b249574 (dirty)", "sourceDigest": "051432ce3be08499d920ab3d7262d7f33fb02f0212059a951320974a588db120"},
   "oracle": {"determinatePixels": 512, "failures": 0},
   "handTolerance": 1,
   "comparisons": [{"texel": [0, 0], "input": [32, 64, 96], "expected": [99, 137, 165], "read": [99, 137, 165]}, {"texel": [1, 0], "input": [128, 128, 128], "expected": [188, 188, 188], "read": [188, 188, 188]}, {"texel": [2, 0], "input": [160, 192, 224], "expected": [208, 225, 241], "read": [208, 225, 241]}, {"texel": [3, 0], "input": [16, 48, 240], "expected": [71, 120, 248], "read": [71, 120, 248]}, {"texel": [0, 1], "input": [64, 128, 192], "expected": [137, 188, 225], "read": [137, 188, 225]}, {"texel": [1, 1], "input": [200, 100, 50], "expected": [229, 168, 122], "read": [229, 168, 122]}, {"texel": [2, 1], "input": [1, 2, 3], "expected": [13, 22, 28], "read": [13, 22, 28]}, {"texel": [3, 1], "input": [250, 251, 252], "expected": [253, 253, 254], "read": [253, 253, 254]}],

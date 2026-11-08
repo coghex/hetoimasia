@@ -8,7 +8,7 @@
   "coverageBitsHex": "fb",
   "factsReachedThrough": "retainTexture (the public retention boundary)",
   "windows": 0,
-  "build": {"revision": "92330829cf57fc930af61ec1e8c17f256903057c (dirty)", "sourceDigest": "bbad521cf43f5f65d291fa7f6ba06128f0a7e216617667209949d99122da7821"},
+  "build": {"revision": "9752b786dbcb44c2752c985a563e38771b249574 (dirty)", "sourceDigest": "051432ce3be08499d920ab3d7262d7f33fb02f0212059a951320974a588db120"},
   "oracle": {"determinatePixels": 512, "failures": 0},
   "readbackSha256": "61349f596273ae647164d73e896f6011433c394dd4fd5381b82abe448630618c",
   "pngSha256": "e50f53d0d7ed2b550c38afda9854afbfbcc0d572b00ad0b1c3fde34b246d09c6"
