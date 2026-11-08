@@ -337,6 +337,11 @@ data CellPrep = CellPrep
   , prSteps ∷ !Int
   , prChunks ∷ !(Map.Map ChunkKey (Integer, Integer))
   , prUsed ∷ !(Set.Set AssetKey)
+  , prExactX ∷ !(Map.Map Integer Bool)
+  -- ^ By a cell's left edge in render-world pixels: whether the cells to its
+  -- east and south are drawn exactly one canvas step away in x (see 'exactAlongX').
+  , prExactY ∷ !(Map.Map Integer Bool)
+  -- ^ By a cell's top edge: the same for y, east, south and above.
   }
 
 -- A quad before it is ranked.
@@ -456,6 +461,8 @@ startCells inputs = do
       , prSteps = 0
       , prChunks = Map.empty
       , prUsed = Set.empty
+      , prExactX = maybe Map.empty (exactColumnsX view) envelope
+      , prExactY = maybe Map.empty (exactRowsY view) envelope
       }
 
 -- The envelope of candidate columns. The column of view offset @(rx, ry)@ has
@@ -595,7 +602,20 @@ evaluateColumn inputs st env (v, u) budget
                   (opaqueIntervals opaque south)
                   [(a - 1, b - 1) | (a, b) ← opaqueIntervals opaque own]
               )
-          visible = [(z, s) | SRun a b s ← ownWindow, emits s, (x, y) ← subtractI [(a, b)] hidden, z ← [x .. y - 1]]
+          -- A cell is omitted only where the cells that would cover it are drawn
+          -- exactly one canvas step away, so the texel proof holds for the pixels
+          -- actually sampled; elsewhere it is drawn.
+          proved =
+            if Map.findWithDefault False (48 * (rx - ry) - 48) (prExactX st)
+              then
+                mergeI
+                  [ (z, z + 1)
+                  | (a, b) ← hidden
+                  , z ← [a .. b - 1]
+                  , Map.findWithDefault False (24 * (rx + ry - 1) - 16 * (z - ref) - 16) (prExactY st)
+                  ]
+              else []
+          visible = [(z, s) | SRun a b s ← ownWindow, emits s, (x, y) ← subtractI [(a, b)] proved, z ← [x .. y - 1]]
           pendings = [(a, b) | SRun a b SPend ← ownWindow]
           units = [UCell z s | (z, s) ← visible] <> [UPend a b | (a, b) ← pendings]
       go units st (drop (prSkip st) units) 0
@@ -681,7 +701,8 @@ emits _ = False
 -- the cells behind it are hidden. A colour with a hole proves nothing, and a
 -- mixed cell is conservatively not a proof.
 opaqueState ∷ AssetSnapshot → ViewFacing → CState → Bool
-opaqueState assets _ SFog = colourCoversHexagon assets ColourBlank
+opaqueState assets facing SFog =
+  mapCoversHexagon assets (lookupFullFog (lookupFor facing fogShape)) && colourCoversHexagon assets ColourBlank
 opaqueState assets facing (SOrd material shape) =
   mapCoversHexagon assets (lookupOrdinary (lookupFor facing shape)) && colourCoversHexagon assets (ColourMaterial material)
 opaqueState _ _ _ = False
@@ -836,6 +857,52 @@ targetOf mapping transform = case drawnOutline mapping transform [(0, 0), (1, 0)
   where
     aligned [(ax, ay), (bx, by), (cx, cy), (dx, dy)] = ay == by && bx == cx && cy == dy && dx == ax
     aligned _ = False
+
+-- The rectangle a cell whose canvas has its top-left at @(x, y)@ render-world
+-- pixels covers in the target, exactly as 'quad' draws it.
+rectAt ∷ RenderView → Integer → Integer → Maybe TargetRect
+rectAt view x y = either (const Nothing) Just (transformOf x y 96 64 >>= targetOf (rvMapping view))
+
+-- Whether the cells one canvas step east (@+48@) and south (@-48@) are drawn at
+-- exactly that many texel widths from this cell's left edge, with equal widths.
+-- Each rectangle is rounded through 32-bit floats on its own, so this is not
+-- implied by the integer positions; the view's world transform has no rotation,
+-- so the x edges depend on the cell's x alone and are read at y = 0.
+exactAlongX ∷ RenderView → Integer → Bool
+exactAlongX view x = case (rectAt view x 0, rectAt view (x + 48) 0, rectAt view (x - 48) 0) of
+  (Just (TargetRect l _ r _), Just (TargetRect le _ re _), Just (TargetRect ls _ rs _)) →
+    let step = (r - l) / 96 * 48
+     in le == l + step && re == r + step && ls == l - step && rs == r - step
+  _ → False
+
+-- The same in y: the cells one canvas step south and east (@+24@) and the cell
+-- above (@-16@, one level up) at exactly that many texel heights.
+exactAlongY ∷ RenderView → Integer → Bool
+exactAlongY view y = case (rectAt view 0 y, rectAt view 0 (y + 24), rectAt view 0 (y - 16)) of
+  (Just (TargetRect _ t _ b), Just (TargetRect _ tn _ bn), Just (TargetRect _ tu _ bu)) →
+    let texel = (b - t) / 64
+     in tn == t + 24 * texel && bn == b + 24 * texel && tu == t - 16 * texel && bu == b - 16 * texel
+  _ → False
+
+-- The verdicts of 'exactAlongX' for every column origin the envelope can reach
+-- (cell @x@ is @48 * (rx - ry) - 48@, and @rx - ry@ is the candidate's @u@).
+exactColumnsX ∷ RenderView → Envelope → Map.Map Integer Bool
+exactColumnsX view env =
+  Map.fromList [(x, exactAlongX view x) | u ← [uLo - 1 .. uHi + 1], let x = 48 * u - 48]
+  where
+    (uLo, uHi) = envURange env
+
+-- The verdicts of 'exactAlongY' for every row origin the envelope can reach: a
+-- cell's top edge is @8 * m@ with @m = 3 * (v - 1) - 2 * k - 2@ for its row sum
+-- @v@ and its level @k@ above the reference, so the range of @m@ covers them all.
+exactRowsY ∷ RenderView → Envelope → Map.Map Integer Bool
+exactRowsY view env =
+  Map.fromList [(y, exactAlongY view y) | m ← [mLo .. mHi], let y = 8 * m]
+  where
+    (vLo, vHi) = envVRange env
+    (kLo, kHi) = envZRel env
+    mLo = 3 * (vLo - 2) - 2 * (kHi + 2) - 2
+    mHi = 3 * vHi - 2 * (kLo - 1) - 2
 
 -- The pending span of a window of one column.
 pendSpanOf ∷ RenderView → Envelope → Maybe Column → Offset → Integer → Integer → Either CellError PendSpan

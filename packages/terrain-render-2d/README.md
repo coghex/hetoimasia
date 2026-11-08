@@ -585,7 +585,15 @@ unavailable neighbour is neither air nor a proof, a mixed neighbour is not a pro
 and a colour with a hole proves nothing. The supplied full-block map is itself
 checked from the planes: it must cover itself translated to the three cells that
 can hide one (east, south, above) and contain every catalog map, otherwise no asset
-is a covering proof and nothing is omitted as hidden. Runs, not levels, are walked,
+is a covering proof and nothing is omitted as hidden. The proof is made in the
+canvas, so it also needs the covering cells to be *drawn* exactly one canvas step
+from the hidden one: every quad's rectangle is rounded through 32-bit floats on its
+own, so at a fractional zoom or pan neighbouring rectangles can miss an exact
+translation by a unit in the last place and a pixel centre can then fall on the wrong
+side of a shared edge. `startCells` therefore checks the rectangles as drawn, once
+per column origin and per row origin the envelope reaches (the view's transform has
+no rotation, so x and y are independent), and a cell is omitted only where both
+hold; elsewhere it is drawn. Runs, not levels, are walked,
 so cost follows run boundaries and exposed cells, not depth, and a column's
 knowledge runs are searched by interval, so a window never visits runs outside it.
 

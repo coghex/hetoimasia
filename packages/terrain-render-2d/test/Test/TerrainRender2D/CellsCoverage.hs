@@ -27,6 +27,7 @@ import Hetoimasia.Terrain.Render2D.Facts
 import Hetoimasia.Terrain.Render2D.Knowledge
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
 import Hetoimasia.Terrain.Shape (ViewFacing (..), mkShapeId)
+import qualified Data.Set as Set
 import Hetoimasia.Terrain.Source
 import System.FilePath ((</>))
 import Test.Hspec
@@ -40,6 +41,7 @@ spec = describe "Cell picking coverage conventions (TRA-16)" $ do
   rearCandidates
   rasterEdges
   viewportAndScale
+  fractionalOcclusion
 
 fullShape ∷ MapKey
 fullShape = MapKey Ordinary (either (error . show) id (mkShapeId 0))
@@ -316,3 +318,52 @@ viewportAndScale = describe "viewport, scale, snapping and extents" $ do
   where
     setupZero s = s {setupViewport = Viewport (V2 0 0) (V2 0 0)}
     _unused = (emptyChanges, factsOf flatWorld, ViewSettings, source, Versions, mkKnowledge, MapKey, knowledgeRuns)
+
+-- ---------------------------------------------------------------------------
+
+-- A cell is omitted as hidden only when its neighbours' drawn rectangles are
+-- exact translates of its own, because only then does the translation of the
+-- texel proof hold for the pixels actually sampled. Each quad's rectangle is
+-- rounded through 32-bit floats on its own, so at a fractional zoom or pan the
+-- rectangles can miss by a unit of the last place and a pixel centre can fall
+-- on the wrong side of a shared edge.
+fractionalOcclusion ∷ Spec
+fractionalOcclusion = describe "omission of hidden cells under the transforms as drawn" $ do
+  let cluster = sceneOf FaceSouth 1 [OCell 0 0 0 0 KnownAll, OCell 0 0 1 0 KnownAll, OCell 1 0 0 0 KnownAll, OCell 0 1 0 0 KnownAll]
+      rear = tileAt 0 0 0
+      tilesOf plan = Set.fromList [t | q ← cellPlanQuads plan, Just t ← [quadCell q]]
+      zoomed z = withCamera (command (SetZoom z))
+      panned dx dy = withCamera (command (Pan dx dy))
+      snapped scene = scene {sceneSetup = (sceneSetup scene) {setupSettings = (setupSettings (sceneSetup scene)) {settingPixelSnap = True}}}
+  it "keeps the rear block where a pixel centre falls on a rounded shared edge, as a retained quad would answer" $ do
+    assets ← loadAssets 5
+    let scene = panned (5 / 48) (5 / 144) (zoomed 0.15 cluster)
+        plan = planScene assets scene
+    tilesOf plan `shouldSatisfy` Set.member rear
+    hitCellOf (pickPixel plan (159, 125)) `shouldBe` Just rear
+  it "answers every sampled pixel exactly as the plan that omits nothing does, across zooms, pans and snapping" $ do
+    assets ← loadAssets 5
+    -- A style whose catalog holds a map that reaches outside the full block proves
+    -- nothing, so its plan keeps every cell; the planes the scene draws are the same.
+    unproved ← loadAssetsWith 5 [(AssetMap (MapKey Ordinary (either (error . show) id (mkShapeId 5))), allOn)]
+    mapCoversHexagon unproved fullShape `shouldBe` False
+    let variants =
+          [ (zoom, (dx, dy), snap)
+          | zoom ← [0.15, 0.3, 0.5, 1, 1.1, 1.5, 2, 2.5]
+          , (dx, dy) ← [(0, 0), (5 / 48, 5 / 144), (1 / 64, 1 / 192), (0.3, 0.2)]
+          , snap ← [False, True]
+          , not snap || zoom `elem` [0.5, 1, 2]
+          ]
+        build snap zoom (dx, dy) = (if snap then snapped else id) (panned dx dy (zoomed zoom cluster))
+        outcome (zoom, pan, snap) =
+          let scene = build snap zoom pan
+              kept = planScene unproved scene
+              plan = planScene assets scene
+           in ( [px | px ← stridePixels 6 <> [(159, 125)], pickPixel plan px /= pickPixel kept px]
+              , Set.member rear (tilesOf plan)
+              )
+        outcomes = map outcome variants
+    [v | (v, (differences, _)) ← zip variants outcomes, not (null differences)] `shouldBe` []
+    -- The shortcut still works where the rectangles are exact, and still declines elsewhere.
+    any (not . snd) outcomes `shouldBe` True
+    any snd outcomes `shouldBe` True
