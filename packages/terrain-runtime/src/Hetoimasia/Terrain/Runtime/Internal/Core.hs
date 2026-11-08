@@ -796,6 +796,10 @@ invariants snapshotBank st =
        | rid <- modelIds
        , maybe True (not . reqModel) (Map.lookup rid (stateRequests st) <|> Map.lookup rid (stateGhosts st))
        ]
+    <> [ "the request " <> show rid <> " is being prepared but the model no longer holds its credits"
+       | Just (rid, _) <- [stateRunning st]
+       , rid `notElem` modelIds
+       ]
     <> [ "a ghost or a deferred retirement exists while no preparation is running"
        | stateRunning st == Nothing
        , not (Map.null (stateGhosts st)) || not (Set.null (stateDeferredRetire st))

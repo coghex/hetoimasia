@@ -56,8 +56,32 @@ spec ∷ Spec
 spec = describe "A randomized interleaving over the service" $ do
   forM_ [1 .. 24 ∷ Word64] $ \seed →
     it ("keeps every invariant and settles every request exactly once (seed " <> show seed <> ")") $
-      withService (tightConfig (2, 1, 2) 3 4096) $ \svc → do
+      runSeed (tightConfig (2, 1, 2) 3 4096) False seed
+  -- The same, with cancellations, lease releases and client ends injected by the owner
+  -- itself inside its preparations, where credits must be held to the safe point.
+  forM_ [1 .. 24 ∷ Word64] $ \seed →
+    it ("keeps every invariant when releases arrive while a preparation runs (seed " <> show seed <> ")") $
+      runSeed (tightConfig (2, 1, 2) 3 4096) True seed
+  -- And under capacity pressure that later clears: a bank that holds about two
+  -- regions and two commands, so refusals and waits are routine; every request must
+  -- still settle once the hosts are granted.
+  forM_ [1 .. 16 ∷ Word64] $ \seed →
+    it ("settles every request once pressure clears (seed " <> show seed <> ")") $
+      runSeed (microConfigSlots 3) True (seed + 100)
+
+-- | One seeded run. With the injection on, the owner performs a seeded cancellation,
+-- lease release or client end inside each preparation, and the model and table are
+-- checked there too, while the credits are held.
+runSeed ∷ Config → Bool → Word64 → IO ()
+runSeed config inject seed = do
+  hook <- newIORef Nothing
+  let probe = Probe $ \point → case point of
+        PointStaging _ | inject → inside hook
+        PointCaptured {} | inject → inside hook
+        _ → pure ()
+  withServiceUsing config alwaysAdmitting probe $ \svc → do
         world <- World <$> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef (seed * 7919) <*> newIORef []
+        writeIORef hook (Just (svc, world))
         -- Two clients and a first arena, so the steps have something to act on.
         forM_ [0, 1 ∷ Int] $ \_ → registerClient svc >>= either (const (pure ())) (\c → modifyIORef' (wClients world) (c :))
         firstClient <- head' <$> readIORef (wClients world)
@@ -95,6 +119,23 @@ spec = describe "A randomized interleaving over the service" $ do
       and [ledgerReserved (bankLedger m b) == 0 | b ← [ResidentBank, EditBank, StagingBank]]
         && slotInUse m CommandSlot == 0
         && slotInUse m LoadJobSlot == 0
+
+-- | The owner's own release inside a preparation: a seeded choice among cancelling a
+-- request, releasing a lease, ending a client, or nothing, then a check that the
+-- state is coherent while the credits are held.
+inside ∷ IORef (Maybe (Service, World)) → IO ()
+inside hook = readIORef hook >>= mapM_ (\(svc, world) → do
+  roll <- next world 8
+  case roll of
+    0 → releaseOne svc world
+    1 → releaseOne svc world
+    2 → readIORef (wLeases world) >>= pick world >>= mapM_ (void . releaseLease svc)
+    3 → readIORef (wClients world) >>= pick world >>= mapM_ (endClient svc)
+    _ → pure ()
+  found <- inspectInvariants svc
+  when (not (null found)) (atomicModifyIORef' (wTrouble world) (\t → (("inside a preparation: " <> show found) : t, ()))))
+  where
+    releaseOne svc world = readIORef (wRequests world) >>= pick world >>= mapM_ (\(request, _) → void (cancel svc request))
 
 -- | Leases that have settled since the last look become usable.
 harvest ∷ World → IO ()
