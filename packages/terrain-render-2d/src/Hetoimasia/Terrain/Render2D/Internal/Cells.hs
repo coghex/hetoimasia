@@ -324,6 +324,9 @@ data CellPrep = CellPrep
   , prView ∷ !RenderView
   , prEnvelope ∷ !(Maybe Envelope)
   , prCursor ∷ !(Maybe (Integer, Integer))
+  , prSkip ∷ !Int
+  -- ^ Units (cells, then pending spans) of the column at the cursor already
+  -- admitted, so a step bound can fall inside a column.
   , prHalt ∷ !(Maybe HaltReason)
   , prRaw ∷ ![RawQuad]
   , prPending ∷ ![PendSpan]
@@ -385,11 +388,10 @@ validConfig config =
     && ccDepth config <= maxVisibleDepth
     && ccMargin config >= 0
     && ccChunkMargin config >= 0
+    && all (>= 1) [clStepCandidates l, clStepLevels l]
     && all
       (>= 0)
-      [ clStepCandidates l
-      , clStepLevels l
-      , clColumns l
+      [ clColumns l
       , clLevels l
       , clInstances l
       , clPending l
@@ -443,6 +445,7 @@ startCells inputs = do
       , prView = view
       , prEnvelope = envelope
       , prCursor = envelope >>= firstCursor
+      , prSkip = 0
       , prHalt = Nothing
       , prRaw = []
       , prPending = []
@@ -510,9 +513,13 @@ nextCursor env (v, u)
 -- Stepping
 
 -- | Examine at most the step bounds' worth of candidate columns and levels,
--- nearest row first. A continuation made under other inputs is refused, so
--- superseded work can never become current. Stepping a settled or halted
--- preparation changes nothing.
+-- nearest row first. A step's level bound counts the cells and pending spans
+-- it admits and may fall inside a column: the column then stays at the cursor
+-- with its admitted units counted, and the next step resumes it. A continuation
+-- made under other inputs is refused, so superseded work can never become
+-- current. Stepping a settled or halted preparation changes nothing. Both step
+-- bounds are at least one (a configuration with a zero bound is refused), so
+-- every step of a working preparation admits or examines something.
 stepCells ∷ CellInputs → CellPrep → Either CellError CellPrep
 stepCells inputs prep = do
   identity ← cellIdentityOf inputs
@@ -523,15 +530,15 @@ stepCells inputs prep = do
     _ → Right prep
   where
     loop limits env cursor scanned levelsDone st
-      | scanned >= max 1 (clStepCandidates limits) = Right st {prCursor = Just cursor}
-      | scanned > 0 && levelsDone >= clStepLevels limits = Right st {prCursor = Just cursor}
+      | scanned >= clStepCandidates limits || levelsDone >= clStepLevels limits = Right st {prCursor = Just cursor}
       | otherwise = do
-          result ← evaluateColumn inputs st env cursor
-          case result of
-            Left halted → Right st {prCursor = Just cursor, prHalt = Just halted}
-            Right (st', levels) → case nextCursor env cursor of
-              Nothing → Right st' {prCursor = Nothing}
-              Just next → loop limits env next (scanned + 1) (levelsDone + levels) st'
+          ColumnStep st' charged outcome ← evaluateColumn inputs st env cursor (clStepLevels limits - levelsDone)
+          case outcome of
+            ColumnHalted halted → Right st' {prCursor = Just cursor, prHalt = Just halted}
+            ColumnPaused → Right st' {prCursor = Just cursor}
+            ColumnDone → case nextCursor env cursor of
+              Nothing → Right st' {prCursor = Nothing, prSkip = 0}
+              Just next → loop limits env next (scanned + 1) (levelsDone + charged) st' {prSkip = 0}
 
 -- ---------------------------------------------------------------------------
 -- One column
@@ -547,13 +554,32 @@ data CState
 data SRun = SRun !Integer !Integer !CState
   deriving stock (Eq, Show)
 
--- Evaluate the column at a cursor into the state, or report the bound it hit.
--- A column is atomic: it is taken whole or not at all, so the parts of a mixed
--- cell are never split by a bound.
-evaluateColumn ∷ CellInputs → CellPrep → Envelope → (Integer, Integer) → Either CellError (Either HaltReason (CellPrep, Int))
-evaluateColumn inputs st env (v, u)
-  | lo > hi = Right (Right (st, 0))
-  | prColumns st + 1 > clColumns limits = Right (Left HaltColumns)
+-- What one look at a column achieved.
+data ColumnOutcome
+  = -- | Every unit of the column is admitted.
+    ColumnDone
+  | -- | The step's level bound ended inside the column.
+    ColumnPaused
+  | -- | A plan-wide bound stopped the column before its next unit.
+    ColumnHalted !HaltReason
+
+-- The state after the look, the levels it charged, and what happened.
+data ColumnStep = ColumnStep !CellPrep !Int !ColumnOutcome
+
+-- One admissible piece of a column: a drawn cell (all of its parts together, so
+-- the parts of a mixed cell are never split) or a pending span.
+data Unit
+  = UCell !Integer !CState
+  | UPend !Integer !Integer
+
+-- Evaluate the column at a cursor and admit its units in order from the first
+-- not yet admitted, at most @budget@ of them (each charges one level). A plan-wide
+-- bound stops before the unit that would exceed it, leaving everything admitted
+-- so far in place and the rest unresolved.
+evaluateColumn ∷ CellInputs → CellPrep → Envelope → (Integer, Integer) → Int → Either CellError ColumnStep
+evaluateColumn inputs st env (v, u) budget
+  | lo > hi = Right (ColumnStep st 0 ColumnDone)
+  | prSkip st == 0 && prColumns st + 1 > clColumns limits = Right (ColumnStep st 0 (ColumnHalted HaltColumns))
   | otherwise = do
       -- Own states one level above the window (what covers its top), the
       -- columns nearer to the camera over the window itself.
@@ -571,30 +597,8 @@ evaluateColumn inputs st env (v, u)
               )
           visible = [(z, s) | SRun a b s ← ownWindow, emits s, (x, y) ← subtractI [(a, b)] hidden, z ← [x .. y - 1]]
           pendings = [(a, b) | SRun a b SPend ← ownWindow]
-          levelsHere = length visible + length ownWindow
-      quads ← concat <$> traverse (partsOf inputs st env (rx, ry)) visible
-      spans ← traverse (uncurry (pendSpanOf (prView st) env column (rx, ry))) pendings
-      pure $
-        if
-          | prLevels st + levelsHere > clLevels limits → Left HaltLevels
-          | prCount st + length quads > clInstances limits → Left HaltInstances
-          | prPendCount st + length spans > clPending limits → Left HaltPending
-          | otherwise →
-              Right
-                ( st
-                    { prRaw = reverse quads <> prRaw st
-                    , prPending = reverse spans <> prPending st
-                    , prColumns = prColumns st + 1
-                    , prLevels = prLevels st + levelsHere
-                    , prCount = prCount st + length quads
-                    , prPendCount = prPendCount st + length spans
-                    , prChunks = case column of
-                        Just c → Map.insertWith (\(a, b) (c', d) → (min a c', max b d)) (chunkOfColumn c) (lo, hi + 2) (prChunks st)
-                        Nothing → prChunks st
-                    , prUsed = Set.union (Set.fromList (concat [[AssetColour (rawColour q), AssetMap (rawMap q)] | q ← quads])) (prUsed st)
-                    }
-                , levelsHere
-                )
+          units = [UCell z s | (z, s) ← visible] <> [UPend a b | (a, b) ← pendings]
+      go units st (drop (prSkip st) units) 0
   where
     rx = (u + v) `div` 2
     ry = (v - u) `div` 2
@@ -610,6 +614,62 @@ evaluateColumn inputs st env (v, u)
     lo = max zLoRel (ceiling ((24 * fromInteger (v - 1) - 16 - y2) / 16)) + ref
     hi = min zHiRel (floor ((24 * fromInteger (v + 1) - y1) / 16)) + ref
     column = worldColumn camera (rx, ry)
+
+    -- A column with no unit at all still counts as examined.
+    go units cur remaining charged = case remaining of
+      []
+        | null units → Right (ColumnStep (started cur) charged ColumnDone)
+        | otherwise → Right (ColumnStep cur charged ColumnDone)
+      unit : rest
+        | charged >= budget → Right (ColumnStep cur charged ColumnPaused)
+        | otherwise → do
+            admitted ← admit cur unit
+            case admitted of
+              Left halted → Right (ColumnStep cur charged (ColumnHalted halted))
+              Right cur' → go units cur' rest (charged + 1)
+
+    -- The column's own bookkeeping, once, with its first unit (or with its
+    -- completion when it has none).
+    started cur
+      | prSkip cur == 0 =
+          cur
+            { prColumns = prColumns cur + 1
+            , prChunks = case column of
+                Just c → Map.insertWith (\(a, b) (c', d) → (min a c', max b d)) (chunkOfColumn c) (lo, hi + 2) (prChunks cur)
+                Nothing → prChunks cur
+            }
+      | otherwise = cur
+
+    admit cur unit = case unit of
+      UCell z s → do
+        quads ← partsOf inputs cur env (rx, ry) (z, s)
+        pure $
+          if
+            | prLevels cur + 1 > clLevels limits → Left HaltLevels
+            | prCount cur + length quads > clInstances limits → Left HaltInstances
+            | otherwise →
+                Right
+                  (started cur)
+                    { prRaw = reverse quads <> prRaw cur
+                    , prLevels = prLevels cur + 1
+                    , prCount = prCount cur + length quads
+                    , prSkip = prSkip cur + 1
+                    , prUsed = Set.union (Set.fromList (concat [[AssetColour (rawColour q), AssetMap (rawMap q)] | q ← quads])) (prUsed cur)
+                    }
+      UPend a b → do
+        pending ← pendSpanOf (prView cur) env column (rx, ry) a b
+        pure $
+          if
+            | prLevels cur + 1 > clLevels limits → Left HaltLevels
+            | prPendCount cur + 1 > clPending limits → Left HaltPending
+            | otherwise →
+                Right
+                  (started cur)
+                    { prPending = pending : prPending cur
+                    , prLevels = prLevels cur + 1
+                    , prPendCount = prPendCount cur + 1
+                    , prSkip = prSkip cur + 1
+                    }
 
 emits ∷ CState → Bool
 emits SFog = True
@@ -991,6 +1051,8 @@ instance Show CellPrep where
       . shows (prCount prep)
       . showString ", cursor = "
       . shows (prCursor prep)
+      . showString "+"
+      . shows (prSkip prep)
       . showString ", halt = "
       . shows (prHalt prep)
       . showString "}"

@@ -10,6 +10,7 @@ import Data.List (sort)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import qualified Data.Set as Set
+import Hetoimasia.Asset.Image.DataMap (coverageAt)
 import Hetoimasia.Math.Vector (V2 (..))
 import Data.Ratio (denominator)
 import Data.Word (Word32)
@@ -23,7 +24,8 @@ import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Facts
 import Hetoimasia.Terrain.Render2D.Knowledge
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
-import Hetoimasia.Terrain.Shape (ViewFacing (..), allViewFacings)
+import Hetoimasia.Terrain.MapBake.Catalog (lookupFor, lookupOrdinary)
+import Hetoimasia.Terrain.Shape (ViewFacing (..), allViewFacings, mkShapeId)
 import Hetoimasia.Terrain.Source
 import Hetoimasia.Render.TwoD.Snapshot (Viewport (..))
 import Test.Hspec
@@ -246,6 +248,32 @@ progress = describe "bounded, resumable preparation" $ do
     map fullView (cellPlanQuads settled) `shouldBe` map fullView (cellPlanQuads once)
     cellPlanDemand settled `shouldBe` cellPlanDemand once
     cellPlanUnresolved settled `shouldSatisfy` isNothing
+  it "bounds the levels of every step, inside a column too, without splitting a mixed cell" $ \assets → do
+    let stack = sceneOf FaceSouth 0 ([OCell 0 0 z 0 KnownAll | z ← [-40 .. 0]] <> [OCell 3 0 0 5 KnownSolid, OCell 0 3 0 12 KnownSolid])
+        oneLevel = withLimits (\l → l {clStepLevels = 1}) stack
+        inputs = inputsOf assets oneLevel
+        start = either (error . show) id (startCells inputs)
+        trail = stepsOf inputs start [start]
+        planAt p = either (error . show) id (cellPlanOf inputs p)
+        levelsAfter = cellStatLevels . cellPlanStats . planAt
+        deltas = zipWith (-) (map levelsAfter (drop 1 trail)) (map levelsAfter trail)
+        once = planScene assets stack
+        sibling q = let CellKey a z x y _ = quadKey q in (a, z, x, y)
+    -- The whole scene needs many levels, yet no step admits more than one.
+    cellStatLevels (cellPlanStats once) `shouldSatisfy` (> 4)
+    deltas `shouldSatisfy` all (<= 1)
+    deltas `shouldSatisfy` any (== 1)
+    cellPrepProgress (last trail) `shouldBe` Settled
+    -- A mixed cell's known part never appears without its fog, at any step.
+    forM_ trail $ \p → do
+      let quads = cellPlanQuads (planAt p)
+          fogged = Set.fromList [sibling q | q ← quads, quadPart q == PartFog]
+          known = Set.fromList [sibling q | q ← quads, quadPart q == PartKnown]
+      Set.toList (known `Set.difference` fogged) `shouldBe` []
+    -- Every unfinished prefix says what is still unresolved; the end result is the unbounded plan.
+    forM_ [p | p ← trail, cellPrepProgress p == Working] $ \p → isNothing (cellPlanUnresolved (planAt p)) `shouldBe` False
+    map fullView (cellPlanQuads (planAt (last trail))) `shouldBe` map fullView (cellPlanQuads once)
+    cellPlanDemand (planAt (last trail)) `shouldBe` cellPlanDemand once
   it "publishes a coherent partial plan whose unprocessed area is loading and whose near rows come first" $ \assets → do
     let inputs = inputsOf assets tiny
         start = either (error . show) id (startCells inputs)
@@ -446,7 +474,7 @@ refusals = describe "explicit refusals" $ do
     planSceneWith assets (sceneFrom FaceSouth 0 0 0 ore (knowledgeOf 1 CellDiscovered []) AllKnown)
       `shouldSatisfy` (\r → case r of Left (CellMissingMaterialColour _) → True; _ → False)
   it "refuses an unusable configuration and a snap view that would crack the quads" $ \assets → do
-    forM_ [withConfig (\c → c {ccDepth = 251}), withConfig (\c → c {ccDepth = -1}), withConfig (\c → c {ccMargin = -1}), withLimits (\l → l {clColumns = -1})] $ \f →
+    forM_ [withConfig (\c → c {ccDepth = 251}), withConfig (\c → c {ccDepth = -1}), withConfig (\c → c {ccMargin = -1}), withLimits (\l → l {clColumns = -1}), withLimits (\l → l {clStepLevels = 0}), withLimits (\l → l {clStepCandidates = 0})] $ \f →
       planSceneWith assets (f base) `shouldSatisfy` (\r → case r of Left CellInvalidConfig → True; _ → False)
     let snapping = base {sceneSetup = (sceneSetup base) {setupSettings = (setupSettings (sceneSetup base)) {settingPixelSnap = True}}, sceneCamera = either (error . show) stepCamera (applyCommand defaultCameraConfig (factsOf flatWorld) (SetZoom 1.01) (sceneCamera base))}
     planSceneWith assets snapping `shouldSatisfy` (\r → case r of Left (CellPixelSnapUnsupported _) → True; _ → False)
@@ -466,5 +494,22 @@ refusals = describe "explicit refusals" $ do
     colourCoversHexagon holey (ColourMaterial stoneId) `shouldBe` False
     tiles (planScene assets block) `shouldSatisfy` (not . Set.member (tileAt 1 1 1))
     tiles (planScene holey block) `shouldSatisfy` Set.member (tileAt 1 1 1)
+  it "omits a hidden cell only on a valid coverage proof: a hole in the supplied full-block map proves nothing" $ \assets → do
+    let shape0 = either (error . show) id (mkShapeId 0)
+        blockKey = lookupOrdinary (lookupFor FaceSouth shape0)
+    real ← maybe (fail "the adopted style has no full-block map") pure (mapCoverage assets blockKey)
+    holey ←
+      loadAssetsWith
+        5
+        [(AssetMap blockKey, planeFromFormula (\x y → coverageAt real (fromIntegral x) (fromIntegral y) == Just True && not (x == 48 && y == 48)))]
+    let cluster = sceneOf FaceSouth 1 [OCell 0 0 0 0 KnownAll, OCell 0 0 1 0 KnownAll, OCell 1 0 0 0 KnownAll, OCell 0 1 0 0 KnownAll]
+        tiles p = Set.fromList [t | q ← cellPlanQuads p, Just t ← [quadCell q]]
+    mapCoversHexagon assets blockKey `shouldBe` True
+    mapCoversHexagon holey blockKey `shouldBe` False
+    -- The same cluster with the real full-block map hides its rear cell; with the
+    -- holed map the texel (48, 32) of that cell shows through the block above it,
+    -- so it is drawn.
+    tiles (planScene assets cluster) `shouldSatisfy` (not . Set.member (tileAt 0 0 0))
+    tiles (planScene holey cluster) `shouldSatisfy` Set.member (tileAt 0 0 0)
   where
     _unused = (axis, Column, Map.empty ∷ Map.Map Int Int, Viewport)

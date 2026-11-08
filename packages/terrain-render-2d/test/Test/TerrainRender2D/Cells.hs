@@ -19,7 +19,9 @@ module Test.TerrainRender2D.Cells
 
 import Control.Monad (forM_)
 import Data.Int (Int64)
+import Data.Function (on)
 import Data.List (sortOn)
+import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.ByteString as ByteString
 import Hetoimasia.Asset.Image.DataMap (NormalEncoding (..), buildBinaryCoverage, coverageAt)
 import Hetoimasia.Terrain.Cell (Column (..))
@@ -80,6 +82,22 @@ checkedInputs = describe "checked supplied knowledge" $ do
                  , KnowRun 32 40 CellUndiscovered
                  ]
     knowledgeRevision knowledge `shouldBe` 9
+  it "finds the runs of a small window among very many runs elsewhere in the column" $ do
+    let col = Column (axis 0) (axis 0)
+        near = [(10, 12, CellPending), (13, 20, CellSolidKnown)]
+        far = [(2 * k, 2 * k + 1, if even k then CellPending else CellSolidKnown) | k ← [1000 .. 21000]]
+        runs = near <> far
+        knowledge = either (error . show) id (mkKnowledge (KnowledgeSpec 3 CellUndiscovered [] [(col, runs)]))
+        stateAt z = case [s | (a, b, s) ← runs, a <= z, z < b] of
+          s : _ → s
+          [] → CellUndiscovered
+        -- The reference reads each level on its own and joins equal neighbours.
+        expected lo hi =
+          [ KnowRun (fst (NonEmpty.head g)) (fst (NonEmpty.last g) + 1) (snd (NonEmpty.head g))
+          | g ← NonEmpty.groupBy ((==) `on` snd) [(z, stateAt z) | z ← [lo .. hi - 1]]
+          ]
+    forM_ [(8, 22), (11, 13), (12, 14), (20, 21), (1999, 2005), (2000, 2001), (2001, 2002), (20998, 21012), (41990, 42010), (-5, 3), (0, 0), (9, 8)] $ \(lo, hi) →
+      knowledgeRuns knowledge col lo hi `shouldBe` expected lo hi
 
 -- The adopted style is checked before any plan can be asked for.
 checkedAssets ∷ Spec

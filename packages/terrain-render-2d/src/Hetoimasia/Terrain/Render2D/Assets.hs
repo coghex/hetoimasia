@@ -39,6 +39,13 @@
 -- only occlusion premise a plan uses; a colour with a hole in the hexagon
 -- proves nothing and its cell is never treated as covering what lies behind.
 --
+-- The full-block map is itself supplied, so it is checked too: translated to
+-- the three cells that can hide one (east, south and above) it must cover
+-- itself, and every catalog map must lie inside it. A snapshot whose full-block
+-- plane fails either test is still accepted, but then no asset is a covering
+-- proof and no cell is omitted as hidden: the planner draws what it cannot
+-- prove covered.
+--
 -- State, ownership and lifetime: none. The planes are immutable values the
 -- texture pipeline owns; a snapshot only names them. Its identity
 -- ('assetIdentity') changes when any version does.
@@ -166,6 +173,9 @@ data AssetSnapshot = AssetSnapshot
   , snMaps ∷ !(Map.Map MapKey MapAsset)
   , snHexagonColours ∷ !(Map.Map ColourRef Bool)
   , snHexagonMaps ∷ !(Map.Map MapKey Bool)
+  , snSound ∷ !Bool
+  -- ^ Whether the full-block plane proves what an omission needs; see
+  -- 'occlusionSound'. When it does not, no asset is a covering proof.
   }
   deriving stock (Eq, Show)
 
@@ -186,6 +196,7 @@ mkAssetSnapshot version blank materials maps = do
       , snMaps = Map.map snd mapTable
       , snHexagonColours = Map.map (\(_, a) → covers (caPlane a) hexagon) colours
       , snHexagonMaps = Map.map (\(_, a) → maPlane a == hexagon) mapTable
+      , snSound = occlusionSound hexagon [maPlane a | (_, a) ← Map.elems mapTable]
       }
   where
     unique wrap key = go Map.empty
@@ -204,6 +215,30 @@ hexagonOf maps = case [maPlane a | (MapKey Ordinary shape, (_, a)) ← Map.toLis
   where
     head' (x : _) = x
     head' [] = error "Hetoimasia.Terrain.Render2D.Assets: no shape identities"
+
+-- Whether the supplied full-block plane can serve as an occlusion proof, checked
+-- from the planes themselves and not from a geometric ideal. A cell is omitted
+-- when the cells that would be drawn over it (the next one east, the next one
+-- south and the one above it) cover everything it could draw, so two things
+-- must hold of the actual coverage:
+--
+-- * every texel the full block covers is covered by that block translated to
+--   one of the three occluders (canvas offsets @(48, 24)@, @(-48, 24)@ and
+--   @(0, -16)@); a hole in the supplied block fails this at once, where
+--   comparing the block with itself could not;
+-- * every catalog map lies inside the full block, so what the omitted cell
+--   would have drawn is among the texels just proved covered.
+occlusionSound ∷ CoveragePlane → [CoveragePlane] → Bool
+occlusionSound block maps = selfCovering && all (\m → covers block m) maps
+  where
+    set plane x y = x >= 0 && y >= 0 && coverageAt plane (fromInteger x) (fromInteger y) == Just True
+    selfCovering =
+      and
+        [ any (\(a, b) → set block a b) [(x - 48, y - 24), (x + 48, y - 24), (x, y + 16)]
+        | y ← [0 .. toInteger canvasHeight - 1]
+        , x ← [0 .. toInteger canvasWidth - 1]
+        , set block x y
+        ]
 
 -- Whether every texel the hexagon covers is covered by the plane.
 covers ∷ CoveragePlane → CoveragePlane → Bool
@@ -242,11 +277,11 @@ mapCoverage snapshot key = maPlane <$> Map.lookup key (snMaps snapshot)
 
 -- | Whether the colour covers the full hexagon (a valid occlusion premise).
 colourCoversHexagon ∷ AssetSnapshot → ColourRef → Bool
-colourCoversHexagon snapshot ref = Map.findWithDefault False ref (snHexagonColours snapshot)
+colourCoversHexagon snapshot ref = snSound snapshot && Map.findWithDefault False ref (snHexagonColours snapshot)
 
 -- | Whether the map equals the full-block map (it is itself a full hexagon).
 mapCoversHexagon ∷ AssetSnapshot → MapKey → Bool
-mapCoversHexagon snapshot key = Map.findWithDefault False key (snHexagonMaps snapshot)
+mapCoversHexagon snapshot key = snSound snapshot && Map.findWithDefault False key (snHexagonMaps snapshot)
 
 -- | The materials whose colour the snapshot holds.
 assetMaterials ∷ AssetSnapshot → [MaterialId]

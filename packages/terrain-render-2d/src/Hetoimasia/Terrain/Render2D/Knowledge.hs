@@ -111,7 +111,9 @@ data Knowledge = Knowledge
   { kRevision ∷ !Word64
   , kDefault ∷ !CellKnowledge
   , kRegions ∷ !(Map.Map (ChunkKey, Integer) CellKnowledge)
-  , kColumns ∷ !(Map.Map Column [KnowRun])
+  , kColumns ∷ !(Map.Map Column (Map.Map Integer KnowRun))
+  -- ^ Each column's disjoint runs by their first level, so a query finds the
+  -- runs meeting its interval without visiting the others.
   }
   deriving stock (Eq, Show)
 
@@ -127,7 +129,7 @@ mkKnowledge spec = do
       { kRevision = specRevision spec
       , kDefault = specDefault spec
       , kRegions = Map.fromList [((k, r), s) | (k, r, s) ← Map.elems regions]
-      , kColumns = Map.fromList checked
+      , kColumns = Map.fromList [(column, Map.fromList [(knowLo run, run) | run ← runs]) | (column, runs) ← checked]
       }
   where
     uniqueBy key err = go Map.empty
@@ -164,12 +166,17 @@ knowledgeRuns knowledge column lo hi
   | lo >= hi = []
   | otherwise = coalesceRuns (fill lo explicit)
   where
+    -- The runs meeting @[lo, hi)@: the one that starts before @lo@ and
+    -- reaches it, then those that start inside. Runs outside the interval are
+    -- never visited, however many the column holds (the cost is the search
+    -- plus the runs returned).
     explicit =
       [ KnowRun (max a lo) (min b hi) s
-      | KnowRun a b s ← Map.findWithDefault [] column (kColumns knowledge)
-      , b > lo
-      , a < hi
+      | KnowRun a b s ← straddling <> inside
       ]
+    runsOf = Map.findWithDefault Map.empty column (kColumns knowledge)
+    straddling = [run | Just (_, run) ← [Map.lookupLT lo runsOf], knowHi run > lo]
+    inside = Map.elems (Map.takeWhileAntitone (< hi) (Map.dropWhileAntitone (< lo) runsOf))
     key = chunkOfColumn column
     fill from [] = background from hi
     fill from (run@(KnowRun a b _) : rest) = background from a <> [run] <> fill b rest
