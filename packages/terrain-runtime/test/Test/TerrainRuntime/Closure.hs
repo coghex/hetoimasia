@@ -244,7 +244,7 @@ spec = describe "Closure and authority" $ do
         _ <- okOf (removeWith svc (hostEndpoint svc (Just lease) editing) lease (tile x y z) Nothing)
         waitFor (readTVar (hostReady editing) >>= \n → if n == 0 then retry else pure ())
         atomically (writeTVar open False)
-        awaitOwnerStopped' svc
+        awaitClosed svc
         grant editing
         grant acquisition
         -- Exactly one terminal outcome each, and the edit never committed.
@@ -271,9 +271,8 @@ spec = describe "Closure and authority" $ do
         -- The owner is at the boundary with the edit ready; the session ends first.
         atomically (writeTVar open False)
         openGate gate
-        awaitOwnerStopped' svc
+        awaitClosed svc
         settledOf host `shouldReturn` [Failed ArenaClosed]
         inspectInvariants svc >>= (`shouldBe` [])
   where
     isBusy = \case RefusedBusy _ → True; _ → False
-    awaitOwnerStopped' = awaitOwnerStopped

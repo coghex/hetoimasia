@@ -6,12 +6,16 @@ module Test.TerrainRuntime.Lifecycle (spec) where
 import Control.Concurrent (killThread, yield)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), throwIO, try)
+import Control.Exception (ErrorCall (..), fromException, throwIO, try)
 import Data.IORef
+import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import Hetoimasia.Runtime.Supervision (checkRuntime, withSupervision)
 import Hetoimasia.Terrain.Coordinate (decomposeTile)
+import Hetoimasia.Terrain.Residency (Revision (..))
 import Hetoimasia.Terrain.Residency (Slot (..), slotInUse)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
+import Hetoimasia.Terrain.Runtime.Supervised (supervisedOwner)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
@@ -93,6 +97,32 @@ spec = describe "Lifecycle" $ do
       defects <- inspectDefects svc
       length defects `shouldBe` 1
       inspectInvariants svc >>= (`shouldBe` [])
+
+  it "runs under the application's supervision and ends cleanly" $
+    withLoggingLifetime quiet $ \lifetime →
+      withSupervision lifetime $ \control → do
+        withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe) $ \svc → do
+          (_, lease) <- openMain svc "main"
+          answer <- readCell svc lease (tile 3 4 5)
+          cellRevision answer `shouldBe` Revision 0
+          checkRuntime control
+          settleChecks svc
+
+  it "surfaces a provider defect through supervision, as the owner's own failure" $ do
+    outcome <- try $
+      withLoggingLifetime quiet $ \lifetime →
+        withSupervision lifetime $ \control →
+          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe) $ \svc → do
+            (_, lease) <- openMain svc "main"
+            host <- newHost True
+            let failing = (hostEndpoint svc Nothing host) {endpointSettle = \_ → throwSTM (ErrorCall "host defect")}
+            _ <- okOf (removeWith svc failing lease (tile 1 1 1) Nothing)
+            awaitOwnerStopped svc
+            -- The failure is the supervised owner's, latched and rethrown with its own type.
+            checkRuntime control
+    case outcome of
+      Left failure → fromException failure `shouldSatisfy` \found → case found of Just (ProviderDefect _) → True; _ → False
+      Right () → expectationFailure "the supervised run ended cleanly although the owner failed"
 
   it "keeps the service live while a borrower still uses a snapshot, then ends in order" $ do
     events <- newMVar ([] ∷ [String])

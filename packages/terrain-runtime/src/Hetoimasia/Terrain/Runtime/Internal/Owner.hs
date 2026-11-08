@@ -113,7 +113,7 @@ nextWork svc token = do
         [] → case handoffCandidate st of
           Just (aid, region) → pure (WHandoff aid region)
           Nothing
-            | closing && stateBorrowers st == 0 → pure WStop
+            | closing && stateBorrowers st == 0 && stopping → pure WStop
             | otherwise →
                 pickRequestWork st >>= \case
                   Just work → pure work

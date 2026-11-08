@@ -10,7 +10,7 @@ module Hetoimasia.Terrain.Runtime.Supervised
 
 import Control.Exception (throwIO)
 import Hetoimasia.Terrain.Runtime.Internal.Owner (terrainComponent)
-import Hetoimasia.Terrain.Runtime.Internal.Types (Supervisor (..))
+import Hetoimasia.Terrain.Runtime.Internal.Types (OwnerControl (..), Supervisor (..))
 import Hetoimasia.Runtime.Supervision
 
 -- | Start the owner as a required service of the supervised group: its failure
@@ -27,6 +27,6 @@ supervisedOwner control = Supervisor $ \definition →
       }
     definition
     >>= \case
-      WorkerStarted _ → pure ()
+      WorkerStarted worker → pure (OwnerControl (stopSupervised worker))
       WorkerStartUnavailable _ failure → throwIO failure
       WorkerStartRejected → ioError (userError "the supervised boundary closed before the terrain owner started")

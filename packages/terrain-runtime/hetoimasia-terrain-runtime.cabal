@@ -85,6 +85,7 @@ test-suite terrain-runtime-tests
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-runtime ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0

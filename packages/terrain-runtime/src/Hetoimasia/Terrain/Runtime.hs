@@ -29,10 +29,12 @@ module Hetoimasia.Terrain.Runtime
   , SessionAdmission (..)
   , alwaysAdmitting
   , Supervisor (..)
+  , OwnerControl (..)
   , standaloneSupervisor
   , withTerrainService
   , closeService
   , awaitOwnerStopped
+  , awaitClosed
 
     -- * Diagnostics seam
   , Probe (..)
@@ -106,7 +108,7 @@ import Data.Text (Text)
 import Data.Unique (newUnique)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Resource (withResource)
-import Hetoimasia.Foundation.Worker (StartOutcome (..), WorkerGroup, startWorker)
+import Hetoimasia.Foundation.Worker (StartOutcome (..), WorkerGroup, requestStop, startWorker)
 import Hetoimasia.Terrain.Cell (Column, ZRange)
 import Hetoimasia.Terrain.Changes (Changes)
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord)
@@ -162,7 +164,7 @@ instance Exception OwnerNotStarted
 standaloneSupervisor ∷ WorkerGroup → Supervisor
 standaloneSupervisor group = Supervisor $ \definition →
   startWorker group definition >>= \case
-    Started _ → pure ()
+    Started worker → pure (OwnerControl (atomically (requestStop worker)))
     StartupFailed _ _ → throwIO OwnerNotStarted
     StartRejected _ → throwIO OwnerNotStarted
 
@@ -177,19 +179,23 @@ withTerrainService ∷ Config → Ports → (Service → IO a) → IO a
 withTerrainService config ports body =
   withResource acquire (\svc → atomically (closeServiceSTM svc)) $ \svc → do
     started <- try (superviseOwner (portSupervisor ports) (ownerDefinition svc))
-    case started of
+    owner <- case started of
       Left (failure ∷ SomeException) → do
         atomically (modifySt svc (\st → st {stateOwner = OwnerStopped}))
         throwIO failure
-      Right () → pure ()
-    body svc `finally` drain svc
+      Right control → pure control
+    body svc `finally` drain svc owner
   where
     acquire = do
       tag <- newUnique
       var <- newTVarIO (initialState config)
       pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports))
-    drain svc = do
+    -- Close admission, ask the owner to stop, and wait until it has: it stops
+    -- only once the service is closed, nothing is left to settle and no
+    -- borrower is outstanding.
+    drain svc owner = do
       atomically (closeServiceSTM svc)
+      stopOwner owner
       atomically $ do
         st <- readSt svc
         check (stateOwner st == OwnerStopped)
@@ -199,6 +205,13 @@ awaitOwnerStopped ∷ Service → IO ()
 awaitOwnerStopped svc = atomically $ do
   st <- readSt svc
   check (stateOwner st == OwnerStopped)
+
+-- | Wait until the service is closed and every accepted request has reached its
+-- terminal outcome. The owner may still be running, waiting to be asked to stop.
+awaitClosed ∷ Service → IO ()
+awaitClosed svc = atomically $ do
+  st <- readSt svc
+  check (statePhase st == Closing && Map.null (stateRequests st))
 
 -- | Close admission, settle everything pending and end every arena. Idempotent.
 -- It does not wait for borrowers; the end of 'withTerrainService' does.

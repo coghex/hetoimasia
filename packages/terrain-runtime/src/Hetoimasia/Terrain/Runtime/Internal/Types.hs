@@ -36,6 +36,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , Config (..)
   , SessionAdmission (..)
   , Supervisor (..)
+  , OwnerControl (..)
   , Probe (..)
   , Point (..)
   , noProbe
@@ -284,10 +285,18 @@ newtype SessionAdmission = SessionAdmission
   { sessionOpen ∷ STM Bool
   }
 
--- | The supervision capability: how the service starts its owner. The owner
--- thread never holds it, and in particular never holds the runtime control.
+-- | The supervision capability: how the service starts its owner, and the
+-- control it gets back. The owner thread never holds either, and in particular
+-- never holds the runtime control.
 newtype Supervisor = Supervisor
-  { superviseOwner ∷ WorkerDefinition () → IO ()
+  { superviseOwner ∷ WorkerDefinition () → IO OwnerControl
+  }
+
+-- | What the service may do to the owner it started: ask it to stop. The owner
+-- stops only when asked, so that its orderly return after the service closed is
+-- never mistaken for an unexpected exit of a supervised service.
+newtype OwnerControl = OwnerControl
+  { stopOwner ∷ IO ()
   }
 
 -- | Controlled gates and fault points on the owner thread, called outside any
