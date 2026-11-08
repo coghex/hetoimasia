@@ -31,7 +31,7 @@ import Hetoimasia.Asset.Image.Png (decodePng)
 import Hetoimasia.GPU.Model (Usage (..))
 import Hetoimasia.GPU.Vulkan.GLFW (UploadTicket, Image, VulkanHost (..))
 import Hetoimasia.LuaEngine.Graphics.Texture
-import Hetoimasia.LuaEngine.Graphics.Texture.Backend (BackendReading (..), readBackend, textureBackend, withBackend)
+import Hetoimasia.LuaEngine.Graphics.Texture.Backend (readBackend, textureBackend, withBackend)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 import Hetoimasia.LuaEngine.Texture (OwnerReading (..), ownerReading)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMark, retainedEntries)
@@ -127,7 +127,7 @@ spec env = describe "the texture backend on a real device, with no window" $ do
         command comp vm "a" "use" key
         used ← awaitNoteContaining comp ("a use " <> key <> " ")
         case Text.decimal (last (Text.words used)) of
-          Right (identity, _) → pure identity
+          Right (identity, _) → pure (identity ∷ Integer)
           Left reason → assertFailure ("the identity was not a number: " <> reason)
       -- all 150 are held now: the owner counts them, each charged the minimum, and the table gave each its own slot
       owner ← ownerOf vm "a"
