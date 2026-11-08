@@ -370,6 +370,16 @@ fractionalOcclusion = describe "omission of hidden cells under the transforms as
     any (not . snd) outcomes `shouldBe` True
     any snd outcomes `shouldBe` True
 
+  it "answers the pixels on rounded edges as the plan that omits nothing does, over a grid of exact-rational zooms and pans" $ do
+    assets ← loadAssets 5
+    unproved ← loadAssetsWith 5 [(AssetMap (MapKey Ordinary (either (error . show) id (mkShapeId 5))), allOn)]
+    let grid = [(m, k, l) | m ← [1 .. 6 ∷ Int], k ← [0, 3, 5, 7 ∷ Int], l ← [0, 3, 5, 7 ∷ Int]]
+        outcome (m, k, l) =
+          let scene = panned (fromIntegral k / 48) (fromIntegral l / 144) (zoomed (fromIntegral m * 3 / 20) cluster)
+              plan = planScene assets scene
+              kept = planScene unproved scene
+           in [px | px ← stridePixels 11 <> edgePixels kept, pickPixel plan px /= pickPixel kept px]
+    [c | c ← grid, not (null (outcome c))] `shouldBe` []
   it "answers every sampled pixel as the plan that omits nothing does, over generated zooms, pans, facings, cuts and discovered sets" $ do
     assets ← loadAssets 5
     unproved ← loadAssetsWith 5 [(AssetMap (MapKey Ordinary (either (error . show) id (mkShapeId 5))), allOn)]
