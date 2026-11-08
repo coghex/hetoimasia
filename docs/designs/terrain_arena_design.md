@@ -114,6 +114,15 @@ retain the connected space and exposed boundary in compressed form; materialize
 tile/render detail on demand. Completion does not require visiting every
 boundary tile, and unproved connections remain pending.
 
+D-52 allows explicit Lua requests to increase a live arena's reserved storage
+allowance. Reserve the extra space before increasing the cap and resuming
+capacity-paused work; failed increases preserve the old cap, state and pause.
+
+D-53 requires bounded exact connectivity preparation before arena opening
+succeeds. Build a compact summary from the source recipe without generating
+underground tiles; clearly refuse over-budget preparation. The required flat,
+gap and shape cases must be supported and proved, not excluded as a shortcut.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1582,6 +1591,57 @@ close/reset. Detail eviction cannot erase discovery. D-41/D-43 still govern
 capacity and I/O failure. Q-20 retains exact representation, publication,
 source-compilation, capacity and API mechanics; Q-19 must assign their proof.
 
+### D-52. Lua may increase a live arena's reserved storage allowance
+
+Owner, directly in this design pane on 2026-11-07, answered “yes” to allowing
+Lua to request a larger reservation without restarting the arena, reserving
+the additional space before resuming capacity-paused work and preserving
+existing state and the pause if reservation fails.
+
+Provide an explicit asynchronous Lua request to increase the same live arena's
+storage allowance. The old cap remains authoritative until the additional
+reservation succeeds. Only then may the larger cap admit retained changes and
+allow capacity-paused work to resume. Failure preserves the old allowance,
+acknowledged changes and pending discovery; it does not discard history to
+make room or reset the arena.
+
+This extends D-43's startup-only configuration scope. Growth is explicit and
+bounded by the newly reserved allowance; it is not automatic quota growth,
+a shrinking API, a UI or persistence across runs. D-41 still governs other
+storage failures: obtaining extra capacity is not proof that a separate I/O
+fault has recovered. Q-20 retains the exact Lua signature/authority, request
+results, cancellation/close behavior, reservation accounting and retry protocol;
+Q-19 must include the operation and its failure-path qualification.
+
+### D-53. Prepare bounded exact source connectivity before opening the arena
+
+Owner, directly in this design pane on 2026-11-07, answered “approved” to
+preparing and validating a compact connectivity summary before arena opening,
+with a clear refusal when preparation exceeds its limits. The recommendation
+explicitly preserved asynchronous opening and required support/proof for the
+flat terrain, gaps and shape fixtures without generating underground tiles.
+
+Haskell derives and validates the initial summary from the copied Lua source
+recipe, compressed layers and the approved shape openings before the arena-open
+request succeeds. Work from compressed structure, without enumerating buried
+tiles or flooding the sky. This establishes initial exterior connectivity;
+computing the summary does not reveal sealed caverns to the player. Keep
+opening asynchronous, bounded and cancellable, with no partial arena published.
+
+Preparation has explicit work and memory limits. If an exact summary cannot
+be established within them, refuse opening with a clear expected Lua result.
+This is an additional admission condition beyond the existing authored-record
+limits: a syntactically valid but too complex recipe can be refused before
+play. It is not approval to exclude the required flat arena, world-spanning
+air layer or specified shape/cavity fixtures to avoid their implementation.
+The solver must prove those cases and bounded refusal for excessive complexity.
+
+Q-20 still needs the precise representation, accounting/bounds, error encoding,
+cleanup and edit-time update contract; Q-19 must assign the preparation and
+qualification work. This is not a general constant-cost topology oracle or
+approval of new procedural callbacks. D-51's knowledge/detail separation and
+D-39's retained pending obligations continue to govern later discovery.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2642,7 +2702,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-51 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-53 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2694,6 +2754,9 @@ D-38 starts sky and initially exterior-connected spaces discovered and requires
 overlapping unsealing operations to preserve all pending discovery without
 expanding across the exterior. D-39 approves the bounded shared-work mechanism
 in P-7; its remaining concrete representation/capacity choices are still open.
+D-53 requires bounded exact source-connectivity preparation before arena
+opening succeeds, with clear over-budget refusal and no underground tile
+enumeration. Required flat/gap/shape cases remain qualification obligations.
 D-40 approves P-8's temporary session disk backing for retained changes with
 bounded RAM caching. D-41 selects pause/preserve/recover for expected storage
 exhaustion or write failures; its exact protocol and storage/quota/lifecycle
@@ -2701,6 +2764,9 @@ rules remain open. D-42 records larger CPU banks and best-effort camera demand,
 without choosing the disk allowance. D-43 selects reservation of a hard disk
 allowance before arena opening and pausing at capacity while preserving the
 expandable world; the allowance's size and qualified mechanism remain open.
+D-52 adds explicit asynchronous Lua requests to increase a live allowance,
+resuming capacity-paused work only after the larger reservation succeeds.
+Failed increases preserve the old cap, state and pending work.
 
 D-29 resolves the first lighting scope: face-map alpha and facing-aware
 top/left/right shading with an adjustable sun-position input for previews.
@@ -2744,7 +2810,7 @@ dependency insertion and existing-issue revisions await Q-16–Q-20; the ledger
 and delivery plan remain the original filed arc until those changes receive
 sign-off. No final issue bodies are drafted here.
 
-### P-7. Shared discovery mechanism — D-39/D-51 approved, concrete details open
+### P-7. Shared discovery — D-39/D-51/D-53 approved, concrete details open
 
 The high-level shared-work mechanism implementing D-31–D-38 is approved by
 D-39, with D-51 separating whole-space knowledge from detail loading. The
@@ -2761,7 +2827,9 @@ round-robin work quanta.
    cells. The current source is bounded authored layers/column runs
    (`packages/terrain/src/Hetoimasia/Terrain/Source.hs:1–30`), which supports
    a run/region-level compilation approach; its actual connectivity compiler,
-   accounting and refusal rules still need specification. No claim of a
+   accounting and refusal encoding still need specification. D-53 requires
+   bounded exact preparation before opening succeeds, with a clear refusal
+   if it exceeds its limits. No claim of a
    general constant-time exterior oracle is made. Initially known cave
    detail loads only on demand. Never reclassify an entire newly opened cave
    as already-processed exterior merely because it now has a path to sky.
@@ -2854,7 +2922,33 @@ capacity interruption without false completion, lost obligations or accidental
 discovery of sealed controls. Record work/storage scaling rather than claiming
 compression alone proves bounded behavior.
 
-### P-8. Session retention backing — D-40/D-41/D-43 approved, concrete details open
+**Bounded connectivity preparation before arena opening — approved by D-53.**
+The existing source validator checks authored
+layers/patches and their size; its stored form is layer/patch interval maps,
+not a cavity-connectivity index (H
+`packages/terrain/src/Hetoimasia/Terrain/Internal/Source.hs:95–133` at
+`e3363c4b5b`). D-53 selects preparing and validating an exact compact connectivity
+summary in Haskell from the copied Lua recipe before the arena-open request
+succeeds. Work from runs, repeated regions and the approved shape portals,
+not enumerated underground cells or a flood across sky. The summary identifies
+initial exterior connectivity without making sealed cavities player-known.
+
+Bound preparation work and memory explicitly. If the summary cannot be
+established within those limits, refuse arena opening with a clear expected
+Lua result and publish no partial arena. Keep the asynchronous opening
+responsive/cancellable. This adds an admission condition beyond today's
+source-record limits: a syntactically valid but too complex recipe may be
+refused before play. It does not authorize refusing the required flat arena,
+world-spanning air-layer case or the specified shape/cavity fixtures merely
+to avoid implementing their connectivity. Those remain qualification cases.
+
+The tradeoff is bounded preparation before entering the arena, in exchange
+for establishing its initial sky/closed-space classification before it is
+visible. Exact symbolic representation, numeric bounds and edit-time updates
+still need specification and proof. No arbitrary procedural callback or
+general finite-cost topology oracle is implied by this decision.
+
+### P-8. Session retention backing — D-40/D-41/D-43/D-52 approved, details open
 
 The original P-5 keeps retained changes in memory, with an initial 32 MiB
 session-edit cap (raised to 64 MiB by D-42) and new edits refused once that
@@ -2907,18 +3001,18 @@ whole reveal fits based on its opening tile: continuation and its capacity
 must remain bounded and resumable. Exact default size, reservations, platform
 support and admission/recovery protocol remain open.
 
-**Next owner choice — increasing a live arena's allowance (proposal, not approved).**
+**Increasing a live arena's allowance — approved by D-52.**
 A full retained-history allowance is distinct from a temporary device write
 failure: freeing reconstructible resident chunks does not remove the edits
-and discovery the session must remember. Recommend an explicit asynchronous
+and discovery the session must remember. D-52 selects an explicit asynchronous
 Lua operation to request a larger allowance for the same live arena. Establish
 the additional reservation before raising the cap or resuming capacity-paused
 work; on failure retain the old cap, stored state and pending obligations.
-This would permit continued exploration without discarding the arena, while
+This permits continued exploration without discarding the arena, while
 keeping storage growth explicit and bounded. It adds no UI, automatic quota
-growth, shrinking or cross-run persistence. D-43 currently approves a
-configurable startup allowance only; live increases require a separate owner
-decision. Exact operation/results, reservation accounting and recovery from
+growth, shrinking or cross-run persistence. D-52 extends D-43's configurable
+startup allowance to explicit live increases. Exact operation/results,
+reservation accounting and recovery from
 non-capacity I/O errors remain part of the concrete storage contract.
 
 A free-space query is a snapshot, not a reservation against other writers.
@@ -3339,6 +3433,23 @@ inspection supports that mismatch, but no runtime reproduction is claimed.
 The numerical contract and qualification described above remain to be filled
 out; do not copy the old curve and call the reported problem fixed.
 
+Current owner question — ambient control (proposal, not approved): recommend
+a separate Lua-controlled ambient level that stays unchanged when only the
+sun direction/elevation changes. Directional face lighting still follows the
+world-fixed sun. Ambient is the base illumination of faces receiving little
+or no direct sun; an independent control makes preview conditions explicit.
+Later Lua day/night rules could drive both values without changing the shader
+contract, but no cycle is part of this amendment.
+
+This intentionally differs from S's `computeAmbientLight`, which derives
+ambient from its sun phase (`src/Engine/Graphics/Vulkan/ShaderCode.hs:204–212`
+at `3777d437`); merely supplying a new sun position also changes background
+illumination there. The proposed independence means moving the preview sun
+does not itself perform that ambient day/night transition. Numeric defaults,
+face-light equations and the existing depth effects still need the concrete
+appearance contract. Retaining S's automatic sun-linked ambient curve is the
+alternative, not assumed parity.
+
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
 Open. After the behavior, including D-31/D-32/Q-20 fog and discovery, is
@@ -3359,7 +3470,7 @@ reconciling the pure planner's limits with progressive camera preparation.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-41/D-43/D-51. Preserve fog over both solid and air until
+Partially resolved by D-31–D-41/D-43/D-51–D-53. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
 cavity reveals its whole connected empty space and exposed boundary terrain,
 beyond the adjacent cells and across chunks, in bounded steps. D-51 replaces
@@ -3392,7 +3503,9 @@ requiring all their detail resident. Later discovery applies to previously
 sealed space. Overlapping openings during progressive work must not flood the
 exterior, duplicate work or lose unprocessed branches. D-39 approves shared
 pending work, new-edit seeding and stopping only exterior branches. P-7's exact
-representations, source metadata and API/capacity contract remain open.
+representations, source metadata and API/capacity contract remain open. D-53
+requires bounded exact preparation of source connectivity before arena opening,
+with clear over-budget refusal; it does not select the precise encoding/limits.
 
 D-40 chooses temporary per-arena disk backing for retained edits/discovery,
 with bounded RAM caching and asynchronous I/O, discarded on arena close/reset.
@@ -3426,11 +3539,14 @@ D-33 settles session retention/replay with normal streaming; D-34 settles
 whole-empty-cell face adjacency. D-35 includes partial-shape/diagonal openings.
 Exact API, representation, per-shape geometric rules, failure and capacity
 policies remain open.
-The whole-cavern knowledge/detail question is resolved by D-51. Current owner
-question: P-8 proposes explicit Lua-requested increases of the live arena's
-reserved storage allowance, preserving the old cap/state on failure and
-resuming capacity-paused work only after the larger reservation succeeds.
-Live quota increases are not approved yet.
+The whole-cavern knowledge/detail question is resolved by D-51. D-52 resolves
+live allowance increases: explicit Lua requests may obtain a larger reservation,
+preserving the old cap/state on failure and resuming capacity-paused work only
+after success. Exact request and recovery mechanics remain open.
+The startup-preparation question is resolved by D-53: bounded exact connectivity
+preparation precedes successful arena opening, with clear over-budget refusal
+and no dense hidden-cell enumeration. Concrete encoding, limits and proof
+remain to specify alongside the other storage/publication mechanisms.
 Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
