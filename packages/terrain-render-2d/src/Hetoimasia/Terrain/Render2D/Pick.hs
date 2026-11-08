@@ -1,5 +1,11 @@
 -- | CPU picking against one exact plan.
 --
+-- /Temporary migration baseline/ (TRA-7): this analytic face picker answers
+-- from the old per-face plan. The approved visual picker reads the coverage the
+-- cell-quad plan draws ("Hetoimasia.Terrain.Render2D.CellPick", TRA-16), and
+-- TRA-17 removes this route when it switches every consumer; it must not
+-- become a second answer path for the same click.
+--
 -- A pick takes the immutable 'Plan' it is to answer from, the identity the
 -- caller believes that plan has and a window point. It converts the point with
 -- the plan's own render-2d mapping (the one drawing uses, including its pixel

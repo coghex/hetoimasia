@@ -1,6 +1,17 @@
 -- | Bounded visible-face planning, missing-data demand and ordering
 -- candidates for the isometric cutaway.
 --
+-- == Temporary migration baseline
+--
+-- This per-face planner is the /temporary migration baseline/ (TRA-7). The
+-- approved visual path is whole-cell quads with cutout and normal maps
+-- ("Hetoimasia.Terrain.Render2D.Cells", TRA-16), picked from the coverage they
+-- draw ("Hetoimasia.Terrain.Render2D.CellPick"). Both exist while the filed
+-- consumers still build; neither is a second final player-facing contract.
+-- TRA-17 switches every repository consumer to the cell-quad path and removes
+-- this face plan and its analytic visual picker in one migration, after actual
+-- renderer qualification. Nothing new should depend on this module.
+--
 -- == What a plan is
 --
 -- 'planTerrain' turns one coherent request (a camera, a view, versions) and one
