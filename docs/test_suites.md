@@ -57,6 +57,11 @@ cabal test hetoimasia-tests --test-show-details=direct
   the colour policy's charges), the generic binary-coverage plane (bits, partial bytes, row order, the first nonbinary texel), the
   exact normalized sampling rule at representable boundaries, and the `unit-normal-rgb-v1` validator. A new decoder or data-map
   rule belongs there.
+- `terrain-tests` (`packages/terrain/test/`, group `test.terrain`, the CPU project) owns the pure terrain kernel. Its
+  connectivity examples (TRA-18: `Test.Terrain.Connectivity`, `Test.Terrain.ConnectivityBounds`, with the independent flood
+  oracle `Test.Terrain.ConnectivityOracle` and the deterministic generators `Test.Terrain.ConnectivityFixtures`) own the
+  symbolic source compiler's contract: exact component families, exterior, canonical keys, the six preparation limits, quanta,
+  typed refusal and scale-independence. A new connectivity rule belongs there, not in a parallel suite.
 - `terrain-render-2d-tests` (`packages/terrain-render-2d/test/`, group `test.terrain-render-2d`, the CPU project) owns the
   pure planner and picker (TRA-7), the terrain material's CPU model (TRA-8) and, in `Test.TerrainRender2D.MapAssets` (TRA-14),
   the canonical cutout and unit-normal map assets: the committed catalog under `samples/ecce-homo/content/textures/facemap/`
