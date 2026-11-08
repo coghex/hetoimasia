@@ -1186,6 +1186,8 @@ allBoundaryPages env provider key = go 0 (1000000 ∷ Int)
     go from fuel = case observedValue (queryKnownBoundary env provider key from) of
       Right (Just page) → do
         length (pageFaces page) `shouldSatisfy` (<= max (limitBoundaryFaces (envLimits env)) minimumBoundaryFaces)
+        -- the traversal is bounded too: a page scans at most the limit's boxes.
+        forM_ (pageNext page) $ \next → (next - from) `shouldSatisfy` (\scanned → scanned > 0 && scanned <= max (limitBoundaryFaces (envLimits env)) minimumBoundaryFaces)
         rest ← maybe (pure []) (\next → go next (fuel - 1)) (pageNext page)
         pure (pageFaces page <> rest)
       other → expectationFailure ("unexpected page " <> show (const () <$> Just other)) >> pure []
