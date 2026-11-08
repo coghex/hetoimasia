@@ -177,11 +177,24 @@ row failed at least the examples named. The controls of the retired state-depend
 feasibility computation, of the camera cap and of the job-slot reserve were removed
 with them, and a stale-running-job branch in `failJob` and `completeJob` that no
 transition can reach (a superseded running job becomes cancelling) was deleted rather
-than controlled. Three protections are not controlled because they are redundant by
-construction (the step gate is a backstop that valid events never reach, and the
-camera staging share repeats what the admission checks of free staging enforce): a camera demand's own regions need no protection from camera eviction
-(its own interest already blocks them), and the held-region bound in the invariants
-repeats what hold acquisition enforces.
+than controlled. The last full run applied 89 controls; every one that is not retired is
+caught except three, which are not gaps:
+
+* **N9** (the owner reports the shared index's column growth instead of its own columns)
+  is an equivalent mutant: the model derives a job's column charge from the coverage it
+  gains and ignores the reported `costColumns`, so nothing can observe the difference; the
+  real-data cycle suite checks the derived charge against the real `Resident` after every
+  completion, commit and release.
+* **G5** (the gate in `step` that refuses any result breaking a charge rule) is a backstop
+  that valid events never reach: each transition is already held to the rules where it is
+  made (`admissionCheck` for camera admissions and holds, `guardCharge` for owner reports),
+  so removing the gate changes nothing observable until a path forgets a check, and then
+  the interleaving properties' `modelInvariants` (which is `chargeCheck`) after every step
+  is what catches it.
+* **G7** (the camera's staging share as a charge rule) repeats what the admission checks of
+  free staging already enforce: what the camera uses of staging is at most what the bank
+  uses, which those checks keep at or below the limit less the headroom explicit work needs,
+  so the share rule holds whenever they do.
 
 | Mutation | Failing examples |
 | --- | --- |
@@ -203,6 +216,8 @@ repeats what hold acquisition enforces.
 | No resident growth reserved for a removal | the edit-reservation, growth-contract and compressed-segment examples (9) |
 | An older handoff clears newer changes | the handoff-interleaving example |
 | A replacement does not withdraw the view first | the replacement examples, the storm example and the withdraw-then-admit property |
+| A demand is discarded while cancelled work still holds its scratch | the running-load examples, the identical storm and the running-load property |
+| A pending description is kept longer than it could start after the release | the running-load property |
 | A fresh camera description is not left room for its first region | the minimum-budget examples and the starts-what-it-keeps properties |
 | Unsupported region keys accepted | the region-boundary examples |
 | A removal commit does not add the rebuilt segment growth | the growth-contract and compressed-segment examples |
@@ -391,6 +406,15 @@ progress and a configuration that cannot is refused at construction. The propert
   two properties over 2,000 random replacements each (one after the first description
   settled, one while its work is still queued) require the view to survive with a
   non-empty description whose first region is admitted, in a model with no explicit work.
+- **A replacement during a running load** (examples at the minimum budgets and a property
+  over 2,000 random replacements): the withdrawal cancels the job, whose 258 bytes of
+  scratch stay charged until it is acknowledged, leaving the camera room for the
+  description but not yet its interest and scratch. The same description, another region
+  and a storm of twenty identical replacements all keep the view with its demand pending
+  (nothing is freed before the acknowledgement), and after the acknowledgement `Service`
+  admits it and it loads. The property also requires the view to survive every replacement
+  of a settled, queued or running first description, the first region to start at once when
+  nothing is cancelled, and progress once the owner has acknowledged everything.
 - **Normalized descriptions** (examples): an empty description withdraws the demand,
   repeated keys coalesce into the first occurrence, an unsupported key and a region
   wholly outside the extent are excluded and reported while the valid entries are
