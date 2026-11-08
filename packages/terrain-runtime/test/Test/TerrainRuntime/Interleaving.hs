@@ -32,6 +32,7 @@ data World = World
   , wViews ∷ IORef [View]
   , wRandom ∷ IORef Word64
   , wTrouble ∷ IORef [String]
+  , wRetiring ∷ IORef Int
   }
 
 next ∷ World → Int → IO Int
@@ -57,14 +58,14 @@ spec = describe "A randomized interleaving over the service" $ do
   plain <- runIO (newIORef (0 ∷ Int))
   forM_ [1 .. 24 ∷ Word64] $ \seed →
     it ("keeps every invariant and settles every request exactly once (seed " <> show seed <> ")") $
-      runSeed (tightConfig (2, 1, 2) 3 4096) False seed >>= \n → modifyIORef' plain (+ n)
+      runSeed (tightConfig (2, 1, 2) 3 4096) False seed >>= \(n, _) → modifyIORef' plain (+ n)
   covers "the plain runs" plain
   -- The same, with cancellations, lease releases and client ends injected by the owner
   -- itself inside its preparations, where credits must be held to the safe point.
   injected <- runIO (newIORef (0 ∷ Int))
   forM_ [1 .. 24 ∷ Word64] $ \seed →
     it ("keeps every invariant when releases arrive while a preparation runs (seed " <> show seed <> ")") $
-      runSeed (tightConfig (2, 1, 2) 3 4096) True seed >>= \n → modifyIORef' injected (+ n)
+      runSeed (tightConfig (2, 1, 2) 3 4096) True seed >>= \(n, _) → modifyIORef' injected (+ n)
   covers "the runs with releases inside preparations" injected
   -- And under capacity pressure that later clears: a bank that holds about two
   -- regions and two commands, so refusals and waits are routine; every request must
@@ -72,8 +73,20 @@ spec = describe "A randomized interleaving over the service" $ do
   pressed <- runIO (newIORef (0 ∷ Int))
   forM_ [1 .. 16 ∷ Word64] $ \seed →
     it ("settles every request once pressure clears (seed " <> show seed <> ")") $
-      runSeed (microConfigSlots 3) True (seed + 100) >>= \n → modifyIORef' pressed (+ n)
+      runSeed (microConfigSlots 3) True (seed + 100) >>= \(n, _) → modifyIORef' pressed (+ n)
   covers "the runs under capacity pressure" pressed
+  -- And under tight service-wide limits (two arenas, a handful of leases and views),
+  -- where a closed arena whose snapshot is borrowed is routinely retiring while an
+  -- open is admitted or refused. After every step each limit's count must equal the
+  -- entities holding the resource of every state, retiring included, and no
+  -- admission may exceed it.
+  limited <- runIO (newIORef (0 ∷ Int))
+  retiringSeen <- runIO (newIORef (0 ∷ Int))
+  forM_ [1 .. 24 ∷ Word64] $ \seed →
+    it ("counts every resource-holding entity against every limit (seed " <> show seed <> ")") $
+      runSeed ((tightConfig (2, 1, 2) 3 4096) {configMaxArenas = 2, configMaxLeases = 5, configMaxViews = 2, configMaxClients = 3}) True (seed + 200) >>= \(n, r) → modifyIORef' limited (+ n) >> modifyIORef' retiringSeen (+ r)
+  covers "the runs under tight service limits" limited
+  it "has steps where a closed arena was still retiring across the runs under tight service limits" $ readIORef retiringSeen >>= \n → n `shouldSatisfy` (> 0)
   where
     -- A single seed may by chance end with no success; a group of them must not.
     covers label counter = it ("has requests that succeed across " <> label) $ readIORef counter >>= \n → n `shouldSatisfy` (> 0)
@@ -81,7 +94,7 @@ spec = describe "A randomized interleaving over the service" $ do
 -- | One seeded run. With the injection on, the owner performs a seeded cancellation,
 -- lease release or client end inside each preparation, and the model and table are
 -- checked there too, while the credits are held.
-runSeed ∷ Config → Bool → Word64 → IO Int
+runSeed ∷ Config → Bool → Word64 → IO (Int, Int)
 runSeed config inject seed = do
   hook <- newIORef Nothing
   let probe = Probe $ \point → case point of
@@ -89,13 +102,13 @@ runSeed config inject seed = do
         PointCaptured {} | inject → inside hook
         _ → pure ()
   withServiceUsing config alwaysAdmitting probe $ \svc → do
-        world <- World <$> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef (seed * 7919) <*> newIORef []
+        world <- World <$> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef [] <*> newIORef (seed * 7919) <*> newIORef [] <*> newIORef 0
         writeIORef hook (Just (svc, world))
         -- Two clients and a first arena, so the steps have something to act on.
         forM_ [0, 1 ∷ Int] $ \_ → registerClient svc >>= either (const (pure ())) (\c → modifyIORef' (wClients world) (c :))
         firstClient <- head' <$> readIORef (wClients world)
         forM_ firstClient $ \c → openArena svc c "arena0" thinSoil >>= either (const (pure ())) (\p → await svc p >>= either (const (pure ())) (\l → modifyIORef' (wLeases world) (l :)))
-        replicateM_ 300 (harvest world >> randomStep svc world 0 >> check' svc world)
+        replicateM_ 300 (harvest world >> randomStep svc world 0 >> checkAll svc world)
         -- Every host is granted and every result taken as it settles: no request may
         -- stay waiting on a refusal that will never clear, so all of them settle.
         requests <- readIORef (wRequests world)
@@ -116,20 +129,32 @@ runSeed config inject seed = do
         -- Every region and arena has ended: nothing is remembered about retrying them.
         inspectRetryMemory svc `shouldReturn` 0
         settleChecks svc
-        pure (length [() | [Succeeded _] <- outcomes])
+        retiring <- readIORef (wRetiring world)
+        pure (length [() | [Succeeded _] <- outcomes], retiring)
   where
     head' = \case (x : _) → Just x; [] → Nothing
-    check' svc world = do
-      found <- inspectInvariants svc
-      defects <- inspectDefects svc
-      when (not (null found) || not (null defects)) $
-        atomicModifyIORef' (wTrouble world) (\t → ((show found <> show defects) : t, ()))
-      found `shouldBe` []
-      defects `shouldBe` []
     settledModel m =
       and [ledgerReserved (bankLedger m b) == 0 | b ← [ResidentBank, EditBank, StagingBank]]
         && slotInUse m CommandSlot == 0
         && slotInUse m LoadJobSlot == 0
+
+-- | The state is coherent, no defect was recorded and every limit's count equals what
+-- holds the resource, wherever it is looked at: between steps and inside a borrow.
+checkAll ∷ Service → World → IO ()
+checkAll svc world = do
+    found <- inspectInvariants svc
+    defects <- inspectDefects svc
+    when (not (null found) || not (null defects)) $
+      atomicModifyIORef' (wTrouble world) (\t → ((show found <> show defects) : t, ()))
+    found `shouldBe` []
+    defects `shouldBe` []
+    -- Each limit: what admission counts is what the entities hold, and within the limit.
+    rows <- inspectLimits svc
+    let off = [row | row ← rows, limitRowCounted row /= limitRowHeld row || limitRowCounted row > limitRowMax row]
+    unless (null off) $ atomicModifyIORef' (wTrouble world) (\t → (("limits: " <> show off) : t, ()))
+    off `shouldBe` []
+    model <- inspectModel svc
+    when (any ((== ArenaRetiringPhase) . arenaPhase) (modelArenas model)) (modifyIORef' (wRetiring world) (+ 1))
 
 -- | The owner's own release inside a preparation: a seeded choice among cancelling a
 -- request, releasing a lease, ending a client, or nothing, then a check that the
@@ -200,7 +225,13 @@ randomStep svc world depth = do
       | r < 98 && depth < 2 → withLease $ \l → do
           Just (x, y, z) <- pick world tiles
           let (area, _) = decomposeTile (tile x y z)
-          void $ withSnapshot svc l [area] $ \_ → replicateM_ 6 (randomStep svc world (depth + 1))
+          void $ withSnapshot svc l [area] $ \_ → do
+            -- Often the borrower's own arena is closed while the borrow is held: the
+            -- arena is then retiring, and still counts against every limit.
+            closing <- next world 3
+            when (closing == 0) (void (releaseLease svc l))
+            checkAll svc world
+            replicateM_ 6 (randomStep svc world (depth + 1) >> checkAll svc world)
       | otherwise → yield
   where
     withClient k = readIORef (wClients world) >>= pick world >>= mapM_ k

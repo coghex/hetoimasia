@@ -98,6 +98,8 @@ module Hetoimasia.Terrain.Runtime
   , inspectDefects
   , inspectSnapshotBytes
   , inspectRetryMemory
+  , inspectLimits
+  , LimitRow (..)
   , inspectReadmissionWaits
   , inspectReadmissionWaitsSTM
   , inspectArena
@@ -353,7 +355,7 @@ withSnapshot svc lease regions body =
 -- | Every structural rule tying the request table, leases, names, arenas and
 -- holds to the accounting model; empty when coherent.
 inspectInvariants ∷ Service → IO [String]
-inspectInvariants svc = invariants (configRetainedBytes (serviceConfig svc)) <$> readTVarIO (serviceState svc)
+inspectInvariants svc = invariants (serviceConfig svc) <$> readTVarIO (serviceState svc)
 
 -- | The accounting model as it is now.
 inspectModel ∷ Service → IO Model
@@ -386,6 +388,13 @@ inspectRetryMemory ∷ Service → IO Int
 inspectRetryMemory svc = do
   st <- readTVarIO (serviceState svc)
   pure (Map.size (stateTransfers st) + Map.size (stateHandoffBusy st))
+
+-- | Every service-wide limit with what admission counts against it and what an
+-- independent enumeration of the entities holding the resource finds. The two
+-- agree and never exceed the limit (an invariant); a closed arena whose snapshot
+-- is still borrowed counts against the arena limit until its retirement completes.
+inspectLimits ∷ Service → IO [LimitRow]
+inspectLimits svc = limitRows (serviceConfig svc) <$> readTVarIO (serviceState svc)
 
 inspectSnapshotBytes ∷ Service → IO (Word64, Word64)
 inspectSnapshotBytes svc = do

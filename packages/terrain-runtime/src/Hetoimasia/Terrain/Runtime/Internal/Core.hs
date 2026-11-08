@@ -68,6 +68,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
 
     -- * Invariants
   , invariants
+  , LimitRow (..)
+  , limitRows
   , bumpGeneration
   , waitingReadmission
   , retainedBankUse
@@ -336,7 +338,61 @@ retainedRecords = countReqs (\req → not (isDone req && reqModel req))
 -- | Command slots the service holds for requests the model has no record of: a
 -- settled result not yet taken, and a pending open or attach.
 slotsHeldHere ∷ St → Int
-slotsHeldHere st = retainedResults st + countReqs (\req → isAcquisition req || waitingReadmission req) st
+slotsHeldHere st = retainedResults st + pendingAcquisitions st + countReqs waitingReadmission st
+
+-- | Opens and attaches admitted and not yet settled. A settled one holds no
+-- acquisition: it either made its arena and lease (and left the table) or failed
+-- (and its untaken result is counted as a result).
+pendingAcquisitions ∷ St → Int
+pendingAcquisitions = countReqs (\req → isAcquisition req && not (isDone req))
+
+-- | Arena incarnations the service holds, for the service-wide arena limit: every
+-- live arena, every pending open, and every arena that is closed but still
+-- retiring because a snapshot of it is borrowed (its resident detail stays
+-- charged until the last borrower returns it). An arena leaves the count only when
+-- its retirement has completed.
+arenaUse ∷ St → Int
+arenaUse st = Map.size (stateArenas st) + Map.size (stateRetiring st) + countReqs (\req → isOpenCmd req && not (isDone req)) st
+
+-- | Leases the service holds, for the lease limit: every lease record (live or
+-- revoked, until released) and every pending acquisition.
+leasesInUse ∷ St → Int
+leasesInUse st = Map.size (stateLeases st) + pendingAcquisitions st
+
+-- | One service-wide limit, what the admission test counts against it, and what
+-- an independent enumeration of the entities holding the resource finds.
+data LimitRow = LimitRow
+  { limitRowName ∷ !String
+  , limitRowMax ∷ !Word64
+  , limitRowCounted ∷ !Word64
+  , limitRowHeld ∷ !Word64
+  }
+  deriving stock (Eq, Show)
+
+-- | Every service-wide limit with its count and the independent enumeration.
+limitRows ∷ Config → St → [LimitRow]
+limitRows config st =
+  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (length (R.modelArenas model)) + w (length [() | req ← requestsAndGhosts, isOpenCmd req, not (isDone req)]))
+  , LimitRow "leases" (w (configMaxLeases config)) (w (leasesInUse st)) (sum [w (Set.size (clientLeases c)) | c ← Map.elems (stateClients st)] + w (length [() | req ← requestsAndGhosts, isAcquisition req, not (isDone req)]))
+  , LimitRow "views" (w (configMaxViews config)) (w (Map.size (stateViews st))) (sum [w (Set.size (clientViews c)) | c ← Map.elems (stateClients st)])
+  , LimitRow "clients" (w (configMaxClients config)) (w (Map.size (stateClients st))) (w (length (Map.keys (stateClients st))))
+  , LimitRow "command slots" slotLimit (fromIntegral (R.slotInUse model R.CommandSlot) + w (slotsHeldHere st)) (fromIntegral (R.slotInUse model R.CommandSlot) + sum (map slotOf requestsAndGhosts))
+  , LimitRow "retained bank" (configRetainedBytes config) (retainedBankUse st) (sum (Map.elems (stateSnapshots st)) + sum (map recordOf requestsAndGhosts))
+  ]
+  where
+    model = stateModel st
+    slotLimit = fromIntegral (R.limitSlot (R.modelLimits model) R.CommandSlot) ∷ Word64
+    requestsAndGhosts = Map.elems (stateRequests st) <> Map.elems (stateGhosts st)
+    w ∷ Int → Word64
+    w = fromIntegral
+    -- The slot a request holds beyond the model's own record of it.
+    slotOf ∷ Req → Word64
+    slotOf req
+      | isDone req = if reqModel req then 0 else 1
+      | isAcquisition req = 1
+      | waitingReadmission req = 1
+      | otherwise = 0
+    recordOf req = if isDone req && reqModel req then 0 else resultRecordBytes
 
 -- | Why one more request cannot be admitted for want of command slots or retained
 -- bytes, if it cannot. Every admission consults this, so no kind bypasses it.
@@ -404,7 +460,7 @@ decide svc st rid = \case
     cid <- first' ShortRefused (clientOf svc client st)
     checkName name
     when (Map.member name (stateNames st)) (Left (ShortFailed NameInUse))
-    when (Map.size (stateArenas st) + countReqs isOpenCmd st >= configMaxArenas config) (Left (ShortRefused (RefusedBusy BusyArenas)))
+    when (arenaUse st >= configMaxArenas config) (Left (ShortRefused (RefusedBusy BusyArenas)))
     when (leaseUse >= configMaxLeases config) (Left (ShortRefused (RefusedBusy BusyLeases)))
     forM_ (capacityRefusal config st True) (Left . busyWhy)
     Right (Insertion (COpen name source cid) Nothing cid Nothing False [] (Just name))
@@ -444,7 +500,7 @@ decide svc st rid = \case
     -- (a removal's result no longer has a model record, so it is counted here):
     -- admission is busy once accepted commands and untaken results fill the slots.
     slotRefusal producesRecord = pure (capacityRefusal config st producesRecord)
-    leaseUse = Map.size (stateLeases st) + countReqs isAcquisition st
+    leaseUse = leasesInUse st
     first' f = either (Left . f) Right
     -- A name is held in the name map, so it is bounded: nonempty, 256 characters.
     checkName name
@@ -822,8 +878,8 @@ releaseSnapshotSTM svc hid =
 
 -- | Every structural rule that ties the request table, leases, names, arenas
 -- and holds to the accounting model. An empty list means the state is coherent.
-invariants ∷ Word64 → St → [String]
-invariants snapshotBank st =
+invariants ∷ Config → St → [String]
+invariants config st =
   map ("model: " <>) (R.modelInvariants model)
     <> map (("charge: " <>) . show) (R.chargeCheck model)
     <> [ "request " <> show rid <> " claims a model record the model lacks"
@@ -873,10 +929,19 @@ invariants snapshotBank st =
     <> [ "retained bank holds " <> show (retainedBankUse st) <> " beyond its limit " <> show snapshotBank
        | retainedBankUse st > snapshotBank
        ]
+    <> [ "limit " <> limitRowName row' <> ": admission counts " <> show (limitRowCounted row') <> " but the entities holding it number " <> show (limitRowHeld row')
+       | row' <- limitRows config st
+       , limitRowCounted row' /= limitRowHeld row'
+       ]
+    <> [ "limit " <> limitRowName row' <> " is exceeded: " <> show (limitRowCounted row') <> " > " <> show (limitRowMax row')
+       | row' <- limitRows config st
+       , limitRowCounted row' > limitRowMax row'
+       ]
     <> [ "borrowers " <> show (stateBorrowers st) <> " but the model holds " <> show borrows
        | stateBorrowers st /= borrows
        ]
   where
+    snapshotBank = configRetainedBytes config
     model = stateModel st
     modelIds = [R.requestId info | info <- R.modelRequests model]
     borrows = length [() | (_, _, R.Borrow, _) <- R.modelHolds model]

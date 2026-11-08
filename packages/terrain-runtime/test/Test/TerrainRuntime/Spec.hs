@@ -7,6 +7,7 @@ import qualified Test.TerrainRuntime.Credits as Credits
 import qualified Test.TerrainRuntime.Hardening as Hardening
 import qualified Test.TerrainRuntime.Interleaving as Interleaving
 import qualified Test.TerrainRuntime.Lifecycle as Lifecycle
+import qualified Test.TerrainRuntime.Limits as Limits
 import qualified Test.TerrainRuntime.Offload as Offload
 import qualified Test.TerrainRuntime.Opacity as Opacity
 import qualified Test.TerrainRuntime.Races as Races
@@ -24,5 +25,6 @@ spec = do
   Lifecycle.spec
   Hardening.spec
   Credits.spec
+  Limits.spec
   Interleaving.spec
   Closure.spec
