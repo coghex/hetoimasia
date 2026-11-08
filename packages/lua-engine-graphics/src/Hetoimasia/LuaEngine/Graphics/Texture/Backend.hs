@@ -127,6 +127,7 @@ import Hetoimasia.Foundation.Worker
 import qualified Hetoimasia.Foundation.Resource as Resource
 import Hetoimasia.LuaEngine.Graphics.Texture.Port hiding (textureIdentity)
 import qualified Hetoimasia.LuaEngine.Graphics.Texture.Port as Port
+import Hetoimasia.Asset.Image (TexelFormat)
 import Hetoimasia.LuaEngine.Texture.Backend
   ( BackendTexture (..)
   , RetirementState (..)
@@ -184,7 +185,8 @@ data Boot
 
 -- | One accepted upload, from 'backendUpload' to its terminal event.
 data Job image ticket = Job
-  { jWidth ∷ !Word32
+  { jFormat ∷ !TexelFormat
+  , jWidth ∷ !Word32
   , jHeight ∷ !Word32
   , jTexels ∷ !ByteString
     -- ^ The borrowed level, until the copy into staging ended.
@@ -311,7 +313,8 @@ accept backend upload sink = do
       (Running', Nothing) → do
         let job =
               Job
-                { jWidth = width
+                { jFormat = uploadFormat upload
+                , jWidth = width
                 , jHeight = height
                 , jTexels = texels
                 , jSink = sink
@@ -655,7 +658,7 @@ jobStep backend standing jid job = do
       PNew
         | atRest st → beginDisposal backend jid job
         | otherwise → whenRunning $ do
-            let action = allocateAction backend jid (jWidth job) (jHeight job)
+            let action = allocateAction backend jid (jFormat job) (jWidth job) (jHeight job)
             wake ← portWatch (bPort backend)
             portAct (bPort backend) action >>= \case
               Right sub → Just StepProgress <$ setPhase backend jid (PAllocating wake sub)
@@ -695,7 +698,7 @@ jobStep backend standing jid job = do
                 Nothing → failAt PUploaded "an uploaded job holds no image"
                 Just image → do
                   wake ← portWatch (bPort backend)
-                  portAct (bPort backend) (registerAction backend jid image (Level (jWidth job) (jHeight job) (jBinary job))) >>= \case
+                  portAct (bPort backend) (registerAction backend jid image (Level (jFormat job) (jWidth job) (jHeight job) (jBinary job))) >>= \case
                     Right sub → Just StepProgress <$ setPhase backend jid (PRegistering wake sub)
                     Left refusal → refused refusal
               -- The table's bootstrap is read once, when the first upload needs it, and read again as the owner
@@ -870,9 +873,9 @@ faultOf ∷ Fault → Maybe Fault
 faultOf = Just
 
 -- | Allocate a job's image on the owner's thread and record it in the job before the action returns.
-allocateAction ∷ ∀ image ticket. Backend image ticket → JobId → Word32 → Word32 → Device image → IO (Maybe Fault)
-allocateAction backend jid width height device = mask_ $
-  deviceAllocate device width height >>= \case
+allocateAction ∷ ∀ image ticket. Backend image ticket → JobId → TexelFormat → Word32 → Word32 → Device image → IO (Maybe Fault)
+allocateAction backend jid format width height device = mask_ $
+  deviceAllocate device format width height >>= \case
     Left fault → pure (faultOf fault)
     Right image →
       atomically (trackImage backend jid image) >>= \case

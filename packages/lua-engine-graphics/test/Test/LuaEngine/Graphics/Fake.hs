@@ -79,6 +79,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
+import Hetoimasia.Asset.Image (TexelFormat (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld, newSceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 import Test.Support.Owned (withOwnedThread)
@@ -506,7 +507,7 @@ admitUpload fake image bytes = atomically $ do
 deviceFor ∷ Fake → Device Int
 deviceFor fake =
   Device
-    { deviceAllocate = \width height → do
+    { deviceAllocate = \format width height → do
         atomically (held fake HoldAllocate >>= \on → when on retry)
         atomically $ do
           failure ← takeInjection fake (\case FailAllocate fault → Just fault; _ → Nothing)
@@ -521,7 +522,7 @@ deviceFor fake =
                   image ← readTVar (fNextImage fake)
                   writeTVar (fNextImage fake) (image + 1)
                   modifyTVar' (fImages fake) (Map.insert image Allocated)
-                  record fake ("allocated " <> tshow image <> " " <> tshow width <> "x" <> tshow height)
+                  record fake ("allocated " <> tshow image <> " " <> tshow width <> "x" <> tshow height <> formatSuffix format)
                   bump fake
                   pure (Right image)
     , deviceDiscard = \image → atomically $ do
@@ -548,7 +549,7 @@ deviceFor fake =
                   writeTVar (fNextGeneration fake) (generation + 1)
                   writeTVar (fSlotsFree fake) rest
                   modifyTVar' (fImages fake) (Map.insert image (Registered slot))
-                  record fake ("registered " <> tshow image <> " slot " <> tshow slot <> " alpha " <> tshow (levelBinaryAlpha level))
+                  record fake ("registered " <> tshow image <> " slot " <> tshow slot <> " alpha " <> tshow (levelBinaryAlpha level) <> formatSuffix (levelFormat level))
                   bump fake
                   pure (Right (Registration (TextureRef slot generation) slot))
     , deviceHeld = atomically . ledgerHeld (fLedger fake) . textureIdentity . registrationRef
@@ -565,6 +566,12 @@ deviceFor fake =
     }
   where
     isReleased = \case ReleasedHandle _ → True; _ → False
+    -- The interpretation an image was allocated and registered under, appended to the event only when it is not the
+    -- default premultiplied sRGB colour, so the examples that predate data textures read their events unchanged.
+    formatSuffix = \case
+      TexelRgba8Srgb → ""
+      TexelRgba8Linear → " linear"
+      other → " " <> tshow other
     releaseNow registration = do
         failure ← takeInjection fake (\case FailRelease fault → Just fault; _ → Nothing)
         images ← readTVar (fImages fake)

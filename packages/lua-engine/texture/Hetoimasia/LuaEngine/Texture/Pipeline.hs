@@ -64,6 +64,20 @@
 -- hands the cell to the pipeline's own housekeeping, which releases it and returns the charge only
 -- when the backend proves the texture retired.
 --
+-- = The loaded version and its interests
+--
+-- The decode that passed its request's policy builds one 'Version' ("Hetoimasia.LuaEngine.Texture.Version"): the
+-- checked facts and, for @coverage = "binary"@, the one shared coverage plane. The job holds its first
+-- /interest/ in it ('jInterest') until the backend's registration is delivered, when the 'Cell' takes it over in
+-- the transaction that creates the cell ('cellInterest'). From there exactly one thing drops it: the pipeline
+-- claiming the cell for release ('dropPipelineInterest'), or the lease that adopts the cell, which takes its own
+-- interest first and then lets the pipeline's go, in one transaction ('adoptionFor'), and drops its own when it is
+-- released, at once and whatever the backend answers ('releaseResource'). A job that settles holding its first
+-- interest (the upload failed, was withdrawn or never started) drops it in 'settleJob'. The version's reservation
+-- on the shared CPU account is returned by the last interest, once; a request that ended before a version existed
+-- returns it from the host's credit release. The account is read at the one admission ('requestCredits') and
+-- shrunk once at the decode; no later stage reserves from it or waits for it.
+--
 -- = Housekeeping
 --
 -- A transition that no event drives has to be driven by somebody: a read cancelled after its worker took
@@ -87,6 +101,7 @@ module Hetoimasia.LuaEngine.Texture.Pipeline
   , specInstanceSlots
   , specInstanceBytes
   , specSessionBytes
+  , specMaxPixels
   , TextureSpecRefused (..)
   , textureSpec
 
@@ -176,8 +191,19 @@ import qualified Data.Text.Encoding.Error as Encoding
 import Data.Int (Int64)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Asset (Asset (..), AssetId (..), Provenance (FromMemory))
-import Hetoimasia.Asset.Image (DecodedImage (..))
-import Hetoimasia.Asset.Image.PngDecode (PayloadAccount (..), decodeBounded)
+import Hetoimasia.Asset.Image (DecodedImage (..), TexelFormat (TexelRgba8Linear, TexelRgba8Srgb))
+import Hetoimasia.Asset.Image.DataMap
+  ( CoveragePlane
+  , buildBinaryCoverage
+  , checkNormalEncoding
+  , coverageBits
+  , coverageMetadataBytes
+  , coverageRefusalText
+  , coverageRetainedBytes
+  , maxCoveragePlaneBytes
+  , normalRefusalText
+  )
+import Hetoimasia.Asset.Image.PngDecode (DecodePolicy (..), PayloadAccount (..), decodeBoundedWith)
 import Hetoimasia.Asset.Image.PngPreflight
   ( PngLimitSettings (..)
   , PngLimits
@@ -237,8 +263,26 @@ import Hetoimasia.LuaEngine.Profile
   , countLimit
   , pngOutputBytes
   )
+import Hetoimasia.LuaEngine.Texture.Account
+  ( Reservation
+  , RenderAccount
+  , newReservation
+  , reserveHold
+  , returnHold
+  , shrinkHold
+  )
 import Hetoimasia.LuaEngine.Texture.Backend
 import Hetoimasia.LuaEngine.Texture.Banks
+import Hetoimasia.LuaEngine.Texture.Version
+  ( Interest
+  , TextureKind (..)
+  , TexturePolicy (..)
+  , Version
+  , VersionFacts (..)
+  , dropInterest
+  , newVersion
+  , takeInterest
+  )
 import Hetoimasia.Scripting.Lua.Admission (Credit (..), ExpectedFailure (..))
 import Hetoimasia.Scripting.Lua.Lease (Retirements, afterRetirement, retireAsynchronously)
 import Hetoimasia.Scripting.Lua.Provider
@@ -271,6 +315,8 @@ data TextureSpec = TextureSpec
   , tsInstanceBytes ∷ !Word64
   , tsSessionBytes ∷ !Word64
   , tsPngLimits ∷ !PngLimits
+  , tsMaxPixels ∷ !Word64
+    -- ^ The validated pixel limit: the worst case a coverage plane's reservation is made for.
   }
 
 -- | The numbers, read. The record's own fields are not exported by the facade: a field selector is also
@@ -285,12 +331,13 @@ specDecodeWorkers = tsDecodeWorkers
 specLanes = tsLanes
 specInstanceSlots = tsInstanceSlots
 
-specWorkspace, specSourceLimit, specInitialNominal, specInstanceBytes, specSessionBytes ∷ TextureSpec → Word64
+specWorkspace, specSourceLimit, specInitialNominal, specInstanceBytes, specSessionBytes, specMaxPixels ∷ TextureSpec → Word64
 specWorkspace = tsWorkspace
 specSourceLimit = tsSourceLimit
 specInitialNominal = tsInitialNominal
 specInstanceBytes = tsInstanceBytes
 specSessionBytes = tsSessionBytes
+specMaxPixels = tsMaxPixels
 
 -- | Why a profile could not be turned into a pipeline's numbers.
 data TextureSpecRefused
@@ -347,6 +394,7 @@ textureSpec profile jobs = do
       , tsInstanceBytes = perInstance
       , tsSessionBytes = perSession
       , tsPngLimits = limits
+      , tsMaxPixels = fromIntegral (count PngPixels)
       }
   where
     count limit = let Count value = countLimit profile limit in value
@@ -409,6 +457,12 @@ data CellState
 data Cell = Cell
   { cellTexture ∷ !BackendTexture
   , cellState ∷ !(TVar CellState)
+  , cellVersion ∷ !Version
+    -- ^ The loaded version this texture was uploaded from: its dimensions, kind, checked facts and
+    -- shared coverage, paired with the texture here and nowhere else.
+  , cellInterest ∷ !(TVar (Maybe Interest))
+    -- ^ The pipeline's interest in that version while the pipeline owns the cell. Dropped when the
+    -- pipeline releases the cell, or handed to the lease that adopts it.
   }
 
 instance Eq Cell where
@@ -427,6 +481,9 @@ data Prepared = Prepared
   , prepKey ∷ !ContentKey
   , prepFate ∷ !Fate
   , prepCharge ∷ !TextureCharge
+  , prepPolicy ∷ !TexturePolicy
+  , prepReservation ∷ !(Maybe Reservation)
+    -- ^ The request's hold on the shared account: present exactly when it asked for binary coverage.
   }
 
 -- | What the inventory says will become of a request, decided from the immutable inventory alone.
@@ -465,6 +522,15 @@ data Job = Job
     -- ^ Where the admission transaction placed the request: stage queues serve the oldest first.
   , jFailure ∷ !(Maybe Text)
     -- ^ What the backend said when it reported a failure.
+  , jPolicy ∷ !TexturePolicy
+    -- ^ What the request asked of the load beyond its path.
+  , jReservation ∷ !(Maybe Reservation)
+    -- ^ The request's hold on the shared CPU account, when it asked for binary coverage.
+  , jVersion ∷ !(Maybe Version)
+    -- ^ The version the decode built, from its validation to the job's end.
+  , jInterest ∷ !(Maybe Interest)
+    -- ^ The pipeline's first interest in that version, held by the job until a delivered cell takes
+    -- it over, or dropped when the job settles without one.
   }
 
 -- | A delivered texture no lease owns, awaiting its release and retirement, with the charge that is
@@ -493,12 +559,15 @@ data PState = PState
     -- ^ The admission order of each reserved record, from its reservation to its return.
   , psOrderNext ∷ !Word64
     -- ^ Decode workers running now.
+  , psVersions ∷ !Word64
+    -- ^ The identity the next loaded version is issued.
   }
 
 -- | The pipeline: its numbers, its one state, and what it borrows. The pool, the inventory and the
 -- backend are borrowed from enclosing scopes that outlive it.
 data TexturePipeline = TexturePipeline
-  { tpSpec ∷ !TextureSpec
+  { tpAccount ∷ !RenderAccount
+  , tpSpec ∷ !TextureSpec
   , tpHooks ∷ !PipelineHooks
   , tpState ∷ !(TVar PState)
   , tpBackend ∷ !TextureBackend
@@ -521,11 +590,15 @@ data PipelineHooks = PipelineHooks
   , hookOffering ∷ !(ContentKey → IO ())
     -- ^ The job settled with a delivered texture, and the answer that offers it to the host has not yet
     -- decided: nothing about the texture was recorded as offered, claimed or adopted.
+  , hookBuilt ∷ !(ContentKey → CoveragePlane → IO ())
+    -- ^ The version's coverage plane was built, fully evaluated and recorded with the version and the job's first
+    -- interest; the handoff to the backend is next. Given the very value the version holds, so that an example can
+    -- watch whether anything still reaches it.
   }
 
 -- | No hooks.
 noHooks ∷ PipelineHooks
-noHooks = PipelineHooks (\_ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ → pure ())
+noHooks = PipelineHooks (\_ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ _ → pure ())
 
 -- | The numbers the pipeline was built with.
 pipelineSpec ∷ TexturePipeline → TextureSpec
@@ -559,8 +632,9 @@ newTextureOwner tp role = atomically $ do
 
 -- The scope ----------------------------------------------------------------------------------------
 
--- | Run a body over a texture pipeline of this specification, this backend, this shared read pool and
--- this inventory.
+-- | Run a body over a texture pipeline of this specification, this injected CPU render/staging account
+-- (the one allowance retained coverage is charged to: the pipeline makes none of its own), this
+-- backend, this shared read pool and this inventory.
 --
 -- The scope, in order: the worker group (inside the scopes of the pool and the backend it borrows); the
 -- state; the decode workers, each started with registration checked; the body. On every exit the pipeline
@@ -570,15 +644,15 @@ newTextureOwner tp role = atomically $ do
 -- offered one has been adopted or dropped (and, if dropped, released and proved retired); only then
 -- does the group stop the worker, and only then may the pool, the inventory and the backend unwind. A
 -- cancellation delivered while it drains is remembered and raised once the drain is over.
-withTexturePipeline ∷ TextureSpec → TextureBackend → ReadPool → Inventory → (TexturePipeline → IO a) → IO a
+withTexturePipeline ∷ TextureSpec → RenderAccount → TextureBackend → ReadPool → Inventory → (TexturePipeline → IO a) → IO a
 withTexturePipeline = withTexturePipelineWith noHooks
 
 -- | 'withTexturePipeline' with the coordination hooks of this package's tests.
-withTexturePipelineWith ∷ PipelineHooks → TextureSpec → TextureBackend → ReadPool → Inventory → (TexturePipeline → IO a) → IO a
-withTexturePipelineWith hooks spec backend pool inventory body = withWorkerGroup $ \group → do
-  var ← newTVarIO (PState Open Nothing [] Map.empty 0 0 Map.empty (Map.fromList [(lane, Lane Nothing 0) | lane ← [0 .. tsLanes spec - 1]]) Map.empty 0 0 0 0 Map.empty 0)
+withTexturePipelineWith ∷ PipelineHooks → TextureSpec → RenderAccount → TextureBackend → ReadPool → Inventory → (TexturePipeline → IO a) → IO a
+withTexturePipelineWith hooks spec account backend pool inventory body = withWorkerGroup $ \group → do
+  var ← newTVarIO (PState Open Nothing [] Map.empty 0 0 Map.empty (Map.fromList [(lane, Lane Nothing 0) | lane ← [0 .. tsLanes spec - 1]]) Map.empty 0 0 0 0 Map.empty 0 0)
   session ← newSessionBytes (tsSessionBytes spec)
-  let tp = TexturePipeline spec hooks var backend pool inventory session
+  let tp = TexturePipeline account spec hooks var backend pool inventory session
   result ← mask $ \restore → do
     outcome ← tryWithContext @SomeException $ restore $ do
       reading ← atomically (status pool)
@@ -753,13 +827,14 @@ fateOf tp key = case inspectEntry (tpInventory tp) key of
 -- | Prepare one request's start: its token and its charge, kept until the submission consumes them
 -- or 'forgetPrepared' drops them. The table's size is the number of start calls in flight, one per
 -- calling thread.
-prepareRequest ∷ TexturePipeline → TextureOwner → ContentKey → IO Prepared
-prepareRequest tp owner key = atomically $ do
+prepareRequest ∷ TexturePipeline → TextureOwner → ContentKey → TexturePolicy → IO Prepared
+prepareRequest tp owner key policy = atomically $ do
   st ← readTVar (tpState tp)
   -- The token travels as a Lua integer, so the numbers stop at the largest one.
   when (psNext st >= fromIntegral (maxBound ∷ Int64)) $ throwSTM (TextureDefect "the texture job numbers are exhausted")
   charge ← newCharge owner
-  let prepared = Prepared (psNext st) key (fateOf tp key) charge
+  reservation ← if policyBinaryCoverage policy then Just <$> newReservation (tpAccount tp) else pure Nothing
+  let prepared = Prepared (psNext st) key (fateOf tp key) charge policy reservation
   writeTVar (tpState tp) st {psNext = psNext st + 1, psPrepared = Map.insert (psNext st) prepared (psPrepared st)}
   pure prepared
 
@@ -798,7 +873,22 @@ requestCredits tp prepared =
       , creditRelease = \_ → settleCharge tp token charge
       , creditTransfers = True
       }
-  , Credit
+  ]
+    <> [ -- Binary coverage's plane and metadata, reserved from the shared account at the one atomic admission
+         -- at the worst case the validated pixel limit allows, and shrunk to the exact figure once the decode
+         -- has validated the dimensions. A request that ends without a version returns it here; once a version
+         -- owns it, the version's last interest does, and this release is then a no-op. No later stage
+         -- reserves from, refuses on or waits for the account.
+         Credit
+           { creditName = "coverage bytes"
+           , creditReserve = reserveHold hold (worstCoverageBytes tp)
+           , creditRelease = \_ → returnHold hold
+           , creditTransfers = False
+           }
+       | Just hold ← [prepReservation prepared]
+       ]
+    <>
+  [ Credit
       { creditName = "texture jobs"
       , creditReserve = reserveRecord tp token
       , creditRelease = \_ → releaseRecord tp token
@@ -818,6 +908,13 @@ requestCredits tp prepared =
   where
     token = prepToken prepared
     charge = prepCharge prepared
+
+-- | The bytes a coverage plane's reservation is made for at admission: the plane and the fixed
+-- metadata of the largest image the validated pixel limit lets through. The decode shrinks it to
+-- the exact figure once the dimensions are known.
+worstCoverageBytes ∷ TexturePipeline → Word64
+worstCoverageBytes tp =
+  fromInteger (maxCoveragePlaneBytes (toInteger (tsMaxPixels (tpSpec tp))) + coverageMetadataBytes)
 
 -- | The name of the admission's first credit, which reserves nothing and says whether the owner still
 -- takes requests and the pipeline is open: read in the admission's own transaction, so a closure that
@@ -969,6 +1066,10 @@ submitJob tp token reply = mask_ $ do
                     , jCell = Nothing
                     , jOrder = order
                     , jFailure = Nothing
+                    , jPolicy = prepPolicy found
+                    , jReservation = prepReservation found
+                    , jVersion = Nothing
+                    , jInterest = Nothing
                     }
                   (psJobs st)
             }
@@ -1138,13 +1239,17 @@ settleJob tp jid = do
               _ → Left ()
       case lanes of
         Left () → throwSTM (TextureDefect "a lane was settled for more workspace than it was charged")
-        Right updated →
+        Right updated → do
           writeTVar
             (tpState tp)
             st
               { psLanes = updated
-              , psJobs = Map.insert jid job {jStage = StageSettled, jLane = Nothing, jEncoded = 0, jOutput = 0} (psJobs st)
+              , psJobs = Map.insert jid job {jStage = StageSettled, jLane = Nothing, jEncoded = 0, jOutput = 0, jInterest = Nothing} (psJobs st)
               }
+          -- A job that settles holding its first interest in the version it built (no delivered cell took it
+          -- over: the upload failed, was withdrawn or never started) is the last holder: dropping it returns
+          -- the plane's reservation. A delivered cell took the interest at its creation, so there is none here.
+          mapM_ dropInterest (jInterest job)
 
 -- The reads ------------------------------------------------------------------------------------------
 
@@ -1354,13 +1459,16 @@ decodeStages tp restore jid job bytes lane = do
       -- dimensions, the nominal charge becomes the actual checked size, in one transaction.
       wanted ← atomically $ do
         shrinkNominal (jCharge job) (fromIntegral (preflightRgba8Bytes pf))
+        -- The coverage reservation made for the worst case shrinks to the exact plane and metadata of this
+        -- extent, in the same transaction: from here the account is charged what will be retained.
+        mapM_ (\hold → shrinkHold hold (fromInteger (coverageRetainedBytes width height))) (jReservation job)
         modifyState tp $ \st → st {psJobs = Map.adjust (\found → found {jDims = Just (width, height)}) jid (psJobs st)}
         st ← readTVar (tpState tp)
         pure (maybe False (\found → not (jWithdrawn found || jStopping found)) (Map.lookup jid (psJobs st)))
       if not wanted
         then settleAs (ProviderFailure "the texture pipeline stopped while the request was live")
         else
-          decodeBounded (laneAccount tp lane) pf >>= \case
+          decodeBoundedWith (decodePolicyOf (jPolicy job)) (laneAccount tp lane) pf >>= \case
             Left refusal → settleAs (ProviderExpected (refusalFailure key refusal))
             Right image → do
               level ← case decodedLevels image of
@@ -1371,13 +1479,75 @@ decodeStages tp restore jid job bytes lane = do
               atomically $ modifyState tp $ \st →
                 st {psJobs = Map.adjust (\found → found {jOutput = fromIntegral (ByteString.length level)}) jid (psJobs st)}
               restore (hookDecoded (tpHooks tp) key)
-              handoff tp jid level width height
+              -- The declared policies are checked on the very bytes that will be uploaded, while the accounted
+              -- decode buffer exists and before anything is uploaded or published. A failure is an expected
+              -- content failure: the job settles, returning the lane's charges, and nothing usable was made.
+              checked ← restore (evaluate (checkPolicies (jPolicy job) width height level))
+              case checked of
+                Left why → settleAs (ProviderExpected (attributed key "invalid_image" why))
+                Right plane → do
+                  -- The plane is forced here, in the guarded decode stage and before the level is handed over: a lazily
+                  -- built plane would close over the whole decoded RGBA level and keep it, uncharged, for as long as
+                  -- anyone held the version, and would be allocated on whichever thread read it first.
+                  restore (mapM_ (\built → evaluate (ByteString.length (coverageBits built))) plane)
+                  built ← atomically (buildVersion tp jid (jPolicy job) width height plane)
+                  case built of
+                    Nothing → throwIO (TextureDefect "a decoded job's record was lost before its version was recorded")
+                    Just () → do
+                      restore (mapM_ (hookBuilt (tpHooks tp) key) plane)
+                      handoff tp jid level width height (formatOf (jPolicy job))
   where
     settleAs reply = do
       effects ← atomically $ do
         settled ← failStage tp jid reply
         (settled <>) <$> promote tp
       runEffects tp effects
+
+-- | How the decoder reads the texels of a request of this policy.
+decodePolicyOf ∷ TexturePolicy → DecodePolicy
+decodePolicyOf policy = case policyKind policy of
+  ColourKind → DecodeColour
+  DataKind → DecodeData
+
+-- | The texel interpretation the backend allocates, uploads and registers the level under.
+formatOf ∷ TexturePolicy → TexelFormat
+formatOf policy = case policyKind policy of
+  ColourKind → TexelRgba8Srgb
+  DataKind → TexelRgba8Linear
+
+-- | Check the request's declared policies against the decoded level, reading it and nothing more: the
+-- normal encoding first (it allocates nothing), then binary coverage, whose plane is built only for a
+-- level that passed everything else. The failure is bounded text naming the policy that failed.
+checkPolicies ∷ TexturePolicy → Word32 → Word32 → ByteString → Either Text (Maybe CoveragePlane)
+checkPolicies policy width height level = do
+  case policyNormalEncoding policy of
+    Nothing → Right ()
+    Just encoding → either (Left . normalRefusalText encoding) Right (checkNormalEncoding encoding width height level)
+  if policyBinaryCoverage policy
+    then Just <$> either (Left . coverageRefusalText) Right (buildBinaryCoverage width height level)
+    else Right Nothing
+
+-- | Record the version the decode built, in one transaction: its identity, the checked facts, the plane
+-- and the reservation that pays for it (which passes to the version here), and the job's first interest in
+-- it. 'Nothing' if the job's record is gone.
+buildVersion ∷ TexturePipeline → JobId → TexturePolicy → Word32 → Word32 → Maybe CoveragePlane → STM (Maybe ())
+buildVersion tp jid policy width height plane = do
+  st ← readTVar (tpState tp)
+  case Map.lookup jid (psJobs st) of
+    Nothing → pure Nothing
+    Just job
+      | isJust plane /= isJust (jReservation job) → throwSTM (TextureDefect "a coverage plane and the request's reservation disagree")
+      | otherwise → do
+          let facts =
+                VersionFacts
+                  { factsKind = policyKind policy
+                  , factsWidth = width
+                  , factsHeight = height
+                  , factsNormal = policyNormalEncoding policy
+                  }
+          (version, interest) ← newVersion (psVersions st) facts plane (jReservation job)
+          writeTVar (tpState tp) st {psVersions = psVersions st + 1, psJobs = Map.insert jid job {jVersion = Just version, jInterest = Just interest} (psJobs st)}
+          pure (Just ())
 
 -- | The decoder's account onto one lane's workspace bank: each reservation is checked against what is
 -- left and charged in a transaction before the buffer it covers is allocated.
@@ -1416,8 +1586,8 @@ releaseLane tp lane amount = do
 -- The intent to hand over is recorded before the call, so a sink event that arrives while
 -- 'backendUpload' is still running finds the job uploading; and what the call returned is recorded after,
 -- so a cancellation that arrived meanwhile is told to the work at once.
-handoff ∷ TexturePipeline → JobId → ByteString → Word32 → Word32 → IO ()
-handoff tp jid level width height = do
+handoff ∷ TexturePipeline → JobId → ByteString → Word32 → Word32 → TexelFormat → IO ()
+handoff tp jid level width height format = do
   decision ← atomically $ do
     st ← readTVar (tpState tp)
     job ← maybe (throwSTM (TextureDefect "a decoded job's record was lost")) pure (Map.lookup jid (psJobs st))
@@ -1441,7 +1611,7 @@ handoff tp jid level width height = do
   case decision of
     (Nothing, effects) → runEffects tp effects
     (Just key, _) → do
-      let upload = Upload {uploadSource = renderKey key, uploadWidth = width, uploadHeight = height, uploadTexels = level}
+      let upload = Upload {uploadSource = renderKey key, uploadWidth = width, uploadHeight = height, uploadTexels = level, uploadFormat = format}
       -- Evaluated inside the guard, for the same reason: a work record that throws when it is first
       -- used is the backend raising as it was handed the level.
       issued ← tryWithContext @SomeException (backendUpload (tpBackend tp) upload (sinkFor tp jid) >>= evaluate)
@@ -1541,8 +1711,11 @@ uploadEvent tp jid ev = do
         | jTerminal job → late
         | otherwise → do
             state ← newTVar CellJob
-            let cell = Cell texture state
-            modifyState tp (\now → now {psJobs = Map.adjust (\found → found {jTerminal = True, jCell = Just cell}) jid (psJobs now)})
+            version ← maybe (throwSTM (TextureDefect "the backend registered a texture for a job with no loaded version")) pure (jVersion job)
+            -- The job's first interest in the version passes to the cell in this transaction.
+            held ← newTVar (jInterest job)
+            let cell = Cell texture state version held
+            modifyState tp (\now → now {psJobs = Map.adjust (\found → found {jTerminal = True, jCell = Just cell, jInterest = Nothing}) jid (psJobs now)})
             (SinkTaken,) <$> finishIfDone job {jTerminal = True, jCell = Just cell} {- the answer, if any, follows -}
       EventFailed (UploadFailure why) → terminal job (Just why)
       EventWithdrawn → terminal job Nothing
@@ -1729,6 +1902,12 @@ data TextureResource = TextureResource
   , resourceHeight ∷ !Word32
   , resourceCell ∷ !Cell
   , resourceCharge ∷ !TextureCharge
+  , resourceVersion ∷ !Version
+    -- ^ The loaded version this texture belongs to, whose facts and coverage the lease may hand to a consumer.
+  , resourceInterest ∷ !(Maybe Interest)
+    -- ^ The lease's own interest in that version, dropped when the lease is released (before, and
+    -- independently of, the registration's retirement). 'Nothing' only for a lease built over a cell the
+    -- pipeline had already released, whose version had no interest left to take.
   }
 
 -- | The recipe the host runs, on the owner's thread, to build the texture into the lease the request
@@ -1745,10 +1924,25 @@ adoptionFor _ _ cell width height charge =
       "texture"
       (releaseRank 0)
       ( do
-          atomically $ readTVar (cellState cell) >>= \case
-            CellOffered → writeTVar (cellState cell) CellAdopted
-            _ → pure ()
-          pure TextureResource {resourceTexture = cellTexture cell, resourceWidth = width, resourceHeight = height, resourceCell = cell, resourceCharge = charge}
+          -- The adoption and the lease's interest are one transaction: the lease takes its own interest in the
+          -- version before the pipeline gives up the one it held, so the plane never has a moment with no owner.
+          interest ← atomically $ do
+            adopted ← readTVar (cellState cell) >>= \case
+              CellOffered → True <$ writeTVar (cellState cell) CellAdopted
+              _ → pure False
+            taken ← takeInterest (cellVersion cell)
+            when adopted (dropPipelineInterest cell)
+            pure taken
+          pure
+            TextureResource
+              { resourceTexture = cellTexture cell
+              , resourceWidth = width
+              , resourceHeight = height
+              , resourceCell = cell
+              , resourceCharge = charge
+              , resourceVersion = cellVersion cell
+              , resourceInterest = interest
+              }
       )
       (releaseResource retirements)
 
@@ -1762,6 +1956,9 @@ adoptionFor _ _ cell width height charge =
 -- stay held: a failed cleanup is never reported as reclaimed.
 releaseResource ∷ Retirements → TextureResource → IO ()
 releaseResource retirements resource = do
+  -- The lease's CPU interest ends with the lease, at once and whatever the backend answers: the registration
+  -- and the nominal charges retire on its evidence, the coverage with its last reader.
+  atomically (mapM_ dropInterest (resourceInterest resource))
   releaseCellBy ByLease (resourceCell resource)
   settled ← atomically $
     readTVar (cellState (resourceCell resource)) >>= \case
@@ -1779,6 +1976,15 @@ releaseResource retirements resource = do
           retireAsynchronously retirements "texture" poll
           afterRetirement retirements (atomically (returnCharge (resourceCharge resource)))
     _ → throwIO (TextureDefect "a lease released a texture whose release was never requested")
+
+-- | The pipeline lets go of its interest in the cell's version: the cell is no longer the pipeline's
+-- to hold (it claimed it for release). The CPU coverage ends with the last interest, whoever holds it
+-- and whenever the GPU registration retires; neither event stands in for the other.
+dropPipelineInterest ∷ Cell → STM ()
+dropPipelineInterest cell = do
+  held ← readTVar (cellInterest cell)
+  writeTVar (cellInterest cell) Nothing
+  mapM_ dropInterest held
 
 -- | Request the release of a cell on behalf of the pipeline.
 releaseCell ∷ TexturePipeline → Cell → IO ()
@@ -1809,8 +2015,8 @@ releaseCellBy ∷ Claimant → Cell → IO ()
 releaseCellBy by cell = mask_ $ do
   claimed ← atomically $
     readTVar (cellState cell) >>= \case
-      CellJob | by /= ByLease → True <$ writeTVar (cellState cell) CellClaimed
-      CellOffered | by == ByPipeline → True <$ writeTVar (cellState cell) CellClaimed
+      CellJob | by /= ByLease → True <$ (writeTVar (cellState cell) CellClaimed >> dropPipelineInterest cell)
+      CellOffered | by == ByPipeline → True <$ (writeTVar (cellState cell) CellClaimed >> dropPipelineInterest cell)
       CellAdopted | by == ByLease → True <$ writeTVar (cellState cell) CellClaimed
       _ → pure False
   when claimed $ do

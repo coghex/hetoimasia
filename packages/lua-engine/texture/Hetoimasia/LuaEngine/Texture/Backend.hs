@@ -1,8 +1,9 @@
 -- | The upload and registration port the texture pipeline (LFE-16) is injected with, and that the
 -- concrete graphics adapter (LFE-17) implements on the protected graphics owner.
 --
--- The pipeline decodes a verified PNG into one premultiplied RGBA8 level on the CPU. Turning that
--- level into a texture a renderer can sample is the backend's: allocate, upload, wait for the
+-- The pipeline decodes a verified PNG into one RGBA8 level on the CPU: premultiplied sRGB for a colour
+-- texture, or linear numeric data exactly as decoded for a data texture ('uploadFormat'). Turning that
+-- level into a texture a renderer can sample, under the interpretation it carries, is the backend's: allocate, upload, wait for the
 -- upload to complete, register the texture so a scene can name it. This module is the whole of what
 -- the pipeline asks of it, and of what it must answer, so that the CPU component imports nothing of
 -- Vulkan, GLFW, a console or a game.
@@ -55,6 +56,7 @@ module Hetoimasia.LuaEngine.Texture.Backend
 
 import Data.ByteString (ByteString)
 import Data.Text (Text)
+import Hetoimasia.Asset.Image (TexelFormat)
 import Data.Word (Word32, Word64)
 import Control.Concurrent.STM (STM)
 import Hetoimasia.Scripting.Lua.Provider (RetirementState (..))
@@ -79,6 +81,10 @@ data Upload = Upload
     -- ^ One tightly packed, top-row-first RGBA8 level of exactly @width * height * 4@ bytes. The
     -- pipeline charges its backing allocation to the lane that owns the upload; it is the level the
     -- decoder produced, not a copy.
+  , uploadFormat ∷ !TexelFormat
+    -- ^ How the texels are to be interpreted: 'Hetoimasia.Asset.Image.TexelRgba8Srgb' (premultiplied
+    -- colour, the default) or 'Hetoimasia.Asset.Image.TexelRgba8Linear' (numeric data, untouched). The
+    -- image the backend allocates, uploads and registers must carry exactly this interpretation.
   }
 
 -- | What the engine holds of accepted upload work, so that interest in it can end.

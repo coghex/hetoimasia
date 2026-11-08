@@ -196,6 +196,7 @@ test-suite lua-engine-graphics-native-tests
         Test.LuaEngine.Graphics.Native.Facade
         Test.LuaEngine.Graphics.Native.Frame
         Test.LuaEngine.Graphics.Native.Loader
+        Test.LuaEngine.Graphics.Native.DataTextures
         Test.LuaEngine.Graphics.Native.Pixels
         Test.LuaEngine.Graphics.Native.Scenes
         Test.LuaEngine.Graphics.Native.Session
