@@ -56,7 +56,6 @@ module Hetoimasia.Terrain.Internal.Residency.Model
   , modelInvariants
   ) where
 
-import Control.Monad (foldM)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -1115,11 +1114,13 @@ checkDemand m cap demands = do
 
 -- | The staging bytes camera work may still use: what is free beyond the headroom
 -- kept for explicit requests.
-cameraFree ∷ Model → Ledger → Word64
-cameraFree m staging =
-  let free = freeBytes staging
-      headroom = limitExplicitStagingBytes (mLimits m)
-   in if free > headroom then free - headroom else 0
+-- | What the camera may still take of the staging bank, beside the headroom kept for
+-- explicit requests: negative when a state takes more than that.
+cameraStagingRoom ∷ Model → Integer
+cameraStagingRoom m = toInteger (freeBytes (bankLedger m StagingBank)) - toInteger (limitExplicitStagingBytes (mLimits m))
+
+cameraFree ∷ Model → Word64
+cameraFree m = fromInteger (max 0 (cameraStagingRoom m))
 
 -- | Normalize a camera description: unsupported keys are excluded, cells outside the
 -- configured extent are clipped away (a region left with none is excluded), and
@@ -1160,52 +1161,69 @@ setCamera m v a demands0 = do
   --
   -- A fresh demand is best effort and its description is normalized, never refused: an
   -- empty description withdraws the demand, repeated keys coalesce, unsupported keys and
-  -- cells outside the extent are excluded and reported. The description is bounded: its
-  -- structural maximum, and the staging the camera may use beside the headroom kept for
-  -- explicit requests. Beside the description the camera needs room for the interest and
-  -- scratch of the first region. When that room is there, the description is kept no
-  -- longer than the camera can start now. When it is not there yet only because work
-  -- already cancelled still holds its scratch until its owner acknowledges it, a
-  -- description that fits now and would start once those charges are released is kept
-  -- pending: the first region is admitted by a later 'Service'. Only a description that
-  -- cannot fit, or could not start even then, is cut away entirely. The end of a cut
-  -- description, the lowest priority, is reported.
+  -- cells outside the extent are excluded and reported. How much of it is kept is decided
+  -- by 'admitInOrder', which asks the ordinary admission for each region in priority order;
+  -- no camera cost is computed anywhere else. What is not kept is reported.
   let limits = mLimits m
       (normal, excluded) = normalizeCamera (limitExtent limits) demands0
       (mw, withdrawn, gone, cancelling) = clearView m v
-      room = cameraFree mw (bankLedger mw StagingBank)
-      unit = case normal of
-        (d : _) → interestRecordBytes + scratchBytes (demandCoverage d)
-        [] → 0
-      regionsFor free = if free >= descriptionBytes 0 then fromIntegral ((free - descriptionBytes 0) `div` 64) else 0 ∷ Int
-      most = min (length normal) (fromIntegral (limitCameraRegions limits))
-      -- Staging that returns when the owner acknowledges the work already cancelled.
-      releasable = sum [jbScratch j | j ← Map.elems (mJobs mw), jbState j == JobCancelling]
-      startsNow = if room >= unit then min most (regionsFor (room - unit)) else 0
-      startsLater = min most (min (regionsFor room) (regionsFor (room + releasable - unit)))
-      keep = if startsNow > 0 then startsNow else if room + releasable >= unit then startsLater else 0
-      demands = take keep normal
-      truncated = map demandRegion (drop keep normal)
-  if null demands
-    then Right (mw, CameraSet [] [] withdrawn gone cancelling excluded truncated)
-    else admitFresh mw v a demands withdrawn gone cancelling excluded truncated
+      considered = take (fromIntegral (limitCameraRegions limits)) normal
+  (m1, admitted, kept) ← admitInOrder mw v a considered
+  let pending = map demandRegion (drop (length admitted) kept)
+      truncated = map demandRegion (drop (length kept) normal)
+  Right (m1, CameraSet admitted pending withdrawn gone cancelling excluded truncated)
 
--- | Admit a fresh camera demand, in demand order: only pressure leaves a region pending,
--- any other refusal fails the event, and once a region is busy the rest wait behind it, so
--- a later region never takes room an earlier one needs.
-admitFresh ∷ Model → ViewId → ArenaId → [RegionDemand] → [RegionCoord] → [JobId] → [JobId] → [RegionCoord] → [RegionCoord] → Run
-admitFresh m v a demands withdrawn gone0 cancelling0 excluded truncated = do
-  let owner = OwnerView v
-      wanted = Set.fromList [(a, demandRegion d) | d ← demands]
-      m1 = m {mViews = Map.insert v (View a demands Set.empty) (mViews m)}
-      attempt (mm, done, waiting) d
-        | not (null waiting) = Right (mm, done, waiting <> [demandRegion d])
-        | otherwise = case planAdmission mm a owner [d] noExtras {exProtect = wanted} of
-            Right plan → let (mm', admission, _) = applyPlan mm a owner plan in Right (mm', done <> [admission], waiting)
-            Left (Busy _) → Right (mm, done, waiting <> [demandRegion d])
-            Left other → Left other
-  (m2, admitted, pending) ← foldM attempt (m1, [], []) demands
-  Right (m2, CameraSet admitted pending withdrawn gone0 cancelling0 excluded truncated)
+-- | Admit a fresh camera demand: walk its regions in priority order on the state the
+-- withdrawal left, growing the view's description by one region at a time, and ask the
+-- ordinary admission ('planAdmission', the code 'service' runs later) for each.
+--
+-- * A region that fits now is admitted and the walk goes on.
+-- * The first region that does not fit now is kept, pending, with the description of the
+--   regions behind it, when it would be admitted once the pressure that is the owner's to
+--   release has been released ('afterRelease': work finished or acknowledged, pins,
+--   explicit requests); its turn then comes on a later 'service'. Admission is
+--   strictly in demand order: nothing behind a pending region is admitted.
+-- * The walk stops, and the rest of the demand is cut, at the first region whose
+--   description no longer fits the staging the camera may use, or that would not be
+--   admitted even after the release, so a kept description can always be started. Only
+--   pressure leaves a region pending: any other refusal fails the event.
+admitInOrder ∷ Model → ViewId → ArenaId → [RegionDemand] → Either Refusal (Model, [Admission], [RegionDemand])
+admitInOrder m0 v a considered = go m0 [] [] Nothing considered
+  where
+    owner = OwnerView v
+    protect = Set.fromList [(a, demandRegion d) | d ← considered]
+    request = noExtras {exProtect = protect}
+    describe mm kept = mm {mViews = Map.insert v (View a kept Set.empty) (mViews mm)}
+    startsAfterRelease mm d = either (const False) (const True) (planAdmission (afterRelease mm) a owner [d] request)
+    go mm done kept _ [] = Right (mm, done, kept)
+    go mm done kept blocked (d : ds) =
+      let kept' = kept <> [d]
+          hyp = describe mm kept'
+       in if cameraStagingRoom hyp < 0
+            then Right (mm, done, kept)
+            else case blocked of
+              Nothing → case planAdmission hyp a owner [d] request of
+                Right plan → let (m1, admission, _) = applyPlan hyp a owner plan in go m1 (done <> [admission]) kept' Nothing ds
+                Left (Busy _)
+                  | startsAfterRelease hyp d → go hyp done kept' (Just d) ds
+                  | otherwise → Right (mm, done, kept)
+                Left other → Left other
+              Just b
+                | startsAfterRelease hyp b → go hyp done kept' blocked ds
+                | otherwise → Right (mm, done, kept)
+
+-- | The state once the owner has released what is its to release: every job is finished
+-- or acknowledged, every pin and explicit request is withdrawn and regions being evicted
+-- for them are gone. What stays is what no release returns: the views' descriptions and
+-- interests and the resident data they protect. It is only ever asked whether a region
+-- would be admitted.
+afterRelease ∷ Model → Model
+afterRelease m =
+  let m1 = foldl' (flip (withdrawOwner . OwnerRequest)) m {mRequests = Map.empty, mHolds = Map.empty} (Map.keys (mRequests m))
+      evicting = [(key, t) | (key, t@Target {tgResident = Just r}) ← Map.toList (mTargets m1), rsEvicting r]
+      m2 = foldl' (\mm (key, t) → setResident key Nothing t mm) m1 evicting
+      (m3, _, _) = pruneJobs m2
+   in m3 {mJobs = Map.empty}
 
 -- | Retry the pending part of every view's latest camera demand, in view order.
 service ∷ Model → (Model, Decision)
@@ -1519,7 +1537,7 @@ acquireHold m h a kind regions = do
           used = viewPins m v
       if used + 1 > total then Left (Busy (SlotFull ViewPinSlot total used 1)) else Right ()
     Borrow → Right ()
-  if bytes > cameraFree m staging then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) bytes)) else Right ()
+  if bytes > cameraFree m then Left (Busy (BankFull StagingBank (ledgerLimit staging) (ledgerOccupied staging + ledgerReserved staging) bytes)) else Right ()
   let touch key mm = case Map.lookup key (mTargets mm) of
         Just t@Target {tgResident = Just r} → mm {mTargets = Map.insert key t {tgResident = Just r {rsLastUse = mClock mm}} (mTargets mm)}
         _ → mm

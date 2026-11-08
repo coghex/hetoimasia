@@ -1398,6 +1398,38 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     m4 ← drainDemand m3
     map viewPending (modelViews m4) `shouldBe` [[]]
     map regionCoord (modelRegions m4) `shouldBe` [reg 0 0 0]
+  it "keeps a replacement of a pinned resident region by a cell it already holds: nothing is loaded, so no scratch is needed" $ do
+    -- 1,548 resident and 1,510 staging bytes, extent 1 x 1 x 2, one-region holds. The view
+    -- has loaded both cells of a region and pinned it; it then names only the second cell.
+    -- That needs a description (192) and an interest (64) beside the hold's record (64):
+    -- 320 of the camera's 516, because the cell is resident and no load is made.
+    let limits = limitsWith $ \x → x {specResidentBytes = 1548, specStagingBytes = 1510, specExtentZ = 2, specHoldRegions = 1, specCameraRegions = 64}
+    m0 ← opened limits
+    m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (box 0 1 0 1 0 2)])
+    m2 ← drainDemand m1
+    (m3, _) ← stepOk m2 (AcquireHold (HoldId 1) a1 (Pin (ViewId 1)) [reg 0 0 0])
+    (m4, set) ← stepOk m3 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 1)])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ excluded truncated → (length admitted, length (concatMap admissionJobs admitted), waiting, excluded, truncated) `shouldBe` (1, 0, [], [], [])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m4) `shouldBe` [[reg 0 0 0]]
+    -- Releasing the pin changes nothing about the demand.
+    (_, again) ← stepOk m4 Service
+    reportDecision again `shouldBe` Serviced []
+  it "lets a second view share the resident coverage of the first at tight budgets: no load, no scratch" $ do
+    -- View 1 holds region A, loaded: a description (192) and an interest (64). View 2 names
+    -- the same cell: another 256 of the camera's 516, because nothing is loaded.
+    let limits = limitsWith $ \x → x {specResidentBytes = 1548, specStagingBytes = 1510, specExtentZ = 2, specCameraRegions = 64}
+        same = [demand (reg 0 0 0) (cell 0 0 0)]
+    m0 ← opened limits
+    m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 same)
+    m2 ← drainDemand m1
+    (m3, set) ← stepOk m2 (SetCameraDemand (ViewId 2) a1 same)
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ excluded truncated → (length admitted, length (concatMap admissionJobs admitted), waiting, excluded, truncated) `shouldBe` (1, 0, [], [], [])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m3) `shouldBe` [[reg 0 0 0], [reg 0 0 0]]
+    map viewPending (modelViews m3) `shouldBe` [[], []]
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])

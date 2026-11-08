@@ -28,6 +28,7 @@
 module Test.Terrain.ResidencyProperty (spec) where
 
 import Control.Monad (forM_, unless)
+import Data.List (find)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Hetoimasia.Terrain.Coordinate (decomposeTile, tileCoord)
 import Hetoimasia.Terrain.Residency
@@ -721,6 +722,49 @@ observed m =
   , [bankLedger m b | b ← allBanks]
   )
 
+-- | The kept prefix of a camera description is what the ordinary admission leaves, region
+-- by region: at every state a random sequence reaches, for a view and a random description,
+--
+-- * the ordinary path ('Service') has nothing more to admit for that view right after the
+--   demand is set (the walk stopped at the first region that does not fit now);
+-- * asking for exactly the kept prefix keeps all of it, and in the same model (the walk is
+--   deterministic and stable); and
+-- * growing the description one region at a time from the same state keeps
+--   @min i k@ regions for @i@ (admitting regions one by one reaches the same prefix),
+--   compared where none of the regions is resident, so no eviction can differ with the
+--   protected set.
+keptPrefixIsOrdinary ∷ Limits → [(Int, Int, Int)] → Property
+keptPrefixIsOrdinary limits seeds = go (newModel limits) seeds (0 ∷ Int)
+  where
+    go _ [] n = cover 60 (n > 0) "a demand was compared" (property True)
+    go m (s@(x, y, z) : rest) n =
+      let (m', _) = step m (eventFor m s)
+          description = [demandFor (y + i) (x + i) | i ← [0 .. z `mod` 6]]
+          vid = ViewId (fromIntegral (x `mod` 2))
+          setOn mm d = case step mm (SetCameraDemand vid (ArenaId 1) d) of
+            (r, Right _) → Just (r, maybe [] (map demandRegion . viewDemand) (find ((== vid) . viewId) (modelViews r)))
+            _ → Nothing
+          resident = [regionCoord r | r ← modelRegions m']
+       in case setOn m' description of
+            Nothing → go m' rest n
+            Just (r, kept) →
+              let k = length kept
+                  keptDemands = [d | d ← description, demandRegion d `elem` kept]
+                  servicesNone = case step r Service of
+                    (_, Right rep) → case reportDecision rep of
+                      Serviced adm → null [() | (w, _) ← adm, w == vid]
+                      _ → True
+                    _ → False
+                  stable = fmap (map demandRegion . viewDemand . snd) (fmap (\(mm, _) → (mm, head' (modelViews mm))) (setOn m' keptDemands)) == Just kept
+                  head' vs = fromMaybe (error "no view") (find ((== vid) . viewId) vs)
+                  grown = [(i, fmap (length . snd) (setOn m' (take i description))) | i ← [1 .. length description]]
+                  growsOneByOne = and [got == Just (min i k) | (i, got) ← grown]
+                  disjoint = null [() | d ← description, demandRegion d `elem` resident]
+               in counterexample ("kept " <> show k <> " of " <> show (length description) <> "; service admitted more: " <> show (not servicesNone)) servicesNone
+                    .&&. counterexample "asking for exactly the kept prefix did not keep all of it" (null keptDemands || stable)
+                    .&&. counterexample ("growing the description one region at a time kept " <> show (map snd grown) <> " where " <> show k <> " were kept at once") (not disjoint || growsOneByOne)
+                    .&&. go m' rest (n + 1)
+
 -- | A request over its caps is invalid from every state, with a typed reason.
 overCapAlwaysInvalid ∷ [(Int, Int, Int)] → Property
 overCapAlwaysInvalid seeds =
@@ -839,6 +883,12 @@ spec = describe "Residency model properties" $ do
         forAll seedsOf $ \seeds → case limitsNear resident staging of
           Nothing → counterexample ("a configuration at or above the minimum was refused: " <> show (resident, staging)) False
           Just limits → replacementIsWithdrawThenAdmit limits seeds
+  it "keeps the prefix of a camera description that the ordinary admission leaves, region by region, at every state random sequences reach" $
+    withNumTests 300 $
+      forAll ((,) <$> chooseInteger (4384, 6400) <*> chooseInteger (1530, 3600)) $ \(resident, staging) →
+        forAll seedsOf $ \seeds → case limitsNear resident staging of
+          Nothing → counterexample ("a configuration at or above the minimum was refused: " <> show (resident, staging)) False
+          Just limits → keptPrefixIsOrdinary limits seeds
   it "never reserves more for an explicit request than the construction-time worst case" $
     withNumTests 2000 $
       forAll (vectorOf 3 pair) reservationWithinMinimum
