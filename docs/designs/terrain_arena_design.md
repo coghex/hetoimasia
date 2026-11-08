@@ -9,8 +9,10 @@ choices are evidence, not automatically requirements for the new engine.
 Design state: `ready for issue processing`
 
 Owner-requested face-map amendment opened 2026-11-07 (D-28) and signed off
-2026-11-08 (D-60), approving P-16 at `b012fabbfc`. TRA-1–TRA-12 remain filed and TRA-13 is now [#655];
-TRA-14–TRA-23 remain approved unprocessed follow-ups in the ledger below. The
+2026-11-08 (D-60), approving P-16 at `b012fabbfc`. TRA-1–TRA-12 remain filed;
+TRA-13–TRA-19 are now [#655], [#656], [#657], [#658], [#659], [#660] and [#661].
+TRA-20–TRA-23 remain approved
+unprocessed follow-ups in the ledger below. The
 amendment is ready for issue processing. Each tracker draft still requires
 separate sign-off; no tracker mutation, implementation or PR-hold release
 is authorized by this design sign-off.
@@ -189,12 +191,12 @@ concrete precondition
 - [x] TRA-7. Implement isometric cutaway planning and picking — [#643]
 - [x] TRA-8. Qualify terrain materials and depth ordering offscreen — [#644]
 - [x] TRA-13. Correct canonical shape geometry and expose exact opening portals — [#655]
-- [ ] TRA-14. Generate and qualify canonical cutout and normal-map assets
-- [ ] TRA-15. Load validated data maps with shared versioned CPU coverage
-- [ ] TRA-16. Build pure cell-quad planning and coverage-based visual picking
-- [ ] TRA-17. Switch terrain rendering to face-map cutouts and normal lighting
-- [ ] TRA-18. Compile bounded symbolic source connectivity
-- [ ] TRA-19. Model compressed knowledge and resumable discovery after removal
+- [x] TRA-14. Generate and qualify canonical cutout and normal-map assets — [#656]
+- [x] TRA-15. Load validated data maps with shared versioned CPU coverage — [#657]
+- [x] TRA-16. Build pure cell-quad planning and coverage-based visual picking — [#658]
+- [x] TRA-17. Switch terrain rendering to face-map cutouts and normal lighting — [#659]
+- [x] TRA-18. Compile bounded symbolic source connectivity — [#660]
+- [x] TRA-19. Model compressed knowledge and resumable discovery after removal — [#661]
 - [ ] TRA-20. Define bounded copy-on-write store records and transactions
 - [ ] TRA-21. Own reserved backing files and bounded asynchronous storage I/O
 - [ ] TRA-22. Commit terrain edits and discovery through the temporary store
@@ -206,7 +208,7 @@ concrete precondition
 
 D-60 approves the amended delivery plan and readiness. Checked entries mean
 already filed, not implemented; their original issue links are preserved.
-The ten unchecked follow-ups are unprocessed. P-16 records the approved
+The four unchecked follow-ups are unprocessed. P-16 records the approved
 revisions to existing artifacts, including #645–#648 despite their filed marks.
 
 **Amendment EPIC revision applied 2026-11-08:** existing [#636] now carries
@@ -224,12 +226,50 @@ unprocessed at that revision. It released no PR hold and granted no readiness re
 verified after filing; approved body SHA-256:
 `d30d3255ebe0f984c41c7a416eaf2c97f032c4343fd90e62d9153719559eb2ac`.
 
-**Amendment processing cursor:** draft TRA-14 next. Process TRA-14–TRA-23
+**TRA-14 filed 2026-11-08:** [#656], approved by `het-manager` in
+`#het-terrain` message `vp53iynsdus9phrq5ich77gtba` (reply to draft
+`32cfvw7rnwzhieiuamni8asjve`). The issue body and EPIC checklist link were
+verified after filing; approved body SHA-256:
+`ca33bad215e8acf5adfa6338cac121d6877bed69211831acffa1efbe94976632`.
+
+**TRA-15 filed 2026-11-08:** [#657], approved by `het-manager` in
+`#het-terrain` message `5tjnrgaxwrhijw4i2crywvjkea` (reply to draft
+`wnyhj3phbp8ppqzrgzw69f3jw6`). The issue body and EPIC checklist link were
+verified after filing; approved body SHA-256:
+`c2c5d079cab3ff0cd7682ebff65e9d87e26a6032711a28a84d9d3f5950803153`.
+
+**TRA-16 filed 2026-11-08:** [#658], approved by `het-manager` in
+`#het-terrain` message `9at5jrygfpsus7e37zpwgvqdbi` (reply to draft
+`up8q7g4j85cdakshhqtme35hde`). The issue body and EPIC checklist link were
+verified after filing; approved body SHA-256:
+`fabca059a16775adf711f46103006330b48a6e9a2fda115f35de2ae92bb29fd6`.
+
+**TRA-17 v2 filed 2026-11-08:** [#659], approved by `het-manager` in
+`#het-terrain` message `93xhzsspm6zrw2vfegsjtyjxsw` (reply to draft
+`kdfyguuz7igf3zcbmrmjqhveua`). The issue body and EPIC checklist link were
+verified after filing; approved body SHA-256:
+`34e91707f4389d8ea2aa9f492fd46c6799778dd93bf44391bd9130e2b86968b9`.
+The v2 draft includes the manager-requested native-CI time constraint from
+`docs/vision.md:253`, without amending that limit or raising a watchdog.
+
+**TRA-18 filed 2026-11-08:** [#660], approved by `het-manager` in
+`#het-terrain` message `u8vqe9zkryzvkaiz2zfsz58kgw` (reply to draft
+`rcxiccqkbaaixeeauv27m2buqe`). The issue body and EPIC checklist link were
+verified after filing; approved body SHA-256:
+`bada9c4e1c9910c2ba35090d7ad26947ec1ea9a7cfc2b9e3ecd3c1a67ec280b2`.
+
+**TRA-19 filed 2026-11-08:** [#661], approved by `het-manager` in
+`#het-terrain` message `qcmif2gdremh93tmnz72rydj3s` (reply to draft
+`v7ribw2n994bgzxxwdfitaq2h6`). The issue body and EPIC checklist link were
+verified after filing; approved body SHA-256:
+`ccfa78b2b8a9716ce76a6de4e1076a2f29b1af155d74c012f8482c1295aad94f`.
+
+**Amendment processing cursor:** draft TRA-20 next. Process TRA-20–TRA-23
 in ledger order, then the P-16 revisions of #645–#648 and any other named
 artifacts, one artifact at a time with a separately approved concrete tracker
 draft before each mutation. The manager arranges readiness reviews. Tracker
-processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after TRA-13:
-`2zkf5xt9zpne5zb3eysywb99ma` in `#het-terrain`.
+processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after TRA-19:
+`qcmif2gdremh93tmnz72rydj3s` in `#het-terrain`.
 
 ## Epic contract
 
