@@ -36,6 +36,7 @@ module Test.TerrainRuntime.Fixtures
 
     -- * Budgets and the independent model
   , tightConfig
+  , microConfig
   , layered
   , cellMaterial
   , expectedMaterial
@@ -240,6 +241,34 @@ tightConfig (ex, ey, ez) spare edit = defaultConfig {configLimits = limits, conf
     stagingFor bytes = fromMaybe (error "no staging bank satisfies the minimum budgets") (listToMaybe [t | t <- [1000, 2000 .. 4000000], Just _ <- [valid bytes t]])
     residentBank = smallest + spare * 400
     limits = fromMaybe (error "tight limits are invalid") (valid residentBank (3 * stagingFor residentBank))
+
+-- | The smallest validated limits for a single-cell-wide extent of two levels, one
+-- region per query, two commands and no holds or camera: a resident bank that
+-- holds about one region, so a region that cannot be evicted leaves no room for
+-- another.
+microConfig ∷ Config
+microConfig = defaultConfig {configLimits = limits, configRetainedBytes = 2000}
+  where
+    spec resident staging =
+      LimitsSpec
+        { specResidentBytes = resident
+        , specEditBytes = 4096
+        , specStagingBytes = staging
+        , specLoadJobs = 1
+        , specQueuedCommands = 2
+        , specPinsPerView = 1
+        , specAgingQuanta = 3
+        , specQueryRegions = 1
+        , specExtentX = 1
+        , specExtentY = 1
+        , specExtentZ = 2
+        , specHoldRegions = 0
+        , specCameraRegions = 0
+        }
+    valid resident staging = either (const Nothing) Just (mkLimits (spec resident staging))
+    smallest = fromMaybe (error "no micro bank") (listToMaybe [r | r <- [100, 150 .. 100000], Just _ <- [valid r 1000000]])
+    stagingFor resident = fromMaybe (error "no micro staging") (listToMaybe [t | t <- [500, 1000 .. 1000000], Just _ <- [valid resident t]])
+    limits = fromMaybe (error "micro limits are invalid") (valid (smallest + 100) (stagingFor smallest + 4000))
 
 -- | A source from layers @(min, max, material, shape)@ and patches, for an
 -- independent expectation.

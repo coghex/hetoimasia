@@ -21,6 +21,7 @@ import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (checkRuntime, withSupervision)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Supervised (supervisedOwner)
+import Hetoimasia.Terrain.Source (SourceSpec)
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.Support.Bounded (bounded)
@@ -475,6 +476,38 @@ spec = describe "Accounting and lifetime hardening" $ do
       later <- removeCell' svc lease (tile 1 0 1)
       removeChangedFlag later `shouldBe` True
       settleChecks svc
+
+  it "keeps a request that waits to be admitted again charged until it is readmitted or ends" $ do
+    -- Every transfer fails, so an edited region stays protected; the bank holds about
+    -- one region, so a request that needs another cannot be admitted again.
+    let probe = Probe $ \point → case point of
+          PointHandoff _ _ → throwIO (ErrorCall "every transfer fails")
+          _ → pure ()
+    reported <- newTVarIO (0 ∷ Int)
+    withServiceUsing microConfig alwaysAdmitting (Probe (\p → probePoint probe p >> case p of PointHandoffReported {} → atomically (modifyTVar' reported (+ 1)); _ → pure ())) $ \svc → do
+      client <- okOf (registerClient svc)
+      let definition = layered [(Just 0, Just 2, "soil", 0), (Just 32, Just 34, "stone", 0)] [] ∷ SourceSpec
+      lease <- okOf (openArena svc client "waits" definition) >>= await svc >>= expectSuccess
+      surfaceHost <- newHost False
+      _ <- okOf (surfaceWith svc (hostEndpoint svc Nothing surfaceHost) lease (column 0 0))
+      waitFor (readTVar (hostReady surfaceHost) >>= \n → check (n >= 1))
+      -- Two edits bring the column's top down into the other region.
+      _ <- removeCell' svc lease (tile 0 0 33)
+      waitFor (readTVar reported >>= \n → check (n >= 1))
+      _ <- removeCell' svc lease (tile 0 0 32)
+      waitFor (readTVar reported >>= \n → check (n >= 2))
+      waitFor (inspectReadmissionWaitsSTM svc >>= \n → check (n == 1))
+      -- It is charged: it holds a command slot, so only one more fits two, and the
+      -- state is coherent.
+      inspectInvariants svc >>= (`shouldBe` [])
+      first' <- okOf (cellAt svc lease (tile 0 0 32))
+      cellAt svc lease (tile 0 0 33) >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True
+      void (cancelPending svc first')
+      -- Ending the arena ends the request once and returns its charge.
+      closeService svc
+      settledOf surfaceHost `shouldReturn` [Failed ArenaClosed]
+      inspectReadmissionWaits svc `shouldReturn` 0
+      inspectInvariants svc >>= (`shouldBe` [])
 
   it "never lets a failing logger replace the defect it was reporting" $ do
     let sink entry = if entryMessage entry == "defect" then throwIO (ErrorCall "the sink failed") else pure ()

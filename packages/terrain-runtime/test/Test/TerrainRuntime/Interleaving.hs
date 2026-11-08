@@ -12,7 +12,7 @@ module Test.TerrainRuntime.Interleaving (spec) where
 
 import Control.Concurrent (yield)
 import Control.Concurrent.STM
-import Control.Monad (forM_, replicateM_, void, when)
+import Control.Monad (filterM, forM_, replicateM_, unless, void, when)
 import Data.IORef
 import Data.Text (pack)
 import Data.Word (Word64)
@@ -20,7 +20,9 @@ import Hetoimasia.Terrain.Coordinate (decomposeTile)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
+import Hetoimasia.Terrain.Source (SourceSpec)
 import Test.Hspec
+import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures
 
 data World = World
@@ -42,10 +44,16 @@ pick _ [] = pure Nothing
 pick world xs = Just . (xs !!) <$> next world (length xs)
 
 tiles ∷ [(Integer, Integer, Integer)]
-tiles = [(x, 0, z) | x ← [0, 1, 16, 17, -16], z ← [0, 1, 32, 33, -32]]
+tiles = [(x, 0, z) | x ← [0, 1, 16, 17, -16], z ← [0, 1, 32]]
+
+-- | Soil two levels thick over stone: a column's surface sits at level 1 and can be
+-- edited down to -1, which is outside the tight extent, so a surface query that an
+-- edit supersedes can be refused permanently when it is admitted again.
+thinSoil ∷ SourceSpec
+thinSoil = layered [(Just (-5), Just 0, "stone", 0), (Just 0, Just 2, "soil", 0)] []
 
 spec ∷ Spec
-spec = describe "A randomized interleaving over the service" $
+spec = describe "A randomized interleaving over the service" $ do
   forM_ [1 .. 24 ∷ Word64] $ \seed →
     it ("keeps every invariant and settles every request exactly once (seed " <> show seed <> ")") $
       withService (tightConfig (2, 1, 2) 3 4096) $ \svc → do
@@ -53,11 +61,14 @@ spec = describe "A randomized interleaving over the service" $
         -- Two clients and a first arena, so the steps have something to act on.
         forM_ [0, 1 ∷ Int] $ \_ → registerClient svc >>= either (const (pure ())) (\c → modifyIORef' (wClients world) (c :))
         firstClient <- head' <$> readIORef (wClients world)
-        forM_ firstClient $ \c → openArena svc c "arena0" soilOverStone >>= either (const (pure ())) (\p → await svc p >>= either (const (pure ())) (\l → modifyIORef' (wLeases world) (l :)))
+        forM_ firstClient $ \c → openArena svc c "arena0" thinSoil >>= either (const (pure ())) (\p → await svc p >>= either (const (pure ())) (\l → modifyIORef' (wLeases world) (l :)))
         replicateM_ 300 (harvest world >> randomStep svc world 0 >> check' svc world)
-        -- Wind down: every host is granted, every result taken, every client ends.
+        -- Every host is granted and every result taken as it settles: no request may
+        -- stay waiting on a refusal that will never clear, so all of them settle.
         requests <- readIORef (wRequests world)
         forM_ requests $ \(_, host) → grant host
+        bounded (settleAll svc requests)
+        -- Wind down: every client ends.
         forM_ requests $ \(request, _) → retire svc request
         readIORef (wViews world) >>= mapM_ (closeView svc)
         readIORef (wClients world) >>= mapM_ (endClient svc)
@@ -144,7 +155,7 @@ randomStep svc world depth = do
     withLease k = readIORef (wLeases world) >>= pick world >>= mapM_ k
     opened c name = do
       host <- newHost True
-      r <- openArenaWith svc (hostEndpoint svc Nothing host) c name soilOverStone
+      r <- openArenaWith svc (hostEndpoint svc Nothing host) c name thinSoil
       submit host r
       -- The creator's lease arrives through the host; remember it once settled.
       settled <- settledOf host
@@ -178,3 +189,13 @@ randomStep svc world depth = do
     withClientView = do
       clients <- readIORef (wClients world)
       pick world clients >>= mapM_ (\c → openView svc c >>= either (const (pure ())) (\v → modifyIORef' (wViews world) (v :)))
+
+-- | Take every settled result until every request has settled. A request stuck
+-- waiting on a permanent refusal would never settle, and this would time out.
+settleAll ∷ Service → [(Request, Host)] → IO ()
+settleAll svc requests = do
+  forM_ requests $ \(request, host) → do
+    settled <- settledOf host
+    when (not (null settled)) (retire svc request)
+  unsettled <- filterM (\(_, host) → null <$> settledOf host) requests
+  unless (null unsettled) (yield >> settleAll svc unsettled)
