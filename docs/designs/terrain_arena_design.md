@@ -27,9 +27,10 @@ tracks reveal rules, retention and the fog interaction contract; they are not
 settled by the earlier picking or cutaway proposals.
 
 D-32 chooses whole-cavity discovery: unsealing a connected empty space reveals
-that space and loads all newly exposed boundary terrain, including across
-chunks. Work proceeds in bounded steps; Q-20 retains connectivity, capacity,
-retention and fog interaction details.
+that space and its newly exposed boundary terrain, including across chunks.
+D-51 refines its original exhaustive-loading requirement: retain compressed
+whole-space knowledge and load tile detail only on camera or explicit demand.
+Work proceeds in bounded steps; Q-20 retains concrete execution/storage details.
 
 D-33 resolves discovery retention: record revealed state as chunk changes,
 retain it on offload and replay it before publishing the reloaded chunk.
@@ -64,8 +65,8 @@ with a bounded RAM cache and asynchronous I/O. The store is session-only and
 discarded on arena close/reset; exact quota/failure/lifecycle details remain open.
 
 D-41 approves pausing new edits/discovery on storage exhaustion or write
-failure, retaining acknowledged changes and unfinished work. Startup space
-checks, reservation and a hard disk allowance are proposed below, not yet chosen.
+failure, retaining acknowledged changes and unfinished work. D-43 subsequently
+selects startup reservation and a hard disk allowance; exact recovery remains open.
 D-42 records the manager-relayed CPU budget increase and best-effort camera
 demand; it does not select the temporary store's disk quota.
 
@@ -78,11 +79,40 @@ Additional Q-16 finding: the pinned N/E mask silhouettes fail a cross-facing
 unit-cell geometry consistency check. The audit below records a concrete
 counterexample. D-44 approves correcting inconsistent masks while preserving
 all 16 IDs, conditional on solver-delivered proof. The exact replacement
-catalog remains open; no artwork or code has been changed in this design turn.
+logical catalog is approved by D-49/P-9; no artwork or code has been changed
+in this design turn.
 
 D-45 selects crisp nearest-neighbor sampling for terrain colour artwork and
 face maps, with the same alpha cutoff for rendering and screen picking.
 Q-17 retains exact sample/edge conventions, data loading and ownership.
+
+D-46 selects Lua-supplied sun compass direction and elevation, fixed relative
+to the world as the camera rotates. Appearance defaults and depth effects
+remain Q-18; no UI or automatic cycle is added.
+
+D-47 keeps both depth darkening and blue haze, adjustable/disableable through
+Lua, and requires stronger numerical, offscreen and navigation regression
+coverage. The owner reports the reference behavior does not work well; a
+specific symptom is now recorded in P-10: expected hazed background terrain
+is absent outside the camera loading radius. Source inspection supports a
+load/view mismatch; no runtime reproduction is claimed.
+
+D-48 approves viewport-driven terrain demand and view-aware eviction within
+the existing budgets. The face-map integration must prove that visible hazed
+background terrain is requested and retained when capacity permits.
+
+D-49 approves P-9's illustrated 16-shape catalog: named edges are lowered to
+the base; ID 15 is a central half-height peak. The exact table is the logical
+target for corrected masks, discovery and queries; solver proof remains required.
+
+D-50 resolves cutaway caps: hide levels above the selected slice, preserve
+remaining known tiles' actual shapes/materials, and add no flat caps. Unknown
+regions keep generic blank fog; moving the slice does not discover them.
+
+D-51 separates whole-cavern knowledge from detail residency. Discover and
+retain the connected space and exposed boundary in compressed form; materialize
+tile/render detail on demand. Completion does not require visiting every
+boundary tile, and unproved connections remain pending.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -1392,6 +1422,166 @@ concrete contract work. Include non-integer zoom, tile edges and all four
 facings in D-44's coverage/picking evidence. No particular corrected shape or
 lighting appearance is selected by this sampling decision.
 
+### D-46. Control a world-fixed sun through Lua
+
+Owner, directly in this design pane on 2026-11-07, answered “yes” to Lua
+setting the sun's compass direction and height above the horizon, with the
+same terrain side staying sunlit when the camera rotates.
+
+The preview light is anchored in world space. Camera facing changes how the
+light is expressed for the selected face map; it does not move the sun around
+the terrain. Lua supplies the direction/elevation through the terrain-view
+lighting controls. Preserve D-29's deferred automatic day/night cycle and moon
+lighting; this adds neither a UI nor a world clock.
+
+Q-18's input meaning and supply path are resolved. Exact angle units/ranges,
+binding shape, initial sun position, ambient/intensity values and depth
+dimming/haze remain concrete contract choices. D-44's evidence must include
+camera rotation at a fixed sun input and changing the sun at a fixed camera,
+so a light that accidentally follows the camera cannot pass the preview check.
+
+### D-47. Keep both depth effects and require better testing
+
+Owner, directly in this design pane on 2026-11-07, answered the choice between
+both adjustable depth effects, darkening alone and neither:
+
+> keep both, but this is something that doesnt really work well so we will
+> need to make sure we get better testing in place
+
+Retain gradual depth darkening and blue haze below the cutaway, with Lua
+controls to adjust or disable each. These are presentation effects, separate
+from directional face lighting and from the discovery/fog-of-war state. They
+must not change terrain knowledge, alpha cutout coverage or screen-pick targets.
+Turning both off provides a face-lit baseline for tile/geometry previews.
+
+The owner requires improved tests, not unquestioned reproduction of S's
+appearance. Its exact depth formula, strengths and colour mixing are therefore
+not approved merely by keeping both effects. Q-18 must define those numerical
+expectations; the evidence contract below requires isolated and combined
+effects, depth extremes, changing cutaway/camera/lighting, and streaming seams.
+
+The reported reference weakness has not yet been narrowed to a reproduced
+symptom. The owner has been asked what they remember seeing. Add that case
+to the solver's regression/evidence matrix when known; do not invent a root
+cause or claim that this design has diagnosed or fixed it. The general
+qualification work can still be specified without an exact reproduction.
+Q-19 must assign D-47's tests/evidence to the lighting and integration work,
+and carry the requirement into final TRA-12 acceptance.
+
+### D-48. Load terrain from the projected view, not a flat camera radius
+
+Owner, directly in this design pane on 2026-11-07, answered “yes, if you think
+its feasable, its what i want” to P-10's viewport-driven loading contract.
+
+The feasibility basis is the existing pure planner's viewport/height-window
+calculation and the approved bounded runtime demand model, verified in P-10.
+This establishes a feasible implementation direction, not measured capacity
+or completion of the face-map integration.
+
+Derive camera demand from viewport size/aspect, zoom, facing, cutaway and the
+visible height range. Include potentially visible background tiles even when
+their horizontal chunks are far from the camera anchor. Visible demand comes
+before the small prefetch margin, while explicit query/removal priority remains.
+Eviction respects current view interests and capacity rather than a fixed
+horizontal radius. Preserve D-42's bounded best-effort admission: unresolved
+visible demand remains pending, and insufficient memory can still leave
+terrain absent. No memory-limit increase or full-view residency guarantee is
+implied.
+
+P-10's refinement and regression package are approved. The solver must show
+the owner's background/haze case requested from a nonresident starting state,
+loaded and retained when budgets suffice, and distinguished from expected
+capacity pressure when budgets do not suffice. Include rotation, zoom,
+viewport changes, cutaway/elevation displacement and eviction/reload. Keep
+fog concealment and sparse underground materialization intact; merely moving
+the camera cannot discover a hidden cavern.
+
+This refines P-5's visible-region demand and D-42 rather than adopting S's
+5×5 camera square. Q-16/Q-19 must carry the actual whole-tile bounds and the
+planning-limit/runtime integration work; the existing pure planner alone is
+not the solver proof. No code or tracker change is made in this design turn.
+
+### D-49. Adopt the illustrated lowered-edge catalog, including peak ID 15
+
+Owner, directly in this design pane on 2026-11-07, answered “ok sounds good”
+to adopting the illustrated P-9 catalog as the logical target for corrected
+masks and solver proof. All 16 IDs were shown with their forms and maximum
+heights; the diagram was explicitly a design illustration, not engine output.
+
+Adopt P-9's exact rule in the unit cell: `N=y`, `E=1-x`, `S=1-y`, `W=x`;
+ID 0 has top height 1 and every other ID uses the minimum of the expressions
+selected by its bits. The solid lies between the base and that top. Combining
+lowered edges gives the illustrated corner and ridge forms. ID 15 is the
+four-sided central peak, height 1/2, with all four edges at the base.
+
+This explicitly supersedes D-25/P-5's flat-top treatment of ID 15 and the old
+alias between IDs 0 and 15. Retain the IDs and rotation/coordinate conventions.
+For IDs 0–14 the intended mathematical shapes agree with the existing
+lower-envelope definitions; that does not make the mismatching reference
+artwork correct. Correct and qualify the masks against the chosen catalog
+under D-44. Discovery and terrain point/ray queries continue to share D-36's
+logical geometry, with real openings rather than image-alpha connectivity.
+
+P-9's table durably specifies the illustrated forms. Its opening regions
+follow from those solids and D-34/D-35's positive-area connection rule; query
+and portal implementation still require the specified qualification. This is
+not approval of automatic reshaping, movement rules, new IDs or a new renderer
+ABI. Q-16 retains emission/cutaway and compatibility details; Q-20 retains
+discovery execution/storage mechanics. The solver must still provide evidence
+rather than treating this approval or the illustration as a completed proof.
+
+### D-50. Cutaways preserve known shapes without additional flat caps
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that's right
+i think” to hiding levels above the selected slice while keeping every
+remaining known tile's actual shape and material, including ramps, without
+adding flat caps; unknown regions retain generic blank fog.
+
+At integer slice `k`, omit cell levels `z > k`. Each remaining known tile
+keeps its approved geometry and material: a ramp at the slice remains a ramp.
+Do not create an additional flat cap or change terrain to represent the cut.
+Known air stays air. Generic blank coverage still conceals unknown regions,
+including unknown air, under D-31/D-37; it is neither a physical cap nor a
+selectable tile. Changing the cutaway grants no discovery.
+
+This supersedes earlier proposals for additional cutaway caps. It settles
+their visible behavior, not whole-cell emission, hidden-cell culling, painter
+ordering or their qualification. Those remain Q-16/Q-19 work; automatic
+headroom and manual camera navigation retain their earlier decisions.
+
+### D-51. Discover whole caverns without exhaustively loading their detail
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that fits”
+to the recommendation to remember the entire connected cavern and its exposed
+boundary as discovered in compressed form, while loading actual tile/render
+detail only when the camera or an explicit request needs it. The question
+explicitly identified this as a refinement of the earlier requirement to load
+every boundary tile, including in enormous/world-spanning spaces.
+
+Whole-space discovery remains the behavior: it crosses chunks, includes the
+exposed solid boundary and is not restricted to the current view. Represent
+that knowledge with exact compressed regions. Finite caverns use the same
+rule as enormous or world-spanning ones. Materialize their boundary detail
+only for camera or explicit query/edit demand, with normal bounded streaming.
+There is no requirement to instantiate every boundary tile once before the
+discovery can finish.
+
+Completion means the connected space and its boundary are known, with the
+required connectivity work accounted for, not that all detail is resident or
+has been loaded. Do not guess across unresolved connections or label a partial
+reveal complete: unprocessed obligations stay pending under D-39. Compact
+source connectivity and its limits still require a concrete implementation
+contract and proof; this decision promises neither constant-size encoding nor
+instant discovery of arbitrary terrain.
+
+This supersedes D-32's exhaustive boundary-loading requirement and that
+requirement's restatement in D-33. It preserves their whole-cavity scope and
+D-33's session retention/replay: compressed knowledge must survive normal
+offload, apply before chunk publication and disappear only with arena
+close/reset. Detail eviction cannot erase discovery. D-41/D-43 still govern
+capacity and I/O failure. Q-20 retains exact representation, publication,
+source-compilation, capacity and API mechanics; Q-19 must assign their proof.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1485,6 +1675,11 @@ Use the full 16-ID mask catalog selected by D-25:
 | 5, 10 | NS, EW (opposite-direction forms) |
 | 7, 11, 13, 14 | NES, NEW, NSW, ESW |
 | 15 | NESW; preserve the ID even with flat-top treatment |
+
+Amendment: D-49/P-9 now defines the exact logical catalog and replaces ID 15's
+flat-top treatment with a central half-height peak. D-44 permits demonstrated
+mask corrections and requires solver proof; the original reference-fidelity
+wording below does not override those decisions.
 
 Rotation permutes the four bits; the world ID itself does not change when
 the camera turns. Preserve reference silhouettes and face orientation in all
@@ -2275,7 +2470,7 @@ every other mask is inconsistent. Snapshot integrity was checked against
 S's Git blobs: N `effc21564c7a653605dcbafca23ce7bc560e262d`,
 E `5ed533b4d9467fa3b371a4cb489a87844fa64611`.
 
-**Correction direction approved by D-44; exact catalog still open.** Preserve
+**Correction direction approved by D-44; catalog approved by D-49.** Preserve
 all 16 authored IDs, the isometric material artwork and the face-map shader
 approach, with corrections to inconsistent mask silhouettes/face weights in
 the new project's catalog.
@@ -2289,9 +2484,9 @@ IDs, dropping shapes, automatic neighbor reshaping or editing Synarchy.
 The alternative of retaining exact masks while accepting disagreement between
 visible openings and logical geometry is not selected. D-44 requires proof
 from the solver, including reproduction of the original mismatch and the
-corrected result. Concrete replacement shapes, the special ID-15 meaning,
-pixel-edge conventions and appearance still require review; permission to
-correct a mask does not approve an unspecified replacement catalog.
+corrected result. D-49/P-9 now specifies the replacement shapes, including
+ID 15's central half-height peak. Pixel-edge conventions and lighting still
+need a concrete contract; approval of the catalog is not implementation proof.
 
 ### Solver evidence required for the shape/mask correction — D-44
 
@@ -2330,6 +2525,44 @@ the relevant follow-up slice and final TRA-12 qualification.
   alone, unretained local captures or the old solid-renderer evidence do not
   satisfy this requirement. Unexplained mismatches block the affected renderer
   qualification and final arena acceptance until resolved.
+
+### Depth-effect qualification required — D-47
+
+Specify the numerical depth/colour contract under Q-18 before implementing
+its expected-result tests. The solver must then deliver the following evidence
+through the same retained, revision-pinned workflow as D-44:
+
+- A controlled scene with repeated soil/stone materials and slopes at known
+  depths, including adjoining chunk boundaries. Capture all four combinations:
+  neither effect, darkening only, haze only and both. Each disable control must
+  reproduce its defined baseline without changing alpha coverage or picking.
+- Independent reference calculations in the renderer's linear-colour contract
+  for depth zero, intermediate depth, the configured end of the effect range
+  and clamped out-of-range inputs. Check each curve's intended direction,
+  bounds and exact composition order with face lighting; visual approval alone
+  cannot detect a colour-space or clamp error reliably.
+- Offscreen comparisons at selected sun directions/elevations and all four
+  camera facings, sampling corresponding visible surfaces. Show that lighting
+  still follows D-46 while the depth effects follow their specified depth
+  measure. Include non-integer zoom and partially transparent/cutout edges
+  under D-45; darkening/haze must not create opaque fringes or select fog.
+- Controlled pan/zoom/rotation, manual slice changes, surface-following over
+  different heights, and jumps with/without explicit Z. Expected changes from
+  a changed depth must be distinguished from spurious resets, stale parameters
+  or changes caused solely by chunk boundaries. Camera/lighting/style and
+  retained terrain must publish coherently; no frame may combine incompatible
+  old and new settings.
+- Offload/reload and delayed chunk arrival in the same scene. Identical terrain
+  under the same adopted camera/style must regain the same depth treatment;
+  loading order must not create seams. Supply a side-by-side comparison of the
+  owner's reported bad case when it can be reproduced, documenting what
+  changed and any remaining limitation.
+
+The implementation handoff must include reviewable captures and the numerical
+results/reproduction commands, not only a passing test count. This is a
+required qualification matrix, not a claim that tests have run or that the
+unspecified reference complaint has already been reproduced. It adds no
+fluid, moon, day/night-cycle or UI testing scope.
 
 ### Existing material ABI and the remaining integration gap
 
@@ -2409,24 +2642,26 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-45 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-51 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
 face lighting, and uses the existing material ABI. It replaces the claim that
 the current convex solid's projected polygons reproduce Synarchy's sprites.
-The exact emission/occlusion/cap contract is still open; the verified S path
+The exact emission/occlusion contract is still open; D-50 selects unchanged
+known shapes/materials at the cutaway with no additional flat caps. The verified S path
 is one whole quad per non-air visible-range cell, not three separately meshed
 faces. Preserve sparse authoritative cell/material/shape state and atomic
 removal; do not infer world occupancy from camera-facing texture alpha.
 D-36 resolves the query authority: the existing subcell point/ray queries and
 cavity discovery use the same corrected logical shape definitions. The exact
-per-shape catalog and compatibility details remain to be specified and reviewed.
+per-shape catalog is now selected by D-49/P-9; API compatibility and the
+implementation's geometry/coverage proof remain to be specified and qualified.
 
 The cross-facing mask audit above found that the pinned N/E assets cannot
 both be exact silhouettes of one rotated unit-cell shape. D-44 approves
 correcting inconsistent masks while retaining all 16 IDs, with solver-delivered
-proof of the defect and correction. The exact catalog remains Q-16; do not
+proof of the defect and correction. D-49 supplies the logical catalog; do not
 choose camera-dependent logical geometry or claim the current PNG set already
 establishes a coherent solid catalog.
 
@@ -2434,7 +2669,7 @@ D-30 selects the picking approach: use the adopted drawn quads, matching
 artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
 D-45 selects nearest-neighbor colour/mask sampling and a shared render/pick
 alpha cutoff. The former analytic-solid picker is not the visual authority.
-Exact emission, cut surfaces, numeric sample/edge conventions and the remaining
+Exact emission, numeric sample/edge conventions and the remaining
 ownership details are still open.
 
 D-31 requires a separate fog presentation over undiscovered underground
@@ -2442,15 +2677,17 @@ terrain, including real air gaps. The generic blank is intentional gameplay
 concealment. The earlier proposal to expose real material/air at every cutaway
 is superseded; lazily loading terrain must not itself reveal it. Fog must
 occlude visual picking without becoming authoritative physical occupancy.
-D-32 selects whole-cavity discovery/loading on unsealing, including boundary
-terrain beyond adjacent cells and across chunks, processed in bounded steps.
+D-32 selects whole-cavity discovery on unsealing, including boundary terrain
+beyond adjacent cells and across chunks, processed in bounded steps. D-51
+refines exhaustive boundary loading into compressed whole-space knowledge
+with tile/render detail materialized on camera or explicit demand.
 D-33 retains discovery as chunk changes across normal offload/reload for the
 arena session, replayed before render/pick publication. Revealing terrain is
 distinct from editing its contents; discovered chunks need not stay resident.
 D-34 connects whole empty cells through their six shared faces and excludes
 edge/corner-only contacts. D-35 additionally requires explicit shape openings,
-including real diagonal openings through ramps into unrevealed spaces. Exact
-per-shape geometry, capacity/completion and API authority remain Q-16/Q-20.
+including real diagonal openings through ramps into unrevealed spaces. D-49
+supplies the shape geometry; capacity/completion and API authority remain Q-20.
 D-37 resolves fog interaction: fog is unselectable, returns no player target
 and blocks screen picks/removal of the terrain it conceals.
 D-38 starts sky and initially exterior-connected spaces discovered and requires
@@ -2471,8 +2708,16 @@ The earlier fixed-configuration recommendation is superseded to the extent
 it implied an unchangeable sun. The automatic cycle is deferred; selected
 sun positions can still change the lighting without a world clock, calendar
 or solar-page/time simulation. Eventual moon lighting is deferred too.
-Exact parameter representation, preview supply path and initial appearance
-remain Q-18; this paragraph settles no other amendment proposal.
+D-46 selects Lua-supplied compass direction and elevation anchored in world
+space through camera rotation. D-47 retains both adjustable depth darkening
+and blue haze and requires improved numerical/visual/navigation coverage.
+Exact units/binding, depth/colour equations and initial strengths remain Q-18;
+this paragraph settles no other amendment proposal.
+
+D-48 approves P-10's viewport-driven demand, view-aware eviction and explicit
+background/haze regression within D-42's existing budgets. The face-map path
+must preserve the height-aware footprint and reconcile bounded planning with
+best-effort runtime admission; this is not a guarantee that every view fits.
 
 Affected tracker work, for later approved revisions only:
 
@@ -2499,10 +2744,11 @@ dependency insertion and existing-issue revisions await Q-16–Q-20; the ledger
 and delivery plan remain the original filed arc until those changes receive
 sign-off. No final issue bodies are drafted here.
 
-### P-7. Shared discovery mechanism — D-39 approved, concrete details open
+### P-7. Shared discovery mechanism — D-39/D-51 approved, concrete details open
 
 The high-level shared-work mechanism implementing D-31–D-38 is approved by
-D-39. The detailed engineering below still identifies representation,
+D-39, with D-51 separating whole-space knowledge from detail loading. The
+detailed engineering below still identifies representation,
 capacity, publication and source-compilation choices requiring a concrete
 contract; this is not a claim that the algorithm is implemented. It builds
 on P-5's existing single terrain owner, serialized edit commits and bounded
@@ -2525,7 +2771,7 @@ round-robin work quanta.
    discovered component cannot expose another disconnected part. Claims and
    their queue/continuation obligations are installed together by the terrain
    owner. Discovering/claiming a region is not proof that all of its exits or
-   boundary terrain loads have been processed. Use compressed spans/regions
+   boundary discovery has been processed. Use compressed spans/regions
    where valid; do not turn this into a dense visited-cell array.
 3. **Edits seed new connectivity in the same commit boundary.** Each accepted
    removal installs the obligation to inspect its new empty regions and open
@@ -2537,7 +2783,7 @@ round-robin work quanta.
    discovery capacity/failure behavior remains an explicit open contract.
 4. **Process bounded batches, share claims and stop at known exterior.** An
    unseen reachable region is claimed once and queued. A pending region joins
-   existing work without dropping its queued exits/boundary loads. A completed
+   existing work without dropping its queued exits/boundary discovery. A completed
    known region or implicit initial exterior needs no traversal through it;
    edits that change its connectivity must have supplied new obligations as
    above. Reaching sky ends that branch, not the entire reveal. The queue is
@@ -2550,26 +2796,63 @@ round-robin work quanta.
    knowledge uses D-33 retention. Pending work is separately arena-owned and
    must survive ordinary chunk offload; its cancellation/close/reset and
    publication rules must be specified. A component is complete only when its
-   discovery and required boundary-load obligations are fulfilled, never just
-   because two fronts met.
+   connectivity and boundary-knowledge obligations are fulfilled, never just
+   because two fronts met. D-51 removes exhaustive detail loading from that
+   completion condition; view/query-driven detail work remains separate.
 
 For the owner's two-opening example: opening A queues one end of the cave;
 opening B queues the other end. Each meets already-known sky at its entrance
 and stops only that outward branch. They traverse the cave until their claims
 meet, reuse the same pending work, and finish all remaining branches and
-boundary loads. A small abstract graph check exercised immediate and delayed
+boundary discovery. A small abstract graph check exercised immediate and delayed
 second openings in both directions, including a side branch: each of eight
 unknown nodes expanded once and sky expanded zero times. This is a design-
 model sanity check, not a repository test, a geometric proof or performance
 evidence. The concrete implementation needs interleaving, chunk-offload,
 capacity, later-edit and partial-shape cases before its claims are qualified.
 
-**Still unresolved:** the exact 16-shape region/portal catalog; source metadata
+**Still unresolved:** implementation/encoding of D-49's regions/portals;
+source metadata
 for initially exterior-connected spaces (including unbounded authored air
-layers); definition of completion for boundary loading with normal eviction;
+layers); exact completion/publication of compressed discovery with normal eviction;
 retained-discovery and pending-work capacity/refusal; API results and coherent
 publication. An enormous/infinite component cannot silently become an
 unbounded allocation, a completed partial reveal or an erased obligation.
+
+**Discovery versus materialization — approved by D-51.**
+The current source can describe a world-spanning underground air layer with
+just a gap between two base layers: those layers apply to every column, and
+uncovered levels are air (H `packages/terrain/src/Hetoimasia/Terrain/Source.hs:1–19`
+at `3ce8bf411f`). Its description is small even though enumerating all exposed
+floor/ceiling tiles is infeasible. Bounded batches alone do not make such an
+enumeration finish; a larger disk allowance does not solve this either.
+
+D-51 refines D-32's boundary-loading requirement: discover the whole
+connected space and its exposed boundary using exact compressed knowledge
+regions, while materializing boundary tile/render data only for camera or
+explicit query/edit demand. Completion means the connected space and
+boundary are known, not that every boundary tile has been instantiated once.
+Finite caverns follow the same rule. D-33 retention/replay still applies
+to the compressed knowledge, and ordinary detail eviction cannot undo it.
+
+The owner approved this change to D-32's requirement to load all boundary
+tiles. It is not permission to mark an unexplored
+region complete by guessing: compact source connectivity must be proved, and
+work not yet established stays pending. Exact source compilation, limits,
+refusal and integration with edit-created connections remain to specify; no
+constant-size representation or instant discovery of arbitrary terrain is
+claimed. The rejected exhaustive-loading alternative would require an explicit
+restriction on supported cavern sizes/topologies or accepting work that cannot
+finish at the available capacity.
+
+Qualification must distinguish known regions from resident detail: use a small
+finite cavern, a world-spanning authored air layer and a fragmented connected
+cavity. Whole-space knowledge must survive eviction/reload without enumerating
+each boundary tile; camera demand must materialize newly viewed known detail.
+Exercise unresolved branches, two openings, edits merging regions, offload and
+capacity interruption without false completion, lost obligations or accidental
+discovery of sealed controls. Record work/storage scaling rather than claiming
+compression alone proves bounded behavior.
 
 ### P-8. Session retention backing — D-40/D-41/D-43 approved, concrete details open
 
@@ -2624,6 +2907,20 @@ whole reveal fits based on its opening tile: continuation and its capacity
 must remain bounded and resumable. Exact default size, reservations, platform
 support and admission/recovery protocol remain open.
 
+**Next owner choice — increasing a live arena's allowance (proposal, not approved).**
+A full retained-history allowance is distinct from a temporary device write
+failure: freeing reconstructible resident chunks does not remove the edits
+and discovery the session must remember. Recommend an explicit asynchronous
+Lua operation to request a larger allowance for the same live arena. Establish
+the additional reservation before raising the cap or resuming capacity-paused
+work; on failure retain the old cap, stored state and pending obligations.
+This would permit continued exploration without discarding the arena, while
+keeping storage growth explicit and bounded. It adds no UI, automatic quota
+growth, shrinking or cross-run persistence. D-43 currently approves a
+configurable startup allowance only; live increases require a separate owner
+decision. Exact operation/results, reservation accounting and recovery from
+non-capacity I/O errors remain part of the concrete storage contract.
+
 A free-space query is a snapshot, not a reservation against other writers.
 [Apple's file-control documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html)
 documents file preallocation, including an all-requested-space-or-none option;
@@ -2646,11 +2943,11 @@ of a save failure, the write directory had only 27 MB free at startup and the
 developer fixed the error to report insufficient space. It supports retaining
 runtime error handling, not claiming Factorio pre-reserves all future saves.
 
-### P-9. Concrete logical shape catalog — proposal for Q-16 review
+### P-9. Concrete logical shape catalog — approved by D-49
 
-This is a proposed replacement catalog, not an approved interpretation of the
-corrected artwork. D-44 permits demonstrated mask corrections but does not
-choose these shapes. It preserves S's documented meaning of a set bit as a
+This is the intended logical catalog approved after an illustrated owner
+review in D-49. D-44 requires the solver to correct and prove the artwork
+against it. It preserves S's documented meaning of a set bit as a
 lower cardinal neighbor (`src/World/Slope/Compute.hs:135–143,173–205`), and
 makes that direction the cell's lowered edge. It does not infer terrain shape
 from camera pixels or enable automatic slope recomputation after removal.
@@ -2661,7 +2958,7 @@ other shape's top is the minimum of the expressions named by its bits.
 Its closed solid is `0 <= z <= h(x,y)`. This is a finite, piecewise-planar
 catalog with exact rational intersections, not an arbitrary height-field API.
 
-| ID | Name | Proposed top height | Form / maximum height |
+| ID | Name | Approved top height | Form / maximum height |
 | --- | --- | --- | --- |
 | 0 | Flat | `1` | Full block, 1 |
 | 1 | N | `N` | Ramp, 1 at S edge |
@@ -2686,21 +2983,21 @@ exception. Quarter turns permute the bits and rotate the same solid. The
 half-height peaks are consequences of intersecting unit-rise/unit-run slopes,
 not new fractional-slab IDs or an arbitrary authored-height parameter.
 
-**Important proposed departure:** ID 15 becomes a central half-height peak
+**Departure approved by D-49:** ID 15 becomes a central half-height peak
 with all four edges at the base, instead of the old flat-block alias or S's
 lowered flat-diamond mask. This changes D-25/P-5's earlier flat-top treatment
-and needs explicit owner approval. The alternative is to retain ID 15 as a
-documented flat-block exception; do not silently choose between them.
+as explicitly approved in D-49. The alternative of retaining ID 15 as a
+documented flat-block exception is not selected.
 
 For IDs 0–14, this mathematical rule matches the existing H
 `packages/terrain/src/Hetoimasia/Terrain/Geometry.hs` lower-envelope definition.
 The audit disproved its claimed fidelity to the pinned masks; it did not
 establish that the solids are intrinsically invalid. Keeping that rule as the
-new intended catalog while correcting the masks would be an explicit design
-choice. ID 15 would remove the existing full-block special case. Actual API
+new intended catalog while correcting the masks is the D-49 design choice.
+ID 15 removes the existing full-block special case. Actual API
 compatibility, corrected masks and evidence still belong to the amendment.
 
-**Derived opening contract, also proposed for review:**
+**Opening geometry derived from D-49's catalog and D-34/D-35:**
 
 - In each shaped cell, the empty region is the space above `h`. Shape 0 has
   no interior empty region; each other catalog shape has one connected empty
@@ -2723,11 +3020,120 @@ compatibility, corrected masks and evidence still belong to the amendment.
   from the same catalog, without unrelated floating tolerances. Qualify the
   table and rotated portal intersections independently under D-44.
 
-This proposal does not settle full-cell emission/cutaway ordering, sampling
+This catalog does not settle full-cell emission/ordering, sampling
 edges, lighting weights or the renderer proof. It provides a concrete logical
-target to approve and test rather than asking the solver to invent the shape
-semantics while fixing artwork. An illustrated owner review of the catalog,
-especially ID 15, remains required before it becomes a decision.
+target to implement and test rather than asking the solver to invent the shape
+semantics while fixing artwork. The illustrated owner review is complete;
+the solver's independent implementation qualification is still required.
+D-50 separately settles cutaway appearance: preserve remaining known shapes
+and materials without additional flat caps, retaining fog over unknown regions.
+
+### P-10. Viewport-driven demand and missing hazed background — approved by D-48
+
+**Owner's clarified symptom, 2026-11-07:**
+
+> since the haze happens over far away tiles, because of the isometric view
+> and the chunk loading limit around the camera, often the tiles that are
+> supposed to be hazed in the background are simply not loaded, and show up
+> blank. it looks ok, but i would like to look into the possibility of loading
+> the chunks needed based on what the camera sees, not just a flat radius
+
+This request initiated the viewport-based loading investigation; D-48 approves
+the resulting contract below. It does not approve an unbounded resident world
+or a larger arbitrary camera radius. It explains the
+D-47 complaint as missing terrain that the haze would have shaded, rather
+than establishing that its colour formula is wrong.
+
+**Verified reference mechanism.** At S `3777d437`,
+`src/World/Thread/ChunkLoading.hs:96–111` computes the camera chunk and demands
+the square `[-chunkLoadRadius..chunkLoadRadius]` in X/Y. The configured radius
+is 2 (`src/World/Generate/Constants.hs:12–13`): 5×5 chunks. The queue is sorted
+by camera-chunk distance and admits at most 8 new chunks per tick
+(`ChunkLoading.hs:62–63,151–154`); camera-driven eviction also receives that
+radius (`:219–222`). This camera demand is not derived from the viewport's
+projected extent or its vertical visibility band.
+
+S's render path independently inspects already-loaded chunks
+(`src/World/Render/Quads.hs:127,162–170`). Its view bounds include viewport
+aspect/zoom and a padding proportional to visible depth
+(`src/World/Render/ViewBounds.hs:32–50`), then test projected chunk extents
+(`src/World/Render/ChunkCulling.hs:58–73`). Thus the renderer can consider a
+region visible that the camera loader never requested. A larger culling bound
+cannot render an absent chunk. This source mismatch supports the owner's
+report; no exact camera/scene capture or runtime reproduction has been made.
+
+S's haze is specifically based on `zSlice - worldZ`, normalized by effective
+view depth (`src/World/Render/TileQuads.hs:68–75`), not a horizontal-distance
+fog formula. The loading correction is independent of any future choice of
+haze curve; do not silently change its distance/depth meaning on this report.
+
+**Existing Hetoimasia foundation.** The approved P-5 describes a visible region
+plus one chunk of prefetch, and D-42 preserves the full zoom/depth range with
+best-effort camera admission. At H revision
+`e61a1ec55284e7ec8aa71664878c89a38d2322c2`, the merged pure planner already derives
+the view rectangle from the viewport mapping
+(`packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Projection.hs:230–242`),
+uses the vertical band to enumerate candidate columns and per-column level
+windows (`Plan.hs:396–420,453–477`), and builds camera demand plus a margin
+(`Plan.hs:849–896`). It is not a flat-radius planner. Existing tests cover
+visible chunks/margins and bounds (`packages/terrain-render-2d/test/Test/TerrainRender2D/Planning.hs`,
+the `demand for the camera` group); they are not proof of this end-to-end
+background scene through the new face-map path.
+
+Two remaining integration issues must not be hidden: the planner's bounds
+were written for the old solid/face representation, and `prepare`/`cameraDemand`
+can refuse an oversized enumeration/demand (`Plan.hs:457–459,885,893–895`).
+The face-map follow-up must enclose the actual whole-tile sprites and reconcile
+bounded planning with D-42's best-effort camera policy. Do not turn a planning
+capacity refusal into a silent, permanently empty background or claim that
+runtime admission alone has fixed every upstream limit. The filed #645 view
+adapter connects this demand to runtime; that integration remains separate
+from a pure planner's existence. This turn changes no code or tracker item.
+
+**Refined contract approved by D-48:**
+
+1. Derive demand from the current viewport, aspect, zoom, facing, cutaway and
+   allowed height range. Include any known/discovered terrain whose projected
+   tile bounds could contribute pixels, even when its horizontal chunk lies
+   far from the camera anchor. Determine potential coverage without relying on
+   which chunks are already resident; otherwise blank areas never request data.
+2. Use conservative projected bounds and per-column/region height intervals.
+   Do not project only the ground plane or materialize the whole underground
+   prism. Compressed source/discovery summaries prune air and hidden interior;
+   fog-covered undiscovered terrain stays concealed under D-31/D-37. Camera
+   demand alone does not grant discovery or load every buried cell.
+3. Prioritize current visible demand before the existing small prefetch margin,
+   while preserving explicit query/removal priority. Coalesce superseded
+   camera intents; old GPU frames retain their required resources. Eviction
+   must respect current view interests and capacity policy, not discard a
+   needed background chunk merely because it is beyond a camera radius.
+4. Keep bounded, progressive preparation/admission and D-42's budgets. At
+   sufficient capacity a settled view must not have holes caused by an omitted
+   demand footprint. At insufficient capacity, unresolved visible demand stays
+   pending and unloaded terrain remains absent as already approved; no promise
+   that every maximum-zoom view fits, no automatic budget increase and no LOD
+   system is introduced. Prefetch must not consume the capacity needed for
+   visible terrain or explicit work.
+
+**Required regression coverage under D-48:** a controlled, discovered terrain
+scene with lower/distant background surfaces outside a camera-radius square
+but inside the projected viewport, with both depth effects enabled. With ample
+budgets, assert those chunks enter demand and remain available while needed,
+then capture the loaded/hazed result after streaming settles. A radius-based
+negative control must leave the expected background absent. Vary all four
+facings, zoom, portrait/wide aspect, resize and the manual/automatic cutaway;
+include sprite edges and elevation displacement, not only flat tile centres.
+With constrained budgets, show visible-before-prefetch admission and explicit
+request progress, with pending work distinguished from a missed footprint.
+Include pan/rotation away and back, delayed loads and eviction so the same
+background does not repeatedly disappear despite sufficient capacity. Preserve
+fog concealment and sparse underground allocation in those traces.
+
+Q-16 owns the amended projection/emission demand bounds, Q-18 the owner's
+visible haze/background qualification, and Q-19 the planner/view integration
+and final evidence assignment. The viewport-based direction already has P-5
+support; D-48 approves the explicit refinement and regression package above.
+This does not settle Q-20's separate cavity discovery work.
 
 ## Open questions and review checkpoints
 
@@ -2870,26 +3276,36 @@ Fog-specific picking is resolved by D-37: no selectable target, no interaction
 and no picking through the fog. Remaining reveal behavior is tracked in Q-20.
 D-35 requires
 logical shape openings for discovery, including ramp-created diagonal
-connections; the exact 16-shape solid/empty-region catalog is still to be
-specified and reviewed.
+connections; D-49/P-9 now supplies the approved 16-shape solid/empty regions
+and their derived openings.
 
 D-36 resolves #637's subcell query authority: correct those definitions so
 point/ray queries and discovery share the canonical logical shape model.
 Rendering/screen picking retain sprite coverage as their visual authority.
 
-Still open: the exact 16-shape logical geometry and query boundary/compatibility
-details, full-cell versus isolated-face emission and hidden-face/cap behavior.
-P-9 now proposes a complete lowered-edge shape table and derived portal rules,
-including a central half-height peak for ID 15. Neither the table nor this
-change to the earlier flat-top treatment is approved yet.
+Still open: query/API compatibility details, full-cell versus isolated-face
+emission and hidden-cell culling/ordering. D-50 resolves cap behavior: omit
+levels above the slice, retain known shapes/materials and add no flat caps;
+unknown regions retain generic blank fog. D-49 approves P-9's lowered-edge catalog,
+including the central half-height peak for ID 15, replacing its earlier
+flat-block exception. The existing closed-solid boundary convention and the
+derived positive-area portal geometry remain the qualification targets.
 D-44 resolves the fidelity choice: correct demonstrated mask inconsistencies
 while preserving all 16 IDs and face-map rendering, and require solver proof
-of both defect and correction. The exact replacement catalog and sampling
-conventions still need review; approval of the correction direction does not
-select unspecified geometry.
+of both defect and correction. D-49 selects the replacement logical catalog;
+exact sampling conventions and corrected-mask evidence remain separate work.
+P-10 adds the owner's viewport-loading concern and source comparison. Preserve
+the existing view-aware direction when adapting demand bounds to whole-tile
+face maps, and reconcile planning limits with D-42. The explicit
+coverage/admission/eviction contract is approved by D-48; the concrete planner
+integration and qualification remain implementation work to assign in Q-19.
 Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
 coverage resource contracts remain Q-17; the approved picking approach itself
 does not need another sign-off.
+
+The integer-cutaway owner question is resolved by D-50. Concrete emission,
+culling and ordering must implement that behavior and prove it alongside
+D-44's shape/mask/picking qualification.
 
 ### Q-17. Face-map data loading, sampling and ownership
 
@@ -2905,19 +3321,23 @@ is approved.
 
 ### Q-18. Exact initial appearance beyond the silhouette
 
-Open. D-29 requires an adjustable sun-position input and defers its automatic
-cycle and moon lighting. Settle that input's representation, world/facing
-convention and preview supply path, the initial light and ambient values,
-whether to carry S's depth dimming/haze, and which deviations are intentional.
+Partially resolved by D-29/D-46/D-47: Lua supplies sun compass direction and
+elevation, anchored in world space through camera rotation, without an automatic
+cycle or moon lighting. Settle exact angle conventions/units/ranges and binding,
+the initial light and ambient values, and the depth/colour equations and
+initial strengths for the selected darkening/haze. State intentional deviations.
 S's clock phase labels and shader sine disagree; full clock parity cannot be
 claimed from labels alone. Fluids, selection outlines, lifecycle sprites and
 zoom-map crossfade remain outside the approved arena unless explicitly changed.
 
-Current owner question: recommend a Lua call supplying the sun's compass
-direction and height above the horizon, anchored in world space through camera
-rotation. This remains a proposal pending the answer; it supplies no automatic
-cycle or UI. Exact coordinate/unit conventions and appearance defaults would
-then be specified in the concrete contract.
+D-47 resolves which depth effects to keep: both, adjustable/disableable through
+Lua, with stronger tests/evidence. Darkening-only and no-depth-effect defaults
+are not selected. The owner reports S's behavior does not work well; specific
+symptoms are now recorded in P-10: hazed background tiles can be absent outside
+the camera loader's radius despite projecting into the viewport. Source
+inspection supports that mismatch, but no runtime reproduction is claimed.
+The numerical contract and qualification described above remain to be filled
+out; do not copy the old curve and call the reported problem fixed.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
@@ -2931,14 +3351,20 @@ requires fresh owner sign-off. This design turn files or edits no tracker item.
 The follow-up plan must explicitly assign D-44's reproducible defect/correction
 proof, all-16/four-facing captures and geometry/opening/picking checks to the
 owning correction and integration work; carry its evidence gate into TRA-12.
+Also assign D-47's numerical, isolated/combined depth-effect and navigation/
+streaming regression evidence to the lighting and integration slices.
+Include D-48/P-10's viewport-driven demand/eviction refinement and background
+regression, preserving the existing D-42 capacity policy and
+reconciling the pure planner's limits with progressive camera preparation.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-41/D-43. Preserve fog over both solid and air until
+Partially resolved by D-31–D-41/D-43/D-51. Preserve fog over both solid and air until
 discovery, distinct from residency and authoritative terrain. Unsealing a
-cavity reveals its whole connected empty space and loads the newly exposed
-boundary terrain, beyond the adjacent cells and across chunks, in bounded
-steps. The local-only discovery alternative is rejected.
+cavity reveals its whole connected empty space and exposed boundary terrain,
+beyond the adjacent cells and across chunks, in bounded steps. D-51 replaces
+exhaustive boundary loading with compressed whole-space knowledge; detail loads
+on camera or explicit demand. The local-only discovery alternative is rejected.
 
 D-33 records revealed state as retained chunk changes, preserved on offload
 and replayed before reload publication alongside terrain edits. Discovery
@@ -2979,8 +3405,9 @@ not possible, and pause at capacity while preserving the expandable world.
 The numeric allowance and qualified reservation mechanism remain open. D-42
 raises the CPU banks independently; it does not choose the disk allowance.
 
-Still open: specify and review the exact 16-shape solid/empty regions,
-openings and internal connectivity; derive/budget the initial exterior-connected
+The logical 16-shape regions and their openings are now specified by D-49/P-9;
+their implementation still requires D-44 qualification. Still open: derive and
+budget the initial exterior-connected
 knowledge metadata without scanning infinite sky. Specify completion and
 memory-pressure behavior for very large spaces, including P-8/D-40's concrete
 temporary-store cache/staging/disk quotas and write/read failure behavior. Specify
@@ -2988,8 +3415,9 @@ Lua/engine authority and concrete reset,
 reveal-job resumability and replay/publication boundaries, including the API
 encoding of D-37's no-selectable-target fog result.
 
-Proposed storage direction: implicit unknown plus sparse discovered spans or
-regions, budgeted separately from resident terrain and retained edits. Reveal
+D-51 selects compressed whole-space knowledge, distinct from resident detail.
+Its exact encoding/accounting remains open: implicit unknown plus sparse
+discovered spans or regions is the storage direction to specify. Reveal
 work must be bounded; an enormous or exterior-connected air region cannot
 force an unbounded flood fill or eager underground allocation. Consider
 coherent terrain/reveal publication so a pending or failed edit/reveal cannot
@@ -2998,6 +3426,11 @@ D-33 settles session retention/replay with normal streaming; D-34 settles
 whole-empty-cell face adjacency. D-35 includes partial-shape/diagonal openings.
 Exact API, representation, per-shape geometric rules, failure and capacity
 policies remain open.
+The whole-cavern knowledge/detail question is resolved by D-51. Current owner
+question: P-8 proposes explicit Lua-requested increases of the live arena's
+reserved storage allowance, preserving the old cap/state on failure and
+resuming capacity-paused work only after the larger reservation succeeds.
+Live quota increases are not approved yet.
 Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
