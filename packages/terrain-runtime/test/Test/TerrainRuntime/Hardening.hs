@@ -608,6 +608,11 @@ spec = describe "Accounting and lifetime hardening" $ do
                 old <- readIORef previous
                 forM_ old (void . cancel svc)
                 writeIORef previous (either (const Nothing) Just fresh)
+                -- A read cancelled while still pending returns its credits, which is
+                -- what sets the retry flag again.
+                ephemeral <- newHost True
+                doomed <- cellWith svc (hostEndpoint svc Nothing ephemeral) hot (tile 1 1 1)
+                forM_ (either (const Nothing) Just doomed) (void . cancel svc)
           PointJob {} → readIORef steps >>= \n → modifyIORef' settledAt (Just . maybe n id)
           _ → pure ()
     withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → do
