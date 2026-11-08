@@ -15,12 +15,14 @@ mutation or implementation is authorized by this amendment's draft proposals.
 
 Lighting scope resolved by D-29: expose sun position to the face-map shader
 for previewing the tiles; defer the automatic day/night cycle and eventual
-moon lighting. Q-16/Q-19/Q-20 still block amendment readiness; D-55/D-57
-specify the asset/sampling and numerical lighting contracts.
+moon lighting. Q-19/Q-20 still block amendment readiness; D-55/D-57/D-58
+specify sampling, lighting and cell-quad presentation. P-15 is the remaining
+storage/discovery contract proposal, awaiting its own owner checkpoint.
 
 Picking scope resolved by D-30: select from the adopted drawn quads in
-front-to-back order using matching artwork/face-map coverage. Q-16 remains
-partially open for logical geometry, emission and cut-surface contracts.
+front-to-back order using matching artwork/face-map coverage. D-49/D-50/D-58
+complete Q-16's geometry, emission, cutaway and visual/logical API specification;
+the required implementation and visual proof remain outstanding.
 
 D-31 preserves generic blank terrain as gameplay fog of war over undiscovered
 underground solids and air gaps, and reaffirms lazy loading with gaps. Q-20
@@ -141,6 +143,12 @@ D-57 approves P-13's numerical lighting contract: validated normal encoding,
 Lua settings/defaults, world-fixed diffuse/ambient shading, fixed depth range
 and linear-light darkening followed by haze. Q-18 is specified; solver
 qualification and owner visual acceptance remain required.
+
+D-58 approves P-14's whole-cell emission, complementary ramp/fog masks,
+exact ordering, conservative demand/culling and visual picking contract.
+Fog stops picking with `no_hit`; unavailable knowledge remains `loading`.
+Q-16 is specified. P-15 proposes how edits and discovery become retained,
+coherent state; it is not approved by the P-14 answer.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -1756,6 +1764,30 @@ implementation, exact sampling agreement and D-44/D-47/D-48 evidence still
 need solver proof and owner visual acceptance. Geometry emission/ordering
 and discovery/storage mechanics remain Q-16/Q-20; Q-19 must assign delivery.
 There is no code or tracker mutation in this design turn.
+
+### D-58. Adopt P-14's cell-quad, fog and visual picking contract
+
+Owner, directly in this design pane on 2026-11-08, answered “approved” to
+P-14 as written at `07930b5295`. Adopt its whole-cell representations,
+complementary known-material/fog masks, exact ordering and bounded depth-rank
+admission, conservative view planning, adopted-snapshot alpha picking and
+explicit visual/logical API migration.
+
+Knowledge remains distinct from residency and from the underlying terrain.
+A known shaped solid can border an undiscovered void: its required material
+and fog parts are admitted/adopted together. Confirmed fog is uninteractable,
+stops traversal and yields `no_hit` without hidden coordinates or edit
+authority. Unavailable information that could cover a candidate yields
+`loading`. Logical point/ray queries retain their separate truth contract;
+loading or querying does not itself discover terrain.
+
+This resolves Q-16's remaining specification and the concrete player-facing
+fog-result portion of Q-20. Preserve P-14's all-shape/facing, ordering,
+coverage, disclosure, loading and lifecycle qualification obligations under
+D-44/D-47/D-48. Approval is not evidence that the renderer or picker has been
+implemented or proved. Storage, discovery transactions and recovery remain
+Q-20; delivery and fresh amendment readiness remain Q-19. No code or tracker
+mutation occurs in this design turn.
 
 ## Design boundaries
 
@@ -3647,12 +3679,12 @@ format; retain expected values, captures and reproduction commands. Solver
 proof and owner visual acceptance remain required after this contract's
 approval. No performance improvement is inferred from the unchanged ABI.
 
-### P-14. Cell-quad emission, fog composition and visual picking — proposal
+### P-14. Cell-quad emission, fog composition and visual picking — approved by D-58
 
 This is the concrete Q-16 proposal, with the player-facing fog/pick result
 needed by Q-20. It preserves P-9 geometry, D-50's integer cutaway, P-11
-coverage and P-13 normals/lighting. It requires owner approval; discovery and
-storage implementation mechanics remain a separate contract.
+coverage and P-13 normals/lighting. D-58 approves this contract as written at
+`07930b5295`; discovery and storage mechanics remain a separate P-15 checkpoint.
 
 **Knowledge is not residency.** The planner consumes a coherent immutable
 terrain/knowledge snapshot. Distinguish a confirmed undiscovered region from
@@ -3787,6 +3819,335 @@ transparent colour/mask holes, loading in front/behind a candidate, camera
 capacity pressure and generation reuse. Retain captures, counts and commands
 under D-44/D-47/D-48, not only mathematical reasoning or passing headless tests.
 
+### P-15. Compressed discovery and temporary-store transactions — proposal
+
+**Owner checkpoint, not yet approved.** This completes Q-20's proposed
+mechanism for D-38–D-43/D-51–D-53. The principal tradeoff is that an edit is
+acknowledged only after its changed records and discovery continuation have
+been written to the temporary store. The camera remains asynchronous, but
+edit completion includes disk latency. This is a session store, not a game
+save or a promise of recovery after process, OS or power failure.
+
+The proposed initial allowance is **1 GiB per arena**, configurable at open,
+with explicit Lua growth and recovery. The following limits are conservative
+starting contracts, not measurements of throughput or process RSS. They must
+be qualified; an implementation that cannot meet them reports the evidence
+and returns for a design decision instead of silently relaxing them.
+
+**1. Compile exact component families, not hidden cells.** The immutable
+source remains the bounded layer/column-patch recipe. Derive compressed
+regions and shared-face portal relations from that recipe and P-9's exact
+geometry. Partition at authored coordinate/interval boundaries, with
+parameterized families for repeated independent components and bounded
+exceptions around patches. Coordinates, interval ends and intersection
+calculations use checked exact arithmetic, including the upper endpoint one
+past the highest supported cell.
+
+One rectangular range is not necessarily one connected space. For example,
+a uniform N-ramp layer has separate parallel row channels: the S face is
+sealed while the N face is open. Repeating shaped cells vertically can also
+leave separate components at each level because no approved shape has a
+positive-area bottom opening. The compiled representation must preserve
+row/column and level indices as component parameters where necessary.
+Full-air slabs, connected shaped planes, isolated channels and patch-created
+splits have distinct descriptors; a descriptor may cover a vast range without
+asserting that every member is mutually connected.
+
+Represent joins between entire parameter ranges symbolically when the portal
+proof applies to that range, with explicit fragments/exceptions otherwise.
+A shaft can join many layer components without enumerating their cells.
+The compiled result provides exact component lookup, canonical source keys,
+range membership, portal relations and compressed boundary descriptions.
+Keys depend on the validated source, never the order of chunk loading.
+Do not infer connectivity from overlapping bounding boxes or visual alpha.
+
+Initial exterior means connection through positive-area openings to the
+**upper Z boundary**, including the unobstructed sky above ordinary terrain.
+The horizontal and lower coordinate limits are not exterior openings: a
+world-spanning covered air layer must not become known merely because its
+range reaches X/Y limits. Derive upper connectivity symbolically; do not flood
+the sky. An occupied topmost full block supplies no opening, while a topmost
+shape's actual top portal can reach exterior. This explicitly defines the
+otherwise exceptional finite-coordinate boundary behavior.
+
+Open succeeds only with exact exterior/component metadata. The required
+flat arena, world-spanning air layer, all-16-shape cavity fixtures and huge
+uniform ramp/channel/layer families must work. Valid but excessive patch or
+connectivity complexity may settle as expected `source_complexity` before
+an arena is published. There is no dense fallback or partial open.
+
+Proposed default preparation bounds, all checked before the corresponding
+allocation/work, are:
+
+| Resource | Initial bound |
+| --- | --- |
+| Compiled connectivity per arena | 16 MiB, charged to the 256 MiB resident terrain bank |
+| Compilation peak, including its result | 48 MiB from that bank; one compilation active per session |
+| Structural nodes / portal or range relations | 65,536 / 262,144; the byte bound may be tighter |
+| Total compilation work | 8,388,608 counted bounded primitive steps |
+| Service quantum | At most 1,024 such steps before yielding fairly to other work |
+
+A primitive step cannot conceal a scan over a coordinate span, unbounded
+container or arbitrary recipe. Decoder/page operations and exact arithmetic
+also have checked bounded inputs. Opening is asynchronous and cancellable;
+discard all partial metadata/reservations on failure. Existing source and
+copied-value limits continue to apply independently.
+
+**2. Removal adds connectivity; it never splits existing air.** Keep the
+source component index immutable. The dynamic overlay contains coalesced
+removed intervals, additional connections/unions, discovered component/range
+labels and pending obligations. Whole-cell removal only enlarges air, so old
+source components remain valid connected subsets. Union aliases may combine
+them; they do not require rebuilding all underground terrain. This reasoning
+does not authorize later placement, reshaping or moving solids: those would
+need a split-capable topology contract.
+
+Every changed removal records a minimal connection-inspection continuation
+in the same transaction as the edit. Connecting to known space propagates
+knowledge; merely executing a raw Lua removal inside a sealed unknown area
+does **not** grant discovery. Such edits still record their new connections,
+so a later opening reaches the whole modified component. Raw queries and
+loading remain non-discovering under P-14. Removing already-air terrain is a
+no-op and does not append redundant history.
+
+Shared work records distinguish unseen, pending and expanded obligations,
+refer to the arena/source incarnation and authoritative revision, and merge
+overlapping fronts. A batch that marks a component/range known also retains
+its unprocessed outgoing obligations and exposed-boundary knowledge. Existing
+known/exterior branches may stop traversal only after newly added connections
+have been accounted for. Two opposite openings cannot lose each other's work
+or turn a pending branch into a false completion.
+
+Knowledge is recorded by compressed component/range identity. Exposed solid
+boundary knowledge is derived/retained with that identity and exact contact
+geometry; it need not copy one marker into every boundary chunk. A chunk
+reload resolves the source, removed intervals and applicable knowledge before
+publication. Global compressed knowledge therefore satisfies D-33/D-51's
+per-chunk replay requirement without enumerating all chunks of a vast cavern.
+Known solid and known empty component remain separate facts under P-14.
+Completion means no unaccounted connectivity obligation, not resident detail
+or a percentage of hidden tiles. Progress cannot rely on unbounded RAM sets.
+
+**3. A reserved, private, bounded temporary file.** Create one arena-private
+file with private permissions and no inherited descriptor, then unlink its
+name while retaining the descriptor. Open-file lifetime lasts until its final
+descriptor closes; there is no named save to reopen and no later orphan-file
+scan. The resource owner must drain descriptor borrowers before closing it.
+This lifecycle follows the native [unlink contract](https://man7.org/linux/man-pages/man2/unlink.2.html);
+both target platforms require qualification.
+
+`storage_bytes` defaults to 1 GiB, has a minimum of 64 MiB, and must be an
+integer multiple of 1 MiB within checked native signed file-offset limits.
+The allowance includes private data/index/allocator pages, in-flight copies,
+retired pages and conservative reservation/format overhead. Reserve before
+successful open; preserve at least 256 MiB of reported free-space headroom
+on that volume after the proposed reservation. This headroom is an initial
+host-profile guard, not a guarantee that other applications cannot fill it.
+
+The backend must actually reserve the required extents and account for its
+allocation granularity/overhead; making a sparse file of the right length
+does not qualify. The target mechanisms are macOS
+[`F_PREALLOCATE` with `F_ALLOCATEALL`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html)
+and Linux native [`fallocate` allocation](https://man7.org/linux/man-pages/man2/fallocate.2.html).
+Require qualified filesystem behavior and checked file-length establishment;
+do not substitute an unreserved or user-space zero-writing fallback on an
+unsupported filesystem. Native API documentation is a starting point, not
+proof of APFS/Linux behavior, overhead or later writes. External filesystem,
+device and space failures remain possible and use D-41's pause/preserve rule.
+
+Use immutable 4 KiB pages with copy-on-write B+tree indexes for removed
+intervals, component/union/knowledge records, pending discovery and allocator/
+retirement records. Keep complete history and indexes on disk with bounded
+caches, not an ever-growing heap index or replay-only operation log. The
+private versioned codec uses explicit little-endian fields, bounded counts,
+checked page references and CRC32C page checksums, tied to the arena/source
+identity. It is not `Show`/`Read` serialization or a public game-save format.
+
+The live committed root set is held by the terrain owner. Write all new pages
+successfully before publishing a new root; never overwrite pages reachable
+from the committed root or a reader's pinned root. Successful writes mean OS
+write completion, not per-edit `fsync` or power-loss durability. No cross-run
+root journal/recovery protocol is required for this disposable arena.
+
+Before publication, staged pages are unreachable and claimed only by the
+pending transaction. If writing/cancellation fails, retain the old root and
+release those claims after I/O drains; reverting the authoritative state must
+not require another successful write. After publication, retire only replaced
+pages, retaining their reclamation obligations until the last reader of the
+old root releases it. Shared unchanged pages remain owned by the new tree.
+Store reclamation work on disk and process it incrementally. No full-store
+second copy or unbounded compaction is permitted.
+
+Keep 8 MiB **inside** the allowance protected for allocator/reclamation
+progress. Ordinary new history cannot spend it. Reserve the transaction's
+worst-case new pages, index paths and retirement metadata before admitting
+the mutation. If that cannot fit, pause before changing authoritative state.
+The memory-held root and page-cache accounting do not excuse disk growth.
+
+**4. Bound the working set and I/O.** Preserve D-42's service-wide banks and
+P-5's arena/view/lease/command/load-job limits. Proposed sub-budgets inside
+the existing 64 MiB edit bank are 48 MiB for record/page caches, 8 MiB for
+staging and 8 MiB for control/frontier state. These are shared across arenas;
+retained history beyond the caches belongs in the reserved files. Coverage,
+render preparation and GPU resources keep their separate existing banks.
+
+Use one active mutating store transaction per session, fairly scheduled
+between explicit edits, discovery, growth/recovery and reclamation. Each
+transaction reserves at most 4 MiB of RAM and writes at most 1 MiB of new
+encoded pages, including its index/allocator/retirement changes. A discovery
+batch performs at most 64 structural updates and persists a continuation
+when more remain. Both bounds apply; large discoveries span transactions.
+
+Use two storage I/O workers and at most eight queued I/O descriptors per
+session. A job transfers at most 1 MiB; allocate its accounted buffer at
+dispatch, not once per queued job. A transaction's I/O buffers count within
+its own reservation. Protect 4 MiB of staging for a foreground mutation so
+camera reads cannot consume every byte it needs. Every buffer, decoded copy,
+cache pin, reader root and queued continuation has an owner and byte/count
+charge. Scratch maps and retiring pages are not free hidden banks.
+
+The terrain-owner thread alone publishes roots, revisions and request
+results. Workers perform bounded file I/O with arena-incarnation jobs and
+return completions; they do not mutate the world or retain Lua values. Pure
+connectivity, codec and allocation decisions remain independently testable.
+Explicit requests retain priority over camera prefetch, with fair service
+for already accepted work and discovery/reclamation. Reads and camera/input
+processing can continue while a write is outstanding. Admission must prove
+that the supported standalone explicit transaction fits; eviction or a clear
+`busy` result handles temporary occupied capacity, never a circular wait.
+
+**5. One publication point for an edit and its discovery obligation.**
+
+1. Validate authority, coordinates and optional pick consistency against the
+   current arena; reserve the peak RAM/disk needs and minimum continuation.
+2. Stage the removal plus its connection-inspection obligation and associated
+   metadata against the committed root. Compute bounded discovery batches
+   by the same protocol, with known labels and remaining obligations together.
+3. Write the new pages asynchronously, handling short writes and failures
+   explicitly. No staged knowledge is exposed to a view or raw terrain query.
+4. On the terrain owner, recheck incarnation, root and cancellation. Arbitrate
+   cancellation/close against publication once: either the old state survives
+   with no committed mutation, or the new root/revisions and success result
+   become authoritative together. Cancellation cannot undo a published edit.
+5. Release staging; reclaim replaced pages only after their readers finish.
+
+Removal success means the edit and required pending work are backed; it does
+not mean the whole cavern has finished discovery or the GPU has adopted it.
+Content revision advances for changed terrain, knowledge revision for changed
+knowledge, and a private store revision for frontier/maintenance commits.
+Check all revision increments for overflow; none wraps or silently reuses
+an authority. P-14's coherent plan identity includes knowledge revision.
+
+Acknowledged changes already have a backing copy, so ordinary chunk offload
+can evict caches without another required write. Reload uses one coherent
+committed root; missing edit/knowledge pages are `loading` or an expected
+storage failure, never permission to substitute pristine source terrain.
+Prepared rendering copies its data and releases store readers; a GPU fence
+must not pin disk pages. Existing CPU/GPU retirement still applies to its
+separate resources.
+
+Expected capacity, I/O or integrity failures pause new edits and advancing
+discovery for the affected arena, retain its last committed state and pending
+frontier, and settle uncommitted user mutations with an expected result.
+Do not keep those requests hanging or automatically repeat them after
+recovery. Unaffected arenas may continue. Already available coherent display
+and provable reads remain usable; unreadable authoritative pages do not
+become air, unknown fog or regenerated unedited terrain. An integrity failure
+cannot be cleared merely by demonstrating that a scratch write works.
+
+**6. Concrete Lua control and expected results.** Extend the P-5 facade as
+follows. Each call uses its existing `OptionalRequest`/`api.request` policy,
+copied plain records, phase/role checks and immediate `busy` admission result.
+Both script roles may use terrain services; creator authority is still local
+to the creating instance, not obtainable by attaching to an arena name.
+
+| Call | Proposed contract |
+| --- | --- |
+| `api.terrain.open(name, definition [, options])` | Optional `storage_bytes`; omitted means 1 GiB. Finish source compilation, reservation and initial roots before returning the creator's arena lease. No other new options. |
+| `api.terrain.status(arena)` | Any valid own lease; bounded copied status snapshot, with no hidden coordinates or history dump. Advisory, not a reservation for later work. |
+| `api.terrain.grow_storage(arena, new_bytes)` | Creator-owner lease only. Larger reservation is obtained before publishing the larger allowance and resuming capacity-paused work. Equal size is an idempotent success; a smaller size at execution settles as `storage_size_not_increased`. No shrink or automatic growth. |
+| `api.terrain.retry_storage(arena)` | Creator-owner lease only. Explicit bounded I/O/revalidation attempt; resume internal discovery only if the recorded failure is actually cleared. Never re-execute a previously failed user edit. |
+
+Status, growth and retry remain admissible while the arena is paused, subject
+to their ordinary bounded request capacity. Retry on an already ready arena
+is an idempotent success. Protected reclamation may continue during a
+capacity pause; retry succeeds only after space for the supported next
+transaction is available. Growth or explicit successful retry clears that
+pause, rather than automatically restarting failed user mutations.
+
+Status contains `storage.state` (`ready`/`paused`), an optional `reason`,
+`reserved_bytes`, `used_bytes`, `pending_reclaim_bytes` and
+`pending_reserved_bytes`; `discovery.state` (`idle`/`pending`/`paused`) and
+`pending_items`; and content/knowledge revisions. Counts refer to compressed
+work records and bytes, not a hidden-tile count or completion percentage.
+Reserved bytes are the committed allowance; used bytes count occupied private
+pages and overhead within it, not the still-free preallocated pages. Used
+bytes include live, staged and retired allocations; pending reclaim is a
+subset, not extra available space. Report uncommitted
+growth reservations separately until committed or released. Status itself
+does not require enumerating the store.
+
+Malformed options/types, foreign/non-owner handles where owner authority is
+required, invalid size/alignment and out-of-range coordinates are ordinary
+binding errors before provider work. Add expected domain codes
+`source_complexity`, `storage_unsupported`, `reservation_failed`,
+`storage_full`, `storage_io`, `storage_integrity` and
+`storage_size_not_increased`; preserve existing `arena_closed`, cancellation
+and other request results. Expected domain results do not latch an instance
+failure. Host invariant/provider defects remain host failures.
+
+Growth is serialized with store mutation and checks the current cap at
+execution. Failure/cancellation before its commit preserves the old cap,
+roots and pause. Account and finish releasing any partially obtained extra
+reservation before another growth attempt; if release itself fails, retain
+that accounted pending reservation and report it until recovery/close.
+Capacity recovery does not clear a separate I/O/integrity pause. Retry checks
+the recorded failing operation/pages plus a bounded reservation/write probe
+as applicable; persistent errors preserve the pause. No polling retry loop,
+implicit reset or history deletion is allowed.
+
+**7. Ownership, teardown and proof.** The arena owns the recipe/index,
+committed roots, file and knowledge; the narrow terrain service owns workers
+and shared bank accounting. Reads borrow bounded immutable roots, and views
+hold coherent copied publications. Close, creator-instance exit or session
+reset invalidates the incarnation, cancels uncommitted work, drains I/O and
+reader borrowers, closes the private file through `withResource` and releases
+the banks. Preserve primary/cleanup failures under the resource contract.
+Do not close/reuse a descriptor while an old job can still use it. Reset
+means closing and opening a fresh arena; no new reset API or cross-run replay
+is introduced. A process exit naturally discards this unnamed temporary
+store after all descriptors close.
+
+Required evidence, assigned to implementation slices later under Q-19:
+
+- Compare the symbolic compiler to an independent small explicit portal/flood
+  oracle across all 16 shapes, rotations, patch-created splits, sealed spaces,
+  diagonal openings and sky. Prove huge independent ramp rows/levels remain
+  separate, whole-air layers stay compact, and X/Y/lower limits do not act as
+  sky. Record structural/work/byte counts and bounded complexity refusals.
+- Exercise both opening orders and interleavings, a raw buried removal,
+  long coalesced removed runs, range unions, known solid beside unknown void,
+  pending continuation and coherent offload/reload after every discovery
+  batch. Whole-space completion cannot require materializing its boundary.
+- Inject short writes, read/write failures, checksum faults, full allowance,
+  growth and rollback/release failures, and cancellation/close on each side
+  of root publication. Prove unchanged old roots on failure, no duplicate
+  edit, no lost obligation, bounded queues/buffers and safe reader retirement.
+- Qualify reservation, write capacity, overhead/peak space, growth and
+  unlink/last-close behavior on the supported macOS/Linux backends using
+  bounded temporary-volume or fault-provider fixtures. Never fill the owner's
+  ordinary drive as a test. Unsupported storage must refuse cleanly.
+- Retain storage latency/allocation evidence, close/reset/late-incarnation
+  checks and the P-14 fog/picking integration proof. Headless algorithm tests
+  do not replace P-11/P-13/P-14's offscreen visual evidence. No performance
+  result is claimed by this design.
+
+The alternatives not recommended are acknowledging RAM-only edits before
+backing succeeds, an ever-growing operation log/heap index, dense hidden-cell
+flooding, automatic quota expansion and cross-run crash recovery. This
+proposal adds none of the deferred general gameplay/ECS transactions,
+whole-tick rollback, movement rules, UI or saved-world schema.
+
 ## Open questions and review checkpoints
 
 ### Q-1. What does flat terrain contain vertically?
@@ -3918,7 +4279,8 @@ and preview contract remain Q-18.
 
 ### Q-16. Logical terrain, visual coverage and picking contract
 
-Partially resolved by D-30: picking uses the adopted drawn quads and matching
+Resolved as a specification by D-30/D-36/D-49/D-50/D-55–D-58 and
+P-9/P-11/P-13/P-14. Picking uses the adopted drawn quads and matching
 artwork/mask coverage in front-to-back order, with shared CPU asset coverage.
 The result identifies the logical cell for the existing edit contract.
 
@@ -3935,8 +4297,8 @@ D-36 resolves #637's subcell query authority: correct those definitions so
 point/ray queries and discovery share the canonical logical shape model.
 Rendering/screen picking retain sprite coverage as their visual authority.
 
-Still open: query/API compatibility details, full-cell versus isolated-face
-emission and hidden-cell culling/ordering. D-50 resolves cap behavior: omit
+P-14/D-58 resolves query/API compatibility, whole-cell emission and
+hidden-cell culling/ordering. D-50 resolves cap behavior: omit
 levels above the slice, retain known shapes/materials and add no flat caps;
 unknown regions retain generic blank fog. D-49 approves P-9's lowered-edge catalog,
 including the central half-height peak for ID 15, replacing its earlier
@@ -3951,18 +4313,19 @@ the existing view-aware direction when adapting demand bounds to whole-tile
 face maps, and reconcile planning limits with D-42. The explicit
 coverage/admission/eviction contract is approved by D-48; the concrete planner
 integration and qualification remain implementation work to assign in Q-19.
-Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
-coverage resource contracts remain Q-17; the approved picking approach itself
-does not need another sign-off.
+Do not silently retain incompatible ray/coverage claims. Q-17's exact
+sample/threshold and coverage resource contract is resolved by D-55/P-11;
+its proof is implementation work, not another design choice.
 
 The integer-cutaway owner question is resolved by D-50. Concrete emission,
 culling and ordering must implement that behavior and prove it alongside
 D-44's shape/mask/picking qualification.
 
-Current owner checkpoint: P-14 proposes whole-cell quads, mixed ramp/fog
+Completed owner checkpoint: D-58 approves P-14's whole-cell quads, mixed ramp/fog
 composition, exact ordering, conservative bounded planning, `no_hit` for fog,
-loading distinctions and the visual/logical API migration. It is not approved
-yet; the existing decisions do not silently settle those concrete details.
+loading distinctions and visual/logical API migration. Q-13's renderer proof
+and Q-19's assignment of that work remain; specification approval does not
+claim implementation, successful captures or owner visual acceptance.
 
 ### Q-17. Face-map data loading, sampling and ownership
 
@@ -4118,10 +4481,14 @@ The startup-preparation question is resolved by D-53: bounded exact connectivity
 preparation precedes successful arena opening, with clear over-budget refusal
 and no dense hidden-cell enumeration. Concrete encoding, limits and proof
 remain to specify alongside the other storage/publication mechanisms.
-P-14 separately proposes the concrete player-facing fog result (`no_hit`,
+D-58/P-14 resolves the concrete player-facing fog result (`no_hit`,
 with traversal stopped) and distinguishes pending knowledge from confirmed
 undiscovered space, including mixed known-ramp/unknown-void rendering. Those
-details await its owner checkpoint; the storage/commit contract remains open.
+details are approved; the storage/commit contract remains open. P-15 is its
+concrete proposal: compressed component families and edit overlays, bounded
+preparation, reserved temporary storage, commit-before-acknowledgement,
+Lua status/growth/retry and failure/lifecycle qualification. All new P-15
+choices await the owner's separate checkpoint; D-58 does not approve them.
 Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
