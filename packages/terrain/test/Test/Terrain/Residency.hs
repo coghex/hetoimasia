@@ -1348,6 +1348,56 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       other → expectationFailure (show other)
     map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0]]
     [(jobRegion j, jobCoverage j) | j ← modelJobs m2, jobPhase j == JobQueued] `shouldBe` [(reg 0 0 0, cell 0 0 1)]
+  it "keeps a replacement pending while the work it cancelled still holds its scratch, and completes it once that is acknowledged: the same description, at the minimum budget" $ do
+    -- 1,446 resident and 1,508 staging bytes: the camera's 514 hold one region's
+    -- description (192), interest (64) and scratch (258). The region's load is running
+    -- when the view names the same region again: the withdrawal cancels the job, whose 258
+    -- bytes of scratch stay charged until its owner acknowledges it, which leaves 256, room
+    -- for the description but not yet for the interest and scratch. The description stays,
+    -- pending, instead of being discarded, and starts once the acknowledgement frees the
+    -- scratch.
+    let limits = limitsWith $ \x → x {specResidentBytes = 1446, specStagingBytes = 1508, specCameraRegions = 64}
+        same = [demand (reg 0 0 0) (cell 0 0 0)]
+    m0 ← opened limits
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 same, Dispatch]
+    (m2, set) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 same)
+    case reportDecision set of
+      CameraSet admitted waiting _ _ cancelling excluded truncated → (length admitted, waiting, cancelling, excluded, truncated) `shouldBe` (0, [reg 0 0 0], [JobId 0], [], [])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0]]
+    map viewPending (modelViews m2) `shouldBe` [[reg 0 0 0]]
+    -- Nothing is freed before the acknowledgement.
+    (m3, again) ← stepOk m2 Service
+    reportDecision again `shouldBe` Serviced []
+    m4 ← fst <$> stepOk m3 (JobAcknowledged (JobId 0))
+    m5 ← drainDemand m4
+    map viewPending (modelViews m5) `shouldBe` [[]]
+    map regionCoord (modelRegions m5) `shouldBe` [reg 0 0 0]
+  it "keeps a replacement by another region pending while the cancelled work drains, and completes it once acknowledged" $ do
+    let limits = limitsWith $ \x → x {specResidentBytes = 1446, specStagingBytes = 1508, specCameraRegions = 64}
+    m0 ← opened limits
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch]
+    (m2, _) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [demand (reg 1 0 0) (cell 0 0 0)])
+    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 1 0 0]]
+    map viewPending (modelViews m2) `shouldBe` [[reg 1 0 0]]
+    m3 ← fst <$> stepOk m2 (JobAcknowledged (JobId 0))
+    m4 ← drainDemand m3
+    map viewPending (modelViews m4) `shouldBe` [[]]
+    map regionCoord (modelRegions m4) `shouldBe` [reg 1 0 0]
+  it "survives a storm of identical replacements while its load runs, and completes once the cancelled work is acknowledged" $ do
+    let limits = limitsWith $ \x → x {specResidentBytes = 1446, specStagingBytes = 1508, specCameraRegions = 64}
+        same = [demand (reg 0 0 0) (cell 0 0 0)]
+    m0 ← opened limits
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 same, Dispatch]
+    -- Twenty replacements in a row, each the same description; none may drop the view.
+    m2 ← foldM (\m _ → do
+                   (m', _) ← stepOk m (SetCameraDemand (ViewId 1) a1 same)
+                   map (map demandRegion . viewDemand) (modelViews m') `shouldBe` [[reg 0 0 0]]
+                   pure m') m1 [1 .. 20 ∷ Int]
+    m3 ← fst <$> stepOk m2 (JobAcknowledged (JobId 0))
+    m4 ← drainDemand m3
+    map viewPending (modelViews m4) `shouldBe` [[]]
+    map regionCoord (modelRegions m4) `shouldBe` [reg 0 0 0]
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])

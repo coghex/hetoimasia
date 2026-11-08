@@ -1162,9 +1162,14 @@ setCamera m v a demands0 = do
   -- empty description withdraws the demand, repeated keys coalesce, unsupported keys and
   -- cells outside the extent are excluded and reported. The description is bounded: its
   -- structural maximum, and the staging the camera may use beside the headroom kept for
-  -- explicit requests. Beside the description the camera must have room for the interest
-  -- and scratch of the first region, so a description is never kept longer than the camera
-  -- can start; the end of it, the lowest priority, is cut and the remainder reported.
+  -- explicit requests. Beside the description the camera needs room for the interest and
+  -- scratch of the first region. When that room is there, the description is kept no
+  -- longer than the camera can start now. When it is not there yet only because work
+  -- already cancelled still holds its scratch until its owner acknowledges it, a
+  -- description that fits now and would start once those charges are released is kept
+  -- pending: the first region is admitted by a later 'Service'. Only a description that
+  -- cannot fit, or could not start even then, is cut away entirely. The end of a cut
+  -- description, the lowest priority, is reported.
   let limits = mLimits m
       (normal, excluded) = normalizeCamera (limitExtent limits) demands0
       (mw, withdrawn, gone, cancelling) = clearView m v
@@ -1174,7 +1179,11 @@ setCamera m v a demands0 = do
         [] → 0
       regionsFor free = if free >= descriptionBytes 0 then fromIntegral ((free - descriptionBytes 0) `div` 64) else 0 ∷ Int
       most = min (length normal) (fromIntegral (limitCameraRegions limits))
-      keep = if room >= unit then min most (regionsFor (room - unit)) else 0
+      -- Staging that returns when the owner acknowledges the work already cancelled.
+      releasable = sum [jbScratch j | j ← Map.elems (mJobs mw), jbState j == JobCancelling]
+      startsNow = if room >= unit then min most (regionsFor (room - unit)) else 0
+      startsLater = min most (min (regionsFor room) (regionsFor (room + releasable - unit)))
+      keep = if startsNow > 0 then startsNow else if room + releasable >= unit then startsLater else 0
       demands = take keep normal
       truncated = map demandRegion (drop keep normal)
   if null demands

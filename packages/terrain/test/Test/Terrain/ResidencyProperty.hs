@@ -628,12 +628,17 @@ cameraStartsWhatItKeeps staging picks = case limitsNear 4384 staging of
           (_, Left r) → counterexample ("the camera demand was refused: " <> show r) False
 
 -- | The same for a replacement: a camera that has loaded one description and pans to
--- another (the owner has completed everything in between, or has not yet dispatched
--- the first one's queued work, and nothing else holds the room) never has the new description cut to nothing. Whatever staging, a non-empty
--- replacement retains a non-empty description and starts its first region, because the
--- interests and queued work the replacement drops are credited before it is cut.
-cameraReplacementStarts ∷ Bool → Integer → [(Int, Int)] → [(Int, Int)] → Property
-cameraReplacementStarts settled staging firstPicks nextPicks = case limitsNear 4384 staging of
+-- another (the owner has completed everything in between, or has not yet dispatched the
+-- first one's queued work, or its load is running and the replacement cancels it, and
+-- nothing else holds the room) never loses the new description. Whatever the staging, a
+-- non-empty replacement keeps the view with a non-empty description; when no cancelled
+-- work still holds its scratch it also starts its first region at once; and once the owner
+-- has completed or acknowledged everything it has made progress (a demand larger than the
+-- camera's share is admitted partially, as always).
+data FirstWork = Settled | Queued | Running deriving stock (Eq, Show)
+
+cameraReplacementStarts ∷ FirstWork → Integer → [(Int, Int)] → [(Int, Int)] → Property
+cameraReplacementStarts firstWork staging firstPicks nextPicks = case limitsNear 4384 staging of
   Nothing → counterexample ("a configuration at the minimum was refused: " <> show staging) False
   Just limits →
     let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
@@ -649,19 +654,34 @@ cameraReplacementStarts settled staging firstPicks nextPicks = case limitsNear 4
           [VictimReleased (regionArena r) (regionCoord r) | r ← modelRegions m, regionEvicting r]
             <> [JobCompleted (jobId j) (honestCost m j) | j ← modelJobs m, jobPhase j `elem` [JobRunningPhase, JobCancellingPhase]]
             <> [Dispatch | any ((== JobQueued) . jobPhase) (modelJobs m)]
+        -- Dispatch whatever is queued, leaving every load running.
+        dispatchAll ∷ Int → Model → Maybe Model
+        dispatchAll 0 _ = Nothing
+        dispatchAll n m
+          | any ((== JobQueued) . jobPhase) (modelJobs m) = case step m Dispatch of
+              (m', Right r) | reportDecision r /= NothingToDispatch → dispatchAll (n - 1) m'
+              (m', Right _) → Just m'
+              _ → Nothing
+          | otherwise = Just m
         firstDemand = distinctOf firstPicks
         nextDemand = distinctOf nextPicks
      in case step start (SetCameraDemand (ViewId 1) (ArenaId 1) firstDemand) of
-          (m1, Right _) → case (if settled then settle 200 m1 else Just m1) of
+          (m1, Right _) → case (case firstWork of Settled → settle 200 m1; Queued → Just m1; Running → dispatchAll 50 m1) of
             Nothing → counterexample "the first description did not settle" False
             Just m2 → case step m2 (SetCameraDemand (ViewId 1) (ArenaId 1) nextDemand) of
-              (m3, Right _) →
-                if null nextDemand
-                  then property True
-                  else case modelViews m3 of
+              (m3, Right _)
+                | null nextDemand → property True
+                | otherwise → case modelViews m3 of
                     [v] →
-                      counterexample ("a replacement of " <> show (length nextDemand) <> " regions kept " <> show (length (viewDemand v)) <> " and started " <> show (length (viewDemand v) - length (viewPending v)) <> " at " <> show staging) $
-                        not (null (viewDemand v)) && length (viewPending v) < length (viewDemand v)
+                      let cancelled = any ((== JobCancellingPhase) . jobPhase) (modelJobs m3)
+                          summary = show (length nextDemand) <> " regions kept " <> show (length (viewDemand v)) <> " and started " <> show (length (viewDemand v) - length (viewPending v)) <> " at " <> show staging <> " after " <> show firstWork
+                       in counterexample ("a replacement of " <> summary) (not (null (viewDemand v)))
+                            .&&. counterexample ("a replacement with nothing cancelled did not start its first region: " <> summary) (cancelled || length (viewPending v) < length (viewDemand v))
+                            .&&. case settle 400 m3 of
+                              Nothing → counterexample "the replacement did not settle" False
+                              Just m4 → case modelViews m4 of
+                                [w] → counterexample ("the replacement made no progress after the owner acknowledged everything: " <> summary) (not (null (viewDemand w)) && length (viewPending w) < length (viewDemand w))
+                                ws → counterexample ("the view did not survive settling: " <> show (length ws) <> " views") False
                     vs → counterexample ("the view did not survive a non-empty replacement: " <> show (length vs) <> " views") False
               (_, Left r) → counterexample ("the replacement was refused: " <> show r) False
           (_, Left r) → counterexample ("the first demand was refused: " <> show r) False
@@ -806,10 +826,13 @@ spec = describe "Residency model properties" $ do
       forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \picks → cameraStartsWhatItKeeps staging picks
   it "starts the first region of every replacement of a settled camera description, at any staging from the minimum" $
     withNumTests 2000 $
-      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts True staging a b
+      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts Settled staging a b
   it "starts the first region of every replacement of a camera description whose work is still queued, at any staging from the minimum" $
     withNumTests 2000 $
-      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts False staging a b
+      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts Queued staging a b
+  it "keeps and completes every replacement of a camera description whose load is running, at any staging from the minimum" $
+    withNumTests 2000 $
+      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts Running staging a b
   it "replaces a view's demand exactly as a withdrawal followed by a fresh demand, at every state random sequences reach" $
     withNumTests 300 $
       forAll ((,) <$> chooseInteger (4384, 6400) <*> chooseInteger (1530, 3600)) $ \(resident, staging) →
