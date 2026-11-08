@@ -168,7 +168,7 @@ import Hetoimasia.Terrain.Render2D.Projection (Rect, RenderView)
 import Hetoimasia.Terrain.Shape (ViewFacing)
 
 -- | Engineering defaults, not measured capacity: a step examines 4,096
--- candidate columns and 65,536 levels; a plan examines 1,048,576 columns and
+-- candidate columns, 65,536 levels and 8,388,608 metered input items; a plan examines 1,048,576 columns and
 -- 16,777,216 levels, holds 1,048,576 instances (the whole key space is
 -- 16,777,216) and 65,536 pending spans, and a demand lists 1,024 chunks,
 -- 8,192 intervals and 16 regions per chunk; a preparation keeps at most 4,096
@@ -178,6 +178,7 @@ defaultCellLimits =
   CellLimits
     { clStepCandidates = 4096
     , clStepLevels = 65536
+    , clStepWork = 8388608
     , clColumns = 1048576
     , clLevels = 16777216
     , clInstances = 1048576

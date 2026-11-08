@@ -11,6 +11,7 @@ module Test.TerrainRender2D.CellFixtures
   ( -- * Assets
     loadAssets
   , loadAssetsWith
+  , loadAssetsExtra
   , planeFromFormula
   , stoneId
   , soilId
@@ -129,6 +130,28 @@ loadAssetsWith version overrides = do
   orFail (mkAssetSnapshot version blank [(stoneId, stone), (soilId, soil)] maps)
   where
     override key plane = maybe plane id (lookup key overrides)
+    orFail = either (\e → fail ("fixture assets: " <> show e)) pure
+
+-- | The adopted style with @n@ further material colours nothing uses, each a copy
+-- of the loam artwork: the asset-count growth the work-meter property uses.
+loadAssetsExtra ∷ Word64 → Int → IO AssetSnapshot
+loadAssetsExtra version n = do
+  blankPlane ← catalogPlane (texturesDirectory </> "blanktexture.png")
+  loam ← catalogPlane (texturesDirectory </> "loam.png")
+  granite ← catalogPlane (texturesDirectory </> "granite.png")
+  maps ← forM catalogKeys $ \key → do
+    plane ← catalogPlane (texturesDirectory </> "facemap" </> mapFileName key)
+    asset ← orFail (mkMapAsset key version version (Just UnitNormalRgbV1) plane)
+    pure (key, asset)
+  blank ← orFail (mkColourAsset ColourBlank version version blankPlane)
+  stone ← orFail (mkColourAsset (ColourMaterial stoneId) version version loam)
+  soil ← orFail (mkColourAsset (ColourMaterial soilId) version version granite)
+  extras ← forM [1 .. n] $ \i → do
+    let material = either (error . show) id (mkMaterialId ("unused" <> show i))
+    asset ← orFail (mkColourAsset (ColourMaterial material) version version loam)
+    pure (material, asset)
+  orFail (mkAssetSnapshot version blank ([(stoneId, stone), (soilId, soil)] <> extras) maps)
+  where
     orFail = either (\e → fail ("fixture assets: " <> show e)) pure
 
 -- ---------------------------------------------------------------------------

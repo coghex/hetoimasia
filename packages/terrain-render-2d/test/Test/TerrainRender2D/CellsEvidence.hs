@@ -80,7 +80,7 @@ renderEvidence commit identities assets =
       <> [ ""
          , "The asset snapshot used is version 5, built from the committed catalog (46 maps), the blank colour and"
          , "the loam (`stone`) and granite (`soil`) artwork above, each with texture version 5 and coverage version 5."
-         , "Its identity is the sorted list of those versions: `" <> show (assetIdentity assets) <> "`."
+         , "Its identity is a fixed-size digest of those versions, taken once when the snapshot is built: `" <> show (assetIdentity assets) <> "`."
          , ""
          , "## Expected against actual classifications"
          , ""

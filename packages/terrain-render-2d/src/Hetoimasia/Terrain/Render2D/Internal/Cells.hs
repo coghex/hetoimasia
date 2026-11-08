@@ -99,6 +99,9 @@ data CellLimits = CellLimits
   -- ^ Intervals one demand lists.
   , clRegionsPerChunk ∷ !Int
   -- ^ Vertical regions one demand lists for a chunk.
+  , clStepWork ∷ !Int
+  -- ^ Input items one step may examine, counted by the one meter (see
+  -- 'columnWorkBound'); at least 'columnWorkBound' so every step can make progress.
   , clProofs ∷ !Int
   -- ^ Drawn-rectangle verdicts a preparation keeps (zero keeps none): only a
   -- cache, so the plan is the same at any value, only the work to reach it differs.
@@ -279,6 +282,13 @@ data CellStats = CellStats
   , cellStatInstances ∷ !Int
   , cellStatPending ∷ !Int
   , cellStatSteps ∷ !Int
+  , cellStatWork ∷ !Int
+  -- ^ Input items the steps charged to the meter, in all.
+  , cellStatStepWork ∷ !Int
+  -- ^ What the last step charged: at most 'clStepWork'.
+  , cellStatDemandWork ∷ !Int
+  -- ^ What computing the plan's prefetch demand examined: ring chunks and the
+  -- readiness windows read for them, at most 'clDemandChunks' windows.
   , cellStatProofs ∷ !Int
   -- ^ Drawn-rectangle verdicts the preparation holds, at most 'clProofs'.
   }
@@ -329,6 +339,10 @@ data CellPrep = CellPrep
   , prView ∷ !RenderView
   , prEnvelope ∷ !(Maybe Envelope)
   , prCursor ∷ !(Maybe (Integer, Integer))
+  , prWork ∷ !Int
+  -- ^ Everything the steps so far charged to the meter.
+  , prStepWork ∷ !Int
+  -- ^ What the last step charged.
   , prSkip ∷ !Int
   -- ^ Units (cells, then pending spans) of the column at the cursor already
   -- admitted, so a step bound can fall inside a column.
@@ -398,6 +412,7 @@ validConfig config =
     && ccMargin config >= 0
     && ccChunkMargin config >= 0
     && all (>= 1) [clStepCandidates l, clStepLevels l]
+    && clStepWork l >= columnWorkBound
     && all
       (>= 0)
       [ clColumns l
@@ -455,6 +470,8 @@ startCells inputs = do
       , prView = view
       , prEnvelope = envelope
       , prCursor = envelope >>= firstCursor
+      , prWork = 0
+      , prStepWork = 0
       , prSkip = 0
       , prHalt = Nothing
       , prRaw = []
@@ -537,19 +554,26 @@ stepCells inputs prep = do
   when (identity /= prIdentity prep) (Left CellStaleContinuation)
   case (prHalt prep, prCursor prep, prEnvelope prep) of
     (Nothing, Just cursor, Just env) →
-      loop (ccLimits (idConfig identity)) env cursor (0 ∷ Int) (0 ∷ Int) prep {prSteps = prSteps prep + 1}
+      loop (ccLimits (idConfig identity)) env cursor (0 ∷ Int) (0 ∷ Int) (0 ∷ Int) prep {prSteps = prSteps prep + 1}
     _ → Right prep
   where
-    loop limits env cursor scanned levelsDone st
-      | scanned >= clStepCandidates limits || levelsDone >= clStepLevels limits = Right st {prCursor = Just cursor}
+    -- The step ends on a bound before a column is looked at, so the work it
+    -- charges is at most 'clStepWork': a column is only begun when its worst case
+    -- ('columnWorkBound') still fits.
+    loop limits env cursor scanned levelsDone workDone st
+      | scanned >= clStepCandidates limits
+          || levelsDone >= clStepLevels limits
+          || workDone + columnWorkBound > clStepWork limits =
+          Right (finish workDone st {prCursor = Just cursor})
       | otherwise = do
-          ColumnStep st' charged outcome ← evaluateColumn inputs st env cursor (clStepLevels limits - levelsDone)
+          ColumnStep st' charged worked outcome ← evaluateColumn inputs st env cursor (clStepLevels limits - levelsDone)
           case outcome of
-            ColumnHalted halted → Right st' {prCursor = Just cursor, prHalt = Just halted}
-            ColumnPaused → Right st' {prCursor = Just cursor}
+            ColumnHalted halted → Right (finish (workDone + worked) st' {prCursor = Just cursor, prHalt = Just halted})
+            ColumnPaused → Right (finish (workDone + worked) st' {prCursor = Just cursor})
             ColumnDone → case nextCursor env cursor of
-              Nothing → Right st' {prCursor = Nothing, prSkip = 0}
-              Just next → loop limits env next (scanned + 1) (levelsDone + charged) st' {prSkip = 0}
+              Nothing → Right (finish (workDone + worked) st' {prCursor = Nothing, prSkip = 0})
+              Just next → loop limits env next (scanned + 1) (levelsDone + charged) (workDone + worked) st' {prSkip = 0}
+    finish worked st = st {prStepWork = worked, prWork = prWork st + worked}
 
 -- ---------------------------------------------------------------------------
 -- One column
@@ -574,8 +598,25 @@ data ColumnOutcome
   | -- | A plan-wide bound stopped the column before its next unit.
     ColumnHalted !HaltReason
 
--- The state after the look, the levels it charged, and what happened.
-data ColumnStep = ColumnStep !CellPrep !Int !ColumnOutcome
+-- The state after the look, the levels it charged, the input items it charged
+-- to the meter, and what happened.
+data ColumnStep = ColumnStep !CellPrep !Int !Int !ColumnOutcome
+
+-- | The most input items one column look can charge. Everything a look reads of
+-- the caller's inputs is bounded by the window of levels it covers (at most the
+-- 250-level band and its slack), and the look charges: one for the candidate, the
+-- window and one for each of the three state reads (knowledge runs, readiness
+-- intervals and terrain steps each cover at least one level), one per hidden
+-- level examined, three per drawn-rectangle proof computed, and per admitted unit
+-- one plus two asset lookups per quad. Well under this bound; a configuration
+-- whose step work is smaller is refused.
+columnWorkBound ∷ Int
+columnWorkBound = 8192
+
+-- The items a read of @[a, b)@ is charged: a run, interval or step covers at
+-- least a level, and the search costs one.
+windowWork ∷ Integer → Integer → Int
+windowWork a b = if a >= b then 0 else fromInteger (b - a) + 1
 
 -- One admissible piece of a column: a drawn cell (all of its parts together, so
 -- the parts of a mixed cell are never split) or a pending span.
@@ -589,8 +630,8 @@ data Unit
 -- so far in place and the rest unresolved.
 evaluateColumn ∷ CellInputs → CellPrep → Envelope → (Integer, Integer) → Int → Either CellError ColumnStep
 evaluateColumn inputs st env (v, u) budget
-  | lo > hi = Right (ColumnStep st 0 ColumnDone)
-  | prSkip st == 0 && prColumns st + 1 > clColumns limits = Right (ColumnStep st 0 (ColumnHalted HaltColumns))
+  | lo > hi = Right (ColumnStep st 0 1 ColumnDone)
+  | prSkip st == 0 && prColumns st + 1 > clColumns limits = Right (ColumnStep st 0 1 (ColumnHalted HaltColumns))
   | otherwise = do
       -- Own states one level above the window (what covers its top), the
       -- columns nearer to the camera over the window itself.
@@ -609,11 +650,18 @@ evaluateColumn inputs st env (v, u) budget
           -- A cell is omitted only where the cells that would cover it are drawn
           -- exactly one canvas step away, so the texel proof holds for the pixels
           -- actually sampled; elsewhere it is drawn.
-          (proved, cache) = provedLevels (prView st) ref (rx, ry) (clProofs limits) (prExactY st) hidden
+          (proved, cache, proofWork) = provedLevels (prView st) ref (rx, ry) (clProofs limits) (prExactY st) hidden
           visible = [(z, s) | SRun a b s ← ownWindow, emits s, (x, y) ← subtractI [(a, b)] proved, z ← [x .. y - 1]]
           pendings = [(a, b) | SRun a b SPend ← ownWindow]
           units = [UCell z s | (z, s) ← visible] <> [UPend a b | (a, b) ← pendings]
-      go units st {prExactY = cache} (drop (prSkip st) units) 0
+          -- The meter: the candidate, the three state reads, the proofs.
+          base =
+            1
+              + windowWork lo (min (hi + 2) (clip + 1))
+              + windowWork lo (min (hi + 1) (clip + 1))
+              + windowWork lo (min (hi + 1) (clip + 1))
+              + proofWork
+      go units st {prExactY = cache} (drop (prSkip st) units) 0 base
   where
     rx = (u + v) `div` 2
     ry = (v - u) `div` 2
@@ -631,17 +679,17 @@ evaluateColumn inputs st env (v, u) budget
     column = worldColumn camera (rx, ry)
 
     -- A column with no unit at all still counts as examined.
-    go units cur remaining charged = case remaining of
+    go units cur remaining charged worked = case remaining of
       []
-        | null units → Right (ColumnStep (started cur) charged ColumnDone)
-        | otherwise → Right (ColumnStep cur charged ColumnDone)
+        | null units → Right (ColumnStep (started cur) charged worked ColumnDone)
+        | otherwise → Right (ColumnStep cur charged worked ColumnDone)
       unit : rest
-        | charged >= budget → Right (ColumnStep cur charged ColumnPaused)
+        | charged >= budget → Right (ColumnStep cur charged worked ColumnPaused)
         | otherwise → do
             admitted ← admit cur unit
             case admitted of
-              Left halted → Right (ColumnStep cur charged (ColumnHalted halted))
-              Right cur' → go units cur' rest (charged + 1)
+              Left halted → Right (ColumnStep cur charged worked (ColumnHalted halted))
+              Right (cur', unitWork) → go units cur' rest (charged + 1) (worked + unitWork)
 
     -- The column's own bookkeeping, once, with its first unit (or with its
     -- completion when it has none).
@@ -664,13 +712,15 @@ evaluateColumn inputs st env (v, u) budget
             | prCount cur + length quads > clInstances limits → Left HaltInstances
             | otherwise →
                 Right
-                  (started cur)
-                    { prRaw = reverse quads <> prRaw cur
-                    , prLevels = prLevels cur + 1
-                    , prCount = prCount cur + length quads
-                    , prSkip = prSkip cur + 1
-                    , prUsed = Set.union (Set.fromList (concat [[AssetColour (rawColour q), AssetMap (rawMap q)] | q ← quads])) (prUsed cur)
-                    }
+                  ( (started cur)
+                      { prRaw = reverse quads <> prRaw cur
+                      , prLevels = prLevels cur + 1
+                      , prCount = prCount cur + length quads
+                      , prSkip = prSkip cur + 1
+                      , prUsed = Set.union (Set.fromList (concat [[AssetColour (rawColour q), AssetMap (rawMap q)] | q ← quads])) (prUsed cur)
+                      }
+                  , 1 + 2 * length quads
+                  )
       UPend a b → do
         pending ← pendSpanOf (prView cur) env column (rx, ry) a b
         pure $
@@ -679,12 +729,14 @@ evaluateColumn inputs st env (v, u) budget
             | prPendCount cur + 1 > clPending limits → Left HaltPending
             | otherwise →
                 Right
-                  (started cur)
-                    { prPending = pending : prPending cur
-                    , prLevels = prLevels cur + 1
-                    , prPendCount = prPendCount cur + 1
-                    , prSkip = prSkip cur + 1
-                    }
+                  ( (started cur)
+                      { prPending = pending : prPending cur
+                      , prLevels = prLevels cur + 1
+                      , prPendCount = prPendCount cur + 1
+                      , prSkip = prSkip cur + 1
+                      }
+                  , 1
+                  )
 
 emits ∷ CState → Bool
 emits SFog = True
@@ -885,20 +937,21 @@ exactAlongY view y = case (rectAt view 0 y, rectAt view 0 (y + 24), rectAt view 
 -- verdict is read from the cache or computed (three rectangles) and kept while
 -- the cache holds fewer than @capacity@ entries, so the scratch is bounded and
 -- the work follows the levels examined, never the size of the view.
-provedLevels ∷ RenderView → Integer → Offset → Int → Map.Map Integer Bool → [(Integer, Integer)] → ([(Integer, Integer)], Map.Map Integer Bool)
+provedLevels ∷ RenderView → Integer → Offset → Int → Map.Map Integer Bool → [(Integer, Integer)] → ([(Integer, Integer)], Map.Map Integer Bool, Int)
 provedLevels view ref (rx, ry) capacity cache hidden
-  | null hidden = ([], cache)
-  | not (exactAlongX view (48 * (rx - ry) - 48)) = ([], cache)
+  | null hidden = ([], cache, 0)
+  | not (exactAlongX view (48 * (rx - ry) - 48)) = ([], cache, 3)
   | otherwise =
-      let (verdicts, cache') = foldl' look ([], cache) [z | (a, b) ← hidden, z ← [a .. b - 1]]
-       in (mergeI [(z, z + 1) | (z, True) ← verdicts], cache')
+      let (verdicts, cache', misses) = foldl' look ([], cache, 0 ∷ Int) levels
+       in (mergeI [(z, z + 1) | (z, True) ← verdicts], cache', 3 + length levels + 3 * misses)
   where
-    look (acc, held) z = case Map.lookup y held of
-      Just verdict → verdict `seq` ((z, verdict) : acc, held)
+    levels = [z | (a, b) ← hidden, z ← [a .. b - 1]]
+    look (acc, held, missed) z = case Map.lookup y held of
+      Just verdict → verdict `seq` ((z, verdict) : acc, held, missed)
       Nothing →
         let verdict = exactAlongY view y
             held' = if Map.size held < capacity then Map.insert y verdict held else held
-         in verdict `seq` held' `seq` ((z, verdict) : acc, held')
+         in verdict `seq` held' `seq` ((z, verdict) : acc, held', missed + 1)
       where
         y = 24 * (rx + ry - 1) - 16 * (z - ref) - 16
 
@@ -960,10 +1013,10 @@ cellPlanOf inputs prep = do
         (Nothing, Just _) → Working
       pendings = sortOn pendKey (prPending prep)
       (visible, visibleCut) = boundedDemand limits [(c, pendLo s, pendHi s) | s ← pendings, Just c ← [pendColumn s]]
-      (prefetch, prefetchCut) =
+      (prefetch, prefetchCut, demandWork) =
         if progress == Settled && not visibleCut
           then prefetchDemand config (factsAvailability (inputsFacts inputs)) visible (prChunks prep)
-          else (emptyDemand, False)
+          else (emptyDemand, False, 0)
       bounds = case raw of
         [] → Nothing
         _ →
@@ -993,6 +1046,9 @@ cellPlanOf inputs prep = do
             , cellStatInstances = length quads
             , cellStatPending = length pendings
             , cellStatSteps = prSteps prep
+            , cellStatWork = prWork prep
+            , cellStatStepWork = prStepWork prep
+            , cellStatDemandWork = demandWork
             , cellStatProofs = Map.size (prExactY prep)
             }
       }
@@ -1016,19 +1072,22 @@ fitDemand limits = go [] (0 ∷ Int) False
 -- windows the facts do not make ready, in the chunks that are not themselves
 -- visible. It is bounded by what the visible demand left of each bound, so it
 -- can never take capacity visible work needs.
-prefetchDemand ∷ CellConfig → Availability → Demand → Map.Map ChunkKey (Integer, Integer) → (Demand, Bool)
+prefetchDemand ∷ CellConfig → Availability → Demand → Map.Map ChunkKey (Integer, Integer) → (Demand, Bool, Int)
 prefetchDemand config availability visible windows
-  | ccChunkMargin config == 0 = (emptyDemand, False)
+  | ccChunkMargin config == 0 = (emptyDemand, False, 0)
   | otherwise = case collectRing room (Map.keysSet windows) (concatMap ring (Map.keys windows)) of
-      Nothing → (emptyDemand, True)
-      Just keys →
+      (Nothing, examined) → (emptyDemand, True, examined)
+      (Just keys, examined) →
         let unmet =
               [ (key, a, b)
               | key ← Set.toAscList keys
               , (a, b) ← unknownPieces availability key (max lo worldLo) (min hi worldHi)
               ]
             (demand, cut) = fitDemand limits {clDemandChunks = room, clDemandIntervals = clDemandIntervals limits - demandIntervalCount visible} (demandChunks (demandFrom unmet))
-         in (demand, cut)
+            -- The meter: each ring key examined, and for each chunk listed one read of
+            -- the common window (a readiness interval covers at least a level).
+            work = examined + Set.size keys * windowWork (max lo worldLo) (min hi worldHi)
+         in (demand, cut, work)
   where
     limits = ccLimits config
     room = max 0 (clDemandChunks limits - length (demandChunks visible))
@@ -1049,14 +1108,14 @@ prefetchDemand config availability visible windows
 -- The ring chunks that are not already visible, never more than the room: the
 -- first key past it is a refusal found before the rest of a large margin is
 -- generated.
-collectRing ∷ Int → Set.Set ChunkKey → [ChunkKey] → Maybe (Set.Set ChunkKey)
-collectRing room visible = go Set.empty
+collectRing ∷ Int → Set.Set ChunkKey → [ChunkKey] → (Maybe (Set.Set ChunkKey), Int)
+collectRing room visible = go Set.empty (0 ∷ Int)
   where
-    go acc [] = Just acc
-    go acc (k : rest)
-      | k `Set.member` visible || k `Set.member` acc = go acc rest
-      | Set.size acc >= room = Nothing
-      | otherwise = go (Set.insert k acc) rest
+    go acc n [] = (Just acc, n)
+    go acc n (k : rest)
+      | k `Set.member` visible || k `Set.member` acc = go acc (n + 1) rest
+      | Set.size acc >= room = (Nothing, n + 1)
+      | otherwise = go (Set.insert k acc) (n + 1) rest
 
 -- | Whether a render-world point (grown by the margin) could lie under the
 -- sprite of a candidate column that is still unresolved, and, when a row is

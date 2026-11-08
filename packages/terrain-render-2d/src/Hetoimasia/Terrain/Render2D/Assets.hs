@@ -55,6 +55,8 @@ module Hetoimasia.Terrain.Render2D.Assets
   , AssetKey (..)
   , canvasWidth
   , canvasHeight
+  , maxAssetMaterials
+  , maxAssetMaps
 
     -- * Assets
   , ColourAsset
@@ -76,6 +78,9 @@ module Hetoimasia.Terrain.Render2D.Assets
   , assetMaterials
   ) where
 
+import Data.Bits (rotateL, xor)
+import Data.Char (ord)
+import Control.Monad (when)
 import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32, Word64)
@@ -97,6 +102,16 @@ canvasWidth = 96
 -- | The height, in texels, of every colour and map canvas.
 canvasHeight ∷ Word32
 canvasHeight = 64
+
+-- | The most material colours one snapshot may hold. A snapshot is checked once,
+-- when it is built, with this stated bound; no step of a plan walks it again.
+maxAssetMaterials ∷ Int
+maxAssetMaterials = 4096
+
+-- | The most maps one snapshot may hold: the catalog's, with room for a later
+-- extension of it.
+maxAssetMaps ∷ Int
+maxAssetMaps = 4096
 
 -- | Which colour artwork a quad is drawn with.
 data ColourRef
@@ -124,6 +139,10 @@ data AssetError
     AssetMissingMap !MapKey
   | -- | The same asset was listed twice.
     AssetDuplicate !AssetKey
+  | -- | More materials than 'maxAssetMaterials' were listed; the field is the limit.
+    AssetTooManyMaterials !Int
+  | -- | More maps than 'maxAssetMaps' were listed; the field is the limit.
+    AssetTooManyMaps !Int
   deriving stock (Eq, Show)
 
 -- | One colour artwork's coverage and the versions it was built from.
@@ -173,6 +192,8 @@ data AssetSnapshot = AssetSnapshot
   , snMaps ∷ !(Map.Map MapKey MapAsset)
   , snHexagonColours ∷ !(Map.Map ColourRef Bool)
   , snHexagonMaps ∷ !(Map.Map MapKey Bool)
+  , snIdentity ∷ !AssetIdentity
+  -- ^ Taken once, when the snapshot is built: a plan compares it in constant time.
   , snSound ∷ !Bool
   -- ^ Whether the full-block plane proves what an omission needs; see
   -- 'occlusionSound'. When it does not, no asset is a covering proof.
@@ -183,6 +204,10 @@ data AssetSnapshot = AssetSnapshot
 -- colours and every authored map.
 mkAssetSnapshot ∷ Word64 → ColourAsset → [(MaterialId, ColourAsset)] → [(MapKey, MapAsset)] → Either AssetError AssetSnapshot
 mkAssetSnapshot version blank materials maps = do
+  -- The bounds are checked before anything is walked: looking past a bound by
+  -- one element is all it takes to refuse.
+  when (not (null (drop maxAssetMaterials materials))) (Left (AssetTooManyMaterials maxAssetMaterials))
+  when (not (null (drop maxAssetMaps maps))) (Left (AssetTooManyMaps maxAssetMaps))
   colours ← unique AssetColour (\(ref, _) → ref) ((ColourBlank, blank) : [(ColourMaterial m, a) | (m, a) ← materials])
   mapTable ← unique AssetMap fst maps
   case [key | key ← catalogKeys, isNothing (Map.lookup key mapTable)] of
@@ -196,6 +221,7 @@ mkAssetSnapshot version blank materials maps = do
       , snMaps = Map.map snd mapTable
       , snHexagonColours = Map.map (\(_, a) → covers (caPlane a) hexagon) colours
       , snHexagonMaps = Map.map (\(_, a) → maPlane a == hexagon) mapTable
+      , snIdentity = identityOf version (Map.map snd colours) (Map.map snd mapTable)
       , snSound = occlusionSound hexagon [maPlane a | (_, a) ← Map.elems mapTable]
       }
   where
@@ -254,18 +280,29 @@ covers plane hexagon =
 assetVersion ∷ AssetSnapshot → Word64
 assetVersion = snVersion
 
--- | The versions of every asset a snapshot holds, with the snapshot's own:
--- equal exactly when the same texture and coverage versions are adopted.
-data AssetIdentity = AssetIdentity !Word64 ![(AssetKey, Word64, Word64)]
+-- | The versions of every asset a snapshot holds, with the snapshot's own, as a
+-- fixed-size digest: equal exactly when the same texture and coverage versions
+-- are adopted (up to the collision of two independent 64-bit digests, which is
+-- not a security boundary here: a stale plan is a wrong answer, not an attack).
+-- It is taken once when the snapshot is built, so comparing two is constant time
+-- however many materials the snapshot holds.
+data AssetIdentity = AssetIdentity !Word64 !Int !Word64 !Word64
   deriving stock (Eq, Show)
 
 assetIdentity ∷ AssetSnapshot → AssetIdentity
-assetIdentity snapshot =
-  AssetIdentity
-    (snVersion snapshot)
-    ( [(AssetColour ref, caTexture a, caCoverage a) | (ref, a) ← Map.toAscList (snColours snapshot)]
-        <> [(AssetMap key, maTexture a, maCoverage a) | (key, a) ← Map.toAscList (snMaps snapshot)]
-    )
+assetIdentity = snIdentity
+
+identityOf ∷ Word64 → Map.Map ColourRef ColourAsset → Map.Map MapKey MapAsset → AssetIdentity
+identityOf version colours maps =
+  AssetIdentity version (Map.size colours + Map.size maps) (digest 14695981039346656037 fnv) (digest 7809847782465536322 mix)
+  where
+    entries =
+      [(show (AssetColour ref), caTexture a, caCoverage a) | (ref, a) ← Map.toAscList colours]
+        <> [(show (AssetMap key), maTexture a, maCoverage a) | (key, a) ← Map.toAscList maps]
+    wordsOf (name, texture, coverage) = map (fromIntegral . ord) name <> [0xFF, texture, coverage]
+    digest seed step = foldl' step (step seed version) (concatMap wordsOf entries)
+    fnv h w = (h `xor` w) * 1099511628211
+    mix h w = rotateL (h `xor` w) 23 * 0x9E3779B97F4A7C15 + w
 
 -- | The coverage plane of a colour artwork, if the snapshot holds it.
 colourCoverage ∷ AssetSnapshot → ColourRef → Maybe CoveragePlane
