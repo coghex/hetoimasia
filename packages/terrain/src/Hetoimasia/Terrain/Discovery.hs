@@ -98,8 +98,11 @@
 -- knowledge from exact contact geometry (a known void whose portal lies over the
 -- tile's solid face section by positive area, the tile's own known void, or the
 -- sky above the top level), and 'queryKnownBoundary' gives a known component's
--- compressed boundary faces. A chunk reloaded later resolves the same answer from
--- the retained records alone, with no per-chunk marker.
+-- compressed boundary faces one bounded page at a time: a page scans at most
+-- 'limitBoundaryFaces' boxes of the component's class and returns at most as many
+-- faces, with the position of the next page, and its accounted bytes are charged
+-- before it is built. A chunk reloaded later resolves the same answer from the
+-- retained records alone, with no per-chunk marker.
 --
 -- = Records, windows and missing data
 --
@@ -117,7 +120,15 @@
 --
 -- A candidate names the 'Authority' it read: the arena incarnation (an
 -- 'Hetoimasia.Terrain.Residency.ArenaId') and the content, knowledge and store
--- revisions. 'applyCandidate' accepts it only against exactly that authority, so
+-- revisions. __The revision rule__ is stated once: content advances exactly when a
+-- candidate changes terrain (an applied removal); knowledge advances exactly when a
+-- candidate makes known space that was not known (a class becomes known, or a cell
+-- joins a known class: an extended or bridged run, a known old void), and never
+-- decreases; store advances on every candidate (obligation progress and unions that
+-- change no knowledge). A reader that keyed a derived result by the knowledge
+-- revision is stale as soon as the retained revision differs, one keyed by content
+-- when terrain changed; a stale reader keeps the old immutable value, correct for the
+-- authority it names, and a stale holder of a candidate is refused. 'applyCandidate' accepts it only against exactly that authority, so
 -- a candidate from a closed incarnation, or one made stale by an applied
 -- candidate (a frontier-only one included), is refused and applied nowhere. A
 -- candidate says whether it changes terrain (content revision), knowledge
@@ -132,7 +143,11 @@
 --
 -- 'DiscoveryLimits' are validated: a figure outside its range, or too small for
 -- one minimal progress step, is refused by field and never clamped. An
--- 'Allowance' can only tighten them per call. Costs are conservative accounted
+-- 'Allowance' can only tighten them per call. Every resource is charged through one
+-- function (a provider read, a staged write and the output of a query page are each
+-- a charge), checked against every cap before the work happens, and the reported peak
+-- is read from the same state, so a rejected or suspended attempt reports what it had
+-- been charged. Costs are conservative accounted
 -- bytes and counts (a model counter proves neither final encoded pages nor
 -- process RSS): keys, aliases, boundary-free obligations, container overhead and
 -- scratch are charged; the shared compiled source is charged once, to the arena

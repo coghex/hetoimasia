@@ -1166,6 +1166,7 @@ windowSpecs = describe "replay through a bounded window" $ do
     -- were really replaced.
     sum (map suspensions results) `shouldSatisfy` (> 100)
     sum (map evictions results) `shouldSatisfy` (> 0)
+    putStrLn ("windowed replay: " <> show (length results) <> " generated runs, " <> show (sum (map suspensions results)) <> " suspensions, " <> show (sum (map evictions results)) <> " evicted records")
   it "serves nothing outside its window" $ do
     let rig = newRig (limitsWith 64) twoOpenings
         (queued, _) = runTrace rig [Edit (1, 0, 5)]
