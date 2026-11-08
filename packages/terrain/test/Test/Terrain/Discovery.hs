@@ -11,7 +11,7 @@
 module Test.Terrain.Discovery (spec) where
 
 import Control.Exception (evaluate)
-import Control.Monad (forM_, unless)
+import Control.Monad (foldM, forM_, unless)
 import Data.Word (Word64)
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
 import System.Mem (performMajorGC)
@@ -597,7 +597,9 @@ familySpecs = describe "huge families" $ do
     let work rig = evaluate (retainedBytes (rigRetained (drainRig fullAllowance (foldl (\r c → fst (editRig fullAllowance c r)) rig (familyEdits (sceneTop rig))))))
     costs ← mapM (\r → allocatedBy (repeatN 20 (work r))) rigs
     case costs of
-      [small, large] → sameCost "span" small large
+      [small, large] → do
+        putStrLn ("allocation, 20 repetitions, span 2^20: " <> show small <> " B; span 2^60: " <> show large <> " B")
+        sameCost "span" small large
       _ → expectationFailure "two spans expected"
     let base = newRig (limitsWith 64) (rampFamily (2 ^ (60 ∷ Int)))
         shortRig = base {rigRetained = historyOf 100}
@@ -605,6 +607,7 @@ familySpecs = describe "huge families" $ do
     _ ← evaluate (retainedBytes (rigRetained shortRig) + retainedBytes (rigRetained longRig))
     short ← allocatedBy (repeatN 20 (work shortRig))
     long ← allocatedBy (repeatN 20 (work longRig))
+    putStrLn ("allocation, 20 repetitions, history 100 runs: " <> show short <> " B; history 100000 runs: " <> show long <> " B")
     sameCost "history" short long
   where
     sceneTop rig = case sceneSky (rigScene rig) of Just w → w; Nothing → 0
@@ -762,6 +765,35 @@ evidenceSpecs = describe "evidence" $ do
           <> ", pending "
           <> show (pendingOf end)
           <> ", resident detail 0"
+  it "prints the per-step expected and observed knowledge of one interleaved trace" $ do
+    let rig0 = newRig (limitsWith 1) twoOpenings
+        events =
+          concat
+            [ [Edit a, Batch (allowanceOf (limitsWith 1)), Edit b, Batch (allowanceOf (limitsWith 1)), Batch (allowanceOf (limitsWith 1))]
+            | (a, b) ← zip openingA openingB
+            ]
+            <> [Drain fullAllowance]
+        counts rig =
+          let provider = retainedProvider (rigRetained rig)
+              inner = [c | c@(x, y, z) ← cellsOfWindow (rigScene rig), x > -3, x < 12, y > -3, y < 5, z > 2, z < 10]
+              answers = [r | c ← inner, Right r ← [modelKnowledge (rigEnv rig) provider c]]
+              scene = rigScene rig
+              lowerV = (rigOracle rig) !! min (fromIntegral (hHead (retainedHeader (rigRetained rig)))) (length (rigOracle rig) - 1)
+              upperV = last (rigOracle rig)
+              within f set = length [() | c ← inner, f c, Set.member c set]
+           in ( length (filter fst answers)
+              , within (const True) lowerV
+              , within (const True) upperV
+              , length (filter snd answers)
+              , within (const True) (oracleKnownSolid scene (rigRemovals rig) upperV)
+              )
+        step (rig, n) action = do
+          let rig' = apply action rig
+              (mv, lv, uv, ms, us) = counts rig'
+          putStrLn ("step " <> show n <> " " <> showAction action <> ": pending " <> show (pendingOf rig') <> ", known voids " <> show mv <> " (oracle between " <> show lv <> " and " <> show uv <> "), known solids " <> show ms <> " (oracle after every removal " <> show us <> ")")
+          pure (rig', n + 1 ∷ Int)
+    _ ← foldM step (rig0, 1) events
+    pure ()
   where
     small = limitsWith 64
     traces =
