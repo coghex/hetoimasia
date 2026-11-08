@@ -25,6 +25,7 @@ module Hetoimasia.Terrain.Internal.Polygon
   , intersectConvex
   , subtractConvex
   , containsClosed
+  , containsSection
   , rotateToLeast
   ) where
 
@@ -142,6 +143,24 @@ subtractConvex whole removed
       let outside = tidy (clipLine False edge remaining)
           inside = clipLine True edge remaining
        in [outside | not (null outside)] <> (if null inside then [] else go inside rest)
+
+-- | Whether a point lies in the closed convex hull of a set of points, however
+-- degenerate that hull is: nothing for no points, the point itself for one, the
+-- segment between the extreme points for collinear points, and otherwise the
+-- polygon, boundary included. This is the covered part of a face, which can be a
+-- segment or a point, so a boundary point of the solid is recognized even when the
+-- section has no area.
+containsSection ∷ [P2] → P2 → Bool
+containsSection points p = case sort (nub points) of
+  [] → False
+  [only] → p == only
+  distinct@(first : _ : _)
+    | null hull → onSegment first (last distinct)
+    | otherwise → containsClosed hull p
+    where
+      hull = convexHull distinct
+  where
+    onSegment a b = orient a b p == 0 && p >= min a b && p <= max a b
 
 -- | Whether a point lies in a convex polygon, boundary included.
 containsClosed ∷ Poly → P2 → Bool

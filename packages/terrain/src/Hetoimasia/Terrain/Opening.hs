@@ -40,7 +40,9 @@
 -- (the plane supports the solid, so the section is a face of the polytope), and
 -- the difference is split into convex pieces ('openingPieces'). The pieces are
 -- one representation of a region, not a canonical one for comparing regions;
--- compare regions by 'openingArea' and 'openingContains'.
+-- compare regions by 'openingArea' and 'openingContains'. The area is that of the
+-- closed pieces, and 'openingContains' is true to the closed solid: it excludes the
+-- solid's own section by the face, edges and corners included.
 --
 -- = Connections
 --
@@ -219,30 +221,35 @@ faceCoordinates TopFace (V3 x y _) = (x, y)
 -- Regions of a face
 
 -- | An exact region of a cell face, in face coordinates: a union of convex
--- pieces without a common interior. Obtain one from a 'Portal'.
-newtype Opening = Opening [Poly]
+-- pieces without a common interior, and the part of the face the solid covers
+-- (the corners of its section, which can be a segment or a point and so have no
+-- area). Obtain one from a 'Portal'.
+data Opening = Opening ![Poly] ![P2]
   deriving stock (Eq, Show)
 
 -- | The convex pieces, each counter-clockwise from its least corner, with the
 -- pieces in a fixed order. Together they are the region; no piece has zero area.
 openingPieces ∷ Opening → [[(Rational, Rational)]]
-openingPieces (Opening pieces) = pieces
+openingPieces (Opening pieces _) = pieces
 
 -- | The exact area of the region, in @[0, 1]@.
 openingArea ∷ Opening → Rational
-openingArea (Opening pieces) = sum (map polyArea pieces)
+openingArea (Opening pieces _) = sum (map polyArea pieces)
 
 -- | Whether the region has no area.
 openingIsEmpty ∷ Opening → Bool
-openingIsEmpty (Opening pieces) = null pieces
+openingIsEmpty (Opening pieces _) = null pieces
 
--- | Whether a face point is in the region, its boundary included. The boundary
--- the region shares with the solid belongs to the solid, which is closed
--- (@classifyPoint@ calls such a point a boundary point, not exterior), so a
--- point strictly inside the region is exactly a point the solid classifies as
--- exterior.
+-- | Whether a face point is open air: in the region and not on the solid. The
+-- solid is closed, so every point of its section by the face, edges and corners
+-- included, belongs to it and is not air (@classifyPoint@ calls the corresponding
+-- cell point a boundary point). A point of the region off the solid, including one
+-- on the seam between two pieces or on the edge of the face itself, is exactly a
+-- point the solid classifies as exterior. The pieces are closed polygons, which
+-- serve the area; this predicate is what stays true to the solid's boundary.
 openingContains ∷ Opening → (Rational, Rational) → Bool
-openingContains (Opening pieces) point = any (`containsClosed` point) pieces
+openingContains (Opening pieces section) point =
+  any (`containsClosed` point) pieces && not (containsSection section point)
 
 -- ---------------------------------------------------------------------------
 -- The openings of a cell
@@ -302,7 +309,7 @@ portalOpening (Portal _ _ opening) = opening
 -- | Full air: one empty component, open over the whole of all six faces. It is
 -- the adjoining geometry of a known empty cell, and it is not a shape identity.
 airOpenings ∷ CellOpenings
-airOpenings = CellOpenings Nothing [Component 0 [Portal face 0 (Opening [unitSquare]) | face ← cellFaces]]
+airOpenings = CellOpenings Nothing [Component 0 [Portal face 0 (Opening [unitSquare] []) | face ← cellFaces]]
 
 -- | The openings of a catalog shape in its authored orientation.
 shapeOpenings ∷ ShapeId → CellOpenings
@@ -325,8 +332,8 @@ catalog = map build allShapeIds
         -- A face's opening: the unit square less the solid's section by the
         -- face's plane, which is the hull of the solid's vertices on that plane.
         opening face =
-          Opening
-            (subtractConvex unitSquare (convexHull [faceCoordinates face v | v ← vertices, onFacePlane face v]))
+          let covered = [faceCoordinates face v | v ← vertices, onFacePlane face v]
+           in Opening (subtractConvex unitSquare (convexHull covered)) covered
         -- Every portal belongs to the shape's one component: the empty region
         -- lies above a graph, so it is joined upward to the top face (see the
         -- module header). A shape with no portal of positive area has no empty

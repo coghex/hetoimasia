@@ -608,14 +608,40 @@ agreementSpec = describe "agreement with point and ray queries" $ do
           , classifyPoint (shapeSolid (shape identity)) (liftTo face p) /= (if held then Exterior else Boundary)
           ]
           `shouldBe` []
-  it "keeps the boundary of an opening on the solid: closed to the portal, boundary to the solid" $ do
-    -- NS, east face: the opening is the region above z = min(y, 1 - y); (y, z) = (1/2, 1/2) is the ridge.
-    openingContains (portalOpening (only (portalsOn (WallFace East) (openings 5)))) (1 / 2, 1 / 2) `shouldBe` True
-    classifyPoint (shapeSolid (shape 5)) (point 1 (1 / 2) (1 / 2)) `shouldBe` Boundary
-    classifyPoint (shapeSolid (shape 5)) (point 1 (1 / 2) (51 / 100)) `shouldBe` Exterior
-    openingContains (portalOpening (only (portalsOn (WallFace East) (openings 5)))) (1 / 2, 51 / 100) `shouldBe` True
-    openingContains (portalOpening (only (portalsOn (WallFace East) (openings 5)))) (1 / 2, 49 / 100) `shouldBe` False
-    classifyPoint (shapeSolid (shape 5)) (point 1 (1 / 2) (49 / 100)) `shouldBe` Boundary
+  it "agrees with the closed-solid classification on every point of every face, boundaries and seams included" $
+    -- A face point is open air exactly when the solid calls the cell point exterior. The grid has step 1/8, so it
+    -- holds the face's edges and corners, the ramp and ridge lines, the base edge, the top edge, the diagonals and the
+    -- seams between the opening's convex pieces.
+    forM_ [0 .. 15] $ \identity →
+      forM_ faceOrder $ \face →
+        [ (identity, face, p, held)
+          | i ← [0 .. 8 ∷ Integer]
+          , j ← [0 .. 8 ∷ Integer]
+          , let p = (fromInteger i / 8, fromInteger j / 8)
+          , let held = faceHolds (openings identity) face p
+          , held /= (classifyPoint (shapeSolid (shape identity)) (liftTo face p) == Exterior)
+          ]
+          `shouldBe` []
+  it "keeps the solid's boundary out of the opening: ramp, ridge, top edge and base edge" $ do
+    let holds identity face p = faceHolds (openings identity) face p
+    -- N, east face: the ramp line z = y is solid boundary, above it is air, below it is sealed.
+    holds 1 (WallFace East) (1 / 2, 1 / 2) `shouldBe` False
+    holds 1 (WallFace East) (1 / 2, 51 / 100) `shouldBe` True
+    holds 1 (WallFace East) (1 / 2, 49 / 100) `shouldBe` False
+    -- NS, east face: the ridge point (1/2, 1/2) is boundary; the seam between the pieces is air.
+    holds 5 (WallFace East) (1 / 2, 1 / 2) `shouldBe` False
+    holds 5 (WallFace East) (1 / 4, 3 / 4) `shouldBe` True
+    holds 5 (WallFace East) (3 / 4, 3 / 4) `shouldBe` True
+    -- N, top face: the line y = 1 reaches the cell's top, so it is solid; the rest of the top is air.
+    holds 1 TopFace (1 / 2, 1) `shouldBe` False
+    holds 1 TopFace (1 / 2, 99 / 100) `shouldBe` True
+    -- ID 15, east face: the base edge z = 0 is solid; the apex's facets leave everything above it air.
+    holds 15 (WallFace East) (1 / 2, 0) `shouldBe` False
+    holds 15 (WallFace East) (1 / 2, 1 / 100) `shouldBe` True
+    -- A sealed block is never air, and air always is, edges included.
+    holds 0 (WallFace East) (1 / 2, 1 / 2) `shouldBe` False
+    or [holds 0 face (0, 0) | face ← faceOrder] `shouldBe` False
+    and [faceHolds airOpenings face p | face ← faceOrder, p ← [(0, 0), (1, 1), (1 / 2, 1 / 2), (0, 1)]] `shouldBe` True
   it "lets a ray through an opening point miss a ramp that is lower there, and stops one at a sealed point" $ do
     -- N, east face: open where z > y. At y = 3/4: z = 7/8 is open, z = 1/4 is sealed.
     let solid = shapeSolid (shape 1)

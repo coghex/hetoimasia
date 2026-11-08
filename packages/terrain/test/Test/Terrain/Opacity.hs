@@ -181,7 +181,7 @@ forged =
   , ("PackedCell", ["import Hetoimasia.Terrain.Palette (PackedCell)"], ["airWithShape :: PackedCell", "airWithShape = PackedCell 5"])
   , -- A region that claims an opening a shape does not have, an air cell that
     -- claims no component, and a connection that claims an overlap.
-    ("Opening", ["import Hetoimasia.Terrain.Opening (Opening)"], ["wholeFace :: Opening", "wholeFace = Opening [[(0, 0), (1, 0), (1, 1), (0, 1)]]"])
+    ("Opening", ["import Hetoimasia.Terrain.Opening (Opening)"], ["wholeFace :: Opening", "wholeFace = Opening [[(0, 0), (1, 0), (1, 1), (0, 1)]] []"])
   , ("CellOpenings", ["import Hetoimasia.Terrain.Opening (CellOpenings)"], ["sealed :: CellOpenings", "sealed = CellOpenings Nothing []"])
   , ("Component", ["import Hetoimasia.Terrain.Opening (Component)"], ["second :: Component", "second = Component 1 []"])
   , ("Portal", ["import Hetoimasia.Terrain.Opening (Portal)"], ["unowned :: Portal", "unowned = Portal undefined 9 undefined"])
