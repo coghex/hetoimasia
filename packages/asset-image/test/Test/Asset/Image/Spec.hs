@@ -4,6 +4,7 @@ module Test.Asset.Image.Spec (spec) where
 
 import qualified Test.Asset.Image.Bc7 as Bc7
 import qualified Test.Asset.Image.Bc7Opacity as Bc7Opacity
+import qualified Test.Asset.Image.DataMap as DataMap
 import qualified Test.Asset.Image.Fixtures as Fixtures
 import qualified Test.Asset.Image.Ktx2 as Ktx2
 import qualified Test.Asset.Image.Mips as Mips
@@ -30,6 +31,7 @@ spec = describe "AssetImage" $ do
   PngDecode.spec
   PngDecodeBudget.spec
   PngDecodeClient.spec
+  DataMap.spec
   Bc7.spec
   Bc7Opacity.spec
   Mips.spec

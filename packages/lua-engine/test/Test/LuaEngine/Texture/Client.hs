@@ -39,9 +39,123 @@ spec = describe "composition from outside the packages" $ do
     withClient "Client.hs" specClient $ \compile → do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-10237"
+
+  it "lets a client name the data-map capability from outside the packages and nothing of terrain or of the graphics stack: the policy, the shared account, the requirement, the retained facts and the generic coverage sampling" $
+    withDataClient "Client.hs" dataMapClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status → expectationFailure ("the client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
+
+  it "keeps what a version's interests and an account's bytes are made of out of a client's reach: it cannot forge a retained texture, an account, a reservation or a version" $ do
+    -- A retained texture is made only by the retention boundary.
+    withDataClient "Client.hs" forgedRetainedClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-01928"
+    -- An account is made by its constructor function, with its limit, never by a record.
+    withDataClient "Client.hs" forgedAccountClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-01928"
+    -- The reservation machine and the version are the pipeline's: not exported at all.
+    -- The identity of a retained texture is read through functions over private fields: no record update can pair
+    -- another texture's identity with a version's plane and interest.
+    withDataClient "Client.hs" updatedRetainedClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-22385"
+    withDataClient "Client.hs" reservationClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-61689"
+    withDataClient "Client.hs" versionClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-61689"
   where
     withClient = withStorePackageClient ["base", "bytestring", "stm", "hetoimasia-content-0.1.0.0-inplace", "hetoimasia-lua-engine-0.1.0.0-inplace", "hetoimasia-lua-engine-0.1.0.0-inplace-texture"]
+    -- The data-map capability: the texture sublibrary and the generic image package's data maps, and nothing else.
+    withDataClient = withStorePackageClient ["base", "stm", "hetoimasia-asset-image-0.1.0.0-inplace", "hetoimasia-lua-engine-0.1.0.0-inplace-texture"]
     a </> b = a <> "/" <> b
+
+dataMapClient ∷ String
+dataMapClient =
+  unlines
+    [ "module Client (policy, requirement, charged, sample, release) where"
+    , ""
+    , "import Control.Concurrent.STM (STM)"
+    , "import Data.Word (Word64)"
+    , "import Hetoimasia.Asset.Image.DataMap (coverageSample)"
+    , "import Hetoimasia.LuaEngine.Texture"
+    , ""
+    , "policy ∷ TexturePolicy"
+    , "policy = TexturePolicy {policyKind = DataKind, policyBinaryCoverage = True, policyNormalEncoding = Just UnitNormalRgbV1}"
+    , ""
+    , "requirement ∷ TextureRequirement"
+    , "requirement = TextureRequirement {requireKind = Just DataKind, requireCoverage = True, requireNormal = Just UnitNormalRgbV1}"
+    , ""
+    , "-- What the shared account holds, read in a transaction a consumer composes with its own charges."
+    , "charged ∷ RenderAccount → STM Word64"
+    , "charged = accountCharged"
+    , ""
+    , "-- The generic top-row-first sampling of a retained version's one shared plane."
+    , "sample ∷ RetainedTexture → Double → Double → STM (Maybe Bool)"
+    , "sample retained u v = fmap (>>= \\plane → coverageSample plane u v) (retainedCoverage retained)"
+    , ""
+    , "release ∷ RetainedTexture → IO ()"
+    , "release = releaseRetained"
+    ]
+
+forgedRetainedClient ∷ String
+forgedRetainedClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Texture"
+    , ""
+    , "forged ∷ RetainedTexture"
+    , "forged = RetainedTexture"
+    ]
+
+forgedAccountClient ∷ String
+forgedAccountClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Texture"
+    , ""
+    , "forged ∷ RenderAccount"
+    , "forged = RenderAccount 1"
+    ]
+
+updatedRetainedClient ∷ String
+updatedRetainedClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Texture"
+    , ""
+    , "forged ∷ RetainedTexture → RetainedTexture → RetainedTexture"
+    , "forged old other = old {retainedView = retainedView other, retainedVersion = retainedVersion other}"
+    ]
+
+reservationClient ∷ String
+reservationClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Texture (Reservation)"
+    , ""
+    , "forged ∷ Maybe Reservation"
+    , "forged = Nothing"
+    ]
+
+versionClient ∷ String
+versionClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Texture (Version)"
+    , ""
+    , "forged ∷ Maybe Version"
+    , "forged = Nothing"
+    ]
 
 composingClient ∷ String
 composingClient =
@@ -70,10 +184,11 @@ composingClient =
     , "  key ← either (fail . show) pure (rootKey (BC.pack \"client\"))"
     , "  spec ← either (fail . show) pure (textureSpec fixedM1Profile 4)"
     , "  pool ← either (fail . show) pure (poolSpec (specIoWorkers spec) 8)"
+    , "  account ← newRenderAccount m1RenderAccountBytes"
     , "  withContentRoot (configContentLimits configuration) directory $ \\root → do"
     , "    inventory ← scanInventory (configInventoryLimits configuration) key root >>= either (fail . show) pure"
     , "    withReadPool pool inventory root $ \\readPool →"
-    , "      withTexturePipeline spec backend readPool inventory $ \\pipeline → do"
+    , "      withTexturePipeline spec account backend readPool inventory $ \\pipeline → do"
     , "        reading ← atomically $ do"
     , "          now ← pipelineReading pipeline"
     , "          if readingDecodeWorkers now == 1 then pure now else retry"

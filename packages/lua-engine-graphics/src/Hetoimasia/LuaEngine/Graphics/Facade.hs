@@ -53,6 +53,8 @@ import Hetoimasia.LuaEngine.Facade
   , GraphicsServices (..)
   , GraphicsStart (..)
   , GraphicsVm (..)
+  , TextureImageKind (..)
+  , TextureOptions (..)
   )
 import Hetoimasia.LuaEngine.Graphics.Input (InputConfig (..), InputHost (inputObserve), declareInput, forgetInput, inputServices, newInputRegistry)
 import Hetoimasia.LuaEngine.Graphics.Scene.Publish (PublishHooks, ScenePublisher, graphicsPublishBindingWith, publisherGatedBy)
@@ -80,13 +82,16 @@ import Hetoimasia.LuaEngine.Profile
   )
 import Hetoimasia.LuaEngine.Scene (sceneLimits)
 import Hetoimasia.LuaEngine.Texture
-  ( TextureOwner
+  ( TextureKind (..)
+  , TextureOwner
   , TextureRequest (..)
   , TextureRole (LogicalRole, PresentationRole)
   , TextureStart (..)
   , TexturePipeline
   , closeTextureOwner
   , newTextureOwner
+  , parseNormalEncoding
+  , policyRefusalText
   , releaseTexture
   , releaseWord
   , startTexture
@@ -94,6 +99,7 @@ import Hetoimasia.LuaEngine.Texture
   , textureEndpoint
   , textureHandleType
   , textureService
+  , texturePolicy
   , withTextureOr
   )
 import Hetoimasia.Scripting.Lua.Admission (Necessity (OptionalRequest, RequiredRequest))
@@ -211,12 +217,14 @@ graphicsInjection config = GraphicsInjection $ \vm → do
             modifyTVar' owners (Map.delete identity)
             pure found
           mapM_ (\(Owners textureOwner windowOwner) → closeTextureOwner textureOwner >> closeWindowOwner windowOwner) held
-      , gsTextureCheck = \identity key optional owner values → do
+      , gsTextureCheck = \identity key optional options owner values → do
           Owners textureOwner _ ← ownersOf identity
-          textureArgumentCheck texture (const (TextureRequest textureOwner key (necessity optional))) owner values
-      , gsTextureStart = \identity key optional context → do
+          policy ← policyOf options
+          textureArgumentCheck texture (const (TextureRequest textureOwner key (necessity optional) policy)) owner values
+      , gsTextureStart = \identity key optional options context → do
           Owners textureOwner _ ← ownersOf identity
-          startTexture texture (TextureRequest textureOwner key (necessity optional)) context <&> \case
+          policy ← policyOf options
+          startTexture texture (TextureRequest textureOwner key (necessity optional) policy) context <&> \case
             TextureStarted started → GraphicsStarted started
             TextureRefused why → GraphicsRefused why
       , gsWindowCheck = \identity title width height owner values → do
@@ -248,3 +256,13 @@ graphicsInjection config = GraphicsInjection $ \vm → do
   where
     necessity optional = if optional then OptionalRequest else RequiredRequest
     (<&>) = flip fmap
+    -- The facade checked the spelling and the one incompatible combination before this was called; a policy it
+    -- cannot make from options it passed is a composition fault, never a script's.
+    policyOf options = do
+      encoding ← case optionNormalEncoding options of
+        Nothing → pure Nothing
+        Just name → maybe (throwIO (GraphicsCompositionRefused ("the facade passed a normal encoding the texture service does not know: " <> Text.take 64 name))) (pure . Just) (parseNormalEncoding name)
+      let kind = case optionKind options of
+            ImageColour → ColourKind
+            ImageData → DataKind
+      either (\refused → throwIO (GraphicsCompositionRefused ("the facade passed texture options the service refuses: " <> policyRefusalText refused))) pure (texturePolicy kind (optionBinaryCoverage options) encoding)

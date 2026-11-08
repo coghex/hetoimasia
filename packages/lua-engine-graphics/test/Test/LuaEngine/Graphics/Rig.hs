@@ -62,6 +62,7 @@ import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64, Word8)
+import Hetoimasia.Asset.Image (TexelFormat (TexelRgba8Srgb))
 import Hetoimasia.LuaEngine.Graphics.Texture.Backend
 import Hetoimasia.LuaEngine.Texture.Backend
 import System.Environment (lookupEnv)
@@ -273,7 +274,7 @@ awaitEvents probe wanted = atomically $ do
 -- | Accept one level of this extent whose alpha is this, and answer the work and the level's bytes.
 submit ∷ Rig → Probe → Word32 → Word32 → Word8 → IO UploadWork
 submit rig probe width height alpha =
-  backendUpload (rigPort rig) (Upload "test:a.png" width height (level width height alpha)) (probeSink (rigFake rig) probe)
+  backendUpload (rigPort rig) (Upload "test:a.png" width height (level width height alpha) TexelRgba8Srgb) (probeSink (rigFake rig) probe)
 
 -- | A tightly packed RGBA8 level whose every texel has this alpha.
 level ∷ Word32 → Word32 → Word8 → ByteString

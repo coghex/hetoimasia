@@ -6,8 +6,8 @@
 -- the inflated buffer ('Hetoimasia.Asset.Image.Internal.PngUnfilter') and its
 -- pixels are written, premultiplied, to their final place in the output, so
 -- no sample, index or pass image is ever materialized. The only memory this
--- module allocates is the palette's table of at most 256 premultiplied
--- entries.
+-- module allocates is the palette's table of at most 256 entries, premultiplied
+-- for a colour image and straight for a data image.
 --
 -- The texel contract is the general decoder's
 -- ('Hetoimasia.Asset.Image.Png'), restated here for the one colour kind:
@@ -22,8 +22,10 @@
 -- * a palette entry's alpha is the one @tRNS@ chunk's byte for its index,
 --   255 past the chunk, and 255 if there is not exactly one such chunk;
 -- * a palette index must name an entry of the palette;
--- * colour channels are premultiplied once, in linear light, by the texel's
---   alpha, from the shared table.
+-- * a colour image's channels are premultiplied once, in linear light, by the
+--   texel's alpha, from the shared table; a data image's ('rasterPremultiply'
+--   false) are written exactly as decoded, so the RGB of a transparent texel
+--   survives.
 --
 -- Failures here are content failures ('Refusal'): a filter-type byte that is
 -- not 0 to 4 and a palette index outside the palette. Every offset is derived
@@ -66,8 +68,8 @@ import Hetoimasia.Asset.Image.Internal.Texels (narrow)
 import Hetoimasia.Asset.Image.PngPreflight (PngRefusalClass (MalformedPng))
 
 -- | A palette image's lookup: how many entries the PLTE chunk holds (every
--- index below that is valid) and the premultiplied RGBA8 of the first at most
--- 256, which is every entry an 8-bit index can name.
+-- index below that is valid) and the RGBA8 of the first at most 256, which is
+-- every entry an 8-bit index can name, premultiplied for a colour image.
 data Palette = Palette
   { entryCount ∷ !Int
   , entryTable ∷ !(ForeignPtr Word8)
@@ -79,9 +81,10 @@ paletteBytes = 256 * 4
 
 -- | A palette from the PLTE chunk's data (whose length is a multiple of 3)
 -- and the file's tRNS chunks' data. Only a file with exactly one tRNS chunk
--- has per-entry alpha.
-makePalette ∷ ByteString → [ByteString] → IO Palette
-makePalette plte transparency = do
+-- has per-entry alpha. The first argument says whether the entries are
+-- premultiplied (a colour image) or left as the file states them (a data image).
+makePalette ∷ Bool → ByteString → [ByteString] → IO Palette
+makePalette premultiply plte transparency = do
   table ← mallocForeignPtrBytes paletteBytes
   withForeignPtr table $ \pointer →
     mapM_
@@ -90,9 +93,9 @@ makePalette plte transparency = do
                 [alphas] | i < ByteString.length alphas → ByteString.unsafeIndex alphas i
                 _ → 255
               channel k = ByteString.unsafeIndex plte (3 * i + k)
-          pokeByteOff pointer (4 * i) (premultiplyChannel alpha (channel 0))
-          pokeByteOff pointer (4 * i + 1) (premultiplyChannel alpha (channel 1))
-          pokeByteOff pointer (4 * i + 2) (premultiplyChannel alpha (channel 2))
+          pokeByteOff pointer (4 * i) (weigh premultiply alpha (channel 0))
+          pokeByteOff pointer (4 * i + 1) (weigh premultiply alpha (channel 1))
+          pokeByteOff pointer (4 * i + 2) (weigh premultiply alpha (channel 2))
           pokeByteOff pointer (4 * i + 3) alpha
       )
       [0 .. min count 256 - 1]
@@ -111,6 +114,8 @@ data Raster = Raster
   , rasterHeight ∷ !Int
   , rasterKey ∷ !(Maybe ColourKey)
   , rasterPalette ∷ !(Maybe Palette)
+  , rasterPremultiply ∷ !Bool
+    -- ^ A colour image: channels are premultiplied by the texel's alpha. A data image: they are not.
   }
 
 -- | Unfilter and convert every pass of the inflated @scanlines@ (@scanBytes@
@@ -131,45 +136,45 @@ rasterize raster scanlines scanBytes zeros zeroBytes out outBytes = do
   case (rasterColour raster, depth) of
     (ColourGreyscale, 8) → walk $ \row x dest → do
       y ← byteAt row x
-      emit dest y y y (greyAlpha (fromIntegral y))
+      emit premultiply dest y y y (greyAlpha (fromIntegral y))
     (ColourGreyscale, 16) → walk $ \row x dest → do
       s ← wordAt row x
       let y = narrow s
-      emit dest y y y (greyAlpha s)
+      emit premultiply dest y y y (greyAlpha s)
     (ColourGreyscale, d) → walk $ \row x dest → do
       s ← sampleAt d row x
       let y = s * (255 `div` ((1 `shiftL` d) - 1))
-      emit dest y y y (greyAlpha (fromIntegral s))
+      emit premultiply dest y y y (greyAlpha (fromIntegral s))
     (ColourTruecolour, 8) → walk $ \row x dest → do
       r ← byteAt row (3 * x)
       g ← byteAt row (3 * x + 1)
       b ← byteAt row (3 * x + 2)
-      emit dest r g b (rgbAlpha (fromIntegral r) (fromIntegral g) (fromIntegral b))
+      emit premultiply dest r g b (rgbAlpha (fromIntegral r) (fromIntegral g) (fromIntegral b))
     (ColourTruecolour, _) → walk $ \row x dest → do
       r ← wordAt row (3 * x)
       g ← wordAt row (3 * x + 1)
       b ← wordAt row (3 * x + 2)
-      emit dest (narrow r) (narrow g) (narrow b) (rgbAlpha r g b)
+      emit premultiply dest (narrow r) (narrow g) (narrow b) (rgbAlpha r g b)
     (ColourGreyscaleAlpha, 8) → walk $ \row x dest → do
       y ← byteAt row (2 * x)
       a ← byteAt row (2 * x + 1)
-      emit dest y y y a
+      emit premultiply dest y y y a
     (ColourGreyscaleAlpha, _) → walk $ \row x dest → do
       y ← narrow <$> wordAt row (2 * x)
       a ← narrow <$> wordAt row (2 * x + 1)
-      emit dest y y y a
+      emit premultiply dest y y y a
     (ColourTruecolourAlpha, 8) → walk $ \row x dest → do
       r ← byteAt row (4 * x)
       g ← byteAt row (4 * x + 1)
       b ← byteAt row (4 * x + 2)
       a ← byteAt row (4 * x + 3)
-      emit dest r g b a
+      emit premultiply dest r g b a
     (ColourTruecolourAlpha, _) → walk $ \row x dest → do
       r ← narrow <$> wordAt row (4 * x)
       g ← narrow <$> wordAt row (4 * x + 1)
       b ← narrow <$> wordAt row (4 * x + 2)
       a ← narrow <$> wordAt row (4 * x + 3)
-      emit dest r g b a
+      emit premultiply dest r g b a
     (ColourIndexed, d) → case rasterPalette raster of
       Nothing → error "PngRaster: an indexed image without a palette"
       Just palette → withForeignPtr (entryTable palette) $ \table →
@@ -187,6 +192,7 @@ rasterize raster scanlines scanBytes zeros zeroBytes out outBytes = do
           pokeByteOff dest 2 b
           pokeByteOff dest 3 a
   where
+    premultiply = rasterPremultiply raster
     depth = fromIntegral (rasterDepth raster) ∷ Int
     bits = bitsPerPixel (rasterColour raster) (rasterDepth raster)
     filterBytes = max 1 (fromInteger (bits `div` 8)) ∷ Int
@@ -243,15 +249,21 @@ rasterize raster scanlines scanBytes zeros zeroBytes out outBytes = do
           go rest (offset + rows * stride)
     {-# INLINE walk #-}
 
--- | Four output bytes: the colour channels premultiplied by the alpha, which
--- is stored unchanged.
-emit ∷ Ptr Word8 → Word8 → Word8 → Word8 → Word8 → IO ()
-emit dest r g b a = do
-  pokeByteOff dest 0 (premultiplyChannel a r)
-  pokeByteOff dest 1 (premultiplyChannel a g)
-  pokeByteOff dest 2 (premultiplyChannel a b)
+-- | Four output bytes: the colour channels premultiplied by the alpha (a colour
+-- image) or exactly as decoded (a data image), and the alpha, stored unchanged.
+emit ∷ Bool → Ptr Word8 → Word8 → Word8 → Word8 → Word8 → IO ()
+emit premultiply dest r g b a = do
+  pokeByteOff dest 0 (weigh premultiply a r)
+  pokeByteOff dest 1 (weigh premultiply a g)
+  pokeByteOff dest 2 (weigh premultiply a b)
   pokeByteOff dest 3 a
 {-# INLINE emit #-}
+
+-- | A colour channel under the image's policy: premultiplied by the alpha, or untouched.
+weigh ∷ Bool → Word8 → Word8 → Word8
+weigh True alpha channel = premultiplyChannel alpha channel
+weigh False _ channel = channel
+{-# INLINE weigh #-}
 
 byteAt ∷ Ptr Word8 → Int → IO Word8
 byteAt = peekByteOff

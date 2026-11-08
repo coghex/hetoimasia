@@ -4,6 +4,7 @@ module Test.LuaEngine.Texture.Spec (spec) where
 import qualified Test.LuaEngine.Texture.Cancellation as Cancellation
 import qualified Test.LuaEngine.Texture.Client as Client
 import qualified Test.LuaEngine.Texture.Contract as Contract
+import qualified Test.LuaEngine.Texture.DataMaps as DataMaps
 import qualified Test.LuaEngine.Texture.Failures as Failures
 import qualified Test.LuaEngine.Texture.Lifecycle as Lifecycle
 import qualified Test.LuaEngine.Texture.Limits as Limits
@@ -17,6 +18,7 @@ import Test.Hspec (Spec, describe)
 spec ∷ Spec
 spec = describe "Texture" $ do
   Contract.spec
+  DataMaps.spec
   Limits.spec
   Stages.spec
   Workers.spec

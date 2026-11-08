@@ -3,7 +3,8 @@
 -- allocated.
 --
 -- This is the M1 Lua texture profile's decoding stage (design D-65, D-77;
--- LFE-15), over 'Hetoimasia.Asset.Image.PngPreflight.preflightPng'. It is
+-- LFE-15; the data policy is TRA-15), over
+-- 'Hetoimasia.Asset.Image.PngPreflight.preflightPng'. It is
 -- opt-in. 'Hetoimasia.Asset.Image.Png.decodePng' and 'pngDecoder' are
 -- unchanged, impose none of these limits and still decode through JuicyPixels;
 -- so do the KTX2, BC7 and mip entry points. Nothing here imports the Lua
@@ -185,6 +186,8 @@
 module Hetoimasia.Asset.Image.PngDecode
   ( -- * Decoding
     decodeBounded
+  , decodeBoundedWith
+  , DecodePolicy (..)
 
     -- * The account
   , PayloadAccount (..)
@@ -211,7 +214,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
 import Foreign.Marshal.Utils (fillBytes)
-import Hetoimasia.Asset.Image (DecodedImage (..), TexelFormat (TexelRgba8Srgb))
+import Hetoimasia.Asset.Image (DecodedImage (..), TexelFormat (TexelRgba8Linear, TexelRgba8Srgb))
 import Hetoimasia.Asset.Image.Internal.PngGeometry
   ( Pass (passColumns)
   , bitsPerPixel
@@ -323,21 +326,36 @@ planFor colour depth interlace w h =
     zeroRow = maximum (0 : [packedRowBytes bits (passColumns pass) | pass ← passesOf interlace w h])
     bits = bitsPerPixel colour (fromIntegral depth)
 
+-- | How the decoded texels are to be read.
+data DecodePolicy
+  = -- | A colour image: 'TexelRgba8Srgb', premultiplied in linear light.
+    DecodeColour
+  | -- | A data image: 'TexelRgba8Linear', the file's samples untouched.
+    DecodeData
+  deriving (Eq, Show)
+
 -- | Decode a preflighted PNG within the account, as the module description
 -- says: a fully evaluated one-level 'DecodedImage' with 'preflightRgba8Bytes'
 -- left charged to the account, or a refusal with nothing left charged. Any
--- other failure is an exception with nothing left charged.
+-- other failure is an exception with nothing left charged. A colour image:
+-- @decodeBoundedWith DecodeColour@.
 decodeBounded ∷ PayloadAccount → PngPreflight → IO (Either PngRefusal DecodedImage)
-decodeBounded account pf =
+decodeBounded = decodeBoundedWith DecodeColour
+
+-- | 'decodeBounded' under a stated policy. The policy changes the texel
+-- format and the channel arithmetic and nothing else: the reservations, their
+-- order, the refusals and the hand-over of the output are identical.
+decodeBoundedWith ∷ DecodePolicy → PayloadAccount → PngPreflight → IO (Either PngRefusal DecodedImage)
+decodeBoundedWith policy account pf =
   -- A success is already evaluated, inside the scope that holds its output's
   -- charge, so nothing is forced after the hand-over; a refusal holds no
   -- charge and is forced here.
-  (Right <$> decodeOrRefuse account pf) `catch` \(Refusal cls reason) → evaluate (force (Left (refusal cls reason)))
+  (Right <$> decodeOrRefuse policy account pf) `catch` \(Refusal cls reason) → evaluate (force (Left (refusal cls reason)))
   where
     refusal cls reason = PngRefusal {pngRefusedAsset = preflightAsset pf, pngRefusalClass = cls, pngRefusalReason = reason}
 
-decodeOrRefuse ∷ PayloadAccount → PngPreflight → IO DecodedImage
-decodeOrRefuse account pf = do
+decodeOrRefuse ∷ DecodePolicy → PayloadAccount → PngPreflight → IO DecodedImage
+decodeOrRefuse policy account pf = do
   palette ← paletteData
   outputBytes ← narrowReservation (planOutput plan)
   scratchBytes ← narrowReservation (planScratch plan)
@@ -347,7 +365,7 @@ decodeOrRefuse account pf = do
     withCharge False account StageScratch scratchBytes $ do
       zeroRow ← mallocForeignPtrBytes zeroBytes
       withForeignPtr zeroRow $ \pointer → fillBytes pointer 0 zeroBytes
-      table ← traverse (uncurry makePalette) palette
+      table ← traverse (uncurry (makePalette premultiply)) palette
       withCharge False account StageWorking workingBytes $ do
         scanlines ← mallocForeignPtrBytes workingBytes
         inflated ← withForeignPtr scanlines $ \pointer →
@@ -368,6 +386,7 @@ decodeOrRefuse account pf = do
                 , rasterHeight = preflightHeight pf
                 , rasterKey = preflightColourKey pf
                 , rasterPalette = table
+                , rasterPremultiply = premultiply
                 }
         level ← ByteString.create outputBytes $ \out → do
           fillBytes out 0 outputBytes
@@ -376,7 +395,7 @@ decodeOrRefuse account pf = do
               rasterize raster source workingBytes zeros zeroBytes out outputBytes
         evaluate . force $
           DecodedImage
-            { decodedFormat = TexelRgba8Srgb
+            { decodedFormat = if premultiply then TexelRgba8Srgb else TexelRgba8Linear
             , decodedWidth = fromIntegral (preflightWidth pf)
             , decodedHeight = fromIntegral (preflightHeight pf)
             , decodedLevels = [level]
@@ -384,6 +403,7 @@ decodeOrRefuse account pf = do
             }
   where
     plan = planOf pf
+    premultiply = policy == DecodeColour
     inflateLimit = fromInteger (settingInflatedBytes (pngLimitSettings (preflightLimits pf))) ∷ Int
 
     -- An indexed image needs a palette JuicyPixels would accept: the first
