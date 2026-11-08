@@ -5,7 +5,7 @@ references on fixed scenes. It does not show that a device rasterizer, depth tes
 TRA-17 owns that proof (Q-13), and a disagreement found there is a counterexample, not a reason to
 change an order, threshold or rule here.
 
-- Pinned to commit: `470da816871c66961b893198a4bccc00e8f6c1d9`
+- Pinned to commit: `e581d3674046666a290da5a54fce8e939c7dd2e5`
 - Reproduce: `HETOIMASIA_TRA16_EVIDENCE_DIR=<dir> HETOIMASIA_TRA16_COMMIT=<commit> cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct --test-options='--match "TRA-16 evidence record"'`
 - Seeds: none. Every scene, facing and sample pixel is enumerated in `packages/terrain-render-2d/test/Test/TerrainRender2D/Cells.hs`;
   the run is deterministic (Hspec's seed affects only example order).
