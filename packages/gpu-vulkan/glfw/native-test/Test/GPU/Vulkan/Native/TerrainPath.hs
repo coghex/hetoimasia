@@ -710,7 +710,12 @@ renderSnapshot ctx s parts = do
           rejected
             | specControl s = Just (indMismatchCount independent > 0 || judgedMismatchCount pickJudged > 0)
             | otherwise = Nothing
-          problems =
+          -- A render, completion or readback that failed leaves no probes, or too few: the original
+          -- failure is what is reported, and no pixel is judged against a readback that is not there.
+          readbackMissing = not (completeReadback (map (sceneTarget . partScene) parts) (resultProbes result))
+          problems
+            | readbackMissing = [maybe "the readback holds fewer pixels than the targets" Text.unpack (resultFailure result)]
+            | otherwise =
             [ "the independent expectation found " <> show (indMismatchCount independent) <> " mismatches, e.g. " <> show (take 3 (indMismatches independent))
             | not (specControl s)
             , indMismatchCount independent > 0
@@ -753,14 +758,6 @@ renderSnapshot ctx s parts = do
         , inputTextures = decodedAt
         }
 
--- | The oracle's probes of a fixture, which run pass by pass and row by row, split by pass.
-splitPasses ∷ [(Int, Int)] → [ProbeResult] → [[ProbeResult]]
-splitPasses extents probes = case extents of
-  [] → []
-  (w, h) : rest →
-    let (these, others) = splitAt (w * h) probes
-     in these : splitPasses rest others
-
 -- | The draw path of each run the plan made, with the material's reference and the number of its instances.
 runsOf ∷ DrawPlan → [(String, Int, String)]
 runsOf plan =
@@ -770,12 +767,6 @@ runsOf plan =
   , layer ← layers
   , run ← plannedRuns layer
   ]
-
--- | The readback's pixels by (x, y), from the oracle probes, which run row by row.
-observedFrom ∷ Int → [ProbeResult] → Int → Int → Maybe Rgba8
-observedFrom width probes = \x y → table ! (y * width + x)
-  where
-    table = listArray (0, length probes - 1) (map probeObserved probes) ∷ Array Int (Maybe Rgba8)
 
 -- | The named probes the fixture's needs ask for: for each, a pixel the scene's
 -- hand-stated expectation says shows the behaviour and a contrast where it is

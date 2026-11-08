@@ -190,6 +190,7 @@ test-suite vulkan-native-tests
         Test.GPU.Vulkan.Native.Png
         Test.GPU.Vulkan.Native.SurfaceFree
         Test.GPU.Vulkan.Native.TerrainJudge
+        Test.GPU.Vulkan.Native.TerrainJudgeSpec
         Test.GPU.Vulkan.Native.TerrainPath
         Test.GPU.Vulkan.Native.WindowScenes
         Test.GPU.Vulkan.Native.Spec

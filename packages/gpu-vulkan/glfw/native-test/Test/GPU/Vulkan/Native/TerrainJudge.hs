@@ -19,16 +19,21 @@ module Test.GPU.Vulkan.Native.TerrainJudge
   , tintOf
   , Independent (..)
   , judgeIndependent
+  , splitPasses
+  , observedFrom
+  , completeReadback
   , expectedByte
   , expectedRgba
   , Json (..)
   , renderJson
   ) where
 
+import Data.Array (Array, bounds, listArray, (!))
 import Data.List (intercalate)
 import Data.Word (Word8)
 import Numeric (showHex)
 import Hetoimasia.Render.TwoD.Oracle.Colour (Rgba8 (..))
+import Test.GPU.Vulkan.Native.OrderedPath (ProbeResult (..))
 import Hetoimasia.Terrain.Render2D.Agreement (surfaceTint)
 import Hetoimasia.Terrain.Render2D.Evidence
 
@@ -127,6 +132,29 @@ judgeIndependent look (w, h) expectedAtPixel observed =
       Just (Rgba8 r g b a)
         | all (\(e, o) → abs (fromIntegral e - fromIntegral o) <= tolerance) [(er, r), (eg, g), (eb, b), (ea, a)] → []
         | otherwise → ["pixel " <> show (x, y) <> ": expected " <> show (er, eg, eb, ea) <> " (" <> what <> "), read " <> show (r, g, b, a)]
+
+-- | The oracle's probes of a fixture, which run pass by pass and row by row, split by pass.
+splitPasses ∷ [(Int, Int)] → [ProbeResult] → [[ProbeResult]]
+splitPasses extents probes = case extents of
+  [] → []
+  (w, h) : rest →
+    let (these, others) = splitAt (w * h) probes
+     in these : splitPasses rest others
+
+-- | The readback's pixel at (x, y) of a target @width@ wide, from the oracle's probes of
+-- its pass, which run row by row; 'Nothing' for a pixel the probes do not hold (a
+-- readback that failed leaves none), never an exception.
+observedFrom ∷ Int → [ProbeResult] → Int → Int → Maybe Rgba8
+observedFrom width probes = \x y →
+  let index = y * width + x
+   in if x < 0 || y < 0 || x >= width || index > snd (bounds table) then Nothing else table ! index
+  where
+    table = listArray (0, length probes - 1) (map probeObserved probes) ∷ Array Int (Maybe Rgba8)
+
+-- | Whether the probes hold every pixel of every target: a render, completion or
+-- readback that failed returns a result with too few, and nothing is judged then.
+completeReadback ∷ [(Int, Int)] → [ProbeResult] → Bool
+completeReadback extents probes = length probes == sum [w * h | (w, h) ← extents]
 
 -- ---------------------------------------------------------------------------
 -- A small JSON writer for the fixture record
