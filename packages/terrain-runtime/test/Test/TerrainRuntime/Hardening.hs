@@ -613,7 +613,7 @@ spec = describe "Accounting and lifetime hardening" $ do
                 ephemeral <- newHost True
                 doomed <- cellWith svc (hostEndpoint svc Nothing ephemeral) hot (tile 1 1 1)
                 forM_ (either (const Nothing) Just doomed) (void . cancel svc)
-          PointJob {} → readIORef steps >>= \n → modifyIORef' settledAt (Just . maybe n id)
+          PointJob {} → readIORef steps >>= \n → when (n >= 3) (modifyIORef' settledAt (Just . maybe n id))
           _ → pure ()
     withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → do
       (client, hot) <- openMain svc "hot"
