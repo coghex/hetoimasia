@@ -177,8 +177,9 @@ row failed at least the examples named. The controls of the retired state-depend
 feasibility computation, of the camera cap and of the job-slot reserve were removed
 with them, and a stale-running-job branch in `failJob` and `completeJob` that no
 transition can reach (a superseded running job becomes cancelling) was deleted rather
-than controlled. The last full run applied 89 controls; every one that is not retired is
-caught except three, which are not gaps:
+than controlled. The last full run applied 89 controls (two whose mutation text had gone stale, V1
+and Z7, were repaired and re-run afterwards and are caught); every one that is not retired
+is caught except three, which are not gaps:
 
 * **N9** (the owner reports the shared index's column growth instead of its own columns)
   is an equivalent mutant: the model derives a job's column charge from the coverage it
