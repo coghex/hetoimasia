@@ -474,7 +474,7 @@ refusals = describe "explicit refusals" $ do
     planSceneWith assets (sceneFrom FaceSouth 0 0 0 ore (knowledgeOf 1 CellDiscovered []) AllKnown)
       `shouldSatisfy` (\r → case r of Left (CellMissingMaterialColour _) → True; _ → False)
   it "refuses an unusable configuration and a snap view that would crack the quads" $ \assets → do
-    forM_ [withConfig (\c → c {ccDepth = 251}), withConfig (\c → c {ccDepth = -1}), withConfig (\c → c {ccMargin = -1}), withLimits (\l → l {clColumns = -1}), withLimits (\l → l {clStepLevels = 0}), withLimits (\l → l {clStepCandidates = 0})] $ \f →
+    forM_ [withConfig (\c → c {ccDepth = 251}), withConfig (\c → c {ccDepth = -1}), withConfig (\c → c {ccMargin = -1}), withLimits (\l → l {clColumns = -1}), withLimits (\l → l {clStepLevels = 0}), withLimits (\l → l {clStepCandidates = 0})] $ \f → do
       -- The configuration is checked when preparation starts, before any step.
       startCells (inputsOf assets (f base)) `shouldSatisfy` (\r → case r of Left CellInvalidConfig → True; _ → False)
       planSceneWith assets (f base) `shouldSatisfy` (\r → case r of Left CellInvalidConfig → True; _ → False)
