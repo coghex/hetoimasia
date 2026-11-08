@@ -2,11 +2,13 @@
 module Test.TerrainRuntime.Revalidation (spec) where
 
 import Control.Concurrent.STM
+import Control.Concurrent (yield)
 import Control.Monad (forM, forM_)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..), modelRegions, regionCoord)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
+import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures
 
 -- | One step of an ordered trace.
@@ -35,12 +37,19 @@ runTrace svc lease = concat <$> mapM batch (chunks 5 trace)
   where
     chunks _ [] = []
     chunks n xs = take n xs : chunks n (drop n xs)
+    -- Busy is transient pressure (a region whose detail is being released, a
+    -- full queue): the command is admitted again, in the same place in the trace.
+    admitted submit = bounded $ do
+      r <- submit
+      case r of
+        Left (RefusedBusy _) → yield >> admitted submit
+        other → expectRight other
     -- A whole batch is admitted before any is awaited, so the commands queue in
     -- one fixed order while their loads and evictions interleave freely.
     batch ops = do
       pendings <- forM ops $ \op → case op of
-        Remove (x, y, z) → Left <$> okOf (removeAt svc lease (tile x y z) Nothing)
-        Read (x, y, z) → Right <$> okOf (cellAt svc lease (tile x y z))
+        Remove (x, y, z) → Left <$> admitted (removeAt svc lease (tile x y z) Nothing)
+        Read (x, y, z) → Right <$> admitted (cellAt svc lease (tile x y z))
       forM pendings $ \p → case p of
         Left removal → (\a → SawRemoval (removeChangedFlag a) (removeRevision a)) <$> (await svc removal >>= expectSuccess)
         Right reading → (\a → SawCell (cellRevision a) (cellMaterial (cellValue a))) <$> (await svc reading >>= expectSuccess)
