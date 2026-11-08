@@ -288,6 +288,7 @@ handoff svc aid region = do
           void (applyEvent svc (R.HandoffConfirmed aid region))
         Left _ → void (applyEvent svc (R.HandoffFailed aid region))
       markFreed svc
+    probe svc (PointHandoffReported aid region (either (const False) (const True) outcome))
 
 -- | Run the next queued load job on real resident detail.
 dispatchJob ∷ Service → IO ()

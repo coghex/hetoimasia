@@ -70,6 +70,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Budgets
         Test.TerrainRuntime.Closure
         Test.TerrainRuntime.Fixtures
+        Test.TerrainRuntime.Offload
         Test.TerrainRuntime.Races
         Test.TerrainRuntime.Spec
     build-depends:

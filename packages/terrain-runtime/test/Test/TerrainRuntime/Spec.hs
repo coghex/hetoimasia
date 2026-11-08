@@ -3,6 +3,7 @@ module Test.TerrainRuntime.Spec (spec) where
 import qualified Test.TerrainRuntime.Basic as Basic
 import qualified Test.TerrainRuntime.Budgets as Budgets
 import qualified Test.TerrainRuntime.Closure as Closure
+import qualified Test.TerrainRuntime.Offload as Offload
 import qualified Test.TerrainRuntime.Races as Races
 import Test.Hspec (Spec)
 
@@ -11,4 +12,5 @@ spec = do
   Basic.spec
   Races.spec
   Budgets.spec
+  Offload.spec
   Closure.spec

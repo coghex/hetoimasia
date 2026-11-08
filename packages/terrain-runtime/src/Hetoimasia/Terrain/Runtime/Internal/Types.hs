@@ -314,6 +314,8 @@ data Point
     PointJob !ArenaId !RegionCoord
   | -- | A changed region's transfer is about to run; an exception is a failed transfer.
     PointHandoff !ArenaId !RegionCoord
+  | -- | A transfer ended and was reported: whether it succeeded.
+    PointHandoffReported !ArenaId !RegionCoord !Bool
   | -- | A victim's detail is about to be discarded.
     PointVictim !ArenaId !RegionCoord
   deriving stock (Eq, Show)
