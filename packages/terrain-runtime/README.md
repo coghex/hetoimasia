@@ -225,9 +225,58 @@ the stores only after the borrowers finish.
   attempted, and then it reaches supervision whatever the owner ended with: as the
   owner's failure when it would have returned, or attached to its failure as cleanup
   evidence (`composeCleanup`) when it had already failed.
-* The owner's turns are shared: staging and commits take turns with loads and retries
-  whenever both are ready, so a continuous stream of ready requests cannot starve a
-  queued load (the model's round-robin and aging then choose among loads).
+* **The fairness rule.** Staging, commits, retries and load dispatches take turns
+  whenever two or more are ready: each ready kind gets one quantum in every four,
+  whatever the others are being fed (`stateTurn` hands the next choice to the kind after
+  the one that just ran). A continuous stream of new, cancelled or replaced reads cannot
+  starve an eligible commit or a queued load. A retry pass is run only when it can matter
+  (a registered view has pending demand, or a request waits to be admitted again); a
+  freed credit alone does not make one. Within commits the per-arena admission order is
+  unchanged, and the model's round-robin and aging choose among loads.
+* **The retained-bank reservation.** Every request reserves one result record
+  (`resultRecordBytes`) in the retained bank when it is admitted, because every request can
+  come to hold a record the model does not charge (a result not yet taken, a wait to be
+  admitted again). The reservation is simply kept through such a transition, so a wait
+  never adds to a full bank; only a settled read, whose record the model still charges,
+  holds none.
+* **Readmission.** When a commit supersedes a pending request's revision it is admitted
+  to the model again. Every refusal is classified: temporary pressure keeps the request
+  waiting, and it stays charged (a command slot and a retained record) until it is
+  readmitted or ends; a permanent refusal (its demand left the configured extent, the
+  retained edits are full, its arena ended) ends it at once with a typed failure
+  (`Superseded`, or `ArenaClosed`). Nothing waits on a refusal that will not clear.
+* **R1: credits are released only at the owner's safe point.** A request's model record
+  owns its command slot, staging, retained-edit and growth credits, and the arena's
+  retirement gives back everything its requests hold. They are released through one
+  function, `withdrawRecord` (and `retireArenaRecord` for an arena), and a release
+  never touches credits that running work still uses. The owner runs a preparation
+  (`running`, which records `stateRunning`) with the request's captured values; while it
+  runs, a cancellation, lease release, client end or closure ends the request for its
+  holder at once (the outcome is decided in the transaction that finds it) but the
+  request becomes a ghost: the table forgets it, the model keeps its record, and
+  the service keeps its reserved record, so no admission can spend them. The safe point
+  (`safePointSTM`, run when the preparation ends, however it ends, and again by the
+  owner's terminal step) is the only other code that issues those events: it withdraws
+  the ghosts, then retires the arenas whose retirement waited. The release sites this
+  replaces: `releaseReq` (every settlement: cancel, retire a result, lease release,
+  client end, closure), the removal's `retainResult` at commit, `resubmitSTM`, and
+  `closeArena`'s retirement. Releases that cannot overlap a preparation (victims,
+  job acknowledgements, transfer outcomes, holds, camera demand) run on the owner thread
+  or touch no request's credits, and are unchanged.
+* **R2: a capacity refusal is never terminal.** A `Busy` refusal leaves the item pending,
+  reconsidered whenever capacity is returned (`stateCapacityEpoch` advances on every event
+  that can return a credit). The refusal sites: admission returns it to the caller and
+  creates nothing; a read superseded by a commit and refused on readmission waits,
+  charged, and the retry pass reconsiders it; a camera demand the model cannot yet
+  admit stays pending in the model and the retry pass reconsiders it; and a changed
+  region's transfer refused for want of staging capacity stays a candidate, suppressed
+  only until the epoch moves (`stateHandoffBusy`), where it was previously marked as tried
+  and never retried. Only a transfer that ran and failed is suppressed until the region
+  changes again, and only refusals that can never clear (the arena is gone, the demand left
+  the extent) end an item.
+* **Diagnostics never decide.** A defect is thrown with a failing logger's failure attached
+  as cleanup evidence, never replaced by it; a logger that fails on a routine record is
+  itself recorded as a defect and the work goes on.
 * Every release path steps the model through one function that says which events
   may have returned credits (`freesCapacity`); what waits for capacity (pending
   camera demand, a request waiting to be admitted again) is retried after each, so
