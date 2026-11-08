@@ -10,19 +10,31 @@
 -- hold and view records, and a transfer's duplicate), taken from the model's own entity
 -- lists. If a model record disappears while the service still holds the resource, the
 -- two disagree: that is the point.
-module Test.TerrainRuntime.Usage (usageDisagreements) where
+module Test.TerrainRuntime.Usage (usageDisagreements, jobRunningDisagreements) where
 
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
+import Hetoimasia.Terrain.Coordinate (RegionCoord)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime (ArenaCensus (..), Census (..), RequestCensus (..))
+import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 
--- | Every place a ledger or slot count differs from what the service holds.
+-- | How a count is compared with what the service holds.
+data Rule = Exact | AtLeast
+
+-- | The most a whole-cell removal can raise the payload of the segment it edits: a dense
+-- segment of 'maxSegmentLevels' cells is two bytes a cell, a uniform one two bytes in
+-- all. The model reserves exactly this for each removal.
+removalGrowthBound ∷ Word64
+removalGrowthBound = 2 * fromIntegral maxSegmentLevels - 2
+
+-- | Every place a ledger, slot or arena is charged less than the service holds (or, where
+-- the charge is exact, differently), and every record that exists on one side only.
 usageDisagreements ∷ Census → Model → [String]
 usageDisagreements census m =
-  [ what <> ": the model counts " <> show counted <> " but the service holds " <> show held <> (if slack == 0 then "" else " (the model may exceed it by at most " <> show slack <> ")")
-  | (what, counted, held, slack) ← rows <> regionRows
-  , counted < held || counted > held + slack
+  [ what <> ": the model counts " <> show counted <> " but the service holds " <> show held
+  | (what, counted, held, rule) ← rows <> regionRows <> arenaRows
+  , case rule of Exact → counted /= held; AtLeast → counted < held
   ]
     <> regionGaps
     <> [ "arena " <> show (censusArena a) <> ": the service holds it (" <> (if censusRetiring a then "retiring" else "live") <> ") but the model does not"
@@ -43,24 +55,15 @@ usageDisagreements census m =
     -- reservations.
     held' = [r | r ← censusRequests census, censusModelRecord r]
     removals = len [() | r ← held', censusRemoval r]
-    -- A removal's resident growth is a model constant the model does not export; what is
-    -- checked is that none is held for a removal the service no longer holds.
-    removalGrowth = if removals == 0 then 0 else modelGrowth
     modelGrowth = sumW (map requestResidentActive (modelRequests m)) + sumW (map requestResidentDeferred (modelRequests m))
     -- Resident detail, region by region: what the arena's detail itself holds there (a
     -- region's fixed metadata, an index entry per column and each segment) against what
     -- the model charges for that region. A region the owner has discarded but the model
-    -- has not yet released (it is evicting) is charged until its victim is released.
+    -- has not yet released (it is evicting) is still charged until its victim is released.
     serviceRegions = [((censusArena a, region), bytes) | a ← censusArenas census, (region, bytes) ← Map.toList (censusRegionBytes a)]
     modelRegionBytes = Map.fromList [((regionArena r, regionCoord r), (regionBytes r, regionEvicting r)) | r ← modelRegions m]
-    modelGenerations = Map.fromList [((regionArena r, regionCoord r), regionGeneration r) | r ← modelRegions m]
-    -- The model reserves a removal's growth at its worst case and keeps a conservative
-    -- charge once it commits, so a region that has had removals may be charged a little
-    -- above what its detail holds (at most the worst case of a segment's payload, 64
-    -- bytes, per removal); a region with none is charged exactly what it holds.
-    slackOf key = 64 * Map.findWithDefault 0 key modelGenerations
     regionRows =
-      [ ("resident bytes of region " <> show key <> ": the model", modelBytes, bytes, slackOf key)
+      [ ("resident bytes of region " <> show key <> ": the model", modelBytes, bytes, AtLeast)
       | (key, bytes) ← serviceRegions
       , Just (modelBytes, _) ← [Map.lookup key modelRegionBytes]
       ]
@@ -73,12 +76,19 @@ usageDisagreements census m =
            | (key, (bytes, False)) ← Map.toList modelRegionBytes
            , key `notElem` map fst serviceRegions
            ]
-    resident = sumW (map snd serviceRegions) + sumW [bytes | (key, (bytes, True)) ← Map.toList modelRegionBytes, key `notElem` map fst serviceRegions]
+    resident = sumW (map snd serviceRegions)
+    -- Each arena's retained changes, live or retiring, against the arena's own charge.
+    arenaRows =
+      [ ("retained bytes of arena " <> show (censusArena a) <> ": the model", arenaRetainedBytes info, censusRetainedBytes a, AtLeast)
+      | a ← censusArenas census
+      , info ← modelArenas m
+      , arenaId info == censusArena a
+      ]
     rows =
-      [ ("resident bank occupied (every arena's resident detail, retiring included)", ledgerOccupied (ledger ResidentBank), resident, sumW [slackOf key | (key, _) ← serviceRegions])
-      , ("resident growth reserved for removals the service holds", modelGrowth, removalGrowth, 0)
-      , ("edit bank occupied (every arena's retained changes, retiring included)", ledgerOccupied (ledger EditBank), sumW (map censusRetainedBytes (censusArenas census)), 0)
-      , ("edit bank reserved by removals", ledgerReserved (ledger EditBank), removals * removalRetainedBytes, 0)
+      [ ("resident bank occupied (every arena's resident detail, retiring included)", ledgerOccupied (ledger ResidentBank), resident, AtLeast)
+      , ("resident growth reserved for the removals the service holds (each at least the worst case of a segment)", modelGrowth, removals * removalGrowthBound, AtLeast)
+      , ("edit bank occupied (every arena's retained changes, retiring included)", ledgerOccupied (ledger EditBank), sumW (map censusRetainedBytes (censusArenas census)), AtLeast)
+      , ("edit bank reserved by removals", ledgerReserved (ledger EditBank), removals * removalRetainedBytes, Exact)
       ,
         ( "staging bank occupied"
         , ledgerOccupied (ledger StagingBank)
@@ -87,9 +97,29 @@ usageDisagreements census m =
             + sumW [len regions * holdRecordBytes | (_, _, _, regions) ← modelHolds m]
             + sumW [descriptionBytes (len (viewDemand v)) | v ← modelViews m]
             + sumW [d | Just d ← map regionHandoff (modelRegions m)]
-        , 0
+        , Exact
         )
-      , ("staging bank reserved", ledgerReserved (ledger StagingBank), sumW (map jobScratch (modelJobs m)) + removals * removalStagingBytes, 0)
-      , ("command slots (every request the service holds a model record for)", slotInUse m CommandSlot, len held', 0)
-      , ("snapshot holds", len [() | (_, _, Borrow, _) ← modelHolds m], fromIntegral (censusBorrows census), 0)
+      , ("staging bank reserved (each removal's staging reservation, beside the jobs' scratch)", ledgerReserved (ledger StagingBank), removals * removalStagingBytes, AtLeast)
+      , ("command slots (every request the service holds a model record for)", slotInUse m CommandSlot, len held', Exact)
+      , ("snapshot holds", len [() | (_, _, Borrow, _) ← modelHolds m], fromIntegral (censusBorrows census), Exact)
       ]
+
+-- | What must hold while the owner is about to run a load job for a region: the model
+-- still holds that job as running, with its slot and its resident and staging
+-- reservations. The owner running the work is the service's own fact; a model that has
+-- already forgotten the job is under-charging it.
+jobRunningDisagreements ∷ Model → ArenaId → RegionCoord → [String]
+jobRunningDisagreements m arena region =
+  [ "the owner is about to run the job for " <> show (arena, region) <> " but the model holds no running job for it"
+  | null running
+  ]
+    <> [ what <> ": the owner runs a job but the model counts " <> show counted
+       | (what, counted) ←
+           [ ("load-job slots", slotInUse m LoadJobSlot)
+           , ("resident bank reserved", ledgerReserved (bankLedger m ResidentBank))
+           , ("staging bank reserved", ledgerReserved (bankLedger m StagingBank))
+           ]
+       , counted == 0
+       ]
+  where
+    running = [j | j ← modelJobs m, jobArena j == arena, jobRegion j == region, jobPhase j == JobRunningPhase]

@@ -7,15 +7,15 @@ module Test.TerrainRuntime.Limits (spec) where
 
 import Control.Concurrent.STM (atomically, check, readTVar)
 import Control.Exception (finally)
-import Control.Monad (void)
+import Control.Monad (forM_, void)
 import Hetoimasia.Terrain.Coordinate (decomposeTile)
-import Data.List (isInfixOf)
-import Hetoimasia.Terrain.Residency (ArenaPhase (..), Event (..), Revision (..), arenaId, arenaPhase, modelArenas, modelLimits, modelRegions, newModel, regionHandoff, step)
+import Data.List (isInfixOf, nub)
+import Hetoimasia.Terrain.Residency (ArenaPhase (..), Event (..), JobPhase (..), Revision (..), arenaId, arenaPhase, arenaRetainedBytes, jobArena, jobId, jobPhase, jobRegion, modelArenas, modelJobs, modelLimits, modelRegions, newModel, regionHandoff, step)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
-import Test.TerrainRuntime.Usage (usageDisagreements)
+import Test.TerrainRuntime.Usage (jobRunningDisagreements, usageDisagreements)
 
 -- | Every disagreement between the model's ledgers and what the service holds, read in
 -- one transaction.
@@ -180,3 +180,63 @@ spec = describe "Service-wide limits count every state that holds the resource" 
       either (\r → expectationFailure (show r)) pure outcome
       openGate gate
       void (settledOf host)
+
+  -- The accounting rule is that nothing is under-charged, not that the charge is exact: the
+  -- model keeps a monotone, conservative retained charge when edits coalesce.
+  it "charges coalescing edits at least what the arena holds (remove levels 0, 2, then 1)" $
+    withService defaultConfig $ \svc → do
+      (_, lease) <- openMain svc "main"
+      _ <- readCell svc lease (tile 1 1 0)
+      forM_ [tile 1 1 0, tile 1 1 2, tile 1 1 1] $ \at → do
+        _ <- removeCell' svc lease at
+        usageOf svc `shouldReturn` []
+      (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
+      let charged = [arenaRetainedBytes info | info ← modelArenas model]
+          held = map censusRetainedBytes (censusArenas census)
+      length charged `shouldBe` 1
+      -- Never under-charged; the coalesced interval may be charged more than it now holds.
+      zipWith (>=) charged held `shouldBe` [True]
+      -- (and here it is in fact charged more: exact equality would fail this sequence)
+      zipWith (>) charged held `shouldBe` [True]
+      inspectInvariants svc >>= (`shouldBe` [])
+      settleChecks svc
+
+  -- A job the owner is about to run must still be charged: a model that already forgot it
+  -- (an early acknowledgement) is under-charging it.
+  it "notices a model that forgot a load job the owner is about to run" $ do
+    gate <- newDisarmedGate
+    withGatedService defaultConfig alwaysAdmitting (\p → case p of PointJob {} → True; _ → False) gate $ \svc → (\act → act `finally` openGate gate) $ do
+      client <- okOf (registerClient svc)
+      lease <- okOf (openArena svc client "main" soilOverStone) >>= await svc >>= expectSuccess
+      armGate gate
+      host <- newHost True
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1))
+      awaitReached gate
+      model <- inspectModel svc
+      case [(jobId j, jobArena j, jobRegion j) | j ← modelJobs model, jobPhase j == JobRunningPhase] of
+        (jid, arena, loaded) : _ → do
+          jobRunningDisagreements model arena loaded `shouldBe` []
+          let forgotten = fst (step model (JobFailed jid))
+          jobRunningDisagreements forgotten arena loaded `shouldSatisfy` (not . null)
+        [] → expectationFailure "the owner is at a job but the model holds none running"
+      openGate gate
+      void (settledOf host)
+
+  -- One arena's retained charge swapped with another's: neither total nor count changes,
+  -- but each arena must be charged at least what it holds.
+  it "notices retained charges swapped between two arenas" $
+    withService defaultConfig $ \svc → do
+      (client, first') <- openMain svc "first"
+      second <- okOf (openArena svc client "second" soilOverStone) >>= await svc >>= expectSuccess
+      _ <- readCell svc first' (tile 1 1 0)
+      _ <- readCell svc second (tile 1 1 0)
+      -- One edit in the first arena, two (in separate columns) in the second.
+      _ <- removeCell' svc first' (tile 1 1 0)
+      forM_ [tile 1 1 0, tile 3 3 0] $ \at → readCell svc second at >> removeCell' svc second at
+      (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
+      usageDisagreements census model `shouldBe` []
+      let held = map censusRetainedBytes (censusArenas census)
+      length (nub held) `shouldBe` 2
+      -- The same census with the two arenas' retained bytes exchanged.
+      let swapped = census {censusArenas = zipWith (\a v → a {censusRetainedBytes = v}) (censusArenas census) (reverse held)}
+      usageDisagreements swapped model `shouldSatisfy` any ("retained bytes of arena" `isInfixOf`)

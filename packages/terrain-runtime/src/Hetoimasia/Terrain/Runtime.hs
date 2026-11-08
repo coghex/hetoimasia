@@ -408,8 +408,9 @@ inspectLimits svc = limitRows (serviceConfig svc) <$> readTVarIO (serviceState s
 -- snapshot or an unfinished release keeps it) the size of its resident detail, its
 -- retained changes and the regions that detail covers; every request it holds, in the
 -- table or withdrawn behind a running preparation; and its outstanding snapshots. A
--- diagnostic for tests: it changes nothing. A transaction, so it can be read in one
--- look with the model.
+-- diagnostic for verification: read-only, it changes nothing, and no production caller
+-- uses it (owner ruling on the issue: a read-only test inspector is allowed). A
+-- transaction, so it can be read in one look with the model.
 inspectCensusSTM ∷ Service → STM Census
 inspectCensusSTM svc = do
   st <- readSt svc
