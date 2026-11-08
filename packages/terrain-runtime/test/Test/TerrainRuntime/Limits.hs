@@ -5,16 +5,22 @@
 -- before it settles, a revoked lease until it is released.
 module Test.TerrainRuntime.Limits (spec) where
 
-import Control.Concurrent.STM (check, readTVar)
+import Control.Concurrent.STM (atomically, check, readTVar)
 import Control.Exception (finally)
 import Control.Monad (void)
 import Hetoimasia.Terrain.Coordinate (decomposeTile)
-import Hetoimasia.Terrain.Residency (ArenaPhase (..), arenaPhase, modelArenas, modelRegions, regionHandoff)
+import Data.List (isInfixOf)
+import Hetoimasia.Terrain.Residency (ArenaPhase (..), Event (..), Revision (..), arenaId, arenaPhase, modelArenas, modelLimits, modelRegions, newModel, regionHandoff, step)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
 import Test.TerrainRuntime.Usage (usageDisagreements)
+
+-- | Every disagreement between the model's ledgers and what the service holds, read in
+-- one transaction.
+usageOf ∷ Service → IO [String]
+usageOf svc = atomically (usageDisagreements <$> inspectCensusSTM svc <*> inspectModelSTM svc)
 
 arenasRow ∷ Service → IO LimitRow
 arenasRow svc =
@@ -131,10 +137,46 @@ spec = describe "Service-wide limits count every state that holds the resource" 
         awaitReached gate
         model <- inspectModel svc
         [d | Just d ← map regionHandoff (modelRegions model)] `shouldSatisfy` (not . null)
-        usageDisagreements model `shouldBe` []
+        usageOf svc `shouldReturn` []
         inspectInvariants svc >>= (`shouldBe` [])
         openGate gate
         waitFor $ inspectModelSTM svc >>= \m → check (all ((== Nothing) . regionHandoff) (modelRegions m))
-        usageDisagreements <$> inspectModel svc >>= (`shouldBe` [])
+        usageOf svc `shouldReturn` []
       either (\r → expectationFailure (show r)) pure outcome
       settleChecks svc
+
+  -- The usage check must notice a model that has lost a record while the service still
+  -- holds the resource: the model here is rebuilt without the arena (an empty arena of
+  -- the same identity, no regions, no requests, no holds) beside the service's real
+  -- census. Every bank and slot must disagree.
+  it "notices a model that dropped its records while the service still holds the resources, in every bank" $ do
+    gate <- newDisarmedGate
+    withGatedService defaultConfig alwaysAdmitting (\p → case p of PointStaging _ → True; _ → False) gate $ \svc → (\act → act `finally` openGate gate) $ do
+      (_, lease) <- openMain svc "main"
+      _ <- readCell svc lease (tile 1 1 1)
+      -- A committed edit: retained changes and resident detail the service holds.
+      _ <- removeCell' svc lease (tile 1 1 1)
+      let (held, _) = decomposeTile (tile 1 1 1)
+      armGate gate
+      host <- newHost True
+      _ <- okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 2) Nothing)
+      awaitReached gate
+      outcome <- withSnapshot svc lease [held] $ \_ → do
+        (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
+        -- The honest model agrees with the service ...
+        usageDisagreements census model `shouldBe` []
+        -- ... and one that lost its arena's records does not, bank by bank.
+        let broken = case [arenaId info | info ← modelArenas model] of
+              aid : _ → fst (step (newModel (modelLimits model)) (OpenArena aid (Revision 0)))
+              [] → newModel (modelLimits model)
+            found = usageDisagreements census broken
+            mentions needle = any (needle `isInfixOf`) found
+        mentions "resident bytes of region" || mentions "no record of it" `shouldBe` True
+        mentions "edit bank occupied" `shouldBe` True
+        mentions "edit bank reserved" `shouldBe` True
+        mentions "staging bank occupied" `shouldBe` True
+        mentions "command slots" `shouldBe` True
+        mentions "snapshot holds" `shouldBe` True
+      either (\r → expectationFailure (show r)) pure outcome
+      openGate gate
+      void (settledOf host)

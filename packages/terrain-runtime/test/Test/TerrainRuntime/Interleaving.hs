@@ -16,7 +16,6 @@ import Control.Monad (filterM, forM_, replicateM_, unless, void, when)
 import Data.IORef
 import Data.Text (pack)
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Changes (changesBytes)
 import Hetoimasia.Terrain.Coordinate (decomposeTile)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime
@@ -158,18 +157,9 @@ checkAll svc world = do
     -- Every bank and slot, from the entities alone, in one consistent look: the model's
     -- own arenas (live and retiring), regions, jobs, requests, interests, holds and
     -- views, and the service's own view of each arena the harness still holds a lease on.
-    leases <- readIORef (wLeases world)
-    (model, arenas) <- atomically ((,) <$> inspectModelSTM svc <*> mapM (inspectArenaSTM svc) leases)
-    let spent = usageDisagreements model
-        retained info = arenaRetainedBytes info
-        liveRetained =
-          [ "arena " <> show (viewIncarnation v) <> ": the model retains " <> show (retained info) <> " bytes but its changes are " <> show (changesBytes (viewChanges v))
-          | Just v ← arenas
-          , info ← modelArenas model
-          , arenaId info == viewIncarnation v
-          , retained info /= fromIntegral (changesBytes (viewChanges v))
-          ]
-        usage = spent <> liveRetained
+    -- (the service's own census and the model, read in one transaction).
+    (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
+    let usage = usageDisagreements census model
     unless (null usage) $ atomicModifyIORef' (wTrouble world) (\t → (("usage: " <> show usage) : t, ()))
     usage `shouldBe` []
     when (any ((== ArenaRetiringPhase) . arenaPhase) (modelArenas model)) (modifyIORef' (wRetiring world) (+ 1))
