@@ -14,7 +14,8 @@
 -- from its base up to the lower envelope of one 45° ramp for each lowered side
 -- (north @z <= y@, east @z <= 1 - x@, south @z <= 1 - y@, west @z <= x@, in the
 -- cell's frame) and the flat top at 1. The identities are stated by hand: bit 1
--- is north, 2 east, 4 south, 8 west; 0 and 15 are both flat. A view turns the
+-- is north, 2 east, 4 south, 8 west; only 0, with no bit, has the flat top as its
+-- surface, and 15 takes all four ramps, a central peak. A view turns the
 -- scene by whole quarter turns about the anchor tile, taking north to east to
 -- south to west and an offset @(dx, dy)@ to @(-dy, dx)@; the cell keeps its
 -- identity and the viewer sees its turned mask.
@@ -270,11 +271,10 @@ diagnosticSheet = ArtPixels 96 64 texel
 -- The independent model
 
 -- | The lowered sides of a stored shape identity, by hand: bit 1 north, 2 east,
--- 4 south, 8 west; identity 15 has a flat top and so no ramp.
+-- 4 south, 8 west. Identity 15 takes all four, so it is the central peak and not
+-- a flat top; identity 0 takes none.
 handSides ∷ Int → [Char]
-handSides shape
-  | shape == 15 = []
-  | otherwise = [name | (bit, name) ← [(1, 'N'), (2, 'E'), (4, 'S'), (8, 'W')], shape `div` bit `mod` 2 == 1]
+handSides shape = [name | (bit, name) ← [(1, 'N'), (2, 'E'), (4, 'S'), (8, 'W')], shape `div` bit `mod` 2 == 1]
 
 -- | A side after a number of positive quarter turns: north to east to south to
 -- west to north.

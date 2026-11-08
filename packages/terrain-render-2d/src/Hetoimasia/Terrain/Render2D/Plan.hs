@@ -606,8 +606,12 @@ data RawFace = RawFace
   , rawRole ∷ !FaceRole
   }
 
-isFlatShape ∷ ShapeId → Bool
-isFlatShape shape = shapeIdValue shape == 0 || shapeIdValue shape == 15
+-- Whether a shape is the full block: every wall covers its whole side, so a
+-- stretch of it beside another full block shows nothing between them. This is
+-- read from the shared solid and never from an identity: only identity 0 is the
+-- full block, and identity 15 is the central peak, whose walls cover nothing.
+isFullBlock ∷ ShapeId → Bool
+isFullBlock shape = all ((== FullCoverage) . sideCoverage shape) allSides
 
 -- Evaluate the cells of one candidate column.
 evaluateCandidate ∷ CameraState → Integer → PlanLimits → Map.Map Offset [FRun] → Layer → Cand → Either PlanError Layer
@@ -671,17 +675,17 @@ interesting lo hi own east south = Set.filter inside (Set.fromList (lo : hi : bo
         , FRun c d nk ← neighbour
         , d > lo
         , c <= hi
-        , not (isFlatShape ownShape && flatSolid nk)
+        , not (isFullBlock ownShape && fullBlock nk)
         ]
         <> concat
           [ [max a lo .. min b (hi + 1) - 1]
           | FRun a b (FSolid _ ownShape) ← own
           , b > lo
           , a <= hi
-          , not (isFlatShape ownShape)
+          , not (isFullBlock ownShape)
           ]
-    flatSolid (FSolid _ s) = isFlatShape s
-    flatSolid _ = False
+    fullBlock (FSolid _ s) = isFullBlock s
+    fullBlock _ = False
 
 -- The faces of one cell that are exposed, and which neighbours were unavailable.
 exposures ∷ ViewFacing → Integer → Integer → ShapeId → (FKind, FKind, FKind) → ([(Int, Face, FaceRole)], Bool, Bool, Bool)
