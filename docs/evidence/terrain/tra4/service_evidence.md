@@ -212,3 +212,37 @@ compares at-least for resident bytes (per region), resident growth, each arena's
 exactly for the request records, reservations, slots and holds; it also runs at every job and inside the
 preparation hook after each injected release; the coalescing sequence (remove levels 0, 2, then 1) is charged
 80 where the arena holds 64. The suite is 212 examples, run 90 and 200 more times at `+RTS -N4`.
+
+## Round 14 (the takeover; owner amendment 6728512155)
+
+The owner's ruling of 2026-11-08 allows the service to publish a read-only record of the work its owner runs,
+read by no production decision. The owner thread writes it in the transaction that starts or ends the work,
+from the values the work holds (`RunningWork`: a load job's coverage reservation, scratch and slot, the running
+preparation, each handoff duplicate); the oracle (`Test.TerrainRuntime.Usage`) compares it, with the service's own
+data, against the model's entities and ledgers under the never-under-charged rule. Census and record types are
+abstract (accessors only), with external-client rejection cases for each.
+
+Gated amounts (literal, worked out from the data the work holds, not from the model):
+
+| Where the owner is held | Record | The honest model charges |
+| --- | --- | --- |
+| `PointJob`, a one-cell read in a fresh region | job: resident 144 (48 column index + 32 segment + 64 dense payload), scratch 258 (256 frame + 2), slot 1 | job 400 resident (144 + the region's 256 metadata), 258 scratch, 1 load-job slot |
+| `PointHandoff`, after one removal | duplicate 64 (one removed interval, 16, and one column entry, 48) | the region's duplicate 64; staging occupied includes it |
+| `PointStaging`, a removal | preparation: removal, growth 62, staging 512, edit 64, command record 160 | the request's record and reservations held until the owner's safe point |
+
+Controls that fail (in the suite): job charged 1 and 1 instead of 400 and 258; 399/258 passes (still above 144),
+143 and 257 fail; the job forgotten early; the 64-byte duplicate zeroed or uncharged; the request being prepared
+withdrawn, or its growth zeroed; the empty-arena model; swapped arena retained charges.
+
+Negative controls against production code (each broken once locally on a committed tree, run, reverted; none committed):
+NC54 (the handoff duplicate charged 0: 3 failures, the new handoff example among them), NC55 (the model charges a
+job's scratch 1 byte: 94 failures, the new job examples and the property), NC58 (the job record never written: 97
+failures, every new job example and the "saw jobs" coverage), NC59 (the handoff record never ended: 71), NC60 (the
+preparation record never ended: 89), NC61 (an over-budget camera demand refused as invalid: the D-42 example and the
+two camera-demand examples fail). Two mutations did not discriminate and are not counted: the model forgetting a job
+at dispatch and the model reserving 1 resident byte for a job both break the job path altogether (183 and 181 failures,
+the model refuses the completion), so the in-suite 400-to-1 control is the evidence for those.
+
+Also: an arena whose edits coalesced (charged 80, holding 64) returns every account when it retires, and the property
+ends with every bank (occupied and reserved), slot and arena at zero. The suite is 245 examples, run 40 times at
+`+RTS -N4` on the final code.

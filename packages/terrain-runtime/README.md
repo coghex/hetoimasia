@@ -89,6 +89,7 @@ values.
 | Snapshot holds and the borrower count | The port acquires and releases | The owner (for closure) | Any | `specHoldRegions` per hold | Released on every exit of `withSnapshot`; closure waits for the count to reach zero |
 | Victim queue | The port appends (from admission decisions); the owner drains | The owner | Port, owner | Bounded by the banks | Drained by the owner, which discards the detail and then reports the release |
 | Defect record | Any thread that detects one | Inspection | Any | The latest 16 | Kept for the life of the service |
+| Running-work record (`RunningWork`: each load job's reservation, scratch and slot; the preparation; each handoff duplicate) | The owner thread alone, in the transaction that starts or ends the work, from the values the work holds | Inspection only (`inspectCensusSTM`); no production decision reads it | The owner | One preparation, one job per dispatch, one duplicate per changed region | Each entry ends with the work it describes (a job's report, the owner's safe point, a transfer's outcome); the owner's terminal step empties it |
 
 The owner runs bounded quanta: one dispatched load job, one staged computation or
 one commit at a time. Waiting for a host's eligibility, for a load or for a caller is
@@ -409,13 +410,28 @@ holds); over-charging is allowed where the model is conservative by design (an e
 coalesces keeps its monotone retained charge: remove levels 0, 2, then 1 and the arena is
 charged 80 bytes where it holds 64). `Test.TerrainRuntime.Usage` states what each bank and
 slot must hold from **the service's own data**, never from the accounting model's fields.
-`inspectCensusSTM` (read-only, for verification, used by no production caller; read in one
+`inspectCensusSTM` (read-only, for verification, used by no production caller or decision; read in one
 transaction with the model) reports, from the service's own structures, the bytes each
 arena's resident detail holds in every vertical region (a region's fixed metadata, an index
 entry per column and each segment's metadata and payload, measured on the `Resident` value),
 each arena's retained-changes bytes, live or retiring, every request the service holds
-(table and withdrawn ghosts) with whether it holds a removal reservation, and its
-outstanding snapshots. The check requires: each region charged at least what its detail
+(table and withdrawn ghosts) with whether it holds a removal reservation, its
+outstanding snapshots, and **the owner's record of the work it runs**. That record
+(`RunningWork`, the owner's ruling of 2026-11-08 on the issue, comment 6728512155) is written
+by the owner thread, in the transaction that starts or ends the work, from the values the
+work itself holds, and no production decision reads it: each load job (what its coverage
+can store, 48 bytes a column, 32 a segment and 64 of payload a segment, so 144 for a one-cell
+read; its scratch, a 256-byte frame and two bytes a cell, 258; and its one load-job slot) from
+its dispatch to its report (completed, failed or acknowledged); the preparation the owner is
+running (a removal's resident growth, 62 bytes, staging, 512, and retained edit, 64, and the
+command record it reads under) from its start to the owner's safe point; and each handoff
+duplicate (the bytes the owner copies, 64 for one removal) from the transfer's admission to
+its outcome. Every inspection type (`Census`, `ArenaCensus`, `RequestCensus`, `RunningWork`,
+`JobWork`, `PreparationWork`, `HandoffWork`) is abstract with read-only accessors that are
+functions, never field labels: an external client cannot construct, forge or update one, and
+none carries an authority, a handle or a snapshot. Reading them takes no hold, interest or
+reservation and changes no residency, LRU order or scheduling.
+The check requires: each region charged at least what its detail
 holds, and no region held by the service with no model record (nor charged, unless
 evicting, when the service holds none); each arena (live or retiring) charged at least its
 own retained changes, and the edit bank at least their sum; a removal's resident growth at
@@ -423,16 +439,35 @@ least the worst case of a segment (two bytes a cell for a dense segment, less th
 of a uniform one) and its edit and staging reservations as stated; the staging bank's
 request records exactly what the service's requests hold; the command slots exactly the
 service's requests that hold a model record; and the snapshot holds exactly the service's
-outstanding snapshots. Only what exists nowhere but in the model (interests, hold and view
-records, a transfer's duplicate) is taken from the model's entity lists. The load jobs are
-the owner's running work: the probe at `PointJob`, on the owner's own thread, requires the
-model to hold the job (running, or cancelling while it waits for its acknowledgement) with
-its load-job slot and its resident and staging reservations. These comparisons run after
-every step of the property, inside every held borrow, at every job, and, with releases
-injected, inside the preparation hook right after each cancellation, lease release or
-client end, before the owner resumes. Controls that must fail: a model rebuilt without the
-arena beside the service's real census (every bank disagrees); a model that forgot the job
-the owner is about to run; and two arenas' retained charges swapped.
+outstanding snapshots. The owner's running work is compared in its own amounts, entity by
+entity and bank by bank: each running load job must be charged, in the model, at least its
+coverage's resident reservation and its scratch (the model reserves 400 for the one-cell read
+above, 144 plus the region's 256-byte metadata, and 258 of scratch), the load-job slots at
+least the jobs the owner runs, the resident bank's reservations (counting what still waits for
+victims) at least the jobs' reservations plus the removals' growth, the staging bank's
+reservations at least the removals' staging plus the jobs' scratch, each handoff duplicate at
+least the bytes the owner copied (the staging bank's occupied bytes exactly the request
+records, interests, holds, view descriptions and duplicates), and the model must still hold,
+with its growth, the request the owner is preparing. Only what exists nowhere but in the model
+(interests, hold and view records) is taken from the model's entity lists. These comparisons
+run after every step of the property, inside every held borrow, at every job (where the record
+must also hold the job, with a slot and non-zero amounts) and, with releases injected, inside
+the preparation hook right after each cancellation, lease release or client end, before the
+owner resumes. The property ends with every bank, occupied as well as reserved, every slot and
+every arena at zero: no charge, a coalescing excess included, outlives its holder.
+`Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job, handoff and
+preparation, and holds the controls that must fail: a model that charges the running job 1
+byte of resident and 1 of scratch instead of 400 and 258 (and one byte short of each figure),
+a job the model forgot while it runs, a 64-byte handoff duplicate zeroed (or not charged at
+all), a preparation whose request the model dropped or for which it reserved no growth, a
+model rebuilt without the arena beside the service's real census (every bank disagrees), and
+two arenas' retained charges swapped. It also shows that reading the census changes neither the
+model, its clock, its requests nor its limits, and that an arena with coalesced edits, charged
+more than it holds, returns every account when it retires.
+`Test.TerrainRuntime.Budgets` pins D-42: a twelve-region camera demand over a resident bank of about two
+regions is admitted best effort with a pending remainder (asserted, so the example cannot pass
+without capacity pressure), and an explicit query and a removal are admitted and complete
+while that demand stays registered and is never withdrawn.
 `Test.TerrainRuntime.Limits` pins the examples: with the default limits, four closed
 incarnations each held by a snapshot refuse a fifth admission; exactly one borrow is
 released, three stay outstanding, and a replacement is admitted (and a further one is
@@ -447,9 +482,10 @@ starts is owned through `Test.Support.Owned`, and every wait is bounded
 shares no code with the library. The suite is built `-threaded` and is run at more
 than one capability count. `Test.TerrainRuntime.Opacity` compiles clients outside the
 package through `Test.Support.ExternalClient`: one composes the public service, and
-every attempt to name an authority, snapshot or service constructor, forge one, rewrite
-a snapshot with record-update syntax or import a private module is refused for the
-specific diagnostic that names the cause. Retained gated traces with before and after
+every attempt to name an authority, snapshot, service or inspection-type constructor, forge
+one, rewrite a snapshot or an inspection value (the census, its arenas and requests, the
+record of the owner's running work) with record-update syntax or import a private module is
+refused for the specific diagnostic that names the cause. Retained gated traces with before and after
 accounting are in
 [the TRA-4 evidence](../../docs/evidence/terrain/tra4/service_evidence.md).
 
