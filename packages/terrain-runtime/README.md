@@ -128,9 +128,15 @@ Retained-edit bytes are accounted monotonically by the model: a removal that
 *coalesces* two retained intervals shrinks the real changes, but the saving is not
 credited (the added bytes are reported as zero), so the account stays an upper bound.
 
-A settled removal's result (and a no-op's) is kept, with its command slot, until its
-holder takes it (`await`, or `retire` for a host): admission is busy once accepted
-commands and untaken results fill the slots, exactly as for a read's result.
+Every record the service itself holds for a request is charged **from admission** to
+take, discard or cancellation, in the retained bank (160 accounted bytes each, a
+one-region command record): a removal's (pending, then its settled result, a no-op's
+included, until the holder takes it with `await`, or `retire` for a host) and a pending
+open's or attach's. A settled result the model no longer records, and a pending open
+or attach, also hold a command slot. Admission of any of them is busy once the slots
+are full or the bank cannot hold one more record, and a snapshot cannot take space
+promised to a pending request, nor the reverse; a read's record stays charged by the
+model itself. The registered clients are bounded too (`configMaxClients`, 256).
 
 Removing air is a no-op: `changed = false` and the unchanged revision. A removal
 whose staged revision was superseded is recomputed against the current revision and
@@ -171,7 +177,7 @@ region and protects the regions from eviction) and builds an immutable `Snapshot
 whose resident detail is restricted to exactly the held regions. Its **backing
 allocation is accounted**: each outstanding snapshot is charged the payload and
 metadata bytes of its restricted detail, conservatively per snapshot, against a
-snapshot bank (`configSnapshotBytes`, 16 MiB by default) that is carved out of the
+retained bank (`configRetainedBytes`, 16 MiB by default) that is carved out of the
 configured staging bank, which the accounting model is built without (so the two
 cannot overbook the approved 128 MiB). An edit rebuilds a segment while an earlier
 snapshot keeps the old one alive; a borrow that would retain a further version
@@ -211,9 +217,17 @@ the stores only after the borrowers finish.
   each cancelling load is acknowledged, each outstanding transfer is abandoned and
   each committed victim's release is finished, so no reservation outlives it (a
   hold still outstanding keeps only its own arena retiring until released).
+* Reporting is tracked **per defect**: a defect the owner is about to throw is marked
+  reported, and every other unreported one is attached to it, so nothing hides behind
+  a later failure.
 * A defect recorded where nothing could throw (a host settlement callback that
   failed inside a closing transaction) never hides: every settlement is still
-  attempted, and then the owner ends with the recorded defect, so supervision sees it.
+  attempted, and then it reaches supervision whatever the owner ended with: as the
+  owner's failure when it would have returned, or attached to its failure as cleanup
+  evidence (`composeCleanup`) when it had already failed.
+* The owner's turns are shared: staging and commits take turns with loads and retries
+  whenever both are ready, so a continuous stream of ready requests cannot starve a
+  queued load (the model's round-robin and aging then choose among loads).
 * Every release path steps the model through one function that says which events
   may have returned credits (`freesCapacity`); what waits for capacity (pending
   camera demand, a request waiting to be admitted again) is retried after each, so
