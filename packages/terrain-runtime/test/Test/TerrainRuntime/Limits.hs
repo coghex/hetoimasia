@@ -6,13 +6,15 @@
 module Test.TerrainRuntime.Limits (spec) where
 
 import Control.Concurrent.STM (check, readTVar)
+import Control.Exception (finally)
 import Control.Monad (void)
 import Hetoimasia.Terrain.Coordinate (decomposeTile)
-import Hetoimasia.Terrain.Residency (ArenaPhase (..), arenaPhase, modelArenas)
+import Hetoimasia.Terrain.Residency (ArenaPhase (..), arenaPhase, modelArenas, modelRegions, regionHandoff)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
+import Test.TerrainRuntime.Usage (usageDisagreements)
 
 arenasRow ∷ Service → IO LimitRow
 arenasRow svc =
@@ -113,4 +115,26 @@ spec = describe "Service-wide limits count every state that holds the resource" 
       [limitRowCounted r | r ← rows, limitRowName r == "command slots"] `shouldBe` [0]
       inspectInvariants svc >>= (`shouldBe` [])
       retire svc request
+      settleChecks svc
+
+  it "derives every bank from the entities while a transfer holds its duplicate, a removal holds its reservation and a snapshot is borrowed" $ do
+    gate <- newDisarmedGate
+    withGatedService defaultConfig alwaysAdmitting (\p → case p of PointHandoff {} → True; _ → False) gate $ \svc → (\act → act `finally` openGate gate) $ do
+      (_, lease) <- openMain svc "main"
+      _ <- readCell svc lease (tile 1 1 1)
+      let (held, _) = decomposeTile (tile 1 1 1)
+      armGate gate
+      outcome <- withSnapshot svc lease [held] $ \_ → do
+        _ <- removeCell' svc lease (tile 1 1 1)
+        -- The owner is in the middle of the region's transfer: its duplicate is charged
+        -- to staging, beside the borrow's hold and the arena's retained edit.
+        awaitReached gate
+        model <- inspectModel svc
+        [d | Just d ← map regionHandoff (modelRegions model)] `shouldSatisfy` (not . null)
+        usageDisagreements model `shouldBe` []
+        inspectInvariants svc >>= (`shouldBe` [])
+        openGate gate
+        waitFor $ inspectModelSTM svc >>= \m → check (all ((== Nothing) . regionHandoff) (modelRegions m))
+        usageDisagreements <$> inspectModel svc >>= (`shouldBe` [])
+      either (\r → expectationFailure (show r)) pure outcome
       settleChecks svc
