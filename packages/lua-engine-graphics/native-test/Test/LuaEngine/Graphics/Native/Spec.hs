@@ -61,14 +61,17 @@ spec env = describe "the texture backend on a real device, with no window" $ do
     within 120 . withLoaded env [("big.png", Png.solid 2048 2048 (200, 100, 50, 255))] $ \comp vm → do
       -- The first level this large the session allocates may need a memory block of its own, because the table's lookup ring
       -- (versions x capacity x 8 bytes, 20 MiB for the fixed profile) now fills the block the first allocations share; the
-      -- allocator keeps one emptied block for reuse, and the model's bytes count it. A first load and release of an instance
-      -- of its own settles that, and the session's rest is read after it: the example then shows the accounting returning, in
-      -- bytes, objects and resources, to what it was with the level's block in place (observed on the Linux software device:
-      -- after the release the objects and resources were at rest and the bytes one retained block above it).
+      -- allocator keeps one emptied block for reuse (vendor/vma/vk_mem_alloc.h, "We now have one empty block - leave it. A
+      -- hysteresis to avoid allocating whole block back and forth"; docs/gpu_backend.md, "VMA's retained empty block stays
+      -- charged until VMA frees it"), and the model's bytes count it. A first load and release of an instance of its own
+      -- settles that, and the session's rest is read after it. The load and release below are then a SECOND cycle, and it must
+      -- return the bytes, objects and resources exactly to that rest: a leak would show there, and the banks' own returns are
+      -- asserted exact elsewhere (observed on the Linux software device without the warm-up: after the release the objects
+      -- and resources were at rest and the bytes one retained block, 128 MiB, above it).
       restBefore ← restNow env
       _ ← loadWith comp vm "warm" "w" "big.png" (\_ → pure ())
       release' env comp vm "warm" "w"
-      awaitUsage env (\now → usageObjects now == usageObjects restBefore && usageResources now == usageResources restBefore)
+      awaitWithin env "the warm-up's objects and resources returning" (\now → usageObjects now == usageObjects restBefore && usageResources now == usageResources restBefore)
       markRest env
       atRest ← restNow env
       identity ← loadWith comp vm "a" "k" "big.png" (\line → line `shouldSatisfy` Text.isInfixOf "width=2048")
@@ -79,7 +82,7 @@ spec env = describe "the texture backend on a real device, with no window" $ do
       registeredMark (graphicsTextures (envGraphics env)) (textureHandleOf (fromIntegral identity)) `shouldReturn` Just True
       evidence env ("2048x2048: accounting at rest " <> summarise atRest <> "; while live " <> summarise during <> "; the configuration budgets " <> tshow (accountingNativeBytes (configurationAccounting (graphicsConfiguration (envGraphics env)))) <> " native bytes of " <> tshow (accountingNativeLimit (configurationAccounting (graphicsConfiguration (envGraphics env)))))
       release' env comp vm "a" "k"
-      awaitUsage env (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
+      awaitWithin env "the second cycle returning to the warmed rest" (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
 
   it "loads the same content independently for two instances, and ending one leaves the other's texels" $
     within 90 . withLoaded env [("tiny.png", Png.asymmetric 8 4)] $ \comp vm → do
@@ -298,3 +301,14 @@ evidence env line = atomically (modifyTVar' (envEvidence env) (line :))
 
 tshow ∷ Show a ⇒ a → Text
 tshow = Text.pack . show
+
+-- | Wait, in STM on the owner's own evidence, for the model's accounting to read like this, but only so long: a reading that
+-- never comes fails the example here with what was measured, never at the group's own deadline.
+awaitWithin ∷ Env → Text → (Usage → Bool) → IO ()
+awaitWithin env what wanted =
+  timeout 20000000 (awaitUsage env wanted) >>= \case
+    Just () → pure ()
+    Nothing → do
+      rest ← restNow env
+      now ← usageNow env
+      assertFailure ("waited 20 s for " <> Text.unpack what <> "; rest read " <> Text.unpack (summarise rest) <> "; now " <> Text.unpack (summarise now))
