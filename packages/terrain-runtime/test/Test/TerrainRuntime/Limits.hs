@@ -5,7 +5,7 @@
 -- before it settles, a revoked lease until it is released.
 module Test.TerrainRuntime.Limits (spec) where
 
-import Control.Concurrent.STM (check)
+import Control.Concurrent.STM (check, readTVar)
 import Control.Monad (void)
 import Hetoimasia.Terrain.Coordinate (decomposeTile)
 import Hetoimasia.Terrain.Residency (modelArenas)
@@ -78,3 +78,18 @@ spec = describe "Service-wide limits count every state that holds the resource" 
       grant host
       waitFor $ inspectModelSTM svc >>= \m → check (length (modelArenas m) == 1)
       counted svc `shouldReturn` (1, 1)
+
+  it "releases a cancelled open's place at once: it counts as no arena, no lease and no command slot" $
+    withService defaultConfig $ \svc → do
+      (client, _) <- openMain svc "main"
+      host <- newHost False
+      request <- okOf (openArenaWith svc (hostEndpoint svc Nothing host) client "second" soilOverStone)
+      void (cancel svc request)
+      waitFor (readTVar (hostSettled host) >>= check . not . null)
+      rows <- inspectLimits svc
+      [limitRowCounted r | r ← rows, limitRowName r == "arenas"] `shouldBe` [1]
+      [limitRowCounted r | r ← rows, limitRowName r == "leases"] `shouldBe` [1]
+      [limitRowCounted r | r ← rows, limitRowName r == "command slots"] `shouldBe` [0]
+      inspectInvariants svc >>= (`shouldBe` [])
+      retire svc request
+      settleChecks svc
