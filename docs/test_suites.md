@@ -85,7 +85,10 @@ cabal test hetoimasia-tests --test-show-details=direct
   planes), `CellsProgress` (pending ahead of and behind a hit, reveal, offload, reload and late knowledge, hidden-truth
   alternatives, atomic mixed-part admission under capacity, bounded resumable steps and obsolete continuations, visible
   demand before prefetch, viewport demand against a brute-force sprite enumeration, compressed summaries, refusals),
-  `CellsClient` (the package boundary) and `CellsEvidence` (the reproducible CPU evidence record under
+  `CellsWork` (the one work meter: no step charges more than `clStepWork`, and a property over every input dimension
+  — unused materials, knowledge runs, columns and regions, readiness intervals and chunks, terrain patches, retained
+  removals, viewport and margin — grown 1x, 10x and 100x shows the meter reading unchanged and a step's allocation not
+  following the input), `CellsClient` (the package boundary) and `CellsEvidence` (the reproducible CPU evidence record under
   `docs/evidence/terrain/tra16/`, written only when `HETOIMASIA_TRA16_EVIDENCE_DIR` names a directory). A new rule of the
   cell-quad path belongs there; the device's raster, depth and sampling agreement is TRA-17's.
 - `terrain-runtime-tests` (`packages/terrain-runtime/test/`, TRA-4) owns the
