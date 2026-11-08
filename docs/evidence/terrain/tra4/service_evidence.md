@@ -133,6 +133,12 @@ committed. The failing assertion is the one that protects the behaviour.
 | NC36b | As NC36 | `counts every resource-holding entity against every limit (seed 1)` | `limit arenas: admission counts 1 but the entities holding it number 2` |
 | NC38 | The arena limit ignores a pending open | `counts a pending open before it settles` | expected 1 of 1, got 0 |
 | NC39 | The lease limit ignores pending acquisitions | `counts every resource-holding entity against every limit` | 24 of 24 seeds: `limit leases: admission counts 1 but the entities holding it number 2` |
+| NC40 | Releasing one borrow forgets every retiring arena | `with the default limits, four closed incarnations held by snapshots refuse a fifth admission, and releasing exactly one borrow admits a replacement while three stay outstanding` | expected 3 of 4 counted after one release, got 0 |
+| NC41 | The edit bank forgets a retiring arena | `randomized interleaving` (16 of 93 examples) | `edit bank occupied (every arena, retiring included): the model counts 0 but the entities hold 64` |
+| NC42 | The staging bank forgets the holds | `randomized interleaving` (48 of 93) | `staging bank occupied: the model counts 1120 but the entities hold 1184` |
+| NC43 | The resident bank forgets a removal's reserved growth | `randomized interleaving` (89 of 93) | `resident bank reserved: the model counts 400 but the entities hold 462` |
+| NC44 | A handed-off duplicate is not charged to staging | `derives every bank from the entities while a transfer holds its duplicate ...` (the randomized property did not catch it: a transfer is rarely in flight at a check) | `staging bank occupied: the model counts 64 but the entities hold 128` |
+| NC45 | A commit adds nothing to the arena's retained bytes | `randomized interleaving` (54 of 93) | `arena ArenaId 0: the model retains 0 bytes but its changes are 64` (service against model) |
 | NC9 | The drain does not wait for outstanding borrowers | `does not return while a borrower holds a snapshot after the owner failed` | expected the service not to have returned, got that it had |
 
 ## Acceptance commands
@@ -146,7 +152,7 @@ compile of every module, not an incremental one.
 | Command | Result |
 | --- | --- |
 | `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning (package build directory removed first) |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 206 examples, 0 failures |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 207 examples, 0 failures |
 | `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 669 examples, 0 failures (on the merged head; passes at the round-10 head) |
 | `cabal test --project-file cabal.project.cpu hetoimasia:workflow-tests --test-show-details=direct` | 965 examples, 0 failures |
 | `(cd packages/terrain-runtime && cabal check)` | No errors or warnings could be found in the package |
@@ -178,3 +184,10 @@ times at `+RTS -N4` on the code head (25 + 40 + 5 after the master merge), all p
 NC37 (counting a settled acquisition twice) was reasoned equivalent and not counted as a
 control: an open or attach is removed from the table when it settles or ends, so the
 `not (isDone ..)` guard on an acquisition is defensive and unreachable.
+
+Round 11 (owner directive, tests only; no production file changed): `Test.TerrainRuntime.Usage`
+derives every bank (resident, edit and staging, occupied and reserved) and the command and
+load-job slots from the entities alone and the property compares it with the model's ledgers
+after every step, including inside held borrows; the one-borrow-release regression was rewritten
+to the exact scenario; the suite is 207 examples, run 50 times at `+RTS -N4` on a clean
+rebuild of the package, all passing.
