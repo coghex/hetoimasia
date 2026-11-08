@@ -591,47 +591,53 @@ spec = describe "Accounting and lifetime hardening" $ do
 
   it "dispatches a queued load while every preparation is followed by a cancellation and a replacement, with a view registered" $ do
     -- The stream is driven by the owner's own progress: at each preparation a read is
-    -- replaced by another, so the retry flag is set again before every next choice.
-    stream <- newIORef (Nothing ∷ Maybe (Service, ArenaLease, Host))
+    -- replaced by another and one more is cancelled while still pending, so the retry
+    -- flag is set again before every next choice. The owner is held at the first
+    -- preparation while the cold query is submitted, so the load is queued before
+    -- the stream begins.
+    gate <- newDisarmedGate
+    stream <- newIORef (Nothing ∷ Maybe (Service, ArenaLease))
     previous <- newIORef (Nothing ∷ Maybe Request)
     steps <- newIORef (0 ∷ Int)
-    settledAt <- newIORef (Nothing ∷ Maybe Int)
-    let probe = Probe $ \point → case point of
-          PointCaptured {} → readIORef stream >>= \case
-            Nothing → pure ()
-            Just (svc, hot, _) → do
-              n <- readIORef steps
-              when (n < 60) $ do
-                writeIORef steps (n + 1)
-                host <- newHost True
-                fresh <- cellWith svc (hostEndpoint svc Nothing host) hot (tile 1 1 1)
-                old <- readIORef previous
-                forM_ old (void . cancel svc)
-                writeIORef previous (either (const Nothing) Just fresh)
-                -- A read cancelled while still pending returns its credits, which is
-                -- what sets the retry flag again.
-                ephemeral <- newHost True
-                doomed <- cellWith svc (hostEndpoint svc Nothing ephemeral) hot (tile 1 1 1)
-                forM_ (either (const Nothing) Just doomed) (void . cancel svc)
-          PointJob {} → readIORef steps >>= \n → when (n >= 3) (modifyIORef' settledAt (Just . maybe n id))
-          _ → pure ()
-    withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → do
+    jobAt <- newIORef (Nothing ∷ Maybe Int)
+    let holding = gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate
+        probe = Probe $ \point → do
+          probePoint holding point
+          case point of
+            PointCaptured {} → readIORef stream >>= \case
+              Nothing → pure ()
+              Just (svc, hot) → do
+                n <- readIORef steps
+                when (n < 60) $ do
+                  writeIORef steps (n + 1)
+                  host <- newHost True
+                  fresh <- cellWith svc (hostEndpoint svc Nothing host) hot (tile 1 1 1)
+                  old <- readIORef previous
+                  forM_ old (void . cancel svc)
+                  writeIORef previous (either (const Nothing) Just fresh)
+                  -- A read cancelled while still pending returns its credits, which is
+                  -- what sets the retry flag again.
+                  ephemeral <- newHost True
+                  doomed <- cellWith svc (hostEndpoint svc Nothing ephemeral) hot (tile 1 1 1)
+                  forM_ (either (const Nothing) Just doomed) (void . cancel svc)
+            PointJob {} → readIORef steps >>= \n → when (n >= 1) (modifyIORef' jobAt (Just . maybe n id))
+            _ → pure ()
+    withGatedServiceUsing probe gate $ \svc → do
       (client, hot) <- openMain svc "hot"
       cold <- okOf (openArena svc client "cold" soilOverStone) >>= await svc >>= expectSuccess
       _ <- okOf (openView svc client)
       _ <- readCell svc hot (tile 1 1 1)
-      coldHost <- newHost True
-      writeIORef stream (Just (svc, hot, coldHost))
-      -- Start the stream with one read; every preparation then sustains it.
+      armGate gate
       starter <- newHost True
       _ <- okOf (cellWith svc (hostEndpoint svc Nothing starter) hot (tile 1 1 1))
-      let spin = readIORef steps >>= \n → if n >= 3 then pure () else yield >> spin
-      bounded spin
-      base <- readIORef steps
+      awaitReached gate
+      coldHost <- newHost True
       _ <- okOf (cellWith svc (hostEndpoint svc Nothing coldHost) cold (tile 0 0 0))
+      writeIORef stream (Just (svc, hot))
+      openGate gate
       waitFor (readTVar (hostSettled coldHost) >>= \x → check (not (null x)))
-      -- The load ran within a few preparations of being queued, however long the stream.
-      readIORef settledAt >>= \n → n `shouldSatisfy` maybe False (\k → k - base <= 8)
+      -- The load ran within a few preparations of the stream starting, however long it is.
+      readIORef jobAt >>= \n → n `shouldSatisfy` maybe False (<= 8)
       settleChecks svc
 
   it "serves an eligible staged commit while a producer keeps cancelling and replacing cache-hit reads" $ do
