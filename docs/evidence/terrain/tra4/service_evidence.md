@@ -129,11 +129,15 @@ committed. The failing assertion is the one that protects the behaviour.
 | NC33 | Credits released while a preparation runs, caught by the randomized property | `keeps every invariant when releases arrive while a preparation runs` | 18 of 24 seeds: the request being prepared had no model record |
 | NC34 | The capacity-refusal memory is never forgotten (the round-8 defect) | `reconsiders a transfer refused for want of capacity ... and forgets it when the arena ends` (three incarnations on one service) | the retry memory held 1 entry after the arena ended |
 | NC35 | A transfer in flight when its arena ends leaves a memory behind | `remembers nothing about a transfer whose arena ended while it was in flight` | the retry memory held 1 entry (also found by two flaky seeds of the randomized property before the guard) |
+| NC36 | The arena limit ignores a closed arena whose snapshot is borrowed (the round-9 defect) | `keeps a closed arena with a borrowed snapshot counted against the arena limit until the borrower returns it` (and the second borrower example) | expected the arena count 2 of 2 while borrowed, got 1: a fifth incarnation would be admitted |
+| NC36b | As NC36 | `counts every resource-holding entity against every limit (seed 1)` | `limit arenas: admission counts 1 but the entities holding it number 2` |
+| NC38 | The arena limit ignores a pending open | `counts a pending open before it settles` | expected 1 of 1, got 0 |
+| NC39 | The lease limit ignores pending acquisitions | `counts every resource-holding entity against every limit` | 24 of 24 seeds: `limit leases: admission counts 1 but the entities holding it number 2` |
 | NC9 | The drain does not wait for outstanding borrowers | `does not return while a borrower holds a snapshot after the owner failed` | expected the service not to have returned, got that it had |
 
 ## Acceptance commands
 
-Collected on branch head `a677b9fd` (the pull request body carries the final-head
+Collected on branch head `057310ea` for round 10 (earlier rows on earlier heads) (the pull request body carries the final-head
 acceptance record), with the qualified toolchain activated on `PATH`
 (`ghc --numeric-version` 9.14.1, `cabal --numeric-version` 3.18.1.0). The package was
 rebuilt from a removed package build directory, so the `-Werror` build is a clean
@@ -142,8 +146,8 @@ compile of every module, not an incremental one.
 | Command | Result |
 | --- | --- |
 | `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning (package build directory removed first) |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 176 examples, 0 failures |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 669 examples, 0 failures (on the merged head) |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 206 examples, 0 failures |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 669 examples, 0 failures (on the merged head; passes at the round-10 head) |
 | `cabal test --project-file cabal.project.cpu hetoimasia:workflow-tests --test-show-details=direct` | 965 examples, 0 failures |
 | `(cd packages/terrain-runtime && cabal check)` | No errors or warnings could be found in the package |
 | `python3 tools/validation/plan.py --catalog-check` | catalog valid: 37 groups, policy version 25 |
@@ -165,3 +169,12 @@ The native display groups the plan selects were not run locally: this slice open
 window, and CI runs them.
 
 NC26 (the retry trigger alone, a registered view with no pending demand) and NC27 (a retry pass handing the next turn to staging instead of dispatch) are not independently pinned by an example: the four-way rotation gives dispatch its turn anyway, so each is redundant with it and is disclosed as such rather than counted as a control.
+
+Round 10 (owner directive: every limit counts every resource-holding state) added
+`Test.TerrainRuntime.Limits` (four examples) and the fourth property group (24 seeds
+under tight service limits, with a per-step comparison of every limit's count against an
+independent enumeration, also inside held borrows); the suite is 206 examples, run 70
+times at `+RTS -N4` on the code head (25 + 40 + 5 after the master merge), all passing.
+NC37 (counting a settled acquisition twice) was reasoned equivalent and not counted as a
+control: an open or attach is removed from the table when it settles or ends, so the
+`not (isDone ..)` guard on an acquisition is defensive and unreachable.
