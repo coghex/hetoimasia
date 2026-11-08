@@ -308,6 +308,30 @@ viewportAndScale = describe "viewport, scale, snapping and extents" $ do
     (r - l, b - t) `shouldBe` (96, 64)
     isHit (pickPixel plan (floor l, floor t)) `shouldBe` True
     pickPixel plan (floor l - 1, floor t) `shouldBe` CellPickNoHit
+  it "picks only inside the intersection of the viewport and the framebuffer: an oversized viewport" $ do
+    assets ← loadAssets 5
+    let wide fb = (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll]) {sceneSetup = (sceneSetup oneBlock) {setupViewport = Viewport (V2 0 0) (V2 640 480), setupMetrics = TargetMetrics (PixelExtent fb fb') (PixelExtent fb fb') 1 1}}
+          where fb' = fb * 3 `div` 4
+        at plan x y = pickCells plan (CellPickQuery (cellPlanIdentity plan) (V2 x y))
+        small = planScene assets (wide 320)
+        large = planScene assets (wide 640)
+    -- The block is drawn around the viewport's centre, (320, 240): half of it is past the 320 x 240 framebuffer.
+    fmap isHit (at small 300.5 230.5) `shouldBe` Right True
+    at small 330.5 230.5 `shouldBe` Right CellPickNoHit
+    at small 300.5 250.5 `shouldBe` Right CellPickNoHit
+    -- The same point hits when the framebuffer holds it: only its extent changed.
+    fmap isHit (at large 330.5 230.5) `shouldBe` Right True
+  it "picks only inside the intersection of the viewport and the framebuffer: a negative-origin viewport" $ do
+    assets ← loadAssets 5
+    let scene = (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll]) {sceneSetup = (sceneSetup oneBlock) {setupViewport = Viewport (V2 (-320) (-240)) (V2 640 480)}}
+        plan = planScene assets scene
+        at x y = pickCells plan (CellPickQuery (cellPlanIdentity plan) (V2 x y))
+    -- The block is drawn around the origin; the part at negative pixels is not on the framebuffer.
+    fmap isHit (at 10.5 0.5) `shouldBe` Right True
+    fmap isHit (at 0.5 0.5) `shouldBe` Right True
+    at (-0.5) 0.5 `shouldBe` Right CellPickNoHit
+    at 10.5 (-0.5) `shouldBe` Right CellPickNoHit
+    at (-10.5) (-10.5) `shouldBe` Right CellPickNoHit
   it "has no hit in a zero extent and refuses a non-finite point and a stale identity" $ do
     assets ← loadAssets 5
     let zero = (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll]) {sceneSetup = (setupZero (sceneSetup oneBlock))}

@@ -10,7 +10,7 @@
 --
 -- 1. The logical point goes through the plan's own render-2d mapping to a
 --    framebuffer position; the /physical pixel/ it lies in is tested at that
---    pixel's centre. A centre outside the viewport, or a view that draws
+--    pixel's centre. A centre outside the viewport or the framebuffer, or a view that draws
 --    nothing, has no hit.
 -- 2. The quads are examined from the nearest (largest depth key) to the
 --    farthest. A quad contains the centre under the raster rule stated below,
@@ -66,6 +66,7 @@ import Data.Word (Word32)
 import Hetoimasia.Asset.Image.DataMap (coverageAt)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld, viewportContains, windowToTarget)
+import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Render2D.Assets
 import Hetoimasia.Terrain.Render2D.Internal.Cells
@@ -92,7 +93,7 @@ data CellHit = CellHit
 data CellPickResult
   = -- | The frontmost covered quad is known material.
     CellPickHit !CellHit
-  | -- | Nothing selectable is under the point: empty, outside the viewport, or
+  | -- | Nothing selectable is under the point: empty, outside the viewport or the framebuffer, or
     -- covered by fog, which are deliberately not distinguished.
     CellPickNoHit
   | -- | Information not yet available could lie ahead of the answer.
@@ -120,8 +121,13 @@ pickCells plan (CellPickQuery presented point@(V2 px py))
       Just (V2 fx fy)
         | isNaN fx || isInfinite fx || isNaN fy || isInfinite fy → Right CellPickNoHit
         | otherwise →
-            let centre = (toRational (floor fx ∷ Integer) + 1 / 2, toRational (floor fy ∷ Integer) + 1 / 2)
-             in if viewportContains viewport (V2 (fromRational (fst centre)) (fromRational (snd centre)))
+            let pixelX = floor fx ∷ Integer
+                pixelY = floor fy ∷ Integer
+                centre = (toRational pixelX + 1 / 2, toRational pixelY + 1 / 2)
+             in -- A pixel is pickable only inside the intersection of the viewport and
+                -- the framebuffer: the renderer clamps drawing to the attachment, so a
+                -- viewport that reaches past it shows nothing there.
+                if inFramebuffer pixelX pixelY && viewportContains viewport (V2 (fromRational (fst centre)) (fromRational (snd centre)))
                   then resolve centre
                   else Right CellPickNoHit
   where
@@ -129,6 +135,8 @@ pickCells plan (CellPickQuery presented point@(V2 px py))
     view = cpView plan
     mapping = rvMapping view
     viewport = setupViewport (rvSetup view)
+    framebuffer = metricsFramebuffer (setupMetrics (rvSetup view))
+    inFramebuffer x y = 0 <= x && x < toInteger (pixelWidth framebuffer) && 0 <= y && y < toInteger (pixelHeight framebuffer)
     assets = cpAssets plan
 
     resolve centre = do
