@@ -350,6 +350,16 @@ replaySpecs = describe "replay" $ do
     -- restored, the drain completes and matches the oracle.
     let restored = withheld {rigDelay = noDelay}
     compareDrained (drainRig fullAllowance restored) `shouldBe` []
+  it "reports each obligation as unseen, pending or expanded" $ do
+    let rig0 = newRig (limitsWith 1) twoOpenings
+        (queued, _) = runTrace rig0 [Edit (1, 0, 5), Edit (9, 0, 5)]
+        stateOf rig n = observedValue (queryObligation (rigEnv rig) (retainedHeader (rigRetained rig)) (rigProvider rig) n)
+    stateOf queued 0 `shouldBe` Right (Just Unseen)
+    stateOf queued 2 `shouldBe` Right Nothing
+    let (started, _) = batchRig (allowanceOf (limitsWith 1)) queued
+    stateOf started 0 `shouldBe` Right (Just Pending)
+    stateOf started 1 `shouldBe` Right (Just Unseen)
+    stateOf (drainRig fullAllowance queued) 0 `shouldBe` Right (Just Expanded)
   it "keeps existing logical queries independent of knowledge" $ do
     let rig = newRig (limitsWith 64) twoOpenings
         (drained, _) = runTrace rig ([Edit c | c ← openingA] <> [Drain fullAllowance])
@@ -429,6 +439,57 @@ limitSpecs = describe "limits" $ do
         pendingOf partial `shouldSatisfy` (> 0)
       other → expectationFailure ("unexpected " <> show other)
     compareDrained (drainRig fullAllowance partial) `shouldBe` []
+  it "stops exactly at an exact allowance of each resource and below it" $ do
+    let rig0 = newRig (limitsWith 64) twoOpenings
+        (queued, _) = runTrace rig0 [Edit c | c ← openingA <> openingB]
+        (_, full) = batchRig fullAllowance queued
+        report = case full of BatchProgress r _ → r; _ → error "expected progress"
+        updatesWith allow = case snd (batchRig allow queued) of
+          BatchProgress r _ → reportUpdates r
+          BatchRefused _ → 0
+          _ → -1
+        exact = reportUpdates report
+    forM_
+      [ ("reads", \n → fullAllowance {allowReads = n}, reportReads report)
+      , ("writes", \n → fullAllowance {allowWrites = n}, reportWrites report)
+      , ("delta bytes", \n → fullAllowance {allowDeltaBytes = n}, reportDeltaBytes report)
+      , ("scratch bytes", \n → fullAllowance {allowScratchBytes = n}, reportScratchBytes report)
+      ]
+      $ \(label, with, amount) → do
+        (label, updatesWith (with amount)) `shouldBe` (label, exact)
+        (label, updatesWith (with (amount - 1)) < exact) `shouldBe` (label, True)
+  it "refuses at the retained-byte and obligation limits and resumes once there is room" $ do
+    let tinyPending = either (error . show) id (mkDiscoveryLimits baseSpec {specPendingObligations = 2})
+        rig0 = newRig tinyPending twoOpenings
+        (two, _) = runTrace rig0 [Edit (1, 0, 5), Edit (9, 0, 5)]
+        (refusedRig, kind) = editRig fullAllowance (1, 0, 6) two
+    kind `shouldBe` EditRefused (CapacityBlocked CapacityObligations 2 2)
+    retainedRecords (rigRetained refusedRig) `shouldBe` retainedRecords (rigRetained two)
+    -- the committed edits are not reissued: after a drain the same edit fits.
+    let drained = drainRig fullAllowance two
+        (resumed, kind') = editRig fullAllowance (1, 0, 6) drained
+    kind' `shouldSatisfy` (\k → case k of EditApplied _ → True; _ → False)
+    compareDrained (drainRig fullAllowance resumed) `shouldBe` []
+    let tinyBytes = either (error . show) id (mkDiscoveryLimits baseSpec {specRetainedBytes = toInteger minimumRetainedBytes})
+        grow rig n
+          | n > (40 ∷ Int) = (rig, Nothing)
+          | otherwise = case editRig fullAllowance (-2 - toInteger n, 0, 4) rig of
+              (rig', EditRefused r) → (rig', Just r)
+              (rig', _) → grow rig' (n + 1)
+        (fullRig, refusal) = grow (newRig tinyBytes twoOpenings) 0
+    refusal `shouldSatisfy` (\r → case r of Just (CapacityBlocked CapacityRetainedBytes _ _) → True; _ → False)
+    invariants fullRig `shouldBe` []
+  it "stages a later removal while older discovery is suspended, then resumes" $ do
+    let rig0 = newRig (limitsWith 1) twoOpenings
+        (queued, _) = runTrace rig0 [Edit c | c ← openingA]
+        withheld = queued {rigDelay = Delay mempty (Set.singleton (KeyTodo 0))}
+        (staged, kind) = editRig fullAllowance (9, 0, 5) withheld
+        (_, stalled) = batchRig fullAllowance staged
+    kind `shouldSatisfy` (\k → case k of EditApplied _ → True; _ → False)
+    stalled `shouldBe` BatchStalled (KeyTodo 0)
+    pendingOf staged `shouldBe` 4
+    let resumed = staged {rigDelay = noDelay}
+    compareDrained (drainRig (allowanceOf (limitsWith 1)) resumed) `shouldBe` []
   where
     isBlocked (BatchRefused (CapacityBlocked _ _ _)) = True
     isBlocked _ = False

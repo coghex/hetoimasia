@@ -79,6 +79,8 @@ module Hetoimasia.Terrain.Internal.Discovery.Core
   , queryComponentKnown
   , queryKnownBoundary
   , queryNodeClass
+  , ObligationState (..)
+  , queryObligation
   ) where
 
 import Control.Monad (ap)
@@ -533,12 +535,20 @@ settleWrites s = (writes, added - removed)
 -- | The accounted payload of a candidate: the new entries, a tombstone for each
 -- deletion and the header.
 payloadBytes ∷ [(RecordKey, Maybe Record)] → Int
-payloadBytes writes = headerBytes + sum [maybe (keyBytes k + entryOverheadBytes) (entryBytes k) v | (k, v) ← writes]
+payloadBytes writes = headerBytes + sum [maybe (tombstoneBytes k) (entryBytes k) v | (k, v) ← writes]
+
+-- | The accounted bytes of a deletion: charged as the largest record of its
+-- kind, so a candidate's size never shrinks as more updates are staged (a
+-- finished obligation costs what its last progress record did).
+tombstoneBytes ∷ RecordKey → Int
+tombstoneBytes k = keyBytes k + entryOverheadBytes + case k of
+  KeyTodo _ → 40
+  _ → 8
 
 scratchOf ∷ S → Int
 scratchOf s =
   sum [maybe (32 + entryOverheadBytes) (entryBytes k) v | (k, v) ← Map.toList (sCache s)]
-    + sum [maybe (keyBytes k + entryOverheadBytes) (entryBytes k) v | (k, v) ← Map.toList (sOverlay s)]
+    + sum [maybe (tombstoneBytes k) (entryBytes k) v | (k, v) ← Map.toList (sOverlay s)]
     + Map.size (sFloor s) * 32
 
 -- ---------------------------------------------------------------------------
@@ -1065,3 +1075,30 @@ anyM _ [] = pure False
 anyM f (x : xs) = do
   r ← f x
   if r then pure True else anyM f xs
+
+-- | The state of one removal's obligation, separate from whether any class it
+-- touches is known.
+data ObligationState
+  = -- | Allocated, with no connection inspected yet.
+    Unseen
+  | -- | Partly inspected; the remaining connections stay queued.
+    Pending
+  | -- | Every connection inspected and the record retired.
+    Expanded
+  deriving stock (Eq, Show)
+
+-- | The state of the obligation with a sequence number, or 'Nothing' for one
+-- not yet allocated. A sequence below the header's oldest unfinished one is
+-- expanded; one inside the window is read from its record.
+queryObligation ∷ Env → Header → Provider → Word64 → Observed (Maybe ObligationState)
+queryObligation env hdr prov seqNo
+  | seqNo < hHead hdr = Observed (Right (Just Expanded)) 0
+  | seqNo >= hTail hdr = Observed (Right Nothing) 0
+  | otherwise = runQuery env prov $ do
+      r ← getRec (KeyTodo seqNo)
+      case r of
+        Just (RecTodo (Todo _ done))
+          | done == 1 → pure (Just Unseen)
+          | otherwise → pure (Just Pending)
+        Nothing → corrupt (MissingObligation seqNo)
+        Just _ → corrupt (MalformedRecord (KeyTodo seqNo))

@@ -117,6 +117,7 @@ accepted =
   , ("accepts and runs a client using the public opening interface: portals, components and connections", openingClient, openingOutput)
   , ("accepts and runs a client that validates limits and drives the residency model through its public interface", residencyClient, residencyOutput)
   , ("accepts and runs a client that validates limits and compiles source connectivity through its public interface", connectivityClient, connectivityOutput)
+  , ("accepts and runs a client that stages a removal, runs discovery and reads knowledge through the public interface", discoveryClient, discoveryOutput)
   ]
 
 -- | The modules hidden inside the main library.
@@ -130,6 +131,9 @@ hidden =
   , "Hetoimasia.Terrain.Internal.Connectivity.Limits"
   , "Hetoimasia.Terrain.Internal.Connectivity.Prepare"
   , "Hetoimasia.Terrain.Internal.Coordinate"
+  , "Hetoimasia.Terrain.Internal.Discovery.Core"
+  , "Hetoimasia.Terrain.Internal.Discovery.Limits"
+  , "Hetoimasia.Terrain.Internal.Discovery.Records"
   , "Hetoimasia.Terrain.Internal.Interval"
   , "Hetoimasia.Terrain.Internal.Packed"
   , "Hetoimasia.Terrain.Internal.Polygon"
@@ -176,6 +180,10 @@ constructors =
   , ("Connectivity", ["import Hetoimasia.Terrain.Connectivity (Connectivity (Connectivity))"], [])
   , ("ComponentKey", ["import Hetoimasia.Terrain.Connectivity (ComponentKey (ComponentKey))"], [])
   , ("Preparation", ["import Hetoimasia.Terrain.Connectivity (Preparation (Preparation))"], [])
+  , ("DiscoveryLimits", ["import Hetoimasia.Terrain.Discovery (DiscoveryLimits (DiscoveryLimits))"], [])
+  , ("Env", ["import Hetoimasia.Terrain.Discovery (Env (Env))"], [])
+  , ("Candidate", ["import Hetoimasia.Terrain.Discovery (Candidate (Candidate))"], [])
+  , ("Retained", ["import Hetoimasia.Terrain.Discovery (Retained (Retained))"], [])
   ]
 
 -- | A value forged by applying a private constructor the client never imported.
@@ -208,6 +216,13 @@ forged =
   , ("Connectivity", ["import Hetoimasia.Terrain.Connectivity (Connectivity)"], ["claimed :: Connectivity", "claimed = Connectivity undefined undefined undefined undefined undefined undefined undefined undefined undefined"])
   , ("ComponentKey", ["import Hetoimasia.Terrain.Connectivity (ComponentKey)"], ["forgedKey :: ComponentKey", "forgedKey = ComponentKey undefined Nothing Nothing Nothing"])
   , ("Preparation", ["import Hetoimasia.Terrain.Connectivity (Preparation)"], ["finished :: Preparation", "finished = Preparation undefined undefined undefined"])
+  , -- Validated discovery limits that claim no bound, a candidate that claims
+    -- a delta nobody staged, retained state that claims a knowledge nobody
+    -- earned and an environment built without its checked limits.
+    ("DiscoveryLimits", ["import Hetoimasia.Terrain.Discovery (DiscoveryLimits)"], ["zeroed :: DiscoveryLimits", "zeroed = DiscoveryLimits 0 0 0 0 0 0 0"])
+  , ("Env", ["import Hetoimasia.Terrain.Discovery (Env)"], ["bare :: Env", "bare = Env undefined undefined undefined"])
+  , ("Candidate", ["import Hetoimasia.Terrain.Discovery (Candidate)"], ["claimed :: Candidate", "claimed = Candidate undefined undefined [] True True undefined"])
+  , ("Retained", ["import Hetoimasia.Terrain.Discovery (Retained)"], ["claimed :: Retained", "claimed = Retained undefined undefined"])
   ]
 
 -- | A checked value rewritten through an exported accessor used as a field
@@ -238,6 +253,13 @@ recordUpdates =
     ("limitWorkSteps", ["import Hetoimasia.Terrain.Connectivity (ConnectivityLimits, defaultConnectivityLimits, limitWorkSteps)"], ["unbounded :: ConnectivityLimits", "unbounded = defaultConnectivityLimits {limitWorkSteps = 1000000000}"])
   , ("lQuantum", ["import Hetoimasia.Terrain.Connectivity (ConnectivityLimits, defaultConnectivityLimits)"], ["greedy :: ConnectivityLimits", "greedy = defaultConnectivityLimits {lQuantum = 1000000}"])
   , ("lNodes", ["import Hetoimasia.Terrain.Connectivity (ConnectivityLimits, defaultConnectivityLimits)"], ["greedy :: ConnectivityLimits", "greedy = defaultConnectivityLimits {lNodes = 1000000}"])
+  , -- Discovery limits, candidates and retained state are rewritten through no
+    -- field either: the accessors are functions and the fields are not exported.
+    ("limitBatchUpdates", ["import Hetoimasia.Terrain.Discovery (DiscoveryLimits, defaultDiscoveryLimits, limitBatchUpdates)"], ["unbounded :: DiscoveryLimits", "unbounded = defaultDiscoveryLimits {limitBatchUpdates = 1000}"])
+  , ("lBatch", ["import Hetoimasia.Terrain.Discovery (DiscoveryLimits, defaultDiscoveryLimits)"], ["unbounded :: DiscoveryLimits", "unbounded = defaultDiscoveryLimits {lBatch = 1000}"])
+  , ("candidateWrites", ["import Hetoimasia.Terrain.Discovery (Candidate, candidateWrites)"], ["emptied :: Candidate → Candidate", "emptied c = c {candidateWrites = []}"])
+  , ("candidateBase", ["import Hetoimasia.Terrain.Discovery (Candidate, candidateBase)"], ["rebased :: Candidate → Candidate", "rebased c = c {candidateBase = undefined}"])
+  , ("retainedHeader", ["import Hetoimasia.Terrain.Discovery (Retained, retainedHeader)"], ["rewound :: Retained → Retained", "rewound r = r {retainedHeader = undefined}"])
   ]
 
 supportedClient ∷ String
@@ -475,4 +497,76 @@ connectivityOutput =
   , "Just []"
   , "Just 2"
   , "Refusal {refusedResource = StructuralNodes, refusedNeeded = 2, refusedLimit = 1}"
+  ]
+
+-- | A client that stages a removal, applies its candidate, runs a discovery
+-- batch and reads knowledge, all through the public interface.
+discoveryClient :: String
+discoveryClient =
+  unlines
+    [ "module Main (main) where"
+    , ""
+    , "import Hetoimasia.Terrain.Cell"
+    , "import Hetoimasia.Terrain.Connectivity (defaultConnectivityLimits, prepareConnectivity)"
+    , "import Hetoimasia.Terrain.Coordinate"
+    , "import Hetoimasia.Terrain.Discovery"
+    , "import Hetoimasia.Terrain.Residency (ArenaId (..))"
+    , "import Hetoimasia.Terrain.Source"
+    , ""
+    , "main :: IO ()"
+    , "main = do"
+    , "  let spec0 = DiscoverySpec 64 1000 100 100000 100000 100 100000"
+    , "  putStrLn (either show (const \"valid\") (mkDiscoveryLimits spec0))"
+    , "  putStrLn (either show (const \"valid\") (mkDiscoveryLimits spec0 {specBatchUpdates = 0}))"
+    , "  putStrLn (either show (const \"valid\") (mkDiscoveryLimits spec0 {specBatchUpdates = 65}))"
+    , "  putStrLn (either show (const \"valid\") (mkDiscoveryLimits spec0 {specInspectedRecords = 1}))"
+    , "  let definition = SourceSpec [\"stone\"] [LayerSpec Nothing (Just 0) \"stone\" 0] []"
+    , "  case (mkSource defaultSourceLimits definition, tileCoord 0 0 (-1), tileCoord 0 0 (-2), tileCoord 3 3 (-3)) of"
+    , "    (Right source, Right top, Right below, Right far) -> case prepareConnectivity defaultConnectivityLimits source of"
+    , "      Left e -> print e"
+    , "      Right (compiled, _) -> do"
+    , "        let limits = defaultDiscoveryLimits"
+    , "            env = mkEnv limits source compiled"
+    , "            fresh = newRetained (ArenaId 1)"
+    , "            allow = allowanceOf limits"
+    , "        case stageRemoval env (retainedHeader fresh) (retainedProvider fresh) allow top of"
+    , "          Right (Staged candidate) -> do"
+    , "            print (candidateTerrain candidate, candidateKnowledge candidate, candidateFrontierOnly candidate, reportWrites (candidateReport candidate))"
+    , "            case applyCandidate candidate fresh of"
+    , "              Left e -> print e"
+    , "              Right edited -> do"
+    , "                print (pendingObligations (retainedHeader edited))"
+    , "                print (observedValue (queryCell env (retainedProvider edited) top))"
+    , "                putStrLn (either (const \"stale\") (const \"applied\") (applyCandidate candidate edited))"
+    , "                case stepDiscovery env (retainedHeader edited) (retainedProvider edited) allow of"
+    , "                  Right (Progress step halt) -> do"
+    , "                    print (reportUpdates (candidateReport step), halt, candidateKnowledge step, length (reportNewlyKnown (candidateReport step)))"
+    , "                    case applyCandidate step edited of"
+    , "                      Left e -> print e"
+    , "                      Right drained -> do"
+    , "                        print (pendingObligations (retainedHeader drained))"
+    , "                        let view t = fmap (\\k -> (cellSolid k, cellVoid k, presentation k)) (observedValue (queryCell env (retainedProvider drained) t))"
+    , "                        print (view top)"
+    , "                        print (view below)"
+    , "                        print (view far)"
+    , "                  other -> print other"
+    , "          other -> print other"
+    , "    _ -> putStrLn \"unexpected\""
+    ]
+
+discoveryOutput :: [String]
+discoveryOutput =
+  [ "valid"
+  , "LimitNotPositive FieldBatchUpdates 0"
+  , "LimitUnrepresentable FieldBatchUpdates 65 64"
+  , "LimitBelowProgress FieldInspectedRecords 1 197"
+  , "(True,False,False,2)"
+  , "1"
+  , "Right (CellKnowledge {cellSolid = NoSolid, cellVoid = VoidUnknown})"
+  , "stale"
+  , "(6,HaltDrained,True,1)"
+  , "0"
+  , "Right (NoSolid,VoidKnown,Ordinary)"
+  , "Right (SolidKnown,NoVoidHere,Ordinary)"
+  , "Right (SolidUnknown,NoVoidHere,FullyUnknown)"
   ]

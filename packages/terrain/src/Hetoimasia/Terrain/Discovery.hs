@@ -242,6 +242,8 @@ module Hetoimasia.Terrain.Discovery
   , queryComponentKnown
   , queryKnownBoundary
   , queryNodeClass
+  , ObligationState (..)
+  , queryObligation
   ) where
 
 import Hetoimasia.Terrain.Internal.Discovery.Core
