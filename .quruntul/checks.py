@@ -416,9 +416,9 @@ class AdapterChecks(unittest.TestCase):
         affected = self.assert_policy_change(suites, "test.vulkan-headless", ["trial_seconds"])
         # One suite for each component the group's command names: the native
         # backend's two, the integration's, the four samples', the 2D
-        # renderer's Vulkan recorder's, and the Lua-first engine's graphics
-        # adapter's.
-        self.assertEqual(len(affected), 9, sorted(affected))
+        # renderer's Vulkan recorder's, the terrain material's and the
+        # Lua-first engine's graphics adapter's.
+        self.assertEqual(len(affected), 10, sorted(affected))
 
     def test_a_policy_edit_that_leaves_execution_unchanged_keeps_the_identity(self):
         # Both timeouts fall below the trial floor, so both run 60-second trials.

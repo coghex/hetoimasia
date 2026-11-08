@@ -28,6 +28,9 @@ module Hetoimasia.Render.TwoD.Oracle.Internal.Geometry
     -- * Coverage
   , Coverage (..)
   , coverage
+  , Footprint
+  , footprint
+  , coverageOf
   , nearBoundary
   , Point
 
@@ -139,15 +142,58 @@ data Coverage
 
 -- | Where a pixel centre stands to a non-singular placement's quad.
 coverage ∷ Placement → Point Rational → Coverage
-coverage p centre
-  | nearBoundary (1 / 16) (edges (corners p)) centre = NearEdge
+coverage = coverageOf . footprint
+
+-- | What a placement's coverage needs of it at every pixel, worked out once: the
+-- quad's bounding box widened by the edge distance, its edges, and the inverse of
+-- its linear part. The same exact 'Rational' values 'coverage' would compute at
+-- each pixel, so no answer differs; only the repetition is gone.
+data Footprint = Footprint
+  { fpLeft ∷ Rational
+  , fpRight ∷ Rational
+  , fpTop ∷ Rational
+  , fpBottom ∷ Rational
+  , fpEdges ∷ [(Point Rational, Point Rational)]
+  , fpOrigin ∷ Point Rational
+  , fpInverse ∷ ((Rational, Rational), (Rational, Rational))
+  }
+
+-- | The footprint of a non-singular placement.
+footprint ∷ Placement → Footprint
+footprint p =
+  Footprint
+    { fpLeft = minimum xs - tolerance
+    , fpRight = maximum xs + tolerance
+    , fpTop = minimum ys - tolerance
+    , fpBottom = maximum ys + tolerance
+    , fpEdges = edges (corners p)
+    , fpOrigin = (plTx p, plTy p)
+    , fpInverse = inverseLinear p
+    }
+  where
+    xs = map fst (corners p)
+    ys = map snd (corners p)
+    tolerance = 1 / 16
+    edges [p00, p10, p01, p11] = [(p00, p10), (p10, p11), (p11, p01), (p01, p00)]
+    edges _ = []
+
+-- | Where a pixel centre stands to a footprint's quad.
+coverageOf ∷ Footprint → Point Rational → Coverage
+coverageOf f centre@(cx, cy)
+  -- A centre farther than the edge distance outside the quad's bounding box is
+  -- neither inside it nor near any edge, which all lie within the box: the same
+  -- answer as below, without the distance to each edge.
+  | cx < fpLeft f || cx > fpRight f || cy < fpTop f || cy > fpBottom f = Outside
+  | nearBoundary (1 / 16) (fpEdges f) centre = NearEdge
   | inside = Inside (lx, ly)
   | otherwise = Outside
   where
-    (lx, ly) = localPoint p centre
+    ((m00, m01), (m10, m11)) = fpInverse f
+    dx = cx - fst (fpOrigin f)
+    dy = cy - snd (fpOrigin f)
+    lx = m00 * dx + m01 * dy
+    ly = m10 * dx + m11 * dy
     inside = lx >= 0 && lx <= 1 && ly >= 0 && ly <= 1
-    edges [p00, p10, p01, p11] = [(p00, p10), (p10, p11), (p11, p01), (p01, p00)]
-    edges _ = []
 
 -- | Whether a point is within a distance of any of the segments.
 nearBoundary ∷ (Fractional a, Ord a) ⇒ a → [(Point a, Point a)] → Point a → Bool

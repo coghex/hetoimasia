@@ -595,6 +595,14 @@ scenarios =
         outcome ← SurfaceFree.runMaterials (consentBackend consent) journal
         pure (SurfaceFree.materialsSpec outcome, section "The R2D-11 application materials evidence record" (SurfaceFree.materialsSection outcome))
   , Scenario
+      "tra8-terrain"
+      "draws plans of the terrain arena's faces through the existing fixed-quad and material ABI into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — the 16 shape identities in each of 4 facings, roofs over cavities, disconnected spans, ramps and corners, manual and automatic cutaways, a floor 70 levels below the cut, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, the same scene submitted in plan order, scrambled, split between two materials and split between retained chunks, transparent coverage, and three negative controls — reads each back after its batch completed, judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated line-of-sight expectation, compares the pure pick, and writes a lossless PNG a target, a probe record and a fixture record; where the device chooses another depth format it reports that it cannot qualify, and fails"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runTerrain (consentBackend consent) journal
+        pure (SurfaceFree.terrainSpec outcome, section "The TRA-8 terrain material evidence record" (SurfaceFree.terrainSection outcome))
+  , Scenario
       "r2d18-animation"
       "records nine render-2d snapshots whose instances name a frame table of their view, with the view's animation time, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — an animated dynamic sprite and an animated tile of a retained chunk built once and never rebuilt, at times including one near 10^6 seconds and times exactly on frame boundaries, the same chunk drawn in two views with different tables and times, a non-animated instance in the same draw, and the two counterexamples to a 32-bit phase — the batch's frame tables written into its storage region and the vertex stage reading each instance's rectangle from the current frame of its table, reads each target back after completion, judges every pixel against the render-2d oracle and each named colour against the frame worked out by hand, and writes a lossless PNG a target and a probe record; where the device chooses another depth format it reports that"
       False

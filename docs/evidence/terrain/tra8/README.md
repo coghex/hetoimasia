@@ -14,7 +14,7 @@ a renderer inability.
 - Command (macOS, under the desktop-consent policy; the scenario creates no window):
   `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --private-roots tra8-terrain`
   (Linux: the same command without the variable, through the runner's isolated display.)
-- Source revision `b1c07fd1029c8e8376c60a9be62b39a8231579d6` (clean tree), source digest `3e6fffe65a320e0bd7a7d521fe85a3f9db98cea6473aab6eff980867232edfe6`; device
+- Source revision `fc7125ee32d5f36bb1005b3488c981c3f48e9f21` (clean tree), source digest `bad3d131e784aa4e968aafb275dd7bb9ca60f8cc5e8ad5e09042a40dc1705380`; device
   `Apple M3 Max` (MoltenVK); depth format `Depth32Float`, target `Rgba8Srgb`; validation and
   synchronization validation clean through teardown.
 - Shader identity (SPIR-V SHA-256 of the checked fragment variants): cutout
@@ -26,11 +26,13 @@ a renderer inability.
   (all `true`, the decoded default) and the draw path its faces took: **every face of every fixture
   took the cutout path**, so the conclusion holds for the path the approved art takes with its decoded
   mark; no mark override was used.
-- Budget: scenario body 9.08 s; the scenario's child ran 9.4 s against the 20 s child deadline and the whole
-  `--complete` profile 22.0 s against its 30 s watchdog (`complete-profile-transcript.txt`, taken on head 23a44e1c; the only
-  source change since is the failure-path fix of review round 2, which the passing path does not run). Every
-  batch's completion was awaited before its readback; the oracle's per-pixel judging dominates the
-  time, recording and readback of all fixtures together taking about 1.2 s.
+- Budget: scenario body 3.84 s; the scenario's child ran 4.1 s against the 20 s child deadline and the whole
+  `--complete` profile 15.9 s against its 30 s watchdog (`complete-profile-transcript.txt`, same head). Every
+  batch's completion was awaited before its readback; the oracle's per-pixel judging still dominates the time
+  (about 2.6 s of the 3.8 s), recording and readback of all fixtures together taking about 1.1 s. The
+  oracle first placed each instance afresh at every pixel, which made the scenario 9.1 s on the same machine and
+  about 15.6 s on the Linux runner (where the watchdog expired at 30.1 s in total); it now places each instance
+  once, with the same exact values, and every oracle and independent count in this record is the same as before.
 
 ## How a pixel is judged
 
