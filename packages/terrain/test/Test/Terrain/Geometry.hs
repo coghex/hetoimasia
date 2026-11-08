@@ -93,12 +93,27 @@ matrixSpec = describe "the sixteen canonical solids" $ do
           dotP (newell (map toP (faceVertices face))) (toP (planeNormal (facePlane face))) `shouldSatisfy` (> 0)
       it "has the identity it was asked for" $
         shapeIdValue (solidShape (solid (fixtureId fixture))) `shouldBe` fixtureId fixture
-  it "has five faces for every identity but the flat ones, which have six" $
-    map (length . solidFaces . solid) [0 .. 15] `shouldBe` [6, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6]
-  it "keeps identities 0 and 15 distinct but gives them one solid shape" $ do
-    solidShape (solid 0) `shouldNotBe` solidShape (solid 15)
-    solidVertices (solid 0) `shouldBe` solidVertices (solid 15)
-    faceSet (solid 0) `shouldBe` faceSet (solid 15)
+  it "has five faces for every identity but identity 0, which has six" $
+    map (length . solidFaces . solid) [0 .. 15] `shouldBe` [6, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+  -- The intentional semantic change (D-49): identity 15 was the full block of
+  -- identity 0 and is now a central half-height peak. These are not regressions
+  -- of the compatibility catalog; they replace the alias's expectations.
+  describe "identity 15, the central half-height peak" $ do
+    it "is not the full block of identity 0: its identity, vertices and faces all differ" $ do
+      solidShape (solid 0) `shouldNotBe` solidShape (solid 15)
+      solidVertices (solid 15) `shouldNotBe` solidVertices (solid 0)
+      faceSet (solid 15) `shouldNotBe` faceSet (solid 0)
+    it "has the four base corners and an apex at (1/2, 1/2, 1/2), and no other vertex" $
+      sort (map toP (solidVertices (solid 15)))
+        `shouldBe` sort [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (1 / 2, 1 / 2, 1 / 2)]
+    it "has four sloping top facets, a full base and no wall of positive area" $ do
+      sort [faceLabel (faceKind face) | face ← solidFaces (solid 15)] `shouldBe` ["Bottom", "Top", "Top", "Top", "Top"]
+      [face | face ← solidFaces (solid 15), faceKind face /= TopFace, faceKind face /= BottomFace] `shouldBe` []
+      [planeNormal (facePlane face) | face ← solidFaces (solid 15), faceKind face == TopFace]
+        `shouldBe` [point 0 (-1) 1, point 1 0 1, point 0 1 1, point (-1) 0 1]
+    it "keeps its four base corners in the solid, as boundary points" $
+      forM_ [(0, 0), (1, 0), (1, 1), (0, 1)] $ \(x, y) →
+        classifyPoint (solid 15) (point x y 0) `shouldBe` Boundary
   it "gives NS and EW different solids" $
     faceSet (solid 5) `shouldNotBe` faceSet (solid 10)
   it "covers the whole footprint with top faces and the bottom with one face" $
@@ -156,33 +171,28 @@ coverageSpec = describe "face coverage of the cell sides" $ do
     sideCoverage (shape 1) South `shouldBe` FullCoverage
     sideCoverage (shape 1) North `shouldBe` NoCoverage
     sideCoverage (shape 5) East `shouldBe` PartialCoverage
-    sideCoverage (shape 15) West `shouldBe` FullCoverage
+  it "gives the peak no covered side at all: its walls have no positive area" $
+    forM_ allSides $ \side → do
+      sideCoverage (shape 15) side `shouldBe` NoCoverage
+      sideCoverageArea (shape 15) side `shouldBe` 0
   where
     coverageOf ∷ Rational → Coverage
     coverageOf 0 = NoCoverage
     coverageOf 1 = FullCoverage
     coverageOf _ = PartialCoverage
 
--- | The oracle: a point is in the closed solid of a shape when it is in the
--- unit footprint, at or above the base and at or below every ramp the mask
--- sets; it is interior when each of those holds strictly.
-height ∷ [Side] → Rational → Rational → Rational
-height sides x y = minimum (1 : [ramp side | side ← sides])
-  where
-    ramp North = y
-    ramp East = 1 - x
-    ramp South = 1 - y
-    ramp West = x
-
--- | Flat identities have the full height 1, which 'height' gives for no sides.
+-- | The oracle: a point is in the closed solid of an identity when it is in the
+-- unit footprint, at or above the base and at or below the top height the mask
+-- bits give ('topHeight', stated in "Test.Terrain.Fixtures" from the bits alone,
+-- with no special case for any identity); it is interior when each of those
+-- holds strictly.
 oracle ∷ Int → V3 → PointClass
 oracle identity (V3 x y z)
   | x < 0 || x > 1 || y < 0 || y > 1 || z < 0 || z > top = Exterior
   | x > 0 && x < 1 && y > 0 && y < 1 && z > 0 && z < top = Interior
   | otherwise = Boundary
   where
-    sides = if identity == 15 then [] else shapeSides (shape identity)
-    top = height sides x y
+    top = topHeight identity x y
 
 membershipSpec ∷ Spec
 membershipSpec = describe "point membership" $ do
@@ -210,8 +220,20 @@ membershipSpec = describe "point membership" $ do
       , (0, point (1 / 2) (1 / 2) (-1 / 1000), Exterior)
       , (0, point (-1 / 1000) (1 / 2) (1 / 2), Exterior)
       , (0, point 5 5 5, Exterior)
-      , (15, point (1 / 2) (1 / 2) (1 / 2), Interior)
-      , (15, point (1 / 2) (1 / 2) 1, Boundary)
+      , -- The peak: apex on the boundary, the air above it exterior, and the old
+        -- alias's flat top at 1 now outside.
+        (15, point (1 / 2) (1 / 2) (1 / 2), Boundary)
+      , (15, point (1 / 2) (1 / 2) (3 / 4), Exterior)
+      , (15, point (1 / 2) (1 / 2) 1, Exterior)
+      , (15, point (1 / 2) (1 / 2) (1 / 4), Interior)
+      , (15, point (1 / 4) (1 / 2) (1 / 4), Boundary)
+      , (15, point (1 / 4) (1 / 2) (1 / 5), Interior)
+      , (15, point (1 / 4) (1 / 2) (3 / 10), Exterior)
+      , (15, point (1 / 4) (1 / 4) (1 / 4), Boundary)
+      , (15, point (1 / 2) 0 0, Boundary)
+      , (15, point (1 / 2) 0 (1 / 100), Exterior)
+      , (15, point 0 0 0, Boundary)
+      , (15, point 0 0 (1 / 100), Exterior)
       , (1, point (1 / 2) (1 / 2) (1 / 4), Interior)
       , (1, point (1 / 2) (1 / 2) (1 / 2), Boundary)
       , (1, point (1 / 2) (1 / 2) (3 / 4), Exterior)
@@ -329,6 +351,36 @@ raySpec = describe "ray and segment queries" $ do
     toP (hitPoint found) `shouldBe` (0, 1, 1)
     hitContact found `shouldBe` Grazes
     fmap (planeNormal . facePlane) (hitFace found) `shouldBe` Just (point 0 (-1) 1)
+  describe "identity 15, the central half-height peak" $ do
+    it "first meets the apex of a downward ray from above at parameter 3/2" $ do
+      found ← hitOrFail (solid 15) (point (1 / 2) (1 / 2) 2) (point 0 0 (-1))
+      hitParameter found `shouldBe` 3 / 2
+      toP (hitPoint found) `shouldBe` (1 / 2, 1 / 2, 1 / 2)
+      hitContact found `shouldBe` Enters
+      -- The apex lies on all four facets; the first in canonical order that the
+      -- ray moves into is the North one (normal (0, -1, 1)).
+      fmap (planeNormal . facePlane) (hitFace found) `shouldBe` Just (point 0 (-1) 1)
+    it "meets a facet's interior at that facet's own height" $ do
+      found ← hitOrFail (solid 15) (point (1 / 4) (1 / 2) 2) (point 0 0 (-1))
+      hitParameter found `shouldBe` 7 / 4
+      toP (hitPoint found) `shouldBe` (1 / 4, 1 / 2, 1 / 4)
+      hitContact found `shouldBe` Enters
+      fmap (planeNormal . facePlane) (hitFace found) `shouldBe` Just (point (-1) 0 1)
+    it "enters through a ridge between two facets by the first in canonical order" $ do
+      found ← hitOrFail (solid 15) (point (1 / 4) (1 / 4) 2) (point 0 0 (-1))
+      hitParameter found `shouldBe` 7 / 4
+      hitContact found `shouldBe` Enters
+      fmap (planeNormal . facePlane) (hitFace found) `shouldBe` Just (point 0 (-1) 1)
+    it "no longer meets a ray that stops between the apex and the old flat top" $ do
+      castSegment (solid 15) (point (1 / 2) (1 / 2) 2) (point (1 / 2) (1 / 2) 1) `shouldBe` Right Nothing
+      -- Ending exactly on the apex touches the closed solid without entering it.
+      fmap (fmap hitContact) (castSegment (solid 15) (point (1 / 2) (1 / 2) 2) (point (1 / 2) (1 / 2) (1 / 2)))
+        `shouldBe` Right (Just Grazes)
+    it "passes a horizontal ray just above the apex and meets one just below it" $ do
+      hit (solid 15) (point (-1) (1 / 2) (3 / 4)) (point 1 0 0) `shouldBe` Nothing
+      found ← hitOrFail (solid 15) (point (-1) (1 / 2) (1 / 4)) (point 1 0 0)
+      hitParameter found `shouldBe` 5 / 4
+      toP (hitPoint found) `shouldBe` (1 / 4, 1 / 2, 1 / 4)
   it "touches a ridge from outside without entering" $ do
     found ← hitOrFail (solid 5) (point (-1) (1 / 2) (1 / 2)) (point 1 0 0)
     hitContact found `shouldBe` Grazes

@@ -14,19 +14,27 @@
 --
 -- = The solid of a shape
 --
--- The solid is the closed convex set @0 <= x,y <= 1@, @z >= 0@ under the top
--- surface: a flat top at @z = 1@ for identities 0 and 15, and otherwise one
--- ramp per set bit, each a full-width 45° plane that is @0@ high on its own
--- side and @1@ high on the opposite side:
+-- In the local frame let @N = y@, @E = 1 - x@, @S = 1 - y@ and @W = x@. The
+-- closed solid of a shape is @0 <= z <= h(x, y)@ over the unit footprint
+-- @0 <= x, y <= 1@, where @h = 1@ for identity 0 and otherwise @h@ is the minimum
+-- of the expressions named by the shape's set bits (bit 1 North, 2 East, 4 South,
+-- 8 West). Each is a full-width 45° ramp that is @0@ high on its own side and
+-- @1@ high on the opposite side, so a set bit lowers its own side to the base,
+-- where the neighbor one level lower meets it, and the solid is the intersection
+-- of every ramp (the lower envelope): always a convex polytope with
+-- piecewise-planar faces. A lowered side leaves a zero-thickness edge, which is
+-- no face.
 --
--- * North: @z <= y@; East: @z <= 1 - x@; South: @z <= 1 - y@; West: @z <= x@.
+-- Identity 15, NESW, takes all four: its top is four sloping facets meeting in
+-- the apex @(1/2, 1/2, 1/2)@, all four edges of its footprint are at the base,
+-- it has no vertical wall of positive area, and it is not the full block of
+-- identity 0 (the owner's D-49 amendment replaced the earlier flat-top alias).
+-- The four base corners remain in the solid. No identity is derived from a
+-- neighbor: removing a tile reshapes nothing.
 --
--- A set bit therefore lowers its own side to the base, where the neighbor one
--- level lower meets it, and the solid is the intersection of every ramp (the
--- lower envelope), so it is always a convex polytope with piecewise-planar
--- faces. A lowered side leaves a zero-thickness edge, which is no face.
--- Identity 15 is the authored all-sides identity with a flat top: its solid is
--- exactly that of identity 0.
+-- The cell's empty space, the portion strictly above @h@, and the openings the
+-- solid leaves on each cell face are the business of "Hetoimasia.Terrain.Opening",
+-- which derives them from this module's 'Solid' so the two cannot disagree.
 --
 -- = Exactness and conventions
 --
@@ -190,9 +198,10 @@ taggedPlanes shape =
   ]
     <> tops
   where
-    -- Identity 15 is the authored all-sides identity with a flat top.
+    -- Only identity 0 has a flat top; every other identity keeps one ramp per
+    -- set bit, including identity 15 with all four.
     tops
-      | shapeIdValue shape == 15 || null sides = [(TopFace, Plane (V3 0 0 1) 1)]
+      | null sides = [(TopFace, Plane (V3 0 0 1) 1)]
       | otherwise = [(TopFace, ramp side) | side ← sides]
     sides = shapeSides shape
     -- z <= y, z <= 1 - x, z <= 1 - y, z <= x.

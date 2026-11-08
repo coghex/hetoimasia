@@ -53,9 +53,10 @@ spec = beforeAll loadEnv $ describe "Terrain scenes against the hand-stated expe
           pure ()
 
     forM_ allViewFacings $ \facing →
-      it ("divide their hexagon into faces of their own for every identity but 0 and 15, which share the flat one, facing " <> show facing) $ \env → do
+      it ("divide their hexagon into faces of their own for every identity, none sharing a partition with another, facing " <> show facing) $ \env → do
+        -- Identity 15 is the central peak (TRA-13), so it no longer shares identity 0's flat partition.
         let partitions = [(shape, surfaces env (singleShape shape facing) 2) | shape ← [0 .. 15 ∷ Int]]
-        [(a, b) | (a, sa) ← partitions, (b, sb) ← partitions, a < b, sa == sb] `shouldBe` [(0, 15)]
+        [(a, b) | (a, sa) ← partitions, (b, sb) ← partitions, a < b, sa == sb] `shouldBe` []
 
   describe "occlusion and cutaway" $ do
     forM_ allViewFacings $ \facing → do

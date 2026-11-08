@@ -1,8 +1,10 @@
 # TRA-13 evidence: the corrected canonical shapes and their exact openings
 
 Issue [#655](https://github.com/coghex/hetoimasia/issues/655), epic #636. Pinned to the
-implementation commit `33a66b97da50fe4c616b3aafdc15a9a826d910e8` on branch `issue-655-canonical-shape-geometry-portals`
-(base: master after PR #654). Everything here is a **CPU, exact-arithmetic** result. No
+implementation head `7b5779e54b41d58513f4ff3b4517f44334ebc67c` of PR #667 (merged to master as
+`d661115676cc3853a25a148126e5bb554728b522`; base: master after PR #654). Re-pinned after review: round 1 found
+that `openingContains` counted the solid's own boundary as air, fixed in `92c79ae4`, and the figures below are
+for the final head unless a line says it was measured at the earlier head `33a66b97da50`. Everything here is a **CPU, exact-arithmetic** result. No
 performance claim and no amended GPU, corrected-mask, lighting or alpha-picking proof is
 made (TRA-14, TRA-16 and TRA-17 own those).
 
@@ -10,7 +12,7 @@ made (TRA-14, TRA-16 and TRA-17 own those).
 
 ```sh
 export PATH="$HOME/.cache/hetoimasia/toolchain/ghc-9.14.1/bin:$PATH"   # ghc 9.14.1, cabal 3.18.1.0
-git checkout 33a66b97da50fe4c616b3aafdc15a9a826d910e8
+git checkout 7b5779e54b41d58513f4ff3b4517f44334ebc67c   # or master at d661115676cc
 cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct
 (cd packages/terrain && cabal check)
@@ -18,9 +20,10 @@ python3 tools/validation/plan.py --catalog-check
 cabal test workflow-tests --test-show-details=direct
 ```
 
-Results at this commit: `terrain-tests` 668 examples, 0 failures; `terrain-render-2d-tests` 256
+Results: `terrain-tests` 669 examples, 0 failures (final head); `terrain-render-2d-tests` 256
 examples, 0 failures; `cabal check` clean; catalog valid (36 groups); `workflow-tests` 965 examples,
-0 failures; `terrain-render-2d-vulkan-tests` passed; the native `tra8-terrain` scenario (surface-free,
+0 failures; `terrain-render-2d-vulkan-tests` passed (the last four measured at `33a66b97da50`; the later
+changes are the one `Opening.hs`/`Polygon.hs` fix, its tests, a README bullet and docs-only master merges); the native `tra8-terrain` scenario (surface-free,
 no window) 5 examples, 0 failures with the 16-shape matrix judged in all four facings. A clean rebuild
 of both touched packages (build directories removed first) produced no warning.
 
@@ -42,10 +45,20 @@ apex at parameter `3/2` (`Enters`, the North facet by canonical order); the same
 ### Old alias against the new cases
 
 The alias (`shapeIdValue shape == 15 || null sides` in `taggedPlanes`) was reintroduced locally,
-uncommitted, with every test unchanged: **40 of 668 examples fail**, including the apex, the
+uncommitted, with every test unchanged (measured at `33a66b97da50`, 668 examples): **40 of 668 examples fail**, including the apex, the
 ID-15 membership points, the wall-coverage table, "gives the peak no covered side at all", the
 five-face count, and the opening-interface external client. The same run fails the portal
 examples that need the peak's open sides (ID 15's side and top areas are 1, not 0).
+
+### Boundary convention (round 1 fix)
+
+`openingContains` is true to the closed solid: a face point is in an opening exactly when `classifyPoint`
+calls the corresponding cell point `Exterior`. The solid's section by the face (the ramp and ridge lines, the
+base edge, the top edge, the corners, even a section with no area) is excluded; the cell face's own edges and the
+seams between an opening's convex pieces are air wherever the solid is not. Tests: "agrees with the
+closed-solid classification on every point of every face, boundaries and seams included" (a 1/8 grid over all
+16 identities and 6 faces) and "keeps the solid's boundary out of the opening: ramp, ridge, top edge and base
+edge". Negative control: restoring closed polygon membership fails exactly these two of 669 examples.
 
 ## All 16 identities in all 4 orientations
 
