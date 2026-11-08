@@ -319,10 +319,14 @@ residency or turn missing data into air.
   adds the tile's exact integer coordinates to the local points, so it is exact at
   the supported extremes and across negative region seams.
 - *Boundary convention.* The closed-solid convention is unchanged: a boundary point
-  belongs to the solid and is not air, so a face point strictly inside a portal is
-  exactly a point `classifyPoint` calls `Exterior`, and one on the solid's section
-  is `Boundary`. An opening is closed as a region (`openingContains` includes its
-  edge), but a zero-width contact never connects.
+  belongs to the solid and is not air. `openingContains` is true to it: a face point
+  is in an opening exactly when `classifyPoint` calls the corresponding cell point
+  `Exterior`, so the solid's section by the face (the ramp line, the ridge, the base
+  edge, the top edge and the corners, even where the section has no area) is
+  excluded, while the cell face's own edges, and the artificial seams between an
+  opening's convex pieces, are air wherever the solid is not. The pieces
+  (`openingPieces`) are closed polygons that serve `openingArea`, and a zero-width
+  contact never connects.
 
 ## Layered source
 
