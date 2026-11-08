@@ -20,10 +20,11 @@ module Test.TerrainRender2D.Cells
 import Control.Monad (forM_)
 import Data.Int (Int64)
 import Data.List (sortOn)
-import Hetoimasia.Asset.Image.DataMap (coverageAt)
+import qualified Data.ByteString as ByteString
+import Hetoimasia.Asset.Image.DataMap (NormalEncoding (..), buildBinaryCoverage, coverageAt)
 import Hetoimasia.Terrain.Cell (Column (..))
 import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
-import Hetoimasia.Terrain.MapBake.Catalog (MapKey (..), MapRole (..), mapFileName)
+import Hetoimasia.Terrain.MapBake.Catalog (MapKey (..), MapRole (..), catalogKeys, mapFileName)
 import Hetoimasia.Terrain.Render2D.Assets
 import Hetoimasia.Terrain.Render2D.Camera (camRef)
 import Hetoimasia.Terrain.Render2D.CellPick
@@ -43,6 +44,7 @@ shapeNo n = either (error . show) id (mkShapeId n)
 spec ∷ Spec
 spec = describe "Cell quads (TRA-16)" $ do
   checkedInputs
+  checkedAssets
   beforeAll (loadAssets 5) $ do
     representation
     agreement
@@ -78,6 +80,25 @@ checkedInputs = describe "checked supplied knowledge" $ do
                  , KnowRun 32 40 CellUndiscovered
                  ]
     knowledgeRevision knowledge `shouldBe` 9
+
+-- The adopted style is checked before any plan can be asked for.
+checkedAssets ∷ Spec
+checkedAssets = describe "checked supplied assets" $ do
+  let full = planeFromFormula (\_ _ → True)
+      short = either (error . show) id (buildBinaryCoverage 96 63 (ByteString.replicate (96 * 63 * 4) 255))
+      colour ref = either (error . show) id (mkColourAsset ref 1 1 full)
+      mapAsset key = either (error . show) id (mkMapAsset key 1 1 (Just UnitNormalRgbV1) full)
+      allMaps = [(key, mapAsset key) | key ← catalogKeys]
+  it "refuses a plane that is not 96 x 64, mismatched versions and a map without its checked profile" $ do
+    mkColourAsset ColourBlank 1 1 short `shouldSatisfy` isLeft
+    mkColourAsset ColourBlank 1 2 full `shouldSatisfy` isLeft
+    mkMapAsset (MapKey Ordinary (shapeNo 0)) 1 1 Nothing full `shouldSatisfy` isLeft
+    mkMapAsset (MapKey Ordinary (shapeNo 0)) 3 4 (Just UnitNormalRgbV1) full `shouldSatisfy` isLeft
+  it "refuses a catalog that lacks an authored map and a duplicate asset, so no plan can be asked for" $ do
+    mkAssetSnapshot 1 (colour ColourBlank) [] (drop 1 allMaps) `shouldSatisfy` isLeft
+    mkAssetSnapshot 1 (colour ColourBlank) [(stoneId, colour (ColourMaterial stoneId)), (stoneId, colour (ColourMaterial stoneId))] allMaps `shouldSatisfy` isLeft
+    mkAssetSnapshot 1 (colour ColourBlank) [] (allMaps <> take 1 allMaps) `shouldSatisfy` isLeft
+    mkAssetSnapshot 1 (colour ColourBlank) [(stoneId, colour (ColourMaterial stoneId))] allMaps `shouldSatisfy` (not . isLeft)
 
 isLeft ∷ Either a b → Bool
 isLeft (Left _) = True

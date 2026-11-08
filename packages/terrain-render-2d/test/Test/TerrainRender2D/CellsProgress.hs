@@ -11,6 +11,7 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import qualified Data.Set as Set
 import Hetoimasia.Math.Vector (V2 (..))
+import Data.Ratio (denominator)
 import Data.Word (Word32)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..))
 import Hetoimasia.Terrain.Cell (Column (..), ZRange, mkZRange)
@@ -279,6 +280,14 @@ progress = describe "bounded, resumable preparation" $ do
     cellPlanProgress plan `shouldBe` Settled
     prefetchKeys `shouldSatisfy` (not . null)
     Set.fromList visibleKeys `shouldSatisfy` Set.disjoint (Set.fromList prefetchKeys)
+    -- A partial plan of the same scene has no prefetch yet, though the settled one has.
+    let tinyFlat = withLimits (\l → l {clStepCandidates = 3}) flat
+        inputs = inputsOf assets tinyFlat
+        start = either (error . show) id (startCells inputs)
+        partial = foldl (\p _ → either (error . show) id (stepCells inputs p)) start [1 :: Int, 2]
+        partialPlan = either (error . show) id (cellPlanOf inputs partial)
+    cellPlanProgress partialPlan `shouldBe` Working
+    cdPrefetch (cellPlanDemand partialPlan) `shouldBe` emptyDemand
     -- With room for the visible chunks only, prefetch is cut, not the visible demand.
     let tightLimit = length visibleKeys
         tight = planScene assets (withLimits (\l → l {clDemandChunks = tightLimit}) flat)
@@ -441,6 +450,14 @@ refusals = describe "explicit refusals" $ do
       planSceneWith assets (f base) `shouldSatisfy` (\r → case r of Left CellInvalidConfig → True; _ → False)
     let snapping = base {sceneSetup = (sceneSetup base) {setupSettings = (setupSettings (sceneSetup base)) {settingPixelSnap = True}}, sceneCamera = either (error . show) stepCamera (applyCommand defaultCameraConfig (factsOf flatWorld) (SetZoom 1.01) (sceneCamera base))}
     planSceneWith assets snapping `shouldSatisfy` (\r → case r of Left (CellPixelSnapUnsupported _) → True; _ → False)
+  it "refuses a view that cannot be built: a non-finite viewport" $ \assets →
+    planSceneWith assets base {sceneSetup = (sceneSetup base) {setupViewport = Viewport (V2 (0 / 0) 0) (V2 10 10)}}
+      `shouldSatisfy` (\r → case r of Left (CellInvalidView _) → True; _ → False)
+  it "places quads on whole pixels under snapping at zooms that are whole multiples of 1/8" $ \assets →
+    forM_ [2, 0.5, 1.125] $ \zoom → do
+      let snapped = base {sceneSetup = (sceneSetup base) {setupSettings = (setupSettings (sceneSetup base)) {settingPixelSnap = True}}, sceneCamera = either (error . show) stepCamera (applyCommand defaultCameraConfig (factsOf flatWorld) (SetZoom zoom) (sceneCamera base))}
+          plan = planScene assets snapped
+      [ (denominator l, denominator t) | q ← cellPlanQuads plan, let TargetRect l t _ _ = quadTarget q ] `shouldBe` [(1, 1)]
   it "omits a hidden cell only on a valid coverage proof: a colour with a hole proves nothing" $ \assets → do
     holey ← loadAssetsWith 5 [(AssetColour (ColourMaterial stoneId), planeFromFormula (\x y → not (x == 48 && y == 30)))]
     let block = sceneOf FaceSouth 2 [OCell x y z 0 KnownAll | x ← [0 .. 2], y ← [0 .. 2], z ← [0 .. 2]]

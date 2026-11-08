@@ -5,7 +5,11 @@ exact isometric projection of the shared terrain solids, the follow and manual
 cutaway camera as pure state, the bounded visible faces and the facts that decide
 their exposure, missing-data demand, deterministic back-to-front ordering
 candidates inside the 2D renderer's 24-bit depth keys, and CPU picking against
-the exact plan it was given.
+the exact plan it was given. Beside that per-face baseline it carries the
+approved replacement (TRA-16): whole-cell quads over supplied discovery
+knowledge and coverage planes, bounded resumable preparation, viewport demand
+and picking from the coverage the plan draws (see
+[the cell-quad path](#the-cell-quad-planner-and-visual-picker-tra-16)).
 
 It plans; it does not draw. Its `terrain-material` component (TRA-8, #644) adds
 the pure half of the terrain material: the art sheet, the record a face carries,
@@ -22,8 +26,12 @@ keeps a cache.
 | `Hetoimasia.Terrain.Render2D.Projection` | The exact projection, facing turns, the render view built on render-2d's mapping |
 | `Hetoimasia.Terrain.Render2D.Camera` | Follow and manual camera state, commands, zoom, rotation, jumps |
 | `Hetoimasia.Terrain.Render2D.Facts` | Versions, availability, the three-way fact answer, surface lookup, demand |
-| `Hetoimasia.Terrain.Render2D.Plan` | Visible faces, exposure, bounds, demand, ordering and depth keys |
-| `Hetoimasia.Terrain.Render2D.Pick` | CPU picking against one plan |
+| `Hetoimasia.Terrain.Render2D.Plan` | Visible faces, exposure, bounds, demand, ordering and depth keys (the temporary per-face baseline) |
+| `Hetoimasia.Terrain.Render2D.Pick` | CPU picking against one per-face plan (the temporary analytic baseline) |
+| `Hetoimasia.Terrain.Render2D.Knowledge` | The supplied discovery knowledge a cell-quad plan reads (TRA-16) |
+| `Hetoimasia.Terrain.Render2D.Assets` | The supplied colour and map coverage planes with their versions (TRA-16) |
+| `Hetoimasia.Terrain.Render2D.Cells` | Cell-quad planning, bounded progress, demand and identity (TRA-16) |
+| `Hetoimasia.Terrain.Render2D.CellPick` | Visual picking from the coverage a cell-quad plan draws (TRA-16) |
 
 The package also owns the offline cutout and normal-map asset generator
 (TRA-14; see [the canonical maps](#the-canonical-cutout-and-normal-map-assets-tra-14)):
@@ -488,6 +496,184 @@ above independently, and this is CPU and generated-image proof only: GPU samplin
 raster-edge agreement, alpha picking, lighting, depth composition and offscreen
 readback are TRA-15 through TRA-17, and no performance claim is made.
 
+## The cell-quad planner and visual picker (TRA-16)
+
+The approved visual path replaces the per-face polygons above with **one or two
+whole-cell quads per potentially visible cell**, each a full 96 x 64 canvas with UV
+`[0,1]` drawn through a catalog cutout and normal map, ordered by an exact integer
+key and picked from the coverage they draw. It is added beside the per-face
+baseline so every filed consumer still builds. **The per-face plan and its
+analytic picker are the temporary migration baseline, labelled so in their module
+comments; this path is not a second final player-facing contract.** TRA-17
+switches every repository consumer to it and removes the baseline in one
+migration, after actual renderer qualification. Until then nothing here wires a
+second live picker, changes the held baseline material or touches #645 and #646.
+
+The path is pure: no GPU, window, Lua, runtime-terrain, storage or concrete-game
+dependency, no I/O, no lease, no thread and no state. It reads one coherent
+immutable snapshot and returns values.
+
+### The inputs
+
+| Input | Module | What it is |
+| --- | --- | --- |
+| Terrain facts | `Facts` | The source, retained removals and availability (unchanged). |
+| Knowledge | `Knowledge` | Per cell: `CellUndiscovered`, `CellDiscovered`, `CellSolidKnown` or `CellPending`, as a default, uniform 32-level region summaries and exact column runs (most specific wins), with a caller revision. |
+| Assets | `Assets` | The colour artwork and map **coverage planes** (TRA-15 `CoveragePlane`, 96 x 64) of one adopted style, each with its texture and coverage version. |
+| Camera, setup, configuration | `Camera`, `Projection`, `Cells` | The existing camera and view setup; a `CellConfig` with the 250-level band, slack, prefetch margin and `CellLimits`. |
+
+`Knowledge` is the narrow contract revised #645 adapts live discovery into. It
+lists no cell: a long buried or aerial span is one run. The combination P-14 does
+not define, a discovered empty component whose solid boundary is not known, has no
+state and is unrepresentable (a discovery publication records the void and its
+exposed solid together); a `CellSolidKnown` cell that the terrain holds as air is
+refused (`CellInconsistentKnowledge`), never drawn by guess. **Knowledge is not
+residency:** `CellPending` (retained knowledge not arrived) and unavailable terrain
+are pending, never fog and never air; a confirmed undiscovered cell is fog and its
+terrain is **not read** for display.
+
+`mkAssetSnapshot` refuses a plane that is not 96 x 64, a texture version that
+differs from its coverage version, a map without the checked
+`unit-normal-rgb-v1` profile, a catalog that lacks any of the 46 authored maps and
+a duplicate; a plan additionally refuses a material with no colour
+(`CellMissingMaterialColour`). Nothing is thresholded, resized or substituted.
+`assetIdentity` is the snapshot's version with every texture and coverage version.
+How textures are bound, counted or packed for the device is not decided here:
+`cellPlanAssets` names the distinct colour and map assets a plan references, which
+is the unit a caller's own account counts.
+
+### What a cell draws
+
+| Supplied knowledge and detail | Representation |
+| --- | --- |
+| Confirmed undiscovered, whatever its hidden contents | one generic fog quad: blank colour, identity 0's map; no hidden lookup |
+| Discovered whole air | no quad |
+| Known solid, void discovered or absent (identity 0) | one quad: the view-turned shape's ordinary map, the material colour |
+| Known shaped solid, void undiscovered | two quads: fog (the shape's cover map, blank colour) then known (its known map, material colour) |
+| Terrain or retained knowledge unavailable | pending: no quad, no fabricated air, no newly forgotten fog |
+
+The map is the catalog's rotated lookup (`lookupFor`): South 0, West 3, North 2,
+East 1 positive quarter turns, world identities never change. At cut level `k`
+every cell above `k` is omitted and the remaining known shapes keep their forms and
+materials: no flat cap is added. Cells deeper than the configured depth (at most
+250) below the cut are outside the band; zoom 0.125 to 8, the 25-level automatic
+headroom, manual depth and jumps are the camera's and unchanged. The quad of a cell
+at view offset `(rx, ry)` and level `z` (reference elevation `ref`) has its canvas
+top-left at `(48 (rx - ry) - 48, 24 (rx + ry - 1) - 16 (z - ref) - 16)`, i.e.
+`u = 48 + 48 (x - y)`, `v = 16 + 24 (x + y) - 16 z` for a point of the cell. All
+differences are exact integers before conversion to a 32-bit transform, across the
+legal axes and negative chunk seams.
+
+### Order and the 24-bit keys
+
+Cells are ordered far to near by the exact key `(viewX + viewY, z, viewX, viewY)` of
+the rotated view frame, then fog before known material within a cell. Two distinct
+cells on one view ray occur with nondecreasing X, Y and Z toward the camera, so
+`X + Y` orders them and `Z` orders cells that agree in X and Y. The admitted quads
+are ranked by that total order into `[0, 2^24)`, larger nearer, so ranks are
+distinct, never wrap or reuse a key and do not depend on enumeration. No floating
+key exists anywhere. This is a mathematical argument plus CPU proof against an
+independent ray oracle, **not** a claim about a device: the backend's rank
+translation and raster ties are TRA-17's Q-13 gate.
+
+### Hidden cells
+
+A quad is omitted only with a coverage proof: its east, south and upper neighbours
+are each drawn with coverage **proved**, from the adopted planes themselves, to be
+the whole hexagon (fog, or a full block whose colour and map both cover it). An
+unavailable neighbour is neither air nor a proof, a mixed neighbour is not a proof
+and a colour with a hole proves nothing. Runs, not levels, are walked, so cost
+follows run boundaries and exposed cells, not depth.
+
+### Bounded, resumable preparation
+
+`startCells` reads nothing. `stepCells` examines at most `clStepCandidates`
+candidate columns (and stops between columns past `clStepLevels`), **nearest row
+first**; `cellPlanOf` returns the plan reached so far, publishable at any point.
+`planCells` runs to settled or to a bound. A column is admitted whole or not at
+all, so a mixed cell's fog and known parts are never split. Plan-wide bounds
+(`clColumns`, `clLevels`, `clInstances` at most 2^24, `clPending`) **halt** with the
+remainder explicitly unresolved (`Halted`); nothing is truncated and called
+complete. The unprocessed candidate columns are `cellPlanUnresolved`; a valid
+camera larger than one plan's capacity is therefore never an invalid camera. With
+sufficient capacity and unchanged inputs repeated steps reach `Settled` with the
+plan one unbounded pass gives. A continuation, or a plan, made under a different
+camera, knowledge revision, asset version, target or configuration is refused
+(`CellStaleContinuation`): obsolete work never becomes current.
+
+| Default | Value | Default | Value |
+| --- | ---: | --- | ---: |
+| `clStepCandidates` | 4,096 | `clInstances` | 1,048,576 (at most 16,777,216) |
+| `clStepLevels` | 65,536 | `clPending` | 65,536 |
+| `clColumns` | 1,048,576 | demand chunks / intervals / regions per chunk | 1,024 / 8,192 / 16 |
+| `clLevels` | 16,777,216 | band, slack, prefetch margin | 250, 2, 1 |
+
+These are engineering defaults, not measured capacity.
+
+### Demand
+
+The candidate envelope is every column and level whose **full canvas** can touch
+the padded viewport, so a lower or distant background outside any camera radius is
+requested (`candidates` of the baseline already used the same bound). `cdVisible`
+names, in 16 x 16 chunks and 32-level regions, the pending spans of the processed
+part; `cdPrefetch` is the existing horizontal chunk margin, empty until the visible
+work is settled and bounded by what the visible demand left of each limit, so
+prefetch never takes capacity visible work needs. `cdTruncated` says a demand bound
+cut a listing short. Admission, queueing and priority belong to the runtime.
+
+### Picking
+
+`pickCells plan (CellPickQuery identity point)` maps the logical point through the
+plan's mapping to a framebuffer position and tests that **physical pixel's
+centre**, from the nearest quad to the farthest. A quad **contains** the centre
+under the left-and-top half-open rule (left and top edges inside, right and bottom
+outside); the two triangles' shared diagonal is inside the rectangle, so a centre on
+it is covered, and a centre on an outer edge shared by two quads belongs to exactly
+one. The texel is `min (n - 1) (floor (u * n))` with `u` the exact rational position
+across the drawn rectangle (an interior boundary selects the higher index). The quad
+covers the centre when the texel is covered in **both** its colour plane and its
+map plane (colour alpha times map alpha at 0.5 for binary alpha); lighting, haze and
+darkening play no part; nothing is sampled outside the rectangle because UVs clamp.
+
+* The first covered quad decides. A known part is `CellPickHit` with its exact
+  `TileCoord`, part and plan identity. **Fog is `CellPickNoHit`, the same answer as
+  a miss:** it ends the search and leaks no hidden coordinate, material, shape,
+  selection or edit authority (a fog quad itself holds none).
+* Pending information that could lie ahead (a pending span whose footprint contains
+  the centre with a nearer possible key, or an unprocessed candidate column in a row
+  no farther) makes the answer `CellPickLoading` with no candidate. With no covering
+  quad, any such information is loading. Information proved **behind** the covering
+  quad does not change a hit.
+* A stale identity is `CellPickStale`; a non-finite point `CellPickInvalidPoint`;
+  outside the viewport or a zero extent, no hit. The result issues no Lua token and
+  edits nothing; the logical point and ray queries of `hetoimasia-terrain` remain
+  the separate terrain-truth API, and fog or cutouts never replace occupancy or
+  discover anything.
+
+### Identity and state
+
+`CellIdentity` is built only by the planner and compares exactly the arena
+incarnation, content revision, residency generation, knowledge revision, camera
+revision, anchor, fraction, reference, zoom, facing, cut, target mapping and
+metrics, every asset and coverage version and the configuration. A plan, identity,
+quad, preparation, knowledge value and asset snapshot cannot be built or edited by
+constructor or record update from a client (checked by external clients).
+
+| State | Owner | Writers | Readers | Lifetime |
+| --- | --- | --- | --- | --- |
+| Facts, knowledge, asset snapshot | the caller | the caller | the planner and picker (reads only) | the caller's |
+| A `CellPrep` or `CellPlan` | the caller | nobody (each step returns a new value) | the caller, `pickCells` | the value's |
+
+No thread, process, lease, cache, global or I/O.
+
+### What remains
+
+CPU proof only: the device's raster edges and depth keys, sampling, lighting, the
+retained resources and their interests, live discovery, adoption and the Lua pick
+result are TRA-17, #645 and #646; a counterexample found there is a Q-13 stop, not
+a reason to change an order, threshold or rule here. The reproducible CPU evidence
+is under `docs/evidence/terrain/tra16/`.
+
 ## Tests
 
 `hetoimasia-terrain-render-2d:terrain-render-2d-tests` is the non-optional CPU
@@ -496,6 +682,14 @@ group `test.terrain-render-2d`:
 ```sh
 cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain-render-2d-tests --test-show-details=direct
 ```
+
+Its TRA-16 groups (`Test.TerrainRender2D.Cells`, `CellsCoverage`, `CellsProgress`,
+`CellsClient`, `CellsEvidence`) check the cell-quad path against an independent
+exact view-ray oracle (`CellFixtures`) that shares no code with the planner or the
+picker, over the committed catalog for all 16 identities at all four facings in
+ordinary, fogged and mixed states, with synthetic technical-fixture planes for the
+texel and edge conventions. Their negative controls were broken once locally and
+caught; none is committed.
 
 It is deterministic, starts no thread and sleeps nowhere; its TRA-14 group reads the committed assets from the repository and writes only to temporary directories. Projection, camera and
 planning expectations are hand-stated from the equations above and small explicit
