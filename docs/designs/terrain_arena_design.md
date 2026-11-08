@@ -9,8 +9,8 @@ choices are evidence, not automatically requirements for the new engine.
 Design state: `ready for issue processing`
 
 Owner-requested face-map amendment opened 2026-11-07 (D-28) and signed off
-2026-11-08 (D-60), approving P-16 at `b012fabbfc`. TRA-1–TRA-12 remain filed;
-TRA-13–TRA-23 are approved unprocessed follow-ups in the ledger below. The
+2026-11-08 (D-60), approving P-16 at `b012fabbfc`. TRA-1–TRA-12 remain filed and TRA-13 is now [#655];
+TRA-14–TRA-23 remain approved unprocessed follow-ups in the ledger below. The
 amendment is ready for issue processing. Each tracker draft still requires
 separate sign-off; no tracker mutation, implementation or PR-hold release
 is authorized by this design sign-off.
@@ -188,7 +188,7 @@ concrete precondition
 - [x] TRA-6. Expose ordered window input to Lua — [#642]
 - [x] TRA-7. Implement isometric cutaway planning and picking — [#643]
 - [x] TRA-8. Qualify terrain materials and depth ordering offscreen — [#644]
-- [ ] TRA-13. Correct canonical shape geometry and expose exact opening portals
+- [x] TRA-13. Correct canonical shape geometry and expose exact opening portals — [#655]
 - [ ] TRA-14. Generate and qualify canonical cutout and normal-map assets
 - [ ] TRA-15. Load validated data maps with shared versioned CPU coverage
 - [ ] TRA-16. Build pure cell-quad planning and coverage-based visual picking
@@ -206,7 +206,7 @@ concrete precondition
 
 D-60 approves the amended delivery plan and readiness. Checked entries mean
 already filed, not implemented; their original issue links are preserved.
-The eleven unchecked follow-ups are unprocessed. P-16 records the approved
+The ten unchecked follow-ups are unprocessed. P-16 records the approved
 revisions to existing artifacts, including #645–#648 despite their filed marks.
 
 **Amendment EPIC revision applied 2026-11-08:** existing [#636] now carries
@@ -215,15 +215,21 @@ revision v1, approved by `het-manager` in `#het-terrain` message
 The exact replacement body was verified after editing; SHA-256:
 `d34f0dc7bbab4a54facf05d25d3ca92a4edd9e058be24746e7238f947846c90f`.
 Title, labels, state and other issue metadata are unchanged. All existing
-child links and ledger markers are preserved; eleven new children remain
-unprocessed. This revision releases no PR hold and grants no readiness review.
+child links and ledger markers were preserved; eleven new children remained
+unprocessed at that revision. It released no PR hold and granted no readiness review.
 
-**Amendment processing cursor:** draft TRA-13 next. Process TRA-13–TRA-23
+**TRA-13 filed 2026-11-08:** [#655], approved by `het-manager` in
+`#het-terrain` message `2zkf5xt9zpne5zb3eysywb99ma` (reply to draft
+`fma957hskub7y27a2v2sp9e5ba`). The issue body and EPIC checklist link were
+verified after filing; approved body SHA-256:
+`d30d3255ebe0f984c41c7a416eaf2c97f032c4343fd90e62d9153719559eb2ac`.
+
+**Amendment processing cursor:** draft TRA-14 next. Process TRA-14–TRA-23
 in ledger order, then the P-16 revisions of #645–#648 and any other named
 artifacts, one artifact at a time with a separately approved concrete tracker
 draft before each mutation. The manager arranges readiness reviews. Tracker
-processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after this
-revision: `wwkfu39cnxfmw3ttbhtx22vg7n` in `#het-terrain`.
+processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after TRA-13:
+`2zkf5xt9zpne5zb3eysywb99ma` in `#het-terrain`.
 
 ## Epic contract
 
