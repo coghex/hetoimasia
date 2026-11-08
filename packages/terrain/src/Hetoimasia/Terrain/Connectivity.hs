@@ -155,6 +155,8 @@ module Hetoimasia.Terrain.Connectivity
   , classResultBytes
   , relationResultBytes
   , nodeTempBytes
+  , intervalTempBytes
+  , latticeTempBytes
 
     -- * The compiled result
   , Connectivity

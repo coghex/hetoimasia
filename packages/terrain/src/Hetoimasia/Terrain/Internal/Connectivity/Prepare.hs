@@ -63,6 +63,8 @@ module Hetoimasia.Terrain.Internal.Connectivity.Prepare
   , classResultBytes
   , relationResultBytes
   , nodeTempBytes
+  , intervalTempBytes
+  , latticeTempBytes
   ) where
 
 import Control.Monad (foldM, when)
@@ -178,6 +180,15 @@ classResultBytes = 96
 -- | One relation record.
 relationResultBytes ∷ Int
 relationResultBytes = 64
+
+-- | One lattice interval of one axis while the lattice is walked: its list cell,
+-- its pair of cuts and the zipped boxes' share.
+intervalTempBytes ∷ Int
+intervalTempBytes = 128
+
+-- | The fixed traversal state of the lattice walk.
+latticeTempBytes ∷ Int
+latticeTempBytes = 512
 
 -- | The temporaries one node needs until canonicalization ends: its entries in
 -- the node and dimension union-find maps and its collapse marks.
@@ -480,6 +491,9 @@ buildLattice source (Cuts xs ys zs) = do
       limit = limitWorkSteps (aLimits acct)
   when (needed > toInteger limit) $ exhausted WorkSteps needed limit
   putAcct acct {aLattice = cells}
+  -- The interval lists and the walk's state exist until the lattice is built.
+  let intervalBytes = (nx + ny + nz) * intervalTempBytes + latticeTempBytes
+  chargeTemp intervalBytes
   let xIntervals = consecutive (Set.toAscList xs)
       yIntervals = consecutive (Set.toAscList ys)
       zIntervals = consecutive (Set.toAscList zs)
@@ -490,13 +504,14 @@ buildLattice source (Cuts xs ys zs) = do
         , (i, (x0, x1)) ← zip [0 ..] xIntervals
         ]
   (_, nodeAt, nodes) ← foldM step (0 ∷ Int, IntMap.empty, IntMap.empty) boxes
+  releaseTemp intervalBytes
   pure (nodeAt, nodes)
   where
     step (!next, !nodeAt, !nodes) (index, x0, x1, y0, y1, z0, z1) = do
       tick
       let kind = contentKind source x0 x1 y0 y1 z0
       if not (kindHasVoid kind)
-        then pure (next, nodeAt, nodes)
+        then pure $! (next, nodeAt, nodes)
         else do
           chargeNode
           chargeResult nodeResultBytes
@@ -506,7 +521,11 @@ buildLattice source (Cuts xs ys zs) = do
           let retain axis lo hi = if hi > lo + 1 && not (joinedAlong axis kind) then axisBit axis else 0
               mask = retain 0 x0 x1 .|. retain 1 y0 y1 .|. retain 2 z0 z1
               node = Node {nodeLattice = index, nodeKind = kind, nodeClass = next, nodeRetain = mask, nodeAxes = mask}
-          pure (next + 1, IntMap.insert index next nodeAt, IntMap.insert next node nodes)
+          -- Evaluate every update inside the step that pays for it.
+          let !next' = next + 1
+              !nodeAt' = IntMap.insert index next nodeAt
+              !nodes' = IntMap.insert next node nodes
+          pure $! (next', nodeAt', nodes')
 
 data Related = Related
   { relNodes ∷ !UF
@@ -552,7 +571,7 @@ buildRelations (Cuts xs ys zs) nodeAt nodes = foldM visit (Related emptyUF empty
                       (False, True) → (dimUF, IntSet.insert (3 * other + b) markSet)
                       (False, False) → (dimUF, markSet)
           (dimsUF, marksOut) = foldl step (relDims related, relMarks related) [0, 1, 2]
-      pure
+      pure $!
         Related
           { relNodes = nodesUF
           , relDims = dimsUF
@@ -566,16 +585,18 @@ data Canon = Canon
   , canMembers ∷ !(IntMap [Int])
   , canAxes ∷ !(IntMap Word8)
   , canExterior ∷ !IntSet
+  , canClasses ∷ !Int
   }
 
 canonical ∷ Cuts → IntMap Int → IntMap Node → Related → Co Connectivity
 canonical (Cuts xs ys zs) nodeAt nodes related = do
-  collapsed ← foldM (\roots m → tick >> pure (IntSet.insert (find (relDims related) m) roots)) IntSet.empty (IntSet.toAscList (relMarks related))
+  collapsed ← foldM (\roots m → tick >> (pure $! IntSet.insert (find (relDims related) m) roots)) IntSet.empty (IntSet.toAscList (relMarks related))
   let size = (Set.size xs - 1, Set.size ys - 1, Set.size zs - 1)
       (_, _, nz) = size
       top = nz - 1
-  canon ← foldM (visit collapsed size top) (Canon IntMap.empty IntMap.empty IntMap.empty IntMap.empty IntSet.empty) (IntMap.toAscList nodes)
-  releaseTemp (IntMap.size nodes * nodeTempBytes)
+  canon ← foldM (visit collapsed size top) (Canon IntMap.empty IntMap.empty IntMap.empty IntMap.empty IntSet.empty 0) (IntMap.toAscList nodes)
+  counted ← getAcct
+  releaseTemp (aNodes counted * nodeTempBytes)
   tick
   acct ← getAcct
   let cells = aLattice acct
@@ -584,7 +605,7 @@ canonical (Cuts xs ys zs) nodeAt nodes related = do
           { statLatticeCells = cells
           , statNodes = toInteger (aNodes acct)
           , statRelations = toInteger (aRelations acct)
-          , statClasses = toInteger (IntMap.size (canAxes canon))
+          , statClasses = toInteger (canClasses canon)
           , statResultBytes = toInteger (aResult acct)
           }
   pure
@@ -617,11 +638,12 @@ canonical (Cuts xs ys zs) nodeAt nodes related = do
           Just repAxes
             | repAxes == axes → pure ()
           _ → failWith (Inconsistent "the nodes of one class keep different parameters")
-      pure
+      pure $!
         Canon
           { canRep = IntMap.insert root rep (canRep canon)
           , canNodes = IntMap.insert nid node {nodeClass = rep, nodeAxes = axes} (canNodes canon)
           , canMembers = IntMap.insertWith (++) rep [nid] (canMembers canon)
           , canAxes = if rep == nid then IntMap.insert nid axes (canAxes canon) else canAxes canon
           , canExterior = if exterior then IntSet.insert rep (canExterior canon) else canExterior canon
+          , canClasses = if rep == nid then canClasses canon + 1 else canClasses canon
           }

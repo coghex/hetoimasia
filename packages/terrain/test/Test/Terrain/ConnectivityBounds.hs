@@ -19,7 +19,9 @@ module Test.Terrain.ConnectivityBounds (spec) where
 import Control.Exception (evaluate)
 import Control.Monad (forM_, unless)
 import Data.Maybe (fromMaybe)
+import Data.Int (Int64)
 import Data.Word (Word64)
+import GHC.Conc (getAllocationCounter)
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
 import Hetoimasia.Terrain.Connectivity
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..), sourceDefinitionBytes)
@@ -89,6 +91,24 @@ drive quantum limits source = go (startPreparation limits (mustSource source)) [
       Right (Pending next) → go next (workSteps (preparationStats next) : seen)
       Right (Complete result stats) → (reverse (workSteps stats : seen), Right (result, stats))
       Right (Refused e stats) → (reverse (workSteps stats : seen), Left e)
+
+-- | The most the thread allocated while forcing any one single-step resume of a
+-- preparation. A step that left work unevaluated for a later one would show as
+-- a spike where the work is finally demanded, however small the reported step
+-- count is.
+worstStepAllocation ∷ SourceSpec → IO Int64
+worstStepAllocation source = go (startPreparation defaultConnectivityLimits (mustSource source)) 0
+  where
+    go preparation worst = do
+      started ← getAllocationCounter
+      outcome ← case resumePreparation 1 preparation of
+        Left e → error (show e)
+        Right progress → evaluate progress
+      finished ← getAllocationCounter
+      let used = started - finished
+      case outcome of
+        Pending next → go next (max worst used)
+        _ → pure (max worst used)
 
 spec ∷ Spec
 spec = describe "Source connectivity bounds" $ do
@@ -199,6 +219,31 @@ spec = describe "Source connectivity bounds" $ do
       let tight = limitsOf defaultSpec {specNodes = 1, specRelations = 1}
       case prepareConnectivity tight (mustSource fixture) of
         Left (Complexity (Refusal resource _ _)) → resource `shouldBe` StructuralNodes
+        other → expectationFailure ("unexpected " <> show (fmap snd other))
+
+  describe "work stays inside the step that pays for it" $ do
+    it "allocates a bounded amount in any one-step resume, whatever the size" $ do
+      small ← worstStepAllocation (scaled 2 (2 ^ (60 ∷ Int)))
+      large ← worstStepAllocation (scaled 8 (2 ^ (60 ∷ Int)))
+      putStrLn ("worst single-step allocation, bytes: n=2 " <> show small <> ", n=8 " <> show large)
+      -- Megabytes at the relation-to-canonical transition, before the fold's
+      -- accumulators were forced inside their steps.
+      small `shouldSatisfy` (< 262144)
+      large `shouldSatisfy` (< 262144)
+      large `shouldSatisfy` (<= 2 * small + 65536)
+
+  describe "temporaries are charged with no node at all" $ do
+    let solid = world [stoneLayer Nothing Nothing] [blockPatch (5 * i) 0 0 5 | i ← [1 .. 200]]
+        measured = statsOf solid
+    it "builds a lattice of boxes that hold no void" $ do
+      workNodes measured `shouldBe` 0
+      workLatticeCells measured `shouldSatisfy` (> 20000)
+      workPeakBytes measured `shouldSatisfy` (> workResultBytes measured + 100000)
+    it "completes with exactly the measured peak and is refused one short, naming the peak" $ do
+      let at p = prepareConnectivity (limitsOf defaultSpec {specPeakBytes = p, specResultBytes = min p 16777216}) (mustSource solid)
+      fmap snd (at (workPeakBytes measured)) `shouldBe` Right measured
+      case at (workPeakBytes measured - 1) of
+        Left (Complexity (Refusal PeakBytes figure limit)) → (limit, figure > limit) `shouldBe` (workPeakBytes measured - 1, True)
         other → expectationFailure ("unexpected " <> show (fmap snd other))
 
   describe "valid but excessive complexity" $ do
