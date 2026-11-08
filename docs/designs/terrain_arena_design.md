@@ -6,32 +6,38 @@ testing arena is the concrete reference. The owner
 chooses behavior in this design conversation; existing Synarchy implementation
 choices are evidence, not automatically requirements for the new engine.
 
-Design state: `exploring`
+Design state: `ready for issue processing`
 
-Owner-requested face-map amendment opened 2026-11-07 (D-28). TRA-1–TRA-12
-remain filed; this reopens design readiness, not their filing ledger. The source
-audit and pending choices are in the face-map amendment below. No new tracker
-mutation or implementation is authorized by this amendment's draft proposals.
+Owner-requested face-map amendment opened 2026-11-07 (D-28) and signed off
+2026-11-08 (D-60), approving P-16 at `b012fabbfc`. TRA-1–TRA-12 remain filed;
+TRA-13–TRA-23 are approved unprocessed follow-ups in the ledger below. The
+amendment is ready for issue processing. Each tracker draft still requires
+separate sign-off; no tracker mutation, implementation or PR-hold release
+is authorized by this design sign-off.
 
 Lighting scope resolved by D-29: expose sun position to the face-map shader
 for previewing the tiles; defer the automatic day/night cycle and eventual
-moon lighting. Q-16/Q-19/Q-20 still block amendment readiness; D-55/D-57
-specify the asset/sampling and numerical lighting contracts.
+moon lighting. D-60 resolves Q-19's delivery/revision plan and fresh readiness
+checkpoint. D-55/D-57/D-58 specify
+sampling, lighting and cell-quad presentation; D-59 approves the concrete
+storage/discovery contract in P-15 and resolves Q-20's specification. P-16
+contains the approved follow-up and existing-issue revision plan. Its 11 new
+slices are promoted into the dependency-ordered ledger and delivery plan.
 
 Picking scope resolved by D-30: select from the adopted drawn quads in
-front-to-back order using matching artwork/face-map coverage. Q-16 remains
-partially open for logical geometry, emission and cut-surface contracts.
+front-to-back order using matching artwork/face-map coverage. D-49/D-50/D-58
+complete Q-16's geometry, emission, cutaway and visual/logical API specification;
+the required implementation and visual proof remain outstanding.
 
 D-31 preserves generic blank terrain as gameplay fog of war over undiscovered
-underground solids and air gaps, and reaffirms lazy loading with gaps. Q-20
-tracks reveal rules, retention and the fog interaction contract; they are not
-settled by the earlier picking or cutaway proposals.
+underground solids and air gaps, and reaffirms lazy loading with gaps.
+D-58/D-59 now complete the fog, discovery and retention specification.
 
 D-32 chooses whole-cavity discovery: unsealing a connected empty space reveals
 that space and its newly exposed boundary terrain, including across chunks.
 D-51 refines its original exhaustive-loading requirement: retain compressed
 whole-space knowledge and load tile detail only on camera or explicit demand.
-Work proceeds in bounded steps; Q-20 retains concrete execution/storage details.
+Work proceeds in bounded steps under the approved P-15 execution/storage contract.
 
 D-33 resolves discovery retention: record revealed state as chunk changes,
 retain it on offload and replay it before publishing the reloaded chunk.
@@ -39,12 +45,11 @@ Discovery lasts for the arena session while off-screen chunks stream normally.
 
 D-34 resolves connectivity between empty cells: six shared-face neighbors;
 edge-only or corner-only contact does not join cavities. Partial openings
-around shaped terrain remain a separate Q-16/Q-20 choice.
+around shaped terrain use the approved P-9 geometry and P-15 connectivity.
 
 D-35 requires explicit logical opening rules for ramps/corner slopes: a real
 diagonal opening into an unrevealed space must discover it. Whole-air-cell
-adjacency alone is insufficient; the exact per-shape catalog still needs
-specification and review under Q-16/Q-20.
+adjacency alone is insufficient; P-9 specifies the approved per-shape catalog.
 
 D-36 chooses one logical shape authority shared by cavity discovery and
 terrain point/ray queries, correcting the existing solid definitions.
@@ -63,18 +68,18 @@ connections and stop only outward branches at known exterior.
 
 D-40 approves temporary per-arena disk backing for retained edits/discovery,
 with a bounded RAM cache and asynchronous I/O. The store is session-only and
-discarded on arena close/reset; exact quota/failure/lifecycle details remain open.
+discarded on arena close/reset; D-59/P-15 specifies quota, failures and lifecycle.
 
 D-41 approves pausing new edits/discovery on storage exhaustion or write
 failure, retaining acknowledged changes and unfinished work. D-43 subsequently
-selects startup reservation and a hard disk allowance; exact recovery remains open.
+selects startup reservation and a hard disk allowance; D-59/P-15 fixes recovery.
 D-42 records the manager-relayed CPU budget increase and best-effort camera
 demand; it does not select the temporary store's disk quota.
 
 D-43 approves a reserved, configurable disk allowance before arena opening,
 including storage overhead, and refusal when it cannot be reserved. Keep the
 world expandable; pause new edits/discovery before exceeding the allowance.
-The numeric allowance and the qualified storage mechanism remain Q-20.
+The allowance and storage mechanism are specified by D-59/P-15, with proof due.
 
 Additional Q-16 finding: the pinned N/E mask silhouettes fail a cross-facing
 unit-cell geometry consistency check. The audit below records a concrete
@@ -85,11 +90,11 @@ in this design turn.
 
 D-45 selects crisp nearest-neighbor sampling for terrain colour artwork and
 face maps, with the same alpha cutoff for rendering and screen picking.
-Q-17 retains exact sample/edge conventions, data loading and ownership.
+D-55/P-11 specifies exact sample/edge conventions, data loading and ownership.
 
 D-46 selects Lua-supplied sun compass direction and elevation, fixed relative
-to the world as the camera rotates. Appearance defaults and depth effects
-remain Q-18; no UI or automatic cycle is added.
+to the world as the camera rotates. D-57/P-13 specifies appearance defaults
+and depth effects; no UI or automatic cycle is added.
 
 D-47 keeps both depth darkening and blue haze, adjustable/disableable through
 Lua, and requires stronger numerical, offscreen and navigation regression
@@ -126,7 +131,7 @@ gap and shape cases must be supported and proved, not excluded as a shortcut.
 
 D-54 gives ambient illumination its own Lua control. Changing only the sun
 position leaves ambient unchanged; future Lua day/night rules may animate
-both. Numeric lighting defaults/equations remain part of Q-18's contract review.
+both. D-57/P-13 specifies the approved lighting defaults and equations.
 
 D-55 approves P-11's cutout asset/sampling contract, including bounded
 `kind`/`coverage` texture options, shared versioned CPU bitplanes and required
@@ -141,6 +146,22 @@ D-57 approves P-13's numerical lighting contract: validated normal encoding,
 Lua settings/defaults, world-fixed diffuse/ambient shading, fixed depth range
 and linear-light darkening followed by haze. Q-18 is specified; solver
 qualification and owner visual acceptance remain required.
+
+D-58 approves P-14's whole-cell emission, complementary ramp/fog masks,
+exact ordering, conservative demand/culling and visual picking contract.
+Fog stops picking with `no_hit`; unavailable knowledge remains `loading`.
+Q-16 is specified. The separate P-15 storage/discovery contract is now
+approved by D-59.
+
+D-59 approves P-15's exact compressed connectivity, bounded preparation and
+temporary-store transactions, including the configurable 1 GiB reservation,
+write-before-acknowledgement, Lua status/growth/retry and failure/teardown
+contract. Q-20 is specified; solver qualification remains mandatory.
+
+D-60 records the owner's final amendment sign-off, approves P-16's delivery
+boundaries and retains Q-13 as an implementation proof gate. There are no
+remaining blocking design choices. PR #654 remains held for manager-coordinated
+baseline completion; all later tracker drafts require individual approval.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -167,15 +188,33 @@ concrete precondition
 - [x] TRA-6. Expose ordered window input to Lua — [#642]
 - [x] TRA-7. Implement isometric cutaway planning and picking — [#643]
 - [x] TRA-8. Qualify terrain materials and depth ordering offscreen — [#644]
+- [ ] TRA-13. Correct canonical shape geometry and expose exact opening portals
+- [ ] TRA-14. Generate and qualify canonical cutout and normal-map assets
+- [ ] TRA-15. Load validated data maps with shared versioned CPU coverage
+- [ ] TRA-16. Build pure cell-quad planning and coverage-based visual picking
+- [ ] TRA-17. Switch terrain rendering to face-map cutouts and normal lighting
+- [ ] TRA-18. Compile bounded symbolic source connectivity
+- [ ] TRA-19. Model compressed knowledge and resumable discovery after removal
+- [ ] TRA-20. Define bounded copy-on-write store records and transactions
+- [ ] TRA-21. Own reserved backing files and bounded asynchronous storage I/O
+- [ ] TRA-22. Commit terrain edits and discovery through the temporary store
+- [ ] TRA-23. Expose terrain storage status, growth and recovery through Lua
 - [x] TRA-9. Publish retained terrain views with safe GPU retirement — [#645]
 - [x] TRA-10. Expose terrain views and camera controls to Lua — [#646]
 - [x] TRA-11. Assemble the authored terrain arena — [#647]
 - [x] TRA-12. Qualify the arena and remove the development shortcut — [#648]
 
-The delivery plan is approved through Q-12/D-27. Process the EPIC first, then
-one child per invocation with separate filing sign-off. The manager authorized
-the EPIC draft only and requires its complete draft in `#het-terrain` before
-filing. Design approval does not itself create tracker items or authorize code.
+D-60 approves the amended delivery plan and readiness. Checked entries mean
+already filed, not implemented; their original issue links are preserved.
+The eleven unchecked follow-ups are unprocessed. P-16 records the approved
+revisions to existing artifacts, including #645–#648 despite their filed marks.
+
+**Amendment processing cursor:** draft the revision of existing EPIC #636
+first; do not create another epic. Then process exactly one new child or
+existing-issue revision per invocation, with a separately approved concrete
+tracker draft before each mutation. No tracker body is changed by this
+ledger promotion. The amendment's design-only assignment ends with publication
+and manager handoff; dispatch for tracker processing is a separate step.
 
 ## Epic contract
 
@@ -195,6 +234,20 @@ filing. Design approval does not itself create tracker items or authorize code.
 - **Users and operators:** the owner developing Ecce Homo, game authors using
   engine services, and later players of the recreated game.
 - **Arc label:** None proposed.
+
+**Approved amendment additions to the done condition (D-28–D-59):** the
+final path uses canonical cell-quad cutouts and normal lighting, corrected
+all-16/four-facing maps, exact shared coverage for screen picking, shaped
+cutaways without added caps, and uninteractable fog over unknown solids and
+air. Viewport-driven demand includes visible hazed background when capacity
+permits. Opening proves bounded source connectivity; discovery retains whole
+connected spaces and their exposed boundary without materializing all detail.
+Edits/discovery survive offload through the reserved temporary store, with
+the approved atomic settlement, pause/growth/retry and teardown behavior.
+The final executable proves these contracts under normal operation and
+failure, retains the required visual/resource evidence, and removes the
+temporary shortcut. These are specification choices, not delivered results;
+P-16/D-60 approves their delivery boundaries and the amended Q-13 gate.
 
 ## Current state and evidence
 
@@ -1757,6 +1810,88 @@ need solver proof and owner visual acceptance. Geometry emission/ordering
 and discovery/storage mechanics remain Q-16/Q-20; Q-19 must assign delivery.
 There is no code or tracker mutation in this design turn.
 
+### D-58. Adopt P-14's cell-quad, fog and visual picking contract
+
+Owner, directly in this design pane on 2026-11-08, answered “approved” to
+P-14 as written at `07930b5295`. Adopt its whole-cell representations,
+complementary known-material/fog masks, exact ordering and bounded depth-rank
+admission, conservative view planning, adopted-snapshot alpha picking and
+explicit visual/logical API migration.
+
+Knowledge remains distinct from residency and from the underlying terrain.
+A known shaped solid can border an undiscovered void: its required material
+and fog parts are admitted/adopted together. Confirmed fog is uninteractable,
+stops traversal and yields `no_hit` without hidden coordinates or edit
+authority. Unavailable information that could cover a candidate yields
+`loading`. Logical point/ray queries retain their separate truth contract;
+loading or querying does not itself discover terrain.
+
+This resolves Q-16's remaining specification and the concrete player-facing
+fog-result portion of Q-20. Preserve P-14's all-shape/facing, ordering,
+coverage, disclosure, loading and lifecycle qualification obligations under
+D-44/D-47/D-48. Approval is not evidence that the renderer or picker has been
+implemented or proved. Storage, discovery transactions and recovery remain
+Q-20; delivery and fresh amendment readiness remain Q-19. No code or tracker
+mutation occurs in this design turn.
+
+### D-59. Adopt P-15's compressed discovery and temporary-store contract
+
+Owner, directly in this design pane on 2026-11-08, answered “approved” to
+P-15 as written at `d527957369`. The checkpoint named the configurable
+1 GiB reservation per arena, writing edits and their pending discovery work
+before reporting success, bounded compressed connectivity/preparation/cache
+work, Lua status/growth/retry and preservation of committed history on failure.
+It explicitly stated the edit-latency and admission-refusal tradeoffs and
+that a raw buried removal does not reveal a sealed space until it connects
+to known air.
+
+Adopt all seven P-15 clauses: exact parameterized source components and
+upper-boundary exterior semantics; monotonic removal/connectivity overlays
+and retained discovery obligations; the reserved private temporary-file and
+copy-on-write page contract; numeric preparation/cache/I/O/transaction limits;
+one publication/settlement arbitration after writes; the exact Lua surface,
+authority and expected result classes; and resource ownership/qualification.
+The stated defaults are initial limits requiring proof, not performance
+measurements or a guarantee against external filesystem/device failures.
+
+This resolves Q-20's concrete storage, discovery, API and lifecycle
+specification alongside D-58's fog/picking contract. It does not claim that
+the symbolic compiler, backing store or amended runtime exists or has passed
+its independent tests. No cross-run save/recovery, general terrain placement,
+gameplay-state/ECS or whole-tick rollback is added. Q-19 still requires the
+follow-up delivery plan, existing-issue revision plan and fresh amendment
+readiness sign-off. No tracker or implementation change occurs here.
+
+### D-60. Approve the amendment delivery plan and readiness
+
+Owner, directly in this design pane on 2026-11-08, answered “yes i approve”
+to the explicit checkpoint approving P-16 at `b012fabbfc` and declaring the
+terrain amendment ready for issue processing. The checkpoint enumerated
+eleven follow-up slices under existing EPIC #636, revisions to #645–#648,
+required amended proof before final qualification and the continuing hold
+on renderer PR #654.
+
+Approve P-16's exact one-PR boundaries and dependencies for TRA-13–TRA-23,
+the baseline disposition/coordination, existing-issue revision scopes and
+evidence ownership. Promote the new slices as unprocessed in the ledger and
+delivery plan, ordered EPIC; TRA-1–TRA-8; TRA-13–TRA-23; TRA-9–TRA-12.
+Preserve every original stable ID and issue link. Original filed scopes remain
+history where explicitly superseded; the amended contracts govern delivery.
+
+This resolves Q-19 and completes design readiness. D-28–D-59's behavior,
+P-9–P-15's contracts and P-16's delivery plan are the signed-off amendment.
+Q-13 remains a deliberate in-delivery proof gate: TRA-17 must establish the
+amended renderer path before dependent integration, and TRA-12 still requires
+the complete final evidence. Readiness is not implementation completion,
+successful qualification or owner acceptance of uncaptured visual output.
+
+Later issue processing revises existing EPIC #636 first and then handles
+one new child or existing-issue revision at a time, each with its own concrete
+draft and separate approval before tracker mutation. This sign-off neither
+files/edits tracker items nor authorizes code work, releases PR #654's hold,
+approves a PR head or authorizes a merge. Report the published design and
+readiness to the manager; operational coordination remains with that workflow.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -1777,11 +1912,17 @@ now approved through the explicit Q-12/D-27 contract review.
 
 ## Concrete technical contract — P-5, approved through Q-12/D-27
 
-This is the approved implementation contract. D-1–D-25 record the individual
+This is the original approved implementation contract. D-1–D-25 record the individual
 owner choices, D-26 the delegated storage selection, and D-27 the owner's
 approval of this complete contract and delivery plan. Numeric caps are initial
 implementation defaults to qualify, not measured performance claims. Q-13
 retains its explicit renderer-proof gate.
+
+Read P-5 with the explicit amendments D-28–D-59 and P-9–P-15. In particular,
+the old flat-ID-15, extra cutaway-cap, analytic visual-picker and RAM-only
+total-history assumptions are superseded, as are the old CPU bank defaults.
+Their original wording remains as filing history, not an alternative current
+contract. P-16/D-60 approves how the filed baseline is extended and migrated.
 
 ### Scope and compatibility
 
@@ -2817,7 +2958,12 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-57 decisions, remaining proposals
+### P-6. Amendment framing — historical framing, resolved through D-59
+
+The investigation below records how the amendment developed. Its earlier
+open emission/API/storage questions are now specified by P-9–P-15 and
+D-49–D-59. Those later approved contracts govern where this framing still
+says “open” or “proposed”; D-60 now resolves Q-19's delivery/readiness decisions.
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2926,12 +3072,17 @@ Affected tracker work, for later approved revisions only:
   and facings with lighting/cutout/pick controls, and measure the additional
   data/texture ownership before shortcut removal and final acceptance.
 
-The owner chose a follow-up before TRA-12. Exact one-PR slice boundaries,
-dependency insertion and existing-issue revisions await Q-16–Q-20; the ledger
-and delivery plan remain the original filed arc until those changes receive
-sign-off. No final issue bodies are drafted here.
+The owner chose a follow-up before TRA-12. D-60/P-16 now approves the exact
+one-PR boundaries, dependency insertion and existing-issue revision scopes.
+The ledger and delivery plan reflect that amendment; original issue links and
+filed scopes remain preserved. No final issue bodies are drafted here.
 
-### P-7. Shared discovery — D-39/D-51/D-53 approved, concrete details open
+### P-7. Shared discovery — framing completed by D-59/P-15
+
+Historical mechanism discussion below; D-59 approves P-15's concrete source,
+overlay, accounting, transaction, API and proof contract. References here to
+details still needing specification are resolved there, not delegated to an
+implementation's discretion.
 
 The high-level shared-work mechanism implementing D-31–D-38 is approved by
 D-39, with D-51 separating whole-space knowledge from detail loading. The
@@ -3069,7 +3220,11 @@ visible. Exact symbolic representation, numeric bounds and edit-time updates
 still need specification and proof. No arbitrary procedural callback or
 general finite-cost topology oracle is implied by this decision.
 
-### P-8. Session retention backing — D-40/D-41/D-43/D-52 approved, details open
+### P-8. Session retention backing — framing completed by D-59/P-15
+
+Historical tradeoff discussion below; the exact quota, format, reservation,
+cache/staging, commit, failure/recovery and lifecycle choices are now approved
+by D-59/P-15. The earlier open questions here are preserved as design history.
 
 The original P-5 keeps retained changes in memory, with an initial 32 MiB
 session-edit cap (raised to 64 MiB by D-42) and new edits refused once that
@@ -3647,12 +3802,12 @@ format; retain expected values, captures and reproduction commands. Solver
 proof and owner visual acceptance remain required after this contract's
 approval. No performance improvement is inferred from the unchanged ABI.
 
-### P-14. Cell-quad emission, fog composition and visual picking — proposal
+### P-14. Cell-quad emission, fog composition and visual picking — approved by D-58
 
 This is the concrete Q-16 proposal, with the player-facing fog/pick result
 needed by Q-20. It preserves P-9 geometry, D-50's integer cutaway, P-11
-coverage and P-13 normals/lighting. It requires owner approval; discovery and
-storage implementation mechanics remain a separate contract.
+coverage and P-13 normals/lighting. D-58 approves this contract as written at
+`07930b5295`; discovery and storage mechanics remain a separate P-15 checkpoint.
 
 **Knowledge is not residency.** The planner consumes a coherent immutable
 terrain/knowledge snapshot. Distinguish a confirmed undiscovered region from
@@ -3787,6 +3942,438 @@ transparent colour/mask holes, loading in front/behind a candidate, camera
 capacity pressure and generation reuse. Retain captures, counts and commands
 under D-44/D-47/D-48, not only mathematical reasoning or passing headless tests.
 
+### P-15. Compressed discovery and temporary-store transactions — approved by D-59
+
+**Owner checkpoint completed by D-59 at `d527957369`.** All seven clauses
+below are approved; “proposed” describes their drafting history, not remaining
+implementation discretion. This completes Q-20's specification for
+D-38–D-43/D-51–D-53. The principal tradeoff is that an edit is
+acknowledged only after its changed records and discovery continuation have
+been written to the temporary store. The camera remains asynchronous, but
+edit completion includes disk latency. This is a session store, not a game
+save or a promise of recovery after process, OS or power failure.
+
+The proposed initial allowance is **1 GiB per arena**, configurable at open,
+with explicit Lua growth and recovery. The following limits are conservative
+starting contracts, not measurements of throughput or process RSS. They must
+be qualified; an implementation that cannot meet them reports the evidence
+and returns for a design decision instead of silently relaxing them.
+
+**1. Compile exact component families, not hidden cells.** The immutable
+source remains the bounded layer/column-patch recipe. Derive compressed
+regions and shared-face portal relations from that recipe and P-9's exact
+geometry. Partition at authored coordinate/interval boundaries, with
+parameterized families for repeated independent components and bounded
+exceptions around patches. Coordinates, interval ends and intersection
+calculations use checked exact arithmetic, including the upper endpoint one
+past the highest supported cell.
+
+One rectangular range is not necessarily one connected space. For example,
+a uniform N-ramp layer has separate parallel row channels: the S face is
+sealed while the N face is open. Repeating shaped cells vertically can also
+leave separate components at each level because no approved shape has a
+positive-area bottom opening. The compiled representation must preserve
+row/column and level indices as component parameters where necessary.
+Full-air slabs, connected shaped planes, isolated channels and patch-created
+splits have distinct descriptors; a descriptor may cover a vast range without
+asserting that every member is mutually connected.
+
+Represent joins between entire parameter ranges symbolically when the portal
+proof applies to that range, with explicit fragments/exceptions otherwise.
+A shaft can join many layer components without enumerating their cells.
+The compiled result provides exact component lookup, canonical source keys,
+range membership, portal relations and compressed boundary descriptions.
+Keys depend on the validated source, never the order of chunk loading.
+Do not infer connectivity from overlapping bounding boxes or visual alpha.
+
+Initial exterior means connection through positive-area openings to the
+**upper Z boundary**, including the unobstructed sky above ordinary terrain.
+The horizontal and lower coordinate limits are not exterior openings: a
+world-spanning covered air layer must not become known merely because its
+range reaches X/Y limits. Derive upper connectivity symbolically; do not flood
+the sky. An occupied topmost full block supplies no opening, while a topmost
+shape's actual top portal can reach exterior. This explicitly defines the
+otherwise exceptional finite-coordinate boundary behavior.
+
+Open succeeds only with exact exterior/component metadata. The required
+flat arena, world-spanning air layer, all-16-shape cavity fixtures and huge
+uniform ramp/channel/layer families must work. Valid but excessive patch or
+connectivity complexity may settle as expected `source_complexity` before
+an arena is published. There is no dense fallback or partial open.
+
+Proposed default preparation bounds, all checked before the corresponding
+allocation/work, are:
+
+| Resource | Initial bound |
+| --- | --- |
+| Compiled connectivity per arena | 16 MiB, charged to the 256 MiB resident terrain bank |
+| Compilation peak, including its result | 48 MiB from that bank; one compilation active per session |
+| Structural nodes / portal or range relations | 65,536 / 262,144; the byte bound may be tighter |
+| Total compilation work | 8,388,608 counted bounded primitive steps |
+| Service quantum | At most 1,024 such steps before yielding fairly to other work |
+
+A primitive step cannot conceal a scan over a coordinate span, unbounded
+container or arbitrary recipe. Decoder/page operations and exact arithmetic
+also have checked bounded inputs. Opening is asynchronous and cancellable;
+discard all partial metadata/reservations on failure. Existing source and
+copied-value limits continue to apply independently.
+
+**2. Removal adds connectivity; it never splits existing air.** Keep the
+source component index immutable. The dynamic overlay contains coalesced
+removed intervals, additional connections/unions, discovered component/range
+labels and pending obligations. Whole-cell removal only enlarges air, so old
+source components remain valid connected subsets. Union aliases may combine
+them; they do not require rebuilding all underground terrain. This reasoning
+does not authorize later placement, reshaping or moving solids: those would
+need a split-capable topology contract.
+
+Every changed removal records a minimal connection-inspection continuation
+in the same transaction as the edit. Connecting to known space propagates
+knowledge; merely executing a raw Lua removal inside a sealed unknown area
+does **not** grant discovery. Such edits still record their new connections,
+so a later opening reaches the whole modified component. Raw queries and
+loading remain non-discovering under P-14. Removing already-air terrain is a
+no-op and does not append redundant history.
+
+Shared work records distinguish unseen, pending and expanded obligations,
+refer to the arena/source incarnation and authoritative revision, and merge
+overlapping fronts. A batch that marks a component/range known also retains
+its unprocessed outgoing obligations and exposed-boundary knowledge. Existing
+known/exterior branches may stop traversal only after newly added connections
+have been accounted for. Two opposite openings cannot lose each other's work
+or turn a pending branch into a false completion.
+
+Knowledge is recorded by compressed component/range identity. Exposed solid
+boundary knowledge is derived/retained with that identity and exact contact
+geometry; it need not copy one marker into every boundary chunk. A chunk
+reload resolves the source, removed intervals and applicable knowledge before
+publication. Global compressed knowledge therefore satisfies D-33/D-51's
+per-chunk replay requirement without enumerating all chunks of a vast cavern.
+Known solid and known empty component remain separate facts under P-14.
+Completion means no unaccounted connectivity obligation, not resident detail
+or a percentage of hidden tiles. Progress cannot rely on unbounded RAM sets.
+
+**3. A reserved, private, bounded temporary file.** Create one arena-private
+file with private permissions and no inherited descriptor, then unlink its
+name while retaining the descriptor. Open-file lifetime lasts until its final
+descriptor closes; there is no named save to reopen and no later orphan-file
+scan. The resource owner must drain descriptor borrowers before closing it.
+This lifecycle follows the native [unlink contract](https://man7.org/linux/man-pages/man2/unlink.2.html);
+both target platforms require qualification.
+
+`storage_bytes` defaults to 1 GiB, has a minimum of 64 MiB, and must be an
+integer multiple of 1 MiB within checked native signed file-offset limits.
+The allowance includes private data/index/allocator pages, in-flight copies,
+retired pages and conservative reservation/format overhead. Reserve before
+successful open; preserve at least 256 MiB of reported free-space headroom
+on that volume after the proposed reservation. This headroom is an initial
+host-profile guard, not a guarantee that other applications cannot fill it.
+
+The backend must actually reserve the required extents and account for its
+allocation granularity/overhead; making a sparse file of the right length
+does not qualify. The target mechanisms are macOS
+[`F_PREALLOCATE` with `F_ALLOCATEALL`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html)
+and Linux native [`fallocate` allocation](https://man7.org/linux/man-pages/man2/fallocate.2.html).
+Require qualified filesystem behavior and checked file-length establishment;
+do not substitute an unreserved or user-space zero-writing fallback on an
+unsupported filesystem. Native API documentation is a starting point, not
+proof of APFS/Linux behavior, overhead or later writes. External filesystem,
+device and space failures remain possible and use D-41's pause/preserve rule.
+
+Use immutable 4 KiB pages with copy-on-write B+tree indexes for removed
+intervals, component/union/knowledge records, pending discovery and allocator/
+retirement records. Keep complete history and indexes on disk with bounded
+caches, not an ever-growing heap index or replay-only operation log. The
+private versioned codec uses explicit little-endian fields, bounded counts,
+checked page references and CRC32C page checksums, tied to the arena/source
+identity. It is not `Show`/`Read` serialization or a public game-save format.
+
+The live committed root set is held by the terrain owner. Write all new pages
+successfully before publishing a new root; never overwrite pages reachable
+from the committed root or a reader's pinned root. Successful writes mean OS
+write completion, not per-edit `fsync` or power-loss durability. No cross-run
+root journal/recovery protocol is required for this disposable arena.
+
+Before publication, staged pages are unreachable and claimed only by the
+pending transaction. If writing/cancellation fails, retain the old root and
+release those claims after I/O drains; reverting the authoritative state must
+not require another successful write. After publication, retire only replaced
+pages, retaining their reclamation obligations until the last reader of the
+old root releases it. Shared unchanged pages remain owned by the new tree.
+Store reclamation work on disk and process it incrementally. No full-store
+second copy or unbounded compaction is permitted.
+
+Keep 8 MiB **inside** the allowance protected for allocator/reclamation
+progress. Ordinary new history cannot spend it. Reserve the transaction's
+worst-case new pages, index paths and retirement metadata before admitting
+the mutation. If that cannot fit, pause before changing authoritative state.
+The memory-held root and page-cache accounting do not excuse disk growth.
+
+**4. Bound the working set and I/O.** Preserve D-42's service-wide banks and
+P-5's arena/view/lease/command/load-job limits. Proposed sub-budgets inside
+the existing 64 MiB edit bank are 48 MiB for record/page caches, 8 MiB for
+staging and 8 MiB for control/frontier state. These are shared across arenas;
+retained history beyond the caches belongs in the reserved files. Coverage,
+render preparation and GPU resources keep their separate existing banks.
+
+Use one active mutating store transaction per session, fairly scheduled
+between explicit edits, discovery, growth/recovery and reclamation. Each
+transaction reserves at most 4 MiB of RAM and writes at most 1 MiB of new
+encoded pages, including its index/allocator/retirement changes. A discovery
+batch performs at most 64 structural updates and persists a continuation
+when more remain. Both bounds apply; large discoveries span transactions.
+
+Use two storage I/O workers and at most eight queued I/O descriptors per
+session. A job transfers at most 1 MiB; allocate its accounted buffer at
+dispatch, not once per queued job. A transaction's I/O buffers count within
+its own reservation. Protect 4 MiB of staging for a foreground mutation so
+camera reads cannot consume every byte it needs. Every buffer, decoded copy,
+cache pin, reader root and queued continuation has an owner and byte/count
+charge. Scratch maps and retiring pages are not free hidden banks.
+
+The terrain-owner thread alone publishes roots, revisions and request
+results. Workers perform bounded file I/O with arena-incarnation jobs and
+return completions; they do not mutate the world or retain Lua values. Pure
+connectivity, codec and allocation decisions remain independently testable.
+Explicit requests retain priority over camera prefetch, with fair service
+for already accepted work and discovery/reclamation. Reads and camera/input
+processing can continue while a write is outstanding. Admission must prove
+that the supported standalone explicit transaction fits; eviction or a clear
+`busy` result handles temporary occupied capacity, never a circular wait.
+
+**5. One publication point for an edit and its discovery obligation.**
+
+1. Validate authority, coordinates and optional pick consistency against the
+   current arena; reserve the peak RAM/disk needs and minimum continuation.
+2. Stage the removal plus its connection-inspection obligation and associated
+   metadata against the committed root. Compute bounded discovery batches
+   by the same protocol, with known labels and remaining obligations together.
+3. Write the new pages asynchronously, handling short writes and failures
+   explicitly. No staged knowledge is exposed to a view or raw terrain query.
+4. On the terrain owner, recheck incarnation, root and cancellation. Arbitrate
+   cancellation/close against publication once: either the old state survives
+   with no committed mutation, or the new root/revisions and success result
+   become authoritative together. Cancellation cannot undo a published edit.
+5. Release staging; reclaim replaced pages only after their readers finish.
+
+Removal success means the edit and required pending work are backed; it does
+not mean the whole cavern has finished discovery or the GPU has adopted it.
+Content revision advances for changed terrain, knowledge revision for changed
+knowledge, and a private store revision for frontier/maintenance commits.
+Check all revision increments for overflow; none wraps or silently reuses
+an authority. P-14's coherent plan identity includes knowledge revision.
+
+Acknowledged changes already have a backing copy, so ordinary chunk offload
+can evict caches without another required write. Reload uses one coherent
+committed root; missing edit/knowledge pages are `loading` or an expected
+storage failure, never permission to substitute pristine source terrain.
+Prepared rendering copies its data and releases store readers; a GPU fence
+must not pin disk pages. Existing CPU/GPU retirement still applies to its
+separate resources.
+
+Expected capacity, I/O or integrity failures pause new edits and advancing
+discovery for the affected arena, retain its last committed state and pending
+frontier, and settle uncommitted user mutations with an expected result.
+Do not keep those requests hanging or automatically repeat them after
+recovery. Unaffected arenas may continue. Already available coherent display
+and provable reads remain usable; unreadable authoritative pages do not
+become air, unknown fog or regenerated unedited terrain. An integrity failure
+cannot be cleared merely by demonstrating that a scratch write works.
+
+**6. Concrete Lua control and expected results.** Extend the P-5 facade as
+follows. Each call uses its existing `OptionalRequest`/`api.request` policy,
+copied plain records, phase/role checks and immediate `busy` admission result.
+Both script roles may use terrain services; creator authority is still local
+to the creating instance, not obtainable by attaching to an arena name.
+
+| Call | Proposed contract |
+| --- | --- |
+| `api.terrain.open(name, definition [, options])` | Optional `storage_bytes`; omitted means 1 GiB. Finish source compilation, reservation and initial roots before returning the creator's arena lease. No other new options. |
+| `api.terrain.status(arena)` | Any valid own lease; bounded copied status snapshot, with no hidden coordinates or history dump. Advisory, not a reservation for later work. |
+| `api.terrain.grow_storage(arena, new_bytes)` | Creator-owner lease only. Larger reservation is obtained before publishing the larger allowance and resuming capacity-paused work. Equal size is an idempotent success; a smaller size at execution settles as `storage_size_not_increased`. No shrink or automatic growth. |
+| `api.terrain.retry_storage(arena)` | Creator-owner lease only. Explicit bounded I/O/revalidation attempt; resume internal discovery only if the recorded failure is actually cleared. Never re-execute a previously failed user edit. |
+
+Status, growth and retry remain admissible while the arena is paused, subject
+to their ordinary bounded request capacity. Retry on an already ready arena
+is an idempotent success. Protected reclamation may continue during a
+capacity pause; retry succeeds only after space for the supported next
+transaction is available. Growth or explicit successful retry clears that
+pause, rather than automatically restarting failed user mutations.
+
+Status contains `storage.state` (`ready`/`paused`), an optional `reason`,
+`reserved_bytes`, `used_bytes`, `pending_reclaim_bytes` and
+`pending_reserved_bytes`; `discovery.state` (`idle`/`pending`/`paused`) and
+`pending_items`; and content/knowledge revisions. Counts refer to compressed
+work records and bytes, not a hidden-tile count or completion percentage.
+Reserved bytes are the committed allowance; used bytes count occupied private
+pages and overhead within it, not the still-free preallocated pages. Used
+bytes include live, staged and retired allocations; pending reclaim is a
+subset, not extra available space. Report uncommitted
+growth reservations separately until committed or released. Status itself
+does not require enumerating the store.
+
+Malformed options/types, foreign/non-owner handles where owner authority is
+required, invalid size/alignment and out-of-range coordinates are ordinary
+binding errors before provider work. Add expected domain codes
+`source_complexity`, `storage_unsupported`, `reservation_failed`,
+`storage_full`, `storage_io`, `storage_integrity` and
+`storage_size_not_increased`; preserve existing `arena_closed`, cancellation
+and other request results. Expected domain results do not latch an instance
+failure. Host invariant/provider defects remain host failures.
+
+Growth is serialized with store mutation and checks the current cap at
+execution. Failure/cancellation before its commit preserves the old cap,
+roots and pause. Account and finish releasing any partially obtained extra
+reservation before another growth attempt; if release itself fails, retain
+that accounted pending reservation and report it until recovery/close.
+Capacity recovery does not clear a separate I/O/integrity pause. Retry checks
+the recorded failing operation/pages plus a bounded reservation/write probe
+as applicable; persistent errors preserve the pause. No polling retry loop,
+implicit reset or history deletion is allowed.
+
+**7. Ownership, teardown and proof.** The arena owns the recipe/index,
+committed roots, file and knowledge; the narrow terrain service owns workers
+and shared bank accounting. Reads borrow bounded immutable roots, and views
+hold coherent copied publications. Close, creator-instance exit or session
+reset invalidates the incarnation, cancels uncommitted work, drains I/O and
+reader borrowers, closes the private file through `withResource` and releases
+the banks. Preserve primary/cleanup failures under the resource contract.
+Do not close/reuse a descriptor while an old job can still use it. Reset
+means closing and opening a fresh arena; no new reset API or cross-run replay
+is introduced. A process exit naturally discards this unnamed temporary
+store after all descriptors close.
+
+Required evidence, assigned to implementation slices later under Q-19:
+
+- Compare the symbolic compiler to an independent small explicit portal/flood
+  oracle across all 16 shapes, rotations, patch-created splits, sealed spaces,
+  diagonal openings and sky. Prove huge independent ramp rows/levels remain
+  separate, whole-air layers stay compact, and X/Y/lower limits do not act as
+  sky. Record structural/work/byte counts and bounded complexity refusals.
+- Exercise both opening orders and interleavings, a raw buried removal,
+  long coalesced removed runs, range unions, known solid beside unknown void,
+  pending continuation and coherent offload/reload after every discovery
+  batch. Whole-space completion cannot require materializing its boundary.
+- Inject short writes, read/write failures, checksum faults, full allowance,
+  growth and rollback/release failures, and cancellation/close on each side
+  of root publication. Prove unchanged old roots on failure, no duplicate
+  edit, no lost obligation, bounded queues/buffers and safe reader retirement.
+- Qualify reservation, write capacity, overhead/peak space, growth and
+  unlink/last-close behavior on the supported macOS/Linux backends using
+  bounded temporary-volume or fault-provider fixtures. Never fill the owner's
+  ordinary drive as a test. Unsupported storage must refuse cleanly.
+- Retain storage latency/allocation evidence, close/reset/late-incarnation
+  checks and the P-14 fog/picking integration proof. Headless algorithm tests
+  do not replace P-11/P-13/P-14's offscreen visual evidence. No performance
+  result is claimed by this design.
+
+The alternatives not recommended are acknowledging RAM-only edits before
+backing succeeds, an ever-growing operation log/heap index, dense hidden-cell
+flooding, automatic quota expansion and cross-run crash recovery. This
+proposal adds none of the deferred general gameplay/ECS transactions,
+whole-tick rollback, movement rules, UI or saved-world schema.
+
+### P-16. Amendment delivery and readiness — approved by D-60
+
+**Q-19 owner checkpoint completed on 2026-11-08.** D-60 approves P-16 as
+written at `b012fabbfc` and declares the amendment ready for issue processing.
+The approved plan adds **11 follow-up children, TRA-13–TRA-23**, to existing
+EPIC #636, specifies revisions to #645–#648 and the baseline coordination
+below. It creates no second epic, reopens no completed issue and changes no
+tracker artifact. The approved slice clauses are promoted verbatim into the
+delivery plan; the ledger retains all original IDs/links and marks only the
+new follow-ups unprocessed. They are design IDs, not filed issue numbers.
+
+**Tracker refresh, 2026-11-08.** #636 is the existing open terrain epic;
+no overlapping second open arc was found. #637/#638/#642/#643 are closed with
+merged PRs #649/#651/#650/#652. #639 remains open with PR #653 at
+`8938cc7286be`; #640/#641 remain open. #644 remains open with held PR #654
+at `734a8543ab9b`; #645–#648 remain open without implementation PRs in the
+checked listing. The other open work (#563 and deferred #446) does not supply
+this amendment; render-target sampling from #446 is not a prerequisite.
+These are snapshot facts, not a claim that readiness labels approve new text.
+
+**Keep useful baseline work and replace its superseded assumptions explicitly.**
+Retain #654's artwork provenance, material registration/package separation,
+offscreen harness and original measured evidence as baseline work. Complete
+its existing review defects through the manager's normal review path before
+any landing; its old per-face renderer is replaced by TRA-17. The approved
+plan keeps this as a follow-up correction under D-28, rather than expand
+#644 into the entire amendment. Approval of this plan does **not** release
+the manager's hold, approve the current PR head or authorize a merge. The
+manager coordinates resumption and any baseline-disposition change before
+dependent implementation. New renderer qualification is mandatory below.
+
+Likewise, #639/#640/#641 remain the pure-residency, service and Lua-settlement
+baseline, with D-42's already authorized CPU budgets/explicit-demand policy.
+TRA-20–TRA-23 replace their RAM-only total-history/capacity assumptions with
+the approved store contract. Do not make the active residency worker absorb
+the storage subsystem or treat a baseline's completion as amended acceptance.
+
+Each new child in the delivery plan is one PR with its own owning contracts,
+focused tests and required evidence. Phase order expresses dependencies, not
+permission to skip proof or broaden a slice. Independent work may proceed
+once its prerequisites exist; no numeric ID grants parallel edit authority.
+
+The eleven approved one-PR slice specifications now appear in **Delivery
+plan**, in the same order as the processing ledger. Promotion changes their
+location and heading level, not the signed-off scope, dependencies or proof.
+
+**Existing tracker artifacts to revise later, one signed-off draft at a time.**
+The following is the revision scope, not ready-to-post issue body text.
+
+| Artifact | Required revision or coordination |
+| --- | --- |
+| EPIC #636 | Extend the existing arc/checklist and dependency graph with TRA-13–TRA-23; distinguish logical query geometry from visual alpha picking; add corrected ID 15, fog/discovery, lighting, viewport demand and temporary backing/recovery. Replace the cross-run-persistence exclusion's ambiguous wording, keep saves deferred, and require new evidence before final acceptance. No new umbrella. |
+| Closed #637/#638/#642/#643 | Preserve their history and issue status. TRA-13 and TRA-16/TRA-17 supersede affected geometry/visual assumptions; TRA-18–TRA-22 extend source/change behavior. No duplicate rewrite of ordered input. |
+| #639 / PR #653 | Preserve the manager's D-42 budget and best-effort/explicit-demand clarification. Add later coordination links to the new model/store owners; do not enlarge this active baseline into discovery/storage or silently claim its RAM-only model is the final history policy. |
+| #640 | Keep its scoped service, settlement seam and baseline scope; link TRA-22 as the owner of write-backed transactions, startup compilation and knowledge revisions. Its “no disk store” is a baseline scope limit, superseded for the complete arc by the follow-up. |
+| #641 | Keep the original facade/real settlement bridge; link TRA-23 as the owner of storage options/control/error changes. Its old immediate busy rule for total RAM history is not the amended hard-disk-cap contract. Preserve pending-open name-claim semantics. |
+| #644 / PR #654 | Record the baseline disposition and retained evidence limits above; add TRA-17 as the new amended Q-13 gate. Original review fixes and a fresh exact-head review remain required. No hold release or merge follows from this document. |
+| #645 / TRA-9 | Depend on TRA-17 and TRA-22 as well as baseline prerequisites. Consume cell/mixed-fog quads and coherent knowledge revisions; own exact normal/colour versions and CPU coverage interests; charge the amended 128 MiB CPU render bank and existing GPU/retirement banks. Integrate full projected viewport/height-band demand, progressive bounded admission and view-aware eviction. Test hazed background beyond the old radius, pending knowledge, reveal/offload/reload and atomic mixed-part adoption under pressure. Preserve exclusive target ownership and actual frame-completion retirement. |
+| #646 / TRA-10 | Depend on TRA-23, TRA-6 and revised TRA-9. Add P-13's strict partial lighting/depth records and defaults to style/configure, with complete colour/blank/normal-map mappings and P-11/P-13 validated texture authorities. Preserve the existing atomic camera controls/`slice_delta`; replace conflicting legacy face-tint/filter controls with the approved sampling and unit wrapper tint/brightness. Issue picks only from adopted matching coverage/knowledge: confirmed fog gives `no_hit`, incomplete information gives `loading`, known cell hits alone yield edit authority. Replace the old analytic face/cap result contract. Cover wrong normal profile, stale knowledge/assets, all-or-nothing configuration and independent lighting controls. |
+| #647 / TRA-11 | Depend on revised TRA-10 and all transitive amendment gates. Load approved colour/blank/maps with the proper options, author the exact lighting/depth defaults and storage allowance in Lua, and use the real amended services. Keep the default flat source, generic launcher and existing controls. Extend the temporary F8 proof to fog refusal, ramp/mask selection and discovery replay; expose no new UI or debug binding. A storage pause is an expected reported condition: preserve the arena and navigation where data is available, without replaying edits or automatically growing/resetting it. Startup failure retains the existing bounded failure/quit path. |
+| #648 / TRA-12 | Depend on revised TRA-11 and every amendment child/proof gate. Replace old flat-ID-15/cap/analytic-picker/RAM-only assertions and stale CPU budgets. Qualify final all-16/four-facing normal/cutout/pick/fog behavior, sky/cavity/dual-opening discovery, viewport/haze loading, store limits/failure/recovery and all owning banks. Retain pre-removal F8 proof separately, remove its binding/glue, then verify final public Lua API behavior and visual/resource evidence. Preserve the bounded optional memory experiment, honest measurements, M1 compatibility and owner visual acceptance. |
+
+**Approved ledger and delivery order:** EPIC; TRA-1–TRA-8; TRA-13–TRA-23;
+TRA-9–TRA-12. Every original ID/link remains; its checked mark means filed,
+not implemented. The 11 follow-ups are unprocessed and the delivery plan
+mirrors that order. Baseline scopes remain history, with current amendment
+requirements preceding TRA-9–TRA-12's historical text. The numbers need not
+be ascending when dependencies require inserted work.
+
+The material path is TRA-13/TRA-14/TRA-15 → TRA-16 → TRA-17 → TRA-9.
+The discovery/storage path is TRA-13 → TRA-18 → TRA-19 → TRA-20 → TRA-21
+→ TRA-22 → TRA-23, with baseline dependencies listed above. TRA-9 also waits
+for TRA-22; TRA-10 joins TRA-9, TRA-23 and ordered input. TRA-11 assembles that
+result, and TRA-12 is the final barrier after **all** amended behavior exists.
+This lets baseline service work and rendering/discovery foundations proceed
+independently where their actual source/interface boundaries permit.
+
+**Evidence gates and readiness.** TRA-13/TRA-14 own the reference-defect and
+canonical geometry/map evidence; TRA-17 owns amended offscreen Q-13 proof;
+TRA-18/TRA-19 own exact compressed-connectivity/discovery proof; TRA-20–TRA-22
+own store/admission/publication and native-reservation qualification. Revised
+TRA-9 owns live viewport/haze demand, adoption and GPU lifetime evidence;
+revised TRA-10/TRA-11 own real Lua/content behavior; TRA-12 owns the final-build
+matrix, native observations, retained captures, measurement summary and
+shortcut removal. Each owning slice updates its current contract and catalog,
+and lands human docs/evidence with `docs-push` before final implementation review.
+
+No old screenshot, unreviewed fixture fix or passing CPU-only test proves the
+amended GPU result. No unlimited world-size claim, default limit or source
+compression formula is a measured performance result. Required unproved
+geometry, sampling/order, source-family or filesystem behavior is an explicit
+delivery blocker with a reproducible counterexample; return material changes
+to the owner rather than silently dropping a fixture or widening an interface.
+
+D-60 records approval of this slice/revision plan and the explicit declaration
+that the amendment is **ready for issue processing**. The document's ledger,
+order and readiness are promoted; this does not create/edit tracker items,
+authorize code work or release PR #654. Later processing revises the existing
+epic first, then handles one new child or existing-issue revision per invocation,
+with a separately approved concrete tracker draft.
+
 ## Open questions and review checkpoints
 
 ### Q-1. What does flat terrain contain vertically?
@@ -3866,14 +4453,19 @@ including P-5, its defaults/limitations, the epic done condition and
 TRA-1–TRA-12. Verified manager relay: `#het-terrain`, message
 `39em862uwqaj3x3t4dn9kipeta`, 2026-11-07T02:13Z.
 
-The design is ready for issue processing. The current authorization is an
+This was the original design's readiness sign-off and authorization for an
 EPIC draft for manager sign-off before creation, not approval to file it.
+The original arc was subsequently filed. D-28 reopened readiness for the
+amendment; D-60 now records its new sign-off and resolves Q-19. The design
+is `ready for issue processing` for the approved amendment.
 Q-13 remains an in-delivery proof gate; Q-14's migration dispositions stand.
 
 ### Q-13. Can the current renderer represent the geometry correctly?
 
-Deliberately gated implementation question, owned by TRA-7/TRA-8 before
-TRA-9–TRA-12 proceed. Prove depth ordering, cutaway coverage and pick/render
+Deliberately gated implementation question: TRA-7/TRA-8 own the historical
+baseline; D-60 assigns amended-path proof to TRA-17, using TRA-13/TRA-14's
+geometry/map evidence, before TRA-9–TRA-12 proceed. Prove depth ordering,
+cutaway coverage and pick/render
 agreement for roofs, gaps, ramps and corner slopes through the current
 render-2d ABI. If the proof fails, stop those dependent slices and return a
 specific renderer-change proposal to the owner. Do not broaden renderer
@@ -3897,6 +4489,13 @@ The broader historical “full Synarchy port” memory reconciliation is not an
 implementation dependency for this explicitly approved first arena. Fidelity
 beyond this arc remains uncommitted; MEMORY.md is unchanged.
 
+Readiness refresh, 2026-11-08: PR #654 remains open at `734a8543ab9b`.
+Its body records fixes after CHANGES_REQUESTED, unreconciled snapping proof
+and stale captures for several earlier fixtures; the fixes have not been
+reviewed. The linked historical outcome above is not current-head approval,
+release of the manager's hold or qualification of P-9–P-15. The approved
+delivery plan retains those limitations and assigns fresh amended-path evidence.
+
 ### Q-14. Migration-review disposition
 
 Resolved for this arc by D-23–D-26. Separate automatic headroom and manual
@@ -3918,7 +4517,8 @@ and preview contract remain Q-18.
 
 ### Q-16. Logical terrain, visual coverage and picking contract
 
-Partially resolved by D-30: picking uses the adopted drawn quads and matching
+Resolved as a specification by D-30/D-36/D-49/D-50/D-55–D-58 and
+P-9/P-11/P-13/P-14. Picking uses the adopted drawn quads and matching
 artwork/mask coverage in front-to-back order, with shared CPU asset coverage.
 The result identifies the logical cell for the existing edit contract.
 
@@ -3935,8 +4535,8 @@ D-36 resolves #637's subcell query authority: correct those definitions so
 point/ray queries and discovery share the canonical logical shape model.
 Rendering/screen picking retain sprite coverage as their visual authority.
 
-Still open: query/API compatibility details, full-cell versus isolated-face
-emission and hidden-cell culling/ordering. D-50 resolves cap behavior: omit
+P-14/D-58 resolves query/API compatibility, whole-cell emission and
+hidden-cell culling/ordering. D-50 resolves cap behavior: omit
 levels above the slice, retain known shapes/materials and add no flat caps;
 unknown regions retain generic blank fog. D-49 approves P-9's lowered-edge catalog,
 including the central half-height peak for ID 15, replacing its earlier
@@ -3951,18 +4551,19 @@ the existing view-aware direction when adapting demand bounds to whole-tile
 face maps, and reconcile planning limits with D-42. The explicit
 coverage/admission/eviction contract is approved by D-48; the concrete planner
 integration and qualification remain implementation work to assign in Q-19.
-Do not silently retain incompatible ray/coverage claims. Exact sample/threshold and
-coverage resource contracts remain Q-17; the approved picking approach itself
-does not need another sign-off.
+Do not silently retain incompatible ray/coverage claims. Q-17's exact
+sample/threshold and coverage resource contract is resolved by D-55/P-11;
+its proof is implementation work, not another design choice.
 
 The integer-cutaway owner question is resolved by D-50. Concrete emission,
 culling and ordering must implement that behavior and prove it alongside
 D-44's shape/mask/picking qualification.
 
-Current owner checkpoint: P-14 proposes whole-cell quads, mixed ramp/fog
+Completed owner checkpoint: D-58 approves P-14's whole-cell quads, mixed ramp/fog
 composition, exact ordering, conservative bounded planning, `no_hit` for fog,
-loading distinctions and the visual/logical API migration. It is not approved
-yet; the existing decisions do not silently settle those concrete details.
+loading distinctions and visual/logical API migration. Q-13's renderer proof
+and Q-19's assignment of that work remain; specification approval does not
+claim implementation, successful captures or owner visual acceptance.
 
 ### Q-17. Face-map data loading, sampling and ownership
 
@@ -4023,107 +4624,70 @@ implementation gates; specification approval is not visual acceptance.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
-Open. After the behavior, including D-31/D-32/Q-20 fog and discovery, is
-settled, approve dependency-ordered follow-up
-slices and exact revision needs for #645–#648, with the owner-selected barrier
-before TRA-12 and explicit coordination of held PR #654. Mirror approved new
-slice IDs in the ledger and delivery plan; preserve earlier IDs. Readiness
-requires fresh owner sign-off. This design turn files or edits no tracker item.
+Resolved by D-60. On 2026-11-08 the owner explicitly approved P-16 at
+`b012fabbfc` and declared the terrain amendment ready for issue processing.
+The approved 11 follow-ups (TRA-13–TRA-23), baseline disposition, existing
+artifact revisions and evidence ownership are now reflected in the
+processing ledger and delivery plan, preserving all original IDs/links.
 
-The follow-up plan must explicitly assign D-44's reproducible defect/correction
-proof, all-16/four-facing captures and geometry/opening/picking checks to the
-owning correction and integration work; carry its evidence gate into TRA-12.
-Also assign D-47's numerical, isolated/combined depth-effect and navigation/
-streaming regression evidence to the lighting and integration slices.
-Include D-48/P-10's viewport-driven demand/eviction refinement and background
-regression, preserving the existing D-42 capacity policy and
-reconciling the pure planner's limits with progressive camera preparation.
+D-44's geometry/map proof belongs to TRA-13/TRA-14; TRA-17 owns amended
+Q-13 material qualification. D-47's numerical lighting/depth proof and
+D-48/P-10's live viewport/haze regression remain separately assigned to
+TRA-17 and revised TRA-9, then final TRA-12. D-59's connectivity, storage and
+recovery qualification has explicit model/effects/runtime owners. Those are
+implementation obligations, not remaining design choices or delivered results.
+
+No tracker artifact or code changes in this design turn. Each eventual
+EPIC/child revision or new issue still requires its own concrete draft and
+separate approval before mutation. PR #654 remains held; implementation
+coordination, reviews and merge authority remain with the manager/owner.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
-Partially resolved by D-31–D-41/D-43/D-51–D-53. Preserve fog over both solid and air until
-discovery, distinct from residency and authoritative terrain. Unsealing a
-cavity reveals its whole connected empty space and exposed boundary terrain,
-beyond the adjacent cells and across chunks, in bounded steps. D-51 replaces
-exhaustive boundary loading with compressed whole-space knowledge; detail loads
-on camera or explicit demand. The local-only discovery alternative is rejected.
+Resolved as a specification by D-31–D-41/D-43/D-49–D-53/D-58/D-59 and
+P-9/P-14/P-15. Preserve the decisions' history; the exact current contract
+is P-15, approved as written at `d527957369`, together with P-14's visual
+knowledge and fog-result contract.
 
-D-33 records revealed state as retained chunk changes, preserved on offload
-and replayed before reload publication alongside terrain edits. Discovery
-persists for the arena session while off-screen chunks may unload normally;
-closing/resetting the arena discards it. Both revealed air and exposed solid
-boundary tiles retain their known state.
+Knowledge, truth and residency remain separate. Sky and initially
+sky-connected spaces begin known; sealed spaces become known through real
+positive-area connections under the shared logical shape catalog. Whole-space
+discovery includes exposed solid boundaries and crosses chunks, in bounded
+steps. It retains compressed component/range knowledge and pending obligations;
+it does not require loading every boundary tile. Two openings share work
+without losing newly added connections or flooding the exterior.
 
-D-34 resolves whole-empty-cell connectivity: six shared-face neighbors,
-including across chunks, with edge/corner-only contacts excluded.
+P-15 fixes exact source component families and exceptions, upper-boundary
+exterior semantics, startup work/memory limits and expected complexity
+refusal. Required flat, world-spanning gap and shape/channel cases must be
+proved. Removal enlarges air and records its connection-inspection obligation
+atomically; an isolated raw buried edit does not itself discover that space.
+Queries and residency alone still do not grant knowledge.
 
-D-35 requires discovery through explicit partial-shape openings, including
-real diagonal openings from ramps into unrevealed spaces. It excludes both
-the shortcut of treating all shaped cells as sealed blocks and the shortcut
-of treating every diagonal neighbor as connected.
+The reserved temporary store replaces the original RAM-only history cap:
+default 1 GiB per arena, configurable at open with explicit creator-authorized
+growth. P-15 fixes the private file/page/index format, cache/staging/I/O bounds,
+peak-space reservations, reader retirement and one commit/settlement
+arbitration after backing writes. Offload evicts reconstructible caches;
+reload reapplies source, edits and knowledge coherently before publication.
 
-D-36 makes those logical shape definitions the common authority for discovery
-and terrain point/ray queries, correcting the previous solid definitions.
+Storage capacity, I/O and integrity failures preserve committed state and
+pending obligations, pause affected mutations/discovery and return the
+specified expected results. Exact Lua status/growth/retry authority,
+cancellation, recovery and close/reset behavior are approved. A new arena
+starts fresh; no save or cross-run recovery is added.
 
-D-37 resolves fog interaction: generic blanks are non-interactive and
-unselectable. A fog-covered screen pick gives no player target and does not
-continue through the cover; the temporary removal shortcut does nothing there.
+D-58/P-14 resolves player interaction: confirmed generic fog is unselectable,
+stops traversal and returns `no_hit`; unavailable authoritative information
+remains `loading`. Mixed known-solid/unknown-void presentation is coherent
+and does not expose hidden contents.
 
-D-38 starts sky and initially sky-connected cavities discovered, without
-requiring all their detail resident. Later discovery applies to previously
-sealed space. Overlapping openings during progressive work must not flood the
-exterior, duplicate work or lose unprocessed branches. D-39 approves shared
-pending work, new-edit seeding and stopping only exterior branches. P-7's exact
-representations, source metadata and API/capacity contract remain open. D-53
-requires bounded exact preparation of source connectivity before arena opening,
-with clear over-budget refusal; it does not select the precise encoding/limits.
-
-D-40 chooses temporary per-arena disk backing for retained edits/discovery,
-with bounded RAM caching and asynchronous I/O, discarded on arena close/reset.
-The earlier RAM-only total-history cap is superseded. Exact record/index,
-quota and lifecycle rules remain open. D-41 selects pause/preserve/recover
-on storage exhaustion or write failure; exact read/write results, admission
-and recovery triggers remain open. D-43 resolves startup reservation and a
-hard allowance: reserve before opening the arena, refuse opening if that is
-not possible, and pause at capacity while preserving the expandable world.
-The numeric allowance and qualified reservation mechanism remain open. D-42
-raises the CPU banks independently; it does not choose the disk allowance.
-
-The logical 16-shape regions and their openings are now specified by D-49/P-9;
-their implementation still requires D-44 qualification. Still open: derive and
-budget the initial exterior-connected
-knowledge metadata without scanning infinite sky. Specify completion and
-memory-pressure behavior for very large spaces, including P-8/D-40's concrete
-temporary-store cache/staging/disk quotas and write/read failure behavior. Specify
-Lua/engine authority and concrete reset,
-reveal-job resumability and replay/publication boundaries, including the API
-encoding of D-37's no-selectable-target fog result.
-
-D-51 selects compressed whole-space knowledge, distinct from resident detail.
-Its exact encoding/accounting remains open: implicit unknown plus sparse
-discovered spans or regions is the storage direction to specify. Reveal
-work must be bounded; an enormous or exterior-connected air region cannot
-force an unbounded flood fill or eager underground allocation. Consider
-coherent terrain/reveal publication so a pending or failed edit/reveal cannot
-flash secret contents. D-32 settles whole-space propagation in bounded steps;
-D-33 settles session retention/replay with normal streaming; D-34 settles
-whole-empty-cell face adjacency. D-35 includes partial-shape/diagonal openings.
-Exact API, representation, per-shape geometric rules, failure and capacity
-policies remain open.
-The whole-cavern knowledge/detail question is resolved by D-51. D-52 resolves
-live allowance increases: explicit Lua requests may obtain a larger reservation,
-preserving the old cap/state on failure and resuming capacity-paused work only
-after success. Exact request and recovery mechanics remain open.
-The startup-preparation question is resolved by D-53: bounded exact connectivity
-preparation precedes successful arena opening, with clear over-budget refusal
-and no dense hidden-cell enumeration. Concrete encoding, limits and proof
-remain to specify alongside the other storage/publication mechanisms.
-P-14 separately proposes the concrete player-facing fog result (`no_hit`,
-with traversal stopped) and distinguishes pending knowledge from confirmed
-undiscovered space, including mixed known-ramp/unknown-void rendering. Those
-details await its owner checkpoint; the storage/commit contract remains open.
-Do not introduce
-full unit vision/day-night visibility or general gameplay state by inference.
+Qualification remains implementation work: independent connectivity oracles,
+compressed-space/limit evidence, I/O and publication fault interleavings,
+retention/replay, native reservation/lifecycle checks and visual fog/picking
+proof. Q-19/D-60 assigns those obligations to reviewable slices and final
+TRA-12 acceptance. Approval supplies no test result and does not introduce
+unit vision, automatic day/night, general gameplay state or placement.
 
 ## Verification strategy — approved through Q-12
 
@@ -4189,12 +4753,19 @@ validation catalog once slices exist (H `AGENTS.md`, Language and build;
 
 ## Delivery plan
 
-Approved one-PR boundaries, Q-12/D-27. Phases express dependency barriers,
-not permission to create issues. The independent input and geometry work can
-be prepared earlier; the ledger lists a valid complete order. Every slice
-includes its owning contract/tests/catalog updates; documentation lands through
-`docs-push` and is linked from its eventual PR. Broader scope discovered during
-processing is split/reviewed explicitly, never hidden inside a child.
+Approved one-PR boundaries: original Q-12/D-27, amended by Q-19/D-60.
+The ledger and this plan have the same dependency-valid order. TRA-1–TRA-8
+retain their filed baseline scopes as history; later follow-ups supersede
+conflicting assumptions. TRA-9–TRA-12 state their current amendment first and
+preserve the original filed text underneath. P-16 owns existing-issue revision
+and baseline coordination; an issue's old readiness label does not approve a
+new body or prove this amendment implemented.
+
+Phases express dependency barriers, not permission to create issues. Every
+slice includes its owning contract/tests/catalog updates; human documentation
+lands through `docs-push` and is linked from its eventual PR. Broader scope
+discovered during processing is split/reviewed explicitly, never hidden inside
+a child. All amended rendering/discovery/storage evidence precedes TRA-12.
 
 ### TRA-1. Define terrain coordinates and shared shape geometry
 
@@ -4301,7 +4872,219 @@ processing is split/reviewed explicitly, never hidden inside a child.
 - **Open questions:** Q-13 is a hard stop gate: failed proof returns a concrete
   renderer proposal to the owner before dependent slices proceed.
 
+### TRA-13. Correct canonical shape geometry and expose exact opening portals
+
+- **Outcome/scope:** implement P-9's complete logical catalog, including the
+  ID-15 central half-height peak, exact rotated facet/portal geometry and
+  closed-solid point/ray behavior. Keep coordinate/source identities intact.
+- **Phase:** amendment geometry. **Depends on:** TRA-1 and the baseline TRA-8
+  completion. **Ordering:** critical prerequisite shared by rendering and
+  discovery. Complete the held baseline first so its review/evidence is not
+  changed underneath it by the ID-15 correction; this is a delivery dependency,
+  not a graphics import into the pure terrain library.
+- **Relevant decisions:** D-34–D-36, D-44, D-49; P-9.
+- **Acceptance:** independent all-16/four-facing solid and positive-area
+  portal tests, diagonal paths versus edge/point contacts, exact boundaries
+  and query compatibility. Preserve a reproducible reference-defect fixture.
+- **Excludes:** texture generation, source compilation, runtime and GPU work.
+- **Open questions:** none; a refuted shape premise returns to the owner.
+
+### TRA-14. Generate and qualify canonical cutout and normal-map assets
+
+- **Outcome/scope:** deterministic P-9/P-11/P-13/P-14 map generation and
+  rotated-ID lookup: ordinary shapes, full fog and complementary mixed
+  known-solid/unknown-void parts within P-14's shared-map bound. Preserve
+  loam/granite artwork and import the pinned generic blank with provenance.
+- **Phase:** amendment assets. **Depends on:** TRA-8, TRA-13.
+  **Ordering:** rendering prerequisite; independent of terrain runtime.
+- **Relevant decisions:** D-44/D-49/D-55/D-56/D-57/D-58.
+- **Acceptance:** reproduce the pinned Synarchy inconsistency independently,
+  retain immutable original/corrected comparisons for all 16 IDs/four facings,
+  verify silhouette unions/disjoint parts, facet normals, encoding, dimensions
+  and deterministic hashes. Mark CPU/generated-image proof as such; actual
+  material/readback qualification follows in TRA-17.
+- **Excludes:** new colour art, automatic slopes, shader/runtime integration.
+- **Open questions:** none; D-44's stop/report rule applies to refuted evidence.
+
+### TRA-15. Load validated data maps with shared versioned CPU coverage
+
+- **Outcome/scope:** P-11/P-13's bounded `kind`, `coverage` and
+  `normal_encoding` texture options from decoding through protected asset
+  ownership. Produce one immutable bitplane per exact asset version, preserve
+  raw normal data and validate the declared profile before upload.
+- **Phase:** amendment asset service. **Depends on:** no new terrain child;
+  uses the existing content/texture/resource interfaces. **Ordering:** may
+  proceed independently of geometry and storage.
+- **Relevant decisions:** D-30/D-45/D-55–D-57.
+- **Acceptance:** exact boundary/alpha/profile fixtures; colour/data handling;
+  nonbinary/incompatible rejection; bounded decode and 128 MiB bank charges;
+  version replacement, canceled load and CPU/GPU-interest retirement. Existing
+  omitted-option texture loading and M1 clients retain their behavior.
+- **Excludes:** terrain planning, camera controls and arbitrary shader loading.
+- **Open questions:** none; keep injection narrow, with no terrain import in
+  the generic image/content machinery.
+
+### TRA-16. Build pure cell-quad planning and coverage-based visual picking
+
+- **Outcome/scope:** P-14's whole-cell/mixed-fog plans, exact sort/rank keys,
+  conservative projected bounds and matching P-11 alpha picker. Accept one
+  coherent supplied terrain/knowledge/asset/camera snapshot; include the
+  P-10 viewport/height-band demand envelope and bounded progressive planning.
+- **Phase:** amendment pure rendering. **Depends on:** TRA-7, TRA-13,
+  TRA-14, TRA-15. **Ordering:** prerequisite to the production material switch.
+- **Relevant decisions:** D-30/D-37/D-42/D-48/D-50/D-55/D-58.
+- **Acceptance:** independent ray/order and texel-coverage oracles; fog stops
+  traversal without a target; pending data in front versus behind a hit;
+  mixed-part atomic admission, cutaways without added caps, extreme checked
+  coordinates, chunk seams and viewport bounds at fractional pan/zoom.
+- **Compatibility staging:** add the new pure path with its tests while the
+  filed baseline still builds. It is not a second final player-facing picker.
+  TRA-17 switches every existing repository consumer and removes the obsolete
+  face-plan/analytic visual-picking path in one coherent migration.
+- **Excludes:** live discovery/I/O, GPU effects and Lua token issuance.
+- **Open questions:** Q-13 remains a proof gate; counterexamples stop migration.
+
+### TRA-17. Switch terrain rendering to face-map cutouts and normal lighting
+
+- **Outcome/scope:** consume TRA-16 plans through the existing material ABI,
+  sample colour plus normal/cutout data, implement P-13's exact lighting/depth
+  equations and replace the legacy per-face material/adapter/picker clients.
+  Keep pure material/model code separate from the Vulkan definition.
+- **Phase:** amendment rendering proof. **Depends on:** TRA-8, TRA-14,
+  TRA-15, TRA-16. **Ordering:** hard prerequisite to TRA-9–TRA-12.
+- **Relevant decisions:** D-29/D-44–D-50/D-54–D-58.
+- **Acceptance:** retained real offscreen proof of all 16 IDs/four facings,
+  ordinary/fog/mixed masks, overlap, transparent colour holes, integer slices,
+  fractional transforms/scaling and shared pixel-edge ownership. Verify
+  numerical normal/sun/ambient/depth/haze cases, low-angle ramp lighting,
+  world-fixed illumination across facings and isolated/combined depth effects.
+  Independent discriminating probes and negative controls must reject wrong
+  masks, order, colour/data treatment and picking; no self-approved goldens.
+- **Migration:** remove old `PlannedFace`/polygon visual contracts and migrate
+  repository tests/harnesses/material adapters; retain pure logical queries.
+  Historical captures stay labelled with their original model/revision.
+- **Excludes:** new renderer ABI, day/night, live streaming and view retirement.
+- **Open questions:** Q-13 is discharged for the amended material only by its
+  evidence. An ABI/ordering/sampling counterexample returns to the owner.
+
+### TRA-18. Compile bounded symbolic source connectivity
+
+- **Outcome/scope:** P-15's pure exact source compiler, component families,
+  exceptions, portal/range relations and initial exterior classification.
+  Expose bounded resumable preparation and canonical source keys without
+  allocating hidden cells or marking sealed components discovered.
+- **Phase:** amendment discovery foundation. **Depends on:** TRA-2, TRA-13.
+  **Ordering:** independent of rendering after shared geometry.
+- **Relevant decisions:** D-38/D-49/D-51/D-53/D-59.
+- **Acceptance:** independent small explicit flood/portal oracle; required
+  flat, enormous gap, independent ramp-row/level and patch-split fixtures;
+  upper versus horizontal/lower boundary cases; measured structural/work/byte
+  counts and bounded `source_complexity` refusals at P-15's limits.
+- **Excludes:** edit-time knowledge, file I/O, arena open and Lua binding.
+- **Open questions:** none; unsupported required fixtures are a blocker,
+  not permission for dense fallback or a silent reduced source language.
+
+### TRA-19. Model compressed knowledge and resumable discovery after removal
+
+- **Outcome/scope:** pure monotonic removed-interval/connection overlays,
+  component/range knowledge, exposed-boundary lookup and shared pending work.
+  Produce bounded edit/discovery deltas and retained continuations suitable
+  for the later atomic store transaction; no I/O or mutable world owner.
+- **Phase:** amendment discovery model. **Depends on:** TRA-3, TRA-18.
+  **Ordering:** prerequisite to store records and live discovery.
+- **Relevant decisions:** D-31–D-39/D-49/D-51/D-59.
+- **Acceptance:** both orders and interleavings of two openings, new joins to
+  already known exterior, raw buried edits without premature discovery,
+  known solid versus unknown void, compressed boundary replay and whole-space
+  completion without boundary enumeration. Independent state traces prove no
+  lost obligation, false completion, duplicate work or unbounded RAM set.
+- **Excludes:** placement/splits, units/vision, file I/O and rendering.
+- **Open questions:** none; the source-plus-removal restriction is explicit.
+
+### TRA-20. Define bounded copy-on-write store records and transactions
+
+- **Outcome/scope:** pure store codec, page/index/allocator/retirement model
+  and staged transaction planning inside the terrain-runtime boundary.
+  Encode TRA-19 records and changes with P-15's page size, checksums, limits,
+  peak reservation, reader roots and protected reclamation allowance.
+  Adapt the baseline admission model to bounded edit caches and disk-backed
+  history without freeing authoritative records as ordinary cache entries.
+- **Phase:** amendment storage model. **Depends on:** TRA-4, TRA-19.
+  **Ordering:** prerequisite to storage effects and runtime adoption.
+- **Relevant decisions:** D-40–D-43/D-51/D-52/D-59.
+- **Acceptance:** bounded codec refusals, reference-map round trips, COW
+  root isolation, no write-dependent rollback, pinned-reader reclamation,
+  interrupted staged pages, capacity/overflow and per-transaction byte limits.
+- **Excludes:** native files/workers, live arena publication and public saves.
+- **Open questions:** none; no generic database framework is part of the slice.
+
+### TRA-21. Own reserved backing files and bounded asynchronous storage I/O
+
+- **Outcome/scope:** private unlinked arena files, qualified native reservation
+  and growth, scoped descriptors, bounded workers/buffers and page reads/
+  staged writes for TRA-20. The storage boundary prepares results; the later
+  terrain owner still controls authoritative root publication.
+- **Phase:** amendment storage effects. **Depends on:** TRA-20.
+  **Ordering:** prerequisite to write-backed terrain transactions.
+- **Relevant decisions:** D-40/D-41/D-43/D-52/D-59.
+- **Acceptance:** deterministic short-read/write, I/O, integrity, cancellation
+  and reservation failure fixtures; bounded platform qualification of actual
+  reservation, peak space/growth and unlink/last-close; pending-reservation
+  release failures; worker/drain/descriptor-reuse and primary/cleanup failures.
+  Use private test volumes/providers, not a full personal drive.
+- **Excludes:** terrain settlement/discovery orchestration, Lua and cross-run
+  recovery. No root may publish as a side effect of an I/O worker completion.
+- **Open questions:** filesystem qualification is a delivery gate; unsupported
+  environments use the approved expected refusal, not an unreserved fallback.
+
+### TRA-22. Commit terrain edits and discovery through the temporary store
+
+- **Outcome/scope:** integrate TRA-18–TRA-21 with the single terrain owner:
+  bounded opening/preparation, backed edits and discovery batches, coherent
+  content/knowledge revisions, cache replay, typed status/growth/retry and
+  affected-arena pause/recovery. Use the existing settlement arbitration.
+- **Phase:** amendment runtime. **Depends on:** TRA-4, TRA-5, TRA-19,
+  TRA-21. **Ordering:** prerequisite to amended views and storage Lua calls.
+  TRA-5 is a delivery dependency so its real settlement bridge exists; the
+  runtime library must still import no Lua component.
+- **Relevant decisions:** D-17/D-19/D-20/D-33/D-38–D-43/D-51–D-53/D-59.
+- **Acceptance:** actual service tests at each write/publication/cancellation
+  boundary, two-front discovery, offload/reload after each committed batch,
+  capacity/I/O/integrity pause and explicit recovery, growth failure, open/
+  close/instance/session end and late incarnation results. Preserve one host
+  settlement and test logical eligibility delays through the existing bridge;
+  neither disk completion nor a held reply is terminal success.
+- **Excludes:** new Lua schemas, graphics effects and general gameplay rollback.
+- **Open questions:** none; all old committed state survives a failed update.
+
+### TRA-23. Expose terrain storage status, growth and recovery through Lua
+
+- **Outcome/scope:** extend TRA-5 with exactly P-15's optional open storage
+  record, status/grow/retry requests, creator authority and expected codes.
+  Replace the old RAM-total-history refusal rule with the approved distinction
+  between immediate transient `busy` and terminal storage-domain outcomes.
+- **Phase:** amendment Lua service. **Depends on:** TRA-5, TRA-22.
+  **Ordering:** prerequisite to amended Lua view/content assembly.
+- **Relevant decisions:** D-19/D-40–D-43/D-52/D-53/D-59.
+- **Acceptance:** real Lua plus production terrain service, strict plain-record
+  validation, both roles/phase rules, owner versus attached lease, status while
+  paused, atomic name/open settlement and cancellation, equal/decreasing/
+  failed growth, retry without repeated user edits and unread expected failures.
+  No engine-owned handle or terrain authority crosses VMs through Lua data.
+- **Excludes:** UI, reset/save APIs, automatic expansion and view bindings.
+- **Open questions:** none; existing request timing/cleanup policies remain.
+
 ### TRA-9. Publish retained terrain views with safe GPU retirement
+
+**Current amendment — D-60:** Depend on TRA-17 and TRA-22 as well as baseline prerequisites. Consume cell/mixed-fog quads and coherent knowledge revisions; own exact normal/colour versions and CPU coverage interests; charge the amended 128 MiB CPU render bank and existing GPU/retirement banks. Integrate full projected viewport/height-band demand, progressive bounded admission and view-aware eviction. Test hazed background beyond the old radius, pending knowledge, reveal/offload/reload and atomic mixed-part adoption under pressure. Preserve exclusive target ownership and actual frame-completion retirement.
+
+**Current dependency gate:** TRA-4, TRA-8, TRA-17 and TRA-22. Q-13's amended-path evidence
+must pass; filing or readiness approval is not implementation qualification.
+The inherited one-PR phase/ownership and exclusions below still apply where
+consistent with P-9–P-16; the amendment supersedes conflicting payload,
+appearance, retention and acceptance requirements.
+
+**Original filed scope (historical):**
 
 - **Outcome/scope:** view adapter from coherent CPU snapshots to retained
   render regions, bounded uploads, target ownership, adoption/picking snapshot
@@ -4316,6 +5099,16 @@ processing is split/reviewed explicitly, never hidden inside a child.
 
 ### TRA-10. Expose terrain views and camera controls to Lua
 
+**Current amendment — D-60:** Depend on TRA-23, TRA-6 and revised TRA-9. Add P-13's strict partial lighting/depth records and defaults to style/configure, with complete colour/blank/normal-map mappings and P-11/P-13 validated texture authorities. Preserve the existing atomic camera controls/`slice_delta`; replace conflicting legacy face-tint/filter controls with the approved sampling and unit wrapper tint/brightness. Issue picks only from adopted matching coverage/knowledge: confirmed fog gives `no_hit`, incomplete information gives `loading`, known cell hits alone yield edit authority. Replace the old analytic face/cap result contract. Cover wrong normal profile, stale knowledge/assets, all-or-nothing configuration and independent lighting controls.
+
+**Current dependency gate:** TRA-23, TRA-6 and revised TRA-9. Q-13's amended-path evidence
+must pass; filing or readiness approval is not implementation qualification.
+The inherited one-PR phase/ownership and exclusions below still apply where
+consistent with P-9–P-16; the amendment supersedes conflicting payload,
+appearance, retention and acceptance requirements.
+
+**Original filed scope (historical):**
+
 - **Outcome/scope:** view open/close, move with optional Z, configure and pick
   through instance-owned leases and the coherent graphics adapter.
 - **Phase:** 3. **Depends on:** TRA-5, TRA-6, TRA-9. **Ordering:** critical path.
@@ -4327,6 +5120,16 @@ processing is split/reviewed explicitly, never hidden inside a child.
 - **Open questions:** Q-13 must have passed.
 
 ### TRA-11. Assemble the authored terrain arena
+
+**Current amendment — D-60:** Depend on revised TRA-10 and all transitive amendment gates. Load approved colour/blank/maps with the proper options, author the exact lighting/depth defaults and storage allowance in Lua, and use the real amended services. Keep the default flat source, generic launcher and existing controls. Extend the temporary F8 proof to fog refusal, ramp/mask selection and discovery replay; expose no new UI or debug binding. A storage pause is an expected reported condition: preserve the arena and navigation where data is available, without replaying edits or automatically growing/resetting it. Startup failure retains the existing bounded failure/quit path.
+
+**Current dependency gate:** revised TRA-10 and its amendment prerequisites. Q-13's amended-path evidence
+must pass; filing or readiness approval is not implementation qualification.
+The inherited one-PR phase/ownership and exclusions below still apply where
+consistent with P-9–P-16; the amendment supersedes conflicting payload,
+appearance, retention and acceptance requirements.
+
+**Original filed scope (historical):**
 
 - **Outcome/scope:** generic launcher/service composition plus Lua arena
   content, approved textures, four-layer soil default, camera controls and
@@ -4342,6 +5145,16 @@ processing is split/reviewed explicitly, never hidden inside a child.
 
 ### TRA-12. Qualify the arena and remove the development shortcut
 
+**Current amendment — D-60:** Depend on revised TRA-11 and every amendment child/proof gate. Replace old flat-ID-15/cap/analytic-picker/RAM-only assertions and stale CPU budgets. Qualify final all-16/four-facing normal/cutout/pick/fog behavior, sky/cavity/dual-opening discovery, viewport/haze loading, store limits/failure/recovery and all owning banks. Retain pre-removal F8 proof separately, remove its binding/glue, then verify final public Lua API behavior and visual/resource evidence. Preserve the bounded optional memory experiment, honest measurements, M1 compatibility and owner visual acceptance.
+
+**Current dependency gate:** revised TRA-11 and all amendment children/proof gates. Q-13's amended-path evidence
+must pass; filing or readiness approval is not implementation qualification.
+The inherited one-PR phase/ownership and exclusions below still apply where
+consistent with P-9–P-16; the amendment supersedes conflicting payload,
+appearance, retention and acceptance requirements.
+
+**Original filed scope (historical):**
+
 - **Outcome/scope:** complete end-to-end and resource evidence, remove the
   temporary binding and its dedicated glue, retain Lua API regressions and
   finish current subsystem contracts/test catalog entries.
@@ -4356,6 +5169,10 @@ processing is split/reviewed explicitly, never hidden inside a child.
 
 ### Acceptance matrix and evidence delivery
 
+The original rows remain baseline coverage. D-60's additions below and the
+current TRA-12 amendment govern where original presentation/retention
+assumptions differ from P-9–P-15; every required final row needs evidence.
+
 | Concern | Required evidence |
 | --- | --- |
 | Model/source | All 16 mask identities and shared geometry; deep queries allocate no intervening volume; compressed gaps and soil transition; uniform/run/dense round trips and transitions |
@@ -4366,6 +5183,14 @@ processing is split/reviewed explicitly, never hidden inside a child.
 | Residency | Traverse and descend many region boundaries under fixed caps; record resident bytes/counts, retained edits, staging and retiring GPU data separately |
 | Compatibility | Existing M1 rectangle scenes, state-unavailable behavior, CPU composition and role/lease rules remain intact |
 | Delivery | Updated owning contracts and validation catalog; public Lua API remains; temporary shortcut/glue absent |
+
+| Amendment concern | Additional required final evidence / owning slices |
+| --- | --- |
+| Canonical geometry/maps | Reproduced reference inconsistency; corrected ID 15 and all 16 IDs/four facings; exact openings, ordinary/mixed/fog masks and normals — TRA-13/TRA-14/TRA-17 |
+| Render/pick/lighting | Actual cutout/readback and adopted CPU coverage agree at the specified pixels; fog cannot yield a target; no added cutaway caps; numerical sun/ambient/depth/haze and navigation evidence — TRA-17, amended TRA-9–TRA-12 |
+| Compressed discovery | Sky, sealed cavities, partial openings, independent ramp families, two fronts, buried edits and whole-space completion without boundary enumeration; retained knowledge replays coherently — TRA-18/TRA-19/TRA-22 |
+| Temporary backing | Real reservation/overhead, bounded caches and I/O, write-before-settlement, capacity/I/O/integrity pause, growth/retry, reader retirement and close/reset with fault/interleaving evidence — TRA-20–TRA-23 |
+| View-driven demand | Full projected height-band footprint requests hazed background beyond the old radius when capacity permits; explicit priority, progressive pressure and view-aware eviction preserve coherent fog/loading distinctions — TRA-16, amended TRA-9–TRA-12 |
 
 Qualify deterministic terrain for an identical source and ordered successful
 command trace on the same build/platform. Vary internal loading/eviction order

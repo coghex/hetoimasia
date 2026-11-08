@@ -490,21 +490,23 @@ cells outside the configured extent are excluded and reported (`cameraExcluded`)
 and a description longer than its structural maximum (`specCameraRegions`, 16,384:
 more than the approved envelope needs) or than the staging the camera may use is cut
 at the end, lowest priority first, and the remainder reported (`cameraTruncated`). The
-staging the camera may use must hold the description; how much of a description is kept
-is decided by the ordinary admission, never by a separate estimate. The model walks the
-regions in priority order on the state the withdrawal left, growing the view's description
-by one region at a time and asking `planAdmission` (the code `Service` runs later) for each.
-A region that fits is admitted. The first that does not fit now is kept, pending, with the
-regions behind it, when it would be admitted once the pressure that is the owner's to
-release has been released (jobs finished or acknowledged, pins and explicit requests
-withdrawn, regions evicted for them gone); its turn comes on a later `Service`, and cancelled
-work keeps its charges until its owner acknowledges it. The walk stops, and the rest is cut
-and reported, at the first region whose description no longer fits the staging the camera
-may use, or that would not be admitted even after the release, so a kept description can
-always be started. Replacing a view's demand is withdrawing the old one and admitting the
-new one through this same path (a property checks that the two produce the same model at
-every state random sequences reach, and another that the kept prefix is what the ordinary
-path leaves).
+staging the camera may use must hold the description, and nothing else decides how much of
+it is stored: a description is cut only by its own bytes (the ledger's `descriptionBytes`)
+against the camera share, net of the one camera region's interest and scratch the share must
+always keep for the first region to start (`limitCameraRegionStagingBytes`, the same figure
+the staging minimum keeps), and against the room the bank has now beside the headroom for
+explicit requests (`cameraStagingRoom`). Nothing predicts what will or will not load, and a
+stored demand is dropped only by withdrawal or replacement. Setting a demand is withdrawing
+the old one (the existing withdrawal), storing the new description and admitting its
+regions in priority order through the ordinary `planAdmission` while they fit now; the rest
+stay pending, and every `Service` admits the next pending regions in the same order
+whenever they fit (nothing is protected from eviction but the regions an admission names).
+Cancelled work keeps its charges until its owner acknowledges it. Properties check that the
+kept prefix is what the ordinary path leaves (right after the set `Service` has nothing
+more for the view; the kept prefix is stable; growing the description one region at a time
+keeps `min i k`), that replacing is the same as withdrawing and setting, and that a stored
+demand that fits an empty camera share is eventually admitted whole by `Service` and
+acknowledgements alone.
 
 What camera work can occupy, and why it cannot starve explicit work. The mechanism is
 a reserve of room, not a race: camera admission and hold acquisition are refused

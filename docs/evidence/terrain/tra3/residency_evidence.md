@@ -216,11 +216,10 @@ is caught except three, which are not gaps:
 | A job does not reserve its columns | 35 examples, including the largest-request boundary |
 | No resident growth reserved for a removal | the edit-reservation, growth-contract and compressed-segment examples (9) |
 | An older handoff clears newer changes | the handoff-interleaving example |
+| A description is not bounded to leave one camera region its interest and scratch | the minimum-budget description example and the starts-what-it-keeps properties (6) |
+| A busy region drops the stored demand instead of leaving it pending | the pending-demand examples and properties (22 in all) |
+| The stored demand is cut by a prediction | the stored-demand examples and properties (43 in all) |
 | A replacement does not withdraw the view first | the replacement examples, the storm example and the withdraw-then-admit property |
-| A region blocked only by releasable pressure is cut instead of kept pending | the running-load examples, the identical storm and the running-load property (13 in all) |
-| A blocked region is kept pending whether or not it could ever start | the minimum-budget description examples and the starts-what-it-keeps properties |
-| The release leaves in-flight work charged | the pending-demand examples and properties (10 in all) |
-| The release leaves explicit requests and pins in place | the explicit-pressure example |
 | Unsupported region keys accepted | the region-boundary examples |
 | A removal commit does not add the rebuilt segment growth | the growth-contract and compressed-segment examples |
 | Retirement settles with a victim release outstanding | the cross-arena retirement example and a random property |
@@ -408,29 +407,30 @@ progress and a configuration that cannot is refused at construction. The propert
   two properties over 2,000 random replacements each (one after the first description
   settled, one while its work is still queued) require the view to survive with a
   non-empty description whose first region is admitted, in a model with no explicit work.
-- **The kept prefix is the ordinary admission's** (property, 300 sequences under random
-  budgets from the minimum, a random description for a view after every event): right after
-  the demand is set the ordinary path (`Service`) has nothing more to admit for the view;
-  asking for exactly the kept prefix keeps all of it; and, where none of the regions is
-  resident, growing the description one region at a time from the same state keeps
-  `min i k` regions, so admitting regions one by one reaches the same prefix. There is no
-  camera cost computed outside the charge function: the walk asks `planAdmission` for each
-  region and the staging room of a state is `cameraStagingRoom`, which `cameraFree` and the
-  hold check use as well.
-- **A replacement during a running load** (examples at the minimum budgets and a property
-  over 2,000 random replacements): the withdrawal cancels the job, whose 258 bytes of
-  scratch stay charged until it is acknowledged, leaving the camera room for the
-  description but not yet its interest and scratch. The same description, another region
-  and a storm of twenty identical replacements all keep the view with its demand pending
-  (nothing is freed before the acknowledgement), and after the acknowledgement `Service`
-  admits it and it loads. The property also requires the view to survive every replacement
-  of a settled, queued or running first description, the first region to start at once when
-  nothing is cancelled, and progress once the owner has acknowledged everything.
-- **Resident and shared coverage need no scratch** (examples at 1,548 resident and 1,510
-  staging bytes): a view that has loaded both cells of a region and pinned it replaces its
-  demand with only the second cell (320 of the camera's 516: description, interest and the
-  hold's record) and the view is kept with no job; a second view naming the cell the first
-  has loaded is admitted with no load (256 more).
+- **A stored demand is cut only by its own bytes and admitted by the ordinary path**
+  (examples and properties): setting a demand withdraws the old one, stores the
+  description (bounded by its structural maximum, by `descriptionBytes` against the camera
+  share net of one region's interest and scratch, and by the staging room now) and admits
+  its regions in order while they fit; `Service` admits the rest. Properties (300 random
+  sequences under random budgets from the minimum, a random description for a view after
+  every event): right after the set `Service` has nothing more to admit for the view; asking
+  for exactly the kept prefix keeps all of it; growing the description one region at a time
+  keeps `min i k`; replacing equals withdrawing and setting; and (2,000 cases, budgets that
+  hold two whole regions) the stored regions of a demand that fits an empty camera share
+  are all admitted by `Service` and acknowledgements alone.
+- **Pending demand survives temporary pressure** (examples at the minimum budgets, and
+  properties over 2,000 random replacements for settled, queued and running first
+  descriptions): a replacement during a running load (the same description, another region,
+  and a storm of twenty identical replacements), a second view naming coverage a running
+  load will publish, and a longer description while an explicit request holds the staging
+  all keep the view with its demand pending; cancelled work keeps its charges until it is
+  acknowledged, and `Service` admits the regions afterwards.
+- **Resident and shared coverage need no scratch, and unreferenced resident regions are
+  not protected** (examples at 1,548 resident and 1,510 staging bytes, and 1,446/1,508):
+  a view that has loaded both cells of a region and pinned it replaces its demand with only
+  the second cell (no job); a second view naming a cell the first has loaded is admitted
+  with no load; and a demand [A, B, C, D, E] over four unreferenced resident regions keeps
+  A and loads it by evicting B, instead of losing the whole demand.
 - **Normalized descriptions** (examples): an empty description withdraws the demand,
   repeated keys coalesce into the first occurrence, an unsupported key and a region
   wholly outside the extent are excluded and reported while the valid entries are
