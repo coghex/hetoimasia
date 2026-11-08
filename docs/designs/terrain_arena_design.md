@@ -18,7 +18,9 @@ for previewing the tiles; defer the automatic day/night cycle and eventual
 moon lighting. Q-19 remains the amendment readiness checkpoint: delivery
 boundaries, issue revisions and fresh owner sign-off. D-55/D-57/D-58 specify
 sampling, lighting and cell-quad presentation; D-59 approves the concrete
-storage/discovery contract in P-15 and resolves Q-20's specification.
+storage/discovery contract in P-15 and resolves Q-20's specification. P-16
+contains the proposed 11 follow-up slices and existing-issue revision plan;
+the original filing ledger remains unchanged until that plan is approved.
 
 Picking scope resolved by D-30: select from the adopted drawn quads in
 front-to-back order using matching artwork/face-map coverage. D-49/D-50/D-58
@@ -26,15 +28,14 @@ complete Q-16's geometry, emission, cutaway and visual/logical API specification
 the required implementation and visual proof remain outstanding.
 
 D-31 preserves generic blank terrain as gameplay fog of war over undiscovered
-underground solids and air gaps, and reaffirms lazy loading with gaps. Q-20
-tracks reveal rules, retention and the fog interaction contract; they are not
-settled by the earlier picking or cutaway proposals.
+underground solids and air gaps, and reaffirms lazy loading with gaps.
+D-58/D-59 now complete the fog, discovery and retention specification.
 
 D-32 chooses whole-cavity discovery: unsealing a connected empty space reveals
 that space and its newly exposed boundary terrain, including across chunks.
 D-51 refines its original exhaustive-loading requirement: retain compressed
 whole-space knowledge and load tile detail only on camera or explicit demand.
-Work proceeds in bounded steps; Q-20 retains concrete execution/storage details.
+Work proceeds in bounded steps under the approved P-15 execution/storage contract.
 
 D-33 resolves discovery retention: record revealed state as chunk changes,
 retain it on offload and replay it before publishing the reloaded chunk.
@@ -42,12 +43,11 @@ Discovery lasts for the arena session while off-screen chunks stream normally.
 
 D-34 resolves connectivity between empty cells: six shared-face neighbors;
 edge-only or corner-only contact does not join cavities. Partial openings
-around shaped terrain remain a separate Q-16/Q-20 choice.
+around shaped terrain use the approved P-9 geometry and P-15 connectivity.
 
 D-35 requires explicit logical opening rules for ramps/corner slopes: a real
 diagonal opening into an unrevealed space must discover it. Whole-air-cell
-adjacency alone is insufficient; the exact per-shape catalog still needs
-specification and review under Q-16/Q-20.
+adjacency alone is insufficient; P-9 specifies the approved per-shape catalog.
 
 D-36 chooses one logical shape authority shared by cavity discovery and
 terrain point/ray queries, correcting the existing solid definitions.
@@ -66,18 +66,18 @@ connections and stop only outward branches at known exterior.
 
 D-40 approves temporary per-arena disk backing for retained edits/discovery,
 with a bounded RAM cache and asynchronous I/O. The store is session-only and
-discarded on arena close/reset; exact quota/failure/lifecycle details remain open.
+discarded on arena close/reset; D-59/P-15 specifies quota, failures and lifecycle.
 
 D-41 approves pausing new edits/discovery on storage exhaustion or write
 failure, retaining acknowledged changes and unfinished work. D-43 subsequently
-selects startup reservation and a hard disk allowance; exact recovery remains open.
+selects startup reservation and a hard disk allowance; D-59/P-15 fixes recovery.
 D-42 records the manager-relayed CPU budget increase and best-effort camera
 demand; it does not select the temporary store's disk quota.
 
 D-43 approves a reserved, configurable disk allowance before arena opening,
 including storage overhead, and refusal when it cannot be reserved. Keep the
 world expandable; pause new edits/discovery before exceeding the allowance.
-The numeric allowance and the qualified storage mechanism remain Q-20.
+The allowance and storage mechanism are specified by D-59/P-15, with proof due.
 
 Additional Q-16 finding: the pinned N/E mask silhouettes fail a cross-facing
 unit-cell geometry consistency check. The audit below records a concrete
@@ -88,11 +88,11 @@ in this design turn.
 
 D-45 selects crisp nearest-neighbor sampling for terrain colour artwork and
 face maps, with the same alpha cutoff for rendering and screen picking.
-Q-17 retains exact sample/edge conventions, data loading and ownership.
+D-55/P-11 specifies exact sample/edge conventions, data loading and ownership.
 
 D-46 selects Lua-supplied sun compass direction and elevation, fixed relative
-to the world as the camera rotates. Appearance defaults and depth effects
-remain Q-18; no UI or automatic cycle is added.
+to the world as the camera rotates. D-57/P-13 specifies appearance defaults
+and depth effects; no UI or automatic cycle is added.
 
 D-47 keeps both depth darkening and blue haze, adjustable/disableable through
 Lua, and requires stronger numerical, offscreen and navigation regression
@@ -129,7 +129,7 @@ gap and shape cases must be supported and proved, not excluded as a shortcut.
 
 D-54 gives ambient illumination its own Lua control. Changing only the sun
 position leaves ambient unchanged; future Lua day/night rules may animate
-both. Numeric lighting defaults/equations remain part of Q-18's contract review.
+both. D-57/P-13 specifies the approved lighting defaults and equations.
 
 D-55 approves P-11's cutout asset/sampling contract, including bounded
 `kind`/`coverage` texture options, shared versioned CPU bitplanes and required
@@ -209,6 +209,20 @@ filing. Design approval does not itself create tracker items or authorize code.
 - **Users and operators:** the owner developing Ecce Homo, game authors using
   engine services, and later players of the recreated game.
 - **Arc label:** None proposed.
+
+**Approved amendment additions to the done condition (D-28–D-59):** the
+final path uses canonical cell-quad cutouts and normal lighting, corrected
+all-16/four-facing maps, exact shared coverage for screen picking, shaped
+cutaways without added caps, and uninteractable fog over unknown solids and
+air. Viewport-driven demand includes visible hazed background when capacity
+permits. Opening proves bounded source connectivity; discovery retains whole
+connected spaces and their exposed boundary without materializing all detail.
+Edits/discovery survive offload through the reserved temporary store, with
+the approved atomic settlement, pause/growth/retry and teardown behavior.
+The final executable proves these contracts under normal operation and
+failure, retains the required visual/resource evidence, and removes the
+temporary shortcut. These are specification choices, not delivered results;
+P-16 proposes their delivery boundaries and the new Q-13 gate.
 
 ## Current state and evidence
 
@@ -1843,11 +1857,17 @@ now approved through the explicit Q-12/D-27 contract review.
 
 ## Concrete technical contract — P-5, approved through Q-12/D-27
 
-This is the approved implementation contract. D-1–D-25 record the individual
+This is the original approved implementation contract. D-1–D-25 record the individual
 owner choices, D-26 the delegated storage selection, and D-27 the owner's
 approval of this complete contract and delivery plan. Numeric caps are initial
 implementation defaults to qualify, not measured performance claims. Q-13
 retains its explicit renderer-proof gate.
+
+Read P-5 with the explicit amendments D-28–D-59 and P-9–P-15. In particular,
+the old flat-ID-15, extra cutaway-cap, analytic visual-picker and RAM-only
+total-history assumptions are superseded, as are the old CPU bank defaults.
+Their original wording remains as filing history, not an alternative current
+contract. P-16 proposes how the filed baseline is extended and migrated.
 
 ### Scope and compatibility
 
@@ -4198,6 +4218,301 @@ flooding, automatic quota expansion and cross-run crash recovery. This
 proposal adds none of the deferred general gameplay/ECS transactions,
 whole-tick rollback, movement rules, UI or saved-world schema.
 
+### P-16. Amendment delivery and readiness — proposal
+
+**Q-19 owner checkpoint; not yet approved.** Behavior is specified through
+D-59. This proposal adds **11 follow-up children, TRA-13–TRA-23**, to the
+existing EPIC #636, revises the four unstarted integration/acceptance issues
+#645–#648, and records the narrower baseline coordination below. It creates
+no second epic, reopens no completed issue and changes no tracker artifact.
+The original processing ledger and delivery plan remain intact until approval;
+the candidate IDs below are design IDs, not filed issue numbers.
+
+**Tracker refresh, 2026-11-08.** #636 is the existing open terrain epic;
+no overlapping second open arc was found. #637/#638/#642/#643 are closed with
+merged PRs #649/#651/#650/#652. #639 remains open with PR #653 at
+`8938cc7286be`; #640/#641 remain open. #644 remains open with held PR #654
+at `734a8543ab9b`; #645–#648 remain open without implementation PRs in the
+checked listing. The other open work (#563 and deferred #446) does not supply
+this amendment; render-target sampling from #446 is not a prerequisite.
+These are snapshot facts, not a claim that readiness labels approve new text.
+
+**Keep useful baseline work and replace its superseded assumptions explicitly.**
+Retain #654's artwork provenance, material registration/package separation,
+offscreen harness and original measured evidence as baseline work. Complete
+its existing review defects through the manager's normal review path before
+any landing; its old per-face renderer is replaced by TRA-17. The selected
+plan would keep this as a follow-up correction under D-28, rather than expand
+#644 into the entire amendment. Approval of this plan does **not** release
+the manager's hold, approve the current PR head or authorize a merge. The
+manager coordinates resumption and any baseline-disposition change before
+dependent implementation. New renderer qualification is mandatory below.
+
+Likewise, #639/#640/#641 remain the pure-residency, service and Lua-settlement
+baseline, with D-42's already authorized CPU budgets/explicit-demand policy.
+TRA-20–TRA-23 replace their RAM-only total-history/capacity assumptions with
+the approved store contract. Do not make the active residency worker absorb
+the storage subsystem or treat a baseline's completion as amended acceptance.
+
+Each new child below is one implementation PR with its own owning contracts,
+focused tests and required evidence. Phase order expresses dependencies, not
+permission to skip proof or broaden a slice. Independent work may proceed
+once its prerequisites exist; no numeric ID grants parallel edit authority.
+
+#### TRA-13. Correct canonical shape geometry and expose exact opening portals
+
+- **Outcome/scope:** implement P-9's complete logical catalog, including the
+  ID-15 central half-height peak, exact rotated facet/portal geometry and
+  closed-solid point/ray behavior. Keep coordinate/source identities intact.
+- **Phase:** amendment geometry. **Depends on:** TRA-1. **Ordering:** critical
+  prerequisite shared by rendering and discovery.
+- **Relevant decisions:** D-34–D-36, D-44, D-49; P-9.
+- **Acceptance:** independent all-16/four-facing solid and positive-area
+  portal tests, diagonal paths versus edge/point contacts, exact boundaries
+  and query compatibility. Preserve a reproducible reference-defect fixture.
+- **Excludes:** texture generation, source compilation, runtime and GPU work.
+- **Open questions:** none; a refuted shape premise returns to the owner.
+
+#### TRA-14. Generate and qualify canonical cutout and normal-map assets
+
+- **Outcome/scope:** deterministic P-9/P-11/P-13/P-14 map generation and
+  rotated-ID lookup: ordinary shapes, full fog and complementary mixed
+  known-solid/unknown-void parts within P-14's shared-map bound. Preserve
+  loam/granite artwork and import the pinned generic blank with provenance.
+- **Phase:** amendment assets. **Depends on:** TRA-8, TRA-13.
+  **Ordering:** rendering prerequisite; independent of terrain runtime.
+- **Relevant decisions:** D-44/D-49/D-55/D-56/D-57/D-58.
+- **Acceptance:** reproduce the pinned Synarchy inconsistency independently,
+  retain immutable original/corrected comparisons for all 16 IDs/four facings,
+  verify silhouette unions/disjoint parts, facet normals, encoding, dimensions
+  and deterministic hashes. Mark CPU/generated-image proof as such; actual
+  material/readback qualification follows in TRA-17.
+- **Excludes:** new colour art, automatic slopes, shader/runtime integration.
+- **Open questions:** none; D-44's stop/report rule applies to refuted evidence.
+
+#### TRA-15. Load validated data maps with shared versioned CPU coverage
+
+- **Outcome/scope:** P-11/P-13's bounded `kind`, `coverage` and
+  `normal_encoding` texture options from decoding through protected asset
+  ownership. Produce one immutable bitplane per exact asset version, preserve
+  raw normal data and validate the declared profile before upload.
+- **Phase:** amendment asset service. **Depends on:** no new terrain child;
+  uses the existing content/texture/resource interfaces. **Ordering:** may
+  proceed independently of geometry and storage.
+- **Relevant decisions:** D-30/D-45/D-55–D-57.
+- **Acceptance:** exact boundary/alpha/profile fixtures; colour/data handling;
+  nonbinary/incompatible rejection; bounded decode and 128 MiB bank charges;
+  version replacement, canceled load and CPU/GPU-interest retirement. Existing
+  omitted-option texture loading and M1 clients retain their behavior.
+- **Excludes:** terrain planning, camera controls and arbitrary shader loading.
+- **Open questions:** none; keep injection narrow, with no terrain import in
+  the generic image/content machinery.
+
+#### TRA-16. Build pure cell-quad planning and coverage-based visual picking
+
+- **Outcome/scope:** P-14's whole-cell/mixed-fog plans, exact sort/rank keys,
+  conservative projected bounds and matching P-11 alpha picker. Accept one
+  coherent supplied terrain/knowledge/asset/camera snapshot; include the
+  P-10 viewport/height-band demand envelope and bounded progressive planning.
+- **Phase:** amendment pure rendering. **Depends on:** TRA-7, TRA-13,
+  TRA-14, TRA-15. **Ordering:** prerequisite to the production material switch.
+- **Relevant decisions:** D-30/D-37/D-42/D-48/D-50/D-55/D-58.
+- **Acceptance:** independent ray/order and texel-coverage oracles; fog stops
+  traversal without a target; pending data in front versus behind a hit;
+  mixed-part atomic admission, cutaways without added caps, extreme checked
+  coordinates, chunk seams and viewport bounds at fractional pan/zoom.
+- **Compatibility staging:** add the new pure path with its tests while the
+  filed baseline still builds. It is not a second final player-facing picker.
+  TRA-17 switches every existing repository consumer and removes the obsolete
+  face-plan/analytic visual-picking path in one coherent migration.
+- **Excludes:** live discovery/I/O, GPU effects and Lua token issuance.
+- **Open questions:** Q-13 remains a proof gate; counterexamples stop migration.
+
+#### TRA-17. Switch terrain rendering to face-map cutouts and normal lighting
+
+- **Outcome/scope:** consume TRA-16 plans through the existing material ABI,
+  sample colour plus normal/cutout data, implement P-13's exact lighting/depth
+  equations and replace the legacy per-face material/adapter/picker clients.
+  Keep pure material/model code separate from the Vulkan definition.
+- **Phase:** amendment rendering proof. **Depends on:** TRA-8, TRA-14,
+  TRA-15, TRA-16. **Ordering:** hard prerequisite to TRA-9–TRA-12.
+- **Relevant decisions:** D-29/D-44–D-50/D-54–D-58.
+- **Acceptance:** retained real offscreen proof of all 16 IDs/four facings,
+  ordinary/fog/mixed masks, overlap, transparent colour holes, integer slices,
+  fractional transforms/scaling and shared pixel-edge ownership. Verify
+  numerical normal/sun/ambient/depth/haze cases, low-angle ramp lighting,
+  world-fixed illumination across facings and isolated/combined depth effects.
+  Independent discriminating probes and negative controls must reject wrong
+  masks, order, colour/data treatment and picking; no self-approved goldens.
+- **Migration:** remove old `PlannedFace`/polygon visual contracts and migrate
+  repository tests/harnesses/material adapters; retain pure logical queries.
+  Historical captures stay labelled with their original model/revision.
+- **Excludes:** new renderer ABI, day/night, live streaming and view retirement.
+- **Open questions:** Q-13 is discharged for the amended material only by its
+  evidence. An ABI/ordering/sampling counterexample returns to the owner.
+
+#### TRA-18. Compile bounded symbolic source connectivity
+
+- **Outcome/scope:** P-15's pure exact source compiler, component families,
+  exceptions, portal/range relations and initial exterior classification.
+  Expose bounded resumable preparation and canonical source keys without
+  allocating hidden cells or marking sealed components discovered.
+- **Phase:** amendment discovery foundation. **Depends on:** TRA-2, TRA-13.
+  **Ordering:** independent of rendering after shared geometry.
+- **Relevant decisions:** D-38/D-49/D-51/D-53/D-59.
+- **Acceptance:** independent small explicit flood/portal oracle; required
+  flat, enormous gap, independent ramp-row/level and patch-split fixtures;
+  upper versus horizontal/lower boundary cases; measured structural/work/byte
+  counts and bounded `source_complexity` refusals at P-15's limits.
+- **Excludes:** edit-time knowledge, file I/O, arena open and Lua binding.
+- **Open questions:** none; unsupported required fixtures are a blocker,
+  not permission for dense fallback or a silent reduced source language.
+
+#### TRA-19. Model compressed knowledge and resumable discovery after removal
+
+- **Outcome/scope:** pure monotonic removed-interval/connection overlays,
+  component/range knowledge, exposed-boundary lookup and shared pending work.
+  Produce bounded edit/discovery deltas and retained continuations suitable
+  for the later atomic store transaction; no I/O or mutable world owner.
+- **Phase:** amendment discovery model. **Depends on:** TRA-3, TRA-18.
+  **Ordering:** prerequisite to store records and live discovery.
+- **Relevant decisions:** D-31–D-39/D-49/D-51/D-59.
+- **Acceptance:** both orders and interleavings of two openings, new joins to
+  already known exterior, raw buried edits without premature discovery,
+  known solid versus unknown void, compressed boundary replay and whole-space
+  completion without boundary enumeration. Independent state traces prove no
+  lost obligation, false completion, duplicate work or unbounded RAM set.
+- **Excludes:** placement/splits, units/vision, file I/O and rendering.
+- **Open questions:** none; the source-plus-removal restriction is explicit.
+
+#### TRA-20. Define bounded copy-on-write store records and transactions
+
+- **Outcome/scope:** pure store codec, page/index/allocator/retirement model
+  and staged transaction planning inside the terrain-runtime boundary.
+  Encode TRA-19 records and changes with P-15's page size, checksums, limits,
+  peak reservation, reader roots and protected reclamation allowance.
+  Adapt the baseline admission model to bounded edit caches and disk-backed
+  history without freeing authoritative records as ordinary cache entries.
+- **Phase:** amendment storage model. **Depends on:** TRA-4, TRA-19.
+  **Ordering:** prerequisite to storage effects and runtime adoption.
+- **Relevant decisions:** D-40–D-43/D-51/D-52/D-59.
+- **Acceptance:** bounded codec refusals, reference-map round trips, COW
+  root isolation, no write-dependent rollback, pinned-reader reclamation,
+  interrupted staged pages, capacity/overflow and per-transaction byte limits.
+- **Excludes:** native files/workers, live arena publication and public saves.
+- **Open questions:** none; no generic database framework is part of the slice.
+
+#### TRA-21. Own reserved backing files and bounded asynchronous storage I/O
+
+- **Outcome/scope:** private unlinked arena files, qualified native reservation
+  and growth, scoped descriptors, bounded workers/buffers and page reads/
+  staged writes for TRA-20. The storage boundary prepares results; the later
+  terrain owner still controls authoritative root publication.
+- **Phase:** amendment storage effects. **Depends on:** TRA-20.
+  **Ordering:** prerequisite to write-backed terrain transactions.
+- **Relevant decisions:** D-40/D-41/D-43/D-52/D-59.
+- **Acceptance:** deterministic short-read/write, I/O, integrity, cancellation
+  and reservation failure fixtures; bounded platform qualification of actual
+  reservation, peak space/growth and unlink/last-close; pending-reservation
+  release failures; worker/drain/descriptor-reuse and primary/cleanup failures.
+  Use private test volumes/providers, not a full personal drive.
+- **Excludes:** terrain settlement/discovery orchestration, Lua and cross-run
+  recovery. No root may publish as a side effect of an I/O worker completion.
+- **Open questions:** filesystem qualification is a delivery gate; unsupported
+  environments use the approved expected refusal, not an unreserved fallback.
+
+#### TRA-22. Commit terrain edits and discovery through the temporary store
+
+- **Outcome/scope:** integrate TRA-18–TRA-21 with the single terrain owner:
+  bounded opening/preparation, backed edits and discovery batches, coherent
+  content/knowledge revisions, cache replay, typed status/growth/retry and
+  affected-arena pause/recovery. Use the existing settlement arbitration.
+- **Phase:** amendment runtime. **Depends on:** TRA-4, TRA-5, TRA-19,
+  TRA-21. **Ordering:** prerequisite to amended views and storage Lua calls.
+  TRA-5 is a delivery dependency so its real settlement bridge exists; the
+  runtime library must still import no Lua component.
+- **Relevant decisions:** D-17/D-19/D-20/D-33/D-38–D-43/D-51–D-53/D-59.
+- **Acceptance:** actual service tests at each write/publication/cancellation
+  boundary, two-front discovery, offload/reload after each committed batch,
+  capacity/I/O/integrity pause and explicit recovery, growth failure, open/
+  close/instance/session end and late incarnation results. Preserve one host
+  settlement and test logical eligibility delays through the existing bridge;
+  neither disk completion nor a held reply is terminal success.
+- **Excludes:** new Lua schemas, graphics effects and general gameplay rollback.
+- **Open questions:** none; all old committed state survives a failed update.
+
+#### TRA-23. Expose terrain storage status, growth and recovery through Lua
+
+- **Outcome/scope:** extend TRA-5 with exactly P-15's optional open storage
+  record, status/grow/retry requests, creator authority and expected codes.
+  Replace the old RAM-total-history refusal rule with the approved distinction
+  between immediate transient `busy` and terminal storage-domain outcomes.
+- **Phase:** amendment Lua service. **Depends on:** TRA-5, TRA-22.
+  **Ordering:** prerequisite to amended Lua view/content assembly.
+- **Relevant decisions:** D-19/D-40–D-43/D-52/D-53/D-59.
+- **Acceptance:** real Lua plus production terrain service, strict plain-record
+  validation, both roles/phase rules, owner versus attached lease, status while
+  paused, atomic name/open settlement and cancellation, equal/decreasing/
+  failed growth, retry without repeated user edits and unread expected failures.
+  No engine-owned handle or terrain authority crosses VMs through Lua data.
+- **Excludes:** UI, reset/save APIs, automatic expansion and view bindings.
+- **Open questions:** none; existing request timing/cleanup policies remain.
+
+**Existing tracker artifacts to revise later, one signed-off draft at a time.**
+The following is the revision scope, not ready-to-post issue body text.
+
+| Artifact | Required revision or coordination |
+| --- | --- |
+| EPIC #636 | Extend the existing arc/checklist and dependency graph with TRA-13–TRA-23; distinguish logical query geometry from visual alpha picking; add corrected ID 15, fog/discovery, lighting, viewport demand and temporary backing/recovery. Replace the cross-run-persistence exclusion's ambiguous wording, keep saves deferred, and require new evidence before final acceptance. No new umbrella. |
+| Closed #637/#638/#642/#643 | Preserve their history and issue status. TRA-13 and TRA-16/TRA-17 supersede affected geometry/visual assumptions; TRA-18–TRA-22 extend source/change behavior. No duplicate rewrite of ordered input. |
+| #639 / PR #653 | Preserve the manager's D-42 budget and best-effort/explicit-demand clarification. Add later coordination links to the new model/store owners; do not enlarge this active baseline into discovery/storage or silently claim its RAM-only model is the final history policy. |
+| #640 | Keep its scoped service, settlement seam and baseline scope; link TRA-22 as the owner of write-backed transactions, startup compilation and knowledge revisions. Its “no disk store” is a baseline scope limit, superseded for the complete arc by the follow-up. |
+| #641 | Keep the original facade/real settlement bridge; link TRA-23 as the owner of storage options/control/error changes. Its old immediate busy rule for total RAM history is not the amended hard-disk-cap contract. Preserve pending-open name-claim semantics. |
+| #644 / PR #654 | Record the baseline disposition and retained evidence limits above; add TRA-17 as the new amended Q-13 gate. Original review fixes and a fresh exact-head review remain required. No hold release or merge follows from this document. |
+| #645 / TRA-9 | Depend on TRA-17 and TRA-22 as well as baseline prerequisites. Consume cell/mixed-fog quads and coherent knowledge revisions; own exact normal/colour versions and CPU coverage interests; charge the amended 128 MiB CPU render bank and existing GPU/retirement banks. Integrate full projected viewport/height-band demand, progressive bounded admission and view-aware eviction. Test hazed background beyond the old radius, pending knowledge, reveal/offload/reload and atomic mixed-part adoption under pressure. Preserve exclusive target ownership and actual frame-completion retirement. |
+| #646 / TRA-10 | Depend on TRA-23, TRA-6 and revised TRA-9. Add P-13's strict partial lighting/depth records and defaults to style/configure, with complete colour/blank/normal-map mappings and P-11/P-13 validated texture authorities. Preserve the existing atomic camera controls/`slice_delta`; replace conflicting legacy face-tint/filter controls with the approved sampling and unit wrapper tint/brightness. Issue picks only from adopted matching coverage/knowledge: confirmed fog gives `no_hit`, incomplete information gives `loading`, known cell hits alone yield edit authority. Replace the old analytic face/cap result contract. Cover wrong normal profile, stale knowledge/assets, all-or-nothing configuration and independent lighting controls. |
+| #647 / TRA-11 | Depend on revised TRA-10 and all transitive amendment gates. Load approved colour/blank/maps with the proper options, author the exact lighting/depth defaults and storage allowance in Lua, and use the real amended services. Keep the default flat source, generic launcher and existing controls. Extend the temporary F8 proof to fog refusal, ramp/mask selection and discovery replay; expose no new UI or debug binding. A storage pause is an expected reported condition: preserve the arena and navigation where data is available, without replaying edits or automatically growing/resetting it. Startup failure retains the existing bounded failure/quit path. |
+| #648 / TRA-12 | Depend on revised TRA-11 and every amendment child/proof gate. Replace old flat-ID-15/cap/analytic-picker/RAM-only assertions and stale CPU budgets. Qualify final all-16/four-facing normal/cutout/pick/fog behavior, sky/cavity/dual-opening discovery, viewport/haze loading, store limits/failure/recovery and all owning banks. Retain pre-removal F8 proof separately, remove its binding/glue, then verify final public Lua API behavior and visual/resource evidence. Preserve the bounded optional memory experiment, honest measurements, M1 compatibility and owner visual acceptance. |
+
+**Dependency-valid ledger order after approval:** EPIC; TRA-1–TRA-8;
+TRA-13–TRA-23; TRA-9–TRA-12. Every original ID/link remains; its checked mark
+means filed, not implemented. Promote the 11 candidate entries as unprocessed
+and mirror that same order in the delivery plan. Preserve the baseline scopes
+as history and annotate TRA-9–TRA-12 with the approved revision requirements.
+The numbers need not be ascending when dependencies require inserted work.
+
+The material path is TRA-13/TRA-14/TRA-15 → TRA-16 → TRA-17 → TRA-9.
+The discovery/storage path is TRA-13 → TRA-18 → TRA-19 → TRA-20 → TRA-21
+→ TRA-22 → TRA-23, with baseline dependencies listed above. TRA-9 also waits
+for TRA-22; TRA-10 joins TRA-9, TRA-23 and ordered input. TRA-11 assembles that
+result, and TRA-12 is the final barrier after **all** amended behavior exists.
+This lets baseline service work and rendering/discovery foundations proceed
+independently where their actual source/interface boundaries permit.
+
+**Evidence gates and readiness.** TRA-13/TRA-14 own the reference-defect and
+canonical geometry/map evidence; TRA-17 owns amended offscreen Q-13 proof;
+TRA-18/TRA-19 own exact compressed-connectivity/discovery proof; TRA-20–TRA-22
+own store/admission/publication and native-reservation qualification. Revised
+TRA-9 owns live viewport/haze demand, adoption and GPU lifetime evidence;
+revised TRA-10/TRA-11 own real Lua/content behavior; TRA-12 owns the final-build
+matrix, native observations, retained captures, measurement summary and
+shortcut removal. Each owning slice updates its current contract and catalog,
+and lands human docs/evidence with `docs-push` before final implementation review.
+
+No old screenshot, unreviewed fixture fix or passing CPU-only test proves the
+amended GPU result. No unlimited world-size claim, default limit or source
+compression formula is a measured performance result. Required unproved
+geometry, sampling/order, source-family or filesystem behavior is an explicit
+delivery blocker with a reproducible counterexample; return material changes
+to the owner rather than silently dropping a fixture or widening an interface.
+
+The remaining owner choice is approval of this slice/revision plan and an
+explicit declaration that the amendment is **ready for issue processing**.
+That approval permits the document's ledger/order/readiness promotion, not
+tracker creation/editing, code work or release of PR #654. Later processing
+revises the existing epic first, then handles one new child or existing-issue
+revision per invocation, with a separately approved concrete tracker draft.
+
 ## Open questions and review checkpoints
 
 ### Q-1. What does flat terrain contain vertically?
@@ -4445,21 +4760,32 @@ implementation gates; specification approval is not visual acceptance.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
-Open. After the behavior, including D-31/D-32/Q-20 fog and discovery, is
-settled, approve dependency-ordered follow-up
-slices and exact revision needs for #645–#648, with the owner-selected barrier
-before TRA-12 and explicit coordination of held PR #654. Mirror approved new
-slice IDs in the ledger and delivery plan; preserve earlier IDs. Readiness
-requires fresh owner sign-off. This design turn files or edits no tracker item.
+Open for one final owner checkpoint. Behavior is specified through D-59;
+P-16 proposes 11 new follow-up slices (TRA-13–TRA-23), the existing epic and
+baseline coordination, revisions to #645–#648, a dependency-valid insertion
+order and explicit evidence owners. No tracker artifact or code is changed
+by preparing that plan.
 
-The follow-up plan must explicitly assign D-44's reproducible defect/correction
-proof, all-16/four-facing captures and geometry/opening/picking checks to the
-owning correction and integration work; carry its evidence gate into TRA-12.
-Also assign D-47's numerical, isolated/combined depth-effect and navigation/
-streaming regression evidence to the lighting and integration slices.
-Include D-48/P-10's viewport-driven demand/eviction refinement and background
-regression, preserving the existing D-42 capacity policy and
-reconciling the pure planner's limits with progressive camera preparation.
+Review the P-16 boundaries and baseline disposition, including the held
+#644/PR #654 work, then explicitly approve the plan and call the amendment
+ready for issue processing. On that sign-off, promote its candidate entries
+into the processing ledger/delivery plan while preserving all original IDs
+and issue links, record a new decision, and update the design state. Until
+then the original 12-child filing ledger is unchanged and the design remains
+`exploring`.
+
+D-44's defect/correction and all-16/four-facing proof belongs to the proposed
+geometry/map/material work; P-16 names TRA-17 as the amended Q-13 gate.
+D-47's numerical depth/light tests and D-48/P-10's live viewport/haze regression
+are assigned separately to material qualification and revised TRA-9, then
+final TRA-12. D-59's compressed-connectivity, storage and recovery proof has
+explicit model/effects/runtime owners. No baseline evidence or issue
+readiness label substitutes for those implementation results.
+
+Readiness is a documentation decision. Each eventual epic/child revision or
+new issue still needs its own concrete draft/sign-off and the appropriate
+tracker review; PR holds, implementation dispatch and merge authority remain
+with the manager/owner workflow.
 
 ### Q-20. Underground discovery, fog interactions and sparse retention
 
