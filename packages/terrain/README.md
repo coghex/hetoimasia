@@ -710,8 +710,12 @@ top level. `queryKnownBoundary` returns a known source component's compressed
 boundary faces one bounded **page** at a time (at most six per box of its class, never an
 enumeration of tiles): a page scans at most `limitBoundaryFaces` boxes of the class and returns
 at most as many faces, possibly none when the boxes it scans lie inside the class, with the
-position where the next page begins; its bytes are charged before it is built, and the pages
-in order are the whole description. A removal's effect on a boundary is read cell by cell. A chunk reloaded later resolves
+box identity where the next page resumes; the cursor is that identity, resumed by a seek in an ordered
+member index built once with the environment (charged once, 32 bytes a node, in `envSharedBytes`), so
+a late page never walks the boxes before it and `pageVisited` stays within the limit on every page.
+The page's bytes are charged before it is built, validation requires the scratch to cover the class
+lookup as well as the page (no accepted configuration refuses every query), and the pages together are
+the whole description (in box-identity order). A removal's effect on a boundary is read cell by cell. A chunk reloaded later resolves
 the same answers from the retained records alone.
 
 ### Missing data and replay
@@ -769,7 +773,7 @@ pending state. An `Allowance` can only tighten them per call.
 | scratch bytes | `minimumScratchBytes` to 2^40 | 4 MiB |
 | unfinished obligations | 1 to 2^32 | 65,536 |
 | retained bytes | `minimumRetainedBytes` to 2^40 | 48 MiB |
-| boundary page | 6 to 2^16 boxes and faces (its accounted bytes must fit the scratch) | 1,024 |
+| boundary page | 6 to 2^16 boxes and faces (the scratch must cover the lookup of the class, `findReadsBound` records, and a page: `boundaryQueryScratch`) | 1,024 |
 
 Bytes and counts are conservative accounted figures (keys, aliases, obligations,
 container overhead and scratch; a deletion is charged as the largest record of its
