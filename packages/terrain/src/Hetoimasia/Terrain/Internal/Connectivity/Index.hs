@@ -67,6 +67,7 @@ module Hetoimasia.Terrain.Internal.Connectivity.Index
   , componentRelations
   , componentBoundary
   , componentBoundaryPage
+  , memberIndex
   , componentContains
   , portalRelations
   ) where
@@ -472,28 +473,36 @@ componentBoundary c key = do
   (_, nodes) ← resolve c key
   pure (concatMap (boundaryOf c key) nodes)
 
--- | One page of a component's boundary: from the box at position @from@ of its
--- class, at most @limit@ boxes are scanned and at most @limit@ faces returned
--- (whole boxes only, and always at least one box), with the position of the next
--- box when more remain. A page may hold fewer faces than the limit, or none: a box
--- inside the class has no boundary face. Neither the members of the class nor the
--- faces are materialized beyond the page; skipping to @from@ walks immutable
--- shared metadata without allocating.
-componentBoundaryPage ∷ Connectivity → ComponentKey → Int → Int → Maybe ([BoundaryFace], Maybe Int)
-componentBoundaryPage c key from limit = do
+-- | The members of every class as an ordered set of node identities, built once
+-- (by the owner, with the other shared metadata) so a boundary page can resume at
+-- a box without walking the boxes before it.
+memberIndex ∷ Connectivity → IntMap IntSet
+memberIndex c = IntMap.map IntSet.fromList (cMembers c)
+
+-- | One page of a component's boundary, resumed at the box with identity @from@
+-- (the first box at or after it): at most @limit@ boxes are scanned and at most
+-- @limit@ faces returned (whole boxes only, and always at least one box). The result
+-- is the faces, the identity of the next box when more remain, and the number of
+-- member entries the page visited. Resuming is an ordered-set seek, so a page never
+-- walks the boxes before it; a page may hold fewer faces than the limit, or none,
+-- when the boxes it scans lie inside the class.
+componentBoundaryPage ∷ Connectivity → IntMap IntSet → ComponentKey → Int → Int → Maybe ([BoundaryFace], Maybe Int, Int)
+componentBoundaryPage c index key from limit = do
   rep ← resolveRep c key
-  ids ← IntMap.lookup (nodeClass rep) (cMembers c)
-  pure (go from (drop from ids) [] 0 (0 ∷ Int))
+  members ← IntMap.lookup (nodeClass rep) index
+  let (_, present, above) = IntSet.splitMember from members
+      ids = [from | present] <> IntSet.toAscList above
+  pure (go ids [] 0 (0 ∷ Int))
   where
-    go _ [] acc _ _ = (concat (reverse acc), Nothing)
-    go i (nid : rest) acc count scanned
-      | scanned >= limit = (concat (reverse acc), Just i)
+    go [] acc _ visited = (concat (reverse acc), Nothing, visited)
+    go (nid : rest) acc count visited
+      | visited >= limit = (concat (reverse acc), Just nid, visited)
       | otherwise =
           let faces = maybe [] (boundaryOf c key) (IntMap.lookup nid (cNodes c))
               total = count + length faces
            in if total > limit && count > 0
-                then (concat (reverse acc), Just i)
-                else go (i + 1) rest (faces : acc) total (scanned + 1)
+                then (concat (reverse acc), Just nid, visited)
+                else go rest (faces : acc) total (visited + 1)
 
 boundaryOf ∷ Connectivity → ComponentKey → Node → [BoundaryFace]
 boundaryOf c key node = case (memberRange c key node, nodeRange c node) of

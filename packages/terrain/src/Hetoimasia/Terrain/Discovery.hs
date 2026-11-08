@@ -194,6 +194,7 @@ module Hetoimasia.Terrain.Discovery
   , boundaryFaceBytes
   , traversalBytes
   , boundaryPageBytes
+  , boundaryQueryScratch
 
     -- * The environment
   , Env

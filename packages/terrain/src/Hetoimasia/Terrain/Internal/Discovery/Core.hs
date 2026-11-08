@@ -86,6 +86,8 @@ module Hetoimasia.Terrain.Internal.Discovery.Core
 
 import Control.Monad (ap)
 import Data.Int (Int64)
+import Data.IntMap.Strict (IntMap)
+import Data.IntSet (IntSet)
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -102,6 +104,7 @@ import Hetoimasia.Terrain.Internal.Connectivity.Index
   , Stats (..)
   , VoidLookup (..)
   , componentBoundaryPage
+  , memberIndex
   , isExterior
   , lookupVoid
   )
@@ -142,21 +145,23 @@ data Env = Env
   { envSource ∷ !Source
   , envConn ∷ !Connectivity
   , envLimitsField ∷ !DiscoveryLimits
+  , envMembers ∷ !(IntMap IntSet)
+  -- ^ The ordered members of every class, built once with the environment.
   }
 
 -- | Pair a source with its compiled connectivity and validated limits.
 mkEnv ∷ DiscoveryLimits → Source → Connectivity → Env
-mkEnv limits source conn = Env source conn limits
+mkEnv limits source conn = Env source conn limits (memberIndex conn)
 
 -- | The environment's limits.
 envLimits ∷ Env → DiscoveryLimits
 envLimits = envLimitsField
 
 -- | The accounted bytes of the shared immutable source metadata the model reads:
--- the compiled connectivity, charged once per arena by the owner and never to a
--- candidate.
+-- the compiled connectivity and the ordered member index built from it (32 bytes
+-- a node), charged once per arena by the owner and never to a candidate.
 envSharedBytes ∷ Env → Integer
-envSharedBytes = statResultBytes . cStats . envConn
+envSharedBytes env = statResultBytes (cStats (envConn env)) + 32 * statNodes (cStats (envConn env))
 
 -- ---------------------------------------------------------------------------
 -- Failures
@@ -1107,11 +1112,16 @@ queryComponentKnown env prov key = runQuery env prov (nodeKnown (SrcNode key))
 data BoundaryPage = BoundaryPage
   { pageFaces ∷ [BoundaryFace]
   , pageNext ∷ !(Maybe Int)
+  -- ^ The identity of the box the next page resumes at.
+  , pageVisited ∷ !Int
+  -- ^ The member entries this page visited. Never above the limit: resuming
+  -- seeks in an ordered set and walks nothing before the page.
   }
   deriving stock (Eq, Show)
 
 -- | The compressed exposed boundary of a source component, when the component is
--- known, one bounded page at a time from a box position (start at 0): at most six
+-- known, one bounded page at a time from a box identity (start at 0; each page names
+-- where the next resumes): at most six
 -- faces per box of the class, each a rectangle of cells with what lies across,
 -- never an enumeration of exposed tiles. The page's accounted bytes are charged
 -- through the same function as every read and write, before the page is built; a
@@ -1126,9 +1136,9 @@ queryKnownBoundary env prov key from = runQuery env prov $ do
     else do
       let limit = limitBoundaryFaces (envLimitsField env)
       spend (ChargeOutput (boundaryPageBytes limit))
-      case componentBoundaryPage (envConn env) key (max 0 from) limit of
+      case componentBoundaryPage (envConn env) (envMembers env) key (max 0 from) limit of
         Nothing → corrupt (UnknownComponent key)
-        Just (faces, next) → pure (Just (BoundaryPage faces next))
+        Just (faces, next, visited) → pure (Just (BoundaryPage faces next visited))
 
 -- | What is known of the empty space of a tile.
 data VoidKnowledge

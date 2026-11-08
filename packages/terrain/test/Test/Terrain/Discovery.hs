@@ -12,6 +12,7 @@ module Test.Terrain.Discovery (spec) where
 
 import Control.Exception (evaluate)
 import Data.IORef (newIORef, readIORef)
+import Data.List (sort)
 import Control.Monad (foldM, forM_, unless)
 import Data.Word (Word64)
 import GHC.Stats (RTSStats (allocated_bytes), getRTSStats, getRTSStatsEnabled)
@@ -1187,8 +1188,10 @@ allBoundaryPages env provider key = go 0 (1000000 ∷ Int)
     go from fuel = case observedValue (queryKnownBoundary env provider key from) of
       Right (Just page) → do
         length (pageFaces page) `shouldSatisfy` (<= max (limitBoundaryFaces (envLimits env)) minimumBoundaryFaces)
-        -- the traversal is bounded too: a page scans at most the limit's boxes.
-        forM_ (pageNext page) $ \next → (next - from) `shouldSatisfy` (\scanned → scanned > 0 && scanned <= max (limitBoundaryFaces (envLimits env)) minimumBoundaryFaces)
+        -- the traversal is bounded too, on every page and the late ones above all:
+        -- a page visits at most the limit's member entries and moves forward.
+        pageVisited page `shouldSatisfy` (<= max (limitBoundaryFaces (envLimits env)) minimumBoundaryFaces)
+        forM_ (pageNext page) $ \next → next `shouldSatisfy` (> from)
         rest ← maybe (pure []) (\next → go next (fuel - 1)) (pageNext page)
         pure (pageFaces page <> rest)
       other → expectationFailure ("unexpected page " <> show (const () <$> Just other)) >> pure []
@@ -1207,7 +1210,8 @@ boundarySpecs = describe "bounded boundary queries" $ do
       Nothing → expectationFailure "no sky component"
       Just key → do
         faces ← allBoundaryPages (rigEnv rig) provider key
-        Just faces `shouldBe` componentBoundary compiled key
+        -- the pages go by box identity, the whole description by class order: the same faces.
+        Just (sort (map show faces)) `shouldBe` fmap (sort . map show) (componentBoundary compiled key)
         length faces `shouldSatisfy` (> 10000)
         -- one page costs one read of the representative and a bounded charge.
         let first = queryKnownBoundary (rigEnv rig) provider key 0
@@ -1227,8 +1231,52 @@ boundarySpecs = describe "bounded boundary queries" $ do
     b ← allocatedBy (repeatN 20 (first many keyMany))
     putStrLn ("allocation, 20 first boundary pages of 64 boxes, 200 patches: " <> show a <> " B; 400 patches: " <> show b <> " B")
     sameCost "boundary page" a b
+  it "answers a query under exactly the smallest accepted scratch, for a singleton and a linked class" $ do
+    let exact = either (error . show) id (mkDiscoveryLimits baseSpec {specScratchBytes = toInteger (boundaryQueryScratch 1024), specBoundaryFaces = 1024})
+        flat = flatGround "flat" []
+        rigFlat = newRig exact flat
+        compiledFlat = fst (mustCompile defaultConnectivityLimits (sceneSpec flat))
+    case componentOf compiledFlat (mustTile3 (1, 1, 3)) of
+      Nothing → expectationFailure "no sky component"
+      Just key → case observedValue (queryKnownBoundary (rigEnv rigFlat) (retainedProvider (rigRetained rigFlat)) key 0) of
+        Right (Just page) → pageFaces page `shouldSatisfy` (not . null)
+        other → expectationFailure ("singleton class: expected a page, got " <> show (const () <$> Just other))
+    -- a class linked by a removal: the lookup walks a chain before the page.
+    let linked = newRig exact twoOpenings
+        (opened, _) = runTrace linked ([Edit c | c ← openingA] <> [Drain fullAllowance])
+        compiledCave = fst (mustCompile defaultConnectivityLimits (sceneSpec twoOpenings))
+    case componentOf compiledCave (mustTile3 (5, 0, 5)) of
+      Nothing → expectationFailure "no cave component"
+      Just key → do
+        observedValue (queryComponentKnown (rigEnv opened) (retainedProvider (rigRetained opened)) key) `shouldBe` Right True
+        case observedValue (queryKnownBoundary (rigEnv opened) (retainedProvider (rigRetained opened)) key 0) of
+          Right (Just page) → pageFaces page `shouldSatisfy` (not . null)
+          other → expectationFailure ("linked class: expected a page, got " <> show (const () <$> Just other))
+  it "visits at most a page of entries on the last page of a vast class" $ do
+    let rig = newRig small (sceneOf 200)
+        compiled = fst (mustCompile defaultConnectivityLimits (patchedSource 200))
+        provider = retainedProvider (rigRetained rig)
+        cursors key from = case observedValue (queryKnownBoundary (rigEnv rig) provider key from) of
+          Right (Just page) → from : maybe [] (cursors key) (pageNext page)
+          _ → [from]
+    case componentOf compiled (mustTile3 (1, 5, 5)) of
+      Nothing → expectationFailure "no sky component"
+      Just key → do
+        let starts = cursors key 0
+            lastStart = last starts
+        length starts `shouldSatisfy` (> 100)
+        case observedValue (queryKnownBoundary (rigEnv rig) provider key lastStart) of
+          Right (Just page) → do
+            pageVisited page `shouldSatisfy` (<= 64)
+            pageNext page `shouldBe` Nothing
+          other → expectationFailure ("last page: " <> show (const () <$> Just other))
   it "refuses a page the scratch cannot hold, at validation and never at the query" $ do
     mkDiscoveryLimits baseSpec {specScratchBytes = 52224, specBoundaryFaces = 1024}
-      `shouldBe` Left (LimitBelowProgress FieldScratchBytes 52224 (toInteger (boundaryPageBytes 1024)))
+      `shouldBe` Left (LimitBelowProgress FieldScratchBytes 52224 (toInteger (boundaryQueryScratch 1024)))
+    -- the lookup of the class is part of the query: a page alone is not enough.
+    mkDiscoveryLimits baseSpec {specScratchBytes = toInteger (boundaryPageBytes 1024), specBoundaryFaces = 1024}
+      `shouldBe` Left (LimitBelowProgress FieldScratchBytes (toInteger (boundaryPageBytes 1024)) (toInteger (boundaryQueryScratch 1024)))
+    mkDiscoveryLimits baseSpec {specScratchBytes = toInteger (boundaryQueryScratch 1024) - 1, specBoundaryFaces = 1024}
+      `shouldBe` Left (LimitBelowProgress FieldScratchBytes (toInteger (boundaryQueryScratch 1024) - 1) (toInteger (boundaryQueryScratch 1024)))
     mkDiscoveryLimits baseSpec {specBoundaryFaces = 5} `shouldBe` Left (LimitBelowProgress FieldBoundaryFaces 5 6)
     mkDiscoveryLimits baseSpec {specBoundaryFaces = 65537} `shouldBe` Left (LimitUnrepresentable FieldBoundaryFaces 65537 65536)

@@ -50,6 +50,7 @@ module Hetoimasia.Terrain.Internal.Discovery.Limits
   , boundaryFaceBytes
   , traversalBytes
   , boundaryPageBytes
+  , boundaryQueryScratch
   ) where
 
 -- | The most hops a union-find chain may take. Union by size bounds a chain by
@@ -139,6 +140,13 @@ minimumBoundaryFaces = 6
 boundaryPageBytes ∷ Int → Int
 boundaryPageBytes n = n * boundaryFaceBytes + traversalBytes
 
+-- | The accounted scratch a boundary query needs in the worst case: the lookup of
+-- the component's class (a chain of at most 'findReadsBound' records, each charged
+-- the largest record) and then a page of at most @n@ faces. Validation requires the
+-- scratch limit to cover it, so no accepted configuration refuses every query.
+boundaryQueryScratch ∷ Int → Int
+boundaryQueryScratch n = findReadsBound * maxRecordBytes + boundaryPageBytes n
+
 -- | The most structural updates one discovery batch performs: P-15 clause 4.
 maxBatchUpdates ∷ Int
 maxBatchUpdates = 64
@@ -161,8 +169,8 @@ data DiscoverySpec = DiscoverySpec
   , specRetainedBytes ∷ !Integer
   -- ^ Accounted bytes of all retained records and the header.
   , specBoundaryFaces ∷ !Integer
-  -- ^ Faces in one page of a boundary query, at least 6; the page's accounted
-  -- bytes must fit the scratch.
+  -- ^ Boxes scanned and faces returned in one page of a boundary query, at least
+  -- 6; the query's accounted bytes (lookup and page) must fit the scratch.
   }
   deriving stock (Eq, Show)
 
@@ -253,8 +261,8 @@ mkDiscoveryLimits spec = do
   retained ← check FieldRetainedBytes byteCeiling (toInteger minimumRetainedBytes) (specRetainedBytes spec)
   boundary ← check FieldBoundaryFaces boundaryCeiling (toInteger minimumBoundaryFaces) (specBoundaryFaces spec)
   -- A page must fit the scratch, or no boundary query could ever make progress.
-  if scratch < boundaryPageBytes boundary
-    then Left (LimitBelowProgress FieldScratchBytes (toInteger scratch) (toInteger (boundaryPageBytes boundary)))
+  if scratch < boundaryQueryScratch boundary
+    then Left (LimitBelowProgress FieldScratchBytes (toInteger scratch) (toInteger (boundaryQueryScratch boundary)))
     else pure ()
   pure (DiscoveryLimits batch reads' records deltaBytes scratch pending retained boundary)
   where
