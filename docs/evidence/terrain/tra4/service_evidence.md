@@ -109,6 +109,10 @@ committed. The failing assertion is the one that protects the behaviour.
 | NC7 | A later eligible command may commit ahead of an earlier eligible, unstaged one | `commits the same ordered trace to the same results and terrain under different residency schedules` | the roomy and tight schedules answer different revisions for the same ordered trace |
 | NC8 | A column is measured once per interval of the load, not once per column | `demands several intervals of one column and measures the load once per column` | the owner ended on an over-reported cost and the wait for the loaded demand never completed |
 | NC6b | As NC6 | `randomized interleaving ... (seed 1)` | the request table claims model records the model lacks, found after the first mutated step |
+| NC11 | The owner's terminal step no longer retires in-flight accounts | `retires every in-flight account when the owner is interrupted while a load runs` | the model still holds a cancelling job with 400 resident and 258 staging bytes reserved and an arena retiring |
+| NC15 | Loads and retries starve behind a stream of ready requests | `gives a queued load its turn while ready requests keep arriving elsewhere` | the cold load settled after all 41 cache hits |
+| NC16 | The owner drops the cleanup's defects when it had already failed | `attaches the cleanup's defects to the failure the owner already has` | no cleanup evidence reached supervision |
+| NC17 | An untaken removal result is not charged bytes | `keeps an untaken removal result's bytes charged in the retained bank until it is taken` | expected 320 bytes charged, got 0 |
 | NC9 | The drain does not wait for outstanding borrowers | `does not return while a borrower holds a snapshot after the owner failed` | expected the service not to have returned, got that it had |
 
 ## Acceptance commands
@@ -122,20 +126,23 @@ compile of every module, not an incremental one.
 | Command | Result |
 | --- | --- |
 | `cabal build --project-file cabal.project.cpu lib:hetoimasia-terrain-runtime` | success, no warning (package build directory removed first) |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 101 examples, 0 failures |
-| `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 501 examples, 0 failures |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests --test-show-details=direct` | 115 examples, 0 failures |
+| `cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --test-show-details=direct` | 669 examples, 0 failures (on the merged head) |
 | `cabal test --project-file cabal.project.cpu hetoimasia:workflow-tests --test-show-details=direct` | 965 examples, 0 failures |
 | `(cd packages/terrain-runtime && cabal check)` | No errors or warnings could be found in the package |
 | `python3 tools/validation/plan.py --catalog-check` | catalog valid: 37 groups, policy version 25 |
 | `python3 tools/validation/plan.py --base origin/master --head HEAD` | selects `test.terrain-runtime` and every affected predecessor and mandatory group (29 of 37; the catalog and workflow changes are policy inputs and widen the plan) |
 | `python3 tools/validation/owned_starts.py check` and `ratchet --base origin/master` | pass; the new package has no unowned start |
 
-After the first review the suite grew from 66 to 101 examples (24 seeds of a randomized interleaving, retained-size shrink on
+After the first three reviews the suite grew from 66 to 115 examples (24 seeds of a randomized interleaving, retained-size shrink on
 coalescing, residency kept across a delayed commit, several intervals of one column,
 the column length limit, a failing readiness callback, snapshot backing across
 revisions, the drain on the failure path and under cancellation, the owner's logging
 failures); it was then run six times at `+RTS -N4` and once at the default
-capability count, all passing. Before that it was run eight times at `+RTS -N4` after the one example that raced its own
+capability count on the round-2 head, all passing. NC14 (a borrow release no longer
+counted as a retry opportunity) was run and the progress example did not fail under it,
+because that scenario also reaches a retry through other events; the rule is
+structural (one function, `freesCapacity`) and is reported as not mutation-checked. Before that it was run eight times at `+RTS -N4` after the one example that raced its own
 bookkeeping was corrected (it asserted the order of two events that nothing orders), and
 six more times after the owner was made to stop only when asked; every run passed.
 The native display groups the plan selects were not run locally: this slice opens no
