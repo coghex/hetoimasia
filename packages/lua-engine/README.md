@@ -188,7 +188,7 @@ and `DurationLimit` (`Duration`). Read one with `bytesLimit`, `countLimit` or
 | Scenes | 4,096 sprites; 2 MiB encoded input; depth 4; one latest scene and one bounded publication draft per window; no publication FIFO |
 | Diagnostics | message 2 KiB; traceback 8 KiB; complete role-failure record 16 KiB; opaque instance ID 128 UTF-8 bytes; engine report 64 KiB with at most 16 secondary summaries of 2 KiB each; print and warn 4 KiB per call |
 | PNG | 32 MiB encoded; 4,096 chunks; axes 1–2,048; 4,194,304 pixels; 40 MiB of inflated scanlines; 128 MiB accounted payload and workspace per texture pipeline |
-| Textures | 16 pending, live and retiring leases and 128 MiB nominal bytes per UI instance; 256 MiB per session |
+| Textures | memory only: 512 MiB of nominal bytes per UI instance and 1 GiB per session, every texture charged at least 4 KiB; no count of textures is a limit |
 | Windows and sprites | 1 pending, live and retiring window slot per UI instance; title 512 UTF-8 bytes; requested width and height 1–4,096; x and y in [−1,000,000, 1,000,000]; width and height in (0, 1,000,000] |
 | Native budget selection | 2 target records; 2 frame slots per window and 4 aggregate; 4 frameless batches; 2 generations per target; 16 tracked images per generation; 2 GiB accounted native bytes; 4,096 objects; reclaim pass of 64 records; 32 progress actions per turn; 100 ms maximum idle backoff |
 | Workers | 2 I/O workers, 1 decode worker, 2 texture pipeline lanes |
@@ -244,7 +244,8 @@ Most limits are **caps on what comes in** (a manifest, a module's source, a data
 | `CopiedValueBytes` | `minimumCopiedValueBytes` of the identity and print bounds and the most text a failure may hold (`failureTextBytes`) | what the facade itself makes cross the value boundary, the [status record](#the-session-controls-lfe-26) of two failed roles included (565 at the smallest bounds) |
 | `CopiedValueElements` | the larger of `sceneFixedElements + sceneElementsPerSprite + sceneCallExtraElements` (13) and `minimumStatusElements` (30) | a publishing call of one sprite and the largest status record must be able to cross |
 | `CopiedValueDepth` | `minimumStatusDepth` (3) | the status record nests three deep: the record, a role, a failure |
-| `PngPipelineWorkspaceBytes`, `TextureBytesPerUiInstance`, `TextureBytesPerSession` | 4 (`rgba8BytesPerPixel`) | a texture holds at least one RGBA8 pixel |
+| `PngPipelineWorkspaceBytes` | 4 (`rgba8BytesPerPixel`) | a texture holds at least one RGBA8 pixel |
+| `TextureBytesPerUiInstance`, `TextureBytesPerSession` | 4,096 (`textureMinimumChargeBytes`) | a texture is charged at least the minimum charge, so a bank that cannot hold one cannot admit any; that the instance bank also holds the admission's reservation (the larger of the largest level and the minimum charge) is the relation `OutputWithinTextureBytesPerUi` |
 | every other byte, count and duration limit | 1 (1 ns) | a cap on what comes in, or on a text cut visibly to it; the relations then keep them consistent (the smallest legal profile, every limit at its least, satisfies all of them) |
 
 The facade's own check of the first six (`LimitBelowFormatting`) is a guard that no validated profile reaches; the other bounds the session and its services check (`NotRepresentable`: a value that does not fit a machine integer; the texture pipeline's job capacity and PNG limits; the scene limits) are unreachable for a validated profile because every ceiling is within the machine integers and every least is at least one. The examples (`Profile`, *the least each limit may be*) accept each limit at its least and refuse it one below, for every limit.
@@ -601,17 +602,30 @@ One atomic admission (the host's `startAdmitted`) reserves, before the provider 
 | Owner liveness (nothing is reserved) | the texture owner is open and the pipeline is open, read in the admission's own transaction | n/a |
 | Request and result records, the owner's places | the host: 16 per instance, 64 per VM | the result taken **and** the work retired |
 | Result lease capacity | the instance's lease scope | with the instance's lease |
-| One texture slot | `texture slots`: 16 pending/live/retiring per UI instance | the texture proved retired |
-| 16 MiB of nominal RGBA8 bytes | `texture bytes`: 128 MiB per instance and 256 MiB per session, taken from both or neither | shrunk to `width * height * 4` once the decode validated the dimensions; the remainder returned when the texture is proved retired |
+| 16 MiB of nominal RGBA8 bytes (at least the 4 KiB minimum charge) | `texture bytes`: 512 MiB per instance and 1 GiB per session, taken from both or neither; the only bound on how many textures an instance holds | shrunk to `width * height * 4` (never below 4 KiB) once the decode validated the dimensions; the remainder returned when the texture is proved retired |
 | Coverage bytes, only for `coverage = "binary"` | `coverage bytes`: the session's one injected CPU render/staging account, 128 MiB (`RenderAccount`); the worst case the validated pixel limit allows, `ceil (4,194,304 ÷ 8)` = 524,288 plane bytes plus the fixed 128 bytes of metadata | shrunk to the exact plane and metadata once the decode validated the dimensions; returned with the last CPU interest in the loaded version, or by the credit release of a request that ended without a version |
 | One accepted-work record | `texture jobs`: the session's job capacity (`textureSpec`), which bounds every stage queue | the request taken and its work retired |
 | One queue slot of the shared read pool | `io queue` | the request taken and its read retired (only for a file that will be read) |
+
+**Memory is the only bound on how many textures there are** (owner decision 2026-11-08: "drop the count, the number is arbitrary in
+a bindless system, set the limit on memory"; the values are the manager's choice under the owner's delegation). An instance holds
+any number of pending, live and retiring textures its byte limits admit; no bank, credit, refusal text or error code states a count.
+Every texture is charged at least `textureMinimumChargeBytes` (4 KiB) in both banks, from admission until its proven retirement,
+even when it decodes to fewer bytes: the reservation is the larger of the largest level and 4 KiB, and the decode shrinks it to the
+larger of the decoded size and 4 KiB. Without that floor 1 GiB would admit 268,435,456 one-pixel textures, far more than any
+device's descriptor array, and a full table could bind before bytes did. With it, a bank of *n* bytes holds at most *n* ÷ 4 KiB
+textures, and every structural capacity that holds textures is *derived* from the byte limits and so never answers first: the
+native texture table (1 GiB ÷ 4 KiB + slot 0 = 262,145) and the facade's lease scope (512 MiB ÷ 4 KiB + the window slot = 131,073).
+Validation requires each byte limit to be at least 4 KiB and the instance bank to hold the reservation (the larger of
+`pngOutputBytes` and 4 KiB), so a validated profile always admits at least one maximum-size texture. The per-owner number of held
+textures remains only as the read-only `ownerTexturesHeld` observation: nothing compares it with anything. The request bounds
+(`RequestsPerInstance` 16, `RequestsPerVm` 64) bind before bytes for in-flight reservations (16 × 16 MiB = 256 MiB of the 512 MiB).
 
 A bank without room is the host's busy answer, naming the bank, with **no file open, no decode, no backend call and nothing
 left reserved**; a refusal that races other admissions takes nothing from them, because every reservation is made in one STM
 transaction. The 16 MiB is reserved without reading a header, so a small image can be refused busy while larger
 reservations are held: accepted behavior. A file the inventory does not hold, or one over 32 MiB, is accepted and fails
-without a worker. The slot and the nominal bytes **transfer** to the texture when a lease adopts it: they are not returned
+without a worker. The nominal bytes **transfer** to the texture when a lease adopts it: they are not returned
 when the request is taken, when the pipeline's CPU buffers retire or when Lua loses its handle, but when the backend proves
 the texture itself retired.
 
@@ -656,7 +670,7 @@ colour image (never an implicit `kind = "data"`).
   last interest's drop clears the plane from the version in the transaction that returns the charge: a job, a cell or a lease
   record that still names the version (a texture awaiting its GPU retirement) reaches no payload. A Lua `release` stops the lease granting new
   interests (and drops the lease's own, at once) and leaves the ones already taken. The CPU plane ends with its last
-  interest; the texture's slot, nominal bytes and GPU registration end on the backend's evidence of retirement; neither
+  interest; the texture's nominal bytes and GPU registration end on the backend's evidence of retirement; neither
   event stands in for the other. `releaseRetained` is idempotent.
 * **Publication.** `api.scene.publish` accepts any live texture lease, unchanged. A published data texture is sampled from
   its linear UNORM image as numbers and is not reinterpreted as premultiplied sRGB colour; the adapter registers it with the
@@ -1182,7 +1196,7 @@ resource (lease keys are never reissued and a script cannot forge a handle). The
 `already_released` as before, inside and outside the record; wrong-kind, wrong-VM, forged and never-issued handles stay errors.
 
 **Busy.** `content.texture` and `window.open` return `nil, {code="busy", message=TEXT}` when a temporary bank (the request
-places, the texture slots and bytes, the provider's records) has no room: two Lua values, no handle, no provider or native action.
+places, the texture bytes, the provider's records) has no room: two Lua values, no handle, no provider or native action.
 Busy comes only from the atomic M1 reservations the admission makes before it acquires a lease or starts a request. A second window
 while the instance already has a pending, live or retiring one is the permanent ordinary error `this instance already has a window`,
 decided before any temporary bank, so a full bank never turns it into busy. The host's own lease and request capacity refusals are

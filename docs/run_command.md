@@ -265,7 +265,7 @@ diagnostic that cannot be written never replaces what it reports.
 
 The generic host's lease and request bounds sit above every M1 reservation that can coexist, and the M1 admission checks its own atomic reservations
 first, so ordinary full capacity is the common `busy` answer and never a host fault: a VM's lease scope holds
-16 + 1 leases per instance (`facadeLeaseCapacity`); the window provider has `windowSlots` (2) work records; the read pool has 16 slots and
+131,073 leases per instance, derived from the instance's 512 MiB of texture bytes over the 4 KiB minimum charge plus its window slot (`facadeLeaseCapacity`); the window provider has `windowSlots` (2) work records; the read pool has 16 slots and
 the texture pipeline 16 accepted-work records. No M1 ceiling is changed by this composition.
 
 ## Diagnostics
