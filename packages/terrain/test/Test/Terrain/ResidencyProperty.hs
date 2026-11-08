@@ -628,12 +628,12 @@ cameraStartsWhatItKeeps staging picks = case limitsNear 4384 staging of
           (_, Left r) → counterexample ("the camera demand was refused: " <> show r) False
 
 -- | The same for a replacement: a camera that has loaded one description and pans to
--- another (the owner has completed everything in between, and nothing else holds the
--- room) never has the new description cut to nothing. Whatever staging, a non-empty
+-- another (the owner has completed everything in between, or has not yet dispatched
+-- the first one's queued work, and nothing else holds the room) never has the new description cut to nothing. Whatever staging, a non-empty
 -- replacement retains a non-empty description and starts its first region, because the
 -- interests and queued work the replacement drops are credited before it is cut.
-cameraReplacementStarts ∷ Integer → [(Int, Int)] → [(Int, Int)] → Property
-cameraReplacementStarts staging firstPicks nextPicks = case limitsNear 4384 staging of
+cameraReplacementStarts ∷ Bool → Integer → [(Int, Int)] → [(Int, Int)] → Property
+cameraReplacementStarts settled staging firstPicks nextPicks = case limitsNear 4384 staging of
   Nothing → counterexample ("a configuration at the minimum was refused: " <> show staging) False
   Just limits →
     let start = fst (step (newModel limits) (OpenArena (ArenaId 1) (Revision 0)))
@@ -652,7 +652,7 @@ cameraReplacementStarts staging firstPicks nextPicks = case limitsNear 4384 stag
         firstDemand = distinctOf firstPicks
         nextDemand = distinctOf nextPicks
      in case step start (SetCameraDemand (ViewId 1) (ArenaId 1) firstDemand) of
-          (m1, Right _) → case settle 200 m1 of
+          (m1, Right _) → case (if settled then settle 200 m1 else Just m1) of
             Nothing → counterexample "the first description did not settle" False
             Just m2 → case step m2 (SetCameraDemand (ViewId 1) (ArenaId 1) nextDemand) of
               (m3, Right _) →
@@ -770,7 +770,10 @@ spec = describe "Residency model properties" $ do
       forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \picks → cameraStartsWhatItKeeps staging picks
   it "starts the first region of every replacement of a settled camera description, at any staging from the minimum" $
     withNumTests 2000 $
-      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts staging a b
+      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts True staging a b
+  it "starts the first region of every replacement of a camera description whose work is still queued, at any staging from the minimum" $
+    withNumTests 2000 $
+      forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts False staging a b
   it "never reserves more for an explicit request than the construction-time worst case" $
     withNumTests 2000 $
       forAll (vectorOf 3 pair) reservationWithinMinimum

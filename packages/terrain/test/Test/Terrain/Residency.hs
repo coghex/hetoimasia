@@ -1308,6 +1308,18 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 1 0 0]]
     m3 ← drainDemand m2
     map viewPending (modelViews m3) `shouldBe` [[]]
+  it "credits the queued work a pan makes obsolete: panning before the load was dispatched, at the minimum budget, keeps and starts the new region" $ do
+    -- The same minimum budgets, but region A's load is still queued when the view pans to
+    -- B: the replacement drops A's interest (64) and its queued job (258 of scratch), and
+    -- B's description, interest and scratch fit exactly.
+    let limits = limitsWith $ \x → x {specResidentBytes = 1446, specStagingBytes = 1508, specCameraRegions = 64}
+    m0 ← opened limits
+    m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
+    (m2, set) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [demand (reg 1 0 0) (cell 0 0 0)])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ excluded truncated → (map (map snd . admissionJobs) admitted, waiting, excluded, truncated) `shouldBe` ([[reg 1 0 0]], [], [], [])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 1 0 0]]
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
