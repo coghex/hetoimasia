@@ -16,6 +16,7 @@ module Test.TerrainRender2D.MapAssets (spec) where
 
 import Control.Monad (forM, forM_, when)
 import qualified Data.ByteString as ByteString
+import Data.Char (toUpper)
 import Data.List (nub, sort, sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
@@ -43,6 +44,7 @@ import Hetoimasia.Terrain.MapBake.Catalog
   , mapIdentifier
   )
 import Hetoimasia.Terrain.MapGen.Cli (Outcome (..), runCli)
+import Hetoimasia.Terrain.MapGen.Evidence (JoinedView (..), evidenceFiles, joinedTitleLines, textWidth)
 import Hetoimasia.Terrain.MapGen.Generate (Discrepancy (..), compareCatalog, describeDiscrepancy, generate)
 import Hetoimasia.Terrain.MapGen.Inputs (loadInputs)
 import Hetoimasia.Terrain.MapGen.Png (decodeRgba, encodeRgba)
@@ -703,6 +705,25 @@ generatorSpec = describe "the generator" $ do
       length a `shouldBe` 47
       -- The reports differ only in the first line, which names each run's own directory.
       drop 1 (outcomeOut one) `shouldBe` drop 1 (outcomeOut two')
+
+  it "writes evidence sheets whose every title line fits inside its canvas, deterministically" $ do
+    sample ← sampleDirectory
+    loaded ← loadInputs sample
+    case loaded of
+      Left problems → expectationFailure (unlines problems)
+      Right inputs → do
+        let files = evidenceFiles inputs
+            width name = case lookup name files >>= either (const Nothing) (\(w, _, _) → Just w) . decodeRgba of
+              Just w → w
+              Nothing → -1
+        forM_ [(FaceSouth, "south"), (FaceWest, "west"), (FaceNorth, "north"), (FaceEast, "east")] $ \(facing, name) → do
+          forM_ [(NormalsView, "normals"), (ArtView, "art")] $ \(view, suffix) → do
+            let titles = joinedTitleLines facing view
+                imageWidth = width ("joined-" <> name <> "-" <> suffix <> ".png")
+            imageWidth `shouldSatisfy` (>= 16 + maximum (map (textWidth 2) titles))
+          width ("comparison-" <> name <> ".png") `shouldSatisfy` (>= 16 + textWidth 2 ("CPU GENERATED IMAGE EVIDENCE - NOT AN ENGINE SCREENSHOT - FACING " <> map toUpper name <> " - terrain-mapgen/1"))
+        map fst files `shouldSatisfy` ("evidence-index.json" `elem`)
+        evidenceFiles inputs `shouldBe` files
 
   it "refuses usage it cannot satisfy: no mode, two modes and an unknown argument" $ do
     outcomeExit <$> runCli [] >>= (`shouldBe` 2)

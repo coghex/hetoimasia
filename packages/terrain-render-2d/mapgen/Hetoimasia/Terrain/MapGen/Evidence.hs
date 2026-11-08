@@ -27,10 +27,13 @@ module Hetoimasia.Terrain.MapGen.Evidence
   ( writeEvidence
   , evidenceFiles
   , defectRecord
+  , JoinedView (..)
+  , joinedTitleLines
+  , textWidth
   ) where
 
 import Codec.Picture (Image, PixelRGBA8 (..), encodePng)
-import Codec.Picture.Types (MutableImage, createMutableImage, freezeImage, writePixel)
+import Codec.Picture.Types (MutableImage, createMutableImage, freezeImage, mutableImageHeight, mutableImageWidth, writePixel)
 import Control.Monad (forM_, when)
 import Control.Monad.ST (ST, runST)
 import Data.ByteString (ByteString)
@@ -111,7 +114,9 @@ panel = PixelRGBA8 70 72 80 255
 
 fillRect ∷ Canvas s → Int → Int → Int → Int → PixelRGBA8 → ST s ()
 fillRect canvas x0 y0 w h colour =
-  forM_ [y0 .. y0 + h - 1] $ \y → forM_ [x0 .. x0 + w - 1] $ \x → writePixel canvas x y colour
+  -- Clipped to the canvas: a pixel past the right edge would otherwise wrap into the next row.
+  forM_ [max 0 y0 .. min (mutableImageHeight canvas) (y0 + h) - 1] $ \y →
+    forM_ [max 0 x0 .. min (mutableImageWidth canvas) (x0 + w) - 1] $ \x → writePixel canvas x y colour
 
 -- | A 96 × 64 sprite at a scale, written where the source says a texel exists.
 sprite ∷ Canvas s → Int → Int → Int → (Int → Int → Maybe Rgb) → ST s ()
@@ -122,6 +127,11 @@ sprite canvas x0 y0 scale texel =
       Just (r, g, b) →
         forM_ [0 .. scale - 1] $ \dy → forM_ [0 .. scale - 1] $ \dx →
           writePixel canvas (x0 + x * scale + dx) (y0 + y * scale + dy) (PixelRGBA8 r g b 255)
+
+-- | The width in pixels 'text' needs for a string at a scale (four pixels of
+-- advance per character at scale 1).
+textWidth ∷ Int → String → Int
+textWidth scale string = 4 * scale * length string
 
 -- | Text in a 3 × 5 pixel face at an integer scale, upper-cased; characters the
 -- face lacks draw as a box.
@@ -264,6 +274,14 @@ wallCoverage shape = unwords [letter side : ':' : [mark (sideCoverage shape side
 -- The joined sheet
 
 data JoinedView = NormalsView | ArtView
+  deriving stock (Eq, Show)
+
+-- | The two title lines of a joined sheet, drawn at scale 2 in a 28-pixel band.
+joinedTitleLines ∷ ViewFacing → JoinedView → [String]
+joinedTitleLines facing view =
+  [ "CPU GENERATED IMAGE EVIDENCE"
+  , "JOINED " <> (case view of NormalsView → "NORMALS"; ArtView → "LOAM CUTOUT") <> " - FACING " <> map toUpper (facingName facing)
+  ]
 
 joinedSheet ∷ Inputs → ViewFacing → JoinedView → Image PixelRGBA8
 joinedSheet inputs facing view = runST $ do
@@ -279,11 +297,11 @@ joinedSheet inputs facing view = runST $ do
       ys = [fromInteger (24 * (dx + dy)) | (dx, dy, _) ← placed]
       left = minimum xs
       top = minimum ys
-      width = maximum xs - left + canvasWidth + 2 * margin
+      width = max (maximum xs - left + canvasWidth + 2 * margin) (2 * margin + maximum (map (textWidth 2) (joinedTitleLines facing view)))
       height = maximum ys - top + canvasHeight + 2 * margin + 28
       loam = colourSource inputs "loam"
   canvas ← createMutableImage width height background
-  text canvas margin 6 2 ("CPU GENERATED IMAGE EVIDENCE - JOINED " <> (case view of NormalsView → "NORMALS"; ArtView → "LOAM CUTOUT") <> " - FACING " <> map toUpper (facingName facing))
+  forM_ (zip [0 ..] (joinedTitleLines facing view)) $ \(line, title) → text canvas margin (3 + line * 12) 2 title
   forM_ placed $ \(dx, dy, entry) → do
     let source = mapSource (lookupOrdinary entry)
         ox = margin + fromInteger (48 * (dx - dy)) - left
