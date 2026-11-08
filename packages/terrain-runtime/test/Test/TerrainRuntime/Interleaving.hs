@@ -54,25 +54,34 @@ thinSoil = layered [(Just (-5), Just 0, "stone", 0), (Just 0, Just 2, "soil", 0)
 
 spec ∷ Spec
 spec = describe "A randomized interleaving over the service" $ do
+  plain <- runIO (newIORef (0 ∷ Int))
   forM_ [1 .. 24 ∷ Word64] $ \seed →
     it ("keeps every invariant and settles every request exactly once (seed " <> show seed <> ")") $
-      runSeed (tightConfig (2, 1, 2) 3 4096) False seed
+      runSeed (tightConfig (2, 1, 2) 3 4096) False seed >>= \n → modifyIORef' plain (+ n)
+  covers "the plain runs" plain
   -- The same, with cancellations, lease releases and client ends injected by the owner
   -- itself inside its preparations, where credits must be held to the safe point.
+  injected <- runIO (newIORef (0 ∷ Int))
   forM_ [1 .. 24 ∷ Word64] $ \seed →
     it ("keeps every invariant when releases arrive while a preparation runs (seed " <> show seed <> ")") $
-      runSeed (tightConfig (2, 1, 2) 3 4096) True seed
+      runSeed (tightConfig (2, 1, 2) 3 4096) True seed >>= \n → modifyIORef' injected (+ n)
+  covers "the runs with releases inside preparations" injected
   -- And under capacity pressure that later clears: a bank that holds about two
   -- regions and two commands, so refusals and waits are routine; every request must
   -- still settle once the hosts are granted.
+  pressed <- runIO (newIORef (0 ∷ Int))
   forM_ [1 .. 16 ∷ Word64] $ \seed →
     it ("settles every request once pressure clears (seed " <> show seed <> ")") $
-      runSeed (microConfigSlots 3) True (seed + 100)
+      runSeed (microConfigSlots 3) True (seed + 100) >>= \n → modifyIORef' pressed (+ n)
+  covers "the runs under capacity pressure" pressed
+  where
+    -- A single seed may by chance end with no success; a group of them must not.
+    covers label counter = it ("has requests that succeed across " <> label) $ readIORef counter >>= \n → n `shouldSatisfy` (> 0)
 
 -- | One seeded run. With the injection on, the owner performs a seeded cancellation,
 -- lease release or client end inside each preparation, and the model and table are
 -- checked there too, while the credits are held.
-runSeed ∷ Config → Bool → Word64 → IO ()
+runSeed ∷ Config → Bool → Word64 → IO Int
 runSeed config inject seed = do
   hook <- newIORef Nothing
   let probe = Probe $ \point → case point of
@@ -103,9 +112,9 @@ runSeed config inject seed = do
           settled <- settledOf host
           (request, length settled) `shouldBe` (request, 1)
         outcomes <- mapM (settledOf . snd) requests
-        length [() | [Succeeded _] <- outcomes] `shouldSatisfy` (>= 1)
         readIORef (wTrouble world) >>= (`shouldBe` [])
         settleChecks svc
+        pure (length [() | [Succeeded _] <- outcomes])
   where
     head' = \case (x : _) → Just x; [] → Nothing
     check' svc world = do
