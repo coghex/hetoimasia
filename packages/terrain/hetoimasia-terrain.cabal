@@ -42,6 +42,7 @@ library
         Hetoimasia.Terrain.Changes
         Hetoimasia.Terrain.Connectivity
         Hetoimasia.Terrain.Coordinate
+        Hetoimasia.Terrain.Discovery
         Hetoimasia.Terrain.Geometry
         Hetoimasia.Terrain.Opening
         Hetoimasia.Terrain.Palette
@@ -62,6 +63,9 @@ library
         Hetoimasia.Terrain.Internal.Connectivity.Limits
         Hetoimasia.Terrain.Internal.Connectivity.Prepare
         Hetoimasia.Terrain.Internal.Coordinate
+        Hetoimasia.Terrain.Internal.Discovery.Core
+        Hetoimasia.Terrain.Internal.Discovery.Limits
+        Hetoimasia.Terrain.Internal.Discovery.Records
         Hetoimasia.Terrain.Internal.Interval
         Hetoimasia.Terrain.Internal.Packed
         Hetoimasia.Terrain.Internal.Polygon
@@ -92,6 +96,8 @@ test-suite terrain-tests
         Test.Terrain.ConnectivityFixtures
         Test.Terrain.ConnectivityOracle
         Test.Terrain.Coordinate
+        Test.Terrain.Discovery
+        Test.Terrain.DiscoveryHarness
         Test.Terrain.Fixtures
         Test.Terrain.Geometry
         Test.Terrain.Growth
