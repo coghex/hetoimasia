@@ -6,11 +6,13 @@ module Test.TerrainRuntime.Budgets (spec) where
 import Control.Concurrent (yield)
 import Control.Concurrent.STM
 import Control.Monad (forM_)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Hetoimasia.Terrain.Cell (Cell (..))
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime
 import Test.Hspec
+import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
 import Test.TerrainRuntime.Fixtures
 
@@ -24,6 +26,34 @@ spread n = (toInteger (n `mod` 4) * 16, 0, toInteger (n `div` 4 `mod` 5 - 2) * 3
 
 resident ∷ Model → Word
 resident m = fromIntegral (length (modelRegions m))
+
+-- | Limits whose camera description may name far more regions than the resident bank
+-- holds: one explicit region per query, a resident bank of about two one-cell regions,
+-- and a camera cap of 64 regions. The explicit request guarantee (the minimum budgets)
+-- holds at these figures; the camera demand has no capacity guarantee.
+overBudget ∷ Config
+overBudget = defaultConfig {configLimits = limits, configRetainedBytes = 2000}
+  where
+    spec' bytes staging =
+      LimitsSpec
+        { specResidentBytes = bytes
+        , specEditBytes = 4096
+        , specStagingBytes = staging
+        , specLoadJobs = 4
+        , specQueuedCommands = 8
+        , specPinsPerView = 1
+        , specAgingQuanta = 3
+        , specQueryRegions = 1
+        , specExtentX = 1
+        , specExtentY = 1
+        , specExtentZ = 2
+        , specHoldRegions = 0
+        , specCameraRegions = 64
+        }
+    valid bytes staging = either (const Nothing) Just (mkLimits (spec' bytes staging))
+    smallest = fromMaybe (error "no resident bank") (listToMaybe [r | r ← [100, 150 .. 200000], Just _ ← [valid r 1000000]])
+    stagingFor bytes = fromMaybe (error "no staging bank") (listToMaybe [s | s ← [500, 1000 .. 2000000], Just _ ← [valid bytes s]])
+    limits = fromMaybe (error "over-budget limits are invalid") (valid (smallest + 700) (stagingFor smallest + 40000))
 
 spec ∷ Spec
 spec = describe "Budgets against real owned data" $ do
@@ -125,8 +155,56 @@ spec = describe "Budgets against real owned data" $ do
       okOf (clearViewDemand svc view)
       closeView svc view
       settleChecks svc
+  -- D-42 (the owner's rule for camera demand): a demand larger than the banks is never
+  -- refused as invalid. It is admitted best effort, in the producer's order, and the
+  -- remainder stays pending; it must not block or starve explicit work. Here the demand
+  -- stays registered throughout (it is never withdrawn), and an explicit query and a
+  -- removal are both admitted and complete beside it.
+  it "admits an over-budget view demand best effort, and still completes an explicit query and a removal without withdrawing it" $
+    withService overBudget $ \svc → do
+      (client, lease) <- openMain svc "main"
+      view <- okOf (openView svc client)
+      -- Twelve one-cell regions along one row: far more than the resident bank holds.
+      let demanded = [RegionCoord (fromIntegral n) 0 0 | n ← [0 .. 11 ∷ Int]]
+
+      receipt <- okOf (setViewDemand svc view lease (map oneCell demanded))
+      -- The setup this example stands on: some of the demand is admitted and the rest is
+      -- pending, so the test cannot pass without capacity pressure.
+      receiptAdmitted receipt `shouldSatisfy` (not . null)
+      receiptPending receipt `shouldSatisfy` (not . null)
+      length (receiptAdmitted receipt) + length (receiptPending receipt) `shouldBe` length demanded
+      -- The demand is registered with a pending remainder, in the model's own record.
+      pendingBefore <- viewPendingOf svc
+      pendingBefore `shouldSatisfy` (not . null)
+      -- An explicit query outside the demand completes with the right material (never air).
+      let (x, y, z) = (16 * 14, 0, 0)
+      answer <- readCellPatient svc lease (tile x y z)
+      cellMaterial (cellValue answer) `shouldBe` expectedMaterial soilOverStone [] (x, y, z)
+      -- And an explicit removal commits at the next revision.
+      removed <- bounded (removePatient svc lease (tile x y z))
+      (removeChangedFlag removed, removeRevision removed) `shouldBe` (True, Revision 1)
+      -- The demand was never withdrawn: the view still has its whole demand registered, and
+      -- the part that cannot fit is still pending (unloaded terrain stays unknown).
+      views <- modelViews <$> inspectModel svc
+      map (length . viewDemand) views `shouldBe` [length demanded]
+      viewPendingOf svc >>= (`shouldSatisfy` (not . null))
+      inspectDefects svc >>= (`shouldBe` [])
+      inspectInvariants svc >>= (`shouldBe` [])
+      okOf (clearViewDemand svc view)
+      closeView svc view
+      settleChecks svc
+
   where
     bounded' wait = wait
     isKnown c = case c of Known _ → True; _ → False
     jobsOf svc = modelJobs <$> inspectModel svc
+    viewPendingOf svc = concatMap viewPending . modelViews <$> inspectModel svc
+    -- A removal that waits out a refusal for a region the owner has not finished evicting.
+    removePatient svc lease at = go
+      where
+        go =
+          removeAt svc lease at Nothing >>= \case
+            Right request → await svc request >>= expectSuccess
+            Left (RefusedBusy (BusyModel (RegionEvicting _))) → yield >> go
+            Left refusal → expectationFailure ("expected a removal, got " <> show refusal) >> fail "unreachable"
 

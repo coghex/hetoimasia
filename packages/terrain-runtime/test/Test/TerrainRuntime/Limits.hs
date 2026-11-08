@@ -15,7 +15,7 @@ import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
-import Test.TerrainRuntime.Usage (jobRunningDisagreements, usageDisagreements)
+import Test.TerrainRuntime.Usage (Held (..), HeldArena (..), chargedOf, disagreements, heldOf, jobStartDisagreements, usageDisagreements)
 
 -- | Every disagreement between the model's ledgers and what the service holds, read in
 -- one transaction.
@@ -212,12 +212,12 @@ spec = describe "Service-wide limits count every state that holds the resource" 
       host <- newHost True
       _ <- okOf (cellWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1))
       awaitReached gate
-      model <- inspectModel svc
+      (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
       case [(jobId j, jobArena j, jobRegion j) | j ← modelJobs model, jobPhase j == JobRunningPhase] of
         (jid, arena, loaded) : _ → do
-          jobRunningDisagreements model arena loaded `shouldBe` []
+          jobStartDisagreements census model arena loaded `shouldBe` []
           let forgotten = fst (step model (JobFailed jid))
-          jobRunningDisagreements forgotten arena loaded `shouldSatisfy` (not . null)
+          jobStartDisagreements census forgotten arena loaded `shouldSatisfy` (not . null)
         [] → expectationFailure "the owner is at a job but the model holds none running"
       openGate gate
       void (settledOf host)
@@ -238,5 +238,6 @@ spec = describe "Service-wide limits count every state that holds the resource" 
       let held = map censusRetainedBytes (censusArenas census)
       length (nub held) `shouldBe` 2
       -- The same census with the two arenas' retained bytes exchanged.
-      let swapped = census {censusArenas = zipWith (\a v → a {censusRetainedBytes = v}) (censusArenas census) (reverse held)}
-      usageDisagreements swapped model `shouldSatisfy` any ("retained bytes of arena" `isInfixOf`)
+      let heldNow = heldOf census
+          swapped = heldNow {heldArenas = zipWith (\a v → a {haRetained = v}) (heldArenas heldNow) (reverse held)}
+      disagreements swapped (chargedOf model) `shouldSatisfy` any ("retained bytes of arena" `isInfixOf`)

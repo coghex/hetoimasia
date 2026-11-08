@@ -10,6 +10,7 @@ import qualified Test.TerrainRuntime.Lifecycle as Lifecycle
 import qualified Test.TerrainRuntime.Limits as Limits
 import qualified Test.TerrainRuntime.Offload as Offload
 import qualified Test.TerrainRuntime.Opacity as Opacity
+import qualified Test.TerrainRuntime.Oracle as Oracle
 import qualified Test.TerrainRuntime.Races as Races
 import qualified Test.TerrainRuntime.Revalidation as Revalidation
 import Test.Hspec (Spec)
@@ -26,5 +27,6 @@ spec = do
   Hardening.spec
   Credits.spec
   Limits.spec
+  Oracle.spec
   Interleaving.spec
   Closure.spec

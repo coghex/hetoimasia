@@ -77,6 +77,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Limits
         Test.TerrainRuntime.Offload
         Test.TerrainRuntime.Opacity
+        Test.TerrainRuntime.Oracle
         Test.TerrainRuntime.Races
         Test.TerrainRuntime.Revalidation
         Test.TerrainRuntime.Usage

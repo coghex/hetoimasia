@@ -54,6 +54,47 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , ReqPhase (..)
   , Req (..)
 
+    -- * Inspection records (read-only, for verification)
+  , RunningWork (..)
+  , noRunningWork
+  , JobWork (..)
+  , jobWorkArena
+  , jobWorkRegion
+  , jobWorkResident
+  , jobWorkScratch
+  , jobWorkSlots
+  , PreparationWork (..)
+  , preparationRequest
+  , preparationArena
+  , preparationRemoval
+  , preparationRecordBytes
+  , preparationResident
+  , preparationStaging
+  , preparationEdit
+  , HandoffWork (..)
+  , handoffWorkArena
+  , handoffWorkRegion
+  , handoffWorkDuplicate
+  , runningJobs
+  , runningPreparation
+  , runningHandoffs
+  , Census (..)
+  , ArenaCensus (..)
+  , RequestCensus (..)
+  , censusArenas
+  , censusRequests
+  , censusBorrows
+  , censusRunning
+  , censusArena
+  , censusRetiring
+  , censusRegionBytes
+  , censusRetainedBytes
+  , censusRegions
+  , censusRemoval
+  , censusModelRecord
+  , censusSettled
+  , censusGhost
+
     -- * State
   , Arena (..)
   , LeaseRec (..)
@@ -89,6 +130,7 @@ import Hetoimasia.Terrain.Residency
   ( ArenaId (..)
   , BusyReason
   , HoldId
+  , JobId
   , LimitError
   , Limits
   , Model
@@ -437,6 +479,165 @@ data Req = Req
   }
 
 -- ---------------------------------------------------------------------------
+-- Inspection records
+--
+-- Everything in this section is a read-only observation, kept for verification.
+-- No production decision reads it: not admission, not scheduling, not accounting.
+-- The types are abstract outside the package (positional constructors that
+-- "Hetoimasia.Terrain.Runtime" does not export, and accessors that are ordinary
+-- functions, never field labels), so a client cannot construct, forge or update
+-- one, and none carries an authority, a handle or a snapshot.
+
+-- | The work the owner thread is running or holding, recorded where that work
+-- starts and where it ends, from the values the work itself holds, and not from the
+-- accounting model: the model's ledgers are what a test compares this against.
+--
+-- Owner and thread: written only by the owner thread (a job at its dispatch and at its
+-- report, a preparation between its start and the owner's safe point, a handoff's
+-- duplicate between the transfer's admission and its outcome) and emptied by the
+-- owner's terminal step. Readers: the inspection function only. Bounded by the
+-- single owner: one preparation at a time, one job per dispatch, one handoff per
+-- changed region, and every entry ends with the work it describes.
+data RunningWork = RunningWork
+  { rwJobs ∷ !(Map JobId JobWork)
+  , rwPreparation ∷ !(Maybe PreparationWork)
+  , rwHandoffs ∷ !(Map RegionKey HandoffWork)
+  }
+
+noRunningWork ∷ RunningWork
+noRunningWork = RunningWork Map.empty Nothing Map.empty
+
+-- | A load job the owner is running: where, the resident bytes its coverage can
+-- store (what it reserves in the resident bank, region metadata not claimed), its
+-- scratch, and the job slot it holds.
+data JobWork = JobWork !ArenaId !RegionCoord !Word64 !Word64 !Word64
+  deriving stock (Eq, Show)
+
+jobWorkArena ∷ JobWork → ArenaId
+jobWorkArena (JobWork a _ _ _ _) = a
+
+jobWorkRegion ∷ JobWork → RegionCoord
+jobWorkRegion (JobWork _ r _ _ _) = r
+
+jobWorkResident ∷ JobWork → Word64
+jobWorkResident (JobWork _ _ n _ _) = n
+
+jobWorkScratch ∷ JobWork → Word64
+jobWorkScratch (JobWork _ _ _ n _) = n
+
+jobWorkSlots ∷ JobWork → Word64
+jobWorkSlots (JobWork _ _ _ _ n) = n
+
+-- | A preparation the owner is running for a request: the request, its arena, whether it
+-- is a removal, the command record it reads under, and, for a removal, the resident
+-- growth, staging and retained-edit bytes its buffers and result can hold.
+data PreparationWork = PreparationWork !RequestId !(Maybe ArenaId) !Bool !Word64 !Word64 !Word64 !Word64
+  deriving stock (Eq, Show)
+
+preparationRequest ∷ PreparationWork → RequestId
+preparationRequest (PreparationWork r _ _ _ _ _ _) = r
+
+preparationArena ∷ PreparationWork → Maybe ArenaId
+preparationArena (PreparationWork _ a _ _ _ _ _) = a
+
+preparationRemoval ∷ PreparationWork → Bool
+preparationRemoval (PreparationWork _ _ r _ _ _ _) = r
+
+preparationRecordBytes ∷ PreparationWork → Word64
+preparationRecordBytes (PreparationWork _ _ _ n _ _ _) = n
+
+preparationResident ∷ PreparationWork → Word64
+preparationResident (PreparationWork _ _ _ _ n _ _) = n
+
+preparationStaging ∷ PreparationWork → Word64
+preparationStaging (PreparationWork _ _ _ _ _ n _) = n
+
+preparationEdit ∷ PreparationWork → Word64
+preparationEdit (PreparationWork _ _ _ _ _ _ n) = n
+
+-- | The temporary duplicate of a region's changes the owner holds while it transfers
+-- them: where, and how many bytes.
+data HandoffWork = HandoffWork !ArenaId !RegionCoord !Word64
+  deriving stock (Eq, Show)
+
+handoffWorkArena ∷ HandoffWork → ArenaId
+handoffWorkArena (HandoffWork a _ _) = a
+
+handoffWorkRegion ∷ HandoffWork → RegionCoord
+handoffWorkRegion (HandoffWork _ r _) = r
+
+handoffWorkDuplicate ∷ HandoffWork → Word64
+handoffWorkDuplicate (HandoffWork _ _ n) = n
+
+-- | The jobs, the preparation and the handoff duplicates of a record, oldest first.
+runningJobs ∷ RunningWork → [JobWork]
+runningJobs = Map.elems . rwJobs
+
+runningPreparation ∷ RunningWork → Maybe PreparationWork
+runningPreparation = rwPreparation
+
+runningHandoffs ∷ RunningWork → [HandoffWork]
+runningHandoffs = Map.elems . rwHandoffs
+
+-- | One arena as the service holds it: whether it is retiring, the accounted bytes its
+-- resident detail holds in each vertical region (from the detail itself), and the
+-- bytes of its retained changes.
+data ArenaCensus = ArenaCensus !ArenaId !Bool !(Map RegionCoord Word64) !Word64
+  deriving stock (Eq, Show)
+
+censusArena ∷ ArenaCensus → ArenaId
+censusArena (ArenaCensus a _ _ _) = a
+
+censusRetiring ∷ ArenaCensus → Bool
+censusRetiring (ArenaCensus _ r _ _) = r
+
+censusRegionBytes ∷ ArenaCensus → Map RegionCoord Word64
+censusRegionBytes (ArenaCensus _ _ m _) = m
+
+censusRetainedBytes ∷ ArenaCensus → Word64
+censusRetainedBytes (ArenaCensus _ _ _ n) = n
+
+-- | One request as the service holds it: the regions it demands, whether it is a
+-- removal, whether the model still holds its record and credits, whether it has
+-- settled (its result waiting to be taken), and whether it was withdrawn behind a
+-- running preparation and is still charged.
+data RequestCensus = RequestCensus !Int !Bool !Bool !Bool !Bool
+  deriving stock (Eq, Show)
+
+censusRegions ∷ RequestCensus → Int
+censusRegions (RequestCensus n _ _ _ _) = n
+
+censusRemoval ∷ RequestCensus → Bool
+censusRemoval (RequestCensus _ r _ _ _) = r
+
+censusModelRecord ∷ RequestCensus → Bool
+censusModelRecord (RequestCensus _ _ m _ _) = m
+
+censusSettled ∷ RequestCensus → Bool
+censusSettled (RequestCensus _ _ _ s _) = s
+
+censusGhost ∷ RequestCensus → Bool
+censusGhost (RequestCensus _ _ _ _ g) = g
+
+-- | What the service itself holds, read from its own data structures and not from
+-- the accounting model: its arenas (live, and retiring while a borrowed snapshot or an
+-- unfinished release keeps one), its requests, the number of outstanding snapshots and
+-- the record of the work its owner is running.
+data Census = Census ![ArenaCensus] ![RequestCensus] !Int !RunningWork
+
+censusArenas ∷ Census → [ArenaCensus]
+censusArenas (Census a _ _ _) = a
+
+censusRequests ∷ Census → [RequestCensus]
+censusRequests (Census _ r _ _) = r
+
+censusBorrows ∷ Census → Int
+censusBorrows (Census _ _ b _) = b
+
+censusRunning ∷ Census → RunningWork
+censusRunning (Census _ _ _ w) = w
+
+-- ---------------------------------------------------------------------------
 -- State
 
 -- | One live arena incarnation. The contents (the resident detail, palette,
@@ -539,6 +740,9 @@ data St = St
     -- capacity. That is not a failed transfer: the region is reconsidered as soon
     -- as the epoch moves.
     stateHandoffBusy ∷ !(Map RegionKey Word64)
+  , -- | The read-only record of the work the owner is running (see 'RunningWork'):
+    -- written by the owner where that work starts and ends, read by no decision.
+    stateWork ∷ !RunningWork
   }
 
 initialState ∷ Config → Limits → St
@@ -575,6 +779,7 @@ initialState config limits =
     , stateDeferredRetire = Set.empty
     , stateCapacityEpoch = 0
     , stateHandoffBusy = Map.empty
+    , stateWork = noRunningWork
     }
   where
     first = configFirstIdentity config

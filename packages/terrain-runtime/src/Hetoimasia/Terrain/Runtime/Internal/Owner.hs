@@ -246,7 +246,7 @@ perform svc = \case
   WCloseSession → atomically (closeServiceSTM svc) >> pure True
   WVictim key → releaseVictim svc key >> pure True
   WAck jid → do
-    atomically (void (applyEvent svc (R.JobAcknowledged jid)) >> markFreed svc)
+    atomically (void (applyEvent svc (R.JobAcknowledged jid)) >> endJobWork svc jid >> markFreed svc)
     pure True
   WHandoff aid region → handoff svc aid region >> pure True
   WPrepare rid → takeTurn svc TurnCommit >> prepareReq svc rid >> pure True
@@ -347,7 +347,7 @@ handoff svc aid region = do
         let working = Map.lookup region (arenaWorking arena)
             duplicate = maybe 0 (fromIntegral . changesBytes) working
         applyEvent svc (R.BeginHandoff aid region duplicate) >>= \case
-          Right _ → pure (False, Just working)
+          Right _ → startHandoffWork svc aid region duplicate >> pure (False, Just working)
           -- Capacity pressure is not a failed transfer: the region stays a candidate
           -- and is reconsidered when capacity is returned (R2). Only a refusal that
           -- can never clear ends the attempt.
@@ -360,6 +360,7 @@ handoff svc aid region = do
       st <- readSt svc
       let generation = maybe 0 fromIntegral (regionGeneration st aid region)
       modifySt svc (rememberTried (aid, region) generation)
+      endHandoffWork svc aid region
       case outcome of
         Right () → do
           modifySt svc $ \s →
@@ -380,7 +381,14 @@ handoff svc aid region = do
 -- | Run the next queued load job on real resident detail.
 dispatchJob ∷ Service → IO ()
 dispatchJob svc = do
-  dispatched <- atomically (applyEvent svc R.Dispatch)
+  -- The job is recorded in the transaction that dispatches it, from the coverage it
+  -- loads: the record exists exactly while the model holds the job running.
+  dispatched <- atomically $ do
+    outcome <- applyEvent svc R.Dispatch
+    forM_ outcome $ \report → case R.reportDecision report of
+      R.Dispatched jid (aid, region) cover → startJobWork svc jid aid region cover
+      _ → pure ()
+    pure outcome
   case dispatched of
     Right report
       | R.Dispatched jid (aid, region) cover <- R.reportDecision report → do
@@ -397,6 +405,8 @@ dispatchJob svc = do
 -- accounting defect when the model refuses what a valid job reported.
 finishJob ∷ Service → R.JobId → ArenaId → Either String (Palette, Resident, R.Cost) → STM (Maybe Text)
 finishJob svc jid aid result = do
+  -- The job's report ends its record, in the same transaction as the report.
+  endJobWork svc jid
   st <- readSt svc
   let cancelling = not (null [() | j <- R.modelJobs (stateModel st), R.jobId j == jid, R.jobPhase j == R.JobCancellingPhase])
   outcome <-

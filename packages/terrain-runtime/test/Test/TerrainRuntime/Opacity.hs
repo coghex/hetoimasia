@@ -12,8 +12,12 @@
 --   snapshot or of the service cannot be named, so a client cannot forge arena
 --   authority, a mutable snapshot or the authority to settle a request:
 --   @GHC-10237@ for an import and @GHC-01928@ for a term-level use;
--- * an exported accessor of a snapshot is a function, never a field label, so
---   record-update syntax cannot rewrite one: @GHC-22385@;
+-- * an exported accessor of a snapshot, or of a read-only inspection value (the census,
+--   its arenas and requests, and the record of the owner's running work), is a function,
+--   never a field label, so record-update syntax cannot rewrite one: @GHC-22385@; the
+--   constructors of those inspection types are refused like an authority's, so a client
+--   cannot construct or forge one (and none carries an authority, a handle or a
+--   snapshot);
 -- * each hidden module is refused as a hidden module of the package's library,
 --   @GHC-87110@.
 module Test.TerrainRuntime.Opacity (spec) where
@@ -72,6 +76,14 @@ spec = describe "Terrain runtime opacity across the package boundary" $ do
         clientOutput outcome `shouldContain` "Not in scope: record field"
         clientOutput outcome `shouldContain` name
 
+  forM_ inspectionUpdates $ \(name, imports, source) →
+    it ("rejects a client that rewrites an inspection value through " <> name <> " with record-update syntax") $
+      withClient "Client.hs" (clientImporting imports source) $ \compile → do
+        outcome <- compile Typecheck
+        rejectedBecause outcome "GHC-22385"
+        clientOutput outcome `shouldContain` "Not in scope: record field"
+        clientOutput outcome `shouldContain` name
+
   forM_ hidden $ \module' →
     it ("rejects a client that imports the hidden module " <> module') $
       withClient "Client.hs" (unlines ["module Client () where", "", "import " <> module']) $ \compile → do
@@ -114,6 +126,14 @@ constructors =
   , ("Snapshot", ["import Hetoimasia.Terrain.Runtime (Snapshot (Snapshot))"])
   , ("Service", ["import Hetoimasia.Terrain.Runtime (Service (Service))"])
   , ("Pending", ["import Hetoimasia.Terrain.Runtime (Pending (Pending))"])
+  , -- The read-only inspection types: a client reads them through accessors only.
+    ("Census", ["import Hetoimasia.Terrain.Runtime (Census (Census))"])
+  , ("ArenaCensus", ["import Hetoimasia.Terrain.Runtime (ArenaCensus (ArenaCensus))"])
+  , ("RequestCensus", ["import Hetoimasia.Terrain.Runtime (RequestCensus (RequestCensus))"])
+  , ("RunningWork", ["import Hetoimasia.Terrain.Runtime (RunningWork (RunningWork))"])
+  , ("JobWork", ["import Hetoimasia.Terrain.Runtime (JobWork (JobWork))"])
+  , ("PreparationWork", ["import Hetoimasia.Terrain.Runtime (PreparationWork (PreparationWork))"])
+  , ("HandoffWork", ["import Hetoimasia.Terrain.Runtime (HandoffWork (HandoffWork))"])
   ]
 
 -- | An authority forged by applying a constructor the client never imported.
@@ -123,6 +143,13 @@ forged =
   , ("Client", ["import Hetoimasia.Terrain.Runtime (Client)"], ["forgedClient :: Client", "forgedClient = Client undefined 0"])
   , ("Request", ["import Hetoimasia.Terrain.Runtime (Request)"], ["forgedRequest :: Request", "forgedRequest = Request undefined undefined"])
   , ("Snapshot", ["import Hetoimasia.Terrain.Runtime (Snapshot)"], ["forgedSnapshot :: Snapshot", "forgedSnapshot = Snapshot undefined undefined undefined undefined undefined undefined"])
+  , ("Census", ["import Hetoimasia.Terrain.Runtime (Census)"], ["forgedCensus :: Census", "forgedCensus = Census [] [] 0 undefined"])
+  , ("ArenaCensus", ["import Hetoimasia.Terrain.Runtime (ArenaCensus)"], ["forgedArena :: ArenaCensus", "forgedArena = ArenaCensus undefined False undefined 0"])
+  , ("RequestCensus", ["import Hetoimasia.Terrain.Runtime (RequestCensus)"], ["forgedRequestCensus :: RequestCensus", "forgedRequestCensus = RequestCensus 0 False False False False"])
+  , ("RunningWork", ["import Hetoimasia.Terrain.Runtime (RunningWork)"], ["forgedWork :: RunningWork", "forgedWork = RunningWork undefined Nothing undefined"])
+  , ("JobWork", ["import Hetoimasia.Terrain.Runtime (JobWork)"], ["forgedJob :: JobWork", "forgedJob = JobWork undefined undefined 0 0 1"])
+  , ("PreparationWork", ["import Hetoimasia.Terrain.Runtime (PreparationWork)"], ["forgedPreparation :: PreparationWork", "forgedPreparation = PreparationWork undefined Nothing True 0 0 0 0"])
+  , ("HandoffWork", ["import Hetoimasia.Terrain.Runtime (HandoffWork)"], ["forgedHandoff :: HandoffWork", "forgedHandoff = HandoffWork undefined undefined 0"])
   ]
 
 -- | A snapshot rewritten through an exported accessor used as a field label.
@@ -133,12 +160,26 @@ recordUpdates =
   , ("snapshotGeneration", ["import Hetoimasia.Terrain.Runtime (Snapshot, snapshotGeneration)"], ["later :: Snapshot -> Snapshot", "later s = s {snapshotGeneration = snapshotGeneration s}"])
   ]
 
+-- | An inspection value rewritten through an exported accessor used as a field label:
+-- the accessors are functions, never field labels, so the update is refused.
+inspectionUpdates ∷ [(String, [String], [String])]
+inspectionUpdates =
+  [ ("censusArenas", ["import Hetoimasia.Terrain.Runtime (Census, censusArenas)"], ["emptied :: Census -> Census", "emptied c = c {censusArenas = []}"])
+  , ("censusRetainedBytes", ["import Hetoimasia.Terrain.Runtime (ArenaCensus, censusRetainedBytes)"], ["lighter :: ArenaCensus -> ArenaCensus", "lighter a = a {censusRetainedBytes = 0}"])
+  , ("censusModelRecord", ["import Hetoimasia.Terrain.Runtime (RequestCensus, censusModelRecord)"], ["recordless :: RequestCensus -> RequestCensus", "recordless r = r {censusModelRecord = False}"])
+  , ("jobWorkResident", ["import Hetoimasia.Terrain.Runtime (JobWork, jobWorkResident)"], ["cheaper :: JobWork -> JobWork", "cheaper j = j {jobWorkResident = 0}"])
+  , ("preparationStaging", ["import Hetoimasia.Terrain.Runtime (PreparationWork, preparationStaging)"], ["lean :: PreparationWork -> PreparationWork", "lean p = p {preparationStaging = 0}"])
+  , ("handoffWorkDuplicate", ["import Hetoimasia.Terrain.Runtime (HandoffWork, handoffWorkDuplicate)"], ["smaller :: HandoffWork -> HandoffWork", "smaller h = h {handoffWorkDuplicate = 0}"])
+  , ("runningJobs", ["import Hetoimasia.Terrain.Runtime (RunningWork, runningJobs)"], ["idle :: RunningWork -> RunningWork", "idle w = w {runningJobs = []}"])
+  ]
+
 supportedClient ∷ String
 supportedClient =
   unlines
     [ "{-# LANGUAGE OverloadedStrings #-}"
     , "module Main (main) where"
     , ""
+    , "import Control.Concurrent.STM (atomically)"
     , "import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)"
     , "import Hetoimasia.Foundation.Worker (withWorkerGroup)"
     , "import Hetoimasia.Terrain.Cell"
@@ -173,6 +214,8 @@ supportedClient =
     , "    Right third <- cellAt svc lease2 at"
     , "    Right fresh <- await svc third"
     , "    print (cellRevision fresh == Revision 0)"
+    , "    census <- atomically (inspectCensusSTM svc)"
+    , "    print (censusBorrows census, length (runningJobs (censusRunning census)))"
     , "    inspectInvariants svc >>= print"
     ]
 
@@ -183,5 +226,6 @@ supportedOutput =
   , "(Revision 1,True)"
   , "Right ()"
   , "True"
+  , "(0,0)"
   , "[]"
   ]

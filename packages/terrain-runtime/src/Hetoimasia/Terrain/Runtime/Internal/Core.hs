@@ -36,6 +36,12 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
   , demandFor
   , pendingEdits
 
+    -- * The read-only record of the owner's running work
+  , startJobWork
+  , endJobWork
+  , startHandoffWork
+  , endHandoffWork
+
     -- * Settlement
   , terminate
   , terminateWith
@@ -96,6 +102,7 @@ import Hetoimasia.Terrain.Residency (ArenaId (..), HoldId (..), RegionDemand, Re
 import Hetoimasia.Terrain.Runtime.Internal.Content
 import Hetoimasia.Terrain.Runtime.Internal.Snapshot
 import Hetoimasia.Terrain.Resident (ResidentStats (..), discardRegion, residentStats)
+import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Source (Source, SourceError)
 
@@ -605,6 +612,38 @@ retireArenaRecord svc aid = do
     Just (_, Just running) | running == aid → modifySt svc (\s → s {stateDeferredRetire = Set.insert aid (stateDeferredRetire s)})
     _ → void (applyEvent svc (R.RetireArena aid))
 
+-- | What a preparation holds, from the command it runs: the command record it reads
+-- under and, for a removal, the resident growth, staging and retained-edit bytes its
+-- buffers and its result can hold (a segment's worst case: two bytes a cell, a dense
+-- segment of 'maxSegmentLevels' cells). Recorded for inspection only.
+preparationWorkOf ∷ RequestId → Req → PreparationWork
+preparationWorkOf rid req = case reqCmd req of
+  CRemove {} → PreparationWork rid (reqArena req) True recordBytes (2 * fromIntegral maxSegmentLevels - 2) R.removalStagingBytes R.removalRetainedBytes
+  _ → PreparationWork rid (reqArena req) False recordBytes 0 0 0
+  where
+    recordBytes = R.commandRecordBytes (fromIntegral (Set.size (Set.fromList (map R.demandRegion (reqDemand req)))))
+
+-- | The owner starts running a load job: record it, from the coverage it loads, in the
+-- same transaction that dispatched it. Read-only bookkeeping: nothing decides by it.
+startJobWork ∷ Service → R.JobId → ArenaId → RegionCoord → R.Coverage → STM ()
+startJobWork svc jid aid region cover =
+  modifySt svc $ \st →
+    st {stateWork = (stateWork st) {rwJobs = Map.insert jid (JobWork aid region (fromMaybe 0 (R.costBytes (R.reserveCost cover))) (R.scratchBytes cover) 1) (rwJobs (stateWork st))}}
+
+-- | The job's report (completed, failed or acknowledged) ends its record, in the
+-- transaction that reports it.
+endJobWork ∷ Service → R.JobId → STM ()
+endJobWork svc jid = modifySt svc (\st → st {stateWork = (stateWork st) {rwJobs = Map.delete jid (rwJobs (stateWork st))}})
+
+-- | The owner holds the duplicate of a region's changes while it transfers them.
+startHandoffWork ∷ Service → ArenaId → RegionCoord → Word64 → STM ()
+startHandoffWork svc aid region duplicate =
+  modifySt svc $ \st →
+    st {stateWork = (stateWork st) {rwHandoffs = Map.insert (aid, region) (HandoffWork aid region duplicate) (rwHandoffs (stateWork st))}}
+
+endHandoffWork ∷ Service → ArenaId → RegionCoord → STM ()
+endHandoffWork svc aid region = modifySt svc (\st → st {stateWork = (stateWork st) {rwHandoffs = Map.delete (aid, region) (rwHandoffs (stateWork st))}})
+
 -- | The owner starts running a request's preparation, if the request is still
 -- there to prepare: from now until the safe point nothing it holds is released.
 beginRunning ∷ Service → RequestId → STM Bool
@@ -613,7 +652,7 @@ beginRunning svc rid = do
   case Map.lookup rid (stateRequests st) of
     Nothing → pure False
     Just req → do
-      modifySt svc (\s → s {stateRunning = Just (rid, reqArena req)})
+      modifySt svc (\s → s {stateRunning = Just (rid, reqArena req), stateWork = (stateWork s) {rwPreparation = Just (preparationWorkOf rid req)}})
       pure True
 
 -- | The owner's safe point: no preparation is running, so what was deferred is
@@ -621,7 +660,7 @@ beginRunning svc rid = do
 safePointSTM ∷ Service → STM ()
 safePointSTM svc = do
   st <- readSt svc
-  modifySt svc (\s → s {stateRunning = Nothing, stateGhosts = Map.empty, stateDeferredRetire = Set.empty})
+  modifySt svc (\s → s {stateRunning = Nothing, stateGhosts = Map.empty, stateDeferredRetire = Set.empty, stateWork = (stateWork s) {rwPreparation = Nothing}})
   forM_ (Map.keys (stateGhosts st)) $ \rid → applyEvent svc (R.Withdraw rid)
   forM_ (Set.toList (stateDeferredRetire st)) (applyEvent svc . R.RetireArena)
   markFreed svc
@@ -988,8 +1027,9 @@ retireInFlightSTM ∷ Service → STM ()
 retireInFlightSTM svc = do
   st <- readSt svc
   let model = stateModel st
-  forM_ [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions model, isJust (R.regionHandoff r)] $ \(aid, region) →
-    applyEvent svc (R.HandoffFailed aid region)
+  forM_ [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions model, isJust (R.regionHandoff r)] $ \(aid, region) → do
+    void (applyEvent svc (R.HandoffFailed aid region))
+    endHandoffWork svc aid region
   victims <- stateVictims <$> readSt svc
   forM_ victims $ \key@(aid, region) → do
     modifySt svc $ \cur →
@@ -1001,8 +1041,13 @@ retireInFlightSTM svc = do
     applyEvent svc (R.VictimReleased aid region)
   modifySt svc (\cur → cur {stateVictims = Seq.empty})
   after <- readSt svc
-  forM_ [R.jobId j | j <- R.modelJobs (stateModel after), R.jobPhase j == R.JobCancellingPhase] $ \jid →
-    applyEvent svc (R.JobAcknowledged jid)
+  forM_ [R.jobId j | j <- R.modelJobs (stateModel after), R.jobPhase j == R.JobCancellingPhase] $ \jid → do
+    void (applyEvent svc (R.JobAcknowledged jid))
+    endJobWork svc jid
+  -- No transfer is outstanding any more, and a job the model no longer holds has ended.
+  final <- readSt svc
+  let liveJobs = Set.fromList [R.jobId j | j <- R.modelJobs (stateModel final)]
+  modifySt svc (\cur → cur {stateWork = (stateWork cur) {rwHandoffs = Map.empty, rwJobs = Map.filterWithKey (\jid _ → Set.member jid liveJobs) (rwJobs (stateWork cur))}})
   markFreed svc
   where
     discardOf region a = a {arenaResident = discardRegion region (arenaResident a), arenaGeneration = bumpGeneration (arenaGeneration a)}

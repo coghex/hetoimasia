@@ -101,9 +101,44 @@ module Hetoimasia.Terrain.Runtime
   , inspectLimits
   , LimitRow (..)
   , inspectCensusSTM
-  , Census (..)
-  , ArenaCensus (..)
-  , RequestCensus (..)
+  , Census
+  , censusArenas
+  , censusRequests
+  , censusBorrows
+  , censusRunning
+  , ArenaCensus
+  , censusArena
+  , censusRetiring
+  , censusRegionBytes
+  , censusRetainedBytes
+  , RequestCensus
+  , censusRegions
+  , censusRemoval
+  , censusModelRecord
+  , censusSettled
+  , censusGhost
+  , RunningWork
+  , runningJobs
+  , runningPreparation
+  , runningHandoffs
+  , JobWork
+  , jobWorkArena
+  , jobWorkRegion
+  , jobWorkResident
+  , jobWorkScratch
+  , jobWorkSlots
+  , PreparationWork
+  , preparationRequest
+  , preparationArena
+  , preparationRemoval
+  , preparationRecordBytes
+  , preparationResident
+  , preparationStaging
+  , preparationEdit
+  , HandoffWork
+  , handoffWorkArena
+  , handoffWorkRegion
+  , handoffWorkDuplicate
   , inspectReadmissionWaits
   , inspectReadmissionWaitsSTM
   , inspectArena
@@ -121,7 +156,6 @@ import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.Foundation.Worker (StartOutcome (..), WorkerGroup, awaitCompletion, requestStop, startWorker)
 import Hetoimasia.Terrain.Cell (Column (..), ZRange)
-import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Hetoimasia.Terrain.Changes (Changes, changesBytes)
 import Hetoimasia.Terrain.Coordinate (RegionCoord, TileCoord (..), decomposeTile)
@@ -407,20 +441,24 @@ inspectLimits svc = limitRows (serviceConfig svc) <$> readTVarIO (serviceState s
 -- accounting model: for every arena it keeps (live, and retiring while a borrowed
 -- snapshot or an unfinished release keeps it) the size of its resident detail, its
 -- retained changes and the regions that detail covers; every request it holds, in the
--- table or withdrawn behind a running preparation; and its outstanding snapshots. A
--- diagnostic for verification: read-only, it changes nothing, and no production caller
--- uses it (owner ruling on the issue: a read-only test inspector is allowed). A
--- transaction, so it can be read in one look with the model.
+-- table or withdrawn behind a running preparation; its outstanding snapshots; and the
+-- record of the work its owner is running (each load job with its reservation, scratch
+-- and slot, the preparation, each handoff duplicate), written by the owner where that
+-- work starts and ends.
+--
+-- A diagnostic for verification: read-only, it changes nothing, takes no hold, interest
+-- or reservation, and no production caller or decision uses it or the record (owner
+-- rulings on the issue: a read-only test inspector and a read-only record of the running
+-- work are allowed). It returns plain observational data only: counts, byte figures,
+-- states and inert identities, never a client, lease or arena authority, a request or
+-- settlement handle, an endpoint or a snapshot. Its types are abstract: a client cannot
+-- construct, forge or update one. A transaction, so it can be read in one look with the
+-- model.
 inspectCensusSTM ∷ Service → STM Census
 inspectCensusSTM svc = do
   st <- readSt svc
   let arenaRows retiring arenas =
-        [ ArenaCensus
-            { censusArena = aid
-            , censusRetiring = retiring
-            , censusRegionBytes = regionBytesOf (arenaResident a)
-            , censusRetainedBytes = fromIntegral (changesBytes (arenaChanges a))
-            }
+        [ ArenaCensus aid retiring (regionBytesOf (arenaResident a)) (fromIntegral (changesBytes (arenaChanges a)))
         | (aid, a) ← Map.toList arenas
         ]
       -- What the detail itself holds in each vertical region: the fixed metadata of a
@@ -439,51 +477,20 @@ inspectCensusSTM svc = do
           ]
       requestRows ghost reqs =
         [ RequestCensus
-            { censusRegions = Set.size (Set.fromList (map R.demandRegion (reqDemand req)))
-            , censusRemoval = case reqCmd req of CRemove {} → True; _ → False
-            , censusModelRecord = reqModel req
-            , censusSettled = case reqPhase req of Done → True; _ → False
-            , censusGhost = ghost
-            }
+            (Set.size (Set.fromList (map R.demandRegion (reqDemand req))))
+            (case reqCmd req of CRemove {} → True; _ → False)
+            (reqModel req)
+            (case reqPhase req of Done → True; _ → False)
+            ghost
         | req ← Map.elems reqs
         ]
   pure
-    Census
-      { censusArenas = arenaRows False (stateArenas st) <> arenaRows True (stateRetiring st)
-      , censusRequests = requestRows False (stateRequests st) <> requestRows True (stateGhosts st)
-      , censusBorrows = Map.size (stateSnapshots st)
-      }
-
--- | One arena as the service holds it.
-data ArenaCensus = ArenaCensus
-  { censusArena ∷ !ArenaId
-  , censusRetiring ∷ !Bool
-  , -- | The accounted bytes its resident detail holds in each vertical region, from the
-    -- detail itself.
-    censusRegionBytes ∷ !(Map RegionCoord Word64)
-  , -- | The bytes of its retained changes.
-    censusRetainedBytes ∷ !Word64
-  }
-  deriving stock (Eq, Show)
-
--- | One request as the service holds it.
-data RequestCensus = RequestCensus
-  { censusRegions ∷ !Int
-  , censusRemoval ∷ !Bool
-  , -- | Whether the model still holds its record and credits.
-    censusModelRecord ∷ !Bool
-  , censusSettled ∷ !Bool
-  , -- | Withdrawn behind a running preparation, still charged.
-    censusGhost ∷ !Bool
-  }
-  deriving stock (Eq, Show)
-
-data Census = Census
-  { censusArenas ∷ ![ArenaCensus]
-  , censusRequests ∷ ![RequestCensus]
-  , censusBorrows ∷ !Int
-  }
-  deriving stock (Eq, Show)
+    ( Census
+        (arenaRows False (stateArenas st) <> arenaRows True (stateRetiring st))
+        (requestRows False (stateRequests st) <> requestRows True (stateGhosts st))
+        (Map.size (stateSnapshots st))
+        (stateWork st)
+    )
 
 inspectSnapshotBytes ∷ Service → IO (Word64, Word64)
 inspectSnapshotBytes svc = do

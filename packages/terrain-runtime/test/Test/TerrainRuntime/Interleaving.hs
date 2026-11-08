@@ -24,7 +24,7 @@ import Hetoimasia.Terrain.Source (SourceSpec)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures
-import Test.TerrainRuntime.Usage (jobRunningDisagreements, usageDisagreements)
+import Test.TerrainRuntime.Usage (jobStartDisagreements, usageDisagreements)
 
 data World = World
   { wClients ∷ IORef [Client]
@@ -139,10 +139,14 @@ runSeed config inject seed = do
         pure (length [() | [Succeeded _] <- outcomes], retiring, jobs)
   where
     head' = \case (x : _) → Just x; [] → Nothing
+    -- Everything has ended: no charge outlives its holder, so every bank reads zero,
+    -- occupied as well as reserved (an arena's whole retained account, a coalescing
+    -- excess included, goes back when the arena retires), and so does every slot.
     settledModel m =
-      and [ledgerReserved (bankLedger m b) == 0 | b ← [ResidentBank, EditBank, StagingBank]]
+      and [ledgerReserved (bankLedger m b) == 0 && ledgerOccupied (bankLedger m b) == 0 | b ← [ResidentBank, EditBank, StagingBank]]
         && slotInUse m CommandSlot == 0
         && slotInUse m LoadJobSlot == 0
+        && null (modelArenas m)
 
 -- | The state is coherent, no defect was recorded and every limit's count equals what
 -- holds the resource, wherever it is looked at: between steps and inside a borrow.
@@ -198,15 +202,15 @@ usageHere svc world where' = do
   let usage = usageDisagreements census model
   unless (null usage) $ atomicModifyIORef' (wTrouble world) (\t → ((where' <> ": " <> show usage) : t, ()))
 
--- | The owner is about to run a load job: the model must hold it running, with its slot
--- and reservations, and every bank still covers what the service holds.
+-- | The owner is about to run a load job: it recorded the job (with its slot and its
+-- reservation and scratch), the model still holds it running in those amounts, and every
+-- bank, slot and arena still covers what the service holds.
 job ∷ IORef (Maybe (Service, World)) → ArenaId → RegionCoord → IO ()
 job hook arena loaded = readIORef hook >>= mapM_ (\(svc, world) → do
-  model <- inspectModel svc
-  let found = jobRunningDisagreements model arena loaded
+  (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
+  let found = jobStartDisagreements census model arena loaded
   unless (null found) $ atomicModifyIORef' (wTrouble world) (\t → (("at a job: " <> show found) : t, ()))
-  atomicModifyIORef' (wJobs world) (\n → (n + 1, ()))
-  usageHere svc world "at a job")
+  atomicModifyIORef' (wJobs world) (\n → (n + 1, ())))
 
 -- | Leases that have settled since the last look become usable.
 harvest ∷ World → IO ()
