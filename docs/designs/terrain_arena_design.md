@@ -15,7 +15,8 @@ mutation or implementation is authorized by this amendment's draft proposals.
 
 Lighting scope resolved by D-29: expose sun position to the face-map shader
 for previewing the tiles; defer the automatic day/night cycle and eventual
-moon lighting. Q-16–Q-19 still block amendment readiness.
+moon lighting. Q-16/Q-19/Q-20 still block amendment readiness; D-55/D-57
+specify the asset/sampling and numerical lighting contracts.
 
 Picking scope resolved by D-30: select from the adopted drawn quads in
 front-to-back order using matching artwork/face-map coverage. Q-16 remains
@@ -134,7 +135,12 @@ CPU/GPU edge agreement. Q-17 is specified; implementation proof remains due.
 D-56 selects surface-normal RGB lighting in the same RGBA cutout texture.
 Normals follow the approved shape geometry and world-fixed sun; P-11's
 alpha, sampling and ownership contract remains. Exact encoding/equations are
-the proposed P-13 contract, not yet approved.
+specified by P-13, approved through D-57.
+
+D-57 approves P-13's numerical lighting contract: validated normal encoding,
+Lua settings/defaults, world-fixed diffuse/ambient shading, fixed depth range
+and linear-light darkening followed by haze. Q-18 is specified; solver
+qualification and owner visual acceptance remain required.
 
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
@@ -1729,6 +1735,28 @@ Include low-angle sunlight on opposing ramps and all peak facets, ambient/sun
 independence and world-surface consistency through four camera facings in
 the solver's proof. No implementation or tracker mutation occurs here.
 
+### D-57. Adopt P-13's numerical lighting and depth-effect contract
+
+Owner, directly in this design pane on 2026-11-08, answered “approved” to
+P-13 as written at `f052296f6e`. The review named encoded-normal validation,
+southwest sunlight at 45 degrees, 35% ambient and full direct strength,
+15% darkening and 60% blue haze over a fixed 250-level range, post-lighting
+haze blending, independent Lua controls, zero direct sun at/below the horizon
+and required numerical/side-by-side visual evidence.
+
+Adopt P-13's exact `unit-normal-rgb-v1` encoding and additional bounded
+`normal_encoding` texture option, lighting/depth schema and defaults, atomic
+configuration behavior, equations/composition order, existing-ABI packing
+direction and qualification obligations. Its numerical/API choices are now
+the initial contract. Lua can tune the settings within the approved ranges;
+the defaults are starting values, not a claim of visually accepted output.
+
+This resolves Q-18's specification. The normal-map correction, material
+implementation, exact sampling agreement and D-44/D-47/D-48 evidence still
+need solver proof and owner visual acceptance. Geometry emission/ordering
+and discovery/storage mechanics remain Q-16/Q-20; Q-19 must assign delivery.
+There is no code or tracker mutation in this design turn.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2789,7 +2817,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-56 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-57 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2869,9 +2897,9 @@ D-54 supplies independent Lua ambient control; changing sun position alone
 does not change ambient illumination.
 D-56 replaces RGB face-brightness weights with encoded surface normals in
 the same cutout data texture. P-12 records the reason and required proof;
-P-13 proposes its exact numerical/configuration contract.
-Exact units/binding, depth/colour equations and initial strengths remain Q-18;
-this paragraph settles no other amendment proposal.
+P-13 supplies its exact numerical/configuration contract, approved by D-57.
+This specifies units, bindings, depth/colour equations and initial strengths;
+the material and visual result still require qualification.
 
 D-48 approves P-10's viewport-driven demand, view-aware eviction and explicit
 background/haze regression within D-42's existing budgets. The face-map path
@@ -3331,8 +3359,9 @@ terrain; partial translucency would require a later contract.
 
 D-56 subsequently replaces the RGB face-weight meaning below with encoded
 surface normals. The approved alpha, dimensions, sampling, loading and
-ownership clauses remain; P-13 separately proposes encoding validation and
-exact lighting parameters. This annotation preserves the signed P-11 text.
+ownership clauses remain; P-13 supplies encoding validation and exact lighting
+parameters, approved by D-57. This annotation preserves
+the signed P-11 text.
 
 **Verified fit with the reference and current engine.** At S `3777d437`,
 `assets/textures/world/loam/loam.png` and
@@ -3473,8 +3502,8 @@ cannot be silently interpreted as normals. It needs no additional texture
 per cell or new vertex/depth ABI by the source-level feasibility reading;
 the material implementation still requires qualification. Do not promise
 performance parity without measurement. Exact normal encoding, directional
-equation, default sun/ambient values and depth-effect composition remain
-Q-18 contract work, proposed concretely in P-13.
+equation, default sun/ambient values and depth-effect composition are specified
+by P-13, approved through D-57.
 
 The rejected alternative retains the stylized three-face brightness blend
 and its surface-orientation limits. Under D-56, solver evidence must
@@ -3482,11 +3511,12 @@ include the low-angle ramp case, opposite slopes and all facets of ID 15,
 sun/ambient independence, and the same world-facing surface under all four
 camera facings, alongside D-44/P-11's cutout/picking proof.
 
-### P-13. Numerical preview lighting contract — proposal for review
+### P-13. Numerical preview lighting contract — approved by D-57
 
-This completes the proposed Q-18 specification under D-29/D-46/D-47/D-54/D-56.
-The numbers, API additions and depth-effect composition below require owner
-approval. They are initial preview defaults, not measured visual acceptance.
+This Q-18 specification under D-29/D-46/D-47/D-54/D-56 was approved as written
+at `f052296f6e` by D-57, including the numbers, API additions and depth-effect
+composition below. These are initial preview defaults, not measured visual
+acceptance.
 
 **Normal encoding and validation.** Name the data encoding
 `unit-normal-rgb-v1`. Store a unit surface normal in RGB bytes as
@@ -3514,8 +3544,8 @@ asset identity. Malformed normals are an expected content refusal. Terrain
 mask loads request this option plus `coverage="binary"`; attachment requires
 that encoding fact. A raw data handle or an old face-weight map does not
 silently acquire normal-map authority. Omitted encoding preserves P-11's
-generic colour/data behavior. This is an additional proposed texture option;
-it is not already authorized by D-55 alone. Keep the validator generic to
+generic colour/data behavior. This additional texture option is approved by
+D-57, extending D-55. Keep the validator generic to
 normal data, without importing terrain/game code into the decoder.
 
 **Lua settings.** Add optional `lighting` and `depth` records to the terrain
@@ -3614,8 +3644,148 @@ the intentional tint-to-haze change beside the reference and test it across
 offload/reload, delayed arrival, noninteger zoom and manual/follow cutaways
 under D-47/D-48. Predeclare numeric/pixel tolerances appropriate to the output
 format; retain expected values, captures and reproduction commands. Solver
-proof and owner visual acceptance remain required even if this contract is
-approved. No performance improvement is inferred from the unchanged ABI.
+proof and owner visual acceptance remain required after this contract's
+approval. No performance improvement is inferred from the unchanged ABI.
+
+### P-14. Cell-quad emission, fog composition and visual picking — proposal
+
+This is the concrete Q-16 proposal, with the player-facing fog/pick result
+needed by Q-20. It preserves P-9 geometry, D-50's integer cutaway, P-11
+coverage and P-13 normals/lighting. It requires owner approval; discovery and
+storage implementation mechanics remain a separate contract.
+
+**Knowledge is not residency.** The planner consumes a coherent immutable
+terrain/knowledge snapshot. Distinguish a confirmed undiscovered region from
+data whose retained knowledge is still loading. Knowledge of a solid boundary
+tile is also distinct from discovery of the empty component above a ramp:
+seeing the solid from one side does not prove that empty component connects
+to the discovered space. A discovery publication records its revealed void
+and exposed solid boundary together; materialized detail may arrive later.
+
+For display only, unknown space is covered by generic opaque fog. It does not
+change the source, occupancy, logical geometry or query results. Select the
+following representations within the existing bounded viewing band:
+
+| Available knowledge | Emission at a potentially visible cell |
+| --- | --- |
+| Confirmed undiscovered cell, regardless of its hidden contents | One generic full-cell fog quad, with no lookup of its hidden material/shape for display |
+| Discovered whole-air cell | No terrain quad |
+| Known solid, with its empty component discovered or absent | One whole-cell quad with the material and approved shape/normal mask |
+| Known shaped solid, but its empty component is undiscovered | At most two whole-cell quads with shared complementary masks: visible known material and generic fog over the unknown component |
+| Terrain or retained knowledge needed for this result is unavailable | Pending/loading, not fabricated air, newly forgotten fog or an authoritative pick |
+
+Each emitted quad uses the same 96×64 canvas/projection, with GPU cutout and
+normal shading. Do not emit independent top/side meshes or add flat cutaway
+caps. At slice `k`, omit levels above `k`; remaining known shapes keep their
+forms/materials. Whole-cell omission is allowed when safely culled; two quads
+is a maximum for the mixed-knowledge case, not a requirement to retain hidden
+instances. The approved catalog has one empty component per nonflat shape;
+new shapes with other component structures require a new contract.
+Admit/adopt a mixed cell's required parts and their asset interests together;
+budget pressure must never publish its material while dropping its fog cover.
+
+**Mixed ramp/fog masks.** In a cell whose solid is known but void is not,
+the presentation volume is the solid plus opaque cover filling that void.
+Bake the frontmost visible portions of that union into disjoint known-material
+and fog masks, with each part's outward normal. Their alpha union is the full
+cell cover. Use the known solid's material only where it is visible; use
+generic blank colour where cover is visible. Removing the cover after
+discovery exposes the ordinary sloped shape mask. Do not show the actual ramp
+through the cover or make its visible known side unselectable merely because
+another part of the same cell is fogged.
+
+These are shared catalog assets, not per-cell images. The 16 ordinary shape
+maps plus two mixed-part maps for each of the 15 nonflat IDs need at most 46
+normal/cutout maps before deduplication; generic full fog reuses ID 0's map.
+Rotating selects the corresponding rotated catalog entry under the existing
+bit convention. Use the reference grey blank artwork
+`assets/textures/utility/blanktexture.png` (S `3777d437`) as the initial fog
+colour asset: read-only inspection found 96×64, binary alpha, and opaque RGB
+`(66,63,64)`. Record/copy its provenance with the other artwork. All added
+maps/coverage/retiring versions count against existing budgets, and each mixed
+cell's actual instance count is charged. No resource bank grows automatically.
+
+The disjoint-mask construction is specific to these shapes and this view.
+Along the camera-facing direction `(1,1,3)`, `z-h(x,y)` increases for every
+P-9 facet: its directional derivative is at least 2. Thus a ray cannot pass
+from the unknown void into a nearer known solid in the same cell. This gives
+a basis for the two-part construction, but the generator and raster coverage
+still need proof, including material-alpha holes and facet/cell boundary ties.
+
+**Order and bounds.** For cells in rotated view coordinates, use ascending
+exact key `(viewX+viewY, z, viewX, viewY)` for far-to-near cell order. Within
+a mixed cell, use a fixed fog-then-known part order; the baked masks must be
+disjoint, so that tie cannot change a covered pixel's classification. Compute
+keys using checked/wide integers or exact camera-relative coordinates, never
+Synarchy's floating `x+y+0.001*z` approximation. Rank the admitted instances
+into the existing 24-bit render depth-key space and refuse/admit progressively
+within the existing key/work limits; do not silently collide or wrap keys.
+
+The ordering argument is that two distinct cells intersecting the same view
+ray occur with nondecreasing X, Y and Z toward the camera. X+Y distinguishes
+them unless X/Y agree, in which case Z distinguishes them. Stable tie fields
+resolve equal key prefixes. Shared geometric boundaries need the same raster
+ownership convention as P-11. This is a mathematical design argument, not a
+claim that masks, backend rank translation or all raster edges already pass
+Q-13. A counterexample blocks the affected implementation; it does not grant
+a new depth/vertex ABI or an unreviewed mesh fallback.
+
+Candidate generation uses the full quad envelope, the viewport/height band
+and D-48's independent demand, not only already resident chunks. Skip buried
+intervals using compressed presentation/knowledge summaries; never instantiate
+a dense vertical prism to find their boundary. Cull conservatively: an
+unavailable neighbor is not air or a guaranteed occluder, and hidden terrain
+truth cannot choose fog shape/material. Omit a candidate only with a valid
+boundary/occlusion proof under the adopted coverage; preserve visible sprites
+through cutouts and partial neighbors. If work/data capacity is exhausted,
+retain pending demand under D-42 rather than making an oversized camera view
+invalid. Viewport edges and missing chunks do not invent terrain walls or
+change which regions the player has discovered.
+
+**Picking and compatibility.** Preserve exact world cell identities rather
+than recovering them from projected floats. Traverse the adopted instances
+front-to-back using P-11's pixel/alpha rules. A known-material hit returns its
+cell and existing opaque edit authority. A fog hit stops traversal and returns
+Lua `no_hit`, with no hidden coordinate/material/shape, selection token or
+fallback target. The shortcut therefore submits nothing there. If a missing
+data region could cover the pixel ahead of a candidate, return `loading`
+without actionable candidate details; a missing region proved behind a known
+hit does not invalidate that hit. Never call a pending region undiscovered
+just because its retention record has not arrived.
+
+Plan identity includes the knowledge revision as well as existing arena,
+content, residency, camera and asset/style identities. Geometry, mask parts,
+pick data and settings adopt together. Keep existing stale-view rejection
+and cancellation authority for edits. Refine the former `PlannedFace`/polygon
+visual payload into cell-quad/part data and migrate repository clients/tests
+in the owning follow-up; do not keep the old analytic visual picker as a
+second answer path. The existing pure logical point/ray query interfaces and
+closed-solid boundary conventions remain, with ID 15 corrected under D-49.
+Raw terrain queries continue to answer authoritative terrain independently
+of residency/knowledge; querying or loading it does not itself discover it.
+Presentation fog is never substituted into those logical queries.
+
+H at `f052296f6e` provides the migration baseline:
+`packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs:1–69`
+describes the old per-face polygon plan, incomplete facts and 24-bit ranking;
+`Pick.hs:1–28,57–78` uses analytic face coverage and an incomplete candidate.
+`packages/terrain/src/Hetoimasia/Terrain/Query.hs:1–29` supplies source/change
+queries independent of residency, and `Geometry.hs:30–38` defines closed
+exact solids. This proposal changes visual planning/picking, not that logical
+authority or the source's sparse-query guarantee.
+
+**Qualification.** Extend all-16/four-facing evidence to ordinary, fully fogged
+and mixed-knowledge cases. Include a known ramp side beside an unrevealed void,
+cutaway over undiscovered air, later reveal, two openings, offload/reload and
+late knowledge arrival. Assert that fog never produces a target or leaks
+hidden contents, visible known material stays selectable, and undiscovered
+air/solid with the same knowledge produce identical fog. Compare exact sort
+keys to an independent geometric ray oracle for roofs, cavities, stacked
+spans, steep depth separations, chunk seams and extreme legal coordinates;
+verify the GPU depth-key path and shared raster-edge ownership. Include
+transparent colour/mask holes, loading in front/behind a candidate, camera
+capacity pressure and generation reuse. Retain captures, counts and commands
+under D-44/D-47/D-48, not only mathematical reasoning or passing headless tests.
 
 ## Open questions and review checkpoints
 
@@ -3789,6 +3959,11 @@ The integer-cutaway owner question is resolved by D-50. Concrete emission,
 culling and ordering must implement that behavior and prove it alongside
 D-44's shape/mask/picking qualification.
 
+Current owner checkpoint: P-14 proposes whole-cell quads, mixed ramp/fog
+composition, exact ordering, conservative bounded planning, `no_hit` for fog,
+loading distinctions and the visual/logical API migration. It is not approved
+yet; the existing decisions do not silently settle those concrete details.
+
 ### Q-17. Face-map data loading, sampling and ownership
 
 Resolved as a specification by D-30/D-45/D-55 and P-11: binary-alpha
@@ -3801,15 +3976,15 @@ the approved policy. Implementation/qualification and the corrected asset
 catalog/provenance remain required; no temporary colour-decoding workaround is
 approved. D-56/P-12 explicitly supersedes RGB face weights with surface
 normals; the alpha/sampling/ownership contract remains. P-13's proposed
-normal-encoding validation is a further concrete contract checkpoint.
+normal-encoding validation is now approved through D-57.
 
 ### Q-18. Exact initial appearance beyond the silhouette
 
-Partially resolved by D-29/D-46/D-47/D-54/D-56: Lua supplies sun compass direction and
-elevation, anchored in world space through camera rotation, without an automatic
-cycle or moon lighting. Settle exact angle conventions/units/ranges and binding,
-the initial light and ambient values, and the depth/colour equations and
-initial strengths for the selected darkening/haze. State intentional deviations.
+Resolved as a specification by D-29/D-46/D-47/D-54/D-56/D-57 and P-13. Lua
+supplies world-fixed sun direction/elevation and independent ambient, sun
+strength and depth effects, without a cycle or moon lighting. P-13 fixes
+units/ranges, configuration, initial values and linear-light composition,
+including its intentional deviations from the reference.
 S's clock phase labels and shader sine disagree; full clock parity cannot be
 claimed from labels alone. Fluids, selection outlines, lifecycle sprites and
 zoom-map crossfade remain outside the approved arena unless explicitly changed.
@@ -3820,8 +3995,8 @@ are not selected. The owner reports S's behavior does not work well; specific
 symptoms are now recorded in P-10: hazed background tiles can be absent outside
 the camera loader's radius despite projecting into the viewport. Source
 inspection supports that mismatch, but no runtime reproduction is claimed.
-The numerical contract and qualification described above remain to be filled
-out; do not copy the old curve and call the reported problem fixed.
+P-13 now specifies the numerical contract; the qualification described above
+still must prove it and the background loading correction.
 
 Ambient control is resolved by D-54: use a separate Lua-controlled ambient
 level that stays unchanged when only the
@@ -3835,16 +4010,16 @@ This intentionally differs from S's `computeAmbientLight`, which derives
 ambient from its sun phase (`src/Engine/Graphics/Vulkan/ShaderCode.hs:204–212`
 at `3777d437`); merely supplying a new sun position also changes background
 illumination there. The approved independence means moving the preview sun
-does not itself perform that ambient day/night transition. Numeric defaults,
-face-light equations and the existing depth effects still need the concrete
-appearance contract. Retaining S's automatic sun-linked ambient curve is the
+does not itself perform that ambient day/night transition. P-13 specifies the
+numeric defaults, face-light equation and depth composition. Retaining S's
+automatic sun-linked ambient curve is the
 rejected alternative, not assumed parity.
 
 The lighting-representation question is resolved by D-56/P-12: surface-normal
 RGB supplies actual ramp/peak orientation while alpha retains the cutout.
-Current owner checkpoint: P-13 proposes the exact normal encoding/validation,
-Lua settings/defaults, sun/ambient equation, depth range and linear-light
-darkening/haze composition. Its numerical/API choices are not approved yet.
+The numerical/API checkpoint is resolved by D-57/P-13. Corrected-map,
+normal/lighting, cutout/picking and depth/streaming qualification remain
+implementation gates; specification approval is not visual acceptance.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
@@ -3943,6 +4118,10 @@ The startup-preparation question is resolved by D-53: bounded exact connectivity
 preparation precedes successful arena opening, with clear over-budget refusal
 and no dense hidden-cell enumeration. Concrete encoding, limits and proof
 remain to specify alongside the other storage/publication mechanisms.
+P-14 separately proposes the concrete player-facing fog result (`no_hit`,
+with traversal stopped) and distinguishes pending knowledge from confirmed
+undiscovered space, including mixed known-ramp/unknown-void rendering. Those
+details await its owner checkpoint; the storage/commit contract remains open.
 Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
