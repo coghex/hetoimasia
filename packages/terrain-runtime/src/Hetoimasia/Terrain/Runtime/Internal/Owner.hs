@@ -40,7 +40,7 @@ import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (Component, logError, logInfo, unsafeComponent)
 import Hetoimasia.Foundation.Resource (Scoped)
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, stopRequested, workerDefinition)
-import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesBytes, changesFromIntervals, emptyChanges, mergeChanges)
+import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesBytes, emptyChanges, mergeChanges)
 import Hetoimasia.Terrain.Coordinate (RegionCoord, decomposeTile)
 import Hetoimasia.Terrain.Palette (Palette, emptyPalette, internSourceMaterials)
 import qualified Hetoimasia.Terrain.Residency as R
@@ -519,6 +519,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
           releaseReq svc rid req
           endpointSettle ep (Succeeded (ARemoved (RemoveAnswer aid (arenaRevision arena) False)))
           pure (CommitDone (Just aid) (Just (arenaRevision arena)))
+      | Revision n <- arenaRevision arena, n == maxBound = pure (CommitDefect "content revision exhausted after admission")
       | otherwise = do
           let Revision n = arenaRevision arena
               newRevision = Revision (n + 1)
@@ -526,7 +527,6 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
           applyEvent svc (R.RemovalCommitted rid newRevision (preparedRetained prepared) (preparedGrowth prepared)) >>= \case
             Left refusal → pure (CommitDefect (Text.pack ("removal commit refused: " <> show refusal)))
             Right report → do
-              let interval = maybe emptyChanges (\piece → either (const emptyChanges) id (changesFromIntervals (ChangeLimits maxBound) [piece])) (preparedInterval prepared)
               modifySt svc $ \s →
                 s
                   { stateArenas =
@@ -536,7 +536,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
                               { arenaPalette = preparedPalette prepared
                               , arenaResident = preparedResident prepared
                               , arenaChanges = preparedChanges prepared
-                              , arenaWorking = Map.insertWith mergeChanges region interval (arenaWorking a)
+                              , arenaWorking = Map.insertWith mergeChanges region (preparedWorking prepared) (arenaWorking a)
                               , arenaRevision = newRevision
                               , arenaGeneration = arenaGeneration a + 1
                               }

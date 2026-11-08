@@ -111,8 +111,10 @@ data Prepared = Prepared
   , preparedChanges ∷ !Changes
   , preparedPalette ∷ !Palette
   , preparedResident ∷ !Resident
-  , -- | The removed interval in the cell's column, when something was removed.
-    preparedInterval ∷ !(Maybe (Column, ZRange))
+  , -- | The removed interval as retained changes of its own, to join the changed
+    -- region's working set. Built here, where a failure is an ordinary refusal,
+    -- so that nothing fallible is left for after the commit has mutated.
+    preparedWorking ∷ !Changes
   , -- | The retained-edit bytes the removal adds.
     preparedRetained ∷ !Word64
   , -- | The bytes the rebuilt segment now accounts beyond the old one.
@@ -126,12 +128,13 @@ prepareRemoval ∷ ChangeLimits → Source → Changes → Palette → Resident 
 prepareRemoval limits source changes palette resident tile = do
   outcome ← either (Left . show) Right (removeCell limits source tile changes)
   if not (removeChanged outcome)
-    then Right (Prepared False changes palette resident Nothing 0 0)
+    then Right (Prepared False changes palette resident emptyChanges 0 0)
     else do
       let TileCoord x y z = tile
           column = Column x y
           level = toInteger (axisValue z)
       range ← either (Left . show) Right (mkZRange level (level + 1))
+      working ← either (Left . show) Right (changesFromIntervals limits [(column, range)])
       let changes' = removeResult outcome
           bytesOf r = let (_, payload, metadata) = columnsSegmentStats r [column] in payload + metadata
           before = bytesOf resident
@@ -145,7 +148,7 @@ prepareRemoval limits source changes palette resident tile = do
           , preparedChanges = changes'
           , preparedPalette = palette'
           , preparedResident = resident'
-          , preparedInterval = Just (column, range)
+          , preparedWorking = working
           , preparedRetained = grown
           , preparedGrowth = if after > before then after - before else 0
           }
