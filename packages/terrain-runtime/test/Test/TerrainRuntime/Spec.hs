@@ -3,6 +3,7 @@ module Test.TerrainRuntime.Spec (spec) where
 import qualified Test.TerrainRuntime.Basic as Basic
 import qualified Test.TerrainRuntime.Budgets as Budgets
 import qualified Test.TerrainRuntime.Closure as Closure
+import qualified Test.TerrainRuntime.Credits as Credits
 import qualified Test.TerrainRuntime.Hardening as Hardening
 import qualified Test.TerrainRuntime.Interleaving as Interleaving
 import qualified Test.TerrainRuntime.Lifecycle as Lifecycle
@@ -22,5 +23,6 @@ spec = do
   Opacity.spec
   Lifecycle.spec
   Hardening.spec
+  Credits.spec
   Interleaving.spec
   Closure.spec

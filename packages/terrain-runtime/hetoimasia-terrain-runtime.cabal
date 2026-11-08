@@ -69,6 +69,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Basic
         Test.TerrainRuntime.Budgets
         Test.TerrainRuntime.Closure
+        Test.TerrainRuntime.Credits
         Test.TerrainRuntime.Fixtures
         Test.TerrainRuntime.Hardening
         Test.TerrainRuntime.Interleaving

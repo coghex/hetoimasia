@@ -336,22 +336,23 @@ regionGeneration st aid region =
 -- it is the union of store and working, so a transfer cannot change any answer.
 handoff ∷ Service → ArenaId → RegionCoord → IO ()
 handoff svc aid region = do
-  started <- atomically $ do
+  (busy, started) <- atomically $ do
     st <- readSt svc
     let generation = maybe 0 fromIntegral (regionGeneration st aid region)
         tried = modifySt svc (\s → s {stateTransfers = Map.insert (aid, region) generation (stateTransfers s)})
     case Map.lookup aid (stateArenas st) of
-      Nothing → tried >> pure Nothing
+      Nothing → tried >> pure (False, Nothing)
       Just arena → do
         let working = Map.lookup region (arenaWorking arena)
             duplicate = maybe 0 (fromIntegral . changesBytes) working
         applyEvent svc (R.BeginHandoff aid region duplicate) >>= \case
-          Right _ → pure (Just working)
+          Right _ → pure (False, Just working)
           -- Capacity pressure is not a failed transfer: the region stays a candidate
           -- and is reconsidered when capacity is returned (R2). Only a refusal that
           -- can never clear ends the attempt.
-          Left (R.Busy _) → modifySt svc (\s → s {stateHandoffBusy = Map.insert (aid, region) (stateCapacityEpoch s) (stateHandoffBusy s)}) >> pure Nothing
-          Left _ → tried >> pure Nothing
+          Left (R.Busy _) → modifySt svc (\s → s {stateHandoffBusy = Map.insert (aid, region) (stateCapacityEpoch s) (stateHandoffBusy s)}) >> pure (True, Nothing)
+          Left _ → tried >> pure (False, Nothing)
+  when busy (probe svc (PointHandoffBusy aid region))
   forM_ started $ \working → do
     outcome <- tryNonAsync (probe svc (PointHandoff aid region))
     atomically $ do

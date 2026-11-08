@@ -38,6 +38,7 @@ module Test.TerrainRuntime.Fixtures
   , tightConfig
   , microConfig
   , microConfigSlots
+  , microConfigWith
   , layered
   , cellMaterial
   , expectedMaterial
@@ -252,7 +253,12 @@ microConfig = microConfigSlots 2
 
 -- | The same with a given number of command slots.
 microConfigSlots ∷ Int → Config
-microConfigSlots slots = defaultConfig {configLimits = limits, configRetainedBytes = 2000}
+microConfigSlots slots = microConfigWith slots 4000
+
+-- | The same with a given number of command slots and bytes of staging above the
+-- smallest valid bank.
+microConfigWith ∷ Int → Integer → Config
+microConfigWith slots headroom = defaultConfig {configLimits = limits, configRetainedBytes = 2000}
   where
     spec resident staging =
       LimitsSpec
@@ -273,7 +279,7 @@ microConfigSlots slots = defaultConfig {configLimits = limits, configRetainedByt
     valid resident staging = either (const Nothing) Just (mkLimits (spec resident staging))
     smallest = fromMaybe (error "no micro bank") (listToMaybe [r | r <- [100, 150 .. 100000], Just _ <- [valid r 1000000]])
     stagingFor resident = fromMaybe (error "no micro staging") (listToMaybe [t | t <- [500, 1000 .. 1000000], Just _ <- [valid resident t]])
-    limits = fromMaybe (error "micro limits are invalid") (valid (smallest + 100) (stagingFor smallest + 4000))
+    limits = fromMaybe (error "micro limits are invalid") (valid (smallest + 100) (stagingFor smallest + headroom))
 
 -- | A source from layers @(min, max, material, shape)@ and patches, for an
 -- independent expectation.
