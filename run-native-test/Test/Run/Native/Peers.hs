@@ -717,6 +717,8 @@ withVm context role injection tick body = do
             , scheduledRequestHandles = Just handles
             , scheduledLending = gsLending <$> services
             , scheduledLeases = gsLeases <$> services
+            , -- the collection holds every live instance (eight here) at the lease capacity the profile's byte limits derive
+              scheduledMemberLimit = maximum (defaultMemberLimit : [8 * gsLeaseCapacity found | Just found ← [services]])
             , scheduledRequests = Just (RequestGrant (facadeRequestEndpoints facade) 64 (if role == Gameplay then SettleAtAssignedTick Nothing else SettleOnArrival))
             , scheduledLoader = Just (coordinatorPlan coordinator)
             , scheduledClock = monotonicSource

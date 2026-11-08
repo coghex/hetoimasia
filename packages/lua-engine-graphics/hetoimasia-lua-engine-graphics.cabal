@@ -136,6 +136,7 @@ test-suite lua-engine-graphics-tests
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
+        QuickCheck >=2.15 && <2.19,
         HUnit >=1.6 && <1.7,
         stm >=2.5.3 && <2.6,
         temporary >=1.3 && <1.4,

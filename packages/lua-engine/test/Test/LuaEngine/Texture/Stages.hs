@@ -11,28 +11,28 @@ import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (ByteLimit (..), CountLimit (..))
 import Test.Hspec
 import Test.LuaEngine.Request.Profiles (smaller)
-import Test.LuaEngine.Texture.Contract (layout, loadAs, small, started)
+import Test.LuaEngine.Texture.Contract (layout, loadAs, started, wide, wideLayout)
 import Test.LuaEngine.Texture.Png (opaque)
 import Test.LuaEngine.Texture.Support
 
 spec ∷ Spec
 spec = describe "the charges, stage by stage" $ do
   it "charges the lane the encoded input before the read, the level while the backend holds it and nothing once it retires, and shrinks the nominal charge only after the decode validated the dimensions" $
-    withSession (config small layout) $ \session _ runtime → do
+    withSession (config wide wideLayout) $ \session _ runtime → do
       vm ← startVm session runtime "trace" OnArrival
       admitDriver session vm "i"
-      closeGate (ssProbe session) "a.png"
-      started session vm "i" "k0" "a.png"
+      closeGate (ssProbe session) "big.png"
+      started session vm "i" "k0" "big.png"
       awaitStarted (ssProbe session) 1
       -- Before the read: the input's length is charged to the lane and the reservation is the maximum.
-      lanesCharged session `shouldReturn` [fromIntegral (BS.length (opaque 8 4)), 0]
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
-      openGate (ssProbe session) "a.png"
+      lanesCharged session `shouldReturn` [fromIntegral (BS.length (opaque 40 40)), 0]
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 16384)
+      openGate (ssProbe session) "big.png"
       awaitUploads (ssFake session) 1
       -- At the handoff: the input is released and dropped, the level is charged, the nominal bytes are
       -- the validated width times height times four.
-      lanesCharged session `shouldReturn` [128, 0]
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
+      lanesCharged session `shouldReturn` [6400, 0]
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 6400)
       held ← uploadN (ssFake session) 0
       -- The backend lets go of the level: the lane's workspace is free, but the lane is not, until the
       -- backend says the upload ended too.
@@ -42,31 +42,31 @@ spec = describe "the charges, stage by stage" $ do
       identity ← fst <$> registerTexture (ssFake session) held
       awaitPipeline session (all ((== Nothing) . laneReadingJob) . readingLanes)
       -- The texture is live and still charged to its instance and the session.
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
-      sessionNow session `shouldReturn` 128
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 6400)
+      sessionNow session `shouldReturn` 6400
       command session vm "i" "wait_take" "k0"
       _ ← lineStarting session "i wait_take k0 "
       command session vm "i" "use" "k0"
       awaitNote session ("i use k0 " <> Text.pack (show identity))
 
-  it "keeps each instance's account and the session's together: a smaller image shrinks only its own share" $
-    withSession (config small layout) $ \session _ runtime → do
+  it "keeps each instance's account and the session's together: a smaller image shrinks only its own share, and none below the minimum charge" $
+    withSession (config wide wideLayout) $ \session _ runtime → do
       vm ← startVm session runtime "accounts" OnArrival
       mapM_ (admitDriver session vm) ["i", "j"]
       started session vm "i" "k0" "a.png"
-      started session vm "i" "k1" "c.png"
+      started session vm "i" "k1" "big.png"
       started session vm "j" "k0" "b.png"
       awaitUploads (ssFake session) 2
       -- Two lanes: the third waits, holding its whole reservation.
       awaitPipeline session ((== 1) . readingPending)
-      sessionNow session `shouldReturn` 128 + 1024 + 4096
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 2 (128 + 1024))
-      ownerNow vm "j" >>= (`shouldBe` OwnerReading 1 4096)
+      sessionNow session `shouldReturn` 4096 + 6400 + 16384
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 2 (4096 + 6400))
+      ownerNow vm "j" >>= (`shouldBe` OwnerReading 1 16384)
       first ← uploadN (ssFake session) 0
       _ ← finishUpload (ssFake session) first
       awaitUploads (ssFake session) 3
-      awaitOwner vm "j" (== OwnerReading 1 128)
-      sessionNow session `shouldReturn` 128 + 1024 + 128
+      awaitOwner vm "j" (== OwnerReading 1 4096)
+      sessionNow session `shouldReturn` 4096 + 6400 + 4096
 
   it "lets a live texture outlast the request, the result and the pipeline's buffers: the request place is reusable while the slot and the nominal bytes stay charged" $
     withSession (config (smaller [(RequestsPerInstance, 1), (PngPixels, 1024), (PngAxisMaximum, 32)] bytes) layout) $ \session _ runtime → do
@@ -82,7 +82,7 @@ spec = describe "the charges, stage by stage" $ do
       -- The request is taken and its work retired: a new request is accepted at once, and the first
       -- texture still holds its slot and its bytes.
       started session vm "i" "k1" "b.png"
-      ownerNow vm "i" >>= \reading → ownerSlotsHeld reading `shouldBe` 2
+      ownerNow vm "i" >>= \reading → ownerTexturesHeld reading `shouldBe` 2
       awaitUploads (ssFake session) 2
       command session vm "i" "use" "k0"
       awaitNote session "i use k0 100"

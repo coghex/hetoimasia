@@ -44,17 +44,17 @@ spec = describe "the adapter under the pipeline, the leases and a real Lua owner
       _ ← awaitNoteContaining comp "a wait_take k"
       owner ← ownerOf vm "a"
       held ← atomically (ownerReading owner)
-      ownerSlotsHeld held `shouldBe` 1
+      ownerTexturesHeld held `shouldBe` 1
       -- A batch still maps the slot: the texture is released but not retired.
       hold fake HoldReclaim
       setVersionHolders fake 1
       command comp vm "a" "release" "k"
       awaitEvent fake "released"
       still ← atomically (ownerReading owner)
-      ownerSlotsHeld still `shouldBe` 1
+      ownerTexturesHeld still `shouldBe` 1
       setVersionHolders fake 0
       release fake HoldReclaim
-      atomically (ownerReading owner >>= \r → if ownerSlotsHeld r == 0 then pure () else retry)
+      atomically (ownerReading owner >>= \r → if ownerTexturesHeld r == 0 then pure () else retry)
 
   it "frees everything when the instance ends with its request in flight, at every stage" $
     mapM_ stageEnd [HoldOwner, HoldAllocate, HoldUploadStart, HoldUploadFinish, HoldRegister]
@@ -68,7 +68,7 @@ spec = describe "the adapter under the pipeline, the leases and a real Lua owner
       void (awaitFailure comp "a")
       awaitFake fake ((== 0) . readingRegistrations)
       owner ← ownerOf vm "a"
-      atomically (ownerReading owner >>= \r → if ownerSlotsHeld r == 0 then pure () else retry)
+      atomically (ownerReading owner >>= \r → if ownerTexturesHeld r == 0 then pure () else retry)
 
   it "keeps a peer instance's independent texture across the end of the other" $
     composed defaultFakeConfig $ \fake _ comp vm → do
@@ -115,7 +115,7 @@ spec = describe "the adapter under the pipeline, the leases and a real Lua owner
         release fake stage
         void (awaitFailure comp "a")
         owner ← ownerOf vm "a"
-        atomically (ownerReading owner >>= \r → if ownerSlotsHeld r == 0 then pure () else retry)
+        atomically (ownerReading owner >>= \r → if ownerTexturesHeld r == 0 then pure () else retry)
         awaitFake fake (\r → readingRegistrations r == 0 && readingImagesAlive r == 0)
 
 -- | A composition over a fake owner: one backend, the pipeline over it, a Lua owner, one VM; and the checks every

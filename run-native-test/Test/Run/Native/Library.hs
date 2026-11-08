@@ -176,7 +176,7 @@ spec env = describe "the command's production composition" $ do
         either (\failure → show failure) (const "no failure") outcome `shouldSatisfy` isInfixOf "the assertion raised while the run was ending"
         evidence env "assertion kept: a scenario assertion that failed while the harness was ending it was raised as the example's failure, not replaced by the end"
 
-  it "answers busy, nonfatally and with no host capacity fault, when the reachable request and texture reservations are full while the window slot is free, accepts the explicit retry after reclamation, and keeps a second own-window request an ordinary error" $
+  it "answers busy, nonfatally and with no host capacity fault, when the reachable request places and the texture read queue are full while the window slot is free, accepts the explicit retry after reclamation, and keeps a second own-window request an ordinary error" $
     within 120 $
       withSystemTempDirectory "hetoimasia-run-native" $ \folder → do
         copyTree shippedContent folder
@@ -191,7 +191,7 @@ spec env = describe "the command's production composition" $ do
                      , "second window: error"
                      ]
         retired ran
-        evidence env "capacity: through the production facade, 8 texture requests (the instance's 128 MiB nominal bytes) and 8 data requests filled the instance's 16 request records; the window request with its own slot free answered busy, a nonfatal data answer with no host fault; after the results were taken and the textures released an explicit retry was accepted; a second window request was the ordinary error; the session exited 0 and everything retired"
+        evidence env "capacity: through the production facade, 8 texture requests (the shared read pool's io queue answered busy at the eighth, the refusal naming it; the instance's 512 MiB of nominal bytes, 128 MiB of it reserved, did not) and 8 data requests filled the instance's 16 request places; the window request with its own slot free answered busy, a nonfatal data answer with no host fault; after the results were taken and the textures released an explicit retry was accepted; a second window request was the ordinary error; the session exited 0 and everything retired"
 
   it "serves the owner's retirement while it unwinds an owner loop that failed with a window live, and exits 1 with everything retired" $
     within 120 $

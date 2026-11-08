@@ -214,7 +214,7 @@ ownerClient =
     , "import Hetoimasia.LuaEngine.Texture (TextureOwner (..))"
     , ""
     , "forged ∷ TextureOwner → Int"
-    , "forged owner = ownerSlotLimit owner"
+    , "forged owner = ownerByteLimit owner"
     ]
 
 specClient ∷ String

@@ -38,8 +38,9 @@
 -- the ledger has no adoption for (or an adoption of a revision under a different scene) is a defect of
 -- the host's pairing, not something a hook may raise: it is counted and its first description kept, and
 -- 'ledgerReading' shows it. The records are bounded by the host's own retention (six unreleased
--- revisions for each target, two windows in the M1 profile) and each holds at most the sixteen
--- textures an instance may have.
+-- revisions for each target, two windows in the M1 profile) and each holds the distinct textures its scene names,
+-- which the scene's own sprite limit ('SceneSprites') bounds: a scene has at most that many sprites, so it names at
+-- most that many textures. The ledger itself is a map and a set, not a fixed table.
 module Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   ( -- * The scene
     GraphicsScene (..)

@@ -885,6 +885,8 @@ startVmWith session wrap runtime label timing = do
           { scheduledInstances = Just (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8, instanceSources = [commandSource]})
           , scheduledLending = Just lending
           , scheduledLeases = Just leases
+          , -- the collection holds every live instance (eight here) at the lease capacity
+            scheduledMemberLimit = max defaultMemberLimit (8 * cfgLeases (ssConfig session))
           , scheduledRequestHandles = Just handles
           , scheduledRequests = Just grant
           }

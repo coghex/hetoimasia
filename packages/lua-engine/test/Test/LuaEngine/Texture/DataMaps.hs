@@ -273,7 +273,7 @@ coverage = describe "binary coverage" $ do
       -- The lease's CPU interest ended with its release: no GPU retirement is needed for the plane to go.
       charged session `shouldReturn` 0
       -- The texture itself is still charged until the backend proves it retired.
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 36)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
 
   it "refuses a nonbinary image as invalid_image before any upload, naming the policy, and returns every charge" $
     withSession (config small files) $ \session _ runtime → do
@@ -517,7 +517,7 @@ versions = describe "loaded versions" $ do
       retainAs session vm "i" "a" "late" ["coverage"] >>= (`shouldSatisfy` Text.isInfixOf "refused:")
       -- ...and leaves the interest already taken. The texture is retiring on the backend and the plane is charged.
       charged session `shouldReturn` 130
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 36)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
       retireTexture (ssFake session) identity
       awaitOwner vm "i" (== OwnerReading 0 0)
       -- The registration's retirement did not stand in for the CPU interest.
@@ -540,7 +540,7 @@ versions = describe "loaded versions" $ do
       awaitNote session "i release a retiring"
       charged session `shouldReturn` 0
       -- The CPU scope's exit is not retirement evidence: the slot and the nominal bytes are still held.
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 36)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
       retireTexture (ssFake session) identity
       awaitOwner vm "i" (== OwnerReading 0 0)
 
