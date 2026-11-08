@@ -7,6 +7,9 @@ module Test.TerrainRender2D.CellsProgress (spec) where
 
 import Control.Monad (forM_)
 import Data.List (sort)
+import Data.Function (on)
+import qualified Data.List.NonEmpty as NonEmpty
+import qualified Data.Map.Lazy as LazyMap
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import qualified Data.Set as Set
@@ -15,7 +18,7 @@ import Hetoimasia.Math.Vector (V2 (..))
 import Data.Ratio (denominator)
 import Data.Word (Word32)
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..))
-import Hetoimasia.Terrain.Cell (Column (..), ZRange, mkZRange)
+import Hetoimasia.Terrain.Cell (Column (..), ZRange, mkZRange, zRangeHi, zRangeLo)
 import Hetoimasia.Terrain.Coordinate (TileCoord, axisValue)
 import Hetoimasia.Terrain.Render2D.Assets
 import Hetoimasia.Terrain.Render2D.Camera
@@ -433,6 +436,38 @@ summaries = describe "compressed summaries and bounded scratch" $ do
       cellStatColumns stats `shouldSatisfy` (> 100)
       cellStatLevels stats `shouldSatisfy` (< dense `div` 20)
       cellStatInstances stats `shouldSatisfy` (<= 3 * cellStatColumns stats)
+  it "answers a window of readiness among very many intervals elsewhere in the chunk, as a level-by-level reading does" $ \_ → do
+    let key = ChunkKey 0 0
+        ranges = [zr (10 * k) (10 * k + 4) | k ← [0 .. 400]] <> [zr 4004 4010, zr 4010 4013, zr 4100 4101, zr 4101 4107]
+        availability = mkAvailability [(key, ranges)]
+        ready z = any (\r → zRangeLo r <= z && z < zRangeHi r) ranges
+        -- The reference reads each level on its own and joins equal neighbours.
+        expected lo hi =
+          [ (fst (NonEmpty.head g), fst (NonEmpty.last g) + 1)
+          | g ← NonEmpty.groupBy ((==) `on` snd) [(z, ready z) | z ← [lo .. hi - 1]]
+          , not (snd (NonEmpty.head g))
+          ]
+    forM_ [(0, 0), (3, 12), (4003, 4015), (4009, 4011), (4012, 4101), (4106, 4200), (-20, 5), (4000, 4001), (5000, 5010)] $ \(lo, hi) →
+      unknownPieces availability key lo hi `shouldBe` expected lo hi
+  it "reads availability by interval: a chunk with very many readiness intervals below the band is never scanned" $ \assets → do
+    let key = ChunkKey 0 0
+        cut = 100010
+        -- Every interval far below the viewing band holds an error where its end
+        -- should be; one that is visited fails the example. The one just below the
+        -- band and the two inside it are ordinary.
+        poisoned = [(2 * k, error "a readiness interval below the band was visited") | k ← [0 .. 19999 ∷ Integer]]
+        near = [(99000, 99100), (100000, 100005), (100010, 100020)]
+        availability = KnownIntervals (Map.singleton key (LazyMap.fromDistinctAscList (poisoned <> near)))
+        scene = sceneFrom FaceSouth cut 0 0 (sourceOf [OCell 0 0 cut 0 KnownAll]) (knowledgeOf 1 CellDiscovered []) availability
+        tiny = withLimits (\l → l {clStepCandidates = 1, clStepLevels = 1}) scene
+        inputs = inputsOf assets tiny
+        start = either (error . show) id (startCells inputs)
+        stepped = foldl (\p _ → either (error . show) id (stepCells inputs p)) start [1 .. 40 ∷ Int]
+        plan = planScene assets scene
+    length (show (cellPlanDemand (either (error . show) id (cellPlanOf inputs stepped)))) `shouldSatisfy` (> 0)
+    cellPlanProgress plan `shouldBe` Settled
+    [q | q ← cellPlanQuads plan, quadCell q == Just (tileAt 0 0 cut)] `shouldSatisfy` (not . null)
+    length (show (cellPlanDemand plan)) `shouldSatisfy` (> 0)
   it "handles a cut thousands of levels above all terrain without examining them" $ \assets → do
     let scene = sceneFrom FaceSouth (2 ^ (50 ∷ Int)) 0 0 flatWorld (knowledgeOf 1 CellDiscovered []) AllKnown
         plan = planScene assets scene

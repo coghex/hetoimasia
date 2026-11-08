@@ -602,7 +602,11 @@ window of at most 251 levels (the 250-level band and its top), and three rectang
 computations per level examined; it is not charged to `clStepLevels`, which counts the
 cells and pending spans a step admits. Runs, not levels, are walked,
 so cost follows run boundaries and exposed cells, not depth, and a column's
-knowledge runs are searched by interval, so a window never visits runs outside it.
+knowledge runs and a chunk's readiness intervals (`Facts.pieces`, shared with the
+baseline planner and the camera, which return exactly what they did) are searched by
+interval, so a window never visits intervals outside it. Terrain reads go through
+`columnRuns` under the explicit `ccQueryLimits` of the terrain query API, whose own
+cost is that package's contract and is not changed here.
 
 ### Bounded, resumable preparation
 
