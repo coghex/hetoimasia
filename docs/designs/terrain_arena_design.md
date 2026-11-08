@@ -10,11 +10,11 @@ Design state: `ready for issue processing`
 
 Owner-requested face-map amendment opened 2026-11-07 (D-28) and signed off
 2026-11-08 (D-60), approving P-16 at `b012fabbfc`. TRA-1–TRA-12 remain filed;
-TRA-13–TRA-22 are now [#655], [#656], [#657], [#658], [#659], [#660], [#661], [#662], [#663] and [#665].
-TRA-23 remains an approved
-unprocessed follow-up in the ledger below. The
-amendment is ready for issue processing. Each tracker draft still requires
-separate sign-off; no tracker mutation, implementation or PR-hold release
+all 11 amendment children, TRA-13–TRA-23, are now filed as [#655], [#656],
+[#657], [#658], [#659], [#660], [#661], [#662], [#663], [#665] and [#666].
+No unprocessed new children remain; P-16 revisions to existing artifacts
+remain. The amendment is ready for issue processing. Each tracker draft still
+requires separate sign-off; no tracker mutation, implementation or PR-hold release
 is authorized by this design sign-off.
 
 Lighting scope resolved by D-29: expose sun position to the face-map shader
@@ -200,7 +200,7 @@ concrete precondition
 - [x] TRA-20. Define bounded copy-on-write store records and transactions — [#662]
 - [x] TRA-21. Own reserved backing files and bounded asynchronous storage I/O — [#663]
 - [x] TRA-22. Commit terrain edits and discovery through the temporary store — [#665]
-- [ ] TRA-23. Expose terrain storage status, growth and recovery through Lua
+- [x] TRA-23. Expose terrain storage status, growth and recovery through Lua — [#666]
 - [x] TRA-9. Publish retained terrain views with safe GPU retirement — [#645]
 - [x] TRA-10. Expose terrain views and camera controls to Lua — [#646]
 - [x] TRA-11. Assemble the authored terrain arena — [#647]
@@ -208,8 +208,10 @@ concrete precondition
 
 D-60 approves the amended delivery plan and readiness. Checked entries mean
 already filed, not implemented; their original issue links are preserved.
-The one unchecked follow-up is unprocessed. P-16 records the approved
-revisions to existing artifacts, including #645–#648 despite their filed marks.
+All 11 amendment children are filed; zero unprocessed new children remain.
+P-16 revisions to existing artifacts, including #645–#648 despite their filed
+marks, remain separately approved work. Filing does not complete implementation
+or the EPIC.
 
 **Amendment EPIC revision applied 2026-11-08:** existing [#636] now carries
 revision v1, approved by `het-manager` in `#het-terrain` message
@@ -282,11 +284,17 @@ verified after filing; approved body SHA-256:
 verified after filing; approved body SHA-256:
 `9e48e5526a130dd92e609623aed926d0423834f4ace05a8f34c18b93ac1f48b5`.
 
-**Amendment processing cursor:** draft TRA-23 next, then the P-16 revisions of #645–#648 and any other named
-artifacts, one artifact at a time with a separately approved concrete tracker
-draft before each mutation. The manager arranges readiness reviews. Tracker
-processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after TRA-22:
-`p8r8fjsu38z92er2my73q55xh2` in `#het-terrain`.
+**TRA-23 filed 2026-11-08:** [#666], approved by `het-manager` in
+`#het-terrain` message `5uymu8d9jy58dht8ikgrwgi6ea` (reply to draft
+`pnfuevnfnmmrvceb2q8dpe85na`). The issue body and EPIC checklist link were
+verified after filing; approved body SHA-256:
+`4b1d473dfb570a46617b7adcb5f91239b378403c2041590eea2fb7b3c96ea857`.
+
+**Amendment processing cursor:** new-child filing is complete. Continue the
+P-16 revisions of #645–#648 and any other named artifacts, one artifact at a
+time with a separately approved concrete tracker draft before each mutation. The manager arranges readiness reviews. Tracker
+processing dispatch: `rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after TRA-23:
+`5uymu8d9jy58dht8ikgrwgi6ea` in `#het-terrain`.
 
 ## Epic contract
 
