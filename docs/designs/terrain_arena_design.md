@@ -131,6 +131,11 @@ D-55 approves P-11's cutout asset/sampling contract, including bounded
 `kind`/`coverage` texture options, shared versioned CPU bitplanes and required
 CPU/GPU edge agreement. Q-17 is specified; implementation proof remains due.
 
+D-56 selects surface-normal RGB lighting in the same RGBA cutout texture.
+Normals follow the approved shape geometry and world-fixed sun; P-11's
+alpha, sampling and ownership contract remains. Exact encoding/equations are
+the proposed P-13 contract, not yet approved.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1694,6 +1699,36 @@ D-44's corrected masks have been proved. Full-cell emission/ordering and
 lighting equations remain Q-16/Q-18; Q-19 must assign the approved loader,
 coverage and integration work and its qualification before final acceptance.
 
+### D-56. Use surface-normal RGB with the existing alpha-cutout technique
+
+Owner, directly in this design pane on 2026-11-08, answered “ok, i see, i
+approve your idea” after clarification of P-12's difference from Synarchy:
+the reference blends right/top/left brightnesses, while the proposal stores
+actual surface orientation and compares it with the sun direction. The
+clarification used a ramp facing low sunlight and explicitly preserved flat
+CPU quads, GPU cutouts, texture dimensions and the picking contract.
+
+Encode the visible surface normal in the face map's RGB channels, with alpha
+retaining its binary silhouette. Generate normals and cutouts from D-49's
+logical catalog, transform directions consistently with the chosen camera
+facing, and shade against D-46's world-fixed sun plus D-54's independent
+ambient illumination. Regenerate the maps' RGB contents deliberately and
+distinguish the encoding so old face-weight maps cannot be silently reused
+as normals. D-44's correction/provenance and visual proof remain mandatory.
+
+This explicitly supersedes the right/top/left RGB-weight interpretation in
+the earlier lighting framing and P-11's description of face weights. It
+preserves P-11's approved raw-data transport, dimensions, cutout alpha,
+sampling, CPU picking coverage and resource ownership. It adds no terrain
+cell mesh or extra per-cell texture. The exact encoded-normal format,
+numerical lighting/depth equations, defaults and Lua configuration require
+the remaining Q-18 contract review; the idea's approval does not choose those
+unstated values or prove the material implementation.
+
+Include low-angle sunlight on opposing ramps and all peak facets, ambient/sun
+independence and world-surface consistency through four camera facings in
+the solver's proof. No implementation or tracker mutation occurs here.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2754,7 +2789,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-55 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-56 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2832,6 +2867,9 @@ space through camera rotation. D-47 retains both adjustable depth darkening
 and blue haze and requires improved numerical/visual/navigation coverage.
 D-54 supplies independent Lua ambient control; changing sun position alone
 does not change ambient illumination.
+D-56 replaces RGB face-brightness weights with encoded surface normals in
+the same cutout data texture. P-12 records the reason and required proof;
+P-13 proposes its exact numerical/configuration contract.
 Exact units/binding, depth/colour equations and initial strengths remain Q-18;
 this paragraph settles no other amendment proposal.
 
@@ -3291,6 +3329,11 @@ D-30/D-45's shared coverage and crisp sampling without deciding the remaining
 emission/ordering or lighting equations. The initial scope is opaque/cutout
 terrain; partial translucency would require a later contract.
 
+D-56 subsequently replaces the RGB face-weight meaning below with encoded
+surface normals. The approved alpha, dimensions, sampling, loading and
+ownership clauses remain; P-13 separately proposes encoding validation and
+exact lighting parameters. This annotation preserves the signed P-11 text.
+
 **Verified fit with the reference and current engine.** At S `3777d437`,
 `assets/textures/world/loam/loam.png` and
 `assets/textures/world/granite/granite.png` are 96×64 and contain only alpha
@@ -3388,7 +3431,7 @@ Q-19 must assign the bounded loader/coverage work and its integration separately
 from mask correction and final renderer qualification. Approval specifies the
 target and does not establish that the implementation exists or passes proof.
 
-### P-12. Lighting representation for actual ramp orientations — proposal
+### P-12. Lighting representation for actual ramp orientations — approved by D-56
 
 **Source fact.** S `3777d437`
 `src/Engine/Graphics/Vulkan/ShaderCode.hs:258–303` normalizes nonnegative RGB
@@ -3413,15 +3456,15 @@ is not solely a hidden-face case. The calculation establishes a limitation of
 three fixed face responses if the target is actual surface-orientation
 lighting; it does not claim S promised that model or substitute for GPU proof.
 
-**Recommendation for owner decision.** Keep the same RGBA data texture and
+**Direction approved by D-56.** Keep the same RGBA data texture and
 binary-alpha silhouette, but encode the visible surface normal in RGB instead
 of right/top/left brightness weights. Generate normals and cutouts from the
 same D-49 catalog, transform normals consistently with the selected facing,
 and shade against the world-fixed sun plus D-54's independent ambient level.
 The CPU still submits the same flat cell quads; the GPU uses the mask alpha
 for the cutout. P-11's bounded raw-data loading, dimensions, sampling, CPU
-coverage and resource ownership remain applicable. This would explicitly
-revise its description of RGB as face weights, not its approved alpha or
+coverage and resource ownership remain applicable. D-56 explicitly
+revises its description of RGB as face weights, not its approved alpha or
 transport contract.
 
 This is an intentional lighting/asset-encoding change from Synarchy, requiring
@@ -3430,15 +3473,149 @@ cannot be silently interpreted as normals. It needs no additional texture
 per cell or new vertex/depth ABI by the source-level feasibility reading;
 the material implementation still requires qualification. Do not promise
 performance parity without measurement. Exact normal encoding, directional
-equation, default sun/ambient values and depth-effect composition depend on
-the owner's choice and remain Q-18 contract work.
+equation, default sun/ambient values and depth-effect composition remain
+Q-18 contract work, proposed concretely in P-13.
 
-The alternative is to retain the stylized three-face brightness blend and
-accept that it is not general surface-normal lighting for ramps. No choice
-has been made yet. If the recommendation is approved, solver evidence must
+The rejected alternative retains the stylized three-face brightness blend
+and its surface-orientation limits. Under D-56, solver evidence must
 include the low-angle ramp case, opposite slopes and all facets of ID 15,
 sun/ambient independence, and the same world-facing surface under all four
 camera facings, alongside D-44/P-11's cutout/picking proof.
+
+### P-13. Numerical preview lighting contract — proposal for review
+
+This completes the proposed Q-18 specification under D-29/D-46/D-47/D-54/D-56.
+The numbers, API additions and depth-effect composition below require owner
+approval. They are initial preview defaults, not measured visual acceptance.
+
+**Normal encoding and validation.** Name the data encoding
+`unit-normal-rgb-v1`. Store a unit surface normal in RGB bytes as
+`round(128 + 127*n)` componentwise; decode byte vector `c` by normalizing
+`c-(128,128,128)`. Opaque texels require all components in `1..255` and a
+nonzero decoded vector. Transparent texels' RGB is ignored; the material
+returns zero coverage before attempting to normalize a transparent sample.
+Recover bytes by rounding the nearest-sampled UNORM RGB times 255, avoiding
+a spurious nonzero component at the neutral byte 128. Flat-up is `(128,128,255)`;
+the W ramp normal is `(38,128,218)`, which decodes to
+`(-1,0,1)/sqrt(2)`. Cardinal and 45-degree catalog normals are represented
+without an angular quantization error under this encoding.
+
+Maps carry the outward normal of the visible D-49 facet at the baked pixel
+centre, in the rotated view frame used to draw that catalog entry. Preserve
+hard geometric creases; do not average unrelated facet normals into a smooth
+surface. The generator/reference must document a deterministic tie rule at
+shared facet edges and prove silhouette and normal selection together.
+
+Extend P-11's data-load options with optional
+`normal_encoding="unit-normal-rgb-v1"`, valid only with `kind="data"`.
+Validate nontransparent RGB while the accounted decode buffer exists, before
+upload/publication, and retain the checked encoding fact with the immutable
+asset identity. Malformed normals are an expected content refusal. Terrain
+mask loads request this option plus `coverage="binary"`; attachment requires
+that encoding fact. A raw data handle or an old face-weight map does not
+silently acquire normal-map authority. Omitted encoding preserves P-11's
+generic colour/data behavior. This is an additional proposed texture option;
+it is not already authorized by D-55 alone. Keep the validator generic to
+normal data, without importing terrain/game code into the decoder.
+
+**Lua settings.** Add optional `lighting` and `depth` records to the terrain
+view's opening style, with these defaults. The same records may be supplied
+as partial changes to `api.terrainView.configure`; omitted fields retain
+their current values. Unknown fields/metatables and nonfinite/out-of-range
+values are refused before mutation. Scalar controls accept finite Lua
+numbers; `range_levels` is an integer. An entire camera/lighting/depth change
+is validated and admitted atomically under the existing `true,nil` / `busy`
+configure contract. It creates no request handle or UI.
+
+| Record field | Meaning / accepted range | Initial value |
+| --- | --- | --- |
+| `lighting.sun_azimuth_deg` | Compass degrees `[0,360)`: north 0, east 90, south 180, west 270 | 225 (southwest) |
+| `lighting.sun_elevation_deg` | Degrees above horizon, `[-90,90]`; no direct sun at or below 0 | 45 |
+| `lighting.ambient` | Independent linear base illumination, `[0,1]` | 0.35 |
+| `lighting.sun_strength` | Direct-light strength, `[0,1]`; zero disables direct light | 1 |
+| `depth.range_levels` | Fixed depth-effect range in cell levels, `1..250` | 250 |
+| `depth.darkening` | Fractional darkening at that range, `[0,1]`; zero disables it | 0.15 |
+| `depth.haze` | Haze blend fraction at that range, `[0,1]`; zero disables it | 0.60 |
+| `depth.haze_srgb` | Plain `{r,g,b}` record of sRGB components in `[0,1]` | `{r=0.72,g=0.85,b=0.95}` |
+
+At open, missing records/fields use the defaults. A supplied `haze_srgb` is a
+complete three-component value; it is not a nested partial patch. Lighting
+and depth settings belong to the presentation view, with its existing owner,
+revision/lifetime and close/reset behavior, not a global clock or mutable
+terrain source. The depth range stays fixed through zoom/viewport changes;
+the effects measure depth below the effective cutaway, not horizontal distance.
+
+**Directional equation.** In the established world frame X east, Y south,
+Z up, azimuth `a` and elevation `e` give the unit direction toward the sun
+`s=(sin(a)*cos(e), -cos(a)*cos(e), sin(e))`, converting degrees to radians.
+Apply the existing camera quarter-turn transform to its X/Y components
+exactly once (`Projection.hs:108–134`: one turn is `(x,y)->(-y,x)`). Normals
+are already encoded in that view frame; do not apply Synarchy's additional
+left/right weight swizzle. Let `p=clamp(dot(n,s_view),0,1)` and let `S` be
+`sun_strength` above the horizon, zero otherwise. The brightness is
+`B=A+(1-A)*S*p`, with `A=ambient`. There is no extra per-side ambient factor.
+This is unshadowed directional/ambient preview lighting; cast shadows and
+occlusion lighting are not added by a normal texture.
+
+With the defaults, unmodified top, south-facing and east-facing surfaces
+have brightness about 0.80962, 0.675 and 0.35 respectively, before depth
+effects. These calculated reference values illustrate the proposed settings;
+they are not captures or proof of a running shader.
+
+**Depth and colour composition.** For a drawn cell at level `z` and effective
+clip level `k`, form `d=k-z` with checked/wide integer arithmetic before
+conversion to a bounded render value. Set `t=clamp(d/range_levels,0,1)`,
+darkening multiplier `D=1-darkening*t`, and haze fraction `H=haze*t*t`.
+Convert `haze_srgb` once to linear colour `F`: per component use `v/12.92`
+when `v<=0.04045`, otherwise `((v+0.055)/1.055)^2.4`.
+
+For sampled premultiplied linear colour `T`, mask alpha `m` and resulting
+coverage `alpha=T.a*m`, the material returns:
+
+```text
+rgb   = (1-H) * T.rgb * m * B * D + H * F * alpha
+alpha = T.a * m
+```
+
+Lighting then darkening then haze is the explicit composition order. P-11's
+cutout wrapper/threshold applies afterward; haze never makes a cutout opaque.
+Use opaque white instance tint and unit wrapper brightness so these factors
+are applied once. Fog shading may use only its generic cover geometry/data,
+never a hidden tile's normal/material to reveal what lies behind it.
+
+This intentionally changes S `TileQuads.hs:68–98`, which builds a blue tint
+and multiplies the material by it: here haze blends the already lit terrain
+toward `F`, so even dark surfaces can fade into the haze. The haze colour is
+an independent scene input; turning off sun/ambient does not darken it. A
+future Lua day/night rule could change it too. The strengths 0.15/0.60 and
+blue sRGB triplet are starting values derived from the reference, while the
+linear-light composition and fixed range are deliberate changes. At depths
+0/half/full range the dark multipliers are 1/0.925/0.85 and haze fractions
+0/0.15/0.60. This does not replace D-48's missing-background streaming fix.
+
+**Bounded publication and ABI fit.** Keep the normal map as the one secondary
+texture. Three `vec4` application pushes suffice: view-space sun plus ambient;
+effective sun strength/darkening/haze/reciprocal range; linear haze RGB plus
+padding. They use the existing 48-byte allowance
+(`render-2d-vulkan/.../Layout.hs:55–61` at H `c21d080e2f`). A bounded per-cell
+depth word can travel in the material record alongside the mask handle.
+This is source-level layout feasibility, not a GPU qualification result.
+Publish camera, normal-map identity, depth and lighting settings coherently
+with the adopted frame. No frame mixes a new setting with stale depth/facing
+data; no absolute large-world coordinate is converted to a low-precision
+shader position merely to calculate depth. Picking remains P-11 coverage-only.
+
+**Qualification.** Independently check encoded normals, the low-angle ramp
+case and all peak facets, quarter-turn world-light invariance, every parameter
+endpoint and invalid input, and the numeric examples above. Exercise sun-only,
+ambient-only, darkening-only, haze-only and combined settings, including black
+terrain under haze and disabled haze with both light sources zero. Capture
+the intentional tint-to-haze change beside the reference and test it across
+offload/reload, delayed arrival, noninteger zoom and manual/follow cutaways
+under D-47/D-48. Predeclare numeric/pixel tolerances appropriate to the output
+format; retain expected values, captures and reproduction commands. Solver
+proof and owner visual acceptance remain required even if this contract is
+approved. No performance improvement is inferred from the unchanged ABI.
 
 ## Open questions and review checkpoints
 
@@ -3622,12 +3799,13 @@ to the existing texture API and refuses incompatible terrain assets.
 General `DataImage` support is not proof that the bounded Lua route implements
 the approved policy. Implementation/qualification and the corrected asset
 catalog/provenance remain required; no temporary colour-decoding workaround is
-approved. P-12's possible change from RGB face weights to encoded normals is
-a separate Q-18 lighting choice, not an unapproved alteration of this contract.
+approved. D-56/P-12 explicitly supersedes RGB face weights with surface
+normals; the alpha/sampling/ownership contract remains. P-13's proposed
+normal-encoding validation is a further concrete contract checkpoint.
 
 ### Q-18. Exact initial appearance beyond the silhouette
 
-Partially resolved by D-29/D-46/D-47/D-54: Lua supplies sun compass direction and
+Partially resolved by D-29/D-46/D-47/D-54/D-56: Lua supplies sun compass direction and
 elevation, anchored in world space through camera rotation, without an automatic
 cycle or moon lighting. Settle exact angle conventions/units/ranges and binding,
 the initial light and ambient values, and the depth/colour equations and
@@ -3662,12 +3840,11 @@ face-light equations and the existing depth effects still need the concrete
 appearance contract. Retaining S's automatic sun-linked ambient curve is the
 rejected alternative, not assumed parity.
 
-Current owner question: P-12 recommends encoding surface normals in the RGB
-channels of the same cutout data texture, so the approved ramps/peak respond
-to their actual tilt under a world-fixed sun. Retaining Synarchy's stylized
-three-face brightness blend is the alternative. The RGB representation and
-lighting equation change are not approved yet; P-11's alpha/loading/ownership
-contract remains approved independently.
+The lighting-representation question is resolved by D-56/P-12: surface-normal
+RGB supplies actual ramp/peak orientation while alpha retains the cutout.
+Current owner checkpoint: P-13 proposes the exact normal encoding/validation,
+Lua settings/defaults, sun/ambient equation, depth range and linear-light
+darkening/haze composition. Its numerical/API choices are not approved yet.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
