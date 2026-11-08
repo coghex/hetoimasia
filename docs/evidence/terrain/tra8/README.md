@@ -14,7 +14,7 @@ a renderer inability.
 - Command (macOS, under the desktop-consent policy; the scenario creates no window):
   `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --private-roots tra8-terrain`
   (Linux: the same command without the variable, through the runner's isolated display.)
-- Source revision `23a44e1cdb8eeca329dfb6573624e5a9b2028657` (clean tree), source digest `c2ed8205fb084bf1ee3504518736b19a5ea0df4c412cac8ea40cd3ceb27d0730`; device
+- Source revision `b1c07fd1029c8e8376c60a9be62b39a8231579d6` (clean tree), source digest `3e6fffe65a320e0bd7a7d521fe85a3f9db98cea6473aab6eff980867232edfe6`; device
   `Apple M3 Max` (MoltenVK); depth format `Depth32Float`, target `Rgba8Srgb`; validation and
   synchronization validation clean through teardown.
 - Shader identity (SPIR-V SHA-256 of the checked fragment variants): cutout
@@ -26,8 +26,9 @@ a renderer inability.
   (all `true`, the decoded default) and the draw path its faces took: **every face of every fixture
   took the cutout path**, so the conclusion holds for the path the approved art takes with its decoded
   mark; no mark override was used.
-- Budget: scenario body 9.08 s; the child ran 9.4 s against the 20 s child deadline; the whole
-  `--complete` profile ran 22.0 s against its 30 s watchdog (`complete-profile-transcript.txt`). Every
+- Budget: scenario body 9.08 s; the scenario's child ran 9.4 s against the 20 s child deadline and the whole
+  `--complete` profile 22.0 s against its 30 s watchdog (`complete-profile-transcript.txt`, taken on head 23a44e1c; the only
+  source change since is the failure-path fix of review round 2, which the passing path does not run). Every
   batch's completion was awaited before its readback; the oracle's per-pixel judging dominates the
   time, recording and readback of all fixtures together taking about 1.2 s.
 

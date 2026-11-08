@@ -9,12 +9,12 @@ Verdict: **pass**.
 - target standing: no target
 - actions: ran the terrain evidence
 - device calls, in order: vkCreateInstance, vkCreateDebugUtilsMessengerEXT, vkEnumeratePhysicalDevices, vkCreateDevice, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
-- Vulkan calls: 794, on 1 thread(s)
+- Vulkan calls: 791, on 1 thread(s)
 - frames presented: 0, presentations retired: 0
 - verdict issues: []
 - error reports: 0
-- seconds, from the loader integration to the verdict: 9.389997
-- probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/031b4ebb-935c-4584-bbfa-56623775a271/scratchpad/evidM/terrain/tra8-terrain-probes.json
+- seconds, from the loader integration to the verdict: 9.382857
+- probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/031b4ebb-935c-4584-bbfa-56623775a271/scratchpad/evidO/terrain/tra8-terrain-probes.json
 - failure: none
 - depth format: Depth32Float
 - matrix-FaceSouth-0.25: pass, 10560 probes, 10040 determinate
@@ -103,8 +103,8 @@ Verdict: **pass**.
 
 ```
 ## TRA-8: a surface-free session draws plans of the terrain arena's faces, adapted through the existing fixed-quad and material ABI, into offscreen targets that have a D32_SFLOAT depth image, reads each back after its batch completed and judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated line-of-sight expectation: the 16 shape identities in each of 4 facings, roofs over cavities, disconnected spans, ramps and corners, cutaways, the automatic follow, a deep floor, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, equivalent submissions and retained chunks, transparent coverage and three negative controls
-the terrain evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/031b4ebb-935c-4584-bbfa-56623775a271/scratchpad/evidM/terrain
-terrain probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/031b4ebb-935c-4584-bbfa-56623775a271/scratchpad/evidM/terrain/tra8-terrain-probes.json
+the terrain evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/031b4ebb-935c-4584-bbfa-56623775a271/scratchpad/evidO/terrain
+terrain probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/031b4ebb-935c-4584-bbfa-56623775a271/scratchpad/evidO/terrain/tra8-terrain-probes.json
 terrain depth format: Depth32Float
 terrain fixture matrix-FaceSouth-0.25: 10560 probes, 10040 determinate, 520 not counted; passed
 terrain fixture matrix-FaceWest-0.25: 10560 probes, 9840 determinate, 720 not counted; passed
