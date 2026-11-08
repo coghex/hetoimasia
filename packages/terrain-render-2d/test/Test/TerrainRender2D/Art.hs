@@ -11,6 +11,7 @@ module Test.TerrainRender2D.Art
   , parseJson
   , field
   , texturesDirectory
+  , findUpwards
   ) where
 
 import Crypto.Hash.SHA256 (hash)
