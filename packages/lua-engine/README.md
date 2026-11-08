@@ -649,7 +649,12 @@ colour image (never an implicit `kind = "data"`).
   `TextureRequirement` states what the consumer needs (the kind, binary coverage, a checked encoding); a version without
   it is a clear refusal, as data, before anything is retained. The retained value pairs the registration's identity, the
   dimensions, the shared plane and the checked profile, all from the one version, so a path, a recycled registration slot or a
-  reused handle generation can never pair an old plane with a new texture. A Lua `release` stops the lease granting new
+  reused handle generation can never pair an old plane with a new texture; its fields are private (the identity is read
+  through `retainedView` and `retainedVersion`, which no record update can reach). The plane is read **through the retained
+  value's own interest** (`retainedCoverage` is an STM read, `Nothing` once that interest is released), and the plane is built
+  and fully evaluated in the decode stage before the level is handed over, so it never closes over the decoded RGBA image. The
+  last interest's drop clears the plane from the version in the transaction that returns the charge: a job, a cell or a lease
+  record that still names the version (a texture awaiting its GPU retirement) reaches no payload. A Lua `release` stops the lease granting new
   interests (and drops the lease's own, at once) and leaves the ones already taken. The CPU plane ends with its last
   interest; the texture's slot, nominal bytes and GPU registration end on the backend's evidence of retirement; neither
   event stands in for the other. `releaseRetained` is idempotent.
@@ -671,7 +676,7 @@ charges return, and the reservation is returned by the host's credit release, ex
 | A texture's `Cell` | the pipeline until the answer offers it, then the host (adopt or drop), then the lease | the backend's sink, the answer's offer, the adoption recipe, the release | the retirement readings | one transition per decision on the cell (offer, adopt, claim); exactly one party calls the backend's release, once |
 | The session's CPU render/staging account (`RenderAccount`) | the composition root: `run/Hetoimasia/Run/Session.hs` makes exactly one per session, sized `m1RenderAccountBytes` (128 MiB), and passes it narrowly to `withTexturePipeline`; a test composition injects its own; the pipeline makes none | the request's reservation at its admission (`reserveHold`), the decode's one shrink (`shrinkHold`), the last release of a version's interests (`returnOwned`), the host's credit release (`returnHold`), and any other consumer through `accountReserve`/`accountRelease` | `accountCharged` | the session; never reset, never raised, no cache. Terrain's internal staging ledger (`packages/terrain/README.md`, the staging bank) is **not yet unified** with it: a later terrain service receives this same handle |
 | A request's reservation (`Reservation`) | the request: `prepareRequest` makes it with the prepared token | admission, the decode's shrink, the transfer to the version (`takeOwnership`, in the transaction that records the version) | `reservationReading` | `Unreserved → Held n → (Held m) → Owned m → Done`, or `Held → Done`; every state past `Done` is final, so the bytes go back exactly once |
-| A loaded `Version` (the checked kind, dimensions, normal encoding and the one shared coverage plane) | the pipeline, which makes it and holds the first interest | its interest count only: every operation is one STM transaction; the facts are immutable | any holder of an interest | from the decode that built it to its last interest; an interest is a token dropped exactly once |
+| A loaded `Version` (the checked kind, dimensions and normal encoding, and a variable holding the one shared coverage plane, cleared by the last interest) | the pipeline, which makes it and holds the first interest | its interest count only: every operation is one STM transaction; the facts are immutable | any holder of an interest | from the decode that built it to its last interest; an interest is a token dropped exactly once |
 
 There are two session read workers (the shared pool, LFE-10), **one decode worker** and **two lanes**. No thread is made
 for a request, an instance or a VM.

@@ -1,7 +1,7 @@
 # The graphics adapter on a real device
 
-- revision: 92330829cf57fc930af61ec1e8c17f256903057c (dirty)
-- source digest: bbad521cf43f5f65d291fa7f6ba06128f0a7e216617667209949d99122da7821
+- revision: 9752b786dbcb44c2752c985a563e38771b249574 (dirty)
+- source digest: 051432ce3be08499d920ab3d7262d7f33fb02f0212059a951320974a588db120
 - command: lua-engine-graphics-native-tests --match Lua offscreen pixels (through tools/vulkan/run.sh native)
 - platform: darwin/aarch64, ghc Version {versionBranch = [9,14], versionTags = []}
 - device: Apple M3 Max
@@ -11,10 +11,10 @@
 - windows: 0 (the session is started without a surface and no window is requested)
 - validation: synchronization validation, pinned features synchronization
 - diagnostic verdict: clean, 64 records delivered
-- native calls: 425
+- native calls: 426
 - destruction: vkDestroyFence, vkDestroyFence, vkDestroyPipeline, vkDestroyCommandPool, vkDestroyCommandPool, vkDestroyDescriptorPool, vkDestroyDescriptorPool, vkDestroyDescriptorPool, vkDestroyDescriptorSetLayout, vkDestroyDescriptorSetLayout, vkDestroyDescriptorSetLayout, vkDestroySampler, vkDestroySampler, vkDestroySampler, vkDestroySampler, vkDestroyPipelineLayout, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
 - configuration: staging 33554432 bytes, table capacity 33, versions 10, native bytes budgeted 306186832 bytes of 2147483648 bytes
-- seconds: 8.252566
+- seconds: 8.074268
 - result: every check passed
 
 ## What the examples measured

@@ -128,9 +128,11 @@ Retained-edit bytes are accounted monotonically by the model: a removal that
 *coalesces* two retained intervals shrinks the real changes, but the saving is not
 credited (the added bytes are reported as zero), so the account stays an upper bound.
 
-A settled removal's result (and a no-op's) is kept, with its command slot, until its
-holder takes it (`await`, or `retire` for a host): admission is busy once accepted
-commands and untaken results fill the slots, exactly as for a read's result.
+A settled removal's result (and a no-op's) is kept until its holder takes it
+(`await`, or `retire` for a host), and is charged while it is: one command slot, and
+160 accounted bytes (a one-region command record) in the retained bank. Admission of a
+removal is busy once accepted commands and untaken results fill the slots, or the bank
+cannot hold one more result; a read's result stays charged by the model itself.
 
 Removing air is a no-op: `changed = false` and the unchanged revision. A removal
 whose staged revision was superseded is recomputed against the current revision and
@@ -171,7 +173,7 @@ region and protects the regions from eviction) and builds an immutable `Snapshot
 whose resident detail is restricted to exactly the held regions. Its **backing
 allocation is accounted**: each outstanding snapshot is charged the payload and
 metadata bytes of its restricted detail, conservatively per snapshot, against a
-snapshot bank (`configSnapshotBytes`, 16 MiB by default) that is carved out of the
+retained bank (`configRetainedBytes`, 16 MiB by default) that is carved out of the
 configured staging bank, which the accounting model is built without (so the two
 cannot overbook the approved 128 MiB). An edit rebuilds a segment while an earlier
 snapshot keeps the old one alive; a borrow that would retain a further version
@@ -213,7 +215,12 @@ the stores only after the borrowers finish.
   hold still outstanding keeps only its own arena retiring until released).
 * A defect recorded where nothing could throw (a host settlement callback that
   failed inside a closing transaction) never hides: every settlement is still
-  attempted, and then the owner ends with the recorded defect, so supervision sees it.
+  attempted, and then it reaches supervision whatever the owner ended with: as the
+  owner's failure when it would have returned, or attached to its failure as cleanup
+  evidence (`composeCleanup`) when it had already failed.
+* The owner's turns are shared: staging and commits take turns with loads and retries
+  whenever both are ready, so a continuous stream of ready requests cannot starve a
+  queued load (the model's round-robin and aging then choose among loads).
 * Every release path steps the model through one function that says which events
   may have returned credits (`freesCapacity`); what waits for capacity (pending
   camera demand, a request waiting to be admitted again) is retried after each, so

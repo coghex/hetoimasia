@@ -15,8 +15,10 @@ HETOIMASIA_NATIVE_SESSION=desktop HETOIMASIA_VALIDATION_EVIDENCE=<dir> bash tool
 HETOIMASIA_NATIVE_SESSION=desktop HETOIMASIA_VALIDATION_EVIDENCE=<dir> bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --match 'Lua offscreen pixels'
 ```
 
-Build identity of both runs: revision `92330829cf57…` (the branch head with the documentation of this change
-still uncommitted, hence `dirty`), source digest `bbad521cf43f5f65d291fa7f6ba06128f0a7e216617667209949d99122da7821`.
+Build identity of both runs: revision `9752b786dbcb…` (the merged pull request head, with the README correction of
+this change still uncommitted, hence `dirty`), source digest
+`051432ce3be08499d920ab3d7262d7f33fb02f0212059a951320974a588db120`. The run was repeated at this head after the first
+review round's repairs and the merge of #655.
 
 ## Files
 
