@@ -378,7 +378,11 @@ line-of-sight expectation worked out from half-spaces (`Evidence`), with negativ
 controls that reject reversed overlap, an incorrect coverage mask and a pick through
 a nearer face. The device proof is the `tra8-terrain` scenario of
 `vulkan-native-tests`; its measured outcome and the Q-13 assessment are under
-`docs/evidence/terrain/tra8/`.
+`docs/evidence/terrain/tra8/`. That retained baseline evidence is revision-pinned
+and describes identity 15 as the old flat solid; TRA-13 superseded that geometry
+(identity 15 is the central half-height peak), so the hand-stated expectation here
+and in `Evidence` now takes all four ramps for 15, and the retained table is not
+rewritten. Amended offscreen proof of the corrected shapes belongs to TRA-17.
 
 ## Tests
 

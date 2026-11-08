@@ -6,8 +6,10 @@ description:
     Tile coordinates on three axes with a checked signed 64-bit range, exact
     region and local decomposition by floor division, the sixteen-shape catalog
     with exact quarter-turn rotation, and the canonical unit-cell solid of every
-    shape with its faces, face coverage, point membership and ray and segment
-    intersection, all in exact rational arithmetic; the layered source, packed
+    shape (identity 15 the central half-height peak) with its faces, face
+    coverage, point membership and ray and segment intersection, and the exact
+    empty components and portals of every shape with the connections between
+    neighboring cells, all in exact rational arithmetic; the layered source, packed
     sparse resident detail and retained removals over them; and the pure
     residency and admission model that decides, under validated bounded limits,
     what may be loaded, shared, evicted and retained. The library is pure and

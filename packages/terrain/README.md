@@ -4,7 +4,9 @@ Checked terrain tile identity, the canonical geometry of every terrain shape,
 and the pure source, storage and query kernel of the terrain arena arc (epic
 #636). TRA-1 supplied pure coordinates, region keys, a 16-shape catalog with
 exact rotation, and the one geometric authority that face generation, cutaway
-coverage and picking will share. TRA-2 adds the immutable layered source, the
+coverage and picking will share; TRA-13 corrected identity 15 to the approved
+central peak and added the exact empty-space openings and their connections
+between neighboring cells. TRA-2 adds the immutable layered source, the
 packed sparse resident-detail representation and the retained-removal overlay
 with the queries over them, and TRA-3 the pure residency and admission model
 over them. It is a data, query and decision kernel, not a world store:
@@ -16,6 +18,7 @@ transactional ownership, revisions and live offload (TRA-4), Lua copying
 | `Hetoimasia.Terrain.Coordinate` | Checked tile identity, region/local decomposition, cutaway |
 | `Hetoimasia.Terrain.Shape` | The 16-shape catalog, sides, quarter turns, view facings |
 | `Hetoimasia.Terrain.Geometry` | The canonical unit-cell solid, face coverage, membership, ray and segment queries |
+| `Hetoimasia.Terrain.Opening` | The exact empty components of a cell, their portals on the six faces, and the connections between neighbors |
 | `Hetoimasia.Terrain.Cell` | Authored materials, the air-or-solid cell value, half-open Z intervals, columns |
 | `Hetoimasia.Terrain.Source` | The declarative layered source: definition, validation, limits and byte accounting |
 | `Hetoimasia.Terrain.Changes` | Retained removals: canonical intervals, whole-cell removal, merge and restore |
@@ -112,8 +115,9 @@ East toward positive X.
 - `mkShapeId` refuses every identity outside `0..15`. An unsupported identity
   is never normalized to flat, and the rejected thirteen-shape catalog is not
   substituted.
-- Identities 0 and 15 are distinct authored identities, kept distinct even
-  though both have a flat top; NS and EW are distinct opposite-direction forms.
+- Identities 0 and 15 are distinct authored identities with distinct solids:
+  0 is the full block and 15 the central half-height peak. NS and EW are distinct
+  opposite-direction forms.
 - Arbitrary fractional slabs and new identities need a later, explicit
   extension.
 
@@ -124,8 +128,9 @@ East to South to West to North.** This is a compass mapping, never inferred from
 an angle sign: with North toward -Y, East toward +X and Z as elevation the axes
 are left-handed compared with the math package's "a quarter turn about +Z takes
 +X to +Y", so reusing that package's `rotation` sign would reverse the facing
-order. Four turns restore the starting shape; 0 and 15 are fixed and NS and EW
-exchange under a single turn. `turns` normalizes any count, including a negative
+order. Four turns restore the starting shape; 0 and 15 are fixed (each is
+symmetric about the cell's vertical axis) and NS and EW exchange under a single
+turn. `turns` normalizes any count, including a negative
 one, to `0..3`.
 
 A local point turns with its shape: `rotatePoint (turns 1)` takes `(x, y, z)` to
@@ -164,9 +169,9 @@ closed convex region
 
 `0 <= x <= 1`, `0 <= y <= 1`, `z >= 0`, under the top surface,
 
-where the top is a flat `z <= 1` for identities 0 and 15, and otherwise one
-full-width 45-degree ramp per set bit, each 0 high on its own side and 1 high on
-the opposite side:
+where the top is a flat `z <= 1` for identity 0 and otherwise one full-width
+45-degree ramp per set bit, each 0 high on its own side and 1 high on the
+opposite side:
 
 | Set bit | Ramp |
 | --- | --- |
@@ -181,8 +186,17 @@ a convex polytope with piecewise-planar faces: a corner form (NE, ES, NW, SW) is
 a square pyramid with its apex over the opposite corner, an opposite pair (NS,
 EW) is a tent with a half-height ridge along the other axis, and a three-side
 form peaks at half height on the edge of its open side. A lowered side leaves a
-zero-thickness edge, which is no face. Identity 15 is the authored all-sides
-identity with a flat top, and its solid is exactly that of identity 0.
+zero-thickness edge, which is no face. Written as a height field, with `N = y`,
+`E = 1 - x`, `S = 1 - y` and `W = x`, the solid is `0 <= z <= h(x, y)` where `h = 1`
+for identity 0 and otherwise the minimum of the expressions its bits name.
+**Identity 15 takes all four**: `h = min(N, E, S, W)`, a central four-sided peak
+whose apex is `(1/2, 1/2, 1/2)`. It has four sloping top facets and a full base,
+no wall of positive area (every side meets the base along an edge), and its four
+base corners stay in the solid. It is not a full block and not a lowered flat
+slab (owner decision D-49, which replaced the earlier flat-top alias; the old
+identity-15-is-identity-0 expectations were reversed on purpose, not preserved
+as a second authority). IDs 0 to 14 keep their lower-envelope solids, and no
+identity is reshaped when a neighboring tile is removed.
 
 `solidVertices`, `solidFaces` and `solidPlanes` give the exact vertices, faces
 and bounding half-spaces. A `Face` has a kind (`TopFace`, `WallFace side`,
@@ -196,7 +210,8 @@ South, West, then the bottom.
 `sideCoverageArea shape side` is the exact area of a cell side's wall, and
 `sideCoverage` classifies it as none, partial or full. This is what a later face
 generator needs to decide which neighbor-facing walls can be hidden: a side is
-fully covered only opposite a lowered side, or on a flat identity. The top faces
+fully covered only opposite a lowered side, or on the flat identity 0. The peak
+covers no side at all. The top faces
 together always cover the whole footprint (`faceFootprintArea` sums to 1), and
 the bottom is one full face.
 
@@ -247,6 +262,67 @@ values exactly. A ray with no direction, and a segment of no length, are refused
 with `ZeroLengthDirection`. Integer tile identity stays exact at the extreme
 coordinates because `cellWorldPoint` adds the exact integer coordinates to the
 local point as rationals.
+
+## Openings and connections
+
+`Hetoimasia.Terrain.Opening` is where empty space can pass. It derives everything
+from the same `Solid` as the geometry above, so a portal, a point query and a ray
+query cannot disagree; it owns no state and does not traverse a world, inspect
+residency or turn missing data into air.
+
+- *The empty region.* An occupied shape's empty region is the unit-cell space
+  strictly above `h`. Identity 0 has none. Every other catalog identity has
+  exactly one connected component (the region lies above a graph, so every point
+  is joined straight up to the top face, whose open part is the footprint less at
+  most an edge or a point). Membership is nonetheless explicit
+  (`cellComponents`, `componentPortals`, `portalComponent`) so no consumer assumes
+  a cell has at most one component, and the connection inside a cell is exactly
+  "two portals of one component".
+- *Portals.* A `Portal` is the part of a cell face through which a component is
+  open: an exact `Opening` region (`openingPieces` as convex pieces without a
+  common interior, `openingArea`, `openingContains`) on one of the six faces
+  (`TopFace`, `WallFace side`, `BottomFace`). Face coordinates are `(y, z)` on
+  East and West, `(x, z)` on North and South and `(x, y)` on top and bottom, each
+  in `[0, 1]`, so a shared face has the same coordinates from either cell. A
+  horizontal face's opening is its portion with `z > h`; the top opening is where
+  `h < 1`; no occupied shape has a bottom opening of positive area. A selected
+  side is open above its base and an unselected one may be partly open or sealed
+  according to the same height function. N, for example, is fully open to the
+  north, sealed to the south, triangular (area 1/2) to the east and west, and open
+  over the whole top; identity 15 is open over all four sides and the top, and not
+  at all below. Full air (`airOpenings`) is one component open over all six faces;
+  it is not a seventeenth shape.
+- *How an opening is computed.* The opening of a face is the unit square less the
+  solid's section by that face's plane, which is the convex hull of the solid's
+  vertices on the plane, subtracted as convex pieces. The pieces are one
+  representation of a region, not a canonical form: compare regions by area and
+  containment.
+- *Connections.* `placePortals` puts a cell's portals on a tile, `connectPortals`
+  joins two placed portals and `connectCells` all the portals two neighboring
+  tiles share. Two components connect exactly when their portals are on opposite
+  faces of one world plane and overlap over **positive area**, computed exactly
+  after placement in world coordinates; the result names both components, the face
+  and the common region (`connectionArea`, `connectionRegion`). Scalar areas are
+  never compared: an N ramp beside another N ramp across X shares an opening of
+  area 1/2, but an N beside an S shares 1/4 although each opens 1/2, and an
+  adjoining full block seals it. Edge-only and point-only contact has area zero
+  and never connects, there is no tolerance, and only the six face directions
+  connect, so diagonal neighbors, which touch along an edge or at a corner, are
+  never linked. A cell carrying a solid material is not automatically a sealed
+  cube: whether it seals a face is the portal's business alone. A path can
+  therefore turn through the empty region above a ramp into a diagonally situated
+  cavity, and be stopped by a sealed neighbor or by a ramp whose open side faces
+  away.
+- *Rotation.* `rotateOpenings` follows `rotateShape`; four turns restore the
+  original and full air is unchanged. A camera facing selects the turned openings
+  and never rewrites the authored shape identity or a connection. World placement
+  adds the tile's exact integer coordinates to the local points, so it is exact at
+  the supported extremes and across negative region seams.
+- *Boundary convention.* The closed-solid convention is unchanged: a boundary point
+  belongs to the solid and is not air, so a face point strictly inside a portal is
+  exactly a point `classifyPoint` calls `Exterior`, and one on the solid's section
+  is `Boundary`. An opening is closed as a region (`openingContains` includes its
+  edge), but a zero-width contact never connects.
 
 ## Layered source
 
@@ -821,15 +897,17 @@ the reference's relevant arithmetic is restated in the fixtures with provenance.
 - *The view mapping.* `Textures.hs:27-37` (`viewSlopeId`) rotates the four bits
   by `0`, `1`, `2`, `3` places for the South, West, North and East facings, which
   is the table above.
-- *The flat top of 15.* `Compute.hs:158` and `:164` turn a raw slope of 15 into 0:
-  generation never produces a distinct sloped form for 15, which therefore has a
-  flat-top treatment. 0 and 15 stay distinct identities; the solid of both is the
-  cube.
+- *Slope 15 in generation.* `Compute.hs:158` and `:164` turn a raw slope of 15 into
+  0: the reference never generates a distinct sloped form for 15 and its mask is a
+  flat treatment. Hetoimasia **departs from this on purpose**: owner decision D-49
+  makes identity 15 the central half-height peak. The earlier flat-block alias of
+  this package (identity 15 as identity 0) is gone; the reference's treatment is
+  evidence of what its sprites do, not the shape definition.
 
 **What this package selects, because the reference leaves it open**
 
 - The *solid* behind each mask: a full-width 45-degree ramp per set bit, the
-  intersection of the ramps, flat top for 0 and 15.
+  intersection of the ramps, flat top for 0 alone (15 is the four-ramp peak).
 - The *interior profile of NS and EW*: a tent with a half-height ridge.
 - The *interior form of the three-side identities* (7, 11, 13, 14): the lower
   envelope of three ramps, peaking at half height on the open side's edge.
@@ -858,7 +936,27 @@ the reference's relevant arithmetic is restated in the fixtures with provenance.
 | 12 | SW | `:53`; bits 4 and 8 | pyramid, apex `(1, 0, 1)` |
 | 13 | NSW | `:54`; bits 1, 4 and 8 | lower envelope, open to the East |
 | 14 | ESW | `:55`; bits 2, 4 and 8 | lower envelope, open to the North |
-| 15 | NESW | `:56`; bits 1, 2, 4 and 8; flat-top treatment (`Compute.hs:158`, `:164`) | the unit cube, as 0 |
+| 15 | NESW | `:56`; bits 1, 2, 4 and 8; the reference treats a raw slope 15 as flat (`Compute.hs:158`, `:164`) | the central peak, apex `(1/2, 1/2, 1/2)` (D-49; not the cube) |
+
+### The retained reference defect
+
+The reference's own masks are not consistent with any one solid under a quarter
+turn, and that is why its masks are evidence and not the shape definition. With the
+reference's full-block projection `u = 48 + 48 (x - y)`, `v = 16 + 24 (x + y) - 16 z`,
+the E mask's texel `(48, 2)` is opaque `(0, 255, 0, 255)`. The cell points that
+project anywhere into that texel's whole area satisfy `0 <= x + y <= 1/8`,
+`0 <= x - y <= 1/48` and `13/16 <= z <= 1`. Under the inverse quarter turn
+`(x, y, z) -> (y, 1 - x, z)` they project into the N mask's window
+`[0, 6] x [23.5, 27]`, every enclosing texel of which is transparent (the first
+opaque N rows of columns 0 to 7 are `39, 39, 38, 38, 37, 37, 36, 36`). So an opaque
+part E requires would lie inside a transparent part of N after the turn, by a wide
+margin. `Test.Terrain.Reference` keeps the samples (the two pinned blobs
+`effc21564c7a653605dcbafca23ce7bc560e262d` for N and
+`5ed533b4d9467fa3b371a4cb489a87844fa64611` for E at the reference revision above),
+`test/reference/extract_facemap_samples.py` reproduces them from a sibling checkout,
+and the suite derives the implication itself in exact arithmetic. No PNG, checkout
+or network is read at test time, and this is not corrected-mask, alpha-picking,
+lighting or GPU evidence (TRA-14, TRA-16 and TRA-17).
 
 ## Tests
 
@@ -870,14 +968,21 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --t
 
 It is deterministic, starts no thread of its own and sleeps nowhere. Expected geometry is an
 independently authored matrix of vertices and faces for all 16 identities, with
-exact rotation checked in four facings against the tests' own turn. The source,
+exact rotation checked in four facings against the tests' own turn. The opening
+examples check the portals of every identity in all four orientations against a hand
+table of areas and a height-rule oracle sampled on a lattice that avoids every
+boundary, integrate the area two neighbors share across each side independently,
+exercise all six directions, edge-only and point-only contact, and diagonal paths and
+their sealed controls through every orientation at placements across chunk,
+vertical-region and negative seams and at both ends of the range (a missing tile is
+unavailable, never air), and tie portals back to point and ray results. The source,
 storage and query examples compare the library with an independent naive model
 (`Test.Terrain.Model`) that scans every record for every level and shares no code
 with the library, and with literals; the encoding examples assert the approved
 payload table. The suite is built with `-with-rtsopts=-T` for the growth
 examples, and an example that finds the statistics disabled fails. No example's
 expected value is produced by the code it checks. `Test.Support.ExternalClient`
-compiles a client outside the package: two must link and run, and every attempt
+compiles a client outside the package: three must link and run, and every attempt
 to name a private constructor, forge a value from one, rewrite a validated limit or
 the model's state with record update, or import a private module must be refused for
 the specific diagnostic that names the cause. The residency examples drive the model

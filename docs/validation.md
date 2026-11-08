@@ -309,11 +309,19 @@ and local decomposition of 16 × 16 columns and 32-level regions across the
 negative seams, at the extremes and as a round trip; whole-cell cutaway levels;
 the 16-shape catalog, with the identities 0 and 15 and NS and EW kept distinct,
 unsupported identities refused, exact quarter turns and the view-facing
-selection that leaves world identities unchanged; and the canonical unit-cell
+selection that leaves world identities unchanged; the canonical unit-cell
 solid of every shape against an independently authored vertex and face matrix in
-all four facings, its face coverage, point membership, and ray and segment
+all four facings (identity 15 the central half-height peak, not a flat alias of
+identity 0), its face coverage, point membership, and ray and segment
 intersection with their edge, vertex and in-plane tie-breaking and the refusal of
-non-finite or zero-length input. It also runs the layered source and its
+non-finite or zero-length input; and the exact empty components and portals of
+every shape on the six cell faces (TRA-13): all 16 identities in all four
+orientations against an independent area table and height-rule oracle, the area
+neighbors share integrated independently, positive-area overlap told from equal
+areas and from edge-only or point-only contact, diagonal paths and their sealed
+and unavailable-tile controls in every orientation at placements across chunk,
+vertical-region and negative seams and at the range ends, and the retained
+original N/E reference-defect fixture. It also runs the layered source and its
 storage (TRA-2): a definition validated whole before it is exposed, with every
 half-open endpoint tested at the exact boundary, one past it and at the lower
 limit, and the 256 KiB, 8,192-authored-run and 4,095-material bounds each
