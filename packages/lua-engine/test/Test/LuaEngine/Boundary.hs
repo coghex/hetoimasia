@@ -516,6 +516,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Texture"
                , "Hetoimasia.LuaEngine.Scene"
                , "Hetoimasia.Asset.Image"
+               , "Hetoimasia.Asset.Image.DataMap"
                , "Hetoimasia.Math.Affine2"
                , "Hetoimasia.Math.Vector"
                , "Hetoimasia.Render.Api.Texture"

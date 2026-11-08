@@ -913,7 +913,7 @@ ownerOf ∷ Vm → Text → IO TextureOwner
 ownerOf vm name = (Map.! name) <$> readIORef (vmOwners vm)
 
 -- | The bindings: @fx.record@ and @fx.block@, the common operations from the adapter, and
--- @tex.load(who, path [, optional])@, @tex.use(texture)@ and @tex.release(texture)@, written the way
+-- @tex.load(who, path [, optional [, policy]])@, @tex.use(texture)@ and @tex.release(texture)@, written the way
 -- the facade will write them from "Hetoimasia.LuaEngine.Texture". The @who@ names the texture owner:
 -- this is the example's own scaffolding, where the facade would hold the instance's owner in its
 -- binding. It is not an API of the engine.
@@ -1186,7 +1186,7 @@ enderSource =
     source =
       [ "function init(self, api) end"
       , "function shutdown(self, reason)"
-      , "  local ok, err = pcall(tex.load, 'e', 'a.png', nil)"
+      , "  local ok, err = pcall(tex.load, 'e', 'a.png', nil, nil)"
       , "  fx.record('shutdown load ' .. tostring(ok) .. ' ' .. tostring(err))"
       , "end"
       ]
@@ -1199,7 +1199,7 @@ failingSource =
   where
     source =
       [ "function init(self, api)"
-      , "  self.r = tex.load('f', 'a.png', nil)"
+      , "  self.r = tex.load('f', 'a.png', nil, nil)"
       , "  fx.record('failing started')"
       , "end"
       , "function shutdown(self, reason) error('shutdown boom') end"
