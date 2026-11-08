@@ -328,6 +328,28 @@ and uses the source (256 KiB, 8,192 authored runs) and query (1,024 runs, 8,192
 levels) limits of `hetoimasia-terrain`. All are configurable through `Config`
 within the model's minimum-budget rule.
 
+### Every limit counts every state that holds the resource
+
+A limit is checked against what is held, in every state, until the release has
+actually completed (owner directive, round 10). Each service-wide limit is computed by
+one function, and `inspectLimits` (the `LimitRow` list) sets each count beside an
+independent enumeration of the entities holding the resource; `inspectInvariants`
+requires the two to agree and the count never to exceed the limit.
+
+| Limit | States counted | Function |
+| --- | --- | --- |
+| Arenas (four) | live arenas; pending opens (admitted, not settled); **retiring** arenas (closed, an outstanding snapshot or an unfinished release keeps them in the model) until the model reports their retirement complete | `arenaUse` |
+| Arena leases (64) | every lease record, live or revoked, until it is released; pending opens and attaches | `leasesInUse` |
+| Views (eight) | open views, until closed or their client ends | `Map.size stateViews` |
+| Clients (256) | registered clients, until `endClient` | `Map.size stateClients` |
+| Command slots | the model's accepted commands; untaken results; pending opens and attaches; reads and removals waiting to be admitted again; every ghost (a request withdrawn while its preparation runs) | `slotsHeldHere` with the model |
+| Retained bank | outstanding snapshots' backing; one result record per request, from admission to take, including ghosts | `retainedBankUse` |
+| Per-arena retained edits, resident, edit and staging banks, holds, jobs | the residency model's own accounting, whose records (live or retiring arenas, ghosts, running preparations) stay charged until released at the owner's safe point | the model's `chargeCheck` and invariants |
+
+The enumeration reads the model's arenas, each client's lease and view sets, and the
+request and ghost tables, so a state that one count forgot is a disagreement, not a
+silent over-admission.
+
 Identities (clients, leases, requests, the admission sequence, arenas, views, holds) and
 content revisions are checked 64-bit counters; the residency generation saturates. The last value is never issued, and an admission that would
 need it is refused before any work (`RefusedExhausted`).
@@ -339,7 +361,8 @@ admitted, what holds it, every way it is released and the example that exercises
 that exit. `inspectInvariants` checks the structural rules after every example: the
 model's own invariants and charge rules, the two-way agreement between the request
 table and the model's records, lease and name consistency, no arena both live and
-retiring, and the borrower count against the model's holds.
+retiring, the borrower count against the model's holds, and every service-wide limit's
+count against the entities that hold it (retiring arenas included).
 
 | Item | Admitted by | Held in | Released by | Exercised by |
 | --- | --- | --- | --- | --- |
@@ -373,7 +396,13 @@ grant, release, end, edit, borrow and view demand (24 seeds of 300 steps each, t
 sequence a function of the seed) beside the running owner, checking after every step
 that the structural invariants and the model's charge rules hold and that no defect
 was recorded, and at the end that every accepted request reached exactly one terminal
-outcome and every bank is empty.
+outcome and every bank is empty. A fourth group of 24 seeds runs under tight
+service-wide limits (two arenas, five leases, two views, three clients) and, after
+every step including those taken inside a held borrow, requires each limit's count to
+equal the entities of every state that hold it (a closed arena whose snapshot is still
+borrowed included) and never to exceed the limit; the group asserts that it saw
+retiring arenas. `Test.TerrainRuntime.Limits` pins the examples: outstanding
+borrowers block a further open and releasing one permits progress.
 
 The examples drive the production service. A **gate** is an `MVar` the owner blocks
 on at a named point (`Probe`), so an example decides which side of a race wins by
