@@ -273,6 +273,9 @@ preflight's, and the byte account is a handle the caller passes.
 
 ```haskell
 decodeBounded ∷ PayloadAccount → PngPreflight → IO (Either PngRefusal DecodedImage)
+decodeBoundedWith ∷ DecodePolicy → PayloadAccount → PngPreflight → IO (Either PngRefusal DecodedImage)
+
+data DecodePolicy = DecodeColour | DecodeData
 
 data PayloadAccount = PayloadAccount
   { reservePayload ∷ PayloadStage → Int → IO Bool
@@ -293,7 +296,13 @@ with `decodedBinaryAlpha` as everywhere. The texel contract is the colour-image
 contract above, applied exactly once: transparency keys and palette alpha at the
 stored depth, 16-bit rounding to nearest, palette indices checked against the
 palette. Opaque channels stay unchanged and alpha zero makes the channels zero.
-There is no data-image, HDR or colour-profile option; `gAMA`, `cHRM`, `sRGB`,
+Under `DecodeData` (`decodeBoundedWith`, TRA-15) the same level is `TexelRgba8Linear`
+and the channels are exactly the file's samples (16-bit samples narrowed the same
+way, a colour key and palette alpha giving the same alpha), with no gamma
+conversion and no premultiplication, so the RGB of a transparent texel survives.
+That is the general decoder's data image, byte for byte; the reservations, their
+order, the refusals and the hand-over are identical to the colour policy's.
+There is no HDR or colour-profile option; `gAMA`, `cHRM`, `sRGB`,
 `iCCP` and every other ignored chunk never change a texel and are never
 decompressed (a decoder that inflated a compressed ancillary chunk would fail
 on the suite's fixture whose `zTXt`, `iTXt` and `iCCP` payloads are not zlib
@@ -509,6 +518,52 @@ enlarged. A smaller validated profile or bank, which the suite uses, goes
 through the same arithmetic and refuses at the same stage. An injected-small-bank
 refusal is not a reason to refuse an approved M1 file under the production bank:
 the largest peak above is under the bank.
+
+## Data maps (TRA-15)
+
+`Hetoimasia.Asset.Image.DataMap` is the generic validation and CPU coverage the
+texture pipeline applies to a decoded data level. It is pure, imports no Lua
+engine, graphics, account or terrain module, and owns no state: it works on one
+RGBA8 level (what `decodeBoundedWith DecodeData` produces) and returns values.
+
+**Binary coverage.** `buildBinaryCoverage width height level` inspects the very
+alpha bytes that will be uploaded. Only 0 and 255 are valid: any other alpha is a
+`CoverageNotBinary column row alpha` naming the first such texel in row-major
+order, and nothing is thresholded; a level that is not `width × height × 4`
+bytes is `CoverageLevelMismatch`. The result is an immutable `CoveragePlane`:
+one bit per texel, tightly packed across rows with no row padding, top row
+first. Texel `(x, y)` is bit `k = y × width + x`, which is bit `k mod 8` of byte
+`k div 8`, least significant bit first; the unused high bits of the final byte
+are zero. It is `ceil(width × height ÷ 8)` bytes (`coveragePlaneBytes`), and a
+retained plane is accounted at that plus the fixed `coverageMetadataBytes` (128):
+`coverageRetainedBytes`. The validated 4,194,304-pixel limit's worst case is
+`maxCoveragePlaneBytes 4194304` = 524,288 bytes. `coverageAt` reproduces every
+decoded alpha, partial final byte included, and answers `Nothing` outside the
+extent.
+
+**The sampling reference.** `sampleIndex n u` is `min (n − 1) (floor (clamp u 0 1 × n))`
+for a `Double` coordinate and an extent of `n` texels, evaluated **exactly**: the
+product is taken on the coordinate's own mantissa and exponent as integers, never
+as a floating product, so the predecessor of an interior boundary `k/n` cannot be
+rounded up onto it. An interior boundary selects the higher index; the outer edge
+selects the last texel; a coordinate that is not a number has no texel. For a
+width of 3 the double nearest 1/3 (`0x3FD5555555555555`) is below 1/3 and selects
+texel 0, its successor selects texel 1; for 96, `1/32` selects texel 3 and its
+predecessor texel 2. `coverageSample plane u v` applies the rule to each axis. It
+claims nothing outside a rasterized quad and implements no viewport or
+raster-edge ownership.
+
+**Normal encodings.** `UnitNormalRgbV1` (`unit-normal-rgb-v1`) represents a unit
+normal `n` as `round (128 + 127 × n)` per channel. `checkNormalEncoding` requires,
+for every nontransparent texel (alpha not 0, a fractional alpha included), all of
+R, G and B in 1..255 and a triple other than `(128, 128, 128)`; a transparent
+texel's RGB is ignored; the bytes are only read. `unitNormal` is the decoding
+(normalize `c − (128, 128, 128)`): flat-up `(128, 128, 255)` is `(0, 0, 1)` and the
+W ramp `(38, 128, 218)` is `(−√½, 0, √½)`.
+
+| State | Owner | Writers | Readers | Lifetime |
+|---|---|---|---|---|
+| A `CoveragePlane` | whoever `buildBinaryCoverage` returned it to (the texture pipeline keeps one per loaded version) | nobody: built once, never written | any thread | the value's; sharing it copies nothing |
 
 ## BC7
 
@@ -827,6 +882,15 @@ package or spelled out as stored blocks, and expected scanline sizes counted
 pixel by pixel), independently of the production parser, JuicyPixels and the
 formula the production code uses, over the committed fixtures where an existing
 file already holds the defect. Boundary cases use small injected limits.
+
+The data policy and data maps (TRA-15, `Test.Asset.Image.DataMap`) decode every
+fixture with hand-stated texels under `DecodeData` and compare the level with
+those straight texels, byte for byte with the general decoder's data image and
+with the colour policy's charges; the coverage plane's bits, partial bytes and
+row order are worked out by hand in the examples; the sampling rule is checked at
+exactly representable boundaries named by their IEEE 754 bit patterns (widths 4,
+3 and 96); and the normal-encoding validator is run over the legal extremes, the
+zero vector, each zero channel, transparent texels and fractional alpha.
 
 The bounded decode's examples run every fixture whose texels the suite states
 by hand through the complete entry (preflight, then decode in a byte ledger the
