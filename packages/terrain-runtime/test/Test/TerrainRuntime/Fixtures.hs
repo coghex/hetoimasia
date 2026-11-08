@@ -47,6 +47,7 @@ module Test.TerrainRuntime.Fixtures
     -- * Doing things
   , openMain
   , readCell
+  , readCellPatient
   , removeCell'
   , cellIs
   , refusedWith
@@ -61,6 +62,7 @@ module Test.TerrainRuntime.Fixtures
   , okOf
   ) where
 
+import Control.Concurrent (yield)
 import Control.Concurrent.MVar
 import Control.Exception (finally)
 import Control.Concurrent.STM
@@ -71,7 +73,7 @@ import Data.Text (Text)
 import Hetoimasia.Terrain.Cell (Cell (..), Column, ZRange, mkColumn, mkZRange, materialIdString)
 import Hetoimasia.Terrain.Shape (shapeIdValue)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, tileCoord)
-import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), Revision (..), mkLimits)
+import Hetoimasia.Terrain.Residency (BusyReason (..), Limits, LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
@@ -326,6 +328,18 @@ openMain svc name = do
 
 readCell ∷ Service → ArenaLease → TileCoord → IO CellAnswer
 readCell svc lease at = okOf (cellAt svc lease at) >>= await svc >>= expectSuccess
+
+-- | A read that waits out a refusal for a region the owner has not finished
+-- evicting: that is temporary pressure, not a verdict, and it clears once the owner
+-- has released the victim.
+readCellPatient ∷ Service → ArenaLease → TileCoord → IO CellAnswer
+readCellPatient svc lease at = bounded go
+  where
+    go =
+      cellAt svc lease at >>= \case
+        Right request → await svc request >>= expectSuccess
+        Left (RefusedBusy (BusyModel (RegionEvicting _))) → yield >> go
+        Left refusal → expectationFailure ("expected success, got " <> show refusal) >> fail "unreachable"
 
 removeCell' ∷ Service → ArenaLease → TileCoord → IO RemoveAnswer
 removeCell' svc lease at = okOf (removeAt svc lease at Nothing) >>= await svc >>= expectSuccess

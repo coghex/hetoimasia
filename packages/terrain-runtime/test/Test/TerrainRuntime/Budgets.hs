@@ -119,7 +119,7 @@ spec = describe "Budgets against real owned data" $ do
         sum [length (viewDemand v) | v ← modelViews model] `shouldSatisfy` (<= 4)
         -- An explicit request is never blocked by camera holdings.
         let (x, y, z) = spread (k + 3)
-        answer <- readCell svc lease (tile x y z)
+        answer <- readCellPatient svc lease (tile x y z)
         cellMaterial (cellValue answer) `shouldBe` expectedMaterial soilOverStone [] (x, y, z)
         inspectInvariants svc >>= (`shouldBe` [])
       okOf (clearViewDemand svc view)
