@@ -28,12 +28,13 @@ import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.LuaEngine.Facade (forgetInstance)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (noProviderHooks, providerReading, readingAcquisitions)
+import Hetoimasia.LuaEngine.Profile (ByteLimit (..), Bytes (Bytes), ProfileSpec (..), profileSpec, validateProfile)
 import Hetoimasia.Scripting.Lua.Instance hiding (forgetInstance)
 import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint, scheduledTick)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
 import qualified Test.LuaEngine.Graphics.Fake as Fake
-import Test.LuaEngine.Graphics.Composition (holdReadsOf, readsEntered, readsFinished, releaseReadsOf)
+import Test.LuaEngine.Graphics.Composition (compositionProfile, holdReadsOf, readsEntered, readsFinished, releaseReadsOf)
 import Test.LuaEngine.Graphics.PeersRig
 import Test.LuaEngine.Graphics.Rig (bounded)
 import Test.LuaEngine.Graphics.SceneHost
@@ -277,17 +278,19 @@ retainedEndSpec =
       awaitAcquisitions peers 0
       atomically (Fake.readFake fake) >>= \final → Fake.readingRegistrations final `shouldBe` 0
 
--- | The texture bank of one UI instance, saturated through the fixed product profile, beside a peer.
+-- | The texture bank of one UI instance, saturated through the production composition over a smaller validated profile than
+-- the fixed one, beside a peer.
 --
--- A UI instance's texture bytes are 128 MiB and every request reserves 16 MiB of nominal RGBA8 bytes before it reads
--- anything, so eight requests are accepted and the ninth is busy (the instance's sixteen slots and request places are not
--- reached first). The peer has its own bank and its own places. Accepted work never turns back into busy; cancelling an
+-- The fixed profile gives an instance 512 MiB of texture bytes, which its sixteen request places (16 MiB each, 256 MiB) cannot
+-- fill, so memory could not be what answers first. This profile gives an instance 128 MiB and the session 256 MiB, and every
+-- request reserves 16 MiB of nominal RGBA8 bytes before it reads anything, so eight requests are accepted and the ninth is
+-- busy on bytes (the instance's sixteen request places are not reached first). The peer has its own bank and its own places. Accepted work never turns back into busy; cancelling an
 -- accepted request does not hand its reservation back, only the proof that its texture retired does; and only a later
 -- explicit request from Lua uses the freed room.
 saturationSpec ∷ Spec
 saturationSpec =
   it "answers the ninth texture request of one UI instance busy with nothing reserved, leaves the peer's own bank and the accepted work alone, and frees a reservation only when its work has actually retired: queued work withdrawn without any read, and a read a worker holds only after it returns" $
-    withPair holdingUploads saturating $ \peers → do
+    withPeersProfiled saturationProfile holdingUploads saturating $ \peers → do
       let fake = peFake peers
       -- every read of the picture waits at the pool's reader, so that no decode has yet shrunk a 16 MiB reservation
       holdReadsOf (peComposition peers) "images/quad.png"
@@ -323,6 +326,13 @@ saturationSpec =
       awaitAcquisitions peers 0
       atomically (Fake.readFake fake) >>= \final → (Fake.readingImagesAlive final, Fake.readingRegistrations final) `shouldBe` (0, 0)
   where
+    saturationProfile = either (error . ("the profile was refused: " <>) . show) id (validateProfile saturationSpecification)
+    saturationSpecification =
+      let base = profileSpec compositionProfile
+       in base {specBytes = \limit → case limit of
+            TextureBytesPerUiInstance → Bytes (128 * 1048576)
+            TextureBytesPerSession → Bytes (256 * 1048576)
+            _ → specBytes base limit}
     saturating =
       Text.encodeUtf8 . Text.unlines $
         [ "local share = import('lua/share.lua')"

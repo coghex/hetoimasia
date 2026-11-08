@@ -13,7 +13,8 @@
 module Test.LuaEngine.Graphics.Native.Spec (spec, within, withLoaded, load, decoded', release', noWindows) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
-import Control.Monad (unless)
+import Control.Monad (forM, forM_, unless)
+import Data.List (nub)
 import Data.IORef (readIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.ByteString as ByteString
@@ -30,7 +31,7 @@ import Hetoimasia.Asset.Image.Png (decodePng)
 import Hetoimasia.GPU.Model (Usage (..))
 import Hetoimasia.GPU.Vulkan.GLFW (UploadTicket, Image, VulkanHost (..))
 import Hetoimasia.LuaEngine.Graphics.Texture
-import Hetoimasia.LuaEngine.Graphics.Texture.Backend (readBackend, textureBackend, withBackend)
+import Hetoimasia.LuaEngine.Graphics.Texture.Backend (BackendReading (..), readBackend, textureBackend, withBackend)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 import Hetoimasia.LuaEngine.Texture (OwnerReading (..), ownerReading)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (registeredMark, retainedEntries)
@@ -108,6 +109,45 @@ spec env = describe "the texture backend on a real device, with no window" $ do
       awaitUsage env (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
       retainedEntries (graphicsTextures (envGraphics env)) `shouldReturn` marks
       evidence env "a request cancelled while its completed upload was still hidden from the backend registered nothing and drained"
+
+  it "registers well over the table's former 33 slots at once, 150 tiny textures held together, each in a slot of its own and not the placeholder, from a table sized by the profile's bytes, and retires them all" $
+    within 170 . withLoaded env [("pixel.png", Png.solid 1 1 (10, 20, 30, 255))] $ \comp vm → do
+      noWindows env
+      atRest ← restNow env
+      let accounting = configurationAccounting (graphicsConfiguration (envGraphics env))
+      -- the table the host was built with is the fixed profile's derived capacity (1 GiB over 4 KiB, and slot 0), not the 33 of a count
+      accountingTableCapacity accounting `shouldBe` 262145
+      admit comp vm "a"
+      identities ← forM [0 .. 149 ∷ Int] $ \n → do
+        let key = "t" <> tshow n
+        commandLoad comp vm "a" key "pixel.png" False
+        command comp vm "a" "wait_take" key
+        line ← awaitNoteContaining comp ("a wait_take " <> key <> " ")
+        line `shouldSatisfy` Text.isInfixOf "status=success"
+        command comp vm "a" "use" key
+        used ← awaitNoteContaining comp ("a use " <> key <> " ")
+        case Text.decimal (last (Text.words used)) of
+          Right (identity, _) → pure identity
+          Left reason → assertFailure ("the identity was not a number: " <> reason)
+      -- all 150 are held now: the owner counts them, each charged the minimum, and the table gave each its own slot
+      owner ← ownerOf vm "a"
+      reading ← atomically (ownerReading owner)
+      (ownerTexturesHeld reading, ownerNominalHeld reading) `shouldBe` (150, 150 * 4096)
+      let slots = [refIndex (textureRefOf (fromIntegral identity)) | identity ← identities]
+      length (nub slots) `shouldBe` 150
+      slots `shouldSatisfy` all (/= 0)
+      marks ← mapM (registeredMark (graphicsTextures (envGraphics env)) . textureHandleOf . fromIntegral) identities
+      marks `shouldSatisfy` all (/= Nothing)
+      live ← atomically (graphicsReading (envGraphics env))
+      readingLiveTextures live `shouldSatisfy` (>= 150)
+      evidence env ("150 one-pixel textures held at once in slots " <> tshow (minimum slots) <> " to " <> tshow (maximum slots) <> " of a table of " <> tshow (accountingTableCapacity accounting) <> ", the former count's 33 passed")
+      forM_ [0 .. 149 ∷ Int] $ \n → do
+        let key = "t" <> tshow n
+        command comp vm "a" "release" key
+        _ ← awaitNoteContaining comp ("a release " <> key <> " ")
+        pure ()
+      atomically (ownerReading owner >>= \held → if ownerTexturesHeld held == 0 && ownerNominalHeld held == 0 then pure () else retry)
+      awaitUsage env (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
 
   it "returns the model's native accounting to what the session held at rest" $ do
     rest ← restNow env

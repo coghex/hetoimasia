@@ -36,9 +36,9 @@ import Hetoimasia.LuaEngine.Graphics.Texture.Port (Fault (FaultFatal))
 import Hetoimasia.LuaEngine.Graphics.Window.Port (CreateOutcome (..), Port (..), WindowToken (..), fatalText)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
 import Hetoimasia.LuaEngine.Manifest (Role (Presentation))
-import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (RequestsPerInstance, TextureLeasesPerUiInstance), Profile, ProfileSpec (..), profileSpec, validateProfile)
+import Hetoimasia.LuaEngine.Profile (ByteLimit (..), Bytes (Bytes), Count (Count), CountLimit (PngAxisMaximum, PngPixels, RequestsPerInstance), Profile, ProfileSpec (..), profileSpec, validateProfile)
 import Hetoimasia.LuaEngine.Scene (SceneContent (..), SceneRect (..), SceneSprite (..), TextureUse (..))
-import Hetoimasia.LuaEngine.Texture (TextureView (..))
+import Hetoimasia.LuaEngine.Texture (TexturePipeline, TextureView (..), sessionNominal)
 import qualified Data.Set as Set
 import Hetoimasia.LuaEngine.Session
 import Hetoimasia.Render.TwoD.Vulkan.Textures (newTextures)
@@ -67,6 +67,8 @@ data FS = FS
   -- ^ What the roles printed, oldest first.
   , fsGate ∷ !(MVar ())
   -- ^ Held by the output sink's first line when the example asked for it: the authored output parks the role's @init@.
+  , fsPipeline ∷ !TexturePipeline
+  -- ^ The session's texture pipeline, for its banks' readings.
   }
 
 -- | How an example shapes the session.
@@ -100,10 +102,24 @@ defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFak
 
 -- | The fixed M1 profile with these counts changed, so that a bank is full after a few requests.
 profileWith ∷ [(CountLimit, Word64)] → Profile
-profileWith changes = either (error . ("the profile was refused: " <>) . show) id (validateProfile edited)
+profileWith changes = profileOver changes []
+
+-- | The fixed M1 profile with these counts and byte limits changed, validated.
+profileOver ∷ [(CountLimit, Word64)] → [(ByteLimit, Word64)] → Profile
+profileOver changes byteChanges = either (error . ("the profile was refused: " <>) . show) id (validateProfile edited)
   where
     base = profileSpec compositionProfile
-    edited = base {specCounts = \limit → maybe (specCounts base limit) Count (lookup limit changes)}
+    edited =
+      base
+        { specCounts = \limit → maybe (specCounts base limit) Count (lookup limit changes)
+        , specBytes = \limit → maybe (specBytes base limit) Bytes (lookup limit byteChanges)
+        }
+
+-- | A profile whose every texture reserves exactly the 4,096-byte minimum charge (a pixel limit of 1,024 reserves
+-- 4,096 bytes of output), with room for exactly two of them in an instance and four in the session. A request's charge is
+-- then 4,096 bytes whether it is pending or its decode has run, so the bank is full at two whatever the timing.
+twoTextures ∷ Profile
+twoTextures = profileOver [(PngPixels, 1024), (PngAxisMaximum, 32)] [(TextureBytesPerUiInstance, 8192), (TextureBytesPerSession, 16384)]
 
 spec ∷ Spec
 spec = describe "graphics facade" $ do
@@ -275,14 +291,31 @@ spec = describe "graphics facade" $ do
     outQuit outcome `shouldBe` True
     outFailures outcome `shouldBe` []
 
-  it "answers busy from a full texture bank while the window, whose own slot is free, is accepted, starts no native work for the refused request, and accepts the explicit retry after actual reclamation" $ do
-    outcome ← runFacade ((defaultShape textureBank) {shapeBoth = False, shapeProfile = profileWith [(TextureLeasesPerUiInstance, 2)]}) $ \fs → do
+  it "answers busy from a full texture byte bank while the window, whose own slot is free, is accepted, starts no native work for the refused request, and accepts the explicit retry after actual reclamation" $ do
+    outcome ← runFacade ((defaultShape textureBank) {shapeBoth = False, shapeProfile = twoTextures}) $ \fs → do
       awaitLine fs "banks\ttrue\tbusy\ttrue\ttrue"
       awaitLine fs "retry\ttrue\ttrue"
       -- Three requests ever reached the native owner: the two accepted and the retry; the refused one started nothing.
       Fake.awaitEvent (rigFake (fsRig fs)) "allocated 2 "
       allocated ← length . filter (Text.isPrefixOf "allocated ") <$> Fake.events (rigFake (fsRig fs))
       allocated `shouldBe` 3
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outFailures outcome `shouldBe` []
+
+  it "retains a thousand one-pixel textures at once in one instance through the production facade: each is charged the 4 KiB minimum, nothing is refused on a count, and every byte comes back when they are released" $ do
+    outcome ← runFacade ((defaultShape thousandPixels) {shapeBoth = False, shapeParkOutput = True, shapeTexture = Fake.defaultFakeConfig {Fake.fcSlots = 1024, Fake.fcImages = 1024}, shapeFiles = [("images/pixel.png", Png.solid 1 1 (10, 20, 30, 255))]}) $ \fs → do
+      -- The role prints nothing until it holds all thousand, and parks in the print: they are all held while this reads. (The
+      -- fake owner's table and image allowance have room for them: the example sizes them, as the native table's capacity is derived
+      -- from the bytes.)
+      awaitLine fs "held\t1000"
+      atomically (sessionNominal (fsPipeline fs)) `shouldReturn` 1000 * 4096
+      registered ← length . filter (Text.isPrefixOf "registered ") <$> Fake.events (rigFake (fsRig fs))
+      registered `shouldBe` 1000
+      void (tryPutMVar (fsGate fs) ())
+      awaitLine fs "released\t1000"
+      -- The fake retires what is released; the session's bytes come back to zero.
+      atomically (sessionNominal (fsPipeline fs) >>= \held → unless (held == 0) retry)
       requestStop (fsSession fs) StopQuit
     outVerdict outcome `shouldBe` VerdictSuccess
     outFailures outcome `shouldBe` []
@@ -569,7 +602,7 @@ runCore rig shape scenario = do
                       found ← readMVar handle
                       writeIORef sessionRef (Just found)
                       forM_ (shapeSession shape) (\ref → writeIORef ref (Just found))
-                      let fs = FS found rig windows model provider outLines gate
+                      let fs = FS found rig windows model provider outLines gate (cpPipeline composition)
                       attempted ←
                         try @SomeException $
                           timeout 8000000 (scenario fs) >>= \case
@@ -848,6 +881,52 @@ textureBank =
     , "        self.retried = true"
     , "        local t4, e4 = api.content.texture('images/quad.png')"
     , "        print('retry', t4 ~= nil, e4 == nil)"
+    , "      end"
+    , "    end"
+    ]
+
+-- | A thousand textures of one pixel, each requested as the places allow, taken when ready and held; only when all
+-- thousand are held does the role print (and park there), and then it releases every one.
+thousandPixels ∷ ByteString
+thousandPixels =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.reqs = {}"
+    , "      self.held = {}"
+    , "      self.started = 0"
+    , "    end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.done then return end"
+    , "      local rest = {}"
+    , "      for _, r in ipairs(self.reqs) do"
+    , "        if api.request.ready(r) then"
+    , "          local result = api.request.take(r)"
+    , "          if result.status ~= 'success' then print('failed', result.status) self.done = true return end"
+    , "          self.held[#self.held + 1] = result.value.texture"
+    , "        else"
+    , "          rest[#rest + 1] = r"
+    , "        end"
+    , "      end"
+    , "      self.reqs = rest"
+    , "      while self.started < 1000 do"
+    , "        local r, e = api.content.texture('images/pixel.png')"
+    , "        if r == nil then"
+    , "          if e.code ~= 'busy' then print('refused', e.code, e.message) self.done = true return end"
+    , "          break"
+    , "        end"
+    , "        self.reqs[#self.reqs + 1] = r"
+    , "        self.started = self.started + 1"
+    , "      end"
+    , "      if #self.held == 1000 then"
+    , "        self.done = true"
+    , "        print('held', #self.held)"
+    , "        local released = 0"
+    , "        for _, t in ipairs(self.held) do"
+    , "          local answer = api.texture.release(t)"
+    , "          if answer == 'done' or answer == 'retiring' then released = released + 1 end"
+    , "        end"
+    , "        print('released', released)"
     , "      end"
     , "    end"
     ]

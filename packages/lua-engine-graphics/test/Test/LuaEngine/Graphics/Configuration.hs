@@ -1,9 +1,11 @@
 -- | The native configuration the fixed M1 profile maps to: every native budget the design fixes, a staging
--- that admits the largest legal level, a table that holds the approved two instances' slots, and the
--- refusals of a profile or a host that does not fit. Pure, and so run without a device.
+-- that admits the largest legal level, a table whose capacity is derived from the session's byte bank (there is no
+-- count of textures to size it from), and the refusals of a profile or a host that does not fit. Pure, and so run without a device.
 module Test.LuaEngine.Graphics.Configuration (spec) where
 
 import Data.Word (Word64)
+import Hetoimasia.LuaEngine.Graphics.Facade (facadeLeaseCapacity)
+import Test.QuickCheck (Gen, choose, conjoin, counterexample, elements, forAll, property, withNumTests, (===))
 import Hetoimasia.Foundation.Time (durationNanoseconds)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.GPU.Model.Budget
@@ -58,28 +60,60 @@ spec = describe "the native configuration the profile maps to" $ do
     fromIntegral (uploadTurnBudget uploads) `shouldSatisfy` (>= (4 * 32768 ∷ Word64))
     uploadQueueCapacity uploads `shouldBe` 8
 
-  it "holds the approved texture slots of two instances, and a version ring from the frame and frame-less budgets" $ do
+  it "derives the table's capacity from the session's bytes, 1 GiB over the 4 KiB minimum charge plus slot 0's placeholder, and a version ring from the frame and frame-less budgets" $ do
     let accounting = configurationAccounting (mapped fixedM1Profile)
-    accountingTextureSlots accounting `shouldBe` 32
-    accountingTableCapacity accounting `shouldBe` 33
+    accountingTableSlots accounting `shouldBe` 262144
+    accountingTableCapacity accounting `shouldBe` 262145
     accountingTableVersions accounting `shouldBe` 4 + 4 + 2
+    -- the lookup ring is versions times capacity times eight bytes, and the native accounting counts it
+    accountingTableVersions accounting * accountingTableCapacity accounting * 8 `shouldBe` 20971600
 
   it "accounts the native bytes it asks for within the profile's, apart from the CPU workspace" $ do
     let accounting = configurationAccounting (mapped fixedM1Profile)
     accountingNativeBytes accounting `shouldSatisfy` (<= accountingNativeLimit accounting)
     accountingNativeLimit accounting `shouldBe` 2 * 1024 * 1024 * 1024
-    accountingTextureBytes accounting `shouldBe` 256 * 1024 * 1024
+    accountingTextureBytes accounting `shouldBe` 1024 * 1024 * 1024
+    -- 32 MiB of staging, 4 MiB of ring, 20,971,600 bytes of lookup entries and 1 GiB of texture bytes
+    accountingNativeBytes accounting `shouldBe` 32 * 1048576 + 4 * 1048576 + 20971600 + 1073741824
+    accountingNativeBytes accounting `shouldBe` 1132462160
 
   it "refuses a profile whose native bytes cannot hold what the configuration asks, without clamping" $
     case configurationFor (smaller [] [(NativeAccountedBytes, 64 * 1024 * 1024)]) of
       Left (NativeBytesExceeded asked allowed) → (asked > allowed) `shouldBe` True
       other → expectationFailure ("expected the native bytes refused, found " <> either show (const "a configuration") other)
 
+  it "refuses, with the existing structured reason, a profile whose derived table would exceed the native budget, without clamping" $
+    -- 1 GiB of texture bytes derives a 20 MiB ring; a 40 MiB native budget cannot hold it with the staging and the bytes
+    case configurationFor (smaller [] [(NativeAccountedBytes, 40 * 1024 * 1024)]) of
+      Left (NativeBytesExceeded asked allowed) → (asked, allowed) `shouldBe` (1132462160, 40 * 1024 * 1024)
+      other → expectationFailure ("expected the native bytes refused, found " <> either show (const "a configuration") other)
+
   it "scales with a smaller validated profile and refuses nothing the fixed one does not" $ do
-    let profile = smaller [(TexturePipelineLanes, 1), (InstancesPerVm, 1), (TextureLeasesPerUiInstance, 4)] []
+    let profile = smaller [(TexturePipelineLanes, 1), (InstancesPerVm, 1), (PngPixels, 1024), (PngAxisMaximum, 32)] [(TextureBytesPerUiInstance, 16384), (TextureBytesPerSession, 20480)]
         accounting = configurationAccounting (mapped profile)
     accountingStagingBytes accounting `shouldBe` accountingLevelBytes accounting
-    accountingTableCapacity accounting `shouldBe` 5
+    -- 20,480 bytes hold five textures of the 4,096-byte minimum charge, and the placeholder takes slot 0
+    accountingTableSlots accounting `shouldBe` 5
+    accountingTableCapacity accounting `shouldBe` 6
+
+  it "gives every validated profile a table with a slot for each texture its session bytes can hold, and a lease scope with room for each its instance bytes can hold and its windows (property)" $
+    withNumTests 200 $
+      forAll generatedProfile $ \profile →
+        case configurationFor profile of
+          -- native configuration rejection stays a separate, structured outcome
+          Left _ → property True
+          Right configuration → do
+            let accounting = configurationAccounting configuration
+                Bytes sessionBytes = bytesLimit profile TextureBytesPerSession
+                Bytes instanceBytes = bytesLimit profile TextureBytesPerUiInstance
+                Count windows = countLimit profile WindowSlotsPerUiInstance
+            conjoin
+              [ counterexample "table slots are session bytes over the minimum charge" (accountingTableSlots accounting === sessionBytes `div` textureMinimumChargeBytes)
+              , counterexample "slot 0 is the placeholder" (accountingTableCapacity accounting === accountingTableSlots accounting + 1)
+              , counterexample "the lease scope holds every texture the instance bytes can, and its windows" (fromIntegral (facadeLeaseCapacity profile) === instanceBytes `div` textureMinimumChargeBytes + windows)
+              , counterexample "the table never fills before the session bytes do" (instanceBytes `div` textureMinimumChargeBytes <= accountingTableSlots accounting)
+              , counterexample "the ring is counted" (accountingNativeBytes accounting >= accountingTableVersions accounting * accountingTableCapacity accounting * 8 + accountingTextureBytes accounting)
+              ]
 
   it "names what is wrong with a host that was not built for the backend, before any texture work is admitted" $ do
     let configuration = mapped fixedM1Profile
@@ -107,3 +141,16 @@ smaller countChanges byteChanges = case validateProfile changed of
         { specCounts = \limit → maybe (specCounts base limit) Count (lookup limit countChanges)
         , specBytes = \limit → maybe (specBytes base limit) Bytes (lookup limit byteChanges)
         }
+
+-- | A validated profile whose texture banks are any size the validation allows: a pixel limit whose reservation is at or
+-- below the minimum charge or above it, an instance bank that is not a multiple of anything, and a session bank at least as
+-- large (up to the fixed profile's).
+generatedProfile ∷ Gen Profile
+generatedProfile = do
+  pixels ← elements [1, 16, 1024, 4096, 65536, 4194304]
+  let reservation = max textureMinimumChargeBytes (4 * pixels)
+  axis ← pure (if pixels <= 1024 then 32 else if pixels <= 4096 then 64 else if pixels <= 65536 then 256 else 2048)
+  instanceBytes ← choose (reservation, 512 * 1024 * 1024)
+  sessionBytes ← choose (instanceBytes, 1024 * 1024 * 1024)
+  lanes ← elements [1, 2]
+  pure (smaller [(PngPixels, pixels), (PngAxisMaximum, axis), (TexturePipelineLanes, lanes)] [(TextureBytesPerUiInstance, instanceBytes), (TextureBytesPerSession, sessionBytes)])
