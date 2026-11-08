@@ -656,32 +656,50 @@ cameraReplacementStarts settled staging firstPicks nextPicks = case limitsNear 4
             Nothing → counterexample "the first description did not settle" False
             Just m2 → case step m2 (SetCameraDemand (ViewId 1) (ArenaId 1) nextDemand) of
               (m3, Right _) →
-                conjoin
-                  [ counterexample ("a replacement of " <> show (length nextDemand) <> " regions kept " <> show (length (viewDemand v)) <> " and started " <> show (length (viewDemand v) - length (viewPending v)) <> " at " <> show staging) $
-                      not (null (viewDemand v)) && length (viewPending v) < length (viewDemand v)
-                  | not (null nextDemand)
-                  , v ← modelViews m3
-                  ]
+                if null nextDemand
+                  then property True
+                  else case modelViews m3 of
+                    [v] →
+                      counterexample ("a replacement of " <> show (length nextDemand) <> " regions kept " <> show (length (viewDemand v)) <> " and started " <> show (length (viewDemand v) - length (viewPending v)) <> " at " <> show staging) $
+                        not (null (viewDemand v)) && length (viewPending v) < length (viewDemand v)
+                    vs → counterexample ("the view did not survive a non-empty replacement: " <> show (length vs) <> " views") False
               (_, Left r) → counterexample ("the replacement was refused: " <> show r) False
           (_, Left r) → counterexample ("the first demand was refused: " <> show r) False
 
--- | The kept prefix of a camera description is found by bisection, which is sound only
--- if fitting is monotone in the prefix length. At every state a random sequence reaches
--- (explicit requests, pins, other views, queued and running jobs), for each view and a
--- random description, the bisected prefix equals the linear scan of the same predicate.
-bisectionMatchesLinearScan ∷ Limits → [(Int, Int, Int)] → Property
-bisectionMatchesLinearScan limits seeds = go (newModel limits) seeds (0 ∷ Int)
+-- | Replacing a view's camera demand is exactly withdrawing the old one and admitting the
+-- new one afresh: at every state a random sequence reaches, for each view that has a
+-- demand and a random new description, the model after the replacement equals the model
+-- after the withdrawal followed by the fresh demand.
+replacementIsWithdrawThenAdmit ∷ Limits → [(Int, Int, Int)] → Property
+replacementIsWithdrawThenAdmit limits seeds = go (newModel limits) seeds (0 ∷ Int)
   where
-    go _ [] n = counterexample "no state was compared" (n > 0) .&&. property True
+    go _ [] n = cover 60 (n > 0) "a replacement was compared" (property True)
     go m (s@(x, y, z) : rest) n =
       let (m', _) = step m (eventFor m s)
-          descriptions = [[demandFor (y + i) (x + i) | i ← [0 .. z `mod` 6]], [demandFor (x + i) (z + 2 * i) | i ← [0 .. y `mod` 4]]]
-          checks = [(v, d, cameraKeepBoth m' (ViewId v) (ArenaId 1) d) | v ← [0, 1], d ← descriptions]
-       in conjoin
-            [ counterexample ("view " <> show v <> ", " <> show (length d) <> " regions: bisection " <> show b <> ", linear scan " <> show l) (b == l)
-            | (v, d, (b, l)) ← checks
-            ]
-            .&&. go m' rest (n + length checks)
+          description = [demandFor (y + i) (x + i) | i ← [0 .. z `mod` 5]]
+          cases = [v | v ← modelViews m', not (null (viewDemand v))]
+          agrees v =
+            let direct = step m' (SetCameraDemand (viewId v) (ArenaId 1) description)
+                staged = case step m' (ClearCameraDemand (viewId v)) of
+                  (mw, Right _) → step mw (SetCameraDemand (viewId v) (ArenaId 1) description)
+                  other → other
+             in case (direct, staged) of
+                  ((md, Right _), (ms, Right _)) → counterexample ("view " <> show (viewId v) <> ": the replacement differs from withdraw-then-admit") (observed md == observed ms)
+                  -- A refused replacement changes nothing; only an accepted one is compared.
+                  ((_, Left _), _) → property True
+                  ((_, Right _), (_, Left r)) → counterexample ("the fresh demand after a withdrawal was refused: " <> show r) False
+       in conjoin (map agrees cases) .&&. go m' rest (n + length cases)
+
+-- | Everything a model exposes except its logical clock, which a second event advances
+-- (and which only orders eviction): two models that differ only in it are the same.
+observed ∷ Model → (String, String, String, [(ArenaId, String, Coverage, Integer)], [Ledger])
+observed m =
+  ( show (modelViews m)
+  , show (modelJobs m)
+  , show (modelInterests m)
+  , [(regionArena r, show (regionCoord r), regionCoverage r, toInteger (regionBytes r)) | r ← modelRegions m]
+  , [bankLedger m b | b ← allBanks]
+  )
 
 -- | A request over its caps is invalid from every state, with a typed reason.
 overCapAlwaysInvalid ∷ [(Int, Int, Int)] → Property
@@ -792,12 +810,12 @@ spec = describe "Residency model properties" $ do
   it "starts the first region of every replacement of a camera description whose work is still queued, at any staging from the minimum" $
     withNumTests 2000 $
       forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts False staging a b
-  it "keeps the same camera prefix by bisection as by a linear scan, at every state random sequences reach" $
+  it "replaces a view's demand exactly as a withdrawal followed by a fresh demand, at every state random sequences reach" $
     withNumTests 300 $
       forAll ((,) <$> chooseInteger (4384, 6400) <*> chooseInteger (1530, 3600)) $ \(resident, staging) →
         forAll seedsOf $ \seeds → case limitsNear resident staging of
           Nothing → counterexample ("a configuration at or above the minimum was refused: " <> show (resident, staging)) False
-          Just limits → bisectionMatchesLinearScan limits seeds
+          Just limits → replacementIsWithdrawThenAdmit limits seeds
   it "never reserves more for an explicit request than the construction-time worst case" $
     withNumTests 2000 $
       forAll (vectorOf 3 pair) reservationWithinMinimum

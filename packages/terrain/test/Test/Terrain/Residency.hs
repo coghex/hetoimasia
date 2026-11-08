@@ -789,10 +789,11 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- View 1 names regions 40 and 41; view 2 still names region 1.
     sort [(o, r) | InterestInfo o _ r _ ← modelInterests final]
       `shouldBe` sort [(OwnerView (ViewId 1), reg 40 0 0), (OwnerView (ViewId 1), reg 41 0 0), (OwnerView (ViewId 2), reg 1 0 0)]
-    -- Each job that survived is the one created when its region first appeared:
-    -- region k + 1 got job k at replacement k.
+    -- A replacement withdraws the old demand and admits the new one afresh, so the jobs
+    -- that survive are those the last replacement made (the second and later each make
+    -- two, so replacement 40 made jobs 78 and 79) and the one view 2 still needs.
     sort [(jobRegion j, jobId j) | j ← modelJobs final]
-      `shouldBe` sort [(reg 1 0 0, JobId 0), (reg 40 0 0, JobId 39), (reg 41 0 0, JobId 40)]
+      `shouldBe` sort [(reg 1 0 0, JobId 0), (reg 40 0 0, JobId 78), (reg 41 0 0, JobId 79)]
     -- Staging holds one description per view (256 and 192), three interests and
     -- three scratch reservations; nothing from the 39 replaced demands.
     ledgersOf final `shouldBe` Ledgers (0, 3 * 400) (0, 0) (256 + 192 + 3 * 64, 3 * 258)
@@ -1250,13 +1251,14 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     -- bytes and a job beyond that reserves 1,584, so explicit work needs 2,976, and the
     -- camera share must hold one camera job (2,976): 5,952 bytes. Region A is loaded for
     -- the camera and pinned (charged 1,392). The camera then widens it one level at a
-    -- time; none of the jobs is dispatched. Each reserves 144, so only 11 fit the 1,584
-    -- left of the share: the 12th is busy (and drops the view's interest in what it
-    -- replaced, so the queued jobs go and the view starts over from the pinned detail).
-    -- At every step the reservations in flight stay within the 1,584, the model obeys the
-    -- charge rules, and an explicit query for sixteen separate intervals of another region
-    -- is admitted at once.
-    let limits = limitsWith $ \x → x {specResidentBytes = 5952, specStagingBytes = 16384, specLoadJobs = 6, specQueryRegions = 1, specHoldRegions = 1, specExtentZ = 32, specCameraRegions = 64}
+    -- time, withdrawing the old demand and admitting the wider one afresh, and each
+    -- widening's job is dispatched before the next, so the cancelled one stays reserved
+    -- until its owner acknowledges it. Each reserves 144, so only 11 fit the 1,584 left
+    -- of the share: from the 12th on the new demand is busy. At every step the
+    -- reservations in flight stay within the 1,584, the model obeys the charge rules,
+    -- and an explicit query for sixteen separate intervals of another region is
+    -- admitted at once.
+    let limits = limitsWith $ \x → x {specResidentBytes = 5952, specStagingBytes = 16384, specLoadJobs = 14, specQueryRegions = 1, specHoldRegions = 1, specExtentZ = 32, specCameraRegions = 64}
         upTo z = demand (reg 0 0 0) (box 0 1 0 1 0 z)
     m0 ← opened limits
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [upTo 1])
@@ -1264,10 +1266,11 @@ cameraSpec = describe "camera demand is latest-value state" $ do
     (m3, _) ← stepOk m2 (AcquireHold (HoldId 1) a1 (Pin (ViewId 1)) [reg 0 0 0])
     let widen (m, busiest) z = do
           (m', _) ← stepOk m (SetCameraDemand (ViewId 1) a1 [upTo z])
-          modelInvariants m' `shouldBe` []
-          let reserved = sum [jobActive j + jobDeferred j | j ← modelJobs m']
+          (m'', _) ← stepOk m' Dispatch
+          modelInvariants m'' `shouldBe` []
+          let reserved = sum [jobActive j + jobDeferred j | j ← modelJobs m'']
           reserved `shouldSatisfy` (<= 1584)
-          pure (m', max busiest reserved)
+          pure (m'', max busiest reserved)
     (m4, busiest) ← foldM widen (m3, 0) [2 .. 32]
     -- (It does reach the share: eleven jobs of 144.)
     busiest `shouldBe` 1584
@@ -1320,6 +1323,31 @@ cameraSpec = describe "camera demand is latest-value state" $ do
       CameraSet admitted waiting _ _ _ excluded truncated → (map (map snd . admissionJobs) admitted, waiting, excluded, truncated) `shouldBe` ([[reg 1 0 0]], [], [], [])
       other → expectationFailure (show other)
     map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 1 0 0]]
+  it "replaces the coverage of a region the view already has: a loaded cell, then another cell of the same region, at the minimum budget" $ do
+    -- 1,548 resident and 1,510 staging bytes, extent 1 x 1 x 2: a replacement is a
+    -- withdrawal followed by a fresh demand, so the new description (192), interest (64)
+    -- and scratch (258) need 514 of the 516 the camera has, whatever the old demand held.
+    let limits = limitsWith $ \x → x {specResidentBytes = 1548, specStagingBytes = 1510, specExtentZ = 2, specCameraRegions = 64}
+    m0 ← opened limits
+    m1 ← stepsOk m0 [SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)], Dispatch, JobCompleted (JobId 0) oneCellCost]
+    (m2, set) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 1)])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ excluded truncated → (length admitted, waiting, excluded, truncated) `shouldBe` (1, [], [], [])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0]]
+    m3 ← drainDemand m2
+    map viewPending (modelViews m3) `shouldBe` [[]]
+    [regionCoverage r | r ← modelRegions m3] `shouldBe` [coverageUnion (cell 0 0 0) (cell 0 0 1)]
+  it "replaces the coverage of a region whose load is still queued, at the minimum budget" $ do
+    let limits = limitsWith $ \x → x {specResidentBytes = 1548, specStagingBytes = 1510, specExtentZ = 2, specCameraRegions = 64}
+    m0 ← opened limits
+    m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])
+    (m2, set) ← stepOk m1 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 1)])
+    case reportDecision set of
+      CameraSet admitted waiting _ _ _ excluded truncated → (length admitted, waiting, excluded, truncated) `shouldBe` (1, [], [], [])
+      other → expectationFailure (show other)
+    map (map demandRegion . viewDemand) (modelViews m2) `shouldBe` [[reg 0 0 0]]
+    [(jobRegion j, jobCoverage j) | j ← modelJobs m2, jobPhase j == JobQueued] `shouldBe` [(reg 0 0 0, cell 0 0 1)]
   it "clears a view's demand and cancels the work only it needed" $ do
     m0 ← opened roomy
     m1 ← fst <$> stepOk m0 (SetCameraDemand (ViewId 1) a1 [demand (reg 0 0 0) (cell 0 0 0)])

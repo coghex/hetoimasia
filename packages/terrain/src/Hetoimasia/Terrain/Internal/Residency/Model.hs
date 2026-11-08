@@ -24,7 +24,6 @@ module Hetoimasia.Terrain.Internal.Residency.Model
   , ContractReason (..)
   , ChargeViolation (..)
   , chargeCheck
-  , cameraKeepBoth
   , Report (..)
   , Decision (..)
   , Admission (..)
@@ -1154,132 +1153,50 @@ clearView m v = case Map.lookup v (mViews m) of
 setCamera ∷ Model → ViewId → ArenaId → [RegionDemand] → Run
 setCamera m v a demands0 = do
   _ ← liveArena m a
-  -- Camera demand is best effort and its description is normalized, never refused:
-  -- an empty description withdraws the demand, repeated keys coalesce, unsupported
-  -- keys and cells outside the extent are excluded and reported. The description is
-  -- bounded: its structural maximum, and the staging the camera may use beside the
-  -- headroom kept for explicit requests (the replaced description is released first),
-  -- cut the end of it, the lowest priority, and the remainder is reported.
+  -- Replacing a view's camera demand is withdrawing the old one and admitting the new one
+  -- as a fresh demand: there is no replacement-specific path. The withdrawal releases the
+  -- view's description and interests and prunes the queued work nothing else needs (work
+  -- in flight is cancelled and freed only when its owner acknowledges it).
+  --
+  -- A fresh demand is best effort and its description is normalized, never refused: an
+  -- empty description withdraws the demand, repeated keys coalesce, unsupported keys and
+  -- cells outside the extent are excluded and reported. The description is bounded: its
+  -- structural maximum, and the staging the camera may use beside the headroom kept for
+  -- explicit requests. Beside the description the camera must have room for the interest
+  -- and scratch of the first region, so a description is never kept longer than the camera
+  -- can start; the end of it, the lowest priority, is cut and the remainder reported.
   let limits = mLimits m
       (normal, excluded) = normalizeCamera (limitExtent limits) demands0
-      keep = fst (keepPrefix m v a normal)
+      (mw, withdrawn, gone, cancelling) = clearView m v
+      room = cameraFree mw (bankLedger mw StagingBank)
+      unit = case normal of
+        (d : _) → interestRecordBytes + scratchBytes (demandCoverage d)
+        [] → 0
+      regionsFor free = if free >= descriptionBytes 0 then fromIntegral ((free - descriptionBytes 0) `div` 64) else 0 ∷ Int
+      most = min (length normal) (fromIntegral (limitCameraRegions limits))
+      keep = if room >= unit then min most (regionsFor (room - unit)) else 0
       demands = take keep normal
       truncated = map demandRegion (drop keep normal)
   if null demands
-    then
-      let (mCleared, regions, gone, cancelling) = clearView m v
-       in Right (mCleared, CameraSet [] [] regions gone cancelling excluded truncated)
-    else setCameraNormal m v a demands excluded truncated
+    then Right (mw, CameraSet [] [] withdrawn gone cancelling excluded truncated)
+    else admitFresh mw v a demands withdrawn gone cancelling excluded truncated
 
--- | How many regions of a normalized camera description to keep: the longest prefix,
--- within the structural maximum, whose replacement state leaves the camera room to
--- progress. The first component is found by bisection; the second is a linear scan of
--- the same predicate, which a test compares it to.
---
--- The predicate is judged against the state the replacement produces (the same
--- 'replaceView' that applies it): that state has this view's old description gone, the
--- interests it no longer needs dropped and the queued work nothing needs pruned, and
--- beside the description it must hold the interest and scratch of the first region of the
--- kept prefix this view has no interest in yet, so a description is never kept longer than
--- the camera can start.
---
--- Bisection is sound because the predicate is monotone in the prefix length. Compare the
--- replacement states of a prefix and of a longer one: the longer holds 64 more bytes of
--- description per added region; it drops fewer of the view's interests (a region added to
--- the prefix can only keep an interest the shorter prefix dropped); and the jobs it keeps
--- are those some interest still covers, a superset of the shorter one's. The first
--- uncovered region's need does not depend on the prefix length, only on whether the
--- prefix reaches it. So the state of a longer prefix holds at least what a shorter one's
--- does, and the prefixes that fit are an initial segment.
-keepPrefix ∷ Model → ViewId → ArenaId → [RegionDemand] → (Int, Int)
-keepPrefix m v a normal = (longest 0 most, maximum (0 : [k | k ← [1 .. most], fits k]))
-  where
-    limits = mLimits m
-    covered d = case Map.lookup (a, demandRegion d) (mTargets m) >>= Map.lookup (OwnerView v) . tgInterests of
-      Just i → coverageSubset (demandCoverage d) (inCoverage i)
-      Nothing → False
-    leading = length (takeWhile covered normal)
-    unit = case drop leading normal of
-      (d : _) → interestRecordBytes + scratchBytes (demandCoverage d)
-      [] → 0
-    most = min (length normal) (fromIntegral (limitCameraRegions limits))
-    fits k
-      | k <= 0 = True
-      | otherwise =
-          let (mk, _, _, _) = replaceView m v a (take k normal)
-              need = if k > leading then unit else 0
-              room = toInteger (freeBytes (bankLedger mk StagingBank)) - toInteger (limitExplicitStagingBytes limits)
-           in room >= toInteger need
-    longest lo hi
-      | lo >= hi = lo
-      | fits mid = longest mid hi
-      | otherwise = longest lo (mid - 1)
-      where
-        mid = (lo + hi + 1) `div` 2
-
--- | The bisected and the linearly scanned kept prefix of a raw camera description for a
--- view of this model, for a test of their agreement; (0, 0) when the arena is not live.
-cameraKeepBoth ∷ Model → ViewId → ArenaId → [RegionDemand] → (Int, Int)
-cameraKeepBoth m v a demands = case liveArena m a of
-  Left _ → (0, 0)
-  Right _ → keepPrefix m v a (fst (normalizeCamera (limitExtent (mLimits m)) demands))
-
-setCameraNormal ∷ Model → ViewId → ArenaId → [RegionDemand] → [RegionCoord] → [RegionCoord] → Run
-setCameraNormal m v a demands excluded truncated = do
+-- | Admit a fresh camera demand, in demand order: only pressure leaves a region pending,
+-- any other refusal fails the event, and once a region is busy the rest wait behind it, so
+-- a later region never takes room an earlier one needs.
+admitFresh ∷ Model → ViewId → ArenaId → [RegionDemand] → [RegionCoord] → [JobId] → [JobId] → [RegionCoord] → [RegionCoord] → Run
+admitFresh m v a demands withdrawn gone0 cancelling0 excluded truncated = do
   let owner = OwnerView v
-      (m3, obsolete, gone, cancelling) = replaceView m v a demands
-      -- Only pressure leaves a region pending; any other refusal fails the event.
-      -- A region that stays pending drops this view's interest in the coverage it
-      -- replaced, so an obsolete interest never survives a replacement. Whatever a
-      -- step leaves without an interest is pruned at once and reported, so the owner
-      -- is told to cancel every job the replacement made obsolete.
-      -- Regions are admitted strictly in demand order: once one is busy the rest
-      -- wait behind it, so a later region never takes room an earlier one needs.
       wanted = Set.fromList [(a, demandRegion d) | d ← demands]
-      dropInterest mm key = dropViewInterest owner mm key
-      attempt (mm, done, waiting, replaced, goneAcc, cancelAcc) d = case (if null waiting then planAdmission mm a owner [d] noExtras {exProtect = wanted} else Left (Busy (RegionEvicting (demandRegion d)))) of
-        Right plan →
-          let (mm', admission, _) = applyPlan mm a owner plan
-              (mm'', g, c) = pruneJobs mm'
-           in Right (mm'', done <> [admission], waiting, replaced, goneAcc <> g, cancelAcc <> c)
-        Left (Busy _) →
-          let key = (a, demandRegion d)
-              old = Map.lookup key (mTargets mm) >>= Map.lookup owner . tgInterests
-           in case old of
-                Just i | inCoverage i /= demandCoverage d →
-                  let (mm', g, c) = pruneJobs (dropInterest mm key)
-                   in Right (mm', done, waiting <> [demandRegion d], replaced <> [demandRegion d], goneAcc <> g, cancelAcc <> c)
-                _ → Right (mm, done, waiting <> [demandRegion d], replaced, goneAcc, cancelAcc)
-        Left other → Left other
-  (m4, admitted, pending, replaced, gone1, cancelling1) ← foldM attempt (m3, [], [], [], gone, cancelling) demands
-  -- Dropping an obsolete interest may have freed a slot or bytes: offer them to
-  -- the regions that stayed pending, once.
-  (m5, admitted2, pending2, _, gone2, cancelling2) ← foldM attempt (m4, admitted, [], [], gone1, cancelling1) [d | d ← demands, demandRegion d `elem` pending]
-  Right (m5, CameraSet admitted2 pending2 (map snd obsolete <> replaced) gone2 cancelling2 excluded truncated)
-
--- | The state a view's replacement demand leaves before any region is admitted: the
--- view holds the new description, the interests it no longer needs are dropped, and the
--- queued work nothing needs is pruned. Both the truncation of a description and its
--- application are this one function.
-replaceView ∷ Model → ViewId → ArenaId → [RegionDemand] → (Model, [(ArenaId, RegionCoord)], [JobId], [JobId])
-replaceView m v a demands =
-  let wanted = Set.fromList [(a, demandRegion d) | d ← demands]
-      owner = OwnerView v
-      obsolete =
-        [ key
-        | (key, t) ← Map.toAscList (mTargets m)
-        , Map.member owner (tgInterests t)
-        , not (Set.member key wanted)
-        ]
-      m1 = foldl' (dropViewInterest owner) m obsolete
-      m2 = m1 {mViews = Map.insert v (View a demands Set.empty) (mViews m1)}
-      (m3, gone, cancelling) = pruneJobs m2
-   in (m3, obsolete, gone, cancelling)
-
-dropViewInterest ∷ Owner → Model → RegionKey → Model
-dropViewInterest owner mm key = case Map.lookup key (mTargets mm) of
-  Nothing → mm
-  Just t → putTarget key t {tgInterests = Map.delete owner (tgInterests t)} mm
+      m1 = m {mViews = Map.insert v (View a demands Set.empty) (mViews m)}
+      attempt (mm, done, waiting) d
+        | not (null waiting) = Right (mm, done, waiting <> [demandRegion d])
+        | otherwise = case planAdmission mm a owner [d] noExtras {exProtect = wanted} of
+            Right plan → let (mm', admission, _) = applyPlan mm a owner plan in Right (mm', done <> [admission], waiting)
+            Left (Busy _) → Right (mm, done, waiting <> [demandRegion d])
+            Left other → Left other
+  (m2, admitted, pending) ← foldM attempt (m1, [], []) demands
+  Right (m2, CameraSet admitted pending withdrawn gone0 cancelling0 excluded truncated)
 
 -- | Retry the pending part of every view's latest camera demand, in view order.
 service ∷ Model → (Model, Decision)
