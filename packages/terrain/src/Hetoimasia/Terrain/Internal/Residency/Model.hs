@@ -24,6 +24,7 @@ module Hetoimasia.Terrain.Internal.Residency.Model
   , ContractReason (..)
   , ChargeViolation (..)
   , chargeCheck
+  , cameraKeepBoth
   , Report (..)
   , Decision (..)
   , Admission (..)
@@ -1161,36 +1162,7 @@ setCamera m v a demands0 = do
   -- cut the end of it, the lowest priority, and the remainder is reported.
   let limits = mLimits m
       (normal, excluded) = normalizeCamera (limitExtent limits) demands0
-      -- The description must leave room for the camera to progress, judged against the
-      -- state the replacement produces (the same 'replaceView' that applies it): that
-      -- state has this view's old description gone, the interests it no longer needs
-      -- dropped and the queued work nothing needs pruned, and beside the description it
-      -- must hold the interest and scratch of the first region of the kept prefix this
-      -- view has no interest in yet. A description that kept more regions than it can
-      -- start would stall. A longer prefix only adds to what the state holds, so the
-      -- longest prefix that fits is found by bisection.
-      covered d = case Map.lookup (a, demandRegion d) (mTargets m) >>= Map.lookup (OwnerView v) . tgInterests of
-        Just i → coverageSubset (demandCoverage d) (inCoverage i)
-        Nothing → False
-      leading = length (takeWhile covered normal)
-      unit = case drop leading normal of
-        (d : _) → interestRecordBytes + scratchBytes (demandCoverage d)
-        [] → 0
-      most = min (length normal) (fromIntegral (limitCameraRegions limits))
-      fits k
-        | k <= 0 = True
-        | otherwise =
-            let (mk, _, _, _) = replaceView m v a (take k normal)
-                need = if k > leading then unit else 0
-                room = toInteger (freeBytes (bankLedger mk StagingBank)) - toInteger (limitExplicitStagingBytes limits)
-             in room >= toInteger need
-      longest lo hi
-        | lo >= hi = lo
-        | fits mid = longest mid hi
-        | otherwise = longest lo (mid - 1)
-        where
-          mid = (lo + hi + 1) `div` 2
-      keep = longest 0 most
+      keep = fst (keepPrefix m v a normal)
       demands = take keep normal
       truncated = map demandRegion (drop keep normal)
   if null demands
@@ -1198,6 +1170,59 @@ setCamera m v a demands0 = do
       let (mCleared, regions, gone, cancelling) = clearView m v
        in Right (mCleared, CameraSet [] [] regions gone cancelling excluded truncated)
     else setCameraNormal m v a demands excluded truncated
+
+-- | How many regions of a normalized camera description to keep: the longest prefix,
+-- within the structural maximum, whose replacement state leaves the camera room to
+-- progress. The first component is found by bisection; the second is a linear scan of
+-- the same predicate, which a test compares it to.
+--
+-- The predicate is judged against the state the replacement produces (the same
+-- 'replaceView' that applies it): that state has this view's old description gone, the
+-- interests it no longer needs dropped and the queued work nothing needs pruned, and
+-- beside the description it must hold the interest and scratch of the first region of the
+-- kept prefix this view has no interest in yet, so a description is never kept longer than
+-- the camera can start.
+--
+-- Bisection is sound because the predicate is monotone in the prefix length. Compare the
+-- replacement states of a prefix and of a longer one: the longer holds 64 more bytes of
+-- description per added region; it drops fewer of the view's interests (a region added to
+-- the prefix can only keep an interest the shorter prefix dropped); and the jobs it keeps
+-- are those some interest still covers, a superset of the shorter one's. The first
+-- uncovered region's need does not depend on the prefix length, only on whether the
+-- prefix reaches it. So the state of a longer prefix holds at least what a shorter one's
+-- does, and the prefixes that fit are an initial segment.
+keepPrefix ∷ Model → ViewId → ArenaId → [RegionDemand] → (Int, Int)
+keepPrefix m v a normal = (longest 0 most, maximum (0 : [k | k ← [1 .. most], fits k]))
+  where
+    limits = mLimits m
+    covered d = case Map.lookup (a, demandRegion d) (mTargets m) >>= Map.lookup (OwnerView v) . tgInterests of
+      Just i → coverageSubset (demandCoverage d) (inCoverage i)
+      Nothing → False
+    leading = length (takeWhile covered normal)
+    unit = case drop leading normal of
+      (d : _) → interestRecordBytes + scratchBytes (demandCoverage d)
+      [] → 0
+    most = min (length normal) (fromIntegral (limitCameraRegions limits))
+    fits k
+      | k <= 0 = True
+      | otherwise =
+          let (mk, _, _, _) = replaceView m v a (take k normal)
+              need = if k > leading then unit else 0
+              room = toInteger (freeBytes (bankLedger mk StagingBank)) - toInteger (limitExplicitStagingBytes limits)
+           in room >= toInteger need
+    longest lo hi
+      | lo >= hi = lo
+      | fits mid = longest mid hi
+      | otherwise = longest lo (mid - 1)
+      where
+        mid = (lo + hi + 1) `div` 2
+
+-- | The bisected and the linearly scanned kept prefix of a raw camera description for a
+-- view of this model, for a test of their agreement; (0, 0) when the arena is not live.
+cameraKeepBoth ∷ Model → ViewId → ArenaId → [RegionDemand] → (Int, Int)
+cameraKeepBoth m v a demands = case liveArena m a of
+  Left _ → (0, 0)
+  Right _ → keepPrefix m v a (fst (normalizeCamera (limitExtent (mLimits m)) demands))
 
 setCameraNormal ∷ Model → ViewId → ArenaId → [RegionDemand] → [RegionCoord] → [RegionCoord] → Run
 setCameraNormal m v a demands excluded truncated = do

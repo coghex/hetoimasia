@@ -490,10 +490,14 @@ cells outside the configured extent are excluded and reported (`cameraExcluded`)
 and a description longer than its structural maximum (`specCameraRegions`, 16,384:
 more than the approved envelope needs) or than the staging the camera may use is cut
 at the end, lowest priority first, and the remainder reported (`cameraTruncated`). The
-staging the camera may use must hold the description and, beside it, the interest and
-scratch of the first region of the kept prefix that the view has no interest in yet, so
-a description is never kept longer than the camera can start: whatever is retained,
-its first region is admitted at once.
+cut is made against the state the replacement produces (`replaceView`, the function
+that also applies it): that state has the view's old description gone, the interests it no
+longer needs dropped and the queued work nothing needs pruned, and beside the kept
+description it must hold the interest and scratch of the first region of the kept prefix
+that the view has no interest in yet. A description is therefore never kept longer than
+the camera can start, and a pan is never cut to nothing by what it is about to release:
+whatever is retained, its first region is admitted at once (when nothing else holds the
+room).
 
 What camera work can occupy, and why it cannot starve explicit work. The mechanism is
 a reserve of room, not a race: camera admission and hold acquisition are refused

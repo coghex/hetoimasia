@@ -186,6 +186,7 @@ module Hetoimasia.Terrain.Residency
   , ContractReason (..)
   , ChargeViolation (..)
   , chargeCheck
+  , cameraKeepBoth
   , Report (..)
   , Decision (..)
   , Admission (..)

@@ -665,6 +665,24 @@ cameraReplacementStarts settled staging firstPicks nextPicks = case limitsNear 4
               (_, Left r) → counterexample ("the replacement was refused: " <> show r) False
           (_, Left r) → counterexample ("the first demand was refused: " <> show r) False
 
+-- | The kept prefix of a camera description is found by bisection, which is sound only
+-- if fitting is monotone in the prefix length. At every state a random sequence reaches
+-- (explicit requests, pins, other views, queued and running jobs), for each view and a
+-- random description, the bisected prefix equals the linear scan of the same predicate.
+bisectionMatchesLinearScan ∷ Limits → [(Int, Int, Int)] → Property
+bisectionMatchesLinearScan limits seeds = go (newModel limits) seeds (0 ∷ Int)
+  where
+    go _ [] n = counterexample "no state was compared" (n > 0) .&&. property True
+    go m (s@(x, y, z) : rest) n =
+      let (m', _) = step m (eventFor m s)
+          descriptions = [[demandFor (y + i) (x + i) | i ← [0 .. z `mod` 6]], [demandFor (x + i) (z + 2 * i) | i ← [0 .. y `mod` 4]]]
+          checks = [(v, d, cameraKeepBoth m' (ViewId v) (ArenaId 1) d) | v ← [0, 1], d ← descriptions]
+       in conjoin
+            [ counterexample ("view " <> show v <> ", " <> show (length d) <> " regions: bisection " <> show b <> ", linear scan " <> show l) (b == l)
+            | (v, d, (b, l)) ← checks
+            ]
+            .&&. go m' rest (n + length checks)
+
 -- | A request over its caps is invalid from every state, with a typed reason.
 overCapAlwaysInvalid ∷ [(Int, Int, Int)] → Property
 overCapAlwaysInvalid seeds =
@@ -774,6 +792,12 @@ spec = describe "Residency model properties" $ do
   it "starts the first region of every replacement of a camera description whose work is still queued, at any staging from the minimum" $
     withNumTests 2000 $
       forAll (chooseInteger (1530, 4000)) $ \staging → forAll (vectorOf 5 pair) $ \a → forAll (vectorOf 5 pair) $ \b → cameraReplacementStarts False staging a b
+  it "keeps the same camera prefix by bisection as by a linear scan, at every state random sequences reach" $
+    withNumTests 300 $
+      forAll ((,) <$> chooseInteger (4384, 6400) <*> chooseInteger (1530, 3600)) $ \(resident, staging) →
+        forAll seedsOf $ \seeds → case limitsNear resident staging of
+          Nothing → counterexample ("a configuration at or above the minimum was refused: " <> show (resident, staging)) False
+          Just limits → bisectionMatchesLinearScan limits seeds
   it "never reserves more for an explicit request than the construction-time worst case" $
     withNumTests 2000 $
       forAll (vectorOf 3 pair) reservationWithinMinimum
