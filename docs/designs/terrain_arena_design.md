@@ -127,6 +127,10 @@ D-54 gives ambient illumination its own Lua control. Changing only the sun
 position leaves ambient unchanged; future Lua day/night rules may animate
 both. Numeric lighting defaults/equations remain part of Q-18's contract review.
 
+D-55 approves P-11's cutout asset/sampling contract, including bounded
+`kind`/`coverage` texture options, shared versioned CPU bitplanes and required
+CPU/GPU edge agreement. Q-17 is specified; implementation proof remains due.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1667,6 +1671,29 @@ qualification must vary sun with ambient held fixed and ambient with sun held
 fixed, across all facings, so independent controls are observable rather than
 two names for the same automatic curve.
 
+### D-55. Adopt P-11's cutout asset, sampling and ownership contract
+
+Owner, directly in this design pane on 2026-11-08, answered “approved” to
+P-11 as written at `f372d0793f`. The review explicitly covered binary-alpha
+96×64 artwork/masks, nearest level-zero sampling, the common 0.5 cutoff,
+bounded data/CPU-coverage loading options, exact displayed-version ownership,
+existing memory budgets, refusal of incompatible/semi-transparent terrain
+assets and required CPU/GPU edge-agreement evidence.
+
+Adopt all six clauses of P-11, including its UV/pixel convention,
+premultiplied-colour/data-image distinction, `api.content.texture` options,
+coverage accounting/lifetime and failure-path qualification. The normal
+texture-loading behavior remains unchanged when the new options are omitted.
+The initial terrain style uses the approved opaque/cutout contract; other
+translucent terrain needs a later contract rather than silent alteration of
+authored assets.
+
+This resolves Q-17's concrete asset/sampling/ownership specification. It is
+not a claim that the bounded loader or renderer has been changed or that
+D-44's corrected masks have been proved. Full-cell emission/ordering and
+lighting equations remain Q-16/Q-18; Q-19 must assign the approved loader,
+coverage and integration work and its qualification before final acceptance.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2727,7 +2754,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-54 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-55 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2753,9 +2780,10 @@ establishes a coherent solid catalog.
 D-30 selects the picking approach: use the adopted drawn quads, matching
 artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
 D-45 selects nearest-neighbor colour/mask sampling and a shared render/pick
-alpha cutoff. The former analytic-solid picker is not the visual authority.
-Exact emission, numeric sample/edge conventions and the remaining
-ownership details are still open.
+alpha cutoff. D-55/P-11 specifies the exact cutout sampling, bounded asset
+loading and shared CPU coverage ownership. The former analytic-solid picker
+is not the visual authority. Emission/ordering remains Q-16 and the changed
+path still needs implementation proof.
 
 D-31 requires a separate fog presentation over undiscovered underground
 terrain, including real air gaps. The generic blank is intentional gameplay
@@ -3256,9 +3284,9 @@ and final evidence assignment. The viewport-based direction already has P-5
 support; D-48 approves the explicit refinement and regression package above.
 This does not settle Q-20's separate cavity discovery work.
 
-### P-11. Concrete cutout asset and sampling contract — proposal for review
+### P-11. Concrete cutout asset and sampling contract — approved by D-55
 
-This is one proposed Q-17 contract, not an approved decision. It fills in
+This Q-17 contract was approved as written at `f372d0793f` by D-55. It fills in
 D-30/D-45's shared coverage and crisp sampling without deciding the remaining
 emission/ordering or lighting equations. The initial scope is opaque/cutout
 terrain; partial translucency would require a later contract.
@@ -3350,14 +3378,67 @@ decoder still lacks the data-image policy described in the integration audit.
    threshold or silently switch filtering to hide it. The immutable asset
    provenance and reproduction commands accompany D-44's corrected-mask proof.
 
-The proposed loading options are new API surface and require approval with
-this contract; the current facade accepts only `root`/`optional` at this call
-(H `packages/lua-engine/README.md:1098–1101`). The proposed binary-only terrain
+The approved loading options are new API surface; the audited facade accepts
+only `root`/`optional` at this call
+(H `packages/lua-engine/README.md:1098–1101`). The approved binary-only terrain
 contract intentionally excludes semi-transparent terrain textures now. It
 preserves the imported loam/granite assets and crisp cutouts, not a promise
 that arbitrary existing translucent content is accepted by a terrain style.
 Q-19 must assign the bounded loader/coverage work and its integration separately
-from mask correction and final renderer qualification once this is approved.
+from mask correction and final renderer qualification. Approval specifies the
+target and does not establish that the implementation exists or passes proof.
+
+### P-12. Lighting representation for actual ramp orientations — proposal
+
+**Source fact.** S `3777d437`
+`src/Engine/Graphics/Vulkan/ShaderCode.hs:258–303` normalizes nonnegative RGB
+as right/top/left weights and blends three computed face brightnesses. Its
+sun phase drives both height and apparent direction, while D-46 has already
+selected separate world-space direction/elevation. The ramp PNGs also carry
+authored gradients: read-only inspection found 511 distinct opaque RGB values
+in `isoface_slope_n.png`, 35 in `_e`, 342 in `_s` and 252 in `_w`; `_nesw`
+has only green on its 2,400 opaque pixels. These are lighting weights under
+the source shader, not stored three-dimensional surface normals. This is
+not a new claim that every gradient is an accidental asset bug.
+
+**Constraint exposed by the approved shape catalog.** D-49 includes ramp
+planes facing each horizontal direction. For example, the W shape has
+`h=x`, outward top normal `(-1,0,1)/sqrt(2)`. With sun from west at elevation
+10 degrees, its ideal diffuse response `max(0,dot(normal,sunDirection))` is
+about 0.81915. The two camera-facing vertical cube normals `+X`/`+Y` have
+response zero and the flat top has response about 0.17365. No nonnegative
+normalized blend of those three face responses can reach the ramp response.
+The ramp is visible from the reference above-ground isometric view, so this
+is not solely a hidden-face case. The calculation establishes a limitation of
+three fixed face responses if the target is actual surface-orientation
+lighting; it does not claim S promised that model or substitute for GPU proof.
+
+**Recommendation for owner decision.** Keep the same RGBA data texture and
+binary-alpha silhouette, but encode the visible surface normal in RGB instead
+of right/top/left brightness weights. Generate normals and cutouts from the
+same D-49 catalog, transform normals consistently with the selected facing,
+and shade against the world-fixed sun plus D-54's independent ambient level.
+The CPU still submits the same flat cell quads; the GPU uses the mask alpha
+for the cutout. P-11's bounded raw-data loading, dimensions, sampling, CPU
+coverage and resource ownership remain applicable. This would explicitly
+revise its description of RGB as face weights, not its approved alpha or
+transport contract.
+
+This is an intentional lighting/asset-encoding change from Synarchy, requiring
+new RGB map contents and an unambiguous encoding identity so old weight maps
+cannot be silently interpreted as normals. It needs no additional texture
+per cell or new vertex/depth ABI by the source-level feasibility reading;
+the material implementation still requires qualification. Do not promise
+performance parity without measurement. Exact normal encoding, directional
+equation, default sun/ambient values and depth-effect composition depend on
+the owner's choice and remain Q-18 contract work.
+
+The alternative is to retain the stylized three-face brightness blend and
+accept that it is not general surface-normal lighting for ramps. No choice
+has been made yet. If the recommendation is approved, solver evidence must
+include the low-angle ramp case, opposite slopes and all facets of ID 15,
+sun/ambient independence, and the same world-facing surface under all four
+camera facings, alongside D-44/P-11's cutout/picking proof.
 
 ## Open questions and review checkpoints
 
@@ -3533,22 +3614,16 @@ D-44's shape/mask/picking qualification.
 
 ### Q-17. Face-map data loading, sampling and ownership
 
-Partially resolved by D-30/D-45: shared CPU coverage per asset/version,
-nearest-neighbor colour/mask sampling and a shared render/pick alpha cutoff.
-Decide the bounded data-image route, approved asset catalog/provenance,
-numeric cutoff, UV/texel edges, mip/LOD and premultiplication rules,
-CPU coverage retention and how style
-acquires/version-checks both texture kinds. General `DataImage` support is
-not proof that the current bounded Lua loader exposes it. Preserve protected
-leases and account for new storage; no temporary colour-decoding workaround
-is approved.
-
-P-11 is the complete proposed asset/sampling contract for review: binary-alpha
+Resolved as a specification by D-30/D-45/D-55 and P-11: binary-alpha
 96×64 initial terrain art/masks, level-zero nearest/clamped sampling and
 threshold 0.5, bounded explicit data loading, shared versioned CPU bitplanes,
 accounted ownership and CPU/GPU qualification. It adds `kind`/`coverage` options
-to the existing texture API and refuses incompatible terrain assets. None of
-these additional constraints/API changes is a decision until approved.
+to the existing texture API and refuses incompatible terrain assets.
+General `DataImage` support is not proof that the bounded Lua route implements
+the approved policy. Implementation/qualification and the corrected asset
+catalog/provenance remain required; no temporary colour-decoding workaround is
+approved. P-12's possible change from RGB face weights to encoded normals is
+a separate Q-18 lighting choice, not an unapproved alteration of this contract.
 
 ### Q-18. Exact initial appearance beyond the silhouette
 
@@ -3586,6 +3661,13 @@ does not itself perform that ambient day/night transition. Numeric defaults,
 face-light equations and the existing depth effects still need the concrete
 appearance contract. Retaining S's automatic sun-linked ambient curve is the
 rejected alternative, not assumed parity.
+
+Current owner question: P-12 recommends encoding surface normals in the RGB
+channels of the same cutout data texture, so the approved ramps/peak respond
+to their actual tilt under a world-fixed sun. Retaining Synarchy's stylized
+three-face brightness blend is the alternative. The RGB representation and
+lighting equation change are not approved yet; P-11's alpha/loading/ownership
+contract remains approved independently.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
