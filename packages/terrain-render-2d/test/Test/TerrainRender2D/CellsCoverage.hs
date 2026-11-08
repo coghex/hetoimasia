@@ -373,13 +373,13 @@ fractionalOcclusion = describe "omission of hidden cells under the transforms as
   it "answers every sampled pixel as the plan that omits nothing does, over generated zooms, pans, facings, cuts and discovered sets" $ do
     assets ← loadAssets 5
     unproved ← loadAssetsWith 5 [(AssetMap (MapKey Ordinary (either (error . show) id (mkShapeId 5))), allOn)]
-    let cases = take 60 (generated 20261108)
+    let cases = take 80 (generated 20261108)
         outcome (facing, cut, zoom, (dx, dy), snap, cells) =
           let scene0 = sceneOf facing cut [OCell x y z 0 KnownAll | (x, y, z) ← cells]
               scene = (if snap then snapped else id) (panned dx dy (zoomed zoom scene0))
               plan = planScene assets scene
               kept = planScene unproved scene
-           in ( [px | px ← stridePixels 7, pickPixel plan px /= pickPixel kept px]
+           in ( [px | px ← stridePixels 7 <> edgePixels kept, pickPixel plan px /= pickPixel kept px]
               , length (cellPlanQuads kept) - length (cellPlanQuads plan)
               )
         outcomes = map outcome cases
@@ -388,6 +388,17 @@ fractionalOcclusion = describe "omission of hidden cells under the transforms as
     sum (map snd outcomes) `shouldSatisfy` (> 0)
     any ((== 0) . snd) outcomes `shouldBe` True
   where
+    -- The pixels whose centre lies within 1/64 of an edge of some quad: the only
+    -- places a rounding difference between two rectangles can change an answer.
+    edgePixels plan =
+      concat
+        [ [(k, y) | k ← near [l, r], y ← [floor t - 1 .. ceiling b]]
+            <> [(x, k) | k ← near [t, b], x ← [floor l - 1 .. ceiling r]]
+        | q ← cellPlanQuads plan
+        , let TargetRect l t r b = quadTarget q
+        ]
+      where
+        near edges = [k | e ← edges, let k = round (e - 1 / 2) ∷ Int, abs (e - (fromIntegral k + 1 / 2)) < 1 / 64]
     generated seed = go (draws seed)
       where
         go (a : b : c : d : e : f : g : rest) =
