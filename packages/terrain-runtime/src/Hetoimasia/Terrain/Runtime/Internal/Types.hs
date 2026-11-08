@@ -275,6 +275,8 @@ data Config = Config
   , -- | The first identity every counter issues. The default is zero; a test
     -- raises it to exercise exhaustion without issuing billions.
     configFirstIdentity ∷ !Word64
+  , -- | The content revision a new arena starts at, likewise for exhaustion tests.
+    configFirstRevision ∷ !Word64
   }
 
 -- | The parent session's admission, readable inside the arbitration.

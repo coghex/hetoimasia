@@ -67,7 +67,9 @@ test-suite terrain-runtime-tests
     ghc-options: -threaded -rtsopts
     other-modules:
         Test.TerrainRuntime.Basic
+        Test.TerrainRuntime.Closure
         Test.TerrainRuntime.Fixtures
+        Test.TerrainRuntime.Races
         Test.TerrainRuntime.Spec
     build-depends:
         base >=4.22 && <4.23,

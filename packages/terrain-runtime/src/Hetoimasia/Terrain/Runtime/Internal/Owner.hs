@@ -458,7 +458,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
         | otherwise → do
             let aid = ArenaId (stateNextArena st)
                 lid = stateNextLease st
-            applyEvent svc (R.OpenArena aid (Revision 0)) >>= \case
+            applyEvent svc (R.OpenArena aid (Revision (configFirstRevision (serviceConfig svc)))) >>= \case
               Left refusal → pure (CommitDefect (Text.pack ("open refused: " <> show refusal)))
               Right _ → do
                 let arena =
@@ -470,7 +470,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
                         , arenaChanges = emptyChanges
                         , arenaStore = emptyChanges
                         , arenaWorking = Map.empty
-                        , arenaRevision = Revision 0
+                        , arenaRevision = Revision (configFirstRevision (serviceConfig svc))
                         , arenaGeneration = 0
                         , arenaCreator = cid
                         , arenaLeases = Set.singleton lid

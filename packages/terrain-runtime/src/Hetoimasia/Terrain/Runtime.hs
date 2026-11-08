@@ -32,6 +32,7 @@ module Hetoimasia.Terrain.Runtime
   , standaloneSupervisor
   , withTerrainService
   , closeService
+  , awaitOwnerStopped
 
     -- * Diagnostics seam
   , Probe (..)
@@ -90,6 +91,7 @@ module Hetoimasia.Terrain.Runtime
     -- * Inspection
   , inspectInvariants
   , inspectModel
+  , inspectModelSTM
   , inspectDefects
   , inspectArena
   , inspectArenaSTM
@@ -131,6 +133,7 @@ defaultConfig =
     , configSourceLimits = defaultSourceLimits
     , configQueryLimits = defaultQueryLimits
     , configFirstIdentity = 0
+    , configFirstRevision = 0
     }
 
 -- | What the service borrows. Each is narrow: the parent session's admission as
@@ -190,6 +193,12 @@ withTerrainService config ports body =
       atomically $ do
         st <- readSt svc
         check (stateOwner st == OwnerStopped)
+
+-- | Wait until the owner has ended, however it ended. There is no deadline.
+awaitOwnerStopped ∷ Service → IO ()
+awaitOwnerStopped svc = atomically $ do
+  st <- readSt svc
+  check (stateOwner st == OwnerStopped)
 
 -- | Close admission, settle everything pending and end every arena. Idempotent.
 -- It does not wait for borrowers; the end of 'withTerrainService' does.
@@ -304,7 +313,11 @@ inspectInvariants svc = invariants <$> readTVarIO (serviceState svc)
 
 -- | The accounting model as it is now.
 inspectModel ∷ Service → IO Model
-inspectModel svc = stateModel <$> readTVarIO (serviceState svc)
+inspectModel svc = atomically (inspectModelSTM svc)
+
+-- | The same as a transaction, so a wait can be on the accounting itself.
+inspectModelSTM ∷ Service → STM Model
+inspectModelSTM svc = stateModel <$> readSt svc
 
 -- | The unexpected defects recorded, newest first.
 inspectDefects ∷ Service → IO [Defect]
@@ -317,6 +330,10 @@ data ArenaView = ArenaView
   , viewGeneration ∷ !Word
   , viewChanges ∷ !Changes
   , viewResident ∷ !Resident
+  , -- | The retained store: changes whose transfer succeeded.
+    viewStore ∷ !Changes
+  , -- | The regions whose changes are committed but not yet transferred.
+    viewWorking ∷ ![RegionCoord]
   }
 
 inspectArena ∷ Service → ArenaLease → IO (Maybe ArenaView)
@@ -329,6 +346,6 @@ inspectArenaSTM svc lease = do
   st <- readSt svc
   pure $ case leaseOf svc lease st of
     Right (_, ls) →
-      (\a → ArenaView (leaseArena ls) (arenaRevision a) (fromIntegral (arenaGeneration a)) (arenaChanges a) (arenaResident a))
+      (\a → ArenaView (leaseArena ls) (arenaRevision a) (fromIntegral (arenaGeneration a)) (arenaChanges a) (arenaResident a) (arenaStore a) (Map.keys (arenaWorking a)))
         <$> Map.lookup (leaseArena ls) (stateArenas st)
     Left _ → Nothing

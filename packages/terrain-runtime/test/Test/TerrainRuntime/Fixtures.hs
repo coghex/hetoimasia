@@ -17,9 +17,12 @@ module Test.TerrainRuntime.Fixtures
     -- * Gates
   , Gate
   , newGate
+  , newDisarmedGate
+  , armGate
   , openGate
   , gatedProbe
   , awaitReached
+  , withGatedService
 
     -- * Hosts
   , Host (..)
@@ -29,6 +32,16 @@ module Test.TerrainRuntime.Fixtures
   , settledOf
   , seenAtSettle
 
+    -- * Doing things
+  , openMain
+  , readCell
+  , removeCell'
+  , cellIs
+  , refusedWith
+  , limitsWith
+  , configWith
+  , settleChecks
+
     -- * Waiting
   , waitFor
   , expectRight
@@ -37,16 +50,18 @@ module Test.TerrainRuntime.Fixtures
   ) where
 
 import Control.Concurrent.MVar
+import Control.Exception (finally)
 import Control.Concurrent.STM
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
-import Hetoimasia.Terrain.Cell (Column, ZRange, mkColumn, mkZRange)
+import Data.Text (Text)
+import Hetoimasia.Terrain.Cell (Cell (..), Column, ZRange, mkColumn, mkZRange)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord, tileCoord)
-import Hetoimasia.Terrain.Residency (Revision (..))
+import Hetoimasia.Terrain.Residency (Limits, LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
-import Test.Hspec (HasCallStack, expectationFailure)
+import Test.Hspec (HasCallStack, expectationFailure, shouldBe)
 import Test.Support.Bounded (bounded)
 
 quiet ∷ Logger
@@ -92,10 +107,19 @@ region x y z = RegionCoord (fromInteger x) (fromInteger y) (fromInteger z)
 data Gate = Gate
   { gateArrived ∷ MVar ()
   , gateOpen ∷ MVar ()
+  , gateArmed ∷ TVar Bool
   }
 
+-- | A gate, armed from the start; 'disarmedGate' starts it open to nothing.
 newGate ∷ IO Gate
-newGate = Gate <$> newEmptyMVar <*> newEmptyMVar
+newGate = Gate <$> newEmptyMVar <*> newEmptyMVar <*> newTVarIO True
+
+-- | A gate that holds nothing until it is armed.
+newDisarmedGate ∷ IO Gate
+newDisarmedGate = Gate <$> newEmptyMVar <*> newEmptyMVar <*> newTVarIO False
+
+armGate ∷ Gate → IO ()
+armGate gate = atomically (writeTVar (gateArmed gate) True)
 
 -- | Idempotent and non-blocking.
 openGate ∷ Gate → IO ()
@@ -104,12 +128,21 @@ openGate gate = () <$ tryPutMVar (gateOpen gate) ()
 -- | A probe that holds the owner at every point the predicate selects, until the
 -- gate opens, and says it arrived.
 gatedProbe ∷ (Point → Bool) → Gate → Probe
-gatedProbe selects gate = Probe $ \point →
-  if selects point
+gatedProbe selects gate = Probe $ \point → do
+  armed <- readTVarIO (gateArmed gate)
+  if selects point && armed
     then do
       _ <- tryPutMVar (gateArrived gate) ()
       readMVar (gateOpen gate)
     else pure ()
+
+-- | A service whose owner is held at the points a predicate selects, until the
+-- gate opens. The gate is opened on every exit from the body, before the
+-- service drains its owner, so a failed example fails instead of deadlocking
+-- behind its own gate.
+withGatedService ∷ Config → SessionAdmission → (Point → Bool) → Gate → (Service → IO a) → IO a
+withGatedService config admission selects gate body =
+  withServiceUsing config admission (gatedProbe selects gate) (\svc → body svc `finally` openGate gate)
 
 awaitReached ∷ Gate → IO ()
 awaitReached gate = bounded (readMVar (gateArrived gate))
@@ -154,6 +187,62 @@ settledOf host = reverse <$> readTVarIO (hostSettled host)
 
 seenAtSettle ∷ Host → IO [Maybe (Integer, Bool)]
 seenAtSettle host = reverse <$> readTVarIO (hostSeen host)
+
+-- ---------------------------------------------------------------------------
+-- Doing things
+
+-- | A client with a named arena over the soil-over-stone source.
+openMain ∷ Service → Text → IO (Client, ArenaLease)
+openMain svc name = do
+  client <- okOf (registerClient svc)
+  lease <- okOf (openArena svc client name soilOverStone) >>= await svc >>= expectSuccess
+  pure (client, lease)
+
+readCell ∷ Service → ArenaLease → TileCoord → IO CellAnswer
+readCell svc lease at = okOf (cellAt svc lease at) >>= await svc >>= expectSuccess
+
+removeCell' ∷ Service → ArenaLease → TileCoord → IO RemoveAnswer
+removeCell' svc lease at = okOf (removeAt svc lease at Nothing) >>= await svc >>= expectSuccess
+
+-- | Whether a cell answer is air.
+cellIs ∷ CellAnswer → Bool
+cellIs answer = cellValue answer == Air
+
+-- | The reason an admission was refused, or nothing if it was admitted.
+refusedWith ∷ Either Refused a → Maybe Refused
+refusedWith = either Just (const Nothing)
+
+-- | Validated limits: the approved profile with some figures changed.
+limitsWith ∷ (LimitsSpec → LimitsSpec) → Limits
+limitsWith change = either (error . show) id (mkLimits (change approved))
+  where
+    mib = 1024 * 1024
+    approved =
+      LimitsSpec
+        { specResidentBytes = 256 * mib
+        , specEditBytes = 64 * mib
+        , specStagingBytes = 128 * mib
+        , specLoadJobs = 128
+        , specQueuedCommands = 256
+        , specPinsPerView = 2
+        , specAgingQuanta = 8
+        , specQueryRegions = 257
+        , specExtentX = 16
+        , specExtentY = 16
+        , specExtentZ = 32
+        , specHoldRegions = 256
+        , specCameraRegions = 16384
+        }
+
+configWith ∷ (LimitsSpec → LimitsSpec) → Config
+configWith change = defaultConfig {configLimits = limitsWith change}
+
+-- | After an example: the state is coherent, nothing is left reserved, and no
+-- defect was recorded.
+settleChecks ∷ Service → IO ()
+settleChecks svc = do
+  inspectInvariants svc >>= (`shouldBe` [])
+  inspectDefects svc >>= (`shouldBe` [])
 
 -- ---------------------------------------------------------------------------
 -- Waiting
