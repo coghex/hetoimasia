@@ -107,6 +107,29 @@ spec = describe "Accounting and lifetime hardening" $ do
         Right (ProviderDefect _ : _) → pure ()
         other → expectationFailure ("expected a provider defect first, got " <> show other)
 
+  it "retries pending camera demand when a borrow is released, without another admission" $
+    withService (tightConfig (2, 1, 2) 0 4096) $ \svc → do
+      (client, lease) <- openMain svc "main"
+      view <- okOf (openView svc client)
+      let oneCellOf (x, z) = let (area, local) = decomposeTile (tile x 0 z) in RegionDemand area (coverageTile local)
+          held = [(0, 0), (16, 0)]
+          wanted = [oneCellOf (x, z) | x ← [32, 48, 64, -16, -32, -48, 80, 96], z ← [0, 32]]
+      forM_ held $ \(x, z) → readCell svc lease (tile x 0 z)
+      let heldRegions = [fst (decomposeTile (tile x 0 z)) | (x, z) ← held]
+      outcome <- withSnapshot svc lease heldRegions $ \_ → do
+        receipt <- okOf (setViewDemand svc view lease wanted)
+        waitFor (inspectModelSTM svc >>= \m → check (null [() | j ← modelJobs m, jobPhase j /= JobQueued && jobPhase j /= JobWaiting]))
+        pendingWhileHeld <- concatMap viewPending . modelViews <$> inspectModel svc
+        -- The scenario is only meaningful if the borrow really holds demand back.
+        pure (length (receiptPending receipt), pendingWhileHeld)
+      case outcome of
+        Right (_, stillPending) → stillPending `shouldSatisfy` (not . null)
+        Left refused → expectationFailure (show refused)
+      -- The borrow is released; nothing else is admitted. The owner retries on its own.
+      waitFor (inspectModelSTM svc >>= \m → check (all (null . viewPending) (modelViews m) && null (modelJobs m)))
+      inspectDefects svc >>= (`shouldBe` [])
+      settleChecks svc
+
   it "refuses an unbounded name and a borrow that names more regions than a hold may, before enumerating them" $
     withService defaultConfig $ \svc → do
       (client, lease) <- openMain svc "main"
