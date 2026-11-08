@@ -622,13 +622,16 @@ spec = describe "Accounting and lifetime hardening" $ do
       _ <- readCell svc hot (tile 1 1 1)
       coldHost <- newHost True
       writeIORef stream (Just (svc, hot, coldHost))
-      _ <- okOf (cellWith svc (hostEndpoint svc Nothing coldHost) cold (tile 0 0 0))
       -- Start the stream with one read; every preparation then sustains it.
       starter <- newHost True
       _ <- okOf (cellWith svc (hostEndpoint svc Nothing starter) hot (tile 1 1 1))
+      let spin = readIORef steps >>= \n → if n >= 3 then pure () else yield >> spin
+      bounded spin
+      base <- readIORef steps
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing coldHost) cold (tile 0 0 0))
       waitFor (readTVar (hostSettled coldHost) >>= \x → check (not (null x)))
       -- The load ran within a few preparations of being queued, however long the stream.
-      readIORef settledAt >>= \n → n `shouldSatisfy` maybe False (<= 8)
+      readIORef settledAt >>= \n → n `shouldSatisfy` maybe False (\k → k - base <= 8)
       settleChecks svc
 
   it "serves an eligible staged commit while a producer keeps cancelling and replacing cache-hit reads" $ do
