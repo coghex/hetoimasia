@@ -103,7 +103,7 @@ module Hetoimasia.Terrain.Runtime
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (Exception, ExceptionWithContext, SomeAsyncException, SomeException, mask, rethrowIO, throwIO, try, tryWithContext)
+import Control.Exception (Exception, ExceptionWithContext, SomeException, mask, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (when)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -182,22 +182,25 @@ standaloneSupervisor group = Supervisor $ \definition →
 -- borrower that never returns keeps the service, and so its dependencies, alive.
 withTerrainService ∷ Config → Ports → (Service → IO a) → IO a
 withTerrainService config ports body =
-  withResource acquire (\svc → atomically (closeServiceSTM svc)) $ \svc → do
-    started <- try (superviseOwner (portSupervisor ports) (ownerDefinition svc))
-    owner <- case started of
-      Left (failure ∷ SomeException) → do
-        atomically (modifySt svc (\st → st {stateOwner = OwnerStopped}))
-        throwIO failure
-      Right control → pure control
-    -- The body runs to its end or its failure; the drain then runs whatever
-    -- happened, and survives a cancellation delivered while it waits: it keeps
-    -- waiting and delivers the cancellation afterwards. The body's own failure,
-    -- with its context, is the one that propagates.
+  withResource acquire (\svc → atomically (closeServiceSTM svc)) $ \svc →
+    -- Everything from the owner's start to the end of the drain is masked, so
+    -- there is no window between a started owner and the drain that will join it:
+    -- the start's own wait is interruptible, and the foundation's start drains a
+    -- worker it could not acknowledge before it propagates.
     mask $ \restore → do
+      started <- try (superviseOwner (portSupervisor ports) (ownerDefinition svc))
+      owner <- case started of
+        Left (failure ∷ SomeException) → do
+          atomically (modifySt svc (\st → st {stateOwner = OwnerStopped}))
+          throwIO failure
+        Right control → pure control
+      -- The body runs to its end or its failure; the drain then runs whatever
+      -- happened. The body's own failure, with its context, is the one that
+      -- propagates; an interruption received while draining is delivered after it.
       outcome <- tryWithContext (restore (body svc))
       late <- drain svc owner
       case outcome of
-        Right result → maybe (pure result) throwIO late
+        Right result → maybe (pure result) rethrowIO late
         Left primary → rethrowIO (primary ∷ ExceptionWithContext SomeException)
   where
     acquire = do
@@ -207,8 +210,9 @@ withTerrainService config ports body =
       pure (Service tag var config (portAdmission ports) (portLogger ports) (portProbe ports))
     -- Close admission, ask the owner to stop, and wait for both proofs: the
     -- owner's worker has published its terminal outcome, and no borrower is
-    -- outstanding. There is no deadline and no detach. An asynchronous exception
-    -- received while waiting is remembered, not obeyed, and returned.
+    -- outstanding. There is no deadline and no detach. Any exception received
+    -- while waiting, of whatever type (a cancellation can deliver any), is
+    -- remembered with its context, not obeyed, and returned.
     drain svc owner = do
       atomically (closeServiceSTM svc)
       stopOwner owner
@@ -219,9 +223,9 @@ withTerrainService config ports body =
           st <- readSt svc
           check (stateBorrowers st == 0)
         wait late =
-          try (atomically retired) >>= \case
+          tryWithContext (atomically retired) >>= \case
             Right () → pure late
-            Left (interruption ∷ SomeAsyncException) → wait (maybe (Just interruption) Just late)
+            Left (interruption ∷ ExceptionWithContext SomeException) → wait (maybe (Just interruption) Just late)
 
 -- | Wait until the owner has ended, however it ended. There is no deadline.
 awaitOwnerStopped ∷ Service → IO ()

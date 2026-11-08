@@ -75,7 +75,20 @@ ownerMain svc token =
       logInfo logger terrainComponent "terrain owner stopped" []
   )
     `finally` uninterruptibleMask_ (atomically terminal)
+    >> reportUnreported
   where
+    -- A defect recorded while the owner was closing (a host callback that failed
+    -- during closure, after every settlement was still delivered) reaches
+    -- supervision as the owner's own failure, after the cleanup has committed.
+    reportUnreported = do
+      pending <- atomically $ do
+        st <- readSt svc
+        if stateDefectCount st > stateDefectsReported st
+          then do
+            writeTVar (serviceState svc) st {stateDefectsReported = stateDefectCount st}
+            pure (listToMaybe (reverse (stateDefects st)))
+          else pure Nothing
+      forM_ pending throwIO
     logger = serviceLogger svc
     loop = do
       work <- tryNonAsync (atomically (nextWork svc token)) >>= \case
@@ -94,6 +107,7 @@ ownerMain svc token =
     -- bookkeeping, so it is safe under the uninterruptible mask.
     terminal = do
       closeServiceSTM svc
+      retireInFlightSTM svc
       modifySt svc (\st → st {stateOwner = OwnerStopped})
 
 -- | One piece of owner work.
@@ -107,6 +121,7 @@ data Work
   | WCommit !RequestId
   | WRetry
   | WDispatch
+  | WReport
 
 -- | Choose the next quantum, or wait until there is one. A transaction that
 -- retries wakes when any state it read changes: a new command, a cancellation,
@@ -118,7 +133,9 @@ nextWork svc token = do
   stopping <- stopRequested token
   let model = stateModel st
       closing = statePhase st == Closing
-  if (not open || stopping) && not closing
+  if stateDefectCount st > stateDefectsReported st
+    then pure WReport
+    else if (not open || stopping) && not closing
     then pure WCloseSession
     else case Seq.viewl (stateVictims st) of
       key Seq.:< _ → pure (WVictim key)
@@ -226,6 +243,16 @@ perform svc = \case
   WCommit rid → commitReq svc rid >> pure True
   WRetry → retryPass svc >> pure True
   WDispatch → dispatchJob svc >> pure True
+  WReport → do
+    -- A defect was recorded where nothing could throw (a host callback that failed
+    -- inside a closing transaction). The cleanup is committed; now the owner ends
+    -- with it, so supervision sees it.
+    first' <- atomically $ do
+      st <- readSt svc
+      writeTVar (serviceState svc) st {stateDefectsReported = stateDefectCount st}
+      pure (listToMaybe (reverse (stateDefects st)))
+    forM_ first' throwIO
+    pure True
 
 probe ∷ Service → Point → IO ()
 probe svc = probePoint (serviceProbe svc)
@@ -545,7 +572,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
       | not (preparedChanged prepared) = do
           -- Removing air changes nothing: the revision is unchanged and the
           -- reservations return.
-          releaseReq svc rid req
+          retainResult req
           endpointSettle ep (Succeeded (ARemoved (RemoveAnswer aid (arenaRevision arena) False)))
           pure (CommitDone (Just aid) (Just (arenaRevision arena)))
       | Revision n <- arenaRevision arena, n == maxBound = pure (CommitDefect "content revision exhausted after admission")
@@ -574,7 +601,7 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
                         )
                         aid
                         (stateArenas s)
-                  , stateRequests = Map.delete rid (stateRequests s)
+                  , stateRequests = Map.insert rid req {reqPhase = Done, reqModel = False} (stateRequests s)
                   }
               -- Every other pending removal of the arena carries a reservation
               -- stamped with the old revision, and the readers that lost their
@@ -599,6 +626,10 @@ commitStaged svc st rid req sg = case (reqCmd req, stagedWork sg) of
           Just (Precondition pa pr) → pa /= aid || pr /= arenaRevision arena
           Nothing → False
     isRemoval' q = case reqCmd q of CRemove {} → True; _ → False
+    -- A settled result is kept, with its command slot, until its holder takes it.
+    retainResult q = do
+      void (applyEvent svc (R.Withdraw rid))
+      modifySt svc (\s → s {stateRequests = Map.insert rid q {reqPhase = Done, reqModel = False} (stateRequests s)})
 
 -- | Admit a request's demand to the model again, at the arena's current
 -- revision: the request's record is withdrawn and a fresh one made in the same

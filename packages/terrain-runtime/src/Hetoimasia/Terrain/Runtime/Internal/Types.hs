@@ -494,6 +494,8 @@ data St = St
     stateTransfers ∷ !(Map RegionKey Word64)
   , stateDefects ∷ ![Defect]
   , stateDefectCount ∷ !Word64
+  , -- | How many of those the owner has reported by ending (so that supervision sees them).
+    stateDefectsReported ∷ !Word64
   }
 
 initialState ∷ Config → Limits → St
@@ -524,6 +526,7 @@ initialState config limits =
     , stateTransfers = Map.empty
     , stateDefects = []
     , stateDefectCount = 0
+    , stateDefectsReported = 0
     }
   where
     first = configFirstIdentity config

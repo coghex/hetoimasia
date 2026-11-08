@@ -60,6 +60,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
     -- * Invariants
   , invariants
   , bumpGeneration
+  , retireInFlightSTM
   , modelLimitsFor
   ) where
 
@@ -80,7 +81,7 @@ import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), HoldId (..), RegionDemand, RequestId (..), Revision (..), ViewId (..))
 import Hetoimasia.Terrain.Runtime.Internal.Content
 import Hetoimasia.Terrain.Runtime.Internal.Snapshot
-import Hetoimasia.Terrain.Resident (residentStats, ResidentStats (..))
+import Hetoimasia.Terrain.Resident (ResidentStats (..), discardRegion, residentStats)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Source (Source, SourceError)
 
@@ -115,12 +116,32 @@ applyEvent svc event = do
     Left _ → pure outcome
     Right report → do
       writeTVar (serviceState svc) $
+        (if freesCapacity event then \x → x {stateFreed = True, stateDispatchIdle = False} else id)
         st
           { stateModel = model
           , stateVictims = stateVictims st <> Seq.fromList (decisionVictims (R.reportDecision report))
           , stateRetiring = foldr Map.delete (stateRetiring st) (R.reportSettled report)
           }
       pure outcome
+
+-- | Events whose acceptance may have returned credits, so that what waits for
+-- capacity should be tried again. Every release path goes through 'applyEvent',
+-- so none can forget to say so.
+freesCapacity ∷ R.Event → Bool
+freesCapacity = \case
+  R.Withdraw {} → True
+  R.RetireArena {} → True
+  R.ClearCameraDemand {} → True
+  R.SetCameraDemand {} → True
+  R.ReleaseHold {} → True
+  R.JobCompleted {} → True
+  R.JobFailed {} → True
+  R.JobAcknowledged {} → True
+  R.VictimReleased {} → True
+  R.HandoffConfirmed {} → True
+  R.HandoffFailed {} → True
+  R.RemovalCommitted {} → True
+  _ → False
 
 -- | Keep a bounded record of an unexpected defect.
 recordDefect ∷ Service → Defect → STM ()
@@ -250,8 +271,12 @@ countReqs ∷ (Req → Bool) → St → Int
 countReqs p st = Map.size (Map.filter p (stateRequests st))
 
 -- | The removals admitted for an arena and not yet settled.
+-- | Settled results the model no longer records but their holder has not taken.
+retainedResults ∷ St → Int
+retainedResults = countReqs (\req → isDone req && not (reqModel req))
+
 pendingEdits ∷ ArenaId → St → Int
-pendingEdits aid = countReqs (\req → isRemoval req && reqArena req == Just aid)
+pendingEdits aid = countReqs (\req → isRemoval req && not (isDone req) && reqArena req == Just aid)
 
 -- | Admit a command, or refuse it. A refusal creates no request, no work and no
 -- reservation. A command whose outcome is already known (a name in use, a
@@ -314,12 +339,22 @@ decide svc st rid = \case
       | revisionExhausted aid arena → pure (Left (ShortRefused RefusedExhausted))
       | otherwise → do
           let cmd = CRemove tile precondition
-          outcome <- applyEvent svc (R.SubmitRemoval rid aid (arenaRevision arena) tile)
+          outcome <- slotRefusal >>= \case
+            Just refusal → pure (Left refusal)
+            Nothing → applyEvent svc (R.SubmitRemoval rid aid (arenaRevision arena) tile)
           pure $ case outcome of
             Left refusal → Left (busyWhy refusal)
             Right _ → Right (Insertion cmd (Just lid) (leaseClient ls) (Just aid) True [tileDemand tile] Nothing)
   where
     config = serviceConfig svc
+    -- A settled result that has not been taken occupies a command slot until it is
+    -- (a removal's result no longer has a model record, so it is counted here):
+    -- admission is busy once accepted commands and untaken results fill the slots.
+    slotRefusal = do
+      let model = stateModel st
+          limit = R.limitSlot (R.modelLimits model) R.CommandSlot
+          held = R.slotInUse model R.CommandSlot + fromIntegral (retainedResults st)
+      pure (if held >= limit then Just (R.Busy (R.SlotFull R.CommandSlot limit held 1)) else Nothing)
     leaseUse = Map.size (stateLeases st) + countReqs isAcquisition st
     first' f = either (Left . f) Right
     -- A name is held in the name map, so it is bounded: nonempty, 256 characters.
@@ -345,7 +380,9 @@ decide svc st rid = \case
       Right (lid, ls, aid, arena) → case demandFor arena cmd of
         Left why → pure (Left (ShortFailed (SourceFailure (Text.pack why))))
         Right demands → do
-          outcome <- applyEvent svc (R.SubmitQuery rid aid (arenaRevision arena) demands)
+          outcome <- slotRefusal >>= \case
+            Just refusal → pure (Left refusal)
+            Nothing → applyEvent svc (R.SubmitQuery rid aid (arenaRevision arena) demands)
           pure $ case outcome of
             Left refusal → Left (busyWhy refusal)
             Right _ → Right (Insertion cmd (Just lid) (leaseClient ls) (Just aid) True demands Nothing)
@@ -695,3 +732,31 @@ modelLimitsFor config =
 -- only compared for change, and two states are never confused by its end.
 bumpGeneration ∷ Word64 → Word64
 bumpGeneration g = if g == maxBound then g else g + 1
+
+-- | Retire everything in flight, at the owner's terminal safe point and whatever
+-- ended it: acknowledge each cancelling load, abandon each outstanding transfer,
+-- and finish each committed victim's release. Non-blocking bookkeeping, safe under
+-- the uninterruptible mask. Idempotent. A hold that is still outstanding keeps its
+-- arena retiring until its borrower releases it.
+retireInFlightSTM ∷ Service → STM ()
+retireInFlightSTM svc = do
+  st <- readSt svc
+  let model = stateModel st
+  forM_ [(R.regionArena r, R.regionCoord r) | r <- R.modelRegions model, isJust (R.regionHandoff r)] $ \(aid, region) →
+    applyEvent svc (R.HandoffFailed aid region)
+  victims <- stateVictims <$> readSt svc
+  forM_ victims $ \key@(aid, region) → do
+    modifySt svc $ \cur →
+      cur
+        { stateArenas = Map.adjust (discardOf region) aid (stateArenas cur)
+        , stateRetiring = Map.adjust (discardOf region) aid (stateRetiring cur)
+        , stateTransfers = Map.delete key (stateTransfers cur)
+        }
+    applyEvent svc (R.VictimReleased aid region)
+  modifySt svc (\cur → cur {stateVictims = Seq.empty})
+  after <- readSt svc
+  forM_ [R.jobId j | j <- R.modelJobs (stateModel after), R.jobPhase j == R.JobCancellingPhase] $ \jid →
+    applyEvent svc (R.JobAcknowledged jid)
+  markFreed svc
+  where
+    discardOf region a = a {arenaResident = discardRegion region (arenaResident a), arenaGeneration = bumpGeneration (arenaGeneration a)}

@@ -2,11 +2,11 @@
 -- reproduced, each as an example that fails without its fix.
 module Test.TerrainRuntime.Hardening (spec) where
 
-import Control.Concurrent (killThread, yield)
+import Control.Concurrent (killThread, throwTo, yield)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), SomeException, catch, throwIO)
-import Control.Monad (forM_, void)
+import Control.Exception (ErrorCall (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, fromException, throwIO, try)
+import Control.Monad (forM_, void, when)
 import qualified Data.Text as T
 import Hetoimasia.Foundation.Log (LogEntry (..), callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Terrain.Cell (zRangeLo)
@@ -14,7 +14,11 @@ import Hetoimasia.Terrain.Changes (changesBytes)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Resident (residentCell)
+import Hetoimasia.Foundation.Worker (withWorkerGroup)
+import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import Hetoimasia.Runtime.Supervision (checkRuntime, withSupervision)
 import Hetoimasia.Terrain.Runtime
+import Hetoimasia.Terrain.Runtime.Supervised (supervisedOwner)
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.Support.Bounded (bounded)
@@ -188,7 +192,8 @@ spec = describe "Accounting and lifetime hardening" $ do
     chronological <- reverse <$> readMVar events
     chronological `shouldBe` ["body done", "borrow finished", "service returned"]
 
-  it "keeps draining when it is cancelled while a borrower is outstanding, and delivers the cancellation afterwards" $ do
+  forM_ [("a cancellation (ThreadKilled)", killIt), ("any other asynchronously delivered exception (ErrorCall)", errorIt)] $ \(label, interrupt) →
+   it ("keeps draining under " <> label <> " while a borrower is outstanding, and delivers it afterwards") $ do
     events <- newMVar ([] ∷ [String])
     let note e = modifyMVar_ events (pure . (e :))
     boxed <- newEmptyMVar
@@ -196,15 +201,14 @@ spec = describe "Accounting and lifetime hardening" $ do
     bodyDone <- newEmptyMVar
     release <- newEmptyMVar
     let served =
-          withService defaultConfig (\svc → do
-            (_, lease) <- openMain svc "main"
-            _ <- readCell svc lease (tile 3 4 5)
-            putMVar boxed (svc, lease)
-            bounded (readMVar holding)
-            putMVar bodyDone svc)
-            `finally'` note "service exited"
-        finally' action cleanup = action `catchAll` (\e → cleanup >> throwIO e) >> cleanup
-        catchAll = catchAny
+          ( withService defaultConfig $ \svc → do
+              (_, lease) <- openMain svc "main"
+              _ <- readCell svc lease (tile 3 4 5)
+              putMVar boxed (svc, lease)
+              bounded (readMVar holding)
+              putMVar bodyDone svc
+          )
+            `catch` (\e → note "service exited" >> throwIO (e ∷ SomeException))
         borrower = do
           (svc, lease) <- bounded (readMVar boxed)
           let (borrowed, _) = decomposeTile (tile 3 4 5)
@@ -220,15 +224,99 @@ spec = describe "Accounting and lifetime hardening" $ do
               Left other → fail ("unexpected refusal " <> show other)
               Right client → endClient svc client >> yield >> closed
         bounded closed
-        -- The service is draining behind the borrower; a cancellation arrives.
-        killThread thread
-        readIORef' events `shouldReturn` []
+        -- The service is draining behind the borrower; the interruption arrives.
+        interrupt thread
+        readMVar events `shouldReturn` []
         putMVar release ()
         bounded waitBorrower
         bounded waitServed
     chronological <- reverse <$> readMVar events
     chronological `shouldBe` ["borrow finished", "service exited"]
 
+  it "returns only after the owner's last record when it is cancelled just as the owner has started" $ do
+    events <- newMVar ([] ∷ [String])
+    let note e = modifyMVar_ events (pure . (e :))
+    started <- newEmptyMVar
+    let logger = mkLogger defaultLogFilter (callbackSink (\entry → if entryMessage entry == "terrain owner stopped" then note "owner log: stopped" else pure ()))
+        served =
+          withWorkerGroup $ \group →
+            ( withTerrainService defaultConfig (Ports alwaysAdmitting (signalling group started) logger noProbe) (\_ → atomically retry)
+                `catch` (\e → note "service returned" >> throwIO (e ∷ SomeException))
+            )
+    withOwnedThread served $ \thread waitServed → do
+      bounded (readMVar started)
+      killThread thread
+      bounded waitServed
+    chronological <- reverse <$> readMVar events
+    chronological `shouldBe` ["owner log: stopped", "service returned"]
+
+  forM_ pointsOfWork $ \(label, selects, scenario) →
+   it ("retires every in-flight account when the owner is interrupted " <> label) $ do
+    armed <- newTVarIO False
+    verdict <- newEmptyMVar
+    let probe = Probe $ \point → do
+          fire <- atomically (readTVar armed >>= \a → if a && selects point then writeTVar armed False >> pure True else pure False)
+          when fire (throwIO OwnerInterrupted)
+    -- The interruption ends the owner and the worker group reports it when the
+    -- service's scope ends, so the checks run inside it and their verdict is
+    -- carried out through a box.
+    _ <- try @SomeException $
+      withServiceUsing (tightConfig (2, 1, 2) 0 4096) alwaysAdmitting probe $ \svc → do
+        checks <- try @SomeException $ do
+          (_, lease) <- openMain svc "main"
+          bounded (scenario svc lease (atomically (writeTVar armed True)))
+          bounded (awaitOwnerStopped svc)
+          model <- inspectModel svc
+          -- Nothing is left reserved, running, transferring or retiring.
+          ( modelJobs model, modelRequests model, [regionCoord r | r ← modelRegions model], [arenaId a | a ← modelArenas model]
+            , [ledgerReserved (bankLedger model b) | b ← [ResidentBank, EditBank, StagingBank]], slotInUse model LoadJobSlot )
+            `shouldBe` ([], [], [], [], [0, 0, 0], 0)
+          inspectInvariants svc >>= (`shouldBe` [])
+        putMVar verdict checks
+    readMVar verdict >>= either throwIO pure
+
+  it "reports a defect recorded during closure to supervision, after every request was settled" $ do
+    outcome <- try $
+      withLoggingLifetime quiet $ \lifetime →
+        withSupervision lifetime $ \control →
+          withTerrainService defaultConfig (Ports alwaysAdmitting (supervisedOwner control) quiet noProbe) $ \svc → do
+            (creator, _) <- openMain svc "main"
+            other <- okOf (registerClient svc)
+            attached <- okOf (attachArena svc other "main") >>= await svc >>= expectSuccess
+            good <- newHost False
+            bad <- newHost False
+            let failing = (hostEndpoint svc Nothing bad) {endpointSettle = \_ → throwSTM (ErrorCall "cleanup failure")}
+            _ <- okOf (cellWith svc failing attached (tile 1 1 1))
+            _ <- okOf (cellWith svc (hostEndpoint svc Nothing good) attached (tile 2 2 2))
+            waitFor (readTVar (hostReady good) >>= \n → check (n >= 1))
+            endClient svc creator
+            settledOf good `shouldReturn` [Failed ArenaClosed]
+            awaitOwnerStopped svc
+            checkRuntime control
+    case outcome of
+      Left failure → fromException failure `shouldSatisfy` \found → case found of Just (ProviderDefect _) → True; _ → False
+      Right () → expectationFailure "the supervised run ended cleanly although a closure callback failed"
+
+  it "keeps a settled removal result charged until it is taken, including a no-op" $
+    withService (configWith (\limits → limits {specQueuedCommands = 2})) $ \svc → do
+      (_, lease) <- openMain svc "main"
+      hostA <- newHost True
+      hostB <- newHost True
+      a <- okOf (removeWith svc (hostEndpoint svc Nothing hostA) lease (tile 1 1 1) Nothing)
+      b <- okOf (removeWith svc (hostEndpoint svc Nothing hostB) lease (tile 1 1 1) Nothing)
+      waitFor (readTVar (hostSettled hostA) >>= \x → check (not (null x)))
+      waitFor (readTVar (hostSettled hostB) >>= \x → check (not (null x)))
+      -- Settled and untaken: the request table still holds both, the model none.
+      model <- inspectModel svc
+      slotInUse model CommandSlot `shouldBe` 0
+      removeAt svc lease (tile 2 2 2) Nothing >>= \r → fmap isBusy (refusedWith r) `shouldBe` Just True
+      -- Taking one returns its slot.
+      retire svc a
+      next' <- okOf (removeAt svc lease (tile 2 2 2) Nothing)
+      removed <- await svc next'
+      removed `shouldSatisfy` either (const False) (const True)
+      retire svc b
+      settleChecks svc
   it "never hangs when the owner's startup log fails, and returns only after its last log" $ do
     -- A logger that fails on the owner's first record: the cleanup still runs.
     let failing = mkLogger defaultLogFilter (callbackSink (\entry → if entryMessage entry == "terrain owner started" then throwIO (ErrorCall "sink failed") else pure ()))
@@ -251,6 +339,33 @@ spec = describe "Accounting and lifetime hardening" $ do
     chronological <- reverse <$> readMVar events
     chronological `shouldBe` ["owner log done", "service returned"]
   where
+    killIt thread = killThread thread
+    errorIt thread = throwTo thread (ErrorCall "delivered asynchronously")
+    isBusy = \case RefusedBusy _ → True; _ → False
+    -- A supervisor that tells the test the owner has started, before returning its control.
+    signalling group started = Supervisor $ \definition →
+      superviseOwner (standaloneSupervisor group) definition <* tryPutMVar started ()
+    pointsOfWork =
+      [ ("while a load runs", \p → case p of PointJob _ _ → True; _ → False, \svc lease arm → arm >> void (cellAt svc lease (tile 1 0 1)) >> pure ())
+      , ("while it captures a read", \p → case p of PointCaptured {} → True; _ → False, \svc lease arm → arm >> void (cellAt svc lease (tile 1 0 1)) >> pure ())
+      , ("while it stages an edit", \p → case p of PointStaging _ → True; _ → False, \svc lease arm → arm >> void (removeAt svc lease (tile 1 0 1) Nothing) >> pure ())
+      , ("at the commit boundary", \p → case p of PointBeforeCommit _ → True; _ → False, \svc lease arm → arm >> void (removeAt svc lease (tile 1 0 1) Nothing) >> pure ())
+      , ("while a transfer runs", \p → case p of PointHandoff _ _ → True; _ → False, \svc lease arm → arm >> void (removeCell' svc lease (tile 1 0 1)))
+      , ( "while a victim is being released"
+        , \p → case p of PointVictim _ _ → True; _ → False
+        , \svc lease arm → do
+            _ <- arm
+            forM_ [(x, z) | x ← [16, 32, -16, 48, -32, 64, 80, -48], z ← [0, 32, -32]] $ \(x, z) →
+              cellAt svc lease (tile x 0 z) >>= either (const (pure ())) (void . await svc)
+        )
+      ]
     isInvalid = \case Just (RefusedInvalid _) → True; _ → False
-    readIORef' events = readMVar events
-    catchAny = \action handler → action `catch` (\e → handler (e ∷ SomeException))
+
+-- | An asynchronous exception of the test's own, standing for any cancellation of
+-- the owner.
+data OwnerInterrupted = OwnerInterrupted
+  deriving stock (Show)
+
+instance Exception OwnerInterrupted where
+  toException = asyncExceptionToException
+  fromException = asyncExceptionFromException
