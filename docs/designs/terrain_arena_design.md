@@ -104,6 +104,10 @@ D-49 approves P-9's illustrated 16-shape catalog: named edges are lowered to
 the base; ID 15 is a central half-height peak. The exact table is the logical
 target for corrected masks, discovery and queries; solver proof remains required.
 
+D-50 resolves cutaway caps: hide levels above the selected slice, preserve
+remaining known tiles' actual shapes/materials, and add no flat caps. Unknown
+regions keep generic blank fog; moving the slice does not discover them.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1520,6 +1524,25 @@ ABI. Q-16 retains emission/cutaway and compatibility details; Q-20 retains
 discovery execution/storage mechanics. The solver must still provide evidence
 rather than treating this approval or the illustration as a completed proof.
 
+### D-50. Cutaways preserve known shapes without additional flat caps
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that's right
+i think” to hiding levels above the selected slice while keeping every
+remaining known tile's actual shape and material, including ramps, without
+adding flat caps; unknown regions retain generic blank fog.
+
+At integer slice `k`, omit cell levels `z > k`. Each remaining known tile
+keeps its approved geometry and material: a ramp at the slice remains a ramp.
+Do not create an additional flat cap or change terrain to represent the cut.
+Known air stays air. Generic blank coverage still conceals unknown regions,
+including unknown air, under D-31/D-37; it is neither a physical cap nor a
+selectable tile. Changing the cutaway grants no discovery.
+
+This supersedes earlier proposals for additional cutaway caps. It settles
+their visible behavior, not whole-cell emission, hidden-cell culling, painter
+ordering or their qualification. Those remain Q-16/Q-19 work; automatic
+headroom and manual camera navigation retain their earlier decisions.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2580,13 +2603,14 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-49 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-50 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
 face lighting, and uses the existing material ABI. It replaces the claim that
 the current convex solid's projected polygons reproduce Synarchy's sprites.
-The exact emission/occlusion/cap contract is still open; the verified S path
+The exact emission/occlusion contract is still open; D-50 selects unchanged
+known shapes/materials at the cutaway with no additional flat caps. The verified S path
 is one whole quad per non-air visible-range cell, not three separately meshed
 faces. Preserve sparse authoritative cell/material/shape state and atomic
 removal; do not infer world occupancy from camera-facing texture alpha.
@@ -2606,7 +2630,7 @@ D-30 selects the picking approach: use the adopted drawn quads, matching
 artwork/mask coverage and front-to-back order, with shared CPU asset coverage.
 D-45 selects nearest-neighbor colour/mask sampling and a shared render/pick
 alpha cutoff. The former analytic-solid picker is not the visual authority.
-Exact emission, cut surfaces, numeric sample/edge conventions and the remaining
+Exact emission, numeric sample/edge conventions and the remaining
 ownership details are still open.
 
 D-31 requires a separate fog presentation over undiscovered underground
@@ -2751,6 +2775,32 @@ layers); definition of completion for boundary loading with normal eviction;
 retained-discovery and pending-work capacity/refusal; API results and coherent
 publication. An enormous/infinite component cannot silently become an
 unbounded allocation, a completed partial reveal or an erased obligation.
+
+**Next owner choice — discovery versus materialization (proposal, not approved).**
+The current source can describe a world-spanning underground air layer with
+just a gap between two base layers: those layers apply to every column, and
+uncovered levels are air (H `packages/terrain/src/Hetoimasia/Terrain/Source.hs:1–19`
+at `3ce8bf411f`). Its description is small even though enumerating all exposed
+floor/ceiling tiles is infeasible. Bounded batches alone do not make such an
+enumeration finish; a larger disk allowance does not solve this either.
+
+Recommend refining D-32's boundary-loading requirement: discover the whole
+connected space and its exposed boundary using exact compressed knowledge
+regions, while materializing boundary tile/render data only for camera or
+explicit query/edit demand. Completion would mean the connected space and
+boundary are known, not that every boundary tile has been instantiated once.
+Finite caverns would follow the same rule. D-33 retention/replay still applies
+to the compressed knowledge, and ordinary detail eviction cannot undo it.
+
+This is a meaningful change to D-32's requirement to load all boundary tiles,
+so it requires owner approval. It is not permission to mark an unexplored
+region complete by guessing: compact source connectivity must be proved, and
+work not yet established stays pending. Exact source compilation, limits,
+refusal and integration with edit-created connections remain to specify; no
+constant-size representation or instant discovery of arbitrary terrain is
+claimed. Retaining exhaustive boundary loading instead would require an
+explicit restriction on supported cavern sizes/topologies or accepting work
+that cannot finish at the available capacity.
 
 ### P-8. Session retention backing — D-40/D-41/D-43 approved, concrete details open
 
@@ -2904,11 +2954,13 @@ compatibility, corrected masks and evidence still belong to the amendment.
   from the same catalog, without unrelated floating tolerances. Qualify the
   table and rotated portal intersections independently under D-44.
 
-This catalog does not settle full-cell emission/cutaway ordering, sampling
+This catalog does not settle full-cell emission/ordering, sampling
 edges, lighting weights or the renderer proof. It provides a concrete logical
 target to implement and test rather than asking the solver to invent the shape
 semantics while fixing artwork. The illustrated owner review is complete;
 the solver's independent implementation qualification is still required.
+D-50 separately settles cutaway appearance: preserve remaining known shapes
+and materials without additional flat caps, retaining fog over unknown regions.
 
 ### P-10. Viewport-driven demand and missing hazed background — approved by D-48
 
@@ -3166,7 +3218,9 @@ point/ray queries and discovery share the canonical logical shape model.
 Rendering/screen picking retain sprite coverage as their visual authority.
 
 Still open: query/API compatibility details, full-cell versus isolated-face
-emission and hidden-face/cap behavior. D-49 approves P-9's lowered-edge catalog,
+emission and hidden-cell culling/ordering. D-50 resolves cap behavior: omit
+levels above the slice, retain known shapes/materials and add no flat caps;
+unknown regions retain generic blank fog. D-49 approves P-9's lowered-edge catalog,
 including the central half-height peak for ID 15, replacing its earlier
 flat-block exception. The existing closed-solid boundary convention and the
 derived positive-area portal geometry remain the qualification targets.
@@ -3183,10 +3237,9 @@ Do not silently retain incompatible ray/coverage claims. Exact sample/threshold 
 coverage resource contracts remain Q-17; the approved picking approach itself
 does not need another sign-off.
 
-Current owner question: at the integer cutaway, hide levels above the slice
-and keep each remaining known tile's actual shape/material, including ramps,
-without additional flat caps; unknown regions retain generic blank fog. This
-is the recommended cap/emission behavior, pending the owner's answer.
+The integer-cutaway owner question is resolved by D-50. Concrete emission,
+culling and ordering must implement that behavior and prove it alongside
+D-44's shape/mask/picking qualification.
 
 ### Q-17. Face-map data loading, sampling and ownership
 
@@ -3305,6 +3358,11 @@ D-33 settles session retention/replay with normal streaming; D-34 settles
 whole-empty-cell face adjacency. D-35 includes partial-shape/diagonal openings.
 Exact API, representation, per-shape geometric rules, failure and capacity
 policies remain open.
+Current owner question: P-7 proposes refining D-32 so whole-cavern discovery
+records compressed knowledge of the connected space and boundary, while tile
+detail loads on camera or explicit demand. This separates completion from
+exhaustive boundary materialization for enormous/world-spanning spaces; it is
+not approved yet.
 Do not introduce
 full unit vision/day-night visibility or general gameplay state by inference.
 
