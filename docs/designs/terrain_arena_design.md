@@ -123,6 +123,10 @@ succeeds. Build a compact summary from the source recipe without generating
 underground tiles; clearly refuse over-budget preparation. The required flat,
 gap and shape cases must be supported and proved, not excluded as a shortcut.
 
+D-54 gives ambient illumination its own Lua control. Changing only the sun
+position leaves ambient unchanged; future Lua day/night rules may animate
+both. Numeric lighting defaults/equations remain part of Q-18's contract review.
+
 Owner sign-off: Q-12 approved for `398a58f35c`, relayed by verified
 `het-manager` in `#het-terrain` at 2026-11-07T02:13Z (2026-11-06 local),
 message `39em862uwqaj3x3t4dn9kipeta`: “i sign off on this”. D-27 records the
@@ -1642,6 +1646,27 @@ qualification work. This is not a general constant-cost topology oracle or
 approval of new procedural callbacks. D-51's knowledge/detail separation and
 D-39's retained pending obligations continue to govern later discovery.
 
+### D-54. Control ambient illumination independently of sun position
+
+Owner, directly in this design pane on 2026-11-07, answered “yes that works”
+to a separate Lua-controlled ambient level that stays fixed when only the
+sun position changes. The recommendation explained that Synarchy derives
+ambient from its sun phase and that a later Lua day/night cycle could still
+animate both independent inputs.
+
+Ambient supplies the base illumination of faces receiving little or no direct
+sun. Give it its own Lua control; changing only sun direction/elevation must
+not alter that value. Directional face lighting still responds to the
+world-fixed sun under D-46. This intentionally replaces Synarchy's automatic
+sun-phase ambient curve for this preview contract. It does not select a fixed
+uneditable ambient level or remove the possibility of a later day/night cycle.
+
+No cycle, moon or UI is added now. Q-18 still needs numeric defaults, bounds,
+face-light equations and their composition with D-47's depth effects. The
+qualification must vary sun with ambient held fixed and ambient with sun held
+fixed, across all facings, so independent controls are observable rather than
+two names for the same automatic curve.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -2702,7 +2727,7 @@ Bare `ShaderCode`, `TileQuads`, `Quads`, `Solar` and `Time/Types` citations in
 the prose refer to the full S paths named in the corresponding trace above;
 H `Plan` refers to `packages/terrain-render-2d/src/Hetoimasia/Terrain/Render2D/Plan.hs`.
 
-### P-6. Amendment framing — D-29–D-53 decisions, remaining proposals
+### P-6. Amendment framing — D-29–D-54 decisions, remaining proposals
 
 The proposed correction is a terrain material that samples colour artwork and
 the selected face map on cell/visible-face quads, applies silhouette alpha and
@@ -2777,6 +2802,8 @@ or solar-page/time simulation. Eventual moon lighting is deferred too.
 D-46 selects Lua-supplied compass direction and elevation anchored in world
 space through camera rotation. D-47 retains both adjustable depth darkening
 and blue haze and requires improved numerical/visual/navigation coverage.
+D-54 supplies independent Lua ambient control; changing sun position alone
+does not change ambient illumination.
 Exact units/binding, depth/colour equations and initial strengths remain Q-18;
 this paragraph settles no other amendment proposal.
 
@@ -3229,6 +3256,109 @@ and final evidence assignment. The viewport-based direction already has P-5
 support; D-48 approves the explicit refinement and regression package above.
 This does not settle Q-20's separate cavity discovery work.
 
+### P-11. Concrete cutout asset and sampling contract — proposal for review
+
+This is one proposed Q-17 contract, not an approved decision. It fills in
+D-30/D-45's shared coverage and crisp sampling without deciding the remaining
+emission/ordering or lighting equations. The initial scope is opaque/cutout
+terrain; partial translucency would require a later contract.
+
+**Verified fit with the reference and current engine.** At S `3777d437`,
+`assets/textures/world/loam/loam.png` and
+`assets/textures/world/granite/granite.png` are 96×64 and contain only alpha
+0/255, as is the checked
+`assets/textures/facemap/isoface_slope_n.png`. A read-only PNG inspection
+checked these dimensions and complete alpha-value sets; the earlier audit
+records binary alpha across the slope-mask catalog. This is asset evidence,
+not GPU output or proof of the corrected masks. At H `b0f28910d5`,
+`packages/render-2d-vulkan/src/Hetoimasia/Render/TwoD/Vulkan/ShaderSources.hs:353–375`
+uses the cutout threshold 0.5. `MaterialSources.hs:11–36` supplies the
+secondary texture and requires premultiplied linear output. The bounded PNG
+decoder still lacks the data-image policy described in the integration audit.
+
+1. **Initial asset contract.** Use full 96×64 colour and face-map canvases for
+   this catalog, UV `[0,1]` across the whole canvas, with the already approved
+   projection proportions. Both images must have binary alpha. Keep colour
+   artwork on the premultiplied sRGB-colour path and face maps on a linear
+   RGBA8 data path that preserves decoded numeric channels, without gamma
+   conversion or colour premultiplication. Face-weight RGB may contain
+   intermediate values; binary alpha does not mean binary lighting weights.
+   Validate image kind, dimensions and binary coverage before attaching the
+   style. Refuse incompatible assets clearly, retaining the previous adopted
+   style/view on an unsuccessful replacement. Do not silently threshold or
+   resize authored assets. Corrected masks still need D-44's evidence/provenance.
+2. **Sampling and coverage.** Nearest-neighbor, clamp-to-edge, level zero only;
+   no mip generation, trilinear filtering or smoothed mask edges. The
+   reference texel rule on an image of width `w` is
+   `i = min(w-1, floor(clamp(u,0,1)*w))`, and similarly for `v`/height, with
+   top-row-first image coordinates. At an interior texel boundary select the
+   higher index; the outer UV edge clamps to the last texel. Rendering and
+   picking use the same adopted quad/UV transform and viewport clipping; the
+   texel rule does not extend coverage outside the rasterized quad. Map a
+   logical cursor through the adopted framebuffer scale to its physical pixel
+   and test that pixel's centre; an outside-viewport cursor gives no hit.
+   Quad-edge ownership must match the backend's raster convention, including
+   the shared diagonal of the two triangles. Colour
+   alpha and mask alpha multiply; coverage survives exactly when the product
+   is at least 0.5. For these assets this is the AND of their two coverage bits.
+   Lighting, haze and darkening alter RGB only. Terrain tint opacity remains
+   one, and this material does not add additive/translucent terrain blending.
+3. **Bounded loading, explicit data policy.** Extend the existing
+   `api.content.texture(path [, options])` route with `kind="colour"|"data"`
+   (default colour) and optional `coverage="binary"`. Omission preserves
+   current behavior. Binary coverage requests validate binary alpha and
+   produce an immutable CPU bitplane alongside the texture; a nonbinary
+   source is an expected content refusal. Both terrain colour and mask loads
+   request this coverage. Preserve existing root/optional rules, instance
+   authority, request cancellation, decode/upload quotas and source preflight
+   limits. Extend the accounted decoder rather than substituting the unbounded
+   general decoder. Do not introduce a terrain dependency into the generic
+   decoder or graphics facade; pass the narrow policy/accounting capabilities
+   through their existing service boundaries.
+4. **Coverage ownership and admission.** Store one bit per texel per immutable
+   loaded asset version, plus accounted metadata, shared by its consumers;
+   never one copy per world cell. Identity includes image kind, dimensions and
+   the exact texture/version authority. Generate it from the same decoded
+   alpha that is uploaded, reserving bytes before allocation. Charge retained
+   bitplanes/metadata and overlap during replacement to the existing 128 MiB
+   CPU render/staging bank through an injected account; existing tighter
+   texture/workspace limits still apply. No extra unbounded cache or automatic
+   bank increase is authorized. Transfer ownership from decode work to the
+   delivered asset resource without leaving uncharged or duplicate payloads.
+   The texture lease and prepared/adopted snapshots retain their interests;
+   CPU payload dies after its last CPU reader/owner, while GPU retirement
+   follows the existing completion rules. Cancellation, failed adoption,
+   instance exit and style replacement release each interest exactly once.
+5. **Coherent render/pick use.** A style holds both texture authorities and
+   their matching CPU coverage. A new frame cannot adopt a texture version
+   without the corresponding bitplane; picking reads only the adopted pair,
+   in front-to-back draw order. It never reads back the GPU or reopens the PNG
+   during a pick. Invalid/released Lua handles cannot acquire new authority;
+   already accepted work retains its protected interests under the existing
+   lifetime rules. Material output multiplies premultiplied RGB and alpha by
+   mask alpha, preserving the render-2d contract before its cutout wrapper.
+   Fog still yields no selectable target and stops the search under D-37.
+6. **Qualification.** Compare a CPU coverage oracle against retained offscreen
+   output at framebuffer pixel centres, including exact UV/texel boundaries,
+   both quad triangles, viewport edges, fractional pan/zoom, device scaling,
+   all 16 masks and all four facings. Prove the sampler and raster-edge tie
+   convention; mathematical nearest-neighbor intent alone is not proof of
+   GPU agreement. Test transparent colour holes independently of mask holes,
+   raw intermediate face-weight bytes, malformed/nonbinary/wrong-kind/wrong-size
+   assets, budget refusal, cancellation, replacement and handle-generation
+   reuse. A mismatch blocks qualification; do not introduce a different pick
+   threshold or silently switch filtering to hide it. The immutable asset
+   provenance and reproduction commands accompany D-44's corrected-mask proof.
+
+The proposed loading options are new API surface and require approval with
+this contract; the current facade accepts only `root`/`optional` at this call
+(H `packages/lua-engine/README.md:1098–1101`). The proposed binary-only terrain
+contract intentionally excludes semi-transparent terrain textures now. It
+preserves the imported loam/granite assets and crisp cutouts, not a promise
+that arbitrary existing translucent content is accepted by a terrain style.
+Q-19 must assign the bounded loader/coverage work and its integration separately
+from mask correction and final renderer qualification once this is approved.
+
 ## Open questions and review checkpoints
 
 ### Q-1. What does flat terrain contain vertically?
@@ -3413,9 +3543,16 @@ not proof that the current bounded Lua loader exposes it. Preserve protected
 leases and account for new storage; no temporary colour-decoding workaround
 is approved.
 
+P-11 is the complete proposed asset/sampling contract for review: binary-alpha
+96×64 initial terrain art/masks, level-zero nearest/clamped sampling and
+threshold 0.5, bounded explicit data loading, shared versioned CPU bitplanes,
+accounted ownership and CPU/GPU qualification. It adds `kind`/`coverage` options
+to the existing texture API and refuses incompatible terrain assets. None of
+these additional constraints/API changes is a decision until approved.
+
 ### Q-18. Exact initial appearance beyond the silhouette
 
-Partially resolved by D-29/D-46/D-47: Lua supplies sun compass direction and
+Partially resolved by D-29/D-46/D-47/D-54: Lua supplies sun compass direction and
 elevation, anchored in world space through camera rotation, without an automatic
 cycle or moon lighting. Settle exact angle conventions/units/ranges and binding,
 the initial light and ambient values, and the depth/colour equations and
@@ -3433,8 +3570,8 @@ inspection supports that mismatch, but no runtime reproduction is claimed.
 The numerical contract and qualification described above remain to be filled
 out; do not copy the old curve and call the reported problem fixed.
 
-Current owner question — ambient control (proposal, not approved): recommend
-a separate Lua-controlled ambient level that stays unchanged when only the
+Ambient control is resolved by D-54: use a separate Lua-controlled ambient
+level that stays unchanged when only the
 sun direction/elevation changes. Directional face lighting still follows the
 world-fixed sun. Ambient is the base illumination of faces receiving little
 or no direct sun; an independent control makes preview conditions explicit.
@@ -3444,11 +3581,11 @@ contract, but no cycle is part of this amendment.
 This intentionally differs from S's `computeAmbientLight`, which derives
 ambient from its sun phase (`src/Engine/Graphics/Vulkan/ShaderCode.hs:204–212`
 at `3777d437`); merely supplying a new sun position also changes background
-illumination there. The proposed independence means moving the preview sun
+illumination there. The approved independence means moving the preview sun
 does not itself perform that ambient day/night transition. Numeric defaults,
 face-light equations and the existing depth effects still need the concrete
 appearance contract. Retaining S's automatic sun-linked ambient curve is the
-alternative, not assumed parity.
+rejected alternative, not assumed parity.
 
 ### Q-19. Follow-up slices, revisions and amendment readiness
 
