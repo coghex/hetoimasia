@@ -15,11 +15,13 @@
 -- * The pipeline, the window provider, the scene publisher and everything under them are the /assembly's/: they are
 --   borrowed here, made before the session and closed after it, and a session never closes them.
 -- * A VM's /lending and lease scope/ are made here, one for each VM, and handed to the VM's scheduled owner. Their
---   capacity is the profile's texture leases plus its window slots for one UI instance (16 + 1): every texture and
---   window a UI instance can hold, pending, live or retiring, is charged by the provider's bank before the host's
---   lease charge is reached, so a lease the host would refuse is a lease an M1 reservation would already have
---   refused as @busy@. The host's lease capacity is therefore never the first bank to answer, and the generic
---   host's faulting refusal cannot be reached by an accepted admission.
+--   capacity ('facadeLeaseCapacity') is /derived/ from the byte limit, not chosen: the instance's byte bank holds at
+--   most @TextureBytesPerUiInstance `div` 4096@ textures (every texture is charged at least 4 KiB), plus its window
+--   slots (131,072 + 1 = 131,073 for the fixed profile). Every texture and window a UI instance can hold, pending,
+--   live or retiring, is charged by the provider's bank before the host's lease charge is reached, so a lease the host
+--   would refuse is a lease an admission would already have refused as @busy@, on bytes. The host's lease capacity is
+--   therefore never the first bank to answer, and the generic host's faulting refusal cannot be reached by an
+--   accepted admission. The capacity is a number, not an allocation: the scope grows with what is leased.
 -- * A UI instance's /texture owner/ and /window owner/ are made when the facade declares the instance and closed when
 --   the facade forgets it (its settlement observed); the table that holds them is written by the declaring thread
 --   and read by the instance's owner thread, in STM. A logical instance gets owners of the logical role, which
@@ -76,9 +78,10 @@ import Hetoimasia.LuaEngine.Graphics.Window.Request (refusalText)
 import Hetoimasia.LuaEngine.Manifest (Role (..))
 import Hetoimasia.LuaEngine.Profile
   ( Count (Count)
-  , CountLimit (TextureLeasesPerUiInstance, WindowSlotsPerUiInstance)
+  , CountLimit (WindowSlotsPerUiInstance)
   , Profile
   , countLimit
+  , textureRoomPerInstance
   )
 import Hetoimasia.LuaEngine.Scene (sceneLimits)
 import Hetoimasia.LuaEngine.Texture
@@ -130,17 +133,22 @@ newtype GraphicsCompositionRefused = GraphicsCompositionRefused Text
 
 instance Exception GraphicsCompositionRefused
 
--- | The lease capacity of one UI instance: the texture leases and the window slots the profile gives it.
+-- | The lease capacity of one UI instance, derived from memory: the most textures its byte bank can hold at the
+-- minimum charge ('textureRoomPerInstance', 131,072 for the fixed profile) and the window slots the profile gives it.
+-- The bank refuses before this capacity can, for every validated profile.
 facadeLeaseCapacity ∷ Profile → Int
-facadeLeaseCapacity profile = number TextureLeasesPerUiInstance + number WindowSlotsPerUiInstance
+facadeLeaseCapacity profile = fromIntegral (textureRoomPerInstance profile) + fromIntegral windowSlots
   where
-    number limit = let Count n = countLimit profile limit in fromIntegral n
+    Count windowSlots = countLimit profile WindowSlotsPerUiInstance
 
 -- | The issuing instance of the most recently issued texture handles, for the refusal of a peer's handle after its lease's
 -- slot is gone. The lease keys are issued in increasing order and never reused, so the smallest key is the oldest: when the
--- record is full the oldest is forgotten. A forgotten handle is a retired texture's, which can alias nothing (its key is never
--- reissued); the host's release path answers it @already_released@ whoever asks. The record is therefore bounded however many
--- textures a VM's instances load and release.
+-- record is full the oldest is forgotten. The record is bounded however many textures a VM's instances load and release, and
+-- it is a history of issuers, not a capacity for held textures: an instance may hold more textures than it remembers, so a
+-- forgotten entry is not necessarily a retired texture's. A handle whose lease is still present is checked against its
+-- lease's own owner ('withLeaseOr' in 'gsReleaseCheck'), independently of this record, so a peer's still-held handle is
+-- refused whether or not it is remembered here; a forgotten handle whose lease is gone can alias nothing (its key is never
+-- reissued) and the host's release path answers it @already_released@ whoever asks.
 newtype Issued = Issued (Map Word64 Text)
 
 emptyIssued ∷ Issued
@@ -161,7 +169,8 @@ issuerOf key (Issued held) = Map.lookup key held
 issuedSize ∷ Issued → Int
 issuedSize (Issued held) = Map.size held
 
--- | Four thousand and ninety-six handles: tens of kilobytes, far above the sixteen an instance holds at once.
+-- | Four thousand and ninety-six handles: tens of kilobytes. It bounds the history only; it says nothing of how many textures
+-- an instance may hold, which its byte bank bounds.
 defaultIssuedMemory ∷ Int
 defaultIssuedMemory = 4096
 
@@ -202,6 +211,7 @@ graphicsInjection config = GraphicsInjection $ \vm → do
     GraphicsServices
       { gsLending = lending
       , gsLeases = leases
+      , gsLeaseCapacity = facadeLeaseCapacity profile
       , gsTypes = [leaseCapabilityType leases textureHandleType, leaseCapabilityType leases windowHandleType]
       , gsEndpoints = [textureEndpoint texture, windowEndpoint window]
       , gsDeclare = \identity → do

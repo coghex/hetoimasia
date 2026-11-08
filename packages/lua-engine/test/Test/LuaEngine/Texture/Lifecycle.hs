@@ -182,7 +182,7 @@ spec = describe "the pipeline's end" $ do
           Left (ExceptionWithContext _ failure) → show failure `shouldSatisfy` containsText scopeText
           Right () → expectationFailure "the scope should have raised the failed retirement"
         -- The texture is not reported reclaimed: its charge is still held.
-        readIORef seen >>= maybe (expectationFailure "the body never ran") (\nested → sessionNow nested `shouldReturn` 128)
+        readIORef seen >>= maybe (expectationFailure "the body never ran") (\nested → sessionNow nested `shouldReturn` 4096)
       -- The owner whose request it was is told as cleanup evidence, as every cleanup failure is.
       show ownerFailure `shouldSatisfy` containsText expected
 

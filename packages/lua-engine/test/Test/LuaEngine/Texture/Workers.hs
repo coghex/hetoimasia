@@ -147,7 +147,7 @@ saturation = describe "with the normal banks full" $
         line `shouldSatisfy` Text.isInfixOf "status=success"
       -- Taking both and the work retiring gives the request places back; the textures stay charged.
       started session vm "i" "k2" "c.png"
-      ownerNow vm "i" >>= \reading → ownerSlotsHeld reading `shouldBe` 3
+      ownerNow vm "i" >>= \reading → ownerTexturesHeld reading `shouldBe` 3
   where
     bytes =
       [ (PngEncodedBytes, 65536)

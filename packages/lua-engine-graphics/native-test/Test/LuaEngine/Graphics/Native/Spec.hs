@@ -81,7 +81,7 @@ spec env = describe "the texture backend on a real device, with no window" $ do
       stopInstance comp vm "a"
       _ ← awaitFailure comp "a"
       ownerA ← ownerOf vm "a"
-      atomically (ownerReading ownerA >>= \reading → if ownerSlotsHeld reading == 0 then pure () else retry)
+      atomically (ownerReading ownerA >>= \reading → if ownerTexturesHeld reading == 0 then pure () else retry)
       second ← draw env two decoded
       shotFailed second `shouldBe` []
       shotDeterminate second `shouldSatisfy` (> 20)
@@ -104,7 +104,7 @@ spec env = describe "the texture backend on a real device, with no window" $ do
       taken ← awaitNoteContaining comp "a wait_take k"
       taken `shouldSatisfy` Text.isInfixOf "cancelled"
       owner ← ownerOf vm "a"
-      atomically (ownerReading owner >>= \reading → if ownerSlotsHeld reading == 0 && ownerNominalHeld reading == 0 then pure () else retry)
+      atomically (ownerReading owner >>= \reading → if ownerTexturesHeld reading == 0 && ownerNominalHeld reading == 0 then pure () else retry)
       awaitUsage env (\now → usageBytes now == usageBytes atRest && usageObjects now == usageObjects atRest && usageResources now == usageResources atRest)
       retainedEntries (graphicsTextures (envGraphics env)) `shouldReturn` marks
       evidence env "a request cancelled while its completed upload was still hidden from the backend registered nothing and drained"
@@ -211,7 +211,7 @@ release' _ comp vm who key = do
   command comp vm who "release" key
   _ ← awaitNoteContaining comp (who <> " release " <> key)
   owner ← ownerOf vm who
-  atomically (ownerReading owner >>= \reading → if ownerSlotsHeld reading == 0 then pure () else retry)
+  atomically (ownerReading owner >>= \reading → if ownerTexturesHeld reading == 0 then pure () else retry)
 
 noWindows ∷ Env → IO ()
 noWindows env = atomically (hostWindowIdentities (vulkanWindowHost (envHost env))) `shouldReturn` []

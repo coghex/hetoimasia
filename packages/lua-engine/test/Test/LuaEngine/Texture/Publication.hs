@@ -53,7 +53,7 @@ spec = describe "publication" $ do
         command session owner "i" "use" "k0"
         awaitNote session ("i use k0 " <> Text.pack (show identity))
         releaseCalls (ssFake session) `shouldReturn` []
-        ownerNow owner "i" >>= (`shouldBe` OwnerReading 1 128)
+        ownerNow owner "i" >>= (`shouldBe` OwnerReading 1 4096)
         -- The lease's own release asks the backend once, and the charges come back when it retires.
         command session owner "i" "release" "k0"
         awaitReleaseCalls (ssFake session) 1
@@ -96,7 +96,7 @@ spec = describe "publication" $ do
           (rdAdopting reading, rdAdopted reading) `shouldBe` (0, 0)
           -- The texture was released once, by the failed pipeline, and holds its charges until it retires.
           releaseCalls (ssFake session) `shouldReturn` [identity]
-          ownerNow owner "i" >>= (`shouldBe` OwnerReading 1 128)
+          ownerNow owner "i" >>= (`shouldBe` OwnerReading 1 4096)
     pure ()
 
   it "releases a delivered texture once, and answers nothing, when the host's interest ended before the answer decided: the withdrawal claims it and the answer finds it withdrawn" $ do

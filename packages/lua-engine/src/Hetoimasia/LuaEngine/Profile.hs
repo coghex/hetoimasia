@@ -88,6 +88,11 @@ module Hetoimasia.LuaEngine.Profile
     -- * Derived values
   , pngOutputBytes
   , rgba8BytesPerPixel
+  , textureMinimumChargeBytes
+  , textureChargeBytes
+  , textureReservationBytes
+  , textureRoomPerInstance
+  , textureRoomPerSession
   , sceneElementBound
   , sceneFixedElements
   , sceneElementsPerSprite
