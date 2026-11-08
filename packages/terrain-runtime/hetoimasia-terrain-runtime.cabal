@@ -79,6 +79,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Opacity
         Test.TerrainRuntime.Races
         Test.TerrainRuntime.Revalidation
+        Test.TerrainRuntime.Usage
         Test.TerrainRuntime.Spec
     build-depends:
         base >=4.22 && <4.23,
