@@ -3,8 +3,8 @@
 Evidence for [#661](https://github.com/coghex/hetoimasia/issues/661) (TRA-19 of #636),
 delivered by pull request [#671](https://github.com/coghex/hetoimasia/pull/671).
 
-**Revision.** Implementation head `e6c4d3f74a32` (branch `issue-661-discovery-model`, based on
-`origin/master` `d8b2aa7b1b78`). Every figure below was produced at that revision with the
+**Revision.** Implementation head `e6e5b19cd776` (branch `issue-661-discovery-model`, based on
+`origin/master` `d8b2aa7b1b78`, with the landed docs merged; round 1 of the review repaired). Every figure below was produced at that revision with the
 qualified toolchain (GHC 9.14.1, Cabal 3.18.1.0). The suite's own output is the primary record;
 this document restates it with the commands that reproduce it. It qualifies a **pure model and
 its logical records only**. Runtime atomicity, real file retention, physical resource bounds,
@@ -29,7 +29,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain:terrain-tests --t
   --test-option=--match --test-option="Discovery"
 ```
 
-Results at the revision: `terrain-tests` 879 examples, 0 failures (43 are the `Discovery` group);
+Results at the revision: `terrain-tests` 886 examples, 0 failures (49 are the `Discovery` group);
 `terrain-render-2d-tests` 298 and `workflow-tests` 965, 0 failures; `cabal check` clean;
 catalog valid (36 groups); clean rebuild of the terrain package without a warning.
 
@@ -106,12 +106,12 @@ Accounted counts and bytes, from the suite's `evidence` rows (max over the repor
 
 | Trace | edits | reports | max updates | max reads | max writes | max delta bytes | max scratch bytes | retained records | retained bytes | pending | resident detail |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| two openings | 6 | 7 | 36 | 44 | 10 | 1,576 | 3,656 | 6 | 1,128 | 0 | 0 |
-| sealed pockets + coalesced run + reveal | 11 | 13 | 64 | 81 | 18 | 2,808 | 6,800 | 11 | 2,016 | 0 | 0 |
-| ramp family 2^20 | 3 | 4 | 18 | 28 | 8 | 1,632 | 3,768 | 10 | 2,152 | 0 | 0 |
-| ramp family 2^60 | 3 | 4 | 18 | 28 | 8 | 1,632 | 3,768 | 10 | 2,152 | 0 | 0 |
+| two openings | 6 | 7 | 36 | 44 | 10 | 1,576 | 12,712 | 6 | 1,128 | 0 | 0 |
+| sealed pockets + coalesced run + reveal | 11 | 13 | 64 | 81 | 18 | 2,808 | 23,416 | 11 | 2,016 | 0 | 0 |
+| ramp family 2^20 | 3 | 4 | 18 | 28 | 8 | 1,632 | 8,672 | 10 | 2,152 | 0 | 0 |
+| ramp family 2^60 | 3 | 4 | 18 | 28 | 8 | 1,632 | 8,672 | 10 | 2,152 | 0 | 0 |
 
-Worst-case constants the limit validation enforces: an edit reads at most 197 records and writes
+Scratch is accounted deterministically: every provider read is charged the largest record (256 bytes) and every staged write its entry, each checked before the read or the staging, so the scratch column is reads x 256 plus the staged entries (a conservative admission figure, not heap). Worst-case constants the limit validation enforces: an edit reads at most 197 records and writes
 at most 7; one structural update reads at most 132 and writes at most 3; a union chain is at most 64
 hops. The shared compiled source is charged once per arena (`envSharedBytes`), never to a candidate.
 
@@ -122,12 +122,14 @@ repetitions of the three edits and a drain; measured allocation, not accounted b
 
 | Variation | Allocated bytes |
 | --- | --- |
-| span `2^20` | 7,476,936 |
-| span `2^60` | 7,480,720 |
-| history of 100 runs | 7,568,064 |
-| history of 100,000 runs | 7,736,064 |
+| span `2^20` | 7,005,096 |
+| span `2^60` | 7,009,720 |
+| history of 100 runs | 7,096,224 |
+| history of 100,000 runs | 7,264,224 |
+| source with 0 patches (one removal and drain, 20 repetitions) | 50,904 |
+| source with 200 separated patches | 50,904 |
 
-Each pair is within a factor of two plus 64 KiB, and the example fails if the statistics are
+The class lookup is bounded: with the first version of `Connectivity.isExterior`, which materialized every member of the class, the same 200-patch row allocates 874,408 B against 51,112 B for 0 patches (a control run locally, not committed). Each pair is within a factor of two plus 64 KiB, and the example fails if the statistics are
 disabled. No cost is proportional to a span, to represented cells, to boundary tiles or to
 retained history.
 
@@ -180,6 +182,20 @@ The `negative controls` examples additionally apply three wrong behaviours to th
 (a driver that forgets the remaining obligations after a batch that finds an exit, a claim that a
 pending state is complete, and a known-solid-implies-known-void transformation of the answers); the
 independent comparison rejects each while accepting the honest result.
+
+## Round 1 of the review and its repairs
+
+The first canonical review (Codex) requested changes on five points, all valid, repaired at the head above:
+
+| Finding | Repair | Evidence |
+| --- | --- | --- |
+| capacity was checked after an inspection ran, so a rejected inspection's reads and scratch were discarded from the report | every read, staged write, candidate record, candidate byte and retained byte is checked before it is made; a rejected inspection reports its reads as `reportAttemptedReads` | `accounting before the work`: a counting provider independent of the model, over a grid of read, scratch, write and delta allowances, for batches, edits and a suspension: requests never exceed the allowance and equal the reported attempted reads |
+| `isExterior` enumerated every member of the class | it resolves the representative only | allocation with 0 and 200 patches identical (50,904 B); the enumerating version fails the example |
+| extending a known run changed knowledge without advancing the knowledge revision | a removal that joins an existing run whose class is known reports it as newly known space | the reviewer's removal sequence: `candidateKnowledge`, the revision, the oracle and overflow at the maximum revision |
+| restored runs were checked only for `lo < hi` | endpoints must lie in `[-2^62, 2^62]` | legal limits accepted, `-2^62-1`, `2^62+1` and `(2^62, 2^62+1)` refused; `retainedRemovals` keeps both legal runs |
+| replay and invariants were not applied after every batch of a drain | drains check state and oracle bounds after each batch; a lockstep example rebuilds a run from its records after every edit and batch and compares it record for record with an uninterrupted run | 3 authored and 10 generated scenes |
+
+Each repair was reverted locally and the examples run (never committed): the enumerating `isExterior` fails the structure example, an extension that reports no knowledge fails the revision example, a scratch check that follows the read fails the counting-provider and rejected-inspection examples, and unchecked run endpoints fail the range example.
 
 ## Defect found by the oracle and fixed
 

@@ -625,7 +625,9 @@ service, a file backend or a persistent-save promise.
 The initial known set is exactly the compiled source's exterior classification
 (`Connectivity.isExterior`: connection through positive-area openings to the
 upper Z boundary). It is derived from the compiled source without flooding sky,
-preloading an exterior cave or using a fixed Z threshold. Every other component
+preloading an exterior cave or using a fixed Z threshold; the lookup reads the
+class's representative only, never the members of a class, so its cost does not grow
+with the source's structure. Every other component
 starts unknown and a sealed space stays unknown whatever is queried, resident or
 raw-edited.
 
@@ -718,12 +720,17 @@ intact (`EditSuspended`, `Stalled`, `HaltSuspended`, `MissingRecord`). It is nev
 read as absent, as air, as newly forgotten fog or as proof that no connection exists,
 and pristine source state is never regenerated in place of a record the model was not
 given. `retainedFromRecords` rebuilds a `Retained` value from a header and its records
-after checking that they are a legitimate state; resuming from those records alone
+after checking that they are a legitimate state (kinds match their keys, a run lies
+inside the supported range `[-2^62, 2^62]` and runs of a column are disjoint and not
+adjacent, so discovery and the existing `Changes` consumers cannot disagree about a
+restored run); resuming from those records alone
 gives the same knowledge and the same remaining work.
 
 ### Authority and candidates
 
-A `Candidate` names the `Authority` it read: the arena incarnation (an
+A removal that extends a run whose class is already known adds known space (a new
+void and the walls it exposes), so it advances the knowledge revision although no class
+changes state; so does every join that makes a class known. A `Candidate` names the `Authority` it read: the arena incarnation (an
 `ArenaId`) and the content, knowledge and store `Revision`s. `applyCandidate`
 accepts it only against exactly that authority, so a candidate from a closed
 incarnation, or one made stale by an applied candidate (a frontier-only one included),
@@ -755,7 +762,14 @@ pending state. An `Allowance` can only tighten them per call.
 
 Bytes and counts are conservative accounted figures (keys, aliases, obligations,
 container overhead and scratch; a deletion is charged as the largest record of its
-kind), not heap or process RSS, and not final encoded pages. The shared compiled
+kind), not heap or process RSS, and not final encoded pages. Every bound is checked
+**before** the work it pays for: a provider read is charged the largest record
+(`maxRecordBytes`) of scratch and one read before the provider is asked, and a staged
+write is charged its entry before it is staged, so a request that would overflow the read
+count, the scratch, the candidate records or bytes, or the retained bytes never reaches
+the provider or the overlay. An inspection rejected part way is discarded whole, and the
+reads it had already made are reported as `reportAttemptedReads` (never above the read
+limit), so the report cannot understate the provider's work. The shared compiled
 source is charged once to the arena (`envSharedBytes`), never to a candidate. The
 integration envelope is P-15's 64 MiB edit bank (48 MiB record caches, 8 MiB staging,
 8 MiB control), at most 4 MiB of RAM and 1 MiB of encoded pages per later store
@@ -1365,7 +1379,8 @@ bytes and not RSS).
 The discovery examples (TRA-19, `Test.Terrain.Discovery` with the driver and explicit
 oracle `Test.Terrain.DiscoveryHarness`) run ordered traces of removals, discovery
 batches, drains and record replays over small authored worlds and, after every event,
-check the retained state for legitimacy (it rebuilds from its own records, its removed
+check the retained state for legitimacy after every event and after every batch of a
+drain as well (it rebuilds from its own records, its removed
 runs are exactly the removals applied, each connection was inspected exactly once, every
 report is within its limit) and compare production knowledge with an independent
 explicit model that shares no code with the overlay. The model reads the source as plain
@@ -1380,8 +1395,12 @@ void, edge-only and point-only controls, 48 generated traces (all 16 identities,
 origins across negative region seams), huge ramp families at `2^20` and `2^60`, a
 bounded working window while retained history grows, a record withheld and restored,
 exact and insufficient allowances, stale and foreign candidates, overflow, and
-negative controls that the oracle must reject. A client compiled outside the package
-shows the discovery state unforgeable.
+negative controls that the oracle must reject. A lockstep example rebuilds one run from its
+records alone after every edit and every batch of a drain and compares it with an
+uninterrupted run record for record. A counting provider, independent of the model's
+accounting, shows no request is made beyond an allowance on any exit, and an allocation
+example shows a class lookup costs the same for a source with 0 and with 200 patches. A
+client compiled outside the package shows the discovery state unforgeable.
 
 ## Consumers
 
