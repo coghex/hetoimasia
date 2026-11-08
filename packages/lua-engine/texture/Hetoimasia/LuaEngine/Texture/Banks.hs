@@ -1,5 +1,9 @@
--- | The texture banks of the M1 profile that are charged per texture rather than per lane: the
--- texture slots and the nominal RGBA8 bytes of one UI instance, and the nominal bytes of the session.
+-- | The texture banks of the M1 profile that are charged per texture rather than per lane: the nominal bytes
+-- of one UI instance and the nominal bytes of the session. Memory is the only bound; there is no count of
+-- textures (owner decision 2026-11-08, "Hetoimasia.LuaEngine.Profile.Limits.textureMinimumChargeBytes").
+-- Every texture is charged at least the minimum charge in both banks, from admission until its proven
+-- retirement, so a bank of @n@ bytes holds at most @n `div` 4096@ textures and the structural capacities
+-- sized from that (the native table, the facade's lease scope) never answer before the banks do.
 --
 -- = Owner, writers, lifetime
 --
@@ -8,16 +12,17 @@
 -- held by that instance's bindings (there is no registry of owners). A 'TextureCharge' belongs to
 -- one accepted texture request. Every write is a transaction:
 --
--- * admission reserves a charge's slot and nominal bytes inside the host's one admission
---   transaction ('reserveSlot', 'reserveNominal'), so a texture's request, lease capacity, slot and
---   bytes are all taken or none is;
--- * the decode stage shrinks the nominal bytes to the validated size ('shrinkNominal');
+-- * admission reserves a charge's nominal bytes inside the host's one admission transaction
+--   ('reserveNominal'), so a texture's request, lease capacity and bytes are all taken or none is;
+-- * the decode stage shrinks the nominal bytes to the validated size ('shrinkNominal'), never below the
+--   minimum charge;
 -- * the charge is returned, once, by whoever owns the texture's end: the lease after the backend
 --   proved the texture retired, the pipeline's own housekeeping for a texture no lease will ever own,
 --   or the host's credit release for a request that never produced a texture.
 --
--- Nothing here is a cache: a charge is a promise about one texture, and each part of it ('returnSlot',
--- 'returnNominal') can be returned once however many paths reach it.
+-- Nothing here is a cache: a charge is a promise about one texture, and it ('returnNominal') can be
+-- returned once however many paths reach it. The number of textures an owner holds is kept only as a
+-- read-only observation ('ownerTexturesCharged'): nothing compares it with anything.
 module Hetoimasia.LuaEngine.Texture.Banks
   ( -- * The session
     SessionBytes
@@ -32,9 +37,8 @@ module Hetoimasia.LuaEngine.Texture.Banks
   , ownerRole
   , ownerNumber
   , ownerSession
-  , ownerSlotLimit
   , ownerByteLimit
-  , ownerSlotsCharged
+  , ownerTexturesCharged
   , ownerBytesCharged
   , ownerIsOpen
   , closeOwner
@@ -43,13 +47,10 @@ module Hetoimasia.LuaEngine.Texture.Banks
   , TextureCharge
   , newCharge
   , chargeOwner
-  , reserveSlot
   , reserveNominal
   , shrinkNominal
-  , returnSlot
   , returnNominal
   , chargeNominal
-  , chargeSlotHeld
   , BankDefect (..)
   ) where
 
@@ -58,6 +59,7 @@ import Control.Exception (Exception)
 import Control.Monad (unless, when)
 import Data.Text (Text)
 import Data.Word (Word64)
+import Hetoimasia.LuaEngine.Profile (textureChargeBytes)
 
 -- | The nominal bytes the session's textures hold.
 data SessionBytes = SessionBytes
@@ -89,25 +91,26 @@ data TextureOwner = TextureOwner
   { ownerNumber ∷ !Word64
   , ownerRole ∷ !TextureRole
   , ownerSession ∷ !SessionBytes
-  , ownerSlotLimit ∷ !Int
-  , ownerSlots ∷ !(TVar Int)
+  , ownerTextures ∷ !(TVar Int)
+    -- ^ The textures the owner holds (a charge holding bytes is a texture): an observation, never enforced.
   , ownerByteLimit ∷ !Word64
   , ownerBytes ∷ !(TVar Word64)
   , ownerOpen ∷ !(TVar Bool)
   }
 
 instance Eq TextureOwner where
-  a == b = ownerSlots a == ownerSlots b
+  a == b = ownerTextures a == ownerTextures b
 
 -- | An owner with these limits, numbered by its pipeline. The numbers are issued in order and never
 -- again.
-newOwner ∷ Word64 → SessionBytes → Int → Word64 → TextureRole → STM TextureOwner
-newOwner number session slotLimit byteLimit role =
-  TextureOwner number role session slotLimit <$> newTVar 0 <*> pure byteLimit <*> newTVar 0 <*> newTVar True
+newOwner ∷ Word64 → SessionBytes → Word64 → TextureRole → STM TextureOwner
+newOwner number session byteLimit role =
+  TextureOwner number role session <$> newTVar 0 <*> pure byteLimit <*> newTVar 0 <*> newTVar True
 
--- | The texture slots the owner holds (pending, live and retiring).
-ownerSlotsCharged ∷ TextureOwner → STM Int
-ownerSlotsCharged = readTVar . ownerSlots
+-- | The textures the owner holds (pending, live and retiring), as a read-only observation: the bytes are
+-- the bound, and no decision reads this.
+ownerTexturesCharged ∷ TextureOwner → STM Int
+ownerTexturesCharged = readTVar . ownerTextures
 
 -- | The nominal bytes the owner holds.
 ownerBytesCharged ∷ TextureOwner → STM Word64
@@ -132,43 +135,27 @@ instance Exception BankDefect
 -- | What one accepted texture request holds.
 data TextureCharge = TextureCharge
   { chargeOwner ∷ !TextureOwner
-  , chargeSlot ∷ !(TVar Bool)
   , chargeBytes ∷ !(TVar Word64)
   }
 
 -- | A charge that holds nothing yet, for this owner.
 newCharge ∷ TextureOwner → STM TextureCharge
-newCharge owner = TextureCharge owner <$> newTVar False <*> newTVar 0
-
--- | Whether the slot is held.
-chargeSlotHeld ∷ TextureCharge → STM Bool
-chargeSlotHeld = readTVar . chargeSlot
+newCharge owner = TextureCharge owner <$> newTVar 0
 
 -- | The nominal bytes the charge holds now.
 chargeNominal ∷ TextureCharge → STM Word64
 chargeNominal = readTVar . chargeBytes
 
--- | Take one of the owner's texture slots, if it has one. Checked: the count is compared with the
--- limit, never incremented past it.
-reserveSlot ∷ TextureCharge → STM Bool
-reserveSlot charge = do
-  held ← readTVar (chargeSlot charge)
-  when held $ throwSTM (BankDefect "a texture slot was reserved twice for one request")
-  used ← readTVar (ownerSlots (chargeOwner charge))
-  if used >= ownerSlotLimit (chargeOwner charge)
-    then pure False
-    else do
-      writeTVar (ownerSlots (chargeOwner charge)) (used + 1)
-      writeTVar (chargeSlot charge) True
-      pure True
-
--- | Take this many nominal bytes from both the owner's bank and the session's, or neither. Checked
--- arithmetic: each request is compared with the room left, so nothing is added that could wrap.
+-- | Take this many nominal bytes (at least the minimum charge) from both the owner's bank and the
+-- session's, or neither. Checked arithmetic: each request is compared with the room left, so nothing is
+-- added that could wrap. The charge then holds at least 'textureMinimumChargeBytes', which is what makes it
+-- a texture to the owner's observation.
 reserveNominal ∷ TextureCharge → Word64 → STM Bool
-reserveNominal charge wanted = do
+reserveNominal charge requested = do
   held ← readTVar (chargeBytes charge)
   when (held /= 0) $ throwSTM (BankDefect "nominal bytes were reserved twice for one request")
-  let owner = chargeOwner charge
+  let wanted = textureChargeBytes requested
+      owner = chargeOwner charge
       session = ownerSession owner
   instanceUsed ← readTVar (ownerBytes owner)
   sessionUsed ← readTVar (sessionCharged session)
@@ -178,36 +165,33 @@ reserveNominal charge wanted = do
       writeTVar (ownerBytes owner) (instanceUsed + wanted)
       writeTVar (sessionCharged session) (sessionUsed + wanted)
       writeTVar (chargeBytes charge) wanted
+      readTVar (ownerTextures owner) >>= writeTVar (ownerTextures owner) . (+ 1)
       pure True
 
--- | Reduce the charge to this many bytes, giving the difference back to both banks in the same
--- transaction. Growing a charge is a defect: the conservative reservation was made for the largest
--- possible output.
+-- | Reduce the charge to this many bytes, or to the minimum charge if that is more, giving the difference
+-- back to both banks in the same transaction. Growing a charge is a defect: the conservative reservation
+-- was made for the largest possible output (and is never below the minimum).
 shrinkNominal ∷ TextureCharge → Word64 → STM ()
-shrinkNominal charge actual = do
+shrinkNominal charge decoded = do
   held ← readTVar (chargeBytes charge)
+  let actual = textureChargeBytes decoded
   when (actual > held) $ throwSTM (BankDefect "a nominal charge was asked to grow")
   unless (actual == held) $ do
     giveBack (chargeOwner charge) (held - actual)
     writeTVar (chargeBytes charge) actual
 
--- | Return the slot, once. Further calls do nothing.
-returnSlot ∷ TextureCharge → STM ()
-returnSlot charge = do
-  held ← readTVar (chargeSlot charge)
-  when held $ do
-    used ← readTVar (ownerSlots (chargeOwner charge))
-    when (used <= 0) $ throwSTM (BankDefect "a texture slot was returned that the owner did not hold")
-    writeTVar (ownerSlots (chargeOwner charge)) (used - 1)
-    writeTVar (chargeSlot charge) False
-
--- | Return the nominal bytes the charge holds now, once. Further calls do nothing.
+-- | Return the nominal bytes the charge holds now, once, and with them the texture the owner observes.
+-- Further calls do nothing.
 returnNominal ∷ TextureCharge → STM ()
 returnNominal charge = do
   held ← readTVar (chargeBytes charge)
   unless (held == 0) $ do
     giveBack (chargeOwner charge) held
     writeTVar (chargeBytes charge) 0
+    let textures = ownerTextures (chargeOwner charge)
+    count ← readTVar textures
+    when (count <= 0) $ throwSTM (BankDefect "a texture was returned that the owner did not hold")
+    writeTVar textures (count - 1)
 
 giveBack ∷ TextureOwner → Word64 → STM ()
 giveBack owner amount = do

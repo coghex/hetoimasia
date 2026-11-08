@@ -3,7 +3,7 @@
 -- | What one texture request is: a verified read, a bounded decode, an upload and a registration,
 -- and a usable owned texture only when the backend says the upload is complete and the registration
 -- usable, with the stages' charges shown as they move.
-module Test.LuaEngine.Texture.Contract (spec, small, layout, loadAs, started) where
+module Test.LuaEngine.Texture.Contract (spec, small, wide, wideLayout, layout, loadAs, started) where
 
 import qualified Data.ByteString as BS
 import Data.Text (Text)
@@ -26,6 +26,24 @@ small =
     , (TextureBytesPerUiInstance, 16384)
     , (TextureBytesPerSession, 32768)
     ]
+
+-- | 64 by 64 texels at most (so a texture reserves 16,384 nominal bytes), four of them for an instance and eight for the
+-- session: a reservation well above the 4,096-byte minimum charge, so that a decode which shrinks it is visible.
+wide ∷ Profile
+wide =
+  smaller
+    [(PngPixels, 4096), (PngAxisMaximum, 64)]
+    [ (PngEncodedBytes, 65536)
+    , (PngInflatedScanlineBytes, 65536)
+    , (PngPipelineWorkspaceBytes, 1048576)
+    , (TextureBytesPerUiInstance, 65536)
+    , (TextureBytesPerSession, 131072)
+    ]
+
+-- | The examples' images, and one of 40 by 40 texels: 6,400 bytes decoded, above the minimum charge.
+wideLayout ∷ Layout
+wideLayout = case layout of
+  Layout images → Layout (images <> [("big.png", opaque 40 40)])
 
 -- | The images the examples load.
 layout ∷ Layout
@@ -66,8 +84,8 @@ spec = describe "a request" $ do
       command session vm "i" "ready" "a"
       awaitNote session "i ready a false"
       lanesCharged session `shouldReturn` [128, 0]
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
-      sessionNow session `shouldReturn` 128
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
+      sessionNow session `shouldReturn` 4096
       identity ← finishUpload (ssFake session) held
       command session vm "i" "wait_take" "a"
       line ← lineStarting session "i wait_take a "
@@ -76,7 +94,7 @@ spec = describe "a request" $ do
       awaitNote session ("i use a " <> showT identity)
       -- The CPU buffers retired; the texture is live and still charges its slot and nominal bytes.
       lanesCharged session `shouldReturn` [0, 0]
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
       awaitLeaseSummary session vm "i" (const True)
   where
     showT = Text.pack . show

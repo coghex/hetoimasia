@@ -6,11 +6,12 @@
 module Test.LuaEngine.Texture.Limits (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, void, when)
 import Data.Text (Text)
+import Data.Word (Word64)
 import qualified Data.Text as Text
 import Hetoimasia.Content.ReadPool (PoolStatus (..))
-import Hetoimasia.LuaEngine.Profile (ByteLimit (..), CountLimit (..), fixedM1Profile)
+import Hetoimasia.LuaEngine.Profile (ByteLimit (..), CountLimit (..), Profile, fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (..), RequestEndpoint (..))
 import Test.Hspec
 import Test.LuaEngine.Request.Profiles (smaller)
@@ -24,6 +25,11 @@ spec = describe "limits" $ do
   refusals
   concurrency
   fixedValues
+
+-- | The fixed profile with its texture banks cut to the 128 MiB and 256 MiB the first milestone had, so that the byte
+-- banks, not the request places, are what fills.
+limited ∷ Profile
+limited = smaller [] [(TextureBytesPerUiInstance, 128 * 1048576), (TextureBytesPerSession, 256 * 1048576)]
 
 keyOf ∷ Int → Text
 keyOf = Text.pack . ("k" <>) . show
@@ -71,24 +77,41 @@ refusing session vm name bank = do
 
 banks ∷ Spec
 banks = describe "each bank, independently full" $ do
-  it "refuses a texture slot beyond the instance's two, naming the bank, with nothing reserved" $
-    withSession (config (smaller [(TextureLeasesPerUiInstance, 2), (PngPixels, 1024), (PngAxisMaximum, 32)] bytes) layout) $ \session _ runtime → do
-      vm ← startVm session runtime "slots" OnArrival
-      admitDriver session vm "i"
-      holdReads session
-      fill session vm "i" 2
-      ownerNow vm "i" >>= (`shouldBe` OwnerReading 2 8192)
-      refusing session vm "i" "the provider has no room in texture slots"
-
-  it "refuses nominal bytes beyond the instance's bank, and gives back the slot the refused attempt had taken" $
+  it "admits a reservation that exactly fits the instance's bank and refuses, naming bytes, when one byte is missing: nothing reserved by the refused attempt" $ do
+    -- 16,384 bytes hold exactly four reservations of 4,096; one byte less room holds three.
     withSession (config small layout) $ \session _ runtime → do
-      vm ← startVm session runtime "bytes" OnArrival
+      vm ← startVm session runtime "exact" OnArrival
       admitDriver session vm "i"
       holdReads session
       fill session vm "i" 4
       ownerNow vm "i" >>= (`shouldBe` OwnerReading 4 16384)
-      -- The slot is taken before the bytes within one admission; the refusal leaves it as it was.
       refusing session vm "i" "the provider has no room in texture bytes"
+    withSession (config (smaller [(PngPixels, 1024), (PngAxisMaximum, 32)] (banksOf 16383 32768)) layout) $ \session _ runtime → do
+      vm ← startVm session runtime "short" OnArrival
+      admitDriver session vm "i"
+      holdReads session
+      fill session vm "i" 3
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 3 12288)
+      refusing session vm "i" "the provider has no room in texture bytes"
+
+  it "refuses with one byte less room in the session's bank than two instances' reservations need, naming bytes, and admits when the room is exact" $ do
+    -- Session room 32,768 holds exactly eight reservations (four for each instance); 32,767 holds seven.
+    withSession (config small layout) $ \session _ runtime → do
+      vm ← startVm session runtime "session-exact" OnArrival
+      mapM_ (admitDriver session vm) ["i", "j"]
+      holdReads session
+      fill session vm "i" 4
+      fill session vm "j" 4
+      sessionNow session `shouldReturn` 32768
+    withSession (config (smaller [(PngPixels, 1024), (PngAxisMaximum, 32)] (banksOf 16384 32767)) layout) $ \session _ runtime → do
+      vm ← startVm session runtime "session-short" OnArrival
+      mapM_ (admitDriver session vm) ["i", "j"]
+      holdReads session
+      fill session vm "i" 4
+      fill session vm "j" 3
+      sessionNow session `shouldReturn` 28672
+      ownerNow vm "j" >>= (`shouldBe` OwnerReading 3 12288)
+      refusing session vm "j" "the provider has no room in texture bytes"
 
   it "refuses nominal bytes beyond the session's bank for an instance whose own bank is empty" $
     withSession (config small layout) $ \session _ runtime → do
@@ -157,13 +180,17 @@ banks = describe "each bank, independently full" $ do
       started session vm "i" "y" "a.png"
       ownerNow vm "i" >>= (`shouldBe` OwnerReading 4 16384)
   where
-    bytes =
-      [ (PngEncodedBytes, 65536)
-      , (PngInflatedScanlineBytes, 65536)
-      , (PngPipelineWorkspaceBytes, 1048576)
-      , (TextureBytesPerUiInstance, 16384)
-      , (TextureBytesPerSession, 32768)
-      ]
+    bytes = banksOf 16384 32768
+
+-- | Small PNG limits and these texture banks: the instance's and the session's.
+banksOf ∷ Word64 → Word64 → [(ByteLimit, Word64)]
+banksOf instanceBytes sessionBytes =
+  [ (PngEncodedBytes, 65536)
+  , (PngInflatedScanlineBytes, 65536)
+  , (PngPipelineWorkspaceBytes, 1048576)
+  , (TextureBytesPerUiInstance, instanceBytes)
+  , (TextureBytesPerSession, sessionBytes)
+  ]
 
 concurrency ∷ Spec
 concurrency = describe "concurrent admissions" $
@@ -199,18 +226,30 @@ fixedValues = describe "the fixed profile's values" $ do
         , specWorkspace numbers
         , specSourceLimit numbers
         , specInitialNominal numbers
-        , specInstanceSlots numbers
         , specInstanceBytes numbers
         , specSessionBytes numbers
         )
-        `shouldBe` (2, 2, 1, 128 * 1048576, 32 * 1048576, 16 * 1048576, 16, 128 * 1048576, 256 * 1048576)
+        `shouldBe` (2, 2, 1, 128 * 1048576, 32 * 1048576, 16 * 1048576, 512 * 1048576, 1024 * 1048576)
       awaitPipeline session ((== 1) . readingDecodeWorkers)
       length . readingLanes <$> pipelineNow session `shouldReturn` 2
       statusWorkers <$> poolReading session `shouldReturn` 2
 
-  it "reserves the maximum 16 MiB before anything is read, eight of them per instance and sixteen per session, and refuses the next" $
+  it "reserves the maximum 16 MiB before anything is read, and the request bounds answer before the bytes: sixteen reservations hold half of the instance's 512 MiB, and the seventeenth is refused on the request places" $
     withSession (config fixedM1Profile (Layout [("a.png", opaque 2 2)])) $ \session _ runtime → do
       vm ← startVm session runtime "fixed" OnArrival
+      admitDriver session vm "i"
+      holdReads session
+      started session vm "i" "k0" "a.png"
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 (16 * 1048576))
+      sessionNow session `shouldReturn` 16 * 1048576
+      forM_ [1 .. 15] $ \n → started session vm "i" (keyOf n) "a.png"
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 16 (256 * 1048576))
+      -- The bytes could take more (512 MiB); the host's request places do not.
+      refusing session vm "i" "the instance holds all 16 of its request places"
+
+  it "reserves the maximum 16 MiB per texture against a 128 MiB instance bank and a 256 MiB session bank (a profile smaller than the fixed one): eight per instance, sixteen per session, and refuses the next on bytes" $
+    withSession (config limited (Layout [("a.png", opaque 2 2)])) $ \session _ runtime → do
+      vm ← startVm session runtime "limited" OnArrival
       mapM_ (admitDriver session vm) ["i", "j", "k"]
       holdReads session
       started session vm "i" "k0" "a.png"
@@ -223,18 +262,38 @@ fixedValues = describe "the fixed profile's values" $ do
       sessionNow session `shouldReturn` 256 * 1048576
       refusing session vm "k" "the provider has no room in texture bytes"
 
-  it "lets a small image be refused busy by the conservative reservation, and admits it once an earlier decode has shrunk its charge" $
-    withSession (config fixedM1Profile (Layout [("a.png", opaque 2 2)])) $ \session _ runtime → do
+  it "lets a small image be refused busy by the conservative reservation, and admits it once an earlier decode has shrunk its charge to the minimum charge, not to its few bytes" $
+    withSession (config limited (Layout [("a.png", opaque 2 2)])) $ \session _ runtime → do
       vm ← startVm session runtime "shrink" OnArrival
       admitDriver session vm "i"
       closeGate (ssProbe session) "a.png"
       forM_ [0 .. 7] $ \n → started session vm "i" (keyOf n) "a.png"
       loadAs session vm "i" "z" "a.png" >>= (`shouldBe` busy "i" "the provider has no room in texture bytes")
-      -- The first two reads decode a two by two image and shrink their 16 MiB to 16 bytes each.
+      -- The first two reads decode a two by two image (16 bytes) and shrink their 16 MiB to the 4 KiB minimum charge each.
       openGate (ssProbe session) "a.png"
       -- Room for one more full reservation, not merely less than a full bank.
       awaitOwner vm "i" (\reading → 128 * 1048576 - ownerNominalHeld reading >= 16 * 1048576)
       started session vm "i" "y" "a.png"
+
+  it "charges a texture smaller than the minimum exactly the minimum, 4,096 bytes, in both banks, from admission to its end, and returns it once" $
+    withSession (config limited (Layout [("a.png", opaque 2 2)])) $ \session _ runtime → do
+      setAutoRetire (ssFake session) True
+      vm ← startVm session runtime "minimum" OnArrival
+      admitDriver session vm "i"
+      started session vm "i" "k0" "a.png"
+      awaitUploads (ssFake session) 1
+      -- A two by two image decodes to 16 bytes; both banks hold the minimum charge, not 16.
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
+      sessionNow session `shouldReturn` 4096
+      void (uploadN (ssFake session) 0 >>= finishUpload (ssFake session))
+      command session vm "i" "wait_take" "k0"
+      line ← lineStarting session "i wait_take k0 "
+      line `shouldSatisfy` Text.isInfixOf "status=success"
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
+      command session vm "i" "release" "k0"
+      awaitNote session "i release k0 done"
+      awaitOwner vm "i" (== OwnerReading 0 0)
+      sessionNow session `shouldReturn` 0
 
 -- | A request the service refuses is an ordinary Lua error before any admission, never busy, and
 -- leaves nothing reserved and nothing done.

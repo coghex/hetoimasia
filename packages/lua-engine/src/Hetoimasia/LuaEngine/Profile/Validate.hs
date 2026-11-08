@@ -171,7 +171,8 @@ relations spec =
   , (SegmentWithinPath, bytes PathSegmentBytes <= bytes PathBytes)
   , (PathSegmentsWithinPathBytes, count PathSegments <= bytes PathBytes)
   , (PixelsWithinAxes, count PngPixels <= count PngAxisMaximum * count PngAxisMaximum)
-  , (OutputWithinTextureBytesPerUi, output <= bytes TextureBytesPerUiInstance)
+  -- admission reserves the larger of the largest legal level and the minimum charge in both banks
+  , (OutputWithinTextureBytesPerUi, max (toInteger textureMinimumChargeBytes) output <= bytes TextureBytesPerUiInstance)
   , (TextureBytesPerUiWithinSession, bytes TextureBytesPerUiInstance <= bytes TextureBytesPerSession)
   , (OutputWithinPipelineWorkspace, output <= bytes PngPipelineWorkspaceBytes)
   , (InflatedScanlinesWithinPipelineWorkspace, bytes PngInflatedScanlineBytes <= bytes PngPipelineWorkspaceBytes)

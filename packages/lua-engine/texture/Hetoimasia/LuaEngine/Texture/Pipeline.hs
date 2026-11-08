@@ -98,7 +98,6 @@ module Hetoimasia.LuaEngine.Texture.Pipeline
   , specWorkspace
   , specSourceLimit
   , specInitialNominal
-  , specInstanceSlots
   , specInstanceBytes
   , specSessionBytes
   , specMaxPixels
@@ -262,6 +261,7 @@ import Hetoimasia.LuaEngine.Profile
   , bytesLimit
   , countLimit
   , pngOutputBytes
+  , textureReservationBytes
   )
 import Hetoimasia.LuaEngine.Texture.Account
   ( Reservation
@@ -310,8 +310,9 @@ data TextureSpec = TextureSpec
   , tsSourceLimit ∷ !Word64
     -- ^ The PNG source limit, also the read's allowance.
   , tsInitialNominal ∷ !Word64
-    -- ^ The nominal bytes reserved for a texture at admission: the largest RGBA8 output.
-  , tsInstanceSlots ∷ !Int
+    -- ^ The nominal bytes reserved for a texture at admission: the largest RGBA8 output, or the minimum charge
+    -- if that is more ('textureReservationBytes'). The decode shrinks it to the decoded size, never below the
+    -- minimum charge.
   , tsInstanceBytes ∷ !Word64
   , tsSessionBytes ∷ !Word64
   , tsPngLimits ∷ !PngLimits
@@ -324,12 +325,11 @@ data TextureSpec = TextureSpec
 specProfile ∷ TextureSpec → Profile
 specProfile = tsProfile
 
-specJobs, specIoWorkers, specDecodeWorkers, specLanes, specInstanceSlots ∷ TextureSpec → Int
+specJobs, specIoWorkers, specDecodeWorkers, specLanes ∷ TextureSpec → Int
 specJobs = tsJobs
 specIoWorkers = tsIoWorkers
 specDecodeWorkers = tsDecodeWorkers
 specLanes = tsLanes
-specInstanceSlots = tsInstanceSlots
 
 specWorkspace, specSourceLimit, specInitialNominal, specInstanceBytes, specSessionBytes, specMaxPixels ∷ TextureSpec → Word64
 specWorkspace = tsWorkspace
@@ -357,12 +357,12 @@ textureSpec profile jobs = do
   ioWorkers ← machine "IoWorkers" (count IoWorkers)
   decodeWorkers ← machine "DecodeWorkers" (count DecodeWorkers)
   lanes ← machine "TexturePipelineLanes" (count TexturePipelineLanes)
-  slots ← machine "TextureLeasesPerUiInstance" (count TextureLeasesPerUiInstance)
   axis ← pure (toInteger (count PngAxisMaximum))
   let Bytes workspace = bytesLimit profile PngPipelineWorkspaceBytes
       Bytes source = bytesLimit profile PngEncodedBytes
       Bytes inflated = bytesLimit profile PngInflatedScanlineBytes
       Bytes output = pngOutputBytes profile
+      Bytes reservation = textureReservationBytes profile
       Bytes perInstance = bytesLimit profile TextureBytesPerUiInstance
       Bytes perSession = bytesLimit profile TextureBytesPerSession
   limits ←
@@ -389,8 +389,7 @@ textureSpec profile jobs = do
       , tsLanes = lanes
       , tsWorkspace = workspace
       , tsSourceLimit = source
-      , tsInitialNominal = output
-      , tsInstanceSlots = slots
+      , tsInitialNominal = reservation
       , tsInstanceBytes = perInstance
       , tsSessionBytes = perSession
       , tsPngLimits = limits
@@ -628,7 +627,7 @@ newTextureOwner tp role = atomically $ do
   st ← readTVar (tpState tp)
   when (psOwners st == maxBound) $ throwSTM (TextureDefect "the texture owner numbers are exhausted")
   writeTVar (tpState tp) st {psOwners = psOwners st + 1}
-  newOwner (psOwners st) (tpSession tp) (tsInstanceSlots (tpSpec tp)) (tsInstanceBytes (tpSpec tp)) role
+  newOwner (psOwners st) (tpSession tp) (tsInstanceBytes (tpSpec tp)) role
 
 -- The scope ----------------------------------------------------------------------------------------
 
@@ -846,12 +845,13 @@ forgetPrepared tp token = atomically $ modifyState tp $ \st → st {psPrepared =
 modifyState ∷ TexturePipeline → (PState → PState) → STM ()
 modifyState tp change = readTVar (tpState tp) >>= writeTVar (tpState tp) . change
 
--- | The credits a request reserves with its admission, in the order they are reserved: the instance's
--- texture slot, the nominal bytes of the instance and the session, a record in the pipeline's
--- accepted-work bound, and, for a file that will be read, a slot of the shared pool's queue.
+-- | The credits a request reserves with its admission, in the order they are reserved: the nominal bytes
+-- of the instance and the session (the only bound on how much a texture may hold: no count of textures is
+-- checked), a record in the pipeline's accepted-work bound, and, for a file that will be read, a slot of
+-- the shared pool's queue.
 --
--- The slot and the nominal bytes transfer to the texture when a lease adopts it: the lease's release
--- returns them, after the backend proved the texture retired. The record and the pool slot are the
+-- The nominal bytes transfer to the texture when a lease adopts it: the lease's release returns them,
+-- after the backend proved the texture retired. The record and the pool slot are the
 -- request's, returned when the host returns them.
 requestCredits ∷ TexturePipeline → Prepared → [Credit]
 requestCredits tp prepared =
@@ -860,12 +860,6 @@ requestCredits tp prepared =
       , creditReserve = ownerAndPipelineLive tp (chargeOwner charge)
       , creditRelease = \_ → pure ()
       , creditTransfers = False
-      }
-  , Credit
-      { creditName = "texture slots"
-      , creditReserve = reserveSlot charge
-      , creditRelease = \_ → settleCharge tp token charge
-      , creditTransfers = True
       }
   , Credit
       { creditName = "texture bytes"
@@ -1014,7 +1008,7 @@ readRetirement poll =
   (poll >>= \state → state `seq` pure state) `catchSTM` \failure → pure (ProviderFailed (failure ∷ SomeException))
 
 returnCharge ∷ TextureCharge → STM ()
-returnCharge charge = returnSlot charge >> returnNominal charge
+returnCharge = returnNominal
 
 -- The endpoint --------------------------------------------------------------------------------------
 
@@ -1456,7 +1450,8 @@ decodeStages tp restore jid job bytes lane = do
       let width = fromIntegral (preflightWidth pf) ∷ Word32
           height = fromIntegral (preflightHeight pf) ∷ Word32
       -- The accounted stage boundary: after the fingerprint-verified input and the validated
-      -- dimensions, the nominal charge becomes the actual checked size, in one transaction.
+      -- dimensions, the nominal charge becomes the actual checked size (never below the minimum charge), in one
+      -- transaction.
       wanted ← atomically $ do
         shrinkNominal (jCharge job) (fromIntegral (preflightRgba8Bytes pf))
         -- The coverage reservation made for the worst case shrinks to the exact plane and metadata of this

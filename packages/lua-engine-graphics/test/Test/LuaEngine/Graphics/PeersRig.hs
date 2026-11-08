@@ -13,6 +13,7 @@ module Test.LuaEngine.Graphics.PeersRig
   , withPeersWith
   , withPeersHooked
   , withPeersConfigured
+  , withPeersProfiled
   , withPeersInput
   , mainLoop
   , mainLoopAs
@@ -70,6 +71,7 @@ import Hetoimasia.Scripting.Lua.Admission (newRequestHandles)
 import Hetoimasia.Scripting.Lua.Instance hiding (forgetInstance)
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Provider (RequestGrant (..), RequestTiming (SettleAtAssignedTick, SettleOnArrival))
+import Hetoimasia.LuaEngine.Profile (Profile)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduler (systemTimerBackend)
@@ -101,6 +103,8 @@ data Peers = Peers
   , peControl ∷ !RuntimeControl
   , peRuntime ∷ !LuaRuntime
   , peOutput ∷ !Output
+  , peProfile ∷ !Profile
+  -- ^ The validated profile the composition, the pipeline and the facade were all built from.
   , peTakes ∷ !(TVar Bool)
   -- ^ Whether the fake session still takes new work for the VM: the admission an input read is gated on in its own transaction.
   }
@@ -123,14 +127,18 @@ withPeersHooked = withPeersConfigured Fake.defaultFakeConfig
 
 -- | The same with the given configuration of the texture owner's fake: the stages it holds from the start.
 withPeersConfigured ∷ Fake.FakeConfig → ProviderHooks → WF.FakeConfig → ByteString → Int → (Peers → IO a) → IO a
-withPeersConfigured = withPeersFull Nothing
+withPeersConfigured = withPeersFull compositionProfile Nothing
+
+-- | The same with a smaller validated profile, in place of the fixed one, for an example that needs a bank full at a few textures.
+withPeersProfiled ∷ Profile → Fake.FakeConfig → ByteString → (Peers → IO a) → IO a
+withPeersProfiled profile fakeConfig entry = withPeersFull profile Nothing fakeConfig noProviderHooks WF.defaultFakeConfig entry 8
 
 -- | The same composition with the window integration's input injected from this host, and nothing else changed.
 withPeersInput ∷ InputHost → ByteString → (Peers → IO a) → IO a
-withPeersInput host entry = withPeersFull (Just host) Fake.defaultFakeConfig noProviderHooks WF.defaultFakeConfig entry defaultIssuedMemory
+withPeersInput host entry = withPeersFull compositionProfile (Just host) Fake.defaultFakeConfig noProviderHooks WF.defaultFakeConfig entry defaultIssuedMemory
 
-withPeersFull ∷ Maybe InputHost → Fake.FakeConfig → ProviderHooks → WF.FakeConfig → ByteString → Int → (Peers → IO a) → IO a
-withPeersFull inputHost fakeConfig hooks windowConfig entry issuedMemory body = bounded . withRig fakeConfig $ \rig → do
+withPeersFull ∷ Profile → Maybe InputHost → Fake.FakeConfig → ProviderHooks → WF.FakeConfig → ByteString → Int → (Peers → IO a) → IO a
+withPeersFull profile inputHost fakeConfig hooks windowConfig entry issuedMemory body = bounded . withRig fakeConfig $ \rig → do
   let fake = rigFake rig
   model ← newModel (fakeLedger fake)
   setBarrier fake (modelCapture model)
@@ -149,15 +157,14 @@ withPeersFull inputHost fakeConfig hooks windowConfig entry issuedMemory body = 
         , ("data.bin", "dd")
         , ("early.bin", "ee")
         ]
-  withComposition compositionProfile files (rigPort rig) $ \composition control runtime →
+  withComposition profile files (rigPort rig) $ \composition control runtime →
     withWindowProviderWith hooks config (retarget (WF.fakePort windows)) $ \provider →
       -- The main-thread steps are served for the whole scope, retirement and the windows' teardown included (#599): they are what
       -- those exits may wait for, so the loop's scope encloses them and the loop is ended and joined after them.
       mainLoop provider $
       ( do
           let publisher = scenePublisherOver textures provider (\window scene → fst (modelTarget model window) scene) (\window → snd (modelTarget model window))
-              injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks issuedMemory inputHost)
-              profile = compositionProfile
+              injection = graphicsInjection (GraphicsFacade profile (cpPipeline composition) provider publisher noPublishHooks issuedMemory inputHost)
               inventory = cpInventory composition
           handles ← newRequestHandles
           requests ← either (\refused → assertFailure ("the request policy was refused: " <> show refused)) pure (m1Requests profile handles)
@@ -223,6 +230,7 @@ withPeersFull inputHost fakeConfig hooks windowConfig entry issuedMemory body = 
                     , scheduledRequestHandles = Just handles
                     , scheduledLending = Just (gsLending services)
                     , scheduledLeases = Just (gsLeases services)
+                    , scheduledMemberLimit = max defaultMemberLimit (8 * gsLeaseCapacity services)
                     , scheduledRequests = Just (RequestGrant (facadeRequestEndpoints facade) 64 SettleOnArrival)
                     , scheduledLoader = Just (coordinatorPlan coordinator)
                     , scheduledClock = monotonicSource
@@ -246,7 +254,7 @@ withPeersFull inputHost fakeConfig hooks windowConfig entry issuedMemory body = 
                   admitBehaviorInstance (scheduledEndpoint owner) request >>= \case
                     InstanceAccepted identity ticket → pure (Spawned (declaredId declared) identity ticket)
                     other → assertFailure ("expected the instance accepted, found " <> take 100 (show other))
-            ( body (Peers facade owner model provider out signal admit fake windows composition control runtime output takes)
+            ( body (Peers facade owner model provider out signal admit fake windows composition control runtime output profile takes)
                 -- (however the body ended, the host model lets go of every adoption first, so that the instances' textures can retire)
                 `finally` (openEveryHold fake >> releaseAllReads composition >> dissolve model >> WF.releaseAll windows >> retireAndAwait control owner)
               )
@@ -343,7 +351,7 @@ data Logical = Logical
 withLogical ∷ Peers → (Logical → IO a) → IO a
 withLogical peers body = do
   let composition = peComposition peers
-      profile = compositionProfile
+      profile = peProfile peers
       inventory = cpInventory composition
   handles ← newRequestHandles
   requests ← either (\refused → assertFailure ("the request policy was refused: " <> show refused)) pure (m1Requests profile handles)

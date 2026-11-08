@@ -40,6 +40,11 @@ module Hetoimasia.LuaEngine.Profile.Limits
     -- * Derived values
   , rgba8BytesPerPixel
   , pngOutputBytes
+  , textureMinimumChargeBytes
+  , textureChargeBytes
+  , textureReservationBytes
+  , textureRoomPerInstance
+  , textureRoomPerSession
   , sceneElementBound
   , sceneFixedElements
   , sceneElementsPerSprite
@@ -123,9 +128,10 @@ data ByteLimit
   | PngPipelineWorkspaceBytes
     -- ^ Accounted CPU payload and workspace of one texture pipeline.
   | TextureBytesPerUiInstance
-    -- ^ Nominal RGBA8 bytes of the textures one UI instance holds.
+    -- ^ Nominal bytes of the textures one UI instance holds, pending, live and retiring. The /only/ bound on how
+    -- much one instance may hold: there is no count of textures (see 'textureMinimumChargeBytes').
   | TextureBytesPerSession
-    -- ^ Nominal RGBA8 bytes of the textures the session holds.
+    -- ^ Nominal bytes of the textures the session holds, in the same sense.
   | WindowTitleBytes
     -- ^ A window title, in UTF-8.
   | NativeAccountedBytes
@@ -172,8 +178,6 @@ data CountLimit
     -- ^ A PNG axis, in texels; the minimum is 1.
   | PngPixels
     -- ^ Pixels of a PNG.
-  | TextureLeasesPerUiInstance
-    -- ^ Pending, live and retiring textures of one UI instance.
   | WindowSlotsPerUiInstance
     -- ^ Pending, live and retiring windows of one UI instance.
   | WindowExtentMaximum
@@ -327,3 +331,49 @@ pngOutputBytes ∷ Profile → Bytes
 pngOutputBytes profile = Bytes (rgba8BytesPerPixel * pixels)
   where
     Count pixels = countLimit profile PngPixels
+
+-- | The least a texture is charged, in the instance's byte bank and the session's, from its admission until its
+-- proven retirement, however few bytes it decodes to: 4 KiB (4,096 bytes).
+--
+-- __Owner decision (2026-11-08).__ Texture admission is bounded by memory only: "drop the count, the number is
+-- arbitrary in a bindless system, set the limit on memory" (D-1 of the GPU resource services design: every texture is an
+-- atlas and a single image is a 1x1 atlas, so a count says nothing about what a texture costs). The byte limits are
+-- 'TextureBytesPerUiInstance' (512 MiB) and 'TextureBytesPerSession' (1 GiB), the manager's choice under the owner's
+-- delegation of the value: a large zoom-out on a laptop with unified memory needs hundreds of MiB for one instance, and
+-- the session total stays within half of the 2 GiB native accounting.
+--
+-- __Why a minimum charge.__ The least a texture can decode to is one RGBA8 pixel, four bytes. Under bytes alone a
+-- gigabyte would then admit 268,435,456 one-pixel textures, far more than any device's descriptor array holds (MoltenVK
+-- reports 1,000,000 update-after-bind sampled images), and a full descriptor table could bind before bytes did,
+-- leaving accepted work retained with no refusal at all. Charging every texture at least this much makes the byte banks
+-- the first bound that answers: a bank of @n@ bytes holds at most @n `div` 4096@ textures, so every structural capacity
+-- that holds textures (the native table, the facade's lease scope) is /derived/ from the byte limits and this figure
+-- ('textureRoomPerSession', 'textureRoomPerInstance') and can never refuse before the banks do. The figure is an accounting
+-- floor chosen by the manager (decision A of issue 672), not a measurement of any device's allocation.
+textureMinimumChargeBytes ∷ Word64
+textureMinimumChargeBytes = 4096
+
+-- | What a texture of this many decoded bytes is charged: its size, or the minimum charge if that is more.
+textureChargeBytes ∷ Word64 → Word64
+textureChargeBytes = max textureMinimumChargeBytes
+
+-- | What admission reserves in both byte banks before the decode shrinks it: the largest legal level, or the minimum
+-- charge if the profile's level is smaller than that.
+textureReservationBytes ∷ Profile → Bytes
+textureReservationBytes profile = Bytes (textureChargeBytes out)
+  where
+    Bytes out = pngOutputBytes profile
+
+-- | The most textures the instance's byte bank can hold at once, given the minimum charge: a consequence of the bank,
+-- not a limit beside it. The facade's lease scope is sized from it.
+textureRoomPerInstance ∷ Profile → Word64
+textureRoomPerInstance profile = bytes `div` textureMinimumChargeBytes
+  where
+    Bytes bytes = bytesLimit profile TextureBytesPerUiInstance
+
+-- | The most textures the session's byte bank can hold at once, given the minimum charge: a consequence of the bank,
+-- not a limit beside it. The native texture table (without its placeholder slot) is sized from it.
+textureRoomPerSession ∷ Profile → Word64
+textureRoomPerSession profile = bytes `div` textureMinimumChargeBytes
+  where
+    Bytes bytes = bytesLimit profile TextureBytesPerSession

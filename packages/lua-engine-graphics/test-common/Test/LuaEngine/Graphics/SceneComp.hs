@@ -97,6 +97,7 @@ import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
+import Hetoimasia.LuaEngine.Graphics.Facade (facadeLeaseCapacity)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.HUnit.Lang (assertFailure)
@@ -184,7 +185,9 @@ startSceneVmWith limits' comp runtime label = do
   textureService' ← either (\refused → assertFailure ("the texture service was refused: " <> show refused)) pure (textureService requests (cpPipeline (scTexture comp)))
   let windowService' = windowService requests (scProvider comp)
   lending ← newLending
-  leases ← newLeases lending 16
+  let capacity = facadeLeaseCapacity compositionProfile
+  -- the lease scope's capacity is the production derivation from the profile's byte limits, not a ceiling of the test's own
+  leases ← newLeases lending capacity
   textureOwners ← newIORef Map.empty
   windowOwners ← newIORef Map.empty
   gates ← newTVarIO (Gates [] [] [] [] False)
@@ -219,6 +222,7 @@ startSceneVmWith limits' comp runtime label = do
           { scheduledInstances = Just (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8, instanceSources = [commandSource]})
           , scheduledLending = Just lending
           , scheduledLeases = Just leases
+          , scheduledMemberLimit = max defaultMemberLimit (8 * capacity)
           , scheduledRequestHandles = Just handles
           , scheduledRequests = Just grant
           }

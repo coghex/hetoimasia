@@ -146,6 +146,7 @@ injectionOpt withInput gx = GraphicsInjection $ \vm → do
     GraphicsServices
       { gsLending = lending
       , gsLeases = leases
+      , gsLeaseCapacity = 17
       , gsTypes = [leaseCapabilityType leases graphicsTextureType, leaseCapabilityType leases graphicsWindowType]
       , gsEndpoints = [endpointOf "texture" (SRecord [("width", SInteger), ("height", SInteger)]), endpointOf "window" SNil]
       , gsDeclare = \identity → note gx ("declare " <> identity)

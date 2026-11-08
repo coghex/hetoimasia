@@ -64,8 +64,10 @@ fixedBytes limit = case limit of
   PngEncodedBytes → mib 32
   PngInflatedScanlineBytes → mib 40
   PngPipelineWorkspaceBytes → mib 128
-  TextureBytesPerUiInstance → mib 128
-  TextureBytesPerSession → mib 256
+  -- The only bound on how many textures there are: memory (owner decision 2026-11-08, see
+  -- 'textureMinimumChargeBytes' for the decision, the values' rationale and the minimum charge per texture).
+  TextureBytesPerUiInstance → mib 512
+  TextureBytesPerSession → gib 1
   WindowTitleBytes → Bytes 512
   NativeAccountedBytes → gib 2
 
@@ -91,7 +93,6 @@ fixedCount limit = Count $ case limit of
   PngChunks → 4096
   PngAxisMaximum → 2048
   PngPixels → 4194304
-  TextureLeasesPerUiInstance → 16
   WindowSlotsPerUiInstance → 1
   WindowExtentMaximum → 4096
   CoordinateMagnitude → 1000000

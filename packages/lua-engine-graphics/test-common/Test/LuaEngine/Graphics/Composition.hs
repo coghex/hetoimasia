@@ -98,6 +98,7 @@ import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime, newLuaRuntime)
+import Hetoimasia.LuaEngine.Graphics.Facade (facadeLeaseCapacity)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Data.Time.Calendar (fromGregorian)
@@ -237,7 +238,9 @@ startVm composition runtime label = do
   requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests compositionProfile handles)
   service ← either (\refused → assertFailure ("the service was refused: " <> show refused)) pure (textureService requests (cpPipeline composition))
   lending ← newLending
-  leases ← newLeases lending 16
+  let capacity = facadeLeaseCapacity compositionProfile
+  -- the lease scope's capacity is the production derivation from the profile's byte limits, not a ceiling of the test's own
+  leases ← newLeases lending capacity
   owners ← newIORef Map.empty
   retained ← newIORef Map.empty
   let vm' = Vm (error "owner not started") service leases owners retained
@@ -262,6 +265,7 @@ startVm composition runtime label = do
           { scheduledInstances = Just (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8, instanceSources = [commandSource]})
           , scheduledLending = Just lending
           , scheduledLeases = Just leases
+          , scheduledMemberLimit = max defaultMemberLimit (8 * capacity)
           , scheduledRequestHandles = Just handles
           , scheduledRequests = Just grant
           }
