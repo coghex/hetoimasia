@@ -589,31 +589,42 @@ spec = describe "Accounting and lifetime hardening" $ do
       readIORef committedAfter >>= \c → c `shouldSatisfy` maybe False (<= 3)
       settleChecks svc
 
-  it "dispatches a queued load while a producer keeps cancelling and replacing reads, with a view registered" $ do
-    withService defaultConfig $ \svc → do
+  it "dispatches a queued load while every preparation is followed by a cancellation and a replacement, with a view registered" $ do
+    -- The stream is driven by the owner's own progress: at each preparation a read is
+    -- replaced by another, so the retry flag is set again before every next choice.
+    stream <- newIORef (Nothing ∷ Maybe (Service, ArenaLease, Host))
+    previous <- newIORef (Nothing ∷ Maybe Request)
+    steps <- newIORef (0 ∷ Int)
+    settledAt <- newIORef (Nothing ∷ Maybe Int)
+    let probe = Probe $ \point → case point of
+          PointCaptured {} → readIORef stream >>= \case
+            Nothing → pure ()
+            Just (svc, hot, _) → do
+              n <- readIORef steps
+              when (n < 60) $ do
+                writeIORef steps (n + 1)
+                host <- newHost True
+                fresh <- cellWith svc (hostEndpoint svc Nothing host) hot (tile 1 1 1)
+                old <- readIORef previous
+                forM_ old (void . cancel svc)
+                writeIORef previous (either (const Nothing) Just fresh)
+          PointJob {} → readIORef steps >>= \n → modifyIORef' settledAt (Just . maybe n id)
+          _ → pure ()
+    withServiceUsing defaultConfig alwaysAdmitting probe $ \svc → do
       (client, hot) <- openMain svc "hot"
       cold <- okOf (openArena svc client "cold" soilOverStone) >>= await svc >>= expectSuccess
       _ <- okOf (openView svc client)
       _ <- readCell svc hot (tile 1 1 1)
       coldHost <- newHost True
-      stop <- newTVarIO False
-      let produce previous = do
-            stopped <- readTVarIO stop
-            if stopped
-              then pure ()
-              else do
-                host <- newHost True
-                fresh <- cellWith svc (hostEndpoint svc Nothing host) hot (tile 1 1 1)
-                forM_ previous (void . cancel svc)
-                yield
-                produce (either (const Nothing) Just fresh)
-      withOwnedThread (produce Nothing) $ \_ stopProducer → do
-        _ <- okOf (cellWith svc (hostEndpoint svc Nothing coldHost) cold (tile 0 0 0))
-        -- The cold query needs a load; it is served while the stream is still running.
-        waitFor (readTVar (hostSettled coldHost) >>= \x → check (not (null x)))
-        atomically (writeTVar stop True)
-        stopProducer
-      settledOf coldHost >>= \x → x `shouldSatisfy` \case [Succeeded _] → True; _ → False
+      writeIORef stream (Just (svc, hot, coldHost))
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing coldHost) cold (tile 0 0 0))
+      -- Start the stream with one read; every preparation then sustains it.
+      starter <- newHost True
+      _ <- okOf (cellWith svc (hostEndpoint svc Nothing starter) hot (tile 1 1 1))
+      waitFor (readTVar (hostSettled coldHost) >>= \x → check (not (null x)))
+      -- The load ran within a few preparations of being queued, however long the stream.
+      readIORef settledAt >>= \n → n `shouldSatisfy` maybe False (<= 8)
+      settleChecks svc
 
   it "serves an eligible staged commit while a producer keeps cancelling and replacing cache-hit reads" $ do
     gate <- newDisarmedGate
