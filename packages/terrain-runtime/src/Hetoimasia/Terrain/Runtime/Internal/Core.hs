@@ -276,7 +276,7 @@ admit svc ep sub =
                   names = case insClaim ins of
                     Nothing → stateNames st
                     Just name → Map.insert name (ClaimPending (RequestId rid)) (stateNames st)
-              writeTVar (serviceState svc) st {stateNextRequest = rid + 1, stateNextSeq = stateNextSeq st + 1, stateRequests = Map.insert (RequestId rid) req (stateRequests st), stateNames = names}
+              writeTVar (serviceState svc) st {stateNextRequest = rid + 1, stateNextSeq = stateNextSeq st + 1, stateRequests = Map.insert (RequestId rid) req (stateRequests st), stateNames = names, stateDispatchIdle = False}
               pure (Right request)
 
 decide ∷ Service → St → RequestId → Submission → STM (Either Short Insertion)
@@ -412,6 +412,7 @@ closeArena svc aid = do
             Just (ClaimLive claimed) | claimed == aid → Map.delete (arenaName arena) (stateNames cur)
             _ → stateNames cur
         , stateLeases = foldr (Map.adjust (\l → l {leaseLive = False})) (stateLeases cur) (Set.toList (arenaLeases arena))
+        , stateTransfers = Map.filterWithKey (\(owner, _) _ → owner /= aid) (stateTransfers cur)
         }
     () <$ applyEvent svc (R.RetireArena aid)
 
@@ -503,6 +504,7 @@ setViewDemandSTM svc (View tag vid) lease demands =
             | not (leaseLive ls) → pure (Left RefusedAuthority)
             | otherwise → do
                 outcome <- applyEvent svc (R.SetCameraDemand vid (leaseArena ls) demands)
+                modifySt svc (\cur → cur {stateDispatchIdle = False})
                 pure $ case outcome of
                   Right report → Right (fromMaybe (DemandReceipt [] [] [] [] []) (receipt (R.reportDecision report)))
                   Left refusal → Left (either id (const RefusedAuthority) (shortRefused refusal))

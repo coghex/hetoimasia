@@ -238,6 +238,7 @@ releaseVictim svc key@(aid, region) = do
             _ → stateVictims st
         , stateArenas = Map.adjust discard aid (stateArenas st)
         , stateRetiring = Map.adjust discard aid (stateRetiring st)
+        , stateTransfers = Map.delete key (stateTransfers st)
         }
     void (applyEvent svc (R.VictimReleased aid region))
     markFreed svc
@@ -279,7 +280,8 @@ handoff svc aid region = do
         Right () → do
           modifySt svc $ \s →
             s
-              { stateArenas =
+              { stateTransfers = Map.delete (aid, region) (stateTransfers s)
+              , stateArenas =
                   Map.adjust
                     (\a → a {arenaStore = maybe (arenaStore a) (mergeChanges (arenaStore a)) working, arenaWorking = Map.delete region (arenaWorking a)})
                     aid

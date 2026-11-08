@@ -3,7 +3,7 @@
 -- while a borrower is still using the service.
 module Test.TerrainRuntime.Lifecycle (spec) where
 
-import Control.Concurrent (killThread)
+import Control.Concurrent (killThread, yield)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), throwIO, try)
@@ -99,6 +99,7 @@ spec = describe "Lifecycle" $ do
     let note e = modifyMVar_ events (pure . (e :))
     boxed <- newEmptyMVar
     holding <- newEmptyMVar
+    bodyDone <- newEmptyMVar
     release <- newEmptyMVar
     returned <- newEmptyMVar
     let served = do
@@ -108,6 +109,7 @@ spec = describe "Lifecycle" $ do
             putMVar boxed (svc, lease)
             bounded (readMVar holding)
             note "body done"
+            putMVar bodyDone svc
           note "service returned"
           putMVar returned ()
         borrower = do
@@ -120,14 +122,17 @@ spec = describe "Lifecycle" $ do
           pure ()
     withOwnedThread served $ \_ waitServed →
       withOwnedThread borrower $ \_ waitBorrower → do
-        bounded (readMVar holding)
-        -- The body has finished or is finishing, but the service cannot return
-        -- while the borrow is outstanding.
-        bounded (tryReadMVar returned) `shouldReturn` Nothing
+        svc <- bounded (readMVar bodyDone)
+        -- The body has finished and the service is closing: admission is closed.
+        let closed = registerClient svc >>= \r → case r of
+              Left RefusedClosed → pure ()
+              Left other → fail ("unexpected refusal " <> show other)
+              Right client → endClient svc client >> yield >> closed
+        bounded closed
+        -- Closing cannot finish while the borrow is outstanding.
+        tryReadMVar returned `shouldReturn` Nothing
         putMVar release ()
         bounded waitBorrower
         bounded waitServed
-    -- The body finished while the borrow was outstanding; the borrow ended before
-    -- the service returned.
     chronological <- reverse <$> readMVar events
     chronological `shouldBe` ["body done", "borrow finished", "service returned"]
