@@ -72,6 +72,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Fixtures
         Test.TerrainRuntime.Offload
         Test.TerrainRuntime.Races
+        Test.TerrainRuntime.Revalidation
         Test.TerrainRuntime.Spec
     build-depends:
         base >=4.22 && <4.23,
