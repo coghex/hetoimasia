@@ -18,6 +18,7 @@ import System.Mem (performMajorGC)
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Hetoimasia.Terrain.Cell (Column (..), mkColumn)
+import Hetoimasia.Terrain.Connectivity (componentOf, defaultConnectivityLimits)
 import Hetoimasia.Terrain.Changes (ChangeLimits (..), changesFromIntervals, removedIntervals)
 import Hetoimasia.Terrain.Coordinate (TileCoord, axisFromInteger)
 import Hetoimasia.Terrain.Discovery
@@ -25,7 +26,7 @@ import Hetoimasia.Terrain.Query (cellAt)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
 import Test.Hspec
-import Test.Terrain.ConnectivityFixtures (R, below, runR)
+import Test.Terrain.ConnectivityFixtures (R, below, mustCompile, runR)
 import Test.Terrain.ConnectivityOracle (Cell3, Window (..))
 import Test.Terrain.DiscoveryHarness
 import Test.Terrain.Model (highest, lowest, mustSource, mustTile, topEnd)
@@ -580,6 +581,11 @@ familySpecs = describe "huge families" $ do
     case reports of
       [small, large] → small `shouldBe` large
       _ → expectationFailure "two spans expected"
+  it "looks up a known component's compressed boundary without enumerating tiles" $ do
+    sizes ← mapM boundaryOf spans
+    case sizes of
+      [small, large] → small `shouldBe` large
+      _ → expectationFailure "two spans expected"
   it "keeps a bounded working window while the retained history grows" $ do
     let base = newRig (limitsWith 64) (rampFamily (2 ^ (60 ∷ Int)))
         with n = base {rigRetained = historyOf n}
@@ -603,6 +609,26 @@ familySpecs = describe "huge families" $ do
   where
     sceneTop rig = case sceneSky (rigScene rig) of Just w → w; Nothing → 0
     reportCost r = (reportReads r, reportWrites r, reportDeltaBytes r)
+    -- the sizes of the boundary descriptions of a known and of an unknown
+    -- component, and whether each is reported known.
+    boundaryOf w = do
+      let rig = newRig (limitsWith 64) (rampFamily w)
+          compiledFor = fst (mustCompile defaultConnectivityLimits (sceneSpec (rampFamily w)))
+          keyAt' c = componentOf compiledFor (mustTile3 c)
+          provider = rigProvider rig
+          boundary key = observedValue (queryKnownBoundary (rigEnv rig) provider key)
+          known key = observedValue (queryComponentKnown (rigEnv rig) provider key)
+      case (keyAt' (1, 1, w - 1), keyAt' (1, 3, w - 2)) of
+        (Just topRow, Just lowerRow) → do
+          known topRow `shouldBe` Right True
+          known lowerRow `shouldBe` Right False
+          boundary lowerRow `shouldBe` Right Nothing
+          case boundary topRow of
+            Right (Just faces) → do
+              faces `shouldSatisfy` (not . null)
+              pure (length faces)
+            other → expectationFailure ("expected a boundary, got " <> show other) >> pure 0
+        other → expectationFailure ("components expected, got " <> show other) >> pure 0
     runFamily w = do
       let rig = newRig (limitsWith 64) (rampFamily w)
           events = [Edit c | c ← familyEdits w] <> [Drain fullAllowance]
