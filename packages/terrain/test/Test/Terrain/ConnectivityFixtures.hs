@@ -168,14 +168,17 @@ sealedRoom name (ox, oy, oz) (w, d, h) def seed =
     columns = [(x, y) | x ← [ox .. ox + toInteger w - 1], y ← [oy .. oy + toInteger d - 1]]
     interior = runR (randomPatches columns (oz - 2) (oz + toInteger h + 2)) seed
 
--- | A covered world with a core of patches and no side ring.
-coveredOpen ∷ String → (Integer, Integer, Integer) → (Int, Int, Int) → Maybe Int → Int → Case
-coveredOpen name (ox, oy, oz) (w, d, h) def seed =
+-- | A covered world with a core of patches and no side ring. The compared cells
+-- reach @margin@ cells past the core on every side, and the window one more, so
+-- the bulk boxes of a default family (rows, columns, levels) beyond the core are
+-- compared as well as the boxes the patches cut.
+coveredOpen ∷ String → Integer → (Integer, Integer, Integer) → (Int, Int, Int) → Maybe Int → Int → Case
+coveredOpen name margin (ox, oy, oz) (w, d, h) def seed =
   Case
     { caseName = name
     , caseSpec = SourceSpec ["stone", "slab"] (layersFor def oz (oz + toInteger h)) interior
-    , caseWindow = Window (ox - 2, ox + toInteger w + 2) (oy - 2, oy + toInteger d + 2) (oz - 4, oz + toInteger h + 4)
-    , caseInner = \(x, y, _) → x >= ox - 1 && x < ox + toInteger w + 1 && y >= oy - 1 && y < oy + toInteger d + 1
+    , caseWindow = Window (ox - margin - 1, ox + toInteger w + margin + 1) (oy - margin - 1, oy + toInteger d + margin + 1) (oz - 4, oz + toInteger h + 4)
+    , caseInner = \(x, y, _) → x >= ox - margin && x < ox + toInteger w + margin && y >= oy - margin && y < oy + toInteger d + margin
     }
   where
     columns = [(x, y) | x ← [ox .. ox + toInteger w - 1], y ← [oy .. oy + toInteger d - 1]]

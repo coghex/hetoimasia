@@ -222,7 +222,11 @@ spec = describe "Source connectivity" $ do
     forM_ (zip [0 ∷ Int ..] kinds) $ \(i, def) →
       it ("agrees on covered open worlds of default kind " <> maybe "air" show def) $
         forM_ [1 .. 3] $ \s →
-          agrees (coveredOpen ("open " <> show i) (ox s, oy s, oz s) (4, 3, 3) def (7000 + 100 * i + s))
+          agrees (coveredOpen ("open " <> show i) 1 (ox s, oy s, oz s) (4, 3, 3) def (7000 + 100 * i + s))
+    forM_ (zip [0 ∷ Int ..] kinds) $ \(i, def) →
+      it ("agrees on the bulk family boxes around a core of patches, default kind " <> maybe "air" show def) $
+        forM_ [1 .. 2] $ \s →
+          agrees (coveredOpen ("wide " <> show i) 6 (ox s, oy s, oz s) (3, 2, 3) def (9000 + 100 * i + s))
     forM_ [1 .. 12] $ \s →
       it ("agrees on an open-top world, seed " <> show s) $
         agrees (openTop ("top " <> show s) (ox s, oy s) (4, 3, 2) (1 + s `mod` 3) (900 + s))
