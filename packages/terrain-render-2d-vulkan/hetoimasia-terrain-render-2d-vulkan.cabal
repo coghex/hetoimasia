@@ -1,0 +1,81 @@
+cabal-version: 3.16
+name: hetoimasia-terrain-render-2d-vulkan
+version: 0.1.0.0
+synopsis: The terrain arena's application material for the 2D renderer's Vulkan recorder
+description:
+    TRA-8's Vulkan-dependent half: the terrain material, defined at build time
+    through the 2D renderer's checked material splice and registered by the
+    caller. It adapts the plan of faces that the pure terrain-render-2d package
+    makes (a quad and a coverage mask for each) through the existing fixed-quad
+    and material ABI: a record of the art sheet and the face's art map and mask,
+    a fragment function that samples the sheet and covers the quad by the mask,
+    and no new descriptor binding, instance format, depth output or vertex
+    stage. It is selected only by `cabal.project.vulkan`, so the ordinary and
+    CPU projects neither resolve the Vulkan binding nor link a loader, and only
+    `tools/vulkan/run.sh` builds it. It creates no service, window publisher,
+    global registry or live shader loader.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+-- The shader toolchain fingerprint every splice here checks and registers,
+-- which `tools/vulkan/run.sh` generates at `shaders/toolchain.fingerprint`
+-- before every build and removes afterwards; see
+-- packages/gpu-vulkan/native/README.md.
+extra-source-files:
+    **/*.fingerprint
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/terrain-render-2d-vulkan
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Terrain.Render2D.Vulkan.Material
+    other-modules:
+        Hetoimasia.Terrain.Render2D.Vulkan.Source
+    build-depends:
+        base >=4.22 && <4.23,
+        template-haskell >=2.24 && <2.25,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-vulkan ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0
+
+-- The material's device-free contracts, registered with the group
+-- `test.vulkan-headless`: its declaration against the pure record layout,
+-- registration through a stand-in native layer and the conversion of an adapted
+-- plan's records into the bytes the renderer writes. None creates a device.
+test-suite terrain-render-2d-vulkan-tests
+    import: language
+    type: exitcode-stdio-1.0
+    ghc-options: -threaded -rtsopts
+    hs-source-dirs: test
+    main-is: Main.hs
+    other-modules:
+        Test.Terrain.Render2D.Vulkan.Material
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        hspec >=2.11 && <3,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-vulkan ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-render-2d ==0.1.0.0,
+        hetoimasia-terrain-render-2d-vulkan,
+        hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0

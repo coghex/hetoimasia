@@ -232,6 +232,12 @@ integrationPackage = "packages/gpu-vulkan/glfw"
 render2dVulkanPackage ∷ String
 render2dVulkanPackage = "packages/render-2d-vulkan"
 
+-- | The terrain material for that recorder (TRA-8). It too resolves the binding
+-- through the recorder, so only the Vulkan project may name it; the pure terrain
+-- packages it needs are listed beside it as its local closure.
+terrainRender2dVulkanPackage ∷ String
+terrainRender2dVulkanPackage = "packages/terrain-render-2d-vulkan"
+
 -- | The GLFW package. The ordinary projects list it with its Vulkan interop
 -- component switched off; the Vulkan project lists it with that component on.
 glfwPackage ∷ String
@@ -275,6 +281,7 @@ vulkanProject =
   , nativePackage
   , integrationPackage
   , render2dVulkanPackage
+  , terrainRender2dVulkanPackage
   ]
     <> samplePackages
     <> [ glfwPackage
@@ -288,6 +295,8 @@ vulkanProject =
        , "packages/render-api"
        , "packages/render-2d"
        , "packages/render-2d-oracle"
+       , "packages/terrain"
+       , "packages/terrain-render-2d"
        , "tools/test-support"
        , luaEngineGraphicsPackage
        , "packages/lua-engine"
@@ -443,6 +452,7 @@ spec = describe "The Vulkan project boundary" $ do
                  , "hetoimasia-sample-image2d:test:image2d-tests"
                  , "hetoimasia-sample-scene3d:test:scene3d-tests"
                  , "hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests"
+                 , "hetoimasia-terrain-render-2d-vulkan:test:terrain-render-2d-vulkan-tests"
                  , "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests"
                  , "hetoimasia:test:hetoimasia-tests"
                  ]

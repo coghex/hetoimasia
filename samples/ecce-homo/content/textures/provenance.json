@@ -1,0 +1,35 @@
+{
+  "schema": "hetoimasia.provenance/1",
+  "purpose": "The approved loam and granite artwork for the terrain arena (epic #636, TRA-8), copied byte for byte from Synarchy. Authored content for the later arena assembly; no engine library names it and nothing reads it at run time from Synarchy.",
+  "source": {
+    "repository": "Synarchy (the owner's local checkout, ~/work/synarchy; no runtime or build dependency on it)",
+    "revision": "3777d437ea00e1302bf55162ad5693fee4879187"
+  },
+  "assets": [
+    {
+      "name": "loam",
+      "sourcePath": "assets/textures/world/loam/loam.png",
+      "destination": "samples/ecce-homo/content/textures/loam.png",
+      "width": 96,
+      "height": 64,
+      "sha256": "f449a06bc3aa76fdf56607c4e4d23ac1cc8c1a67245b8ae5b295dbff621105e1",
+      "synarchyMaterialReference": "mat_tile_56",
+      "treatment": "colour data, sRGB; binary alpha (0 or 255)"
+    },
+    {
+      "name": "granite",
+      "sourcePath": "assets/textures/world/granite/granite.png",
+      "destination": "samples/ecce-homo/content/textures/granite.png",
+      "width": 96,
+      "height": 64,
+      "sha256": "776a28d3ee45f656ee8f024444c0f2529b4d176da455902e4ac9bfb329d79d1c",
+      "synarchyMaterialReference": "mat_tile_1",
+      "treatment": "colour data, sRGB; binary alpha (0 or 255)"
+    }
+  ],
+  "mapping": "Synarchy refers to these as mat_tile_56 (loam) and mat_tile_1 (granite) in scripts/test_arena.lua:117-133. Those references are recorded here only; they are not packed terrain palette indices and no engine constant. The authored material names are loam and granite.",
+  "referenceSilhouettes": {
+    "revision": "3777d437ea00e1302bf55162ad5693fee4879187",
+    "catalog": "src/World/Render/Textures.hs:23-57 maps the 16 world shape identities to the isoface / isoface_slope_* face-map images under assets/textures/facemap/. They are reference evidence for the silhouettes only; the shared solid geometry of hetoimasia-terrain and the TRA-7 coverage are authoritative. No face-map image is retained in this repository."
+  }
+}
