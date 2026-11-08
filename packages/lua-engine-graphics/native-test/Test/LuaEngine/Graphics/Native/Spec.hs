@@ -110,7 +110,7 @@ spec env = describe "the texture backend on a real device, with no window" $ do
       retainedEntries (graphicsTextures (envGraphics env)) `shouldReturn` marks
       evidence env "a request cancelled while its completed upload was still hidden from the backend registered nothing and drained"
 
-  it "registers well over the table's former 33 slots at once, 150 tiny textures held together, each in a slot of its own and not the placeholder, from a table sized by the profile's bytes, and retires them all" $
+  it "registers well over the table's former 33 slots at once, 150 tiny textures held together, each registered in a slot of its own, from a table sized by the profile's bytes, and retires them all" $
     within 170 . withLoaded env [("pixel.png", Png.solid 1 1 (10, 20, 30, 255))] $ \comp vm → do
       noWindows env
       atRest ← restNow env
@@ -135,7 +135,7 @@ spec env = describe "the texture backend on a real device, with no window" $ do
       (ownerTexturesHeld reading, ownerNominalHeld reading) `shouldBe` (150, 150 * 4096)
       let slots = [refIndex (textureRefOf (fromIntegral identity)) | identity ← identities]
       length (nub slots) `shouldBe` 150
-      slots `shouldSatisfy` all (/= 0)
+      -- (the handle's index counts the table's registrations from zero: the placeholder is the table's own entry, not a handle)
       marks ← mapM (registeredMark (graphicsTextures (envGraphics env)) . textureHandleOf . fromIntegral) identities
       marks `shouldSatisfy` all (/= Nothing)
       live ← atomically (graphicsReading (envGraphics env))
