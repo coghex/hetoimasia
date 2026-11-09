@@ -109,6 +109,8 @@ judgeMutated h tok ref keys page offset newByte mutated = do
       allowed = if isLeaf then Set.fromList (keysOf original ++ keysOf mutated) else Set.empty
   -- lookups of a spread of keys, floors, and the full scan
   let firstKey = case keys of (k : _) → k; [] → KeyTodo 0
+      -- the keys of the first leaves, where the first separators of the internal pages sit
+      nearBoundaries = [keys !! i | i ← [0, 7 .. 260], i < length keys]
       sample = [keys !! ((offset * 31 + i * 197) `mod` length keys) | i ← [0 .. 39]] ++ Set.toList allowed
       judgeLookup k = case through h disk' tok (\w → readerLookup (hStore h) tok w k) of
         Left _ → []
@@ -177,7 +179,7 @@ judgeMutated h tok ref keys page offset newByte mutated = do
               missing = [k | k ← Map.keys ref, not (Set.member k allowed), Map.lookup k gotMap /= Map.lookup k ref]
               extra = [k | k ← Map.keys gotMap, not (Set.member k allowed), not (Map.member k ref)]
            in ["scan: " <> show (length missing) <> " records absent or different, " <> show (length extra) <> " extra" | not (null missing && null extra)]
-  let findings = concatMap judgeLookup sample ++ concatMap judgeFloor (take 12 sample) ++ concatMap judgeCeil (take 16 sample) ++ concatMap judgeRange (take 10 sample) ++ judgeLive ++ judgeScan
+  let findings = concatMap judgeLookup sample ++ concatMap judgeFloor (take 12 sample) ++ concatMap judgeCeil nearBoundaries ++ concatMap judgeRange (every 3 nearBoundaries) ++ judgeLive ++ judgeScan
   Right [Finding page offset newByte f | f ← take 3 findings]
 
 spec ∷ Spec
