@@ -9,11 +9,13 @@ module Test.LuaEngine.Terrain.Races (spec) where
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Control.Exception (finally)
-import Control.Monad (void)
+import Control.Monad (void, when)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef)
+import Hetoimasia.Terrain.Coordinate (RegionCoord (..))
 import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
 import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
-import Hetoimasia.Terrain.Runtime (Point (PointCaptured, PointStaging))
+import Hetoimasia.Terrain.Runtime (Point (..), Probe (..))
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
@@ -124,30 +126,53 @@ cancelsUnprepared =
         ]
     }
 
--- | A gameplay instance: open (due tick 1) and read a cell (due tick 2, so that its region is resident); then, at tick 2, a column read over
--- three vertical regions (position 1 of tick 3, two of its regions not resident) and a removal of the warm cell (position 2).
+-- | A gameplay instance over two arenas: it warms a cell of the second at tick 1; at tick 3 it asks the first, whose region is not resident,
+-- for a removal (position 1 of tick 4), and then the second, whose cell is, for another (position 2).
 inverted ∷ Script
 inverted =
   script
     { scPrelude = terrainPrelude
-    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scInit = ["self.s = 0", "self.x = api.terrain.open('x', DEF)", "self.y = api.terrain.open('y', DEF)"]
     , scUpdate =
         [ "local tick = api.time.tick()"
         , "if self.s == 0 then"
-        , "  local t = settle(api, self.q)"
-        , "  if t then self.arena = t.value self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) self.s = 1 end"
+        , "  self.xa = self.xa or settle(api, self.x)"
+        , "  self.ya = self.ya or settle(api, self.y)"
+        , "  if self.xa and self.ya then self.w = api.terrain.cell(self.ya.value, {x = 0, y = 0, z = 0}) self.s = 1 end"
         , "elseif self.s == 1 then"
+        , "  local t = settle(api, self.w)"
+        , "  if t then print('warm at', tick) self.s = 2 end"
+        , "elseif self.s == 2 then"
+        , "  self.r1 = api.terrain.remove(self.xa.value, {x = 0, y = 0, z = 0})"
+        , "  self.r2 = api.terrain.remove(self.ya.value, {x = 0, y = 0, z = 0})"
+        , "  print('issued at', tick) self.s = 3"
+        , "elseif self.s == 3 then"
+        , "  local a, b = settle(api, self.r1), settle(api, self.r2)"
+        , "  print('r1 at', tick, a.status, a.value.changed, a.value.revision)"
+        , "  print('r2 at', tick, b.status, b.value.changed, b.value.revision)"
+        , "  self.s = 4"
+        , "end"
+        ]
+    }
+
+-- | A presentation instance that opens an arena of its own and, when the example says so, reads a cell of a region nobody has read and
+-- cancels the read on its next update.
+holder ∷ Script
+holder =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('z', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
         , "  local t = settle(api, self.q)"
         , "  if t then"
-        , "    self.k = api.terrain.column(self.arena, {x = 0, y = 0, z_min = -40, z_max = 70})"
-        , "    self.r = api.terrain.remove(self.arena, {x = 0, y = 0, z = 0})"
-        , "    print('issued at', tick) self.s = 2"
+        , "    self.z = t.value"
+        , "    TEST_WAIT('go')"
+        , "    self.e = api.terrain.cell(self.z, {x = 16, y = 0, z = 0})"
+        , "    print('E issued') self.s = 1"
         , "  end"
-        , "elseif self.s == 2 then"
-        , "  local k, r = settle(api, self.k), settle(api, self.r)"
-        , "  print('column at', tick, k.status, k.value.revision)"
-        , "  print('removal at', tick, r.status, r.value.changed, r.value.revision)"
-        , "  self.s = 3"
+        , "elseif self.s == 1 then"
+        , "  print('E cancel', api.request.cancel(self.e)) self.s = 2"
         , "end"
         ]
     }
@@ -224,18 +249,44 @@ windowsSpec = describe "Terrain cancel windows" $ do
           -- the cell is as authored when the later tick reads it, and the ticks went on past the cancelled removal's position
           printed `shouldSatisfy` any (\line → "cell at\t" `Text.isPrefixOf` line && "\tfalse\t0" `Text.isSuffixOf` line)
 
-  it "commits a logical read whose regions were not resident before the later removal whose cell was, and the removal after it" $
-    withRig $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource inverted)]) $ \world control runtime →
-        withFvm world runtime (gameplayOver rig) $ \fvm → do
-          _ ← spawn world fvm "modules-test" mainPath
-          -- tick 1 settles the open and issues the warming read; tick 2 settles it and issues the column read and the removal for tick 3
-          pumpUntil world (tickBy control fvm 1 >> (elem "issued at\t2" <$> outLines world))
-          pumpUntil world (tickBy control fvm 1 >> (any (Text.isPrefixOf "removal at\t3") <$> outLines world))
-          printed ← outLines world
-          -- position decides: the read, ordered first, saw the arena before the removal, and the removal committed after it, at the next revision
-          printed `shouldSatisfy` any (\line → "column at\t3\tsuccess\t0" `Text.isPrefixOf` line)
-          printed `shouldContain` ["removal at\t3\tsuccess\ttrue\t1"]
+  it "stages two logical removals in the opposite order of their places and commits them in the order of their places, across two arenas" $ do
+    gate ← newGate
+    armed ← newIORef True
+    stagings ← newIORef ([] ∷ [String])
+    commits ← newIORef ([] ∷ [String])
+    let -- the owner is held while it loads the one region the holder's read asks for, so that the removals arrive behind it
+        probe = Probe $ \point → case point of
+          PointJob _ region
+            | region == RegionCoord 1 0 0 → do
+                go ← atomicModifyIORef' armed (\a → (False, a))
+                when go (holdAt gate)
+          PointStaging rid → modifyIORef' stagings (show rid :)
+          PointCommitted rid _ → modifyIORef' commits (show rid :)
+          _ → pure ()
+    withRigProbe defaultConfigForRaces probe $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource inverted), ("lua/holder.lua", scriptSource holder)]) $ \world control runtime →
+        withFvm world runtime (gameplayOver rig) $ \gameplayVm →
+          withFvm world runtime (presentationOver rig) $ \shown → (`finally` openGate gate) $ do
+            _ ← spawn world gameplayVm "modules-test" mainPath
+            _ ← admitOnly world shown "modules-test" "lua/holder.lua"
+            -- tick 1 settles the opens and issues the warming read; tick 2 settles it: the second arena's cell is resident, the first's is not
+            pumpUntil world (tickBy control gameplayVm 1 >> (elem "warm at\t2" <$> outLines world))
+            -- the holder reads a cell of a region nobody has read, and the owner is held loading it
+            signalRig rig "go"
+            pumpUntilReached world gate
+            -- the holder cancels that read while its job is held; tick 3 issues the two removals, which wait behind the job
+            untilPrinted world "E cancel\tcancelled"
+            pumpUntil world (tickBy control gameplayVm 1 >> (elem "issued at\t3" <$> outLines world))
+            -- the job is released: the owner prepares the removal whose cell is resident first, and the other when its region has loaded
+            openGate gate
+            pumpUntil world (tickBy control gameplayVm 1 >> (any (Text.isPrefixOf "r2 at") <$> outLines world))
+            printed ← outLines world
+            printed `shouldContain` ["r1 at\t4\tsuccess\ttrue\t1", "r2 at\t4\tsuccess\ttrue\t1"]
+            staged ← reverse <$> readIORef stagings
+            committed ← reverse <$> readIORef commits
+            -- two removals, prepared in one order and committed in the opposite: the places decided the commits, not the preparation
+            length staged `shouldBe` 2
+            committed `shouldBe` reverse staged
 
   it "cancels a staged removal when the owner's request epoch changes, and commits nothing" $ do
     gate ← newGate

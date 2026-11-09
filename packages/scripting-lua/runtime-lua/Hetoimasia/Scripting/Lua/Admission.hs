@@ -83,6 +83,7 @@ module Hetoimasia.Scripting.Lua.Admission
   , renderBank
   , startAdmitted
   , preflightAdmission
+  , preflightDeliverable
   , CallerPhase (..)
   , callerPhase
   , callerInstance
@@ -123,7 +124,7 @@ import Hetoimasia.Scripting.Lua.Provider.State
 import Hetoimasia.Scripting.Lua.Provider.Types
 import Hetoimasia.Scripting.Lua.Registration (CapabilityType, RequestContext, capabilityType)
 import Hetoimasia.Scripting.Lua.Runtime.Shared (runtimeComponent)
-import Hetoimasia.Scripting.Lua.Value (Value)
+import Hetoimasia.Scripting.Lua.Value (Schema, Value)
 
 -- | What asking came to.
 data Started
@@ -242,6 +243,16 @@ preflightAdmission context ask = do
   case requesterOf caller of
     Nothing → pure (Just (renderRequestRefusal NoRequester))
     Just requester → fmap renderRequestRefusal <$> atomically (preflightOptIn service requester ask)
+
+-- | Whether the host would take this reply as the settlement of a request admitted with this admission and this result schema, over the
+-- limits of the owner of this context: the pure judgement 'settlingSettle' passes ('settlingJudge'), read in no transaction and reserving
+-- nothing. A binding asks it in its precondition, before any bank is asked, for the largest reply its call can make, so that a call whose
+-- answer could never be delivered is a permanent refusal decided ahead of the temporary pressure of a full bank (busy), as every
+-- other permanent fact is.
+preflightDeliverable ∷ HasCallStack ⇒ RequestContext → Admission → Schema → ProviderReply → IO Bool
+preflightDeliverable context ask schema reply = do
+  service ← serviceOf context
+  pure (replyDeliverable (psLimits service) schema ask reply)
 
 -- | Where the instance whose code is running is in its life.
 data CallerPhase

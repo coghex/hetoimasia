@@ -18,8 +18,10 @@ import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Profile (CountLimit (CopiedValueDepth, CopiedValueElements, LuaIntegerMaximum, SceneDepth, SceneSprites))
 import Hetoimasia.LuaEngine.Terrain (TerrainFacade (..), TerrainHooks (..), noTerrainHooks)
+import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
+import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Test.LuaEngine.Request.Profiles (counts)
-import Hetoimasia.Terrain.Residency (LimitsSpec (..), mkLimits)
+import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Test.Support.Bounded (bounded)
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
@@ -350,6 +352,7 @@ ordered =
         , "    self.c = api.terrain.cell(a, {x = 0, y = 0, z = 0})"
         , "    self.k = api.terrain.column(a, {x = 0, y = 0, z_min = -5, z_max = 3})"
         , "    self.u = api.terrain.surface(a, {x = 0, y = 0})"
+        , "    print('issued')"
         , "    self.s = 1"
         , "  end"
         , "elseif self.s == 1 then"
@@ -827,16 +830,40 @@ spec = describe "Terrain windows and banks" $ do
             writeIORef reached True
     readIORef reached `shouldReturn` True
 
-  it "gives a logical read ordered after a removal of the same cell the post-removal value and revision, reads prepared before the commit included" $
-    withRig $ \rig →
+  it "recomputes a logical cell, column and surface read ordered after a removal of the same cell, after the removal committed, and reports the post-removal values and revision" $ do
+    prepared ← newEmptyMVar
+    events ← newIORef ([] ∷ [String])
+    let -- what the owner does, in order: a read captures its answer at a revision, a removal is staged, a removal commits
+        probe = Probe $ \point → do
+          let note event = atomicModifyIORef' events (\seen → (event : seen, event : seen))
+          seen ← case point of
+            PointCaptured _ _ (Revision w) → note ("capture " <> show w)
+            PointStaging _ → note "staged"
+            PointCommitted _ (Revision w) → note ("commit " <> show w)
+            _ → readIORef events
+          -- the three reads and the removal are prepared against revision 0, before anything commits
+          when (length (filter (== "capture 0") seen) >= 3 && "staged" `elem` seen) (void (tryPutMVar prepared ()))
+    withRigProbe defaultConfigForRaces probe $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource ordered)]) $ \world control runtime →
         withFvm world runtime (gameplayOver rig) $ \fvm → do
           _ ← spawn world fvm "modules-test" mainPath
+          -- tick 1 settles the open and issues the removal, the cell, the column and the surface, all due at tick 2
+          pumpUntil world (tickBy control fvm 1 >> (elem "issued" <$> outLines world))
+          -- the stale captures exist before the commit: the owner has prepared all four against revision 0, and tick 2 has not begun
+          bounded (takeMVar prepared)
+          readIORef events >>= \seen → "commit 1" `shouldNotSatisfy` (`elem` seen)
           pumpUntil world (tickBy control fvm 1 >> (elem "surface\t1\t-1\tsoil" <$> outLines world))
           printed ← outLines world
           printed `shouldContain` ["removal\tsuccess\ttrue\t1"]
           printed `shouldContain` ["cell\ttrue\t1"]
           printed `shouldContain` ["column\t1\t-5:-3:false,-3:0:false,0:3:true"]
+          -- and each was prepared again after it: captures at the new revision (at least one for each of the three) follow the commit, and none at the old one
+          order ← reverse <$> readIORef events
+          let (prior, following) = break (== "commit 1") order
+          length (filter (== "capture 0") prior) `shouldBe` 3
+          prior `shouldSatisfy` ("staged" `elem`)
+          take 1 following `shouldBe` ["commit 1"]
+          drop 1 following `shouldSatisfy` (\recaptured → length recaptured >= 3 && all (== "capture 1") recaptured)
 
   it "keeps a later open of a name hidden from attach until it settles, though an earlier open of the name lets go of its own hold after it was offered" $ do
     releaseGate ← newGate
@@ -947,3 +974,24 @@ spec = describe "Terrain windows and banks" $ do
           -- the attach's lease, built and never published, was released: the creator's is the only lease left, and its arena is live
           limitHeld (rgService rig) "arenas" `shouldReturn` 1
           limitHeld (rgService rig) "leases" `shouldReturn` 1
+
+  it "frees the name of an open that an epoch cancelled between its build and its publication, for another VM's open of it" $ do
+    gate ← newGate
+    armed ← newIORef True
+    let -- only the first open's adoption is held, where its lease is built and not published; the second's goes through
+        holdFirst = do
+          go ← atomicModifyIORef' armed (\a → (False, a))
+          when go (holdAt gate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = holdFirst} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \first →
+          withFvm world runtime (presentationOver rig) $ \second → (`finally` openGate gate) $ do
+            _ ← admitOnly world first "modules-test" mainPath
+            pumpUntilReached world gate
+            -- the owner's requests move to a new epoch: the open is cancelled, and the host's owner is held with the lease built, unpublished
+            void (advanceRequestEpoch (scheduledEndpoint (fvOwner first)))
+            -- another VM opens the name: it is free from the cancellation, not from the first owner's next boundary
+            _ ← admitOnly world second "modules-test" mainPath
+            untilPrinted world "opened\tsuccess"
+            openGate gate
+

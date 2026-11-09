@@ -23,6 +23,7 @@ module Test.LuaEngine.Terrain.Support
   , Step (..)
   , stepsScript
   , tightRigConfig
+  , signalRig
   , Case (..)
   , Verdict (..)
   , caseLua
@@ -45,11 +46,12 @@ module Test.LuaEngine.Terrain.Support
 
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar, tryTakeMVar)
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (onException)
 import Control.Monad (void, when)
 import Data.List (find)
 import Data.Maybe (isJust)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Unique (Unique, hashUnique, newUnique)
@@ -78,6 +80,8 @@ data Rig = Rig
   , rgFacade ∷ !TerrainFacade
   , rgSession ∷ !Unique
   , rgPicks ∷ !TerrainPicks
+  , rgSignals ∷ !(TVar (Set.Set Text))
+  -- ^ The names an example has signalled: @TEST_WAIT(name)@ returns once its name is among them.
   }
 
 quiet ∷ Logger
@@ -100,12 +104,14 @@ withRigHooks config probe terrainHooks body =
     withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe) $ \service → do
       facade ← newTerrainFacade fixedM1Profile service config
       session ← newUnique
+      signals ← newTVarIO Set.empty
       body
         Rig
           { rgService = service
-          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture facade]}
+          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture facade, waitFixture signals]}
           , rgSession = session
           , rgPicks = tfPicks facade
+          , rgSignals = signals
           }
 
 presentationOver, gameplayOver ∷ Rig → VmShape
@@ -119,13 +125,25 @@ presentationOverSession rig session = (presentationOver rig) {shTerrain = Just (
 -- | How a fixture hands a script a pick authority the host issued: @TEST_PICK(key)@. It is a host-created fixture of the seam
 -- and nothing Lua can construct: a real script has no such function.
 pickChunk ∷ [Text]
-pickChunk = ["TEST_PICK = hetoimasia_engine.terrain_test_pick", "TEST_AWAIT_OFFER = hetoimasia_engine.terrain_test_await_offer"]
+pickChunk = ["TEST_PICK = hetoimasia_engine.terrain_test_pick", "TEST_AWAIT_OFFER = hetoimasia_engine.terrain_test_await_offer", "TEST_WAIT = hetoimasia_engine.terrain_test_wait"]
 
 pickFixture ∷ Binding
 pickFixture =
   asynchronousNativeRequestIn "terrain_test_pick" [SInteger] [SCapability terrainPickType] $ \_ values → case values of
     [VInteger key] → pure [pickValue (fromIntegral key)]
     _ → pure []
+
+-- | How a fixture holds a script until the example says so: @TEST_WAIT(name)@ returns once the example has signalled that name
+-- ('signalRig'). It runs on the script's own thread and waits on the rig's own state and nothing else; a real script has no such function.
+waitFixture ∷ TVar (Set.Set Text) → Binding
+waitFixture signals =
+  asynchronousNativeRequestIn "terrain_test_wait" [SText] [] $ \_ values → case values of
+    [VText name] → [] <$ bounded (atomically (readTVar signals >>= \seen → if Set.member name seen then pure () else retry))
+    _ → pure []
+
+-- | Say that this name's moment has come: the scripts waiting on it go on.
+signalRig ∷ Rig → Text → IO ()
+signalRig rig name = atomically (modifyTVar' (rgSignals rig) (Set.insert name))
 
 -- | How a fixture holds a script where an offer of the service's open is already made and the host has not adopted it:
 -- @TEST_AWAIT_OFFER(name)@ returns once the service holds an offered lease for the open of that name. It runs on the script's own

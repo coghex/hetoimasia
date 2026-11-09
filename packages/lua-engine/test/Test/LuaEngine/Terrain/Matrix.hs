@@ -6,18 +6,19 @@
 module Test.LuaEngine.Terrain.Matrix (spec) where
 
 import Control.Exception (finally)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Control.Monad (forM_)
 import Data.Maybe (isJust)
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.LuaEngine.Profile (CountLimit (RequestsPerInstance, RequestsPerVm), fixedM1Profile)
+import Hetoimasia.LuaEngine.Profile (CountLimit (CopiedValueDepth, RequestsPerInstance, RequestsPerVm, SceneDepth), fixedM1Profile)
 import Hetoimasia.LuaEngine.Terrain (issuePick, terrainCodes, terrainFailureReply)
 import Hetoimasia.Scripting.Lua.Admission (ExpectedFailure (expectedCode))
 import Hetoimasia.Scripting.Lua.Provider (ProviderReply (..))
 import Hetoimasia.Terrain.Query (QueryError (TooManyRuns))
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
-import Hetoimasia.Terrain.Runtime (Failure (..), Point (PointCaptured), Precondition (..), closeService)
+import Hetoimasia.Terrain.Runtime (Failure (..), Point (PointCaptured), Precondition (..), Probe (..), closeService)
 import Hetoimasia.Terrain.Source (SourceError (TooManyMaterials), definitionHeaderBytes, materialRecordBytes)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -164,29 +165,59 @@ closedUnderPressure =
         ]
     }
 
--- | An instance that cancels a full bank of reads: a cancelled request keeps its place until its record is taken.
+-- | An instance with a request bank of one: a read the owner is preparing (it is held where that read captures its answer) is cancelled and
+-- taken; the place is still charged, as the owner has not finished with what the read borrowed, and is free once it has.
 cancelledStayCharged ∷ Script
 cancelledStayCharged =
   script
-    { scPrelude = terrainPrelude <> ["local function code(...) local r, e = ... return r == nil and e and e.code or 'accepted' end"]
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.a = t.value self.r = api.terrain.cell(self.a, {x = 0, y = 0, z = 0}) print('issued') self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  print('cancel', api.request.cancel(self.r))"
+        , "  print('take', api.request.take(self.r).status)"
+        , "  local r, e = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
+        , "  print('while preparing', r == nil and e.code or 'accepted')"
+        , "  self.s = 2"
+        , "elseif self.s == 2 then"
+        , "  local r = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
+        , "  if r ~= nil then print('free') self.s = 3 end"
+        , "end"
+        ]
+    }
+
+-- | Calls whose refusal is permanent (the answer could never be carried, the cell lies beyond the service's extent), made with the
+-- request bank (of one) full and then with it free: each must be the same ordinary error, never busy.
+permanentUnderPressure ∷ [Text] → Script
+permanentUnderPressure calls =
+  script
+    { scPrelude =
+        terrainPrelude
+          <> [ "local function refusal(label, ...)"
+             , "  local ok, r, e = pcall(...)"
+             , "  if ok then print(label, 'returned', r == nil and e and e.code or 'accepted')"
+             , "  else print(label, 'refused', string.find(tostring(r), 'busy', 1, true) == nil) end"
+             , "end"
+             , "local function each(api, A, phase)"
+             ]
+          <> ["  refusal(" <> Text.pack (show (Text.unpack label)) <> " .. ' ' .. phase, " <> call <> ")" | call ← calls, let label = last (Text.splitOn "." (Text.takeWhile (/= ',') call))]
+          <> ["end"]
     , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
     , scUpdate =
         [ "if self.s == 0 then"
         , "  local t = settle(api, self.q)"
         , "  if t then"
-        , "    self.a = t.value self.held = {}"
-        , "    self.held[1] = api.terrain.cell(self.a, {x = 0, y = 0, z = 0})"
-        , "    self.held[2] = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
-        , "    print('full', code(api.terrain.cell(self.a, {x = 2, y = 0, z = 0})))"
-        , "    for i = 1, 2 do print('cancel', api.request.cancel(self.held[i])) end"
-        , "    print('cancelled, untaken', code(api.terrain.cell(self.a, {x = 2, y = 0, z = 0})))"
+        , "    self.a = t.value"
+        , "    self.r = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
+        , "    each(api, self.a, 'full')"
         , "    self.s = 1"
         , "  end"
         , "elseif self.s == 1 then"
-        , "  for i = 1, 2 do api.request.take(self.held[i]) end"
-        , "  local r = api.terrain.cell(self.a, {x = 2, y = 0, z = 0})"
-        , "  print('taken', r ~= nil)"
-        , "  print('done') self.s = 2"
+        , "  local t = settle(api, self.r)"
+        , "  if t then each(api, self.a, 'free') print('done') self.s = 2 end"
         , "end"
         ]
     }
@@ -394,16 +425,55 @@ spec = describe "Terrain matrices" $ do
           closeService (rgService rig)
           untilPrinted world "closed try\tfalse\ttrue\tfalse"
 
-  it "keeps a cancelled request's place charged until its record is taken" $ do
+  it "keeps the place of a cancelled and taken request charged until the owner has finished preparing it" $ do
     gate ← newGate
-    -- the owner is held where the first read has captured its answer, so that neither read has settled in the service when the script cancels them
+    -- the owner is held where the read has captured its answer: it is running the read's preparation when the script cancels it
     withRigProbe defaultConfigForRaces (gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate) $ \rig →
-      withWorld (counts [(RequestsPerInstance, 2), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource cancelledStayCharged)]) $ \world _ runtime →
+      withWorld (counts [(RequestsPerInstance, 1), (RequestsPerVm, 1)]) (Layout [("lua/main.lua", scriptSource cancelledStayCharged)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → (`finally` openGate gate) $ do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "issued"
+          awaitReached gate
+          -- cancelled and taken, and still charged: its borrowed data and credits are the owner's until its preparation exits
+          untilPrintedBy world spawned "while preparing\tbusy"
+          outLines world >>= \printed → printed `shouldContain` ["cancel\tcancelled", "take\tcancelled"]
+          outLines world >>= \printed → printed `shouldNotContain` ["free"]
+          openGate gate
+          untilPrintedBy world spawned "free"
+
+  it "refuses a call whose largest answer the VM's limits could never carry as an ordinary error before any bank, with the bank full or free, and no work reaches the service" $ do
+    captured ← newIORef (0 ∷ Int)
+    let probe = Probe $ \point → case point of
+          PointCaptured {} → atomicModifyIORef' captured (\seen → (seen + 1, ()))
+          _ → pure ()
+        calls = ["api.terrain.column, A, {x = 0, y = 0, z_min = 0, z_max = 9}", "api.terrain.column, A, {x = 0, y = 0, z_min = 0, z_max = 2}"]
+    withRigProbe defaultConfigForRaces probe $ \rig →
+      withWorld (counts [(CopiedValueDepth, 3), (SceneDepth, 3), (RequestsPerInstance, 1), (RequestsPerVm, 1)]) (Layout [("lua/main.lua", scriptSource (permanentUnderPressure calls))]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
           spawned ← spawn world fvm "modules-test" mainPath
           untilPrintedBy world spawned "done"
           printed ← outLines world
-          printed `shouldBe` ["full\tbusy", "cancel\tcancelled", "cancel\tcancelled", "cancelled, untaken\tbusy", "taken\ttrue", "done"]
+          forM_ ["full", "free"] $ \phase →
+            printed `shouldContain` ["column " <> phase <> "\trefused\ttrue"]
+          -- only the one read the example itself made reached the owner
+          readIORef captured `shouldReturn` 1
+
+  it "refuses a cell beyond the service's extent as an ordinary error before any bank, with the bank full or free, and a cell inside it as busy or served" $ do
+    captured ← newIORef (0 ∷ Int)
+    let probe = Probe $ \point → case point of
+          PointCaptured {} → atomicModifyIORef' captured (\seen → (seen + 1, ()))
+          _ → pure ()
+        calls = ["api.terrain.cell, A, {x = 2, y = 0, z = 0}", "api.terrain.remove, A, {x = 0, y = 1, z = 0}", "api.terrain.column, A, {x = 0, y = 0, z_min = 0, z_max = 3}"]
+    withRigProbe tightRigConfig probe $ \rig →
+      withWorld (counts [(RequestsPerInstance, 1), (RequestsPerVm, 1)]) (Layout [("lua/main.lua", scriptSource (permanentUnderPressure calls))]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          forM_ ["cell", "remove", "column"] $ \label →
+            forM_ ["full", "free"] $ \phase →
+              printed `shouldContain` [label <> " " <> phase <> "\trefused\ttrue"]
+          readIORef captured `shouldReturn` 1
 
   it "answers a second release of one's own arena without error, before and after the first has retired" $
     withRig $ \rig →

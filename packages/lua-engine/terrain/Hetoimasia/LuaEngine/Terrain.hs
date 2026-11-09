@@ -66,9 +66,9 @@ import Control.Concurrent.STM
 import Control.Exception (Exception, finally, mask, mask_, onException, throwIO)
 import Control.Monad (filterM, forM_, unless, void, when)
 import Data.Int (Int64)
-import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -100,6 +100,7 @@ import Hetoimasia.LuaEngine.Request
   , M1Start (M1Busy)
   , m1Ask
   , m1ArgumentCheck
+  , m1ReplyCheck
   , startM1
   )
 import Hetoimasia.Scripting.Lua.Admission (Credit (..), CreditEnd (..), ExpectedFailure (..), Necessity (OptionalRequest))
@@ -124,16 +125,16 @@ import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, RequestContext, capabilityType)
 import Hetoimasia.Scripting.Lua.Value (Schema (SNil), Value (..), capability)
 import Hetoimasia.Terrain.Cell (Cell (..), Column, IntervalError, MaterialId, ZRange, materialIdString, maxMaterialIdBytes, mkColumn, mkZRange, zRangeHi, zRangeLo)
-import Hetoimasia.Terrain.Coordinate (TileCoord, axisValue, tileCoord)
+import Hetoimasia.Terrain.Coordinate (TileCoord, axisValue, decomposeTile, localX, localY, localZ, regionLevels, tileCoord)
 import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..))
-import Hetoimasia.Terrain.Residency (Revision (..))
+import Hetoimasia.Terrain.Residency (Revision (..), limitExtent)
 import Hetoimasia.Terrain.Runtime
   ( Answer (..)
   , ArenaLease
   , CellAnswer (..)
   , Client
   , ColumnAnswer (..)
-  , Config (configMaxLeases, configQueryLimits)
+  , Config (configLimits, configMaxLeases, configQueryLimits)
   , Failure (..)
   , Precondition (..)
   , RemoveAnswer (..)
@@ -299,15 +300,20 @@ pickValue key = VCapability (capability terrainPickType key)
 -- offer and the build (its offered lease was already released by this adapter).
 newtype TerrainResource = TerrainResource {resourceLease ∷ Maybe ArenaLease}
 
--- | A request's offered lease: offered by the commit, adopted by the host, or disposed of by this adapter when the host
--- withdrew its interest first. One transition out of offered, decided in one transaction.
+-- | A request's offered lease: offered by the commit, built by the host (adopting) and published by the successful settlement
+-- (adopted), or disposed of by this adapter when the host withdrew its interest first. Cancellation authority is kept through every
+-- state before publication ('Offered', 'Adopting', 'Revoking'); each transition is decided in one transaction.
 data LeaseCell
   = NoLease
   | Offered !ArenaLease
   | -- | The host's interest ended and the lease is being revoked: the service's release has not completed, so the arena is still the
     -- open's and its name still held back, until whoever revokes it has finished.
     Revoking !ArenaLease
-  | Adopted
+  | -- | The host has built the lease and has not yet published it by settling the request successfully (its last look, in the
+    -- settling transaction, does that): until then the host's interest can still end, and the lease stays revocable.
+    Adopting !ArenaLease
+  | -- | Published: the request settled successfully and the lease is the instance's.
+    Adopted
   | Disposed
   deriving (Eq)
 
@@ -413,24 +419,40 @@ services env =
               TerrainRefused _ → giveBack
               _ → pure ()
             pure started
-    , tsCellCheck = \identity key _ owner values → leaseCheck env identity key readAsk owner values
+    , tsCellCheck = \identity key cell owner values →
+        firstRefusal
+          [ leaseCheck env identity key readAsk owner values
+          , answerCheck env terrainCellValueSchema LargestCell owner values
+          , pure (either Just (extentRefusal env . cellPlaces) (tileOf cell))
+          ]
     , tsCellStart = \_ key cell context → withArena env key $ \lease →
         startOr cell (\tile → start env context cellName readAsk (AskCell lease tile))
-    , tsColumnCheck = \identity key _ owner values → leaseCheck env identity key readAsk owner values
+    , tsColumnCheck = \identity key ask owner values →
+        firstRefusal
+          [ leaseCheck env identity key readAsk owner values
+          , answerCheck env terrainColumnValueSchema (LargestColumn (levelsOf ask)) owner values
+          , pure (either Just (const (extentRefusal env (columnPlaces ask))) (columnOf ask))
+          ]
     , tsColumnStart = \_ key ask context → withArena env key $ \lease →
         case columnOf ask of
           Left why → pure (TerrainRefused why)
           Right (column, range) → start env context columnName readAsk (AskColumn lease column range)
-    , tsSurfaceCheck = \identity key _ _ owner values → leaseCheck env identity key readAsk owner values
+    , tsSurfaceCheck = \identity key _ _ owner values →
+        firstRefusal
+          [ leaseCheck env identity key readAsk owner values
+          , answerCheck env terrainSurfaceValueSchema LargestSurface owner values
+          ]
     , tsSurfaceStart = \_ key x y context → withArena env key $ \lease →
         case mkColumn (toInteger x) (toInteger y) of
           Left _ → pure (TerrainRefused "the column is outside the supported range")
           Right column → start env context surfaceName readAsk (AskSurface lease column)
-    , tsRemoveCheck = \identity key _ pick owner values → do
-        refused ← pickCheck env identity pick
-        case refused of
-          Just why → pure (Just why)
-          Nothing → leaseCheck env identity key readAsk owner values
+    , tsRemoveCheck = \identity key cell pick owner values →
+        firstRefusal
+          [ pickCheck env identity pick
+          , leaseCheck env identity key readAsk owner values
+          , answerCheck env terrainRemoveValueSchema LargestRemove owner values
+          , pure (either Just (extentRefusal env . cellPlaces) (tileOf cell))
+          ]
     , tsRemoveStart = \identity key cell pick context → withArena env key $ \lease → do
         precondition ← pickPrecondition env identity pick
         case precondition of
@@ -547,6 +569,56 @@ leaseAsk source =
     { askCodes = terrainCodes
     , askLease = Just (InstanceOwned, \_ key → VCapability (capability terrainArenaType key))
     }
+
+-- | The first refusal of these checks, in order: each is a permanent fact decided before any bank is asked, and none reserves anything.
+firstRefusal ∷ [IO (Maybe Text)] → IO (Maybe Text)
+firstRefusal = \case
+  [] → pure Nothing
+  decide : more → decide >>= maybe (firstRefusal more) (pure . Just)
+
+-- | The shape of the largest answer a call can have.
+data Largest = LargestCell | LargestColumn !Int | LargestSurface | LargestRemove
+
+-- | The levels a column ask spans.
+levelsOf ∷ TerrainColumnAsk → Int
+levelsOf (TerrainColumnAsk _ _ lo hi) = fromIntegral (toInteger hi - toInteger lo)
+
+-- | A call whose largest answer the VM's copied-value limits could never carry is refused here, before the host's banks, as an ordinary
+-- error (see 'm1ReplyCheck'): a permanent fact of the call and the profile, never busy because a bank is full.
+answerCheck ∷ Env → Schema → Largest → ArgumentCheck
+answerCheck env schema largest = m1ReplyCheck (tvRequests (envVm env)) readAsk schema (largestReply env largest)
+
+-- | The service's extent is the columns, rows and levels of a region that may ever be loaded: a cell, or a range of a column, that
+-- names a level of a region beyond it is refused by the service's own admission, permanently. It is decided here from the same extent
+-- and the same decomposition of a cell, before any bank, so that it is never busy. (The default extent is a whole region and refuses
+-- nothing; a service configured with a smaller one does.) A surface's answer depends on the arena's content and is the service's alone.
+extentRefusal ∷ Env → [(Int, Int, Int)] → Maybe Text
+extentRefusal env places
+  | all inside places = Nothing
+  | otherwise = Just "the cell is outside the extent of the regions this service loads"
+  where
+    (ex, ey, ez) = limitExtent (configLimits (tfConfig (envFacade env)))
+    inside (lx, ly, hiZ) = lx < ex && ly < ey && hiZ <= ez
+
+-- | What a cell asks of its region: its column's place and the levels it needs.
+cellPlaces ∷ TileCoord → [(Int, Int, Int)]
+cellPlaces tile = [(fromIntegral (localX local), fromIntegral (localY local), fromIntegral (localZ local) + 1)]
+  where
+    (_, local) = decomposeTile tile
+
+-- | What a range of a column asks of each region it spans: the column's place and the levels of the range inside that region.
+columnPlaces ∷ TerrainColumnAsk → [(Int, Int, Int)]
+columnPlaces (TerrainColumnAsk x y lo' hi') = [(lx, ly, piece rz) | rz ← [first .. final]]
+  where
+    lo = toInteger lo'
+    hi = toInteger hi'
+    levels = toInteger regionLevels
+    first = lo `div` levels
+    final = (hi - 1) `div` levels
+    piece rz = fromInteger (min hi ((rz + 1) * levels) - rz * levels)
+    (lx, ly) = case tileCoord (toInteger x) (toInteger y) 0 of
+      Right tile → let (_, local) = decomposeTile tile in (fromIntegral (localX local), fromIntegral (localY local))
+      Left _ → (0, 0)
 
 -- | The host's permanent facts for an ask, decided before any action and reserving nothing: the service is still admitting work (a
 -- closed service is a permanent refusal, never the busy a full bank of the host's would answer first), and the host's own facts. It is
@@ -828,26 +900,34 @@ submit env submission = mask_ $ do
       pure
         ProviderWork
           { workCancel = cancelWork env link request
-          , workRetirement = retirement link
+          , workRetirement = retirement env link
           }
 
 -- | The largest answer a read or a removal can have, as the reply the host judges: a revision at the greatest integer, every field
--- present, and for a column as many runs as the range has levels and the service will return (more is @too_large@, a failure that
--- carries no answer). Nothing for a request whose result is a lease or a failure.
-worstReply ∷ Env → Ask → Maybe ProviderReply
-worstReply env = \case
-  AskCell {} → Just (ProviderResult (VRecord (("revision", greatest) : solid)))
-  AskColumn _ _ range →
-    let levels = max 1 (toInteger (zRangeHi range) - toInteger (zRangeLo range))
-        runs = fromInteger (min (toInteger (limitReturnedRuns (configQueryLimits (tfConfig (envFacade env))))) levels)
-     in Just (ProviderResult (VRecord [("revision", greatest), ("runs", VList (replicate runs (VRecord ([("z_min", greatest), ("z_max", greatest)] <> solid))))]))
-  AskSurface {} → Just (ProviderResult (VRecord [("revision", greatest), ("occupied", VBoolean True), ("z", greatest), ("material", longest), ("shape", greatest)]))
-  AskRemove {} → Just (ProviderResult (VRecord [("changed", VBoolean True), ("revision", greatest)]))
-  _ → Nothing
+-- present, and for a column as many runs as the range has levels and the service returns (more is @too_large@, a failure that
+-- carries no answer).
+largestReply ∷ Env → Largest → ProviderReply
+largestReply env = \case
+  LargestCell → ProviderResult (VRecord (("revision", greatest) : solid))
+  LargestColumn levels →
+    let runs = max 1 (min (limitReturnedRuns (configQueryLimits (tfConfig (envFacade env)))) levels)
+     in ProviderResult (VRecord [("revision", greatest), ("runs", VList (replicate runs (VRecord ([("z_min", greatest), ("z_max", greatest)] <> solid))))])
+  LargestSurface → ProviderResult (VRecord [("revision", greatest), ("occupied", VBoolean True), ("z", greatest), ("material", longest), ("shape", greatest)])
+  LargestRemove → ProviderResult (VRecord [("changed", VBoolean True), ("revision", greatest)])
   where
     greatest = VInteger maxBound
     longest = VText (Text.replicate maxMaterialIdBytes "m")
     solid = [("air", VBoolean False), ("material", longest), ("shape", greatest)]
+
+-- | The largest answer of a request the host was handed, for the hand-off's own judgement (the check before the banks decided the same
+-- thing already; this is the belt to that brace).
+worstReply ∷ Env → Ask → Maybe ProviderReply
+worstReply env = \case
+  AskCell {} → Just (largestReply env LargestCell)
+  AskColumn _ _ range → Just (largestReply env (LargestColumn (fromIntegral (toInteger (zRangeHi range) - toInteger (zRangeLo range)))))
+  AskSurface {} → Just (largestReply env LargestSurface)
+  AskRemove {} → Just (largestReply env LargestRemove)
+  _ → Nothing
 
 -- | Let go of the claims on a name whose request the host has already settled without the service being told: the service is told
 -- now, which frees the name, before another open asks for it.
@@ -872,7 +952,7 @@ done ∷ Link → STM Bool
 done link = do
   answered ← readTVar (lkTerminal link)
   cell ← readTVar (lkLease link)
-  pure (answered && case cell of Offered _ → False; Revoking _ → False; _ → True)
+  pure (answered && case cell of Offered _ → False; Adopting _ → False; Revoking _ → False; _ → True)
 
 -- | Forget the claims of requests that have ended, so the registry holds only what is still open: bounded by the opens in flight,
 -- whatever came and went, and empty once every instance has been forgotten.
@@ -946,6 +1026,12 @@ settleInto env link = \case
     publishable lease = do
       forM_ (lkName link) (\name → letGo (envFacade env) name link)
       view ← Terrain.inspectArenaSTM (service env) lease
+      -- The success is published here, in the settling transaction: only now does the lease stop being revocable by the host's
+      -- withdrawal of interest.
+      when (isJust view) $
+        readTVar (lkLease link) >>= \case
+          Adopting _ → writeTVar (lkLease link) Adopted
+          _ → pure ()
       pure (maybe (Just closedFailure) (const Nothing) view)
 
 -- | The recipe the host runs, on the owner's thread, to build the offered lease into the lease the request reserved. A request
@@ -961,7 +1047,7 @@ adoptionFor env link =
           hookAdopting (hooks env)
           built ← atomically $
             readTVar (lkLease link) >>= \case
-              Offered lease → TerrainResource (Just lease) <$ writeTVar (lkLease link) Adopted
+              Offered lease → TerrainResource (Just lease) <$ writeTVar (lkLease link) (Adopting lease)
               _ → pure (TerrainResource Nothing)
           hookAdopted (hooks env)
           pure built
@@ -975,7 +1061,12 @@ adoptionFor env link =
       released ← Terrain.releaseLease (service env) lease
       hookRevoked (hooks env)
       -- Only once the service has revoked the lease is the name no longer held back from attach.
-      atomically (forM_ (lkName link) (\name → letGo (envFacade env) name link))
+      atomically $ do
+        forM_ (lkName link) (\name → letGo (envFacade env) name link)
+        -- A lease the host built and then released without publishing it (the request ended, the arena closed) is disposed of.
+        readTVar (lkLease link) >>= \case
+          Adopting _ → writeTVar (lkLease link) Disposed
+          _ → pure ()
       either (throwIO . TerrainCompositionRefused . ("a lease's release was refused: " <>) . Text.pack . show) pure released
 
 -- | Withdraw interest in a request: ask the service to cancel it, and give back an offered lease nobody adopted.
@@ -995,6 +1086,8 @@ tellCancelled env link request = mask_ $ do
   claimed ← atomically $
     readTVar (lkLease link) >>= \case
       Offered lease → Just (lease, True) <$ writeTVar (lkLease link) (Revoking lease)
+      -- built by the host and not yet published: the cancellation won, and the name is free from now, not from the owner's next boundary
+      Adopting lease → Just (lease, True) <$ writeTVar (lkLease link) (Revoking lease)
       Revoking lease → pure (Just (lease, False))
       _ → pure Nothing
   forM_ claimed $ \(lease, first) → do
@@ -1008,16 +1101,22 @@ tellCancelled env link request = mask_ $ do
           forM_ (lkName link) (\name → letGo (envFacade env) name link)
         _ → pure ()
 
--- | The provider's own reading of where its work has got to, after interest was withdrawn: over when the service has reached
--- its terminal outcome for the request and no offered lease is waiting for a release.
-retirement ∷ Link → STM RetirementState
-retirement link = do
+-- | The provider's own reading of where its work has got to, after interest was withdrawn: over when the service has reached its
+-- terminal outcome for the request, no lease of it is waiting for a release, and the service has finished with what the request
+-- borrowed. A request cancelled while the owner prepares its answer is withdrawn at once but retained, as a ghost, with its borrowed
+-- data and credits until the owner's safe point: only then is the work over, whatever the terminal notification said. The census
+-- does not say which request a ghost is, so any ghost holds every retirement back: conservative, never early, and a ghost lasts
+-- no longer than the preparation that was running.
+retirement ∷ Env → Link → STM RetirementState
+retirement env link = do
   terminal ← readTVar (lkTerminal link)
   held ← readTVar (lkLease link)
-  pure (if terminal && not (isOffered held) then ProviderComplete else ProviderPending)
+  ghosts ← any Terrain.censusGhost . Terrain.censusRequests <$> Terrain.inspectCensusSTM (service env)
+  pure (if terminal && not (isOffered held) && not ghosts then ProviderComplete else ProviderPending)
   where
     isOffered = \case
       Offered _ → True
+      Adopting _ → True
       Revoking _ → True
       _ → False
 
