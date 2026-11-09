@@ -8,7 +8,7 @@ module Test.LuaEngine.Terrain.Windows (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTMVar, readTVar, readTVarIO, writeTVar)
-import Control.Concurrent (forkIO, yield)
+import Control.Concurrent (yield)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
 import Data.Either (isLeft)
 import Control.Monad (forM_, replicateM_, unless, void, when)
@@ -28,6 +28,7 @@ import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement (Endpoint (..), arrivalEndpoint, cancel, openArenaWith)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -1111,7 +1112,7 @@ spec = describe "Terrain windows and banks" $ do
           note "checked"
           go ← atomicModifyIORef' armed (\a → (False, a))
           when go (holdAt gate)
-    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig → (`finally` openGate gate) $ do
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig → do
       let facade = rgFacade rig
           svc = rgService rig
       hostSettled ← newTVarIO False
@@ -1125,25 +1126,23 @@ spec = describe "Terrain windows and banks" $ do
       secondDone ← newEmptyMVar
       -- the failed open is the first to arrive: it has consulted the failed opens (none) and is held inside the section, before its admission
       writeIORef armed True
-      _ ← forkIO (arbitrateOpen facade "dup" (openArenaWith svc failedEndpoint first "dup" invalid) >>= putMVar firstDone)
-      awaitReached gate
-      -- the other open of the name arrives while it is held
-      _ ← forkIO (arbitrateOpen facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec) >>= putMVar secondDone)
-      bounded (untilM ((>= 2) . length . filter (== "arriving") <$> readIORef events))
-      replicateM_ 200 yield
-      -- it has not consulted the failed opens (without the section it has, and is admitted, before the failed open is)
-      readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving"]
-      -- released, the failed open is admitted first and fails its definition; its name is held, and the other open finds it and is never admitted
-      openGate gate
-      firstResult ← bounded (takeMVar firstDone)
-      secondResult ← bounded (takeMVar secondDone)
-      (isJust firstResult, isJust secondResult) `shouldBe` (True, False)
-      readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving", "submitting"]
+      withOwnedThreadOpening (openGate gate) (arbitrateOpen facade "dup" (openArenaWith svc failedEndpoint first "dup" invalid) >>= putMVar firstDone) $ \_ _ → do
+        awaitReached gate
+        -- the other open of the name arrives while it is held
+        withOwnedThread (arbitrateOpen facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec) >>= putMVar secondDone) $ \_ _ → do
+          bounded (untilM ((>= 2) . length . filter (== "arriving") <$> readIORef events))
+          replicateM_ 200 yield
+          -- it has not consulted the failed opens (without the section it has, and is admitted, before the failed open is)
+          readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving"]
+          -- released, the failed open is admitted first and fails its definition; its name is held, and the other open finds it and is never admitted
+          openGate gate
+          firstResult ← bounded (takeMVar firstDone)
+          secondResult ← bounded (takeMVar secondDone)
+          (isJust firstResult, isJust secondResult) `shouldBe` (True, False)
+          readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving", "submitting"]
       -- the host settles the failed open: the name is free, and an open of it is admitted and succeeds
       atomically (writeTVar hostSettled True)
-      thirdDone ← newEmptyMVar
-      _ ← forkIO (arbitrateOpen facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec) >>= putMVar thirdDone)
-      thirdResult ← bounded (takeMVar thirdDone)
+      thirdResult ← arbitrateOpen facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec)
       isJust thirdResult `shouldBe` True
       settled ← bounded (atomically (readTMVar validBox))
       case settled of
@@ -1154,7 +1153,7 @@ spec = describe "Terrain windows and banks" $ do
     gate ← newGate
     events ← newIORef ([] ∷ [String])
     let note event = modifyIORef' events (event :)
-    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving"} $ \rig → (`finally` openGate gate) $ do
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving"} $ \rig → do
       let facade = rgFacade rig
           svc = rgService rig
       cancelled ← newTVarIO False
@@ -1175,17 +1174,17 @@ spec = describe "Terrain windows and banks" $ do
             pure admitted
       firstDone ← newEmptyMVar
       secondDone ← newEmptyMVar
-      _ ← forkIO (arbitrateOpen facade "held" admitFirst >>= putMVar firstDone)
-      awaitReached gate
-      -- the host cancels the first open (before the service is told anything, and before its claim is registered), and another open of the name
-      -- arrives: it waits for the section, and must not take the cancelled open's name for a duplicate
-      atomically (writeTVar cancelled True)
-      _ ← forkIO (arbitrateOpen facade "held" (openArenaWith svc secondEndpoint second "held" soilOverStoneSpec) >>= putMVar secondDone)
-      bounded (untilM ((>= 2) . length . filter (== "arriving") <$> readIORef events))
-      openGate gate
-      _ ← bounded (takeMVar firstDone)
-      secondResult ← bounded (takeMVar secondDone)
-      isJust secondResult `shouldBe` True
+      withOwnedThreadOpening (openGate gate) (arbitrateOpen facade "held" admitFirst >>= putMVar firstDone) $ \_ _ → do
+        awaitReached gate
+        -- the host cancels the first open (before the service is told anything, and before its claim is registered), and another open of the name
+        -- arrives: it waits for the section, and must not take the cancelled open's name for a duplicate
+        atomically (writeTVar cancelled True)
+        withOwnedThread (arbitrateOpen facade "held" (openArenaWith svc secondEndpoint second "held" soilOverStoneSpec) >>= putMVar secondDone) $ \_ _ → do
+          bounded (untilM ((>= 2) . length . filter (== "arriving") <$> readIORef events))
+          openGate gate
+          _ ← bounded (takeMVar firstDone)
+          secondResult ← bounded (takeMVar secondDone)
+          isJust secondResult `shouldBe` True
       -- the first open's claim was found stale in the section and the service told: the second open is the one that succeeds
       settled ← bounded (atomically (readTMVar secondBox))
       case settled of
