@@ -2,6 +2,7 @@
 module Test.LuaEngine.Terrain.Spec (spec) where
 
 import qualified Test.LuaEngine.Terrain.Basics as Basics
+import qualified Test.LuaEngine.Terrain.Composition as Composition
 import qualified Test.LuaEngine.Terrain.Domain as Domain
 import qualified Test.LuaEngine.Terrain.Limits as Limits
 import qualified Test.LuaEngine.Terrain.Names as Names
@@ -13,6 +14,7 @@ import Test.Hspec (Spec, describe)
 spec ∷ Spec
 spec = describe "Terrain" $ do
   Basics.spec
+  Composition.spec
   Validation.spec
   Domain.spec
   Ownership.spec
