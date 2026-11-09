@@ -219,6 +219,7 @@ withPeersFull profile inputHost fakeConfig hooks windowConfig entry issuedMemory
                   , fsIds = ids
                   , fsTickDuration = Nothing
                   , fsGraphics = Just services
+                  , fsTerrain = Nothing
                   }
                 >>= either (\refused → assertFailure ("the facade was refused: " <> show refused)) pure
             let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "peers"}
@@ -398,6 +399,7 @@ withLogical peers body = do
           , fsIds = ids
           , fsTickDuration = Just tickDuration
           , fsGraphics = Nothing
+          , fsTerrain = Nothing
           }
         >>= either (\refused → assertFailure ("the facade was refused: " <> show refused)) pure
     let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "peers-logical"}
