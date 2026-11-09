@@ -534,6 +534,7 @@
         "packages/terrain-render-2d-vulkan/",
         "packages/terrain-render-2d/",
         "packages/terrain/",
+        "packages/terrain-runtime/",
         "samples/ecce-homo/content/textures/",
         "packages/render-2d/",
         "packages/render-api/",
