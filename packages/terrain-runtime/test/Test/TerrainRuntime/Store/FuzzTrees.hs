@@ -82,7 +82,7 @@ richStore = do
 -- | Run a tree operation through a window filled from a disk: a refused page, or any stop that is
 -- not a missing page, is an integrity failure.
 through ∷ H → Disk → M a → Either String a
-through h disk act = go (windowBelow (rHw (storeRoots (hStore h))) (storeWindow (hStore h))) (0 ∷ Int)
+through h disk act = go (windowTrust (rootTrust (storeRoots (hStore h))) (windowBelow (rHw (storeRoots (hStore h))) (storeWindow (hStore h)))) (0 ∷ Int)
   where
     total = cfgUsablePages (hCfg h)
     go w n
@@ -226,24 +226,55 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
     results ← forM [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree → do
       let ref = fst (referenceOf h tree)
           rootRef = Disk (fromMaybe (PageNo 0) (rootOf (storeRoots (hStore h)) tree))
-      forM (take 6 (candidates tree)) $ \(p, i, es, q, staleEntries) → do
-        -- the parent now names the stale page, with the checksum it recorded for the page that was there
-        let es' = [if j == i then (k, Child (PageNo q) crc) else (k, Child c crc) | (j, (k, Child c crc)) ← zip [0 ∷ Int ..] es]
+      fmap concat $ forM (take 6 (candidates tree)) $ \(p, i, es, q, staleEntries) → forM [False, True] $ \ownCrc → do
+        -- the parent now names the stale page. Either with the checksum it recorded for the page that was there, or (the
+        -- one-page forgery) with the stale page's own checksum, so that the check of the child passes and only the record
+        -- above the forged page (its parent's entry, or the root record when it is the root) can tell
+        let staleCrc = maybe 0 (\bs → getLe32' bs 4092) (diskRead (hDisk h) (PageNo q))
+            es' = [if j == i then (k, Child (PageNo q) (if ownCrc then staleCrc else crc)) else (k, Child c crc) | (j, (k, Child c crc)) ← zip [0 ∷ Int ..] es]
             lv = maybe 1 pgLevel (decodeAt p)
         bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h) (Page tree lv (PageNo p) (Inner es')))
         let disk' = diskWrite (PageNo p) bytes (hDisk h)
             -- keys the stale page holds that the reference answers differently
             differing = [k | (k, v) ← staleEntries, lookup k ref /= Just v]
+            isRoot = rootOf (storeRoots (hStore h)) tree == Just (PageNo p)
         -- a lookup of any key in the stale page's range either fails as corrupt or is the reference's answer: never the stale answer
         let verdicts = [through h disk' (lookupKey tree (Just rootRef) k) | k ← map fst staleEntries]
             stale = [k | (k, Right got) ← zip (map fst staleEntries) verdicts, got /= lookup k ref]
         stale `shouldBe` []
-        pure (tree, length differing, length [() | Left _ ← verdicts])
+        pure (tree, ownCrc, isRoot, length differing, length [() | Left _ ← verdicts])
     let flat = concat results
-    putStrLn ("FUZZTREES stale pointers " <> show flat)
+    putStrLn ("FUZZTREES stale pointers (tree, with the stale page's own checksum, parent is the root, records the stale page would have answered differently, integrity failures) " <> show flat)
     -- the retirement tree, whose pages are rewritten every commit, has such pages; the stale ones differ from the reference
-    [d | (TreeRetire, d, _) ← flat] `shouldSatisfy` (any (> 0))
-    [e | (_, _, e) ← flat] `shouldSatisfy` (any (> 0))
+    [d | (TreeRetire, _, _, d, _) ← flat] `shouldSatisfy` (any (> 0))
+    [e | (_, _, _, _, e) ← flat] `shouldSatisfy` (any (> 0))
+    -- the forgery that records the stale page's own checksum is refused where the forged page is itself the root: the root record tells
+    [e | (_, True, True, _, e) ← flat] `shouldSatisfy` (any (> 0))
+  forM_' [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree →
+    it ("a mutated root record never changes what a read answers, " <> show tree) $ do
+      let roots = storeRoots (hStore h)
+          (ref, treePages) = referenceOf h tree
+          setRoot p r = r {rRuns = pick' TreeRuns (Just p) (rRuns r), rLinks = pick' TreeLinks (Just p) (rLinks r), rTodo = pick' TreeTodo (Just p) (rTodo r), rFree = pick' TreeFree (Just p) (rFree r), rRetire = pick' TreeRetire (Just p) (rRetire r)}
+          pick' t v old = if tree == t then v else old
+          setCrc f r = r {rRootCrcs = [(t, if t == tree then f c else c) | (t, c) ← rRootCrcs r]}
+          dead = [PageNo q | PageNo q ← rLoose roots, q < rHw roots]
+          rootNo = fromMaybe (PageNo 0) (rootOf roots tree)
+          -- one field of the root record: its checksum moved, or the page it names replaced by another page of the tree or a
+          -- dead page (the record's checksum left as it was)
+          variants =
+            [("checksum flipped", setCrc (\c → c + 1), rootNo)]
+              ++ [("the root replaced by page " <> show q, setRoot q, q) | q ← take 4 [PageNo q' | q' ← treePages, PageNo q' /= rootNo] ++ take 4 dead]
+          keysToRead = [fst e | (i, e) ← zip [0 ∷ Int ..] ref, i `mod` 7 == 0]
+          judgeVariant (what, f, newRoot) =
+            let h' = h {hStore = modifyRoots f (hStore h)}
+                verdicts = [ through h' (hDisk h') (lookupKey tree (Just (Disk newRoot)) k) | k ← take 30 keysToRead ]
+                wrong = [k | (k, Right got) ← zip keysToRead verdicts, got /= lookup k ref]
+             in (what, length [() | Left _ ← verdicts], length [() | Right _ ← verdicts], wrong)
+          results = map judgeVariant variants
+      putStrLn ("FUZZTREES root record " <> show tree <> " " <> show [(w, e, q) | (w, e, q, _) ← results])
+      -- never another answer; and a root that names another page, or whose checksum was moved, is refused
+      [w | (w, _, _, _ : _) ← results] `shouldBe` []
+      [w | (w, e, _, _) ← results, e == 0] `shouldBe` []
   forM_' [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree →
     it ("reads exactly as the reference or fails as corrupt, " <> show tree) $ do
       let (ref, treePages) = referenceOf h tree
@@ -272,8 +303,17 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
                         t = pick' targets w4
                      in Just (at, reseal (BS.concat [BS.take at original, le64' t, BS.drop (at + 8) original]))
                   _ → Nothing
-                (offset', mutated) = case retarget of
-                  Just r | w1 `mod` 3 == 0 → r
+                -- the one-page forgery: the entry names a dead page and records that page's own checksum, so the
+                -- check of the child passes and only the record above the forged page can tell
+                retargetCrc = case retarget of
+                  Just (at, _) →
+                    let t = pick' ([q | PageNo q ← rLoose (storeRoots (hStore h))] ++ treePages) w4
+                        tcrc = maybe 0 (\bs → getLe32' bs 4092) (diskRead (hDisk h) (PageNo t))
+                     in Just (at, reseal (BS.concat [BS.take at original, le64' t, le32' tcrc, BS.drop (at + 12) original]))
+                  Nothing → Nothing
+                (offset', mutated) = case (retarget, retargetCrc) of
+                  (_, Just r) | w1 `mod` 3 == 1 → r
+                  (Just r, _) | w1 `mod` 3 == 0 → r
                   _ → (offset, byteMutation)
             pure (judge h tree ref treePages page offset' mutated)
       treePages `shouldSatisfy` (not . null)

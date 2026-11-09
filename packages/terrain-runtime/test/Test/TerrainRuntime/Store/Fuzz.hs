@@ -93,7 +93,7 @@ throughM h disk tok act = start
   where
     total = cfgUsablePages (hCfg h)
     hw = rHw (storeRoots (hStore h))
-    start = either (const (Left "stale")) (\w → go (windowBelow hw w) (0 ∷ Int)) (readerWindow (hStore h) tok)
+    start = either (const (Left "stale")) (\w → go (windowTrust (rootTrust (storeRoots (hStore h))) (windowBelow hw w)) (0 ∷ Int)) (readerWindow (hStore h) tok)
     go w n
       | n > 4000 = Left "did not settle"
       | otherwise = case runM act (newEdit 0 w) of
