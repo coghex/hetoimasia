@@ -129,7 +129,7 @@ import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), SingleImages 
 import Hetoimasia.Terrain.Render2D.CellPick (CellHit (..), CellPickQuery (..), CellPickResult (..), pickCells)
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Material
-import Hetoimasia.Terrain.Atlas.Manifest (AtlasEntry (..), AtlasManifest (..), layoutIdentityHex)
+import Hetoimasia.Terrain.Atlas.Manifest (AtlasEntry (..), AtlasManifest (..), RegionEntry (..), layoutIdentityHex)
 import Hetoimasia.Terrain.Render2D.Presentation (LightInput (..), LightSettings, mkLightSettings, pushBytes)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 
@@ -192,6 +192,11 @@ data Variant
   | -- | A control: the region coordinate interpolated between half-texel-inset endpoints, which
     -- shifts the interior texel boundaries (a third, control-only material).
     HalfTexelInset
+  | -- | A control: every quad's map region is the next region of the normal atlas (a wrong, in effect
+    -- rotated, mask: another shape's silhouette and normals).
+    WrongMapRegion
+  | -- | A control: drawn correctly, but the pick answers through a fog quad to the known solid behind it.
+    PickThroughFog
   | -- | A control: drawn correctly, but the pick answers through the farthest covered quad.
     BackmostPick
   deriving stock (Eq, Show)
@@ -211,11 +216,13 @@ suffixOf = \case
   WholeAtlasRegion → "-control-whole-atlas-clamping"
   WrongTreatment → "-control-normal-as-colour"
   FromSingleImages → "-single-images"
+  WrongMapRegion → "-control-wrong-map-region"
+  PickThroughFog → "-control-pick-through-fog"
   HalfTexelInset → "-control-half-texel-inset"
   BackmostPick → "-control-pick-through-nearer"
 
 isControl ∷ Variant → Bool
-isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, BackmostPick]
+isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, WrongMapRegion, PickThroughFog, BackmostPick]
 
 -- | What a fixture must show, each by a named probe that is determinate for the oracle and differs
 -- from its contrast.
@@ -281,6 +288,18 @@ mixedScene facing =
       }
   where
     cells = [Cell 0 0 0 1 5 "loam", Cell 1 0 0 1 9 "granite", Cell 2 0 0 1 3 "loam", Cell 1 2 0 1 12 "granite", Cell 1 1 0 1 0 "loam"]
+
+-- | A confirmed undiscovered cell in front of a known solid on one view ray, so a pick that passes
+-- through the fog has a known cell to land on.
+fogOverKnown ∷ ViewFacing → Scene
+fogOverKnown facing =
+  atZoom 0.25 $
+    (newScene ("fog-over-known-" <> show facing) [Cell 0 0 0 1 0 "loam", Cell 1 1 0 1 0 "granite", Cell 1 1 1 2 0 "loam"] (64, 64))
+      { sceneFacing = facing
+      , sceneAnchor = (0, 0)
+      , sceneMode = ManualAt 1 1
+      , sceneKnow = [((1, 1, 1), Undisc)]
+      }
 
 lights ∷ [Light]
 lights =
@@ -355,6 +374,8 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Varies] WholeAtlasRegion (atZoom 0.125 (rampsCorners FaceSouth))
          , spec defaultLight [Foreground, Varies] WrongTreatment (atZoom 0.125 (rampsCorners FaceSouth))
          , spec defaultLight [Foreground, Varies] HalfTexelInset (atZoom 0.125 (rampsCorners FaceSouth))
+         , spec defaultLight [Foreground, Varies] WrongMapRegion (atZoom 0.125 (rampsCorners FaceSouth))
+         , spec defaultLight [Foreground, Varies] PickThroughFog (fogOverKnown FaceSouth)
          , spec defaultLight [Foreground, Overlap] BackmostPick (atZoom 0.125 (disconnectedSpans FaceSouth))
          ]
 
@@ -613,6 +634,14 @@ broken variant facing ctx adapted = case variant of
   DepthReset → withWords (\ws → take 12 ws <> [0])
   SwappedColourOrigins → withWords (\ws → case ws of x : rest → (if x == 96 then 0 else if x == 0 then 96 else x) : rest; [] → [])
   WrongFacingLight → adapted {adaptedPush = pushBytes (otherFacing facing) (adaptedSettings adapted)}
+  WrongMapRegion →
+    let origins = [(regionX r, regionY r) | a ← manifestAtlases (styleManifest (ctxStyle ctx)), atlasName a == "normal", r ← atlasRegions a]
+        next origin = case dropWhile (/= origin) (origins <> take 1 origins) of
+          _ : following : _ → following
+          _ → origin
+     in withWords (\ws → case drop 6 ws of
+          ox : oy : _ → take 6 ws <> [fst (next (ox, oy)), snd (next (ox, oy))] <> drop 8 ws
+          _ → ws)
   WrongTreatment → adapted {adaptedRecords = [MaterialRecord [c, ctxNormalAsColour ctx] ws | MaterialRecord [c, _] ws ← adaptedRecords adapted]}
   _ → adapted
   where
@@ -758,6 +787,15 @@ pickThroughNearer = \case
   Ambiguous _ → Nothing
   ExpectedHit {expectedFront = q, expectedBehind = behind} → Just (summaryOf (case reverse behind of far : _ → far; [] → q))
 
+-- | The wrong pick of the fog control: a fog front is answered with the known solid behind it.
+pickThroughFog ∷ Expected → Maybe PickSummary
+pickThroughFog = \case
+  ExpectedClear → Just SNoHit
+  Ambiguous _ → Nothing
+  ExpectedHit {expectedFront = q, expectedBehind = behind}
+    | hqRole q `elem` [FullFog, MixedFog] → Just (case [b | b ← behind, hqRole b `elem` [Ordinary, MixedKnown]] of known : _ → summaryOf known; [] → summaryOf q)
+    | otherwise → Just (summaryOf q)
+
 -- | What the picker finds at a pixel of a plan.
 pickerAt ∷ Part → (Int, Int) → PickSummary
 pickerAt part (px, py) =
@@ -852,7 +890,7 @@ renderSnapshot ctx s parts = do
             , let (gw, gh) = sceneTarget (partScene part)
             , let step = max 1 ((gw * gh) `div` 600)
             , let pixels = [(x, y) | (i, (x, y)) ← zip [0 ∷ Int ..] [(x, y) | y ← [0 .. gh - 1], x ← [0 .. gw - 1]], i `mod` step == 0]
-            , let judged = [(pixel, want, got) | pixel ← pixels, Just want ← [pickExpected (grid ! pixel)], let got = if specVariant s == BackmostPick then fromMaybe want (pickThroughNearer (grid ! pixel)) else pickerAt part pixel]
+            , let judged = [(pixel, want, got) | pixel ← pixels, Just want ← [pickExpected (grid ! pixel)], let got = case specVariant s of { BackmostPick → fromMaybe want (pickThroughNearer (grid ! pixel)); PickThroughFog → fromMaybe want (pickThroughFog (grid ! pixel)); _ → pickerAt part pixel }]
             ]
           pickCompared = sum (map fst pickResults)
           pickProblems = concatMap snd pickResults
@@ -876,7 +914,7 @@ renderSnapshot ctx s parts = do
             [] → (1, 1)
           centreOf (x, y) = (x - gridW `div` 2) ^ (2 ∷ Int) + (y - gridH `div` 2) ^ (2 ∷ Int)
           controlDiffers
-            | specVariant s == BackmostPick = Just (not (null pickProblems))
+            | specVariant s `elem` [BackmostPick, PickThroughFog] = Just (not (null pickProblems))
             | isControl (specVariant s) = Just (any mismatchAt namedPixels)
             | otherwise = Nothing
           readbackMissing = not (completeReadback (map (sceneTarget . partScene) parts) (resultProbes result))
@@ -893,6 +931,7 @@ renderSnapshot ctx s parts = do
                   <> ["pixel snapping changed " <> show snapDifferences <> " pixels the readback shows, fewer than the 20 that discriminate it from a view that ignores the setting" | SnapSensitive `elem` specNeeds s, snapDifferences < 20]
                   <> ["no determinate probe for " <> show need | need ← missing]
                   <> ["the independent expectation compared no pixel the scene covers" | indCovered independent == 0]
+                  <> ["pass " <> show pass <> " covers no compared pixel: a pass judged on nothing" | (pass, one') ← zip [0 ∷ Int ..] independents, indCovered one' == 0, not (isControl (specVariant s))]
                   <> ["more than half the pixels were ambiguous: " <> show (indAmbiguous independent) <> " of " <> show (indAmbiguous independent + indCompared independent) | indAmbiguous independent > indCompared independent]
                   <> ["the control was not rejected: the judge found no disagreement with a draw broken on purpose" | rejected == Just False]
                   <> ["the control did not differ at its named probes, so it did not exercise what it breaks" | controlDiffers == Just False]
