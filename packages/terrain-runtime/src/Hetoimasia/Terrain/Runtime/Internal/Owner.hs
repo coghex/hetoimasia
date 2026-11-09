@@ -381,12 +381,12 @@ handoff svc aid region = do
 -- | Run the next queued load job on real resident detail.
 dispatchJob ∷ Service → IO ()
 dispatchJob svc = do
-  -- The job is recorded in the transaction that dispatches it, from the coverage it
-  -- loads: the record exists exactly while the model holds the job running.
+  -- The job's record (made when the model admitted it) is marked running in the
+  -- transaction that dispatches it: it holds a load-job slot from now to its report.
   dispatched <- atomically $ do
     outcome <- applyEvent svc R.Dispatch
     forM_ outcome $ \report → case R.reportDecision report of
-      R.Dispatched jid (aid, region) cover → startJobWork svc jid aid region cover
+      R.Dispatched jid _ _ → startJobWork svc jid
       _ → pure ()
     pure outcome
   case dispatched of

@@ -21,9 +21,10 @@ module Test.TerrainRuntime.Oracle (spec) where
 import Control.Concurrent.STM (atomically, check, readTVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, void)
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, sort)
 import Data.Maybe (isNothing)
 import Data.Word (Word64)
+import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
@@ -44,16 +45,20 @@ lessReserved, lessOccupied ∷ Word64 → Ledger → Ledger
 lessReserved n l = l {ledgerReserved = ledgerReserved l - min n (ledgerReserved l)}
 lessOccupied n l = l {ledgerOccupied = ledgerOccupied l - min n (ledgerOccupied l)}
 
--- | A model that charges every job the given resident reservation and scratch, however
--- much it should: the ledgers fall by what was taken away, as they would in a faulty
--- accounting.
-chargingJobs ∷ Word64 → Word64 → Charged → Charged
-chargingJobs resident scratch c =
+-- | A model that charges the jobs the predicate selects no more than the given resident
+-- reservation and scratch, however much they should be charged: the ledgers fall by what
+-- was taken away, as they would in a faulty accounting.
+chargingJobsWhere ∷ (ChargedJob → Bool) → Word64 → Word64 → Charged → Charged
+chargingJobsWhere selects resident scratch c =
   c
-    { cJobs = [j {cjResident = min resident (cjResident j), cjScratch = min scratch (cjScratch j)} | j ← cJobs c]
-    , cResident = lessReserved (sum [cjResident j - min resident (cjResident j) | j ← cJobs c]) (cResident c)
-    , cStaging = lessReserved (sum [cjScratch j - min scratch (cjScratch j) | j ← cJobs c]) (cStaging c)
+    { cJobs = [if selects j then j {cjResident = min resident (cjResident j), cjScratch = min scratch (cjScratch j)} else j | j ← cJobs c]
+    , cResident = lessReserved (sum [cjResident j - min resident (cjResident j) | j ← cJobs c, selects j]) (cResident c)
+    , cStaging = lessReserved (sum [cjScratch j - min scratch (cjScratch j) | j ← cJobs c, selects j]) (cStaging c)
     }
+
+-- | Every job charged no more than the given amounts.
+chargingJobs ∷ Word64 → Word64 → Charged → Charged
+chargingJobs = chargingJobsWhere (const True)
 
 mentions ∷ String → [String] → Bool
 mentions needle = any (needle `isInfixOf`)
@@ -61,9 +66,11 @@ mentions needle = any (needle `isInfixOf`)
 spec ∷ Spec
 spec = describe "The accounting oracle and its controls" $ do
   -- A load job: a one-cell read in a fresh region. Its coverage is one column and one
-  -- segment: 48 bytes of column index, 32 of segment metadata and 64 of dense payload
-  -- (144 in all) and, with the 256 bytes the region's metadata costs, the model reserves
-  -- 400; its scratch is a 256-byte frame and two bytes for the one cell (258).
+  -- segment. The model grants it 400 bytes of resident (48 for the column index, 32 of segment
+  -- metadata and the 64 of dense payload a segment can need, and the 256 the region's metadata
+  -- costs) and 258 of scratch (a 256-byte frame and two bytes for the one cell). The record holds
+  -- that grant and, separately, the least the coverage can hold, worked out from the data layer's
+  -- sizes: 82 (48 + 32 + the two payload bytes of a uniform segment) and 258.
   describe "a running load job" $ do
     let atJob act = do
           gate <- newDisarmedGate
@@ -80,9 +87,10 @@ spec = describe "The accounting oracle and its controls" $ do
     it "is recorded from the coverage it loads, and the honest model passes" $
       atJob $ \svc → do
         (model, held, charged) <- look svc
-        [(hjResident j, hjScratch j, hjSlots j) | j ← heldJobs held] `shouldBe` [(144, 258, 1)]
-        -- The model reserves more than the job's coverage alone (it adds the region's
-        -- metadata): 400, the figure the reviewer's control reduced.
+        -- The record: the job as granted (400 and 258, the figures the reviewer's control reduced)
+        -- and the least its coverage can hold from the data layer's sizes (one column index entry,
+        -- 48, and one uniform segment, 32 of metadata and 2 of payload, 82; the scratch, 258).
+        [(hjGrantedResident j, hjGrantedScratch j, hjResident j, hjScratch j, hjSlots j) | j ← heldJobs held] `shouldBe` [(400, 258, 82, 258, 1)]
         [(cjResident j, cjScratch j) | j ← cJobs charged] `shouldBe` [(400, 258)]
         disagreements held charged `shouldBe` []
         slotInUse model LoadJobSlot `shouldBe` 1
@@ -97,9 +105,10 @@ spec = describe "The accounting oracle and its controls" $ do
     it "fails the comparison for a reserve one byte short, and for a scratch one byte short" $
       atJob $ \svc → do
         (_, held, charged) <- look svc
-        mentions "resident reservation" (disagreements held (chargingJobs 399 258 charged)) `shouldBe` False -- 400 charged, 144 held: still above
-        mentions "resident reservation" (disagreements held (chargingJobs 143 258 charged)) `shouldBe` True
+        -- as granted: 400 and 258, so a charge one byte short of either is under-charged
+        mentions "resident reservation" (disagreements held (chargingJobs 399 258 charged)) `shouldBe` True
         mentions "scratch" (disagreements held (chargingJobs 400 257 charged)) `shouldBe` True
+        disagreements held (chargingJobs 400 258 charged) `shouldBe` []
     it "fails the comparison when the model forgot the job early (acknowledged it while it runs)" $
       atJob $ \svc → do
         (model, census) <- snap svc
@@ -107,7 +116,7 @@ spec = describe "The accounting oracle and its controls" $ do
           jid : _ → do
             usageDisagreements census model `shouldBe` []
             let forgotten = fst (step model (JobFailed jid))
-            mentions "holds no running" (usageDisagreements census forgotten) `shouldBe` True
+            mentions "holds no such job" (usageDisagreements census forgotten) `shouldBe` True
           [] → expectationFailure "the owner is at a job but the model holds none running"
     it "ends the record with the job's report" $ do
       gate <- newDisarmedGate
@@ -190,6 +199,97 @@ spec = describe "The accounting oracle and its controls" $ do
             mentions "holds no record" (disagreements held (chargedOf (fst (step model (Withdraw (requestId r)))))) `shouldBe` True
             mentions "resident growth" (disagreements held charged {cRequests = [(rid, removal, 0) | (rid, removal, _) ← cRequests charged]}) `shouldBe` True
           [] → expectationFailure "the owner is preparing a removal but the model holds no request"
+
+  -- A job that has been accepted but is not running (it waits for the owner) holds its
+  -- reservation and its scratch all the same: the record holds every accepted job, with the
+  -- amounts the model granted it, and a model that releases a waiting job's charge early is
+  -- under-charging it.
+  describe "a job that waits for the owner" $ do
+    let withWaiting act = do
+          gate <- newDisarmedGate
+          withGatedService defaultConfig alwaysAdmitting (\p → case p of PointJob {} → True; _ → False) gate $ \svc → (\a → a `finally` openGate gate) $ do
+            client <- okOf (registerClient svc)
+            lease <- okOf (openArena svc client "main" soilOverStone) >>= await svc >>= expectSuccess
+            armGate gate
+            first <- newHost True
+            second <- newHost True
+            _ <- okOf (cellWith svc (hostEndpoint svc Nothing first) lease (tile 1 1 1))
+            awaitReached gate
+            -- The owner is held at the first job; a second one is admitted and waits.
+            _ <- okOf (cellWith svc (hostEndpoint svc Nothing second) lease (tile 17 1 1))
+            void (act svc)
+            openGate gate
+            void (waitFor (settledSTM first))
+            void (waitFor (settledSTM second))
+    it "is recorded as granted, holds no slot, and the honest model charges it" $
+      withWaiting $ \svc → do
+        (_, held, charged) <- look svc
+        sort [(hjGrantedResident j, hjGrantedScratch j, hjSlots j) | j ← heldJobs held] `shouldBe` [(400, 258, 0), (400, 258, 1)]
+        disagreements held charged `shouldBe` []
+    it "fails the comparison when the model releases only the waiting job's 400 bytes of resident and 258 of scratch" $
+      withWaiting $ \svc → do
+        (_, held, charged) <- look svc
+        let waiting = [hjJob j | j ← heldJobs held, hjSlots j == 0]
+            damaged = chargingJobsWhere ((`elem` waiting) . cjJob) 0 0 charged
+            found = disagreements held damaged
+        length waiting `shouldBe` 1
+        mentions "resident reservation" found `shouldBe` True
+        mentions "scratch" found `shouldBe` True
+        -- only the waiting job: the running one is still charged in full
+        length [() | s ← found, "job " `isInfixOf` s] `shouldBe` 2
+    it "fails the comparison for a waiting job charged one byte short" $
+      withWaiting $ \svc → do
+        (_, held, charged) <- look svc
+        let waiting = [hjJob j | j ← heldJobs held, hjSlots j == 0]
+        mentions "resident reservation" (disagreements held (chargingJobsWhere ((`elem` waiting) . cjJob) 399 258 charged)) `shouldBe` True
+        mentions "scratch" (disagreements held (chargingJobsWhere ((`elem` waiting) . cjJob) 400 257 charged)) `shouldBe` True
+
+  -- A borrow's hold names the regions its snapshot covers, and a view's description the
+  -- regions its accepted demand describes: both are read from what the service handed out
+  -- or accepted, not from the model's records of them.
+  describe "a borrow and a view description" $ do
+    it "records the regions a borrowed snapshot covers, and a model that names fewer fails the comparison" $
+      withService defaultConfig $ \svc → do
+        (_, lease) <- openMain svc "main"
+        _ <- readCell svc lease (tile 1 1 1)
+        _ <- readCell svc lease (tile 1 1 33)
+        let regions = [fst (decomposeTile (tile 1 1 1)), fst (decomposeTile (tile 1 1 33))]
+        outcome <- withSnapshot svc lease regions $ \_ → do
+          (_, held, charged) <- look svc
+          map snd (heldHolds held) `shouldBe` [2]
+          disagreements held charged `shouldBe` []
+          -- the model's record of the borrow shortened to one region, its staging charge with it
+          let shortened =
+                charged
+                  { cHolds = [(h, 1) | (h, _) ← cHolds charged]
+                  , cStaging = lessOccupied 64 (cStaging charged)
+                  }
+              found = disagreements held shortened
+          mentions "hold" found `shouldBe` True
+          mentions "staging bank occupied (request records and interests, borrows" found `shouldBe` True
+          -- and a model that lost the borrow altogether
+          mentions "no such borrow" (disagreements held charged {cHolds = []}) `shouldBe` True
+        either (expectationFailure . show) pure outcome
+    it "records the regions a view's accepted demand describes, and a model that names fewer fails the comparison" $
+      withService defaultConfig $ \svc → do
+        (client, lease) <- openMain svc "main"
+        view <- okOf (openView svc client)
+        let demanded = [fst (decomposeTile (tile 1 1 1)), fst (decomposeTile (tile 17 1 1))]
+        _ <- okOf (setViewDemand svc view lease [RegionDemand r (coverageTile (either (error . show) id (mkLocalCoord 0 0 0))) | r ← demanded])
+        (_, held, charged) <- look svc
+        map snd (heldViews held) `shouldBe` [2]
+        disagreements held charged `shouldBe` []
+        let shortened = charged {cViews = [(v, 1) | (v, _) ← cViews charged], cStaging = lessOccupied 64 (cStaging charged)}
+            found = disagreements held shortened
+        -- The description is checked entity by entity (the camera's own interests, held only in
+        -- the model, leave the staging total above what the service can claim here).
+        mentions "description" found `shouldBe` True
+        mentions "holds no view" (disagreements held charged {cViews = []}) `shouldBe` True
+        okOf (clearViewDemand svc view)
+        (_, held', _) <- look svc
+        heldViews held' `shouldSatisfy` null
+        closeView svc view
+        settleChecks svc
 
   it "reads the census and the record without changing the model, its clock, its requests or its limits" $
     withService defaultConfig $ \svc → do

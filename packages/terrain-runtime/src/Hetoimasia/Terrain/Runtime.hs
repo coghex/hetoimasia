@@ -121,9 +121,14 @@ module Hetoimasia.Terrain.Runtime
   , runningJobs
   , runningPreparation
   , runningHandoffs
+  , runningHolds
+  , runningViews
   , JobWork
+  , jobWorkJob
   , jobWorkArena
   , jobWorkRegion
+  , jobWorkGrantedResident
+  , jobWorkGrantedScratch
   , jobWorkResident
   , jobWorkScratch
   , jobWorkSlots

@@ -58,8 +58,11 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , RunningWork (..)
   , noRunningWork
   , JobWork (..)
+  , jobWorkJob
   , jobWorkArena
   , jobWorkRegion
+  , jobWorkGrantedResident
+  , jobWorkGrantedScratch
   , jobWorkResident
   , jobWorkScratch
   , jobWorkSlots
@@ -78,6 +81,8 @@ module Hetoimasia.Terrain.Runtime.Internal.Types
   , runningJobs
   , runningPreparation
   , runningHandoffs
+  , runningHolds
+  , runningViews
   , Census (..)
   , ArenaCensus (..)
   , RequestCensus (..)
@@ -488,45 +493,70 @@ data Req = Req
 -- functions, never field labels), so a client cannot construct, forge or update
 -- one, and none carries an authority, a handle or a snapshot.
 
--- | The work the owner thread is running or holding, recorded where that work
--- starts and where it ends, from the values the work itself holds, and not from the
--- accounting model: the model's ledgers are what a test compares this against.
+-- | What the service is running or holding, recorded where that work starts and where it
+-- ends, and compared by a test with what the accounting model charges for it.
 --
--- Owner and thread: written only by the owner thread (a job at its dispatch and at its
--- report, a preparation between its start and the owner's safe point, a handoff's
--- duplicate between the transfer's admission and its outcome) and emptied by the
--- owner's terminal step. Readers: the inspection function only. Bounded by the
--- single owner: one preparation at a time, one job per dispatch, one handoff per
--- changed region, and every entry ends with the work it describes.
+-- Every accepted load job is recorded, from its admission to its report: the reservation
+-- and scratch the model granted it at that moment (so a later reduction while the work
+-- still holds them is seen), and the least its coverage can hold, worked out from the data
+-- layer's own sizes and not from the model's cost functions (so a grant that was too
+-- small is seen). The owner marks a job it is running (it holds a load-job slot) and
+-- ends it with its report. The rest is the owner's running preparation, each handoff
+-- duplicate between the transfer's admission and its outcome, the regions each
+-- outstanding borrow covers (from the snapshot handed out) and the regions each view's
+-- latest accepted demand describes (from the receipt).
+--
+-- Writers: the owner thread (running marks, preparation, handoffs, job ends) and the port
+-- transactions that admit the work (a job's grant, a borrow, a view's demand), each in
+-- the transaction of the model event it mirrors. Readers: the inspection function only.
+-- Bounded by what the model bounds (jobs, holds, views) plus one preparation and one
+-- duplicate per changed region; every entry ends with the work it describes, and the
+-- owner's terminal step empties the owner's.
 data RunningWork = RunningWork
   { rwJobs ∷ !(Map JobId JobWork)
   , rwPreparation ∷ !(Maybe PreparationWork)
   , rwHandoffs ∷ !(Map RegionKey HandoffWork)
+  , -- | The regions each outstanding borrow covers, from the snapshot it handed out.
+    rwHolds ∷ !(Map HoldId Word64)
+  , -- | The regions each registered view's latest accepted demand describes, from the
+    -- receipt the service gave for it.
+    rwViews ∷ !(Map ViewId Word64)
   }
 
 noRunningWork ∷ RunningWork
-noRunningWork = RunningWork Map.empty Nothing Map.empty
+noRunningWork = RunningWork Map.empty Nothing Map.empty Map.empty Map.empty
 
--- | A load job the owner is running: where, the resident bytes its coverage can
--- store (what it reserves in the resident bank, region metadata not claimed), its
--- scratch, and the job slot it holds.
-data JobWork = JobWork !ArenaId !RegionCoord !Word64 !Word64 !Word64
+-- | An accepted load job: its identity, where, the resident bytes and the scratch the
+-- model granted it at admission, the least its coverage can hold (resident: 48 bytes a
+-- column index and 32 plus 2 a segment; scratch: a 256-byte frame and two bytes a cell),
+-- and the load-job slot it holds (1 while the owner runs it, 0 while it is queued or
+-- waiting for victims).
+data JobWork = JobWork !JobId !ArenaId !RegionCoord !Word64 !Word64 !Word64 !Word64 !Word64
   deriving stock (Eq, Show)
 
+jobWorkJob ∷ JobWork → JobId
+jobWorkJob (JobWork j _ _ _ _ _ _ _) = j
+
 jobWorkArena ∷ JobWork → ArenaId
-jobWorkArena (JobWork a _ _ _ _) = a
+jobWorkArena (JobWork _ a _ _ _ _ _ _) = a
 
 jobWorkRegion ∷ JobWork → RegionCoord
-jobWorkRegion (JobWork _ r _ _ _) = r
+jobWorkRegion (JobWork _ _ r _ _ _ _ _) = r
+
+jobWorkGrantedResident ∷ JobWork → Word64
+jobWorkGrantedResident (JobWork _ _ _ n _ _ _ _) = n
+
+jobWorkGrantedScratch ∷ JobWork → Word64
+jobWorkGrantedScratch (JobWork _ _ _ _ n _ _ _) = n
 
 jobWorkResident ∷ JobWork → Word64
-jobWorkResident (JobWork _ _ n _ _) = n
+jobWorkResident (JobWork _ _ _ _ _ n _ _) = n
 
 jobWorkScratch ∷ JobWork → Word64
-jobWorkScratch (JobWork _ _ _ n _) = n
+jobWorkScratch (JobWork _ _ _ _ _ _ n _) = n
 
 jobWorkSlots ∷ JobWork → Word64
-jobWorkSlots (JobWork _ _ _ _ n) = n
+jobWorkSlots (JobWork _ _ _ _ _ _ _ n) = n
 
 -- | A preparation the owner is running for a request: the request, its arena, whether it
 -- is a removal, the command record it reads under, and, for a removal, the resident
@@ -578,6 +608,14 @@ runningPreparation = rwPreparation
 
 runningHandoffs ∷ RunningWork → [HandoffWork]
 runningHandoffs = Map.elems . rwHandoffs
+
+-- | Each outstanding borrow and how many regions its snapshot covers.
+runningHolds ∷ RunningWork → [(HoldId, Word64)]
+runningHolds = Map.toList . rwHolds
+
+-- | Each view with an accepted demand and how many regions that demand describes.
+runningViews ∷ RunningWork → [(ViewId, Word64)]
+runningViews = Map.toList . rwViews
 
 -- | One arena as the service holds it: whether it is retiring, the accounted bytes its
 -- resident detail holds in each vertical region (from the detail itself), and the

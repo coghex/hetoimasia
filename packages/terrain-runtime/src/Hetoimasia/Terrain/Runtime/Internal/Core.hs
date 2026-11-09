@@ -101,7 +101,7 @@ import qualified Hetoimasia.Terrain.Residency as R
 import Hetoimasia.Terrain.Residency (ArenaId (..), HoldId (..), RegionDemand, RequestId (..), Revision (..), ViewId (..))
 import Hetoimasia.Terrain.Runtime.Internal.Content
 import Hetoimasia.Terrain.Runtime.Internal.Snapshot
-import Hetoimasia.Terrain.Resident (ResidentStats (..), discardRegion, residentStats)
+import Hetoimasia.Terrain.Resident (ResidentStats (..), columnIndexBytes, discardRegion, residentStats)
 import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Source (Source, SourceError)
@@ -142,6 +142,7 @@ applyEvent svc event = do
           { stateModel = model
           , stateVictims = stateVictims st <> Seq.fromList (decisionVictims (R.reportDecision report))
           , stateRetiring = foldr Map.delete (stateRetiring st) (R.reportSettled report)
+          , stateWork = syncWork model (stateWork st)
           }
       pure outcome
 
@@ -623,12 +624,50 @@ preparationWorkOf rid req = case reqCmd req of
   where
     recordBytes = R.commandRecordBytes (fromIntegral (Set.size (Set.fromList (map R.demandRegion (reqDemand req)))))
 
--- | The owner starts running a load job: record it, from the coverage it loads, in the
--- same transaction that dispatched it. Read-only bookkeeping: nothing decides by it.
-startJobWork ∷ Service → R.JobId → ArenaId → RegionCoord → R.Coverage → STM ()
-startJobWork svc jid aid region cover =
+-- | Keep the record of accepted load jobs in step with the jobs the model holds, in the
+-- transaction of every model event: a job the model has admitted is recorded with the
+-- reservation and scratch it was granted at that moment, and with the least its coverage
+-- can hold from the data layer's own sizes; a job the model no longer holds is dropped
+-- unless the owner is running it (the owner ends that one with its report, so a model
+-- that forgets a running job is seen); and a view's description the model no longer holds
+-- is dropped. Read-only bookkeeping: nothing decides by it.
+syncWork ∷ R.Model → RunningWork → RunningWork
+syncWork model rw =
+  rw
+    { rwJobs = Map.union kept added
+    , rwViews = Map.filterWithKey (\view _ → Set.member view liveViews) (rwViews rw)
+    }
+  where
+    jobs = R.modelJobs model
+    ids = Set.fromList (map R.jobId jobs)
+    kept = Map.filterWithKey (\jid work → Set.member jid ids || jobWorkSlots work > 0) (rwJobs rw)
+    added = Map.fromList [(R.jobId j, jobWorkOfModel j) | j ← jobs, not (Map.member (R.jobId j) (rwJobs rw))]
+    liveViews = Set.fromList (map R.viewId (R.modelViews model))
+
+-- | A job as granted: what the model reserved for it and its scratch now, and the least
+-- its coverage can hold. The least is worked out from the cells the job loads and the data
+-- layer's sizes, not from the model's cost functions: a column index entry is 'columnIndexBytes'
+-- (48), a segment is 32 bytes of metadata and at least two of payload (a uniform one), and the
+-- scratch is a 256-byte frame and two bytes a cell.
+jobWorkOfModel ∷ R.JobInfo → JobWork
+jobWorkOfModel j =
+  JobWork
+    (R.jobId j)
+    (R.jobArena j)
+    (R.jobRegion j)
+    (R.jobActive j + R.jobDeferred j)
+    (R.jobScratch j)
+    (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2))
+    (256 + 2 * R.coverageCells cover)
+    0
+  where
+    cover = R.jobCoverage j
+
+-- | The owner starts running a load job: it holds a load-job slot from now to its report.
+startJobWork ∷ Service → R.JobId → STM ()
+startJobWork svc jid =
   modifySt svc $ \st →
-    st {stateWork = (stateWork st) {rwJobs = Map.insert jid (JobWork aid region (fromMaybe 0 (R.costBytes (R.reserveCost cover))) (R.scratchBytes cover) 1) (rwJobs (stateWork st))}}
+    st {stateWork = (stateWork st) {rwJobs = Map.adjust (\(JobWork a b c d e f g _) → JobWork a b c d e f g 1) jid (rwJobs (stateWork st))}}
 
 -- | The job's report (completed, failed or acknowledged) ends its record, in the
 -- transaction that reports it.
@@ -818,9 +857,13 @@ setViewDemandSTM svc (View tag vid) lease demands =
             | otherwise → do
                 outcome <- applyEvent svc (R.SetCameraDemand vid (leaseArena ls) demands)
                 modifySt svc (\cur → cur {stateDispatchIdle = False})
-                pure $ case outcome of
-                  Right report → Right (fromMaybe (DemandReceipt [] [] [] [] []) (receipt (R.reportDecision report)))
-                  Left refusal → Left (either id (const RefusedAuthority) (shortRefused refusal))
+                case outcome of
+                  Right report → do
+                    let given = fromMaybe (DemandReceipt [] [] [] [] []) (receipt (R.reportDecision report))
+                        described = Set.size (Set.fromList (receiptAdmitted given <> receiptPending given))
+                    modifySt svc (\cur → cur {stateWork = (stateWork cur) {rwViews = (if described == 0 then Map.delete vid else Map.insert vid (fromIntegral described)) (rwViews (stateWork cur))}})
+                    pure (Right given)
+                  Left refusal → pure (Left (either id (const RefusedAuthority) (shortRefused refusal)))
           _ → pure (Left RefusedAuthority)
   where
     receipt = \case
@@ -844,7 +887,10 @@ clearViewDemandSTM svc (View tag vid)
   | otherwise = do
       st <- readSt svc
       if Map.member vid (stateViews st)
-        then Right () <$ applyEvent svc (R.ClearCameraDemand vid)
+        then do
+          _ <- applyEvent svc (R.ClearCameraDemand vid)
+          modifySt svc (\cur → cur {stateWork = (stateWork cur) {rwViews = Map.delete vid (rwViews (stateWork cur))}})
+          pure (Right ())
         else pure (Left RefusedAuthority)
 
 closeViewSTM ∷ Service → View → STM ()
@@ -858,6 +904,7 @@ closeViewByIdSTM svc vid = do
       cur
         { stateViews = Map.delete vid (stateViews cur)
         , stateClients = Map.adjust (\c → c {clientViews = Set.delete vid (clientViews c)}) (viewClient viewRec) (stateClients cur)
+        , stateWork = (stateWork cur) {rwViews = Map.delete vid (rwViews (stateWork cur))}
         }
     () <$ applyEvent svc (R.ClearCameraDemand vid)
 
@@ -902,14 +949,21 @@ acquireSnapshotSTM svc lease regions =
                   case outcome of
                     Left refusal → pure (Left (either id (const RefusedAuthority) (case busyWhy refusal of ShortRefused r → Left r; ShortFailed _ → Right ())))
                     Right _ → do
-                      modifySt svc (\cur → cur {stateNextHold = hid + 1, stateBorrowers = stateBorrowers cur + 1, stateSnapshots = Map.insert (HoldId hid) backing (stateSnapshots cur)})
+                      modifySt svc $ \cur →
+                        cur
+                          { stateNextHold = hid + 1
+                          , stateBorrowers = stateBorrowers cur + 1
+                          , stateSnapshots = Map.insert (HoldId hid) backing (stateSnapshots cur)
+                          , -- what the snapshot handed out covers, for inspection
+                            stateWork = (stateWork cur) {rwHolds = Map.insert (HoldId hid) (fromIntegral (Set.size (Set.fromList (snapRegions snapshot)))) (rwHolds (stateWork cur))}
+                          }
                       pure (Right (HoldId hid, snapshot))
 
 -- | Return a borrow. Idempotent.
 releaseSnapshotSTM ∷ Service → HoldId → STM ()
 releaseSnapshotSTM svc hid =
   applyEvent svc (R.ReleaseHold hid) >>= \case
-    Right _ → modifySt svc (\st → st {stateBorrowers = stateBorrowers st - 1, stateSnapshots = Map.delete hid (stateSnapshots st)})
+    Right _ → modifySt svc (\st → st {stateBorrowers = stateBorrowers st - 1, stateSnapshots = Map.delete hid (stateSnapshots st), stateWork = (stateWork st) {rwHolds = Map.delete hid (rwHolds (stateWork st))}})
     Left _ → pure ()
 
 -- ---------------------------------------------------------------------------
