@@ -26,7 +26,7 @@ import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), loadAtlasStyl
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Material
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightSettings, pushBlockBytes)
-import Hetoimasia.Terrain.Render2D.Vulkan.Material (lightPush, terrainMaterial, terrainMaterialEquivalent)
+import Hetoimasia.Terrain.Render2D.Vulkan.Material (lightPush, terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl)
 import Test.Hspec (Spec, beforeAll, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 textures ∷ AtlasTextures
@@ -84,6 +84,10 @@ spec = describe "Terrain material, device-free (TRA-17)" $ do
       definedFacts terrainMaterialEquivalent `shouldBe` definedFacts terrainMaterial
       definedPush terrainMaterialEquivalent `shouldBe` definedPush terrainMaterial
       definedCutout terrainMaterialEquivalent `shouldSatisfy` isJust
+
+    it "declares the half-texel-inset negative control with the same layout, so only its sampling rule differs" $ do
+      definedFacts terrainMaterialInsetControl `shouldBe` definedFacts terrainMaterial
+      definedPush terrainMaterialInsetControl `shouldBe` definedPush terrainMaterial
 
   beforeAll (loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]) $ do
     describe "an adapted plan's records and instances" $ do

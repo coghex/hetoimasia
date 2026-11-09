@@ -29,12 +29,13 @@
 module Hetoimasia.Terrain.Render2D.Vulkan.Material
   ( terrainMaterial
   , terrainMaterialEquivalent
+  , terrainMaterialInsetControl
   , lightPush
   ) where
 
 import Hetoimasia.Render.TwoD.Vulkan.Material
 import Hetoimasia.Terrain.Render2D.Material (recordLayout)
-import Hetoimasia.Terrain.Render2D.Vulkan.Source (lightPush, terrainSource, terrainSourceEquivalent)
+import Hetoimasia.Terrain.Render2D.Vulkan.Source (lightPush, terrainSource, terrainSourceEquivalent, terrainSourceInsetControl)
 
 -- | The terrain material, cutout-capable, with its checked variants.
 terrainMaterial ∷ DefinedMaterial
@@ -59,5 +60,19 @@ terrainMaterialEquivalent =
          , declaredRecord = recordLayout
          , declaredPush = lightPush
          , declaredSource = terrainSourceEquivalent
+         }
+   )
+
+-- | A negative control's material, never a terrain material: the same declaration with the
+-- half-texel-inset interpolation of the region coordinate, which shifts interior texel boundaries.
+-- It exists so the evidence can show its judge rejecting that rule; nothing draws terrain with it.
+terrainMaterialInsetControl ∷ DefinedMaterial
+terrainMaterialInsetControl =
+  $( defineMaterial
+       MaterialDeclaration
+         { declaredCutoutCapable = True
+         , declaredRecord = recordLayout
+         , declaredPush = lightPush
+         , declaredSource = terrainSourceInsetControl
          }
    )

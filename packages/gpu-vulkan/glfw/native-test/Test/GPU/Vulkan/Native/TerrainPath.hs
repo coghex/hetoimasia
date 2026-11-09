@@ -106,7 +106,7 @@ import Hetoimasia.Terrain.Render2D.Camera (CameraState, camClip, camFacing, camR
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Scenes
-import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial, terrainMaterialEquivalent)
+import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl)
 import Hetoimasia.Terrain.Shape (allViewFacings)
 import Test.GPU.Vulkan.Native.OrderedPath
   ( Evidence
@@ -185,6 +185,9 @@ data Variant
     WholeAtlasRegion
   | -- | A control: the normal atlas is bound as colour (sRGB, decoded on sampling).
     WrongTreatment
+  | -- | A control: the region coordinate interpolated between half-texel-inset endpoints, which
+    -- shifts the interior texel boundaries (a third, control-only material).
+    HalfTexelInset
   | -- | A control: drawn correctly, but the pick answers through the farthest covered quad.
     BackmostPick
   deriving stock (Eq, Show)
@@ -203,10 +206,11 @@ suffixOf = \case
   SwappedColourOrigins → "-control-swapped-region-origins"
   WholeAtlasRegion → "-control-whole-atlas-clamping"
   WrongTreatment → "-control-normal-as-colour"
+  HalfTexelInset → "-control-half-texel-inset"
   BackmostPick → "-control-pick-through-nearer"
 
 isControl ∷ Variant → Bool
-isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, BackmostPick]
+isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, BackmostPick]
 
 -- | What a fixture must show, each by a named probe that is determinate for the oracle and differs
 -- from its contrast.
@@ -341,6 +345,7 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Varies] SwappedColourOrigins (atZoom 0.25 (shapeMatrix FaceSouth 1))
          , spec defaultLight [Foreground, Varies] WholeAtlasRegion (atZoom 0.125 (rampsCorners FaceSouth))
          , spec defaultLight [Foreground, Varies] WrongTreatment (atZoom 0.125 (rampsCorners FaceSouth))
+         , spec defaultLight [Foreground, Varies] HalfTexelInset (atZoom 0.125 (rampsCorners FaceSouth))
          , spec defaultLight [Foreground, Overlap] BackmostPick (atZoom 0.125 (disconnectedSpans FaceSouth))
          ]
 
@@ -391,6 +396,7 @@ data Ctx = Ctx
   , ctxDecoded ∷ !(Map.Map Api.TextureHandle DecodedImage)
   , ctxPrimary ∷ !MaterialRef
   , ctxSecond ∷ !MaterialRef
+  , ctxInset ∷ !MaterialRef
   , ctxDevice ∷ !Text
   }
 
@@ -478,6 +484,7 @@ prepare profile host directory device style = do
                   retained ← newRetained
                   primary ← Render.registerMaterial renderer terrainMaterial
                   second ← Render.registerMaterial renderer terrainMaterialEquivalent
+                  inset ← Render.registerMaterial renderer terrainMaterialInsetControl
                   pure
                     ( Right
                         Ctx
@@ -495,6 +502,7 @@ prepare profile host directory device style = do
                           , ctxDecoded = Map.fromList [(colourH, colourD), (normalH, normalD), (unmarkedH, unmarkedD), (asColourH, asColourD)]
                           , ctxPrimary = primary
                           , ctxSecond = second
+                          , ctxInset = inset
                           , ctxDevice = device
                           }
                     )
@@ -612,8 +620,9 @@ runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
             TwoMaterials → [adaptedInstance (materialFor e) adapted e | e ← scramble entries]
             Scrambled → [adaptedInstance (ctxPrimary ctx) adapted e | e ← scramble entries]
             ReversedKeys → [reversedKey (adaptedInstance (ctxPrimary ctx) adapted e) | e ← entries]
+            HalfTexelInset → [adaptedInstance (ctxInset ctx) adapted e | e ← entries]
             _ → [adaptedInstance (ctxPrimary ctx) adapted e | e ← entries]
-          held = [(ref, adaptedMaterialData adapted) | ref ← [ctxPrimary ctx, ctxSecond ctx]]
+          held = [(ref, adaptedMaterialData adapted) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxInset ctx]]
       view ← either (\refused → Left ("the view: " <> describeMaterialRefusal refused)) Right (terrainView plan adapted held [WorldLayer DepthEnabled instances])
       pure (Part sc plan camera shape (Pass (OffscreenTarget (shapeRef shape)) (ClearColour 0 0 0 1) [view]) adapted)
     reversedKey inst = inst {instanceDepthKey = 16777215 - instanceDepthKey inst}
@@ -739,7 +748,7 @@ renderSnapshot ctx s parts = do
       marks ← registeredMarks (ctxTextures ctx)
       buffers ← retainedBuffers (ctxRetained ctx)
       let shapes = map partShape parts
-          models = Map.fromList [(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx]]
+          models = Map.fromList [(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxInset ctx]]
           decodedAt = (`Map.lookup` ctxDecoded ctx)
           art = styleArt (ctxStyle ctx)
           light = lightHand (specLight s)

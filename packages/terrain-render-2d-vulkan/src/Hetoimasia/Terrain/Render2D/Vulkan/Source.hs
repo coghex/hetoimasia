@@ -26,6 +26,7 @@
 module Hetoimasia.Terrain.Render2D.Vulkan.Source
   ( terrainSource
   , terrainSourceEquivalent
+  , terrainSourceInsetControl
   , lightPush
   ) where
 
@@ -98,5 +99,38 @@ terrainSourceEquivalent =
     , "    float cover = map.a * base.a;"
     , "    vec3 colourOut = base.rgb * map.a * light * dim * (1.0 - mist) + pushed.lightHaze.xyz * cover * mist;"
     , "    return vec4(colourOut, cover);"
+    , "}"
+    ]
+
+-- | A NEGATIVE CONTROL, never the terrain's own material: the region coordinate interpolated between
+-- the half-texel-inset endpoints of the region, @(origin + 1/2 + u (w - 1)) / atlasExtent@, instead
+-- of the texel the local index selects. It differs from the specified rule at interior texel
+-- boundaries (they shift), which is exactly what the evidence's judge must reject. It reads the same
+-- record and push block as 'terrainSource'.
+terrainSourceInsetControl ∷ String
+terrainSourceInsetControl =
+  unlines
+    [ "vec4 material(vec4 texel, vec2 uv, uint parameter, MaterialRecord record) {"
+    , "    vec2 unit = clamp(uv, 0.0, 1.0);"
+    , "    vec2 colourExtent = vec2(float(record.words[2]), float(record.words[3]));"
+    , "    vec2 colourAt = (vec2(float(record.words[0]), float(record.words[1])) + 0.5 + unit * (colourExtent - 1.0))"
+    , "        / vec2(float(record.words[4]), float(record.words[5]));"
+    , "    vec2 normalExtent = vec2(float(record.words[8]), float(record.words[9]));"
+    , "    vec2 normalAt = (vec2(float(record.words[6]), float(record.words[7])) + 0.5 + unit * (normalExtent - 1.0))"
+    , "        / vec2(float(record.words[10]), float(record.words[11]));"
+    , "    vec4 colour = sampleTexture(record.handles[0], colourAt);"
+    , "    vec4 data = sampleTexture(record.handles[1], normalAt);"
+    , "    vec3 bytes = floor(data.rgb * 255.0 + 0.5) - 128.0;"
+    , "    float length2 = dot(bytes, bytes);"
+    , "    vec3 normal = (length2 > 0.0) ? bytes * inversesqrt(length2) : vec3(0.0, 0.0, 1.0);"
+    , "    float diffuse = clamp(dot(normal, pushed.lightSun.xyz), 0.0, 1.0);"
+    , "    float ambient = pushed.lightSun.w;"
+    , "    float bright = ambient + (1.0 - ambient) * pushed.lightDepth.x * diffuse;"
+    , "    float t = clamp(float(record.words[12]) * pushed.lightDepth.w, 0.0, 1.0);"
+    , "    float darken = 1.0 - pushed.lightDepth.y * t;"
+    , "    float haze = pushed.lightDepth.z * t * t;"
+    , "    float alpha = colour.a * data.a;"
+    , "    vec3 rgb = (1.0 - haze) * colour.rgb * data.a * bright * darken + haze * pushed.lightHaze.xyz * alpha;"
+    , "    return vec4(rgb, alpha);"
     , "}"
     ]
