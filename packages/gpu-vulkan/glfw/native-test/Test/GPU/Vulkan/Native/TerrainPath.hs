@@ -256,6 +256,30 @@ suffixOf = \case
   BackmostPick → "-control-pick-through-nearer"
   PickLoadingAsMiss → "-control-loading-as-miss"
 
+-- | The device and driver session on which the two sampling controls were MEASURED (owner amendments v2 to v4,
+-- requirement 9): the unbiased index on the exact-boundary fixtures and the 1/10000 bias on the snapped 9/8 and 5/4
+-- fixtures. Only on this session identity (device name, driver name, driver info) must they discriminate; on any other
+-- session, or after the pinned driver moves, a control that does not differ is recorded as non-discriminating there,
+-- neither passed nor failed, and the production biased fixtures still require zero mismatches everywhere.
+measuredSession ∷ (Text, Text, Text)
+measuredSession = ("Apple M3 Max", "MoltenVK", "1.4.2")
+
+-- | Whether a control must discriminate on this session: every control but the two device-scoped sampling controls
+-- always, those two on the measured session only.
+controlMandatory ∷ Ctx → Variant → Bool
+controlMandatory ctx variant
+  | variant `elem` [UnbiasedIndex, StaleBias] = (ctxDevice ctx, fst (ctxDriver ctx), snd (ctxDriver ctx)) == measuredSession
+  | otherwise = True
+
+-- | What a control's record says: rejected (it differed and the judge rejected it), failed (it did not, where it had
+-- to) or non-discriminating on this session (it did not, where it need not). Nothing for a fixture that is not a control.
+controlStatus ∷ Ctx → Spec → Extra → Maybe String
+controlStatus ctx sp extra
+  | not (isControl (specVariant sp)) = Nothing
+  | extraRejected extra == Just True && extraControlDiffers extra /= Just False = Just "rejected"
+  | controlMandatory ctx (specVariant sp) = Just "failed"
+  | otherwise = Just "non-discriminating on this session (not required here: neither passed nor failed)"
+
 isControl ∷ Variant → Bool
 isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, WrongOrder, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, HolesIgnored, UnbiasedIndex, StaleBias, WrongMapRegion, PickThroughFog, PickLoadingAsMiss, BackmostPick]
 
@@ -1251,8 +1275,8 @@ renderSnapshot ctx s parts = do
                   <> ["the independent expectation compared no pixel the scene covers" | indCovered independent == 0]
                   <> ["pass " <> show pass <> " covers no compared pixel: a pass judged on nothing" | (pass, one') ← zip [0 ∷ Int ..] independents, indCovered one' == 0, not (isControl (specVariant s))]
                   <> ["more than half the pixels were ambiguous: " <> show (indAmbiguous independent) <> " of " <> show (indAmbiguous independent + indCompared independent) | indAmbiguous independent > indCompared independent]
-                  <> ["the control was not rejected: the judge found no disagreement with a draw broken on purpose" | rejected == Just False]
-                  <> ["the control did not differ at its named probes, so it did not exercise what it breaks" | controlDiffers == Just False]
+                  <> ["the control was not rejected: the judge found no disagreement with a draw broken on purpose" | rejected == Just False, controlMandatory ctx (specVariant s)]
+                  <> ["the control did not differ at its named probes, so it did not exercise what it breaks" | controlDiffers == Just False, controlMandatory ctx (specVariant s)]
                   <> [Text.unpack reason | Just reason ← [resultFailure result]]
           assessed = case problems of
             [] → result
@@ -1456,6 +1480,8 @@ writeRecord ctx format seconds results = do
             , ("light", JString (lightLabel (specLight sp)))
             , ("control_expected_rejected", maybe JNull JBool (extraRejected extra))
             , ("control_differs_at_named_probes", maybe JNull JBool (extraControlDiffers extra))
+            , ("control_status", maybe JNull JString (controlStatus ctx sp extra))
+            , ("control_mandatory_on_this_session", if isControl (specVariant sp) then JBool (controlMandatory ctx (specVariant sp)) else JNull)
             , ( "scene"
               , JObject
                   [ ("facing", JString (show (sceneFacing sc)))
