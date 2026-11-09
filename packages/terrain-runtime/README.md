@@ -71,6 +71,22 @@ is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).
 
+### Two read-only queries for a host's precheck
+
+Both are transactions, write nothing and change no behaviour of the service. They were added for TRA-5 (#641) at the manager's
+authorization under the owner's 2026-11-09 decision.
+
+* `stagedRemovalChanges service request` answers whether the removal the request has **staged** would change content: `Just True` for a
+  removal that will advance the arena's revision by one, `Just False` for a removal of air, which commits as unchanged at the revision
+  it finds, and `Nothing` for any request that has staged no removal (a read, an open or an attach, one not yet staged, one settled, or
+  another service's). A host's eligibility callback uses it to decide, before the commit, whether a removal needs a revision the host
+  cannot publish, so that a no-op removal at that revision succeeds without a defect.
+* `serviceAdmitting service` answers whether the service is running and its parent session open. A host asks it where a permanent
+  refusal is decided, before it reserves anything of its own. It is a precheck only: every admission asks the same question again,
+  atomically with its own effect (`RefusedClosed`), so a service that closes between the host's check and the hand-off still refuses it
+  and leaves nothing behind. `Closure` examples cover running, the session's end, closing and closed, and the closure between check and
+  admission.
+
 ## State, owner, thread and lifetime
 
 All mutable state is one record behind one `TVar`. Admission, cancellation, release
@@ -565,8 +581,8 @@ has its sign bit flipped) so that the byte order of a key is its logical order.
 
 Leaf entries are `keyLen(1) valueLen(1) key value` (key 1 to 64 bytes, value at most
 64); internal entries are `keyLen(1) key childPage(8)`, the key being the least key
-the child may hold; a list is a strictly increasing run of eight-byte page numbers
-(at most 506). The records of each tree:
+the child may hold; a list is the eight-byte version of the retirement entry that
+names it, then a strictly increasing run of eight-byte page numbers (at most 505). The records of each tree:
 
 | Tree | Key | Value |
 | --- | --- | --- |
@@ -713,15 +729,60 @@ each with an accounted record). Writes, publication and reclamation cannot chang
 answers. A commit retires only the record pages it replaced, in one retirement entry
 keyed by its version; an entry is reclaimable once the oldest pinned version is at
 least that version (`BlockedByReader` otherwise). `planMaintenance` first checks that every page it frees is
-a retired one: inside the used space, a tree page and not the page the committed tree of
-its own header still reaches on the path of its first key (the owner supplies the
-candidate pages through the window like any other page; a retirement entry naming a live
-root, a shared live subtree, a bookkeeping page or a list page is `RetiredPageLive`), and
+a retired one: inside the used space, a record-tree page and not the page a committed
+tree **or any pinned reader's tree** still reaches on the path of its first key (the
+owner supplies the candidate pages as probes; a retirement entry naming a live root, a
+shared live subtree, a bookkeeping page, a list page or a page a reader still pins, as a
+lowered version does, is `RetiredPageLive`; a list whose stamped version is not its
+entry's version is `MalformedRetirement`), and
 that none is already free, loose or claimed by its own supply (`DoubleFree`), so
 a corrupt retirement list never yields a page with two owners. It then frees an entry's
 pages incrementally (at most 64 per transaction, fewer when a bound is tighter), is a
 maintenance transaction and **may spend the protected reserve**. A token of a released
 reader, of another store or of another incarnation reads nothing (`ReadStale`).
+
+### Ownership: what no persisted record is trusted for
+
+The store decides which pages are live, free, pinned or reclaimable from records it wrote
+itself, and any of them can be re-sealed with a valid checksum and name the wrong page.
+It therefore trusts none of them to say a page is *safe to overwrite*. One test decides
+that, at the one place a page is overwritten:
+
+* **A probe, not a page.** A plan that is about to write a page below the used space
+  (a supplied loose page or free extent) or to free one (a retirement entry's page) asks
+  for it with `PendingProbe`; the owner reads it and calls `addProbe`, which keeps only a
+  classification: *nothing a store could read* (it does not decode as a page of this store
+  at that number: garbage, never written, another store's), a tree page with the first key
+  it holds, or a retirement list with the version it is stamped with. A probe is a few
+  bytes, never the 4 KiB buffer, and costs no window page.
+* **Reachable means on the path of its first key.** A tree page is looked for at its level
+  on the path of its first key in the committed tree it belongs to and, for a record tree,
+  in each pinned reader's tree (at most 16, each at most 8 steps per page); a list is looked
+  for under its stamped version in the committed retirement tree. A page found is
+  `SuppliedPageLive` (or `RetiredPageLive` when reclamation was freeing it) and **nothing is
+  written**. The pages written by a plan are at most 256, so the proof is bounded; its
+  steps, probes and pages read through the window are part of the measured bounds.
+* **The used space bounds every reference.** A tree root, a child reference or a retirement
+  list at or past the high-water mark has never been numbered: every descent, plan or read
+  (through a reader's own used space for a pinned read) refuses it with `BadReference`, so
+  the untouched tail can never be reachable.
+* **The loose list is checked whole**: every page inside the used space, none twice, none
+  also in a free extent.
+
+The sites, and what stops a forged record at each (tests are in
+`Test.TerrainRuntime.Store.Ownership` unless named):
+
+| Site (record trusted) | Guard | Tamper test |
+| --- | --- | --- |
+| loose list (root set) | `takeSupply` checks, probe proof before any write | loose page is live; loose list holds a page twice |
+| free extents (allocator tree) | extent inside the used space, ordered, disjoint; probe proof before any write, for a plan and for maintenance | extent offers a live page (every tree root, a page below a root, a list page); a page only a pinned reader reaches; a garbage page is overwritten, not refused; `Readers`: supply outside the used space |
+| retirement entry version | the list's stamp must equal it; reclaimed pages proven unreachable from every pinned tree | version lowered past a pinned reader, with and without its list's stamp |
+| retirement entry list page, count, done | list inside the used space, a list page, the stamped version and the counted length | list past the used space, not a list, wrong counts |
+| retirement list pages | inside the used space, record pages only, unreachable from committed and pinned roots, not already free, loose or claimed | names a bookkeeping page or a page past the used space; `Readers`: a double free; a page the committed trees reach |
+| a retirement list as a supplied page | looked for under its stamped version | extent offers a retirement list page |
+| tree roots and every child reference | used-space bound in every descent; tree, level, bounds (earlier rounds) | a root past the used space; a child past it, for a plan, a committed read and a pinned read; `Codec`: bounds, cycles, levels |
+| a reader's pinned roots | pinned used space, proof against pinned trees | the pinned-read part of the child test; the pinned extent and lowered-version tests |
+| counters | arithmetic only (a negative count is refused); never used to find a page | `Codec` revision and counter wrap tests |
 
 ### The allowance
 

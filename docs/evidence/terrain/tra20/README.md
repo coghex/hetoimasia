@@ -153,3 +153,33 @@ Rounds 1-3 kept finding one class: a value read from an untrusted page used with
 ## Review round 4 (Codex, CHANGES_REQUESTED at `1e1f85d2`)
 
 Three findings, all valid, repaired in `64a8ed36`: reclamation freed any page a retirement entry named that was not free, loose or claimed, so a valid-checksum entry naming a live root made authoritative data reusable (now each candidate must lie inside the used space, be a tree page and not be the page the committed tree of its header reaches on the path of its first key, checked by `livePageAt` through the window; `refuses to reclaim a page the committed trees still reach...` covers the runs root, a live page below it, the free tree's root and the retirement tree's root, and a loose or list page is refused as well); cache credits of zero or a few bytes were granted while allocating an entry and map node each (every cache entry is now charged at least a page, every grant at least 128 bytes in the staging and control accounts); a shrink with large configured overhead was classified `GrowthInvalid (OverheadInvalid ..)` because the replacement configuration was built first (the size rules now come first, and a replacement is built only for an increase).
+
+## Review round 5 (Codex, CHANGES_REQUESTED at `af881bd6`)
+
+Two findings, both valid: a forged free extent naming the committed runs root (re-sealed, valid checksum) was accepted by `takeSupply`, so a plan wrote that page while it was a live root and an abort could not preserve it; and reclamation's liveness check covered only the current roots and trusted the retirement entry's version, so pinning version 1, publishing 2 and lowering the entry's version to 1 freed a page the reader still read, which was later reused (the reader then got `BadPage KindMismatch`). Round 5 was the last the issue allowed; the owner granted rounds 6 and 7 on the condition that the class be closed as a class.
+
+## Round 6: the class-wide ownership proof (before the sixth review)
+
+The manager's instruction: enumerate every site where the store trusts a persisted record about which pages are live, free, pinned or reclaimable, validate each against the live and pinned roots, and give each a tamper test with a forged record that passes its checksum plus a negative control. The sites and their guards are the table in the runtime README ("Ownership: what no persisted record is trusted for"). The design is one test at the one place a page is overwritten: every page a plan writes below the used space, and every page reclamation frees, is classified from a probe (never read into the window as a 4 KiB buffer) and looked for on the path of its first key in the committed tree and in each pinned reader's tree; a retirement list carries the version of its entry and is looked for under it; a reference at or past the used space is refused by every descent. `Test.TerrainRuntime.Store.Ownership` holds ten tamper tests; the runtime suite is 389 examples, 0 failures at the round-6 head.
+
+Negative controls (a mutation applied locally to the library, never committed, file restored; the ownership tests, and for the second batch the retirement tests too, run against each):
+
+| Mutation | Result |
+| --- | --- |
+| pinned roots are not consulted when proving a page unreachable | 2 failures (the pinned extent and the lowered version) |
+| a candidate overwrites supplied pages without the proof | 4 failures (free extents, loose pages) |
+| maintenance overwrites supplied pages without the proof | 1 failure (the maintenance variant) |
+| reclamation checks a retired page against the committed roots only | 1 failure (lowered version past a pinned reader) |
+| a list's stamp is not compared with its entry's version | 1 failure |
+| a reference at or past the used space is followed | 2 failures (a root and a child past it) |
+| a retirement list page past the used space is read | 1 failure |
+| a loose page listed twice beyond the supply is accepted | 1 failure |
+| a pinned read is not bounded by its version's used space | 1 failure |
+| a retirement list page is never looked for under its version | 2 failures |
+| an entry's count is not compared with its list | 1 failure |
+| a page that is not a page of this store is treated as live | the suite aborts (its histories cannot be built); the false-refusal direction is also held by `overwrites a free page that holds garbage...` |
+| a reachable tree page is never refused | 5 failures |
+| the double-free overlap check is removed | 1 failure |
+| a free extent past the used space is handed out | 1 failure |
+
+Limits: the proof is bounded by the pages a plan writes (at most 256) times the pinned readers (at most 16) times the tree height, and a plan that cannot afford the extra window pages is refused with the typed window result, never accepted unproven. A record that is consistently forged across every record that mentions a page, including the committed trees themselves, cannot be told from the truth by any local check; what is guaranteed is that no single forged record, and no inconsistency between a record and the trees a reader can still reach, lets a plan overwrite or free such a page.
