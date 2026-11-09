@@ -183,6 +183,7 @@ startAdmitted context ask name arguments afterCompletion = do
             settling =
               Settling
                 { settlingEligible = eligibleOf service (admittedIdentity found)
+                , settlingSettleFinal = \final → settleWithFinal service ask (endpointResult endpoint) final (admittedIdentity found)
                 , settlingSettle = settleWith service ask (endpointResult endpoint) (admittedIdentity found)
                 , settlingCancel = void (cancelOf service (admittedRequester found) (admittedNumber found))
                 }

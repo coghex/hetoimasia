@@ -75,6 +75,7 @@ module Hetoimasia.Scripting.Lua.Provider.State
   , checkReplyPure
   , eligibleOf
   , settleWith
+  , settleWithFinal
   , replyTo
   , settlementFields
   , deliverable
@@ -1038,13 +1039,29 @@ finishAdoption service identity adopting = do
             , pHeld = Map.adjust (\held → held {heldLease = Nothing, heldCredits = filter (not . creditTransfers) (heldCredits held)}) identity (pHeld st)
             }
     else do
-      writeTVar (psVar service) st
-        { pRecs = Map.adjust (\record → record {recAdopted = True}) identity (pRecs st)
-        , pHeld = Map.adjust (\held → held {heldLease = Nothing, heldCredits = filter (not . creditTransfers) (heldCredits held)}) identity (pHeld st)
-        , pAdopting = Map.delete identity (pAdopting st)
-        , pCounts = (pCounts st) {countAdopted = countAdopted (pCounts st) + 1}
-        }
-      Just <$> applyChecked service identity (CheckedResult (adoptingBytes adopting) (adoptingValue adopting))
+      -- The provider's last look is taken in this transaction, so what it checks and what it makes visible are one with the settlement.
+      verdict ← fromMaybe (pure Nothing) (adoptingFinal adopting)
+      st' ← readTVar (psVar service)
+      case verdict of
+        Just failure → do
+          -- The success cannot be published: the request settles this failure instead, and the resource that was built is released by the
+          -- caller, which returns the credits that transfer.
+          writeTVar (psVar service) st'
+            { pHeld = Map.adjust (\held → held {heldLease = Nothing, heldCredits = filter (not . creditTransfers) (heldCredits held)}) identity (pHeld st')
+            , pAdopting = Map.delete identity (pAdopting st')
+            }
+          case Map.lookup identity (pRecs st') >>= \record → (,) record <$> recAdmission record of
+            Just (record, ask) → () <$ applyCheckedAs service (adoptingNow adopting) identity (checkReplyPure (psLimits service) (recSchema record) ask (ProviderExpected failure))
+            Nothing → pure ()
+          pure Nothing
+        Nothing → do
+          writeTVar (psVar service) st'
+            { pRecs = Map.adjust (\record → record {recAdopted = True}) identity (pRecs st')
+            , pHeld = Map.adjust (\held → held {heldLease = Nothing, heldCredits = filter (not . creditTransfers) (heldCredits held)}) identity (pHeld st')
+            , pAdopting = Map.delete identity (pAdopting st')
+            , pCounts = (pCounts st') {countAdopted = countAdopted (pCounts st') + 1}
+            }
+          Just <$> applyCheckedAs service (adoptingNow adopting) identity (CheckedResult (adoptingBytes adopting) (adoptingValue adopting))
 
 -- | Building a request's resource failed: the reservation was given back by the building, and the
 -- request no longer holds a lease. The failure is the owner's to raise.
@@ -1320,15 +1337,23 @@ modelReply = \case
 -- defect is recorded for the owner to raise, once, and settles nothing: the provider's work is
 -- proved over, and the request stays as it was until the owner's failure revokes it.
 replyTo ∷ ProviderState → RequestId → Checked → STM ReplyAnswer
-replyTo service = replyToAs service True
+replyTo service = replyToAs service (ReplyMode True Nothing False)
+
+-- | How a reply is applied: whether a resource reply proves the provider's work over at once, the provider's last look at the
+-- settlement of a resource reply, and whether the reply was made at its position.
+data ReplyMode = ReplyMode
+  { rmEndsWork ∷ !Bool
+  , rmFinal ∷ !(Maybe (STM (Maybe ExpectedFailure)))
+  , rmNow ∷ !Bool
+  }
 
 -- | 'replyTo', and whether a resource reply proves the provider's work over at once. It does for 'completeRequest': the provider
 -- has nothing more to tell, and learns that interest ended before the build only through 'submissionSettled'. It does not for
 -- the opt-in settlement seam: the resource is the provider's until the owner has built it, so a request that ends first still
 -- has its work told ('workCancel') and the provider reclaims what it offered, at that very cancel, and never waits for a
 -- take, a boundary or a thread of its own.
-replyToAs ∷ ProviderState → Bool → RequestId → Checked → STM ReplyAnswer
-replyToAs service endsWork identity checked = do
+replyToAs ∷ ProviderState → ReplyMode → RequestId → Checked → STM ReplyAnswer
+replyToAs service mode identity checked = do
   st ← readTVar (psVar service)
   let session = pSession st
       unsettled = maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests session))
@@ -1356,8 +1381,8 @@ replyToAs service endsWork identity checked = do
               writeTVar (psVar service) st {pCounts = (pCounts st) {countDuplicateHeld = countDuplicateHeld (pCounts st) + 1}}
               pure ReplyLate
             else do
-              let adopting = st {pAdopting = Map.insert identity (Adopting key number build value bytes False) (pAdopting st)}
-              writeTVar (psVar service) (if endsWork then endWork identity adopting else adopting)
+              let adopting = st {pAdopting = Map.insert identity (Adopting key number build value bytes False (rmFinal mode) (rmNow mode)) (pAdopting st)}
+              writeTVar (psVar service) (if rmEndsWork mode then endWork identity adopting else adopting)
               pure ReplyAdoption
     _ → applyChecked service identity checked
   where
@@ -1473,11 +1498,17 @@ eligibleOf service identity = do
 -- the owner to build the resource, as every resource reply does. A request that is eligible settles now,
 -- whatever its tick; any other is held for its position.
 settleWith ∷ ProviderState → Admission → Schema → RequestId → ProviderReply → STM ReplyAnswer
-settleWith service ask schema identity reply = do
+settleWith service ask schema = settleWithFinal service ask schema (pure Nothing)
+
+-- | 'settleWith' for a resource reply that carries the provider's last look at the settlement ('adoptingFinal'): taken in the very
+-- transaction that settles the request once the owner has built the resource. A resource reply made when the request is eligible is
+-- settled at that point, never held for its tick.
+settleWithFinal ∷ ProviderState → Admission → Schema → STM (Maybe ExpectedFailure) → RequestId → ProviderReply → STM ReplyAnswer
+settleWithFinal service ask schema final identity reply = do
   eligible ← eligibleOf service identity
   case checkReplyPure (psLimits service) schema ask reply of
     checked@(CheckedDefect _) → replyTo service identity checked
-    checked@(CheckedResource {}) → replyToAs service False identity checked
+    checked@(CheckedResource {}) → replyToAs service (ReplyMode False (Just final) eligible) identity checked
     checked → applyCheckedAs service eligible identity checked
 
 -- | How many provider defects are kept for the owner to raise: it fails with the first, and the rest are

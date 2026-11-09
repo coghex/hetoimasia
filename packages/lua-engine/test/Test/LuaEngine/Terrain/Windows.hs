@@ -6,7 +6,7 @@
 module Test.LuaEngine.Terrain.Windows (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext))
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
@@ -66,6 +66,49 @@ opener =
     { scPrelude = terrainPrelude
     , scInit = ["self.q = api.terrain.open('shared', DEF)"]
     , scUpdate = ["if self.q then local t = settle(api, self.q) if t then print('opened', t.status) self.q = nil end end"]
+    }
+
+-- | A gameplay instance that opens a name and cancels the open before its position; a presentation instance that then opens the same name.
+cancelledOpen ∷ Script
+cancelledOpen =
+  script
+    { scPrelude = terrainPrelude
+    , scInit =
+        [ "if api.role == 'gameplay' then"
+        , "  self.q = api.terrain.open('held', DEF)"
+        , "  print('cancel', api.request.cancel(self.q))"
+        , "else"
+        , "  self.q = api.terrain.open('held', DEF)"
+        , "end"
+        ]
+    , scUpdate = ["if api.role ~= 'gameplay' and self.q then local t = settle(api, self.q) if t then print('reopen', t.status, t.error and t.error.code) self.q = nil end end"]
+    }
+
+-- | The first instance opens an arena and shares its handle; the second waits until that instance has ended, then releases it.
+endedHandle ∷ Script
+endedHandle =
+  script
+    { scPrelude = terrainPrelude <> ["SHARED = SHARED or {}"]
+    , scInit = ["self.s = 0", "if api.instance_id == 'inst-1' then self.q = api.terrain.open('e', DEF) end"]
+    , scUpdate =
+        [ "if api.instance_id == 'inst-1' then"
+        , "  if self.s == 0 then local t = settle(api, self.q) if t then SHARED.h = t.value SHARED.opened = true self.s = 1 end end"
+        , "else"
+        , "  if self.s == 0 and SHARED.opened then self.q = api.terrain.attach('e') self.s = 1"
+        , "  elseif self.s == 1 then"
+        , "    local t = settle(api, self.q)"
+        , "    if t then self.arena = t.value print('B ready') self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) self.s = 2 end"
+        , "  elseif self.s == 2 then"
+        , "    local t = settle(api, self.q)"
+        , "    if t then"
+        , "      if t.status == 'failure' then"
+        , "        try('foreign release after the issuer ended', api.terrain.release, SHARED.h)"
+        , "        print('done') self.s = 3"
+        , "      else self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) end"
+        , "    end"
+        , "  end"
+        , "end"
+        ]
     }
 
 -- | An instance that finds the service's clients, arenas or leases all taken.
@@ -239,7 +282,7 @@ spec = describe "Terrain windows and banks" $ do
           -- an observer of the service finds the cell as it was: nothing was committed after the session closed admission
           observeCell rig (arenaName rig "modules-test" "main") (0, 0, 0) `shouldReturn` (0, Just "soil")
 
-  it "keeps an arena the service committed invisible to attach, in every VM, until the host has adopted the open's lease" $ do
+  it "answers an attach to an open the service committed but the host has not adopted as not_found at once, in every VM, and finds it after" $ do
     gate ← newGate
     withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopting = holdAt gate} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener), ("lua/attach.lua", scriptSource attacher)]) $ \world _ runtime →
@@ -249,14 +292,16 @@ spec = describe "Terrain windows and banks" $ do
             _ ← spawn world creatorVm "modules-test" mainPath
             -- the service has committed the open and the host's adoption of it is held: the other VM keeps asking and is never told it is there
             awaitReached gate
-            mapM_ (\_ → advanceClock world 2000000000) [1 ∷ Int .. 6]
+            -- an attach decided now finds a name only the service has settled: it answers not_found at once, without waiting for the adoption
+            notFound ← length . filter (== "attach\tfailure\tnot_found") <$> outLines world
+            pumpUntil world (advanceClock world 2000000000 >> ((> notFound) . length . filter (== "attach\tfailure\tnot_found") <$> outLines world))
             outLines world >>= \printed → printed `shouldNotContain` ["attach\tsuccess\tnil"]
             openGate gate
             untilPrinted world "attach\tsuccess\tnil"
 
   it "settles arena_closed, and publishes no lease, for an attach whose arena closed between its commit and its adoption" $ do
     gate ← newGate
-    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopting = holdAt gate} $ \rig → do
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = holdAt gate} $ \rig → do
       Right client ← registerClient (rgService rig)
       Right opening ← openArena (rgService rig) client (arenaName rig "modules-test" "shared") soilOverStoneSpec
       Right ownerLease ← await (rgService rig) opening
@@ -299,6 +344,43 @@ spec = describe "Terrain windows and banks" $ do
           untilPrinted world "done"
           outLines world >>= \printed →
             printed `shouldSatisfy` any (\line → "foreign release => false ; " `Text.isPrefixOf` line && "another instance" `Text.isInfixOf` line)
+
+  it "frees a cancelled open's name at the host's settlement, while the service has not yet been told" $ do
+    tellGate ← newGate
+    (`finally` openGate tellGate) $
+     withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookCancelling = holdAt tellGate} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource cancelledOpen)]) $ \world _ runtime →
+        withFvm world runtime (gameplayOver rig) $ \logical →
+          withFvm world runtime (presentationOver rig) $ \shown → do
+            -- the instance's init cancels its own held open, and is held at the telling, so it is admitted without waiting for it to serve
+            _ ← admitOnly world logical "modules-test" mainPath
+            -- the host has settled the held open as cancelled and the telling of the service is held
+            awaitReached tellGate
+            _ ← spawn world shown "modules-test" mainPath
+            untilPrinted world "reopen\tsuccess\tnil"
+            openGate tellGate
+
+  it "gives back the attach client of an attach that was refused busy, so the bank is not charged for it" $
+    withRigConfig defaultConfig {configMaxClients = 2, configMaxLeases = 1} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource pressed)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "done"
+          outLines world >>= \printed → printed `shouldContain` ["attach\ttrue\tbusy"]
+          -- only the instance's owner client is held: the refused attach's client was given back
+          limitHeld (rgService rig) "clients" `shouldReturn` 1
+
+  it "refuses another instance's handle after its issuer has ended and the arena is closed" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource endedHandle)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          issuer ← spawn world fvm "modules-test" mainPath
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "B ready"
+          stopSpawned issuer
+          untilPrinted world "done"
+          outLines world >>= \printed →
+            printed `shouldSatisfy` any (\line → "foreign release after the issuer ended => false ; " `Text.isPrefixOf` line && "another instance" `Text.isInfixOf` line)
 
   it "gives a logical read ordered after a removal of the same cell the post-removal value and revision, reads prepared before the commit included" $
     withRig $ \rig →

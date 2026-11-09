@@ -39,11 +39,11 @@ module Test.LuaEngine.Terrain.Support
   , disarmGate
   ) where
 
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (onException)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import Data.List (find)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -161,9 +161,9 @@ gatedProbe selects gate = Probe $ \point →
 awaitReached ∷ Gate → IO ()
 awaitReached gate = bounded (takeMVar (gateArrived gate))
 
--- | Let a held owner go, and every later arrival through.
+-- | Let a held owner go, and every later arrival through. Idempotent, so a scope can open it as part of its stop.
 openGate ∷ Gate → IO ()
-openGate gate = disarmGate gate >> putMVar (gateOpen gate) ()
+openGate gate = disarmGate gate >> void (tryPutMVar (gateOpen gate) ())
 
 -- Cases ---------------------------------------------------------------------------------------------------
 

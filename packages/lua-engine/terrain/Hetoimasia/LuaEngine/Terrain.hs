@@ -62,7 +62,7 @@ module Hetoimasia.LuaEngine.Terrain
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (Exception, finally, mask, mask_, throwIO)
+import Control.Exception (Exception, finally, mask, mask_, onException, throwIO)
 import Control.Monad (forM_, void, when)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
@@ -174,22 +174,36 @@ data TerrainFacade = TerrainFacade
   -- ^ The test seams: 'noTerrainHooks' in production.
   , tfExtraBindings ∷ ![Binding]
   -- ^ Bindings a test fixture adds to the facade's hidden namespace (a host-created pick token). Empty in production.
+  , tfClaims ∷ !(TVar (Map Text [Claim]))
+  -- ^ The opens in flight, by the service's name: how an open finds, before it asks the service, a claim whose request the host has
+  -- already settled as cancelled (the service has not been told yet) and lets it go, so that a name is free from the host's terminal
+  -- settlement and not from the later notification.
   , tfOffered ∷ !(TVar (Set Text))
   -- ^ The names whose open the service committed and the host has not yet adopted or let go: shared by every VM of the service, so
   -- that an attach, whichever VM makes it, is not eligible while the arena it would find is not yet the open's settled result.
+  }
+
+-- | An open the service holds a name for: whether the host has settled it without telling the service, and the telling.
+data Claim = Claim
+  { clStale ∷ STM Bool
+  , clCancel ∷ IO ()
   }
 
 -- | A composition over a service, with no pick authority issued, no hooks and no extra bindings.
 newTerrainFacade ∷ Profile → Service → Config → IO TerrainFacade
 newTerrainFacade profile svc config = do
   picks ← newTerrainPicks
+  claims ← newTVarIO Map.empty
   offered ← newTVarIO Set.empty
-  pure (TerrainFacade profile svc config picks noTerrainHooks [] offered)
+  pure (TerrainFacade profile svc config picks noTerrainHooks [] claims offered)
 
 -- | The windows a test may hold or fail: told, never consulted for an answer.
 data TerrainHooks = TerrainHooks
   { hookAdopting ∷ IO ()
   -- ^ The host is about to build an offered lease into its reserved lease, on the owner's thread.
+  , hookAdopted ∷ IO ()
+  -- ^ The host has built the offered lease into its reserved lease and has not yet settled the request: the window in which the arena
+  -- can close before the settlement.
   , hookReleasing ∷ IO ()
   -- ^ A lease's release is about to reach the service.
   , hookSubmitted ∷ IO ()
@@ -200,7 +214,7 @@ data TerrainHooks = TerrainHooks
   }
 
 noTerrainHooks ∷ TerrainHooks
-noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ())
+noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ())
 
 -- | Why a VM's terrain could not be composed: a failure of the composition, never a script's.
 newtype TerrainCompositionRefused = TerrainCompositionRefused Text
@@ -269,7 +283,9 @@ data LeaseCell
 -- | What this adapter holds of one request while it is the service's: the host's seam, where the offered lease is, and
 -- whether the service has reached its terminal outcome.
 data Link = Link
-  { lkName ∷ !(Maybe Text)
+  { lkAttach ∷ !(Maybe Text)
+  -- ^ The service's name of the arena an attach looks for.
+  , lkName ∷ !(Maybe Text)
   -- ^ The service's name of the arena an open creates: held in 'tfOffered' from the commit until the host adopts or lets go of the lease.
   , lkSettling ∷ !Settling
   , lkLease ∷ !(TVar LeaseCell)
@@ -308,7 +324,11 @@ data Env = Env
   , envClients ∷ !(TVar (Map Text Clients))
   , envAsks ∷ !(TVar (Word64, Map Word64 Pending))
   , envRetire ∷ !(TVar [Request])
-  , envIssued ∷ !(TVar (Map Word64 Text))
+  , envIssued ∷ !(TVar (Map Text (Set Word64)))
+  -- ^ The arena handles each live instance was issued: ownership is positive, so another instance's handle is refused for as long
+  -- as the caller lives, whether or not the issuing instance does. The memory is the handles the instance issued, ended with it.
+  , envDropped ∷ !(TVar [ArenaLease])
+  -- ^ Leases the service made for a request the host settled instead of publishing them: released at the next drain.
   }
 
 service ∷ Env → Service
@@ -328,7 +348,8 @@ terrainInjection config =
         asks ← newTVarIO (1, Map.empty)
         retiring ← newTVarIO []
         issued ← newTVarIO Map.empty
-        let env = Env config vm (hashUnique (tvSession vm)) clients asks retiring issued
+        dropped ← newTVarIO []
+        let env = Env config vm (hashUnique (tvSession vm)) clients asks retiring issued dropped
         pure (services env)
     }
 
@@ -347,7 +368,18 @@ services env =
     , tsAttachStart = \identity root name context → do
         attachClientOf env identity >>= \case
           Nothing → pure (TerrainStarted (M1Busy "request capacity is not available: the terrain service has all of its clients"))
-          Just client → start env context attachName attachAsk (AskAttach client (nameKey env root name))
+          Just (client, fresh) → do
+            -- A client made for this attach is the attach's to give back when it is not accepted: nothing stays charged for a request
+            -- that was refused (busy in the host's banks or the service's), and an exception leaves none behind either.
+            let giveBack = when fresh $ do
+                  atomically (modifyTVar' (envClients env) (Map.adjust (\clients → clients {clAttach = Nothing}) identity))
+                  endClient (service env) client
+            started ← start env context attachName attachAsk (AskAttach client (nameKey env root name)) `onException` giveBack
+            case started of
+              TerrainStarted (M1Busy _) → giveBack
+              TerrainRefused _ → giveBack
+              _ → pure ()
+            pure started
     , tsCellCheck = \identity key _ owner values → leaseCheck env identity key readAsk owner values
     , tsCellStart = \_ key cell context → withArena env key $ \lease →
         startOr cell (\tile → start env context cellName readAsk (AskCell lease tile))
@@ -373,7 +405,7 @@ services env =
           Right found → startOr cell (\tile → start env context removeName readAsk (AskRemove lease tile found))
     , tsReleaseCheck = releaseCheck env
     , tsRelease = \key → releaseWord <$> releaseLease leases key
-    , tsIssued = \identity key → atomically (modifyTVar' (envIssued env) (Map.insert key identity))
+    , tsIssued = \identity key → atomically (modifyTVar' (envIssued env) (Map.insertWith Set.union identity (Set.singleton key)))
     , tsDrain = drainRetired env
     , tsExtraBindings = tfExtraBindings (envFacade env)
     }
@@ -425,7 +457,7 @@ forget env identity = do
     endClient (service env) (clOwner clients)
   -- What an instance was issued is remembered as long as the instance lives, so another instance holding its handle is refused
   -- however many handles have been issued since; the entries end with the instance, whose holdings are gone.
-  atomically (modifyTVar' (envIssued env) (Map.filter (/= identity)))
+  atomically (modifyTVar' (envIssued env) (Map.delete identity))
   drainRetired env
 
 clientOf ∷ Env → Text → IO Client
@@ -438,11 +470,11 @@ clientsOf env identity =
     Nothing → throwIO (TerrainCompositionRefused "no terrain client was declared for the instance")
 
 -- | The client an instance attaches as, made on first use.
-attachClientOf ∷ Env → Text → IO (Maybe Client)
+attachClientOf ∷ Env → Text → IO (Maybe (Client, Bool))
 attachClientOf env identity = do
   clients ← clientsOf env identity
   case clAttach clients of
-    Just found → pure (Just found)
+    Just found → pure (Just (found, False))
     Nothing →
       registerClient (service env) >>= \case
         -- The service's client bank is full: temporary pressure, answered as busy before anything is reserved.
@@ -450,7 +482,7 @@ attachClientOf env identity = do
         Left refused → throwIO (TerrainCompositionRefused ("an instance's attach client was refused: " <> Text.pack (show refused)))
         Right made → do
           atomically (modifyTVar' (envClients env) (Map.insert identity clients {clAttach = Just made}))
-          pure (Just made)
+          pure (Just (made, True))
 
 -- | The name the service holds for an instance's name: in the session's and the instance's content root's namespace.
 nameKey ∷ Env → Text → Text → Text
@@ -462,6 +494,8 @@ drainRetired ∷ Env → IO ()
 drainRetired env = do
   requests ← atomically (swapTVar (envRetire env) [])
   forM_ (reverse requests) (retire (service env))
+  dropped ← atomically (swapTVar (envDropped env) [])
+  forM_ (reverse dropped) (Terrain.releaseLease (service env))
 
 -- The asks ------------------------------------------------------------------------------------------------------
 
@@ -486,15 +520,19 @@ permanent env askOf owner values = m1ArgumentCheck (tvRequests (envVm env)) askO
 -- its request settles @arena_closed@.
 leaseCheck ∷ Env → Text → Word64 → M1Ask → ArgumentCheck
 leaseCheck env identity key ask owner values = do
-  issuer ← Map.lookup key <$> readTVarIO (envIssued env)
-  case issuer of
-    Just other | other /= identity → pure (Just "the arena belongs to another instance")
-    _ →
+  mine ← ownedBy env identity key
+  if not mine
+    then pure (Just "the arena belongs to another instance")
+    else
       withLeaseOr
         (tvLeases (envVm env))
         key
         (\why → pure (Just why))
         (\(_ ∷ TerrainResource) → permanent env (const ask) owner values)
+
+-- | Whether this instance was issued this handle.
+ownedBy ∷ Env → Text → Word64 → IO Bool
+ownedBy env identity key = maybe False (Set.member key) . Map.lookup identity <$> readTVarIO (envIssued env)
 
 -- | Borrow the service's lease from the host's, for a start. A lease that has ended since the check (it cannot, on the one
 -- thread that runs the instance, but the answer is data) is a refusal.
@@ -507,10 +545,12 @@ withArena env key use =
 
 releaseCheck ∷ Env → Text → Word64 → IO (Maybe Text)
 releaseCheck env identity key = do
-  issuer ← Map.lookup key <$> readTVarIO (envIssued env)
-  case issuer of
-    Just other | other /= identity → pure (Just "the arena belongs to another instance")
-    _ →
+  mine ← ownedBy env identity key
+  -- Another instance's handle is refused whether its lease is live, retiring or completely retired (its slot is gone by then):
+  -- ownership is the caller's own record, not the lease's.
+  if not mine
+    then pure (Just "the arena belongs to another instance")
+    else
       withLeaseOr
         (tvLeases (envVm env))
         key
@@ -571,7 +611,7 @@ columnOf (TerrainColumnAsk x y lo hi) = do
 failureReply ∷ Failure → ProviderReply
 failureReply = \case
   NotFound → expected "not_found" "no arena of this name is open in this content root"
-  ArenaClosed → expected "arena_closed" "the arena has closed"
+  ArenaClosed → ProviderExpected closedFailure
   StaleView → expected "stale_view" "the displayed snapshot is no longer the arena's content"
   Definition err → expected "definition" ("the definition was refused: " <> Text.pack (take 400 (show err)))
   TooLarge _ → expected "too_large" "the complete answer has more than 1024 runs: narrow the range"
@@ -581,6 +621,10 @@ failureReply = \case
   HostFailure why → ProviderFailure ("terrain: " <> Text.take 200 why)
   where
     expected code message = ProviderExpected (ExpectedFailure code message Nothing Nothing)
+
+-- | The expected failure of a lease whose arena has closed.
+closedFailure ∷ ExpectedFailure
+closedFailure = ExpectedFailure "arena_closed" "the arena has closed" Nothing Nothing
 
 -- | A revision as a Lua integer, when it is one.
 revisionOf ∷ Revision → Maybe Int64
@@ -641,18 +685,22 @@ submit env submission = mask_ $ do
     pure (Map.lookup ticket held)
   found ← maybe (throwIO (TerrainCompositionRefused "a terrain request's ask was lost")) pure pending
   settling ← maybe (throwIO (TerrainCompositionRefused "a terrain request was handed with no settlement seam")) pure (submissionSettling submission)
-  link ← Link (case pdAsk found of AskOpen _ name _ → Just name; _ → Nothing) settling <$> newTVarIO NoLease <*> newTVarIO False
-  let offered = tfOffered (envFacade env)
-      -- What decides a commit, read in the transaction that makes it: the session still takes new work, the request is still
-      -- waiting (and its tick granted, on logical time), an attach does not find an arena whose open the host has not yet adopted,
-      -- and a read or removal does not need a revision no Lua integer holds.
+  link ←
+    Link
+      (case pdAsk found of AskAttach _ name → Just name; _ → Nothing)
+      (case pdAsk found of AskOpen _ name _ → Just name; _ → Nothing)
+      settling
+      <$> newTVarIO NoLease
+      <*> newTVarIO False
+  let -- What decides a commit, read in the transaction that makes it: the session still takes new work, the request is still
+      -- waiting (and its tick granted, on logical time), and a read or removal does not need a revision no Lua integer holds.
       eligible = do
         takes ← tvTakesWork (envVm env)
         waiting ← settlingEligible settling
         if not (takes && waiting)
           then pure False
           else case pdAsk found of
-            AskAttach _ name → not . Set.member name <$> readTVar offered
+            AskAttach {} → pure True
             AskCell lease _ → representable lease 0
             AskColumn lease _ _ → representable lease 0
             AskSurface lease _ → representable lease 0
@@ -673,6 +721,10 @@ submit env submission = mask_ $ do
           , endpointEligible = eligible
           , endpointSettle = settleInto env link
           }
+  -- A name whose open the host settled as cancelled (and the service was not yet told) is free: let that claim go before asking.
+  case pdAsk found of
+    AskOpen _ name _ → releaseStale env name
+    _ → pure ()
   admitted ← case pdAsk found of
     AskOpen client name spec → openArenaWith (service env) ep client name spec
     AskAttach client name → attachArenaWith (service env) ep client name
@@ -684,12 +736,30 @@ submit env submission = mask_ $ do
     Left refused → throwIO (declination refused)
     Right request → do
       atomically (writeTVar (pdRequest found) (Just request))
+      case pdAsk found of
+        AskOpen _ name _ →
+          atomically $
+            modifyTVar' (tfClaims (envFacade env)) $
+              Map.insertWith (<>) name [Claim ((&&) <$> submissionSettled submission <*> (not <$> readTVar (lkTerminal link))) (tellCancelled env link request)]
+        _ → pure ()
       hookSubmitted (hooks env)
       pure
         ProviderWork
           { workCancel = cancelWork env link request
           , workRetirement = retirement link
           }
+
+-- | Let go of the claims on a name whose request the host has already settled without the service being told: the service is told
+-- now, which frees the name, before another open asks for it.
+releaseStale ∷ Env → Text → IO ()
+releaseStale env name = do
+  stale ← atomically $ do
+    held ← Map.findWithDefault [] name <$> readTVar (tfClaims (envFacade env))
+    flags ← mapM clStale held
+    let kept = [claim | (claim, False) ← zip held flags]
+    modifyTVar' (tfClaims (envFacade env)) (if null kept then Map.delete name else Map.insert name kept)
+    pure [clCancel claim | (claim, True) ← zip held flags]
+  sequence_ stale
 
 -- | What the service's refusal of an admitted request is to the script: busy for a bank with no room, an ordinary error for
 -- anything permanent.
@@ -720,7 +790,16 @@ settleInto env link = \case
     writeTVar (lkTerminal link) True
   Succeeded answer → case answer of
     AOpened lease → offer lease
-    AAttached lease → offer lease
+    AAttached lease → do
+      -- An attach is decided against the names that have settled for the service, and an open the host has not yet published is not one
+      -- for the host: it answers not_found without waiting, and the service's lease for it is let go at the next drain.
+      pending ← maybe (pure False) (\name → Set.member name <$> readTVar (tfOffered (envFacade env))) (lkAttach link)
+      if pending
+        then do
+          modifyTVar' (envDropped env) (lease :)
+          _ ← settlingSettle (lkSettling link) (failureReply NotFound)
+          writeTVar (lkTerminal link) True
+        else offer lease
     other → do
       settled ← settlingSettle (lkSettling link) (answerReply other)
       -- A reply the host rejects abandons the very transaction that is committing the change: nothing of it is written.
@@ -732,9 +811,16 @@ settleInto env link = \case
     offer lease = do
       writeTVar (lkLease link) (Offered lease)
       forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.insert name))
-      settled ← settlingSettle (lkSettling link) (ProviderResource VNil (adoptionFor env link))
+      settled ← settlingSettleFinal (lkSettling link) (publishable lease) (ProviderResource VNil (adoptionFor env link))
       when (settled `elem` [ReplyDefective, ReplyRefusedValue]) (throwSTM (SettlementRejected (Text.pack (show settled))))
       writeTVar (lkTerminal link) True
+    -- The last look at the settlement, taken in the very transaction that publishes the result once the host has built the resource:
+    -- the arena is still there, or the request settles arena_closed instead. Either way the open's name stops being held back from
+    -- attach in the same step, so what is visible and what has settled are one.
+    publishable lease = do
+      forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name))
+      view ← Terrain.inspectArenaSTM (service env) lease
+      pure (maybe (Just closedFailure) (const Nothing) view)
 
 -- | The recipe the host runs, on the owner's thread, to build the offered lease into the lease the request reserved. A request
 -- that ended between the offer and the build has had its offered lease released by 'cancelWork': the resource is then built over
@@ -749,36 +835,29 @@ adoptionFor env link =
           hookAdopting (hooks env)
           built ← atomically $
             readTVar (lkLease link) >>= \case
-              Offered lease →
-                Terrain.inspectArenaSTM (service env) lease >>= \case
-                  Just _ → do
-                    writeTVar (lkLease link) Adopted
-                    forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name))
-                    pure (Right (TerrainResource (Just lease)))
-                  -- The arena closed between the commit and the build: no lease for it is adopted or published, the request
-                  -- settles the expected arena_closed instead, and the lease is let go.
-                  Nothing → do
-                    writeTVar (lkLease link) Disposed
-                    forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name))
-                    _ ← settlingSettle (lkSettling link) (failureReply ArenaClosed)
-                    pure (Left lease)
-              _ → pure (Right (TerrainResource Nothing))
-          case built of
-            Right resource → pure resource
-            Left lease → TerrainResource Nothing <$ Terrain.releaseLease (service env) lease
+              Offered lease → TerrainResource (Just lease) <$ writeTVar (lkLease link) Adopted
+              _ → pure (TerrainResource Nothing)
+          hookAdopted (hooks env)
+          pure built
       )
       releaseResource
   where
     -- The service's lease is released through its non-waiting release: the creator's final owner lease closes the arena, an
     -- attachment ends its client's interest only. It waits for no borrower and for nothing of the owner.
     releaseResource resource = forM_ (resourceLease resource) $ \lease → do
+      atomically (forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name)))
       hookReleasing (hooks env)
       Terrain.releaseLease (service env) lease >>= either (throwIO . TerrainCompositionRefused . ("a lease's release was refused: " <>) . Text.pack . show) pure
 
 -- | Withdraw interest in a request: ask the service to cancel it, and give back an offered lease nobody adopted.
 cancelWork ∷ Env → Link → Request → IO ()
-cancelWork env link request = mask_ $ do
-  hookCancelling (hooks env)
+cancelWork env link request = mask_ (hookCancelling (hooks env) >> tellCancelled env link request)
+
+-- | Tell the service a request the host settled as cancelled is over, and let go of what it holds: its claim on a name and any lease
+-- offered for it. Whoever finds the settlement first tells it (the host's cancel, or an open that finds the name still claimed); the
+-- telling is idempotent.
+tellCancelled ∷ Env → Link → Request → IO ()
+tellCancelled env link request = mask_ $ do
   _ ← cancel (service env) request
   atomically (writeTVar (lkTerminal link) True)
   offered ← atomically $

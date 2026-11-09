@@ -312,6 +312,9 @@ data Settling = Settling
     -- logical time, the scheduler stands at the boundary just before the request's assigned tick, which the
     -- request holds (so the tick does not begin until the request is settled, cancelled or ended). An owner on
     -- elapsed time is eligible whenever the request is waiting.
+  , settlingSettleFinal ∷ STM (Maybe ExpectedFailure) → ProviderReply → STM ReplyAnswer
+    -- ^ 'settlingSettle' for a resource reply with the provider's last look, taken in the transaction that settles the request once
+    -- the owner has built the resource ('adoptingFinal'). For a reply that is not a resource it is 'settlingSettle'.
   , settlingSettle ∷ ProviderReply → STM ReplyAnswer
     -- ^ Settle the request with this reply, in the caller's transaction. The reply is checked exactly as
     -- 'completeRequest' checks one, but purely, so a reply that fails the check (a value over the ceilings, a
@@ -637,6 +640,12 @@ data Adopting = Adopting
     -- ^ The owner is building the resource now. A claimed entry stays until the building is
     -- finished or failed, so the reservation it builds into is not discharged under it, and
     -- nothing that ends the request drops it.
+  , adoptingFinal ∷ !(Maybe (STM (Maybe ExpectedFailure)))
+    -- ^ The provider's last look, taken in the very transaction that settles the request once the resource is built: 'Nothing' lets
+    -- the success settle, a failure settles that failure instead (and the caller releases the resource it built). It is how what a
+    -- success makes visible (an arena a name names) and what it needs to be alive are one transaction with the settlement.
+  , adoptingNow ∷ !Bool
+    -- ^ The reply was made at its position (it was eligible), so its settlement is not held for the tick.
   }
 
 -- Refusals --------------------------------------------------------------------------
