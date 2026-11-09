@@ -1815,17 +1815,22 @@ serveDue service identities = do
                   , pDiscards = pDiscards st2 <> adoptedOf record
                   }
                 pure []
-              Just (failure, checked) → do
-                let (session, _) = applyReplyIn identity (modelReply checked) (pSession st1)
+              Just (_, checked) → do
+                -- The failure the request settles with and the one it is taken and latched as are the one the check returned, bounded to the
+                -- admission's and the envelope's limits (its message cut), never the provider's own value.
+                let bounded = case checked of
+                      CheckedExpected found → Just found
+                      _ → Nothing
+                    (session, _) = applyReplyIn identity (modelReply checked) (pSession st1)
                 writeTVar (psVar service) $
                   endWork identity
                     st1
                       { pSession = session
-                      , pRecs = Map.insert identity cleared {recAdopted = False, recFailure = Just failure} (pRecs st1)
+                      , pRecs = Map.insert identity cleared {recAdopted = False, recFailure = bounded} (pRecs st1)
                       , pDiscards = pDiscards st1 <> adoptedOf record
                       , pCounts = (pCounts st1) {countSettledAtTick = countSettledAtTick (pCounts st1) + 1}
                       }
-                latchRequired service record {recFailure = Just failure}
+                latchRequired service record {recFailure = bounded}
                 pure [recNumber record]
               Nothing → do
                 let (session, _) = applyReplyIn identity held (pSession st1)

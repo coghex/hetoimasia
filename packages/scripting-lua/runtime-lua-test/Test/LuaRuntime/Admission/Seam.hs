@@ -8,7 +8,7 @@ import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromExcep
 import Control.Exception (throwIO)
 import qualified Data.Text as Text
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Control.Monad (forM_, unless, void)
+import Control.Monad (forM_, unless, void, when)
 import Hetoimasia.Scripting.Lua.Admission
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease (Ownership (..))
@@ -224,6 +224,60 @@ spec = describe "the settlement seam and the declining hand-off" $ do
           awaitDiagnostic owner ((>= 1) . rdHeldNow)
           -- the request ends before the tick: the resource nobody will take is released
           event fixture owner
+          awaitNote fixture "release r1"
+
+  -- Every path by which a provider's expected failure reaches the model through the seam delivers the failure the check returned, whose message
+  -- is cut at a character, visibly, to the bound: one example per path.
+  let longFailure = ExpectedFailure "not_found" (Text.replicate 5000 "é") Nothing Nothing
+      cutTaken = "cmd take a {error={code=not_found,message=" <> Text.replicate 1022 "é" <> "...},status=failure}"
+  forM_
+    [ ("settled at its position", False, False)
+    , ("held for its tick", True, False)
+    , ("held for its tick with the provider's work still owed", True, True)
+    ]
+    $ \(path, logicalTime, keeping) →
+      it ("delivers an expected failure cut to the bound when it is " <> path) $ bounded $ do
+        fixture ← newAFix 4
+        setPolicy fixture (\held → held {polNecessity = OptionalRequest})
+        withBoundary $ \control runtime → settleAll fixture $ do
+          owner ← startAdmitting fixture runtime "cut seam" [admitter] aConfig (admissionGrant fixture 8 (if logicalTime then SettleAtAssignedTick Nothing else SettleOnArrival)) requiredPolicy
+          admitAdmitter fixture owner "i" "admitter"
+          seam ← newIORef Nothing
+          onSubmit (afFake fixture) (captured seam)
+          acommand fixture owner "i" "start" "a"
+          awaitNote fixture "cmd start a started"
+          Just settling ← readIORef seam
+          let reply = ProviderExpected longFailure
+          atomically (if keeping then settlingSettleKeeping settling reply else settlingSettle settling reply) >>= (`shouldBe` (if logicalTime then ReplyHeld else ReplySettled))
+          when logicalTime (grantOne control owner)
+          acommand fixture owner "i" "take" "a"
+          awaitNote fixture cutTaken
+  forM_
+    [ ("when it is built", False)
+    , ("at the tick", True)
+    ]
+    $ \(path, laterInvalid) →
+      it ("delivers an expected failure cut to the bound, and releases the resource, when the last look at an early resource reply fails " <> path) $ bounded $ do
+        fixture ← newAFix 4
+        setPolicy fixture (\held → held {polLease = Just InstanceOwned, polNecessity = OptionalRequest})
+        valid ← newTVarIO (laterInvalid)
+        withBoundary $ \control runtime → settleAll fixture $ do
+          owner ← startAdmitting fixture runtime "cut resource" [admitter] aConfig (admissionGrant fixture 8 (SettleAtAssignedTick Nothing)) requiredPolicy
+          admitAdmitter fixture owner "i" "admitter"
+          seam ← newIORef Nothing
+          onSubmit (afFake fixture) (captured seam)
+          acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+          awaitNote fixture "cmd start a started"
+          Just settling ← readIORef seam
+          let final = readTVar valid >>= \ok → pure (if ok then Nothing else Just longFailure)
+          atomically (settlingSettleFinal settling final (ProviderResource (VInteger 4) (Adoption (\_ → resourceFor fixture "r1")))) >>= (`shouldBe` ReplyAdoption)
+          awaitNote fixture "acquire r1"
+          awaitDiagnostic owner ((>= 1) . rdHeldNow)
+          -- a resource that is invalid when it is built fails there (held for the tick); one that is valid then fails where the tick settles it
+          when laterInvalid (atomically (writeTVar valid False))
+          grantOne control owner
+          acommand fixture owner "i" "take" "a"
+          awaitNote fixture cutTaken
           awaitNote fixture "release r1"
 
   it "treats every reply that comes while a resource reply waits to be built as a duplicate, whatever it is" $ bounded $ do
