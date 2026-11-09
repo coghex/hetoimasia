@@ -109,6 +109,7 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Pixels
         Test.LuaEngine.Graphics.Png
         Test.LuaEngine.Graphics.Pressure
+        Test.LuaEngine.Graphics.TerrainParents
         Test.LuaEngine.Graphics.Release
         Test.LuaEngine.Graphics.Rig
         Test.LuaEngine.Graphics.SceneComp
@@ -163,6 +164,9 @@ test-suite lua-engine-graphics-tests
         hetoimasia-lua-engine:session,
         hetoimasia-lua-engine:texture,
         hetoimasia-math ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-2d-oracle ==0.1.0.0,
         hetoimasia-render-2d-vulkan ==0.1.0.0,

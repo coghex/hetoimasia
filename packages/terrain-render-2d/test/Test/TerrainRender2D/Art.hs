@@ -1,12 +1,8 @@
--- | The approved artwork and the diagnostic sheet as the tests read them: the
--- committed PNGs found above the working directory, decoded by the production
--- decoder as colour art, and a manifest reader for the provenance record.
+-- | The committed artwork as the tests find and read it: files found above the working directory,
+-- their digests and a manifest reader for the provenance record.
 module Test.TerrainRender2D.Art
-  ( Approved (..)
-  , loadApproved
-  , loadFile
+  ( loadFile
   , sha256Hex
-  , artPixelsOf
   , Json (..)
   , parseJson
   , field
@@ -18,22 +14,9 @@ import Crypto.Hash.SHA256 (hash)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
 import Data.Char (isDigit, isSpace)
-import Data.Text (pack)
-import Hetoimasia.Asset (Asset (..), AssetId (..), Provenance (..))
-import Hetoimasia.Asset.Image (DecodedImage (..), ImageKind (..))
-import Hetoimasia.Asset.Image.Png (decodePng)
-import Hetoimasia.Terrain.Render2D.Evidence (ArtPixels (..))
 import Numeric (showHex)
 import System.Directory (doesPathExist, getCurrentDirectory)
 import System.FilePath (takeDirectory, (</>))
-
--- | An approved sheet: its bytes as committed, and as decoded.
-data Approved = Approved
-  { approvedName ∷ !String
-  , approvedPath ∷ !FilePath
-  , approvedBytes ∷ !ByteString.ByteString
-  , approvedDecoded ∷ !DecodedImage
-  }
 
 -- | The directory the approved artwork is committed in, relative to the repository root.
 texturesDirectory ∷ FilePath
@@ -56,38 +39,10 @@ findUpwards relative = getCurrentDirectory >>= go
 loadFile ∷ FilePath → IO ByteString.ByteString
 loadFile relative = findUpwards relative >>= ByteString.readFile
 
--- | An approved sheet by its authored name, decoded as colour art.
-loadApproved ∷ String → IO Approved
-loadApproved name = do
-  let relative = texturesDirectory </> (name <> ".png")
-  path ← findUpwards relative
-  bytes ← ByteString.readFile path
-  case decodePng ColourImage (Asset (AssetId (pack name)) (FromFile path)) bytes of
-    Left refusal → ioError (userError ("the approved " <> name <> " sheet was refused: " <> show refusal))
-    Right decoded → pure (Approved name relative bytes decoded)
-
 sha256Hex ∷ ByteString.ByteString → String
 sha256Hex = concatMap two . ByteString.unpack . hash
   where
     two byte = (if byte < 16 then "0" else "") <> showHex byte ""
-
--- | A decoded sheet's level-0 texels (premultiplied sRGB) as 'ArtPixels'.
-artPixelsOf ∷ DecodedImage → ArtPixels
-artPixelsOf decoded =
-  ArtPixels
-    { artWidth = w
-    , artHeight = h
-    , artTexel = \x y →
-        let base = 4 * (y * w + x)
-         in (at base, at (base + 1), at (base + 2), at (base + 3))
-    }
-  where
-    w = fromIntegral (decodedWidth decoded)
-    h = fromIntegral (decodedHeight decoded)
-    level = case decodedLevels decoded of
-      first : _ → first
-      [] → ByteString.empty
-    at i = ByteString.index level i
 
 -- ---------------------------------------------------------------------------
 -- A small JSON reader for the provenance manifest

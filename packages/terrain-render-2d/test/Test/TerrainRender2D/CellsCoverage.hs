@@ -361,12 +361,19 @@ fractionalOcclusion = describe "omission of hidden cells under the transforms as
       zoomed z = withCamera (command (SetZoom z))
       panned dx dy = withCamera (command (Pan dx dy))
       snapped scene = scene {sceneSetup = (sceneSetup scene) {setupSettings = (setupSettings (sceneSetup scene)) {settingPixelSnap = True}}}
-  it "keeps the rear block where a pixel centre falls on a rounded shared edge, as a retained quad would answer" $ do
+  it "keeps the rear block where a pixel centre falls on a rounded shared edge, and answers there as the plan that omits nothing does" $ do
     assets ← loadAssets 5
+    -- A style whose catalog proves nothing keeps every cell: its plan is the one that omits nothing.
+    unproved ← loadAssetsWith 5 [(AssetMap (MapKey Ordinary (either (error . show) id (mkShapeId 5))), allOn)]
     let scene = panned (5 / 48) (5 / 144) (zoomed 0.15 cluster)
         plan = planScene assets scene
+        full = planScene unproved scene
     tilesOf plan `shouldSatisfy` Set.member rear
-    hitCellOf (pickPixel plan (159, 125)) `shouldBe` Just rear
+    -- The pixel centre (159, 125) lies on the rounded edge shared by the rear block and its right
+    -- neighbour. Under the texel rule with its 1/128 bias (the higher texel on a boundary) the
+    -- edge texel is the neighbour's, and the plan that kept the rear block answers it exactly so.
+    hitCellOf (pickPixel plan (159, 125)) `shouldBe` Just (tileAt 1 0 0)
+    hitCellOf (pickPixel plan (159, 125)) `shouldBe` hitCellOf (pickPixel full (159, 125))
   it "answers every sampled pixel exactly as the plan that omits nothing does, across zooms, pans and snapping" $ do
     assets ← loadAssets 5
     -- A style whose catalog holds a map that reaches outside the full block proves

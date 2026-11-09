@@ -12,17 +12,12 @@ module Test.TerrainRender2D.Fixtures
   , setup
   , manualCamera
   , followCamera
-  , request
-  , plan
-  , planWith
   , axis
   , column
   , tileAt
   , allFacings
-  , faceCells
   ) where
 
-import Data.Word (Word64)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), offscreenMetrics)
 import Hetoimasia.Render.TwoD.Settings (defaultViewSettings)
@@ -32,7 +27,6 @@ import Hetoimasia.Terrain.Changes (Changes, emptyChanges)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, TileCoord (..), axisFromInteger, tileCoord)
 import Hetoimasia.Terrain.Render2D.Camera
 import Hetoimasia.Terrain.Render2D.Facts
-import Hetoimasia.Terrain.Render2D.Plan
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
 import Hetoimasia.Terrain.Shape (ViewFacing, allViewFacings)
 import Hetoimasia.Terrain.Source
@@ -104,25 +98,5 @@ followCamera facts x y =
     Left e → error (show e)
     Right camera → either (\e → error (show e)) stepCamera (refollow defaultCameraConfig facts camera)
 
-request ∷ ViewSetup → CameraState → PlanRequest
-request vs camera =
-  PlanRequest
-    { requestVersions = versions
-    , requestMaterialVersion = 7
-    , requestCamera = camera
-    , requestSetup = vs
-    , requestConfig = defaultPlanConfig
-    }
-
-plan ∷ ViewSetup → CameraState → TerrainFacts → Plan
-plan vs camera facts = either (\e → error ("fixture plan refused: " <> show e)) id (planTerrain (request vs camera) facts)
-
-planWith ∷ (PlanRequest → PlanRequest) → ViewSetup → CameraState → TerrainFacts → Either PlanError Plan
-planWith f vs camera = planTerrain (f (request vs camera))
-
 allFacings ∷ [ViewFacing]
 allFacings = allViewFacings
-
--- | The tile and view kind of every face of a plan, in draw order.
-faceCells ∷ Plan → [(TileCoord, Word64)]
-faceCells p = [(faceCell f, fromIntegral (faceDepthKey f)) | f ← planFaces p]

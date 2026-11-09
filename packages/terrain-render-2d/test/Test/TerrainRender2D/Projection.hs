@@ -7,7 +7,6 @@ import Hetoimasia.Render.TwoD.Mapping (worldToTarget, worldToWindow)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot (Viewport (..))
-import Hetoimasia.Terrain.Render2D.Plan
 import Hetoimasia.Terrain.Render2D.Projection
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
@@ -89,15 +88,6 @@ spec = describe "Projection" $ do
           abs (sx - 144) `shouldSatisfy` (<= 0.5)
           abs (sy - 72) `shouldSatisfy` (<= 0.5)
         Nothing → expectationFailure "the snapped mapping must convert the camera position"
-
-  describe "an empty or invalid view in a plan" $ do
-    it "plans no faces for a zero extent, and refuses an invalid view" $ do
-      let camera = manualCamera 0 0 0
-          facts = factsOf flatWorld
-          empty = plan (setup 0 0) camera facts
-      planFaces empty `shouldBe` []
-      planCompleteness empty `shouldBe` Complete
-      planWith id ((setup 288 144) {setupViewport = Viewport (V2 0 0) (V2 (0 / 0) 10)}) camera facts `shouldSatisfy` isLeft
 
 isLeft ∷ Either a b → Bool
 isLeft (Left _) = True

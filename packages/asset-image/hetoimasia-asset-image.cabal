@@ -66,6 +66,7 @@ library
         Hetoimasia.Asset.Image.Png
         Hetoimasia.Asset.Image.PngDecode
         Hetoimasia.Asset.Image.PngPreflight
+        Hetoimasia.Asset.Image.Region
     -- One BC7 block's texels, the premultiplication table and its
     -- application to RGBA8 levels, the structural checks that run before
     -- JuicyPixels, and the conversion of its output to RGBA8; and the mip
@@ -120,6 +121,7 @@ test-suite asset-image-tests
         Test.Asset.Image.PreflightSupport
         Test.Asset.Image.Premultiply
         Test.Asset.Image.Refusals
+        Test.Asset.Image.Region
         Test.Asset.Image.Spec
         Test.Asset.Image.Support
     build-depends:

@@ -41,11 +41,21 @@ module Hetoimasia.Terrain.Render2D.Scenes
   , viewportOffset
   , scaledTarget
   , snapped
+  , snappedAt
+  , edgeScene
+  , depthStack
+  , pendingScene
+  , mixedShapeCell
+  , fogShapes
+  , seamScene
+  , seamScenesNegative
+  , extremeScene
+  , shiftPan
     -- * Layout
   , fitScene
   ) where
 
-import Hetoimasia.Terrain.Coordinate (axisValue)
+import Hetoimasia.Terrain.Coordinate (axisMaxValue, axisMinValue, axisValue)
 import Hetoimasia.Terrain.Render2D.Camera (camAnchorX, camAnchorY, camClip, camFacing, camRef)
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
@@ -356,3 +366,155 @@ fitScene margin input =
     vx' = (fst centre / 48 + snd centre / 24) / 2
     vy' = (snd centre / 24 - fst centre / 48) / 2
     (px, py) = turn (4 - count) (vx', vy')
+
+-- | A single cell at a zoom in an ODD target with no pan, so the canvas corner lies on a half pixel and
+-- every pixel centre lies at a whole number of pixels from it: centres fall exactly on the quad's left
+-- and top edge (inside), on its right and bottom edge (outside, one pixel beyond the last) and, wherever
+-- the offsets are in the ratio of the canvas extents, exactly on the shared diagonal of its two
+-- triangles, with the pixels beside each. The expectation is the rule itself, exact. At zoom 1/8 (the
+-- minified endpoint) a pixel is eight texels and the quad twelve pixels wide.
+edgeScene ∷ Float → Int → ViewFacing → Scene
+edgeScene zoom shape facing =
+  (newScene ("edges-" <> show shape <> "-" <> show facing <> "@" <> show zoom) [Cell 0 0 0 1 shape "loam"] (oddOf (round (96 * zoom) + 16), oddOf (round (64 * zoom) + 16))) {sceneFacing = facing, sceneZoom = zoom}
+  where
+    oddOf n = if even n then n + 1 else (n ∷ Int)
+
+
+-- | A scene of cells at one column at levels 0 to 8, the cut at the top, for the depth effects:
+-- every level a loam cell of shape 0, so nearer levels overlap farther ones along the view.
+depthStack ∷ ViewFacing → Scene
+depthStack facing =
+  atZoom 0.25 $
+    (newScene ("depth-stack-" <> show facing) [Cell x 0 z (z + 1) 5 (if even z then "loam" else "granite") | (x, z) ← zip [0 .. 8] [0 .. 8]] (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt 8 8
+      , sceneAnchor = (4, 0)
+      }
+
+
+
+-- | Cells either side of every seam of the 16 x 16 x 32 region lattice: columns 15 and 16 on both
+-- horizontal axes and levels 31 and 32, with the cut above the seam, so a face, a ramp and a cutaway
+-- cross a region boundary in every direction a view can look.
+seamScene ∷ ViewFacing → Scene
+seamScene facing =
+  fitScene 6 $
+    (newScene ("seams-" <> show facing) cells (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt 33 33
+      , sceneAnchor = (15, 15)
+      }
+  where
+    cells =
+      [ Cell 15 15 30 34 5 loam
+      , Cell 16 15 31 34 9 granite
+      , Cell 15 16 31 34 12 loam
+      , Cell 16 16 28 35 0 granite
+      , Cell 14 14 29 33 3 granite
+      , Cell 17 17 30 32 6 loam
+      ]
+
+-- | The same across the zero seam of the coordinate lattice (columns -1 and 0, levels -1 and 0).
+seamScenesNegative ∷ ViewFacing → Scene
+seamScenesNegative facing =
+  fitScene 6 $
+    (newScene ("seams-zero-" <> show facing) cells (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt 1 1
+      , sceneAnchor = (-1, -1)
+      }
+  where
+    cells =
+      [ Cell (-1) (-1) (-2) 2 5 loam
+      , Cell 0 (-1) (-1) 2 9 granite
+      , Cell (-1) 0 (-1) 2 12 loam
+      , Cell 0 0 (-3) 3 0 granite
+      ]
+
+-- | Cells at the legal coordinate extremes (@axisMaxValue@ and @axisMinValue@ on every axis, levels
+-- included), the camera anchored there. The planner, picker and renderer work in coordinates relative
+-- to the anchor, so the picture must be as at any other place.
+extremeScene ∷ Bool → ViewFacing → Scene
+extremeScene high facing =
+  fitScene 6 $
+    (newScene ("extremes-" <> (if high then "max-" else "min-") <> show facing) cells (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt cut cut
+      , sceneAnchor = (ax, ax)
+      }
+  where
+    hi = axisMaxValue
+    lo = axisMinValue
+    (ax, z0, cut)
+      | high = (hi - 2, hi - 4, hi - 1)
+      | otherwise = (lo, lo, lo + 3)
+    cells =
+      [ Cell ax ax z0 (z0 + 4) 5 loam
+      , Cell (ax + 1) ax (z0 + 1) (z0 + 4) 9 granite
+      , Cell ax (ax + 1) (z0 + 1) (z0 + 4) 12 loam
+      , Cell (ax + 2) (ax + 1) z0 (z0 + 3) 0 granite
+      ]
+
+-- | A scene with its pan moved by this much (tiles, on the world axes), its target and cells as they are.
+shiftPan ∷ (Double, Double) → Scene → Scene
+shiftPan (dx, dy) sc = sc {scenePan = (fst (scenePan sc) + dx, snd (scenePan sc) + dy)}
+
+
+-- | Pending information beside known terrain: cells along the view diagonal with the middle one pending
+-- (its knowledge not arrived), so a pixel it covers that a nearer known quad also covers is a hit (the
+-- pending cell is proved behind), a pixel only a farther quad covers is loading, and a lone pending
+-- cell off to the side is loading wherever it is the only thing there. Pending cells draw nothing.
+pendingScene ∷ ViewFacing → Scene
+pendingScene facing =
+  fitScene 6 $
+    (newScene ("pending-" <> show facing) cells (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt 1 1
+      , sceneAnchor = (1, 1)
+      , sceneKnow = [((1, 1, 0), Pending), ((3, 0, 0), Pending)]
+      }
+  where
+    cells =
+      [ Cell 0 0 0 1 5 loam
+      , Cell 1 1 0 1 12 loam
+      , Cell 2 2 0 1 9 granite
+      , Cell 3 0 0 1 3 granite
+      , Cell 0 2 0 1 0 loam
+      ]
+
+
+-- | The snapped scene at a zoom. At a large scale (4 and above) the origin is moved off the pixel grid
+-- by about half a pixel on each axis first: the lattice puts every origin on a whole pixel at a whole
+-- scale, a texel spans several pixels, and snapping changes a picture only by moving the quad up to half
+-- a pixel, so the largest change it can make needs the origin half a pixel from the grid. A world pan of
+-- @(dx, dy)@ tiles moves the screen by @((dx - dy) * 48 z, (dx + dy) * 24 z)@ pixels; the pan below makes
+-- both 4.5 pixels.
+snappedAt ∷ String → Float → Scene
+snappedAt label zoom = (if zoom >= 4 then shiftPan (dx, dy) else id) snapped {sceneName = "snapped-" <> label, sceneZoom = zoom}
+  where
+    z = realToFrac zoom ∷ Double
+    ax = 4.5 / (48 * z)
+    ay = 4.5 / (24 * z)
+    (dx, dy) = ((ax + ay) / 2, (ay - ax) / 2)
+
+
+-- | One cell of a shape whose solid is KNOWN beside an undiscovered void: the mixed cell, a known part and
+-- a fog part each with its own map, for the shape in the facing (shape 0, the full block, has no mixed
+-- form and is an ordinary cell). Every shape, every facing.
+mixedShapeCell ∷ Int → ViewFacing → Scene
+mixedShapeCell shape facing =
+  (singleShape shape facing)
+    { sceneName = "mixed-shape-" <> show shape <> "-" <> show facing
+    , sceneKnow = [((0, 0, 0), KnownSolid)]
+    }
+
+-- | The sixteen shapes of the matrix, every cell confirmed undiscovered: full fog, the generic fog quad
+-- (blank colour, the generic map) in the facing, whatever shape the terrain holds.
+fogShapes ∷ ViewFacing → Scene
+fogShapes facing =
+  base
+    { sceneName = "fog-shapes-" <> show facing
+    , sceneKnow = [((cellX c, cellY c, z), Undisc) | c ← sceneCells base, z ← [cellZ0 c .. cellZ1 c - 1]]
+    }
+  where
+    base = shapeMatrix facing 0.25

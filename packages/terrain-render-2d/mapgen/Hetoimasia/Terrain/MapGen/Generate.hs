@@ -19,6 +19,7 @@ module Hetoimasia.Terrain.MapGen.Generate
   , compareCatalog
   , checkCatalog
   , inventory
+  , readDirectory
   ) where
 
 import Control.Monad (forM, forM_)

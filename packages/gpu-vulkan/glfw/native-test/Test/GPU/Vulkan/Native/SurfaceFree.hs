@@ -84,6 +84,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , runRetained
   , runMaterials
   , runTerrain
+  , runTerrainCi
   , runAnimation
   , surfaceFreeSection
   , laterWindowSection
@@ -105,6 +106,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , retainedSection
   , materialsSection
   , terrainSection
+  , terrainCiSection
   , animationSection
   , surfaceFreeSpec
   , laterWindowSpec
@@ -126,6 +128,7 @@ module Test.GPU.Vulkan.Native.SurfaceFree
   , retainedSpec
   , materialsSpec
   , terrainSpec
+  , terrainCiSpec
   , animationSpec
   ) where
 
@@ -629,6 +632,15 @@ uploadConfig = either (error . show) id (validateUploadConfig (1024 * 1024) uplo
 
 uploadBudget ∷ Integer
 uploadBudget = 128 * 1024
+
+-- | The terrain case's upload configuration: the same per-turn budget and queue as every other
+-- case, with a largest single upload of 4 MiB so the packed normal atlas (768 x 384 x 4 = 1,179,648
+-- bytes, 46 maps in one parent by the atlas decision) is accepted in one request and uploaded over
+-- several turns. This is the harness's own staging bound for one upload request; it is not a
+-- texture-admission bank (#672's 512 MiB per instance and 1 GiB per session), which this case does
+-- not touch.
+terrainUploadConfig ∷ UploadConfig
+terrainUploadConfig = either (error . show) id (validateUploadConfig (4 * 1024 * 1024) uploadBudget 8)
 
 -- | The turns the RGBA8 texture needs at least, each a batch of its own.
 rgbaTurns ∷ Int
@@ -1940,29 +1952,49 @@ runMaterials backend journal =
     "vulkan-native-r2d11-materials"
     "materials"
 
--- | The terrain material's case (TRA-8, Q-13): plans of the terrain arena's faces
--- adapted through the existing fixed-quad and material ABI, drawn into offscreen
--- targets that have a real @D32_SFLOAT@ depth image, every batch awaited to its
--- actual completion before its readback, and every pixel judged against the
--- render-2d oracle given the terrain material's model and against a hand-stated
--- line-of-sight expectation ("Test.GPU.Vulkan.Native.TerrainPath"). Where the
--- device chooses another depth format it is reported as unable to qualify, a
--- failure and never a skip. Its files and records go under the validation
--- runner's evidence directory when it names one, and otherwise into a directory
--- of their own that is kept and reported.
+-- | The terrain material's case (TRA-17, Q-13): the cell-quad plans of the terrain arena, adapted
+-- through the existing fixed-quad and material ABI over two atlas textures, drawn into offscreen
+-- targets that have a real @D32_SFLOAT@ depth image, every batch awaited to its actual completion
+-- before its readback, and every pixel judged against the render-2d oracle given the terrain
+-- material's model and against a hand-stated expectation
+-- ("Test.GPU.Vulkan.Native.TerrainPath"). Where the device chooses another depth format it is
+-- reported as unable to qualify, a failure and never a skip. Its files and records go under the
+-- validation runner's evidence directory when it names one, and otherwise into a directory of their
+-- own that is kept and reported. 'runTerrain' is the complete qualification (@tra17-terrain@, run
+-- directly); 'runTerrainCi' the bounded selection the required profile runs.
 runTerrain ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
-runTerrain backend journal =
-  runEvidenceSuite
+runTerrain = runTerrainProfile TerrainPath.Full
+
+runTerrainCi ∷ Maybe Backend → Journal → IO SurfaceFreeOutcome
+runTerrainCi = runTerrainProfile TerrainPath.Bounded
+
+runTerrainProfile ∷ TerrainPath.Profile → Maybe Backend → Journal → IO SurfaceFreeOutcome
+runTerrainProfile profile backend journal =
+  runEvidenceSuiteWith
+    terrainUploadConfig
     backend
     journal
-    (\vulkan directory → TerrainPath.runTerrain (retainedHost vulkan) (deviceNameOf vulkan) directory)
-    "TRA-8: a surface-free session draws plans of the terrain arena's faces, adapted through the existing fixed-quad and material ABI, into offscreen targets that have a D32_SFLOAT depth image, reads each back after its batch completed and judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated line-of-sight expectation: the 16 shape identities in each of 4 facings, roofs over cavities, disconnected spans, ramps and corners, cutaways, the automatic follow, a deep floor, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, equivalent submissions and retained chunks, transparent coverage and three negative controls"
-    "vulkan-native-tra8-terrain"
-    "terrain"
+    (\vulkan directory → TerrainPath.runTerrain profile (retainedHost vulkan) (deviceNameOf vulkan) (subPixelBitsOf vulkan) directory)
+    ( case profile of
+        TerrainPath.Full → "TRA-17: a surface-free session draws the cell-quad plans of the terrain arena, adapted through the existing fixed-quad and material ABI over a packed colour atlas and a packed normal atlas, into offscreen targets that have a D32_SFLOAT depth image, reads each back after its batch completed and judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated expectation: the 16 shape identities in each of 4 facings, mixed and fog cells, roofs over cavities, disconnected spans, ramps, cutaways, the automatic follow, a deep floor, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, lighting and depth-effect settings, equivalent submissions, ordered and cutout wrappers and retained chunks, and nine negative controls"
+        TerrainPath.Bounded → "TRA-17: the bounded required selection of the terrain material's evidence: the 16 shape identities in the south facing, mixed and fog cells, a roof over a cavity in four submissions and both wrappers, ramps, a depth-effect stack, and a reversed-order control, judged as the complete qualification is"
+    )
+    ( case profile of
+        TerrainPath.Full → "vulkan-native-tra17-terrain"
+        TerrainPath.Bounded → "vulkan-native-tra17-terrain-ci"
+    )
+    ( case profile of
+        TerrainPath.Full → "terrain"
+        TerrainPath.Bounded → "terrain-ci"
+    )
   where
     deviceNameOf vulkan = do
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
       pure (viewDeviceName roots)
+    -- The selected device's reported @subPixelPrecisionBits@, queried from the session and never assumed.
+    subPixelBitsOf vulkan = do
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      pure ((,,) <$> (fromIntegral <$> viewSubPixelPrecisionBits roots) <*> viewDriverName roots <*> viewDriverInfo roots)
 
 -- | The animation case (R2D-18): instances that name a frame table of their view,
 -- the tables written into the batch's storage region and the vertex stage taking
@@ -1983,12 +2015,16 @@ runAnimation backend journal =
     "animation"
 
 runEvidenceSuite ∷ Maybe Backend → Journal → (VulkanHost () → FilePath → IO OrderedPath.Evidence) → Text → Text → String → IO SurfaceFreeOutcome
-runEvidenceSuite backend journal runner headline caseName directoryName = do
+runEvidenceSuite = runEvidenceSuiteWith uploadConfig
+
+-- | 'runEvidenceSuite' under a stated upload configuration.
+runEvidenceSuiteWith ∷ UploadConfig → Maybe Backend → Journal → (VulkanHost () → FilePath → IO OrderedPath.Evidence) → Text → Text → String → IO SurfaceFreeOutcome
+runEvidenceSuiteWith uploads backend journal runner headline caseName directoryName = do
   heading journal headline
   directory ← evidenceDirectory
   note journal ("the " <> Text.pack directoryName <> " evidence is written into " <> Text.pack directory)
   runCaseWith
-    (\config → config {vulkanUploads = Just uploadConfig})
+    (\config → config {vulkanUploads = Just uploads})
     backend
     defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
     []
@@ -2952,10 +2988,16 @@ materialsSpec ∷ SurfaceFreeOutcome → Spec
 materialsSpec = evidenceSpec "R2D-11 the application materials' window-free evidence" "materials" 6 True
 
 terrainSection ∷ SurfaceFreeOutcome → [Text]
-terrainSection = evidenceSection "A surface-free session drawing the terrain arena's faces over a D32_SFLOAT depth image" "terrain"
+terrainSection = evidenceSection "A surface-free session drawing the terrain arena's cell quads over a D32_SFLOAT depth image" "terrain"
 
 terrainSpec ∷ SurfaceFreeOutcome → Spec
-terrainSpec = evidenceSpec "TRA-8 the terrain material's window-free evidence" "terrain" TerrainPath.terrainFixtureCount True
+terrainSpec = evidenceSpec "TRA-17 the terrain material's window-free evidence" "terrain" (TerrainPath.terrainFixtureCount TerrainPath.Full) True
+
+terrainCiSection ∷ SurfaceFreeOutcome → [Text]
+terrainCiSection = evidenceSection "A surface-free session drawing the bounded selection of the terrain arena's cell quads over a D32_SFLOAT depth image" "terrain-ci"
+
+terrainCiSpec ∷ SurfaceFreeOutcome → Spec
+terrainCiSpec = evidenceSpec "TRA-17 the terrain material's bounded window-free evidence" "terrain-ci" (TerrainPath.terrainFixtureCount TerrainPath.Bounded) True
 
 animationSection ∷ SurfaceFreeOutcome → [Text]
 animationSection = evidenceSection "A surface-free session recording animated instances over a D32_SFLOAT depth image" "animation"

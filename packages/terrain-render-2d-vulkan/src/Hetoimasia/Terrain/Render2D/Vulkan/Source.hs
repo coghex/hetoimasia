@@ -1,83 +1,176 @@
--- | The GLSL of the terrain material's fragment function (TRA-8), in a module of
--- its own because a Template Haskell splice may use only what another module
--- defines.
+-- | The GLSL of the terrain material's fragment function (TRA-17), in a module of its own because
+-- a Template Haskell splice may use only what another module defines.
 --
--- The record it reads is the layout of "Hetoimasia.Terrain.Render2D.Material":
--- one handle, the art sheet, and these words, floats by their bit patterns:
+-- The record it reads is the layout of "Hetoimasia.Terrain.Render2D.Material": two handles, the
+-- colour atlas and the normal atlas, and these words:
 --
--- > w0..w2   a b c   art u = a·u + b·v + c
--- > w3..w5   d e f   art v = d·u + e·v + f
--- > w6       n       the mask's vertex count
--- > w7..     x0 y0 x1 y1 …
+-- > w0..w5    colour region: origin x, origin y, width, height, atlas width, atlas height
+-- > w6..w11   normal region: the same six
+-- > w12       the cell's depth below the cut, 0 .. 250
 --
--- The function samples the sheet at the art coordinates unconditionally (its
--- implicit derivatives need uniform control flow), then covers the fragment by
--- the mask: a convex polygon, closed, of either orientation, so a fragment is
--- outside exactly when two of its edge functions have opposite signs. Outside is
--- transparent black; inside is the sheet's texel, whose alpha is binary wherever
--- the sheet's is, as a cutout-capable material promises.
+-- and the push block is three @vec4@s: @lightSun@ (view sun direction x, y, z; ambient),
+-- @lightDepth@ (effective sun strength; darkening; haze; reciprocal depth range) and @lightHaze@
+-- (haze colour in linear light; padding), as "Hetoimasia.Terrain.Render2D.Presentation" packs them.
+--
+-- Each atlas is sampled at the texel centre of the texel the quad's UV selects in the region's own
+-- extent, @(origin + (i + 1/2, j + 1/2)) / atlasExtent@, so the sampler (nearest, level zero, one
+-- level) never mixes a neighbour and the origin is added after the local texel is chosen. Both
+-- samples are taken unconditionally, as the sampler's implicit derivatives require. The normal is
+-- decoded from the sampled UNORM by rounding to a byte, subtracting 128 and normalizing, with a
+-- guard so a transparent sample's colour bytes are never normalized into a NaN; its alpha is the
+-- map's coverage. The result is premultiplied linear colour, lit, darkened and hazed in the
+-- specified order, and its alpha is the colour's alpha times the map's, which is binary wherever
+-- both are, as a cutout-capable material promises.
 --
 -- State, ownership and lifetime: none.
 module Hetoimasia.Terrain.Render2D.Vulkan.Source
   ( terrainSource
   , terrainSourceEquivalent
+  , terrainSourceInsetControl
+  , terrainSourceUnbiasedControl
+  , terrainSourceStaleBiasControl
+  , terrainSourceWrongOrderControl
+  , lightPush
   ) where
 
-import Hetoimasia.Terrain.Render2D.Material (maxMaskVertices)
+import Hetoimasia.Terrain.Render2D.TexelRule (texelBias)
+import Hetoimasia.Render.TwoD.Vulkan.MaterialSources (PushField (..), PushType (..))
+
+-- | The texel bias as a GLSL float literal, made from the one definition 'texelBias' (1/128 of a
+-- texel, the owner's 2026-11-09 Q-13 decision) so the shader and every CPU consumer share it.
+biasLiteral ∷ String
+biasLiteral = glslFloat (fromRational texelBias ∷ Double)
+
+glslFloat ∷ Double → String
+glslFloat = show
+
+-- | The three @vec4@ members of the push block, in the order the host packs them.
+lightPush ∷ [PushField]
+lightPush = [PushField "lightSun" PushVec4, PushField "lightDepth" PushVec4, PushField "lightHaze" PushVec4]
 
 -- | The material function's source.
 terrainSource ∷ String
-terrainSource =
+terrainSource = terrainSourceWith biasLiteral
+
+-- | A NEGATIVE CONTROL, never the terrain's own material: 'terrainSource' with the texel bias
+-- removed, the rule the Q-13 counterexample was measured under. At an exact interior texel
+-- boundary float32 interpolation lands a hair below it and this selects the lower texel, which the
+-- evidence's exact-boundary fixtures must reject on the recorded device.
+terrainSourceUnbiasedControl ∷ String
+terrainSourceUnbiasedControl = terrainSourceWith "0.0"
+
+-- | A NEGATIVE CONTROL, never the terrain's own material: 'terrainSource' with the first amendment's
+-- @1/10000@ bias, which the device measured too small at pixel-snapped zooms 9/8 and 5/4 (it read the
+-- lower texel within 1.02e-4 texel of a boundary). The evidence's snapped fixtures must reject it.
+terrainSourceStaleBiasControl ∷ String
+terrainSourceStaleBiasControl = terrainSourceWith "1.0e-4"
+
+-- | A NEGATIVE CONTROL, never the terrain's own material: 'terrainSource' with the depth effects composed in the
+-- wrong order, haze first and darkening over the hazed colour, instead of the specified lit, darkened, then hazed
+-- (haze over the darkened colour). The evidence's depth fixtures, where both effects are on, must reject it.
+terrainSourceWrongOrderControl ∷ String
+terrainSourceWrongOrderControl =
+  terrainSourceComposed biasLiteral "((1.0 - haze) * colour.rgb * data.a * bright + haze * pushed.lightHaze.xyz * alpha) * darken"
+
+terrainSourceWith ∷ String → String
+terrainSourceWith bias =
+  terrainSourceComposed bias "(1.0 - haze) * colour.rgb * data.a * bright * darken + haze * pushed.lightHaze.xyz * alpha"
+
+-- | The material function with this bias literal and this expression for the premultiplied colour.
+terrainSourceComposed ∷ String → String → String
+terrainSourceComposed bias composition =
   unlines
     [ "vec4 material(vec4 texel, vec2 uv, uint parameter, MaterialRecord record) {"
-    , "    vec2 art = vec2("
-    , "        uintBitsToFloat(record.words[0]) * uv.x + uintBitsToFloat(record.words[1]) * uv.y + uintBitsToFloat(record.words[2]),"
-    , "        uintBitsToFloat(record.words[3]) * uv.x + uintBitsToFloat(record.words[4]) * uv.y + uintBitsToFloat(record.words[5]));"
-    , "    vec4 sampled = sampleTexture(record.handles[0], art);"
-    , "    uint count = record.words[6];"
-    , "    bool positive = false;"
-    , "    bool negative = false;"
-    , "    for (uint i = 0u; i < " <> show maxMaskVertices <> "u; i++) {"
-    , "        if (i < count) {"
-    , "            uint j = (i + 1u == count) ? 0u : i + 1u;"
-    , "            vec2 from = vec2(uintBitsToFloat(record.words[7u + 2u * i]), uintBitsToFloat(record.words[8u + 2u * i]));"
-    , "            vec2 to = vec2(uintBitsToFloat(record.words[7u + 2u * j]), uintBitsToFloat(record.words[8u + 2u * j]));"
-    , "            float edge = (to.x - from.x) * (uv.y - from.y) - (to.y - from.y) * (uv.x - from.x);"
-    , "            positive = positive || edge > 0.0;"
-    , "            negative = negative || edge < 0.0;"
-    , "        }"
-    , "    }"
-    , "    return (positive && negative) ? vec4(0.0) : sampled;"
+    , "    vec2 unit = clamp(uv, 0.0, 1.0);"
+    , "    vec2 colourExtent = vec2(float(record.words[2]), float(record.words[3]));"
+    , "    vec2 colourLocal = min(colourExtent - 1.0, floor(unit * colourExtent + " <> bias <> "));"
+    , "    vec2 colourAt = (vec2(float(record.words[0]), float(record.words[1])) + colourLocal + 0.5)"
+    , "        / vec2(float(record.words[4]), float(record.words[5]));"
+    , "    vec2 normalExtent = vec2(float(record.words[8]), float(record.words[9]));"
+    , "    vec2 normalLocal = min(normalExtent - 1.0, floor(unit * normalExtent + " <> bias <> "));"
+    , "    vec2 normalAt = (vec2(float(record.words[6]), float(record.words[7])) + normalLocal + 0.5)"
+    , "        / vec2(float(record.words[10]), float(record.words[11]));"
+    , "    vec4 colour = sampleTexture(record.handles[0], colourAt);"
+    , "    vec4 data = sampleTexture(record.handles[1], normalAt);"
+    , "    vec3 bytes = floor(data.rgb * 255.0 + 0.5) - 128.0;"
+    , "    float length2 = dot(bytes, bytes);"
+    , "    vec3 normal = (length2 > 0.0) ? bytes * inversesqrt(length2) : vec3(0.0, 0.0, 1.0);"
+    , "    float diffuse = clamp(dot(normal, pushed.lightSun.xyz), 0.0, 1.0);"
+    , "    float ambient = pushed.lightSun.w;"
+    , "    float bright = ambient + (1.0 - ambient) * pushed.lightDepth.x * diffuse;"
+    , "    float t = clamp(float(record.words[12]) * pushed.lightDepth.w, 0.0, 1.0);"
+    , "    float darken = 1.0 - pushed.lightDepth.y * t;"
+    , "    float haze = pushed.lightDepth.z * t * t;"
+    , "    float alpha = colour.a * data.a;"
+    , "    vec3 rgb = " <> composition <> ";"
+    , "    return vec4(rgb, alpha);"
     , "}"
     ]
 
--- | The same function written the other way round (the sign tests' operands
--- swapped and the mask's loop counting down), which behaves identically and has
--- its own SPIR-V: a second material the renderer registers as another
--- reference, for evidence that the grouping of faces into runs by material does
--- not change what is drawn.
+-- | The same function with every commutative operation written the other way round (each
+-- product and sum has its operands swapped, which does not change an IEEE result), the
+-- derived locals renamed and the guard inverted. It behaves identically and has its own SPIR-V: a
+-- second material the renderer registers as another reference, for evidence that the grouping of
+-- quads into runs by material does not change what is drawn.
 terrainSourceEquivalent ∷ String
 terrainSourceEquivalent =
   unlines
     [ "vec4 material(vec4 texel, vec2 uv, uint parameter, MaterialRecord record) {"
-    , "    vec2 art = vec2("
-    , "        uintBitsToFloat(record.words[2]) + uintBitsToFloat(record.words[1]) * uv.y + uintBitsToFloat(record.words[0]) * uv.x,"
-    , "        uintBitsToFloat(record.words[5]) + uintBitsToFloat(record.words[4]) * uv.y + uintBitsToFloat(record.words[3]) * uv.x);"
-    , "    vec4 sampled = sampleTexture(record.handles[0], art);"
-    , "    uint count = record.words[6];"
-    , "    bool positive = false;"
-    , "    bool negative = false;"
-    , "    for (uint k = 0u; k < " <> show maxMaskVertices <> "u; k++) {"
-    , "        uint i = " <> show (maxMaskVertices - 1) <> "u - k;"
-    , "        if (i < count) {"
-    , "            uint j = (i + 1u == count) ? 0u : i + 1u;"
-    , "            vec2 from = vec2(uintBitsToFloat(record.words[7u + 2u * i]), uintBitsToFloat(record.words[8u + 2u * i]));"
-    , "            vec2 to = vec2(uintBitsToFloat(record.words[7u + 2u * j]), uintBitsToFloat(record.words[8u + 2u * j]));"
-    , "            float edge = (uv.y - from.y) * (to.x - from.x) - (uv.x - from.x) * (to.y - from.y);"
-    , "            positive = 0.0 < edge || positive;"
-    , "            negative = edge < 0.0 || negative;"
-    , "        }"
-    , "    }"
-    , "    return (negative && positive) ? vec4(0.0) : sampled;"
+    , "    vec2 inside = min(max(uv, 0.0), 1.0);"
+    , "    vec2 cExtent = vec2(float(record.words[2]), float(record.words[3]));"
+    , "    vec2 cLocal = min(floor(" <> biasLiteral <> " + cExtent * inside), cExtent - 1.0);"
+    , "    vec2 cAt = (0.5 + cLocal + vec2(float(record.words[0]), float(record.words[1])))"
+    , "        / vec2(float(record.words[4]), float(record.words[5]));"
+    , "    vec2 nExtent = vec2(float(record.words[8]), float(record.words[9]));"
+    , "    vec2 nLocal = min(floor(" <> biasLiteral <> " + nExtent * inside), nExtent - 1.0);"
+    , "    vec2 nAt = (0.5 + nLocal + vec2(float(record.words[6]), float(record.words[7])))"
+    , "        / vec2(float(record.words[10]), float(record.words[11]));"
+    , "    vec4 base = sampleTexture(record.handles[0], cAt);"
+    , "    vec4 map = sampleTexture(record.handles[1], nAt);"
+    , "    vec3 offsets = floor(255.0 * map.rgb + 0.5) - 128.0;"
+    , "    float squared = dot(offsets, offsets);"
+    , "    vec3 facing = (squared <= 0.0) ? vec3(0.0, 0.0, 1.0) : offsets * inversesqrt(squared);"
+    , "    float lit = clamp(dot(facing, pushed.lightSun.xyz), 0.0, 1.0);"
+    , "    float floorLight = pushed.lightSun.w;"
+    , "    float light = floorLight + (1.0 - floorLight) * (pushed.lightDepth.x * lit);"
+    , "    float depth = clamp(pushed.lightDepth.w * float(record.words[12]), 0.0, 1.0);"
+    , "    float dim = 1.0 - pushed.lightDepth.y * depth;"
+    , "    float mist = pushed.lightDepth.z * depth * depth;"
+    , "    float cover = map.a * base.a;"
+    , "    vec3 colourOut = base.rgb * map.a * light * dim * (1.0 - mist) + pushed.lightHaze.xyz * cover * mist;"
+    , "    return vec4(colourOut, cover);"
+    , "}"
+    ]
+
+-- | A NEGATIVE CONTROL, never the terrain's own material: the region coordinate interpolated between
+-- the half-texel-inset endpoints of the region, @(origin + 1/2 + u (w - 1)) / atlasExtent@, instead
+-- of the texel the local index selects. It differs from the specified rule at interior texel
+-- boundaries (they shift), which is exactly what the evidence's judge must reject. It reads the same
+-- record and push block as 'terrainSource'.
+terrainSourceInsetControl ∷ String
+terrainSourceInsetControl =
+  unlines
+    [ "vec4 material(vec4 texel, vec2 uv, uint parameter, MaterialRecord record) {"
+    , "    vec2 unit = clamp(uv, 0.0, 1.0);"
+    , "    vec2 colourExtent = vec2(float(record.words[2]), float(record.words[3]));"
+    , "    vec2 colourAt = (vec2(float(record.words[0]), float(record.words[1])) + 0.5 + unit * (colourExtent - 1.0))"
+    , "        / vec2(float(record.words[4]), float(record.words[5]));"
+    , "    vec2 normalExtent = vec2(float(record.words[8]), float(record.words[9]));"
+    , "    vec2 normalAt = (vec2(float(record.words[6]), float(record.words[7])) + 0.5 + unit * (normalExtent - 1.0))"
+    , "        / vec2(float(record.words[10]), float(record.words[11]));"
+    , "    vec4 colour = sampleTexture(record.handles[0], colourAt);"
+    , "    vec4 data = sampleTexture(record.handles[1], normalAt);"
+    , "    vec3 bytes = floor(data.rgb * 255.0 + 0.5) - 128.0;"
+    , "    float length2 = dot(bytes, bytes);"
+    , "    vec3 normal = (length2 > 0.0) ? bytes * inversesqrt(length2) : vec3(0.0, 0.0, 1.0);"
+    , "    float diffuse = clamp(dot(normal, pushed.lightSun.xyz), 0.0, 1.0);"
+    , "    float ambient = pushed.lightSun.w;"
+    , "    float bright = ambient + (1.0 - ambient) * pushed.lightDepth.x * diffuse;"
+    , "    float t = clamp(float(record.words[12]) * pushed.lightDepth.w, 0.0, 1.0);"
+    , "    float darken = 1.0 - pushed.lightDepth.y * t;"
+    , "    float haze = pushed.lightDepth.z * t * t;"
+    , "    float alpha = colour.a * data.a;"
+    , "    vec3 rgb = (1.0 - haze) * colour.rgb * data.a * bright * darken + haze * pushed.lightHaze.xyz * alpha;"
+    , "    return vec4(rgb, alpha);"
     , "}"
     ]
