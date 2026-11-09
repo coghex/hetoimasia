@@ -956,11 +956,14 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       Right plan → Right (Planned plan)
       Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret prefix remaining version' edit cs
       Left o → Left o
-    goneFromIndex root edit pg = do
+    -- a page reclaimed already is absent from the index, or was reused since and retired again under
+    -- a newer version (its list keeps the number): only an index record under this entry's own version,
+    -- or an older one, says the page was skipped
+    goneFromIndex ver root edit pg = do
       (mv, edit') ← phase edit (lookupKey TreeRetire root (retiredKey pg))
       case mv of
-        Nothing → Right edit'
-        Just _ → refuse (Integrity (RetiredIndexMismatch pg))
+        Just v | getBe64 v 0 <= ver → refuse (Integrity (RetiredIndexMismatch pg))
+        _ → Right edit'
     unindexRetired ver (root, edit) pg = do
       (mv, edit1) ← phase edit (lookupKey TreeRetire root (retiredKey pg))
       if fmap (\v → getBe64 v 0) mv /= Just ver then refuse (Integrity (RetiredIndexMismatch pg)) else pure ()
@@ -1000,7 +1003,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       -- an entry is finished only when none of its pages is still indexed: the pages its progress
       -- field says were reclaimed already must be gone from the index, or a forged progress field
       -- would drop a page from the obligation for good
-      bkEditI ← if finished then foldM (goneFromIndex retireRoot) bkEditI0 prefix else pure bkEditI0
+      bkEditI ← if finished then foldM (goneFromIndex e retireRoot) bkEditI0 prefix else pure bkEditI0
       (retireRoot1, bkEdit3) ←
         if finished
           then phase bkEditI (deleteKey TreeRetire retireRootI (be64 e))
