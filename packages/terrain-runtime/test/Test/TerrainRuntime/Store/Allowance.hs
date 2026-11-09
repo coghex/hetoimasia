@@ -16,6 +16,7 @@ module Test.TerrainRuntime.Store.Allowance (spec) where
 import Control.Monad (foldM, forM_)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Discovery (Record, RecordKey)
+import Data.Word (Word64)
 import Hetoimasia.Terrain.Runtime.Store.Admission (Failure (..), classifyAdmit, classifyPlan)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
@@ -31,6 +32,9 @@ must = either (\e → expectationFailure e >> fail e) pure
 
 mibI ∷ Integer
 mibI = 1024 * 1024
+
+mibI' ∷ Word64
+mibI' = 1024 * 1024
 
 -- | A 64 MiB allowance whose overhead leaves 16 MiB (4,096 pages) of page space.
 tight ∷ StoreSpec
@@ -205,6 +209,20 @@ spec = describe "the allowance, its protected reserve and its growth" $ do
       proposeGrowth s2 (64 * mibI) `shouldBe` GrowthNotIncreased
       case proposeGrowth s (65 * mibI) of
         GrowthProposed p → (gpFrom p, gpTo p) `shouldBe` (64 * 1024 * 1024, 65 * 1024 * 1024)
+        other → expectationFailure (show other)
+    it "classifies a well-formed shrink as not increased even when the configured overhead is large" $ do
+      -- a 128 MiB allowance whose overhead is 112 MiB: a replacement configuration built for 64 MiB
+      -- with that overhead would be invalid, but the size itself is legal and smaller
+      let big = hStore (newH (specOf (128 * mibI) (Just (112 * mibI))) ident0)
+      proposeGrowth big (64 * mibI) `shouldBe` GrowthNotIncreased
+      proposeGrowth big (96 * mibI) `shouldBe` GrowthNotIncreased
+      proposeGrowth big (128 * mibI) `shouldBe` GrowthNoOp
+      -- a size that breaks the size rules is invalid however it compares with the cap
+      proposeGrowth big (32 * mibI) `shouldSatisfy` isInvalid
+      proposeGrowth big (96 * mibI + 1) `shouldSatisfy` isInvalid
+      -- an increase still builds and validates the replacement configuration
+      case proposeGrowth big (256 * mibI) of
+        GrowthProposed p → (gpFrom p, gpTo p) `shouldBe` (128 * mibI', 256 * mibI')
         other → expectationFailure (show other)
     it "keeps the old allowance until the reservation is reported and committed" $ do
       let s0 = hStore (newH smallSpec ident0)

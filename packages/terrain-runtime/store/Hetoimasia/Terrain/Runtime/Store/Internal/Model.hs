@@ -815,12 +815,16 @@ data GrowthDecision
 
 -- | Propose a larger allowance for this store.
 proposeGrowth ∷ Store → Integer → GrowthDecision
-proposeGrowth s bytes = case growConfig (sCfg s) bytes of
+proposeGrowth s bytes = case validateSize (sCfg s) bytes of
+  -- the size rules (minimum, alignment, offset limit) come first and alone
   Left err → GrowthInvalid err
-  Right cfg
-    | cfgAllowanceBytes cfg == cfgAllowanceBytes (sCfg s) → GrowthNoOp
-    | cfgAllowanceBytes cfg < cfgAllowanceBytes (sCfg s) → GrowthNotIncreased
-    | otherwise → GrowthProposed (GrowthProposal (sIdent s) (cfgAllowanceBytes (sCfg s)) (cfgAllowanceBytes cfg) cfg)
+  Right ()
+    | bytes == toInteger (cfgAllowanceBytes (sCfg s)) → GrowthNoOp
+    | bytes < toInteger (cfgAllowanceBytes (sCfg s)) → GrowthNotIncreased
+    -- only an increase builds a replacement configuration, with the overhead it already has
+    | otherwise → case growConfig (sCfg s) bytes of
+        Left err → GrowthInvalid err
+        Right cfg → GrowthProposed (GrowthProposal (sIdent s) (cfgAllowanceBytes (sCfg s)) (cfgAllowanceBytes cfg) cfg)
 
 data GrowthRefusal
   = GrowthBusyTransaction

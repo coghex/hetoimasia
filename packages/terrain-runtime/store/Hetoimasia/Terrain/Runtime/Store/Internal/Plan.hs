@@ -275,6 +275,8 @@ data IntegrityWhy
   | BrokenInvariant !TreeId
   | CorruptCounters
   | DoubleFree !PageNo
+  | -- | A retirement entry names a page the committed trees still reach, a list page or a page outside the used space.
+    RetiredPageLive !PageNo
   | MalformedRetirement
   | BookkeepingOverflow !Int
   | LooseOverflow !Int
@@ -768,6 +770,23 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
                 _ → refuse (Integrity MalformedRetirement)
               let remaining = drop (fromIntegral (retDone ret)) ps
               attempt e ret remaining version' e0 (chunkSizes (length remaining))
+    -- A page a retirement entry names must be one the committed trees no longer reach: it
+    -- lies inside the used space, is a tree page (never a list page) and is not the page
+    -- its own first key leads to in the tree its header names. A forged entry naming a
+    -- live root, a shared live subtree, a bookkeeping page or a list page is corruption.
+    notLive pages edit0 = go edit0 pages
+      where
+        go edit [] = Right edit
+        go edit (pg@(PageNo n) : rest)
+          | n >= rHw roots = refuse (Integrity (RetiredPageLive pg))
+          | otherwise = do
+              page ← maybe (Left (OutNeed pg)) Right (windowPage pg win)
+              firstKey ← case pgBody page of
+                Leaf ((k, _) : _) → Right k
+                Inner ((k, _) : _) → Right k
+                _ → refuse (Integrity (RetiredPageLive pg))
+              (found, edit') ← phase edit (livePageAt (pgTree page) (fmap Disk (rootOf roots (pgTree page))) firstKey (pgLevel page))
+              if found == Just pg then refuse (Integrity (RetiredPageLive pg)) else go edit' rest
     attempt _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
     attempt e ret remaining version' edit (c : cs) = case tryChunk e ret remaining version' edit c of
       Right plan → Right (Planned plan)
@@ -788,8 +807,10 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
       tk ← maybe (refuse (Capacity (DiskFull (fromIntegral m) (freePool cfg roots + fromIntegral (length (rLoose roots))) 0))) pure mtake
       let claim = fromIntegral m - fromIntegral (tkLoose tk) ∷ Word64
       if freePool cfg roots < claim then refuse (Capacity (DiskFull claim (freePool cfg roots) 0)) else pure ()
+      -- nothing a plan frees may still be reachable from a committed tree
+      bkEditL ← notLive freed bkEdit0
       -- nothing a plan frees may already be free, loose or claimed by this plan's own supply
-      (overlap, bkEditA) ← phase bkEdit0 (overlapOf (fmap Disk (rFree roots)) (Set.fromList (tkPages tk ++ rLoose roots)) freed)
+      (overlap, bkEditA) ← phase bkEditL (overlapOf (fmap Disk (rFree roots)) (Set.fromList (tkPages tk ++ rLoose roots)) freed)
       case overlap of
         Just pg → refuse (Integrity (DoubleFree pg))
         Nothing → Right ()

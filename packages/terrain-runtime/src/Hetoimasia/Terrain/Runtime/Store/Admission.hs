@@ -76,6 +76,8 @@ module Hetoimasia.Terrain.Runtime.Store.Admission
   , transactionCredits
   , maxQueuedDescriptors
   , descriptorRecordBytes
+  , minCacheEntryBytes
+  , minGrantBytes
   , descriptorCredits
 
     -- * The admission
@@ -289,6 +291,21 @@ transactionCredits arena r =
 maxQueuedDescriptors ∷ Int
 maxQueuedDescriptors = 8
 
+-- | What a cache entry is charged at least: a page. An entry costs a record and a map
+-- node of its own besides the bytes it copies, so a credit smaller than this (a zero
+-- one included) is charged as this much, and no number of tiny credits holds memory
+-- the ledger does not show.
+minCacheEntryBytes ∷ Word64
+minCacheEntryBytes = 4096
+
+charged ∷ Word64 → Word64
+charged = max minCacheEntryBytes
+
+-- | What a grant is charged at least in the staging or the control account it draws
+-- on, for the same reason: many tiny grants would otherwise hold records for free.
+minGrantBytes ∷ Word64
+minGrantBytes = 128
+
 -- | The accounted control bytes of one queued descriptor's metadata.
 descriptorRecordBytes ∷ Word64
 descriptorRecordBytes = 128
@@ -381,9 +398,11 @@ reserve cls credits a = do
   if null credits then Left (RefusedInvalid EmptyRequest) else Right ()
   let cfg = aCfg a
       -- every total is taken in Integer, so no sum of credits can wrap
-      wantCacheI = sum [toInteger b | CacheCredit _ b _ _ ← credits]
-      wantStagingI = sum [toInteger b | StagingCredit b ← credits]
-      wantControlI = sum [toInteger b | ControlCredit b ← credits]
+      wantCacheI = sum [toInteger (charged b) | CacheCredit _ b _ _ ← credits]
+      -- a grant holds a record of its own in each account it draws on: at least 'minGrantBytes'
+      wantStagingI = perGrant (sum [toInteger b | StagingCredit b ← credits])
+      wantControlI = perGrant (sum [toInteger b | ControlCredit b ← credits])
+      perGrant n = if n == 0 then 0 else max (toInteger minGrantBytes) n
       stagingLimit = case cls of
         Foreground → cStaging cfg
         Camera → cStaging cfg - cProtected cfg
@@ -407,7 +426,7 @@ reserve cls credits a = do
       clock = aClock a + 1
       entries0 = foldr Map.delete (aEntries a) victims
       newIds = [EntryId (aNextEntry a + fromIntegral i) | (i, CacheCredit {}) ← zip [0 ∷ Int ..] [c | c@(CacheCredit {}) ← credits]]
-      newEntries = [(i, Entry arena b backing (if pinned then 1 else 0) clock) | (i, CacheCredit arena b backing pinned) ← zip newIds [c | c@(CacheCredit {}) ← credits]]
+      newEntries = [(i, Entry arena (charged b) backing (if pinned then 1 else 0) clock) | (i, CacheCredit arena b backing pinned) ← zip newIds [c | c@(CacheCredit {}) ← credits]]
       staging' = if wantStaging > 0 then Map.insert gid (cls, wantStaging) (aStaging a) else aStaging a
       control' = if wantControl > 0 then Map.insert gid wantControl (aControl a) else aControl a
   Right

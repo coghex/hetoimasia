@@ -68,7 +68,7 @@ spec = describe "storage-aware edit-bank admission" $ do
       -- control is nearly full, so a request needing control as well as cache and staging fails whole
       (g1, adm1) ← must (reserve Foreground [ControlCredit (8 * mibW - 10)] adm0)
       let ledgerBefore = ledgers adm1
-          request = [StagingCredit mibW, CacheCredit a1 (2 * mibW) Backed True, ControlCredit 100]
+          request = [StagingCredit mibW, CacheCredit a1 (2 * mibW) Backed True, ControlCredit 200]
       case reserve Foreground request adm1 of
         Left (RefusedBusy (ControlPressure _ _)) → pure ()
         other → expectationFailure ("expected control pressure: " <> either show (const "funded") other)
@@ -77,7 +77,7 @@ spec = describe "storage-aware edit-bank admission" $ do
       let adm2 = release g1 adm1
       (g2, adm3) ← must (reserve Foreground request adm2)
       length (grantEntries g2) `shouldBe` 1
-      (lgStagingForeground (ledgers adm3), lgControlReserved (ledgers adm3)) `shouldBe` (mibW, 100)
+      (lgStagingForeground (ledgers adm3), lgControlReserved (ledgers adm3)) `shouldBe` (mibW, 200)
     it "refuses an empty request, a camera request for a control record and a credit no account could ever hold" $ do
       cfg ← config
       let adm = newAdmission cfg
@@ -159,6 +159,26 @@ spec = describe "storage-aware edit-bank admission" $ do
       length (grantEvicted g) `shouldSatisfy` (> 0)
       -- every evicted copy was backed and unpinned: nothing authoritative was released
       lgCacheRamOnly (ledgers adm4) `shouldBe` 0
+  describe "cache entries are charged for their own metadata" $ do
+    it "charges at least a page per entry, so zero-byte and tiny credits cannot hold memory the ledger does not show" $ do
+      cfg ← config
+      let adm = newAdmission cfg
+          n = 10000 ∷ Int
+      adm1 ← foldM (\x _ → fmap snd (must (reserve Camera [CacheCredit a1 0 Backed True] x))) adm [1 .. n]
+      lgCachePinned (ledgers adm1) `shouldBe` fromIntegral n * minCacheEntryBytes
+      adm2 ← foldM (\x _ → fmap snd (must (reserve Camera [CacheCredit a1 1 Backed True] x))) adm [1 .. n]
+      lgCachePinned (ledgers adm2) `shouldBe` fromIntegral n * minCacheEntryBytes
+      -- more entries than the cache can charge a page each are refused, not retained for free
+      let tooMany = fromIntegral (ebCacheBytes cfg `div` minCacheEntryBytes) + 1 ∷ Int
+      case reserve Foreground (replicate tooMany (CacheCredit a1 0 Backed False)) adm of
+        Left (RefusedInvalid (CreditExceedsAccount "cache" _ _)) → pure ()
+        other → expectationFailure (either show (const "funded") other)
+      -- many tiny grants in the staging and control accounts are charged a record each, too
+      adm4 ← foldM (\x _ → fmap snd (must (reserve Foreground [StagingCredit 1, ControlCredit 1] x))) adm [1 .. n]
+      (lgStagingForeground (ledgers adm4), lgControlReserved (ledgers adm4)) `shouldBe` (fromIntegral n * minGrantBytes, fromIntegral n * minGrantBytes)
+      -- a credit above a page is charged exactly as it was
+      (_, adm3) ← must (reserve Foreground [CacheCredit a1 (3 * minCacheEntryBytes) Backed False] adm)
+      lgCacheBacked (ledgers adm3) `shouldBe` 3 * minCacheEntryBytes
   describe "checked credit arithmetic" $ do
     it "refuses credits whose sum would wrap, in every account, without changing the admission" $ do
       cfg ← config

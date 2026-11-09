@@ -74,6 +74,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 
     -- * Reads
   , lookupKey
+  , livePageAt
   , floorKey
   , ceilKey
   , rangeKeys
@@ -364,6 +365,30 @@ loadChecked tree lo hi lvl ref = do
 
 -- ---------------------------------------------------------------------------
 -- Reads
+
+-- | The page a tree currently holds at a level on the path of a key, if the tree has
+-- one there: the root when its level is the target, else the child reference of the
+-- node one level above (not loaded: only the interior path is read). Every step is
+-- checked as any other descent is, so a malformed path is refused, never followed. It
+-- answers whether a page is reachable from the committed tree without a sweep of the
+-- store: a page reachable at all is on the path of its own first key.
+livePageAt ∷ TreeId → Maybe Ref → ByteString → Int → M (Maybe PageNo)
+livePageAt _ Nothing _ _ = pure Nothing
+livePageAt tree (Just root) key target = go root Nothing Nothing Nothing
+  where
+    go ref lo hi lvl = do
+      n ← loadChecked tree lo hi lvl ref
+      case compare (nLevel n) target of
+        EQ → pure (Just (refPage ref))
+        LT → pure Nothing
+        GT → case nBody n of
+          NLeaf _ → pure Nothing
+          NInner es → case chooseChild key es of
+            Nothing → pure Nothing
+            Just i →
+              let (lo', hi') = childBounds lo hi es i
+                  child = snd (es !! i)
+               in if nLevel n - 1 == target then pure (Just (refPage child)) else go child lo' hi' (Just (nLevel n - 1))
 
 -- | The index of the last separator at most the key, if any.
 chooseChild ∷ ByteString → [(ByteString, a)] → Maybe Int

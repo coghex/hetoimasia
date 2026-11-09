@@ -179,9 +179,44 @@ spec = describe "pinned readers, retirement and reclamation" $ do
           let h4 = h3 {hDisk = diskWrite (PageNo lp) bytes (hDisk h3)}
           (outcome, _, _) ← must (fillWith h4 (planMaintenance (hStore h4)))
           case outcome of
-            Refused (Integrity (DoubleFree _)) → pure ()
+            Refused (Integrity _) → pure ()
             other → expectationFailure ("a double free of " <> what <> " was not refused: " <> take 200 (show other))
         _ → expectationFailure "expected a retirement entry and a page to name"
+  it "refuses to reclaim a page the committed trees still reach, whichever live page a retirement entry names" $ do
+    let st0 = (newH smallSpec ident0, Map.empty, mkRng 15)
+    (h1, ref1, g1) ← must (foldM (\s _ → churn s 30) st0 [1 .. 30 ∷ Int])
+    (h2, _) ← must (reclaimAll h1)
+    (h3, _, _) ← must (foldM (\s _ → churn s 30) (h2, ref1, g1) [1 .. 3 ∷ Int])
+    let ArenaId a = siArena (hIdent h3)
+        roots = storeRoots (hStore h3)
+        o = ownership a (siSource (hIdent h3)) (hStore h3) (diskRead (hDisk h3))
+        entries = sortOn' [(getBe64' k 0, (getBe64' v 0, getLe16' v 8)) | (TreeRetire, ls) ← owLeaves o, (k, v) ← ls]
+        pageOf (PageNo n) = maybe (expectationFailure ("page " <> show n) >> fail "page") pure (diskRead (hDisk h3) (PageNo n))
+    runsRoot ← maybe (expectationFailure "a runs root expected" >> fail "runs") pure (rRuns roots)
+    rootBytes ← pageOf runsRoot
+    -- a live page below the root: a child of the runs root, so a shared subtree, not only a root
+    child ← case parsePage a (siSource (hIdent h3)) rootBytes of
+      Right (RefPage _ _ _ (RefInner ((_, c) : _)) _) → pure c
+      other → expectationFailure ("an inner runs root expected: " <> show other) >> fail "child"
+    freeRoot ← maybe (expectationFailure "a free root expected" >> fail "free") pure (rFree roots)
+    let PageNo rr = runsRoot
+        victims = [("the runs root", rr), ("a live page below the runs root", child), ("the free tree's root", (\(PageNo n) → n) freeRoot)]
+              <> [("the retirement tree's root", n) | Just (PageNo n) ← [rRetire roots]]
+    forM_ victims $ \(what, victim) →
+      case entries of
+        ((_, (lp, count)) : _) → do
+          listPage ← maybe (expectationFailure "list page" >> fail "list") pure (diskRead (hDisk h3) (PageNo lp))
+          ps ← case parsePage a (siSource (hIdent h3)) listPage of
+            Right (RefPage _ _ _ (RefList xs) _) → pure xs
+            other → expectationFailure (show other) >> fail "list"
+          length ps `shouldBe` fromIntegral count
+          bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) (Page TreeRetire 0 (PageNo lp) (List (map PageNo (sortOn' (victim : drop 1 ps))))))
+          let h4 = h3 {hDisk = diskWrite (PageNo lp) bytes (hDisk h3)}
+          (outcome, _, _) ← must (fillWith h4 (planMaintenance (hStore h4)))
+          case outcome of
+            Refused (Integrity (RetiredPageLive _)) → pure ()
+            other → expectationFailure ("reclaiming " <> what <> " was not refused as live: " <> take 200 (show other))
+        _ → expectationFailure "expected a retirement entry"
   it "refuses a supply that names a page outside the used space, however the allocator state came to say so" $ do
     let st0 = (newH smallSpec ident0, Map.empty, mkRng 15)
     (h1, ref1, g1) ← must (foldM (\s _ → churn s 30) st0 [1 .. 30 ∷ Int])

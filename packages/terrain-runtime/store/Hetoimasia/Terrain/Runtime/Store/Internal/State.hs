@@ -76,6 +76,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , pageFileOffset
   , rangeFileEnd
   , growConfig
+  , validateSize
 
     -- * Roots
   , Roots (..)
@@ -297,6 +298,16 @@ rangeFileEnd c p len = do
   let end = toInteger off + toInteger len
       pageSpace = toInteger (cfgUsablePages c) * toInteger pageSizeW
   if end > pageSpace || end > toInteger (cfgAllowance c) || end > toInteger (cfgLimit c) then Left OffsetOverflow else Right (fromInteger end)
+
+-- | Whether a size is a legal allowance on its own: at least the minimum, a multiple
+-- of the unit and inside the native offset limit. The overhead and the reserve room
+-- are properties of a whole configuration, not of a size.
+validateSize ∷ StoreConfig → Integer → Either ConfigError ()
+validateSize c bytes = do
+  let limit = toInteger (cfgLimit c)
+  if bytes < toInteger minAllowanceBytes then Left (AllowanceBelowMinimum bytes) else Right ()
+  if bytes `mod` toInteger allowanceUnitBytes /= 0 then Left (AllowanceNotAligned bytes) else Right ()
+  if bytes > limit then Left (AllowanceBeyondOffsetLimit bytes limit) else Right ()
 
 -- | The configuration with a larger allowance, the overhead unchanged, validated
 -- as a new configuration would be.
