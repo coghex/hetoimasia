@@ -331,7 +331,7 @@ spec = describe "the private page codec against independent bytes" $ do
           q = inner 1 6 5 0
           p = inner 1 5 6 (getLe32' q 4092)
           add win no bs = either (error . show) id (windowInsert total (pageNo no) bs win)
-          w = add (add (emptyWindow ident0 0) 5 p) 6 q
+          w = add (add (uncheckedWindow ident0 0) 5 p) 6 q
       case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 0, bias 0, bias 0])) (newEdit 0 w) of
         Left (Bad (BadLevel 1) (PageNo 6)) → pure ()
         other → expectationFailure ("a cycle was not stopped: " <> either show (const "answered") other)
@@ -339,12 +339,12 @@ spec = describe "the private page codec against independent bytes" $ do
       let leafAt no k = buildPage 1 7 no 1 0 0 1 (leafPayload [(k, bias 9)])
           leaf6 = leafAt 6 (BS.concat [bias 0, bias 0, bias 0])
           parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, BS.concat [bias 5, bias 5, bias 5], le64' 6, le32' (getLe32' leaf6 4092)])
-          w2 = add (add (emptyWindow ident0 0) 5 parent) 6 leaf6
+          w2 = add (add (uncheckedWindow ident0 0) 5 parent) 6 leaf6
       case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit 0 w2) of
         Left (Bad KeyOrder (PageNo 6)) → pure ()
         other → expectationFailure ("bounds not enforced: " <> either show (const "answered") other)
       -- a missing page is pending, never an absent key
-      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit 0 (add (emptyWindow ident0 0) 5 parent)) of
+      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit 0 (add (uncheckedWindow ident0 0) 5 parent)) of
         Left (Need (PageNo 6)) → pure ()
         other → expectationFailure ("a missing page must be pending: " <> either show (const "answered") other)
   describe "a child against its parent" $ do
@@ -356,7 +356,7 @@ spec = describe "the private page codec against independent bytes" $ do
           sepR = runKeyBytes 5000
           -- a runs parent whose child is a leaf of the links tree
           linksLeaf = buildPage 1 7 6 1 1 0 1 (leafPayload [(BS.concat [BS.singleton 1, bias 0, bias 0, bias 1000], BS.concat [BS.singleton 0, be64' 1, BS.singleton 0])])
-          wOther = add (add (emptyWindow ident0 0) 5 (inner 5 [(sepL, (6, linksLeaf))])) 6 linksLeaf
+          wOther = add (add (uncheckedWindow ident0 0) 5 (inner 5 [(sepL, (6, linksLeaf))])) 6 linksLeaf
       case runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 wOther) of
         Left (Bad KindMismatch (PageNo 6)) → pure ()
         other → expectationFailure ("a child of another tree was followed: " <> either show (const "answered") other)
@@ -364,7 +364,7 @@ spec = describe "the private page codec against independent bytes" $ do
       let leafKeys no ks = buildPage 1 7 no 1 0 0 (length ks) (leafPayload [(k, bias (lo + 1)) | (k, lo) ← ks])
           left = leafKeys 6 [(runKeyBytes 1000, 1000), (runKeyBytes 5000, 5000)]
           right = leafKeys 7 [(runKeyBytes 5000, 5000)]
-          wBound = add (add (add (emptyWindow ident0 0) 5 (inner 5 [(sepL, (6, left)), (sepR, (7, right))])) 6 left) 7 right
+          wBound = add (add (add (uncheckedWindow ident0 0) 5 (inner 5 [(sepL, (6, left)), (sepR, (7, right))])) 6 left) 7 right
       case runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 wBound) of
         Left (Bad KeyOrder (PageNo 6)) → pure ()
         other → expectationFailure ("a child reaching the upper separator was followed: " <> either show (const "answered") other)
@@ -378,7 +378,7 @@ spec = describe "the private page codec against independent bytes" $ do
           good = getLe32' leaf6 4092
           entry k crc = BS.concat [BS.singleton 24, k, le64' 6, le32' crc]
           parentOf crcs = buildPage 1 7 5 2 0 1 (length crcs) (BS.concat [entry k crc | (k, crc) ← crcs])
-          wOnly crcs = add (add (emptyWindow ident0 0) 5 (parentOf crcs)) 6 leaf6
+          wOnly crcs = add (add (uncheckedWindow ident0 0) 5 (parentOf crcs)) 6 leaf6
           lookupWith crcs = runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 (wOnly crcs))
       -- the checksum the parent records is the page's: it is followed
       case lookupWith [(sepL, good)] of
@@ -393,6 +393,33 @@ spec = describe "the private page codec against independent bytes" $ do
       case runM twice (newEdit 0 (wOnly [(sepL, good), (sepR, good + 7)])) of
         Left (Bad (ChildChecksum want have) (PageNo 6)) → (want, have) `shouldBe` (good + 7, good)
         other → expectationFailure ("a cached page was used for a pointer that records another checksum: " <> either show (const "answered") other)
+    it "refuses a root with no recorded checksum in every production window, and reads it only through the test-only unchecked window" $ do
+      let add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
+          runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
+          sepL = runKeyBytes 1000
+          leaf6 = buildPage 1 7 6 1 0 0 1 (leafPayload [(sepL, bias 1001)])
+          good = getLe32' leaf6 4092
+          parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, sepL, le64' 6, le32' good])
+          fill w = add (add w 5 parent) 6 leaf6
+          lookupIn w = runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 (fill w))
+          production = emptyWindow ident0 0
+          rootCrc = getLe32' parent 4092
+      -- a window that holds no checksum for the root refuses it
+      case lookupIn production of
+        Left (Bad RootChecksumMissing (PageNo 5)) → pure ()
+        other → expectationFailure ("a root with no recorded checksum was read: " <> either show (const "answered") other)
+      -- the checksum the root record publishes for it makes the same window read it
+      case lookupIn (windowTrust [(PageNo 5, rootCrc)] production) of
+        Right (Just _, _) → pure ()
+        other → expectationFailure ("a root with its recorded checksum was refused: " <> either show (const "answered another way") other)
+      -- another checksum for it is refused as such
+      case lookupIn (windowTrust [(PageNo 5, rootCrc + 1)] production) of
+        Left (Bad (ChildChecksum want have) (PageNo 5)) → (want, have) `shouldBe` (rootCrc + 1, rootCrc)
+        other → expectationFailure ("a root with another checksum was read: " <> either show (const "answered") other)
+      -- only the test-only constructor reads a root no record names
+      case lookupIn (uncheckedWindow ident0 0) of
+        Right (Just _, _) → pure ()
+        other → expectationFailure ("the unchecked test window refused a root: " <> either show (const "answered another way") other)
   describe "rebalancing" $ do
     it "refuses a root collapse that would follow a cycle or a child of the wrong level" $ do
       let runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
@@ -409,7 +436,7 @@ spec = describe "the private page codec against independent bytes" $ do
           cycB = inner 5 1 [(sepR, 2, 0)]
           cycA = inner 2 1 [(sepR, 5, crcOf cycB)]
           root = inner 3 2 [(sepL, 1, crcOf leftInner), (sepR, 2, crcOf cycA)]
-          w = foldl (\acc (no, bs) → add acc no bs) (emptyWindow ident0 0) [(3, root), (1, leftInner), (4, leaf), (2, cycA), (5, cycB)]
+          w = foldl (\acc (no, bs) → add acc no bs) (uncheckedWindow ident0 0) [(3, root), (1, leftInner), (4, leaf), (2, cycA), (5, cycB)]
       -- the deletion empties the left subtree, leaving a one-child root whose collapse reaches the cycle
       -- (a generous wall-clock guard turns a regression that loops into a failure, not a hang)
       outcome ← timeout 20000000 (evaluate (either Left (const (Right ())) (runM (deleteKey TreeRuns (Just (Disk (PageNo 3))) (runKeyBytes 1000)) (newEdit 1000000 w))))
@@ -444,7 +471,7 @@ spec = describe "the private page codec against independent bytes" $ do
           sepRight = runKeyBytes 5000
           parent = buildPage 1 7 3 2 0 1 2 (BS.concat [BS.concat [BS.singleton 24, k, le64' c, le32' (getLe32' cb 4092)] | (k, (c, cb)) ← [(sepLeft, (1, left)), (sepRight, (2, right))]])
           add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
-          w = add (add (add (emptyWindow ident0 0) 3 parent) 1 left) 2 right
+          w = add (add (add (uncheckedWindow ident0 0) 3 parent) 1 left) 2 right
       -- an ordinary lookup already refuses the malformed sibling
       case runM (lookupKey TreeRuns (Just (Disk (PageNo 3))) (runKeyBytes 5000)) (newEdit 0 w) of
         Left (Bad KeyOrder (PageNo 2)) → pure ()
@@ -465,7 +492,7 @@ spec = describe "the private page codec against independent bytes" $ do
                 Authority a (Revision c) (Revision k) (Revision st) = hAuthority hdr
                 nextA = Authority a (Revision (if terrain then c + 1 else c)) (Revision (if knowledge then k + 1 else k)) (Revision (st + 1))
                 d = Delta (hAuthority hdr) hdr {hAuthority = nextA} terrain knowledge 1 [(runKey 0 0 1, Just (runRec 3))]
-             in planDelta cfg ident0 r (emptyWindow ident0 (rVersion r)) Ordinary d
+             in planDelta cfg ident0 r (uncheckedWindow ident0 (rVersion r)) Ordinary d
           is' want p = p `shouldSatisfy` (\x → case x of Refused y → y == want; _ → False)
       is' (Invalid RevisionArithmetic) (plan (at maxBound 0 0) True False)
       is' (Invalid RevisionArithmetic) (plan (at 0 maxBound 0) False True)
@@ -481,13 +508,13 @@ spec = describe "the private page codec against independent bytes" $ do
           other = Authority (ArenaId 9) c0 k0 st0
           stale = Authority (ArenaId 1) (Revision 5) k0 st0
           wrong = Authority (ArenaId 1) c0 k0 (Revision 5)
-          go d = planDelta cfg ident0 roots0 (emptyWindow ident0 0) Ordinary d
+          go d = planDelta cfg ident0 roots0 (uncheckedWindow ident0 0) Ordinary d
       is' (Invalid ForeignArena) (go (Delta other hdr0 True False 1 w))
       is' (Stale (StaleAuthority stale (hAuthority hdr0))) (go (Delta stale hdr0 True False 1 w))
       is' (Invalid InconsistentRevisions) (go (Delta (hAuthority hdr0) hdr0 {hAuthority = wrong} True False 1 w))
       is' (Invalid InconsistentRevisions) (go (Delta (hAuthority hdr0) hdr0 True False 1 w))
       is' (Invalid (TooManyUpdates 65)) (go (Delta (hAuthority hdr0) hdr0 True False 65 w))
-      is' (Stale (StaleWindow 3 0)) (planDelta cfg ident0 roots0 (emptyWindow ident0 3) Ordinary (Delta (hAuthority hdr0) hdr0 True False 1 w))
+      is' (Stale (StaleWindow 3 0)) (planDelta cfg ident0 roots0 (uncheckedWindow ident0 3) Ordinary (Delta (hAuthority hdr0) hdr0 True False 1 w))
       _ ← pure (Map.empty ∷ Map.Map Int Int)
       pure ()
   where

@@ -423,7 +423,7 @@ pinView p = windowBelow (pinHw p) . windowTrust (pinTrust p)
 
 -- | A window for the committed version of the store.
 storeWindow ∷ Store → Window
-storeWindow s = emptyWindow (sIdent s) (rVersion (sRoots s))
+storeWindow s = windowTrust (rootTrust (sRoots s)) (emptyWindow (sIdent s) (rVersion (sRoots s)))
 
 -- | The provider #661's operations read the committed records through. A record the
 -- window cannot supply is 'Unavailable', never absent. A window of another store or
@@ -752,7 +752,7 @@ readerVersion s tok = pinVersion <$> pinsOf s tok
 
 -- | An empty window for a reader's version.
 readerWindow ∷ Store → ReaderToken → Either StaleReader Window
-readerWindow s tok = emptyWindow (sIdent s) . pinVersion <$> pinsOf s tok
+readerWindow s tok = (\p → windowTrust (pinTrust p) (emptyWindow (sIdent s) (pinVersion p))) <$> pinsOf s tok
 
 rootsOfPins ∷ Pins → TreeId → Maybe PageNo
 rootsOfPins p TreeRuns = pinRuns p

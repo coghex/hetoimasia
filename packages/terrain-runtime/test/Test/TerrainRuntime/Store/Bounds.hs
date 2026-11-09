@@ -171,7 +171,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         roots = storeRoots (hStore (newH smallSpec ident0))
         total = cfgUsablePages cfg
         leaf n = Page TreeRuns 0 (PageNo n) (Leaf [(encodeKey (runKey 0 0 (10 * toInteger n)), encodeValue (runRec (10 * toInteger n + 3)))])
-        windowOf m = foldl (\w n → either (error . show) id (windowInsert total (PageNo n) (either (error . show) id (encodePage ident0 (leaf n))) w)) (emptyWindow ident0 0) [1 .. m]
+        windowOf m = foldl (\w n → either (error . show) id (windowInsert total (PageNo n) (either (error . show) id (encodePage ident0 (leaf n))) w)) (uncheckedWindow ident0 0) [1 .. m]
         d = deltaFor (hStore (newH smallSpec ident0)) True False 1 [(runKey 0 0 1, Just (runRec 3))]
         run m = planDelta cfg ident0 roots (windowOf m) Ordinary d
         tight = planDeltaWith (Bounds maxTxnPages txnRamLimit 5 maxWindowBytes) cfg ident0 roots
@@ -192,7 +192,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     let cfg = either (error . show) id (mkStoreConfig smallSpec)
         total = cfgUsablePages cfg
         dense n = Page TreeRuns 0 (PageNo n) (Leaf [(encodeKey (runKey 0 (toInteger n) (100 * i)), encodeValue (runRec (100 * i + 3))) | i ← [1 .. 119]])
-        build = foldl (\w n → either (error . show) id (windowInsert total (PageNo n) (either (error . show) id (encodePage ident0 (dense n))) w)) (emptyWindow ident0 0) [1 .. 310]
+        build = foldl (\w n → either (error . show) id (windowInsert total (PageNo n) (either (error . show) id (encodePage ident0 (dense n))) w)) (uncheckedWindow ident0 0) [1 .. 310]
     liveBefore ← liveBytes
     w ← evaluate (let w' = build in windowBytes w' `seq` w')
     liveAfter ← liveBytes
@@ -223,7 +223,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         disk = foldl (\dk pg → diskWrite (pgNo pg) (either (error . show) id (encodePage ident0 pg)) dk) (hDisk h0) pages
         total = fromIntegral (length pages) ∷ Word64
         roots0 = storeRoots (hStore h0)
-        roots = roots0 {rVersion = 1, rRuns = Just (PageNo (fromIntegral leaves + 2)), rHw = total, rLivePages = total}
+        roots = roots0 {rVersion = 1, rRuns = Just (PageNo (fromIntegral leaves + 2)), rHw = total, rLivePages = total, rRootCrcs = [(TreeRuns, childCrc (childOf rootPage))]}
         store = storeFromRoots (hCfg h0) ident0 roots
         h = h0 {hStore = store, hDisk = disk}
         delta = deltaFor store True False 1 [(leafKey l 5, Just (runRec 509)) | l ← [0 .. leaves - 1]]
@@ -256,7 +256,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         s0 = hStore h0
         w = [(runKey 0 0 1, Just (runRec 3))]
     -- the delta's updates are checked against the validated 64
-    let go n = planDelta cfg ident0 (storeRoots s0) (emptyWindow ident0 0) Ordinary (deltaFor s0 True False n w)
+    let go n = planDelta cfg ident0 (storeRoots s0) (uncheckedWindow ident0 0) Ordinary (deltaFor s0 True False n w)
     case go 64 of
       Planned _ → pure ()
       other → expectationFailure (show other)
@@ -319,7 +319,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         bigRead n = BS.concat [either (error . show) id (encodePage ident0 (leaf i)) | i ← [1 .. n]]
         sliceOf ∷ BS.ByteString → Word64 → BS.ByteString
         sliceOf big i = BS.take pageSize (BS.drop (fromIntegral (i - 1) * pageSize) big)
-        probes n = let big = bigRead n in foldl (\w i → windowProbe total (PageNo i) (sliceOf big i) w) (emptyWindow ident0 0) [1 .. n]
+        probes n = let big = bigRead n in foldl (\w i → windowProbe total (PageNo i) (sliceOf big i) w) (uncheckedWindow ident0 0) [1 .. n]
     liveBefore ← liveBytes
     w ← evaluate (let w' = probes 500 in windowProbeCount w' `seq` w')
     liveAfter ← liveBytes
@@ -330,17 +330,17 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     held `shouldSatisfy` (< 500 * fromIntegral pageSize `div` 4)
     -- a window never keeps the caller's buffer: one page of a large read keeps one page
     liveBefore2 ← liveBytes
-    w2 ← evaluate (let big = bigRead 500 in either (error . show) id (windowInsert total (PageNo 1) (sliceOf big 1) (emptyWindow ident0 0)))
+    w2 ← evaluate (let big = bigRead 500 in either (error . show) id (windowInsert total (PageNo 1) (sliceOf big 1) (uncheckedWindow ident0 0)))
     liveAfter2 ← liveBytes
     windowSize w2 `shouldBe` 1
     (liveAfter2 - liveBefore2) `shouldSatisfy` (< 4 * fromIntegral pageSize)
     -- a window with more probes than a plan may hold is refused, not planned through
     let d = deltaFor (hStore (newH smallSpec ident0)) True False 1 [(runKey 0 0 1, Just (runRec 3))]
-        manyProbes = foldl (\x i → windowProbe total (PageNo i) (BS.replicate pageSize 0) x) (emptyWindow ident0 0) [1 .. fromIntegral (maxWindowProbes + 1)]
+        manyProbes = foldl (\x i → windowProbe total (PageNo i) (BS.replicate pageSize 0) x) (uncheckedWindow ident0 0) [1 .. fromIntegral (maxWindowProbes + 1)]
     windowProbeCount manyProbes `shouldBe` maxWindowProbes + 1
     planDelta cfg ident0 roots manyProbes Ordinary d `shouldBe` Refused (Capacity (ProbesExceeded (maxWindowProbes + 1)))
     -- exactly the bound is accepted
-    let atBound = foldl (\x i → windowProbe total (PageNo i) (BS.replicate pageSize 0) x) (emptyWindow ident0 0) [1 .. fromIntegral maxWindowProbes]
+    let atBound = foldl (\x i → windowProbe total (PageNo i) (BS.replicate pageSize 0) x) (uncheckedWindow ident0 0) [1 .. fromIntegral maxWindowProbes]
     case planDelta cfg ident0 roots atBound Ordinary d of
       Planned _ → pure ()
       other → expectationFailure (show other)

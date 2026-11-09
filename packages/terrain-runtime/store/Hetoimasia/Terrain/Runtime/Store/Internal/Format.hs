@@ -196,5 +196,9 @@ data PageError
   | -- | A child page's checksum is not the one its parent records for it: the checksum the
     -- parent expects, the one the page carries.
     ChildChecksum !Word32 !Word32
+  | -- | A root page was asked for with no checksum recorded for it by the root record (or the pin) the
+    -- window was built from: a root is never read unchecked, except through the test-only
+    -- 'Hetoimasia.Terrain.Runtime.Store.Internal.Tree.windowUnchecked'.
+    RootChecksumMissing
   | EntryTooLarge !Int
   deriving stock (Eq, Show)

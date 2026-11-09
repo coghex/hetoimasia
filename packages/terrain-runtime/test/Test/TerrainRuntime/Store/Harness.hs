@@ -15,6 +15,7 @@ module Test.TerrainRuntime.Store.Harness
   , smallSpec
   , identOf
   , ident0
+  , uncheckedWindow
 
     -- * Planning
   , fillPlan
@@ -321,3 +322,8 @@ todoKey = KeyTodo
 
 todoRec ∷ Integer → Integer → Integer → Word8 → Record
 todoRec x y z d = RecTodo (Todo (tileAt x y z) d)
+
+-- | A window over root sets a test builds by hand, which no root record or pin gives a checksum: the test-only
+-- constructor that reads such roots unchecked. A production window refuses them ('RootChecksumMissing').
+uncheckedWindow ∷ StoreIdentity → Word64 → Window
+uncheckedWindow ident v = windowUnchecked (emptyWindow ident v)

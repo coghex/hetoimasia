@@ -618,7 +618,7 @@ planDeltaWith bounds cfg ident roots = planDeltaPinned bounds cfg ident roots []
 -- from every one of these before it is numbered into the plan.
 planDeltaPinned ∷ Bounds → StoreConfig → StoreIdentity → Roots → [Pins] → Window → TxClass → Delta → Planned
 planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
-  let win = windowTrust (rootTrust roots) (windowBelow (rHw roots) win0)
+  let win = windowTrust (rootTrust roots ++ concatMap pinTrust pins) (windowBelow (rHw roots) win0)
   checkWindow bounds ident roots win
   checkCounters roots
   let base = dlBase cand
@@ -914,7 +914,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
   Right r → r
   where
     total = cfgTotalPages cfg
-    win = windowTrust (rootTrust roots) (windowBelow (rHw roots) win0)
+    win = windowTrust (rootTrust roots ++ concatMap pinTrust pins) (windowBelow (rHw roots) win0)
     reclaimM ∷ P Planned
     reclaimM = do
       checkWindow bounds ident roots win

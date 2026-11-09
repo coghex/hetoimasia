@@ -50,6 +50,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , emptyWindow
   , windowBelow
   , windowTrust
+  , windowUnchecked
   , pageCrcOf
   , windowInsert
   , windowProbe
@@ -150,6 +151,8 @@ data Window = Window
   , wPages ∷ !(Map PageNo VPage)
   , wProbes ∷ !(Map PageNo Probe)
   , wBelow ∷ !Word64
+  , wUnchecked ∷ !Bool
+  -- ^ Test-only: roots with no recorded checksum are read unchecked. No production path sets it.
   , wRoots ∷ !(Map PageNo Word32)
   -- ^ The checksum each root page must carry, by page number, as the root record publishes it.
   }
@@ -157,7 +160,7 @@ data Window = Window
 
 -- | An empty window for a store and a version.
 emptyWindow ∷ StoreIdentity → Word64 → Window
-emptyWindow ident v = Window ident v Map.empty Map.empty maxBound Map.empty
+emptyWindow ident v = Window ident v Map.empty Map.empty maxBound False Map.empty
 
 -- | The window of a version whose used page space is the first @n@ pages: a
 -- reference to a page at or past @n@ is refused, never read.
@@ -169,6 +172,13 @@ windowBelow n w = w {wBelow = n}
 -- carries the checksum its parent recorded. A root set made by hand has none and is read unchecked.
 windowTrust ∷ [(PageNo, Word32)] → Window → Window
 windowTrust cs w = w {wRoots = Map.fromList cs}
+
+-- | TEST-ONLY. A window that reads a root whose checksum no record names unchecked, for the suites that build
+-- root sets by hand. A production window fails closed: a root with no recorded checksum is refused with
+-- 'RootChecksumMissing'. Nothing outside the test suites calls this; the public facade does not export it
+-- and every window a store hands out is built by 'windowTrust' from a root record or a reader's pin.
+windowUnchecked ∷ Window → Window
+windowUnchecked w = w {wUnchecked = True}
 
 -- | The version the window was filled for.
 windowVersion ∷ Window → Word64
@@ -410,6 +420,8 @@ load tree expectLevel ref = do
     Fresh i → maybe (stop (Invariant tree)) pure (freshNode e i)
     DiskRef p recorded → let expected = case recorded of Just c → Just c; Nothing → Map.lookup p (wRoots (eWin e)) in case lookup p (eHot e) of
       Just hot | nTree hot == tree, hotAgrees expected p e → pure hot
+      -- a root with no recorded checksum fails closed
+      _ | Nothing ← expected, not (wUnchecked (eWin e)) → stop (Bad RootChecksumMissing p)
       _ | let PageNo n = p, n >= wBelow (eWin e) → stop (Bad (BadReference p) p)
       _ → case Map.lookup p (wPages (eWin e)) of
           Nothing → stop (Need p)

@@ -792,9 +792,12 @@ Only a page that no owner but the allocator claims is written, and a refusal wri
   of the same node, in the same tree and at the same level, its keys inside the same bounds) can no
   longer stand in for the page a pointer meant, and a re-sealed change to a child page fails the
   record its parent holds. A new page's entries get the checksums of the children encoded before
-  it; a root is named by the root record and carries none. The residual, out of the model, is a
-  *consistent* re-seal of a parent and its child together (and of the root record): the trees then say a
-  different thing consistently, which no local check can tell from a different true history.
+  it, and the **root record anchors the chain**: it carries the checksum each tree root's page must carry
+  (a window holds them, a transaction publishes those of the roots it wrote, a reader's pin records those of
+  its version), so one re-sealed page anywhere on a path, the root included, fails the record above it.
+  The residual, out of the model, is a *consistent* re-seal of the root record together with what it
+  names, or of a whole path of pages together with the record above it: the trees then say a different
+  thing consistently, which no local check can tell from a different true history.
 * **An absence is concluded only from checked separators.** A lookup that finds nothing, a floor,
   a ceiling, the start of a ranged scan and the unreachability of a page are each concluded from the
   leaf (or node) a key leads to, which is only as true as the separators that led there. Before any
