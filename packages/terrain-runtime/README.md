@@ -806,7 +806,7 @@ The sites, and what stops a forged record at each (tests are in
 | tree roots and every child reference | used-space bound in every descent; tree, level, bounds (earlier rounds) | a root past the used space; a child past it, for a plan, a committed read and a pinned read; `Codec`: bounds, cycles, levels |
 | a reader's pinned roots | pinned used space, proof against pinned trees | the pinned-read half of the child test; the pinned extent and lowered-version tests |
 | decoded buffers held past their decode | copies, accounted, bounded | `Bounds`: `keeps nothing of a page buffer behind a probe...` |
-| counters | arithmetic only (a negative count is refused); never used to find a page | `Codec` revision and counter wrap tests |
+| counters (live, retired, free, loose list) | the identity `hw = live + retired + free + loose` and the empty-tree implications are checked at every plan and maintenance transaction (`CorruptCounters`, whatever the sign). A counter forged consistently (a transfer between two) can change only capacity and reporting (`freePool`, the retired backlog bound, the usage report), never which page is overwritten | a re-sealed counter moved up and down (`Ownership`); a consistent transfer writes only dead pages |
 
 ### The allowance
 

@@ -3785,7 +3785,12 @@ decoder still lacks the data-image policy described in the integration audit.
    no mip generation, trilinear filtering or smoothed mask edges. The
    reference texel rule on an image of width `w` is
    `i = min(w-1, floor(clamp(u,0,1)*w))`, and similarly for `v`/height, with
-   top-row-first region coordinates. Add the checked region origin only after
+   top-row-first region coordinates. (The neutral image and region primitive
+   keeps this unbiased rule. The TERRAIN consumers sample with the owner's
+   2026-11-09 Q-13 texel bias, `i = min(w-1, floor(clamp(u,0,1)*w + 1/128))`,
+   defined once in `Hetoimasia.Terrain.Render2D.TexelRule`: float32
+   interpolation on the device lands a hair below an exact texel boundary, and
+   neither no bias nor 1/10000 was enough; see the TRA-17 evidence.) Add the checked region origin only after
    clamping locally. GPU sampling uses that atlas texel's centre; whole-atlas
    clamp alone is insufficient at a region boundary. At an interior texel
    boundary select the higher index; the outer region edge selects its last
@@ -4693,7 +4698,11 @@ decoder or separately reconstructed picking mask is introduced.
 
 **Exact CPU/GPU sampling.** Quad UVs stay in logical `[0,1]²`. For local
 region extent `(w,h)=(96,64)`, choose
-`i=min(w-1,floor(clamp(u,0,1)*w))` and the corresponding `j`. Read CPU coverage
+`i=min(w-1,floor(clamp(u,0,1)*w+1/128))` and the corresponding `j` (the owner's
+2026-11-09 Q-13 texel bias, evaluated exactly, defined once in
+`Hetoimasia.Terrain.Render2D.TexelRule`; the neutral region primitive stays
+unbiased and a terrain consumer passes its integer index to the region lookup).
+Read CPU coverage
 at `(originX+i, originY+j)` in the parent plane. The GPU samples that exact
 texel centre, `(origin+(i+0.5,j+0.5))/atlasExtent`, at level zero with the
 existing nearest/clamp sampler. Apply the same calculation independently to
