@@ -10,6 +10,7 @@ module Test.LuaEngine.Terrain.Support
   ( Rig (..)
   , withRig
   , withRigConfig
+  , refusesComposition
   , withRigProbe
   , withRigHooks
   , holdAt
@@ -68,7 +69,7 @@ import Hetoimasia.Terrain.Coordinate (tileCoord)
 import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Hetoimasia.Terrain.Runtime
-import Test.Hspec (Expectation, expectationFailure)
+import Test.Hspec (Expectation, expectationFailure, shouldThrow)
 import Hetoimasia.Scripting.Lua.Instance (InstanceFailure (failureMessage))
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
 import Test.LuaEngine.Facade.Support (Script (..), Spawned, VmShape (..), World, advanceClock, errLines, gameplayShape, outLines, phaseOf, presentationShape, pumpUntil, script, settledFailure)
@@ -95,6 +96,12 @@ withRig = withRigProbe defaultConfig noProbe
 
 withRigConfig ∷ Config → (Rig → IO a) → IO a
 withRigConfig config = withRigProbe config noProbe
+
+-- | A service configured like this is refused at composition, naming the limit that is over what Lua is promised, and no VM or request exists.
+refusesComposition ∷ Config → Text → Expectation
+refusesComposition config limit =
+  withRigConfig config (\_ → pure ())
+    `shouldThrow` \(TerrainCompositionRefused why) → limit `Text.isInfixOf` why
 
 withRigProbe ∷ Config → Probe → (Rig → IO a) → IO a
 withRigProbe config probe = withRigHooks config probe noTerrainHooks

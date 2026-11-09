@@ -128,7 +128,7 @@ import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, RequestCon
 import Hetoimasia.Scripting.Lua.Value (Schema (SNil), Value (..), capability)
 import Hetoimasia.Terrain.Cell (Cell (..), Column, IntervalError, MaterialId, ZRange, materialIdString, maxMaterialIdBytes, mkColumn, mkZRange, zRangeHi, zRangeLo)
 import Hetoimasia.Terrain.Coordinate (TileCoord, axisValue, decomposeTile, localX, localY, localZ, regionLevels, tileCoord)
-import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..))
+import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..), defaultQueryLimits)
 import Hetoimasia.Terrain.Residency (Revision (..), limitExtent, limitQueryRegions)
 import Hetoimasia.LuaEngine.Terrain.Internal.Arbitration
   ( ArbitrationHooks (..)
@@ -146,7 +146,7 @@ import Hetoimasia.Terrain.Runtime
   , CellAnswer (..)
   , Client
   , ColumnAnswer (..)
-  , Config (configLimits, configMaxLeases, configQueryLimits)
+  , Config (configLimits, configMaxLeases, configQueryLimits, configSourceLimits)
   , Failure (..)
   , Precondition (..)
   , RemoveAnswer (..)
@@ -171,7 +171,7 @@ import Hetoimasia.Terrain.Runtime.Settlement
   , surfaceWith
   )
 import Hetoimasia.Terrain.Shape (shapeIdValue)
-import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
+import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceLimits (..), SourceSpec (..), defaultSourceLimits)
 
 -- The composition -------------------------------------------------------------------------------------
 
@@ -234,9 +234,38 @@ arbitrationHooks facade = ArbitrationHooks (hookArriving (tfHooks facade)) (hook
 heldBack ∷ TerrainFacade → Text → STM Bool
 heldBack facade name = Map.member name <$> readTVar (tfOffered facade)
 
--- | A composition over a service, with no pick authority issued, no hooks and no extra bindings.
+-- | The caps the Lua contract fixes for what a script sends and is answered, and that the service's own configuration must not exceed: a
+-- column answer of at most 1,024 runs (a longer one is the failure @too_large@) over a range of at most 8,192 levels, and a definition of
+-- at most 256 KiB and 8,192 authored runs (a larger one is the failure @definition@). Their values are the service's approved defaults
+-- ('defaultQueryLimits', 'defaultSourceLimits'), read from there so that there is one place they are written.
+--
+-- The rule, one for every cap: **a service configured above them is refused at composition** ('TerrainCompositionRefused', by
+-- 'newTerrainFacade', before any VM or request exists), and a service configured below them is allowed and enforces its own, tighter value
+-- (the service decides the failure, as it does for the default). The alternative, applying @min cap configured@ at the adapter's boundary,
+-- would make the adapter re-decide what the service decides (the definition's conservative byte accounting, the run count of an answer) and
+-- leave two places that can disagree; a refused composition is one explicit decision, taken where the assembly can read the reason. The caps
+-- that are not a service limit are constants of the facade and the validator, which no configuration reaches: the arena name's 128
+-- characters and the column range's 8,192 levels are checked by the facade before the service is asked, and the 4,095 materials are the
+-- validator's constant ('maxAuthoredMaterials').
+incompatibleLimits ∷ Config → [Text]
+incompatibleLimits config =
+  [ field <> " is " <> Text.pack (show configured) <> ", over the " <> Text.pack (show cap) <> " a script is promised"
+  | (field, configured, cap) ←
+      [ ("limitReturnedRuns", limitReturnedRuns (configQueryLimits config), limitReturnedRuns defaultQueryLimits)
+      , ("limitRangeLevels", limitRangeLevels (configQueryLimits config), limitRangeLevels defaultQueryLimits)
+      , ("limitDefinitionBytes", limitDefinitionBytes (configSourceLimits config), limitDefinitionBytes defaultSourceLimits)
+      , ("limitAuthoredRuns", limitAuthoredRuns (configSourceLimits config), limitAuthoredRuns defaultSourceLimits)
+      ]
+  , configured > cap
+  ]
+
+-- | A composition over a service, with no pick authority issued, no hooks and no extra bindings. A service configured with a limit above
+-- what Lua is promised ('incompatibleLimits') is refused, with 'TerrainCompositionRefused'.
 newTerrainFacade ∷ Profile → Service → Config → IO TerrainFacade
 newTerrainFacade profile svc config = do
+  case incompatibleLimits config of
+    [] → pure ()
+    over → throwIO (TerrainCompositionRefused ("the terrain service's configuration exceeds the limits Lua is promised: " <> Text.intercalate "; " over))
   picks ← newTerrainPicks
   claims ← newTVarIO Map.empty
   offered ← newTVarIO Map.empty

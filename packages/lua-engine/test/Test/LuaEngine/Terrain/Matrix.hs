@@ -21,7 +21,7 @@ import Hetoimasia.Scripting.Lua.Provider (ProviderReply (..))
 import Hetoimasia.Terrain.Query (QueryError (TooManyRuns), QueryLimits (..), defaultQueryLimits)
 import Hetoimasia.Terrain.Residency (ArenaId (..), LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime (Config (..), Failure (..), Point (PointCaptured), Precondition (..), Probe (..), closeService, defaultConfig)
-import Hetoimasia.Terrain.Source (SourceError (TooManyMaterials), definitionHeaderBytes, materialRecordBytes)
+import Hetoimasia.Terrain.Source (SourceError (TooManyMaterials), SourceLimits (..), defaultSourceLimits, definitionHeaderBytes, materialRecordBytes)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Request.Profiles (counts)
@@ -798,6 +798,19 @@ spec = describe "Terrain matrices" $ do
           untilPrintedBy world spawned "done"
           printed ← outLines world
           printed `shouldContain` ["at the bound\tsuccess\tok", "past the bound\tfailure\tdefinition"]
+
+  it "refuses at composition a service configured above 256 KiB of definition, and above 8,192 levels of range, so that no larger definition or range can be accepted" $ do
+    refusesComposition defaultConfig {configSourceLimits = defaultSourceLimits {limitDefinitionBytes = 512 * 1024}} "limitDefinitionBytes"
+    refusesComposition defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = 16384}} "limitRangeLevels"
+
+  it "enforces a service's smaller definition limit through Lua: a definition within 256 KiB but over the service's limit is a definition failure" $
+    withRigConfig defaultConfig {configSourceLimits = defaultSourceLimits {limitDefinitionBytes = 128 * 1024}} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource bounded256)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          printed `shouldContain` ["at the bound\tfailure\tdefinition", "past the bound\tfailure\tdefinition"]
 
   it "leaves the creator alive and its arena served when an attached instance ends" $
     withRig $ \rig →

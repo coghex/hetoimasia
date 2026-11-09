@@ -30,7 +30,7 @@ import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement (Endpoint (..), arrivalEndpoint, cancel, openArenaWith)
 import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
-import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
+import Hetoimasia.Terrain.Source (LayerSpec (..), SourceLimits (..), SourceSpec (..), defaultSourceLimits)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
@@ -827,6 +827,18 @@ spec = describe "Terrain windows and banks" $ do
           untilPrinted world "done"
           outLines world >>= \printed → do
             printed `shouldContain` ["many\tfailure\tdefinition"]
+          limitHeld (rgService rig) "arenas" `shouldReturn` 0
+
+  it "refuses at composition a service configured above 8,192 authored runs, so that no definition of 8,193 layers can be accepted" $
+    refusesComposition defaultConfig {configSourceLimits = defaultSourceLimits {limitAuthoredRuns = 16384}} "limitAuthoredRuns"
+
+  it "enforces a service's smaller authored-run limit through Lua: 8,192 layers are a definition failure there" $
+    withRigConfig defaultConfig {configSourceLimits = defaultSourceLimits {limitAuthoredRuns = 4096}} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource (manyLayers 8192))]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "done"
+          outLines world >>= \printed → printed `shouldContain` ["many\tfailure\tdefinition"]
           limitHeld (rgService rig) "arenas" `shouldReturn` 0
 
   it "keeps an arena attachable-never and its name held while the lease of a cancelled open is being revoked, and lets another opener finish the revocation" $ do

@@ -5,6 +5,8 @@
 module Test.LuaEngine.Terrain.Limits (spec) where
 
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
+import Hetoimasia.Terrain.Query (QueryLimits (..), defaultQueryLimits)
+import Hetoimasia.Terrain.Runtime (Config (..), defaultConfig)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
@@ -121,6 +123,25 @@ spec = describe "Terrain limits" $ do
           printed ← outLines world
           printed
             `shouldBe` [ "exactly 1024\t1024"
+                       , "1025\tfailure:too_large"
+                       , "whole\tfailure:too_large"
+                       , "narrowed\t100"
+                       , "range over 8192 levels\tfalse"
+                       , "done"
+                       ]
+
+  it "refuses at composition a service configured above 1,024 returned runs, so that no column of more runs can be answered" $
+    refusesComposition defaultConfig {configQueryLimits = defaultQueryLimits {limitReturnedRuns = 2048}} "limitReturnedRuns"
+
+  it "enforces a service's smaller returned-run limit through Lua: the failure is too_large from there, and a range within it is answered in full" $
+    withRigConfig defaultConfig {configQueryLimits = defaultQueryLimits {limitReturnedRuns = 600}} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource alternating)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          printed
+            `shouldBe` [ "exactly 1024\tfailure:too_large"
                        , "1025\tfailure:too_large"
                        , "whole\tfailure:too_large"
                        , "narrowed\t100"
