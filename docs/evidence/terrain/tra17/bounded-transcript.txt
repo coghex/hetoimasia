@@ -4,11 +4,11 @@ vulkan: VK_DRIVER_FILES=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulk
 vulkan: VK_LAYER_PATH=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
 vulkan: validation features synchronization
 vulkan: VMA binding calls unsafe (VulkanMemoryAllocator -safe-foreign-calls), build directory /Users/vincentcoghlan/worktrees/coghex/hetoimasia/issue-659-terrain-face-map-material/dist-vulkan
-vulkan: repository revision 7e48253fb843162054e52f6d85b18426bd963181
-vulkan: source digest 4c3a4bd0a4551144870a5e9db1c5f49033710a0814b51937396aef47e0257633
+vulkan: repository revision 7bc5b98c0ddf5c82d65bff91a05907c230af6f66
+vulkan: source digest 381400070997224a87bcbcbf809976e68cb0a6a9b03fac44863284cb37557805
 journal: ## TRA-17: the bounded required selection of the terrain material's evidence: the 16 shape identities in the south facing, mixed and fog cells, a roof over a cavity in four submissions and both wrappers, ramps, a depth-effect stack, and a reversed-order control, judged as the complete qualification is
-journal: the terrain-ci evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci16/terrain-ci
-journal: terrain-ci probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci16/terrain-ci/tra17-terrain-ci-probes.json
+journal: the terrain-ci evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci17/terrain-ci
+journal: terrain-ci probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci17/terrain-ci/tra17-terrain-ci-probes.json
 journal: terrain-ci depth format: Depth32Float
 journal: terrain-ci fixture matrix-FaceSouth-0.25: 10560 probes, 10560 determinate, 0 not counted; passed
 journal: terrain-ci fixture mixed-FaceSouth@0.25: 2640 probes, 2640 determinate, 0 not counted; passed
@@ -29,6 +29,6 @@ TRA-17 the terrain material's bounded window-free evidence
   retired cleanly, with every Vulkan call on the owner's thread [✔]
   reached a verdict after the last callback with no issue and no error, synchronization validation included [✔]
 
-Finished in 0.0013 seconds
+Finished in 0.0026 seconds
 5 examples, 0 failures
 vulkan-native-tests tra17-terrain-ci: every check passed
