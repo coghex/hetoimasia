@@ -376,7 +376,9 @@ spec = describe "the package and import boundary" $ do
       , not (permittedSuite name)
       ]
       `shouldBe` []
-    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+    -- no implementation module of the package is imported, but the arbitration of an open's name, which the suite decides with threads (a
+    -- private sub-library of the package, reached by nothing else)
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name, name /= "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"] `shouldBe` []
 
   it "is listed by the ordinary and CPU projects, held to -Werror, and by the Vulkan project only as the graphics adapter's CPU closure" $ do
     root ← above "cabal.project"
@@ -459,6 +461,7 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Terrain.Residency"
                  , "Hetoimasia.Terrain.Runtime"
                  , "Hetoimasia.Terrain.Runtime.Settlement"
+               , "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"
                  , "Hetoimasia.Terrain.Shape"
                  , "Hetoimasia.Terrain.Source"
                  ]

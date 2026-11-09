@@ -238,6 +238,22 @@ library texture
 -- modules for the provider, settlement and lease surface. Neither terrain package imports Lua, and the generic Lua host
 -- imports no terrain, game or graphics package. It imports no module of a game, a window, a GPU, Vulkan or GLFW, and
 -- installs nothing in a VM.
+-- The arbitration of an open's name behind the terrain adapter (TRA-5): an implementation module, in a private sub-library that only the
+-- adapter and this package's own suite depend on, so that the adapter's public interface stays small and the suite decides the
+-- arbitration's windows with threads of its own.
+library terrain-names
+    import: language
+    visibility: private
+    default-extensions: OverloadedStrings
+    hs-source-dirs: terrain-names
+    exposed-modules:
+        Hetoimasia.LuaEngine.Terrain.Internal.Arbitration
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2
+
 library terrain
     import: language
     visibility: public
@@ -253,6 +269,7 @@ library terrain
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine:facade,
+        hetoimasia-lua-engine:terrain-names,
         hetoimasia-lua-engine:request,
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua,
@@ -501,6 +518,7 @@ test-suite lua-engine-tests
         hetoimasia-lua-engine:session,
         hetoimasia-lua-engine:session-harness,
         hetoimasia-lua-engine:terrain,
+        hetoimasia-lua-engine:terrain-names,
         hetoimasia-lua-engine:texture,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,

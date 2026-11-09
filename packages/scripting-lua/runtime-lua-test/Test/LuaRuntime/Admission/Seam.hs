@@ -199,6 +199,33 @@ spec = describe "the settlement seam and the declining hand-off" $ do
             -- and the resource that was built is released
             awaitNote fixture "release r1"
 
+  -- The resource built for an early reply, its success held for the tick, is released whenever the request ends before the tick serves it.
+  forM_
+    [ ("the script cancelled the request", \fixture owner → acommand fixture owner "i" "cancel" "a" >> awaitNote fixture "cmd cancel a cancelled")
+    , ("an epoch change cancelled the request", \_ owner → void (advanceRequestEpoch (scheduledEndpoint owner)))
+    , ("its instance ended", \fixture owner → void (expectControl (afBase fixture) owner "i" InstanceStop))
+    ]
+    $ \(how, event) →
+      it ("releases the resource built for an early reply whose success is held for the tick, when " <> how) $ bounded $ do
+        fixture ← newAFix 4
+        setPolicy fixture (\held → held {polLease = Just InstanceOwned, polNecessity = OptionalRequest})
+        withBoundary $ \_ runtime → settleAll fixture $ do
+          owner ← startAdmitting fixture runtime "early resource ends" [admitter] aConfig (admissionGrant fixture 8 (SettleAtAssignedTick Nothing)) requiredPolicy
+          admitAdmitter fixture owner "i" "admitter"
+          seam ← newIORef Nothing
+          onSubmit (afFake fixture) (captured seam)
+          acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+          awaitNote fixture "cmd start a started"
+          Just settling ← readIORef seam
+          let final = pure Nothing
+          atomically (settlingSettleFinal settling final (ProviderResource (VInteger 4) (Adoption (\_ → resourceFor fixture "r1")))) >>= (`shouldBe` ReplyAdoption)
+          -- built before the tick, and the success is held for it
+          awaitNote fixture "acquire r1"
+          awaitDiagnostic owner ((>= 1) . rdHeldNow)
+          -- the request ends before the tick: the resource nobody will take is released
+          event fixture owner
+          awaitNote fixture "release r1"
+
   it "treats every reply that comes while a resource reply waits to be built as a duplicate, whatever it is" $ bounded $ do
     fixture ← newAFix 4
     setPolicy fixture (\held → held {polLease = Just InstanceOwned})

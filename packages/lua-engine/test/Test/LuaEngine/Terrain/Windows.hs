@@ -19,7 +19,8 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Profile (CountLimit (CopiedValueDepth, CopiedValueElements, LuaIntegerMaximum, SceneDepth, SceneSprites))
-import Hetoimasia.LuaEngine.Terrain (Claim (..), TerrainFacade (..), TerrainHooks (..), arbitrateOpen, holdFailedUntil, noTerrainHooks, registerClaim)
+import Hetoimasia.LuaEngine.Terrain (TerrainFacade (..), TerrainHooks (..), noTerrainHooks)
+import Hetoimasia.LuaEngine.Terrain.Internal.Arbitration (ArbitrationHooks (..), Claim (..), OpenNames (..), arbitrateOpen, holdFailedUntil, registerClaim)
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
 import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
@@ -75,6 +76,17 @@ attacher =
         , "end"
         ]
     }
+
+-- | The state and the hooks the arbitration of an open's name is decided over, as the rig's facade holds them.
+namesOf ∷ TerrainFacade → (OpenNames, ArbitrationHooks)
+namesOf facade =
+  ( OpenNames (tfClaims facade) (tfFailedOpens facade) (tfOpenLock facade)
+  , ArbitrationHooks (hookArriving (tfHooks facade)) (hookChecked (tfHooks facade)) (hookSubmitting (tfHooks facade))
+  )
+
+-- | 'arbitrateOpen' over what the rig's facade holds.
+arbitrate ∷ TerrainFacade → Text → IO a → IO (Maybe a)
+arbitrate facade name admit = let (names, hooks) = namesOf facade in arbitrateOpen names hooks name admit
 
 -- | Wait, yielding, until the condition holds (bounded by the caller).
 untilM ∷ IO Bool → IO ()
@@ -1120,16 +1132,16 @@ spec = describe "Terrain windows and banks" $ do
       second ← registerClient svc >>= either (\refused → expectationFailure (show refused) >> fail "no client") pure
       -- the first open's definition is invalid: the service fails it at admission, and the adapter holds its name until the host settles it
       let invalid = SourceSpec {specMaterials = ["a", "a"], specLayers = [], specPatches = []}
-          failedEndpoint = Endpoint (pure ()) (pure True) (\settled → case settled of Failed _ → holdFailedUntil facade "dup" (readTVar hostSettled); _ → pure ())
+          failedEndpoint = Endpoint (pure ()) (pure True) (\settled → case settled of Failed _ → holdFailedUntil (fst (namesOf facade)) "dup" (readTVar hostSettled); _ → pure ())
       (validEndpoint, validBox) ← arrivalEndpoint
       firstDone ← newEmptyMVar
       secondDone ← newEmptyMVar
       -- the failed open is the first to arrive: it has consulted the failed opens (none) and is held inside the section, before its admission
       writeIORef armed True
-      withOwnedThreadOpening (openGate gate) (arbitrateOpen facade "dup" (openArenaWith svc failedEndpoint first "dup" invalid) >>= putMVar firstDone) $ \_ _ → do
+      withOwnedThreadOpening (openGate gate) (arbitrate facade "dup" (openArenaWith svc failedEndpoint first "dup" invalid) >>= putMVar firstDone) $ \_ _ → do
         awaitReached gate
         -- the other open of the name arrives while it is held
-        withOwnedThread (arbitrateOpen facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec) >>= putMVar secondDone) $ \_ _ → do
+        withOwnedThread (arbitrate facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec) >>= putMVar secondDone) $ \_ _ → do
           bounded (untilM ((>= 2) . length . filter (== "arriving") <$> readIORef events))
           replicateM_ 200 yield
           -- it has not consulted the failed opens (without the section it has, and is admitted, before the failed open is)
@@ -1142,7 +1154,7 @@ spec = describe "Terrain windows and banks" $ do
           readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving", "submitting"]
       -- the host settles the failed open: the name is free, and an open of it is admitted and succeeds
       atomically (writeTVar hostSettled True)
-      thirdResult ← arbitrateOpen facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec)
+      thirdResult ← arbitrate facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec)
       isJust thirdResult `shouldBe` True
       settled ← bounded (atomically (readTMVar validBox))
       case settled of
@@ -1170,16 +1182,16 @@ spec = describe "Terrain windows and banks" $ do
             admitted ← openArenaWith svc firstEndpoint first "held" soilOverStoneSpec
             holdAt gate
             forM_ (either (const Nothing) Just admitted) $ \request →
-              atomically (registerClaim facade "held" (Claim (readTVar cancelled) (readTVar told) (void (cancel svc request) >> atomically (writeTVar told True))))
+              atomically (registerClaim (fst (namesOf facade)) "held" (Claim (readTVar cancelled) (readTVar told) (void (cancel svc request) >> atomically (writeTVar told True))))
             pure admitted
       firstDone ← newEmptyMVar
       secondDone ← newEmptyMVar
-      withOwnedThreadOpening (openGate gate) (arbitrateOpen facade "held" admitFirst >>= putMVar firstDone) $ \_ _ → do
+      withOwnedThreadOpening (openGate gate) (arbitrate facade "held" admitFirst >>= putMVar firstDone) $ \_ _ → do
         awaitReached gate
         -- the host cancels the first open (before the service is told anything, and before its claim is registered), and another open of the name
         -- arrives: it waits for the section, and must not take the cancelled open's name for a duplicate
         atomically (writeTVar cancelled True)
-        withOwnedThread (arbitrateOpen facade "held" (openArenaWith svc secondEndpoint second "held" soilOverStoneSpec) >>= putMVar secondDone) $ \_ _ → do
+        withOwnedThread (arbitrate facade "held" (openArenaWith svc secondEndpoint second "held" soilOverStoneSpec) >>= putMVar secondDone) $ \_ _ → do
           bounded (untilM ((>= 2) . length . filter (== "arriving") <$> readIORef events))
           openGate gate
           _ ← bounded (takeMVar firstDone)
