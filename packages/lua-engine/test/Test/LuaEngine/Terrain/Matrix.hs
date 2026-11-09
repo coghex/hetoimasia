@@ -740,6 +740,33 @@ spec = describe "Terrain matrices" $ do
               openGate gate
               pumpUntil world (tickBy control fvm 1 >> ((/= Just Instance.Stopping) <$> phaseOf spawned))
 
+  forM_
+    [ ("an epoch cancelled it", \fvm → void (advanceRequestEpoch (scheduledEndpoint (fvOwner fvm))))
+    , ("its instance's end left it", \_ → pure ())
+    ]
+    $ \(how, event) →
+      it ("does not let a gameplay instance end while the owner is still preparing a read, made at a logical position, that an arena's closure failed before its position and " <> how) $ do
+        gate ← newGate
+        withRigProbe defaultConfigForRaces (gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate) $ \rig →
+          withWorld (counts [(RequestsPerInstance, 1), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource closedCreator), ("lua/attached.lua", scriptSource closedAttachedLogical)]) $ \world control runtime →
+            withFvm world runtime (presentationOver rig) $ \creatorVm →
+              withFvm world runtime (gameplayOver rig) $ \fvm → (`finally` openGate gate) $ do
+                creatorSpawn ← spawn world creatorVm "modules-test" mainPath
+                untilPrintedBy world creatorSpawn "creator ready"
+                spawned ← spawn world fvm "modules-test" "lua/attached.lua"
+                pumpUntil world (tickBy control fvm 1 >> (elem "read issued at\t1" <$> outLines world))
+                awaitReached gate
+                -- the closure fails the read before its position: its failure is held for the tick, and it leaves the provider's work owed
+                signalRig rig "close"
+                pumpUntil world (advanceClock world 2000000000 >> (elem "release\tdone" <$> outLines world))
+                event fvm
+                stopSpawned spawned
+                pumpUntil world (tickBy control fvm 1 >> ((== Just Instance.Stopping) <$> phaseOf spawned))
+                replicateM_ 3 (tickBy control fvm 1)
+                phaseOf spawned >>= (`shouldBe` Just Instance.Stopping)
+                openGate gate
+                pumpUntil world (tickBy control fvm 1 >> ((/= Just Instance.Stopping) <$> phaseOf spawned))
+
   it "answers a second release of one's own arena without error, before and after the first has retired" $
     withRig $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource releasesTwice)]) $ \world _ runtime →
