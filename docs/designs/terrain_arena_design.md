@@ -19,10 +19,11 @@ Owner-requested face-map amendment opened 2026-11-07 (D-28) and signed off
 2026-11-08 (D-60), approving P-16 at `b012fabbfc`. TRA-1–TRA-12 remain filed;
 all 11 amendment children, TRA-13–TRA-23, are now filed as [#655], [#656],
 [#657], [#658], [#659], [#660], [#661], [#662], [#663], [#665] and [#666].
-No unprocessed new children remain; P-16 revisions to existing artifacts
-remain. The amendment is ready for issue processing. Each tracker draft still
-requires separate sign-off; no tracker mutation, implementation or PR-hold release
-is authorized by this design sign-off.
+No unprocessed new children remain. The assigned #645–#648 and #659
+P-16/P-17 revision packets are now applied; the processing cursor below
+records their sign-offs and the baseline coordination still to confirm.
+Any further tracker draft requires separate sign-off. Design sign-off itself
+authorizes no tracker mutation, implementation or PR-hold release.
 
 Lighting scope resolved by D-29: expose sun position to the face-map shader
 for previewing the tiles; defer the automatic day/night cycle and eventual
@@ -344,14 +345,75 @@ texture clauses with D-61/P-17 atlases and #672's byte-only admission; the
 manager arranges fresh re-approval. Prerequisite implementation and amended
 Q-13 remain gates; this record is not implementation or visual qualification.
 
-**Amendment processing cursor:** new-child filing is complete. The first
-#645/#646 revisions are applied; #659's atlas amendment and #647's amendment
-revision v2 are posted. The manager's
-`request-user-het-terrain-20261106-1838-apply647-prompt.txt` directs a stop after
-recording/reporting #647: **do not start another artifact until asked**.
-#645/#646's atlas follow-ups and #648/other remaining P-16 artifacts remain
-outstanding unless separately confirmed. The manager arranges readiness
-reviews; this cursor does not mark those later artifacts complete.
+**TRA-9 amendment revision v2 applied 2026-11-09:** [#645] now carries the
+[owner-decision amendment](https://github.com/coghex/hetoimasia/issues/645#issuecomment-6731831183),
+marker `owner-decision:645-terrain-atlas-review-v2`. Verified `het-manager`
+sign-off `kbi6eg44xay4h4kypzkuzrw256` (reply to draft
+`t7jgs3k7vz56zzzqzxcasm3thw`) and the subsequent apply645 dispatch authorize
+this exact comment, with the approved issue body and metadata untouched.
+Comment SHA-256:
+`fa70c693e4677fdf8dfa7baaf43b8787da82bb9582dfa16bb168d698ab7b42c9`;
+verbatim effective-spec SHA-256:
+`0371a56fa3a88005378b6ab597bd5ec4d9336f98e03390e6e8bbd620fe159770`.
+The post and unchanged body/metadata were verified. This resolves the CHANGES
+review's texture decision using D-61/P-17 and #672's unchanged byte banks,
+and incorporates complete pre-claim parent/coverage checks, host-wide depth
+accounting and the separate `--terrain-views-full` qualification command.
+Numbered source references were rechecked at `b0e5e35c78`. Requirements 8–9
+remain unchanged. The manager arranges re-approval; amended prerequisites and
+Q-13 remain implementation/qualification gates.
+
+**TRA-10 amendment revision v2 applied 2026-11-09:** [#646] now carries the
+[owner-decision amendment](https://github.com/coghex/hetoimasia/issues/646#issuecomment-6731935937),
+marker `owner-decision:646-terrain-atlas-v2`. Verified `het-manager` sign-off
+`mnru9r5fb3xhuzgmeuwibd3x6a` (reply to draft
+`q55ydyr9fgktedsgs3uszfv8yi`) and the subsequent apply646 dispatch authorize
+this exact comment, with the approved issue body and metadata untouched.
+Comment SHA-256:
+`6d0c7585b2a8151f3af9c4db217aba7ffacd79b7d1d21cdff52d8c6e22137aec`;
+verbatim effective-spec SHA-256:
+`5e262f23110631edea7ecc6c59e6534dd3e6c269a4c0d8136911bf30140efd78`.
+The post and unchanged body/metadata were verified. This carries D-61/P-17's
+checked parent/region mapping, shared coverage, region-aware pick authority
+and #672's unchanged byte-only admission through the Lua view facade. The
+approved qualification alignment extends #645's `--terrain-views-full` mode
+with Lua atlas judgments while retaining the required CI limit. Requirements
+2, 5, 6 and 8 remain unchanged. The manager arranges re-approval; this is not
+implementation or amended Q-13 qualification.
+
+**TRA-12 amendment revision v1 applied 2026-11-09:** [#648] now carries the
+[owner-decision amendment](https://github.com/coghex/hetoimasia/issues/648#issuecomment-6732171662),
+marker `owner-decision:648-terrain-final-atlas-v1`. Verified `het-manager`
+sign-off `mgd99y24qx95e44xxqs5hbbe82` (reply to draft
+`sxf29d4e9q2ri4w2e9v447dckn`) and the subsequent apply648 dispatch authorize
+this exact comment, with the approved issue body and metadata untouched.
+Comment SHA-256:
+`ccea89a13493b59df2d4b7beb728677fd7f6105a2431e9402322e4d31ea89f2c`;
+verbatim effective-spec SHA-256:
+`fc3fe9ee9b4bfa011eae09c9b76f5c087b4cd0bfd68b3f15326f87837f479a25`.
+The post and unchanged body/metadata were verified. This applies the P-16
+final qualification scope and D-61/P-17 atlas equivalence, updated storage and
+bank contracts, amended proof gates and the full-mode/required-CI split.
+The owner-present macOS checkpoint remains supervised: the solver asks the
+manager before it. F8 deletion requirement 2 is unchanged. The manager owns
+re-approval; this record proves neither implementation nor final acceptance.
+
+**Amendment processing cursor:** new-child filing is complete. #645/#646
+revision v2, #647 revision v2, #648 revision v1 and #659's atlas amendment are
+posted. The manager's
+`request-user-het-terrain-20261106-1838-apply648-prompt.txt` directs a stop:
+**do not start another artifact until asked**. The substantive P-16/P-17
+revision packets assigned here are applied; readiness reviews, implementation,
+proof gates and final acceptance remain separate.
+
+P-16 also lists baseline coordination for #639/PR #653 (links to the new
+model/store owners), #640 (TRA-22/[#665]) and #641 (TRA-23/[#666]). The
+read-only closeout check found no dedicated coordination notice in those
+issues' current bodies/trusted timelines; #640's review explicitly leaves its
+link for a separately signed-off revision. These rows are reported to the
+manager for confirmation, not started or silently marked complete. PR #654
+already records #644's baseline disposition and TRA-17 handoff. No other
+artifact is changed by this entry.
 
 ## Epic contract
 
