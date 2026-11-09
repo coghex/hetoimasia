@@ -92,6 +92,7 @@ module Hetoimasia.Terrain.Render2D.Material
     -- * The model
   , terrainModel
   , terrainModelInsetControl
+  , terrainModelUnbiasedControl
   ) where
 
 import Data.ByteString (ByteString)
@@ -391,12 +392,21 @@ clamp01 = max 0 . min 1
 -- the same 32-bit values the record and the push block hold. A record of another layout holds
 -- nothing and draws nothing.
 terrainModel ∷ MaterialModel
-terrainModel = modelWith centre
+terrainModel = modelWith (centreWith (fromRational texelBias))
+
+-- | The model of the unbiased-index negative control (never a terrain rule): the texel index
+-- without the bias, the rule the Q-13 counterexample was measured under. The evidence gives the
+-- oracle this model for the control's own material so the oracle agrees with the device, and the
+-- independent judge, which states the specified rule, rejects it.
+terrainModelUnbiasedControl ∷ MaterialModel
+terrainModelUnbiasedControl = modelWith (centreWith 0)
+
+-- | The texel the local index selects, at its centre, in the atlas, with this bias in texels: the
+-- origin is added after.
+centreWith ∷ Double → Word32 → Word32 → Word32 → Double → Double
+centreWith bias origin extent atlas coordinate = (fromIntegral origin + local + 0.5) / fromIntegral atlas
   where
-    -- The texel the local index selects, at its centre, in the atlas: the origin is added after.
-    centre origin extent atlas coordinate = (fromIntegral origin + local + 0.5) / fromIntegral atlas
-      where
-        local = fromIntegral (min (extent - 1) (floor (clamp01 coordinate * fromIntegral extent + fromRational texelBias) ∷ Word32)) ∷ Double
+    local = fromIntegral (min (extent - 1) (floor (clamp01 coordinate * fromIntegral extent + bias) ∷ Word32)) ∷ Double
 
 -- | The model of the negative control's rule (never a terrain rule): the region coordinate
 -- interpolated between the half-texel-inset endpoints, @(origin + 1/2 + u (w - 1)) / atlasExtent@,
