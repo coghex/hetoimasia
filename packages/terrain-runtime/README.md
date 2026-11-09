@@ -522,7 +522,7 @@ until the terrain owner adopts the store (TRA-22); nothing here is wired into it
 | Surface | What it is |
 | --- | --- |
 | `Hetoimasia.Terrain.Runtime.Store` | the narrow public interface: configuration, windows, `Store`, planning, the transaction, readers, growth, feasibility |
-| `Hetoimasia.Terrain.Runtime.Store.Admission` | the edit bank's division and its all-or-nothing, backed-only-eviction credits |
+| `Hetoimasia.Terrain.Runtime.Store.Admission` | the edit bank's division and its all-or-nothing, backed-only-eviction credits; every cache entry is charged at least a page (`minCacheEntryBytes`) and every grant at least 128 bytes in each account it draws on (`minGrantBytes`), so no number of tiny credits holds records the ledger does not show |
 | private library `store` (`store/`) | the codec, trees, allocator, planner and state machine; visible to no client; this package's suite reaches it to check them against independent references |
 
 A client, such as the later storage backend, holds a `Store` value, plans through a
@@ -586,7 +586,7 @@ the bounds before it is sliced, that the entries end exactly at the stated end a
 the padding is zero, strictly increasing keys, every child or list reference inside
 the page space and never the page itself, and the structure of each leaf entry (a
 well-formed key and value of the tree's own category: coordinates in range,
-`lo < hi` inside the level limits, a class size of at least 1, adjacent runs and free
+`lo < hi` inside the level limits (a link's run-node level too, in a key and in a parent value), a class size of at least 1, adjacent runs and free
 extents already coalesced). A **valid checksum never rescues a malformed page**: the
 same structure checks refuse a re-sealed page. A refusal is an explicit
 `PageError`; it is never an empty index, absent history, air or the pristine source.
@@ -607,7 +607,7 @@ integrity failure. Updates copy the changed path into an overlay and never touch
 committed page. A node that falls under a quarter of a payload after a deletion is
 repacked with a neighbour (both checked against the separators their parent promises before they are merged) (merged, or split evenly), so every non-root node is at
 least a quarter full; an insertion that overflows splits by bytes; a root that
-splits adds a level and a root left with one child gives it back. A tree is at most
+splits adds a level and a root left with one child gives it back (the collapse walks down one level at a time, checking each child's level and its parent's separator bounds, so a malformed or cyclic subtree is refused, never followed). A tree is at most
 **8 levels** (0 to 7); a plan that would need more is refused with a typed
 `TreeTooTall`, never truncated. A legitimate tree needs a ninth level only past
 about 6.7e7 records (more than 36 GiB of leaves), so the default 1 GiB allowance and
@@ -649,7 +649,9 @@ At most **one** mutating transaction is active. A plan takes
 `d + 1 + 68` pages from the supply (loose pages first, then free extents lowest
 first, then the untouched tail), writes the pages it needs and returns the rest as
 loose pages, so the allocator's own updates need no fixed point and never overwrite a
-committed page. It writes at most **256 pages (1 MiB), index, allocator and
+committed page. The supply is checked as it is read: a loose page or free extent outside
+the used page space, a free extent overlapping the one before it, or any page that would be
+handed out twice is corruption (an `Integrity` refusal), never an allocation. It writes at most **256 pages (1 MiB), index, allocator and
 retirement pages included**; reserves at most **4 MiB of RAM**; reads through a window of at
 most **1.25 MiB of validated page buffers** (about 310 pages); and a discovery batch performs at most **64 structural
 updates**, where a structural update is #661's: one connection inspected, at most one
@@ -710,9 +712,13 @@ the OS accepted it, not an `fsync` or power-loss durability.
 each with an accounted record). Writes, publication and reclamation cannot change its
 answers. A commit retires only the record pages it replaced, in one retirement entry
 keyed by its version; an entry is reclaimable once the oldest pinned version is at
-least that version (`BlockedByReader` otherwise). `planMaintenance` first checks that no page it frees is
-already free, loose or claimed by its own supply (a corrupt retirement list is
-`DoubleFree`, never a page with two owners) and frees an entry's
+least that version (`BlockedByReader` otherwise). `planMaintenance` first checks that every page it frees is
+a retired one: inside the used space, a tree page and not the page the committed tree of
+its own header still reaches on the path of its first key (the owner supplies the
+candidate pages through the window like any other page; a retirement entry naming a live
+root, a shared live subtree, a bookkeeping page or a list page is `RetiredPageLive`), and
+that none is already free, loose or claimed by its own supply (`DoubleFree`), so
+a corrupt retirement list never yields a page with two owners. It then frees an entry's
 pages incrementally (at most 64 per transaction, fewer when a bound is tighter), is a
 maintenance transaction and **may spend the protected reserve**. A token of a released
 reader, of another store or of another incarnation reads nothing (`ReadStale`).
@@ -734,8 +740,8 @@ workspace; if a configuration could not hold it, the counterexample is returned 
 design decision and no budget is relaxed.
 
 *Growth* is a conservative, serialised, accounted proposal: `proposeGrowth` is pure
-(equal size is `GrowthNoOp`, an idempotent success; a well-formed smaller size is
-`GrowthNotIncreased`, which the owner maps to `storage_size_not_increased`; a malformed,
+(the size rules are checked first and alone: equal size is `GrowthNoOp`, an idempotent success; a well-formed smaller size is
+`GrowthNotIncreased` whatever overhead the configuration carries (a replacement configuration is built only for an increase), which the owner maps to `storage_size_not_increased`; a malformed,
 misaligned, too small or out-of-range size is `GrowthInvalid`, a validation refusal
 before any provider work); `beginGrowth` is refused while a transaction is active;
 `growthReserved` records the extra reservation as pending, not spendable;
