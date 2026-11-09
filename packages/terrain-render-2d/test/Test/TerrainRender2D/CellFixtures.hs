@@ -58,9 +58,10 @@ import Data.List (minimumBy, sortOn)
 import Data.Ord (comparing)
 import qualified Data.Set as Set
 import Data.Word (Word64)
-import Hetoimasia.Asset.Image.DataMap (CoveragePlane, NormalEncoding (..), buildBinaryCoverage, checkNormalEncoding)
+import Hetoimasia.Asset.Image.DataMap (CoveragePlane, NormalEncoding (..), buildBinaryCoverage)
 import Hetoimasia.Asset.Image.Region (RegionView, fullImageView)
-import Hetoimasia.Terrain.Atlas.Manifest (AtlasManifest, parseManifest)
+import Hetoimasia.Terrain.Atlas.Manifest (AtlasManifest)
+import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), loadAtlasStyle)
 import Hetoimasia.Terrain.Render2D.AtlasAssets (ParentAtlas (..), atlasAssetSnapshot)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld)
@@ -150,22 +151,8 @@ loadAssetsWith version overrides = do
 -- calls, so no plane is built by hand.
 loadAtlasParents ∷ Word64 → IO (AtlasManifest, ParentAtlas, ParentAtlas)
 loadAtlasParents version = do
-  let directory = texturesDirectory </> "terrain-atlas"
-  manifestBytes ← loadFile (directory </> "manifest.json")
-  manifest ← either (\problems → fail (unlines problems)) pure (parseManifest manifestBytes)
-  let parent file profile = do
-        bytes ← loadFile (directory </> file)
-        case decodeRgba bytes of
-          Left why → fail (file <> ": " <> why)
-          Right (w, h, texels) → do
-            case profile of
-              Just encoding → either (\e → fail (file <> ": " <> show e)) pure (checkNormalEncoding encoding (fromIntegral w) (fromIntegral h) texels)
-              Nothing → pure ()
-            plane ← either (\e → fail (file <> ": " <> show e)) pure (buildBinaryCoverage (fromIntegral w) (fromIntegral h) texels)
-            pure (ParentAtlas version version plane profile)
-  colour ← parent "colour.png" Nothing
-  normal ← parent "normal.png" (Just UnitNormalRgbV1)
-  pure (manifest, colour, normal)
+  style ← loadAtlasStyle version []
+  pure (styleManifest style, styleColour style, styleNormal style)
 
 -- | The adopted style of the committed packed atlases at one version: stone is the loam region,
 -- soil the granite region, exactly as 'loadAssets' draws them from the per-image files.
