@@ -59,6 +59,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , UploadRequest (..)
   , constructDepthFormat
   , constructImage
+  , validateTableConfig
   )
 import Hetoimasia.GPU.Vulkan.Native.Shader (CheckedShader (..), CheckedShaders (..))
 import Hetoimasia.Math.Vector (V2 (..))
@@ -124,7 +125,7 @@ import Test.GPU.Vulkan.Native.RetainedPath (RetainedHost (..), buildersWith)
 import Test.GPU.Vulkan.Native.TerrainJudge
 
 import Hetoimasia.Asset.Image (DecodedImage (..))
-import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), loadAtlasStyle)
+import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), SingleImages (..), bindSingleImages, loadAtlasStyle, loadSingleImages)
 import Hetoimasia.Terrain.Render2D.CellPick (CellHit (..), CellPickQuery (..), CellPickResult (..), pickCells)
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Material
@@ -185,6 +186,9 @@ data Variant
     WholeAtlasRegion
   | -- | A control: the normal atlas is bound as colour (sRGB, decoded on sampling).
     WrongTreatment
+  | -- | The same terrain drawn from 49 single images, each a full-image parent bound to its own
+    -- texture, instead of the two packed atlases: it must draw and pick as the packed style does.
+    FromSingleImages
   | -- | A control: the region coordinate interpolated between half-texel-inset endpoints, which
     -- shifts the interior texel boundaries (a third, control-only material).
     HalfTexelInset
@@ -206,6 +210,7 @@ suffixOf = \case
   SwappedColourOrigins → "-control-swapped-region-origins"
   WholeAtlasRegion → "-control-whole-atlas-clamping"
   WrongTreatment → "-control-normal-as-colour"
+  FromSingleImages → "-single-images"
   HalfTexelInset → "-control-half-texel-inset"
   BackmostPick → "-control-pick-through-nearer"
 
@@ -304,6 +309,7 @@ specs profile = case profile of
   Bounded →
     [specMany ("matrix-FaceSouth-0.25") [Foreground, Varies] [shapeMatrixCell shape FaceSouth 0.25 | shape ← [0 .. 15]]]
       <> [spec defaultLight [Foreground, Varies] Dynamic (mixedScene FaceSouth)]
+      <> [spec defaultLight [Foreground, Varies] FromSingleImages (mixedScene FaceSouth)]
       <> [spec defaultLight [Foreground, Overlap] variant (atZoom 0.125 (roofOverCavity 1 FaceWest)) | variant ← [Dynamic, Scrambled, TwoMaterials, Retained, OrderedWrapper]]
       <> [spec defaultLight [Foreground, Overlap, Varies] Dynamic (atZoom 0.125 (rampsCorners FaceEast))]
       <> [spec (mkLight "black-under-haze" 225 45 0 0 4 0 0.8 (0.72, 0.85, 0.95)) [Foreground, Varies] Dynamic (depthStack FaceSouth)]
@@ -312,6 +318,9 @@ specs profile = case profile of
     [specMany ("matrix-" <> show facing <> "-0.25") [Foreground, Varies] [shapeMatrixCell shape facing 0.25 | shape ← [0 .. 15]] | facing ← allViewFacings]
       <> [specMany "native-scale-FaceSouth-1" [Foreground] [shapeMatrixCell shape FaceSouth 1 | shape ← [0, 7]]]
       <> [spec defaultLight [Foreground, Varies] Dynamic (mixedScene facing) | facing ← allViewFacings]
+      -- The same shapes and roles from single images: every identity its own parent and texture.
+      <> [(specMany ("matrix-" <> show facing <> "-0.25-single-images") [Foreground, Varies] [shapeMatrixCell shape facing 0.25 | shape ← [0 .. 15]]) {specVariant = FromSingleImages} | facing ← allViewFacings]
+      <> [spec defaultLight [Foreground, Varies] FromSingleImages (mixedScene facing) | facing ← allViewFacings]
       <> [ spec defaultLight [Foreground, Overlap] Dynamic (atZoom 0.125 (roofOverCavity 2 FaceSouth))
          , spec defaultLight [Foreground, Overlap] Dynamic (atZoom 0.125 (roofOverCavity 1 FaceSouth))
          ]
@@ -389,6 +398,10 @@ data Ctx = Ctx
   , ctxStyle ∷ !AtlasStyle
   , ctxAtlas ∷ !AtlasTextures
   -- ^ The marked colour atlas and the normal atlas, the style's own textures.
+  , ctxColourH ∷ !Api.TextureHandle
+  , ctxNormalH ∷ !Api.TextureHandle
+  , ctxSingle ∷ !SingleImages
+  , ctxSingleTextures ∷ !AtlasTextures
   , ctxUnmarked ∷ !Api.TextureHandle
   -- ^ The colour atlas registered a second time with its cutout mark overridden off.
   , ctxNormalAsColour ∷ !Api.TextureHandle
@@ -399,6 +412,12 @@ data Ctx = Ctx
   , ctxInset ∷ !MaterialRef
   , ctxDevice ∷ !Text
   }
+
+-- | The renderer's configuration for this case: the shared one with a texture table of 128 slots,
+-- because the single-image style registers two atlases, two control registrations and 49 images at
+-- once. This is the harness's table capacity for the case, not a texture-admission bank.
+terrainConfiguration ∷ Render.Configuration
+terrainConfiguration = configuration {Render.configurationTable = either (error . show) id (validateTableConfig 128 8 4)}
 
 tshow ∷ Show a ⇒ a → Text
 tshow = Text.pack . show
@@ -422,7 +441,8 @@ runTerrain profile host deviceName directory = do
       | format /= Depth32Float → finish (Just format) (Just ("this device cannot qualify the terrain material: it chose the depth format " <> tshow format <> ", never a lower-precision substitute for D32_SFLOAT; nothing was rendered")) []
       | otherwise → do
           style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
-          prepare profile host directory device style >>= \case
+          singles ← loadSingleImages 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
+          prepare profile host directory device style singles >>= \case
             Left why → finish (Just format) (Just why) []
             Right ctx → do
               results ← foldM (\done s → (: done) <$> timed (runSpec ctx s)) [] (specs profile)
@@ -450,16 +470,17 @@ timed action = do
   pure (result, extra {extraSeconds = [seconds started acted, seconds acted oracled, seconds oracled independent, seconds independent ended]})
 
 -- | Make the renderer, the registries, the textures and both materials.
-prepare ∷ Profile → RetainedHost → FilePath → Text → AtlasStyle → IO (Either Text Ctx)
-prepare profile host directory device style = do
+prepare ∷ Profile → RetainedHost → FilePath → Text → AtlasStyle → SingleImages → IO (Either Text Ctx)
+prepare profile host directory device style singles = do
   let images =
         [ (styleColourImage style, Rgba8Srgb, DefaultMark)
         , (styleNormalImage style, Rgba8Linear, DefaultMark)
         , (styleColourImage style, Rgba8Srgb, OverrideMark False)
         , (styleNormalAsColour style, Rgba8Srgb, DefaultMark)
         ]
+          <> [(decoded, if take 7 identity == "colour." then Rgba8Srgb else Rgba8Linear, DefaultMark) | (identity, decoded, _) ← singleImages singles]
   made ← OrderedPath.hostAct (retainedBase host) "making the renderer and the atlas textures" $ \construction → do
-    renderer ← Render.makeRenderer (buildersWith (retainedSubmit host) construction) configuration
+    renderer ← Render.makeRenderer (buildersWith (retainedSubmit host) construction) terrainConfiguration
     made' ← traverse (\(decoded, format, _) → constructImage construction (ImageDescription TextureImage format (decodedWidth decoded) (decodedHeight decoded) 1)) images
     pure ((,) <$> renderer <*> sequence made')
   case made of
@@ -480,7 +501,12 @@ prepare profile host directory device style = do
                     Right handle → pure (Right (handle, decoded))
               case registered of
                 Left failure → pure (Left failure)
-                Right entries@[(colourH, colourD), (normalH, normalD), (unmarkedH, unmarkedD), (asColourH, asColourD)] → do
+                Right entries@((colourH, colourD) : (normalH, normalD) : (unmarkedH, unmarkedD) : (asColourH, asColourD) : rest)
+                  | length rest == length (singleImages singles) →
+                      let singleHandles = Map.fromList (zip [identity | (identity, _, _) ← singleImages singles] (map fst rest))
+                       in case ((,,) <$> either (Left . show) Right (bindColourParent (styleColour style) colourH) <*> either (Left . show) Right (bindDataParent (styleNormal style) normalH) <*> bindSingleImages singles singleHandles) of
+                 Left refused → pure (Left ("a parent could not be bound to its texture: " <> Text.pack refused))
+                 Right (colourBound, normalBound, singleBound) → do
                   retained ← newRetained
                   primary ← Render.registerMaterial renderer terrainMaterial
                   second ← Render.registerMaterial renderer terrainMaterialEquivalent
@@ -495,18 +521,22 @@ prepare profile host directory device style = do
                           , ctxTextures = textures
                           , ctxRetained = retained
                           , ctxStyle = style
-                          , ctxAtlas = AtlasTextures colourH normalH
+                          , ctxAtlas = packedTextures colourBound normalBound
+                          , ctxColourH = colourH
+                          , ctxNormalH = normalH
+                          , ctxSingle = singles
+                          , ctxSingleTextures = singleBound
                           , ctxUnmarked = unmarkedH
                           , ctxNormalAsColour = asColourH
                           , ctxAll = map fst entries
-                          , ctxDecoded = Map.fromList [(colourH, colourD), (normalH, normalD), (unmarkedH, unmarkedD), (asColourH, asColourD)]
+                          , ctxDecoded = Map.fromList ([(colourH, colourD), (normalH, normalD), (unmarkedH, unmarkedD), (asColourH, asColourD)] <> [(h, d) | ((h, _), (_, d, _)) ← zip rest (singleImages singles)])
                           , ctxPrimary = primary
                           , ctxSecond = second
                           , ctxInset = inset
                           , ctxDevice = device
                           }
                     )
-                Right _ → pure (Left "the atlas registration did not return its four handles")
+                Right _ → pure (Left "the atlas registration did not return a handle for every texture")
 
 -- | Release what the run made: the retained chunks it still holds, and the atlases.
 teardown ∷ Ctx → IO ()
@@ -601,12 +631,15 @@ runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
         Left why → pure (failed (specName s) why, emptyExtra s)
         Right parts → renderSnapshot ctx s parts
   where
-    assets = styleAssets (ctxStyle ctx)
+    assets = case specVariant s of
+      FromSingleImages → singleAssets (ctxSingle ctx)
+      _ → styleAssets (ctxStyle ctx)
     planOf (index, sc) = case scenePlan assets sc of
       Left refused → Left ("the scene " <> sceneName sc <> "'s plan was refused: " <> show refused)
       Right plan → Right (index - 1, sc, plan, shapeOf index sc)
     texturesFor variant = case variant of
-      OrderedWrapper → (ctxAtlas ctx) {atlasColour = ctxUnmarked ctx}
+      FromSingleImages → ctxSingleTextures ctx
+      OrderedWrapper → withColourHandle (ctxUnmarked ctx) (ctxAtlas ctx)
       _ → ctxAtlas ctx
     draw variant (index, sc, plan, shape) = do
       let camera = sceneCameraFollowed sc
@@ -787,7 +820,7 @@ renderSnapshot ctx s parts = do
           runFacts = runsOf (planSnapshot marks valid)
           expectedPath = if specVariant s == OrderedWrapper then "Ordered" else "Cutout"
           pathProblems = ["a run took the " <> path <> " path, expected " <> expectedPath | (path, _, _) ← runFacts, path /= expectedPath]
-      markFacts ← traverse (\(label, handle) → (,) label <$> registeredMark (ctxTextures ctx) handle) [("colour atlas", atlasColour (ctxAtlas ctx)), ("normal atlas", atlasNormal (ctxAtlas ctx)), ("colour atlas, mark overridden off", ctxUnmarked ctx)]
+      markFacts ← traverse (\(label, handle) → (,) label <$> registeredMark (ctxTextures ctx) handle) [("colour atlas", ctxColourH ctx), ("normal atlas", ctxNormalH ctx), ("colour atlas, mark overridden off", ctxUnmarked ctx)]
       result ← runValidatedWith models (retainedBase (ctxHost ctx)) (terrainSuite (ctxProfile ctx)) (ctxDirectory ctx) Depth32Float (ctxRenderer ctx) marks buffers decodedAt (Text.pack name) shapes (map snd named) valid
       let perPass = splitPasses (map (sceneTarget . partScene) parts) (resultProbes result)
           independents = [judgeIndependent (sceneTarget (partScene part)) (grid !) (observedFrom (fst (sceneTarget (partScene part))) probes) | (part, grid, probes) ← zip3 parts grids perPass]

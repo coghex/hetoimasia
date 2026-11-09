@@ -12,13 +12,18 @@ module Test.TerrainRender2D.Material (spec) where
 import Control.Monad (forM_)
 import qualified Data.ByteString as ByteString
 import Data.Either (isLeft)
-import Data.Word (Word32, Word8)
+import Data.Word (Word32, Word64, Word8)
 import GHC.Float (castWord32ToFloat)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.Material (MaterialFacts (..), MaterialRecord (..), MaterialRef, RecordLayout (..))
 import Hetoimasia.Render.TwoD.Material.Backend (materialRef)
 import Hetoimasia.Render.TwoD.Oracle.Material (Colour (..), MaterialInput (..), MaterialModel (..))
 import Hetoimasia.Render.TwoD.Snapshot (Instance (..), Sampler (..))
+import Hetoimasia.Terrain.Render2D.Assets (ColourRef (..))
+import Hetoimasia.Terrain.Render2D.AtlasAssets (AtlasAssetError (..), ParentAtlas (..), ParentKind (..), atlasAssetSnapshot)
+import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), loadAtlasStyle, loadSingleImageStyle)
+import Hetoimasia.Terrain.MapBake.Catalog (mapIdentifier)
+import qualified Data.Map.Strict as Map
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Material
 import Hetoimasia.Terrain.Render2D.Presentation
@@ -293,8 +298,14 @@ modelSpec = describe "the model" $ do
 -- ---------------------------------------------------------------------------
 -- Adaptation
 
-textures ∷ AtlasTextures
-textures = AtlasTextures (textureHandle 3 1) (textureHandle 4 1)
+-- | A style of the committed packed atlases at one parent version, and its two textures bound to
+-- those very parents (colour handle 3, normal handle 4).
+boundStyle ∷ Word64 → IO (AtlasStyle, AtlasTextures)
+boundStyle version = do
+  style ← loadAtlasStyle version [("stone", "colour.loam"), ("soil", "colour.granite")]
+  colour ← either (fail . show) pure (bindColourParent (styleColour style) (textureHandle 3 1))
+  normal ← either (fail . show) pure (bindDataParent (styleNormal style) (textureHandle 4 1))
+  pure (style, packedTextures colour normal)
 
 reference ∷ MaterialRef
 reference = materialRef 11 (MaterialFacts True recordLayout (fromIntegral pushBlockBytes))
@@ -306,8 +317,9 @@ adaptationSpec = describe "adapting a cell plan" $ do
     recordHandleCount `shouldBe` 2
     recordWordCount `shouldBe` 13
   it "gives every quad a record that names both atlases, the quad's two regions and its depth below the cut" $ do
-    assets ← loadAtlasAssets 5
-    let scene = sceneOf FaceSouth 2 [OCell 0 0 0 0 KnownAll, OCell 0 0 2 0 KnownAll]
+    (style, textures) ← boundStyle 5
+    let assets = styleAssets style
+        scene = sceneOf FaceSouth 2 [OCell 0 0 0 0 KnownAll, OCell 0 0 2 0 KnownAll]
         plan = planScene assets scene
     case adaptCells textures defaultLightSettings assets plan of
       Left why → expectationFailure (describeMaterialRefusal why)
@@ -320,8 +332,9 @@ adaptationSpec = describe "adapting a cell plan" $ do
           length ws `shouldBe` 13
         map (\(MaterialRecord _ ws) → last ws) records `shouldSatisfy` (\depths → all (`elem` depths) [0, 2])
   it "shares one record between quads that need the same regions and depth" $ do
-    assets ← loadAtlasAssets 5
-    let scene = sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll, OCell 3 0 0 0 KnownAll, OCell 0 3 0 0 KnownAll]
+    (style, textures) ← boundStyle 5
+    let assets = styleAssets style
+        scene = sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll, OCell 3 0 0 0 KnownAll, OCell 0 3 0 0 KnownAll]
         plan = planScene assets scene
     case adaptCells textures defaultLightSettings assets plan of
       Left why → expectationFailure (describeMaterialRefusal why)
@@ -330,15 +343,17 @@ adaptationSpec = describe "adapting a cell plan" $ do
         length (adaptedRecords adapted) `shouldBe` 1
         map adaptedParameter (adaptedQuads adapted) `shouldBe` [0, 0, 0]
   it "keeps the push block of the plan's own facing and the settings, 48 bytes" $ do
-    assets ← loadAtlasAssets 5
+    (style, textures) ← boundStyle 5
+    let assets = styleAssets style
     forM_ [FaceSouth, FaceWest, FaceNorth, FaceEast] $ \facing → do
       let plan = planScene assets (sceneOf facing 0 [OCell 0 0 0 0 KnownAll])
       case adaptCells textures defaultLightSettings assets plan of
         Left why → expectationFailure (describeMaterialRefusal why)
         Right adapted → adaptedPush adapted `shouldBe` pushBytes facing defaultLightSettings
   it "draws each instance with the colour atlas as its primary texture, nearest sampling and opaque white" $ do
-    assets ← loadAtlasAssets 5
-    let plan = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll])
+    (style, textures) ← boundStyle 5
+    let assets = styleAssets style
+        plan = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll])
     case adaptCells textures defaultLightSettings assets plan of
       Left why → expectationFailure (describeMaterialRefusal why)
       Right adapted → forM_ (adaptedQuads adapted) $ \quad → do
@@ -351,20 +366,83 @@ adaptationSpec = describe "adapting a cell plan" $ do
           MaterialRecord (h : _) _ : _ → h `shouldBe` instanceTexture instance'
           _ → expectationFailure "no record"
   it "adapts a mixed cell's fog and known parts together or not at all" $ do
-    assets ← loadAtlasAssets 5
-    let plan = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 5 KnownSolid])
+    (style, textures) ← boundStyle 5
+    let assets = styleAssets style
+        plan = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 5 KnownSolid])
     case adaptCells textures defaultLightSettings assets plan of
       Left why → expectationFailure (describeMaterialRefusal why)
       Right adapted → map (quadPart . adaptedQuad) (adaptedQuads adapted) `shouldBe` [PartFog, PartKnown]
     -- Against other assets nothing is adapted, not even one part.
-    other ← loadAtlasAssets 6
-    adaptCells textures defaultLightSettings other plan `shouldBe` Left StaleAssets
+    (otherStyle, _) ← boundStyle 6
+    adaptCells textures defaultLightSettings (styleAssets otherStyle) plan `shouldBe` Left StaleAssets
   it "refuses a view paired with an adaptation of another plan" $ do
-    assets ← loadAtlasAssets 5
-    let planA = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll])
+    (style, textures) ← boundStyle 5
+    let assets = styleAssets style
+        planA = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll])
         planB = planScene assets (sceneOf FaceWest 0 [OCell 0 0 0 0 KnownAll])
     case adaptCells textures defaultLightSettings assets planA of
       Left why → expectationFailure (describeMaterialRefusal why)
       Right adapted → do
         terrainView planB adapted [] [] `shouldSatisfy` isLeft
         terrainView planA adapted [(reference, adaptedMaterialData adapted)] [] `shouldSatisfy` either (const False) (const True)
+  describe "textures are bound to the parents their regions live in" $ do
+    it "refuses a plan whose region's parent has no bound texture, naming the parent" $ do
+      (style, textures) ← boundStyle 5
+      let assets = styleAssets style
+          plan = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll])
+      adaptCells textures {atlasNormal = []} defaultLightSettings assets plan `shouldBe` Left (NoTextureForParent "normal" 5 (768, 384))
+      adaptCells textures {atlasColour = []} defaultLightSettings assets plan `shouldBe` Left (NoTextureForParent "colour" 5 (288, 64))
+    it "refuses a binding whose identity is another parent's: a texture bound to the colour parent is not found for the normal regions" $ do
+      (style, textures) ← boundStyle 5
+      let assets = styleAssets style
+          plan = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll])
+          swapped = textures {atlasColour = atlasNormal textures, atlasNormal = atlasColour textures}
+      adaptCells swapped defaultLightSettings assets plan `shouldSatisfy` isLeft
+    it "binds a parent only as the kind it was decoded as, with one level and the checked profile" $ do
+      (style, _) ← boundStyle 5
+      bindColourParent (styleNormal style) (textureHandle 9 1) `shouldBe` Left (BindWrongKind DataParent)
+      bindDataParent (styleColour style) (textureHandle 9 1) `shouldBe` Left (BindWrongKind ColourParent)
+      bindColourParent (styleColour style) {parentLevels = 3} (textureHandle 9 1) `shouldBe` Left (BindLevels 3)
+      bindDataParent (styleNormal style) {parentLevels = 2} (textureHandle 9 1) `shouldBe` Left (BindLevels 2)
+      bindDataParent (styleNormal style) {parentProfile = Nothing} (textureHandle 9 1) `shouldBe` Left (BindWrongProfile Nothing)
+    it "refuses a multi-level or wrongly decoded parent before any asset is made" $ do
+      (style, _) ← boundStyle 5
+      let build colour normal = atlasAssetSnapshot 5 (styleManifest style) colour normal [(stoneId, "colour.loam")]
+      build (styleColour style) (styleNormal style) {parentLevels = 2} `shouldBe` Left (AtlasParentLevels "normal" 2)
+      build (styleColour style) {parentKind = DataParent} (styleNormal style) `shouldBe` Left (AtlasParentKind "colour" DataParent)
+    it "gives every region of a single-image style the handle of its own image: distinct images never share a handle" $ do
+      (assets, textures, handles) ← loadSingleImageStyle 5 [("stone", "colour.loam"), ("soil", "colour.granite")]
+      let scenes =
+            [ sceneOf facing 1 [OCell 0 0 0 shape know, OCell 2 0 0 (15 - shape) KnownAll]
+            | facing ← [FaceSouth, FaceWest, FaceNorth, FaceEast]
+            , shape ← [0 .. 15]
+            , know ← [KnownAll, Undisc] <> [KnownSolid | shape /= 0]
+            ]
+      forM_ scenes $ \scene → do
+        let plan = planScene assets scene
+        case adaptCells textures defaultLightSettings assets plan of
+          Left why → expectationFailure (describeMaterialRefusal why)
+          Right adapted → forM_ (adaptedQuads adapted) $ \q → do
+            let colourId = case quadColour (adaptedQuad q) of
+                  ColourBlank → "colour.blanktexture"
+                  _ → "colour.loam"
+                expected = [Map.lookup colourId handles, Map.lookup (mapIdentifier (quadMap (adaptedQuad q))) handles]
+            case drop (fromIntegral (adaptedParameter q)) (adaptedRecords adapted) of
+              MaterialRecord hs _ : _ → map Just hs `shouldBe` expected
+              [] → expectationFailure "no record"
+      -- A mixed cell's known and fog parts draw different images, and so are different records.
+      let mixed = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 5 KnownSolid])
+      case adaptCells textures defaultLightSettings assets mixed of
+        Left why → expectationFailure (describeMaterialRefusal why)
+        Right adapted → length (adaptedRecords adapted) `shouldBe` 2
+  describe "capacity" $ do
+    it "refuses the whole plan when it needs more distinct records than the bound, and adapts it at the bound" $ do
+      (style, textures) ← boundStyle 5
+      let assets = styleAssets style
+          -- Three levels of one shape: three distinct depth words, so three records.
+          plan = planScene assets (sceneOf FaceSouth 2 [OCell 0 0 0 0 KnownAll, OCell 0 0 1 0 KnownAll, OCell 0 0 2 0 KnownAll])
+      adaptCellsWith 2 textures defaultLightSettings assets plan `shouldBe` Left (TooManyRecords 2)
+      fmap (length . adaptedRecords) (adaptCellsWith 3 textures defaultLightSettings assets plan) `shouldBe` Right 3
+      -- The documented bound is never exceeded by a caller's larger request.
+      adaptCellsWith (maxRecords + 5) textures defaultLightSettings assets plan `shouldSatisfy` either (const False) (const True)
+      maxRecords `shouldBe` 4096

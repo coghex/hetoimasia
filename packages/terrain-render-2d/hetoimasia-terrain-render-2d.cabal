@@ -196,6 +196,7 @@ library terrain-fixtures
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-render-2d ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-atlas ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-mapgen-core ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0
 

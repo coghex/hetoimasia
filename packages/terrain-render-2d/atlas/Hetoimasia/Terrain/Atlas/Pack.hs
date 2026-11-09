@@ -111,9 +111,10 @@ packGrid columns canvases
     ch = fromIntegral logicalHeight ∷ Int
     canvasBytes = 4 * cw * ch
     usedColumns = min columns count
-    rows = (count + columns - 1) `div` columns
+    -- Wide arithmetic: an extreme column count must not overflow before the bounds are checked.
+    rows = (toInteger count + toInteger columns - 1) `div` toInteger columns
     width = toInteger usedColumns * toInteger cw
-    height = toInteger rows * toInteger ch
+    height = rows * toInteger ch
     sorted = sort (map canvasId canvases)
     duplicates = [a | (a, b) ← zip sorted (drop 1 sorted), a == b]
     blank = ByteString.replicate (4 * cw) 0

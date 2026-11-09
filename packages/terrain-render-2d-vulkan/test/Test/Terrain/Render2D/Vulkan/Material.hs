@@ -29,8 +29,9 @@ import Hetoimasia.Terrain.Render2D.Presentation (defaultLightSettings, pushBlock
 import Hetoimasia.Terrain.Render2D.Vulkan.Material (lightPush, terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl)
 import Test.Hspec (Spec, beforeAll, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
-textures ∷ AtlasTextures
-textures = AtlasTextures (textureHandle 3 1) (textureHandle 4 1)
+-- | The style's two packed parents bound to registered textures 3 (colour) and 4 (normal).
+texturesOf ∷ AtlasStyle → AtlasTextures
+texturesOf style = packedTextures (either (error . show) id (bindColourParent (styleColour style) (textureHandle 3 1))) (either (error . show) id (bindDataParent (styleNormal style) (textureHandle 4 1)))
 
 -- | The reference a renderer would issue for the material: its facts as defined.
 reference ∷ MaterialRef
@@ -63,7 +64,7 @@ instancesOf adapted = map (adaptedInstance reference adapted) (adaptedQuads adap
 adaptedOf ∷ AtlasStyle → Adapted
 adaptedOf style = case scenePlan (styleAssets style) scene of
   Left refused → error (show refused)
-  Right plan → either (error . describeMaterialRefusal) id (adaptCells textures defaultLightSettings (styleAssets style) plan)
+  Right plan → either (error . describeMaterialRefusal) id (adaptCells (texturesOf style) defaultLightSettings (styleAssets style) plan)
   where
     scene = (newScene "vulkan" [Cell 0 0 0 1 0 "loam", Cell 2 0 0 1 3 "granite", Cell 0 2 0 1 5 "loam"] (400, 320)) {sceneMode = ManualAt 1 1, sceneKnow = [((0, 2, 0), KnownSolid)]}
 
@@ -117,7 +118,7 @@ spec = describe "Terrain material, device-free (TRA-17)" $ do
         case validateSnapshot (snapshotOf adapted (adaptedRecords adapted) (instancesOf adapted)) of
           Left refused → expectationFailure (show refused)
           Right valid → do
-            let plan = planSnapshot (cutoutMarks [atlasColour textures]) valid
+            let plan = planSnapshot (cutoutMarks (atlasColourHandles (texturesOf style))) valid
                 runs = [run | pass' ← planPasses plan, view' ← plannedViews pass', layer ← plannedLayers view', run ← plannedRuns layer]
             map runPath runs `shouldBe` [Cutout]
             map runMaterial runs `shouldBe` [reference]

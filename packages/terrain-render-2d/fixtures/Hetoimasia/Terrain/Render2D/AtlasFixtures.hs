@@ -14,6 +14,11 @@
 module Hetoimasia.Terrain.Render2D.AtlasFixtures
   ( AtlasStyle (..)
   , loadAtlasStyle
+  , loadSingleImageStyle
+  , SingleImages (..)
+  , loadSingleImages
+  , bindSingleImages
+  , boundPackedTextures
   , findSampleDirectory
   , materialIdOf
   ) where
@@ -31,8 +36,13 @@ import Hetoimasia.Asset.Image.PngPreflight (m1PngLimits, preflightPng)
 import Hetoimasia.Terrain.Atlas.Manifest
 import Hetoimasia.Terrain.Cell (MaterialId, mkMaterialId)
 import Hetoimasia.Terrain.MapGen.Png (decodeRgba)
-import Hetoimasia.Terrain.Render2D.Assets (AssetSnapshot)
-import Hetoimasia.Terrain.Render2D.AtlasAssets (ParentAtlas (..), atlasAssetSnapshot)
+import Hetoimasia.Render.Api.Texture (TextureHandle)
+import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
+import Hetoimasia.Terrain.MapBake.Catalog (catalogKeys, mapIdentifier)
+import Hetoimasia.Terrain.Render2D.Assets (AssetSnapshot, ColourRef (..), mkAssetSnapshot, mkColourAsset, mkMapAsset)
+import Hetoimasia.Asset.Image.Region (fullImageView)
+import Hetoimasia.Terrain.Render2D.Material (AtlasTextures (..), bindColourParent, bindDataParent, packedTextures)
+import Hetoimasia.Terrain.Render2D.AtlasAssets (ParentAtlas (..), ParentKind (..), atlasAssetSnapshot)
 import Hetoimasia.Terrain.Render2D.Evidence (ArtSource (..))
 import System.Directory (doesDirectoryExist, getCurrentDirectory)
 import System.FilePath (takeDirectory, (</>))
@@ -95,7 +105,7 @@ loadAtlasStyle version materials = do
           Just encoding → either (failWith file . show) pure (checkNormalEncoding encoding w h level)
           Nothing → pure ()
         plane ← either (failWith file . show) pure (buildBinaryCoverage w h level)
-        pure (ParentAtlas version version plane profile, image)
+        pure (ParentAtlas version version plane profile (case policy of DecodeColour → ColourParent; DecodeData → DataParent) (length (decodedLevels image)), image)
   (colour, colourImage) ← parent "colour.png" DecodeColour Nothing
   (normal, normalImage) ← parent "normal.png" DecodeData (Just UnitNormalRgbV1)
   (_, normalAsColour) ← parent "normal.png" DecodeColour Nothing
@@ -127,3 +137,87 @@ loadAtlasStyle version materials = do
       , styleAssets = assets
       , styleArt = ArtSource {artColour = texelOf colourTable, artMap = texelOf table}
       }
+
+-- | The style's two packed parents bound to two registered textures (the colour handle, then the
+-- normal handle), through the checked bindings.
+boundPackedTextures ∷ AtlasStyle → TextureHandle → TextureHandle → IO AtlasTextures
+boundPackedTextures style colourHandle normalHandle = do
+  colour ← either (ioError . userError . show) pure (bindColourParent (styleColour style) colourHandle)
+  normal ← either (ioError . userError . show) pure (bindDataParent (styleNormal style) normalHandle)
+  pure (packedTextures colour normal)
+
+-- | The same terrain as single images: every logical identity is its own full-image parent (one
+-- region covering the whole image, so every region has origin (0, 0), extent 96 x 64 and parent
+-- extent 96 x 64), each with a distinct coverage version. The images are the source files the
+-- manifest records, decoded through the bounded decoder.
+data SingleImages = SingleImages
+  { singleAssets ∷ !AssetSnapshot
+  , singleImages ∷ ![(String, DecodedImage, ParentAtlas)]
+  -- ^ Each identity, its decode and the parent it was validated as, in manifest order.
+  }
+
+-- | Load the single-image style at one snapshot version.
+loadSingleImages ∷ Word64 → [(String, String)] → IO SingleImages
+loadSingleImages version materials = do
+  sample ← findSampleDirectory
+  let atlasDirectory = sample </> "content" </> "textures" </> "terrain-atlas"
+      repositoryRoot = takeDirectory (takeDirectory sample)
+      failWith what why = ioError (userError (what <> ": " <> why))
+      account = PayloadAccount (\_ n → pure (n <= m1WorkspaceBytes)) (\_ _ → pure ())
+  manifest ← ByteString.readFile (atlasDirectory </> "manifest.json") >>= either (failWith "the atlas manifest" . unlines) pure . parseManifest
+  let sources = [(regionId r, regionSourcePath r) | a ← manifestAtlases manifest, r ← atlasRegions a]
+  loaded ← forM (zip [0 ∷ Int ..] sources) $ \(index, (identity, path)) → do
+    bytes ← ByteString.readFile (repositoryRoot </> path)
+    let isColour = take 7 identity == "colour."
+    preflighted ← either (failWith identity . show) pure (preflightPng m1PngLimits (Asset (AssetId (Text.pack identity)) (FromFile path)) bytes)
+    image ← decodeBoundedWith (if isColour then DecodeColour else DecodeData) account preflighted >>= either (failWith identity . show) pure
+    level ← case decodedLevels image of
+      first : _ → pure first
+      [] → failWith identity "no level"
+    case (isColour, checkNormalEncoding UnitNormalRgbV1 (decodedWidth image) (decodedHeight image) level) of
+      (False, Left refusal) → failWith identity (show refusal)
+      _ → pure ()
+    plane ← either (failWith identity . show) pure (buildBinaryCoverage (decodedWidth image) (decodedHeight image) level)
+    let parentVersion = 1000 + fromIntegral index ∷ Word64
+        parent = ParentAtlas parentVersion parentVersion plane (if isColour then Nothing else Just UnitNormalRgbV1) (if isColour then ColourParent else DataParent) 1
+    pure (identity, image, parent)
+  let table = Map.fromList [(identity, parent) | (identity, _, parent) ← loaded]
+      viewOf identity = do
+        parent ← maybe (failWith identity "not loaded") pure (Map.lookup identity table)
+        view ← either (failWith identity . show) pure (fullImageView (parentCoverageVersion parent) (parentCoverage parent))
+        pure (parentCoverageVersion parent, view)
+      colourAsset ref identity = do
+        (v, view) ← viewOf identity
+        either (failWith identity . show) pure (mkColourAsset ref v v view)
+  blank ← colourAsset ColourBlank "colour.blanktexture"
+  coloured ← forM materials $ \(name, regionName) → do
+    material ← materialIdOf name
+    asset ← colourAsset (ColourMaterial material) regionName
+    pure (material, asset)
+  maps ← forM catalogKeys $ \key → do
+    (v, view) ← viewOf (mapIdentifier key)
+    asset ← either (failWith (mapIdentifier key) . show) pure (mkMapAsset key v v (Just UnitNormalRgbV1) view)
+    pure (key, asset)
+  snapshot ← either (failWith "the single-image assets" . show) pure (mkAssetSnapshot version blank coloured maps)
+  pure (SingleImages snapshot loaded)
+
+-- | Bind every single-image parent to the handle it was registered under (by identity).
+bindSingleImages ∷ SingleImages → Map.Map String TextureHandle → Either String AtlasTextures
+bindSingleImages images handles = do
+  bound' ← traverse one (singleImages images)
+  pure (AtlasTextures [t | (True, t) ← bound'] [t | (False, t) ← bound'])
+  where
+    one (identity, _, parent) = do
+      handle ← maybe (Left ("no handle for " <> identity)) Right (Map.lookup identity handles)
+      let isColour = take 7 identity == "colour."
+      texture ← either (Left . show) Right ((if isColour then bindColourParent else bindDataParent) parent handle)
+      pure (isColour, texture)
+
+-- | The single-image style with synthetic handles, one distinct handle per image: the snapshot, the
+-- textures and the handle each identity was given.
+loadSingleImageStyle ∷ Word64 → [(String, String)] → IO (AssetSnapshot, AtlasTextures, Map.Map String TextureHandle)
+loadSingleImageStyle version materials = do
+  images ← loadSingleImages version materials
+  let handles = Map.fromList [(identity, textureHandle (fromIntegral (100 + index)) 1) | (index, (identity, _, _)) ← zip [0 ∷ Int ..] (singleImages images)]
+  textures ← either (ioError . userError) pure (bindSingleImages images handles)
+  pure (singleAssets images, textures, handles)

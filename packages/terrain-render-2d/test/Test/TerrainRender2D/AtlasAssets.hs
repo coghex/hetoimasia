@@ -207,7 +207,10 @@ refusalSpec = describe "adapting the loaded atlases refuses an unusable style wh
     build manifest colour normal `shouldSatisfy` either (const False) (const True)
   it "refuses a parent whose extent is not the manifest's, such as the two parents swapped" $ do
     (manifest, colour, normal) ← loadAtlasParents 3
-    build manifest normal colour `shouldBe` Left (AtlasParentExtent "colour" 768 384 288 64)
+    -- Swapped, the colour slot holds a parent decoded as data: refused by kind before extent.
+    build manifest normal colour `shouldBe` Left (AtlasParentKind "colour" DataParent)
+    -- A colour-kind parent with the normal parent's plane has the wrong extent.
+    build manifest colour {parentCoverage = parentCoverage normal} normal `shouldBe` Left (AtlasParentExtent "colour" 768 384 288 64)
   it "refuses a parent checked against the wrong numeric profile" $ do
     (manifest, colour, normal) ← loadAtlasParents 3
     build manifest colour normal {parentProfile = Nothing} `shouldBe` Left (AtlasParentProfile "normal" Nothing)

@@ -90,6 +90,14 @@ packerSpec = describe "the packer" $ do
   it "refuses an atlas beyond the bounded image limits" $
     -- 22 columns of 96 texels are 2112 wide, beyond 2048.
     packGrid 22 [canvas (show i) 0 | i ← [1 .. 22 ∷ Int]] `shouldBe` Left (PackTooLarge 2112 64)
+  it "does not overflow on an extreme column count: one row of the two canvases, never a wrapped extent" $
+    forM_ [maxBound, maxBound - 1, 2 ^ (40 ∷ Int)] $ \columns →
+      -- Two distinct canvases in one row are 192 wide and 64 tall, whatever the column count.
+      case packGrid columns [canvas "a" 1, canvas "b" 2] of
+        Left why → expectationFailure (describePackError why)
+        Right atlas → do
+          (packedWidth atlas, packedHeight atlas) `shouldBe` (192, 64)
+          ByteString.length (packedTexels atlas) `shouldBe` 192 * 64 * 4
   it "never rotates, trims or scales: an asymmetric canvas keeps its orientation" $
     case packGrid 2 [canvas "a" 1, canvas "b" 2] of
       Left why → expectationFailure (describePackError why)

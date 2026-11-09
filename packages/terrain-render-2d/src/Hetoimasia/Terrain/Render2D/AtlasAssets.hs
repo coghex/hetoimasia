@@ -22,6 +22,7 @@
 -- values and this only names them.
 module Hetoimasia.Terrain.Render2D.AtlasAssets
   ( ParentAtlas (..)
+  , ParentKind (..)
   , AtlasAssetError (..)
   , describeAtlasAssetError
   , blankColourRegion
@@ -36,6 +37,10 @@ import Hetoimasia.Terrain.Cell (MaterialId)
 import Hetoimasia.Terrain.MapBake.Catalog (catalogKeys, mapIdentifier)
 import Hetoimasia.Terrain.Render2D.Assets
 
+-- | What a parent image was decoded as: colour (premultiplied sRGB) or raw linear data.
+data ParentKind = ColourParent | DataParent
+  deriving stock (Eq, Show)
+
 -- | One decoded parent image: the texture's version, the version of the coverage built from the
 -- same decode, that coverage (one bit per texel of the whole image) and the numeric profile its
 -- opaque texels were checked against, if it is a data atlas.
@@ -44,6 +49,10 @@ data ParentAtlas = ParentAtlas
   , parentCoverageVersion ∷ !Word64
   , parentCoverage ∷ !CoveragePlane
   , parentProfile ∷ !(Maybe NormalEncoding)
+  , parentKind ∷ !ParentKind
+  , parentLevels ∷ !Int
+  -- ^ The mip levels the decode holds: sampling at texel centres at level zero is specified only
+  -- for a single-level parent, so any other count is refused.
   }
   deriving stock (Eq, Show)
 
@@ -57,6 +66,10 @@ data AtlasAssetError
     AtlasParentExtent !String !Word32 !Word32 !Word32 !Word32
   | -- | The parent carries the wrong numeric profile for its atlas.
     AtlasParentProfile !String !(Maybe NormalEncoding)
+  | -- | The parent was decoded as another kind than its atlas needs.
+    AtlasParentKind !String !ParentKind
+  | -- | The parent holds more or fewer than one level.
+    AtlasParentLevels !String !Int
   | AtlasRegionRefused !String !RegionRefusal
   | -- | A material names a colour region the manifest does not hold.
     AtlasUnknownColour !String
@@ -69,6 +82,8 @@ describeAtlasAssetError = \case
   AtlasMissing name → "atlas " <> name <> " is not in the manifest"
   AtlasParentExtent name pw ph mw mh → "the loaded " <> name <> " atlas is " <> show pw <> " x " <> show ph <> ", the manifest says " <> show mw <> " x " <> show mh
   AtlasParentProfile name found → "the loaded " <> name <> " atlas was checked as " <> show found
+  AtlasParentKind name found → "the loaded " <> name <> " atlas was decoded as " <> show found
+  AtlasParentLevels name n → "the loaded " <> name <> " atlas holds " <> show n <> " levels, not one"
   AtlasRegionRefused identity why → "region " <> identity <> ": " <> regionRefusalText why
   AtlasUnknownColour identity → "no colour region " <> identity
   AtlasAsset why → "asset refused: " <> show why
@@ -102,12 +117,15 @@ atlasAssetSnapshot version manifest colourParent normalParent materials = do
       a : _ → Just a
       [] → Nothing
     checkParent name entry parent expected
+      | parentLevels parent /= 1 = Left (AtlasParentLevels name (parentLevels parent))
+      | parentKind parent /= (if parentProfile' expected then DataParent else ColourParent) = Left (AtlasParentKind name (parentKind parent))
       | (coverageWidth plane, coverageHeight plane) /= (atlasWidth entry, atlasHeight entry) =
           Left (AtlasParentExtent name (coverageWidth plane) (coverageHeight plane) (atlasWidth entry) (atlasHeight entry))
       | parentProfile parent /= expected = Left (AtlasParentProfile name (parentProfile parent))
       | otherwise = Right ()
       where
         plane = parentCoverage parent
+        parentProfile' = (/= Nothing)
     viewOf entry parent identity = case [r | r ← atlasRegions entry, regionId r == identity] of
       [] → Left (AtlasUnknownColour identity)
       r : _ → do

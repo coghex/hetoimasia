@@ -56,6 +56,13 @@
 module Hetoimasia.Terrain.Render2D.Material
   ( -- * The textures
     AtlasTextures (..)
+  , ParentTexture (..)
+  , BindRefusal (..)
+  , bindColourParent
+  , bindDataParent
+  , packedTextures
+  , atlasColourHandles
+  , withColourHandle
 
     -- * The record
   , recordLayout
@@ -70,6 +77,7 @@ module Hetoimasia.Terrain.Render2D.Material
   , AdaptedQuad (..)
   , Adapted (..)
   , adaptCells
+  , adaptCellsWith
   , adaptedInstance
   , adaptedMaterialData
   , terrainView
@@ -81,13 +89,15 @@ module Hetoimasia.Terrain.Render2D.Material
 
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
+import Hetoimasia.Asset.Image.DataMap (NormalEncoding (..), coverageHeight, coverageWidth)
 import Hetoimasia.Asset.Image.Region
   ( RegionView
   , regionHeight
   , regionOriginX
   , regionOriginY
   , regionViewParentExtent
+  , regionViewParentVersion
   , regionViewRegion
   , regionWidth
   )
@@ -98,19 +108,73 @@ import Hetoimasia.Render.TwoD.Oracle.Material (Colour (..), MaterialInput (..), 
 import Hetoimasia.Render.TwoD.Snapshot (Camera (..), Instance (..), Layer, Sampler (..), View (..))
 import Hetoimasia.Terrain.Coordinate (axisValue)
 import Hetoimasia.Terrain.MapBake.Catalog (MapKey)
+import Hetoimasia.Terrain.Render2D.AtlasAssets (ParentAtlas (..), ParentKind (..))
 import Hetoimasia.Terrain.Render2D.Assets (AssetSnapshot, ColourRef, assetIdentity, colourCoverage, mapCoverage)
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Presentation
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..), rationalToFloat, rvCentre, rvSetup, rvZoom)
 
--- | The two registered parent textures a style's regions live in.
-data AtlasTextures = AtlasTextures
-  { atlasColour ∷ !TextureHandle
-  -- ^ The colour atlas: premultiplied sRGB colour, one level, binary alpha.
-  , atlasNormal ∷ !TextureHandle
-  -- ^ The normal atlas: raw linear data, one level, binary alpha.
+-- | One registered parent texture, bound to the validated parent image it was uploaded from: the
+-- handle and the identity (coverage version and extent) of the 'ParentAtlas' that supplied its
+-- coverage. Only 'bindColourParent' and 'bindDataParent' make one, so a binding cannot claim a
+-- parent that was not decoded as the right kind, with one level and the checked profile.
+data ParentTexture = ParentTexture
+  { ptHandle ∷ !TextureHandle
+  , ptVersion ∷ !Word64
+  , ptExtent ∷ !(Word32, Word32)
   }
   deriving stock (Eq, Show)
+
+-- | Why a parent could not be bound to a texture.
+data BindRefusal
+  = BindWrongKind !ParentKind
+  | BindLevels !Int
+  | BindWrongProfile !(Maybe NormalEncoding)
+  deriving stock (Eq, Show)
+
+-- | Bind a parent decoded as colour, with one level, to its registered texture.
+bindColourParent ∷ ParentAtlas → TextureHandle → Either BindRefusal ParentTexture
+bindColourParent parent handle
+  | parentKind parent /= ColourParent = Left (BindWrongKind (parentKind parent))
+  | parentLevels parent /= 1 = Left (BindLevels (parentLevels parent))
+  | parentProfile parent /= Nothing = Left (BindWrongProfile (parentProfile parent))
+  | otherwise = Right (bound parent handle)
+
+-- | Bind a parent decoded as data, with one level and the checked normal profile, to its texture.
+bindDataParent ∷ ParentAtlas → TextureHandle → Either BindRefusal ParentTexture
+bindDataParent parent handle
+  | parentKind parent /= DataParent = Left (BindWrongKind (parentKind parent))
+  | parentLevels parent /= 1 = Left (BindLevels (parentLevels parent))
+  | parentProfile parent /= Just UnitNormalRgbV1 = Left (BindWrongProfile (parentProfile parent))
+  | otherwise = Right (bound parent handle)
+
+bound ∷ ParentAtlas → TextureHandle → ParentTexture
+bound parent handle = ParentTexture handle (parentCoverageVersion parent) (coverageWidth plane, coverageHeight plane)
+  where
+    plane = parentCoverage parent
+
+-- | The registered parent textures a style's regions live in: the colour parents and the data
+-- parents. A packed style has one of each; a style of single images has one per image. Each
+-- region of a plan is resolved to the texture of /its own/ parent by identity, so two regions of
+-- different parents never share a handle, and a region whose parent has no binding is refused.
+data AtlasTextures = AtlasTextures
+  { atlasColour ∷ ![ParentTexture]
+  , atlasNormal ∷ ![ParentTexture]
+  }
+  deriving stock (Eq, Show)
+
+-- | A packed style's two textures.
+packedTextures ∷ ParentTexture → ParentTexture → AtlasTextures
+packedTextures colour normal = AtlasTextures [colour] [normal]
+
+-- | The colour textures' handles (the instances' primary textures, whose marks route the quads).
+atlasColourHandles ∷ AtlasTextures → [TextureHandle]
+atlasColourHandles = map ptHandle . atlasColour
+
+-- | The same textures with every colour parent drawn through another handle (a second
+-- registration of the same image), for the evidence's ordered-wrapper route.
+withColourHandle ∷ TextureHandle → AtlasTextures → AtlasTextures
+withColourHandle handle textures = textures {atlasColour = [t {ptHandle = handle} | t ← atlasColour textures]}
 
 -- | Two handles (colour, normal) and the words above.
 recordHandleCount ∷ Int
@@ -138,6 +202,9 @@ data MaterialRefusal
     RegionNotCanvas !Word32 !Word32
   | -- | More than 'maxRecords' distinct records: the whole plan is refused.
     TooManyRecords !Int
+  | -- | No texture is bound to the parent a region lives in: the kind of parent, its coverage
+    -- version and its extent.
+    NoTextureForParent !String !Word64 !(Word32, Word32)
   | -- | The assets are not the ones the plan was made against.
     StaleAssets
   | -- | The camera is not representable in 32 bits.
@@ -152,6 +219,7 @@ describeMaterialRefusal = \case
   NoMapRegion key → "the assets hold no map region for " <> show key
   RegionNotCanvas w h → "a region is " <> show w <> " x " <> show h <> ", not a 96 x 64 canvas"
   TooManyRecords n → "the plan needs more than " <> show n <> " distinct material records"
+  NoTextureForParent kind version extent → "no " <> kind <> " texture is bound to the parent of version " <> show version <> " and extent " <> show extent
   StaleAssets → "the assets are not the ones the plan was made against"
   UnrepresentableView → "the camera is not representable in 32 bits"
   StaleAdaptation → "the adaptation is for another plan"
@@ -170,11 +238,22 @@ quadRecord ∷ AtlasTextures → Word32 → RegionView → RegionView → Either
 quadRecord textures depth colour normal = do
   colourWords ← regionWords colour
   normalWords ← regionWords normal
-  pure (MaterialRecord [atlasColour textures, atlasNormal textures] (colourWords <> normalWords <> [depth]))
+  colourTexture ← resolveParent "colour" (atlasColour textures) colour
+  normalTexture ← resolveParent "normal" (atlasNormal textures) normal
+  pure (MaterialRecord [ptHandle colourTexture, ptHandle normalTexture] (colourWords <> normalWords <> [depth]))
+
+-- The texture bound to the parent a region lives in, by the parent's identity.
+resolveParent ∷ String → [ParentTexture] → RegionView → Either MaterialRefusal ParentTexture
+resolveParent kind bindings view =
+  case [t | t ← bindings, ptVersion t == regionViewParentVersion view, ptExtent t == regionViewParentExtent view] of
+    t : _ → Right t
+    [] → Left (NoTextureForParent kind (regionViewParentVersion view) (regionViewParentExtent view))
 
 -- | A planned quad with the table entry that draws it.
 data AdaptedQuad = AdaptedQuad
   { adaptedQuad ∷ !CellQuad
+  , adaptedColourHandle ∷ !TextureHandle
+  -- ^ The colour parent's texture: the instance's primary texture, whose mark routes the quad.
   , adaptedParameter ∷ !Word32
   -- ^ The index of its record in 'adaptedRecords'.
   }
@@ -200,7 +279,11 @@ data Adapted = Adapted
 -- quads that need an equal one. A quad whose region is absent or is not a canvas refuses the whole
 -- plan, so a mixed cell's parts are adapted together or not at all.
 adaptCells ∷ AtlasTextures → LightSettings → AssetSnapshot → CellPlan → Either MaterialRefusal Adapted
-adaptCells textures settings assets plan = do
+adaptCells = adaptCellsWith maxRecords
+
+-- | 'adaptCells' under a stated bound on the distinct records, which the caller may only lower.
+adaptCellsWith ∷ Int → AtlasTextures → LightSettings → AssetSnapshot → CellPlan → Either MaterialRefusal Adapted
+adaptCellsWith limit textures settings assets plan = do
   if assetIdentity assets == cellIdentityAssets identity then pure () else Left StaleAssets
   (reversedQuads, _, reversedRecords) ← foldl' step (Right ([], Map.empty, [])) (cellPlanQuads plan)
   pure
@@ -222,21 +305,24 @@ adaptCells textures settings assets plan = do
       let CellKey _ z _ _ _ = quadKey quad
           depth = depthWord (toInteger cut) z
       record ← quadRecord textures depth colour normal
+      colourHandle ← case record of
+        MaterialRecord (h : _) _ → Right h
+        _ → Left (NoTextureForParent "colour" 0 (0, 0))
       case Map.lookup record known of
-        Just index → pure (AdaptedQuad quad index : done, known, records)
+        Just index → pure (AdaptedQuad quad colourHandle index : done, known, records)
         Nothing
-          | Map.size known >= maxRecords → Left (TooManyRecords maxRecords)
+          | Map.size known >= min limit maxRecords → Left (TooManyRecords (min limit maxRecords))
           | otherwise →
               let index = fromIntegral (Map.size known)
-               in pure (AdaptedQuad quad index : done, Map.insert record index known, record : records)
+               in pure (AdaptedQuad quad colourHandle index : done, Map.insert record index known, record : records)
 
 -- | The render-2d instance that draws an adapted quad with the registered material: the quad's
 -- transform and depth key, the colour atlas as the instance's texture (so its cutout mark routes
 -- the quad), the whole unit square as its texture rectangle, nearest sampling, opaque white tint
 -- and the quad's record as its parameter word.
 adaptedInstance ∷ MaterialRef → Adapted → AdaptedQuad → Instance
-adaptedInstance material adapted quad =
-  (cellQuadInstance (atlasColour (adaptedTextures adapted)) (adaptedQuad quad))
+adaptedInstance material _adapted quad =
+  (cellQuadInstance (adaptedColourHandle quad) (adaptedQuad quad))
     { instanceMaterial = material
     , instanceParameter = adaptedParameter quad
     , instanceSampler = SamplerNearest
