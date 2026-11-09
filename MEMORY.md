@@ -18,9 +18,11 @@ checks merged work and changed issues against it and resumes from
   active delivery, not implemented. The [Lua-first engine design](docs/archive/designs/lua_first_engine_design.md)
   defined M1, a Lua-driven textured quad in a window with a real logical VM and
   no gameplay state store or mod activation. M1 is delivered: epic #514 closed
-  2026-11-01 with all 28 slices merged. The next arc, engine-held gameplay state
-  that Lua defines, is in design in
-  [gameplay_state_design.md](docs/designs/gameplay_state_design.md).
+  2026-11-01 with all 28 slices merged. The gameplay-state example designed next
+  ([gameplay_state_design.md](docs/designs/gameplay_state_design.md)) was
+  superseded by the owner on 2026-11-06.
+- Current arc: the [terrain arena](docs/designs/terrain_arena_design.md)
+  (epic #636), the first piece of Ecce Homo rebuilt on the engine.
 - Rendering: the [2D renderer design](docs/designs/render_2d_design.md) is delivered
   except deferred #446; [GPU backend contract](docs/gpu_backend.md);
   [samples](samples/README.md).
@@ -61,8 +63,15 @@ checks merged work and changed issues against it and resumes from
 - Vulkan: 1.3 minimum, one shared loader, managed retention, present-fence
   retirement, two frame slots by default.
 - Never weaken isolation to turn an inconclusive confinement proof into support.
-- Not committed: a game save schema, a full Synarchy port, permanent RTS tuning,
-  an engine-wide rendering abstraction.
+- 2026-11-09, [vision](docs/vision.md) V-1: Hetoimasia is the engine on which
+  Ecce Homo is being rebuilt, piece by piece. Synarchy is the reference: its
+  code and behavior are evidence of what each system should do, not a
+  compatibility contract and not a source to copy wholesale. The reasons are a
+  full lighting system that Synarchy's renderer cannot support, and uniform
+  sprite assets regenerated from 3D models with `~/work/moskophoros`.
+- Not committed: a game save schema, source or save compatibility with
+  Synarchy, a migration date, permanent RTS tuning, an engine-wide rendering
+  abstraction.
 
 ## Open owner decisions
 
