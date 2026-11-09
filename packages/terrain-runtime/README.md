@@ -649,7 +649,9 @@ At most **one** mutating transaction is active. A plan takes
 `d + 1 + 68` pages from the supply (loose pages first, then free extents lowest
 first, then the untouched tail), writes the pages it needs and returns the rest as
 loose pages, so the allocator's own updates need no fixed point and never overwrite a
-committed page. It writes at most **256 pages (1 MiB), index, allocator and
+committed page. The supply is checked as it is read: a loose page or free extent outside
+the used page space, a free extent overlapping the one before it, or any page that would be
+handed out twice is corruption (an `Integrity` refusal), never an allocation. It writes at most **256 pages (1 MiB), index, allocator and
 retirement pages included**; reserves at most **4 MiB of RAM**; reads through a window of at
 most **1.25 MiB of validated page buffers** (about 310 pages); and a discovery batch performs at most **64 structural
 updates**, where a structural update is #661's: one connection inspected, at most one
