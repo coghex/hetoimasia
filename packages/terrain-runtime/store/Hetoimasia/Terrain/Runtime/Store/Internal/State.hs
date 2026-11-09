@@ -49,6 +49,10 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , maxClaimPages
   , maxWindowPages
   , windowPageBytes
+  , maxWindowBytes
+  , overlayWorstBytes
+  , overlayBudgetRecord
+  , overlayBudgetBookkeeping
   , txnRamLimit
   , maxReaders
   , readerRecordBytes
@@ -126,14 +130,37 @@ bookkeepingReserve = 4 * (2 * (maxLevel + 1) + 1)
 maxClaimPages ∷ Int
 maxClaimPages = maxTxnPages + bookkeepingReserve
 
--- | The most decoded pages a plan's continuation may hold.
+-- | The most validated pages a plan's continuation may hold (a structural bound; the
+-- byte bound, 'maxWindowBytes', is the tighter one for dense pages).
 maxWindowPages ∷ Int
 maxWindowPages = 512
 
--- | The accounted bytes of one decoded page in a window: the decoded copy and its
--- container overhead.
+-- | The accounted bytes of one validated page in a window: its 4 KiB buffer and the
+-- map entry and headers around it.
 windowPageBytes ∷ Int
-windowPageBytes = pageSize + 256
+windowPageBytes = pageSize + 128
+
+-- | The most accounted bytes a plan's window may hold: 1.25 MiB (about 310 pages). The
+-- window keeps validated page buffers, not decoded entry lists, so this is the memory
+-- it really holds; a plan that needs more is refused with a typed result.
+maxWindowBytes ∷ Int
+maxWindowBytes = 1310720
+
+-- | The most accounted bytes of new (overlay) pages the record trees of one plan may
+-- hold while it works: the 256 pages it may write at their packed size and a margin.
+-- An overlay page is held packed, its entries as one byte string.
+overlayBudgetRecord ∷ Int
+overlayBudgetRecord = 1100000
+
+-- | The most accounted bytes the new pages a plan keeps can hold at once: its 256
+-- written pages at their packed size. The working budgets above are looser bounds on
+-- the work in progress; this is what a plan's reservation holds.
+overlayWorstBytes ∷ Int
+overlayWorstBytes = maxTxnPages * (pagePayloadBytes + 160)
+
+-- | The same for the allocator and retirement trees of one plan.
+overlayBudgetBookkeeping ∷ Int
+overlayBudgetBookkeeping = 300000
 
 -- | The RAM one transaction may reserve: 4 MiB.
 txnRamLimit ∷ Int

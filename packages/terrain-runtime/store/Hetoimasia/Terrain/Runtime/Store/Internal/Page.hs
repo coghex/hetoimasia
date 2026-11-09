@@ -50,12 +50,15 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Page
   , innerEntryBytes
   , encodePage
   , decodePage
+  , bodyOfValid
+  , packBody
+  , unpackBody
   ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Crc32c (crc32c)
@@ -226,6 +229,65 @@ decodePage ident total expected bs
                 (bad : _) → Left (BadReference bad)
                 [] → Right ps
     refOk self child@(PageNo c) = child /= self && c < total
+
+-- | The body of a page buffer that 'decodePage' already validated, parsed again without
+-- re-checking: a window keeps the validated buffer (4 KiB) and not a list of entries,
+-- so its memory is the page and not a pointer structure around it.
+bodyOfValid ∷ ByteString → Body
+bodyOfValid bs = case BS.index bs 6 of
+  1 → Leaf (leaf count payload)
+  2 → Inner (inner count payload)
+  _ → List [PageNo (getLe64 payload (8 * i)) | i ← [0 .. count - 1]]
+  where
+    count = fromIntegral (getLe16 bs 34) ∷ Int
+    used = fromIntegral (getLe16 bs 36) ∷ Int
+    payload = BS.take (used - pageHeaderBytes) (BS.drop pageHeaderBytes bs)
+    leaf 0 _ = []
+    leaf n p = case BS.unpack (BS.take 2 p) of
+      [kl, vl] →
+        let body = BS.drop 2 p
+            k = BS.take (fromIntegral kl) body
+            v = BS.take (fromIntegral vl) (BS.drop (fromIntegral kl) body)
+         in (k, v) : leaf (n - 1 ∷ Int) (BS.drop (fromIntegral kl + fromIntegral vl) body)
+      _ → []
+    inner 0 _ = []
+    inner n p = case BS.uncons p of
+      Just (kl, body) →
+        (BS.take (fromIntegral kl) body, PageNo (getLe64 body (fromIntegral kl))) : inner (n - 1 ∷ Int) (BS.drop (fromIntegral kl + 8) body)
+      Nothing → []
+
+-- | A node's entries packed into one byte string (the form an overlay page is kept in):
+-- leaf entries as @keyLen valueLen key value@, internal entries as @keyLen key tag
+-- target(8)@ where the tag says whether the target is a committed page (0) or an
+-- overlay page (1). One packed page costs its bytes and a small header, not a list
+-- cell, a pair and two string headers per entry.
+packBody ∷ Either [(ByteString, ByteString)] [(ByteString, (Word8, Word64))] → ByteString
+packBody (Left es) = BS.concat [BS.concat [BS.pack [fromIntegral (BS.length k), fromIntegral (BS.length v)], k, v] | (k, v) ← es]
+packBody (Right es) = BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, BS.singleton t, le64 c] | (k, (t, c)) ← es]
+
+-- | The inverse of 'packBody' for @count@ entries of the stated kind.
+unpackBody ∷ Bool → Int → ByteString → Either [(ByteString, ByteString)] [(ByteString, (Word8, Word64))]
+unpackBody isLeaf count0 payload0
+  | isLeaf = Left (leaf count0 payload0)
+  | otherwise = Right (inner count0 payload0)
+  where
+    leaf 0 _ = []
+    leaf n p = case BS.unpack (BS.take 2 p) of
+      [kl, vl] →
+        let body = BS.drop 2 p
+            k = BS.take (fromIntegral kl) body
+            v = BS.take (fromIntegral vl) (BS.drop (fromIntegral kl) body)
+         in (k, v) : leaf (n - 1 ∷ Int) (BS.drop (fromIntegral kl + fromIntegral vl) body)
+      _ → []
+    inner 0 _ = []
+    inner n p = case BS.uncons p of
+      Just (kl, body) →
+        let k = BS.take (fromIntegral kl) body
+            rest = BS.drop (fromIntegral kl) body
+         in case BS.uncons rest of
+              Just (t, tgt) → (k, (t, getLe64 tgt 0)) : inner (n - 1 ∷ Int) (BS.drop 8 tgt)
+              Nothing → []
+      Nothing → []
 
 -- | The structure inside a decoded page: ordering and the checks that need only
 -- the page itself.

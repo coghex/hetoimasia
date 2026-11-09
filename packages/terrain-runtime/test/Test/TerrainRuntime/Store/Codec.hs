@@ -280,20 +280,20 @@ spec = describe "the private page codec against independent bytes" $ do
           inner lvl no child = buildPage 1 7 no 2 0 lvl 1 (BS.concat [BS.singleton 8, be64' 0, le64' child])
           p = inner 1 5 6
           q = inner 1 6 5
-          add win no bs = either (error . show) id (windowInsert ident0 total (pageNo no) bs win)
-          w = add (add (emptyWindow 0) 5 p) 6 q
-      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.replicate 24 0)) (newEdit w) of
+          add win no bs = either (error . show) id (windowInsert total (pageNo no) bs win)
+          w = add (add (emptyWindow ident0 0) 5 p) 6 q
+      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.replicate 24 0)) (newEdit 0 w) of
         Left (Bad (BadLevel 1) (PageNo 6)) → pure ()
         other → expectationFailure ("a cycle was not stopped: " <> either show (const "answered") other)
       -- a child that violates its parent's bounds is refused too
       let leafAt no k = buildPage 1 7 no 1 0 0 1 (leafPayload [(k, bias 9)])
           parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, BS.concat [bias 5, bias 5, bias 5], le64' 6])
-          w2 = add (add (emptyWindow 0) 5 parent) 6 (leafAt 6 (BS.concat [bias 0, bias 0, bias 0]))
-      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit w2) of
+          w2 = add (add (emptyWindow ident0 0) 5 parent) 6 (leafAt 6 (BS.concat [bias 0, bias 0, bias 0]))
+      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit 0 w2) of
         Left (Bad KeyOrder (PageNo 6)) → pure ()
         other → expectationFailure ("bounds not enforced: " <> either show (const "answered") other)
       -- a missing page is pending, never an absent key
-      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit (add (emptyWindow 0) 5 parent)) of
+      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit 0 (add (emptyWindow ident0 0) 5 parent)) of
         Left (Need (PageNo 6)) → pure ()
         other → expectationFailure ("a missing page must be pending: " <> either show (const "answered") other)
   describe "revision and version arithmetic" $ do
@@ -308,7 +308,7 @@ spec = describe "the private page codec against independent bytes" $ do
                 Authority a (Revision c) (Revision k) (Revision st) = hAuthority hdr
                 nextA = Authority a (Revision (if terrain then c + 1 else c)) (Revision (if knowledge then k + 1 else k)) (Revision (st + 1))
                 d = Delta (hAuthority hdr) hdr {hAuthority = nextA} terrain knowledge 1 [(runKey 0 0 1, Just (runRec 3))]
-             in planDelta cfg ident0 r (emptyWindow (rVersion r)) Ordinary d
+             in planDelta cfg ident0 r (emptyWindow ident0 (rVersion r)) Ordinary d
           is' want p = p `shouldSatisfy` (\x → case x of Refused y → y == want; _ → False)
       is' (Invalid RevisionArithmetic) (plan (at maxBound 0 0) True False)
       is' (Invalid RevisionArithmetic) (plan (at 0 maxBound 0) False True)
@@ -324,13 +324,13 @@ spec = describe "the private page codec against independent bytes" $ do
           other = Authority (ArenaId 9) c0 k0 st0
           stale = Authority (ArenaId 1) (Revision 5) k0 st0
           wrong = Authority (ArenaId 1) c0 k0 (Revision 5)
-          go d = planDelta cfg ident0 roots0 (emptyWindow 0) Ordinary d
+          go d = planDelta cfg ident0 roots0 (emptyWindow ident0 0) Ordinary d
       is' (Invalid ForeignArena) (go (Delta other hdr0 True False 1 w))
       is' (Stale (StaleAuthority stale (hAuthority hdr0))) (go (Delta stale hdr0 True False 1 w))
       is' (Invalid InconsistentRevisions) (go (Delta (hAuthority hdr0) hdr0 {hAuthority = wrong} True False 1 w))
       is' (Invalid InconsistentRevisions) (go (Delta (hAuthority hdr0) hdr0 True False 1 w))
       is' (Invalid (TooManyUpdates 65)) (go (Delta (hAuthority hdr0) hdr0 True False 65 w))
-      is' (Stale (StaleWindow 3 0)) (planDelta cfg ident0 roots0 (emptyWindow 3) Ordinary (Delta (hAuthority hdr0) hdr0 True False 1 w))
+      is' (Stale (StaleWindow 3 0)) (planDelta cfg ident0 roots0 (emptyWindow ident0 3) Ordinary (Delta (hAuthority hdr0) hdr0 True False 1 w))
       _ ← pure (Map.empty ∷ Map.Map Int Int)
       pure ()
   where

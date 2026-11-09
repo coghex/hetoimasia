@@ -129,6 +129,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Store.Evidence
         Test.TerrainRuntime.Store.Faults
         Test.TerrainRuntime.Store.Harness
+        Test.TerrainRuntime.Store.Identity
         Test.TerrainRuntime.Store.Readers
         Test.TerrainRuntime.Store.Reference
         Test.TerrainRuntime.Store.Replay

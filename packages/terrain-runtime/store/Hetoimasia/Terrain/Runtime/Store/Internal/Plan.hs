@@ -1,4 +1,4 @@
--- | Staged transaction planning: from the committed roots and a window of decoded
+-- | Staged transaction planning: from the committed roots and a window of validated
 -- pages to a complete, bounded candidate of new pages, or a typed result that
 -- explains why there is none.
 --
@@ -35,6 +35,20 @@
 -- need a fixed point and never overwrite a page of the committed roots. The
 -- committed bookkeeping pages it replaced become loose; the committed record pages
 -- it replaced are retired.
+--
+-- = Memory accounting
+--
+-- The RAM a plan reserves (at most 4 MiB, 'ramTotal') is the memory it really holds,
+-- by component. The window keeps validated page /buffers/ (4 KiB and a small header
+-- each, at most 1.25 MiB, 'maxWindowBytes'): entries are parsed from a buffer when a
+-- node is visited, never held as lists. The new pages a plan builds are held packed
+-- (their entries as one byte string, at most 'overlayBudgetRecord' and
+-- 'overlayBudgetBookkeeping' while it works, at most 256 pages' worth when it ends)
+-- except for a few recently used nodes kept parsed ('hotNodes' per tree edit, each
+-- accounted at 'hotNodeBytes'). The encoded output is 4 KiB a written page. The
+-- control header is charged at its fixed record size: the discovery header's byte
+-- total counts the retained /history/, which lives in pages, and is not resident
+-- transaction memory.
 --
 -- = Reclamation
 --
@@ -96,6 +110,7 @@ import Hetoimasia.Terrain.Discovery
   , Candidate
   , Fetch (..)
   , Header (..)
+  , headerBytes
   , Integrity
   , Provider (..)
   , Record (..)
@@ -149,7 +164,7 @@ data Effects = Effects
   }
   deriving stock (Eq, Show)
 
--- | The RAM one transaction reserves, by component. Every buffer, decoded copy, key,
+-- | The RAM one transaction reserves, by component. Every buffer, window page, new page held packed, key,
 -- scratch, page pin, root or control record and retained continuation is counted.
 data RamCharge = RamCharge
   { ramIoBuffers ∷ !Int
@@ -222,6 +237,8 @@ data PlanRefusal
 data StaleWhy
   = -- | The window was filled for another version: the window's, the committed one.
     StaleWindow !Word64 !Word64
+  | -- | The window was made for another store (another arena or source).
+    ForeignWindow
   | -- | The candidate was prepared against another authority: the candidate's, the
     -- store's.
     StaleAuthority !Authority !Authority
@@ -245,6 +262,10 @@ data CapacityWhy
   | TxnPagesExceeded !Int
   | TxnRamExceeded !Int
   | WindowExceeded !Int
+  | -- | The window holds more accounted bytes than a plan may: the figure.
+    WindowBytesExceeded !Int
+  | -- | The new pages of a plan would hold more accounted bytes than it may: the figure.
+    OverlayExceeded !Int
   | TreeTooTall !TreeId
   | ListTooLarge !Int
   deriving stock (Eq, Show)
@@ -265,19 +286,21 @@ data IntegrityWhy
 -- Bounds
 
 -- | The bounds of one transaction: the pages it writes, the RAM it reserves and the
--- decoded pages its continuation holds. The format fixes 'standardBounds'; the suite
+-- validated page bytes its continuation holds. The format fixes 'standardBounds'; the suite
 -- plans under tighter ones to reach the refusals and the shrinking of a batch that
 -- the standard ones allow only at a scale no routine test reaches.
 data Bounds = Bounds
   { bdPages ∷ !Int
   , bdRamBytes ∷ !Int
   , bdWindowPages ∷ !Int
+  , bdWindowBytes ∷ !Int
   }
   deriving stock (Eq, Show)
 
--- | 256 pages (1 MiB of new encoded pages), 4 MiB of RAM and 512 decoded pages.
+-- | 256 pages (1 MiB of new encoded pages), 4 MiB of RAM, 512 window pages and 1.25 MiB
+-- of window bytes.
 standardBounds ∷ Bounds
-standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages
+standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes
 
 -- ---------------------------------------------------------------------------
 -- The planning monad
@@ -291,6 +314,7 @@ phase e m = case runM m e of
   Left (Need p) → Left (OutNeed p)
   Left (Bad err p) → Left (OutRefuse (Integrity (BadPage err p)))
   Left (TooTall t) → Left (OutRefuse (Capacity (TreeTooTall t)))
+  Left (Over n) → Left (OutRefuse (Capacity (OverlayExceeded n)))
   Left (Invariant t) → Left (OutRefuse (Integrity (BrokenInvariant t)))
   Right r → Right r
 
@@ -448,7 +472,7 @@ planDelta = planDeltaWith standardBounds
 -- | 'planDelta' under given bounds.
 planDeltaWith ∷ Bounds → StoreConfig → StoreIdentity → Roots → Window → TxClass → Delta → Planned
 planDeltaWith bounds cfg ident roots win cls cand = settle $ do
-  checkWindow bounds roots win
+  checkWindow bounds ident roots win
   let base = dlBase cand
       hdr = rHeader roots
       next = dlNext cand
@@ -466,7 +490,7 @@ planDeltaWith bounds cfg ident roots win cls cand = settle $ do
     else pure ()
   writes ← canonicalWrites (dlWrites cand)
   -- The record trees.
-  let edit0 = newEdit win
+  let edit0 = newEdit overlayBudgetRecord win
       roots0 = (fmap Disk (rRuns roots), fmap Disk (rLinks roots), fmap Disk (rTodo roots))
   (rootsRec, edit1) ← applyWrites edit0 roots0 writes
   let (rr, rl, rt) = rootsRec
@@ -483,7 +507,7 @@ planDeltaWith bounds cfg ident roots win cls cand = settle $ do
     else do
       let m = d + (if needRetire then 1 else 0) + bookkeepingReserve
       -- The supply.
-      (mtake, bkEdit0) ← phase (newEdit win) (takeSupply cfg roots m)
+      (mtake, bkEdit0) ← phase (newEdit overlayBudgetBookkeeping win) (takeSupply cfg roots m)
       tk ← maybe (refuse (Capacity (DiskFull (fromIntegral m) (freePool cfg roots + fromIntegral (length (rLoose roots))) (protectedFor cls)))) pure mtake
       let claim = fromIntegral m - fromIntegral (tkLoose tk) ∷ Word64
       if freePool cfg roots < claim + protectedFor cls
@@ -542,7 +566,7 @@ planDeltaWith bounds cfg ident roots win cls cand = settle $ do
               }
           windowN = windowSize win
           steps = editSteps edit1 + editSteps bkEdit2
-          ram = ramFor roots windowN written (length writes) (listN + length replBk) m
+          ram = ramFor windowN (windowBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit2) written (length writes) (listN + length replBk) m
       if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
       let measure =
             Measure
@@ -572,7 +596,8 @@ headerOnly _ ident roots cls cand next version' edit writes = do
   let base = dlBase cand
       expected = hAuthority next
       next' = roots {rVersion = version', rHeader = next}
-      ram = ramFor roots 0 0 (length writes) 0 0
+      ram = ramFor 0 (windowBytes win0) 0 0 (length writes) 0 0
+      win0 = editWindow edit
       measure =
         Measure 0 0 0 0 0 0 0 0 0 (editSteps edit) 0 ram (dlUpdates cand) (length writes) 0
   pure (finishPlan ident cls KindCandidate base next' cand [] measure expected version')
@@ -607,10 +632,12 @@ encodeOut ident page = case encodePage ident page of
   Left err → refuse (Integrity (BadPage err (pgNo page)))
   Right bs → Right (pgNo page, bs)
 
-checkWindow ∷ Bounds → Roots → Window → P ()
-checkWindow bounds roots win = do
+checkWindow ∷ Bounds → StoreIdentity → Roots → Window → P ()
+checkWindow bounds ident roots win = do
+  if windowIdentity win /= ident then refuse (Stale ForeignWindow) else pure ()
   if windowVersion win /= rVersion roots then refuse (Stale (StaleWindow (windowVersion win) (rVersion roots))) else pure ()
   if windowSize win > bdWindowPages bounds then refuse (Capacity (WindowExceeded (windowSize win))) else pure ()
+  if windowBytes win > bdWindowBytes bounds then refuse (Capacity (WindowBytesExceeded (windowBytes win))) else pure ()
 
 bumpWord ∷ Word64 → Maybe Word64
 bumpWord w = if w == maxBound then Nothing else Just (w + 1)
@@ -659,15 +686,15 @@ applyWrites edit roots0 = go roots0 edit
             _ → (rr, rl, root')
       go roots' e' rest
 
-ramFor ∷ Roots → Int → Int → Int → Int → Int → RamCharge
-ramFor roots windowN written writes replaced supplyN =
+ramFor ∷ Int → Int → Int → Int → Int → Int → Int → RamCharge
+ramFor windowN windowB overlayB written writes replaced supplyN =
   RamCharge
     { ramIoBuffers = written * pageSize
-    , ramDecodedCopies = windowN * windowPageBytes
+    , ramDecodedCopies = windowB + overlayB
     , ramKeys = writes * maxEntryBytes
-    , ramScratch = replaced * 16 + supplyN * 8 + 4096
+    , ramScratch = replaced * 16 + supplyN * 8 + 4096 + 2 * hotNodes * hotNodeBytes
     , ramPagePins = windowN * 16
-    , ramRootControl = rootRecordBytes + activeRecordBytes + fromIntegral (hBytes (rHeader roots))
+    , ramRootControl = rootRecordBytes + activeRecordBytes + headerBytes
     , ramContinuation = 1024 + windowN * 8
     }
 
@@ -689,10 +716,10 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
     total = cfgTotalPages cfg
     reclaimM ∷ P Planned
     reclaimM = do
-      checkWindow bounds roots win
+      checkWindow bounds ident roots win
       version' ← maybe (refuse (Invalid VersionArithmetic)) pure (bumpWord (rVersion roots))
       let retireRoot = fmap Disk (rRetire roots)
-      (firstEntry, e0) ← phase (newEdit win) (ceilKey TreeRetire False retireRoot BS.empty)
+      (firstEntry, e0) ← phase (newEdit overlayBudgetBookkeeping win) (ceilKey TreeRetire False retireRoot BS.empty)
       case firstEntry of
         Nothing → pure NoWork
         Just (k, v) → do
@@ -774,7 +801,7 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
               , rLoose = loose'
               }
           windowN = windowSize win
-          ram = ramFor roots windowN written 0 (length replBk + c) m
+          ram = ramFor windowN (windowBytes win) (editFreshBytes bkEdit3) written 0 (length replBk + c) m
       if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
       let measure =
             Measure
@@ -813,7 +840,7 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
 lookupRecord ∷ Window → (TreeId → Maybe PageNo) → RecordKey → Either Stop (Maybe Record)
 lookupRecord win rootFor key = do
   let tree = treeOfKey key
-  (mv, _) ← runM (lookupKey tree (fmap Disk (rootFor tree)) (encodeKey key)) (newEdit win)
+  (mv, _) ← runM (lookupKey tree (fmap Disk (rootFor tree)) (encodeKey key)) (newEdit 0 win)
   case mv of
     Nothing → Right Nothing
     Just v → case decodeValue key v of
@@ -823,7 +850,7 @@ lookupRecord win rootFor key = do
 -- | The removed run of a column with the greatest lower end at or below a level.
 floorRun ∷ Window → (TreeId → Maybe PageNo) → Column → Int64 → Either Stop (Maybe (Int64, Int64))
 floorRun win rootFor col z = do
-  (r, _) ← runM (floorKey TreeRuns (fmap Disk (rootFor TreeRuns)) (encodeKey (KeyRun col z))) (newEdit win)
+  (r, _) ← runM (floorKey TreeRuns (fmap Disk (rootFor TreeRuns)) (encodeKey (KeyRun col z))) (newEdit 0 win)
   case r of
     Nothing → Right Nothing
     Just (k, v) → case decodeKey TreeRuns k of
@@ -843,7 +870,7 @@ rangeRecords win rootFor tree start limit = do
   let (strict, key) = case start of
         RangeFrom k → (False, k)
         RangeAfter k → (True, k)
-  (es, _) ← runM (rangeKeys tree (fmap Disk (rootFor tree)) strict (encodeKey key) Nothing limit) (newEdit win)
+  (es, _) ← runM (rangeKeys tree (fmap Disk (rootFor tree)) strict (encodeKey key) Nothing limit) (newEdit 0 win)
   traverse decodeEntry es
   where
     decodeEntry (k, v) = case decodeKey tree k of
@@ -868,14 +895,21 @@ providerFor win rootFor =
         Left _ → Unavailable (KeyRun col z)
     }
 
--- | Why a record is unavailable: the page to fetch, or an integrity failure.
+-- | Why a record is unavailable: the page to fetch, or an integrity failure. A removed
+-- run may have been asked for by key or by a floor lookup (the run at or below a
+-- level, which can also need the page of the previous leaf), and both are resolved, so
+-- a suspension on either names the page it waits for.
 missingPage ∷ Window → (TreeId → Maybe PageNo) → RecordKey → Either IntegrityWhy (Maybe PageNo)
-missingPage win rootFor key = case lookupRecord win rootFor key of
-  Right _ → Right Nothing
-  Left (Need p) → Right (Just p)
-  Left (Bad err p) → Left (BadPage err p)
-  Left (TooTall t) → Left (BrokenInvariant t)
-  Left (Invariant t) → Left (BrokenInvariant t)
+missingPage win rootFor key = case [stop' | Left stop' ← attempts] of
+  (Need p : _) → Right (Just p)
+  (Bad err p : _) → Left (BadPage err p)
+  (TooTall t : _) → Left (BrokenInvariant t)
+  (Invariant t : _) → Left (BrokenInvariant t)
+  (Over _ : _) → Left CorruptCounters
+  [] → Right Nothing
+  where
+    attempts = void' (lookupRecord win rootFor key) : [void' (floorRun win rootFor col lo) | KeyRun col lo ← [key]]
+    void' = fmap (const ())
 
 -- | Map a #661 refusal to this plan's vocabulary: an integrity failure of its
 -- records is an integrity result, anything else is its capacity or overflow.

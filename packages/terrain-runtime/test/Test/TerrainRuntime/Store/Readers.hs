@@ -78,7 +78,7 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     must (checkH hDone)
     must (compareRecords (Map.toList ref3) hDone)
     -- a released token authorises nothing
-    case readerLookup (hStore hDone) r1 (emptyWindow (storeVersion (hStore hDone))) (KeyTodo 0) of
+    case readerLookup (hStore hDone) r1 (storeWindow (hStore hDone)) (KeyTodo 0) of
       ReadStale → pure ()
       other → expectationFailure ("a released token read " <> show other)
     -- the freed pages are reused: more history does not raise the high-water mark first
@@ -107,7 +107,7 @@ spec = describe "pinned readers, retirement and reclamation" $ do
         let go w (n ∷ Int) = case readerFloorRun (hStore h2) tok w c lo of
               Read r → Right r
               ReadNeeds p | n < 50 → case diskRead (hDisk h2) p of
-                Just bs → either (Left . show) (\x → go x (n + 1)) (windowInsert (hIdent h2) total p bs w)
+                Just bs → either (Left . show) (\x → go x (n + 1)) (windowInsert total p bs w)
                 Nothing → Left "missing page"
               other → Left (show other)
         r ← must (go w0 0)
@@ -124,7 +124,7 @@ spec = describe "pinned readers, retirement and reclamation" $ do
         go w act = case act w of
           Read r → Right r
           ReadNeeds p → case diskRead (hDisk h) p of
-            Just bs → either (Left . show) (\x → go x act) (windowInsert (hIdent h) total p bs w)
+            Just bs → either (Left . show) (\x → go x act) (windowInsert total p bs w)
             Nothing → Left "missing page"
           other → Left (show other)
         win = either (const (error "stale")) id (readerWindow s1 tok)

@@ -1,9 +1,9 @@
 -- | The copy-on-write B+tree over immutable pages: bounded reads through a window
--- of decoded pages, and updates that never touch a committed page.
+-- of validated page buffers, and updates that never touch a committed page.
 --
 -- = The window
 --
--- Every operation reads through a 'Window', a bounded set of decoded, validated
+-- Every operation reads through a 'Window', a bounded set of validated page buffers
 -- pages the caller has supplied. A page the operation needs and the window lacks
 -- stops it with @'Need' page@: the pending result of a missing page, never an
 -- empty index or an absent key. The caller fetches the page, adds it and runs the
@@ -48,6 +48,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , windowInsert
   , windowSize
   , windowVersion
+  , windowIdentity
+  , windowBytes
+  , windowPageOverhead
   , windowPageNumbers
   , windowMember
   , windowPage
@@ -61,6 +64,10 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , editSteps
   , editReplaced
   , editWindow
+  , editFreshBytes
+  , overlayNodeBytes
+  , hotNodes
+  , hotNodeBytes
   , Ref (..)
   , liftStop
   , failInvariant
@@ -96,39 +103,64 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page
 -- ---------------------------------------------------------------------------
 -- Window
 
--- | Decoded, validated pages the caller has supplied, for one version of the
--- store. A window is the continuation of one plan or read; it is never carried
--- across a published version, because a page number may then name other content.
-data Window = Window !Word64 !(Map PageNo Page)
+-- | A validated page buffer a window keeps: the 4 KiB buffer and what a lookup needs
+-- to place it. The entries are parsed from the buffer when a node is visited, so the
+-- window's memory is the pages and not a pointer structure around each of them.
+data VPage = VPage
+  { vpTree ∷ !TreeId
+  , vpLevel ∷ !Int
+  , vpBytes ∷ !ByteString
+  }
   deriving stock (Eq, Show)
 
--- | An empty window for a version.
-emptyWindow ∷ Word64 → Window
-emptyWindow v = Window v Map.empty
+-- | Validated pages the caller has supplied, for one store and one version of it. A
+-- window is the continuation of one plan or read; it is bound to the arena and source
+-- it was made for (a page of another store is refused on insertion and a plan or read
+-- through a window of another store or version is refused) and it is never carried
+-- across a published version, because a page number may then name other content.
+data Window = Window !StoreIdentity !Word64 !(Map PageNo VPage)
+  deriving stock (Eq, Show)
+
+-- | An empty window for a store and a version.
+emptyWindow ∷ StoreIdentity → Word64 → Window
+emptyWindow ident v = Window ident v Map.empty
 
 -- | The version the window was filled for.
 windowVersion ∷ Window → Word64
-windowVersion (Window v _) = v
+windowVersion (Window _ v _) = v
 
--- | Decode a page read for a page number and add it. A page that fails any check
--- is refused and the window is unchanged.
-windowInsert ∷ StoreIdentity → Word64 → PageNo → ByteString → Window → Either PageError Window
-windowInsert ident total no bytes (Window v m) = do
+-- | The store the window was made for.
+windowIdentity ∷ Window → StoreIdentity
+windowIdentity (Window i _ _) = i
+
+-- | The accounted bytes a window holds: each page's 4 KiB buffer and the map entry
+-- and headers around it ('windowPageOverhead').
+windowBytes ∷ Window → Int
+windowBytes (Window _ _ m) = Map.size m * (pageSize + windowPageOverhead)
+
+-- | The accounted overhead of one page in a window beyond its buffer.
+windowPageOverhead ∷ Int
+windowPageOverhead = 128
+
+-- | Decode a page read for a page number against the window's store and add it. A page
+-- that fails any check is refused and the window is unchanged.
+windowInsert ∷ Word64 → PageNo → ByteString → Window → Either PageError Window
+windowInsert total no bytes (Window ident v m) = do
   page ← decodePage ident total no bytes
-  Right (Window v (Map.insert no page m))
+  Right (Window ident v (Map.insert no (VPage (pgTree page) (pgLevel page) bytes) m))
 
 windowSize ∷ Window → Int
-windowSize (Window _ m) = Map.size m
+windowSize (Window _ _ m) = Map.size m
 
 windowPageNumbers ∷ Window → [PageNo]
-windowPageNumbers (Window _ m) = Map.keys m
+windowPageNumbers (Window _ _ m) = Map.keys m
 
 windowMember ∷ PageNo → Window → Bool
-windowMember p (Window _ m) = Map.member p m
+windowMember p (Window _ _ m) = Map.member p m
 
--- | A decoded page the window holds.
+-- | A page the window holds, parsed into a value.
 windowPage ∷ PageNo → Window → Maybe Page
-windowPage p (Window _ m) = Map.lookup p m
+windowPage p (Window _ _ m) = (\vp → Page (vpTree vp) (vpLevel vp) p (bodyOfValid (vpBytes vp))) <$> Map.lookup p m
 
 -- ---------------------------------------------------------------------------
 -- The plan monad
@@ -143,6 +175,8 @@ data Stop
     TooTall !TreeId
   | -- | An internal invariant of the tree code failed (never a caller's fault).
     Invariant !TreeId
+  | -- | The overlay of new pages would hold more bytes than a plan may: the figure.
+    Over !Int
   deriving stock (Eq, Show)
 
 -- | A reference to a node: a committed page or an overlay page.
@@ -161,17 +195,64 @@ data Node = Node
   }
   deriving stock (Eq, Show)
 
--- | The working state of one plan.
+-- | The committed nodes a plan keeps parsed: the last 8 (per tree edit).
+hotNodes ∷ Int
+hotNodes = 8
+
+-- | The accounted bytes of one parsed node held in that set: a dense leaf's entry
+-- list, a cons cell, a pair and two string headers per entry (119 entries at most for a
+-- record page and 225 for the smallest bookkeeping entry), rounded up.
+hotNodeBytes ∷ Int
+hotNodeBytes = 28000
+
+-- | A new page held packed: its entries as one byte string.
+data Stored = Stored !TreeId !Int !Bool !Int !ByteString
+
+-- | The accounted bytes of one overlay page: its packed entries and a header.
+overlayNodeBytes ∷ Int → Int
+overlayNodeBytes payload = payload + 160
+
+packNode ∷ Node → Stored
+packNode (Node t l body) = case body of
+  NLeaf es → Stored t l True (length es) (packBody (Left es))
+  NInner es → Stored t l False (length es) (packBody (Right [(k, refCode r) | (k, r) ← es]))
+  where
+    refCode (Disk (PageNo p)) = (0, p)
+    refCode (Fresh i) = (1, fromIntegral i)
+
+unpackNode ∷ Stored → Node
+unpackNode (Stored t l leaf n pl) = case unpackBody leaf n pl of
+  Left es → Node t l (NLeaf es)
+  Right es → Node t l (NInner [(k, if tag == 0 then Disk (PageNo c) else Fresh (fromIntegral c)) | (k, (tag, c)) ← es])
+
+-- | The working state of one plan: the window, the new pages (packed, accounted and
+-- bounded by a byte budget), the committed pages replaced and the visits made.
 data Edit = Edit
   { eWin ∷ !Window
-  , eFresh ∷ !(IntMap Node)
+  , eFresh ∷ !(IntMap Stored)
+  , eFreshBytes ∷ !Int
+  , eSizes ∷ !(IntMap Int)
+  , eFreshHot ∷ [(Int, Node)]
+  -- ^ The last few new pages written, kept parsed (at most 'hotNodes'); an older one is
+  -- packed into 'eFresh'. Every new page is accounted at its packed size in 'eSizes'.
+  , eBudget ∷ !Int
   , eNext ∷ !Int
   , eReplaced ∷ !(Set PageNo)
   , eSteps ∷ !Int
+  , eHot ∷ [(PageNo, Node)]
+  -- ^ The last few committed nodes parsed, so a run of updates in one neighbourhood
+  -- does not parse the same page again for every key. At most 'hotNodes' are held and
+  -- 'hotNodeBytes' each is accounted in a plan's scratch.
   }
 
-newEdit ∷ Window → Edit
-newEdit w = Edit w IntMap.empty 0 Set.empty 0
+-- | A fresh plan state over a window, whose new pages may hold at most the given
+-- accounted bytes.
+newEdit ∷ Int → Window → Edit
+newEdit budget w = Edit w IntMap.empty 0 IntMap.empty [] budget 0 Set.empty 0 []
+
+-- | The accounted bytes of the new pages the plan holds now.
+editFreshBytes ∷ Edit → Int
+editFreshBytes = eFreshBytes
 
 -- | The page reads this plan has made, counting every visit: the measure of its
 -- bounded read work.
@@ -234,11 +315,18 @@ load tree expectLevel ref = do
   e ← getEdit
   putEdit e {eSteps = eSteps e + 1}
   node ← case ref of
-    Fresh i → maybe (stop (Invariant tree)) pure (IntMap.lookup i (eFresh e))
-    Disk p → case eWin e of
-      Window _ m → case Map.lookup p m of
-        Nothing → stop (Need p)
-        Just page → either (\err → stop (Bad err p)) pure (nodeOfPage tree p page)
+    Fresh i → maybe (stop (Invariant tree)) pure (freshNode e i)
+    Disk p → case lookup p (eHot e) of
+      Just hot | nTree hot == tree → pure hot
+      _ → case eWin e of
+        Window _ _ m → case Map.lookup p m of
+          Nothing → stop (Need p)
+          Just vp → case nodeOfPage tree p (Page (vpTree vp) (vpLevel vp) p (bodyOfValid (vpBytes vp))) of
+            Left err → stop (Bad err p)
+            Right n → do
+              e2 ← getEdit
+              putEdit e2 {eHot = take hotNodes ((p, n) : filter ((/= p) . fst) (eHot e2))}
+              pure n
   case expectLevel of
     Just l | l /= nLevel node → stop (Bad (BadLevel (nLevel node)) (refPage ref))
     _ → pure node
@@ -413,18 +501,48 @@ rangeKeys tree (Just root) strictStart start end limit = do
 -- ---------------------------------------------------------------------------
 -- Overlay
 
+-- | A new page as a parsed node: from the hot set, or unpacked from its packed form.
+freshNode ∷ Edit → Int → Maybe Node
+freshNode e i = case lookup i (eFreshHot e) of
+  Just n → Just n
+  Nothing → unpackNode <$> IntMap.lookup i (eFresh e)
+
+-- | The accounted bytes of a node held packed: the length of its packed entries and a
+-- header, computed without packing it.
+packedBytes ∷ Node → Int
+packedBytes (Node _ _ body) = overlayNodeBytes (case body of
+  NLeaf es → sum [2 + BS.length k + BS.length v | (k, v) ← es]
+  NInner es → sum [1 + BS.length k + 9 | (k, _) ← es])
+
+-- | Set a new page, accounting its packed bytes and refusing the plan when the new
+-- pages would hold more than the budget. The page is kept parsed in a small hot set;
+-- the page that falls out of it is packed.
+setFresh ∷ Int → Node → Edit → M Edit
+setFresh i node e = do
+  let size = packedBytes node
+      total = eFreshBytes e - IntMap.findWithDefault 0 i (eSizes e) + size
+  if total > eBudget e
+    then stop (Over total)
+    else do
+      let hot = (i, node) : filter ((/= i) . fst) (eFreshHot e)
+          (keep, spill) = splitAt hotNodes hot
+          packedOut = foldr (\(j, n) m → IntMap.insert j (packNode n) m) (IntMap.delete i (eFresh e)) spill
+      pure e {eFresh = packedOut, eFreshHot = keep, eSizes = IntMap.insert i size (eSizes e), eFreshBytes = total}
+
 -- | Put a node in the overlay under a reference that is being rewritten: an overlay
 -- page is changed in place; a committed page is recorded as replaced and its copy
 -- gets a new overlay number.
 rewrite ∷ Ref → Node → M Ref
 rewrite (Fresh i) node = do
   e ← getEdit
-  putEdit e {eFresh = IntMap.insert i node (eFresh e)}
+  e' ← setFresh i node e
+  putEdit e'
   pure (Fresh i)
 rewrite (Disk p) node = do
   e ← getEdit
   let i = eNext e
-  putEdit e {eFresh = IntMap.insert i node (eFresh e), eNext = i + 1, eReplaced = Set.insert p (eReplaced e)}
+  e' ← setFresh i node e
+  putEdit e' {eNext = i + 1, eReplaced = Set.insert p (eReplaced e')}
   pure (Fresh i)
 
 -- | A node with no committed predecessor.
@@ -432,14 +550,16 @@ fresh ∷ Node → M Ref
 fresh node = do
   e ← getEdit
   let i = eNext e
-  putEdit e {eFresh = IntMap.insert i node (eFresh e), eNext = i + 1}
+  e' ← setFresh i node e
+  putEdit e' {eNext = i + 1}
   pure (Fresh i)
 
 -- | Drop a node that is no longer part of the tree.
 discard ∷ Ref → M ()
 discard (Fresh i) = do
   e ← getEdit
-  putEdit e {eFresh = IntMap.delete i (eFresh e)}
+  let old = IntMap.findWithDefault 0 i (eSizes e)
+  putEdit e {eFresh = IntMap.delete i (eFresh e), eFreshHot = filter ((/= i) . fst) (eFreshHot e), eSizes = IntMap.delete i (eSizes e), eFreshBytes = eFreshBytes e - old}
 discard (Disk p) = do
   e ← getEdit
   putEdit e {eReplaced = Set.insert p (eReplaced e)}
@@ -642,7 +762,7 @@ reachableFresh e roots = reverse (snd (foldl' visit (Set.empty, []) [r | Just r 
     visit acc (Disk _) = acc
     visit (seen, out) (Fresh i)
       | Set.member i seen = (seen, out)
-      | otherwise = case IntMap.lookup i (eFresh e) of
+      | otherwise = case freshNode e i of
           Nothing → (seen, out)
           Just n →
             let (seen', out') = case nBody n of
@@ -669,7 +789,7 @@ assignPages e roots supply0 = do
           resolve (Disk p) = Right p
           resolve (Fresh i) = maybe (Left (Invariant TreeFree)) Right (Map.lookup i numbering)
           toPage i = do
-            n ← maybe (Left (Invariant TreeFree)) Right (IntMap.lookup i (eFresh e))
+            n ← maybe (Left (Invariant TreeFree)) Right (freshNode e i)
             no ← maybe (Left (Invariant TreeFree)) Right (Map.lookup i numbering)
             body ← case nBody n of
               NLeaf es → Right (Leaf es)

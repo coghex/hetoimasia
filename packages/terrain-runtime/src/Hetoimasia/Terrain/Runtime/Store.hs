@@ -59,6 +59,7 @@ module Hetoimasia.Terrain.Runtime.Store
   , pageFileOffset
   , rangeFileEnd
   , maxWindowPages
+  , maxWindowBytes
   , txnRamLimit
   , maxReaders
   , bookkeepingReserve
@@ -67,9 +68,10 @@ module Hetoimasia.Terrain.Runtime.Store
 
     -- * Windows
   , Window
-  , emptyWindow
+  , storeWindow
   , addPage
   , windowSize
+  , windowBytes
   , windowVersion
   , windowPageNumbers
 
@@ -120,6 +122,7 @@ module Hetoimasia.Terrain.Runtime.Store
   , planRemoval
   , planDiscovery
   , planMaintenance
+  , WindowRefusal (..)
   , providerAt
   , missingAt
   , freePool
@@ -166,6 +169,7 @@ module Hetoimasia.Terrain.Runtime.Store
   , readerLookup
   , readerFloorRun
   , readerRange
+  , PinRefusal (..)
   , readerProviderFor
   , readerMissing
 
@@ -200,7 +204,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), bodyBytes, decodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, emptyWindow, windowInsert, windowPageNumbers, windowSize, windowVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, windowBytes, windowInsert, windowPageNumbers, windowSize, windowVersion)
 
 -- The accessors below are functions, never record fields, so a client cannot rewrite
 -- a plan, a growth proposal or a root set with record-update syntax.
@@ -244,10 +248,10 @@ growthFrom = gpFrom
 growthTo = gpTo
 
 -- | Add a page read from the store to a window. The page is decoded and fully
--- validated against the store's identity and page space first; one that fails is
+-- validated against the window's store (arena and source) and page space first; one that fails is
 -- refused and the window is unchanged.
-addPage ∷ StoreConfig → StoreIdentity → PageNo → ByteString → Window → Either PageError Window
-addPage cfg ident = windowInsert ident (cfgTotalPages cfg)
+addPage ∷ StoreConfig → PageNo → ByteString → Window → Either PageError Window
+addPage cfg = windowInsert (cfgTotalPages cfg)
 
 -- | The kind of a page.
 data PageKind = LeafPage | InternalPage | ListPage

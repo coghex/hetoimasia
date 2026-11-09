@@ -151,18 +151,19 @@ drain = go 0
 
 -- | A knowledge query through the store, fetching pages as the provider needs them.
 knowledgeThrough ∷ H → (Provider → Observed a) → Either String a
-knowledgeThrough h q = go (emptyWindow (storeVersion (hStore h))) (0 ∷ Int)
+knowledgeThrough h q = go (storeWindow (hStore h)) (0 ∷ Int)
   where
     go w n
       | n > 500 = Left "query did not settle"
-      | otherwise = case observedValue (q (providerAt (hStore h) w)) of
+      | otherwise = case either (const (Left (MissingRecord (KeyTodo 0)))) (\prov → observedValue (q prov)) (providerAt (hStore h) w) of
           Right a → Right a
           Left (MissingRecord key) → case missingAt (hStore h) w key of
-            Right (Just p) → case diskRead (hDisk h) p of
+            Right (Right (Just p)) → case diskRead (hDisk h) p of
               Nothing → Left ("missing page " <> show p)
-              Just bs → either (Left . show) (\w' → go w' (n + 1)) (windowInsert (hIdent h) (cfgUsablePages (hCfg h)) p bs w)
-            Right Nothing → Left "record unavailable but no page named"
-            Left why → Left (show why)
+              Just bs → either (Left . show) (\w' → go w' (n + 1)) (windowInsert (cfgUsablePages (hCfg h)) p bs w)
+            Right (Right Nothing) → Left "record unavailable but no page named"
+            Right (Left why) → Left (show why)
+            Left refusal → Left (show refusal)
           Left other → Left ("query unresolved: " <> show other)
 
 compareKnowledge ∷ Run → [TileCoord] → Either String ()

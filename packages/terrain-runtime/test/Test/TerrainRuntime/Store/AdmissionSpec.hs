@@ -159,6 +159,30 @@ spec = describe "storage-aware edit-bank admission" $ do
       length (grantEvicted g) `shouldSatisfy` (> 0)
       -- every evicted copy was backed and unpinned: nothing authoritative was released
       lgCacheRamOnly (ledgers adm4) `shouldBe` 0
+  describe "checked credit arithmetic" $ do
+    it "refuses credits whose sum would wrap, in every account, without changing the admission" $ do
+      cfg ← config
+      let adm = newAdmission cfg
+          ledgerBefore = ledgers adm
+          bigs = maxBound ∷ Word64
+      -- two cache credits of maxBound and 1 wrap to zero as a Word64 sum
+      case reserve Foreground [CacheCredit a1 bigs Backed False, CacheCredit a1 1 Backed False] adm of
+        Left (RefusedInvalid (CreditExceedsAccount "cache" _ limit)) → limit `shouldBe` ebCacheBytes cfg
+        other → expectationFailure (either show (const "funded") other)
+      case reserve Foreground [StagingCredit bigs, StagingCredit 1] adm of
+        Left (RefusedInvalid (CreditExceedsAccount "staging" _ _)) → pure ()
+        other → expectationFailure (either show (const "funded") other)
+      case reserve Foreground [ControlCredit bigs, ControlCredit 2] adm of
+        Left (RefusedInvalid (CreditExceedsAccount "control" _ _)) → pure ()
+        other → expectationFailure (either show (const "funded") other)
+      case reserve Camera [StagingCredit (bigs - 1), StagingCredit 3] adm of
+        Left (RefusedInvalid (CreditExceedsAccount "staging" _ _)) → pure ()
+        other → expectationFailure (either show (const "funded") other)
+      ledgers adm `shouldBe` ledgerBefore
+      -- a single credit of maxBound is refused the same way
+      case reserve Foreground [CacheCredit a1 bigs Backed False] adm of
+        Left (RefusedInvalid (CreditExceedsAccount "cache" _ _)) → pure ()
+        other → expectationFailure (either show (const "funded") other)
   describe "queued descriptors" $ do
     it "charges at most eight descriptors' metadata to the control account" $ do
       cfg ← config

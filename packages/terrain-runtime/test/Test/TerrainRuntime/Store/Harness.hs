@@ -114,7 +114,7 @@ newH spec ident = case mkStoreConfig spec of
 -- | Plan through a window filled from the disk, fetching each pending page. It
 -- returns the outcome, the window and the pages fetched.
 fillWith ∷ H → (Window → Planned) → Either String (Planned, Window, Int)
-fillWith h f = go (emptyWindow (storeVersion (hStore h))) 0
+fillWith h f = go (storeWindow (hStore h)) 0
   where
     total = cfgUsablePages (hCfg h)
     go w n
@@ -122,7 +122,7 @@ fillWith h f = go (emptyWindow (storeVersion (hStore h))) 0
       | otherwise = case f w of
       Pending p → case diskRead (hDisk h) p of
         Nothing → Left ("pending page not on disk: " <> show p)
-        Just bs → case windowInsert (hIdent h) total p bs w of
+        Just bs → case windowInsert total p bs w of
           Left e → Left ("page " <> show p <> " refused: " <> show e)
           Right w' → go w' (n + 1 ∷ Int)
       other → Right (other, w, n)
@@ -224,11 +224,11 @@ storeRecords h = concat <$> mapM one [(TreeRuns, minRun), (TreeLinks, minLink), 
     s = hStore h
     total = cfgUsablePages (hCfg h)
     one (tree, start) = loop emptyW tree (RangeFrom start) []
-    emptyW = emptyWindow (storeVersion s)
+    emptyW = storeWindow s
     loop w tree start acc = case rangeRecordsAt s w tree start of
       Left (Need p) → case diskRead (hDisk h) p of
         Nothing → Left ("page " <> show p <> " missing")
-        Just bs → either (Left . show) (\w' → loop w' tree start acc) (windowInsert (hIdent h) total p bs w)
+        Just bs → either (Left . show) (\w' → loop w' tree start acc) (windowInsert total p bs w)
       Left e → Left (show e)
       Right [] → Right acc
       Right rs →
@@ -279,9 +279,10 @@ readAll h tok = concat <$> mapM one [(TreeRuns, minRun), (TreeLinks, minLink), (
          in if length rs < 256 then Right acc' else loop w tree (RangeAfter (fst (last rs))) acc'
       ReadNeeds p → case diskRead (hDisk h) p of
         Nothing → Left ("page " <> show p <> " missing")
-        Just bs → either (Left . show) (\w' → loop w' tree start acc) (windowInsert (hIdent h) total p bs w)
+        Just bs → either (Left . show) (\w' → loop w' tree start acc) (windowInsert total p bs w)
       ReadCorrupt e → Left (show e)
       ReadStale → Left "stale reader"
+      ReadWrongWindow w' → Left ("wrong window " <> show w')
 
 -- ---------------------------------------------------------------------------
 -- Keys

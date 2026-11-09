@@ -115,6 +115,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (AdmitRefusal (..), Condition)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (hotNodeBytes, hotNodes)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -192,9 +193,9 @@ worstTransactionCharge ∷ RamCharge
 worstTransactionCharge =
   RamCharge
     { ramIoBuffers = maxTxnPages * pageSize
-    , ramDecodedCopies = maxWindowPages * windowPageBytes
+    , ramDecodedCopies = maxWindowBytes + overlayWorstBytes
     , ramKeys = 3 * maxBatchUpdates * maxEntryBytes
-    , ramScratch = (maxListPages + bookkeepingReserve) * 16 + maxClaimPages * 8 + 4096
+    , ramScratch = (maxListPages + bookkeepingReserve) * 16 + maxClaimPages * 8 + 4096 + 2 * hotNodes * hotNodeBytes
     , ramPagePins = maxWindowPages * 16
     , ramRootControl = rootRecordBytes + activeRecordBytes + 128
     , ramContinuation = 1024 + maxWindowPages * 8
@@ -379,16 +380,22 @@ reserve ∷ Class → [Credit] → Admission → Either Refusal (Grant, Admissio
 reserve cls credits a = do
   if null credits then Left (RefusedInvalid EmptyRequest) else Right ()
   let cfg = aCfg a
-      wantCache = sum [b | CacheCredit _ b _ _ ← credits]
-      wantStaging = sum [b | StagingCredit b ← credits]
-      wantControl = sum [b | ControlCredit b ← credits]
+      -- every total is taken in Integer, so no sum of credits can wrap
+      wantCacheI = sum [toInteger b | CacheCredit _ b _ _ ← credits]
+      wantStagingI = sum [toInteger b | StagingCredit b ← credits]
+      wantControlI = sum [toInteger b | ControlCredit b ← credits]
       stagingLimit = case cls of
         Foreground → cStaging cfg
         Camera → cStaging cfg - cProtected cfg
-  if cls == Camera && wantControl > 0 then Left (RefusedInvalid CameraControl) else Right ()
-  if wantCache > cCache cfg then Left (RefusedInvalid (CreditExceedsAccount "cache" wantCache (cCache cfg))) else Right ()
-  if wantStaging > stagingLimit then Left (RefusedInvalid (CreditExceedsAccount "staging" wantStaging stagingLimit)) else Right ()
-  if wantControl > cControl cfg then Left (RefusedInvalid (CreditExceedsAccount "control" wantControl (cControl cfg))) else Right ()
+      sat n = fromInteger (min n (toInteger (maxBound ∷ Word64))) ∷ Word64
+  if cls == Camera && wantControlI > 0 then Left (RefusedInvalid CameraControl) else Right ()
+  if wantCacheI > toInteger (cCache cfg) then Left (RefusedInvalid (CreditExceedsAccount "cache" (sat wantCacheI) (cCache cfg))) else Right ()
+  if wantStagingI > toInteger stagingLimit then Left (RefusedInvalid (CreditExceedsAccount "staging" (sat wantStagingI) stagingLimit)) else Right ()
+  if wantControlI > toInteger (cControl cfg) then Left (RefusedInvalid (CreditExceedsAccount "control" (sat wantControlI) (cControl cfg))) else Right ()
+  -- each total now fits its account, so it fits a Word64
+  let wantCache = fromInteger wantCacheI ∷ Word64
+      wantStaging = fromInteger wantStagingI ∷ Word64
+      wantControl = fromInteger wantControlI ∷ Word64
   if stagingUsed a + wantStaging > stagingLimit then Left (RefusedBusy (StagingPressure (stagingUsed a + wantStaging - stagingLimit) 0)) else Right ()
   if controlUsed a + wantControl > cControl cfg then Left (RefusedBusy (ControlPressure (controlUsed a + wantControl - cControl cfg) 0)) else Right ()
   let used = cacheUsed a

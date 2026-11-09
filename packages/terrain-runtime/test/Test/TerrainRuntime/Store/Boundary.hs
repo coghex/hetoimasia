@@ -78,7 +78,7 @@ spec = describe "the store's public interface across the package boundary" $ do
 withClient ∷ FilePath → String → ((Mode → IO Client) → IO ()) → IO ()
 withClient =
   withPackageClient
-    ["base", "bytestring", "containers", "hetoimasia-terrain", "hetoimasia-terrain-runtime"]
+    ["base", "bytestring", "containers", "hetoimasia-terrain", "hetoimasia-terrain-runtime-0.1.0.0-inplace"]
 
 clientImporting ∷ [String] → [String] → String
 clientImporting imports body = unlines (["module Client () where", ""] <> imports <> [""] <> body)
@@ -157,7 +157,7 @@ supportedClient =
     , "  limits ← either (fail . show) pure (mkDiscoveryLimits (DiscoverySpec 64 100000 100000 1048576 4194304 65536 50331648 1024))"
     , "  let env = mkEnv limits source conn"
     , "  tile ← either (fail . show) pure (tileCoord 3 3 3)"
-    , "  case planRemoval env s0 (emptyWindow (storeVersion s0)) tile of"
+    , "  case planRemoval env s0 (storeWindow s0) tile of"
     , "    Planned plan → do"
     , "      putStrLn (\"planned pages > 0: \" <> show (not (null (planPages plan))))"
     , "      putStrLn (\"within 256 pages: \" <> show (length (planPages plan) <= maxTxnPages))"
@@ -173,13 +173,13 @@ supportedClient =
     , "      (tok, s4) ← either (fail . show) pure (acquireReader s3)"
     , "      let load w = case readerLookup s4 tok w (KeyTodo 0) of"
     , "            ReadNeeds p → case Map.lookup p file of"
-    , "              Just bytes → either (fail . show) load (addPage cfg ident p bytes w)"
+    , "              Just bytes → either (fail . show) load (addPage cfg p bytes w)"
     , "              Nothing → fail \"page not in the file\""
     , "            Read r → pure (r /= Nothing)"
     , "            other → fail (show other)"
     , "      readBack ← either (const (fail \"stale reader\")) load (readerWindow s4 tok)"
     , "      putStrLn (\"obligation read back: \" <> show readBack)"
-    , "      case planMaintenance s4 (emptyWindow (storeVersion s4)) of"
+    , "      case planMaintenance s4 (storeWindow s4) of"
     , "        NoWork → putStrLn \"nothing to reclaim\""
     , "        other → putStrLn (\"unexpected \" <> show (fmap (const ()) (Just other)))"
     , "      case proposeGrowth s4 (2 * 1024 * 1024 * 1024) of"

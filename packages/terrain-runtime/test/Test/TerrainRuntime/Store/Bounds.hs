@@ -16,7 +16,7 @@ import Control.Monad (foldM, forM_)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
-import GHC.Stats (getRTSStats, getRTSStatsEnabled, allocated_bytes)
+import GHC.Stats (RTSStats (..), GCDetails (..), getRTSStats, getRTSStatsEnabled)
 import Hetoimasia.Terrain.Discovery (Record, RecordKey (..), maxBatchUpdates)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
@@ -57,6 +57,10 @@ spread keys stride offset k = [(key, Just (runRec 30)) | i ← [0 .. k - 1], let
 
 allocated ∷ IO Word64
 allocated = allocated_bytes <$> getRTSStats
+
+-- | The live heap after a major collection.
+liveBytes ∷ IO Word64
+liveBytes = performMajorGC >> (gcdetails_live_bytes . gc <$> getRTSStats)
 
 -- | The bytes a forced computation allocates.
 measure ∷ IO a → IO Word64
@@ -111,7 +115,7 @@ allocationRatios hBig keysBig = do
             loop w = case readerLookup s1 tok w (keys !! 200) of
               Read r → pure r
               ReadNeeds p → case diskRead (hDisk h) p of
-                Just bs → loop (either (error . show) id (windowInsert (hIdent h) (cfgUsablePages (hCfg h)) p bs w))
+                Just bs → loop (either (error . show) id (windowInsert (cfgUsablePages (hCfg h)) p bs w))
                 Nothing → fail "page"
               other → fail (show other)
         r ← loop w0
@@ -162,18 +166,40 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     n `shouldSatisfy` (> 256)
     ramTotal (mRam (plMeasure p)) `shouldSatisfy` (<= txnRamLimit)
     mWindowPages (plMeasure p) `shouldSatisfy` (<= maxWindowPages)
-  it "refuses a window of 513 decoded pages and accepts one of 512" $ do
+  it "bounds the window by its accounted bytes (310 pages accepted, 311 refused) and by its page count" $ do
     let cfg = either (error . show) id (mkStoreConfig smallSpec)
         roots = storeRoots (hStore (newH smallSpec ident0))
         total = cfgUsablePages cfg
         leaf n = Page TreeRuns 0 (PageNo n) (Leaf [(encodeKey (runKey 0 0 (10 * toInteger n)), encodeValue (runRec (10 * toInteger n + 3)))])
-        windowOf m = foldl (\w n → either (error . show) id (windowInsert ident0 total (PageNo n) (either (error . show) id (encodePage ident0 (leaf n))) w)) (emptyWindow 0) [1 .. m]
+        windowOf m = foldl (\w n → either (error . show) id (windowInsert total (PageNo n) (either (error . show) id (encodePage ident0 (leaf n))) w)) (emptyWindow ident0 0) [1 .. m]
         d = deltaFor (hStore (newH smallSpec ident0)) True False 1 [(runKey 0 0 1, Just (runRec 3))]
         run m = planDelta cfg ident0 roots (windowOf m) Ordinary d
-    case run 512 of
+        tight = planDeltaWith (Bounds maxTxnPages txnRamLimit 5 maxWindowBytes) cfg ident0 roots
+    windowBytes (windowOf 310) `shouldBe` 310 * windowPageBytes
+    windowBytes (windowOf 310) `shouldSatisfy` (<= maxWindowBytes)
+    windowBytes (windowOf 311) `shouldSatisfy` (> maxWindowBytes)
+    case run 310 of
+      Planned p → ramTotal (mRam (plMeasure p)) `shouldSatisfy` (<= txnRamLimit)
+      other → expectationFailure (show other)
+    run 311 `shouldBe` Refused (Capacity (WindowBytesExceeded (311 * windowPageBytes)))
+    case tight (windowOf 5) Ordinary d of
       Planned _ → pure ()
       other → expectationFailure (show other)
-    run 513 `shouldBe` Refused (Capacity (WindowExceeded 513))
+    tight (windowOf 6) Ordinary d `shouldBe` Refused (Capacity (WindowExceeded 6))
+  it "holds a window of dense pages in memory close to what it accounts" $ do
+    enabled ← getRTSStatsEnabled
+    enabled `shouldBe` True
+    let cfg = either (error . show) id (mkStoreConfig smallSpec)
+        total = cfgUsablePages cfg
+        dense n = Page TreeRuns 0 (PageNo n) (Leaf [(encodeKey (runKey 0 (toInteger n) (100 * i)), encodeValue (runRec (100 * i + 3))) | i ← [1 .. 119]])
+        build = foldl (\w n → either (error . show) id (windowInsert total (PageNo n) (either (error . show) id (encodePage ident0 (dense n))) w)) (emptyWindow ident0 0) [1 .. 310]
+    liveBefore ← liveBytes
+    w ← evaluate (let w' = build in windowBytes w' `seq` w')
+    liveAfter ← liveBytes
+    -- keep the window alive across the measurement
+    windowSize w `shouldBe` 310
+    let held = liveAfter - liveBefore
+    (held < 2 * fromIntegral (windowBytes w)) `shouldBe` True
   it "bounds a plan's RAM below 4 MiB by construction, component by component" $ do
     let w = RamCharge (maxTxnPages * pageSize) (maxWindowPages * windowPageBytes) (3 * maxBatchUpdates * maxEntryBytes) ((maxListPages + bookkeepingReserve) * 16 + maxClaimPages * 8 + 4096) (maxWindowPages * 16) (rootRecordBytes + activeRecordBytes + 128) (1024 + maxWindowPages * 8)
     ramTotal w `shouldSatisfy` (< txnRamLimit)
@@ -185,7 +211,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         s0 = hStore h0
         w = [(runKey 0 0 1, Just (runRec 3))]
     -- the delta's updates are checked against the validated 64
-    let go n = planDelta cfg ident0 (storeRoots s0) (emptyWindow 0) Ordinary (deltaFor s0 True False n w)
+    let go n = planDelta cfg ident0 (storeRoots s0) (emptyWindow ident0 0) Ordinary (deltaFor s0 True False n w)
     case go 64 of
       Planned _ → pure ()
       other → expectationFailure (show other)
@@ -195,7 +221,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         scene = runEnv run0
     r1 ← must (foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA)
     let h1 = runH r1
-        tight = Bounds 5 txnRamLimit maxWindowPages
+        tight = Bounds 5 txnRamLimit maxWindowPages maxWindowBytes
     (full, _, _) ← must (fillWith h1 (planDiscovery scene (hStore h1)))
     (small, _, _) ← must (fillWith h1 (planDiscoveryWith tight scene (hStore h1)))
     case (full, small) of

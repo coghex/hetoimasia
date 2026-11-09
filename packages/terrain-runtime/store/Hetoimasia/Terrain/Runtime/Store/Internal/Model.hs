@@ -73,6 +73,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , planDiscoveryWith
   , planMaintenanceWith
   , planMaintenance
+  , WindowRefusal (..)
+  , storeWindow
   , providerAt
   , missingAt
 
@@ -116,6 +118,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , readerLookup
   , readerFloorRun
   , readerRange
+  , PinRefusal (..)
   , readerProviderFor
   , readerMissing
 
@@ -193,11 +196,14 @@ data Active = Active
 
 -- | A transaction's identity: the store's reader-independent serial. Outcomes
 -- carry it, so one for another transaction or an earlier one changes nothing.
-newtype TxnId = TxnId Word64
-  deriving stock (Eq, Ord, Show)
+data TxnId = TxnId !StoreIdentity !Word64
+  deriving stock (Eq, Show)
 
+-- | The transaction's serial within its store. The identity of a transaction is the
+-- store (arena and source) and this serial, so an outcome for another store's
+-- transaction with the same serial changes nothing.
 txnSerial ∷ TxnId → Word64
-txnSerial (TxnId n) = n
+txnSerial (TxnId _ n) = n
 
 -- | Why new history is paused. The first three of these pause an arena; none is
 -- cleared by another's recovery.
@@ -353,7 +359,7 @@ usage s =
 controlBytes ∷ Store → Int
 controlBytes s =
   rootRecordBytes
-    + fromIntegral (hBytes (rHeader (sRoots s)))
+    + Discovery.headerBytes
     + Map.size (sReaders s) * readerRecordBytes
     + maybe 0 (const activeRecordBytes) (sActive s)
 
@@ -372,20 +378,39 @@ planMaintenance = planMaintenanceWith standardBounds
 planMaintenanceWith ∷ Bounds → Store → Window → Planned
 planMaintenanceWith bounds s = planReclaimWith bounds (sCfg s) (sIdent s) (sRoots s) (oldestPin s)
 
+-- | Why a window cannot be used for a store or a pinned version.
+data WindowRefusal
+  = -- | The window was made for another arena or source.
+    WindowOfAnotherStore
+  | -- | The window was filled for another version: the window's, the one asked for.
+    WindowOfAnotherVersion !Word64 !Word64
+  deriving stock (Eq, Show)
+
+windowRefusal ∷ StoreIdentity → Word64 → Window → Maybe WindowRefusal
+windowRefusal ident version win
+  | windowIdentity win /= ident = Just WindowOfAnotherStore
+  | windowVersion win /= version = Just (WindowOfAnotherVersion (windowVersion win) version)
+  | otherwise = Nothing
+
+-- | A window for the committed version of the store.
+storeWindow ∷ Store → Window
+storeWindow s = emptyWindow (sIdent s) (rVersion (sRoots s))
+
 -- | The provider #661's operations read the committed records through. A record the
--- window cannot supply is 'Unavailable', never absent.
-providerAt ∷ Store → Window → Provider
-providerAt s win = providerFor win (committedRoot s)
+-- window cannot supply is 'Unavailable', never absent. A window of another store or
+-- version is refused, never read.
+providerAt ∷ Store → Window → Either WindowRefusal Provider
+providerAt s win = maybe (Right (providerFor win (committedRoot s))) Left (windowRefusal (sIdent s) (rVersion (sRoots s)) win)
 
 -- | Why a record is unavailable: the page to fetch, or an integrity failure.
-missingAt ∷ Store → Window → RecordKey → Either IntegrityWhy (Maybe PageNo)
-missingAt s win = missingPage win (committedRoot s)
+missingAt ∷ Store → Window → RecordKey → Either WindowRefusal (Either IntegrityWhy (Maybe PageNo))
+missingAt s win key = maybe (Right (missingPage win (committedRoot s) key)) Left (windowRefusal (sIdent s) (rVersion (sRoots s)) win)
 
 -- | Plan the removal of one whole cell with its minimum connection obligation, as
 -- one candidate. Removing air or an already removed cell is 'NoWork'.
 planRemoval ∷ Env → Store → Window → TileCoord → Planned
-planRemoval env s win tile =
-  case stageRemoval env (rHeader (sRoots s)) (providerAt s win) (editAllowance env) tile of
+planRemoval env s win tile = withWindow s win $ \prov →
+  case stageRemoval env (rHeader (sRoots s)) prov (editAllowance env) tile of
     Left refusal → Refused (refusalOf refusal)
     Right NoChange → NoWork
     Right (EditSuspended key) → suspended s win key
@@ -401,18 +426,18 @@ planDiscovery = planDiscoveryWith standardBounds
 
 -- | 'planDiscovery' under given bounds.
 planDiscoveryWith ∷ Bounds → Env → Store → Window → Planned
-planDiscoveryWith bounds env s win = go (allowWrites full) (8 ∷ Int)
+planDiscoveryWith bounds env s win = withWindow s win $ \prov → go prov (allowWrites full) (8 ∷ Int)
   where
     full = allowanceOf (envLimits env)
-    go writes tries =
-      case stepDiscovery env (rHeader (sRoots s)) (providerAt s win) full {allowWrites = writes} of
+    go prov writes tries =
+      case stepDiscovery env (rHeader (sRoots s)) prov full {allowWrites = writes} of
         Left refusal → Refused (refusalOf refusal)
         Right Idle → NoWork
         Right (Stalled key) → suspended s win key
         Right (Progress cand _) → case planDeltaWith bounds (sCfg s) (sIdent s) (sRoots s) win Ordinary (deltaOf cand) of
           Refused why
             | tries > 0 && tooBig why && reportWrites (candidateReport cand) > 1 →
-                go (max worstEdgeWritesMin (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
+                go prov (max worstEdgeWritesMin (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
           other → other
     tooBig (Capacity (TxnPagesExceeded _)) = True
     tooBig (Capacity (TxnRamExceeded _)) = True
@@ -423,11 +448,20 @@ planDiscoveryWith bounds env s win = go (allowWrites full) (8 ∷ Int)
 editAllowance ∷ Env → Allowance
 editAllowance = allowanceOf . envLimits
 
+-- | Run a planner over the committed provider, refusing a window of another store or
+-- version before anything is read.
+withWindow ∷ Store → Window → (Provider → Planned) → Planned
+withWindow s win f = case windowRefusal (sIdent s) (rVersion (sRoots s)) win of
+  Just WindowOfAnotherStore → Refused (Stale ForeignWindow)
+  Just (WindowOfAnotherVersion a b) → Refused (Stale (StaleWindow a b))
+  Nothing → f (providerFor win (committedRoot s))
+
 suspended ∷ Store → Window → RecordKey → Planned
 suspended s win key = case missingAt s win key of
-  Right (Just p) → Pending p
-  Right Nothing → Refused (Integrity CorruptCounters)
-  Left why → Refused (Integrity why)
+  Right (Right (Just p)) → Pending p
+  Right (Right Nothing) → Refused (Integrity CorruptCounters)
+  Right (Left why) → Refused (Integrity why)
+  Left _ → Refused (Stale ForeignWindow)
 
 refusalOf ∷ Refusal → PlanRefusal
 refusalOf = refusalToPlan
@@ -460,7 +494,7 @@ admit plan s
   | Just c ← blocking = Left (Paused c)
   | claim > availablePages (sCfg s) (plClass plan) (sRoots s) = Left (NoCapacity claim (availablePages (sCfg s) (plClass plan) (sRoots s)))
   | otherwise =
-      let tid = TxnId (sNextTxn s)
+      let tid = TxnId (sIdent s) (sNextTxn s)
           pages = Map.fromList [(p, PsStaged) | (p, _) ← plPages plan]
        in Right (tid, s {sActive = Just (Active tid plan pages False), sNextTxn = sNextTxn s + 1})
   where
@@ -689,7 +723,7 @@ readerVersion s tok = pinVersion <$> pinsOf s tok
 
 -- | An empty window for a reader's version.
 readerWindow ∷ Store → ReaderToken → Either StaleReader Window
-readerWindow s tok = emptyWindow . pinVersion <$> pinsOf s tok
+readerWindow s tok = emptyWindow (sIdent s) . pinVersion <$> pinsOf s tok
 
 rootsOfPins ∷ Pins → TreeId → Maybe PageNo
 rootsOfPins p TreeRuns = pinRuns p
@@ -709,6 +743,8 @@ data ReadOutcome a
     ReadCorrupt !IntegrityWhy
   | -- | The token is not a live pin of this store.
     ReadStale
+  | -- | The window was made for another store or another version than the pin's.
+    ReadWrongWindow !WindowRefusal
   deriving stock (Eq, Show)
 
 readOutcome ∷ Either Stop a → ReadOutcome a
@@ -717,36 +753,49 @@ readOutcome (Left (Need p)) = ReadNeeds p
 readOutcome (Left (Bad err p)) = ReadCorrupt (BadPage err p)
 readOutcome (Left (TooTall t)) = ReadCorrupt (BrokenInvariant t)
 readOutcome (Left (Invariant t)) = ReadCorrupt (BrokenInvariant t)
+readOutcome (Left (Over _)) = ReadCorrupt CorruptCounters
 
-withPins ∷ Store → ReaderToken → (Pins → Either Stop a) → ReadOutcome a
-withPins s tok f = case pinsOf s tok of
+-- | Run a read against a pinned version, refusing a dead token and a window of another
+-- store or version before any page is read.
+withPins ∷ Store → ReaderToken → Window → (Pins → Either Stop a) → ReadOutcome a
+withPins s tok win f = case pinsOf s tok of
   Left StaleReader → ReadStale
-  Right p → readOutcome (f p)
+  Right p → case windowRefusal (sIdent s) (pinVersion p) win of
+    Just w → ReadWrongWindow w
+    Nothing → readOutcome (f p)
 
 -- | The pinned record for a key.
 readerLookup ∷ Store → ReaderToken → Window → RecordKey → ReadOutcome (Maybe Record)
-readerLookup s tok win key = withPins s tok (\p → lookupRecord win (rootsOfPins p) key)
+readerLookup s tok win key = withPins s tok win (\p → lookupRecord win (rootsOfPins p) key)
 
 -- | The pinned removed run of a column at or below a level.
 readerFloorRun ∷ Store → ReaderToken → Window → Column → Int64 → ReadOutcome (Maybe (Int64, Int64))
-readerFloorRun s tok win col z = withPins s tok (\p → floorRun win (rootsOfPins p) col z)
+readerFloorRun s tok win col z = withPins s tok win (\p → floorRun win (rootsOfPins p) col z)
 
 -- | A bounded ordered read of one record tree from a start (a key, or strictly after
 -- one): at most 'maxRangeRecords' records, each costing one bounded successor lookup.
 readerRange ∷ Store → ReaderToken → Window → TreeId → RangeStart → Int → ReadOutcome [(RecordKey, Record)]
-readerRange s tok win tree start limit = withPins s tok (\p → rangeRecords win (rootsOfPins p) tree start (min limit maxRangeRecords))
+readerRange s tok win tree start limit = withPins s tok win (\p → rangeRecords win (rootsOfPins p) tree start (min limit maxRangeRecords))
 
 -- | The most records one ranged read returns.
 maxRangeRecords ∷ Int
 maxRangeRecords = 256
 
+-- | Why a pinned provider or lookup could not be made.
+data PinRefusal = PinStale | PinWindow !WindowRefusal
+  deriving stock (Eq, Show)
+
 -- | The provider over a pinned version.
-readerProviderFor ∷ Store → ReaderToken → Window → Either StaleReader Provider
-readerProviderFor s tok win = (\p → providerFor win (rootsOfPins p)) <$> pinsOf s tok
+readerProviderFor ∷ Store → ReaderToken → Window → Either PinRefusal Provider
+readerProviderFor s tok win = do
+  p ← either (const (Left PinStale)) Right (pinsOf s tok)
+  maybe (Right (providerFor win (rootsOfPins p))) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
 
 -- | Why a pinned record is unavailable: the page to fetch, or an integrity failure.
-readerMissing ∷ Store → ReaderToken → Window → RecordKey → Either StaleReader (Either IntegrityWhy (Maybe PageNo))
-readerMissing s tok win key = (\p → missingPage win (rootsOfPins p) key) <$> pinsOf s tok
+readerMissing ∷ Store → ReaderToken → Window → RecordKey → Either PinRefusal (Either IntegrityWhy (Maybe PageNo))
+readerMissing s tok win key = do
+  p ← either (const (Left PinStale)) Right (pinsOf s tok)
+  maybe (Right (missingPage win (rootsOfPins p) key)) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
 
 -- ---------------------------------------------------------------------------
 -- Growth
@@ -868,7 +917,9 @@ minimumRemovalPages = worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bo
 minimumRemovalRam ∷ Int
 minimumRemovalRam =
   minimumRemovalPages * pageSize
-    + maxWindowPages * windowPageBytes
+    + maxWindowBytes
+    + overlayWorstBytes
+    + 2 * hotNodes * hotNodeBytes
     + worstEditWrites * maxEntryBytes
     + maxWindowPages * 16
     + rootRecordBytes
