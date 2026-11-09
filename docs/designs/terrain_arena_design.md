@@ -315,15 +315,29 @@ approved body SHA-256:
 The manager arranges fresh readiness review; this revision is not implementation
 or amended Q-13 qualification.
 
+**TRA-17 atlas amendment v1 applied 2026-11-09:** [#659] now carries the
+[owner-decision amendment](https://github.com/coghex/hetoimasia/issues/659#issuecomment-6731497615),
+marker `owner-decision:659-atlas-regions-d61-v1`. Verified `het-manager`
+sign-off `vq4c36nz8dv9bpm6f3kja3ivew` approved draft SHA-256
+`fbadf840d53726857680fc1f1e68468951b18904fa013e425283f7762ced8310`.
+The manager's subsequent `request-user-het-terrain-20261106-1838-apply659-prompt.txt`
+directs a comment amendment instead of editing the approved body and restores
+the docs turn. The comment reproduces that draft verbatim under its scoped
+supersession heading; comment SHA-256:
+`c7f362568980a864d2a7f583fcfa3076ce2c3b157867e79601d726d0ea56d31f`.
+The original body and tracker metadata remain unchanged. This records D-61/P-17
+on the issue; the manager arranges fresh re-approval. It proves no implementation
+or GPU result, and does not revise #645/#646/#647 by implication.
+
 **Amendment processing cursor:** new-child filing is complete. The first
-#645/#646 revisions are applied; #647 has a pending draft. D-61 supersedes
-their whole-texture assumptions. Draft the #659 atlas amendment first, then
-finalize #645, #646 and #647, followed by #648 and other remaining P-16
-artifacts. Each complete body/diff needs separate manager sign-off before
-mutation. The manager arranges readiness reviews. Atlas dispatch is
-`request-user-het-terrain-20261106-1838-atlas-revisions-prompt.txt`, following
-verified #het-terrain relays `apa6ni3b85xr2pt5n4etv5fxr6`,
-`zhzz9jn6sd266g5zcaf78kpwyw` and `e6r3r49zqqj667kiz2hynspr9e`.
+#645/#646 revisions are applied, #659's atlas amendment is posted, and #647
+has a pending draft. The manager's 2026-11-09 apply659 dispatch selects
+**#647's texture clauses next**: finish the full draft with D-61/P-17 atlases
+and #672's byte-only admission, then obtain separate manager sign-off before
+mutation. #645/#646's atlas follow-ups and #648/other remaining P-16 artifacts
+remain outstanding unless separately confirmed; this cursor does not mark
+them complete. The manager arranges readiness reviews. The earlier atlas
+sequence is superseded only by this explicit next-artifact instruction.
 
 ## Epic contract
 
