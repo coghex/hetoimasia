@@ -225,9 +225,12 @@ digests every atlas name and extent and every identity with its rectangle.
 `Hetoimasia.Asset.Image.Region` (asset-image) is the neutral primitive: a
 `RegionView` is a checked rectangle of **one shared coverage plane per loaded
 parent**, never copied per region, quad or cell. The local texel is chosen in the
-region's own extent, `i = min (w - 1) (floor (clamp u 0 1 * w))`, and only then is
-the origin added, so an interior boundary selects the higher texel, the outer edge
-the region's last, and a region never reads a neighbour. `Assets` holds a region
+region's own extent, `i = min (w - 1) (floor (clamp u 0 1 * w + 1/128))` (the owner's
+2026-11-09 Q-13 amendment v2; `texelBias` in the region primitive is its one
+definition, used by the shader's colour and normal samples, CPU coverage and picking
+and the expected model), and only then is the origin added, so an interior boundary
+selects the higher texel, the outer edge the region's last, and a region never reads
+a neighbour. `Assets` holds a region
 for each colour and map; its identity folds in the parent version, the rectangle,
 the layout identity, the parent extent and the normal profile, so a rectangle
 change on the same parent invalidates a stale identity. `AtlasAssets` builds the
@@ -546,8 +549,9 @@ centre**, from the nearest quad to the farthest. A quad **contains** the centre
 under the left-and-top half-open rule (left and top edges inside, right and bottom
 outside); the two triangles' shared diagonal is inside the rectangle, so a centre on
 it is covered, and a centre on an outer edge shared by two quads belongs to exactly
-one. The texel is `min (n - 1) (floor (u * n))` with `u` the exact rational position
-across the drawn rectangle (an interior boundary selects the higher index). The quad
+one. The texel is `min (n - 1) (floor (u * n + 1/128))` with `u` the exact rational
+position across the drawn rectangle (an interior boundary selects the higher index, as
+does a position within 1/128 texel below it). The quad
 covers the centre when the texel is covered in **both** its colour plane and its
 map plane (colour alpha times map alpha at 0.5 for binary alpha); lighting, haze and
 darkening play no part; nothing is sampled outside the rectangle because UVs clamp.
