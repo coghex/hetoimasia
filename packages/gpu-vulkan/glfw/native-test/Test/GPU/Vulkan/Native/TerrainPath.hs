@@ -932,8 +932,11 @@ data PassBand = PassBand
   , pbEligible ∷ !Bool
   , pbUndecided ∷ !Int
   , pbCovered ∷ !Int
-  , pbMargin ∷ !(Maybe (Double, Double))
+  , pbMargin ∷ !MarginRecord
   }
+
+-- | A pass's raster margin as recorded.
+data MarginRecord = MarginNotEligible | MarginIs !Double !Double | MarginUncomputable
 
 -- | A pick as the judge compares it: nothing selectable, or a known cell and the part of it.
 data PickSummary = SNoHit | SLoading | SHit (Integer, Integer, Integer) Role
@@ -1158,11 +1161,14 @@ renderSnapshot ctx s parts = do
             _ → []
           passBands =
             [ PassBand
-                { pbBand = fromRational (undecidedBand bits (partScene part)) ∷ Double
+                { pbBand = fromRational (undecidedBand bits (partPlan part)) ∷ Double
                 , pbEligible = deviceEligible bits (partScene part) (partCamera part) (partPlan part)
                 , pbUndecided = indAmbiguous one'
                 , pbCovered = indCovered one'
-                , pbMargin = fmap (\(m, e) → (fromRational m ∷ Double, fromRational e ∷ Double)) (rasterMargin bits (partScene part) (partCamera part) (partPlan part))
+                , pbMargin = case rasterMargin bits (partScene part) (partCamera part) (partPlan part) of
+                    NotEligible → MarginNotEligible
+                    Margin m e → MarginIs (fromRational m ∷ Double) (fromRational e ∷ Double)
+                    Uncomputable → MarginUncomputable
                 }
             | (part, one') ← zip parts independents
             ]
@@ -1171,9 +1177,12 @@ renderSnapshot ctx s parts = do
           -- vertex quantisation can move them (never banded: the band covers texel thresholds only).
           rasterProblems =
             [ "pass " <> show pass <> ": a quad edge lies " <> show margin <> " pixels from a pixel centre, within the " <> show epsilon <> " the vertex quantisation can move it: redesign the pass (it is never banded)"
-            | (pass, PassBand {pbMargin = Just (margin, epsilon)}) ← zip [0 ∷ Int ..] passBands
+            | (pass, PassBand {pbMargin = MarginIs margin epsilon}) ← zip [0 ∷ Int ..] passBands
             , margin <= epsilon
             ]
+              <> [ "pass " <> show pass <> " is eligible for the device band but its raster margin could not be computed: an eligible pass without an established margin fails"
+                 | (pass, PassBand {pbMargin = MarginUncomputable}) ← zip [0 ∷ Int ..] passBands
+                 ]
           readbackMissing = not (completeReadback (map (sceneTarget . partScene) parts) (resultProbes result))
           problems
             | readbackMissing = [maybe "the readback holds fewer pixels than the targets" Text.unpack (resultFailure result)]
@@ -1447,8 +1456,9 @@ writeRecord ctx format seconds results = do
                       , ("undecided", JNumber (show (pbUndecided pb)))
                       , ("covered", JNumber (show (pbCovered pb)))
                       , ("undecided_share_of_covered", JNumber (show (if pbCovered pb == 0 then 0 else fromIntegral (pbUndecided pb) / fromIntegral (pbCovered pb) ∷ Double)))
-                      , ("raster_margin_px", maybe JNull (JNumber . show . fst) (pbMargin pb))
-                      , ("raster_epsilon_px", maybe JNull (JNumber . show . snd) (pbMargin pb))
+                      , ("raster_margin_px", case pbMargin pb of MarginIs m _ → JNumber (show m); _ → JNull)
+                      , ("raster_epsilon_px", case pbMargin pb of MarginIs _ e → JNumber (show e); _ → JNull)
+                      , ("raster_margin_status", JString (case pbMargin pb of MarginNotEligible → "not eligible"; MarginIs {} → "established"; MarginUncomputable → "UNCOMPUTABLE"))
                       ]
                   | (pass, pb) ← zip [0 ∷ Int ..] (extraBand extra)
                   ]

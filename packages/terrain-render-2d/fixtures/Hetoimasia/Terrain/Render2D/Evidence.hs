@@ -68,6 +68,7 @@ module Hetoimasia.Terrain.Render2D.Evidence
   , expectedForDevice
   , undecidedBand
   , deviceEligible
+  , RasterMargin (..)
   , rasterMargin
   , loadingAt
   , pendingCells
@@ -102,7 +103,7 @@ import Hetoimasia.Terrain.Render2D.Camera
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Facts
 import Hetoimasia.Terrain.Render2D.Knowledge
-import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..), rvMapping, rvSetup)
+import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..), rvMapping, rvSetup, viewScale)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Source
 
@@ -514,62 +515,90 @@ expectedAt art light sc camera plan pixel = fst (decidedAt 0 0 art light sc came
 -- "texels that differ" is judged by: the declared tolerance for the independent judge, the oracle's own
 -- for its path.
 expectedForDevice ∷ Int → Int → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
-expectedForDevice bits tolerance art light sc camera plan pixel = case decidedAt (undecidedBand bits sc) tolerance art light sc camera plan pixel of
+expectedForDevice bits tolerance art light sc camera plan pixel = case decidedAt (undecidedBand bits plan) tolerance art light sc camera plan pixel of
   (_, True) | deviceEligible bits sc camera plan → Ambiguous "an interior texel threshold within the vertex-quantisation band"
   (expected, _) → expected
 
--- | The half-width of the device-undecided band in texels, @2^-(b+1) / s + 1/1000@ with @s@ the scene's
+-- | The half-width of the device-undecided band in texels, @2^-(b+1) / s + 1/1000@ with @s@ the pass's
 -- view scale in pixels per texel: the vertex-quantisation bound of the interpolated coordinate (half a
--- step of the @2^-b@ pixel grid) plus the 1/1000 texel of float arithmetic.
-undecidedBand ∷ Int → Scene → Rational
-undecidedBand bits sc = 1 / (2 ^ (bits + 1)) / viewScaleOf sc + 1 / 1000
+-- step of the @2^-b@ pixel grid) plus the 1/1000 texel of float arithmetic. The scale is read from the
+-- pass's ACTUAL world transform ('viewScale' of the plan's view: target pixels per render-world pixel,
+-- one render-world pixel being one texel), never rebuilt from a scene's zoom and content scale: these
+-- scenes use a pixels-per-unit mapping whose world transform is the camera zoom alone, and a content
+-- scale only changes the window-to-target conversion.
+undecidedBand ∷ Int → CellPlan → Rational
+undecidedBand bits plan = 1 / (2 ^ (bits + 1)) / passScale plan + 1 / 1000
 
--- | The scene's view scale, pixels per texel.
-viewScaleOf ∷ Scene → Rational
-viewScaleOf sc = toRational (sceneZoom sc * sceneScale sc)
+-- | The pass's view scale, pixels per texel, from its world transform.
+passScale ∷ CellPlan → Rational
+passScale = toRational . viewScale . cellPlanView
+
+-- | The render-world point of a TARGET point (pixels, any position: the viewport is not consulted, so an
+-- offset viewport has geometry too), through the view's own mapping.
+targetWorld ∷ CellPlan → (Rational, Rational) → Maybe (Rational, Rational)
+targetWorld plan (tx, ty) = case targetToWorld (rvMapping (cellPlanView plan)) (V2 (fromRational tx) (fromRational ty)) of
+  Just (V2 x y) → Just (toRational x, toRational y)
+  Nothing → Nothing
+
+-- | The quad vertices of a pass in target pixels: each canvas corner and its far corner, by the view's
+-- own mapping (the pixel-(0.5,0.5) and pixel-(1.5,0.5) points fix the offset and the scale exactly).
+-- 'Nothing' when the mapping cannot be inverted there.
+quadVertices ∷ Scene → CameraState → CellPlan → Maybe [(Rational, Rational)]
+quadVertices sc camera plan = case (targetWorld plan (1 / 2, 1 / 2), targetWorld plan (3 / 2, 1 / 2)) of
+  (Just (sx0, sy0), Just (sx1, _)) | sx1 /= sx0 →
+    let scale = 1 / (sx1 - sx0)
+        corners = [(0.5 + (fromInteger cx - sx0) * scale, 0.5 + (fromInteger cy - sy0) * scale) | q ← handQuads sc camera, let (cx, cy) = hqCorner q]
+     in Just (concat [[(x, y), (x + 96 * scale, y + 64 * scale)] | (x, y) ← corners])
+  _ → Nothing
 
 -- | Whether the device may read this scene's samples differently from the exact rule: it is unsnapped
 -- and at least one quad vertex (a canvas corner or its far corner) is off the @2^-b@ pixel grid, so the
 -- rasterizer's vertex quantisation moves the interpolated coordinate. Decided from the exact geometry
--- (the corner of every quad in pixels, by the view's own mapping), not from a flag a fixture sets.
+-- (the corner of every quad in pixels, by the view's own mapping), not from a flag a fixture sets. A pass
+-- whose geometry cannot be computed is eligible (nothing is assumed exact).
 deviceEligible ∷ Int → Scene → CameraState → CellPlan → Bool
 deviceEligible bits sc camera plan
   | sceneSnap sc = False
-  | otherwise = case (pixelWorldPoint plan (0, 0), pixelWorldPoint plan (1, 0)) of
-      (Just (sx0, sy0), Just (sx1, _)) →
-        let scale = 1 / (sx1 - sx0)
-            onGrid v = denominator v `divides` (2 ^ bits)
+  | otherwise = case quadVertices sc camera plan of
+      Just vertices →
+        let onGrid v = denominator v `divides` (2 ^ bits)
             divides d n = n `mod` d == 0
-            corners = [(0.5 + (cx - sx0) * scale, 0.5 + (cy - sy0) * scale) | q ← handQuads sc camera, let (cx0, cy0) = hqCorner q, let cx = fromInteger cx0, let cy = fromInteger cy0]
-            vertices = concat [[(x, y), (x + 96 * scale, y + 64 * scale)] | (x, y) ← corners]
          in any (\(x, y) → not (onGrid x && onGrid y)) vertices
-      _ → True
+      Nothing → True
 
--- | For an eligible pass, the smallest distance in target pixels from any quad edge that reaches the
--- target to the nearest pixel centre on its axis, and the vertex-movement it must exceed:
--- @epsilon = 2^-(b+1) + s/1000@ pixels, the most the rasterizer's vertex quantisation (and the float
--- noise) can move a vertex, which is @delta * s@ for the band @delta@. A quad edge nearer a pixel centre
--- than that can change which side of the edge the centre falls on, so the pass's raster ownership is not
--- decided by the exact model; such a fixture is redesigned (never banded: the band covers interior texel
--- thresholds only). The shared diagonal of a quad's two triangles needs no such margin: a pixel centre on
--- it is covered by exactly one of the two triangles, so the quad's coverage and colour do not change.
--- 'Nothing' for a pass that is not eligible (snapped, or every vertex on the grid): nothing moves.
-rasterMargin ∷ Int → Scene → CameraState → CellPlan → Maybe (Rational, Rational)
+-- | The raster margin of a pass (amendment v3): for an eligible pass, the smallest distance in target
+-- pixels from any quad edge that reaches the target to the nearest pixel centre on its axis, and the
+-- vertex-movement it must exceed, @epsilon = 2^-(b+1) + s/1000@ pixels (@delta * s@ for the band
+-- @delta@). A quad edge nearer a pixel centre than that can change which side of the edge the centre falls
+-- on, so the pass's raster ownership is not decided by the exact model; such a fixture is redesigned
+-- (never banded: the band covers interior texel thresholds only). The shared diagonal of a quad's two
+-- triangles needs no such margin: a pixel centre on it is covered by exactly one of the two triangles, so
+-- the quad's coverage and colour do not change.
+data RasterMargin
+  = -- | Snapped, or every vertex on the grid: nothing moves.
+    NotEligible
+  | -- | The smallest edge-to-centre distance and the epsilon it must exceed.
+    Margin !Rational !Rational
+  | -- | An ELIGIBLE pass whose margin cannot be established: a failure, never a pass.
+    Uncomputable
+
+rasterMargin ∷ Int → Scene → CameraState → CellPlan → RasterMargin
 rasterMargin bits sc camera plan
-  | not (deviceEligible bits sc camera plan) = Nothing
-  | otherwise = case (pixelWorldPoint plan (0, 0), pixelWorldPoint plan (1, 0)) of
-      (Just (sx0, sy0), Just (sx1, _)) →
-        let scale = 1 / (sx1 - sx0)
-            (w, h) = sceneTarget sc
-            epsilon = 1 / (2 ^ (bits + 1)) + scale / 1000
-            quadsPx = [(0.5 + (fromInteger cx - sx0) * scale, 0.5 + (fromInteger cy - sy0) * scale) | q ← handQuads sc camera, let (cx, cy) = hqCorner q]
-            edgesX = concat [[x, x + 96 * scale] | (x, y) ← quadsPx, y + 64 * scale >= negate epsilon, y <= fromIntegral h + epsilon]
-            edgesY = concat [[y, y + 64 * scale] | (x, y) ← quadsPx, x + 96 * scale >= negate epsilon, x <= fromIntegral w + epsilon]
+  | not (deviceEligible bits sc camera plan) = NotEligible
+  | otherwise = case quadVertices sc camera plan of
+      Nothing → Uncomputable
+      Just vertices →
+        let (w, h) = sceneTarget sc
+            epsilon = 1 / (2 ^ (bits + 1)) + passScale plan / 1000
+            pairs (a : b : rest) = (a, b) : pairs rest
+            pairs _ = []
+            quads = pairs vertices
+            edgesX = concat [[x0, x1] | ((x0, y0), (x1, y1)) ← quads, y1 >= negate epsilon, y0 <= fromIntegral h + epsilon]
+            edgesY = concat [[y0, y1] | ((x0, y0), (x1, y1)) ← quads, x1 >= negate epsilon, x0 <= fromIntegral w + epsilon]
             distanceToCentre e = abs (e - 1 / 2 - fromInteger (round (e - 1 / 2)))
-            inTarget lo hi e = e >= negate epsilon && e <= hi && lo <= e
-            nearest = minimum (1 : [distanceToCentre e | e ← edgesX, inTarget 0 (fromIntegral w) e] <> [distanceToCentre e | e ← edgesY, inTarget 0 (fromIntegral h) e])
-         in Just (nearest, epsilon)
-      _ → Nothing
+            inTarget hi e = e >= negate epsilon && e <= hi
+            nearest = minimum (1 : [distanceToCentre e | e ← edgesX, inTarget (fromIntegral w) e] <> [distanceToCentre e | e ← edgesY, inTarget (fromIntegral h) e])
+         in Margin nearest epsilon
 
 -- | The exact expectation and whether any quad it examined has a texel offset within the band of an
 -- interior threshold.

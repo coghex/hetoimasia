@@ -80,13 +80,28 @@ spec = describe "Expectation" $ do
       differing `shouldSatisfy` (> 50)
   it "sets the device's undecided band from the vertex quantisation and exempts only unsnapped scenes with an off-grid vertex" $ do
     (_, assets, _) ← setupAll
+    -- delta = 2^-(b+1) / s + 1/1000 texel, with s the pass's ACTUAL view scale (its world transform):
+    -- at scale 3/16 and b = 4 it is 1/6 + 1/1000.
+    let band bits scene = do
+          plan ← either (\e → fail (show e)) pure (scenePlan assets scene)
+          pure (undecidedBand bits plan)
+    band 4 (atZoom 0.1875 (rampsCorners FaceSouth)) >>= (`shouldBe` (1 / 6 + 1 / 1000))
+    band 4 (snappedAt "8" 8) >>= (`shouldBe` (1 / 256 + 1 / 1000))
+    band 8 (atZoom 0.5 (rampsCorners FaceSouth)) >>= (`shouldBe` (1 / 256 + 1 / 1000))
+    -- A non-unit content scale changes the window-to-target conversion, not the world transform: the scale
+    -- of a pass at zoom 1/8 and content scale 2 is 1/8, so delta at b = 8 is 0.016625, not the 0.0088125 a
+    -- zoom-times-content-scale product would give.
+    band 8 scaledTarget {sceneZoom = 0.125} >>= (`shouldBe` (1 / 512 / (1 / 8) + 1 / 1000))
+    -- At zoom 1 and content scale 2 the world scale is 1, not 2: delta = 2^-9 + 1/1000.
+    band 8 scaledTarget >>= (`shouldBe` (1 / 512 + 1 / 1000))
+    -- An eligible pass has an established margin even when the viewport is offset from the corner.
+    offsetPlan ← either (\e → fail (show e)) pure (scenePlan assets (viewportOffset 0.125))
+    case rasterMargin 8 (viewportOffset 0.125) (sceneCameraFollowed (viewportOffset 0.125)) offsetPlan of
+      Margin _ _ → pure ()
+      other → expectationFailure ("the offset-viewport pass has no established raster margin: " <> (case other of NotEligible → "not eligible"; _ → "uncomputable"))
     let eligible bits scene = do
           plan ← either (\e → fail (show e)) pure (scenePlan assets scene)
           pure (deviceEligible bits scene (sceneCameraFollowed scene) plan)
-    -- delta = 2^-(b+1) / s + 1/1000 texel: at scale 3/16 and b = 4 it is 1/6 + 1/1000.
-    undecidedBand 4 (atZoom 0.1875 (rampsCorners FaceSouth)) `shouldBe` 1 / 6 + 1 / 1000
-    undecidedBand 4 (snappedAt "8" 8) `shouldBe` 1 / 256 + 1 / 1000
-    undecidedBand 8 (atZoom 0.5 (rampsCorners FaceSouth)) `shouldBe` 1 / 256 + 1 / 1000
     -- Eligible: an unsnapped scene whose vertices are off the 2^-b pixel grid (a fractional pan or scale).
     eligible 4 (atZoom 0.1875 (rampsCorners FaceSouth)) >>= (`shouldBe` True)
     eligible 4 (atZoom 0.125 (rampsCorners FaceEast)) >>= (`shouldBe` True)
