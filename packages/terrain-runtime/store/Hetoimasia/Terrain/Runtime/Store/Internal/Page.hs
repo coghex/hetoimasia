@@ -51,6 +51,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Page
   , bodyBytes
   , entryBytes
   , innerEntryBytes
+  , innerKeyBytes
+  , innerEntryTail
   , encodePage
   , decodePage
   , bodyOfValid
@@ -103,9 +105,20 @@ data Page = Page
 entryBytes ∷ (ByteString, ByteString) → Int
 entryBytes (k, v) = 2 + BS.length k + BS.length v
 
+-- | The bytes one internal entry takes in a page, given its key: the one-byte key length, the key, the
+-- child's page number (8) and the child's checksum (4). This is the ONE definition of the encoded size of an
+-- internal entry: every sizing decision (split, merge, redistribution, the accounting of a node) uses it,
+-- and the encoder and decoder of the page are held to it by the codec suite.
+innerKeyBytes ∷ ByteString → Int
+innerKeyBytes k = 1 + BS.length k + innerEntryTail
+
+-- | What follows the key in an internal entry: the child's page number and checksum.
+innerEntryTail ∷ Int
+innerEntryTail = 8 + 4
+
 -- | The bytes one internal entry takes.
 innerEntryBytes ∷ (ByteString, Child) → Int
-innerEntryBytes (k, _) = 1 + BS.length k + 12
+innerEntryBytes (k, _) = innerKeyBytes k
 
 -- | The payload bytes of a body.
 bodyBytes ∷ Body → Int
@@ -228,13 +241,13 @@ decodePage ident total expected bs
         go k rest acc = case BS.uncons rest of
           Just (kl, body)
             | kl < 1 || fromIntegral kl > maxKeyBytes → Left (KeyLength (fromIntegral kl))
-            | BS.length body < fromIntegral kl + 12 → Left (BadLength (BS.length rest))
+            | BS.length body < fromIntegral kl + innerEntryTail → Left (BadLength (BS.length rest))
             | otherwise →
                 let key = BS.take (fromIntegral kl) body
                     child = PageNo (getLe64 body (fromIntegral kl))
                     crc = getLe32 body (fromIntegral kl + 8)
                  in if refOk self child
-                      then go (k - 1 ∷ Int) (BS.drop (fromIntegral kl + 12) body) ((key, Child child crc) : acc)
+                      then go (k - 1 ∷ Int) (BS.drop (fromIntegral kl + innerEntryTail) body) ((key, Child child crc) : acc)
                       else Left (BadReference child)
           Nothing → Left (BadLength 0)
     listEntries self n payload
@@ -270,7 +283,7 @@ bodyOfValid bs = case BS.index bs 6 of
     inner 0 _ = []
     inner n p = case BS.uncons p of
       Just (kl, body) →
-        (BS.take (fromIntegral kl) body, Child (PageNo (getLe64 body (fromIntegral kl))) (getLe32 body (fromIntegral kl + 8))) : inner (n - 1 ∷ Int) (BS.drop (fromIntegral kl + 12) body)
+        (BS.take (fromIntegral kl) body, Child (PageNo (getLe64 body (fromIntegral kl))) (getLe32 body (fromIntegral kl + 8))) : inner (n - 1 ∷ Int) (BS.drop (fromIntegral kl + innerEntryTail) body)
       Nothing → []
 
 -- | A node's entries packed into one byte string (the form an overlay page is kept in):

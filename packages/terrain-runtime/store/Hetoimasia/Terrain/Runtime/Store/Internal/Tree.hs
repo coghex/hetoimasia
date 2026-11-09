@@ -716,7 +716,8 @@ freshNode e i = case lookup i (eFreshHot e) of
 packedBytes ∷ Node → Int
 packedBytes (Node _ _ body) = overlayNodeBytes (case body of
   NLeaf es → sum [2 + BS.length k + BS.length v | (k, v) ← es]
-  NInner es → sum [1 + BS.length k + 13 | (k, _) ← es])
+  -- the page's entry and one byte more for the tag of the reference it is packed with
+  NInner es → sum [innerKeyBytes k + 1 | (k, _) ← es])
 
 -- | Set a new page, accounting its packed bytes and refusing the plan when the new
 -- pages would hold more than the budget. The page is kept parsed in a small hot set;
@@ -770,7 +771,7 @@ discard (Disk p) = do
 
 bodyBytesOf ∷ NBody → Int
 bodyBytesOf (NLeaf es) = sum (map entryBytes es)
-bodyBytesOf (NInner es) = sum [1 + BS.length k + 12 | (k, _) ← es]
+bodyBytesOf (NInner es) = sum [innerKeyBytes k | (k, _) ← es]
 
 nodeBytesOf ∷ Node → Int
 nodeBytesOf = bodyBytesOf . nBody
@@ -855,7 +856,7 @@ insertKey tree root k v = do
             Nothing → stop (Invariant tree)
             Just (l, r@((sk, _) : _)) → twoNodes ref n (NLeaf l) (NLeaf r) sk
             Just _ → stop (Invariant tree)
-          NInner es → case splitEven (\(sk, _) → 1 + BS.length sk + 12) es of
+          NInner es → case splitEven (innerKeyBytes . fst) es of
             Nothing → stop (Invariant tree)
             Just (l, r@((sk, _) : _)) → twoNodes ref n (NInner l) (NInner r) sk
             Just _ → stop (Invariant tree)
@@ -943,7 +944,7 @@ deleteKey tree root@(Just r0) k = do
             Left xs → case packEntries entryBytes xs of
               Nothing → Nothing
               Just parts → Just (map NLeaf parts)
-            Right xs → case packEntries (\(sk, _) → 1 + BS.length sk + 8) xs of
+            Right xs → case packEntries (innerKeyBytes . fst) xs of
               Nothing → Nothing
               Just parts → Just (map NInner parts)
       case repacked of
