@@ -68,6 +68,7 @@ module Hetoimasia.Terrain.Render2D.Evidence
   , expectedForDevice
   , undecidedBand
   , deviceEligible
+  , rasterMargin
   , loadingAt
   , pendingCells
   , expectedImage
@@ -84,6 +85,7 @@ module Hetoimasia.Terrain.Render2D.Evidence
 
 import qualified Data.Map.Strict as Map
 import Data.List (nub, sortOn)
+import Data.Maybe (mapMaybe)
 import Data.Ord (Down (..))
 import Data.Ratio (denominator)
 import Data.Word (Word8)
@@ -541,6 +543,32 @@ deviceEligible bits sc camera plan
          in any (\(x, y) → not (onGrid x && onGrid y)) vertices
       _ → True
 
+-- | For an eligible pass, the smallest distance in target pixels from any quad edge that reaches the
+-- target to the nearest pixel centre on its axis, and the vertex-movement it must exceed:
+-- @epsilon = 2^-(b+1) + s/1000@ pixels, the most the rasterizer's vertex quantisation (and the float
+-- noise) can move a vertex, which is @delta * s@ for the band @delta@. A quad edge nearer a pixel centre
+-- than that can change which side of the edge the centre falls on, so the pass's raster ownership is not
+-- decided by the exact model; such a fixture is redesigned (never banded: the band covers interior texel
+-- thresholds only). The shared diagonal of a quad's two triangles needs no such margin: a pixel centre on
+-- it is covered by exactly one of the two triangles, so the quad's coverage and colour do not change.
+-- 'Nothing' for a pass that is not eligible (snapped, or every vertex on the grid): nothing moves.
+rasterMargin ∷ Int → Scene → CameraState → CellPlan → Maybe (Rational, Rational)
+rasterMargin bits sc camera plan
+  | not (deviceEligible bits sc camera plan) = Nothing
+  | otherwise = case (pixelWorldPoint plan (0, 0), pixelWorldPoint plan (1, 0)) of
+      (Just (sx0, sy0), Just (sx1, _)) →
+        let scale = 1 / (sx1 - sx0)
+            (w, h) = sceneTarget sc
+            epsilon = 1 / (2 ^ (bits + 1)) + scale / 1000
+            quadsPx = [(0.5 + (fromInteger cx - sx0) * scale, 0.5 + (fromInteger cy - sy0) * scale) | q ← handQuads sc camera, let (cx, cy) = hqCorner q]
+            edgesX = concat [[x, x + 96 * scale] | (x, y) ← quadsPx, y + 64 * scale >= negate epsilon, y <= fromIntegral h + epsilon]
+            edgesY = concat [[y, y + 64 * scale] | (x, y) ← quadsPx, x + 96 * scale >= negate epsilon, x <= fromIntegral w + epsilon]
+            distanceToCentre e = abs (e - 1 / 2 - fromInteger (round (e - 1 / 2)))
+            inTarget lo hi e = e >= negate epsilon && e <= hi && lo <= e
+            nearest = minimum (1 : [distanceToCentre e | e ← edgesX, inTarget 0 (fromIntegral w) e] <> [distanceToCentre e | e ← edgesY, inTarget 0 (fromIntegral h) e])
+         in Just (nearest, epsilon)
+      _ → Nothing
+
 -- | The exact expectation and whether any quad it examined has a texel offset within the band of an
 -- interior threshold.
 decidedAt ∷ Rational → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → (Expected, Bool)
@@ -563,7 +591,7 @@ decidedAt band art light sc camera plan pixel = case pixelWorldPoint plan pixel 
           fv = sy - fromInteger cy
        in case (texelOf 96 fu, texelOf 64 fv) of
             (Just u, Just v) →
-              let banded' = banded || nearInterior band 96 fu || nearInterior band 64 fv
+              let banded' = banded || outcomeDiffers q fu fv u v
                   (cr, cg, cb, ca) = artColour art (hqColour q) u v
                   (mr, mg, mb, ma) = artMap art (hqMap q) u v
                in if ca == 0 || ma == 0
@@ -572,6 +600,26 @@ decidedAt band art light sc camera plan pixel = case pixelWorldPoint plan pixel 
                       let shaded = handShade light count (srgbDecode cr, srgbDecode cg, srgbDecode cb) (mr, mg, mb) (hqDepth q)
                        in (ExpectedHit {expectedFront = q, expectedSkipped = skipped, expectedBehind = [b | b ← rest, covers sx sy b], expectedLinear = shaded, expectedTexel = (u, v)}, banded')
             _ → go skipped banded rest sx sy
+    -- A pixel is undecided only where the band CHANGES the outcome: some texel selectable by a sample
+    -- within the band of an interior threshold (on either axis, in the colour or the map region, which
+    -- share the index) gives a different coverage or a colour differing beyond the declared tolerance.
+    -- Predeclared and computed from the art, never from a capture.
+    outcomeDiffers q fu fv u v
+      | not (nearInterior band 96 fu || nearInterior band 64 fv) = False
+      | otherwise =
+          let candidates n t = nub (mapMaybe (texelOf n) [t - band, t, t + band])
+              outcomeAt u' v' =
+                let (cr, cg, cb, ca) = artColour art (hqColour q) u' v'
+                    (mr, mg, mb, ma) = artMap art (hqMap q) u' v'
+                 in if ca == 0 || ma == 0
+                      then Nothing
+                      else Just (shadedByte (handShade light count (srgbDecode cr, srgbDecode cg, srgbDecode cb) (mr, mg, mb) (hqDepth q)))
+              differs a b = case (a, b) of
+                (Nothing, Nothing) → False
+                (Just (r1, g1, b1), Just (r2, g2, b2)) → any (\(x, y) → abs (fromIntegral x - fromIntegral y) > (3 ∷ Int)) [(r1, r2), (g1, g2), (b1, b2)]
+                _ → True
+              exact = outcomeAt u v
+           in or [differs exact (outcomeAt u' v') | u' ← candidates 96 fu, v' ← candidates 64 fv]
 
 -- | The texel the canvas offset @t@ (in canvas texels from the canvas corner) selects along an axis of
 -- @n@ texels: nothing outside the canvas (@t < 0@ or @t >= n@, the half-open rule of the rasterized

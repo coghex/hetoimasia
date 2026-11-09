@@ -38,7 +38,7 @@ import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDela
 import Control.Exception (evaluate)
 import Control.Monad (foldM, forM)
 import Crypto.Hash.SHA256 (hash)
-import Data.Array (Array, listArray, range, (!))
+import Data.Array (Array, bounds, inRange, listArray, range, (!))
 import qualified Data.ByteString as ByteString
 import Data.List (partition, sortOn)
 import qualified Data.Map.Strict as Map
@@ -70,6 +70,8 @@ import Hetoimasia.Render.TwoD.Material (MaterialRecord (..), MaterialRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..))
 import Hetoimasia.Render.TwoD.Oracle
   ( Expectation (..)
+  , Indeterminate (..)
+  , Verdict (..)
   , OracleInput (..)
   , Probe (..)
   , TargetSpec (..)
@@ -79,7 +81,7 @@ import Hetoimasia.Render.TwoD.Oracle
 import Hetoimasia.Render.TwoD.Oracle.Colour (Rgba8 (..))
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..))
 import Hetoimasia.Render.TwoD.Snapshot
-import Hetoimasia.Render.TwoD.Validation (validateSnapshotWith)
+import Hetoimasia.Render.TwoD.Validation (Location (..), validateSnapshotWith)
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 import Hetoimasia.Render.TwoD.Vulkan.Chunks
   ( ChunkStanding (..)
@@ -436,11 +438,11 @@ exactBoundary shape facing = (newScene ("exact-boundary-" <> show shape <> "-" <
 -- reference's own names, and their fixtures: judged exactly and drawn by the terrain material; drawn
 -- by the stale-bias control after an ordinary pass, which must be rejected on the snapped pass.
 snappedScenes ∷ [Scene]
-snappedScenes = [snappedAt label zoom | (label, zoom) ← [("9-8", 1.125), ("5-4", 1.25), ("63-8", 7.875), ("8", 8)]]
+snappedScenes = [snappedAt label zoom | (label, zoom) ← [("1-8", 0.125), ("9-8", 1.125), ("5-4", 1.25), ("63-8", 7.875), ("8", 8)]]
 
 -- | The two scales where the measured counterexample lay: the stale-bias control is drawn at them.
 staleBiasScenes ∷ [Scene]
-staleBiasScenes = take 2 snappedScenes
+staleBiasScenes = take 2 (drop 1 snappedScenes)
 
 -- | The edge and diagonal fixture: an ordinary pass whose named probes the oracle decides, then the
 -- edge scene.
@@ -733,9 +735,10 @@ data Extra = Extra
   , extraRuns ∷ ![(String, Int, String)]
   , extraMarks ∷ ![(String, Maybe Bool)]
   , extraIndependent ∷ !(Maybe Independent)
-  , extraBand ∷ !(Maybe (Double, Bool))
-  -- ^ The first pass's undecided band in texels (amendment v3, from the device's queried
-  -- @subPixelPrecisionBits@ and the view scale) and whether the scene is eligible for it.
+  , extraBand ∷ ![PassBand]
+  -- ^ For each pass, its undecided band in texels (amendment v3, from the device's queried
+  -- @subPixelPrecisionBits@ and the pass's own view scale), whether it is eligible, its undecided and
+  -- covered counts and its raster margin.
   , extraPassMismatches ∷ ![(Int, [String])]
   -- ^ For each pass, its independent mismatch count and its first mismatches.
   , extraPickCompared ∷ !Int
@@ -752,7 +755,7 @@ data Extra = Extra
   }
 
 emptyExtra ∷ Spec → Extra
-emptyExtra s = Extra s [] [] [] [] [] Nothing Nothing [] 0 0 0 [] Nothing Nothing [] Nothing []
+emptyExtra s = Extra s [] [] [] [] [] Nothing [] [] 0 0 0 [] Nothing Nothing [] Nothing []
 
 failed ∷ String → String → FixtureResult
 failed name why = FixtureResult (Text.pack name) [] [] [] (Just (Text.pack why))
@@ -923,6 +926,15 @@ awaitChunk retained reference = do
 -- ---------------------------------------------------------------------------
 -- Rendering and judging
 
+-- | One pass's undecided band, eligibility, counts and raster margin, for the record.
+data PassBand = PassBand
+  { pbBand ∷ !Double
+  , pbEligible ∷ !Bool
+  , pbUndecided ∷ !Int
+  , pbCovered ∷ !Int
+  , pbMargin ∷ !(Maybe (Double, Double))
+  }
+
 -- | A pick as the judge compares it: nothing selectable, or a known cell and the part of it.
 data PickSummary = SNoHit | SLoading | SHit (Integer, Integer, Integer) Role
   deriving stock (Eq, Show)
@@ -1053,7 +1065,20 @@ renderSnapshot ctx s parts = do
                     then Right ()
                     else Left "the atlases' original ownership was not released while the frame was pending"
             | otherwise = pure (Right ())
-      result ← OrderedPath.runValidatedBetween models (retainedBase (ctxHost ctx)) (terrainSuite (ctxProfile ctx)) (ctxDirectory ctx) Depth32Float (ctxRenderer ctx) marks buffers decodedAt between (Text.pack name) shapes (map snd named) valid
+      result0 ← OrderedPath.runValidatedBetween models (retainedBase (ctxHost ctx)) (terrainSuite (ctxProfile ctx)) (ctxDirectory ctx) Depth32Float (ctxRenderer ctx) marks buffers decodedAt between (Text.pack name) shapes (map snd named) valid
+      -- The oracle path applies the same band as the independent judge (amendment v3): where the exact
+      -- expectation leaves a pixel undecided (an unsnapped pass, within the pass's delta of an interior
+      -- biased threshold, between texels that differ) the oracle's probe is the model fault
+      -- NearTexelBoundary, counted and never compared. Outside that set an oracle mismatch stands as a
+      -- failure (a further sampling counterexample). The oracle's generic bands are unchanged.
+      let bandedProbe probed = case drop (probePass (probeAt probed)) grids of
+            grid : _
+              | inRange (bounds grid) (probeX (probeAt probed), probeY (probeAt probed))
+              , Ambiguous _ ← grid ! (probeX (probeAt probed), probeY (probeAt probed)) →
+                  let indeterminate = NearTexelBoundary (AtPass (probePass (probeAt probed)))
+                   in probed {probeExpectation = Indeterminate indeterminate, probeVerdict = ProbeIndeterminate indeterminate}
+            _ → probed
+          result = result0 {resultProbes = map bandedProbe (resultProbes result0)}
       let perPass = splitPasses (map (sceneTarget . partScene) parts) (resultProbes result)
           independents = [judgeIndependent (sceneTarget (partScene part)) (grid !) (observedFrom (fst (sceneTarget (partScene part))) probes) | (part, grid, probes) ← zip3 parts grids perPass]
           independent = foldr1 plus independents
@@ -1128,6 +1153,24 @@ renderSnapshot ctx s parts = do
                       differing = length [() | y ← [0 .. rh - 1], x ← [0 .. rw - 1], seenFirst x y /= seenLast x y]
                    in [ "the final pass does not restore the first: " <> show differing <> " pixels differ" | differing > 0 || sceneTarget (partScene firstPart) /= sceneTarget (partScene lastPart) || partScene firstPart /= partScene lastPart ]
             _ → []
+          passBands =
+            [ PassBand
+                { pbBand = fromRational (undecidedBand bits (partScene part)) ∷ Double
+                , pbEligible = deviceEligible bits (partScene part) (partCamera part) (partPlan part)
+                , pbUndecided = indAmbiguous one'
+                , pbCovered = indCovered one'
+                , pbMargin = fmap (\(m, e) → (fromRational m ∷ Double, fromRational e ∷ Double)) (rasterMargin bits (partScene part) (partCamera part) (partPlan part))
+                }
+            | (part, one') ← zip parts independents
+            ]
+          bits = ctxSubPixelBits ctx
+          -- An eligible pass's quad edges must keep every pixel centre farther than what the rasterizer's
+          -- vertex quantisation can move them (never banded: the band covers texel thresholds only).
+          rasterProblems =
+            [ "pass " <> show pass <> ": a quad edge lies " <> show margin <> " pixels from a pixel centre, within the " <> show epsilon <> " the vertex quantisation can move it: redesign the pass (it is never banded)"
+            | (pass, PassBand {pbMargin = Just (margin, epsilon)}) ← zip [0 ∷ Int ..] passBands
+            , margin <= epsilon
+            ]
           readbackMissing = not (completeReadback (map (sceneTarget . partScene) parts) (resultProbes result))
           problems
             | readbackMissing = [maybe "the readback holds fewer pixels than the targets" Text.unpack (resultFailure result)]
@@ -1139,6 +1182,7 @@ renderSnapshot ctx s parts = do
                   <> ["the pick disagreed with the expectation at " <> show (length pickProblems) <> " pixels, e.g. " <> show (take 3 pickProblems) | not (isControl (specVariant s)), not (null pickProblems)]
                   <> cameraProblems
                   <> restoreProblems
+                  <> [problem | not (isControl (specVariant s)), problem ← rasterProblems]
                   <> pendingProblems
                   <> pathProblems
                   <> ["pixel snapping changed " <> show snapDifferences <> " pixels the readback shows, fewer than the 20 that discriminate it from a view that ignores the setting" | SnapSensitive `elem` specNeeds s, snapDifferences < 20]
@@ -1170,9 +1214,7 @@ renderSnapshot ctx s parts = do
               , extraRuns = runFacts
               , extraMarks = markFacts
               , extraIndependent = Just independent
-              , extraBand = case parts of
-                  part : _ → Just (fromRational (undecidedBand (ctxSubPixelBits ctx) (partScene part)) ∷ Double, deviceEligible (ctxSubPixelBits ctx) (partScene part) (partCamera part) (partPlan part))
-                  [] → Nothing
+              , extraBand = passBands
               , extraPassMismatches = [(indMismatchCount i, take 4 (indMismatches i)) | i ← independents]
               , extraPickCompared = pickCompared
               , extraPickUndecided = pickUndecided
@@ -1391,19 +1433,22 @@ writeRecord ctx format seconds results = do
                       , ("first_mismatches", JArray (map JString (indMismatches i)))
                       ]
               )
-            , ( "device_undecided"
-              , case (extraBand extra, extraIndependent extra) of
-                  (Just (band, eligible), Just i) →
-                    JObject
-                      [ ("device", JString (Text.unpack (ctxDevice ctx)))
+            , ( "device_undecided_by_pass"
+              , JArray
+                  [ JObject
+                      [ ("pass", JNumber (show pass))
+                      , ("device", JString (Text.unpack (ctxDevice ctx)))
                       , ("sub_pixel_precision_bits", JNumber (show (ctxSubPixelBits ctx)))
-                      , ("band_texels", JNumber (show band))
-                      , ("eligible_unsnapped_off_grid", JBool eligible)
-                      , ("undecided", JNumber (show (indAmbiguous i)))
-                      , ("covered", JNumber (show (indCovered i)))
-                      , ("undecided_share_of_covered", JNumber (show (if indCovered i == 0 then 0 else fromIntegral (indAmbiguous i) / fromIntegral (indCovered i) ∷ Double)))
+                      , ("band_texels", JNumber (show (pbBand pb)))
+                      , ("eligible_unsnapped_off_grid", JBool (pbEligible pb))
+                      , ("undecided", JNumber (show (pbUndecided pb)))
+                      , ("covered", JNumber (show (pbCovered pb)))
+                      , ("undecided_share_of_covered", JNumber (show (if pbCovered pb == 0 then 0 else fromIntegral (pbUndecided pb) / fromIntegral (pbCovered pb) ∷ Double)))
+                      , ("raster_margin_px", maybe JNull (JNumber . show . fst) (pbMargin pb))
+                      , ("raster_epsilon_px", maybe JNull (JNumber . show . snd) (pbMargin pb))
                       ]
-                  _ → JNull
+                  | (pass, pb) ← zip [0 ∷ Int ..] (extraBand extra)
+                  ]
               )
             , ( "mismatches_by_pass"
               , JArray [JObject [("pass", JNumber (show pass)), ("mismatches", JNumber (show n)), ("first", JArray (map JString firsts))] | (pass, (n, firsts)) ← zip [0 ∷ Int ..] (extraPassMismatches extra)]
