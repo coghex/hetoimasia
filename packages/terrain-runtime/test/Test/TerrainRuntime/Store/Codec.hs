@@ -257,6 +257,25 @@ spec = describe "the private page codec against independent bytes" $ do
       dec (leaf 4 [(be64' 3, BS.concat [be64' 9, le16' 4, le16' 4])]) `shouldBe` Left MalformedValue
       dec (leaf 4 [(be64' 3, BS.concat [be64' 9, le16' 507, le16' 0])]) `shouldBe` Left MalformedValue
       dec (leaf 4 [(be64' 3, BS.concat [be64' total, le16' 4, le16' 0])]) `shouldBe` Left MalformedValue
+    it "refuses each field of a retired-page index entry wrong in turn, and an internal page's key lengths" $ do
+      let leaf t es = buildPage 1 7 0 1 t 0 (length es) (leafPayload es)
+          dec = decodePage ident0 total (PageNo 0)
+          marked p = BS.cons 0xFF (be64' p)
+          ver = be64' 7
+          entry = (be64' 3, BS.concat [be64' 9, le16' 4, le16' 1])
+      -- an index entry after a version entry is a well-formed leaf
+      either (const False) (const True) (dec (leaf 4 [entry, (marked 5, ver)])) `shouldBe` True
+      dec (leaf 4 [(BS.cons 0xFE (be64' 5), ver)]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(BS.cons 0 (be64' 5), ver)]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(marked total, ver)]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(marked 5, be64' 0)]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(marked 5, BS.take 7 ver)]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(marked 5, BS.snoc ver 0)]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(marked 6, ver), (marked 5, ver)]) `shouldBe` Left KeyOrder
+      -- an internal page's separator lengths are checked before it is sliced
+      let innerRaw kl = buildPage 1 7 0 2 0 1 1 (BS.concat [BS.singleton kl, BS.replicate (fromIntegral kl) 1, le64' 5])
+      dec (innerRaw 0) `shouldBe` Left (KeyLength 0)
+      dec (innerRaw 65) `shouldBe` Left (KeyLength 65)
     it "refuses internal and list pages with bad references, levels or order" $ do
       let inner lvl es = buildPage 1 7 0 2 0 lvl (length es) (BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64' c] | (k, c) ← es])
           list ps = buildPage 1 7 0 3 4 0 (length ps) (BS.concat (le64' 3 : map le64' ps))

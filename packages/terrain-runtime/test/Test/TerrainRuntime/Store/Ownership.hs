@@ -476,6 +476,15 @@ spec = describe "page ownership against forged records with valid checksums" $ d
             Refused (Integrity MalformedRetirement) → pure ()
             bad → expectationFailure ("a retirement entry with " <> what <> " was not refused as malformed: " <> take 200 (show bad))
   describe "child references and the used page space (the trees)" $ do
+    it "refuses a counter that disagrees with the pages it counts where the disagreement would go negative, and never uses one to find a page" $ do
+      (h, _, _) ← fixture
+      -- retired pages below what an entry lists: reclamation would count below zero
+      (m, _, _) ← must (fillWith (withRoots h (\r → r {rRetiredPages = 0})) (planMaintenance (hStore (withRoots h (\r → r {rRetiredPages = 0})))))
+      m `shouldBe` Refused (Integrity CorruptCounters)
+      -- free pages below what an extent holds: taking the extent would count below zero
+      noFree ← pure (withRoots h (\r → r {rFreePages = 0, rLoose = []}))
+      out ← planOn noFree
+      out `shouldBe` Refused (Integrity CorruptCounters)
     it "refuses a re-sealed internal page whose separator is no key of its tree, instead of answering that a record that exists is absent" $ do
       (h, _, _) ← fixture
       runsRoot ← maybe (expectationFailure "runs root" >> fail "runs") pure (rRuns (storeRoots (hStore h)))
