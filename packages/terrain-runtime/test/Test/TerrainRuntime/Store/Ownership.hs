@@ -170,6 +170,9 @@ spec = describe "page ownership against forged records with valid checksums" $ d
         forged ← offerOnly h v
         out ← planOn forged
         refusedLive ("a free extent offering " <> what) v out
+        -- a maintenance transaction writes bookkeeping pages from the same supply
+        (maintenance, _, _) ← must (fillWith forged (planMaintenance (hStore forged)))
+        refusedLive ("a free extent offering " <> what <> ", to maintenance") v maintenance
     it "refuses a free extent that offers a page only a pinned reader reaches, and the same plan unpinned would overwrite it" $ do
       (h0, ref0, g0) ← fixture
       (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h0)))
