@@ -344,14 +344,33 @@ texture clauses with D-61/P-17 atlases and #672's byte-only admission; the
 manager arranges fresh re-approval. Prerequisite implementation and amended
 Q-13 remain gates; this record is not implementation or visual qualification.
 
-**Amendment processing cursor:** new-child filing is complete. The first
-#645/#646 revisions are applied; #659's atlas amendment and #647's amendment
-revision v2 are posted. The manager's
-`request-user-het-terrain-20261106-1838-apply647-prompt.txt` directs a stop after
-recording/reporting #647: **do not start another artifact until asked**.
-#645/#646's atlas follow-ups and #648/other remaining P-16 artifacts remain
-outstanding unless separately confirmed. The manager arranges readiness
-reviews; this cursor does not mark those later artifacts complete.
+**TRA-9 amendment revision v2 applied 2026-11-09:** [#645] now carries the
+[owner-decision amendment](https://github.com/coghex/hetoimasia/issues/645#issuecomment-6731831183),
+marker `owner-decision:645-terrain-atlas-review-v2`. Verified `het-manager`
+sign-off `kbi6eg44xay4h4kypzkuzrw256` (reply to draft
+`t7jgs3k7vz56zzzqzxcasm3thw`) and the subsequent apply645 dispatch authorize
+this exact comment, with the approved issue body and metadata untouched.
+Comment SHA-256:
+`fa70c693e4677fdf8dfa7baaf43b8787da82bb9582dfa16bb168d698ab7b42c9`;
+verbatim effective-spec SHA-256:
+`0371a56fa3a88005378b6ab597bd5ec4d9336f98e03390e6e8bbd620fe159770`.
+The post and unchanged body/metadata were verified. This resolves the CHANGES
+review's texture decision using D-61/P-17 and #672's unchanged byte banks,
+and incorporates complete pre-claim parent/coverage checks, host-wide depth
+accounting and the separate `--terrain-views-full` qualification command.
+Numbered source references were rechecked at `b0e5e35c78`. Requirements 8–9
+remain unchanged. The manager arranges re-approval; amended prerequisites and
+Q-13 remain implementation/qualification gates.
+
+**Amendment processing cursor:** new-child filing is complete. #645 revision
+v2, #659's atlas amendment and #647 revision v2 are posted. The manager's
+`request-user-het-terrain-20261106-1838-apply645-prompt.txt` directs the next
+separate sign-off packet: **#646's atlas follow-up**, checking its existing
+`72828f2f` body against D-61/P-17 and #672. Its approved body/metadata remain
+unchanged until a separate comment amendment is signed off. #648/other
+remaining P-16 artifacts remain outstanding unless separately confirmed.
+The manager arranges readiness reviews; this cursor grants no approval or
+implementation/visual qualification.
 
 ## Epic contract
 
