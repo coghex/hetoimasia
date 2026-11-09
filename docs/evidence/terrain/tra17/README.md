@@ -23,10 +23,10 @@ control or a recorded band.
 | Device | Apple M3 Max, Vulkan through the driver the session reports: `driverName = MoltenVK`, `driverInfo = 1.4.2` (the pinned Homebrew MoltenVK), surface-free, no window; every value is queried from the rendering session's physical device and stored in each record |
 | Device limit read | `subPixelPrecisionBits = 8`, **queried from the session** (`RootsView.viewSubPixelPrecisionBits`, with `viewDriverName` and `viewDriverInfo`) and recorded per pass; a standalone `vulkaninfo` printed 4 and did not reflect the session's device |
 | Depth | `Depth32Float` (an unsupported depth is a failure, never a skip) |
-| Tested head | `7bc5b98c0ddf5c82d65bff91a05907c230af6f66` on a clean tree, master (`651e79e0`) already merged |
-| Source digest | `381400070997224a87bcbcbf809976e68cb0a6a9b03fac44863284cb37557805` |
+| Tested head | `2324b3abebbfe39d196c499a582b863064277fa7` on a clean tree, master (`a89da505`) already merged |
+| Source digest | `0b73a819a8d92fd527c133d0eb8c1399f60ceb6d9da9a45c25c452552f57112a` |
 | Tolerance | 3 8-bit steps per channel, declared before any pixel is read (the oracle's own probe tolerance, one step, judges the oracle path) |
-| Full run | `tra17-terrain`: 133 fixtures, 63.5 s scenario; opt-in, excluded from `--complete` |
+| Full run | `tra17-terrain`: 133 fixtures, 63.2 s scenario; opt-in, excluded from `--complete` |
 | Bounded run | `tra17-terrain-ci`: 11 fixtures, 1.7 s scenario; the CI-device records and `ci-timeline.md` are those of CI's run at the same head and the same source digest |
 | Atlas layout identity | `263cb64032502aa0` |
 
@@ -71,6 +71,14 @@ on the Apple M3 Max in exact `Rational` arithmetic, and each is retained.
    `delta = 2^-(b+1)/s + 1/1000` texel; at b = 8 and s = 3/16 that is 0.0114, which covers the observation.
 
 With 1/128 every fixture passes with 0 mismatches and the two controls are rejected (tables below).
+
+**The two sampling controls are session-scoped** (owner amendments v2 to v4, requirement 9). The unbiased index on the
+exact-boundary fixtures and the 1/10000 bias on the snapped 9/8 and 5/4 fixtures must discriminate only on the device and
+driver session that measured them: Apple M3 Max, `driverName` MoltenVK, `driverInfo` 1.4.2, `subPixelPrecisionBits` 8
+(`measuredSession` in `TerrainPath.hs`). On any other session, or after the pinned driver moves, a control that does not
+differ is recorded as non-discriminating there (`control_status`, `control_mandatory_on_this_session` in each fixture's
+record), neither passed nor failed; the production biased fixtures still require zero mismatches on every device. The
+bounded CI scenario carries neither control.
 
 ## How a pixel is judged
 
@@ -153,11 +161,19 @@ expectation at every pixel of these fixtures, banded or not (`Expectation`, `Mod
 
 - **UNEXERCISED on the device**: packed against single-image atlases on the GPU beyond the 49-image style that
   draws and picks as the packed one does; a streamed or live background (#645); the terrain adapter allocates no texture, so
-  the lifetime of its parents is shown through #672's real pipeline instead of on the device: the lua-engine-graphics
-  headless rig (`Test.LuaEngine.Graphics.TerrainParents`: original lease released while a batch still reads the parents,
-  an adaptation built over the delivered handles, pressure with nothing partial) and the real byte banks
-  (`Test.LuaEngine.Texture.TerrainParents`); the adapter's own all-or-none, one-charge-per-parent and
-  unadmitted-parent refusals are CPU tests.
+  the lifetime of its parents is proved over #672's real pipeline and the real recorder instead of on the device, and the
+  device fixtures stay marker-only (`*-released-while-pending` mark the original ownership released between submission and
+  completion; the surface-free session's real table release is teardown's, after completion). The REAL release while a
+  frame is pending is `Test.Render.TwoD.Vulkan.TerrainParents` (render-2d-vulkan's suite, the backend recorder over its
+  headless native layer): the frame is recorded from the adapted terrain records, the holds come from the adopted revision
+  and from the pending batch's table version, the original ownership is released while it is pending, the slots free only
+  at completion, CPU picks are identical throughout, and a snapshot naming a released required parent is refused whole
+  with the prior revision unchanged. The byte banks' charges are `Test.LuaEngine.Texture.TerrainParents` (real banks) and
+  `Test.LuaEngine.Graphics.TerrainParents` (a required parent refused on texture bytes through the real banks, the
+  acquisition rolled back, the prior terrain's adaptation and handles unchanged). Stated limits of the recorder example:
+  its material is terrain-SHAPED (2 handles, 13 words, a 48-byte push block; the real terrain material lives in a package
+  that depends on render-2d-vulkan) and each parent is a 2 x 2 stand-in image (the parents' real sizes and decoded charges
+  are in the bank tests). The adapter's own all-or-none, one-charge-per-parent and unadmitted-parent refusals are CPU tests.
 - **Reference lighting**: Synarchy's lighting (`ShaderCode.hs` at `3777d437`, lines 255-301) is not reproduced and no
   parity is claimed.
 - Live view ownership, streaming and retirement (#645), the Lua bindings (#646), the arena and its shortcuts (#647) and

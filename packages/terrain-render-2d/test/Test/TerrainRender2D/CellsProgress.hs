@@ -13,7 +13,7 @@ import qualified Data.Map.Lazy as LazyMap
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import qualified Data.Set as Set
-import Hetoimasia.Asset.Image.DataMap (coverageAt)
+import Hetoimasia.Asset.Image.Region (regionViewCoverageAt)
 import Hetoimasia.Math.Vector (V2 (..))
 import Data.Ratio (denominator)
 import Data.Word (Word32)
@@ -560,7 +560,7 @@ refusals = describe "explicit refusals" $ do
     holey ←
       loadAssetsWith
         5
-        [(AssetMap blockKey, planeFromFormula (\x y → coverageAt real (fromIntegral x) (fromIntegral y) == Just True && not (x == 48 && y == 48)))]
+        [(AssetMap blockKey, planeFromFormula (\x y → regionViewCoverageAt real (fromIntegral x) (fromIntegral y) == Just True && not (x == 48 && y == 48)))]
     let cluster = sceneOf FaceSouth 1 [OCell 0 0 0 0 KnownAll, OCell 0 0 1 0 KnownAll, OCell 1 0 0 0 KnownAll, OCell 0 1 0 0 KnownAll]
         tiles p = Set.fromList [t | q ← cellPlanQuads p, Just t ← [quadCell q]]
     mapCoversHexagon assets blockKey `shouldBe` True

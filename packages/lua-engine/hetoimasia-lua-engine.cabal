@@ -449,6 +449,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Support
         Test.LuaEngine.Texture.Cancellation
         Test.LuaEngine.Texture.Capacity
+        Test.LuaEngine.Texture.TerrainParents
         Test.LuaEngine.Texture.Client
         Test.LuaEngine.Texture.Contract
         Test.LuaEngine.Texture.DataMaps

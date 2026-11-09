@@ -774,8 +774,12 @@ Only a page that no owner but the allocator claims is written, and a refusal wri
   sort before them. A commit indexes every page it replaced (a page already indexed is
   `DoubleFree`); reclamation frees a page only if the index holds it under that entry's version
   (`RetiredIndexMismatch`) and removes it as it frees it. An entry is finished only when none of the
-  pages its progress field says were already reclaimed is still indexed, so a re-sealed progress field
-  cannot drop a page from the obligation for good (`RetiredIndexMismatch`). The index is bounded by bounding the
+  pages its progress field says were already reclaimed is still indexed *under this entry or an older
+  one*: a reclaimed page may have been reused and retired again under a newer version (its list keeps the
+  number), which is history, not corruption, and an index record under the entry's own version means the
+  page was skipped (`RetiredIndexMismatch`). A re-sealed progress field therefore cannot drop a page
+  from the obligation for good, and legitimate reuse cannot block maintenance (`History`: a randomized
+  model of edits, partial maintenance, reuse and pinned readers, and the reclaimed-prefix regression). The index is bounded by bounding the
   backlog: an ordinary plan that would take the retired pages past `maxRetiredPages` (16,384)
   is refused with `RetirementBacklog` until a reader releases and maintenance reclaims; a
   maintenance transaction never adds to it.

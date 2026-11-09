@@ -41,6 +41,7 @@ module Test.GPU.Vulkan.Native.OrderedPath
   , runEvidence
   , runValidated
   , runValidatedWith
+  , runValidatedBetween
   , finishEvidence
   , awaitPlaceholder
   , configuration
@@ -482,7 +483,31 @@ runValidatedWith
   → [NamedProbe]
   → ValidSnapshot
   → IO FixtureResult
-runValidatedWith models host suite directory depthFormat renderer marks chunkBuffers decodedAt name shapes namedProbes valid = do
+runValidatedWith models host suite directory depthFormat renderer marks chunkBuffers decodedAt = runValidatedBetween models host suite directory depthFormat renderer marks chunkBuffers decodedAt (pure (Right ()))
+
+-- | 'runValidatedWith' with a caller's action between the submission of the recorded batch and the wait
+-- for its completion: the batch has been handed to the device and has not been awaited, so what the
+-- action releases or changes is released or changed while the GPU work is pending. The action's failure
+-- fails the fixture; its success changes nothing else, and 'runValidatedWith' is this with an action
+-- that does nothing (so every existing scenario runs exactly as before). The action runs on the
+-- caller's thread; one that needs the device's owner thread uses 'hostAct' itself.
+runValidatedBetween
+  ∷ Map.Map MaterialRef MaterialModel
+  → Host
+  → Suite
+  → FilePath
+  → ImageFormat
+  → Render.Renderer
+  → CutoutMarks
+  → (ChunkRef → Maybe Buffer)
+  → (Api.TextureHandle → Maybe DecodedImage)
+  → IO (Either Text ())
+  → Text
+  → [TargetShape]
+  → [NamedProbe]
+  → ValidSnapshot
+  → IO FixtureResult
+runValidatedBetween models host suite directory depthFormat renderer marks chunkBuffers decodedAt between name shapes namedProbes valid = do
       made ← hostAct host ("making " <> name <> "'s targets") $ \construction →
         fmap sequence . traverse (target construction) $ shapes
       case made of
@@ -519,7 +544,10 @@ runValidatedWith models host suite directory depthFormat renderer marks chunkBuf
           case ticket of
             Left failure → pure (failed failure)
             Right batch →
-              hostAwait host batch >>= \case
+              between >>= \case
+               Left failure → pure (failed ("the action between submission and completion failed: " <> failure))
+               Right () →
+                hostAwait host batch >>= \case
                 Left failure → pure (failed ("the batch did not complete: " <> failure))
                 Right () →
                   fmap sequence (traverse (\(shape, (_, readback, _)) → hostRead host readback (targetBytes shape)) (zip shapes pairs)) >>= \case

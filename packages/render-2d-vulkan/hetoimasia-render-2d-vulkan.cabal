@@ -109,6 +109,7 @@ test-suite render-2d-vulkan-tests
         Test.Render.TwoD.Vulkan.Recording
         Test.Render.TwoD.Vulkan.Retained
         Test.Render.TwoD.Vulkan.StandIn
+        Test.Render.TwoD.Vulkan.TerrainParents
         Test.Render.TwoD.Vulkan.Windows
     build-depends:
         base >=4.22 && <4.23,
@@ -129,4 +130,8 @@ test-suite render-2d-vulkan-tests
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-2d-vulkan,
         hetoimasia-render-api ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-render-2d ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0

@@ -5,22 +5,27 @@
 --
 -- A plan names the artwork each quad is drawn with by identity only
 -- ('ColourRef', 'Hetoimasia.Terrain.MapBake.Catalog.MapKey'); which GPU
--- texture that is belongs to the later material slice. What a plan and a pick
+-- texture that is belongs to the material slice. What a plan and a pick
 -- /need/ from the assets is their binary coverage, one bit per texel of a
--- 96 x 64 canvas (TRA-15's 'CoveragePlane'), shared by every cell that uses
--- the asset and never copied per cell. An 'AssetSnapshot' holds, for one
--- adopted style, the coverage of each material's colour artwork, of the
--- generic blank (fog) colour and of the catalog's maps, each with the texture
--- version and the coverage version it was built from.
+-- 96 x 64 logical canvas, shared by every cell that uses the asset and never
+-- copied per cell. Every texture is an atlas (TRA-17): an asset is a checked
+-- 'RegionView' of one parent image's single coverage plane, so the three
+-- colour canvases share one plane and the 46 maps share another, and a single
+-- image is the same contract with one full-image region. An 'AssetSnapshot'
+-- holds, for one adopted style, the region of each material's colour artwork,
+-- of the generic blank (fog) colour and of the catalog's maps, each with the
+-- texture version and the coverage version it was built from.
 --
 -- == Checks that make a snapshot usable
 --
 -- 'mkAssetSnapshot' refuses, with the asset it names:
 --
--- * a plane that is not 96 x 64;
+-- * a region that is not 96 x 64 (the parent atlas may be any size);
 -- * a texture whose version differs from its coverage's, so a recycled
 --   registration or a reused handle generation cannot pair an old plane with
 --   a new texture;
+-- * a region view built for another parent version than the coverage's, so a
+--   stale region reference cannot be adopted beside a new parent;
 -- * a map without the checked normal profile 'UnitNormalRgbV1' (the plane is
 --   binary by construction, but a map whose numeric profile was not verified is
 --   not a catalog map);
@@ -48,7 +53,9 @@
 --
 -- State, ownership and lifetime: none. The planes are immutable values the
 -- texture pipeline owns; a snapshot only names them. Its identity
--- ('assetIdentity') changes when any version does.
+-- ('assetIdentity') changes when any version does, and when any region's
+-- rectangle, layout identity, parent extent, logical identity or normal profile
+-- does, so a rectangle change on the same parent invalidates a stale identity.
 module Hetoimasia.Terrain.Render2D.Assets
   ( -- * Names
     ColourRef (..)
@@ -84,12 +91,15 @@ import Control.Monad (when)
 import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32, Word64)
-import Hetoimasia.Asset.Image.DataMap
-  ( CoveragePlane
-  , NormalEncoding (..)
-  , coverageAt
-  , coverageHeight
-  , coverageWidth
+import Hetoimasia.Asset.Image.DataMap (NormalEncoding (..))
+import Hetoimasia.Asset.Image.Region
+  ( RegionView
+  , regionHeight
+  , regionViewCoverageAt
+  , regionViewIdentity
+  , regionViewParentVersion
+  , regionViewRegion
+  , regionWidth
   )
 import Hetoimasia.Terrain.Cell (MaterialId)
 import Hetoimasia.Terrain.MapBake.Catalog (MapKey (..), MapRole (..), catalogKeys)
@@ -129,10 +139,13 @@ data AssetKey
 
 -- | Why an asset or a snapshot was refused.
 data AssetError
-  = -- | The plane is not 96 x 64.
+  = -- | The region is not 96 x 64.
     AssetBadExtent !AssetKey !Word32 !Word32
   | -- | The texture's version and its coverage's version differ.
     AssetVersionMismatch !AssetKey !Word64 !Word64
+  | -- | The region view was built for another parent version than the coverage's: the view's,
+    -- then the coverage's.
+    AssetStaleRegion !AssetKey !Word64 !Word64
   | -- | A map was declared without the checked unit-normal profile.
     AssetMissingProfile !MapKey
   | -- | The catalog lacks an authored map.
@@ -149,7 +162,7 @@ data AssetError
 data ColourAsset = ColourAsset
   { caTexture ∷ !Word64
   , caCoverage ∷ !Word64
-  , caPlane ∷ !CoveragePlane
+  , caView ∷ !RegionView
   }
   deriving stock (Eq, Show)
 
@@ -157,33 +170,36 @@ data ColourAsset = ColourAsset
 data MapAsset = MapAsset
   { maTexture ∷ !Word64
   , maCoverage ∷ !Word64
-  , maPlane ∷ !CoveragePlane
+  , maView ∷ !RegionView
   , maProfile ∷ !(Maybe NormalEncoding)
   }
   deriving stock (Eq, Show)
 
--- | A colour artwork from its texture version, its coverage version and its
--- plane. The key is only for the refusal's text.
-mkColourAsset ∷ ColourRef → Word64 → Word64 → CoveragePlane → Either AssetError ColourAsset
-mkColourAsset ref texture coverage plane = do
-  checkPlane (AssetColour ref) texture coverage plane
-  pure ColourAsset {caTexture = texture, caCoverage = coverage, caPlane = plane}
+-- | A colour artwork from its parent texture's version, its coverage version and
+-- its region of the parent's coverage. The key is only for the refusal's text.
+mkColourAsset ∷ ColourRef → Word64 → Word64 → RegionView → Either AssetError ColourAsset
+mkColourAsset ref texture coverage view = do
+  checkRegion (AssetColour ref) texture coverage view
+  pure ColourAsset {caTexture = texture, caCoverage = coverage, caView = view}
 
--- | A face map from its texture version, its coverage version, the normal
--- profile its texels were checked against and its plane.
-mkMapAsset ∷ MapKey → Word64 → Word64 → Maybe NormalEncoding → CoveragePlane → Either AssetError MapAsset
-mkMapAsset key texture coverage profile plane = do
-  checkPlane (AssetMap key) texture coverage plane
+-- | A face map from its parent texture's version, its coverage version, the
+-- normal profile its texels were checked against and its region.
+mkMapAsset ∷ MapKey → Word64 → Word64 → Maybe NormalEncoding → RegionView → Either AssetError MapAsset
+mkMapAsset key texture coverage profile view = do
+  checkRegion (AssetMap key) texture coverage view
   case profile of
     Nothing → Left (AssetMissingProfile key)
-    Just UnitNormalRgbV1 → pure MapAsset {maTexture = texture, maCoverage = coverage, maPlane = plane, maProfile = profile}
+    Just UnitNormalRgbV1 → pure MapAsset {maTexture = texture, maCoverage = coverage, maView = view, maProfile = profile}
 
-checkPlane ∷ AssetKey → Word64 → Word64 → CoveragePlane → Either AssetError ()
-checkPlane key texture coverage plane
-  | coverageWidth plane /= canvasWidth || coverageHeight plane /= canvasHeight =
-      Left (AssetBadExtent key (coverageWidth plane) (coverageHeight plane))
+checkRegion ∷ AssetKey → Word64 → Word64 → RegionView → Either AssetError ()
+checkRegion key texture coverage view
+  | regionWidth region /= canvasWidth || regionHeight region /= canvasHeight =
+      Left (AssetBadExtent key (regionWidth region) (regionHeight region))
   | texture /= coverage = Left (AssetVersionMismatch key texture coverage)
+  | regionViewParentVersion view /= coverage = Left (AssetStaleRegion key (regionViewParentVersion view) coverage)
   | otherwise = Right ()
+  where
+    region = regionViewRegion view
 
 -- | The coverage of one adopted style, checked. The constructor is private.
 data AssetSnapshot = AssetSnapshot
@@ -219,10 +235,10 @@ mkAssetSnapshot version blank materials maps = do
       { snVersion = version
       , snColours = Map.map snd colours
       , snMaps = Map.map snd mapTable
-      , snHexagonColours = Map.map (\(_, a) → covers (caPlane a) hexagon) colours
-      , snHexagonMaps = Map.map (\(_, a) → maPlane a == hexagon) mapTable
+      , snHexagonColours = Map.map (\(_, a) → covers (caView a) hexagon) colours
+      , snHexagonMaps = Map.map (\(_, a) → sameCoverage (maView a) hexagon) mapTable
       , snIdentity = identityOf version (Map.map snd colours) (Map.map snd mapTable)
-      , snSound = occlusionSound hexagon [maPlane a | (_, a) ← Map.elems mapTable]
+      , snSound = occlusionSound hexagon [maView a | (_, a) ← Map.elems mapTable]
       }
   where
     unique wrap key = go Map.empty
@@ -234,8 +250,8 @@ mkAssetSnapshot version blank materials maps = do
 
 -- The plane of the full-block map: the hexagon the identity-0 ordinary map
 -- covers. The catalog check has already shown it exists.
-hexagonOf ∷ Map.Map MapKey (MapKey, MapAsset) → CoveragePlane
-hexagonOf maps = case [maPlane a | (MapKey Ordinary shape, (_, a)) ← Map.toList maps, shape == head' allShapeIds] of
+hexagonOf ∷ Map.Map MapKey (MapKey, MapAsset) → RegionView
+hexagonOf maps = case [maView a | (MapKey Ordinary shape, (_, a)) ← Map.toList maps, shape == head' allShapeIds] of
   plane : _ → plane
   [] → error "Hetoimasia.Terrain.Render2D.Assets: the catalog check guarantees the full-block map"
   where
@@ -254,10 +270,10 @@ hexagonOf maps = case [maPlane a | (MapKey Ordinary shape, (_, a)) ← Map.toLis
 --   comparing the block with itself could not;
 -- * every catalog map lies inside the full block, so what the omitted cell
 --   would have drawn is among the texels just proved covered.
-occlusionSound ∷ CoveragePlane → [CoveragePlane] → Bool
+occlusionSound ∷ RegionView → [RegionView] → Bool
 occlusionSound block maps = selfCovering && all (\m → covers block m) maps
   where
-    set plane x y = x >= 0 && y >= 0 && coverageAt plane (fromInteger x) (fromInteger y) == Just True
+    set view x y = x >= 0 && y >= 0 && regionViewCoverageAt view (fromInteger x) (fromInteger y) == Just True
     selfCovering =
       and
         [ any (\(a, b) → set block a b) [(x - 48, y - 24), (x + 48, y - 24), (x, y + 16)]
@@ -266,14 +282,24 @@ occlusionSound block maps = selfCovering && all (\m → covers block m) maps
         , set block x y
         ]
 
--- Whether every texel the hexagon covers is covered by the plane.
-covers ∷ CoveragePlane → CoveragePlane → Bool
-covers plane hexagon =
+-- Whether every texel the hexagon covers is covered by the region.
+covers ∷ RegionView → RegionView → Bool
+covers view hexagon =
   and
-    [ coverageAt plane x y == Just True
+    [ regionViewCoverageAt view x y == Just True
     | y ← [0 .. canvasHeight - 1]
     , x ← [0 .. canvasWidth - 1]
-    , coverageAt hexagon x y == Just True
+    , regionViewCoverageAt hexagon x y == Just True
+    ]
+
+-- Whether two regions have the same coverage, texel by texel (the regions may lie in different
+-- parents, so the parents' bytes are never compared).
+sameCoverage ∷ RegionView → RegionView → Bool
+sameCoverage a b =
+  and
+    [ regionViewCoverageAt a x y == regionViewCoverageAt b x y
+    | y ← [0 .. canvasHeight - 1]
+    , x ← [0 .. canvasWidth - 1]
     ]
 
 -- | The snapshot's own version.
@@ -297,20 +323,21 @@ identityOf version colours maps =
   AssetIdentity version (Map.size colours + Map.size maps) (digest 14695981039346656037 fnv) (digest 7809847782465536322 mix)
   where
     entries =
-      [(show (AssetColour ref), caTexture a, caCoverage a) | (ref, a) ← Map.toAscList colours]
-        <> [(show (AssetMap key), maTexture a, maCoverage a) | (key, a) ← Map.toAscList maps]
+      [(show (AssetColour ref) <> "|colour|" <> show (regionViewIdentity (caView a)), caTexture a, caCoverage a) | (ref, a) ← Map.toAscList colours]
+        <> [(show (AssetMap key) <> "|" <> show (maProfile a) <> "|" <> show (regionViewIdentity (maView a)), maTexture a, maCoverage a) | (key, a) ← Map.toAscList maps]
     wordsOf (name, texture, coverage) = map (fromIntegral . ord) name <> [0xFF, texture, coverage]
     digest seed step = foldl' step (step seed version) (concatMap wordsOf entries)
     fnv h w = (h `xor` w) * 1099511628211
     mix h w = rotateL (h `xor` w) 23 * 0x9E3779B97F4A7C15 + w
 
--- | The coverage plane of a colour artwork, if the snapshot holds it.
-colourCoverage ∷ AssetSnapshot → ColourRef → Maybe CoveragePlane
-colourCoverage snapshot ref = caPlane <$> Map.lookup ref (snColours snapshot)
+-- | The coverage region of a colour artwork, if the snapshot holds it: a checked view of the
+-- parent atlas's one shared plane.
+colourCoverage ∷ AssetSnapshot → ColourRef → Maybe RegionView
+colourCoverage snapshot ref = caView <$> Map.lookup ref (snColours snapshot)
 
--- | The coverage plane of a map, if the snapshot holds it.
-mapCoverage ∷ AssetSnapshot → MapKey → Maybe CoveragePlane
-mapCoverage snapshot key = maPlane <$> Map.lookup key (snMaps snapshot)
+-- | The coverage region of a map, if the snapshot holds it.
+mapCoverage ∷ AssetSnapshot → MapKey → Maybe RegionView
+mapCoverage snapshot key = maView <$> Map.lookup key (snMaps snapshot)
 
 -- | Whether the colour covers the full hexagon (a valid occlusion premise).
 colourCoversHexagon ∷ AssetSnapshot → ColourRef → Bool

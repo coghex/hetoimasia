@@ -2,10 +2,43 @@
 
 Requirement 10: every required Vulkan native group stays under 30 seconds as measured on CI, including
 `test.vulkan-native` and `test.vulkan-wayland`. The bounded scenario `tra17-terrain-ci` is the only TRA-17
-scenario in them; the full `tra17-terrain` (133 fixtures, 63.5 s on the recorded device) is opt-in and excluded from
+scenario in them; the full `tra17-terrain` (133 fixtures, 63.2 s on the recorded device) is opt-in and excluded from
 `--complete`, run directly under the documented mechanism. No watchdog or child deadline was raised.
 
 ## The final head
+
+Pull request #677, head `34745a5e3cb802b8c3450df890a0e86fcc3c2859` (the tested tree `2324b3ab` plus master's documentation
+commit `92bc22c1`), validation run
+[42672296443](https://github.com/coghex/hetoimasia/actions/runs/42672296443/attempts/2) (success on its second attempt: the
+first attempt reported "a workflow file issue" with no job started, which is not a test outcome and cleared on a re-run of the
+same head; the `vulkan` job is [129349675423](https://github.com/coghex/hetoimasia/actions/runs/42672296443/job/129349675423)).
+CI's merge candidate (the executed commit) is `f8e34b68`, tree `3e857ae97c6c`; the source digest the CI device's records carry,
+`0b73a819a8d92fd527c133d0eb8c1399f60ceb6d9da9a45c25c452552f57112a`, **equals the local clean tree's** at the tested head.
+
+| | |
+| --- | --- |
+| Worker | job `vulkan`, GitHub-hosted `ubuntu-latest`, Linux X64, in the CI image `sha256:71ef73f2fd6432b1b70bc96dc0ab7ded728091ad76232309c7e4ec58858603cb` |
+| Device | `llvmpipe (LLVM 20.1.2, 256 bits)`, driver `llvmpipe`, info `Mesa 25.2.8-0ubuntu0.24.04.2 (LLVM 20.1.2)`, `subPixelPrecisionBits = 8`, all queried from the session and stored in the record |
+| Toolchain | ghc 9.14.1, cabal 3.18.1.0, glslang 15.1.0 `96ea85d4228d`, lavapipe `lvp 1.4.318`, validation layer 1.3.275 with synchronization, weston 13.0.0 |
+| Input identity | `e2e47d34be01...`, plan identity `a6c0b332163f...` |
+
+The 30 s watch covers the native command alone; the preparation (the build) is measured separately. Every group passed on
+its first execution within the run's successful attempt.
+
+| Group | Native command start | End | Elapsed | Budget | Outcome |
+| --- | --- | --- | ---: | ---: | --- |
+| `test.vulkan-native` | 2026-11-09T18:21:02.404Z | 18:21:16.749Z | **14.345 s** | 30 s | passed (preparation 27.6 s) |
+| `test.vulkan-wayland` | 2026-11-09T18:21:24.452Z | 18:21:38.647Z | **14.195 s** | 30 s | passed (preparation 7.1 s) |
+| `test.vulkan-lua-engine-native` | 2026-11-09T18:21:54.824Z | 18:22:09.773Z | 14.949 s | 60 s | passed (preparation 15.6 s) |
+| `test.vulkan-run-native` | 2026-11-09T18:22:17.761Z | 18:22:31.904Z | 14.144 s | 30 s | passed (preparation 7.4 s) |
+
+Both required groups are under 30 s with margin. The bounded scenario `tra17-terrain-ci` ran in each of
+`test.vulkan-native` (2.00 s scenario) and `test.vulkan-wayland` (1.75 s scenario): 11 fixtures, all passing, the v3/v4 band
+leaving 0 pixels undecided in every fixture (the record is `bounded/tra17-terrain-ci-fixtures-ci-device.json`; its run record
+is `ci-device-bounded-run-record.md`). Neither bias control is in the bounded selection. `test.vulkan-headless` (57.5 s) and
+`test.glfw-native` (11.2 s) also passed.
+
+## An earlier head: 7bc5b98c (history)
 
 Pull request #677, head `7bc5b98c0ddf5c82d65bff91a05907c230af6f66`, validation run
 [42661485405](https://github.com/coghex/hetoimasia/actions/runs/42661485405/attempts/1) (success; the `vulkan` job
@@ -37,7 +70,7 @@ leaving 0 pixels undecided in every fixture (the record is `bounded/tra17-terrai
 is `ci-device-bounded-run-record.md`). Neither bias control is in the bounded selection. `test.vulkan-headless` (40.0 s) and
 `test.glfw-native` (11.1 s) also passed.
 
-## An earlier candidate (history)
+## An earlier candidate: 47e3182c (history)
 
 An earlier head of pull request #677, `8d6e496a639164339c6b8b7dc4f06b49472d6ef0` (CI's merge candidate, which merges master:
 repository revision `47e3182cbb135c83ac2294c25cf8f66789e343e6`, tree `29daa79f298d94f900502c8b05a5d01f0d61b703`).
