@@ -4084,15 +4084,16 @@ cancel can win between the two, and a held reply is not a settlement. A provider
 
 | Operation | Meaning |
 | --- | --- |
-| `settlingEligible` (STM, read only) | the request is still waiting for its answer (not settled, no completion held, no resource waiting to be built), the owner takes answers, and for an owner on logical time **its assigned tick has been granted and waits, unbegun, at the boundary for this request** (`ticksGranted`: the scheduler stands at the boundary just before it and the application's grant for it is accepted and not applied; a tick nobody has granted has not been reached). An owner on elapsed time is eligible whenever the request is waiting. A request cancelled, ended by its requester, replaced by an epoch change or taken by the owner's exit is settled in the model, so it is not eligible |
+| `settlingEligible` (STM, read only) | the request is still waiting for its answer (not settled, no completion held, no resource waiting to be built), the owner takes answers, and for an owner on logical time **its assigned tick has been granted and waits, unbegun, at the boundary for this request** (`ticksGranted`: the scheduler stands at the boundary just before it and the application's grant for it is accepted and not applied; a tick nobody has granted has not been reached). **and no earlier place of that tick is still waiting for its answer** (the assigned sequence orders what commits: two requests answered in the opposite order of their places still commit in the order they were assigned; a place that is held, settled, ended or cancelled does not hold the later ones, and another owner is another provider state and never waits). An owner on elapsed time is eligible whenever the request is waiting. A request cancelled, ended by its requester, replaced by an epoch change or taken by the owner's exit is settled in the model, so it is not eligible |
 | `settlingSettle reply` (STM) | the reply is judged **purely** under the request's admission (`checkReplyPure`, the same contract and verdicts as `completeRequest`'s), then applied: an eligible request settles now, on logical time too (the position was reached, which is what eligibility says), and hands its tick's hold back; one that is not eligible yet is held for its position as a completion is. A reply the service did not declare is recorded for the owner to raise and settles nothing (`ReplyDefective`). A resource reply waits for the owner to build the resource into the reserved lease at its next boundary |
+| `settlingSettleFinal final reply` (STM) | `settlingSettle` for a resource reply with **the provider's last look**: `final` is read in the very transaction that settles the request once the owner has built the resource, and answers whether the success may settle or an expected failure settles instead (the resource built is then released by the caller). What a success makes visible and what it needs to be alive are therefore one transaction with the settlement. A verdict the service did not declare is the provider's defect, recorded for the owner like any other reply of it. A resource reply made when the request is eligible settles at that point and is never held for its tick |
 | `settlingCancel` (STM) | the provider has itself ended its interest (the lease the request was made through was released, its client ended): the request settles as cancelled, as its script's own cancel would, and a request that settled already keeps its settlement |
 
 A request settled by the seam on logical time stays in the places not yet served, hidden from its waiters (`settledNumber`) until
 its tick serves it, so it reaches them in the order of the places. A resource reply made through the seam **does not prove the
 provider's work over**: the resource is the provider's until the owner has built it, so a request that ends first still has its work
 told (`workCancel`) and the provider reclaims what it offered at that very cancel. A reply made through `completeRequest` still proves
-the work over, as it always did.
+the work over, as it always did. A reply that arrives while a resource reply waits to be built is a duplicate whatever it is (counted, never replacing the first).
 
 **`SubmissionDeclined`** (`DeclinedBusy bank` or `DeclinedRefused why`) is what a provider raises from `endpointSubmit` to decline a
 request it was handed, before it accepted any work. The admission is taken back whole (every bank it reserved is returned unused, the
@@ -4103,7 +4104,7 @@ it must have changed nothing when it raises it. Anything else a provider raises 
 the host with the admission taken back.
 
 **What proves it.** `lua-runtime-tests`, `Test.LuaRuntime.Admission.Seam`: the declining hand-off with nothing held afterwards and
-a later call accepted; an eligible request settled in the provider's own transaction, and a request a cancel won no longer eligible.
+a later call accepted; an eligible request settled in the provider's own transaction, and a request a cancel won no longer eligible; every reply while a resource reply waits is a duplicate; two places of one logical tick commit in their assigned order whichever is ready first; and a final verdict the service did not declare is the provider's defect, fatal even for an optional request.
 
 ## Provider events
 

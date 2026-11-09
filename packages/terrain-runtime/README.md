@@ -522,7 +522,7 @@ until the terrain owner adopts the store (TRA-22); nothing here is wired into it
 | Surface | What it is |
 | --- | --- |
 | `Hetoimasia.Terrain.Runtime.Store` | the narrow public interface: configuration, windows, `Store`, planning, the transaction, readers, growth, feasibility |
-| `Hetoimasia.Terrain.Runtime.Store.Admission` | the edit bank's division and its all-or-nothing, backed-only-eviction credits |
+| `Hetoimasia.Terrain.Runtime.Store.Admission` | the edit bank's division and its all-or-nothing, backed-only-eviction credits; every cache entry is charged at least a page (`minCacheEntryBytes`) and every grant at least 128 bytes in each account it draws on (`minGrantBytes`), so no number of tiny credits holds records the ledger does not show |
 | private library `store` (`store/`) | the codec, trees, allocator, planner and state machine; visible to no client; this package's suite reaches it to check them against independent references |
 
 A client, such as the later storage backend, holds a `Store` value, plans through a
@@ -712,9 +712,13 @@ the OS accepted it, not an `fsync` or power-loss durability.
 each with an accounted record). Writes, publication and reclamation cannot change its
 answers. A commit retires only the record pages it replaced, in one retirement entry
 keyed by its version; an entry is reclaimable once the oldest pinned version is at
-least that version (`BlockedByReader` otherwise). `planMaintenance` first checks that no page it frees is
-already free, loose or claimed by its own supply (a corrupt retirement list is
-`DoubleFree`, never a page with two owners) and frees an entry's
+least that version (`BlockedByReader` otherwise). `planMaintenance` first checks that every page it frees is
+a retired one: inside the used space, a tree page and not the page the committed tree of
+its own header still reaches on the path of its first key (the owner supplies the
+candidate pages through the window like any other page; a retirement entry naming a live
+root, a shared live subtree, a bookkeeping page or a list page is `RetiredPageLive`), and
+that none is already free, loose or claimed by its own supply (`DoubleFree`), so
+a corrupt retirement list never yields a page with two owners. It then frees an entry's
 pages incrementally (at most 64 per transaction, fewer when a bound is tighter), is a
 maintenance transaction and **may spend the protected reserve**. A token of a released
 reader, of another store or of another incarnation reads nothing (`ReadStale`).
@@ -736,8 +740,8 @@ workspace; if a configuration could not hold it, the counterexample is returned 
 design decision and no budget is relaxed.
 
 *Growth* is a conservative, serialised, accounted proposal: `proposeGrowth` is pure
-(equal size is `GrowthNoOp`, an idempotent success; a well-formed smaller size is
-`GrowthNotIncreased`, which the owner maps to `storage_size_not_increased`; a malformed,
+(the size rules are checked first and alone: equal size is `GrowthNoOp`, an idempotent success; a well-formed smaller size is
+`GrowthNotIncreased` whatever overhead the configuration carries (a replacement configuration is built only for an increase), which the owner maps to `storage_size_not_increased`; a malformed,
 misaligned, too small or out-of-range size is `GrowthInvalid`, a validation refusal
 before any provider work); `beginGrowth` is refused while a transaction is active;
 `growthReserved` records the extra reservation as pending, not spendable;
