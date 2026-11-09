@@ -181,10 +181,13 @@ data TerrainHooks = TerrainHooks
   -- ^ A lease's release is about to reach the service.
   , hookSubmitted ∷ IO ()
   -- ^ The service accepted a request and the hand-off is about to return, masked.
+  , hookCancelling ∷ IO ()
+  -- ^ The host settled a request as cancelled (a script's cancel won) and the adapter is about to ask the service to cancel it: the
+  -- window in which the service's own commit and the host's settlement are arbitrated by the request's eligibility alone.
   }
 
 noTerrainHooks ∷ TerrainHooks
-noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ())
+noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ())
 
 -- | Why a VM's terrain could not be composed: a failure of the composition, never a script's.
 newtype TerrainCompositionRefused = TerrainCompositionRefused Text
@@ -708,6 +711,7 @@ adoptionFor env link =
 -- | Withdraw interest in a request: ask the service to cancel it, and give back an offered lease nobody adopted.
 cancelWork ∷ Env → Link → Request → IO ()
 cancelWork env link request = mask_ $ do
+  hookCancelling (hooks env)
   _ ← cancel (service env) request
   atomically (writeTVar (lkTerminal link) True)
   offered ← atomically $

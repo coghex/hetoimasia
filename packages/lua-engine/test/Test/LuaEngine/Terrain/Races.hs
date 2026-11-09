@@ -8,6 +8,7 @@ module Test.LuaEngine.Terrain.Races (spec) where
 
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
+import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
@@ -84,7 +85,10 @@ logical =
     }
 
 spec ∷ Spec
-spec = describe "Terrain races" $ do
+spec = arbitration >> racesSpec
+
+racesSpec ∷ Spec
+racesSpec = describe "Terrain races" $ do
   it "holds a late removal's tick while the presentation VM keeps reading, changes nothing before the position, and releases the tick when it commits" $ do
     gate ← newGate
     probe ← removalProbe gate
@@ -144,3 +148,28 @@ spec = describe "Terrain races" $ do
           untilPrinted world "done"
           printed ← outLines world
           printed `shouldContain` ["cancel after commit\talready_settled", "take\ttrue"]
+
+-- | The window between a script's cancel winning in the host and the service being told: the service's commit is attempted there, and
+-- the request's eligibility alone decides it. The owner is held at the commit and the cancelling thread at the telling; the owner is
+-- let go first, and its commit must find the request already settled and make no edit.
+arbitration ∷ Spec
+arbitration = describe "Terrain arbitration" $
+  it "refuses a commit attempted after the host settled the request as cancelled and before the service was told" $ do
+    commitGate ← newGate
+    tellGate ← newGate
+    probe ← removalProbe commitGate
+    withRigHooks defaultConfigForRaces probe noTerrainHooks {hookCancelling = holdAt tellGate} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource cancelling)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "issued"
+          awaitReached commitGate
+          -- the script's next update cancels: the host settles it, and the cancelling thread stops before telling the service
+          pumpUntil world (advanceClock world 2000000000 >> (pure True))
+          awaitReached tellGate
+          -- the owner attempts the commit now: the request is settled in the host, so it is not eligible and nothing is committed
+          openGate commitGate
+          -- the telling goes on and the script reads the cell: no edit was made
+          openGate tellGate
+          untilPrinted world "done"
+          outLines world >>= \printed → printed `shouldContain` ["cell\tfalse\t0"]

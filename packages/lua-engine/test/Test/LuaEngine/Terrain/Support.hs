@@ -11,6 +11,8 @@ module Test.LuaEngine.Terrain.Support
   , withRig
   , withRigConfig
   , withRigProbe
+  , withRigHooks
+  , holdAt
   , defaultConfigForRaces
   , noProbeForRaces
   , presentationOver
@@ -77,7 +79,11 @@ withRigConfig ∷ Config → (Rig → IO a) → IO a
 withRigConfig config = withRigProbe config noProbe
 
 withRigProbe ∷ Config → Probe → (Rig → IO a) → IO a
-withRigProbe config probe body =
+withRigProbe config probe = withRigHooks config probe noTerrainHooks
+
+-- | A rig whose adapter tells these hooks of the windows a race is decided in.
+withRigHooks ∷ Config → Probe → TerrainHooks → (Rig → IO a) → IO a
+withRigHooks config probe terrainHooks body =
   withWorkerGroup $ \group →
     withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe) $ \service → do
       picks ← newTerrainPicks
@@ -85,7 +91,7 @@ withRigProbe config probe body =
       body
         Rig
           { rgService = service
-          , rgFacade = TerrainFacade fixedM1Profile service config picks noTerrainHooks [pickFixture] 4096
+          , rgFacade = TerrainFacade fixedM1Profile service config picks terrainHooks [pickFixture] 4096
           , rgSession = session
           , rgPicks = picks
           }
@@ -235,3 +241,11 @@ untilPrintedBy world spawned marker =
     case phase of
       Just Instance.Failed → settledFailure spawned >>= \failure → putStrLn ("the instance failed: " <> show (failureMessage <$> failure))
       other → putStrLn ("the instance is " <> show other)
+
+-- | The action that holds whoever runs it at the gate until it is opened: for a hook of the adapter.
+holdAt ∷ Gate → IO ()
+holdAt gate = do
+  armed ← readTVarIO (gateArmed gate)
+  when armed $ do
+    _ ← tryPutMVar (gateArrived gate) ()
+    takeMVar (gateOpen gate)
