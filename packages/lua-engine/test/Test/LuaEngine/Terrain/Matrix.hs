@@ -405,6 +405,16 @@ bounded256 =
     , Step "past the bound" ("return api.terrain.open('past', { materials = mats(" <> Text.pack (show (mostWithin256KiB + 1)) <> "), layers = {} })") "return 'ok'"
     ]
 
+-- | A definition of exactly the validator's 4,095 materials (short identifiers, well within the byte bound), and of one more.
+bounded4095 ∷ Script
+bounded4095 =
+  stepsScript
+    "DEF"
+    [ "local function mats(n) local m = {} for i = 1, n do m[i] = 'm' .. i end return m end" ]
+    [ Step "at the cap" "return api.terrain.open('at', { materials = mats(4095), layers = {} })" "return 'ok'"
+    , Step "past the cap" "return api.terrain.open('past', { materials = mats(4096), layers = {} })" "return 'ok'"
+    ]
+
 -- | The creator opens an arena and reads it on every update; the second instance attaches and says so, and is stopped by the example.
 sharedCreator ∷ Script
 sharedCreator =
@@ -798,6 +808,15 @@ spec = describe "Terrain matrices" $ do
           untilPrintedBy world spawned "done"
           printed ← outLines world
           printed `shouldContain` ["at the bound\tsuccess\tok", "past the bound\tfailure\tdefinition"]
+
+  it "accepts a definition of exactly the validator's 4,095 materials and settles one more as a definition failure, a cap no configuration reaches" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource bounded4095)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          printed `shouldContain` ["at the cap\tsuccess\tok", "past the cap\tfailure\tdefinition"]
 
   it "refuses at composition a service configured above 256 KiB of definition, and above 8,192 levels of range, so that no larger definition or range can be accepted" $ do
     refusesComposition defaultConfig {configSourceLimits = defaultSourceLimits {limitDefinitionBytes = 512 * 1024}} "limitDefinitionBytes"
