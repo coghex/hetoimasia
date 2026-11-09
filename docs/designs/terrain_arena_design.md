@@ -329,15 +329,29 @@ The original body and tracker metadata remain unchanged. This records D-61/P-17
 on the issue; the manager arranges fresh re-approval. It proves no implementation
 or GPU result, and does not revise #645/#646/#647 by implication.
 
+**TRA-11 amendment revision v2 applied 2026-11-09:** [#647] now carries the
+[owner-decision amendment](https://github.com/coghex/hetoimasia/issues/647#issuecomment-6731605899),
+marker `owner-decision:647-terrain-amendment-atlas-v2`. Verified `het-manager`
+sign-off `4r2qt6345uzpye77pmjzeq5ghw` (reply to draft
+`qjyr5xppvuk7i2e5f3569p8tz2`) and the subsequent apply647 dispatch authorize
+this exact comment, with the approved issue body and metadata untouched.
+Comment SHA-256:
+`9ce282b154da0af1dbae667dda757afde32925f795c6029fae55f353c2ac1eab`;
+verbatim effective-spec SHA-256:
+`9e9b4d0b25e89dbac07dda1f67d3912bc0abdef3958b187c7f6805453ad121c9`.
+The post and unchanged body/metadata were verified. This resolves the pending
+texture clauses with D-61/P-17 atlases and #672's byte-only admission; the
+manager arranges fresh re-approval. Prerequisite implementation and amended
+Q-13 remain gates; this record is not implementation or visual qualification.
+
 **Amendment processing cursor:** new-child filing is complete. The first
-#645/#646 revisions are applied, #659's atlas amendment is posted, and #647
-has a pending draft. The manager's 2026-11-09 apply659 dispatch selects
-**#647's texture clauses next**: finish the full draft with D-61/P-17 atlases
-and #672's byte-only admission, then obtain separate manager sign-off before
-mutation. #645/#646's atlas follow-ups and #648/other remaining P-16 artifacts
-remain outstanding unless separately confirmed; this cursor does not mark
-them complete. The manager arranges readiness reviews. The earlier atlas
-sequence is superseded only by this explicit next-artifact instruction.
+#645/#646 revisions are applied; #659's atlas amendment and #647's amendment
+revision v2 are posted. The manager's
+`request-user-het-terrain-20261106-1838-apply647-prompt.txt` directs a stop after
+recording/reporting #647: **do not start another artifact until asked**.
+#645/#646's atlas follow-ups and #648/other remaining P-16 artifacts remain
+outstanding unless separately confirmed. The manager arranges readiness
+reviews; this cursor does not mark those later artifacts complete.
 
 ## Epic contract
 
