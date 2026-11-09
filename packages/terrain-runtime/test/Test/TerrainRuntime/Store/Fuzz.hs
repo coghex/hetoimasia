@@ -165,8 +165,15 @@ judgeMutated h tok ref keys page offset newByte mutated = do
         | q ← take 10 (every 5 livePagesBelow)
         , Just (kb, lvl) ← [firstKeyOf q]
         , not (Set.member (PageNo q) mutatedSet)
+        , not (Set.member (PageNo q) orphaned)
         ]
       mutatedSet = Set.singleton (PageNo page)
+      -- a child pointer that was changed leaves its old child referenced by nothing: that page is unreachable now,
+      -- and saying so is true (the damage is the pointer, which a read through it reports)
+      childrenOf bs = case decodePage (hIdent h) total (PageNo page) bs of
+        Right (Page _ _ _ (Inner cs)) → Set.fromList (map snd cs)
+        _ → Set.empty
+      orphaned = childrenOf original `Set.difference` childrenOf mutated
       every n xs = [x | (i, x) ← zip [0 ∷ Int ..] xs, i `mod` n == 0]
       firstKeyOf q = case decodePage (hIdent h) total (PageNo q) =<< maybe (Left BadMagic) Right (diskRead (hDisk h) (PageNo q)) of
         Right (Page _ lv _ (Leaf ((kb, _) : _))) → Just (kb, lv)
