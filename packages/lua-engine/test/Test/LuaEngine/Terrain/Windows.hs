@@ -10,7 +10,7 @@ import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
 import Data.Either (isLeft)
-import Control.Monad (unless, void, when)
+import Control.Monad (replicateM_, unless, void, when)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
@@ -1120,6 +1120,8 @@ spec = describe "Terrain windows and banks" $ do
             pumpUntilReached world gate
             -- the other VM's open of the name (an invalid definition) is issued while it is held
             _ ← admitOnly world otherVm "modules-test" mainPath
+            -- and the clock runs while it is held: the other VM has every opportunity to be admitted
+            replicateM_ 20 (advanceClock world 2000000000)
             -- released, the first open is admitted and the second after it: the second's consultation did not come between the first's
             -- consultation and its admission (without the critical section it comes first, while the first is held)
             openGate gate
