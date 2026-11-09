@@ -1647,6 +1647,9 @@ data RootsView = RootsView
   , viewDevice ∷ !RootStanding
   , viewAllocator ∷ !RootStanding
   , viewDeviceName ∷ !(Maybe Text)
+  , viewDriverName ∷ !(Maybe Text)
+  , viewDriverInfo ∷ !(Maybe Text)
+  -- ^ The selected device's reported @driverName@ and @driverInfo@ (read-only identity for evidence).
   , viewSubPixelPrecisionBits ∷ !(Maybe Word32)
   -- ^ The selected device's reported @subPixelPrecisionBits@, for evidence that must know the
   -- rasterizer's vertex quantisation; 'Nothing' before a device is selected.
@@ -1676,6 +1679,8 @@ readRootsView roots = do
       , viewDevice = standingOf device
       , viewAllocator = standingOf allocator
       , viewDeviceName = planDeviceName <$> plan
+      , viewDriverName = planDriverName <$> plan
+      , viewDriverInfo = planDriverInfo <$> plan
       , viewSubPixelPrecisionBits = planSubPixelPrecisionBits <$> plan
       , viewQueueFamily = planQueueFamily <$> plan
       , viewTargets = Map.keys targets

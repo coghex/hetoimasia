@@ -43,8 +43,8 @@ import Data.Word (Word64)
 import Foreign.Ptr (FunPtr, Ptr, castFunPtr, castPtr, nullFunPtr, ptrToWordPtr)
 import Vulkan.CStruct.Extends (Chain, SomeStruct (..))
 import Vulkan.Core10
-import Vulkan.Core11 (PhysicalDeviceFeatures2 (..), enumerateInstanceVersion, getPhysicalDeviceFeatures2)
-import Vulkan.Core12 (PhysicalDeviceVulkan12Features (..))
+import Vulkan.Core11 (PhysicalDeviceFeatures2 (..), PhysicalDeviceProperties2 (..), enumerateInstanceVersion, getPhysicalDeviceFeatures2, getPhysicalDeviceProperties2)
+import Vulkan.Core12 (PhysicalDeviceDriverProperties (..), PhysicalDeviceVulkan12Features (..))
 import Vulkan.Core13 (PhysicalDeviceVulkan13Features (..))
 import Vulkan.Exception (VulkanException (..))
 import Vulkan.Dynamic (DeviceCmds (..))
@@ -312,6 +312,9 @@ deviceOffers created bootstrap = do
   (_, devices) ← enumeratePhysicalDevices created
   forM (Vector.toList devices) $ \physical → do
     properties ← getPhysicalDeviceProperties physical
+    driverProperties ∷ PhysicalDeviceProperties2 '[PhysicalDeviceDriverProperties] ← getPhysicalDeviceProperties2 physical
+    let (driver, ()) = driverProperties.next
+        text bytes = Encoding.decodeUtf8Lenient (ByteString.takeWhile (/= 0) bytes)
     features ∷ PhysicalDeviceFeatures2 '[PhysicalDeviceVulkan12Features, PhysicalDeviceVulkan13Features, PhysicalDeviceSwapchainMaintenance1FeaturesKHR] ←
       getPhysicalDeviceFeatures2 physical
     (_, extensions) ← enumerateDeviceExtensionProperties physical Nothing
@@ -329,6 +332,8 @@ deviceOffers created bootstrap = do
       DeviceOffer
         { offerDevice = physical
         , offerDeviceName = Encoding.decodeUtf8Lenient (ByteString.takeWhile (/= 0) properties.deviceName)
+        , offerDriverName = text driver.driverName
+        , offerDriverInfo = text driver.driverInfo
         , offerSubPixelPrecisionBits = properties.limits.subPixelPrecisionBits
         , offerDeviceApiVersion = properties.apiVersion
         , offerDeviceExtensions = [extension.extensionName | extension ← Vector.toList extensions]

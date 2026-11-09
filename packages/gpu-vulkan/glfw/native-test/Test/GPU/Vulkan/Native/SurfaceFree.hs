@@ -1994,7 +1994,7 @@ runTerrainProfile profile backend journal =
     -- The selected device's reported @subPixelPrecisionBits@, queried from the session and never assumed.
     subPixelBitsOf vulkan = do
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
-      pure (fromIntegral <$> viewSubPixelPrecisionBits roots)
+      pure ((,,) <$> (fromIntegral <$> viewSubPixelPrecisionBits roots) <*> viewDriverName roots <*> viewDriverInfo roots)
 
 -- | The animation case (R2D-18): instances that name a frame table of their view,
 -- the tables written into the batch's storage region and the vertex stage taking

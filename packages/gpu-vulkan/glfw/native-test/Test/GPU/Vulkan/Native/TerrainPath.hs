@@ -550,6 +550,9 @@ data Ctx = Ctx
   , ctxNormalH ∷ !Api.TextureHandle
   , ctxSingle ∷ !SingleImages
   , ctxSingleTextures ∷ !AtlasTextures
+  , ctxDriver ∷ !(Text, Text)
+  -- ^ The session's reported @driverName@ and @driverInfo@ (queried, never assumed), beside the device name
+  -- and @subPixelPrecisionBits@ in every record, so a device-scoped sampling control names its driver.
   , ctxSubPixelBits ∷ !Int
   -- ^ The device's queried @subPixelPrecisionBits@ (never assumed), which sets the width of the band in
   -- which an unsnapped fractional fixture's sample is undecided.
@@ -586,7 +589,7 @@ sha256Hex = concatMap two . ByteString.unpack . hash
 
 -- | The session's depth must be @D32_SFLOAT@; a fixture is never rendered over anything lower, and
 -- nothing is skipped.
-runTerrain ∷ Profile → RetainedHost → IO (Maybe Text) → IO (Maybe Int) → FilePath → IO Evidence
+runTerrain ∷ Profile → RetainedHost → IO (Maybe Text) → IO (Maybe (Int, Text, Text)) → FilePath → IO Evidence
 runTerrain profile host deviceName subPixelBitsOf directory = do
   started ← getCurrentTime
   createDirectoryIfMissing True directory
@@ -601,8 +604,8 @@ runTerrain profile host deviceName subPixelBitsOf directory = do
           singles ← loadSingleImages 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
           queried ← subPixelBitsOf
           case queried of
-           Nothing → finish (Just format) (Just "the device's subPixelPrecisionBits could not be queried, and the undecided band of an unsnapped fractional fixture is set by it: nothing was judged on an assumed value") []
-           Just bits → prepare profile host directory device bits style singles >>= \case
+           Nothing → finish (Just format) (Just "the device's subPixelPrecisionBits and driver identity could not be queried from the session, and the undecided band of an unsnapped fractional fixture is set by them: nothing was judged on an assumed value") []
+           Just (bits, driverName, driverInfo) → prepare profile host directory device (bits, driverName, driverInfo) style singles >>= \case
             Left why → finish (Just format) (Just why) []
             Right ctx → do
               results ← foldM (\done s → (: done) <$> timed (runSpec ctx s)) [] (specs profile)
@@ -630,8 +633,8 @@ timed action = do
   pure (result, extra {extraSeconds = [seconds started acted, seconds acted oracled, seconds oracled independent, seconds independent ended]})
 
 -- | Make the renderer, the registries, the textures and both materials.
-prepare ∷ Profile → RetainedHost → FilePath → Text → Int → AtlasStyle → SingleImages → IO (Either Text Ctx)
-prepare profile host directory device subPixelBits style singles = do
+prepare ∷ Profile → RetainedHost → FilePath → Text → (Int, Text, Text) → AtlasStyle → SingleImages → IO (Either Text Ctx)
+prepare profile host directory device (subPixelBits, driverName, driverInfo) style singles = do
   let holedOf = either (error . ("the holed style: " <>)) id (holedStyle style)
       images =
         [ (styleColourImage style, Rgba8Srgb, DefaultMark)
@@ -691,6 +694,7 @@ prepare profile host directory device subPixelBits style singles = do
                           , ctxNormalH = normalH
                           , ctxSingle = singles
                           , ctxSingleTextures = singleBound
+                          , ctxDriver = (driverName, driverInfo)
                           , ctxSubPixelBits = subPixelBits
                           , ctxHoled = holedOf
                           , ctxHoledAtlas = packedTextures holedColourBound normalBound
@@ -1378,6 +1382,9 @@ writeRecord ctx format seconds results = do
           , ("source_revision", maybe JNull JString revision)
           , ("source_digest", maybe JNull JString digest)
           , ("backend_device", JString (Text.unpack (ctxDevice ctx)))
+          , ("backend_driver_name", JString (Text.unpack (fst (ctxDriver ctx))))
+          , ("backend_driver_info", JString (Text.unpack (snd (ctxDriver ctx))))
+          , ("sub_pixel_precision_bits", JNumber (show (ctxSubPixelBits ctx)))
           , ("depth_format", JString (show format))
           , ("target_format", JString (show Rgba8Srgb))
           , ("scenario_seconds", JNumber (show seconds))
@@ -1477,6 +1484,8 @@ writeRecord ctx format seconds results = do
                   [ JObject
                       [ ("pass", JNumber (show pass))
                       , ("device", JString (Text.unpack (ctxDevice ctx)))
+                      , ("driver_name", JString (Text.unpack (fst (ctxDriver ctx))))
+                      , ("driver_info", JString (Text.unpack (snd (ctxDriver ctx))))
                       , ("sub_pixel_precision_bits", JNumber (show (ctxSubPixelBits ctx)))
                       , ("band_texels", JNumber (show (pbBand pb)))
                       , ("eligible_unsnapped_off_grid", JBool (pbEligible pb))

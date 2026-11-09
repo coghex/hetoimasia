@@ -230,6 +230,9 @@ spec = describe "Roots" $ do
       fmap planSubPixelPrecisionBits (selectDevice [coarse]) `shouldBe` Right 4
       fmap planSubPixelPrecisionBits (selectDevice [fine]) `shouldBe` Right 12
       fmap planDeviceName (selectDevice [coarse, fine]) `shouldBe` fmap planDeviceName (selectDevice [fine, coarse])
+      -- The driver identity travels the same way.
+      let named = standInDevice {offerDriverName = "MoltenVK", offerDriverInfo = "1.2.11"}
+      fmap (\plan → (planDriverName plan, planDriverInfo plan)) (selectDevice [named]) `shouldBe` Right ("MoltenVK", "1.2.11")
 
     it "fails startup with NoCompatibleDevice when no family answers graphics, creating nothing, and rolls back" $ do
       standIn ← (\made → made {standOffers = [standInDevice {offerQueueFamilies = [QueueFamilyOffer 0 False True]}]}) <$> newStandIn

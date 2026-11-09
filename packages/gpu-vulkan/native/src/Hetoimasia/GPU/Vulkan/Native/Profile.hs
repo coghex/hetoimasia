@@ -417,6 +417,10 @@ missingBindless offered =
 data DeviceOffer device = DeviceOffer
   { offerDevice ∷ !device
   , offerDeviceName ∷ !Text
+  , offerDriverName ∷ !Text
+  -- ^ @VkPhysicalDeviceDriverProperties.driverName@, read-only like 'offerSubPixelPrecisionBits'.
+  , offerDriverInfo ∷ !Text
+  -- ^ @VkPhysicalDeviceDriverProperties.driverInfo@.
   , offerSubPixelPrecisionBits ∷ !Word32
   -- ^ @VkPhysicalDeviceLimits.subPixelPrecisionBits@: the fractional bits of the rasterizer's vertex
   -- position, so a vertex off the @2^-b@ pixel grid is quantised. Read-only: no selection or
@@ -451,6 +455,8 @@ data DeviceRejection
 data DevicePlan device = DevicePlan
   { planDevice ∷ !device
   , planDeviceName ∷ !Text
+  , planDriverName ∷ !Text
+  , planDriverInfo ∷ !Text
   , planSubPixelPrecisionBits ∷ !Word32
   -- ^ The offer's @subPixelPrecisionBits@, carried unchanged.
   , planDeviceApiVersion ∷ !Word32
@@ -514,6 +520,8 @@ examine presenting offer = case (rejections, family) of
       DevicePlan
         { planDevice = offerDevice offer
         , planDeviceName = offerDeviceName offer
+        , planDriverName = offerDriverName offer
+        , planDriverInfo = offerDriverInfo offer
         , planSubPixelPrecisionBits = offerSubPixelPrecisionBits offer
         , planDeviceApiVersion = offerDeviceApiVersion offer
         , planQueueFamily = chosen
