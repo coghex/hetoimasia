@@ -358,6 +358,8 @@ takeSupply cfg roots m = do
   let loose = take m (rLoose roots)
       nl = length loose
       needFree = m - nl
+  -- a loose page lies inside the used page space, as every page the store ever numbered does
+  if any (\(PageNo p) → p >= rHw roots) loose then failInvariant TreeFree else pure ()
   (extents, got) ← if needFree <= 0 then pure ([], 0) else readExtents (fmap Disk (rFree roots)) needFree
   let remaining = needFree - fromIntegral got
       tailPages = cfgUsablePages cfg - min (cfgUsablePages cfg) (rHw roots)
@@ -367,10 +369,15 @@ takeSupply cfg roots m = do
       let bump = fromIntegral (max 0 remaining) ∷ Word64
           freePagesList = concat [[PageNo (s + i) | i ← [0 .. t - 1]] | (s, _, t) ← extents]
           tailList = [PageNo (rHw roots + i) | bump > 0, i ← [0 .. bump - 1]]
-      pure (Just (Take (loose ++ freePagesList ++ tailList) nl extents bump))
+          supply = loose ++ freePagesList ++ tailList
+      -- no page may be handed out twice: free extents never overlap each other, the loose
+      -- list or the untouched tail, whatever the pages they were read from claim
+      if Set.size (Set.fromList supply) /= length supply then failInvariant TreeFree else pure ()
+      pure (Just (Take supply nl extents bump))
   where
-    readExtents root need = go root need (BS.empty, False) []
-    go root need (from, strict) acc
+    readExtents root need = go root need (BS.empty, False) 0 []
+    -- Each extent lies inside the used page space and past the end of the one before.
+    go root need (from, strict) prevEnd acc
       | need <= 0 = pure (reverse acc, sum [t | (_, _, t) ← acc])
       | otherwise = do
           r ← ceilKey TreeFree strict root from
@@ -378,9 +385,11 @@ takeSupply cfg roots m = do
             Nothing → pure (reverse acc, sum [t | (_, _, t) ← acc])
             Just (k, v) → case decodeFree maxBound k v of
               Nothing → failInvariant TreeFree
-              Just (s, l) →
-                let t = min l (fromIntegral need)
-                 in go root (need - fromIntegral t) (k, True) ((s, l, t) : acc)
+              Just (s, l)
+                | s < prevEnd || s + l > rHw roots → failInvariant TreeFree
+                | otherwise →
+                    let t = min l (fromIntegral need)
+                     in go root (need - fromIntegral t) (k, True) (s + l) ((s, l, t) : acc)
 
 -- | Remove the taken pages from the allocator tree: a whole extent is deleted, the
 -- last one is shortened.
@@ -405,13 +414,18 @@ overlapOf root taken pages = go (runsOf pages)
     go ((s, n) : rest)
       | any (\i → Set.member (PageNo (s + i)) taken) [0 .. n - 1] = pure (Just (PageNo s))
       | otherwise = do
-          before ← floorKey TreeFree root (be64 s)
-          after ← ceilKey TreeFree False root (be64 s)
-          case (before >>= dec, after >>= dec) of
+          before ← floorKey TreeFree root (be64 s) >>= neighbour
+          after ← ceilKey TreeFree False root (be64 s) >>= neighbour
+          case (before, after) of
             (Just (ps, pl), _) | ps + pl > s → pure (Just (PageNo s))
             (_, Just (ns, _)) | ns < s + n → pure (Just (PageNo s))
             _ → go rest
-    dec (k, v) = decodeFree maxBound k v
+
+-- | A free extent read as a neighbour: one that does not decode is corruption, never
+-- the absence of a neighbour.
+neighbour ∷ Maybe (ByteString, ByteString) → M (Maybe (Word64, Word64))
+neighbour Nothing = pure Nothing
+neighbour (Just (k, v)) = maybe (failInvariant TreeFree) (pure . Just) (decodeFree maxBound k v)
 
 -- | Add freed pages as extents, merging with the neighbours that touch them and
 -- refusing a page that is already free.
@@ -422,9 +436,9 @@ insertFreed hw root0 pages = go root0 (runsOf pages)
     go root ((s, n) : rest)
       | s + n > hw = pure (Left (PageNo s))
       | otherwise = do
-          before ← floorKey TreeFree root (be64 s)
-          after ← ceilKey TreeFree False root (be64 s)
-          case (before >>= dec, after >>= dec) of
+          before ← floorKey TreeFree root (be64 s) >>= neighbour
+          after ← ceilKey TreeFree False root (be64 s) >>= neighbour
+          case (before, after) of
             (Just (ps, pl), _) | ps + pl > s → pure (Left (PageNo s))
             (_, Just (ns, _)) | ns < s + n → pure (Left (PageNo s))
             (b, a) → do
@@ -439,7 +453,6 @@ insertFreed hw root0 pages = go root0 (runsOf pages)
               let (k, v) = encodeFree start len1
               r3 ← insertKey TreeFree r2 k v
               go r3 rest
-    dec (k, v) = decodeFree maxBound k v
 
 runsOf ∷ [PageNo] → [(Word64, Word64)]
 runsOf = foldr add []

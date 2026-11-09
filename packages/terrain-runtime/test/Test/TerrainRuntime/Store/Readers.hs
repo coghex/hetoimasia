@@ -20,6 +20,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Test.Hspec
@@ -181,6 +182,38 @@ spec = describe "pinned readers, retirement and reclamation" $ do
             Refused (Integrity (DoubleFree _)) → pure ()
             other → expectationFailure ("a double free of " <> what <> " was not refused: " <> take 200 (show other))
         _ → expectationFailure "expected a retirement entry and a page to name"
+  it "refuses a supply that names a page outside the used space, however the allocator state came to say so" $ do
+    let st0 = (newH smallSpec ident0, Map.empty, mkRng 15)
+    (h1, ref1, g1) ← must (foldM (\s _ → churn s 30) st0 [1 .. 30 ∷ Int])
+    (h2, _) ← must (reclaimAll h1)
+    (h3, _, _) ← must (foldM (\s _ → churn s 30) (h2, ref1, g1) [1 .. 3 ∷ Int])
+    let ArenaId a = siArena (hIdent h3)
+        roots = storeRoots (hStore h3)
+        hw = rHw roots
+        planOn h = do
+          let d = deltaFor (hStore h) True False 1 [(runKey 90000 0 5, Just (runRec 8))]
+          (outcome, _, _) ← must (fillWith h (\w → planDelta (hCfg h) (hIdent h) (storeRoots (hStore h)) w Ordinary d))
+          pure outcome
+        refusedAsCorrupt what outcome = case outcome of
+          Refused (Integrity _) → pure ()
+          other → expectationFailure (what <> " was not refused: " <> take 200 (show other))
+    -- a loose page that is not inside the used page space
+    let looseOut = h3 {hStore = storeFromRoots (hCfg h3) (hIdent h3) roots {rLoose = PageNo hw : rLoose roots}}
+    planOn looseOut >>= refusedAsCorrupt "a loose page past the used space"
+    -- a valid-checksum free-extent page whose only extent reaches past the used space
+    freeRoot ← maybe (expectationFailure "a free root expected" >> fail "free") pure (rFree roots)
+    raw ← maybe (expectationFailure "free page" >> fail "free") pure (diskRead (hDisk h3) freeRoot)
+    firstFree ← case parsePage a (siSource (hIdent h3)) raw of
+      Right (RefPage _ _ _ (RefLeaf ((k0, _) : _)) _) → pure (getBe64' k0 0)
+      other → expectationFailure ("a free leaf expected: " <> show other) >> fail "free"
+    -- a page that is both loose and inside a free extent would be handed out twice
+    let looseAndFree = h3 {hStore = storeFromRoots (hCfg h3) (hIdent h3) roots {rLoose = [PageNo firstFree]}}
+    planOn looseAndFree >>= refusedAsCorrupt "a page both loose and free"
+    let PageNo fr = freeRoot
+        beyond = Page TreeFree 0 freeRoot (Leaf [(be64 0, be64 (hw + 1))])
+    bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) beyond)
+    let tampered = h3 {hDisk = diskWrite (PageNo fr) bytes (hDisk h3), hStore = storeFromRoots (hCfg h3) (hIdent h3) roots {rLoose = []}}
+    planOn tampered >>= refusedAsCorrupt "a free extent past the used space"
   it "refuses more readers than the bound and a token of another store" $ do
     let h = newH smallSpec ident0
         other = newH smallSpec (identOf 2 7)
