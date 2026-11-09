@@ -9,6 +9,8 @@ import Control.Concurrent.STM (atomically, check, readTVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, void)
 import Hetoimasia.Terrain.Coordinate (decomposeTile)
+import Hetoimasia.Terrain.Query (QueryLimits (..), defaultQueryLimits)
+import Hetoimasia.Terrain.Source (SourceLimits (..), defaultSourceLimits)
 import Data.List (isInfixOf, nub)
 import Hetoimasia.Terrain.Residency (ArenaPhase (..), Event (..), JobPhase (..), Revision (..), arenaId, arenaPhase, arenaRetainedBytes, jobArena, jobId, jobPhase, jobRegion, modelArenas, modelJobs, modelLimits, modelRegions, newModel, regionHandoff, step)
 import Hetoimasia.Terrain.Runtime
@@ -33,6 +35,15 @@ counted svc = (\r → (fromIntegral (limitRowCounted r), fromIntegral (limitRowM
 
 spec ∷ Spec
 spec = describe "Service-wide limits count every state that holds the resource" $ do
+  it "reports the configuration the service was built with, the limits it enforces, whatever configuration a caller holds" $ do
+    let configured = defaultConfig {configMaxArenas = 2, configQueryLimits = defaultQueryLimits {limitReturnedRuns = 600}, configSourceLimits = defaultSourceLimits {limitAuthoredRuns = 4096}}
+    withService configured $ \svc → do
+      let reported = inspectConfig svc
+      (configMaxArenas reported, limitReturnedRuns (configQueryLimits reported), limitAuthoredRuns (configSourceLimits reported)) `shouldBe` (2, 600, 4096)
+      limitRangeLevels (configQueryLimits reported) `shouldBe` limitRangeLevels defaultQueryLimits
+    withService defaultConfig $ \svc →
+      configSourceLimits (inspectConfig svc) `shouldBe` defaultSourceLimits
+
   it "keeps a closed arena with a borrowed snapshot counted against the arena limit until the borrower returns it" $
     withService (defaultConfig {configMaxArenas = 2}) $ \svc → do
       (client, first') <- openMain svc "first"

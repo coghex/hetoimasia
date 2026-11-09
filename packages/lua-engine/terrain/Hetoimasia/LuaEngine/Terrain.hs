@@ -156,6 +156,7 @@ import Hetoimasia.Terrain.Runtime
   , Settlement (..)
   , SurfaceAnswer (..)
   , endClient
+  , inspectConfig
   , registerClient
   )
 import qualified Hetoimasia.Terrain.Runtime as Terrain
@@ -259,10 +260,13 @@ incompatibleLimits config =
   , configured > cap
   ]
 
--- | A composition over a service, with no pick authority issued, no hooks and no extra bindings. A service configured with a limit above
--- what Lua is promised ('incompatibleLimits') is refused, with 'TerrainCompositionRefused'.
-newTerrainFacade ∷ Profile → Service → Config → IO TerrainFacade
-newTerrainFacade profile svc config = do
+-- | A composition over a service, with no pick authority issued, no hooks and no extra bindings. Every limit the adapter reads is the
+-- configuration the service itself reports ('inspectConfig'), never one a caller holds: a caller cannot hand the adapter a configuration
+-- that differs from the one the service enforces. A service configured with a limit above what Lua is promised ('incompatibleLimits') is
+-- refused, with 'TerrainCompositionRefused'.
+newTerrainFacade ∷ Profile → Service → IO TerrainFacade
+newTerrainFacade profile svc = do
+  let config = inspectConfig svc
   case incompatibleLimits config of
     [] → pure ()
     over → throwIO (TerrainCompositionRefused ("the terrain service's configuration exceeds the limits Lua is promised: " <> Text.intercalate "; " over))

@@ -100,6 +100,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectRetainedChargesSTM
   , inspectRetryMemory
   , inspectLimits
+  , inspectConfig
   , LimitRow (..)
   , inspectCensusSTM
   , Census
@@ -459,6 +460,12 @@ inspectRetryMemory ∷ Service → IO Int
 inspectRetryMemory svc = do
   st <- readTVarIO (serviceState svc)
   pure (Map.size (stateTransfers st) + Map.size (stateHandoffBusy st))
+
+-- | The configuration the service was built with. A pure read of the service's own immutable field: a host that composes over a service
+-- asks it, rather than being told a configuration that might differ from the one the service enforces. It reads no state and changes no
+-- behaviour.
+inspectConfig ∷ Service → Config
+inspectConfig = serviceConfig
 
 -- | Every service-wide limit with what admission counts against it and what an
 -- independent enumeration of the entities holding the resource finds. The two

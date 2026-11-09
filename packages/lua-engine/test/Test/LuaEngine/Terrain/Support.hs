@@ -111,7 +111,7 @@ withRigHooks ∷ Config → Probe → TerrainHooks → (Rig → IO a) → IO a
 withRigHooks config probe terrainHooks body =
   withWorkerGroup $ \group →
     withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe) $ \service → do
-      facade ← newTerrainFacade fixedM1Profile service config
+      facade ← newTerrainFacade fixedM1Profile service
       session ← newUnique
       signals ← newTVarIO Set.empty
       trace ← newTVarIO []
