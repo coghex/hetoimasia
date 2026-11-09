@@ -973,9 +973,18 @@ renderSnapshot ctx s parts = do
                   <> ["the control was not rejected: the judge found no disagreement with a draw broken on purpose" | rejected == Just False]
                   <> ["the control did not differ at its named probes, so it did not exercise what it breaks" | controlDiffers == Just False]
                   <> [Text.unpack reason | Just reason ← [resultFailure result]]
-          finished = case problems of
+          assessed = case problems of
             [] → result
             _ → result {resultFailure = Just (Text.pack (concatMap (<> "; ") problems))}
+          -- The unbiased-index control draws exact-boundary pixels the oracle, which states no float32
+          -- interpolation, cannot decide (it reads the exact boundary as the higher texel and the
+          -- device the lower on the pixels the counterexample found), so the oracle's verdicts on the
+          -- control's exact pass are not what judges it: the independent exact expectation rejects it
+          -- ('rejected' and 'controlDiffers', above), and only the first, ordinary pass keeps its
+          -- oracle verdicts.
+          finished
+            | specVariant s == UnbiasedIndex = assessed {resultProbes = concat (take 1 perPass)}
+            | otherwise = assessed
           factsExtra =
             Extra
               { extraSpec = s
