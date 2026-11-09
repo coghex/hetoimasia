@@ -571,6 +571,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.Terrain.Query"
                , "Hetoimasia.Terrain.Residency"
                , "Hetoimasia.Terrain.Runtime"
+               , "Hetoimasia.Terrain.Runtime.Settlement"
                , "Hetoimasia.Terrain.Source"
                , "Hetoimasia.Asset.Image"
                , "Hetoimasia.Asset.Image.DataMap"
