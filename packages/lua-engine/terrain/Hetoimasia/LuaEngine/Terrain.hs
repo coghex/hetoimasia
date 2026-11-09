@@ -114,7 +114,7 @@ import Hetoimasia.Scripting.Lua.Provider
   , Submission (..)
   , SubmissionDeclined (..)
   )
-import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, RequestContext)
+import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, RequestContext, capabilityType)
 import Hetoimasia.Scripting.Lua.Value (Schema (SNil), Value (..), capability)
 import Hetoimasia.Terrain.Cell (Cell (..), Column, IntervalError, MaterialId, ZRange, materialIdString, mkColumn, mkZRange, zRangeHi, zRangeLo)
 import Hetoimasia.Terrain.Coordinate (TileCoord, axisValue, tileCoord)
@@ -310,7 +310,7 @@ terrainInjection config =
 services ∷ Env → TerrainServices
 services env =
   TerrainServices
-    { tsTypes = [leaseCapabilityType leases terrainArenaType, leaseCapabilityType leases terrainPickType]
+    { tsTypes = [leaseCapabilityType leases terrainArenaType, capabilityType terrainPickType pickLive]
     , tsEndpoints = endpoints
     , tsDeclare = declare env
     , tsForget = forget env
@@ -353,6 +353,8 @@ services env =
     }
   where
     leases = tvLeases (envVm env)
+    -- A pick authority is live while the registry that issued it holds it: its liveness is not a lease's.
+    pickLive key = let TerrainPicks var = tfPicks (envFacade env) in Map.member key . snd <$> readTVarIO var
     startOr cell run = case tileOf cell of
       Left why → pure (TerrainRefused why)
       Right tile → run tile

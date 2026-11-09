@@ -14,6 +14,7 @@ module Test.LuaEngine.Terrain.Support
   , defaultConfigForRaces
   , noProbeForRaces
   , presentationOver
+  , presentationOverSession
   , gameplayOver
   , soilOverStone
   , terrainPrelude
@@ -45,7 +46,10 @@ import qualified Data.Text as Text
 import Data.Unique (Unique, newUnique)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
+import Hetoimasia.LuaEngine.Facade (terrainPickType)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
+import Hetoimasia.Scripting.Lua.Registration (Binding, asynchronousNativeRequestIn)
+import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger), Value (VInteger))
 import Hetoimasia.LuaEngine.Terrain
 import Hetoimasia.Terrain.Runtime
 import Test.Hspec (Expectation, expectationFailure)
@@ -81,14 +85,29 @@ withRigProbe config probe body =
       body
         Rig
           { rgService = service
-          , rgFacade = TerrainFacade fixedM1Profile service config picks noTerrainHooks [] 4096
+          , rgFacade = TerrainFacade fixedM1Profile service config picks noTerrainHooks [pickFixture] 4096
           , rgSession = session
           , rgPicks = picks
           }
 
 presentationOver, gameplayOver ∷ Rig → VmShape
-presentationOver rig = presentationShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig)}
-gameplayOver rig = gameplayShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig)}
+presentationOver rig = presentationShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk}
+gameplayOver rig = gameplayShape {shTerrain = Just (terrainInjection (rgFacade rig), rgSession rig), shInitialChunks = pickChunk}
+
+-- | The same VM of another session over the same service: its names are its own.
+presentationOverSession ∷ Rig → Unique → VmShape
+presentationOverSession rig session = (presentationOver rig) {shTerrain = Just (terrainInjection (rgFacade rig), session)}
+
+-- | How a fixture hands a script a pick authority the host issued: @TEST_PICK(key)@. It is a host-created fixture of the seam
+-- and nothing Lua can construct: a real script has no such function.
+pickChunk ∷ [Text]
+pickChunk = ["TEST_PICK = hetoimasia_engine.terrain_test_pick"]
+
+pickFixture ∷ Binding
+pickFixture =
+  asynchronousNativeRequestIn "terrain_test_pick" [SInteger] [SCapability terrainPickType] $ \_ values → case values of
+    [VInteger key] → pure [pickValue (fromIntegral key)]
+    _ → pure []
 
 -- | Lua for the soil-over-stone definition the examples share: stone below level -3, four soil levels from -3 to 1.
 soilOverStone ∷ Text

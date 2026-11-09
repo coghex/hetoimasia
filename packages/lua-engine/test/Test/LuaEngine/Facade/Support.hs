@@ -481,6 +481,9 @@ data VmShape = VmShape
   -- ^ The enabled content roots.
   , shGraphics ∷ !(Maybe GraphicsInjection)
   -- ^ The graphics a composition injects into the VM, if any (LFE-21).
+  , shInitialChunks ∷ ![Text]
+  -- ^ Lua a VM runs before the facade's own chunk, which still sees the hidden namespace of bindings: how a fixture hands a script a
+  -- host-made value.
   , shTerrain ∷ !(Maybe (TerrainInjection, Unique))
   -- ^ The terrain a composition injects into the VM, if any (TRA-5), with the identity of the session it belongs to: the
   -- same for every VM of one session, so that both roles share a namespace and a second session does not.
@@ -488,11 +491,11 @@ data VmShape = VmShape
 
 -- | A gameplay VM whose tick is a millisecond, enabling the session's root.
 gameplayShape ∷ VmShape
-gameplayShape = VmShape Gameplay 1000000 ["modules-test"] Nothing Nothing
+gameplayShape = VmShape Gameplay 1000000 ["modules-test"] Nothing [] Nothing
 
 -- | A presentation VM enabling the session's root.
 presentationShape ∷ VmShape
-presentationShape = VmShape Presentation 0 ["modules-test"] Nothing Nothing
+presentationShape = VmShape Presentation 0 ["modules-test"] Nothing [] Nothing
 
 -- | One VM: its owner, coordinator, facade and loader endpoint.
 data Fvm = Fvm
@@ -598,10 +601,16 @@ withFvmRefusing world runtime shape body = do
         >>= either (throwIO . RefusedFacade) pure
     let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "facade-" <> roleText}
     config ← either (\refused → assertFailure ("the facade was not installed: " <> show refused)) pure (installFacade facade [] [] base)
+    let withChunks =
+          config
+            { vmInitialChunks =
+                [(chunkName ("harness chunk " <> Text.pack (show index)), Text.encodeUtf8 source) | (index, source) ← zip [(0 ∷ Int) ..] (shInitialChunks shape)]
+                  <> vmInitialChunks config
+            }
     let grant = RequestGrant (facadeRequestEndpoints facade) 64 (if shRole shape == Gameplay then SettleAtAssignedTick Nothing else SettleOnArrival)
         instances = facadeInstanceConfig facade (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8, instanceTickDuration = tickDuration})
         spec =
-          (scheduledSpec config requiredPolicy bounds)
+          (scheduledSpec withChunks requiredPolicy bounds)
             { scheduledInstances = Just instances
             , scheduledRequestHandles = Just handles
             , scheduledLending = (\(lending, _, _) → lending) <$> scope
