@@ -281,6 +281,7 @@
 module Test.GPU.Vulkan.Native.Private
   ( privateRootsFlag
   , scenarioNames
+  , optInScenarios
   , requiredScenarios
   , runScenario
   , spec
@@ -595,13 +596,21 @@ scenarios =
         outcome ← SurfaceFree.runMaterials (consentBackend consent) journal
         pure (SurfaceFree.materialsSpec outcome, section "The R2D-11 application materials evidence record" (SurfaceFree.materialsSection outcome))
   , Scenario
-      "tra8-terrain"
-      "draws plans of the terrain arena's faces through the existing fixed-quad and material ABI into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — the 16 shape identities in each of 4 facings, roofs over cavities, disconnected spans, ramps and corners, manual and automatic cutaways, a floor 70 levels below the cut, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, the same scene submitted in plan order, scrambled, split between two materials and split between retained chunks, transparent coverage, and three negative controls — reads each back after its batch completed, judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated line-of-sight expectation, compares the pure pick, and writes a lossless PNG a target, a probe record and a fixture record; where the device chooses another depth format it reports that it cannot qualify, and fails"
+      "tra17-terrain"
+      "draws the cell-quad plans of the terrain arena through the existing fixed-quad and material ABI over a packed colour atlas and a packed normal atlas into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — the complete Q-13 qualification: the 16 shape identities in each of 4 facings, mixed and fog cells, roofs over cavities, disconnected spans, ramps, manual and automatic cutaways, a deep floor, the zoom endpoints, a fractional camera, a viewport, a content scale, pixel snapping, the lighting settings and the depth effects, the same scene submitted in plan order, scrambled, split between two materials, split between retained chunks and through the ordered wrapper, and eight negative controls — reads each back after its batch completed, judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated expectation, compares the pure pick, and writes a lossless PNG a target, a probe record and a fixture record; where the device chooses another depth format it reports that it cannot qualify, and fails. It is run directly and is not part of the complete profile (see optInScenarios)"
       False
       Nothing
       $ \consent journal _ → do
         outcome ← SurfaceFree.runTerrain (consentBackend consent) journal
-        pure (SurfaceFree.terrainSpec outcome, section "The TRA-8 terrain material evidence record" (SurfaceFree.terrainSection outcome))
+        pure (SurfaceFree.terrainSpec outcome, section "The TRA-17 terrain material evidence record" (SurfaceFree.terrainSection outcome))
+  , Scenario
+      "tra17-terrain-ci"
+      "draws the bounded required selection of the terrain material's evidence through the same path and judges it as the complete qualification is: the 16 shape identities in the south facing, mixed and fog cells, a roof over a cavity in four submissions and both wrappers, ramps, a depth-effect stack and a reversed-order control"
+      False
+      Nothing
+      $ \consent journal _ → do
+        outcome ← SurfaceFree.runTerrainCi (consentBackend consent) journal
+        pure (SurfaceFree.terrainCiSpec outcome, section "The TRA-17 bounded terrain material evidence record" (SurfaceFree.terrainCiSection outcome))
   , Scenario
       "r2d18-animation"
       "records nine render-2d snapshots whose instances name a frame table of their view, with the view's animation time, into offscreen targets that have a D32_SFLOAT depth image, in a surface-free session — an animated dynamic sprite and an animated tile of a retained chunk built once and never rebuilt, at times including one near 10^6 seconds and times exactly on frame boundaries, the same chunk drawn in two views with different tables and times, a non-animated instance in the same draw, and the two counterexamples to a 32-bit phase — the batch's frame tables written into its storage region and the vertex stage reading each instance's rectangle from the current frame of its table, reads each target back after completion, judges every pixel against the render-2d oracle and each named colour against the frame worked out by hand, and writes a lossless PNG a target and a probe record; where the device chooses another depth format it reports that"
@@ -710,6 +719,14 @@ scenarios =
 scenarioNames ∷ [String]
 scenarioNames = map scenarioName scenarios
 
+-- | Scenarios that are run directly, by name, and are not part of the complete profile: the
+-- complete Q-13 qualification of the terrain material, whose bounded selection
+-- (@tra17-terrain-ci@) is the one the required profile runs inside the child deadline. The
+-- exclusion is stated here, in one place, and is not an Hspec filter; the scenario is still known
+-- to @--private-roots@, which runs it without the parent's deadline.
+optInScenarios ∷ [String]
+optInScenarios = ["tra17-terrain"]
+
 -- | The scenarios a complete run under this consent must run to a pass: every
 -- one, except that a Wayland-only one is required only under the isolated
 -- compositor's consent, and one with a named Wayland gap is not required
@@ -718,6 +735,7 @@ requiredScenarios ∷ Either Refusal Consent → [String]
 requiredScenarios consent =
   [ scenarioName scenario
   | scenario ← scenarios
+  , scenarioName scenario `notElem` optInScenarios
   , if wayland then scenarioWaylandPending scenario == Nothing else not (scenarioWaylandOnly scenario)
   ]
   where
@@ -806,7 +824,7 @@ retain file contents =
 -- a Wayland-only one only under the isolated compositor's.
 spec ∷ Gate → IORef [ChildRun] → Spec
 spec gate timings = describe "with private roots in a child process" $
-  mapM_ example scenarios
+  mapM_ example [scenario | scenario ← scenarios, scenarioName scenario `notElem` optInScenarios]
   where
     example scenario = it (scenarioTitle scenario) $ do
       consent ← admit gate

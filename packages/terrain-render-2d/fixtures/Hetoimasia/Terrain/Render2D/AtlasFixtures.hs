@@ -46,6 +46,9 @@ data AtlasStyle = AtlasStyle
   -- ^ The colour parent as the bounded decoder produced it (premultiplied sRGB colour).
   , styleNormalImage ∷ !DecodedImage
   -- ^ The normal parent as decoded data (raw linear bytes).
+  , styleNormalAsColour ∷ !DecodedImage
+  -- ^ The same file decoded wrongly, as colour (sRGB, premultiplied): the negative control's
+  -- wrong colour-versus-data treatment. Never the style's own texture.
   , styleAssets ∷ !AssetSnapshot
   , styleArt ∷ !ArtSource
   -- ^ The source canvases, decoded independently of the atlases.
@@ -95,6 +98,7 @@ loadAtlasStyle version materials = do
         pure (ParentAtlas version version plane profile, image)
   (colour, colourImage) ← parent "colour.png" DecodeColour Nothing
   (normal, normalImage) ← parent "normal.png" DecodeData (Just UnitNormalRgbV1)
+  (_, normalAsColour) ← parent "normal.png" DecodeColour Nothing
   ids ← forM materials $ \(name, regionName) → (\identity → (identity, regionName)) <$> materialIdOf name
   assets ← either (failWith "the atlas assets" . show) pure (atlasAssetSnapshot version manifest colour normal ids)
   -- The source canvases, from the paths the manifest records, decoded on their own.
@@ -119,6 +123,7 @@ loadAtlasStyle version materials = do
       , styleNormal = normal
       , styleColourImage = colourImage
       , styleNormalImage = normalImage
+      , styleNormalAsColour = normalAsColour
       , styleAssets = assets
       , styleArt = ArtSource {artColour = texelOf colourTable, artMap = texelOf table}
       }

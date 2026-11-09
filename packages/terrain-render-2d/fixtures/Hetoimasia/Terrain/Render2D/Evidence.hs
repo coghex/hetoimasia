@@ -425,11 +425,13 @@ data Expected
   = -- | Nothing: the clear colour.
     ExpectedClear
   | -- | The nearest covered quad (what a pick finds), the nearer quads whose canvas holds the
-    -- point but whose colour or map texel is transparent (the reveals, nearest first), the colour
+    -- point but whose colour or map texel is transparent (the reveals, nearest first), the farther
+    -- quads whose texels at the point are also opaque (the overlaps the front hides), the colour
     -- drawn (lit premultiplied linear light) and the front quad's texel.
     ExpectedHit
       { expectedFront ∷ !HandQuad
       , expectedSkipped ∷ ![HandQuad]
+      , expectedBehind ∷ ![HandQuad]
       , expectedLinear ∷ !(Double, Double, Double)
       , expectedTexel ∷ !(Int, Int)
       }
@@ -488,6 +490,12 @@ expectedAt art light sc camera plan pixel = case pixelWorldPoint plan pixel of
     count = turnsOf (camFacing camera)
     decide sx sy = go [] quads
       where
+        -- Whether a farther quad's two texels at the point are opaque (decided away from boundaries).
+        covers b =
+          let (bx, by) = hqCorner b
+              u' = floor (sx - fromInteger bx) ∷ Int
+              v' = floor (sy - fromInteger by) ∷ Int
+           in u' >= 0 && v' >= 0 && u' < 96 && v' < 64 && (\(_, _, _, ca) → ca /= 0) (artColour art (hqColour b) u' v') && (\(_, _, _, ma) → ma /= 0) (artMap art (hqMap b) u' v')
         go _ [] = ExpectedClear
         go skipped (q : rest) =
           let (cx, cy) = hqCorner q
@@ -508,7 +516,7 @@ expectedAt art light sc camera plan pixel = case pixelWorldPoint plan pixel of
                             then go (skipped <> [q]) rest
                             else
                               let shaded = handShade light count (srgbDecode cr, srgbDecode cg, srgbDecode cb) (mr, mg, mb) (hqDepth q)
-                               in ExpectedHit {expectedFront = q, expectedSkipped = skipped, expectedLinear = shaded, expectedTexel = (u, v)}
+                               in ExpectedHit {expectedFront = q, expectedSkipped = skipped, expectedBehind = [b | b ← rest, covers b], expectedLinear = shaded, expectedTexel = (u, v)}
 
 -- | The expectation at every pixel of a scene's target, row by row, top to bottom.
 expectedImage ∷ ArtSource → HandLight → Scene → CellPlan → [[Expected]]
