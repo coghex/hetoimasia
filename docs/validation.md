@@ -410,9 +410,16 @@ that retains its changes; superseded work recomputed and never relabeled, a stal
 precondition answering `stale_view` and an ordered trace producing identical
 results under two residency schedules; startup, cancellation, unexpected-exit and
 borrower lifecycles; and, through external clients, that authorities, snapshots and
-private modules cannot be forged or reached. It is mandatory but outside the floor,
-like `test.terrain`, and runs through `cabal.project.cpu` on the `haskell-engine`
-worker, with a reusable receipt. Its package directory and Cabal file are inputs of
+private modules cannot be forged or reached; and the temporary store's pure model
+(TRA-20) with no file, thread or clock: its page codec checked against independent
+bytes and CRC32C vectors, its copy-on-write indexes against a reference map and an
+independent page-ownership traversal, #661's removals and discovery replayed through
+pages, failure, cancellation and abort of a staged transaction, pinned readers and
+reclamation, the allowance with its protected reserve and growth, the transaction
+bounds exactly and one past, the edit bank's admission division and a separately
+compiled client of the public store interface. It is mandatory but outside the
+floor, like `test.terrain`, and runs through `cabal.project.cpu` on the
+`haskell-engine` worker, with a reusable receipt. Its package directory and Cabal file are inputs of
 `test.workflow` as well, because the owned-start guard scans every test suite of the
 packages `cabal.project` lists; the package starts no thread of its own, and its
 examples start theirs through `Test.Support.Owned`. See

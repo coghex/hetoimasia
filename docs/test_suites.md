@@ -101,9 +101,19 @@ cabal test hetoimasia-tests --test-show-details=direct
   trace, startup, cancellation and unexpected-exit lifecycles, and the external-client
   boundary. It drives the production service through controlled gates (`Probe`), so
   no example sleeps; every thread it starts is owned through `Test.Support.Owned` and
-  its waits are bounded. It is the CPU group `test.terrain-runtime`, mandatory and
-  outside the floor, on the `haskell-engine` worker with a reusable receipt. See
-  [the package's contract](../packages/terrain-runtime/README.md).
+  its waits are bounded. The temporary store's pure model (TRA-20) is in the same
+  suite (`Test.TerrainRuntime.Store.*`, with no file, thread or clock): its page codec
+  and CRC32C against independent bytes, the copy-on-write indexes against a reference
+  map and an independent page-ownership traversal, #661's removals and discovery
+  replayed through pages, staged-transaction failure, cancellation and abort, pinned
+  readers and reclamation, the allowance, the protected reserve and growth, the
+  transaction bounds exactly and one past, the edit bank's admission division,
+  seeded update/abort/publish/read/reclaim cycles, forced-result allocation, a
+  separately compiled client of the public store interface, and the evidence printer
+  (`--match "TRA-20 evidence"`). The store's implementation is a private library of the
+  package, reached by the suite alone. It is the CPU group `test.terrain-runtime`,
+  mandatory and outside the floor, on the `haskell-engine` worker with a reusable
+  receipt. See [the package's contract](../packages/terrain-runtime/README.md).
 
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,

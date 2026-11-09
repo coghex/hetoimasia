@@ -594,7 +594,12 @@ disposal.
 the empty space, over the immutable source plus retained removals. It is a pure
 model of records, bounded candidate deltas and queries. It performs no I/O,
 starts no thread, keeps no mutable registry and has no Lua, graphics or game
-dependency. The page codec and copy-on-write store (TRA-20), the file and
+dependency. The page codec and copy-on-write store (TRA-20, in
+[`hetoimasia-terrain-runtime`](../terrain-runtime/README.md#the-temporary-store-tra-20))
+consume this model's records through its public types: it encodes
+`RecordKey`/`Record` into pages and plans a `Candidate`'s writes as one bounded
+transaction; this package gained only `mkComponentKey`, the inverse of a component
+key's origin and parameters, so a decoded record names its component. The file and
 asynchronous I/O (TRA-21) and the live owner that holds the committed value and
 publishes candidates (TRA-22) are later slices; nothing here is a terrain
 service, a file backend or a persistent-save promise.
@@ -792,8 +797,11 @@ source is charged once to the arena (`envSharedBytes`), never to a candidate. Th
 integration envelope is P-15's 64 MiB edit bank (48 MiB record caches, 8 MiB staging,
 8 MiB control), at most 4 MiB of RAM and 1 MiB of encoded pages per later store
 transaction and at most 64 structural updates per batch; the model can stop below 64
-when its allowance is tighter, and exact page charges and bank enforcement are TRA-20
-and TRA-22.
+when its allowance is tighter. The exact page charges are TRA-20's
+(`hetoimasia-terrain-runtime`: a plan writes at most 256 pages and reserves at most
+4 MiB, and stops a batch earlier when that is tighter than 64 updates) and the bank
+enforcement is TRA-22's; a structural update stays this model's unit (one connection
+inspected), never a page or an index copy.
 
 ### State, owner and lifetime
 
@@ -1123,9 +1131,16 @@ Checks run in a fixed order and the first failure is reported:
    an arena's teardown frees retained bytes; the public Lua mapping stays `busy`
    until then (TRA-5 owns it). Reads, navigation and camera demand continue within
    their own banks. This bound and its persistent refusal are the current, interim
-   rule: the design's D-40 (temporary disk backing for retained terrain changes,
-   pending Q-19 and Q-20) is outside this slice, and the bound is not the arena's
-   final total-history contract.
+   rule: the design's D-40 (temporary disk backing for retained terrain changes) is
+   specified, and its storage-aware admission decisions exist as a pure model in
+   [`hetoimasia-terrain-runtime`](../terrain-runtime/README.md#the-temporary-store-tra-20)
+   (TRA-20: a 48 MiB cache, 8 MiB staging and 8 MiB control division of this same
+   64 MiB edit bank, backed-only eviction and a per-arena disk allowance). Until the
+   terrain owner adopts them (TRA-22) this baseline keeps its RAM-only behavior
+   exactly: its 64 MiB retained capacity, its lifetime charge (an offload or an
+   eviction never credits it, because the baseline holds the only copy) and this
+   refusal are unchanged and pinned by `Test.Terrain.StorageCompat`. The bound is
+   still not the arena's final total-history contract.
 3. **Busy**: the command slot, the staging bank, the edit bank (other
    reservations outstanding) and last the resident bank, whose refusal names the
    shortfall, the bytes of eligible victims and how many regions each condition
@@ -1246,7 +1261,9 @@ results for the incarnation are stale. The owner still performs the real close.
 
 TRA-4 supplies identities, sequencing, the real cells of each job, the measured cost
 of each completed job, the real edit and its commit revision, and the discard of each
-victim. TRA-5 maps refusals to the Lua `busy`. Native memory, GPU ownership and
+victim. TRA-22 replaces the lifetime retained-edit charge with the storage-aware
+decisions of TRA-20 only when it adopts the store, and only for edits that have a
+real backing copy. TRA-5 maps refusals to the Lua `busy`. Native memory, GPU ownership and
 retirement, and every GPU limit belong to their render and graphics slices.
 
 Retained trace evidence (separate resident, edit and staging ledgers around
