@@ -8,14 +8,16 @@ import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromExcep
 import Control.Exception (throwIO)
 import qualified Data.Text as Text
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Control.Monad (void)
+import Control.Monad (forM_, void)
 import Hetoimasia.Scripting.Lua.Admission
+import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease (Ownership (..))
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Scheduled (grantScheduledStep, scheduledEndpoint)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
+import Test.LuaRuntime.Instance.Support (expectControl, grantOne)
 import Test.LuaRuntime.Request.Support (awaitDiagnostic, diagnostics, finishWork, onSubmit, submissions)
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
@@ -110,6 +112,58 @@ spec = describe "the settlement seam and the declining hand-off" $ do
       -- the provider's retirement says so: the work is over
       finishWork (afFake fixture) 0
       awaitDiagnostic owner ((== 0) . rdWorkPending)
+
+  it "holds a reply made before its tick without proving the provider's work over: invisible until the tick, and its work stays polled through the tick's service" $ bounded $ do
+    fixture ← newAFix 4
+    withBoundary $ \control runtime → settleAll fixture $ do
+      owner ← startAdmitting fixture runtime "keeps late" [admitter] aConfig (admissionGrant fixture 8 (SettleAtAssignedTick Nothing)) requiredPolicy
+      admitAdmitter fixture owner "i" "admitter"
+      seam ← newIORef Nothing
+      onSubmit (afFake fixture) (captured seam)
+      acommand fixture owner "i" "start" "a"
+      awaitNote fixture "cmd start a started"
+      Just settling ← readIORef seam
+      -- the reply arrives before the request's place: it is held for it, and a held completion made while the provider's work remains is
+      -- not proof that the work is over
+      atomically (settlingSettleKeeping settling (ProviderResult (VInteger 7))) >>= (`shouldBe` ReplyHeld)
+      -- it is not visible until the place is reached
+      acommand fixture owner "i" "take" "a"
+      awaitNote fixture "cmd take a {status=pending}"
+      d ← diagnostics owner
+      rdWorkPending d `shouldBe` 1
+      -- the place is reached and served: the script takes it, and the provider's work is still not over
+      grantOne control owner
+      acommand fixture owner "i" "take" "a"
+      awaitNote fixture "cmd take a {status=success,value={v=7}}"
+      d' ← diagnostics owner
+      rdWorkPending d' `shouldBe` 1
+      finishWork (afFake fixture) 0
+      awaitDiagnostic owner ((== 0) . rdWorkPending)
+
+  -- Every way a request ends while a completion made with the provider's work remaining is held for its tick: none proves the work over.
+  forM_
+    [ ("the script cancelled it", \fixture owner → acommand fixture owner "i" "cancel" "a" >> awaitNote fixture "cmd cancel a cancelled")
+    , ("an epoch change cancelled it", \_ owner → void (advanceRequestEpoch (scheduledEndpoint owner)))
+    , ("its instance ended", \fixture owner → void (expectControl (afBase fixture) owner "i" InstanceStop))
+    ]
+    $ \(how, event) →
+      it ("keeps the work of a held completion made while the provider's work remained, when " <> how) $ bounded $ do
+        fixture ← newAFix 4
+        withBoundary $ \_ runtime → settleAll fixture $ do
+          owner ← startAdmitting fixture runtime "keeps held" [admitter] aConfig (admissionGrant fixture 8 (SettleAtAssignedTick Nothing)) requiredPolicy
+          admitAdmitter fixture owner "i" "admitter"
+          seam ← newIORef Nothing
+          onSubmit (afFake fixture) (captured seam)
+          acommand fixture owner "i" "start" "a"
+          awaitNote fixture "cmd start a started"
+          Just settling ← readIORef seam
+          atomically (settlingSettleKeeping settling (ProviderResult (VInteger 7))) >>= (`shouldBe` ReplyHeld)
+          event fixture owner
+          -- the request is over, and the provider's work is not: it is still owed, and its places are still charged
+          d ← diagnostics owner
+          rdWorkPending d `shouldBe` 1
+          finishWork (afFake fixture) 0
+          awaitDiagnostic owner ((== 0) . rdWorkPending)
 
   it "treats every reply that comes while a resource reply waits to be built as a duplicate, whatever it is" $ bounded $ do
     fixture ← newAFix 4

@@ -1031,6 +1031,10 @@ data Rec = Rec
   , recDue ∷ !(Maybe DueSlot)
   , recHeld ∷ !(Maybe (Reply Value))
     -- ^ The provider's completion, held until the request's tick: no settlement yet.
+  , recHeldKeeps ∷ !Bool
+    -- ^ The held completion was made while the provider's work remained ('settlingSettleKeeping'): it does not prove the work over, whatever
+    -- becomes of the request (its tick serves it, a cancel, the requester's end, an epoch or the owner's close), and the work stays polled
+    -- for its retirement until the provider says so.
   , recGated ∷ !(Maybe Word64)
     -- ^ The tick this request keeps from beginning, until it is complete.
   , recEnded ∷ !(Maybe (Settlement Value, CancelCause))

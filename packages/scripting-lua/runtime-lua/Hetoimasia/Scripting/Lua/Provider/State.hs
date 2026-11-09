@@ -575,6 +575,7 @@ admit service requester endpoint placement = do
                         , recSchema = endpointResult endpoint
                         , recDue = slot
                         , recHeld = Nothing
+                        , recHeldKeeps = False
                         , recGated = dueTick <$> slot
                         , recEnded = Nothing
                         , recAdmission = Nothing
@@ -857,6 +858,7 @@ admitOptIn service requester endpoint ask = (OptInAccepted <$> attempt) `catchST
               , recSchema = endpointResult endpoint
               , recDue = slot
               , recHeld = Nothing
+              , recHeldKeeps = False
               , recGated = dueTick <$> slot
               , recEnded = Nothing
               , recAdmission = Just ask
@@ -1454,7 +1456,7 @@ applyCheckedFor service keepsWork settleNow identity checked = do
               session' = case checked of
                 CheckedOversize _ → counting (\counters → counters {countOversizePayloads = countOversizePayloads counters + 1}) session
                 _ → session
-              released = found {recHeld = Just held, recFailure = failureOf}
+              released = found {recHeld = Just held, recHeldKeeps = keepsWork, recFailure = failureOf}
           released' ← dropGate service released
           writeTVar (psVar service) $
             endsWork identity $
@@ -1495,6 +1497,11 @@ applyCheckedFor service keepsWork settleNow identity checked = do
     -- The provider's work is not proved over: it is polled for its retirement, as the work of a request whose interest was withdrawn is, and
     -- is over when the provider says so.
     withdrawWork found st' = st' {pWork = Map.adjust (\work → if workEnded work then work else work {workWantsCancel = True}) found (pWork st')}
+
+-- | A completion the provider held, that proves its work over: one made while its work remained ('recHeldKeeps') does not, whatever
+-- becomes of the request.
+completedHeld ∷ Rec → Bool
+completedHeld record = isJust (recHeld record) && not (recHeldKeeps record)
 
 -- | Whether a request may be settled by the opt-in settlement seam now ('Settling'): read-only. It is waiting for
 -- its answer (it has not settled, no completion is held for it, no resource is waiting to be built into its
@@ -1542,14 +1549,9 @@ settleWith service ask schema = settleWithFinal service ask schema (pure Nothing
 
 -- | 'settleWith' for a reply that leaves the provider's work outstanding ('applyCheckedFor'): the provider still holds something borrowed
 -- for the request, and says when it is over through its retirement. A resource reply is not made through it.
---
--- It settles at once, whatever tick the request is due at, and is never held for it: a held reply is a completion that has not yet been
--- applied, and every path that ends a request while one is held (the tick's service, a cancel, the requester's end, an epoch, the owner's
--- close) takes it for the provider's proof that its work is over. A reply that keeps work outstanding must not be taken so, so it takes the
--- way a settlement at its position does: the request is settled, stays among the places not yet served and is hidden from its waiters until
--- its tick serves it, and its work is polled for its retirement.
 settleKeeping ∷ ProviderState → Admission → Schema → RequestId → ProviderReply → STM ReplyAnswer
-settleKeeping service ask schema identity reply =
+settleKeeping service ask schema identity reply = do
+  eligible ← eligibleOf service identity
   case checkReplyPure (psLimits service) schema ask reply of
     checked@(CheckedDefect _) → replyTo service identity checked
     checked → do
@@ -1558,7 +1560,7 @@ settleKeeping service ask schema identity reply =
         then do
           writeTVar (psVar service) st {pCounts = (pCounts st) {countDuplicateHeld = countDuplicateHeld (pCounts st) + 1}}
           pure ReplyLate
-        else applyCheckedFor service True True identity checked
+        else applyCheckedFor service True eligible identity checked
 
 -- | 'settleWith' for a resource reply that carries the provider's last look at the settlement ('adoptingFinal'): taken in the very
 -- transaction that settles the request once the owner has built the resource. A resource reply made when the request is eligible is
@@ -1712,8 +1714,8 @@ cancelOf service requester number = do
       | otherwise → case cancelRequestWith CancelledByOwner (recIdentity record) (pSession st) of
           (_, Left _) → pure CancelTooLate
           (session, Right ()) → do
-            released ← dropGate service record {recHeld = Nothing}
-            let completed = isJust (recHeld record)
+            released ← dropGate service record {recHeld = Nothing, recHeldKeeps = False}
+            let completed = completedHeld record
                 before = isJust (recDue record)
                 st' =
                   st
@@ -1793,9 +1795,12 @@ serveDue service identities = do
         , maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests (pSession st))) → do
             let (session, _) = applyReplyIn identity held (pSession st)
             writeTVar (psVar service) $
-              endWork identity st
+              -- A completion made while the provider's work remained does not become proof that it is over by being served: the work is still
+              -- polled for its retirement (it was marked at the hold), and the request's places return when the provider says so.
+              (if recHeldKeeps record then id else endWork identity)
+                st
                 { pSession = session
-                , pRecs = Map.insert identity record {recHeld = Nothing} (pRecs st)
+                , pRecs = Map.insert identity record {recHeld = Nothing, recHeldKeeps = False} (pRecs st)
                 , pCounts = (pCounts st) {countSettledAtTick = countSettledAtTick (pCounts st) + 1}
                 }
             -- The completion became a settlement now: a required request's expected failure is
@@ -1830,7 +1835,7 @@ endRequesterSTM service requester cause = do
       theirWork = [identity | (identity, work) ← Map.toList (pWork st), workRequester work == requester]
   released ← forM mine (dropGate service)
   -- A completion the provider held is proof it finished, whatever became of the request.
-  let completed = [recIdentity record | record ← mine, isJust (recHeld record)]
+  let completed = [recIdentity record | record ← mine, completedHeld record]
       withEnded = foldl' (flip endWork) st completed
       revoked = case Map.lookup requester (pHolders withEnded) of
         Just holder → endHolder holder cause (pSession withEnded)
@@ -1937,8 +1942,8 @@ advanceEpochSTM service = do
       | isJust (recEnded record) = pure (st, kept <> [record], cancelled, discarded)
       | otherwise = do
           let identity = recIdentity record
-              completed = isJust (recHeld record)
-          released ← dropGate service record {recHeld = Nothing}
+              completed = completedHeld record
+          released ← dropGate service record {recHeld = Nothing, recHeldKeeps = False}
           case Map.lookup identity (sessionRequests (pSession st)) of
             Just found
               | isNothing (requestSettlement found) → do
@@ -1961,7 +1966,7 @@ closeSTM service = do
     then pure (pExit st)
     else do
       mapM_ (dropGate service) (Map.elems (pRecs st))
-      let completed = [recIdentity record | record ← Map.elems (pRecs st), isJust (recHeld record)]
+      let completed = [recIdentity record | record ← Map.elems (pRecs st), completedHeld record]
           withEnded = foldl' (flip endWork) st completed
           (session, exit) = stopSession (pSession withEnded)
       let prelim =
