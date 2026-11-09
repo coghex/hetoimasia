@@ -4,11 +4,11 @@ vulkan: VK_DRIVER_FILES=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulk
 vulkan: VK_LAYER_PATH=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
 vulkan: validation features synchronization
 vulkan: VMA binding calls unsafe (VulkanMemoryAllocator -safe-foreign-calls), build directory /Users/vincentcoghlan/worktrees/coghex/hetoimasia/issue-659-terrain-face-map-material/dist-vulkan
-vulkan: repository revision 7e48253fb843162054e52f6d85b18426bd963181
-vulkan: source digest 4c3a4bd0a4551144870a5e9db1c5f49033710a0814b51937396aef47e0257633
+vulkan: repository revision 7bc5b98c0ddf5c82d65bff91a05907c230af6f66
+vulkan: source digest 381400070997224a87bcbcbf809976e68cb0a6a9b03fac44863284cb37557805
 journal: ## TRA-17: a surface-free session draws the cell-quad plans of the terrain arena, adapted through the existing fixed-quad and material ABI over a packed colour atlas and a packed normal atlas, into offscreen targets that have a D32_SFLOAT depth image, reads each back after its batch completed and judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated expectation: the 16 shape identities in each of 4 facings, mixed and fog cells, roofs over cavities, disconnected spans, ramps, cutaways, the automatic follow, a deep floor, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, lighting and depth-effect settings, equivalent submissions, ordered and cutout wrappers and retained chunks, and nine negative controls
-journal: the terrain evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full16/terrain
-journal: terrain probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full16/terrain/tra17-terrain-probes.json
+journal: the terrain evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full17/terrain
+journal: terrain probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full17/terrain/tra17-terrain-probes.json
 journal: terrain depth format: Depth32Float
 journal: terrain fixture matrix-FaceSouth-0.25: 10560 probes, 10560 determinate, 0 not counted; passed
 journal: terrain fixture matrix-FaceWest-0.25: 10560 probes, 9504 determinate, 1056 not counted; passed
@@ -125,6 +125,7 @@ journal: terrain fixture spans-FaceSouth@0.125-control-reversed-overlap: 1008 pr
 journal: terrain fixture ramps-FaceSouth@0.125-control-whole-cell-mask: 1596 probes, 1596 determinate, 0 not counted; passed
 journal: terrain fixture ramps-FaceWest@0.125-control-wrong-facing-light: 1404 probes, 1174 determinate, 230 not counted; passed
 journal: terrain fixture depth-stack-FaceSouth@0.25@neither-effect-haze-control-depth-reset: 4788 probes, 4788 determinate, 0 not counted; passed
+journal: terrain fixture depth-stack-FaceSouth@0.25@both-short-range-control-wrong-composition-order: 4788 probes, 4788 determinate, 0 not counted; passed
 journal: terrain fixture matrix-FaceSouth-1.0@0.25-control-swapped-region-origins: 8664 probes, 8664 determinate, 0 not counted; passed
 journal: terrain fixture ramps-FaceSouth@0.125-control-whole-atlas-clamping: 1596 probes, 1596 determinate, 0 not counted; passed
 journal: terrain fixture ramps-FaceSouth@0.125-control-normal-as-colour: 1596 probes, 1596 determinate, 0 not counted; passed
@@ -150,7 +151,6 @@ TRA-17 the terrain material's window-free evidence
   retired cleanly, with every Vulkan call on the owner's thread [✔]
   reached a verdict after the last callback with no issue and no error, synchronization validation included [✔]
 
-Finished in 0.2377 seconds
+Finished in 0.1660 seconds
 5 examples, 0 failures
 vulkan-native-tests tra17-terrain: every check passed
-rc=0

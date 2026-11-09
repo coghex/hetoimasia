@@ -9,12 +9,12 @@ Verdict: **pass**.
 - target standing: no target
 - actions: ran the terrain evidence
 - device calls, in order: vkCreateInstance, vkCreateDebugUtilsMessengerEXT, vkEnumeratePhysicalDevices, vkCreateDevice, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
-- Vulkan calls: 3868, on 1 thread(s)
+- Vulkan calls: 3889, on 1 thread(s)
 - frames presented: 0, presentations retired: 0
 - verdict issues: []
 - error reports: 0
-- seconds, from the loader integration to the verdict: 65.888883
-- probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full16/terrain/tra17-terrain-probes.json
+- seconds, from the loader integration to the verdict: 66.098887
+- probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full17/terrain/tra17-terrain-probes.json
 - failure: none
 - depth format: Depth32Float
 - matrix-FaceSouth-0.25: pass, 10560 probes, 10560 determinate
@@ -325,6 +325,9 @@ Verdict: **pass**.
 - depth-stack-FaceSouth@0.25@neither-effect-haze-control-depth-reset: pass, 4788 probes, 4788 determinate
     - pass a quad's art covers the pixels its colour and map hold and nothing beside them
     - pass the lighting and the art differ across the covered surface
+- depth-stack-FaceSouth@0.25@both-short-range-control-wrong-composition-order: pass, 4788 probes, 4788 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
 - matrix-FaceSouth-1.0@0.25-control-swapped-region-origins: pass, 8664 probes, 8664 determinate
     - pass a quad's art covers the pixels its colour and map hold and nothing beside them
     - pass the lighting and the art differ across the covered surface
@@ -374,8 +377,8 @@ Verdict: **pass**.
 
 ```
 ## TRA-17: a surface-free session draws the cell-quad plans of the terrain arena, adapted through the existing fixed-quad and material ABI over a packed colour atlas and a packed normal atlas, into offscreen targets that have a D32_SFLOAT depth image, reads each back after its batch completed and judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated expectation: the 16 shape identities in each of 4 facings, mixed and fog cells, roofs over cavities, disconnected spans, ramps, cutaways, the automatic follow, a deep floor, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, lighting and depth-effect settings, equivalent submissions, ordered and cutout wrappers and retained chunks, and nine negative controls
-the terrain evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full16/terrain
-terrain probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full16/terrain/tra17-terrain-probes.json
+the terrain evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full17/terrain
+terrain probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full17/terrain/tra17-terrain-probes.json
 terrain depth format: Depth32Float
 terrain fixture matrix-FaceSouth-0.25: 10560 probes, 10560 determinate, 0 not counted; passed
 terrain fixture matrix-FaceWest-0.25: 10560 probes, 9504 determinate, 1056 not counted; passed
@@ -492,6 +495,7 @@ terrain fixture spans-FaceSouth@0.125-control-reversed-overlap: 1008 probes, 100
 terrain fixture ramps-FaceSouth@0.125-control-whole-cell-mask: 1596 probes, 1596 determinate, 0 not counted; passed
 terrain fixture ramps-FaceWest@0.125-control-wrong-facing-light: 1404 probes, 1174 determinate, 230 not counted; passed
 terrain fixture depth-stack-FaceSouth@0.25@neither-effect-haze-control-depth-reset: 4788 probes, 4788 determinate, 0 not counted; passed
+terrain fixture depth-stack-FaceSouth@0.25@both-short-range-control-wrong-composition-order: 4788 probes, 4788 determinate, 0 not counted; passed
 terrain fixture matrix-FaceSouth-1.0@0.25-control-swapped-region-origins: 8664 probes, 8664 determinate, 0 not counted; passed
 terrain fixture ramps-FaceSouth@0.125-control-whole-atlas-clamping: 1596 probes, 1596 determinate, 0 not counted; passed
 terrain fixture ramps-FaceSouth@0.125-control-normal-as-colour: 1596 probes, 1596 determinate, 0 not counted; passed

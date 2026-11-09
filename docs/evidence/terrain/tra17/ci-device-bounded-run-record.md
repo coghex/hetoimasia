@@ -5,15 +5,15 @@ Verdict: **pass**.
 ## A surface-free session drawing the bounded selection of the terrain arena's cell quads over a D32_SFLOAT depth image
 
 - windows: 0
-- roots at the end of the body: RootsView {viewInstance = RootLive, viewMessenger = RootLive, viewDevice = RootLive, viewAllocator = RootLive, viewDeviceName = Just "llvmpipe (LLVM 20.1.2, 256 bits)", viewSubPixelPrecisionBits = Just 8, viewQueueFamily = Just 0, viewTargets = [], viewAdmitting = True, viewLoss = Nothing}
+- roots at the end of the body: RootsView {viewInstance = RootLive, viewMessenger = RootLive, viewDevice = RootLive, viewAllocator = RootLive, viewDeviceName = Just "llvmpipe (LLVM 20.1.2, 256 bits)", viewDriverName = Just "llvmpipe", viewDriverInfo = Just "Mesa 25.2.8-0ubuntu0.24.04.2 (LLVM 20.1.2)", viewSubPixelPrecisionBits = Just 8, viewQueueFamily = Just 0, viewTargets = [], viewAdmitting = True, viewLoss = Nothing}
 - target standing: no target
 - actions: ran the terrain-ci evidence
 - device calls, in order: vkCreateInstance, vkCreateDebugUtilsMessengerEXT, vkEnumeratePhysicalDevices, vkCreateDevice, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
-- Vulkan calls: 950, on 1 thread(s)
+- Vulkan calls: 945, on 1 thread(s)
 - frames presented: 0, presentations retired: 0
 - verdict issues: []
 - error reports: 0
-- seconds, from the loader integration to the verdict: 3.099584428
+- seconds, from the loader integration to the verdict: 1.467637984
 - probe record: /__w/hetoimasia/hetoimasia/receipts/evidence/test.vulkan-native/terrain-ci/tra17-terrain-ci-probes.json
 - failure: none
 - depth format: Depth32Float

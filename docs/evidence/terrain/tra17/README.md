@@ -23,11 +23,11 @@ control or a recorded band.
 | Device | Apple M3 Max, Vulkan through the driver the session reports: `driverName = MoltenVK`, `driverInfo = 1.4.2` (the pinned Homebrew MoltenVK), surface-free, no window; every value is queried from the rendering session's physical device and stored in each record |
 | Device limit read | `subPixelPrecisionBits = 8`, **queried from the session** (`RootsView.viewSubPixelPrecisionBits`, with `viewDriverName` and `viewDriverInfo`) and recorded per pass; a standalone `vulkaninfo` printed 4 and did not reflect the session's device |
 | Depth | `Depth32Float` (an unsupported depth is a failure, never a skip) |
-| Tested head | `7e48253fb843162054e52f6d85b18426bd963181` on a clean tree, master (`c9e29d70`) already merged |
-| Source digest | `4c3a4bd0a4551144870a5e9db1c5f49033710a0814b51937396aef47e0257633` |
+| Tested head | `7bc5b98c0ddf5c82d65bff91a05907c230af6f66` on a clean tree, master (`651e79e0`) already merged |
+| Source digest | `381400070997224a87bcbcbf809976e68cb0a6a9b03fac44863284cb37557805` |
 | Tolerance | 3 8-bit steps per channel, declared before any pixel is read (the oracle's own probe tolerance, one step, judges the oracle path) |
-| Full run | `tra17-terrain`: 132 fixtures, 63.7 s scenario; opt-in, excluded from `--complete` |
-| Bounded run | `tra17-terrain-ci`: 11 fixtures, 1.7 s scenario; the CI timeline and CI-device records (`ci-timeline.md`, `ci-device-bounded-run-record.md`, `*-ci-device.json`) are those of the CI candidate `47e3182c` (source digest `a7766bac...`), an earlier head: CI at the final head is recorded in the pull request |
+| Full run | `tra17-terrain`: 133 fixtures, 63.5 s scenario; opt-in, excluded from `--complete` |
+| Bounded run | `tra17-terrain-ci`: 11 fixtures, 1.7 s scenario; the CI-device records and `ci-timeline.md` are those of CI's run at the same head and the same source digest |
 | Atlas layout identity | `263cb64032502aa0` |
 
 Reproduce (macOS, under the standing per-command consent; on Linux use the runner's isolated display):
@@ -102,8 +102,8 @@ colour do not change.
 
 Undecided pixels in the full run occur in two unsnapped fractional fixtures only, `sequence-zoom` (618 of 6418
 covered, 9.6 %) and `fractional@0.1875` (136 of 844, 16.1 %); every other fixture has none. The device band exempts DEVICE read-back only: the pure picker and the pure material model are compared with the exact
-expectation at every pixel of these fixtures, banded or not (`Expectation`, `ModelAtBand`). On CI's device at the
-earlier candidate (`llvmpipe (LLVM 20.1.2, 256 bits)`, which also reports `b = 8`) the bounded scenario has none.
+expectation at every pixel of these fixtures, banded or not (`Expectation`, `ModelAtBand`). On CI's device
+(`llvmpipe (LLVM 20.1.2, 256 bits)`, which also reports `b = 8`) the bounded scenario has none.
 
 ## What passes
 
@@ -141,7 +141,7 @@ earlier candidate (`llvmpipe (LLVM 20.1.2, 256 bits)`, which also reports `b = 8
   `*-released-while-pending` fixtures, which mark the atlases' original ownership released between the frame's
   submission and its completion (retained chunks included): the frame completes and reads back correct.
 - **Negative controls**, each a draw or a pick broken once and rejected by the same judge, each differing at its named
-  probes: reversed depth order, the whole-cell mask, the wrong facing's sun, the depth effects reset, swapped colour
+  probes: reversed depth order, the whole-cell mask, the wrong facing's sun, the depth effects reset, the depth effects composed in the wrong order (haze first, then darkening; on the short-range depth stack where both are strong), swapped colour
   region origins, whole-atlas clamping, the normal atlas bound as colour, half-texel-inset interpolation, the texel
   rule with no bias, with the superseded 1/10000 bias, a pick through the farthest covered quad, a pick through fog, a
   pick that answers loading as a miss, the wrong (next) map region, and colour holes ignored.
@@ -151,8 +151,7 @@ earlier candidate (`llvmpipe (LLVM 20.1.2, 256 bits)`, which also reports `b = 8
 
 ## What remains (stated, not hidden)
 
-- **UNEXERCISED on the device**: a wrong composition order of darkening and haze has no negative control (the
-  depth-effect reset control is built); packed against single-image atlases on the GPU beyond the 49-image style that
+- **UNEXERCISED on the device**: packed against single-image atlases on the GPU beyond the 49-image style that
   draws and picks as the packed one does; a streamed or live background (#645); the terrain adapter allocates no texture, so
   the lifetime of its parents is shown through #672's real pipeline instead of on the device: the lua-engine-graphics
   headless rig (`Test.LuaEngine.Graphics.TerrainParents`: original lease released while a batch still reads the parents,
@@ -299,6 +298,7 @@ earlier candidate (`llvmpipe (LLVM 20.1.2, 256 bits)`, which also reports `b = 8
 | ramps-FaceSouth@0.125-control-whole-cell-mask | pass | 429 | 389 | 0 | 0.0% | yes | 0.0166 | 0/798 | rejected |
 | ramps-FaceWest@0.125-control-wrong-facing-light | pass | 429 | 239 | 0 | 0.0% | yes | 0.0166 | 0/702 | rejected |
 | depth-stack-FaceSouth@0.25@neither-effect-haze-control-depth-reset | pass | 1093 | 934 | 0 | 0.0% | yes | 0.0088 | 0/684 | rejected |
+| depth-stack-FaceSouth@0.25@both-short-range-control-wrong-composition-order | pass | 1093 | 820 | 0 | 0.0% | yes | 0.0088 | 0/684 | rejected |
 | matrix-FaceSouth-1.0@0.25-control-swapped-region-origins | pass | 2754 | 2754 | 0 | 0.0% | yes | 0.0088 | 0/619 | rejected |
 | ramps-FaceSouth@0.125-control-whole-atlas-clamping | pass | 429 | 424 | 0 | 0.0% | yes | 0.0166 | 0/798 | rejected |
 | ramps-FaceSouth@0.125-control-normal-as-colour | pass | 429 | 243 | 0 | 0.0% | yes | 0.0166 | 0/798 | rejected |
