@@ -69,6 +69,11 @@ checks merged work and changed issues against it and resumes from
   compatibility contract and not a source to copy wholesale. The reasons are a
   full lighting system that Synarchy's renderer cannot support, and uniform
   sprite assets regenerated from 3D models with `~/work/moskophoros`.
+- 2026-11-09, [vision](docs/vision.md) V-1: "Haskell mechanisms, Lua rules"
+  (terrain arena D-17) is the general pattern for every system, not a
+  terrain-only choice. The engine supplies reusable Haskell mechanisms through
+  narrow services; Lua defines the game's rules, recipes and authored choices.
+  A system's design departs from it only by an explicit owner decision.
 - Not committed: a game save schema, source or save compatibility with
   Synarchy, a migration date, permanent RTS tuning, an engine-wide rendering
   abstraction.
