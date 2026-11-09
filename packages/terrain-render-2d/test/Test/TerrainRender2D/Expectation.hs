@@ -44,7 +44,8 @@ spec = describe "Expectation" $ do
             -- Pixel centres exactly on a quad's edges and shared diagonal, and snapped scenes at the
             -- fractional scales: the picker agrees with the exact hand model at every pixel.
             <> [edgeScene zoom shape facing | (zoom, shape, facing) ← [(0.125, 0, FaceSouth), (0.125, 15, FaceEast), (0.5, 0, FaceSouth), (0.5, 9, FaceWest), (1, 0, FaceSouth), (1, 5, FaceNorth)]]
-            <> [snapped {sceneName = "snapped@" <> show zoom, sceneZoom = zoom} | zoom ← [1, 1.125, 1.25, 7.875, 8]]
+            <> [snapped {sceneName = "snapped@1", sceneZoom = 1}]
+            <> [snappedAt (show zoom) zoom | zoom ← [1.125, 1.25, 7.875, 8]]
             -- Seams across the region lattice, the zero seam and the legal coordinate extremes.
             <> [pendingScene facing | facing ← facings]
             <> [seamScene facing | facing ← facings]

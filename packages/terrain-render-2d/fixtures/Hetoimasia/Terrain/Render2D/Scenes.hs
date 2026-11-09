@@ -41,6 +41,7 @@ module Hetoimasia.Terrain.Render2D.Scenes
   , viewportOffset
   , scaledTarget
   , snapped
+  , snappedAt
   , edgeScene
   , depthStack
   , pendingScene
@@ -478,3 +479,12 @@ pendingScene facing =
       , Cell 3 0 0 1 3 granite
       , Cell 0 2 0 1 0 loam
       ]
+
+
+-- | The snapped scene at a zoom. At a large scale (4 and above) the origin is moved off the pixel grid
+-- by a fraction of a tile first (about 1.8 pixels at scale 8, where a tile is 384 pixels wide), because
+-- a texel then spans several pixels and only an origin off the grid lets snapping change which pixel
+-- centres fall in which texel: without it the lattice lands every origin on a whole pixel and snapping
+-- changes nothing.
+snappedAt ∷ String → Float → Scene
+snappedAt label zoom = (if zoom >= 4 then shiftPan (0.0048, 0.0226) else id) snapped {sceneName = "snapped-" <> label, sceneZoom = zoom}

@@ -378,9 +378,7 @@ specs profile = case profile of
          , spec defaultLight [Foreground] Dynamic (capTarget (96, 64) (atZoom 0.125 scaledTarget))
          , spec defaultLight [Foreground] Dynamic snappedZoom2
          ]
-      -- At a whole-number scale (1, 8) a nearest-sampled quad cannot change under a sub-pixel shift, so
-      -- snapping is not discriminable there and no fixture claims it is; at 9/8, 5/4 and 63/8 it is.
-      <> [spec defaultLight (if wholeScale sc then [Foreground] else [Foreground, SnapSensitive]) Dynamic sc | sc ← snappedScenes]
+      <> [spec defaultLight [Foreground, SnapSensitive] Dynamic sc | sc ← snappedScenes]
       -- Lighting: the fixed world sun with the camera turned, and the sun varied at a fixed camera.
       <> [spec defaultLight [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners facing)) | facing ← [FaceSouth, FaceWest]]
       <> [spec light [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners FaceSouth)) | light ← lights, lightLabel light /= "dark"]
@@ -434,10 +432,7 @@ exactBoundary shape facing = (newScene ("exact-boundary-" <> show shape <> "-" <
 -- reference's own names, and their fixtures: judged exactly and drawn by the terrain material; drawn
 -- by the stale-bias control after an ordinary pass, which must be rejected on the snapped pass.
 snappedScenes ∷ [Scene]
-snappedScenes = [snapped {sceneName = "snapped-" <> label, sceneZoom = zoom} | (label, zoom) ← [("9-8", 1.125), ("5-4", 1.25), ("63-8", 7.875), ("8", 8)]]
-
-wholeScale ∷ Scene → Bool
-wholeScale sc = sceneZoom sc == fromInteger (round (sceneZoom sc))
+snappedScenes = [snappedAt label zoom | (label, zoom) ← [("9-8", 1.125), ("5-4", 1.25), ("63-8", 7.875), ("8", 8)]]
 
 -- | The two scales where the measured counterexample lay: the stale-bias control is drawn at them.
 staleBiasScenes ∷ [Scene]
