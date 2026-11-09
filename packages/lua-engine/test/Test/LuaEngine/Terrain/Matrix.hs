@@ -184,7 +184,7 @@ cancelledStayCharged =
         , "  self.s = 2"
         , "elseif self.s == 2 then"
         , "  local r = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
-        , "  if r ~= nil then print('free') self.s = 3 end"
+        , "  if r ~= nil then print('free') self.s = 3 else print('still busy') end"
         , "end"
         ]
     }
@@ -437,6 +437,8 @@ spec = describe "Terrain matrices" $ do
           -- cancelled and taken, and still charged: its borrowed data and credits are the owner's until its preparation exits
           untilPrintedBy world spawned "while preparing\tbusy"
           outLines world >>= \printed → printed `shouldContain` ["cancel\tcancelled", "take\tcancelled"]
+          -- and it stays so over further updates while the owner is held
+          pumpUntil world (advanceClock world 2000000000 >> ((>= 3) . length . filter (== "still busy") <$> outLines world))
           outLines world >>= \printed → printed `shouldNotContain` ["free"]
           openGate gate
           untilPrintedBy world spawned "free"
