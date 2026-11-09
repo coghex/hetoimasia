@@ -1542,9 +1542,14 @@ settleWith service ask schema = settleWithFinal service ask schema (pure Nothing
 
 -- | 'settleWith' for a reply that leaves the provider's work outstanding ('applyCheckedFor'): the provider still holds something borrowed
 -- for the request, and says when it is over through its retirement. A resource reply is not made through it.
+--
+-- It settles at once, whatever tick the request is due at, and is never held for it: a held reply is a completion that has not yet been
+-- applied, and every path that ends a request while one is held (the tick's service, a cancel, the requester's end, an epoch, the owner's
+-- close) takes it for the provider's proof that its work is over. A reply that keeps work outstanding must not be taken so, so it takes the
+-- way a settlement at its position does: the request is settled, stays among the places not yet served and is hidden from its waiters until
+-- its tick serves it, and its work is polled for its retirement.
 settleKeeping ∷ ProviderState → Admission → Schema → RequestId → ProviderReply → STM ReplyAnswer
-settleKeeping service ask schema identity reply = do
-  eligible ← eligibleOf service identity
+settleKeeping service ask schema identity reply =
   case checkReplyPure (psLimits service) schema ask reply of
     checked@(CheckedDefect _) → replyTo service identity checked
     checked → do
@@ -1553,7 +1558,7 @@ settleKeeping service ask schema identity reply = do
         then do
           writeTVar (psVar service) st {pCounts = (pCounts st) {countDuplicateHeld = countDuplicateHeld (pCounts st) + 1}}
           pure ReplyLate
-        else applyCheckedFor service True eligible identity checked
+        else applyCheckedFor service True True identity checked
 
 -- | 'settleWith' for a resource reply that carries the provider's last look at the settlement ('adoptingFinal'): taken in the very
 -- transaction that settles the request once the owner has built the resource. A resource reply made when the request is eligible is

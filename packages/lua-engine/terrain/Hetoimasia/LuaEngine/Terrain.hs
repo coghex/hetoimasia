@@ -62,6 +62,7 @@ module Hetoimasia.LuaEngine.Terrain
   , resourceLease
   ) where
 
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Concurrent.STM
 import Control.Exception (Exception, finally, mask, mask_, onException, throwIO)
 import Control.Applicative ((<|>))
@@ -187,6 +188,8 @@ data TerrainFacade = TerrainFacade
   -- for the request's assigned tick), each with whether it is still pending. The service holds no claim for such an open, so the adapter
   -- holds it, shared by every VM of the service: another open of the name before the host's settlement is @name_in_use@, as it is while a
   -- successful open stands, and the name is free from the settlement.
+  , tfOpenLock ∷ !(MVar ())
+  -- ^ The facade's opens, one at a time from the consultation of 'tfFailedOpens' through the service's admission: the arbitration of a name.
   , tfOffered ∷ !(TVar (Map Text (Set Unique)))
   -- ^ The names whose open the service committed and the host has not yet adopted or let go, each with the opens (by incarnation:
   -- every open request has its own identity) that hold it back: shared by every VM of the service, so that an attach, whichever VM
@@ -213,17 +216,27 @@ letGo ∷ TerrainFacade → Text → Link → STM ()
 letGo facade name link =
   modifyTVar' (tfOffered facade) (Map.update (\held → let rest = Set.delete (lkId link) held in if Set.null rest then Nothing else Just rest) name)
 
--- | An open the service failed holds its name until the host has settled it.
+-- | An open the service failed holds its name until the host has settled it. Every entry is gone at its settlement (or its owner's end): the
+-- registry is swept whole at each insertion, at every drain and at every forgetting of an instance, and an open the host has settled already
+-- is not entered at all, so what it holds is bounded by the failed opens still waiting for their tick, whatever names they used.
 holdFailed ∷ TerrainFacade → Text → Link → STM ()
-holdFailed facade name link = modifyTVar' (tfFailedOpens facade) (Map.insertWith (<>) name [not <$> lkSettled link])
+holdFailed facade name link = do
+  pruneFailedOpens facade
+  settled ← lkSettled link
+  unless settled (modifyTVar' (tfFailedOpens facade) (Map.insertWith (<>) name [not <$> lkSettled link]))
 
--- | Whether an open the service failed is still waiting for the host's settlement of the name, forgetting those the host has settled.
+-- | Forget every failed open the host has settled, of every name.
+pruneFailedOpens ∷ TerrainFacade → STM ()
+pruneFailedOpens facade = do
+  held ← readTVar (tfFailedOpens facade)
+  kept ← traverse (filterM id) held
+  writeTVar (tfFailedOpens facade) (Map.filter (not . null) kept)
+
+-- | Whether an open the service failed is still waiting for the host's settlement of the name.
 failedOpenPending ∷ TerrainFacade → Text → STM Bool
 failedOpenPending facade name = do
-  held ← Map.findWithDefault [] name <$> readTVar (tfFailedOpens facade)
-  live ← filterM id held
-  modifyTVar' (tfFailedOpens facade) (if null live then Map.delete name else Map.insert name live)
-  pure (not (null live))
+  pruneFailedOpens facade
+  Map.member name <$> readTVar (tfFailedOpens facade)
 
 -- | Whether some open still holds a name back from attach.
 heldBack ∷ TerrainFacade → Text → STM Bool
@@ -236,7 +249,8 @@ newTerrainFacade profile svc config = do
   claims ← newTVarIO Map.empty
   offered ← newTVarIO Map.empty
   failed ← newTVarIO Map.empty
-  pure (TerrainFacade profile svc config picks noTerrainHooks [] claims failed offered)
+  lock ← newMVar ()
+  pure (TerrainFacade profile svc config picks noTerrainHooks [] claims failed lock offered)
 
 -- | The windows a test may hold or fail: told, never consulted for an answer.
 data TerrainHooks = TerrainHooks
@@ -252,6 +266,9 @@ data TerrainHooks = TerrainHooks
   , hookCancelling ∷ IO ()
   -- ^ The host settled a request as cancelled (a script's cancel won) and the adapter is about to ask the service to cancel it: the
   -- window in which the service's own commit and the host's settlement are arbitrated by the request's eligibility alone.
+  , hookChecked ∷ IO ()
+  -- ^ An open has consulted the failed opens and is about to be admitted by the service: inside the critical section that arbitrates the name,
+  -- where no other open of this facade can be admitted.
   , hookSubmitting ∷ IO ()
   -- ^ The host admitted a request (its places are reserved) and the hand-off is about to ask the service, masked: the window between a
   -- permanent precheck and the service's own admission, in which the service can close.
@@ -262,7 +279,7 @@ data TerrainHooks = TerrainHooks
   }
 
 noTerrainHooks ∷ TerrainHooks
-noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ())
+noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ())
 
 -- | Why a VM's terrain could not be composed: a failure of the composition, never a script's.
 newtype TerrainCompositionRefused = TerrainCompositionRefused Text
@@ -575,7 +592,7 @@ drainRetired ∷ Env → IO ()
 drainRetired env = do
   requests ← atomically (swapTVar (envRetire env) [])
   forM_ (reverse requests) (retire (service env))
-  atomically (pruneClaims (envFacade env))
+  atomically (pruneClaims (envFacade env) >> pruneFailedOpens (envFacade env))
   dropped ← atomically (swapTVar (envDropped env) [])
   forM_ (reverse dropped) (Terrain.releaseLease (service env))
 
@@ -909,43 +926,57 @@ submit env submission = mask_ $ do
   case pdAsk found of
     AskOpen _ name _ → releaseStale env name
     _ → pure ()
-  duplicate ← case pdAsk found of
-    AskOpen _ name _ → atomically (failedOpenPending (envFacade env) name)
-    _ → pure False
-  if duplicate
-    then do
+  let admitAsk = case pdAsk found of
+        AskOpen client name spec → openArenaWith (service env) ep client name spec
+        AskAttach client name → attachArenaWith (service env) ep client name
+        AskCell lease tile → cellWith (service env) ep lease tile
+        AskColumn lease column range → columnWith (service env) ep lease column range
+        AskSurface lease column → surfaceWith (service env) ep lease column
+        AskRemove lease tile precondition → removeWith (service env) ep lease tile precondition
+  -- The arbitration of a name is one decision. An open the service fails at admission (an invalid definition) holds no claim in the service,
+  -- so the adapter holds its name until the host settles it ('tfFailedOpens'): registered in the very transaction of the service's admission
+  -- (the endpoint's settlement), and consulted before another open is admitted. The consultation and the admission are one critical
+  -- section of the facade's opens, so whichever open the service admits first is the one the other finds: a later open of a name is a
+  -- duplicate of an earlier failed one, and an earlier successful one is the service's own claim. (Nothing else opens a name: the lock is
+  -- the arbitration of every adapter open; the admission it covers is the service's non-waiting one, so a VM waits only for another VM's
+  -- admission of an open, never for a terrain owner.)
+  outcome ← case pdAsk found of
+    AskOpen _ name _ →
+      withMVar (tfOpenLock (envFacade env)) $ \_ → do
+        duplicate ← atomically (failedOpenPending (envFacade env) name)
+        if duplicate
+          then pure Nothing
+          else do
+            hookChecked (hooks env)
+            hookSubmitting (hooks env)
+            Just <$> admitAsk
+    _ → hookSubmitting (hooks env) >> (Just <$> admitAsk)
+  case outcome of
+    Nothing → do
       -- An open the service failed still holds its name until the host settles it: this one is a duplicate of it, answered here and never
       -- handed to the service, which has no claim to find.
       atomically (settlingSettle settling (failureReply NameInUse) >> writeTVar (lkTerminal link) True)
       pure ProviderWork {workCancel = pure (), workRetirement = pure ProviderComplete}
-    else do
-    hookSubmitting (hooks env)
-    admitted ← case pdAsk found of
-      AskOpen client name spec → openArenaWith (service env) ep client name spec
-      AskAttach client name → attachArenaWith (service env) ep client name
-      AskCell lease tile → cellWith (service env) ep lease tile
-      AskColumn lease column range → columnWith (service env) ep lease column range
-      AskSurface lease column → surfaceWith (service env) ep lease column
-      AskRemove lease tile precondition → removeWith (service env) ep lease tile precondition
-    case admitted of
-      Left refused → throwIO (declination refused)
-      Right request → do
-        atomically (writeTVar (pdRequest found) (Just request) >> note)
-        case pdAsk found of
-          AskOpen _ name _ → do
-            let claim = Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)
-            atomically $ do
-              pruneClaims (envFacade env)
-              over ← clDone claim
-              -- A request that has already ended needs no claim: only what is still open can be found stale.
-              unless over (modifyTVar' (tfClaims (envFacade env)) (Map.insertWith (<>) name [claim]))
-          _ → pure ()
-        hookSubmitted (hooks env)
-        pure
-          ProviderWork
-            { workCancel = cancelWork env link request
-            , workRetirement = retirement env link
-            }
+    Just admitted → do
+      case admitted of
+        Left refused → throwIO (declination refused)
+        Right request → do
+          atomically (writeTVar (pdRequest found) (Just request) >> note)
+          case pdAsk found of
+            AskOpen _ name _ → do
+              let claim = Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)
+              atomically $ do
+                pruneClaims (envFacade env)
+                over ← clDone claim
+                -- A request that has already ended needs no claim: only what is still open can be found stale.
+                unless over (modifyTVar' (tfClaims (envFacade env)) (Map.insertWith (<>) name [claim]))
+            _ → pure ()
+          hookSubmitted (hooks env)
+          pure
+            ProviderWork
+              { workCancel = cancelWork env link request
+              , workRetirement = retirement env link
+              }
 
 -- | The largest answer a read or a removal can have, as the reply the host judges: a revision at the greatest integer, every field
 -- present, and for a column as many runs as the range has levels and the service returns (more is @too_large@, a failure that

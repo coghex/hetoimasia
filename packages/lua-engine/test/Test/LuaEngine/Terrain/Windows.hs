@@ -10,7 +10,7 @@ import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
 import Data.Either (isLeft)
-import Control.Monad (unless, void, when)
+import Control.Monad (replicateM_, unless, void, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
@@ -80,6 +80,20 @@ failsLogically =
     { scPrelude = terrainPrelude
     , scInit = ["self.q = api.terrain.open('dup', { materials = { 'a', 'a' }, layers = {} })", "print('invalid open issued')"]
     , scUpdate = ["if self.q then local t = settle(api, self.q) if t then print('invalid open', t.status, t.error and t.error.code) self.q = nil end end"]
+    }
+
+-- | A gameplay instance whose init opens eight names with a definition the service fails, due at tick 1; at tick 1 it opens eight others.
+manyFailing ∷ Script
+manyFailing =
+  script
+    { scPrelude = terrainPrelude <> ["local BAD = { materials = { 'a', 'a' }, layers = {} }"]
+    , scInit = ["self.s = 0", "self.n = 0", "for i = 1, 8 do api.terrain.open('f' .. i, BAD) end"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  for i = 1, 8 do api.terrain.open('g' .. i, BAD) end"
+        , "  print('second round issued') self.s = 1"
+        , "elseif self.s == 1 then print('second round settled') self.s = 2 end"
+        ]
     }
 
 -- | A gameplay instance whose init opens a valid name, due at tick 1.
@@ -1077,4 +1091,47 @@ spec = describe "Terrain windows and banks" $ do
             pumpUntil world (tickBy control gameplayVm 1 >> ((/= Just Instance.Active) <$> phaseOf opener'))
             signalRig rig "second"
             untilPrinted world "second answer\tsuccess\tnil"
+
+  it "arbitrates the name of a failed open and of a normal open as one decision: no open is admitted between another's consultation and its admission" $ do
+    gate ← newGate
+    armed ← newIORef True
+    let holdFirst = do
+          go ← atomicModifyIORef' armed (\a → (False, a))
+          when go (holdAt gate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookChecked = holdFirst} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsLogically), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
+        withFvm world runtime (presentationOver rig) $ \shown →
+          withFvm world runtime (gameplayOver rig) $ \gameplayVm → (`finally` openGate gate) $ do
+            _ ← admitOnly world shown "modules-test" "lua/other.lua"
+            -- the normal open has consulted the failed opens (none) and is about to be admitted: held inside the critical section
+            signalRig rig "first"
+            pumpUntilReached world gate
+            -- the other VM's open of the name (an invalid definition) must wait for it: it is not admitted, so it has not even been issued
+            _ ← admitOnly world gameplayVm "modules-test" mainPath
+            replicateM_ 5 (advanceClock world 2000000000)
+            outLines world >>= \printed → printed `shouldNotContain` ["invalid open issued"]
+            -- released, the normal open is admitted first and wins the name; the other is admitted after it and fails its definition
+            openGate gate
+            untilPrinted world "invalid open issued"
+            untilPrinted world "first answer\tsuccess\tnil"
+            pumpUntil world (tickBy control gameplayVm 1 >> (elem "invalid open\tfailure\tdefinition" <$> outLines world))
+            -- the other instance goes on to the second wait it has in its script: let it
+            signalRig rig "second"
+
+  it "keeps the failed opens' names only while the host has not settled them, whatever names they used, and none once their instance is forgotten" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource manyFailing)]) $ \world control runtime →
+        withFvm world runtime (gameplayOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          let held = Map.size <$> readTVarIO (tfFailedOpens (rgFacade rig))
+          -- eight failed opens of eight names wait for tick 1
+          held `shouldReturn` 8
+          -- tick 1 settles them, and issues eight more of other names: the first eight were swept as the next were entered
+          pumpUntil world (tickBy control fvm 1 >> (elem "second round issued" <$> outLines world))
+          held >>= (`shouldSatisfy` (<= 8))
+          pumpUntil world (tickBy control fvm 1 >> (elem "second round settled" <$> outLines world))
+          -- the instance is forgotten: nothing is left of any of them
+          forgetInstance (fvFacade fvm) (spId spawned)
+          held `shouldReturn` 0
+          (Map.size <$> readTVarIO (tfClaims (rgFacade rig))) >>= (`shouldBe` 0)
 

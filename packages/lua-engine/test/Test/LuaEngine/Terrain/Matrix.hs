@@ -313,6 +313,47 @@ edges =
     , Step "remove at the top" "return api.terrain.remove(A, {x = (1 << 62) - 1, y = 0, z = (1 << 62) - 1})" "return 'ok'"
     ]
 
+-- | A gameplay instance (a request bank of one) that attaches to @shared@ and, at tick 1, reads a cell, due at tick 2; at tick 2 it takes what
+-- the read settled as, and asks again at every tick until a place is free.
+closedAttachedLogical ∷ Script
+closedAttachedLogical =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.attach('shared')"]
+    , scUpdate =
+        [ "local tick = api.time.tick()"
+        , "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t and t.status == 'success' then self.b = t.value self.r = api.terrain.cell(self.b, {x = 0, y = 0, z = 0}) print('read issued at', tick) self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  local t = settle(api, self.r)"
+        , "  if t then"
+        , "    print('settled at', tick, t.status, t.error and t.error.code)"
+        , "    local r, e = api.terrain.cell(self.b, {x = 1, y = 0, z = 0})"
+        , "    print('after taking at', tick, r == nil and e.code or 'accepted')"
+        , "    self.s = 2"
+        , "  end"
+        , "elseif self.s == 2 then"
+        , "  local r = api.terrain.cell(self.b, {x = 1, y = 0, z = 0})"
+        , "  if r ~= nil then print('free') self.s = 3 else print('still busy') end"
+        , "end"
+        ]
+    }
+
+-- | A gameplay instance that opens an arena (due tick 1) and, at tick 1, reads a cell, due at tick 2.
+heldReadLogical ∷ Script
+heldReadLogical =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.a = t.value self.r = api.terrain.cell(self.a, {x = 0, y = 0, z = 0}) print('read issued') self.s = 1 end"
+        , "end"
+        ]
+    }
+
 -- | An instance that releases its arena twice at once, and once more after the release has retired.
 releasesTwice ∷ Script
 releasesTwice =
@@ -653,6 +694,51 @@ spec = describe "Terrain matrices" $ do
           printed ← outLines world
           forM_ ["column at the top", "cell at the top", "surface at the high corner", "surface at the low corner", "cell at the low corner", "remove at the top"] $ \label →
             printed `shouldContain` [label <> "\tsuccess\tok"]
+
+  it "keeps the place of a read that an arena's closure failed before its logical position charged, through the tick that serves it, until the owner has finished preparing it" $ do
+    gate ← newGate
+    withRigProbe defaultConfigForRaces (gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate) $ \rig →
+      withWorld (counts [(RequestsPerInstance, 1), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource closedCreator), ("lua/attached.lua", scriptSource closedAttachedLogical)]) $ \world control runtime →
+        withFvm world runtime (presentationOver rig) $ \creatorVm →
+          withFvm world runtime (gameplayOver rig) $ \gameplayVm → (`finally` openGate gate) $ do
+            creatorSpawn ← spawn world creatorVm "modules-test" mainPath
+            untilPrintedBy world creatorSpawn "creator ready"
+            _ ← spawn world gameplayVm "modules-test" "lua/attached.lua"
+            -- tick 1 settles the attach and issues the read, due at tick 2: the owner is held where the read captured its answer
+            pumpUntil world (tickBy control gameplayVm 1 >> (elem "read issued at\t1" <$> outLines world))
+            awaitReached gate
+            -- the arena is closed under the read before its tick: it fails arena_closed, and its failure waits for its position
+            signalRig rig "close"
+            pumpUntil world (advanceClock world 2000000000 >> (elem "release\tdone" <$> outLines world))
+            -- tick 2 serves it: the instance takes it, and the place is still charged, however many ticks pass, while the owner is held
+            pumpUntil world (tickBy control gameplayVm 1 >> (elem "after taking at\t2\tbusy" <$> outLines world))
+            outLines world >>= \printed → printed `shouldContain` ["settled at\t2\tfailure\tarena_closed"]
+            pumpUntil world (tickBy control gameplayVm 1 >> ((>= 3) . length . filter (== "still busy") <$> outLines world))
+            outLines world >>= \printed → printed `shouldNotContain` ["free"]
+            openGate gate
+            pumpUntil world (tickBy control gameplayVm 1 >> (elem "free" <$> outLines world))
+
+  forM_
+    [ ("the service's closure failed", \_ rig → closeService (rgService rig))
+    , ("an epoch cancelled", \fvm _ → void (advanceRequestEpoch (scheduledEndpoint (fvOwner fvm))))
+    , ("its instance's end left", \_ _ → pure ())
+    ]
+    $ \(how, event) →
+      it ("does not let a gameplay instance end while the owner is still preparing a read, made at a logical position, that " <> how) $ do
+        gate ← newGate
+        withRigProbe defaultConfigForRaces (gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate) $ \rig →
+          withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource heldReadLogical)]) $ \world control runtime →
+            withFvm world runtime (gameplayOver rig) $ \fvm → (`finally` openGate gate) $ do
+              spawned ← spawn world fvm "modules-test" mainPath
+              pumpUntil world (tickBy control fvm 1 >> (elem "read issued" <$> outLines world))
+              awaitReached gate
+              event fvm rig
+              stopSpawned spawned
+              pumpUntil world (tickBy control fvm 1 >> ((== Just Instance.Stopping) <$> phaseOf spawned))
+              replicateM_ 3 (tickBy control fvm 1)
+              phaseOf spawned >>= (`shouldBe` Just Instance.Stopping)
+              openGate gate
+              pumpUntil world (tickBy control fvm 1 >> ((/= Just Instance.Stopping) <$> phaseOf spawned))
 
   it "answers a second release of one's own arena without error, before and after the first has retired" $
     withRig $ \rig →
