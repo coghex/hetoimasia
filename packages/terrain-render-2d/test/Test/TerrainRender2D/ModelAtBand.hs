@@ -23,8 +23,11 @@ import Hetoimasia.Terrain.Render2D.Material
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightSettings)
 import Hetoimasia.Terrain.Render2D.Scenes
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
+import Data.List (sortOn)
+import Data.Ord (Down (..))
 import Test.Hspec
 import Test.TerrainRender2D.CellFixtures (pickPixel)
+import Test.TerrainRender2D.Fixtures (tileAt)
 
 spec ∷ Spec
 spec = describe "TRA-17 the pure material model at every pixel of the fractional fixtures" $
@@ -38,19 +41,31 @@ spec = describe "TRA-17 the pure material model at every pixel of the fractional
         scenes =
           [ fractionalCamera
           , viewportOffset 0.125
+          , -- The native evidence's own fixture `fractional@0.1875` (round-5 review): 136 banded pixels there.
+            atZoom 0.1875 fractionalCamera
           ]
             <> [atZoom z (rampsCorners FaceSouth) | z ← [0.125, 0.1875, 0.25, 0.375]]
             <> [atZoom 0.125 (rampsCorners FaceEast), atZoom 0.25 (rampsCorners FaceWest)]
     results ← mapM (modelAgainstExpectation style textures assets art) scenes
-    forM_ (zip scenes results) $ \(scene, (compared, mismatches, _)) → do
+    forM_ (zip scenes results) $ \(scene, Result compared mismatches banded bandedCompared unevaluated) → do
       (sceneName scene, mismatches) `shouldBe` (sceneName scene, [])
       (sceneName scene, compared > 0) `shouldBe` (sceneName scene, True)
-    -- The fractional fixtures really do have exempted pixels, and the model was compared at them.
-    sum [banded | (_, _, banded) ← results] `shouldSatisfy` (> 0)
+      -- No covered pixel is silently skipped, and EVERY banded pixel was model-compared: none is accepted as not evaluable.
+      (sceneName scene, unevaluated) `shouldBe` (sceneName scene, 0)
+      (sceneName scene, bandedCompared) `shouldBe` (sceneName scene, banded)
+    -- The fractional fixtures really do have exempted pixels, and the model was compared at all of them.
+    sum [banded | Result _ _ banded _ _ ← results] `shouldSatisfy` (> 0)
+    -- The native fixture's own count: 136 banded pixels at zoom 3/16 (the evidence's `fractional@0.1875`).
+    [banded | (scene, Result _ _ banded _ _) ← zip scenes results, sceneName scene == sceneName (atZoom 0.1875 fractionalCamera)]
+      `shouldBe` [136]
 
--- | The model's colour at every covered pixel against the exact expectation: compared count, the first
--- mismatches, and how many compared pixels the device band (at b = 8) leaves undecided.
-modelAgainstExpectation ∷ AtlasStyle → AtlasTextures → AssetSnapshot → ArtSource → Scene → IO (Int, [String], Int)
+-- | What the model was compared on: covered pixels compared, the first mismatches, the pixels the device band (at
+-- b = 8) leaves undecided, how many of those were model-compared, and the covered pixels that could not be evaluated
+-- at all (a hit with no record, say).
+data Result = Result !Int [String] !Int !Int !Int
+
+-- | The model's colour at every covered pixel against the exact expectation.
+modelAgainstExpectation ∷ AtlasStyle → AtlasTextures → AssetSnapshot → ArtSource → Scene → IO Result
 modelAgainstExpectation style textures assets art scene = do
   plan ← either (\e → fail (show e)) pure (scenePlan assets scene)
   adapted ← either (fail . describeMaterialRefusal) pure (adaptCells textures defaultLightSettings assets plan)
@@ -75,7 +90,8 @@ modelAgainstExpectation style textures assets art scene = do
             let (r, g, b, a) = texelOf normalAtlas atX atY
              in Right (Colour (fromIntegral r / 255) (fromIntegral g / 255) (fromIntegral b / 255) (fromIntegral a / 255))
       pixels = [(x, y) | y ← [0 .. h - 1], x ← [0 .. w - 1]]
-      step (compared, bad, banded) pixel = case expectedAt art defaultHandLight scene camera plan pixel of
+      isBanded pixel = case expectedForDevice 8 3 art defaultHandLight scene camera plan pixel of Ambiguous _ → 1; _ → 0 ∷ Int
+      step (Result compared bad banded bandedCompared unevaluated) pixel = case expectedAt art defaultHandLight scene camera plan pixel of
         ExpectedHit {expectedFront = q, expectedLinear = lin} →
           case (pixelWorldPoint plan pixel, pickPixel plan pixel) of
             (Just (sx, sy), CellPickHit hit)
@@ -99,11 +115,40 @@ modelAgainstExpectation style textures assets art scene = do
                           let (mr, mg, mb) = shadedByte (r, g, b)
                               (er, eg, eb) = shadedByte lin
                               close a c = abs (fromIntegral a - fromIntegral c) <= (3 ∷ Int)
-                              exempt = case expectedForDevice 8 3 art defaultHandLight scene camera plan pixel of Ambiguous _ → 1; _ → 0
-                           in if close mr er && close mg eg && close mb eb
-                                then (compared + 1, bad, banded + exempt)
-                                else (compared + 1, take 4 (bad <> [show pixel <> ": model " <> show (mr, mg, mb) <> " against exact " <> show (er, eg, eb)]), banded + exempt)
-                        Left _ → (compared + 1, take 4 (bad <> [show pixel <> ": the model gave no value"]), banded)
-            _ → (compared, bad, banded)
-        _ → (compared, bad, banded)
-  pure (foldl step (0 ∷ Int, [] ∷ [String], 0 ∷ Int) pixels)
+                              exempt = isBanded pixel
+                              bad' = if close mr er && close mg eg && close mb eb then bad else take 4 (bad <> [show pixel <> ": model " <> show (mr, mg, mb) <> " against exact " <> show (er, eg, eb)])
+                           in Result (compared + 1) bad' (banded + exempt) (bandedCompared + exempt) unevaluated
+                        Left _ → Result (compared + 1) (take 4 (bad <> [show pixel <> ": the model gave no value"])) (banded + isBanded pixel) bandedCompared unevaluated
+            _ → Result compared bad (banded + isBanded pixel) bandedCompared (unevaluated + 1)
+        ExpectedClear
+          -- A banded pixel the exact expectation leaves clear: the model is composed over the hand quads whose canvas holds
+          -- the point, nearest first, exactly as the draw would, and every one of them must give no colour (a hole).
+          | isBanded pixel == 1, Just (sx, sy) ← pixelWorldPoint plan pixel →
+              let covering = [q | q ← sortOn (Down . hqKey) (handQuads scene camera), insideCanvas q sx sy]
+                  evaluate q = case [e | e ← adaptedQuads adapted, quadCell (adaptedQuad e) == Just (tileAt cx cy cz), quadPart (adaptedQuad e) == partOf (hqRole q)] of
+                    entry : _ | record : _ ← drop (fromIntegral (adaptedParameter entry)) (adaptedRecords adapted) →
+                      let (qx, qy) = hqCorner q
+                       in either (const Nothing) Just (runMaterialModel terrainModel (modelInput record (fromRational ((sx - fromInteger qx) / 96), fromRational ((sy - fromInteger qy) / 64))))
+                    _ → Nothing
+                    where (cx, cy, cz) = hqCell q
+                  results' = map evaluate covering
+               in if all (maybe False (\(Colour _ _ _ a) → a < 1e-9)) results'
+                    then Result compared bad (banded + 1) (bandedCompared + 1) unevaluated
+                    else Result compared (take 4 (bad <> [show pixel <> ": the exact expectation is clear but the model draws"])) (banded + 1) (bandedCompared + 1) unevaluated
+        _ → Result compared bad (banded + isBanded pixel) bandedCompared unevaluated
+      insideCanvas q sx sy = let (qx, qy) = hqCorner q; fu = sx - fromInteger qx; fv = sy - fromInteger qy in fu >= 0 && fu < 96 && fv >= 0 && fv < 64
+      partOf = \case
+        Ordinary → PartOrdinary
+        MixedKnown → PartKnown
+        _ → PartFog
+      modelInput record uv =
+        MaterialInput
+          { materialTexel = Colour 0 0 0 0
+          , materialUv = uv
+          , materialParameter = 0
+          , materialRecord = record
+          , materialPush = adaptedPush adapted
+          , materialSample = sampler
+          , materialSampleScaled = \handle at _ → sampler handle at
+          }
+  pure (foldl step (Result 0 [] 0 0 0) pixels)
