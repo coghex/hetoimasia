@@ -924,10 +924,6 @@ submit env submission = mask_ $ do
           , endpointEligible = eligible
           , endpointSettle = settleInto env link
           }
-  -- A name whose open the host settled as cancelled (and the service was not yet told) is free: let that claim go before asking.
-  case pdAsk found of
-    AskOpen _ name _ → releaseStale env name
-    _ → pure ()
   let admitAsk = case pdAsk found of
         AskOpen client name spec → openArenaWith (service env) ep client name spec
         AskAttach client name → attachArenaWith (service env) ep client name
@@ -935,51 +931,60 @@ submit env submission = mask_ $ do
         AskColumn lease column range → columnWith (service env) ep lease column range
         AskSurface lease column → surfaceWith (service env) ep lease column
         AskRemove lease tile precondition → removeWith (service env) ep lease tile precondition
-  -- The arbitration of a name is one decision. An open the service fails at admission (an invalid definition) holds no claim in the service,
-  -- so the adapter holds its name until the host settles it ('tfFailedOpens'): registered in the very transaction of the service's admission
-  -- (the endpoint's settlement), and consulted before another open is admitted. The consultation and the admission are one critical
-  -- section of the facade's opens, so whichever open the service admits first is the one the other finds: a later open of a name is a
-  -- duplicate of an earlier failed one, and an earlier successful one is the service's own claim. (Nothing else opens a name: the lock is
-  -- the arbitration of every adapter open; the admission it covers is the service's non-waiting one, so a VM waits only for another VM's
-  -- admission of an open, never for a terrain owner.)
+      -- What follows the service's admission of a request: the host's record of it, and for an open the claim of its name, which is found
+      -- stale if the host settles the open as cancelled before the service is told.
+      afterAdmission request = do
+        atomically (writeTVar (pdRequest found) (Just request) >> note)
+        case pdAsk found of
+          AskOpen _ name _ → do
+            let claim = Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)
+            atomically $ do
+              pruneClaims (envFacade env)
+              over ← clDone claim
+              -- A request that has already ended needs no claim: only what is still open can be found stale.
+              unless over (modifyTVar' (tfClaims (envFacade env)) (Map.insertWith (<>) name [claim]))
+          _ → pure ()
+        hookSubmitted (hooks env)
+  -- The arbitration of a name is one decision, taken in one critical section of the facade's opens ('tfOpenLock') and in this order: the
+  -- release of every claim the host has settled as cancelled without the service's being told (so a name a cancelled open still holds is
+  -- free), the consultation of the opens the service failed ('tfFailedOpens': one fails at admission, holds no claim in the service, and
+  -- is held by the adapter until the host settles it), the service's admission of the open, and the registration of its claim. No open of
+  -- any VM is admitted between another's consultation and its registration, so whichever open the service admits first is the one the other
+  -- finds: its own claim, still open or found stale by the release, or the failed hold. (Nothing else opens a name through this
+  -- adapter; the admission it covers is the service's non-waiting one, so a VM waits only for another VM's admission of an open, never for
+  -- a terrain owner. A non-Lua client opening names on the same service directly is outside the arbitration.)
   outcome ← case pdAsk found of
     AskOpen _ name _ → do
       hookArriving (hooks env)
       withMVar (tfOpenLock (envFacade env)) $ \_ → do
+        releaseStale env name
         duplicate ← atomically (failedOpenPending (envFacade env) name)
         if duplicate
           then pure Nothing
           else do
             hookChecked (hooks env)
             hookSubmitting (hooks env)
-            Just <$> admitAsk
-    _ → hookSubmitting (hooks env) >> (Just <$> admitAsk)
+            admitted ← admitAsk
+            forM_ (either (const Nothing) Just admitted) afterAdmission
+            pure (Just admitted)
+    _ → do
+      hookSubmitting (hooks env)
+      admitted ← admitAsk
+      forM_ (either (const Nothing) Just admitted) afterAdmission
+      pure (Just admitted)
   case outcome of
     Nothing → do
       -- An open the service failed still holds its name until the host settles it: this one is a duplicate of it, answered here and never
       -- handed to the service, which has no claim to find.
       atomically (settlingSettle settling (failureReply NameInUse) >> writeTVar (lkTerminal link) True)
       pure ProviderWork {workCancel = pure (), workRetirement = pure ProviderComplete}
-    Just admitted → do
-      case admitted of
-        Left refused → throwIO (declination refused)
-        Right request → do
-          atomically (writeTVar (pdRequest found) (Just request) >> note)
-          case pdAsk found of
-            AskOpen _ name _ → do
-              let claim = Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)
-              atomically $ do
-                pruneClaims (envFacade env)
-                over ← clDone claim
-                -- A request that has already ended needs no claim: only what is still open can be found stale.
-                unless over (modifyTVar' (tfClaims (envFacade env)) (Map.insertWith (<>) name [claim]))
-            _ → pure ()
-          hookSubmitted (hooks env)
-          pure
-            ProviderWork
-              { workCancel = cancelWork env link request
-              , workRetirement = retirement env link
-              }
+    Just (Left refused) → throwIO (declination refused)
+    Just (Right request) →
+      pure
+        ProviderWork
+          { workCancel = cancelWork env link request
+          , workRetirement = retirement env link
+          }
 
 -- | The largest answer a read or a removal can have, as the reply the host judges: a revision at the greatest integer, every field
 -- present, and for a column as many runs as the range has levels and the service returns (more is @too_large@, a failure that

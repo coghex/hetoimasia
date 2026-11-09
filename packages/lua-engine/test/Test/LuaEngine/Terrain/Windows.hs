@@ -9,10 +9,10 @@ module Test.LuaEngine.Terrain.Windows (spec) where
 import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Concurrent (yield)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, onException, try)
 import Data.Either (isLeft)
 import Control.Monad (replicateM_, unless, void, when)
-import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -94,6 +94,34 @@ failsAtFirstTick =
         , "elseif self.q then local t = settle(api, self.q) if t then print('invalid open', t.status, t.error and t.error.code) self.q = nil end end"
         ]
     }
+
+-- | A gameplay instance that opens a valid name at its first tick (due tick 2).
+opensAtFirstTick ∷ Script
+opensAtFirstTick =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0"]
+    , scUpdate = ["if self.s == 0 then self.q = api.terrain.open('held', DEF) print('held open issued') self.s = 1 end"]
+    }
+
+-- | Run a step of an example, and when it fails say which it was, the events the adapter's hooks saw and what the scripts printed: a bounded
+-- wait that never returns names nothing else.
+named ∷ World → IORef [String] → String → IO a → IO a
+named world events label act =
+  act `onException` do
+    seen ← readIORef events
+    printed ← outLines world
+    putStrLn ("STEP FAILED: " <> label <> "; events " <> show (reverse seen) <> "; printed " <> show printed)
+
+-- | An example's exit, whatever happened in it: the gates open, every wait the scripts have is released and every instance it started is
+-- asked to stop, so a failure in the body is reported as itself and does not become a teardown that never returns.
+leavingAlways ∷ Rig → Gate → IORef [Spawned] → IO a → IO a
+leavingAlways rig gate spawns body =
+  body `finally` do
+    openGate gate
+    signalRig rig "first"
+    signalRig rig "second"
+    readIORef spawns >>= mapM_ (\spawned → void (try (stopSpawned spawned) ∷ IO (Either SomeException ())))
 
 -- | A gameplay instance whose init opens eight names with a definition the service fails, due at tick 1; at tick 1 it opens eight others.
 manyFailing ∷ Script
@@ -1109,6 +1137,7 @@ spec = describe "Terrain windows and banks" $ do
     gate ← newGate
     armed ← newIORef False
     events ← newIORef ([] ∷ [String])
+    spawns ← newIORef ([] ∷ [Spawned])
     let note event = modifyIORef' events (event :)
         holdFirst = do
           note "checked"
@@ -1117,17 +1146,20 @@ spec = describe "Terrain windows and banks" $ do
     withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsAtFirstTick), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
         withFvm world runtime (gameplayOver rig) $ \gameplayVm →
-          withFvm world runtime (presentationOver rig) $ \shown → (`finally` (openGate gate >> signalRig rig "first" >> signalRig rig "second")) $ do
-            _ ← spawn world gameplayVm "modules-test" mainPath
-            _ ← admitOnly world shown "modules-test" "lua/other.lua"
+          withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig gate spawns $ do
+            let step = named world events
+            invalid ← spawn world gameplayVm "modules-test" mainPath
+            modifyIORef' spawns (invalid :)
+            other ← admitOnly world shown "modules-test" "lua/other.lua"
+            modifyIORef' spawns (other :)
             -- the open the service fails (an invalid definition) is the first to arrive, at tick 1: it has consulted the failed opens (none) and
             -- is held inside the critical section, before its admission
             writeIORef armed True
             grantTick gameplayVm
-            awaitReached gate
+            step "the failed open reaches its hold" (awaitReached gate)
             -- another VM's open of the name arrives while it is held, and the clock runs: it has every opportunity to be admitted
             signalRig rig "first"
-            pumpUntil world (advanceClock world 2000000000 >> ((>= 2) . length . filter (== "arriving") <$> readIORef events))
+            step "the other open arrives" (pumpUntil world (advanceClock world 2000000000 >> ((>= 2) . length . filter (== "arriving") <$> readIORef events)))
             replicateM_ 200 (advanceClock world 2000000000 >> yield)
             -- it has not even consulted the failed opens (without the critical section it has, and is admitted, before the invalid open is)
             readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving"]
@@ -1135,13 +1167,46 @@ spec = describe "Terrain windows and banks" $ do
             -- with it the name: the other open consults after it, finds it, and is never admitted (a duplicate is answered before the hook
             -- that precedes an admission)
             openGate gate
-            awaitTickDone control gameplayVm
-            untilPrinted world "first answer\tfailure\tname_in_use"
+            step "the tick of the failed open completes" (awaitTickDone control gameplayVm)
+            step "the other open is answered name_in_use" (untilPrinted world "first answer\tfailure\tname_in_use")
             readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving", "submitting"]
             -- the tick is granted and the failed open is settled: the name is free, and the second open of it is admitted
-            pumpUntil world (tickBy control gameplayVm 1 >> (elem "invalid open\tfailure\tdefinition" <$> outLines world))
+            step "the failed open settles at its tick" (pumpUntil world (tickBy control gameplayVm 1 >> (elem "invalid open\tfailure\tdefinition" <$> outLines world)))
             signalRig rig "second"
-            untilPrinted world "second answer\tsuccess\tnil"
+            step "the second open is admitted" (untilPrinted world "second answer\tsuccess\tnil")
+
+  it "frees the name a cancelled open still holds before the next open of it is admitted, however the cancellation falls in the other open's admission" $ do
+    gate ← newGate
+    armed ← newIORef False
+    events ← newIORef ([] ∷ [String])
+    spawns ← newIORef ([] ∷ [Spawned])
+    let note event = modifyIORef' events (event :)
+        holdSubmitting = do
+          note "submitting"
+          go ← atomicModifyIORef' armed (\a → (False, a))
+          when go (holdAt gate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookSubmitting = holdSubmitting} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensAtFirstTick), ("lua/other.lua", scriptSource (reopensOnSignal "held"))]) $ \world _ runtime →
+        withFvm world runtime (gameplayOver rig) $ \gameplayVm →
+          withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig gate spawns $ do
+            let step = named world events
+            logical ← spawn world gameplayVm "modules-test" mainPath
+            modifyIORef' spawns (logical :)
+            other ← admitOnly world shown "modules-test" "lua/other.lua"
+            modifyIORef' spawns (other :)
+            -- the logical open is the first to arrive, at tick 1, and is held inside the critical section before the service has admitted it
+            writeIORef armed True
+            grantTick gameplayVm
+            step "the logical open reaches its hold" (awaitReached gate)
+            -- the host cancels it (an epoch change) before the service is told anything, and another VM's open of the name arrives: it waits
+            -- for the critical section, and must not take the cancelled open's name for a duplicate
+            void (advanceRequestEpoch (scheduledEndpoint (fvOwner gameplayVm)))
+            signalRig rig "first"
+            step "the other open arrives" (pumpUntil world (advanceClock world 2000000000 >> ((>= 2) . length . filter (== "arriving") <$> readIORef events)))
+            openGate gate
+            -- the logical open is admitted by the service and registers its claim, which the host has settled as cancelled: the other open
+            -- releases it in the same critical section, and is admitted
+            step "the other open is admitted" (untilPrinted world "first answer\tsuccess\tnil")
 
   it "keeps the failed opens' names only while the host has not settled them, whatever names they used, and none once their instance is forgotten" $
     withRig $ \rig →
