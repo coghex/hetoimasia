@@ -526,7 +526,7 @@ until the terrain owner adopts the store (TRA-22); nothing here is wired into it
 | private library `store` (`store/`) | the codec, trees, allocator, planner and state machine; visible to no client; this package's suite reaches it to check them against independent references |
 
 A client, such as the later storage backend, holds a `Store` value, plans through a
-`Window` (a bounded set of decoded pages for one version), writes the pages a `Plan`
+`Window` (a bounded set of validated page buffers for one store and one version), writes the pages a `Plan`
 names, and reports outcomes:
 
 ```haskell
@@ -600,7 +600,7 @@ schema, not `Show`/`Read`, never read by another run.
 Five B+trees share one generic implementation over the page window: the three record
 categories of #661 (`KeyRun`, `KeyLink`, `KeyTodo`), the **free** tree of free page
 extents (coalesced) and the **retire** tree of retirement work. A tree reads only
-through a window of decoded pages: a page it needs and does not have is the
+through a window of validated page buffers: a page it needs and does not have is the
 **pending** result (`Pending page`), never an empty answer; a page that contradicts
 its place (a wrong tree, a wrong level, a key outside its parent's separators) is an
 integrity failure. Updates copy the changed path into an overlay and never touch a
@@ -650,8 +650,8 @@ At most **one** mutating transaction is active. A plan takes
 first, then the untouched tail), writes the pages it needs and returns the rest as
 loose pages, so the allocator's own updates need no fixed point and never overwrite a
 committed page. It writes at most **256 pages (1 MiB), index, allocator and
-retirement pages included**; reserves at most **4 MiB of RAM**; reads through at most
-**512 decoded pages**; and a discovery batch performs at most **64 structural
+retirement pages included**; reserves at most **4 MiB of RAM**; reads through a window of at
+most **1.25 MiB of validated page buffers** (about 310 pages); and a discovery batch performs at most **64 structural
 updates**, where a structural update is #661's: one connection inspected, at most one
 pair of classes joined, and the obligation's progress. The batch keeps its
 continuation in the obligation records; when a tighter bound stops it earlier, it is
@@ -660,13 +660,25 @@ planned again with fewer writes, never truncated.
 | RAM item | Sub-budget of the 64 MiB edit bank |
 | --- | --- |
 | encoded I/O buffers, keys, scratch | staging (8 MiB, 4 MiB protected for a foreground mutation) |
-| decoded copies of the window | caches (48 MiB), pinned while the plan runs |
+| the window's page buffers and the plan's new pages (held packed) | caches (48 MiB), pinned while the plan runs |
 | page-pin records, root and control records, retained continuation | control and frontier (8 MiB) |
+
+*What the RAM figure counts.* It is the memory a plan really holds: the window keeps the
+validated 4 KiB buffer of each page it read (a small header more, at most 1.25 MiB) and
+parses entries from a buffer only while a node is visited; the new pages a plan builds
+are held **packed** (their entries as one byte string, about 4.2 KiB each, 256 pages at
+most when it ends) except for the last eight per tree edit, which stay parsed and are
+accounted at 28,000 bytes each; the encoded output is 4 KiB a written page. The discovery
+header is charged at its fixed 128-byte record size: its byte total counts the retained
+*history*, which lives in pages, and is not transaction memory, so a history of any size
+plans like an empty one. A plan whose window or new pages would hold more is refused
+(`WindowBytesExceeded`, `OverlayExceeded`) with nothing changed.
 
 A removal and its minimum connection obligation are **one** candidate, and so are a
 discovery batch's knowledge, exposed-boundary records and remaining obligations: the
 plan applies every write of the candidate or none. A plan names its base (the store,
-the committed version and the authority); an `admit` of a plan whose base is no
+the committed version and the authority); a transaction's token carries its store, so an
+outcome for another store's transaction with the same serial changes nothing; an `admit` of a plan whose base is no
 longer the committed root is `StalePlan`, never relabelled. Revision arithmetic is
 checked (`RevisionArithmetic`, `VersionArithmetic`); a candidate that changes no page
 and no header is `NoWork`.
@@ -755,7 +767,7 @@ are unchanged until TRA-22 (checked in `terrain-tests`).
 | the committed roots, counters, loose pages and header | the terrain owner alone, only through `publish` of an admitted plan | planning and readers (as copies) | the arena's incarnation |
 | the staged claim and its buffers | the one active transaction | the owner | `admit` to `publish` or `abortTransaction` after the writes drain |
 | reader pins | the owner (`acquireReader`, `releaseReader`) | the reader's token | until released; an arena close drains them before the file closes |
-| a window | the caller of one plan or read | that plan or read | one version; never carried across a publication |
+| a window | the caller of one plan or read | that plan or read | one store and one version; a window of another arena, source or version is refused by every read and plan, and never carried across a publication |
 | the edit-bank occupancy | the owner | the owner | the service |
 
 ### What later slices supply
