@@ -296,6 +296,27 @@ spec = describe "the private page codec against independent bytes" $ do
       case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit 0 (add (emptyWindow ident0 0) 5 parent)) of
         Left (Need (PageNo 6)) → pure ()
         other → expectationFailure ("a missing page must be pending: " <> either show (const "answered") other)
+  describe "rebalancing" $ do
+    it "refuses a sibling whose keys break its parent's separators before merging it into a new page" $ do
+      let runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
+          entries from = [(runKeyBytes lo, bias (lo + 1)) | lo ← [from, from + 10 .. from + 10 * 29]]
+          -- a left leaf of 30 runs (just over the under-full threshold, so one deletion
+          -- under-fills it) and a right leaf whose keys lie BELOW its separator
+          left = buildPage 1 7 1 1 0 0 30 (leafPayload (entries 1000))
+          right = buildPage 1 7 2 1 0 0 30 (leafPayload (entries 100))
+          sepLeft = runKeyBytes 1000
+          sepRight = runKeyBytes 5000
+          parent = buildPage 1 7 3 2 0 1 2 (BS.concat [BS.concat [BS.singleton 24, k, le64' c] | (k, c) ← [(sepLeft, 1), (sepRight, 2)]])
+          add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
+          w = add (add (add (emptyWindow ident0 0) 3 parent) 1 left) 2 right
+      -- an ordinary lookup already refuses the malformed sibling
+      case runM (lookupKey TreeRuns (Just (Disk (PageNo 3))) (runKeyBytes 5000)) (newEdit 0 w) of
+        Left (Bad KeyOrder (PageNo 2)) → pure ()
+        other → expectationFailure ("lookup: " <> either show (const "answered") other)
+      -- and so must the deletion that would merge it
+      case runM (deleteKey TreeRuns (Just (Disk (PageNo 3))) (runKeyBytes 1000)) (newEdit 1000000 w) of
+        Left (Bad KeyOrder (PageNo 2)) → pure ()
+        other → expectationFailure ("a malformed sibling was merged: " <> either show (const "a plan was produced") other)
   describe "revision and version arithmetic" $ do
     it "refuses a revision or version that would wrap, and a delta that names another authority" $ do
       let cfg = either (error . show) id (mkStoreConfig smallSpec)

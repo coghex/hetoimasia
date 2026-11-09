@@ -200,6 +200,48 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     windowSize w `shouldBe` 310
     let held = liveAfter - liveBefore
     (held < 2 * fromIntegral (windowBytes w)) `shouldBe` True
+  it "holds a dense 180-leaf plan within the RAM it reports, the window and the output included" $ do
+    enabled ← getRTSStatsEnabled
+    enabled `shouldBe` True
+    let leaves = 180 ∷ Int
+        perLeaf = 119 ∷ Int
+        -- hand-built tree of full leaves: pages 0 .. leaves-1, two internal pages, one root
+        leafKey ∷ Int → Int → RecordKey
+        leafKey l i = runKey (toInteger l) 0 (100 * toInteger i)
+        leafPage l = Page TreeRuns 0 (PageNo (fromIntegral l)) (Leaf [(encodeKey (leafKey l i), encodeValue (runRec (100 * toInteger i + 3))) | i ← [1 .. perLeaf]])
+        innerPage ∷ Word64 → [Int] → Page
+        innerPage no ls = Page TreeRuns 1 (PageNo no) (Inner [(encodeKey (leafKey l 1), PageNo (fromIntegral l)) | l ← ls])
+        half = leaves `div` 2
+        left = innerPage (fromIntegral leaves) [0 .. half - 1]
+        right = innerPage (fromIntegral leaves + 1) [half .. leaves - 1]
+        rootPage = Page TreeRuns 2 (PageNo (fromIntegral leaves + 2)) (Inner [(encodeKey (leafKey 0 1), PageNo (fromIntegral leaves)), (encodeKey (leafKey half 1), PageNo (fromIntegral leaves + 1))])
+        pages = [leafPage l | l ← [0 .. leaves - 1]] ++ [left, right, rootPage]
+        h0 = newH smallSpec ident0
+        disk = foldl (\dk pg → diskWrite (pgNo pg) (either (error . show) id (encodePage ident0 pg)) dk) (hDisk h0) pages
+        total = fromIntegral (length pages) ∷ Word64
+        roots0 = storeRoots (hStore h0)
+        roots = roots0 {rVersion = 1, rRuns = Just (PageNo (fromIntegral leaves + 2)), rHw = total, rLivePages = total}
+        store = storeFromRoots (hCfg h0) ident0 roots
+        h = h0 {hStore = store, hDisk = disk}
+        delta = deltaFor store True False 1 [(leafKey l 5, Just (runRec 509)) | l ← [0 .. leaves - 1]]
+    must (checkH h)
+    liveBefore ← liveBytes
+    (planned, win, _) ← must (fillWith h (\w → planDelta (hCfg h) ident0 (storeRoots store) w Ordinary delta))
+    plan ← case planned of
+      Planned p → pure p
+      other → expectationFailure ("dense plan: " <> take 300 (show other)) >> fail "plan"
+    -- force every output buffer and keep the plan and its window alive across the measurement
+    _ ← evaluate (sum (map (BS.length . snd) (plPages plan)))
+    liveAfter ← liveBytes
+    windowSize win `shouldSatisfy` (> leaves)
+    mPagesWritten (plMeasure plan) `shouldSatisfy` (> leaves)
+    let held = liveAfter - liveBefore
+        reported = fromIntegral (ramTotal (mRam (plMeasure plan))) ∷ Word64
+        output = fromIntegral (mPagesWritten (plMeasure plan) * pageSize) ∷ Word64
+    -- what the plan and its window really retain stays inside what the plan reports ...
+    (if held <= reported then pure () else expectationFailure ("held " <> show held <> " reported " <> show reported))
+    -- ... and the plan alone retains its output pages and little else: no parsed page survives it
+    (if held <= output + output `div` 4 + fromIntegral (windowBytes win) then pure () else expectationFailure ("held " <> show held <> " but the output is " <> show output))
   it "bounds a plan's RAM below 4 MiB by construction, component by component" $ do
     let w = RamCharge (maxTxnPages * pageSize) (maxWindowPages * windowPageBytes) (3 * maxBatchUpdates * maxEntryBytes) ((maxListPages + bookkeepingReserve) * 16 + maxClaimPages * 8 + 4096) (maxWindowPages * 16) (rootRecordBytes + activeRecordBytes + 128) (1024 + maxWindowPages * 8)
     ramTotal w `shouldSatisfy` (< txnRamLimit)

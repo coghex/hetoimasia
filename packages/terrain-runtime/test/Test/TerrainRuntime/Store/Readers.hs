@@ -149,7 +149,7 @@ spec = describe "pinned readers, retirement and reclamation" $ do
           KeyRun c lo → look (KeyRun c (lo + 1)) `shouldBe` Nothing
           _ → pure ()
       [] → expectationFailure "runs expected"
-  it "refuses to free a page that is already free, however its retirement entry came to name it" $ do
+  it "refuses to free a page that is already free, loose or claimed by the same plan, however its retirement entry came to name it" $ do
     let st0 = (newH smallSpec ident0, Map.empty, mkRng 15)
     (h1, ref1, g1) ← must (foldM (\s _ → churn s 30) st0 [1 .. 30 ∷ Int])
     (h2, _) ← must (reclaimAll h1)
@@ -158,23 +158,29 @@ spec = describe "pinned readers, retirement and reclamation" $ do
         o = ownership a (siSource (hIdent h3)) (hStore h3) (diskRead (hDisk h3))
         entries = sortOn' [(getBe64' k 0, (getBe64' v 0, getLe16' v 8)) | (TreeRetire, ls) ← owLeaves o, (k, v) ← ls]
         freeStarts = [getBe64' k 0 | (TreeFree, ls) ← owLeaves o, (k, _) ← ls]
-    -- the highest free extent is not among the lowest pages the plan itself takes
-    case (entries, reverse freeStarts) of
-      ((_, (lp, count)) : _, fs : _) → do
-        listPage ← maybe (expectationFailure "list page" >> fail "list") pure (diskRead (hDisk h3) (PageNo lp))
-        ps ← case parsePage a (siSource (hIdent h3)) listPage of
-          Right (RefPage _ _ _ (RefList xs) _) → pure xs
-          other → expectationFailure (show other) >> fail "list"
-        length ps `shouldBe` fromIntegral count
-        -- the entry now also names a page the allocator already holds free
-        let tampered = sortOn' (fs : drop 1 ps)
-        bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) (Page TreeRetire 0 (PageNo lp) (List (map PageNo tampered))))
-        let h4 = h3 {hDisk = diskWrite (PageNo lp) bytes (hDisk h3)}
-        (outcome, _, _) ← must (fillWith h4 (planMaintenance (hStore h4)))
-        case outcome of
-          Refused (Integrity (DoubleFree _)) → pure ()
-          other → expectationFailure ("a double free was not refused: " <> take 200 (show other))
-      _ → expectationFailure "expected a retirement entry and a free extent"
+        loosePage = case rLoose (storeRoots (hStore h3)) of
+          (PageNo p : _) → [p]
+          [] → []
+    length freeStarts `shouldSatisfy` (> 1)
+    loosePage `shouldSatisfy` (not . null)
+    -- the highest free extent (untouched by the plan's own supply), the lowest free page (which the
+    -- plan's supply takes first, so it is no longer free once consumed), and a loose page
+    forM_ [("a free page", [last freeStarts]), ("the lowest free page, taken by the plan's own supply", take 1 freeStarts), ("a loose page", loosePage)] $ \(what, victim) →
+      case (entries, victim) of
+        ((_, (lp, count)) : _, fs : _) → do
+          listPage ← maybe (expectationFailure "list page" >> fail "list") pure (diskRead (hDisk h3) (PageNo lp))
+          ps ← case parsePage a (siSource (hIdent h3)) listPage of
+            Right (RefPage _ _ _ (RefList xs) _) → pure xs
+            other → expectationFailure (show other) >> fail "list"
+          length ps `shouldBe` fromIntegral count
+          let tampered = sortOn' (fs : drop 1 ps)
+          bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) (Page TreeRetire 0 (PageNo lp) (List (map PageNo tampered))))
+          let h4 = h3 {hDisk = diskWrite (PageNo lp) bytes (hDisk h3)}
+          (outcome, _, _) ← must (fillWith h4 (planMaintenance (hStore h4)))
+          case outcome of
+            Refused (Integrity (DoubleFree _)) → pure ()
+            other → expectationFailure ("a double free of " <> what <> " was not refused: " <> take 200 (show other))
+        _ → expectationFailure "expected a retirement entry and a page to name"
   it "refuses more readers than the bound and a token of another store" $ do
     let h = newH smallSpec ident0
         other = newH smallSpec (identOf 2 7)

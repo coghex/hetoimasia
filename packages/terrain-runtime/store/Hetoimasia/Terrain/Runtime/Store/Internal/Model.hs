@@ -919,7 +919,7 @@ minimumRemovalRam =
   minimumRemovalPages * pageSize
     + maxWindowBytes
     + overlayWorstBytes
-    + 2 * hotNodes * hotNodeBytes
+    + (2 * hotNodes + 1) * hotNodeBytes
     + worstEditWrites * maxEntryBytes
     + maxWindowPages * 16
     + rootRecordBytes

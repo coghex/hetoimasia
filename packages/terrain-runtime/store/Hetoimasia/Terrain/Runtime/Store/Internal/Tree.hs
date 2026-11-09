@@ -709,20 +709,24 @@ deleteKey tree root@(Just r0) k = do
               cn ← load tree (Just (nLevel n - 1)) c
               let replaced = take i es ++ [(fst (es !! i), c)] ++ drop (i + 1) es
               if nodeBytesOf cn < minNodeBytes && length es >= 2
-                then rebalance (nLevel n - 1) i replaced
+                then rebalance lo hi (nLevel n - 1) i replaced
                 else pure replaced
           case es' of
             [] → discard ref >> pure Nothing
             _ → Just <$> rewrite ref n {nBody = NInner es'}
     -- Repack the under-full child at index i with a neighbour: one merged node
     -- when the pair fits a page, otherwise two nodes split evenly.
-    rebalance childLevel i es = do
+    rebalance lo hi childLevel i es = do
       let j = if i + 1 < length es then i + 1 else i - 1
           (a, b) = (min i j, max i j)
           (sa, ra) = es !! a
           (_, rb) = es !! b
-      na ← load tree (Just childLevel) ra
-      nb ← load tree (Just childLevel) rb
+          (alo, ahi) = childBounds lo hi es a
+          (blo, bhi) = childBounds lo hi es b
+      -- both siblings are checked against the separators their parent promises, so a
+      -- malformed one is refused and never merged into a replacement page
+      na ← loadChecked tree alo ahi (Just childLevel) ra
+      nb ← loadChecked tree blo bhi (Just childLevel) rb
       combined ← case (nBody na, nBody nb) of
         (NLeaf x, NLeaf y) → pure (Left (x ++ y))
         (NInner x, NInner y) → pure (Right (x ++ y))
@@ -775,11 +779,13 @@ reachableFresh e roots = reverse (snd (foldl' visit (Set.empty, []) [r | Just r 
 freshCount ∷ Edit → [Maybe Ref] → Int
 freshCount e roots = length (reachableFresh e roots)
 
--- | Number the reachable overlay pages from a supply of page numbers, children
--- before parents, and return the pages to write with the numbered roots and the
--- supply left. It fails if the supply is short.
-assignPages ∷ Edit → [Maybe Ref] → [PageNo] → Either Stop ([Page], [Maybe PageNo], [PageNo])
-assignPages e roots supply0 = do
+-- | Number the reachable overlay pages from a supply of page numbers, children before
+-- parents, and encode each one as it is built: one parsed page exists at a time, and
+-- each output buffer is forced before the next page is built, so the result holds the
+-- encoded pages and nothing around them. It fails if the supply is short or a page
+-- does not encode.
+assignPages ∷ (Page → Either PageError ByteString) → Edit → [Maybe Ref] → [PageNo] → Either Stop ([(PageNo, ByteString)], [Maybe PageNo], [PageNo])
+assignPages encode e roots supply0 = do
   let order = reachableFresh e roots
   if length supply0 < length order
     then Left (Invariant TreeFree)
@@ -795,9 +801,21 @@ assignPages e roots supply0 = do
               NLeaf es → Right (Leaf es)
               NInner es → Inner <$> traverse (\(sk, c) → (,) sk <$> resolve c) es
             Right (Page (nTree n) (nLevel n) no body)
-      pages ← traverse toPage order
+          step acc i = do
+            page ← toPage i
+            bytes ← either (\err → Left (Bad err (pgNo page))) Right (encode page)
+            -- force the buffer now, so the parsed page it came from can go
+            -- and the page number, which would otherwise keep the whole parsed page alive
+            let PageNo no = pgNo page
+            no `seq` BS.length bytes `seq` Right ((PageNo no, bytes) : acc)
+      encoded ← foldM' step [] order
       rootNos ← traverse (traverse resolve) roots
-      Right (pages, rootNos, rest)
+      Right (reverse encoded, rootNos, rest)
+  where
+    foldM' f z xs = go z xs
+      where
+        go acc [] = Right acc
+        go acc (y : ys) = f acc y >>= \acc' → go acc' ys
 
 -- | The most new pages one update of a tree of the given height writes: a copy of
 -- the path, a split at every level and a new root.

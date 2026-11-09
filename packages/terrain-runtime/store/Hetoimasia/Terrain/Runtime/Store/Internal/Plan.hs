@@ -395,6 +395,24 @@ consume root0 tk = foldl' step (pure root0) (tkExtents tk)
         then pure root'
         else let (k', v') = encodeFree (s + t) (l - t) in insertKey TreeFree root' k' v'
 
+-- | Whether any of the freed pages is already accounted for: free in the committed
+-- allocator tree, loose, or claimed by this very plan's supply. Freeing such a page
+-- would give it two owners.
+overlapOf ∷ Maybe Ref → Set.Set PageNo → [PageNo] → M (Maybe PageNo)
+overlapOf root taken pages = go (runsOf pages)
+  where
+    go [] = pure Nothing
+    go ((s, n) : rest)
+      | any (\i → Set.member (PageNo (s + i)) taken) [0 .. n - 1] = pure (Just (PageNo s))
+      | otherwise = do
+          before ← floorKey TreeFree root (be64 s)
+          after ← ceilKey TreeFree False root (be64 s)
+          case (before >>= dec, after >>= dec) of
+            (Just (ps, pl), _) | ps + pl > s → pure (Just (PageNo s))
+            (_, Just (ns, _)) | ns < s + n → pure (Just (PageNo s))
+            _ → go rest
+    dec (k, v) = decodeFree maxBound k v
+
 -- | Add freed pages as extents, merging with the neighbours that touch them and
 -- refusing a page that is already free.
 insertFreed ∷ Word64 → Maybe Ref → [PageNo] → M (Either PageNo (Maybe Ref))
@@ -514,7 +532,7 @@ planDeltaWith bounds cfg ident roots win cls cand = settle $ do
         then refuse (Capacity (DiskFull claim (freePool cfg roots) (protectedFor cls)))
         else pure ()
       let supply = tkPages tk
-      (pagesRec, recNos, afterRec) ← assign edit1 [rr, rl, rt] supply
+      (pagesRec, recNos, afterRec) ← assign ident edit1 [rr, rl, rt] supply
       (listPage, afterList) ← case (needRetire, afterRec) of
         (True, lp : more) → Right (Just lp, more)
         (True, []) → refuse (Integrity CorruptCounters)
@@ -526,14 +544,13 @@ planDeltaWith bounds cfg ident roots win cls cand = settle $ do
           let (k, v) = encodeRetire version' (Retire lp (fromIntegral listN) 0)
            in phase bkEdit0 (insertKey TreeRetire retireRoot0 k v)
       (freeRoot1, bkEdit2) ← phase bkEdit1 (consume (fmap Disk (rFree roots)) tk)
-      (pagesBk, bkNos, slack) ← assign bkEdit2 [retireRoot1, freeRoot1] afterList
+      (pagesBk, bkNos, slack) ← assign ident bkEdit2 [retireRoot1, freeRoot1] afterList
       let bkUsed = length pagesBk
       if bkUsed > bookkeepingReserve then refuse (Integrity (BookkeepingOverflow bkUsed)) else pure ()
-      let listPages = [Page TreeRetire 0 lp (List replacedRec) | Just lp ← [listPage]]
-          allPages = pagesRec ++ listPages ++ pagesBk
-          written = length allPages
+      listPages ← traverse (\lp → encodeOut ident (Page TreeRetire 0 lp (List replacedRec))) (maybe [] pure listPage)
+      let encoded = pagesRec ++ listPages ++ pagesBk
+          written = length encoded
       if written > bdPages bounds then refuse (Capacity (TxnPagesExceeded written)) else pure ()
-      encoded ← traverse (encodeOut ident) allPages
       (rr', rl', rt') ← case recNos of
         [a, b, c] → Right (a, b, c)
         _ → refuse (Integrity CorruptCounters)
@@ -621,16 +638,18 @@ finishPlan ident cls kind base next' cand pages measure expected version' =
     , plMeasure = measure
     }
 
-assign ∷ Edit → [Maybe Ref] → [PageNo] → P ([Page], [Maybe PageNo], [PageNo])
-assign e roots supply = case assignPages e roots supply of
+-- | Number and encode a plan's new pages, one at a time.
+assign ∷ StoreIdentity → Edit → [Maybe Ref] → [PageNo] → P ([(PageNo, ByteString)], [Maybe PageNo], [PageNo])
+assign ident e roots supply = case assignPages (encodePage ident) e roots supply of
   Left (Invariant t) → refuse (Integrity (BrokenInvariant t))
+  Left (Bad err p) → refuse (Integrity (BadPage err p))
   Left _ → refuse (Integrity CorruptCounters)
   Right r → Right r
 
 encodeOut ∷ StoreIdentity → Page → P (PageNo, ByteString)
 encodeOut ident page = case encodePage ident page of
   Left err → refuse (Integrity (BadPage err (pgNo page)))
-  Right bs → Right (pgNo page, bs)
+  Right bs → let PageNo no = pgNo page in no `seq` BS.length bs `seq` Right (PageNo no, bs)
 
 checkWindow ∷ Bounds → StoreIdentity → Roots → Window → P ()
 checkWindow bounds ident roots win = do
@@ -692,7 +711,7 @@ ramFor windowN windowB overlayB written writes replaced supplyN =
     { ramIoBuffers = written * pageSize
     , ramDecodedCopies = windowB + overlayB
     , ramKeys = writes * maxEntryBytes
-    , ramScratch = replaced * 16 + supplyN * 8 + 4096 + 2 * hotNodes * hotNodeBytes
+    , ramScratch = replaced * 16 + supplyN * 8 + 4096 + (2 * hotNodes + 1) * hotNodeBytes
     , ramPagePins = windowN * 16
     , ramRootControl = rootRecordBytes + activeRecordBytes + headerBytes
     , ramContinuation = 1024 + windowN * 8
@@ -756,7 +775,12 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
       tk ← maybe (refuse (Capacity (DiskFull (fromIntegral m) (freePool cfg roots + fromIntegral (length (rLoose roots))) 0))) pure mtake
       let claim = fromIntegral m - fromIntegral (tkLoose tk) ∷ Word64
       if freePool cfg roots < claim then refuse (Capacity (DiskFull claim (freePool cfg roots) 0)) else pure ()
-      (freeRoot1, bkEdit1) ← phase bkEdit0 (consume (fmap Disk (rFree roots)) tk)
+      -- nothing a plan frees may already be free, loose or claimed by this plan's own supply
+      (overlap, bkEditA) ← phase bkEdit0 (overlapOf (fmap Disk (rFree roots)) (Set.fromList (tkPages tk ++ rLoose roots)) freed)
+      case overlap of
+        Just pg → refuse (Integrity (DoubleFree pg))
+        Nothing → Right ()
+      (freeRoot1, bkEdit1) ← phase bkEditA (consume (fmap Disk (rFree roots)) tk)
       (freed1, bkEdit2) ← phase bkEdit1 (insertFreed (rHw roots) freeRoot1 freed)
       freeRoot2 ← case freed1 of
         Left p → refuse (Integrity (DoubleFree p))
@@ -768,11 +792,10 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
           else
             let (k', v') = encodeRetire e (ret {retDone = fromIntegral done' ∷ Word16})
              in phase bkEdit2 (insertKey TreeRetire retireRoot k' v')
-      (pagesBk, bkNos, slack) ← assign bkEdit3 [retireRoot1, freeRoot2] (tkPages tk)
-      let bkUsed = length pagesBk
+      (encoded, bkNos, slack) ← assign ident bkEdit3 [retireRoot1, freeRoot2] (tkPages tk)
+      let bkUsed = length encoded
       if bkUsed > m then refuse (Integrity (BookkeepingOverflow bkUsed)) else pure ()
       if bkUsed > bdPages bounds then refuse (Capacity (TxnPagesExceeded bkUsed)) else pure ()
-      encoded ← traverse (encodeOut ident) pagesBk
       (retire', free') ← case bkNos of
         [a, b] → Right (a, b)
         _ → refuse (Integrity CorruptCounters)
