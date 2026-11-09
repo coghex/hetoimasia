@@ -131,6 +131,8 @@ data Composition = Composition
   , cpHeldReads ∷ !(TVar (Set ByteString))
   -- ^ The paths whose reads wait at the pool's reader until they are let go (injected evidence: a gated read still opens
   -- and hashes a real file once its gate opens). Empty unless an example holds one.
+  , cpProfile ∷ !Profile
+  -- ^ The profile this composition's texture pipeline and VMs run under: 'compositionProfile' unless an example gives a smaller one.
   }
 
 -- | The profile the compositions run under: the fixed M1 profile.
@@ -175,7 +177,7 @@ withComposition profile files backend body =
       account ← newRenderAccount m1RenderAccountBytes
       withReadPoolUsing pool gated $ \readPool →
         withTexturePipeline spec account backend readPool inventory $ \pipeline → do
-          composition ← Composition tree root inventory readPool pipeline account <$> newTVarIO [] <*> newIORef Map.empty <*> newIORef Map.empty <*> pure entered <*> pure finished <*> pure held
+          composition ← Composition tree root inventory readPool pipeline account <$> newTVarIO [] <*> newIORef Map.empty <*> newIORef Map.empty <*> pure entered <*> pure finished <*> pure held <*> pure profile
           withLoggingLifetime quietLogger $ \lifetime →
             withSupervision lifetime $ \control → do
               runtime ← newLuaRuntime control
@@ -235,10 +237,10 @@ requestHandleType = "treq"
 startVm ∷ Composition → LuaRuntime → Text → IO Vm
 startVm composition runtime label = do
   handles ← newRequestHandles
-  requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests compositionProfile handles)
+  requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests (cpProfile composition) handles)
   service ← either (\refused → assertFailure ("the service was refused: " <> show refused)) pure (textureService requests (cpPipeline composition))
   lending ← newLending
-  let capacity = facadeLeaseCapacity compositionProfile
+  let capacity = facadeLeaseCapacity (cpProfile composition)
   -- the lease scope's capacity is the production derivation from the profile's byte limits, not a ceiling of the test's own
   leases ← newLeases lending capacity
   owners ← newIORef Map.empty
@@ -247,9 +249,9 @@ startVm composition runtime label = do
       registered =
         either (error . ("registration refused: " <>) . show) id $
           registration [admittedHandleType handles requestHandleType, leaseCapabilityType leases textureHandleType] (bindings composition vm')
-      Bytes copied = bytesLimit compositionProfile CopiedValueBytes
-      Count depth = countLimit compositionProfile CopiedValueDepth
-      Count elements = countLimit compositionProfile CopiedValueElements
+      Bytes copied = bytesLimit (cpProfile composition) CopiedValueBytes
+      Count depth = countLimit (cpProfile composition) CopiedValueDepth
+      Count elements = countLimit (cpProfile composition) CopiedValueElements
       limits = either (error . show) id (valueLimits (fromIntegral copied) (fromIntegral depth) (fromIntegral elements))
       vm =
         (vmConfig [LibraryBase, LibraryString, LibraryTable, LibraryMath])

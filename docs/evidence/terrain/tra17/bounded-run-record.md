@@ -9,12 +9,12 @@ Verdict: **pass**.
 - target standing: no target
 - actions: ran the terrain-ci evidence
 - device calls, in order: vkCreateInstance, vkCreateDebugUtilsMessengerEXT, vkEnumeratePhysicalDevices, vkCreateDevice, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
-- Vulkan calls: 1002, on 1 thread(s)
+- Vulkan calls: 999, on 1 thread(s)
 - frames presented: 0, presentations retired: 0
 - verdict issues: []
 - error reports: 0
-- seconds, from the loader integration to the verdict: 1.855835
-- probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci17/terrain-ci/tra17-terrain-ci-probes.json
+- seconds, from the loader integration to the verdict: 1.989808
+- probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci19/terrain-ci/tra17-terrain-ci-probes.json
 - failure: none
 - depth format: Depth32Float
 - matrix-FaceSouth-0.25: pass, 10560 probes, 10560 determinate
@@ -56,8 +56,8 @@ Verdict: **pass**.
 
 ```
 ## TRA-17: the bounded required selection of the terrain material's evidence: the 16 shape identities in the south facing, mixed and fog cells, a roof over a cavity in four submissions and both wrappers, ramps, a depth-effect stack, and a reversed-order control, judged as the complete qualification is
-the terrain-ci evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci17/terrain-ci
-terrain-ci probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci17/terrain-ci/tra17-terrain-ci-probes.json
+the terrain-ci evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci19/terrain-ci
+terrain-ci probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_ci19/terrain-ci/tra17-terrain-ci-probes.json
 terrain-ci depth format: Depth32Float
 terrain-ci fixture matrix-FaceSouth-0.25: 10560 probes, 10560 determinate, 0 not counted; passed
 terrain-ci fixture mixed-FaceSouth@0.25: 2640 probes, 2640 determinate, 0 not counted; passed

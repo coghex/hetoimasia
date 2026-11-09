@@ -795,6 +795,9 @@ Only a page that no owner but the allocator claims is written, and a refusal wri
   it, and the **root record anchors the chain**: it carries the checksum each tree root's page must carry
   (a window holds them, a transaction publishes those of the roots it wrote, a reader's pin records those of
   its version), so one re-sealed page anywhere on a path, the root included, fails the record above it.
+  A root with no recorded checksum **fails closed** (`RootChecksumMissing`): every window a store hands out carries
+  the trust of the root record or the pin, a plan's window also that of every pinned reader's roots, and only the
+  test-only `windowUnchecked`, which the facade does not export, reads a root no record names.
   The residual, out of the model, is a *consistent* re-seal of the root record together with what it
   names, or of a whole path of pages together with the record above it: the trees then say a different
   thing consistently, which no local check can tell from a different true history.

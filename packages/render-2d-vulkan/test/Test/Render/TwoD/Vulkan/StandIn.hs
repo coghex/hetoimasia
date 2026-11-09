@@ -363,6 +363,9 @@ standInDevice =
   DeviceOffer
     { offerDevice = "stand-in device"
     , offerDeviceName = "stand-in device"
+    , offerDriverName = "stand-in driver"
+    , offerDriverInfo = "stand-in"
+    , offerSubPixelPrecisionBits = 8
     , offerDeviceApiVersion = packApiVersion 1 3 0
     , offerDeviceExtensions = [swapchainExtension, swapchainMaintenance1Extension]
     , offerDynamicRendering = True

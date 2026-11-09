@@ -293,16 +293,17 @@ test-suite vulkan-native-tests
         hetoimasia-render-2d-oracle ==0.1.0.0,
         hetoimasia-render-2d-vulkan ==0.1.0.0,
         hetoimasia-render-api ==0.1.0.0,
-        -- The terrain material's evidence (TRA-8): the pure terrain and planner
-        -- packages with their material and fixture components, the Vulkan
-        -- package that declares the material, the production PNG decoder the
-        -- approved artwork is read with and the digest that identifies it. Only
-        -- this suite depends on them, never an engine library, and the suite
-        -- imports no spec of another component.
+        -- The terrain material's evidence (TRA-17): the pure terrain and planner
+        -- packages with their atlas, material and fixture components, the Vulkan
+        -- package that declares the material, the bounded PNG decoder the packed
+        -- atlases are read with and the digest that identifies them. Only this
+        -- suite depends on them, never an engine library, and the suite imports
+        -- no spec of another component.
         cryptohash-sha256 >=0.11.102 && <0.12,
         hetoimasia-asset-image ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-render-2d ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-atlas ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-material ==0.1.0.0,
         hetoimasia-terrain-render-2d-vulkan ==0.1.0.0

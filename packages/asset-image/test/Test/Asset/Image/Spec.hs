@@ -17,6 +17,7 @@ import qualified Test.Asset.Image.PngPreflightClient as PngPreflightClient
 import qualified Test.Asset.Image.PngPreflightInflation as PngPreflightInflation
 import qualified Test.Asset.Image.Premultiply as Premultiply
 import qualified Test.Asset.Image.Refusals as Refusals
+import qualified Test.Asset.Image.Region as Region
 import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
@@ -32,6 +33,7 @@ spec = describe "AssetImage" $ do
   PngDecodeBudget.spec
   PngDecodeClient.spec
   DataMap.spec
+  Region.spec
   Bc7.spec
   Bc7Opacity.spec
   Mips.spec

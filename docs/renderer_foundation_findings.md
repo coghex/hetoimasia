@@ -75,8 +75,8 @@ drawing game managers into the engine.
   resource updates, image-verification tolerances and delivery slices. Do not
   select an ECS, render graph, model importer or universal scene API merely
   to implement this sample.
-- PBR, animation, shadows, general asset import and Synarchy migration remain
-  outside this concern.
+- PBR, animation, shadows, general asset import and rebuilding Ecce Homo's
+  systems remain outside this concern.
 
 ### [deferred] FND-4. Add an independent 2D consumer over the same GPU infrastructure
 
@@ -113,10 +113,13 @@ goal, not an instruction to add a complete UI system.
 - **Unresolved:** texture provenance, alpha/blending and sampling conventions,
   ordering/batching contract and focused slice boundaries. Do not claim
   batching performance without measurement.
-- A complete UI/font stack, broad input expansion and game migration remain
-  outside this concern.
+- A complete UI/font stack, broad input expansion and rebuilding Ecce Homo's
+  systems remain outside this concern.
 
-The foundation's original captured-Synarchy-scene then live-scenario proposal
-can inform FND-4's interfaces. Refine the concrete migration acceptance target
-separately; full text/UI/save/audio compatibility must not silently become
-FND-4 acceptance or replace the independent 3D goal.
+Superseded by the owner on 2026-11-09: the foundation's original
+captured-Synarchy-scene then live-scenario proposal, and a separate migration
+acceptance target, are not the path. Ecce Homo is rebuilt on Hetoimasia piece
+by piece with Synarchy as the reference ([vision](vision.md) V-1; the current
+piece is the [terrain arena](designs/terrain_arena_design.md)). Full
+text/UI/save/audio compatibility is not a goal and must not become FND-4
+acceptance or replace the independent 3D goal.

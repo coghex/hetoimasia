@@ -23,7 +23,8 @@ import Data.Function (on)
 import Data.List (sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.ByteString as ByteString
-import Hetoimasia.Asset.Image.DataMap (NormalEncoding (..), buildBinaryCoverage, coverageAt)
+import Hetoimasia.Asset.Image.DataMap (NormalEncoding (..), buildBinaryCoverage)
+import Hetoimasia.Asset.Image.Region (regionViewCoverageAt)
 import Hetoimasia.Terrain.Cell (Column (..))
 import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
 import Hetoimasia.Terrain.MapBake.Catalog (MapKey (..), MapRole (..), catalogKeys, mapFileName)
@@ -104,14 +105,16 @@ checkedAssets ∷ Spec
 checkedAssets = describe "checked supplied assets" $ do
   let full = planeFromFormula (\_ _ → True)
       short = either (error . show) id (buildBinaryCoverage 96 63 (ByteString.replicate (96 * 63 * 4) 255))
-      colour ref = either (error . show) id (mkColourAsset ref 1 1 full)
-      mapAsset key = either (error . show) id (mkMapAsset key 1 1 (Just UnitNormalRgbV1) full)
+      colour ref = either (error . show) id (mkColourAsset ref 1 1 (wholeImageView 1 full))
+      mapAsset key = either (error . show) id (mkMapAsset key 1 1 (Just UnitNormalRgbV1) (wholeImageView 1 full))
       allMaps = [(key, mapAsset key) | key ← catalogKeys]
   it "refuses a plane that is not 96 x 64, mismatched versions and a map without its checked profile" $ do
-    mkColourAsset ColourBlank 1 1 short `shouldSatisfy` isLeft
-    mkColourAsset ColourBlank 1 2 full `shouldSatisfy` isLeft
-    mkMapAsset (MapKey Ordinary (shapeNo 0)) 1 1 Nothing full `shouldSatisfy` isLeft
-    mkMapAsset (MapKey Ordinary (shapeNo 0)) 3 4 (Just UnitNormalRgbV1) full `shouldSatisfy` isLeft
+    mkColourAsset ColourBlank 1 1 (wholeImageView 1 short) `shouldSatisfy` isLeft
+    mkColourAsset ColourBlank 1 2 (wholeImageView 1 full) `shouldSatisfy` isLeft
+    mkMapAsset (MapKey Ordinary (shapeNo 0)) 1 1 Nothing (wholeImageView 1 full) `shouldSatisfy` isLeft
+    mkMapAsset (MapKey Ordinary (shapeNo 0)) 3 4 (Just UnitNormalRgbV1) (wholeImageView 3 full) `shouldSatisfy` isLeft
+    -- A region view built for parent version 1, adopted beside coverage 2, is a stale region.
+    mkColourAsset ColourBlank 2 2 (wholeImageView 1 full) `shouldBe` Left (AssetStaleRegion (AssetColour ColourBlank) 1 2)
   it "refuses a catalog that lacks an authored map and a duplicate asset, so no plan can be asked for" $ do
     mkAssetSnapshot 1 (colour ColourBlank) [] (drop 1 allMaps) `shouldSatisfy` isLeft
     mkAssetSnapshot 1 (colour ColourBlank) [(stoneId, colour (ColourMaterial stoneId)), (stoneId, colour (ColourMaterial stoneId))] allMaps `shouldSatisfy` isLeft
@@ -220,7 +223,7 @@ coveringQuads assets quads (px, py) = [q | q ← quads, covers q]
           tx = floor (cx - l) ∷ Int
           ty = floor (cy - t) ∷ Int
        in l <= cx && cx < r && t <= cy && cy < b && r - l == 96 && b - t == 64 && bit (colourCoverage assets (quadColour q)) tx ty && bit (mapCoverage assets (quadMap q)) tx ty
-    bit (Just plane) x y = coverageAt plane (fromIntegral x) (fromIntegral y) == Just True
+    bit (Just view) x y = regionViewCoverageAt view (fromIntegral x) (fromIntegral y) == Just True
     bit Nothing _ _ = False
 
 classify ∷ Maybe (PartKind, Maybe TileCoord) → OResult

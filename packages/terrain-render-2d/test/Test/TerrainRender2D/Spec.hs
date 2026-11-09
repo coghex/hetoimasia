@@ -2,6 +2,8 @@
 module Test.TerrainRender2D.Spec (spec) where
 
 import Test.Hspec (Spec, describe)
+import qualified Test.TerrainRender2D.Atlas as Atlas
+import qualified Test.TerrainRender2D.AtlasAssets as AtlasAssets
 import qualified Test.TerrainRender2D.Camera as Camera
 import qualified Test.TerrainRender2D.Cells as Cells
 import qualified Test.TerrainRender2D.CellsClient as CellsClient
@@ -9,28 +11,26 @@ import qualified Test.TerrainRender2D.CellsCoverage as CellsCoverage
 import qualified Test.TerrainRender2D.CellsEvidence as CellsEvidence
 import qualified Test.TerrainRender2D.CellsProgress as CellsProgress
 import qualified Test.TerrainRender2D.CellsWork as CellsWork
-import qualified Test.TerrainRender2D.Generated as Generated
+import qualified Test.TerrainRender2D.Expectation as Expectation
 import qualified Test.TerrainRender2D.MapAssets as MapAssets
 import qualified Test.TerrainRender2D.Material as Material
-import qualified Test.TerrainRender2D.Opacity as Opacity
-import qualified Test.TerrainRender2D.Ordering as Ordering
-import qualified Test.TerrainRender2D.Pick as Pick
-import qualified Test.TerrainRender2D.Planning as Planning
+import qualified Test.TerrainRender2D.ModelAtBand as ModelAtBand
+import qualified Test.TerrainRender2D.ReferenceTint as ReferenceTint
+import qualified Test.TerrainRender2D.TexelRule as TexelRule
 import qualified Test.TerrainRender2D.Projection as Projection
-import qualified Test.TerrainRender2D.Scenes as Scenes
 
 spec ∷ Spec
 spec = describe "TerrainRender2D" $ do
   Projection.spec
   Camera.spec
-  Planning.spec
-  Ordering.spec
-  Pick.spec
-  Generated.spec
-  Opacity.spec
-  Material.spec
-  Scenes.spec
   MapAssets.spec
+  Material.spec
+  Expectation.spec
+  ReferenceTint.spec
+  ModelAtBand.spec
+  TexelRule.spec
+  Atlas.spec
+  AtlasAssets.spec
   Cells.spec
   CellsCoverage.spec
   CellsProgress.spec

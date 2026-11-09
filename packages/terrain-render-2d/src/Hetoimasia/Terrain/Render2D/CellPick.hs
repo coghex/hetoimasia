@@ -39,11 +39,11 @@
 -- bottom edges outside. The two triangles share the diagonal, which lies
 -- inside the rectangle, so a centre on it is covered by the quad. A centre on
 -- an outer edge shared by two adjacent quads therefore belongs to exactly one.
--- The texel index along an axis is @min (n - 1) (floor (u × n))@ with @u@ the
--- exact rational position of the centre across the drawn rectangle: an interior
--- texel boundary selects the higher index, nothing is sampled outside the
--- rectangle merely because UVs clamp, and no floating rounding can move a
--- centre across a boundary. This is the CPU convention; whether a device's
+-- The texel index along an axis is 'texelIndexExact' (the one rule, with its 1/128 bias,
+-- defined in "Hetoimasia.Terrain.Render2D.TexelRule") of the exact rational position of the centre
+-- across the drawn rectangle: an interior texel boundary selects the higher index, nothing
+-- is sampled outside the rectangle merely because UVs clamp, and no floating rounding can
+-- move a centre across a boundary. This is the CPU convention; whether a device's
 -- rasterizer agrees at every edge is TRA-17's proof, and a disagreement found
 -- there is a counterexample, not a reason to change this rule.
 --
@@ -63,7 +63,7 @@ module Hetoimasia.Terrain.Render2D.CellPick
   ) where
 
 import Data.Word (Word32)
-import Hetoimasia.Asset.Image.DataMap (coverageAt)
+import Hetoimasia.Asset.Image.Region (regionViewCoverageAt)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld, viewportContains, windowToTarget)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
@@ -71,6 +71,7 @@ import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Render2D.Assets
 import Hetoimasia.Terrain.Render2D.Internal.Cells
 import Hetoimasia.Terrain.Render2D.Projection
+import Hetoimasia.Terrain.Render2D.TexelRule (texelIndexExact)
 
 -- | One pick: the identity the caller holds for the plan and a window point (a
 -- cursor position in the logical window's coordinates).
@@ -157,19 +158,20 @@ pickCells plan (CellPickQuery presented point@(V2 px py))
           covered ← coveredBy centre quad
           if covered then Right (Just quad) else firstCovered centre rest
 
-    -- The texel the centre selects, exactly, in both planes.
+    -- The texel the centre selects, exactly, in both regions: the local index is taken in the
+    -- region's own 96 x 64 extent, and the region adds its origin when it reads its parent's plane.
     coveredBy (cx, cy) quad = do
       let TargetRect l t r b = cqTarget quad
           tx = texel 96 ((cx - l) / (r - l))
           ty = texel 64 ((cy - t) / (b - t))
       colour ← maybe (Left CellPickUnrepresentable) Right (colourCoverage assets (cqColour quad))
       maps ← maybe (Left CellPickUnrepresentable) Right (mapCoverage assets (cqMap quad))
-      case (coverageAt colour tx ty, coverageAt maps tx ty) of
+      case (regionViewCoverageAt colour tx ty, regionViewCoverageAt maps tx ty) of
         (Just a, Just b') → Right (a && b')
         _ → Left CellPickUnrepresentable
 
-    texel ∷ Integer → Rational → Word32
-    texel n u = fromInteger (min (n - 1) (floor (max 0 (min 1 u) * fromInteger n)))
+    texel ∷ Word32 → Rational → Word32
+    texel = texelIndexExact
 
     isLoading centre front = pendingAhead || unresolvedAheadOf centre
       where

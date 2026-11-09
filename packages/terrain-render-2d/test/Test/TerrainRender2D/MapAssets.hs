@@ -557,7 +557,10 @@ openingSpec = describe "the logical catalog's openings and closed controls agree
 -- ---------------------------------------------------------------------------
 -- Sampling, and colour against map coverage
 
--- | P-11's texel rule: @i = min (w - 1) (floor (clamp u 0 1 * w))@.
+-- | The NEUTRAL normalized sampling rule these map-asset examples use for the baked maps: @i = min (w - 1) (floor
+-- (clamp u 0 1 * w))@, the asset-level reference (@sampleIndex@). The terrain material and picker sample with the
+-- owner's 2026-11-09 Q-13 bias, @+ 1/128@ inside the floor, defined once in
+-- "Hetoimasia.Terrain.Render2D.TexelRule"; these examples do not exercise that rule.
 texelIndex ∷ Int → Rational → Int
 texelIndex size u = min (size - 1) (floor (max 0 (min 1 u) * fromIntegral size))
 

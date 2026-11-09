@@ -47,11 +47,22 @@ block depth (JArray items)
   | null items = "[]"
   | otherwise =
       "[\n"
-        <> intercalate ",\n" [pad (depth + 1) <> inline item | item ← items]
+        <> intercalate ",\n" [pad (depth + 1) <> element item | item ← items]
         <> "\n"
         <> pad depth
         <> "]"
+  where
+    -- An element that itself holds an array of objects (an atlas and its regions) is spread
+    -- over lines like the top level, so one changed region is one changed line; every other
+    -- element stays inline on one line.
+    element item
+      | nests item = block (depth + 1) item
+      | otherwise = inline item
 block _ other = inline other
+
+nests ∷ Json → Bool
+nests (JObject fields) = any (\(_, v) → case v of JArray vs → any (not . scalar) vs; _ → False) fields
+nests _ = False
 
 scalar ∷ Json → Bool
 scalar (JString _) = True
