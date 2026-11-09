@@ -6,8 +6,8 @@
 -- its keys, the picker, the atlas adaptation or the material. Here its frontmost covered quad at
 -- every pixel it can decide is compared with what the picker finds, for every shape in every
 -- facing, roofs and cavities, disconnected spans, ramps and corners, cutaways, and mixed and fog
--- cells. A pixel the model calls ambiguous (within 1/1000 texel of a texel threshold or a canvas edge) is counted and
--- never compared; a scene whose compared or covered count is zero fails, so no scene passes
+-- cells. Every pixel is compared, exactly; a pixel the device would be allowed to read differently
+-- (an unsnapped scene within 1/1000 texel of an interior threshold) is only counted as banded; a scene whose compared or covered count is zero fails, so no scene passes
 -- without judging anything.
 module Test.TerrainRender2D.Expectation (spec) where
 
@@ -47,7 +47,7 @@ spec = describe "Expectation" $ do
   it "decides most pixels: ambiguity is a thin band at texel boundaries, not the common case" $ do
     (manifest, assets, art) ← setupAll
     verdict ← judge manifest assets art (shapeMatrix FaceSouth 1)
-    (jAmbiguous verdict * 5 < jCompared verdict + jAmbiguous verdict) `shouldBe` True
+    (jAmbiguous verdict * 5 < jCompared verdict) `shouldBe` True
   where
     facings = [FaceSouth, FaceWest, FaceNorth, FaceEast]
 
@@ -114,17 +114,20 @@ judge _ assets art scene = do
   let camera = sceneCameraFollowed scene
       (w, h) = sceneTarget scene
       pixels = [(x, y) | y ← [0 .. h - 1], x ← [0 .. w - 1]]
-      step acc pixel = case expectedAt art defaultHandLight scene camera plan pixel of
-        Ambiguous _ → acc {jAmbiguous = jAmbiguous acc + 1}
-        expected →
-          let found = pickPixel plan pixel
-              problem = disagreement expected found
-              covered = case expected of ExpectedHit {} → 1; _ → 0
-           in acc
-                { jCompared = jCompared acc + 1
-                , jCovered = jCovered acc + covered
-                , jMismatches = take 6 (jMismatches acc <> [show pixel <> ": " <> why | Just why ← [problem]])
-                }
+      -- The pure picker is compared with the exact expectation at EVERY pixel, including those the
+      -- device's own exemption ('expectedForDevice') would leave undecided; those are only counted.
+      step acc pixel =
+        let expected = expectedAt art defaultHandLight scene camera plan pixel
+            found = pickPixel plan pixel
+            problem = disagreement expected found
+            covered = case expected of ExpectedHit {} → 1; _ → 0
+            banded = case expectedForDevice art defaultHandLight scene camera plan pixel of Ambiguous _ → 1; _ → 0
+         in acc
+              { jCompared = jCompared acc + 1
+              , jAmbiguous = jAmbiguous acc + banded
+              , jCovered = jCovered acc + covered
+              , jMismatches = take 6 (jMismatches acc <> [show pixel <> ": " <> why | Just why ← [problem]])
+              }
   pure (foldl' step (Judged 0 0 0 []) pixels)
 
 -- | Why the model and the picker disagree at a pixel, if they do.

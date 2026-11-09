@@ -210,6 +210,9 @@ modelSpec = describe "the model" $ do
       sampled (1 / 96 - 1.0e-9, 0) `shouldSatisfy` closeTo 1e-12 (expectedAt 1 0)
       sampled (1 / 96 - 1.0e-4, 0) `shouldSatisfy` closeTo 1e-12 (expectedAt 0 0)
       sampled (0, 1 / 64) `shouldSatisfy` closeTo 1e-12 (expectedAt 0 1)
+      -- The model is exact: 0.031168619791666664 x 96 + 1/128 is just below 3, so the local texel is 2
+      -- (a Double product would round it up to 3).
+      sampled (0.031168619791666664, 0) `shouldSatisfy` closeTo 1e-12 (expectedAt 2 0)
     it "clamps coordinates outside the unit square to the region's outer texels" $ do
       sampled (-3, -3) `shouldSatisfy` closeTo 1e-12 (expectedAt 0 0)
       sampled (7, 7) `shouldSatisfy` closeTo 1e-12 (expectedAt 95 63)

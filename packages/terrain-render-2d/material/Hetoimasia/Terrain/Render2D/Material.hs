@@ -32,7 +32,8 @@
 -- Both samples are unconditional, as the implicit derivatives require.
 --
 -- @texelBias@ is @1/128@ of a texel, the owner's 2026-11-09 Q-13 decision (amendment v2), and 'texelIndex' of
--- "Hetoimasia.Asset.Image.Region" is the rule's one definition: the shader's colour and normal
+-- "Hetoimasia.Terrain.Render2D.TexelRule" is the rule's one definition, evaluated exactly (the coordinate is
+-- converted with 'toRational' before the product): the shader's colour and normal
 -- samples (its literal is made from the constant), CPU coverage and picking and the independent
 -- expected model all use it, so an interior texel boundary selects the higher texel even though
 -- float32 interpolation lands a hair below it on the device. A coordinate more than the bias
@@ -102,7 +103,6 @@ import Data.Word (Word32, Word64)
 import Hetoimasia.Asset.Image.DataMap (NormalEncoding (..), coverageHeight, coverageWidth)
 import Hetoimasia.Asset.Image.Region
   ( RegionView
-  , texelBias
   , regionHeight
   , regionOriginX
   , regionOriginY
@@ -124,6 +124,7 @@ import Hetoimasia.Terrain.Render2D.Assets (AssetSnapshot, ColourRef, assetIdenti
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Presentation
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..), rationalToFloat, rvCentre, rvSetup, rvZoom)
+import Hetoimasia.Terrain.Render2D.TexelRule (texelBias, texelIndexDoubleWith)
 
 -- | One registered parent texture, bound to the validated parent image it was uploaded from: the
 -- handle and the identity (coverage version and extent) of the 'ParentAtlas' that supplied its
@@ -393,7 +394,7 @@ clamp01 = max 0 . min 1
 -- the same 32-bit values the record and the push block hold. A record of another layout holds
 -- nothing and draws nothing.
 terrainModel ∷ MaterialModel
-terrainModel = modelWith (centreWith (fromRational texelBias))
+terrainModel = modelWith (centreWith texelBias)
 
 -- | The model of the unbiased-index negative control (never a terrain rule): the texel index
 -- without the bias, the rule the Q-13 counterexample was measured under. The evidence gives the
@@ -406,14 +407,15 @@ terrainModelUnbiasedControl = modelWith (centreWith 0)
 -- @1/10000@ bias, which the device measured too small at pixel-snapped zooms 9/8 and 5/4. As for the
 -- unbiased control, the oracle is given this model so it agrees with the control's own material.
 terrainModelStaleBiasControl ∷ MaterialModel
-terrainModelStaleBiasControl = modelWith (centreWith 1.0e-4)
+terrainModelStaleBiasControl = modelWith (centreWith (1 / 10000))
 
 -- | The texel the local index selects, at its centre, in the atlas, with this bias in texels: the
 -- origin is added after.
-centreWith ∷ Double → Word32 → Word32 → Word32 → Double → Double
+centreWith ∷ Rational → Word32 → Word32 → Word32 → Double → Double
 centreWith bias origin extent atlas coordinate = (fromIntegral origin + local + 0.5) / fromIntegral atlas
   where
-    local = fromIntegral (min (extent - 1) (floor (clamp01 coordinate * fromIntegral extent + bias) ∷ Word32)) ∷ Double
+    -- Exact: the coordinate is converted to a 'Rational' before the product, never rounded in 'Double'.
+    local = maybe 0 fromIntegral (texelIndexDoubleWith bias extent coordinate) ∷ Double
 
 -- | The model of the negative control's rule (never a terrain rule): the region coordinate
 -- interpolated between the half-texel-inset endpoints, @(origin + 1/2 + u (w - 1)) / atlasExtent@,

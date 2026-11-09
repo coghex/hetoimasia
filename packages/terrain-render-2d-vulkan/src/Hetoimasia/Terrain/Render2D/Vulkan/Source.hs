@@ -32,7 +32,7 @@ module Hetoimasia.Terrain.Render2D.Vulkan.Source
   , lightPush
   ) where
 
-import Hetoimasia.Asset.Image.Region (texelBias)
+import Hetoimasia.Terrain.Render2D.TexelRule (texelBias)
 import Hetoimasia.Render.TwoD.Vulkan.MaterialSources (PushField (..), PushType (..))
 
 -- | The texel bias as a GLSL float literal, made from the one definition 'texelBias' (1/128 of a

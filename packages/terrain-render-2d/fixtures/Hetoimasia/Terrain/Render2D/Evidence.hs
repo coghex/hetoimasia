@@ -30,10 +30,10 @@
 -- The art is supplied by the caller from the independently decoded source images: this module
 -- reads no file and calls neither the atlas nor the planner.
 --
--- A pixel centre within 1/1000 texel of the threshold of a texel boundary of a quad it depends on (the
--- boundary less the 1/128 texel bias) or of a canvas edge is 'Ambiguous', never a guess, unless the
--- caller states that the scene's centres lie on boundaries on purpose, or that every pixel must be
--- decided (then the rule decides, exactly, in rational arithmetic).
+-- Every expectation is exact (rational arithmetic, the 1/128 texel bias restated here, no import of a
+-- production rule). 'expectedForDevice' alone marks a pixel 'Ambiguous', and only for an unsnapped
+-- scene near an interior texel threshold (see there); the pure picker and material model are compared
+-- with 'expectedAt' at every pixel.
 --
 -- State, ownership and lifetime: none. Every value is immutable.
 module Hetoimasia.Terrain.Render2D.Evidence
@@ -65,7 +65,7 @@ module Hetoimasia.Terrain.Render2D.Evidence
   , Expected (..)
   , handQuads
   , expectedAt
-  , expectedAtExact
+  , expectedForDevice
   , expectedImage
   , handSides
   , handTurnSide
@@ -82,7 +82,6 @@ import qualified Data.Map.Strict as Map
 import Data.List (nub, sortOn)
 import Data.Ord (Down (..))
 import Data.Word (Word8)
-import Hetoimasia.Asset.Image.Region (texelBias)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld, viewportContains)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
@@ -438,8 +437,8 @@ data Expected
       , expectedLinear ∷ !(Double, Double, Double)
       , expectedTexel ∷ !(Int, Int)
       }
-  | -- | The point is within 1/1000 texel of the threshold of a texel boundary or of the canvas's edge, or
-  -- the model cannot decide it.
+  | -- | Only from 'expectedForDevice': an unsnapped scene's pixel within 1/1000 texel of an interior
+    -- texel threshold, which the device is not required to read as the exact rule does.
     Ambiguous !String
   deriving stock (Eq, Show)
 
@@ -484,76 +483,79 @@ handShade light count (tr, tg, tb) (nr, ng, nb) depth = (channel tr fr, channel 
 shadedByte ∷ (Double, Double, Double) → (Word8, Word8, Word8)
 shadedByte (r, g, b) = (srgbEncode r, srgbEncode g, srgbEncode b)
 
--- | What the pixel at this column and row shows.
+-- | What the pixel at this column and row shows, decided exactly: the point and every texel test are
+-- 'Rational', the texel rule is restated here (@i = min (n - 1) (floor (offset + 1/128))@ with no
+-- import from the production rule), and no pixel is left undecided. This is what the pure picker and
+-- the pure material model are compared with at every pixel. The device's own exemption, which applies
+-- to a few samples of unsnapped scenes only, is 'expectedForDevice'.
 expectedAt ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
-expectedAt = expectedAtMode False
+expectedAt art light sc camera plan pixel = fst (decidedAt art light sc camera plan pixel)
 
--- | The same in exact 'Rational' arithmetic with no ambiguity band: a pixel centre that lies exactly
--- on a texel boundary is decided by the rule itself (an interior boundary selects the higher texel,
--- the outer edge of a canvas the last, a point outside it no texel). For scenes whose pixel centres
--- are placed on boundaries on purpose; the device must agree with the rule there.
-expectedAtExact ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
-expectedAtExact = expectedAtMode True
+-- | The expectation the device read-back is judged by: 'expectedAt', except a pixel the device may
+-- legitimately read differently becomes 'Ambiguous'. Only a pixel of an UNSNAPPED scene (a fractional
+-- scale or pan lands pixel centres where float32 interpolation cannot be trusted) is eligible, and
+-- only where a texel the pixel's answer depends on has an offset within 'undecidedBand' of an INTERIOR
+-- threshold @k - 1/128@, @k = 1 .. n - 1@. A snapped scene, an outer edge and a shared diagonal are
+-- never exempt: a disagreement there is a counterexample.
+expectedForDevice ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
+expectedForDevice art light sc camera plan pixel = case decidedAt art light sc camera plan pixel of
+  (_, True) | not (sceneSnap sc) → Ambiguous "an interior texel threshold within 1/1000 texel"
+  (expected, _) → expected
 
-expectedAtMode ∷ Bool → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
-expectedAtMode exact art light sc camera plan pixel = case pixelWorldPoint plan pixel of
-  Nothing → ExpectedClear
-  Just (sx, sy)
-    | exact → decide sx sy
-    | otherwise → decide (fromRational sx ∷ Double) (fromRational sy ∷ Double)
+-- | The exact expectation and whether any quad it examined has a texel offset within the band of an
+-- interior threshold.
+decidedAt ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → (Expected, Bool)
+decidedAt art light sc camera plan pixel = case pixelWorldPoint plan pixel of
+  Nothing → (ExpectedClear, False)
+  Just (sx, sy) → go [] False quads sx sy
   where
     quads = sortOn (Down . hqKey) (handQuads sc camera)
     count = turnsOf (camFacing camera)
-    decide ∷ RealFrac a ⇒ a → a → Expected
-    decide sx sy = go [] quads
-      where
-        -- Whether a farther quad's two texels at the point are opaque (decided away from boundaries).
-        covers b =
-          let (bx, by) = hqCorner b
-           in case (texelOf 96 (sx - fromInteger bx), texelOf 64 (sy - fromInteger by)) of
-                (Just u', Just v') → (\(_, _, _, ca) → ca /= 0) (artColour art (hqColour b) u' v') && (\(_, _, _, ma) → ma /= 0) (artMap art (hqMap b) u' v')
-                _ → False
-        go _ [] = ExpectedClear
-        go skipped (q : rest) =
-          let (cx, cy) = hqCorner q
-              fu = sx - fromInteger cx
-              fv = sy - fromInteger cy
-           in case (texelOf 96 fu, texelOf 64 fv) of
-                (Just u, Just v)
-                  | not exact && (undecided 96 fu || undecided 64 fv) → Ambiguous ("a texel boundary of " <> show (hqCell q) <> " " <> show (hqRole q))
-                  | otherwise →
-                      let (cr, cg, cb, ca) = artColour art (hqColour q) u v
-                          (mr, mg, mb, ma) = artMap art (hqMap q) u v
-                       in if ca == 0 || ma == 0
-                            then go (skipped <> [q]) rest
-                            else
-                              let shaded = handShade light count (srgbDecode cr, srgbDecode cg, srgbDecode cb) (mr, mg, mb) (hqDepth q)
-                               in ExpectedHit {expectedFront = q, expectedSkipped = skipped, expectedBehind = [b | b ← rest, covers b], expectedLinear = shaded, expectedTexel = (u, v)}
-                _ → go skipped rest
+    -- Whether a farther quad's two texels at the point are opaque.
+    covers sx sy b =
+      let (bx, by) = hqCorner b
+       in case (texelOf 96 (sx - fromInteger bx), texelOf 64 (sy - fromInteger by)) of
+            (Just u', Just v') → (\(_, _, _, ca) → ca /= 0) (artColour art (hqColour b) u' v') && (\(_, _, _, ma) → ma /= 0) (artMap art (hqMap b) u' v')
+            _ → False
+    go _ banded [] _ _ = (ExpectedClear, banded)
+    go skipped banded (q : rest) sx sy =
+      let (cx, cy) = hqCorner q
+          fu = sx - fromInteger cx
+          fv = sy - fromInteger cy
+       in case (texelOf 96 fu, texelOf 64 fv) of
+            (Just u, Just v) →
+              let banded' = banded || nearInterior 96 fu || nearInterior 64 fv
+                  (cr, cg, cb, ca) = artColour art (hqColour q) u v
+                  (mr, mg, mb, ma) = artMap art (hqMap q) u v
+               in if ca == 0 || ma == 0
+                    then go (skipped <> [q]) banded' rest sx sy
+                    else
+                      let shaded = handShade light count (srgbDecode cr, srgbDecode cg, srgbDecode cb) (mr, mg, mb) (hqDepth q)
+                       in (ExpectedHit {expectedFront = q, expectedSkipped = skipped, expectedBehind = [b | b ← rest, covers sx sy b], expectedLinear = shaded, expectedTexel = (u, v)}, banded')
+            _ → go skipped banded rest sx sy
 
--- | The texel the canvas offset @t@ (in canvas texels from the canvas corner) selects along an axis
--- of @n@ texels: nothing outside the canvas (@t < 0@ or @t >= n@, the half-open rule of the
--- rasterized quad), otherwise the one texel rule, @min (n - 1) (floor (t + 'texelBias'))@, the
--- bias being the owner's 2026-11-09 Q-13 decision. Over 'Rational' this is exact.
-texelOf ∷ RealFrac a ⇒ Int → a → Maybe Int
+-- | The texel the canvas offset @t@ (in canvas texels from the canvas corner) selects along an axis of
+-- @n@ texels: nothing outside the canvas (@t < 0@ or @t >= n@, the half-open rule of the rasterized
+-- quad), otherwise @min (n - 1) (floor (t + 1/128))@. The bias is restated here, on its own, as the
+-- owner's 2026-11-09 Q-13 amendment v2 states it; this module imports no sampling rule from production.
+texelOf ∷ Int → Rational → Maybe Int
 texelOf n t
   | t < 0 || t >= fromIntegral n = Nothing
-  | otherwise = Just (min (n - 1) (floor (t + fromRational texelBias)))
+  | otherwise = Just (min (n - 1) (floor (t + handTexelBias)))
 
--- | Whether a canvas offset @t@ along an axis of @n@ texels is too close to what decides its texel for
--- a device whose float32 interpolation is not exact to be judged: within 'undecidedBand' of the
--- threshold @k - texelBias@ of any interior texel boundary @k@, or of the canvas's outer edge. Only the
--- banded 'expectedAt' (an unsnapped scene at a fractional scale or pan, whose pixel centres wander
--- across texel boundaries by no rule of the scene) skips such a pixel and counts it as ambiguous;
--- 'expectedAtExact' decides every pixel.
-undecided ∷ RealFrac a ⇒ Int → a → Bool
-undecided n t = nearThreshold || t < band || t > fromIntegral n - band
+-- | The amended texel bias, restated: 1/128 of a texel.
+handTexelBias ∷ Rational
+handTexelBias = 1 / 128
+
+-- | Whether the offset @t@ along an axis of @n@ texels is within 'undecidedBand' of an interior
+-- threshold @k - 1/128@ with @1 <= k <= n - 1@.
+nearInterior ∷ Int → Rational → Bool
+nearInterior n t = k >= 1 && k <= n - 1 && abs (w - fromIntegral k) < undecidedBand
   where
-    band = fromRational undecidedBand
-    biased = t + fromRational texelBias
-    nearThreshold = let f = biased - fromInteger (floor biased) in f < band || f > 1 - band
+    w = t + handTexelBias
+    k = round w ∷ Int
 
--- | The half-width of the undecided band, in texels: 1/1000, the owner's 2026-11-09 amendment v2.
+-- | The half-width of the device-undecided band, in texels: 1/1000 (the owner's amendment v2).
 undecidedBand ∷ Rational
 undecidedBand = 1 / 1000
 

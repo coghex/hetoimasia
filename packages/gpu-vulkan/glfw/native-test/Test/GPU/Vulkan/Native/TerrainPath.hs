@@ -244,9 +244,6 @@ data Spec = Spec
   , specVariant ∷ !Variant
   , specLight ∷ !Light
   , specNeeds ∷ ![Need]
-  , specExactFrom ∷ !(Maybe Int)
-  -- ^ The index of the first scene judged in exact arithmetic, that scene and the later ones having
-  -- their pixel centres on texel boundaries on purpose.
   , specLater ∷ ![Light]
   -- ^ The lights of the second and later scenes of a fixture (the first scene has 'specLight'); a
   -- scene without one uses 'specLight'. Each pass's view holds the push block of its own light.
@@ -256,7 +253,7 @@ data Spec = Spec
 
 -- | A fixture of one scene.
 spec ∷ Light → [Need] → Variant → Scene → Spec
-spec light needs variant sc = Spec (sceneName sc <> (if lightLabel light == "default" then "" else "@" <> lightLabel light) <> suffixOf variant) [sc] variant light needs Nothing [] Nothing
+spec light needs variant sc = Spec (sceneName sc <> (if lightLabel light == "default" then "" else "@" <> lightLabel light) <> suffixOf variant) [sc] variant light needs [] Nothing
 
 -- | The light of the scene at this index of a fixture.
 lightOf ∷ Spec → Int → Light
@@ -268,20 +265,14 @@ lightOf s index = case drop (index - 1) (specLater s) of
 -- first under the default light, the second under this one, so that a pixel of one differs from
 -- the same pixel of the other and two views sharing a registered material keep their own pushes.
 twoLights ∷ Light → Scene → Spec
-twoLights second sc = Spec (sceneName sc <> "@" <> lightLabel second <> "-beside-default") [sc, sc] Dynamic defaultLight [Foreground, LightsDiffer] Nothing [second] Nothing
-
--- | A fixture whose every scene is judged in exact arithmetic, the pixel centres of a snapped,
--- fractionally zoomed scene lying within a hair of texel boundaries that the banded expectation
--- would leave undecided.
-exactly ∷ Spec → Spec
-exactly s = s {specExactFrom = Just 0}
+twoLights second sc = Spec (sceneName sc <> "@" <> lightLabel second <> "-beside-default") [sc, sc] Dynamic defaultLight [Foreground, LightsDiffer] [second] Nothing
 
 expecting ∷ (Integer, Integer) → Spec → Spec
 expecting camera s = s {specCamera = Just camera}
 
 -- | A fixture of several scenes, each drawn in a pass of its own into a small target.
 specMany ∷ String → [Need] → [Scene] → Spec
-specMany name needs scs = Spec name scs Dynamic defaultLight needs Nothing [] Nothing
+specMany name needs scs = Spec name scs Dynamic defaultLight needs [] Nothing
 
 -- | A scene of cells at one column at levels 0 to 8, the cut at the top, for the depth effects:
 -- every level a loam cell of shape 0, so nearer levels overlap farther ones along the view.
@@ -375,7 +366,7 @@ specs profile = case profile of
          , spec defaultLight [Foreground] Dynamic (capTarget (96, 64) (atZoom 0.125 scaledTarget))
          , spec defaultLight [Foreground] Dynamic snappedZoom2
          ]
-      <> [exactly (spec defaultLight [Foreground, SnapSensitive] Dynamic sc) | sc ← snappedScenes]
+      <> [spec defaultLight [Foreground, SnapSensitive] Dynamic sc | sc ← snappedScenes]
       -- Lighting: the fixed world sun with the camera turned, and the sun varied at a fixed camera.
       <> [spec defaultLight [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners facing)) | facing ← [FaceSouth, FaceWest]]
       <> [spec light [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners FaceSouth)) | light ← lights, lightLabel light /= "dark"]
@@ -426,7 +417,7 @@ snappedScenes = [snapped {sceneName = "snapped-9-8", sceneZoom = 1.125}, snapped
 
 staleBiasFixture ∷ Scene → Spec
 staleBiasFixture sc =
-  Spec (sceneName sc <> "-beside-ordinary" <> suffixOf StaleBias) [shapeMatrixCell 0 FaceSouth 1, sc] StaleBias defaultLight [Foreground] (Just 1) [] Nothing
+  Spec (sceneName sc <> "-beside-ordinary" <> suffixOf StaleBias) [shapeMatrixCell 0 FaceSouth 1, sc] StaleBias defaultLight [Foreground] [] Nothing
 
 -- | The shapes and facings of the exact-boundary fixtures and of their negative control.
 exactBoundaryCases ∷ [(Int, ViewFacing)]
@@ -441,7 +432,7 @@ exactBoundaryFixture = exactBoundaryWith Dynamic
 -- must be rejected on the exact-boundary pass on the device where the counterexample was measured.
 exactBoundaryWith ∷ Variant → Int → ViewFacing → Spec
 exactBoundaryWith variant shape facing =
-  Spec ("exact-boundary-" <> show shape <> "-" <> show facing <> "-beside-ordinary" <> suffixOf variant) [shapeMatrixCell 0 FaceSouth 1, exactBoundary shape facing] variant defaultLight [Foreground] (Just 1) [] Nothing
+  Spec ("exact-boundary-" <> show shape <> "-" <> show facing <> "-beside-ordinary" <> suffixOf variant) [shapeMatrixCell 0 FaceSouth 1, exactBoundary shape facing] variant defaultLight [Foreground] [] Nothing
 
 -- | One cell of a shape in a facing at a zoom, in a target sized to its hexagon.
 shapeMatrixCell ∷ Int → ViewFacing → Float → Scene
@@ -884,12 +875,15 @@ renderSnapshot ctx s parts = do
           decodedAt = (`Map.lookup` ctxDecoded ctx)
           art = styleArt (ctxStyle ctx)
           light = lightHand (specLight s)
-          grids = zipWith gridOf [0 ..] parts
-          gridOf index part =
+          -- Two grids per pass from the same exact expectation: the one the device read-back is judged
+          -- by (an unsnapped scene's pixel near an interior threshold is 'Ambiguous' there, and
+          -- nowhere else) and the exact one the pure pick is compared with at EVERY pixel.
+          grids = zipWith (gridOf expectedForDevice) [0 ..] parts
+          exactGrids = zipWith (gridOf expectedAt) [0 ..] parts
+          gridOf expectation index part =
             let sc = partScene part
                 (gw, gh) = sceneTarget sc
                 lightHere = lightHand (lightOf s index)
-                expectation = if maybe False (index >=) (specExactFrom s) then expectedAtExact else expectedAt
              in listArray ((0, 0), (gw - 1, gh - 1)) [expectation art lightHere sc (partCamera part) (partPlan part) (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected
           oracle = newOracleWith models (oracleInput valid marks shapes decodedAt)
           determinate probe = case expect oracle probe of
@@ -905,7 +899,7 @@ renderSnapshot ctx s parts = do
           altGrid part alt = case scenePlan (styleAssets (ctxStyle ctx)) alt of
             Right altPlan →
               let (gw, gh) = sceneTarget alt
-               in Just ((listArray ((0, 0), (gw - 1, gh - 1)) [expectedAt art light alt (partCamera part) altPlan (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected) !)
+               in Just ((listArray ((0, 0), (gw - 1, gh - 1)) [expectedForDevice art light alt (partCamera part) altPlan (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected) !)
             Left _ → Nothing
           named = case parts of
             part : _ → chooseNamed (partScene part) (firstGrid !) (case grids of _ : g : _ → Just (g !); _ → Nothing) (alternative part) determinate (specNeeds s)
@@ -948,7 +942,7 @@ renderSnapshot ctx s parts = do
           -- The pick against the hand expectation on a stride of every pass's pixels.
           pickResults =
             [ (length judged, [show pixel <> ": the pick found " <> show got <> ", expected " <> show want | (pixel, want, got) ← judged, got /= want])
-            | (part, grid) ← zip parts grids
+            | (part, grid) ← zip parts exactGrids
             , let (gw, gh) = sceneTarget (partScene part)
             , let step = max 1 ((gw * gh) `div` 600)
             , let pixels = [(x, y) | (i, (x, y)) ← zip [0 ∷ Int ..] [(x, y) | y ← [0 .. gh - 1], x ← [0 .. gw - 1]], i `mod` step == 0]

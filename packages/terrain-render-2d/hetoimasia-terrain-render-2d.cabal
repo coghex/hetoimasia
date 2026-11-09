@@ -46,6 +46,7 @@ library
         Hetoimasia.Terrain.Render2D.Facts
         Hetoimasia.Terrain.Render2D.Knowledge
         Hetoimasia.Terrain.Render2D.Projection
+        Hetoimasia.Terrain.Render2D.TexelRule
     -- The exact planar polygon arithmetic and the overlap ordering the public
     -- modules share; a client cannot import them.
     other-modules:
@@ -231,6 +232,7 @@ test-suite terrain-render-2d-tests
         Test.TerrainRender2D.Oracle
         Test.TerrainRender2D.Projection
         Test.TerrainRender2D.ReferenceTint
+        Test.TerrainRender2D.TexelRule
         Test.TerrainRender2D.Spec
     build-depends:
         base >=4.22 && <4.23,

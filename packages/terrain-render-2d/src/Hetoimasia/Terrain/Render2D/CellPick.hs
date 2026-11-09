@@ -40,7 +40,7 @@
 -- inside the rectangle, so a centre on it is covered by the quad. A centre on
 -- an outer edge shared by two adjacent quads therefore belongs to exactly one.
 -- The texel index along an axis is 'texelIndexExact' (the one rule, with its 1/128 bias,
--- defined in "Hetoimasia.Asset.Image.Region") of the exact rational position of the centre
+-- defined in "Hetoimasia.Terrain.Render2D.TexelRule") of the exact rational position of the centre
 -- across the drawn rectangle: an interior texel boundary selects the higher index, nothing
 -- is sampled outside the rectangle merely because UVs clamp, and no floating rounding can
 -- move a centre across a boundary. This is the CPU convention; whether a device's
@@ -63,7 +63,7 @@ module Hetoimasia.Terrain.Render2D.CellPick
   ) where
 
 import Data.Word (Word32)
-import Hetoimasia.Asset.Image.Region (regionViewCoverageAt, texelIndexExact)
+import Hetoimasia.Asset.Image.Region (regionViewCoverageAt)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld, viewportContains, windowToTarget)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
@@ -71,6 +71,7 @@ import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Render2D.Assets
 import Hetoimasia.Terrain.Render2D.Internal.Cells
 import Hetoimasia.Terrain.Render2D.Projection
+import Hetoimasia.Terrain.Render2D.TexelRule (texelIndexExact)
 
 -- | One pick: the identity the caller holds for the plan and a window point (a
 -- cursor position in the logical window's coordinates).
