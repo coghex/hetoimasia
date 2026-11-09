@@ -2,6 +2,7 @@
 module Test.TerrainRender2D.Spec (spec) where
 
 import Test.Hspec (Spec, describe)
+import qualified Test.TerrainRender2D.Atlas as Atlas
 import qualified Test.TerrainRender2D.Camera as Camera
 import qualified Test.TerrainRender2D.Cells as Cells
 import qualified Test.TerrainRender2D.CellsClient as CellsClient
@@ -31,6 +32,7 @@ spec = describe "TerrainRender2D" $ do
   Material.spec
   Scenes.spec
   MapAssets.spec
+  Atlas.spec
   Cells.spec
   CellsCoverage.spec
   CellsProgress.spec

@@ -81,6 +81,26 @@ library terrain-mapbake
         bytestring >=0.12 && <0.13,
         hetoimasia-terrain ==0.1.0.0
 
+-- The terrain atlas contract (TRA-17): the checked, bounded region manifest, the
+-- deterministic offline packer and the shared names of the two parent atlases.
+-- Pure; it reads no file and has no GPU, Lua, window or game dependency, so the
+-- generator, the planner's asset adaptation, the material and the evidence share it.
+library terrain-atlas
+    import: language
+    visibility: public
+    hs-source-dirs: atlas
+    exposed-modules:
+        Hetoimasia.Terrain.Atlas.Manifest
+        Hetoimasia.Terrain.Atlas.Pack
+    other-modules:
+        Hetoimasia.Terrain.Atlas.Internal.Json
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        hetoimasia-asset-image ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0
+
 -- The generator's file side (TRA-14): the pinned inputs and their checks, the
 -- PNG and manifest bytes, writing and read-only checking of the committed
 -- catalog, the evidence sheets and the command line as a function, shared by
@@ -93,6 +113,7 @@ library terrain-mapgen-core
     visibility: public
     hs-source-dirs: mapgen
     exposed-modules:
+        Hetoimasia.Terrain.MapGen.Atlas
         Hetoimasia.Terrain.MapGen.Cli
         Hetoimasia.Terrain.MapGen.Evidence
         Hetoimasia.Terrain.MapGen.Generate
@@ -109,6 +130,7 @@ library terrain-mapgen-core
         JuicyPixels ==3.3.9,
         temporary >=1.3 && <1.4,
         hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-atlas ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0
 
 -- The offline generator of the cutout and normal-map catalog (TRA-14). It runs
@@ -179,6 +201,7 @@ test-suite terrain-render-2d-tests
     ghc-options: -rtsopts "-with-rtsopts=-T"
     other-modules:
         Test.TerrainRender2D.Art
+        Test.TerrainRender2D.Atlas
         Test.TerrainRender2D.Camera
         Test.TerrainRender2D.CellFixtures
         Test.TerrainRender2D.CellsClient
@@ -220,6 +243,7 @@ test-suite terrain-render-2d-tests
         hetoimasia-render-api ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-render-2d ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-atlas ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-fixtures ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-mapgen-core ==0.1.0.0,
