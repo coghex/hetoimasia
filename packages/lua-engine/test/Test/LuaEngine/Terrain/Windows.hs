@@ -10,8 +10,8 @@ import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
 import Data.Either (isLeft)
-import Control.Monad (replicateM_, unless, void, when)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Control.Monad (unless, void, when)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -1095,10 +1095,13 @@ spec = describe "Terrain windows and banks" $ do
   it "arbitrates the name of a failed open and of a normal open as one decision: no open is admitted between another's consultation and its admission" $ do
     gate ← newGate
     armed ← newIORef True
-    let holdFirst = do
+    events ← newIORef ([] ∷ [String])
+    let note event = modifyIORef' events (event :)
+        holdFirst = do
+          note "checked"
           go ← atomicModifyIORef' armed (\a → (False, a))
           when go (holdAt gate)
-    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookChecked = holdFirst} $ \rig →
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsLogically), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
         withFvm world runtime (presentationOver rig) $ \shown →
           withFvm world runtime (gameplayOver rig) $ \gameplayVm → (`finally` openGate gate) $ do
@@ -1106,15 +1109,14 @@ spec = describe "Terrain windows and banks" $ do
             -- the normal open has consulted the failed opens (none) and is about to be admitted: held inside the critical section
             signalRig rig "first"
             pumpUntilReached world gate
-            -- the other VM's open of the name (an invalid definition) must wait for it: it is not admitted, so it has not even been issued
+            -- the other VM's open of the name (an invalid definition) is issued while it is held
             _ ← admitOnly world gameplayVm "modules-test" mainPath
-            -- its init runs at the first tick of its logical owner: granted without waiting for it, as the init waits for the open in the first
             grantTick gameplayVm
-            replicateM_ 5 (advanceClock world 2000000000)
-            outLines world >>= \printed → printed `shouldNotContain` ["invalid open issued"]
-            -- released, the normal open is admitted first and wins the name; the other is admitted after it and fails its definition
+            -- released, the first open is admitted and the second after it: the second's consultation did not come between the first's
+            -- consultation and its admission (without the critical section it comes first, while the first is held)
             openGate gate
-            untilPrinted world "invalid open issued"
+            pumpUntil world (advanceClock world 2000000000 >> ((>= 4) . length <$> readIORef events))
+            readIORef events >>= \seen → reverse seen `shouldBe` ["checked", "submitting", "checked", "submitting"]
             untilPrinted world "first answer\tsuccess\tnil"
             pumpUntil world (tickBy control gameplayVm 1 >> (elem "invalid open\tfailure\tdefinition" <$> outLines world))
             -- the other instance goes on to the second wait it has in its script: let it
