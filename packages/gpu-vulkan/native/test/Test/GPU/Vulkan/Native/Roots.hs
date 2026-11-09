@@ -222,6 +222,15 @@ spec = describe "Roots" $ do
       fmap planDeviceName (selectSurfaceFreeDevice [lacking])
         `shouldBe` Left (NoCompatibleDevice [("lacking", [DeviceFeatureMissing "synchronization2"])])
 
+    it "carries the device's reported subPixelPrecisionBits into the plan unchanged, and selects no device by it" $ do
+      -- A read-only fact for an evidence judge that must know the rasterizer's vertex quantisation
+      -- (TRA-17): neither device selection nor creation depends on it.
+      let coarse = standInDevice {offerSubPixelPrecisionBits = 4}
+          fine = standInDevice {offerSubPixelPrecisionBits = 12}
+      fmap planSubPixelPrecisionBits (selectDevice [coarse]) `shouldBe` Right 4
+      fmap planSubPixelPrecisionBits (selectDevice [fine]) `shouldBe` Right 12
+      fmap planDeviceName (selectDevice [coarse, fine]) `shouldBe` fmap planDeviceName (selectDevice [fine, coarse])
+
     it "fails startup with NoCompatibleDevice when no family answers graphics, creating nothing, and rolls back" $ do
       standIn ← (\made → made {standOffers = [standInDevice {offerQueueFamilies = [QueueFamilyOffer 0 False True]}]}) <$> newStandIn
       roots ← newStandInRoots standIn (testBudgets 16)

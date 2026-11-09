@@ -78,6 +78,21 @@ spec = describe "Expectation" $ do
               , plain /= withHoles
               ]
       differing `shouldSatisfy` (> 50)
+  it "sets the device's undecided band from the vertex quantisation and exempts only unsnapped scenes with an off-grid vertex" $ do
+    (_, assets, _) ← setupAll
+    let eligible bits scene = do
+          plan ← either (\e → fail (show e)) pure (scenePlan assets scene)
+          pure (deviceEligible bits scene (sceneCameraFollowed scene) plan)
+    -- delta = 2^-(b+1) / s + 1/1000 texel: at scale 3/16 and b = 4 it is 1/6 + 1/1000.
+    undecidedBand 4 (atZoom 0.1875 (rampsCorners FaceSouth)) `shouldBe` 1 / 6 + 1 / 1000
+    undecidedBand 4 (snappedAt "8" 8) `shouldBe` 1 / 256 + 1 / 1000
+    undecidedBand 8 (atZoom 0.5 (rampsCorners FaceSouth)) `shouldBe` 1 / 256 + 1 / 1000
+    -- Eligible: an unsnapped scene whose vertices are off the 2^-b pixel grid (a fractional pan or scale).
+    eligible 4 (atZoom 0.1875 (rampsCorners FaceSouth)) >>= (`shouldBe` True)
+    eligible 4 (atZoom 0.125 (rampsCorners FaceEast)) >>= (`shouldBe` True)
+    -- Fully decided: snapped scenes, and scenes whose every vertex is on the grid (whole or half pixels).
+    mapM_ (\sc → eligible 4 sc >>= (`shouldBe` False)) [snappedAt "9-8" 1.125, snappedAt "63-8" 7.875, snappedAt "8" 8]
+    mapM_ (\(zoom, shape, facing) → eligible 4 (edgeScene zoom shape facing) >>= (`shouldBe` False)) [(0.125, 0, FaceSouth), (0.5, 0, FaceSouth), (1, 5, FaceNorth)]
   it "answers loading exactly where a pending cell could lie in front, and not where it is proved behind" $ do
     (manifest, assets, art) ← setupAll
     verdicts ← forM facings $ \facing → judge manifest assets art (pendingScene facing)
@@ -149,6 +164,11 @@ mapIdentifiers =
   where
     two n = (if n < 10 then "0" else "") <> show n
 
+-- | The sub-pixel precision bits this CPU check assumes only to COUNT the pixels the device's band would
+-- leave undecided; the device scenario queries the real value and never uses this.
+testSubPixelBits ∷ Int
+testSubPixelBits = 4
+
 judge ∷ AtlasManifest → AssetSnapshot → ArtSource → Scene → IO Judged
 judge _ assets art scene = do
   plan ← either (\e → fail ("plan refused: " <> show e)) pure (scenePlan assets scene)
@@ -166,7 +186,7 @@ judge _ assets art scene = do
               Just False → disagreement expected found
               Nothing → Nothing
             covered = case expected of ExpectedHit {} → 1; _ → 0
-            banded = case expectedForDevice art defaultHandLight scene camera plan pixel of Ambiguous _ → 1; _ → 0
+            banded = case expectedForDevice testSubPixelBits art defaultHandLight scene camera plan pixel of Ambiguous _ → 1; _ → 0
          in acc
               { jCompared = jCompared acc + 1
               , jAmbiguous = jAmbiguous acc + banded

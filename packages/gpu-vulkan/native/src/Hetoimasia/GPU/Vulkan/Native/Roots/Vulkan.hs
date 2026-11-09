@@ -329,6 +329,7 @@ deviceOffers created bootstrap = do
       DeviceOffer
         { offerDevice = physical
         , offerDeviceName = Encoding.decodeUtf8Lenient (ByteString.takeWhile (/= 0) properties.deviceName)
+        , offerSubPixelPrecisionBits = properties.limits.subPixelPrecisionBits
         , offerDeviceApiVersion = properties.apiVersion
         , offerDeviceExtensions = [extension.extensionName | extension ← Vector.toList extensions]
         , offerDynamicRendering = thirteen.dynamicRendering

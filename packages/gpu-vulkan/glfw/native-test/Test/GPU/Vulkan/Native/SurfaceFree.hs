@@ -1974,7 +1974,7 @@ runTerrainProfile profile backend journal =
     terrainUploadConfig
     backend
     journal
-    (\vulkan directory → TerrainPath.runTerrain profile (retainedHost vulkan) (deviceNameOf vulkan) directory)
+    (\vulkan directory → TerrainPath.runTerrain profile (retainedHost vulkan) (deviceNameOf vulkan) (subPixelBitsOf vulkan) directory)
     ( case profile of
         TerrainPath.Full → "TRA-17: a surface-free session draws the cell-quad plans of the terrain arena, adapted through the existing fixed-quad and material ABI over a packed colour atlas and a packed normal atlas, into offscreen targets that have a D32_SFLOAT depth image, reads each back after its batch completed and judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated expectation: the 16 shape identities in each of 4 facings, mixed and fog cells, roofs over cavities, disconnected spans, ramps, cutaways, the automatic follow, a deep floor, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, lighting and depth-effect settings, equivalent submissions, ordered and cutout wrappers and retained chunks, and nine negative controls"
         TerrainPath.Bounded → "TRA-17: the bounded required selection of the terrain material's evidence: the 16 shape identities in the south facing, mixed and fog cells, a roof over a cavity in four submissions and both wrappers, ramps, a depth-effect stack, and a reversed-order control, judged as the complete qualification is"
@@ -1991,6 +1991,10 @@ runTerrainProfile profile backend journal =
     deviceNameOf vulkan = do
       roots ← atomically (readVulkanRoots (vulkanController vulkan))
       pure (viewDeviceName roots)
+    -- The selected device's reported @subPixelPrecisionBits@, queried from the session and never assumed.
+    subPixelBitsOf vulkan = do
+      roots ← atomically (readVulkanRoots (vulkanController vulkan))
+      pure (fromIntegral <$> viewSubPixelPrecisionBits roots)
 
 -- | The animation case (R2D-18): instances that name a frame table of their view,
 -- the tables written into the batch's storage region and the vertex stage taking

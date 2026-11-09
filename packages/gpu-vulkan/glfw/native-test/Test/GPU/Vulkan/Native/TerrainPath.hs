@@ -378,7 +378,11 @@ specs profile = case profile of
          , spec defaultLight [Foreground] Dynamic (capTarget (96, 64) (atZoom 0.125 scaledTarget))
          , spec defaultLight [Foreground] Dynamic snappedZoom2
          ]
-      <> [spec defaultLight [Foreground, SnapSensitive] Dynamic sc | sc ← snappedScenes]
+      -- At a WHOLE scale (8) every texel and quad edge is the origin plus whole pixels, so rounding the origin
+      -- by less than half a pixel moves no pixel centre across an edge except at an exact tie: snapping
+      -- cannot be discriminated there, and the fixture is judged exactly, every pixel decided, without that
+      -- need. At 9/8, 5/4 and 63/8 it can and is.
+      <> [spec defaultLight (if sceneZoom sc == 8 then [Foreground] else [Foreground, SnapSensitive]) Dynamic sc | sc ← snappedScenes]
       -- Lighting: the fixed world sun with the camera turned, and the sun varied at a fixed camera.
       <> [spec defaultLight [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners facing)) | facing ← [FaceSouth, FaceWest]]
       <> [spec light [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners FaceSouth)) | light ← lights, lightLabel light /= "dark"]
@@ -544,6 +548,9 @@ data Ctx = Ctx
   , ctxNormalH ∷ !Api.TextureHandle
   , ctxSingle ∷ !SingleImages
   , ctxSingleTextures ∷ !AtlasTextures
+  , ctxSubPixelBits ∷ !Int
+  -- ^ The device's queried @subPixelPrecisionBits@ (never assumed), which sets the width of the band in
+  -- which an unsnapped fractional fixture's sample is undecided.
   , ctxHoled ∷ !AtlasStyle
   -- ^ The style with transparent colour holes, its colour atlas registered as a texture of its own.
   , ctxHoledAtlas ∷ !AtlasTextures
@@ -577,8 +584,8 @@ sha256Hex = concatMap two . ByteString.unpack . hash
 
 -- | The session's depth must be @D32_SFLOAT@; a fixture is never rendered over anything lower, and
 -- nothing is skipped.
-runTerrain ∷ Profile → RetainedHost → IO (Maybe Text) → FilePath → IO Evidence
-runTerrain profile host deviceName directory = do
+runTerrain ∷ Profile → RetainedHost → IO (Maybe Text) → IO (Maybe Int) → FilePath → IO Evidence
+runTerrain profile host deviceName subPixelBitsOf directory = do
   started ← getCurrentTime
   createDirectoryIfMissing True directory
   depth ← OrderedPath.hostAct (retainedBase host) "choosing the depth format" constructDepthFormat
@@ -590,7 +597,10 @@ runTerrain profile host deviceName directory = do
       | otherwise → do
           style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
           singles ← loadSingleImages 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
-          prepare profile host directory device style singles >>= \case
+          queried ← subPixelBitsOf
+          case queried of
+           Nothing → finish (Just format) (Just "the device's subPixelPrecisionBits could not be queried, and the undecided band of an unsnapped fractional fixture is set by it: nothing was judged on an assumed value") []
+           Just bits → prepare profile host directory device bits style singles >>= \case
             Left why → finish (Just format) (Just why) []
             Right ctx → do
               results ← foldM (\done s → (: done) <$> timed (runSpec ctx s)) [] (specs profile)
@@ -618,8 +628,8 @@ timed action = do
   pure (result, extra {extraSeconds = [seconds started acted, seconds acted oracled, seconds oracled independent, seconds independent ended]})
 
 -- | Make the renderer, the registries, the textures and both materials.
-prepare ∷ Profile → RetainedHost → FilePath → Text → AtlasStyle → SingleImages → IO (Either Text Ctx)
-prepare profile host directory device style singles = do
+prepare ∷ Profile → RetainedHost → FilePath → Text → Int → AtlasStyle → SingleImages → IO (Either Text Ctx)
+prepare profile host directory device subPixelBits style singles = do
   let holedOf = either (error . ("the holed style: " <>)) id (holedStyle style)
       images =
         [ (styleColourImage style, Rgba8Srgb, DefaultMark)
@@ -679,6 +689,7 @@ prepare profile host directory device style singles = do
                           , ctxNormalH = normalH
                           , ctxSingle = singles
                           , ctxSingleTextures = singleBound
+                          , ctxSubPixelBits = subPixelBits
                           , ctxHoled = holedOf
                           , ctxHoledAtlas = packedTextures holedColourBound normalBound
                           , ctxHoledH = fst holedEntry
@@ -722,6 +733,9 @@ data Extra = Extra
   , extraRuns ∷ ![(String, Int, String)]
   , extraMarks ∷ ![(String, Maybe Bool)]
   , extraIndependent ∷ !(Maybe Independent)
+  , extraBand ∷ !(Maybe (Double, Bool))
+  -- ^ The first pass's undecided band in texels (amendment v3, from the device's queried
+  -- @subPixelPrecisionBits@ and the view scale) and whether the scene is eligible for it.
   , extraPassMismatches ∷ ![(Int, [String])]
   -- ^ For each pass, its independent mismatch count and its first mismatches.
   , extraPickCompared ∷ !Int
@@ -738,7 +752,7 @@ data Extra = Extra
   }
 
 emptyExtra ∷ Spec → Extra
-emptyExtra s = Extra s [] [] [] [] [] Nothing [] 0 0 0 [] Nothing Nothing [] Nothing []
+emptyExtra s = Extra s [] [] [] [] [] Nothing Nothing [] 0 0 0 [] Nothing Nothing [] Nothing []
 
 failed ∷ String → String → FixtureResult
 failed name why = FixtureResult (Text.pack name) [] [] [] (Just (Text.pack why))
@@ -983,7 +997,7 @@ renderSnapshot ctx s parts = do
           -- Two grids per pass from the same exact expectation: the one the device read-back is judged
           -- by (an unsnapped scene's pixel near an interior threshold is 'Ambiguous' there, and
           -- nowhere else) and the exact one the pure pick is compared with at EVERY pixel.
-          grids = zipWith (gridOf expectedForDevice) [0 ..] parts
+          grids = zipWith (gridOf (expectedForDevice (ctxSubPixelBits ctx))) [0 ..] parts
           exactGrids = zipWith (gridOf expectedAt) [0 ..] parts
           gridOf expectation index part =
             let sc = partScene part
@@ -1004,7 +1018,7 @@ renderSnapshot ctx s parts = do
           altGrid part alt = case scenePlan (styleAssets (ctxStyle ctx)) alt of
             Right altPlan →
               let (gw, gh) = sceneTarget alt
-               in Just ((listArray ((0, 0), (gw - 1, gh - 1)) [expectedForDevice art light alt (partCamera part) altPlan (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected) !)
+               in Just ((listArray ((0, 0), (gw - 1, gh - 1)) [expectedForDevice (ctxSubPixelBits ctx) art light alt (partCamera part) altPlan (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected) !)
             Left _ → Nothing
           named = case parts of
             part : _ → chooseNamed (partScene part) (firstGrid !) (case grids of _ : g : _ → Just (g !); _ → Nothing) (alternative part) determinate (specNeeds s)
@@ -1156,6 +1170,9 @@ renderSnapshot ctx s parts = do
               , extraRuns = runFacts
               , extraMarks = markFacts
               , extraIndependent = Just independent
+              , extraBand = case parts of
+                  part : _ → Just (fromRational (undecidedBand (ctxSubPixelBits ctx) (partScene part)) ∷ Double, deviceEligible (ctxSubPixelBits ctx) (partScene part) (partCamera part) (partPlan part))
+                  [] → Nothing
               , extraPassMismatches = [(indMismatchCount i, take 4 (indMismatches i)) | i ← independents]
               , extraPickCompared = pickCompared
               , extraPickUndecided = pickUndecided
@@ -1373,6 +1390,20 @@ writeRecord ctx format seconds results = do
                       , ("mismatches", JNumber (show (indMismatchCount i)))
                       , ("first_mismatches", JArray (map JString (indMismatches i)))
                       ]
+              )
+            , ( "device_undecided"
+              , case (extraBand extra, extraIndependent extra) of
+                  (Just (band, eligible), Just i) →
+                    JObject
+                      [ ("device", JString (Text.unpack (ctxDevice ctx)))
+                      , ("sub_pixel_precision_bits", JNumber (show (ctxSubPixelBits ctx)))
+                      , ("band_texels", JNumber (show band))
+                      , ("eligible_unsnapped_off_grid", JBool eligible)
+                      , ("undecided", JNumber (show (indAmbiguous i)))
+                      , ("covered", JNumber (show (indCovered i)))
+                      , ("undecided_share_of_covered", JNumber (show (if indCovered i == 0 then 0 else fromIntegral (indAmbiguous i) / fromIntegral (indCovered i) ∷ Double)))
+                      ]
+                  _ → JNull
               )
             , ( "mismatches_by_pass"
               , JArray [JObject [("pass", JNumber (show pass)), ("mismatches", JNumber (show n)), ("first", JArray (map JString firsts))] | (pass, (n, firsts)) ← zip [0 ∷ Int ..] (extraPassMismatches extra)]

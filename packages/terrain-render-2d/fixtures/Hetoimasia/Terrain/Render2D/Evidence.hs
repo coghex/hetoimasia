@@ -66,6 +66,8 @@ module Hetoimasia.Terrain.Render2D.Evidence
   , handQuads
   , expectedAt
   , expectedForDevice
+  , undecidedBand
+  , deviceEligible
   , loadingAt
   , pendingCells
   , expectedImage
@@ -83,6 +85,7 @@ module Hetoimasia.Terrain.Render2D.Evidence
 import qualified Data.Map.Strict as Map
 import Data.List (nub, sortOn)
 import Data.Ord (Down (..))
+import Data.Ratio (denominator)
 import Data.Word (Word8)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld, viewportContains)
@@ -495,23 +498,53 @@ shadedByte (r, g, b) = (srgbEncode r, srgbEncode g, srgbEncode b)
 -- the pure material model are compared with at every pixel. The device's own exemption, which applies
 -- to a few samples of unsnapped scenes only, is 'expectedForDevice'.
 expectedAt ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
-expectedAt art light sc camera plan pixel = fst (decidedAt art light sc camera plan pixel)
+expectedAt art light sc camera plan pixel = fst (decidedAt 0 art light sc camera plan pixel)
 
 -- | The expectation the device read-back is judged by: 'expectedAt', except a pixel the device may
--- legitimately read differently becomes 'Ambiguous'. Only a pixel of an UNSNAPPED scene (a fractional
--- scale or pan lands pixel centres where float32 interpolation cannot be trusted) is eligible, and
--- only where a texel the pixel's answer depends on has an offset within 'undecidedBand' of an INTERIOR
--- threshold @k - 1/128@, @k = 1 .. n - 1@. A snapped scene, an outer edge and a shared diagonal are
--- never exempt: a disagreement there is a counterexample.
-expectedForDevice ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
-expectedForDevice art light sc camera plan pixel = case decidedAt art light sc camera plan pixel of
-  (_, True) | not (sceneSnap sc) → Ambiguous "an interior texel threshold within 1/1000 texel"
+-- legitimately read differently becomes 'Ambiguous' (owner amendment v3). Only a pixel of a scene that
+-- is eligible ('deviceEligible': UNSNAPPED, with some quad vertex off the rasterizer's @2^-b@ pixel
+-- grid, so the vertex quantisation of the interpolated coordinate is not exact) and only where a texel
+-- the pixel's answer depends on has an offset within 'undecidedBand' of an INTERIOR threshold
+-- @k - 1/128@, @k = 1 .. n - 1@. A snapped scene, a scene whose vertices are all on the grid (the
+-- exact-boundary and edge fixtures), an outer edge and a shared diagonal are never exempt: a
+-- disagreement there is a counterexample. The first argument is @b@, the device's queried
+-- @subPixelPrecisionBits@.
+expectedForDevice ∷ Int → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
+expectedForDevice bits art light sc camera plan pixel = case decidedAt (undecidedBand bits sc) art light sc camera plan pixel of
+  (_, True) | deviceEligible bits sc camera plan → Ambiguous "an interior texel threshold within the vertex-quantisation band"
   (expected, _) → expected
+
+-- | The half-width of the device-undecided band in texels, @2^-(b+1) / s + 1/1000@ with @s@ the scene's
+-- view scale in pixels per texel: the vertex-quantisation bound of the interpolated coordinate (half a
+-- step of the @2^-b@ pixel grid) plus the 1/1000 texel of float arithmetic.
+undecidedBand ∷ Int → Scene → Rational
+undecidedBand bits sc = 1 / (2 ^ (bits + 1)) / viewScaleOf sc + 1 / 1000
+
+-- | The scene's view scale, pixels per texel.
+viewScaleOf ∷ Scene → Rational
+viewScaleOf sc = toRational (sceneZoom sc * sceneScale sc)
+
+-- | Whether the device may read this scene's samples differently from the exact rule: it is unsnapped
+-- and at least one quad vertex (a canvas corner or its far corner) is off the @2^-b@ pixel grid, so the
+-- rasterizer's vertex quantisation moves the interpolated coordinate. Decided from the exact geometry
+-- (the corner of every quad in pixels, by the view's own mapping), not from a flag a fixture sets.
+deviceEligible ∷ Int → Scene → CameraState → CellPlan → Bool
+deviceEligible bits sc camera plan
+  | sceneSnap sc = False
+  | otherwise = case (pixelWorldPoint plan (0, 0), pixelWorldPoint plan (1, 0)) of
+      (Just (sx0, sy0), Just (sx1, _)) →
+        let scale = 1 / (sx1 - sx0)
+            onGrid v = denominator v `divides` (2 ^ bits)
+            divides d n = n `mod` d == 0
+            corners = [(0.5 + (cx - sx0) * scale, 0.5 + (cy - sy0) * scale) | q ← handQuads sc camera, let (cx0, cy0) = hqCorner q, let cx = fromInteger cx0, let cy = fromInteger cy0]
+            vertices = concat [[(x, y), (x + 96 * scale, y + 64 * scale)] | (x, y) ← corners]
+         in any (\(x, y) → not (onGrid x && onGrid y)) vertices
+      _ → True
 
 -- | The exact expectation and whether any quad it examined has a texel offset within the band of an
 -- interior threshold.
-decidedAt ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → (Expected, Bool)
-decidedAt art light sc camera plan pixel = case pixelWorldPoint plan pixel of
+decidedAt ∷ Rational → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → (Expected, Bool)
+decidedAt band art light sc camera plan pixel = case pixelWorldPoint plan pixel of
   Nothing → (ExpectedClear, False)
   Just (sx, sy) → go [] False quads sx sy
   where
@@ -530,7 +563,7 @@ decidedAt art light sc camera plan pixel = case pixelWorldPoint plan pixel of
           fv = sy - fromInteger cy
        in case (texelOf 96 fu, texelOf 64 fv) of
             (Just u, Just v) →
-              let banded' = banded || nearInterior 96 fu || nearInterior 64 fv
+              let banded' = banded || nearInterior band 96 fu || nearInterior band 64 fv
                   (cr, cg, cb, ca) = artColour art (hqColour q) u v
                   (mr, mg, mb, ma) = artMap art (hqMap q) u v
                in if ca == 0 || ma == 0
@@ -553,17 +586,13 @@ texelOf n t
 handTexelBias ∷ Rational
 handTexelBias = 1 / 128
 
--- | Whether the offset @t@ along an axis of @n@ texels is within 'undecidedBand' of an interior
--- threshold @k - 1/128@ with @1 <= k <= n - 1@.
-nearInterior ∷ Int → Rational → Bool
-nearInterior n t = k >= 1 && k <= n - 1 && abs (w - fromIntegral k) < undecidedBand
+-- | Whether the offset @t@ along an axis of @n@ texels is within @band@ of an interior threshold
+-- @k - 1/128@ with @1 <= k <= n - 1@.
+nearInterior ∷ Rational → Int → Rational → Bool
+nearInterior band n t = k >= 1 && k <= n - 1 && abs (w - fromIntegral k) < band
   where
     w = t + handTexelBias
     k = round w ∷ Int
-
--- | The half-width of the device-undecided band, in texels: 1/1000 (the owner's amendment v2).
-undecidedBand ∷ Rational
-undecidedBand = 1 / 1000
 
 -- | The expectation at every pixel of a scene's target, row by row, top to bottom.
 expectedImage ∷ ArtSource → HandLight → Scene → CellPlan → [[Expected]]

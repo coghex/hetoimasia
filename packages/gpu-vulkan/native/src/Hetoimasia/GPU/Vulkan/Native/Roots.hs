@@ -1647,6 +1647,9 @@ data RootsView = RootsView
   , viewDevice ∷ !RootStanding
   , viewAllocator ∷ !RootStanding
   , viewDeviceName ∷ !(Maybe Text)
+  , viewSubPixelPrecisionBits ∷ !(Maybe Word32)
+  -- ^ The selected device's reported @subPixelPrecisionBits@, for evidence that must know the
+  -- rasterizer's vertex quantisation; 'Nothing' before a device is selected.
   , viewQueueFamily ∷ !(Maybe Word32)
   , viewTargets ∷ ![TargetId]
   , viewAdmitting ∷ !Bool
@@ -1673,6 +1676,7 @@ readRootsView roots = do
       , viewDevice = standingOf device
       , viewAllocator = standingOf allocator
       , viewDeviceName = planDeviceName <$> plan
+      , viewSubPixelPrecisionBits = planSubPixelPrecisionBits <$> plan
       , viewQueueFamily = planQueueFamily <$> plan
       , viewTargets = Map.keys targets
       , viewAdmitting = admitting && not (isJust loss)
