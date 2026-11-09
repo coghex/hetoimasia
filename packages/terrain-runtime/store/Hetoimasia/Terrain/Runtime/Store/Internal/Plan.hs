@@ -783,6 +783,8 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
           retry fuel rsv = case attempt rsv of
             Left (OutMoreBookkeeping need)
               | need > bdReserveMax bounds → refuse (Capacity (BookkeepingExceeded need))
+              -- the pages a plan writes are bounded for a transaction: a plan that needs more is too big
+              | d + (if needRetire then 1 else 0) + need > bdPages bounds → refuse (Capacity (TxnPagesExceeded (d + (if needRetire then 1 else 0) + need)))
               | fuel > 0 → retry (fuel - 1) (min (bdReserveMax bounds) (need + bookkeepingSlack))
               | otherwise → refuse (Capacity (BookkeepingExceeded need))
             r → r

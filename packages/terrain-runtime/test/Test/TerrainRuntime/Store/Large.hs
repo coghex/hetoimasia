@@ -156,6 +156,30 @@ spec = describe "planning on large valid stores (deep trees, thousands of retire
         integrity = [(k, why) | (k, Refused why@(Integrity _)) ← outcomes]
     integrity `shouldBe` []
     planned `shouldSatisfy` (not . null)
+  -- the same boundary for maintenance: a chunk of reclaimed pages whose bookkeeping outgrows its supply is a
+  -- shrinkable result and the chunk is halved; never an integrity result
+  it "reclaims under a reserve too small for the larger chunks by halving them, never with an integrity result" $
+    forM_ [0, 8 ∷ Int] $ \rsv → do
+      let bounds = standardBounds {bdReserve = rsv, bdReserveMax = rsv}
+          pass h = do
+            (p, _, _) ← fillWith h (\w → planReclaimPinned bounds (hCfg h) (hIdent h) (storeRoots (hStore h)) [] w)
+            case p of
+              Planned plan → (\h' → Right (Just (h', mFreed (plMeasure plan) * 1000 + mBookkeepingPages (plMeasure plan)))) =<< commitPlan h plan
+              NoWork → Right Nothing
+              Refused (Capacity (BookkeepingExceeded n)) → Left ("capacity " <> show n)
+              Refused why → Left ("INTEGRITY-OR-OTHER " <> show why)
+              other → Left ("unexpected " <> take 100 (show other))
+          go h n freedSizes
+            | n > (12 ∷ Int) = (h, reverse freedSizes, "")
+            | otherwise = case pass h of
+                Right Nothing → (h, reverse freedSizes, "drained")
+                Right (Just (h', f)) → go h' (n + 1) (f : freedSizes)
+                Left why → (h, reverse freedSizes, why)
+          (h1, freed, stop) = go h0 0 []
+      putStrLn ("LARGE reclaim under reserve " <> show rsv <> ": pages freed * 1000 + bookkeeping pages used per transaction " <> show freed <> " " <> stop)
+      -- a refusal is only ever the typed capacity result; and the store stays valid
+      (take 17 stop == "INTEGRITY-OR-OTHE") `shouldBe` False
+      must (checkH h1)
   it "keeps committing random batches, the checker agreeing after every commit, and maintenance drains the store" $
     forM_ [1, 2, 3 ∷ Word64] $ \seed → do
       let step (h, ref, g, shrunk) i = do

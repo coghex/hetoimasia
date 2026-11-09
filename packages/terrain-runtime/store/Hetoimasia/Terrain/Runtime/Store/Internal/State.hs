@@ -133,13 +133,15 @@ defaultOffsetLimit = 2 ^ (63 ∷ Int) - 1
 bookkeepingReserve ∷ Int
 bookkeepingReserve = 4 * (2 * (maxLevel + 1) + 1)
 
--- | The most bookkeeping pages one candidate plan may take. The bookkeeping a plan needs is not
--- bounded by the reserve alone: every replaced record page is also indexed in the retirement tree, one
--- root-to-leaf path each. The plan counts the pages its bookkeeping edit really needs before it numbers
--- any, takes up to this many when the reserve is short, and past it reports a shrinkable
--- 'BookkeepingExceeded' (a smaller batch replaces fewer pages).
+-- | The most bookkeeping pages one candidate plan may take: every page a plan writes counts against the
+-- 'maxTxnPages' of a transaction, so the record pages, the list page and the bookkeeping together stay
+-- within them (a plan that needs more is the shrinkable 'TxnPagesExceeded'), and the pages it claims stay
+-- within 'maxClaimPages'. The bookkeeping a plan needs is not bounded by the reserve alone: every replaced
+-- record page is also indexed in the retirement tree, one root-to-leaf path each. The plan counts the pages
+-- its bookkeeping edit really needs before it numbers any and, when the reserve is short, takes that many
+-- (and 'bookkeepingSlack' more) instead.
 maxBookkeepingPages ∷ Int
-maxBookkeepingPages = 4 * bookkeepingReserve
+maxBookkeepingPages = maxTxnPages
 
 -- | The pages taken beyond the count the first attempt needed: the larger supply takes more free
 -- extents, which the allocator tree's own edit may need a page or two more for.
