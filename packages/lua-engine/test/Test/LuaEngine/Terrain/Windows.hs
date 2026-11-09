@@ -7,6 +7,8 @@ module Test.LuaEngine.Terrain.Windows (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally)
+import Control.Monad (unless)
+import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
@@ -109,6 +111,41 @@ endedHandle =
         , "  end"
         , "end"
         ]
+    }
+
+-- | An instance that mutates the definition table it passed after the call returned, then reads the arena it opened.
+copied ∷ Script
+copied =
+  script
+    { scPrelude = terrainPrelude
+    , scInit =
+        [ "self.s = 0"
+        , "self.def = " <> soilOverStone
+        , "self.q = api.terrain.open('copy', self.def)"
+        , "-- the table is the script's own again: nothing it does now may reach the request"
+        , "self.def.layers[1].material = 'soil'"
+        , "self.def.layers[2] = nil"
+        , "self.def.materials[2] = 'junk'"
+        ]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.arena = t.value self.c = api.terrain.cell(self.arena, {x = 0, y = 0, z = -5}) self.d = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  local c, d = settle(api, self.c), settle(api, self.d)"
+        , "  if c and d then print('deep', c.value.material) print('top', d.value.material) print('done') self.s = 2 end"
+        , "end"
+        ]
+    }
+
+-- | An instance that opens an arena and then fails: in its init, or in its shutdown.
+failing ∷ Bool → Script
+failing inInit =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('f', DEF)"] <> ["error('init failed')" | inInit]
+    , scUpdate = ["if self.s == 0 then local t = settle(api, self.q) if t then self.arena = t.value print('opened') self.s = 1 end end"]
+    , scShutdown = ["error('shutdown failed')" | not inInit]
     }
 
 -- | An instance that finds the service's clients, arenas or leases all taken.
@@ -381,6 +418,33 @@ spec = describe "Terrain windows and banks" $ do
           untilPrinted world "done"
           outLines world >>= \printed →
             printed `shouldSatisfy` any (\line → "foreign release after the issuer ended => false ; " `Text.isPrefixOf` line && "another instance" `Text.isInfixOf` line)
+
+  it "decides a request from a copy of the definition: the script's later mutation of its table changes nothing" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource copied)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "done"
+          outLines world >>= \printed → printed `shouldContain` ["deep\tstone", "top\tsoil"]
+
+  it "leaves no arena, lease or client behind when an instance fails in its init, or in its shutdown, holding an open or an arena" $
+    mapM_
+      ( \inInit →
+          withRig $ \rig →
+            withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource (failing inInit))]) $ \world _ runtime →
+              withFvm world runtime (presentationOver rig) $ \fvm → do
+                spawned ← admitOnly world fvm "modules-test" mainPath
+                unless inInit $ untilPrinted world "opened" >> stopSpawned spawned
+                failure ← settledFailure spawned
+                failure `shouldSatisfy` isJust
+                limitHeld (rgService rig) "arenas" `shouldReturn` 0
+                limitHeld (rgService rig) "leases" `shouldReturn` 0
+                -- the application forgets an instance it has observed end, as the session does: its terrain client ends with it
+                limitHeld (rgService rig) "clients" `shouldReturn` 1
+                forgetInstance (fvFacade fvm) (spId spawned)
+                limitHeld (rgService rig) "clients" `shouldReturn` 0
+      )
+      [True, False]
 
   it "gives a logical read ordered after a removal of the same cell the post-removal value and revision, reads prepared before the commit included" $
     withRig $ \rig →

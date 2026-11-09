@@ -675,7 +675,7 @@ withVm context role injection tick body = do
     bank ← newByteBankFor profile
     service ← either (\refused → ioError (userError ("the data service was refused: " <> show refused))) pure (dataService requests inventory (vcPool context) bank)
     ids ← newInstanceIds
-    services ← traverse (\found → injectGraphics found (GraphicsVm role requests (pure True))) injection
+    services ← traverse (\found → injectGraphics found (GraphicsVm role requests (pure True) 0)) injection
     holder ← newIORef (pure 0)
     let endpoints =
           FacadeEndpoints
@@ -706,6 +706,7 @@ withVm context role injection tick body = do
           , fsIds = ids
           , fsTickDuration = tick
           , fsGraphics = services
+          , fsTerrain = Nothing
           }
         >>= either (\refused → ioError (userError ("the facade was refused: " <> show refused))) pure
     let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "native-milestone-" <> Text.pack (show role)}
