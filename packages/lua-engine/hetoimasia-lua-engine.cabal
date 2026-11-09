@@ -460,8 +460,10 @@ test-suite lua-engine-tests
         Test.LuaEngine.Texture.Png
         Test.LuaEngine.Terrain.Basics
         Test.LuaEngine.Terrain.Domain
+        Test.LuaEngine.Terrain.Limits
         Test.LuaEngine.Terrain.Names
         Test.LuaEngine.Terrain.Ownership
+        Test.LuaEngine.Terrain.Races
         Test.LuaEngine.Terrain.Spec
         Test.LuaEngine.Terrain.Support
         Test.LuaEngine.Terrain.Validation

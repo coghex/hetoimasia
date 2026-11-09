@@ -11,6 +11,8 @@ module Test.LuaEngine.Terrain.Support
   , withRig
   , withRigConfig
   , withRigProbe
+  , defaultConfigForRaces
+  , noProbeForRaces
   , presentationOver
   , gameplayOver
   , soilOverStone
@@ -21,9 +23,11 @@ module Test.LuaEngine.Terrain.Support
   , checkCases
   , limitHeld
   , untilPrinted
+  , untilPrintedBy
   , Gate
   , newGate
   , gatedProbe
+  , removalProbe
   , awaitReached
   , openGate
   , armGate
@@ -31,6 +35,7 @@ module Test.LuaEngine.Terrain.Support
   ) where
 
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (onException)
 import Control.Monad (when)
@@ -44,7 +49,9 @@ import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Terrain
 import Hetoimasia.Terrain.Runtime
 import Test.Hspec (Expectation, expectationFailure)
-import Test.LuaEngine.Facade.Support (VmShape (..), World, advanceClock, errLines, gameplayShape, outLines, presentationShape, pumpUntil)
+import Hetoimasia.Scripting.Lua.Instance (InstanceFailure (failureMessage))
+import qualified Hetoimasia.Scripting.Lua.Instance as Instance
+import Test.LuaEngine.Facade.Support (Spawned, VmShape (..), World, advanceClock, errLines, gameplayShape, outLines, phaseOf, presentationShape, pumpUntil, settledFailure)
 import Test.Support.Bounded (bounded)
 
 -- | The real service and the adapter over it.
@@ -176,3 +183,36 @@ untilPrinted world marker =
       printed ← outLines world
       warned ← errLines world
       putStrLn ("waiting for " <> show marker <> "; printed: " <> show printed <> "; warned: " <> show warned)
+
+-- | A probe that holds the owner at the commit of the first removal it stages, and at nothing else: the removal's own request is
+-- found at its staging (only a removal is staged through that point), and the gate holds it where it is about to be offered to the
+-- arbitration, which for a request on logical time is only once its position has been reached.
+removalProbe ∷ Gate → IO Probe
+removalProbe gate = do
+  removal ← newIORef Nothing
+  pure . Probe $ \point → case point of
+    PointStaging rid → modifyIORef' removal (\held → maybe (Just rid) Just held)
+    PointBeforeCommit rid → do
+      mine ← readIORef removal
+      when (mine == Just rid) $ do
+        armed ← readTVarIO (gateArmed gate)
+        when armed $ do
+          _ ← tryPutMVar (gateArrived gate) ()
+          takeMVar (gateOpen gate)
+    _ → pure ()
+
+-- | The service's default configuration, and no probe: what an example that holds nothing runs over.
+defaultConfigForRaces ∷ Config
+defaultConfigForRaces = defaultConfig
+
+noProbeForRaces ∷ Probe
+noProbeForRaces = noProbe
+
+-- | The same, naming the instance whose output it is: when the output does not come and the instance has failed, say how.
+untilPrintedBy ∷ World → Spawned → Text → IO ()
+untilPrintedBy world spawned marker =
+  untilPrinted world marker `onException` do
+    phase ← phaseOf spawned
+    case phase of
+      Just Instance.Failed → settledFailure spawned >>= \failure → putStrLn ("the instance failed: " <> show (failureMessage <$> failure))
+      other → putStrLn ("the instance is " <> show other)
