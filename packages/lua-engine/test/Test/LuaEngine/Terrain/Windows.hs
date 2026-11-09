@@ -115,10 +115,10 @@ named world events label act =
 
 -- | An example's exit, whatever happened in it: the gates open, every wait the scripts have is released and every instance it started is
 -- asked to stop, so a failure in the body is reported as itself and does not become a teardown that never returns.
-leavingAlways ∷ Rig → Gate → IORef [Spawned] → IO a → IO a
-leavingAlways rig gate spawns body =
+leavingAlways ∷ Rig → [Gate] → IORef [Spawned] → IO a → IO a
+leavingAlways rig gates spawns body =
   body `finally` do
-    openGate gate
+    mapM_ openGate gates
     signalRig rig "first"
     signalRig rig "second"
     readIORef spawns >>= mapM_ (\spawned → void (try (stopSpawned spawned) ∷ IO (Either SomeException ())))
@@ -1146,7 +1146,7 @@ spec = describe "Terrain windows and banks" $ do
     withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsAtFirstTick), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
         withFvm world runtime (gameplayOver rig) $ \gameplayVm →
-          withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig gate spawns $ do
+          withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig [gate] spawns $ do
             let step = named world events
             invalid ← spawn world gameplayVm "modules-test" mainPath
             modifyIORef' spawns (invalid :)
@@ -1177,6 +1177,7 @@ spec = describe "Terrain windows and banks" $ do
 
   it "frees the name a cancelled open still holds before the next open of it is admitted, however the cancellation falls in the other open's admission" $ do
     gate ← newGate
+    cancelGate ← newGate
     armed ← newIORef False
     events ← newIORef ([] ∷ [String])
     spawns ← newIORef ([] ∷ [Spawned])
@@ -1185,10 +1186,10 @@ spec = describe "Terrain windows and banks" $ do
           note "submitting"
           go ← atomicModifyIORef' armed (\a → (False, a))
           when go (holdAt gate)
-    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookSubmitting = holdSubmitting} $ \rig →
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookSubmitting = holdSubmitting, hookCancelling = holdAt cancelGate} $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensAtFirstTick), ("lua/other.lua", scriptSource (reopensOnSignal "held"))]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \gameplayVm →
-          withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig gate spawns $ do
+          withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig [gate, cancelGate] spawns $ do
             let step = named world events
             logical ← spawn world gameplayVm "modules-test" mainPath
             modifyIORef' spawns (logical :)
@@ -1198,8 +1199,9 @@ spec = describe "Terrain windows and banks" $ do
             writeIORef armed True
             grantTick gameplayVm
             step "the logical open reaches its hold" (awaitReached gate)
-            -- the host cancels it (an epoch change) before the service is told anything, and another VM's open of the name arrives: it waits
-            -- for the critical section, and must not take the cancelled open's name for a duplicate
+            -- the host cancels it (an epoch change) before the service is told anything, and the service is not told until the example says so
+            -- (the cancellation is held at its hook): another VM's open of the name arrives, waits for the critical section, and must not take the
+            -- cancelled open's name for a duplicate
             void (advanceRequestEpoch (scheduledEndpoint (fvOwner gameplayVm)))
             signalRig rig "first"
             step "the other open arrives" (pumpUntil world (advanceClock world 2000000000 >> ((>= 2) . length . filter (== "arriving") <$> readIORef events)))
@@ -1207,6 +1209,7 @@ spec = describe "Terrain windows and banks" $ do
             -- the logical open is admitted by the service and registers its claim, which the host has settled as cancelled: the other open
             -- releases it in the same critical section, and is admitted
             step "the other open is admitted" (untilPrinted world "first answer\tsuccess\tnil")
+            openGate cancelGate
 
   it "keeps the failed opens' names only while the host has not settled them, whatever names they used, and none once their instance is forgotten" $
     withRig $ \rig →
