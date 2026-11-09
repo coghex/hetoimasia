@@ -748,7 +748,7 @@ renderSnapshot ctx s parts = do
       marks ← registeredMarks (ctxTextures ctx)
       buffers ← retainedBuffers (ctxRetained ctx)
       let shapes = map partShape parts
-          models = Map.fromList [(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxInset ctx]]
+          models = Map.fromList ([(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx]] <> [(ctxInset ctx, terrainModelInsetControl)])
           decodedAt = (`Map.lookup` ctxDecoded ctx)
           art = styleArt (ctxStyle ctx)
           light = lightHand (specLight s)

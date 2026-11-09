@@ -76,6 +76,7 @@ module Hetoimasia.Terrain.Render2D.Material
 
     -- * The model
   , terrainModel
+  , terrainModelInsetControl
   ) where
 
 import Data.ByteString (ByteString)
@@ -281,13 +282,31 @@ clamp01 = max 0 . min 1
 -- the same 32-bit values the record and the push block hold. A record of another layout holds
 -- nothing and draws nothing.
 terrainModel ∷ MaterialModel
-terrainModel = MaterialModel $ \input → case materialRecord input of
+terrainModel = modelWith centre
+  where
+    -- The texel the local index selects, at its centre, in the atlas: the origin is added after.
+    centre origin extent atlas coordinate = (fromIntegral origin + local + 0.5) / fromIntegral atlas
+      where
+        local = fromIntegral (min (extent - 1) (floor (clamp01 coordinate * fromIntegral extent) ∷ Word32)) ∷ Double
+
+-- | The model of the negative control's rule (never a terrain rule): the region coordinate
+-- interpolated between the half-texel-inset endpoints, @(origin + 1/2 + u (w - 1)) / atlasExtent@,
+-- which shifts the interior texel boundaries. The evidence gives the oracle this model for the
+-- control's own material so the oracle agrees with the device, and the independent judge, which
+-- holds the specified rule, rejects the draw.
+terrainModelInsetControl ∷ MaterialModel
+terrainModelInsetControl = modelWith inset
+  where
+    inset origin extent atlas coordinate = (fromIntegral origin + 0.5 + clamp01 coordinate * (fromIntegral extent - 1)) / fromIntegral atlas
+
+-- The shared body of both models, over the rule that maps a region's origin, extent and parent
+-- extent and a coordinate to the sampled coordinate.
+modelWith ∷ (Word32 → Word32 → Word32 → Double → Double) → MaterialModel
+modelWith centre = MaterialModel $ \input → case materialRecord input of
   MaterialRecord [colourHandle, normalHandle] ws
     | [cx, cy, cw, ch, caw, cah, nx, ny, nw, nh, naw, nah, depth] ← ws
     , all (> 0) [cw, ch, caw, cah, nw, nh, naw, nah] → do
         let (u, v) = materialUv input
-            local extent coordinate = fromIntegral (min (extent - 1) (floor (clamp01 coordinate * fromIntegral extent) ∷ Word32)) ∷ Double
-            centre origin extent atlas coordinate = (fromIntegral origin + local extent coordinate + 0.5) / fromIntegral atlas
             colourAt = (centre cx cw caw u, centre cy ch cah v)
             normalAt = (centre nx nw naw u, centre ny nh nah v)
         Colour tr tg tb ta ← materialSample input colourHandle colourAt
