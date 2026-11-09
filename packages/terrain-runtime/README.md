@@ -605,7 +605,7 @@ through a window of validated page buffers: a page it needs and does not have is
 its place (a wrong tree, a wrong level, a key outside its parent's separators) is an
 integrity failure. Updates copy the changed path into an overlay and never touch a
 committed page. A node that falls under a quarter of a payload after a deletion is
-repacked with a neighbour (merged, or split evenly), so every non-root node is at
+repacked with a neighbour (both checked against the separators their parent promises before they are merged) (merged, or split evenly), so every non-root node is at
 least a quarter full; an insertion that overflows splits by bytes; a root that
 splits adds a level and a root left with one child gives it back. A tree is at most
 **8 levels** (0 to 7); a plan that would need more is refused with a typed
@@ -672,7 +672,10 @@ accounted at 28,000 bytes each; the encoded output is 4 KiB a written page. The 
 header is charged at its fixed 128-byte record size: its byte total counts the retained
 *history*, which lives in pages, and is not transaction memory, so a history of any size
 plans like an empty one. A plan whose window or new pages would hold more is refused
-(`WindowBytesExceeded`, `OverlayExceeded`) with nothing changed.
+(`WindowBytesExceeded`, `OverlayExceeded`) with nothing changed. A plan numbers and encodes its new
+pages one at a time and forces each output buffer and page number before the next page is
+built, so no parsed page outlives the plan (a dense 180-leaf plan's measured live heap is
+checked against what it reports).
 
 A removal and its minimum connection obligation are **one** candidate, and so are a
 discovery batch's knowledge, exposed-boundary records and remaining obligations: the
@@ -707,7 +710,9 @@ the OS accepted it, not an `fsync` or power-loss durability.
 each with an accounted record). Writes, publication and reclamation cannot change its
 answers. A commit retires only the record pages it replaced, in one retirement entry
 keyed by its version; an entry is reclaimable once the oldest pinned version is at
-least that version (`BlockedByReader` otherwise). `planMaintenance` frees an entry's
+least that version (`BlockedByReader` otherwise). `planMaintenance` first checks that no page it frees is
+already free, loose or claimed by its own supply (a corrupt retirement list is
+`DoubleFree`, never a page with two owners) and frees an entry's
 pages incrementally (at most 64 per transaction, fewer when a bound is tighter), is a
 maintenance transaction and **may spend the protected reserve**. A token of a released
 reader, of another store or of another incarnation reads nothing (`ReadStale`).
