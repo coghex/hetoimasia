@@ -66,6 +66,8 @@ module Hetoimasia.Terrain.Render2D.Evidence
   , handQuads
   , expectedAt
   , expectedForDevice
+  , loadingAt
+  , pendingCells
   , expectedImage
   , handSides
   , handTurnSide
@@ -235,6 +237,9 @@ data Know
     KnownSolid
   | -- | Confirmed undiscovered: generic fog, whatever the terrain holds.
     Undisc
+  | -- | Retained knowledge not arrived: pending. No quad, no fabricated air, no forgotten fog; a pick
+    -- that could lie in front of it is loading (README, "Knowledge is not residency").
+    Pending
   deriving stock (Eq, Ord, Show)
 
 -- | The discovery knowledge of a scene: every cell discovered except those it lists.
@@ -258,6 +263,7 @@ sceneKnowledge sc =
       KnownAll → CellDiscovered
       KnownSolid → CellSolidKnown
       Undisc → CellUndiscovered
+      Pending → CellPending
 
 -- | The inputs a planner reads for a scene and an adopted style.
 sceneInputs ∷ AssetSnapshot → Scene → CellInputs
@@ -392,7 +398,7 @@ handQuads sc camera = concatMap quadsOf cells
     know = Map.fromList (sceneKnow sc)
     solids = [((cellX c, cellY c, z), (cellShape c, cellMaterial c)) | c ← sceneCells sc, z ← [cellZ0 c .. cellZ1 c - 1]]
     cells =
-      [(p, Just solid, Map.findWithDefault KnownAll p know) | (p, solid) ← solids, Map.lookup p know /= Just Undisc]
+      [(p, Just solid, Map.findWithDefault KnownAll p know) | (p, solid) ← solids, Map.lookup p know /= Just Undisc, Map.lookup p know /= Just Pending]
         <> [(p, Nothing, Undisc) | (p, _) ← solids, Map.lookup p know == Just Undisc]
         <> [(p, Nothing, Undisc) | p ← sceneFogOnly sc]
     inBand (_, _, z) = z <= clip && clip - z <= 250
@@ -565,3 +571,53 @@ expectedImage art light sc plan = [[expectedAt art light sc camera plan (x, y) |
   where
     camera = sceneCameraFollowed sc
     (w, h) = sceneTarget sc
+
+-- | The unit cells of a scene whose knowledge is pending.
+pendingCells ∷ Scene → [(Integer, Integer, Integer)]
+pendingCells sc = [p | (p, Pending) ← sceneKnow sc]
+
+-- | Whether a pick at this pixel is loading, by the documented contract (README, "Bounded,
+-- resumable preparation" and the picker's rules), restated here from the contract and not from the
+-- planner: a pending cell whose canvas contains the pixel centre and whose nearness key is larger
+-- (nearer) than the covering quad's, or any pending cell containing it where no quad covers. A
+-- pending cell proved behind the covering quad changes nothing. The cell's footprint is its canvas
+-- rectangle, the same one a quad of that cell would have; the left and top edges are inside. The
+-- contract says only that a pending span's target rectangle is CONSERVATIVE (everything it could draw),
+-- so a pixel within one device pixel outside a nearer pending canvas may answer loading or not and is
+-- 'Nothing' here (undecided by the contract, never compared); inside the canvas and beyond the ring
+-- the answer is decided.
+loadingAt ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Maybe Bool
+loadingAt art light sc camera plan pixel = case pixelWorldPoint plan pixel of
+  Nothing → Just False
+  Just (sx, sy)
+    | any (\p → standing sx sy p == Inside && nearerThanFront p) pendings → Just True
+    | any (\p → standing sx sy p == Ring && nearerThanFront p) pendings → Nothing
+    | otherwise → Just False
+  where
+    pendings = pendingCells sc
+    anchorX = toInteger (axisValue (camAnchorX camera))
+    anchorY = toInteger (axisValue (camAnchorY camera))
+    clip = toInteger (axisValue (camClip camera))
+    ref = camRef camera
+    count = turnsOf (camFacing camera)
+    -- One device pixel in render-world units.
+    ringWidth = 1 / toRational (sceneZoom sc * sceneScale sc)
+    corner (x, y, z) =
+      let (vx, vy) = turnPair count (x - anchorX, y - anchorY)
+       in (48 * (vx - vy) - 48, 24 * (vx + vy - 1) - 16 * (z - ref) - 16, vx, vy)
+    standing sx sy p =
+      let (cx, cy, _, _) = corner p
+          ox = sx - fromInteger cx
+          oy = sy - fromInteger cy
+       in if ox >= 0 && ox < 96 && oy >= 0 && oy < 64
+            then Inside
+            else if ox >= negate ringWidth && ox < 96 + ringWidth && oy >= negate ringWidth && oy < 64 + ringWidth then Ring else Beyond
+    keyOf p@(_, _, z) = let (_, _, vx, vy) = corner p in (vx + vy, z, vx, vy)
+    inBand (_, _, z) = z <= clip && clip - z <= 250
+    nearerThanFront p = inBand p && case expectedAt art light sc camera plan pixel of
+      ExpectedHit {expectedFront = q} → let (a, b, c, d, _) = hqKey q in keyOf p > (a, b, c, d)
+      _ → True
+
+-- | How a pixel centre stands to a pending cell's conservative footprint.
+data Standing = Inside | Ring | Beyond
+  deriving stock (Eq)

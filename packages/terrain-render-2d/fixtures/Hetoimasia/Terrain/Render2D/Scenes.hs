@@ -43,11 +43,16 @@ module Hetoimasia.Terrain.Render2D.Scenes
   , snapped
   , edgeScene
   , depthStack
+  , pendingScene
+  , seamScene
+  , seamScenesNegative
+  , extremeScene
+  , shiftPan
     -- * Layout
   , fitScene
   ) where
 
-import Hetoimasia.Terrain.Coordinate (axisValue)
+import Hetoimasia.Terrain.Coordinate (axisMaxValue, axisMinValue, axisValue)
 import Hetoimasia.Terrain.Render2D.Camera (camAnchorX, camAnchorY, camClip, camFacing, camRef)
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
@@ -383,3 +388,93 @@ depthStack facing =
       , sceneAnchor = (4, 0)
       }
 
+
+
+-- | Cells either side of every seam of the 16 x 16 x 32 region lattice: columns 15 and 16 on both
+-- horizontal axes and levels 31 and 32, with the cut above the seam, so a face, a ramp and a cutaway
+-- cross a region boundary in every direction a view can look.
+seamScene ∷ ViewFacing → Scene
+seamScene facing =
+  fitScene 6 $
+    (newScene ("seams-" <> show facing) cells (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt 33 33
+      , sceneAnchor = (15, 15)
+      }
+  where
+    cells =
+      [ Cell 15 15 30 34 5 loam
+      , Cell 16 15 31 34 9 granite
+      , Cell 15 16 31 34 12 loam
+      , Cell 16 16 28 35 0 granite
+      , Cell 14 14 29 33 3 granite
+      , Cell 17 17 30 32 6 loam
+      ]
+
+-- | The same across the zero seam of the coordinate lattice (columns -1 and 0, levels -1 and 0).
+seamScenesNegative ∷ ViewFacing → Scene
+seamScenesNegative facing =
+  fitScene 6 $
+    (newScene ("seams-zero-" <> show facing) cells (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt 1 1
+      , sceneAnchor = (-1, -1)
+      }
+  where
+    cells =
+      [ Cell (-1) (-1) (-2) 2 5 loam
+      , Cell 0 (-1) (-1) 2 9 granite
+      , Cell (-1) 0 (-1) 2 12 loam
+      , Cell 0 0 (-3) 3 0 granite
+      ]
+
+-- | Cells at the legal coordinate extremes (@axisMaxValue@ and @axisMinValue@ on every axis, levels
+-- included), the camera anchored there. The planner, picker and renderer work in coordinates relative
+-- to the anchor, so the picture must be as at any other place.
+extremeScene ∷ Bool → ViewFacing → Scene
+extremeScene high facing =
+  fitScene 6 $
+    (newScene ("extremes-" <> (if high then "max-" else "min-") <> show facing) cells (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt cut cut
+      , sceneAnchor = (ax, ax)
+      }
+  where
+    hi = axisMaxValue
+    lo = axisMinValue
+    (ax, z0, cut)
+      | high = (hi - 2, hi - 4, hi - 1)
+      | otherwise = (lo, lo, lo + 3)
+    cells =
+      [ Cell ax ax z0 (z0 + 4) 5 loam
+      , Cell (ax + 1) ax (z0 + 1) (z0 + 4) 9 granite
+      , Cell ax (ax + 1) (z0 + 1) (z0 + 4) 12 loam
+      , Cell (ax + 2) (ax + 1) z0 (z0 + 3) 0 granite
+      ]
+
+-- | A scene with its pan moved by this much (tiles, on the world axes), its target and cells as they are.
+shiftPan ∷ (Double, Double) → Scene → Scene
+shiftPan (dx, dy) sc = sc {scenePan = (fst (scenePan sc) + dx, snd (scenePan sc) + dy)}
+
+
+-- | Pending information beside known terrain: cells along the view diagonal with the middle one pending
+-- (its knowledge not arrived), so a pixel it covers that a nearer known quad also covers is a hit (the
+-- pending cell is proved behind), a pixel only a farther quad covers is loading, and a lone pending
+-- cell off to the side is loading wherever it is the only thing there. Pending cells draw nothing.
+pendingScene ∷ ViewFacing → Scene
+pendingScene facing =
+  fitScene 6 $
+    (newScene ("pending-" <> show facing) cells (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt 1 1
+      , sceneAnchor = (1, 1)
+      , sceneKnow = [((1, 1, 0), Pending), ((3, 0, 0), Pending)]
+      }
+  where
+    cells =
+      [ Cell 0 0 0 1 5 loam
+      , Cell 1 1 0 1 12 loam
+      , Cell 2 2 0 1 9 granite
+      , Cell 3 0 0 1 3 granite
+      , Cell 0 2 0 1 0 loam
+      ]

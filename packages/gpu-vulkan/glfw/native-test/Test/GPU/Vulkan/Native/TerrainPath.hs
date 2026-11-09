@@ -203,6 +203,9 @@ data Variant
     WrongMapRegion
   | -- | A control: drawn correctly, but the pick answers through a fog quad to the known solid behind it.
     PickThroughFog
+  | -- | A control: drawn correctly, but a pick that is loading (pending information could lie in front)
+    -- answers as a miss.
+    PickLoadingAsMiss
   | -- | A control: drawn correctly, but the pick answers through the farthest covered quad.
     BackmostPick
   deriving stock (Eq, Show)
@@ -228,13 +231,14 @@ suffixOf = \case
   UnbiasedIndex → "-control-unbiased-index"
   StaleBias → "-control-stale-bias-1e-4"
   BackmostPick → "-control-pick-through-nearer"
+  PickLoadingAsMiss → "-control-loading-as-miss"
 
 isControl ∷ Variant → Bool
-isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, UnbiasedIndex, StaleBias, WrongMapRegion, PickThroughFog, BackmostPick]
+isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, UnbiasedIndex, StaleBias, WrongMapRegion, PickThroughFog, PickLoadingAsMiss, BackmostPick]
 
 -- | What a fixture must show, each by a named probe that is determinate for the oracle and differs
 -- from its contrast.
-data Need = Foreground | Overlap | Reveal | Clipped | SnapSensitive | Varies | LightsDiffer
+data Need = Foreground | Overlap | Reveal | Clipped | SnapSensitive | Varies | LightsDiffer | Restores
   deriving stock (Eq, Show)
 
 data Spec = Spec
@@ -347,6 +351,7 @@ specs profile = case profile of
       <> [spec defaultLight [Foreground] Dynamic (atZoom 0.125 (staircase cut FaceSouth)) | cut ← [1, 3, 5]]
       <> [exactBoundaryFixture shape facing | (shape, facing) ← exactBoundaryCases]
       <> [edgeFixture zoom shape facing | (zoom, shape, facing) ← edgeCases]
+      <> matrixExtensions
       <> [ expecting (28, 4) (spec defaultLight [Foreground] Dynamic (atZoom 0.125 (followHeadroom FaceSouth)))
          , expecting (0, -33) (spec defaultLight [Foreground, Varies] Dynamic (deepFloor FaceSouth))
          ]
@@ -356,7 +361,9 @@ specs profile = case profile of
          , spec defaultLight [Foreground] Dynamic (capTarget (96, 64) (atZoom 0.125 scaledTarget))
          , spec defaultLight [Foreground] Dynamic snappedZoom2
          ]
-      <> [spec defaultLight [Foreground, SnapSensitive] Dynamic sc | sc ← snappedScenes]
+      -- At a whole-number scale (1, 8) a nearest-sampled quad cannot change under a sub-pixel shift, so
+      -- snapping is not discriminable there and no fixture claims it is; at 9/8, 5/4 and 63/8 it is.
+      <> [spec defaultLight (if wholeScale sc then [Foreground] else [Foreground, SnapSensitive]) Dynamic sc | sc ← snappedScenes]
       -- Lighting: the fixed world sun with the camera turned, and the sun varied at a fixed camera.
       <> [spec defaultLight [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners facing)) | facing ← [FaceSouth, FaceWest]]
       <> [spec light [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners FaceSouth)) | light ← lights, lightLabel light /= "dark"]
@@ -379,6 +386,7 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Overlap] BackmostPick (atZoom 0.125 (disconnectedSpans FaceSouth))
          ]
       -- The Q-13 negative control: the same exact-boundary fixtures drawn without the texel bias.
+      <> [spec defaultLight [Foreground] PickLoadingAsMiss (pendingScene FaceSouth)]
       <> [exactBoundaryWith UnbiasedIndex shape facing | (shape, facing) ← exactBoundaryCases]
       <> [staleBiasFixture sc | sc ← staleBiasScenes]
 
@@ -405,6 +413,9 @@ exactBoundary shape facing = (newScene ("exact-boundary-" <> show shape <> "-" <
 snappedScenes ∷ [Scene]
 snappedScenes = [snapped {sceneName = "snapped-" <> label, sceneZoom = zoom} | (label, zoom) ← [("9-8", 1.125), ("5-4", 1.25), ("63-8", 7.875), ("8", 8)]]
 
+wholeScale ∷ Scene → Bool
+wholeScale sc = sceneZoom sc == fromInteger (round (sceneZoom sc))
+
 -- | The two scales where the measured counterexample lay: the stale-bias control is drawn at them.
 staleBiasScenes ∷ [Scene]
 staleBiasScenes = take 2 snappedScenes
@@ -423,6 +434,44 @@ edgeCases = [(0.125, 0, FaceSouth), (0.125, 15, FaceEast), (0.5, 0, FaceSouth), 
 staleBiasFixture ∷ Scene → Spec
 staleBiasFixture sc =
   Spec (sceneName sc <> "-beside-ordinary" <> suffixOf StaleBias) [shapeMatrixCell 0 FaceSouth 1, sc] StaleBias defaultLight [Foreground] [] Nothing
+
+-- | Seams across the region lattice, legal-coordinate extremes and coherent supplied snapshot sequences
+-- (the issue's matrix beyond the shapes): every pass is judged by the independent exact expectation, the
+-- sequences that end where they began must draw that state again pixel for pixel.
+matrixExtensions ∷ [Spec]
+matrixExtensions =
+  [spec defaultLight [Foreground, Varies] Dynamic (seamScene facing) | facing ← allViewFacings]
+    <> [spec defaultLight [Foreground, Varies] Dynamic (seamScenesNegative facing) | facing ← [FaceSouth, FaceNorth]]
+    <> [spec defaultLight [Foreground, Varies] Dynamic (extremeScene high facing) | high ← [True, False], facing ← [FaceSouth, FaceEast]]
+    <> [spec defaultLight [Foreground, Varies] Dynamic (pendingScene facing) | facing ← allViewFacings]
+    <> sequences
+
+-- | The base of the supplied sequences: ramps and corners at zoom 1/8.
+sequenceBase ∷ Scene
+sequenceBase = atZoom 0.125 (rampsCorners FaceSouth)
+
+sequences ∷ [Spec]
+sequences =
+  [ specMany "sequence-pan" [Foreground, Varies] [shiftPan (k * 0.5, k * 0.25) sequenceBase | k ← [0, 1, 2, 3]]
+  , specMany "sequence-zoom" [Foreground, Varies] [atZoom z (rampsCorners FaceSouth) | z ← [0.125, 0.1875, 0.25, 0.375]]
+  , specMany "sequence-rotation" [Foreground, Varies] [atZoom 0.125 (rampsCorners facing) | facing ← [FaceSouth, FaceWest, FaceNorth, FaceEast]]
+  , restoring "sequence-manual-follow-manual" [sequenceBase, sequenceBase {sceneMode = FollowSurface}, sequenceBase]
+  , restoring "sequence-jump" [sequenceBase, sequenceBase {sceneAnchor = (2, 2)}, sequenceBase {sceneAnchor = (2, 2), sceneMode = ManualAt 2 2}, sequenceBase]
+  , specMany "sequence-reveal" [Foreground, Varies] (revealStages (mixedScene FaceSouth))
+  , restoring "sequence-unload-reload" [sequenceBase, sequenceBase {sceneCells = take 1 (sceneCells sequenceBase), sceneAnchor = (0, 0)}, sequenceBase]
+  ]
+  where
+    restoring name scs = (specMany name [Foreground, Varies, Restores] scs)
+
+-- | Knowledge arriving: first nothing known, then the known solids beside undiscovered voids, then everything discovered.
+revealStages ∷ Scene → [Scene]
+revealStages sc =
+  [ sc {sceneKnow = [(c, Undisc) | c ← unitCells], sceneFogOnly = []}
+  , sc
+  , sc {sceneKnow = [], sceneFogOnly = []}
+  ]
+  where
+    unitCells = [(cellX c, cellY c, z) | c ← sceneCells sc, z ← [cellZ0 c .. cellZ1 c - 1]]
 
 -- | The shapes and facings of the exact-boundary fixtures and of their negative control.
 exactBoundaryCases ∷ [(Int, ViewFacing)]
@@ -853,6 +902,14 @@ pickThroughFog = \case
     | hqRole q `elem` [FullFog, MixedFog] → Just (case [b | b ← behind, hqRole b `elem` [Ordinary, MixedKnown]] of known : _ → summaryOf known; [] → summaryOf q)
     | otherwise → Just (summaryOf q)
 
+-- | What a correct pick finds at a pixel: loading where the contract says pending information could lie
+-- in front, nothing where the contract leaves a conservative ring undecided, else the frontmost covered quad.
+pickWanted ∷ ArtSource → HandLight → Part → Array (Int, Int) Expected → (Int, Int) → Maybe PickSummary
+pickWanted art light part grid pixel = case loadingAt art light (partScene part) (partCamera part) (partPlan part) pixel of
+  Just True → Just SLoading
+  Just False → pickExpected (grid ! pixel)
+  Nothing → Nothing
+
 -- | What the picker finds at a pixel of a plan.
 pickerAt ∷ Part → (Int, Int) → PickSummary
 pickerAt part (px, py) =
@@ -915,7 +972,7 @@ renderSnapshot ctx s parts = do
             , part ← parts
             , (toInteger (axisValue (camClip (partCamera part))), camRef (partCamera part)) /= wanted
             ]
-          missing = [need | need ← specNeeds s, need `notElem` (SnapSensitive : map fst named)]
+          missing = [need | need ← specNeeds s, need `notElem` (SnapSensitive : Restores : map fst named)]
           runFacts = runsOf (planSnapshot marks valid)
           expectedPath = if specVariant s == OrderedWrapper then "Ordered" else "Cutout"
           pathProblems = ["a run took the " <> path <> " path, expected " <> expectedPath | (path, _, _) ← runFacts, path /= expectedPath]
@@ -946,15 +1003,17 @@ renderSnapshot ctx s parts = do
           plus a b = Independent (indCompared a + indCompared b) (indAmbiguous a + indAmbiguous b) (indCovered a + indCovered b) (indReveals a + indReveals b) (indOverlaps a + indOverlaps b) (indMismatchCount a + indMismatchCount b) (take 12 (indMismatches a <> indMismatches b))
           -- The pick against the hand expectation on a stride of every pass's pixels.
           pickResults =
-            [ (length judged, [show pixel <> ": the pick found " <> show got <> ", expected " <> show want | (pixel, want, got) ← judged, got /= want])
+            [ (length judged, [show pixel <> ": the pick found " <> show got <> ", expected " <> show want | (pixel, want, got) ← judged, got /= want], length [() | (_, SLoading, _) ← judged])
             | (part, grid) ← zip parts exactGrids
             , let (gw, gh) = sceneTarget (partScene part)
             , let step = max 1 ((gw * gh) `div` 600)
             , let pixels = [(x, y) | (i, (x, y)) ← zip [0 ∷ Int ..] [(x, y) | y ← [0 .. gh - 1], x ← [0 .. gw - 1]], i `mod` step == 0]
-            , let judged = [(pixel, want, got) | pixel ← pixels, Just want ← [pickExpected (grid ! pixel)], let got = case specVariant s of { BackmostPick → fromMaybe want (pickThroughNearer (grid ! pixel)); PickThroughFog → fromMaybe want (pickThroughFog (grid ! pixel)); _ → pickerAt part pixel }]
+            , let judged = [(pixel, want, got) | pixel ← pixels, Just want ← [pickWanted art light part grid pixel], let got = case specVariant s of { PickLoadingAsMiss → (case pickerAt part pixel of { SLoading → SNoHit; other → other }); BackmostPick → fromMaybe want (pickThroughNearer (grid ! pixel)); PickThroughFog → fromMaybe want (pickThroughFog (grid ! pixel)); _ → pickerAt part pixel }]
             ]
-          pickCompared = sum (map fst pickResults)
-          pickProblems = concatMap snd pickResults
+          pickCompared = sum [n | (n, _, _) ← pickResults]
+          pickProblems = concat [p | (_, p, _) ← pickResults]
+          pickLoadingSeen = sum [n | (_, _, n) ← pickResults]
+          pendingProblems = ["a scene with pending cells whose sampled pixels hold no loading pick: it exercises nothing" | any (not . null . pendingCells . partScene) parts, pickLoadingSeen == 0]
           rejected
             | isControl (specVariant s) = Just (indMismatchCount independent > 0 || not (null pickProblems))
             | otherwise = Nothing
@@ -975,10 +1034,23 @@ renderSnapshot ctx s parts = do
             [] → (1, 1)
           centreOf (x, y) = (x - gridW `div` 2) ^ (2 ∷ Int) + (y - gridH `div` 2) ^ (2 ∷ Int)
           controlDiffers
-            | specVariant s `elem` [BackmostPick, PickThroughFog] = Just (not (null pickProblems))
+            | specVariant s `elem` [BackmostPick, PickThroughFog, PickLoadingAsMiss] = Just (not (null pickProblems))
             | specVariant s `elem` [UnbiasedIndex, StaleBias] = Just (any ((> 0) . indMismatchCount) (drop 1 independents))
             | isControl (specVariant s) = Just (any mismatchAt namedPixels)
             | otherwise = Nothing
+          -- A sequence that ends in the state it began in must draw that state again, pixel for pixel: the
+          -- same terrain, knowledge, camera and style restore the same picture with no seam or residue.
+          restoreProblems = case (perPass, parts) of
+            (firstProbes : (_ : _ : _) , firstPart : _)
+              | Restores `elem` specNeeds s →
+                  let lastProbes = last perPass
+                      lastPart = last parts
+                      (rw, rh) = sceneTarget (partScene firstPart)
+                      seenFirst = observedFrom rw firstProbes
+                      seenLast = observedFrom (fst (sceneTarget (partScene lastPart))) lastProbes
+                      differing = length [() | y ← [0 .. rh - 1], x ← [0 .. rw - 1], seenFirst x y /= seenLast x y]
+                   in [ "the final pass does not restore the first: " <> show differing <> " pixels differ" | differing > 0 || sceneTarget (partScene firstPart) /= sceneTarget (partScene lastPart) || partScene firstPart /= partScene lastPart ]
+            _ → []
           readbackMissing = not (completeReadback (map (sceneTarget . partScene) parts) (resultProbes result))
           problems
             | readbackMissing = [maybe "the readback holds fewer pixels than the targets" Text.unpack (resultFailure result)]
@@ -989,6 +1061,8 @@ renderSnapshot ctx s parts = do
                 ]
                   <> ["the pick disagreed with the expectation at " <> show (length pickProblems) <> " pixels, e.g. " <> show (take 3 pickProblems) | not (isControl (specVariant s)), not (null pickProblems)]
                   <> cameraProblems
+                  <> restoreProblems
+                  <> pendingProblems
                   <> pathProblems
                   <> ["pixel snapping changed " <> show snapDifferences <> " pixels the readback shows, fewer than the 20 that discriminate it from a view that ignores the setting" | SnapSensitive `elem` specNeeds s, snapDifferences < 20]
                   <> ["no determinate probe for " <> show need | need ← missing]
@@ -1091,6 +1165,7 @@ chooseNamed sc expectedAtPixel secondGrid alternative determinate = concatMap on
          in maybe [] pure (pair Overlap "the nearer quad hides the farther where their canvases overlap" overlapped single)
       Varies → maybe [] pure (pair Varies "the lighting and the art differ across the covered surface" covered (reverse covered))
       Reveal → []
+      Restores → []
       LightsDiffer → case secondGrid of
         Just other →
           -- The same covered pixel in the first pass (default light) and in the second (another

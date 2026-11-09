@@ -44,10 +44,21 @@ spec = describe "Expectation" $ do
             -- fractional scales: the picker agrees with the exact hand model at every pixel.
             <> [edgeScene zoom shape facing | (zoom, shape, facing) ← [(0.125, 0, FaceSouth), (0.125, 15, FaceEast), (0.5, 0, FaceSouth), (0.5, 9, FaceWest), (1, 0, FaceSouth), (1, 5, FaceNorth)]]
             <> [snapped {sceneName = "snapped@" <> show zoom, sceneZoom = zoom} | zoom ← [1, 1.125, 1.25, 7.875, 8]]
+            -- Seams across the region lattice, the zero seam and the legal coordinate extremes.
+            <> [pendingScene facing | facing ← facings]
+            <> [seamScene facing | facing ← facings]
+            <> [seamScenesNegative facing | facing ← facings]
+            <> [extremeScene high facing | high ← [True, False], facing ← [FaceSouth, FaceWest]]
     forM_ scenes $ \scene → do
       verdict ← judge manifest assets art scene
       (sceneName scene, jMismatches verdict) `shouldBe` (sceneName scene, [])
       (sceneName scene, jCompared verdict > 0, jCovered verdict > 0) `shouldBe` (sceneName scene, True, True)
+  it "answers loading exactly where a pending cell could lie in front, and not where it is proved behind" $ do
+    (manifest, assets, art) ← setupAll
+    verdicts ← forM facings $ \facing → judge manifest assets art (pendingScene facing)
+    forM_ verdicts $ \verdict → do
+      jMismatches verdict `shouldBe` []
+      jLoading verdict `shouldSatisfy` (> 0)
   it "decides most pixels: ambiguity is a thin band at texel boundaries, not the common case" $ do
     (manifest, assets, art) ← setupAll
     verdict ← judge manifest assets art (shapeMatrix FaceSouth 1)
@@ -72,6 +83,7 @@ data Judged = Judged
   { jCompared ∷ !Int
   , jAmbiguous ∷ !Int
   , jCovered ∷ !Int
+  , jLoading ∷ !Int
   , jMismatches ∷ ![String]
   }
 
@@ -123,16 +135,21 @@ judge _ assets art scene = do
       step acc pixel =
         let expected = expectedAt art defaultHandLight scene camera plan pixel
             found = pickPixel plan pixel
-            problem = disagreement expected found
+            loading = loadingAt art defaultHandLight scene camera plan pixel
+            problem = case loading of
+              Just True → if found == CellPickLoading then Nothing else Just ("expected loading but " <> show found)
+              Just False → disagreement expected found
+              Nothing → Nothing
             covered = case expected of ExpectedHit {} → 1; _ → 0
             banded = case expectedForDevice art defaultHandLight scene camera plan pixel of Ambiguous _ → 1; _ → 0
          in acc
               { jCompared = jCompared acc + 1
               , jAmbiguous = jAmbiguous acc + banded
               , jCovered = jCovered acc + covered
+              , jLoading = jLoading acc + (if loading == Just True then 1 else 0)
               , jMismatches = take 6 (jMismatches acc <> [show pixel <> ": " <> why | Just why ← [problem]])
               }
-  pure (foldl' step (Judged 0 0 0 []) pixels)
+  pure (foldl' step (Judged 0 0 0 0 []) pixels)
 
 -- | Why the model and the picker disagree at a pixel, if they do.
 disagreement ∷ Expected → CellPickResult → Maybe String
