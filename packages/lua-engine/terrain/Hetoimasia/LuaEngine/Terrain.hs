@@ -46,6 +46,11 @@ module Hetoimasia.LuaEngine.Terrain
     TerrainFacade (..)
   , newTerrainFacade
   , TerrainHooks (..)
+    -- * The arbitration of an open's name (exported for the examples that decide its windows with threads)
+  , Claim (..)
+  , arbitrateOpen
+  , holdFailedUntil
+  , registerClaim
   , noTerrainHooks
   , terrainInjection
   , terrainLeaseCapacity
@@ -220,10 +225,39 @@ letGo facade name link =
 -- registry is swept whole at each insertion, at every drain and at every forgetting of an instance, and an open the host has settled already
 -- is not entered at all, so what it holds is bounded by the failed opens still waiting for their tick, whatever names they used.
 holdFailed ∷ TerrainFacade → Text → Link → STM ()
-holdFailed facade name link = do
+holdFailed facade name link = holdFailedUntil facade name (lkSettled link)
+
+-- | 'holdFailed' for an open whose settlement by the host is this transaction.
+holdFailedUntil ∷ TerrainFacade → Text → STM Bool → STM ()
+holdFailedUntil facade name hostSettled = do
   pruneFailedOpens facade
-  settled ← lkSettled link
-  unless settled (modifyTVar' (tfFailedOpens facade) (Map.insertWith (<>) name [not <$> lkSettled link]))
+  settled ← hostSettled
+  unless settled (modifyTVar' (tfFailedOpens facade) (Map.insertWith (<>) name [not <$> hostSettled]))
+
+-- | The claim of an open the service admitted: found stale if the host settles the open as cancelled before the service is told. A request
+-- that has already ended needs none.
+registerClaim ∷ TerrainFacade → Text → Claim → STM ()
+registerClaim facade name claim = do
+  pruneClaims facade
+  over ← clDone claim
+  unless over (modifyTVar' (tfClaims facade) (Map.insertWith (<>) name [claim]))
+
+-- | The arbitration of an open's name: one critical section of the facade's opens ('tfOpenLock'), in this order: the release of every claim
+-- the host has settled as cancelled without the service's being told, the consultation of the opens the service failed, the admission this
+-- action makes (the service's, with the registration of the open's own claim), and nothing else. Answers 'Nothing' for an open that is a
+-- duplicate of one the service failed and the host has not yet settled, which is never admitted. Everything under the lock is non-waiting.
+arbitrateOpen ∷ TerrainFacade → Text → IO a → IO (Maybe a)
+arbitrateOpen facade name admit = do
+  hookArriving (tfHooks facade)
+  withMVar (tfOpenLock facade) $ \_ → do
+    releaseStale facade name
+    duplicate ← atomically (failedOpenPending facade name)
+    if duplicate
+      then pure Nothing
+      else do
+        hookChecked (tfHooks facade)
+        hookSubmitting (tfHooks facade)
+        Just <$> admit
 
 -- | Forget every failed open the host has settled, of every name.
 pruneFailedOpens ∷ TerrainFacade → STM ()
@@ -936,42 +970,22 @@ submit env submission = mask_ $ do
       afterAdmission request = do
         atomically (writeTVar (pdRequest found) (Just request) >> note)
         case pdAsk found of
-          AskOpen _ name _ → do
-            let claim = Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)
-            atomically $ do
-              pruneClaims (envFacade env)
-              over ← clDone claim
-              -- A request that has already ended needs no claim: only what is still open can be found stale.
-              unless over (modifyTVar' (tfClaims (envFacade env)) (Map.insertWith (<>) name [claim]))
+          AskOpen _ name _ →
+            atomically (registerClaim (envFacade env) name (Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)))
           _ → pure ()
         hookSubmitted (hooks env)
-  -- The arbitration of a name is one decision, taken in one critical section of the facade's opens ('tfOpenLock') and in this order: the
-  -- release of every claim the host has settled as cancelled without the service's being told (so a name a cancelled open still holds is
-  -- free), the consultation of the opens the service failed ('tfFailedOpens': one fails at admission, holds no claim in the service, and
-  -- is held by the adapter until the host settles it), the service's admission of the open, and the registration of its claim. No open of
-  -- any VM is admitted between another's consultation and its registration, so whichever open the service admits first is the one the other
-  -- finds: its own claim, still open or found stale by the release, or the failed hold. (Nothing else opens a name through this
-  -- adapter; the admission it covers is the service's non-waiting one, so a VM waits only for another VM's admission of an open, never for
-  -- a terrain owner. A non-Lua client opening names on the same service directly is outside the arbitration.)
+      admitted = do
+        found' ← admitAsk
+        forM_ (either (const Nothing) Just found') afterAdmission
+        pure found'
+  -- An open's name is arbitrated by 'arbitrateOpen': the release of the stale claims, the consultation of the failed opens, the admission and
+  -- the registration of the open's claim are one critical section of the facade's opens, so no open is admitted between another's
+  -- consultation and its registration, whatever the VM. (A non-Lua client opening names on the same service directly is outside it.)
   outcome ← case pdAsk found of
-    AskOpen _ name _ → do
-      hookArriving (hooks env)
-      withMVar (tfOpenLock (envFacade env)) $ \_ → do
-        releaseStale env name
-        duplicate ← atomically (failedOpenPending (envFacade env) name)
-        if duplicate
-          then pure Nothing
-          else do
-            hookChecked (hooks env)
-            hookSubmitting (hooks env)
-            admitted ← admitAsk
-            forM_ (either (const Nothing) Just admitted) afterAdmission
-            pure (Just admitted)
+    AskOpen _ name _ → arbitrateOpen (envFacade env) name admitted
     _ → do
       hookSubmitting (hooks env)
-      admitted ← admitAsk
-      forM_ (either (const Nothing) Just admitted) afterAdmission
-      pure (Just admitted)
+      Just <$> admitted
   case outcome of
     Nothing → do
       -- An open the service failed still holds its name until the host settles it: this one is a duplicate of it, answered here and never
@@ -1014,11 +1028,11 @@ worstReply env = \case
 
 -- | Let go of the claims on a name whose request the host has already settled without the service being told: the service is told
 -- now, which frees the name, before another open asks for it.
-releaseStale ∷ Env → Text → IO ()
-releaseStale env name = do
+releaseStale ∷ TerrainFacade → Text → IO ()
+releaseStale facade name = do
   tells ← atomically $ do
-    pruneClaims (envFacade env)
-    held ← Map.findWithDefault [] name <$> readTVar (tfClaims (envFacade env))
+    pruneClaims facade
+    held ← Map.findWithDefault [] name <$> readTVar (tfClaims facade)
     flags ← mapM clStale held
     pure [clCancel claim | (claim, True) ← zip held flags]
   sequence_ tells

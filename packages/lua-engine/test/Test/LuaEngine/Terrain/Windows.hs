@@ -6,26 +6,27 @@
 -- adapter are held at named points by gates, so an example decides which side wins by what it does and never by how long it waits.
 module Test.LuaEngine.Terrain.Windows (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Concurrent (yield)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, onException, try)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.STM (atomically, newTVarIO, readTMVar, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent (forkIO, yield)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
 import Data.Either (isLeft)
-import Control.Monad (replicateM_, unless, void, when)
-import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Control.Monad (forM_, replicateM_, unless, void, when)
+import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Profile (CountLimit (CopiedValueDepth, CopiedValueElements, LuaIntegerMaximum, SceneDepth, SceneSprites))
-import Hetoimasia.LuaEngine.Terrain (TerrainFacade (..), TerrainHooks (..), noTerrainHooks)
+import Hetoimasia.LuaEngine.Terrain (Claim (..), TerrainFacade (..), TerrainHooks (..), arbitrateOpen, holdFailedUntil, noTerrainHooks, registerClaim)
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
 import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Test.LuaEngine.Request.Profiles (counts)
 import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
+import Hetoimasia.Terrain.Runtime.Settlement (Endpoint (..), arrivalEndpoint, cancel, openArenaWith)
 import Test.Support.Bounded (bounded)
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import Test.Hspec
@@ -74,6 +75,10 @@ attacher =
         ]
     }
 
+-- | Wait, yielding, until the condition holds (bounded by the caller).
+untilM ∷ IO Bool → IO ()
+untilM condition = condition >>= \done → unless done (yield >> untilM condition)
+
 -- | A gameplay instance whose init opens a name with a definition the service fails (a duplicate material), due at tick 1.
 failsLogically ∷ Script
 failsLogically =
@@ -82,47 +87,6 @@ failsLogically =
     , scInit = ["self.q = api.terrain.open('dup', { materials = { 'a', 'a' }, layers = {} })", "print('invalid open issued')"]
     , scUpdate = ["if self.q then local t = settle(api, self.q) if t then print('invalid open', t.status, t.error and t.error.code) self.q = nil end end"]
     }
-
--- | A gameplay instance that opens a name with a definition the service fails at its first tick (due tick 2), saying so and its answer.
-failsAtFirstTick ∷ Script
-failsAtFirstTick =
-  script
-    { scPrelude = terrainPrelude
-    , scInit = ["self.s = 0"]
-    , scUpdate =
-        [ "if self.s == 0 then self.q = api.terrain.open('dup', { materials = { 'a', 'a' }, layers = {} }) print('invalid open issued') self.s = 1"
-        , "elseif self.q then local t = settle(api, self.q) if t then print('invalid open', t.status, t.error and t.error.code) self.q = nil end end"
-        ]
-    }
-
--- | A gameplay instance that opens a valid name at its first tick (due tick 2).
-opensAtFirstTick ∷ Script
-opensAtFirstTick =
-  script
-    { scPrelude = terrainPrelude
-    , scInit = ["self.s = 0"]
-    , scUpdate = ["if self.s == 0 then self.q = api.terrain.open('held', DEF) print('held open issued') self.s = 1 end"]
-    }
-
--- | Run a step of an example, and when it fails say which it was, the events the adapter's hooks saw and what the scripts printed: a bounded
--- wait that never returns names nothing else.
-named ∷ World → Rig → IORef [String] → String → IO a → IO a
-named world rig events label act =
-  act `onException` do
-    seen ← readIORef events
-    printed ← outLines world
-    waits ← readTVarIO (rgTrace rig)
-    putStrLn ("STEP FAILED: " <> label <> "; events " <> show (reverse seen) <> "; waits " <> show (reverse waits) <> "; printed " <> show printed)
-
--- | An example's exit, whatever happened in it: the gates open, every wait the scripts have is released and every instance it started is
--- asked to stop, so a failure in the body is reported as itself and does not become a teardown that never returns.
-leavingAlways ∷ Rig → [Gate] → IORef [Spawned] → IO a → IO a
-leavingAlways rig gates spawns body =
-  body `finally` do
-    mapM_ openGate gates
-    signalRig rig "first"
-    signalRig rig "second"
-    readIORef spawns >>= mapM_ (\spawned → void (try (stopSpawned spawned) ∷ IO (Either SomeException ())))
 
 -- | A gameplay instance whose init opens eight names with a definition the service fails, due at tick 1; at tick 1 it opens eight others.
 manyFailing ∷ Script
@@ -1134,83 +1098,99 @@ spec = describe "Terrain windows and banks" $ do
             signalRig rig "second"
             untilPrinted world "second answer\tsuccess\tnil"
 
+  -- The two examples that decide the windows of the arbitration of an open's name run two threads of the examples' own at the adapter's
+  -- 'arbitrateOpen' (the very section 'submit' takes for every open) over the real service, with the admission it makes parked where the
+  -- window is. They need nothing of any VM's scheduling, so what they show does not depend on the runtime they run on; the real-Lua
+  -- cross-VM examples (the failed open's name held against another VM's open, an epoch-cancelled open's name freed) are the ones above.
   it "arbitrates the name of a failed open and of a normal open as one decision: no open is admitted between another's consultation and its admission" $ do
     gate ← newGate
     armed ← newIORef False
     events ← newIORef ([] ∷ [String])
-    spawns ← newIORef ([] ∷ [Spawned])
     let note event = modifyIORef' events (event :)
         holdFirst = do
           note "checked"
           go ← atomicModifyIORef' armed (\a → (False, a))
           when go (holdAt gate)
-    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsAtFirstTick), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
-        withFvm world runtime (gameplayOver rig) $ \gameplayVm →
-          withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig [gate] spawns $ do
-            let step = named world rig events
-            invalid ← spawn world gameplayVm "modules-test" mainPath
-            modifyIORef' spawns (invalid :)
-            other ← admitOnly world shown "modules-test" "lua/other.lua"
-            modifyIORef' spawns (other :)
-            -- the open the service fails (an invalid definition) is the first to arrive, at tick 1: it has consulted the failed opens (none) and
-            -- is held inside the critical section, before its admission
-            writeIORef armed True
-            grantTick gameplayVm
-            step "the failed open reaches its hold" (awaitReached gate)
-            -- another VM's open of the name arrives while it is held, and the clock runs: it has every opportunity to be admitted
-            signalRig rig "first"
-            step "the other open arrives" (pumpUntil world (advanceClock world 2000000000 >> ((>= 2) . length . filter (== "arriving") <$> readIORef events)))
-            replicateM_ 200 (advanceClock world 2000000000 >> yield)
-            -- it has not even consulted the failed opens (without the critical section it has, and is admitted, before the invalid open is)
-            readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving"]
-            -- released, the invalid open is admitted first and fails its definition at once; the host holds that failure for tick 2, and
-            -- with it the name: the other open consults after it, finds it, and is never admitted (a duplicate is answered before the hook
-            -- that precedes an admission)
-            openGate gate
-            step "the tick of the failed open completes" (awaitTickDone control gameplayVm)
-            step "the other open is answered name_in_use" (untilPrinted world "first answer\tfailure\tname_in_use")
-            readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving", "submitting"]
-            -- the tick is granted and the failed open is settled: the name is free, and the second open of it is admitted
-            step "the failed open settles at its tick" (pumpUntil world (tickBy control gameplayVm 1 >> (elem "invalid open\tfailure\tdefinition" <$> outLines world)))
-            signalRig rig "second"
-            step "the second open is admitted" (untilPrinted world "second answer\tsuccess\tnil")
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig → (`finally` openGate gate) $ do
+      let facade = rgFacade rig
+          svc = rgService rig
+      hostSettled ← newTVarIO False
+      first ← registerClient svc >>= either (\refused → expectationFailure (show refused) >> fail "no client") pure
+      second ← registerClient svc >>= either (\refused → expectationFailure (show refused) >> fail "no client") pure
+      -- the first open's definition is invalid: the service fails it at admission, and the adapter holds its name until the host settles it
+      let invalid = SourceSpec {specMaterials = ["a", "a"], specLayers = [], specPatches = []}
+          failedEndpoint = Endpoint (pure ()) (pure True) (\settled → case settled of Failed _ → holdFailedUntil facade "dup" (readTVar hostSettled); _ → pure ())
+      (validEndpoint, validBox) ← arrivalEndpoint
+      firstDone ← newEmptyMVar
+      secondDone ← newEmptyMVar
+      -- the failed open is the first to arrive: it has consulted the failed opens (none) and is held inside the section, before its admission
+      writeIORef armed True
+      _ ← forkIO (arbitrateOpen facade "dup" (openArenaWith svc failedEndpoint first "dup" invalid) >>= putMVar firstDone)
+      awaitReached gate
+      -- the other open of the name arrives while it is held
+      _ ← forkIO (arbitrateOpen facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec) >>= putMVar secondDone)
+      bounded (untilM ((>= 2) . length . filter (== "arriving") <$> readIORef events))
+      replicateM_ 200 yield
+      -- it has not consulted the failed opens (without the section it has, and is admitted, before the failed open is)
+      readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving"]
+      -- released, the failed open is admitted first and fails its definition; its name is held, and the other open finds it and is never admitted
+      openGate gate
+      firstResult ← bounded (takeMVar firstDone)
+      secondResult ← bounded (takeMVar secondDone)
+      (isJust firstResult, isJust secondResult) `shouldBe` (True, False)
+      readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving", "submitting"]
+      -- the host settles the failed open: the name is free, and an open of it is admitted and succeeds
+      atomically (writeTVar hostSettled True)
+      thirdDone ← newEmptyMVar
+      _ ← forkIO (arbitrateOpen facade "dup" (openArenaWith svc validEndpoint second "dup" soilOverStoneSpec) >>= putMVar thirdDone)
+      thirdResult ← bounded (takeMVar thirdDone)
+      isJust thirdResult `shouldBe` True
+      settled ← bounded (atomically (readTMVar validBox))
+      case settled of
+        Succeeded _ → pure ()
+        other → expectationFailure ("expected the open to succeed, found " <> take 100 (show other))
 
   it "frees the name a cancelled open still holds before the next open of it is admitted, however the cancellation falls in the other open's admission" $ do
     gate ← newGate
-    cancelGate ← newGate
-    armed ← newIORef False
     events ← newIORef ([] ∷ [String])
-    spawns ← newIORef ([] ∷ [Spawned])
     let note event = modifyIORef' events (event :)
-        holdSubmitting = do
-          note "submitting"
-          go ← atomicModifyIORef' armed (\a → (False, a))
-          when go (holdAt gate)
-    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookSubmitting = holdSubmitting, hookCancelling = holdAt cancelGate} $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensAtFirstTick), ("lua/other.lua", scriptSource (reopensOnSignal "held"))]) $ \world _ runtime →
-        withFvm world runtime (gameplayOver rig) $ \gameplayVm →
-          withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig [gate, cancelGate] spawns $ do
-            let step = named world rig events
-            logical ← spawn world gameplayVm "modules-test" mainPath
-            modifyIORef' spawns (logical :)
-            other ← admitOnly world shown "modules-test" "lua/other.lua"
-            modifyIORef' spawns (other :)
-            -- the logical open is the first to arrive, at tick 1, and is held inside the critical section before the service has admitted it
-            writeIORef armed True
-            grantTick gameplayVm
-            step "the logical open reaches its hold" (awaitReached gate)
-            -- the host cancels it (an epoch change) before the service is told anything, and the service is not told until the example says so
-            -- (the cancellation is held at its hook): another VM's open of the name arrives, waits for the critical section, and must not take the
-            -- cancelled open's name for a duplicate
-            void (advanceRequestEpoch (scheduledEndpoint (fvOwner gameplayVm)))
-            signalRig rig "first"
-            step "the other open arrives" (pumpUntil world (advanceClock world 2000000000 >> ((>= 2) . length . filter (== "arriving") <$> readIORef events)))
-            openGate gate
-            -- the logical open is admitted by the service and registers its claim, which the host has settled as cancelled: the other open
-            -- releases it in the same critical section, and is admitted
-            step "the other open is admitted" (untilPrinted world "first answer\tsuccess\tnil")
-            openGate cancelGate
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving"} $ \rig → (`finally` openGate gate) $ do
+      let facade = rgFacade rig
+          svc = rgService rig
+      cancelled ← newTVarIO False
+      told ← newTVarIO False
+      first ← registerClient svc >>= either (\refused → expectationFailure (show refused) >> fail "no client") pure
+      second ← registerClient svc >>= either (\refused → expectationFailure (show refused) >> fail "no client") pure
+      -- the first open is never eligible to commit in the example (the service holds it, and its name, while it is parked): what frees the name
+      -- is the service's being told
+      (secondEndpoint, secondBox) ← arrivalEndpoint
+      let firstEndpoint = Endpoint (pure ()) (pure False) (\_ → pure ())
+          -- the admission, held between the service's and the registration of the open's claim (the window), then its claim: found stale once
+          -- the host has settled the open as cancelled, and the service is told by whoever finds it so
+          admitFirst = do
+            admitted ← openArenaWith svc firstEndpoint first "held" soilOverStoneSpec
+            holdAt gate
+            forM_ (either (const Nothing) Just admitted) $ \request →
+              atomically (registerClaim facade "held" (Claim (readTVar cancelled) (readTVar told) (void (cancel svc request) >> atomically (writeTVar told True))))
+            pure admitted
+      firstDone ← newEmptyMVar
+      secondDone ← newEmptyMVar
+      _ ← forkIO (arbitrateOpen facade "held" admitFirst >>= putMVar firstDone)
+      awaitReached gate
+      -- the host cancels the first open (before the service is told anything, and before its claim is registered), and another open of the name
+      -- arrives: it waits for the section, and must not take the cancelled open's name for a duplicate
+      atomically (writeTVar cancelled True)
+      _ ← forkIO (arbitrateOpen facade "held" (openArenaWith svc secondEndpoint second "held" soilOverStoneSpec) >>= putMVar secondDone)
+      bounded (untilM ((>= 2) . length . filter (== "arriving") <$> readIORef events))
+      openGate gate
+      _ ← bounded (takeMVar firstDone)
+      secondResult ← bounded (takeMVar secondDone)
+      isJust secondResult `shouldBe` True
+      -- the first open's claim was found stale in the section and the service told: the second open is the one that succeeds
+      settled ← bounded (atomically (readTMVar secondBox))
+      case settled of
+        Succeeded _ → pure ()
+        other → expectationFailure ("expected the second open to succeed, found " <> take 100 (show other))
 
   it "keeps the failed opens' names only while the host has not settled them, whatever names they used, and none once their instance is forgotten" $
     withRig $ \rig →
