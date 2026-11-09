@@ -280,3 +280,24 @@ recorded: the three waiting-job examples), NC65 (the borrow's regions never reco
 coverage checks).
 
 The suite is 251 examples, run 40 times at `+RTS -N4` on the final code.
+
+## Round 16 (round 15 requested changes: the retained-snapshot bank)
+
+Round 15's one finding: the retained-snapshot bank was checked against the same `stateSnapshots` that admission
+uses, so zeroing a snapshot's 82 bytes of backing passed. The service now records, when it hands a snapshot out,
+the accounted bytes that snapshot backs, read from the snapshot value (its payload, segment metadata and column
+index entries) and not from the ledger. The oracle compares the retained bank's charge, per snapshot and in total
+(plus one 160-byte record for each request the service holds except a settled read the model charges), after every
+step of the property and inside borrows, live and retiring incarnations alike. Controls: the snapshot's charge zeroed
+and reduced from 82 to 81 while the borrow is held must fail (they do), also after the arena is closed and retiring.
+Negative controls against production code: NC67 (the snapshot's retained charge zero: 57 failures) and NC68 (one
+byte short: 55).
+
+The final audit (every bank, slot and limit, with its expected-side source and where it is captured) is in the pull
+request body. Changes it forced: the service-wide limit rows (arenas, command slots, retained bank) no longer read
+the accounting model or `stateSnapshots` on their enumeration side; the job expectations come only from the work the
+owner runs (a waiting job holds only a promise: its reservation is checked against its own grant, a stability check
+of the model against itself, labelled as such); and the view pin slots are compared with zero, since the service
+never pins a view's revision.
+
+The suite is 254 examples.
