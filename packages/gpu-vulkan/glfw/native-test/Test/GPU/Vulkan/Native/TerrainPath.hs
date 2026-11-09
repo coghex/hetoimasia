@@ -400,8 +400,8 @@ specs profile = case profile of
       <> [staleBiasFixture sc | sc ← staleBiasScenes]
       -- Last: these release the atlases' ownership (marked while their frames are pending), so nothing may
       -- draw from the atlases after them.
-      <> [ spec defaultLight [Foreground, Varies] ReleasedWhilePending (mixedScene FaceSouth)
-         , spec defaultLight [Foreground, Overlap] RetainedReleasedWhilePending (atZoom 0.125 (roofOverCavity 1 FaceWest))
+      <> [ spec defaultLight [Foreground, Overlap] RetainedReleasedWhilePending (atZoom 0.125 (roofOverCavity 1 FaceWest))
+         , spec defaultLight [Foreground, Varies] ReleasedWhilePending (mixedScene FaceSouth)
          ]
 
 -- | The ramps and corners with pixel snapping on at zoom 1, the camera a fraction of a pixel off
@@ -454,8 +454,8 @@ staleBiasFixture sc =
 -- sequences that end where they began must draw that state again pixel for pixel.
 matrixExtensions ∷ [Spec]
 matrixExtensions =
-  [spec defaultLight [Foreground, Varies] Dynamic (seamScene facing) | facing ← allViewFacings]
-    <> [spec defaultLight [Foreground, Varies] Dynamic (seamScenesNegative facing) | facing ← [FaceSouth, FaceNorth]]
+  [spec defaultLight [Foreground] Dynamic (seamScene facing) | facing ← allViewFacings]
+    <> [spec defaultLight [Foreground] Dynamic (seamScenesNegative facing) | facing ← [FaceSouth, FaceNorth]]
     <> [spec defaultLight [Foreground, Varies] Dynamic (extremeScene high facing) | high ← [True, False], facing ← [FaceSouth, FaceEast]]
     <> [spec defaultLight [Foreground, Varies] Dynamic (pendingScene facing) | facing ← allViewFacings]
     <> sequences
@@ -703,6 +703,8 @@ data Extra = Extra
   , extraRuns ∷ ![(String, Int, String)]
   , extraMarks ∷ ![(String, Maybe Bool)]
   , extraIndependent ∷ !(Maybe Independent)
+  , extraPassMismatches ∷ ![(Int, [String])]
+  -- ^ For each pass, its independent mismatch count and its first mismatches.
   , extraPickCompared ∷ !Int
   , extraPickUndecided ∷ !Int
   -- ^ Sampled pixels the picking contract leaves undecided: the one-device-pixel conservative ring
@@ -717,7 +719,7 @@ data Extra = Extra
   }
 
 emptyExtra ∷ Spec → Extra
-emptyExtra s = Extra s [] [] [] [] [] Nothing 0 0 0 [] Nothing Nothing [] Nothing []
+emptyExtra s = Extra s [] [] [] [] [] Nothing [] 0 0 0 [] Nothing Nothing [] Nothing []
 
 failed ∷ String → String → FixtureResult
 failed name why = FixtureResult (Text.pack name) [] [] [] (Just (Text.pack why))
@@ -1001,10 +1003,15 @@ renderSnapshot ctx s parts = do
       let releasing = specVariant s `elem` [ReleasedWhilePending, RetainedReleasedWhilePending]
           between
             | releasing = do
+                -- A handle's release is marked once: an earlier retention fixture of the run already did, and
+                -- the handle then stands released already (it is still registered, and its table release is
+                -- teardown's, after every frame), which this one accepts and a stale or unregistered handle
+                -- never satisfies.
+                before ← atomically (traverse (isReleased (ctxTextures ctx)) [ctxColourH ctx, ctxNormalH ctx])
                 marked ← traverse (markReleased (ctxTextures ctx)) [ctxColourH ctx, ctxNormalH ctx]
                 standing ← atomically (traverse (isReleased (ctxTextures ctx)) [ctxColourH ctx, ctxNormalH ctx])
                 pure $
-                  if and marked && and standing
+                  if and standing && and (zipWith (||) marked before)
                     then Right ()
                     else Left "the atlases' original ownership was not released while the frame was pending"
             | otherwise = pure (Right ())
@@ -1125,6 +1132,7 @@ renderSnapshot ctx s parts = do
               , extraRuns = runFacts
               , extraMarks = markFacts
               , extraIndependent = Just independent
+              , extraPassMismatches = [(indMismatchCount i, take 4 (indMismatches i)) | i ← independents]
               , extraPickCompared = pickCompared
               , extraPickUndecided = pickUndecided
               , extraPickMismatches = length pickProblems
@@ -1341,6 +1349,9 @@ writeRecord ctx format seconds results = do
                       , ("mismatches", JNumber (show (indMismatchCount i)))
                       , ("first_mismatches", JArray (map JString (indMismatches i)))
                       ]
+              )
+            , ( "mismatches_by_pass"
+              , JArray [JObject [("pass", JNumber (show pass)), ("mismatches", JNumber (show n)), ("first", JArray (map JString firsts))] | (pass, (n, firsts)) ← zip [0 ∷ Int ..] (extraPassMismatches extra)]
               )
             , ( "pick_against_expectation"
               , JObject
