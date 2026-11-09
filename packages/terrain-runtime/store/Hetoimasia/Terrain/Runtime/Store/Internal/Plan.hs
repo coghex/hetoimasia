@@ -620,6 +620,7 @@ planDeltaPinned ∷ Bounds → StoreConfig → StoreIdentity → Roots → [Pins
 planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
   let win = windowBelow (rHw roots) win0
   checkWindow bounds ident roots win
+  checkCounters roots
   let base = dlBase cand
       hdr = rHeader roots
       next = dlNext cand
@@ -797,6 +798,20 @@ encodeOut ident page = case encodePage ident page of
   Left err → refuse (Integrity (BadPage err (pgNo page)))
   Right bs → let PageNo no = pgNo page in no `seq` BS.length bs `seq` Right (PageNo no, bs)
 
+-- | The counters of a root set agree with each other and with what they count, exactly:
+-- @hw = live + retired + free + loose@, a tree that has no root holds no page of its kind, and
+-- a tree that has one holds at least one. A counter re-sealed to a figure the other three
+-- and the loose list contradict is corruption at the next plan, whatever its sign; a
+-- consistent forgery across two of them (a transfer between classes) keeps the identity and
+-- can only change capacity decisions, never which page is overwritten, which the ownership
+-- proof decides from the trees.
+checkCounters ∷ Roots → P ()
+checkCounters roots = do
+  let total = toInteger (rLivePages roots) + toInteger (rRetiredPages roots) + toInteger (rFreePages roots) + toInteger (length (rLoose roots))
+  if total /= toInteger (rHw roots) then refuse (Integrity CorruptCounters) else pure ()
+  if (rFree roots == Nothing) /= (rFreePages roots == 0) then refuse (Integrity CorruptCounters) else pure ()
+  if (rRetire roots == Nothing) /= (rRetiredPages roots == 0) then refuse (Integrity CorruptCounters) else pure ()
+
 checkWindow ∷ Bounds → StoreIdentity → Roots → Window → P ()
 checkWindow bounds ident roots win = do
   if windowIdentity win /= ident then refuse (Stale ForeignWindow) else pure ()
@@ -893,6 +908,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
     reclaimM ∷ P Planned
     reclaimM = do
       checkWindow bounds ident roots win
+      checkCounters roots
       version' ← maybe (refuse (Invalid VersionArithmetic)) pure (bumpWord (rVersion roots))
       let retireRoot = fmap Disk (rRetire roots)
       (firstEntry, e0) ← phase (newEdit overlayBudgetBookkeeping win) (ceilKey TreeRetire False retireRoot BS.empty)

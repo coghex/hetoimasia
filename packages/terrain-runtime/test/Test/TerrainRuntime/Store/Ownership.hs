@@ -56,8 +56,12 @@ churn (h, ref, g) n = do
 -- | A store with retired pages, free extents and loose pages: history, a full
 -- reclamation, then a few more commits.
 fixture ∷ IO (H, Map.Map RecordKey Record, Rng)
-fixture = do
-  let st0 = (newH smallSpec ident0, Map.empty, mkRng 15)
+fixture = fixtureWith smallSpec
+
+-- | The same over a given specification.
+fixtureWith ∷ StoreSpec → IO (H, Map.Map RecordKey Record, Rng)
+fixtureWith storeSpec = do
+  let st0 = (newH storeSpec ident0, Map.empty, mkRng 15)
   (h1, ref1, g1) ← must (foldM (\s _ → churn s 30) st0 [1 .. 30 ∷ Int])
   (h2, _) ← must (reclaimAll h1)
   must (foldM (\s _ → churn s 30) (h2, ref1, g1) [1 .. 3 ∷ Int])
@@ -96,9 +100,17 @@ forge h p pg = do
   bs ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h) pg)
   pure h {hDisk = diskWrite p bs (hDisk h)}
 
--- | The same store over other root fields.
+-- | The same store over other root fields, the live-page counter recomputed so that the
+-- counters still agree with each other: a test that forges a page-ownership record is not a
+-- test of the counters.
 withRoots ∷ H → (Roots → Roots) → H
-withRoots h f = h {hStore = modifyRoots f (hStore h)}
+withRoots h f = withRootsRaw h (agree . f)
+  where
+    agree r = r {rLivePages = fromInteger (max 0 (toInteger (rHw r) - toInteger (rRetiredPages r) - toInteger (rFreePages r) - toInteger (length (rLoose r))))}
+
+-- | The same store over other root fields, exactly as given.
+withRootsRaw ∷ H → (Roots → Roots) → H
+withRootsRaw h f = h {hStore = modifyRoots f (hStore h)}
 
 refusedLive ∷ String → Word64 → Planned → Expectation
 refusedLive what v out = case out of
@@ -167,7 +179,7 @@ offerOnly h v = do
     RefLeaf _ → pure ()
     other → expectationFailure ("a free leaf expected: " <> take 100 (show other)) >> fail "free"
   h' ← forge h freeRoot (Page TreeFree 0 freeRoot (Leaf [(be64 v, be64 1)]))
-  pure (withRoots h' (\r → r {rLoose = []}))
+  pure (withRoots h' (\r → r {rLoose = [], rFreePages = 1}))
 
 -- | The retirement tree's leaf holding a key, found by descending from the root by the
 -- independent reference parser.
@@ -409,8 +421,10 @@ spec = describe "page ownership against forged records with valid checksums" $ d
         Refused (Integrity (DoubleFree (PageNo q))) → q `shouldBe` rr
         other → expectationFailure ("a page retired twice was not refused: " <> take 200 (show other))
     it "refuses an ordinary plan that would take the retired backlog past its bound, and never maintenance" $ do
-      (h, _, _) ← fixture
-      let full = withRoots h (\r → r {rRetiredPages = fromIntegral maxRetiredPages})
+      -- a store large enough that the grown used space still leaves the free pool the plan needs
+      (h, _, _) ← fixtureWith (specOf (512 * 1024 * 1024) Nothing)
+      -- the backlog full, the used space grown by what the extra retired pages count, so the counters still agree
+      let full = withRoots h (\r → r {rHw = rHw r + fromIntegral maxRetiredPages - rRetiredPages r, rRetiredPages = fromIntegral maxRetiredPages})
       out ← planOn full
       case out of
         Refused (Capacity (RetirementBacklog _ _)) → pure ()
@@ -476,15 +490,33 @@ spec = describe "page ownership against forged records with valid checksums" $ d
             Refused (Integrity MalformedRetirement) → pure ()
             bad → expectationFailure ("a retirement entry with " <> what <> " was not refused as malformed: " <> take 200 (show bad))
   describe "child references and the used page space (the trees)" $ do
-    it "refuses a counter that disagrees with the pages it counts where the disagreement would go negative, and never uses one to find a page" $ do
+    it "refuses a re-sealed counter that disagrees with the pages, whatever its sign; a transfer between counters cannot change which page is overwritten" $ do
       (h, _, _) ← fixture
-      -- retired pages below what an entry lists: reclamation would count below zero
-      (m, _, _) ← must (fillWith (withRoots h (\r → r {rRetiredPages = 0})) (planMaintenance (hStore (withRoots h (\r → r {rRetiredPages = 0})))))
-      m `shouldBe` Refused (Integrity CorruptCounters)
-      -- free pages below what an extent holds: taking the extent would count below zero
-      noFree ← pure (withRoots h (\r → r {rFreePages = 0, rLoose = []}))
-      out ← planOn noFree
-      out `shouldBe` Refused (Integrity CorruptCounters)
+      let roots = storeRoots (hStore h)
+          counters ∷ [(String, Integer → Roots → Roots)]
+          counters = [("live", \d r → r {rLivePages = fromInteger (toInteger (rLivePages r) + d)}), ("retired", \d r → r {rRetiredPages = fromInteger (toInteger (rRetiredPages r) + d)}), ("free", \d r → r {rFreePages = fromInteger (toInteger (rFreePages r) + d)})]
+      -- each counter moved by a little and by a lot, up and down: the partition identity breaks, so the next plan
+      -- and the next maintenance transaction are refused as corrupt, never planned on a wrong capacity
+      forM_ counters $ \(what, f) →
+        forM_ [1, 100, -1] $ \d → do
+          let forged = withRootsRaw h (f d)
+          out ← planOn forged
+          (what, d, out) `shouldBe` (what, d, Refused (Integrity CorruptCounters))
+          (m, _, _) ← must (fillWith forged (planMaintenance (hStore forged)))
+          (what, d, m) `shouldBe` (what, d, Refused (Integrity CorruptCounters))
+      -- a tree with no root and a counter that says it holds pages, and the converse
+      refusedCorrupt "a free counter with no free tree" =<< planOn (withRootsRaw h (\r → r {rFree = Nothing}))
+      refusedCorrupt "a retired counter with no retirement tree" =<< planOn (withRootsRaw h (\r → r {rRetire = Nothing}))
+      -- a consistent transfer (three pages from live to free): the identity holds, the counters are wrong about which
+      -- class counts the pages, and the plan can only differ in capacity: every page it writes is dead
+      let moved = withRootsRaw h (\r → r {rLivePages = rLivePages r - 3, rFreePages = rFreePages r + 3})
+      out ← planOn moved
+      retired ← retiredPagesOf moved
+      let dead pg = not (Set.member pg (livePages moved)) && pg `notElem` concatMap snd retired
+      case out of
+        Planned plan → [n | (PageNo n, _) ← plPages plan, n < rHw roots, not (dead n)] `shouldBe` []
+        Refused _ → pure ()
+        other → expectationFailure ("unexpected outcome: " <> take 200 (show other))
     it "refuses a re-sealed internal page whose separator is no key of its tree, instead of answering that a record that exists is absent" $ do
       (h, _, _) ← fixture
       runsRoot ← maybe (expectationFailure "runs root" >> fail "runs") pure (rRuns (storeRoots (hStore h)))
