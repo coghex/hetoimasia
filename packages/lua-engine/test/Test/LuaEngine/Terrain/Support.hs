@@ -80,6 +80,8 @@ data Rig = Rig
   , rgFacade ∷ !TerrainFacade
   , rgSession ∷ !Unique
   , rgPicks ∷ !TerrainPicks
+  , rgTrace ∷ !(TVar [Text])
+  -- ^ What the fixtures saw, newest first: a script reaching @TEST_WAIT@ and leaving it, for an example that says where a VM stopped.
   , rgSignals ∷ !(TVar (Set.Set Text))
   -- ^ The names an example has signalled: @TEST_WAIT(name)@ returns once its name is among them.
   }
@@ -105,13 +107,15 @@ withRigHooks config probe terrainHooks body =
       facade ← newTerrainFacade fixedM1Profile service config
       session ← newUnique
       signals ← newTVarIO Set.empty
+      trace ← newTVarIO []
       body
         Rig
           { rgService = service
-          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture facade, waitFixture signals]}
+          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture facade, waitFixture signals trace]}
           , rgSession = session
           , rgPicks = tfPicks facade
           , rgSignals = signals
+          , rgTrace = trace
           }
 
 presentationOver, gameplayOver ∷ Rig → VmShape
@@ -135,10 +139,14 @@ pickFixture =
 
 -- | How a fixture holds a script until the example says so: @TEST_WAIT(name)@ returns once the example has signalled that name
 -- ('signalRig'). It runs on the script's own thread and waits on the rig's own state and nothing else; a real script has no such function.
-waitFixture ∷ TVar (Set.Set Text) → Binding
-waitFixture signals =
+waitFixture ∷ TVar (Set.Set Text) → TVar [Text] → Binding
+waitFixture signals trace =
   asynchronousNativeRequestIn "terrain_test_wait" [SText] [] $ \_ values → case values of
-    [VText name] → [] <$ bounded (atomically (readTVar signals >>= \seen → if Set.member name seen then pure () else retry))
+    [VText name] → do
+      atomically (modifyTVar' trace ("entered " <> name :))
+      bounded (atomically (readTVar signals >>= \seen → if Set.member name seen then pure () else retry))
+      atomically (modifyTVar' trace ("released " <> name :))
+      pure []
     _ → pure []
 
 -- | Say that this name's moment has come: the scripts waiting on it go on.

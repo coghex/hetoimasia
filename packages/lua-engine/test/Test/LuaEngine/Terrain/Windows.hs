@@ -106,12 +106,13 @@ opensAtFirstTick =
 
 -- | Run a step of an example, and when it fails say which it was, the events the adapter's hooks saw and what the scripts printed: a bounded
 -- wait that never returns names nothing else.
-named ∷ World → IORef [String] → String → IO a → IO a
-named world events label act =
+named ∷ World → Rig → IORef [String] → String → IO a → IO a
+named world rig events label act =
   act `onException` do
     seen ← readIORef events
     printed ← outLines world
-    putStrLn ("STEP FAILED: " <> label <> "; events " <> show (reverse seen) <> "; printed " <> show printed)
+    waits ← readTVarIO (rgTrace rig)
+    putStrLn ("STEP FAILED: " <> label <> "; events " <> show (reverse seen) <> "; waits " <> show (reverse waits) <> "; printed " <> show printed)
 
 -- | An example's exit, whatever happened in it: the gates open, every wait the scripts have is released and every instance it started is
 -- asked to stop, so a failure in the body is reported as itself and does not become a teardown that never returns.
@@ -1147,7 +1148,7 @@ spec = describe "Terrain windows and banks" $ do
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsAtFirstTick), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
         withFvm world runtime (gameplayOver rig) $ \gameplayVm →
           withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig [gate] spawns $ do
-            let step = named world events
+            let step = named world rig events
             invalid ← spawn world gameplayVm "modules-test" mainPath
             modifyIORef' spawns (invalid :)
             other ← admitOnly world shown "modules-test" "lua/other.lua"
@@ -1190,7 +1191,7 @@ spec = describe "Terrain windows and banks" $ do
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensAtFirstTick), ("lua/other.lua", scriptSource (reopensOnSignal "held"))]) $ \world _ runtime →
         withFvm world runtime (gameplayOver rig) $ \gameplayVm →
           withFvm world runtime (presentationOver rig) $ \shown → leavingAlways rig [gate, cancelGate] spawns $ do
-            let step = named world events
+            let step = named world rig events
             logical ← spawn world gameplayVm "modules-test" mainPath
             modifyIORef' spawns (logical :)
             other ← admitOnly world shown "modules-test" "lua/other.lua"
