@@ -240,6 +240,11 @@ spec = describe "page ownership against forged records with valid checksums" $ d
         case unpinned of
           Planned plan → map fst (plPages plan) `shouldSatisfy` (PageNo v `elem`)
           other → expectationFailure ("the unpinned plan should accept the forged extent: " <> take 200 (show other))
+    it "refuses a free extent that lies wholly past the used space, where no tail page and no probe would meet it" $ do
+      (h, _, _) ← fixture
+      let hw = rHw (storeRoots (hStore h))
+      forged ← offerOnly h (hw + 100)
+      refusedCorrupt "a free extent past the used space" =<< planOn forged
     it "overwrites a free page that holds garbage or nothing a store could read, instead of refusing it" $ do
       (h, _, _) ← fixture
       freeRoot ← maybe (expectationFailure "free root" >> fail "free") pure (rFree (storeRoots (hStore h)))
