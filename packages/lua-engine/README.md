@@ -1395,8 +1395,10 @@ supported extreme (the last supported cell is covered by an omitted upper end). 
 Terrain requests are `OptionalRequest`s: these settle as structured results and do not fail the instance, read or unread. A lease
 whose arena was closed by someone else (the creator released its owner lease or ended) is not a retired handle: its new requests are
 admitted and its in-flight ones settle `arena_closed`; releasing it stays safe. Only the caller's own released lease, and a foreign,
-wrong-kind or forged handle, is an ordinary error. Any other outcome of the service (an unknown code, a revision that is not a Lua
-integer, an answer over the declared ceilings) is a provider defect and fails the owner; it is never given a code, never busy and
+wrong-kind or forged handle, is an ordinary error; ownership is positive and per instance (an instance may use or release only the
+handles it was issued, and another instance's handle is refused however many have been issued since and whether or not its issuer
+still lives). Any other outcome of the service (an unknown code, a revision that is not a Lua
+integer (above the VM's validated profile ceiling, not only Int64's), an answer over the declared ceilings) is a provider defect and fails the owner; it is never given a code, never busy and
 never air.
 
 **Who may call, and when.** An instance of the facade, in `init` and in an update, while the session's admission is open; refused (an
@@ -1405,7 +1407,7 @@ ordinary error, never busy) at a module's top level (through a captured facade o
 `request.wait` is update-only and cooperative.
 
 **Time.** A presentation instance's requests settle on arrival. A gameplay instance's request is due at the next logical tick
-(`init` originates at tick 0), ordered by assigned sequence, with no `tick_offset`. A logical request is **eligible** only when its
+(`init` originates at tick 0), ordered by assigned sequence, with no `tick_offset`: a request whose tick is granted commits only when every earlier place of that tick that is still waiting for its answer has been answered, whichever provider path or arena answered first. A logical request is **eligible** only when its
 due tick has been granted and waits, unbegun, at the boundary for this request: the terrain owner then commits the edit and settles
 the request in one transaction (below), and the tick begins. Until then nothing is committed, so an early prepared removal changes
 neither terrain nor `ready` or `take`, and a cancel before the position leaves terrain unchanged. A request that is late holds the
@@ -1433,10 +1435,19 @@ collection, a finalizer, `shutdown` or a successful `take`. The creator's owner 
 attach by the creator's own client as an owner lease, so the adapter makes each instance's attachments through a second client of its
 own (registered on first use), and releasing the open's lease, or the creator's end, closes the arena whatever the creator attached
 to. Releasing an attachment ends only that client's interest. A name is claimed in the admission of its open, blocks duplicates
-(`name_in_use`) while the open is pending (a gameplay open held for its position included) and is invisible to attach until the open
-succeeds; a failed or cancelled open frees it at its terminal settlement, even while the result is untaken; a successful open holds it
-until the arena closes. The service keeps one name table: the adapter prefixes the session and the instance's content root, so a name
+(`name_in_use`) while the open is pending (a gameplay open held for its position included) and is invisible to attach until the host has
+built the lease: an attach decided against an open the service committed but the host has not adopted answers `not_found` at once, in
+every VM, and never waits for it. The provider takes a last look in the very transaction that settles the open or the attach once the
+host has built the resource: the arena is still live (otherwise the request settles `arena_closed` and the lease built is released) and
+the name stops being held back in that same transaction. A failed or cancelled open frees its name from the host's terminal settlement
+(not from the later telling of the service), even while the result is untaken and also when the service had already offered its
+lease: an open that finds the name still claimed by a request the host settled without the service's telling tells the service first.
+The lease is then `Revoking` until the service's release has completed (the arena is still the open's: attach finds `not_found`, the
+claim stands, and another opener finishes the revocation itself), then `Disposed`. The claims are kept only for opens in flight and are
+pruned as they end, so the registry is empty once every instance is forgotten. A successful open holds the name until the arena closes. The service keeps one name table: the adapter prefixes the session and the instance's content root, so a name
 that exists only under another root or session is `not_found` and says nothing of it.
+
+**The revision ceiling.** A revision reaches a script only if the VM's profile holds it. A read is refused as a host defect, with nothing committed, when the arena's revision is above the ceiling; a removal when the arena's revision stands at it, because whether a removal changes anything is known to the service only at its commit and a settlement the host rejects there fails the service as a whole while the host's request is never told. The cost is one false defect, a removal of air exactly at the ceiling; below it every removal passes.
 
 **Pick.** The optional third argument of `remove` is an opaque `terrain_pick` capability. The facade checks the type; the adapter
 checks that it is a live authority of the calling instance and forwards its incarnation and revision to the service as the
@@ -1451,7 +1462,7 @@ and no view, camera or picking: TRA-10 issues the real token. The adapter's `iss
 | the VM's lending and lease scope | the session, one per VM, shared with graphics | the owner's |
 | an instance's terrain clients (owner, attach) | the adapter; written when the facade declares and forgets the instance | the instance's |
 | the typed ask of a request in flight | the adapter, by ticket | from the binding's start to the hand-off |
-| an offered lease | the adapter until adopted or released | one transition out of offered |
+| an offered lease | the adapter until adopted or released | `Offered`, then `Adopted`, or `Revoking` and `Disposed` |
 | the service's untaken result of a request | the service | until the host's record is taken or discarded and its work is over (`tsDrain` returns it) |
 
 The lease capacity one instance needs in the shared scope is `configMaxLeases + RequestsPerInstance + 1` (`terrainLeaseCapacity`):
@@ -1462,7 +1473,7 @@ graphics injected the scope is graphics' own with its capacity grown by that; wi
 over the real terrain service, with the service owner's probe holding the commit where an example needs a race decided: the whole
 surface in both roles, every copy and decode rejection and each validator rejection, two instances sharing and losing an arena, names
 and claims, cancel against commit, a late removal holding its tick, the 1,024-run boundary and a full request bank, and the
-composition of the shared scope. The settlement seam and the declining hand-off are `lua-runtime-tests`'
+composition of the shared scope, windows between a commit and its settlement (the closure after the host built the lease, an offered lease cancelled and its name reopened while the service's release is held, a failed adoption, a failed init or shutdown), each service bank seen through Lua, the revision ceiling, the 8,192-run definition boundary, and copy isolation. The settlement seam and the declining hand-off are `lua-runtime-tests`'
 `Test.LuaRuntime.Admission.Seam`.
 
 ### Content roots
