@@ -1,21 +1,20 @@
 cabal-version: 3.16
 name: hetoimasia-terrain-render-2d
 version: 0.1.0.0
-synopsis: Pure isometric cutaway planning and picking for Hetoimasia terrain
+synopsis: Pure isometric cutaway planning, material and picking for Hetoimasia terrain
 description:
-    The pure planning half of the terrain arena's 2D view (TRA-7): the exact,
-    rebased isometric projection of the shared terrain solids through four
-    quarter-turn facings, the follow and manual cutaway camera as pure state and
-    commands, the bounded visible faces and the facts that decide their
-    exposure, missing-data demand, deterministic back-to-front ordering
-    candidates inside the 2D renderer's 24-bit depth keys, and CPU picking
-    against the exact plan it was given. It depends on the pure terrain,
-    math, render-2d and render-api packages only: no GPU, window, Lua, runtime
-    terrain service or game package. Beside that per-face baseline, TRA-16 adds
-    the whole-cell quad planner (supplied discovery knowledge and coverage
-    assets, exact integer draw keys, bounded progressive demand) and the
-    coverage-based visual picker. Every value is immutable and every function
-    pure; the package owns no state, thread or resource.
+    The pure half of the terrain arena's 2D view: the exact, rebased isometric
+    projection of the shared terrain solids through four quarter-turn facings,
+    the follow and manual cutaway camera as pure state and commands, the
+    whole-cell quad planner (supplied discovery knowledge and atlas-region
+    coverage assets, exact integer draw keys, bounded progressive demand), the
+    coverage-based visual picker, the deterministic offline terrain atlases and
+    their checked region manifest, the presentation settings and the material
+    that lights and depth-shades the quads, and the generator that bakes the
+    cutout and normal-map catalog. It depends on the pure terrain, math,
+    asset-image, render-2d and render-api packages only: no GPU, window, Lua,
+    runtime terrain service or game package. Every value is immutable and every
+    function pure; the package owns no state, thread or resource.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -142,11 +141,12 @@ executable terrain-mapgen
         base >=4.22 && <4.23,
         hetoimasia-terrain-render-2d:terrain-mapgen-core ==0.1.0.0
 
--- The terrain material's pure half (TRA-8): the art sheet and style a caller
--- supplies, the record a face carries, the adaptation of a plan's faces into
--- render-2d instances and the model of the material's fragment function. It has
--- no Vulkan, window, Lua or game dependency, so the CPU suite, the Vulkan
--- package's declaration and the device evidence share it.
+-- The terrain material's pure half (TRA-17): the presentation settings and the
+-- push block they pack to, the two-handle record a whole-cell quad carries, the
+-- adaptation of a cell plan into render-2d instances and the model of the
+-- material's fragment function. It has no Vulkan, window, Lua or game
+-- dependency, so the CPU suite, the Vulkan package's declaration and the device
+-- evidence share it.
 library terrain-material
     import: language
     visibility: public
@@ -167,10 +167,11 @@ library terrain-material
         hetoimasia-terrain-render-2d ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0
 
--- Scenes and independent expectations (TRA-8): what the CPU suite and the
--- native evidence scenario both build their fixtures from, through the public
--- terrain and planner interfaces, so neither imports the other's spec. A test
--- support component; no engine library depends on it.
+-- Scenes, the committed atlases' loader and the independent expectation
+-- (TRA-17): what the CPU suite and the native evidence scenario both build their
+-- fixtures from, through the public terrain and planner interfaces, so neither
+-- imports the other's spec. A test support component; no engine library depends
+-- on it.
 library terrain-fixtures
     import: language
     visibility: public

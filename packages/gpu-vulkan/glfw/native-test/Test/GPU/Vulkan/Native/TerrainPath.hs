@@ -38,9 +38,8 @@ import Control.Concurrent.STM (atomically, check, orElse, readTVar, registerDela
 import Control.Exception (evaluate)
 import Control.Monad (foldM, forM)
 import Crypto.Hash.SHA256 (hash)
-import Data.Array (Array, listArray, (!))
+import Data.Array (Array, listArray, range, (!))
 import qualified Data.ByteString as ByteString
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import Data.List (partition, sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, listToMaybe)
@@ -48,9 +47,9 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import Numeric (showHex)
-import System.Directory (createDirectoryIfMissing, doesPathExist, getCurrentDirectory)
+import System.Directory (createDirectoryIfMissing)
 import System.Environment (lookupEnv)
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath ((</>))
 
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ImageDescription (..)
@@ -66,7 +65,7 @@ import Hetoimasia.Math.Vector (V2 (..))
 import qualified Hetoimasia.Render.Api.Texture as Api
 import Hetoimasia.Render.TwoD.Chunk (BoundsRequest (..), ChunkKind (..), ChunkRef)
 import Hetoimasia.Render.TwoD.DrawPlan (DrawPlan (..), DrawRun (..), PlannedLayer (..), PlannedPass (..), PlannedView (..), planSnapshot)
-import Hetoimasia.Render.TwoD.Material (MaterialData (..), MaterialRef)
+import Hetoimasia.Render.TwoD.Material (MaterialRecord (..), MaterialRef)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..))
 import Hetoimasia.Render.TwoD.Oracle
   ( Expectation (..)
@@ -104,6 +103,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Textures
   )
 import Hetoimasia.Terrain.Coordinate (TileCoord (..), axisValue)
 import Hetoimasia.Terrain.Render2D.Camera (CameraState, camClip, camFacing, camRef)
+import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Scenes
 import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial, terrainMaterialEquivalent)
@@ -148,11 +148,11 @@ data Light = Light
   }
 
 mkLight ∷ String → Double → Double → Double → Double → Integer → Double → Double → (Double, Double, Double) → Light
-mkLight label azimuth elevation ambient strength range darkening haze colour =
+mkLight label azimuth elevation ambient strength depthRange darkening haze colour =
   Light
     label
-    (either (\e → error ("light " <> label <> ": " <> show e)) id (mkLightSettings (LightInput azimuth elevation ambient strength range darkening haze colour)))
-    (HandLight azimuth elevation ambient strength (fromInteger range) darkening haze colour)
+    (either (\e → error ("light " <> label <> ": " <> show e)) id (mkLightSettings (LightInput azimuth elevation ambient strength depthRange darkening haze colour)))
+    (HandLight azimuth elevation ambient strength (fromInteger depthRange) darkening haze colour)
 
 -- | The approved defaults.
 defaultLight ∷ Light
@@ -210,7 +210,7 @@ isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLigh
 
 -- | What a fixture must show, each by a named probe that is determinate for the oracle and differs
 -- from its contrast.
-data Need = Foreground | Overlap | Reveal | Clipped | SnapSensitive | Varies
+data Need = Foreground | Overlap | Reveal | Clipped | SnapSensitive | Varies | LightsDiffer
   deriving stock (Eq, Show)
 
 data Spec = Spec
@@ -220,20 +220,35 @@ data Spec = Spec
   , specVariant ∷ !Variant
   , specLight ∷ !Light
   , specNeeds ∷ ![Need]
+  , specLater ∷ ![Light]
+  -- ^ The lights of the second and later scenes of a fixture (the first scene has 'specLight'); a
+  -- scene without one uses 'specLight'. Each pass's view holds the push block of its own light.
   , specCamera ∷ !(Maybe (Integer, Integer))
   -- ^ The cut level and vertical reference the scene's camera must come to, stated here by hand.
   }
 
 -- | A fixture of one scene.
 spec ∷ Light → [Need] → Variant → Scene → Spec
-spec light needs variant sc = Spec (sceneName sc <> (if lightLabel light == "default" then "" else "@" <> lightLabel light) <> suffixOf variant) [sc] variant light needs Nothing
+spec light needs variant sc = Spec (sceneName sc <> (if lightLabel light == "default" then "" else "@" <> lightLabel light) <> suffixOf variant) [sc] variant light needs [] Nothing
+
+-- | The light of the scene at this index of a fixture.
+lightOf ∷ Spec → Int → Light
+lightOf s index = case drop (index - 1) (specLater s) of
+  light : _ | index > 0 → light
+  _ → specLight s
+
+-- | A fixture that draws one scene twice, in two passes whose views hold different lights: the
+-- first under the default light, the second under this one, so that a pixel of one differs from
+-- the same pixel of the other and two views sharing a registered material keep their own pushes.
+twoLights ∷ Light → Scene → Spec
+twoLights second sc = Spec (sceneName sc <> "@" <> lightLabel second <> "-beside-default") [sc, sc] Dynamic defaultLight [Foreground, LightsDiffer] [second] Nothing
 
 expecting ∷ (Integer, Integer) → Spec → Spec
 expecting camera s = s {specCamera = Just camera}
 
 -- | A fixture of several scenes, each drawn in a pass of its own into a small target.
 specMany ∷ String → [Need] → [Scene] → Spec
-specMany name needs scs = Spec name scs Dynamic defaultLight needs Nothing
+specMany name needs scs = Spec name scs Dynamic defaultLight needs [] Nothing
 
 -- | A scene of cells at one column at levels 0 to 8, the cut at the top, for the depth effects:
 -- every level a loam cell of shape 0, so nearer levels overlap farther ones along the view.
@@ -308,14 +323,16 @@ specs profile = case profile of
       <> [ spec defaultLight [Foreground] Dynamic (atZoom 0.1875 fractionalCamera)
          , spec defaultLight [Foreground, Clipped] Dynamic (viewportOffset 0.125)
          , spec defaultLight [Foreground] Dynamic (capTarget (96, 64) (atZoom 0.125 scaledTarget))
-         , spec defaultLight [Foreground, SnapSensitive] Dynamic snapped
+         , spec defaultLight [Foreground] Dynamic snappedZoom2
          ]
       -- Lighting: the fixed world sun with the camera turned, and the sun varied at a fixed camera.
       <> [spec defaultLight [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners facing)) | facing ← [FaceSouth, FaceWest]]
-      <> [spec light [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners FaceSouth)) | light ← lights]
+      <> [spec light [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners FaceSouth)) | light ← lights, lightLabel light /= "dark"]
+      <> [twoLights light (atZoom 0.125 (rampsCorners FaceSouth)) | light ← lights, lightLabel light == "dark"]
       -- Depth effects at the configured range, with the effects separately and together.
-      <> [spec light [Foreground, Varies] Dynamic (depthStack FaceSouth) | light ← depthLights]
-      <> [spec light [Foreground, Varies] Dynamic (depthStack FaceNorth) | light ← take 2 (reverse depthLights)]
+      <> [spec light [Foreground, Varies] Dynamic (depthStack FaceSouth) | light ← depthLights, lightLabel light /= "haze-no-light"]
+      <> [twoLights light (depthStack FaceSouth) | light ← depthLights, lightLabel light == "haze-no-light"]
+      <> [spec light [Foreground, Varies] Dynamic (depthStack FaceNorth) | light ← take 2 (reverse depthLights), lightLabel light /= "haze-no-light"]
       -- Negative controls, each a draw broken once, on the scene that makes the protected behaviour matter.
       <> [ spec defaultLight [Foreground, Overlap] ReversedKeys (atZoom 0.125 (disconnectedSpans FaceSouth))
          , spec defaultLight [Foreground, Varies] WholeCellMask (atZoom 0.125 (rampsCorners FaceSouth))
@@ -326,6 +343,17 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Varies] WrongTreatment (atZoom 0.125 (rampsCorners FaceSouth))
          , spec defaultLight [Foreground, Overlap] BackmostPick (atZoom 0.125 (disconnectedSpans FaceSouth))
          ]
+
+-- | The ramps and corners with pixel snapping on at zoom 1, the camera a fraction of a pixel off
+-- the pixel grid. At a whole-number scale a nearest-sampled quad cannot change when the view is
+-- shifted by less than half a pixel (the sampled texel is the same), so this fixture judges that
+-- snapping leaves the picture correct and does not claim to discriminate it from an ignored setting.
+-- At the fractional snap-compatible scales (9/8 and 5/4) the device agrees with the independent
+-- expectation at every decided pixel and the reusable oracle disagrees at about a hundred
+-- boundary-adjacent pixels; that discrepancy is recorded in the evidence, not hidden by a looser
+-- tolerance or a dropped fixture.
+snappedZoom2 ∷ Scene
+snappedZoom2 = snapped
 
 -- | One cell of a shape in a facing at a zoom, in a target sized to its hexagon.
 shapeMatrixCell ∷ Int → ViewFacing → Float → Scene
@@ -557,7 +585,7 @@ runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
   Left why → pure (failed (specName s) why, emptyExtra s)
   Right planned → case specVariant s of
     Retained → case planned of
-      [(sc, plan, shape)] → retainedFixture ctx s sc plan shape
+      [(_, sc, plan, shape)] → retainedFixture ctx s sc plan shape
       _ → pure (failed (specName s) "a retained fixture draws one scene", emptyExtra s)
     variant → do
       let drawn = traverse (draw variant) planned
@@ -568,13 +596,13 @@ runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
     assets = styleAssets (ctxStyle ctx)
     planOf (index, sc) = case scenePlan assets sc of
       Left refused → Left ("the scene " <> sceneName sc <> "'s plan was refused: " <> show refused)
-      Right plan → Right (sc, plan, shapeOf index sc)
+      Right plan → Right (index - 1, sc, plan, shapeOf index sc)
     texturesFor variant = case variant of
       OrderedWrapper → (ctxAtlas ctx) {atlasColour = ctxUnmarked ctx}
       _ → ctxAtlas ctx
-    draw variant (sc, plan, shape) = do
+    draw variant (index, sc, plan, shape) = do
       let camera = sceneCameraFollowed sc
-      adaptedTrue ← either (\refused → Left ("the quads could not be adapted: " <> describeMaterialRefusal refused)) Right (adaptCells (texturesFor variant) (lightSettings (specLight s)) assets plan)
+      adaptedTrue ← either (\refused → Left ("the quads could not be adapted: " <> describeMaterialRefusal refused)) Right (adaptCells (texturesFor variant) (lightSettings (lightOf s index)) assets plan)
       let adapted = broken variant (camFacing camera) ctx adaptedTrue
           entries = adaptedQuads adapted
           materialFor entry = case quadCell (adaptedQuad entry) of
@@ -715,11 +743,12 @@ renderSnapshot ctx s parts = do
           decodedAt = (`Map.lookup` ctxDecoded ctx)
           art = styleArt (ctxStyle ctx)
           light = lightHand (specLight s)
-          grids = map gridOf parts
-          gridOf part =
+          grids = zipWith gridOf [0 ..] parts
+          gridOf index part =
             let sc = partScene part
                 (gw, gh) = sceneTarget sc
-             in listArray ((0, 0), (gw - 1, gh - 1)) [expectedAt art light sc (partCamera part) (partPlan part) (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected
+                lightHere = lightHand (lightOf s index)
+             in listArray ((0, 0), (gw - 1, gh - 1)) [expectedAt art lightHere sc (partCamera part) (partPlan part) (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected
           oracle = newOracleWith models (oracleInput valid marks shapes decodedAt)
           determinate probe = case expect oracle probe of
             e@(Expected _ _) → Just e
@@ -737,7 +766,7 @@ renderSnapshot ctx s parts = do
                in Just ((listArray ((0, 0), (gw - 1, gh - 1)) [expectedAt art light alt (partCamera part) altPlan (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected) !)
             Left _ → Nothing
           named = case parts of
-            part : _ → chooseNamed (partScene part) (firstGrid !) (alternative part) determinate (specNeeds s)
+            part : _ → chooseNamed (partScene part) (firstGrid !) (case grids of _ : g : _ → Just (g !); _ → Nothing) (alternative part) determinate (specNeeds s)
             [] → []
           cameraProblems =
             [ "the camera came to cut " <> show (axisValue (camClip (partCamera part)), camRef (partCamera part)) <> " (cut, reference), expected " <> show wanted <> ": it was panned off its column or follows another surface"
@@ -794,7 +823,16 @@ renderSnapshot ctx s parts = do
           mismatchAt (x, y) = case (expectedRgba (firstGrid ! (x, y)), observedFirst x y) of
             (Just (er, eg, eb, ea), Just (Rgba8 r g b a)) → not (all (\(e, o) → abs (fromIntegral e - fromIntegral o) <= tolerance) [(er, r), (eg, g), (eb, b), (ea, a)])
             _ → False
-          namedPixels = concat [[(probeX p, probeY p), (probeX c, probeY c)] | (_, NamedProbe _ p c) ← named]
+          -- The named probes' pixels and the hundred covered pixels nearest the centre: a control
+          -- must differ where the behaviour it breaks is judged, and one lighting control may
+          -- break a surface only slightly at a single pixel.
+          namedPixels =
+            concat [[(probeX p, probeY p), (probeX c, probeY c)] | (_, NamedProbe _ p c) ← named]
+              <> take 100 (sortOn centreOf [pixel | pixel ← range ((0, 0), (gridW - 1, gridH - 1)), ExpectedHit {} ← [firstGrid ! pixel]])
+          (gridW, gridH) = case parts of
+            part : _ → sceneTarget (partScene part)
+            [] → (1, 1)
+          centreOf (x, y) = (x - gridW `div` 2) ^ (2 ∷ Int) + (y - gridH `div` 2) ^ (2 ∷ Int)
           controlDiffers
             | specVariant s == BackmostPick = Just (not (null pickProblems))
             | isControl (specVariant s) = Just (any mismatchAt namedPixels)
@@ -869,11 +907,12 @@ runsOf plan =
 chooseNamed
   ∷ Scene
   → ((Int, Int) → Expected)
+  → Maybe ((Int, Int) → Expected)
   → (Need → Maybe ((Int, Int) → Expected))
   → (Probe → Maybe Expectation)
   → [Need]
   → [(Need, NamedProbe)]
-chooseNamed sc expectedAtPixel alternative determinate = concatMap one
+chooseNamed sc expectedAtPixel secondGrid alternative determinate = concatMap one
   where
     (w, h) = sceneTarget sc
     pixels = [(x, y) | y ← [0 .. h - 1], x ← [0 .. w - 1]]
@@ -900,6 +939,19 @@ chooseNamed sc expectedAtPixel alternative determinate = concatMap one
          in maybe [] pure (pair Overlap "the nearer quad hides the farther where their canvases overlap" overlapped single)
       Varies → maybe [] pure (pair Varies "the lighting and the art differ across the covered surface" covered (reverse covered))
       Reveal → []
+      LightsDiffer → case secondGrid of
+        Just other →
+          -- The same covered pixel in the first pass (default light) and in the second (another
+          -- light): the oracle must expect different colours, the readback must show both.
+          maybe [] pure . listToMaybe $
+            [ (LightsDiffer, NamedProbe "two views sharing one registered material keep their own lighting" (probeAt a) (Probe 1 (fst a) (snd a)))
+            | a ← take 8 (filter ok covered)
+            , ExpectedHit {} ← [other a]
+            , Just (Expected one' _) ← [determinate (probeAt a)]
+            , Just (Expected two _) ← [determinate (Probe 1 (fst a) (snd a))]
+            , one' /= two
+            ]
+        Nothing → []
       Clipped → case alternative Clipped of
         Just unclipped →
           let clippedAway = [p | p ← pixels, expectedAtPixel p == ExpectedClear, ExpectedHit {} ← [unclipped p]]

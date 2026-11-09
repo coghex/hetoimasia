@@ -633,6 +633,15 @@ uploadConfig = either (error . show) id (validateUploadConfig (1024 * 1024) uplo
 uploadBudget ∷ Integer
 uploadBudget = 128 * 1024
 
+-- | The terrain case's upload configuration: the same per-turn budget and queue as every other
+-- case, with a largest single upload of 4 MiB so the packed normal atlas (768 x 384 x 4 = 1,179,648
+-- bytes, 46 maps in one parent by the atlas decision) is accepted in one request and uploaded over
+-- several turns. This is the harness's own staging bound for one upload request; it is not a
+-- texture-admission bank (#672's 512 MiB per instance and 1 GiB per session), which this case does
+-- not touch.
+terrainUploadConfig ∷ UploadConfig
+terrainUploadConfig = either (error . show) id (validateUploadConfig (4 * 1024 * 1024) uploadBudget 8)
+
 -- | The turns the RGBA8 texture needs at least, each a batch of its own.
 rgbaTurns ∷ Int
 rgbaTurns = fromIntegral ((sum (map (toInteger . ByteString.length) rgbaLevels) + uploadBudget - 1) `div` uploadBudget)
@@ -1961,7 +1970,8 @@ runTerrainCi = runTerrainProfile TerrainPath.Bounded
 
 runTerrainProfile ∷ TerrainPath.Profile → Maybe Backend → Journal → IO SurfaceFreeOutcome
 runTerrainProfile profile backend journal =
-  runEvidenceSuite
+  runEvidenceSuiteWith
+    terrainUploadConfig
     backend
     journal
     (\vulkan directory → TerrainPath.runTerrain profile (retainedHost vulkan) (deviceNameOf vulkan) directory)
@@ -2001,12 +2011,16 @@ runAnimation backend journal =
     "animation"
 
 runEvidenceSuite ∷ Maybe Backend → Journal → (VulkanHost () → FilePath → IO OrderedPath.Evidence) → Text → Text → String → IO SurfaceFreeOutcome
-runEvidenceSuite backend journal runner headline caseName directoryName = do
+runEvidenceSuite = runEvidenceSuiteWith uploadConfig
+
+-- | 'runEvidenceSuite' under a stated upload configuration.
+runEvidenceSuiteWith ∷ UploadConfig → Maybe Backend → Journal → (VulkanHost () → FilePath → IO OrderedPath.Evidence) → Text → Text → String → IO SurfaceFreeOutcome
+runEvidenceSuiteWith uploads backend journal runner headline caseName directoryName = do
   heading journal headline
   directory ← evidenceDirectory
   note journal ("the " <> Text.pack directoryName <> " evidence is written into " <> Text.pack directory)
   runCaseWith
-    (\config → config {vulkanUploads = Just uploadConfig})
+    (\config → config {vulkanUploads = Just uploads})
     backend
     defaultBudgetRequest {requestedBytes = 2 * 1024 * 1024 * 1024}
     []

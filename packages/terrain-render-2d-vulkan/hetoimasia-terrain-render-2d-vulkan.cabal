@@ -3,15 +3,18 @@ name: hetoimasia-terrain-render-2d-vulkan
 version: 0.1.0.0
 synopsis: The terrain arena's application material for the 2D renderer's Vulkan recorder
 description:
-    TRA-8's Vulkan-dependent half: the terrain material, defined at build time
-    through the 2D renderer's checked material splice and registered by the
-    caller. It adapts the plan of faces that the pure terrain-render-2d package
-    makes (a quad and a coverage mask for each) through the existing fixed-quad
-    and material ABI: a record of the art sheet and the face's art map and mask,
-    a fragment function that samples the sheet and covers the quad by the mask,
-    and no new descriptor binding, instance format, depth output or vertex
-    stage. It is selected only by `cabal.project.vulkan`, so the ordinary and
-    CPU projects neither resolve the Vulkan binding nor link a loader, and only
+    The Vulkan-dependent half of the terrain material (TRA-17): the material,
+    defined at build time through the 2D renderer's checked material splice and
+    registered by the caller. It draws the whole-cell quads that the pure
+    terrain-render-2d package plans through the existing fixed-quad and material
+    ABI: a record of two full handles (the colour atlas and the normal atlas)
+    with each region's rectangle and the cell's depth below the cut, a 48-byte
+    push block of three vec4s for the lighting and depth effects, a fragment
+    function that samples both regions at their own texel centres, lights the
+    result by the unit normal and applies the darkening and haze, and no new
+    descriptor binding, instance format, depth output or vertex stage. It is
+    selected only by `cabal.project.vulkan`, so the ordinary and CPU projects
+    neither resolve the Vulkan binding nor link a loader, and only
     `tools/vulkan/run.sh` builds it. It creates no service, window publisher,
     global registry or live shader loader.
 license: GPL-3.0-only
