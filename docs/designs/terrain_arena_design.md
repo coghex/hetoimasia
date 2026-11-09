@@ -8,6 +8,13 @@ choices are evidence, not automatically requirements for the new engine.
 
 Design state: `ready for issue processing`
 
+Atlas update, 2026-11-08 local (D-61/P-17): every texture is an atlas, with a
+single image represented by a one-region atlas. TRA-17 owns deterministic
+asset packing and region-aware material/picking integration; the authored
+96×64 maps remain unchanged. Texture admission follows the merged byte
+banks, not a texture-count ceiling. The manager directs the #659 amendment
+first, then #645/#646/#647, each with separate tracker sign-off.
+
 Owner-requested face-map amendment opened 2026-11-07 (D-28) and signed off
 2026-11-08 (D-60), approving P-16 at `b012fabbfc`. TRA-1–TRA-12 remain filed;
 all 11 amendment children, TRA-13–TRA-23, are now filed as [#655], [#656],
@@ -308,13 +315,15 @@ approved body SHA-256:
 The manager arranges fresh readiness review; this revision is not implementation
 or amended Q-13 qualification.
 
-**Amendment processing cursor:** new-child filing is complete and #645–#646's
-P-16 revisions are applied. Draft the #647 revision next, then #648 and any
-other remaining P-16 named artifacts, one artifact at a time with a separately
-approved concrete tracker draft before each mutation. The manager arranges
-readiness reviews. Tracker processing dispatch:
-`rquhvs6rjb7mgyd3n2zg4rdrp6`; continuation after #646 revision:
-`vvahwinsz8z8ej2yy7qt3439c2` in `#het-terrain`.
+**Amendment processing cursor:** new-child filing is complete. The first
+#645/#646 revisions are applied; #647 has a pending draft. D-61 supersedes
+their whole-texture assumptions. Draft the #659 atlas amendment first, then
+finalize #645, #646 and #647, followed by #648 and other remaining P-16
+artifacts. Each complete body/diff needs separate manager sign-off before
+mutation. The manager arranges readiness reviews. Atlas dispatch is
+`request-user-het-terrain-20261106-1838-atlas-revisions-prompt.txt`, following
+verified #het-terrain relays `apa6ni3b85xr2pt5n4etv5fxr6`,
+`zhzz9jn6sd266g5zcaf78kpwyw` and `e6r3r49zqqj667kiz2hynspr9e`.
 
 ## Epic contract
 
@@ -1992,6 +2001,40 @@ files/edits tracker items nor authorizes code work, releases PR #654's hold,
 approves a PR head or authorizes a merge. Report the published design and
 readiness to the manager; operational coordination remains with that workflow.
 
+### D-61. Atlas regions, offline packing and byte-bounded textures
+
+Owner direction relayed by verified `het-manager` in #het-terrain,
+`apa6ni3b85xr2pt5n4etv5fxr6` (2026-11-08T16:53Z): every texture is an atlas;
+a single image is a 1×1 atlas, not a separate rendering model. This is a
+family/content grouping, not one atlas for the whole project. It continues
+the owner's 2026-09-29 bindless/atlas decision (archived GPU resource design,
+D-1). The authored whole-canvas maps from TRA-14 remain the source.
+
+The manager explicitly delegated selection of the packing boundary in the
+atlas-revisions prompt. Select **offline asset preparation owned by TRA-17**,
+beside the existing terrain map generator and material integration: produce
+deterministic colour and normal-data atlases plus a region manifest before
+runtime loading. Runtime uses TRA-15's existing bounded loader and validators;
+the material samples checked regions. This keeps game/catalog packing out of
+the generic decoder, avoids a second runtime pack/upload owner and preserves
+the exact qualified source images. It does not introduce a project-wide atlas,
+runtime repacking, a texture-atlas service or a new Lua call. P-17 gives the
+complete region, coverage, lifetime and evidence contract.
+
+Later owner direction is implemented by merged PR #672 at `2d7f35f7` and
+relayed in `zhzz9jn6sd266g5zcaf78kpwyw`: texture admission is memory-only,
+512 MiB per presentation instance and 1 GiB per session, with a 4 KiB minimum
+charge per physical texture. Pending/live/retiring obligations and the existing
+native/workspace/coverage banks still apply. This supersedes the earlier
+count-based interpretation of the atlas direction; atlases remain required.
+Regions share the atlas resource and do not each consume an image allocation.
+
+The explicit dispatch authorizes recording this delegated choice, landing the
+design, and drafting #659 before later revisions. This atlas update is ready
+for that one-artifact processing; it grants no tracker mutation or GPU proof.
+Q-13 still gates implementation qualification. Keep all stable ledger links
+and the earlier decisions as history where this update supersedes them.
+
 ## Design boundaries
 
 Hetoimasia V-1 keeps game rules, authored data and orchestration outside engine
@@ -3605,7 +3648,13 @@ and final evidence assignment. The viewport-based direction already has P-5
 support; D-48 approves the explicit refinement and regression package above.
 This does not settle Q-20's separate cavity discovery work.
 
-### P-11. Concrete cutout asset and sampling contract — approved by D-55
+### P-11. Concrete cutout asset and sampling contract — D-55, amended by D-61
+
+D-61/P-17 distinguish the 96×64 **logical image region** from its physical
+atlas. In the clauses below, a canvas and UV `[0,1]` describe that logical
+region; they do not require one GPU texture per map or authorize sampling
+outside its rectangle. P-17 supersedes whole-image texture/version assumptions
+with checked atlas-region identity and shared whole-atlas coverage.
 
 This Q-17 contract was approved as written at `f372d0793f` by D-55. It fills in
 D-30/D-45's shared coverage and crisp sampling without deciding the remaining
@@ -3631,14 +3680,14 @@ uses the cutout threshold 0.5. `MaterialSources.hs:11–36` supplies the
 secondary texture and requires premultiplied linear output. The bounded PNG
 decoder still lacks the data-image policy described in the integration audit.
 
-1. **Initial asset contract.** Use full 96×64 colour and face-map canvases for
-   this catalog, UV `[0,1]` across the whole canvas, with the already approved
+1. **Initial asset contract.** Preserve full 96×64 authored colour and face-map
+   canvases and local UV `[0,1]` across each region, with the already approved
    projection proportions. Both images must have binary alpha. Keep colour
    artwork on the premultiplied sRGB-colour path and face maps on a linear
    RGBA8 data path that preserves decoded numeric channels, without gamma
    conversion or colour premultiplication. Face-weight RGB may contain
    intermediate values; binary alpha does not mean binary lighting weights.
-   Validate image kind, dimensions and binary coverage before attaching the
+   Validate atlas kind, region dimensions/bounds and binary coverage before attaching the
    style. Refuse incompatible assets clearly, retaining the previous adopted
    style/view on an unsuccessful replacement. Do not silently threshold or
    resize authored assets. Corrected masks still need D-44's evidence/provenance.
@@ -3646,8 +3695,11 @@ decoder still lacks the data-image policy described in the integration audit.
    no mip generation, trilinear filtering or smoothed mask edges. The
    reference texel rule on an image of width `w` is
    `i = min(w-1, floor(clamp(u,0,1)*w))`, and similarly for `v`/height, with
-   top-row-first image coordinates. At an interior texel boundary select the
-   higher index; the outer UV edge clamps to the last texel. Rendering and
+   top-row-first region coordinates. Add the checked region origin only after
+   clamping locally. GPU sampling uses that atlas texel's centre; whole-atlas
+   clamp alone is insufficient at a region boundary. At an interior texel
+   boundary select the higher index; the outer region edge selects its last
+   texel, never its neighbour. Rendering and
    picking use the same adopted quad/UV transform and viewport clipping; the
    texel rule does not extend coverage outside the rasterized quad. Map a
    logical cursor through the adopted framebuffer scale to its physical pixel
@@ -3671,7 +3723,7 @@ decoder still lacks the data-image policy described in the integration audit.
    decoder or graphics facade; pass the narrow policy/accounting capabilities
    through their existing service boundaries.
 4. **Coverage ownership and admission.** Store one bit per texel per immutable
-   loaded asset version, plus accounted metadata, shared by its consumers;
+   loaded atlas version, plus accounted region metadata, shared by its consumers;
    never one copy per world cell. Identity includes image kind, dimensions and
    the exact texture/version authority. Generate it from the same decoded
    alpha that is uploaded, reserving bytes before allocation. Charge retained
@@ -3878,14 +3930,22 @@ linear-light composition and fixed range are deliberate changes. At depths
 0/half/full range the dark multipliers are 1/0.925/0.85 and haze fractions
 0/0.15/0.60. This does not replace D-48's missing-background streaming fix.
 
-**Bounded publication and ABI fit.** Keep the normal map as the one secondary
-texture. Three `vec4` application pushes suffice: view-space sun plus ambient;
+**Bounded publication and ABI fit — amended by D-61/P-17.** Use one colour
+atlas and one normal-data atlas for this catalog, with checked regions for
+both samples. Keep quad UVs logical; the material explicitly samples both
+atlases at region-local texel centres. Its bounded record carries two full
+generation-checked handles (colour and normal), their rectangle/extent words
+and the per-cell depth. The primary texture slot still names the same colour
+atlas, but its pre-sampled texel is not the region-clamped material input.
+Duplicating that handle in the record does not allocate a second image.
+Three `vec4` application pushes suffice: view-space sun plus ambient;
 effective sun strength/darkening/haze/reciprocal range; linear haze RGB plus
 padding. They use the existing 48-byte allowance
-(`render-2d-vulkan/.../Layout.hs:55–61` at H `c21d080e2f`). A bounded per-cell
-depth word can travel in the material record alongside the mask handle.
+(`render-2d-vulkan/.../Layout.hs:55–61` at H `c21d080e2f`). The existing
+material ABI at H `da001722` permits 16 record handles and 64 words; the
+two handles, region metadata and depth fit without extending that ABI.
 This is source-level layout feasibility, not a GPU qualification result.
-Publish camera, normal-map identity, depth and lighting settings coherently
+Publish camera, both atlas/region identities, depth and lighting coherently
 with the adopted frame. No frame mixes a new setting with stale depth/facing
 data; no absolute large-world coordinate is converted to a low-precision
 shader position merely to calculate depth. Picking remains P-11 coverage-only.
@@ -3929,7 +3989,8 @@ following representations within the existing bounded viewing band:
 | Known shaped solid, but its empty component is undiscovered | At most two whole-cell quads with shared complementary masks: visible known material and generic fog over the unknown component |
 | Terrain or retained knowledge needed for this result is unavailable | Pending/loading, not fabricated air, newly forgotten fog or an authoritative pick |
 
-Each emitted quad uses the same 96×64 canvas/projection, with GPU cutout and
+Each emitted quad uses the same logical 96×64 canvas/projection (a checked
+atlas region under P-17), with GPU cutout and
 normal shading. Do not emit independent top/side meshes or add flat cutaway
 caps. At slice `k`, omit levels above `k`; remaining known shapes keep their
 forms/materials. Whole-cell omission is allowed when safely culled; two quads
@@ -4422,6 +4483,20 @@ location and heading level, not the signed-off scope, dependencies or proof.
 **Existing tracker artifacts to revise later, one signed-off draft at a time.**
 The following is the revision scope, not ready-to-post issue body text.
 
+**Atlas update (D-61/P-17):** the baseline tracker snapshot above is historical.
+The manager's 2026-11-08 dispatch records the merged geometry/maps/loader,
+cell-quad planner and source/discovery work, plus #672's byte-only texture
+admission. First revise **#659 / TRA-17** for offline atlas preparation,
+checked region sampling and shared coverage. The #645/#646 bodies already
+applied and the pending #647 draft then need the same region contract:
+#645 retains distinct parent/region versions and shared interests; #646
+validates complete region mappings and kind/profile; #647 loads the generated
+atlases/manifest. #648 must qualify packed-versus-1×1 equivalence and final
+bank accounting. All consume P-17's current byte banks, with no texture-count
+cap. This paragraph and P-17 supersede whole-image assumptions in the scope
+table and historical TRA-9–TRA-12 text below; those earlier requirements
+otherwise remain intact.
+
 | Artifact | Required revision or coordination |
 | --- | --- |
 | EPIC #636 | Extend the existing arc/checklist and dependency graph with TRA-13–TRA-23; distinguish logical query geometry from visual alpha picking; add corrected ID 15, fog/discovery, lighting, viewport demand and temporary backing/recovery. Replace the cross-run-persistence exclusion's ambiguous wording, keep saves deferred, and require new evidence before final acceptance. No new umbrella. |
@@ -4473,6 +4548,124 @@ order and readiness are promoted; this does not create/edit tracker items,
 authorize code work or release PR #654. Later processing revises the existing
 epic first, then handles one new child or existing-issue revision per invocation,
 with a separately approved concrete tracker draft.
+
+### P-17. Atlas preparation, region sampling and shared coverage — D-61
+
+This amendment supersedes whole-texture assumptions in P-11/P-13/P-14 and
+the affected TRA-17/TRA-9–TRA-12 contracts. The source catalog remains the
+qualified output of TRA-14. Packing is **offline asset preparation owned by
+TRA-17 (#659)**, beside that generator and the terrain material integration.
+It is not work for the generic runtime loader, and does not reopen a merged
+prerequisite. At H `da001722`, TRA-13–TRA-16 and TRA-18/TRA-19 have merged;
+TRA-17 extends their public contracts narrowly where regions require it.
+
+**Authored sources and derived assets.** Preserve the original loam, granite,
+blank and 46 whole-canvas normal maps, their logical IDs, bytes and provenance.
+Produce two derivative atlases: one colour/blank atlas and one numeric normal
+atlas, with a versioned, deterministic manifest mapping every logical ID to
+its parent atlas and integer rectangle. Keep the source hashes, parent atlas
+hashes, dimensions, colour/data kind and normal profile in the checked asset
+identity. The four-facing catalog lookup still selects logical maps; it does
+not become four separately authored atlas sets. A single image is represented
+by the same contract with a full-image rectangle (a 1×1 atlas).
+
+Packing may not rotate, trim, scale or alter a source canvas. Each logical
+region remains 96×64 with the existing row orientation. Rectangles are
+non-overlapping and contained within the physical atlas; unused pixels have
+zero alpha. Keep colour and numeric data separate because their decode,
+premultiplication and colour-space rules differ. Deterministic regeneration
+and a non-writing check cover both the original maps and the derivative
+atlases/manifest. Region extraction must recover each source's decoded RGBA
+exactly; a packing change cannot quietly replace authored art or geometry.
+
+**Loading and checked region authority.** Use TRA-15's bounded texture loader
+with the existing colour/data, binary-coverage and `unit-normal-rgb-v1`
+options. Normal validation still covers every opaque texel of the data atlas;
+transparent padding contributes no normal. A region is an immutable checked
+view of a particular parent texture/coverage generation, not another texture
+allocation. Its integer rectangle must be positive, fit the parent without
+overflow, match the logical extent, and have the required kind/profile.
+Reject incomplete, incompatible or wrong-parent mappings before publication.
+An unchanged parent hash with a changed rectangle/layout is a changed asset
+identity: include the rectangle and layout identity in snapshot/cache keys,
+alongside parent versions, map IDs and normal profile. Old region metadata
+must never be paired with a newer atlas or adopted camera/knowledge snapshot.
+
+The CPU stores one immutable binary coverage plane per loaded atlas. Provide
+a checked region view that translates local texels into that parent plane;
+do not copy a plane per region, quad or terrain cell. Keep any neutral image
+region type at an image/asset boundary without a dependency on terrain. Adapt
+TRA-16's 96×64 checks, opacity proofs and asset snapshot identity to the
+logical region, not the larger physical plane. The existing #657 decode and
+#658 coverage/picking authorities remain the source of truth; #659 owns the
+narrow region-view integration required to use them. No independent PNG
+decoder or separately reconstructed picking mask is introduced.
+
+**Exact CPU/GPU sampling.** Quad UVs stay in logical `[0,1]²`. For local
+region extent `(w,h)=(96,64)`, choose
+`i=min(w-1,floor(clamp(u,0,1)*w))` and the corresponding `j`. Read CPU coverage
+at `(originX+i, originY+j)` in the parent plane. The GPU samples that exact
+texel centre, `(origin+(i+0.5,j+0.5))/atlasExtent`, at level zero with the
+existing nearest/clamp sampler. Apply the same calculation independently to
+colour and normal regions; their parent dimensions and origins need not match.
+P-11's higher-index interior-edge and clamped outer-edge rules are unchanged.
+Clamping only to the whole atlas is insufficient. A linear interpolation
+between half-texel-inset endpoints is also insufficient: it moves the interior
+decision boundaries. Neighbouring cells and transparent packing space must
+not bleed into the result. Geometric clipping, raster pixel-centre ownership,
+normal decoding and the shared 0.5 cutout threshold remain unchanged.
+
+P-13's record carries both full texture handles and checked region words,
+so the material can sample both parents correctly using the existing helper.
+Validate that its colour handle agrees with the primary texture slot; retain
+both parents through actual GPU completion. The old pre-sampled primary texel
+cannot substitute for the region-clamped colour sample. Shader sampling must
+respect the existing material compiler's control-flow/derivative constraints.
+No new renderer ABI, descriptor scheme, per-cell GPU image or public Lua call
+is part of this change. TRA-10 consumes the same authority through its strict
+copied style mapping; the five public terrain calls remain the same.
+
+**Ownership and memory.** Loaded assets own parent textures and coverage;
+regions borrow those immutable parents through explicit interests. An adopted
+mixed terrain/fog cell acquires all required parent/region interests together.
+CPU last-reader retirement and GPU completion retirement remain distinct.
+Count the parent allocation once within its existing bank, even when many
+regions or a duplicated material handle reference it; releasing a Lua lease
+does not invalidate an adopted view. Existing bounded metadata/input limits
+still apply, without a new texture-count policy.
+
+Merged #672 removes the per-instance texture-count admission limit. The
+texture-byte banks are **512 MiB per UI instance and 1 GiB per session**, with
+a **4 KiB minimum charge per physical texture**; pending/live/retiring charges
+stay reserved until their established release point. These are texture banks,
+not whole-process RSS ceilings. The amended **128 MiB CPU render bank** still
+covers shared coverage and render metadata; decoder staging/workspace and
+native-accounted banks remain independent. Charge actual atlas allocations
+and their bounded preparation/validation costs under the owning contracts.
+Refusal must preserve the previous usable style/frame and release partial
+acquisitions. Neither adding regions nor packing is permission to evade a bank.
+
+**Proof and migration.** TRA-17 retains its full Q-13 material proof and adds
+independent atlas checks: exact source extraction; distinct colour/data
+treatment; all logical map IDs/facings; nonzero origins and unequal parent
+layouts; internal texel boundaries, outer corners, adjacent regions with
+different colour/alpha/normals, and transparent padding. Compare full-image
+1×1-atlas and packed-atlas render/pick results under the same transforms.
+Reject invalid/out-of-bounds/overflowing rectangles, wrong kind/profile and
+stale parent/layout identity. Negative controls must detect whole-atlas-only
+clamping, shifted texel boundaries, swapped regions and stale region reuse.
+Keep independent expected values and discriminating GPU pixels rather than
+blessing generated output as its own oracle. Shared bitplanes and unchanged
+logical IDs do not by themselves prove sampling or visual equivalence.
+
+TRA-17 owns packing, material use and pure coverage/pick integration; revised
+TRA-9 owns live interests, adoption and retirement; TRA-10 owns strict Lua
+region mappings; TRA-11 loads the derivative assets; TRA-12 qualifies the final
+composition. The manager's processing order is **#659 first, then #645, #646,
+#647**, each as its own complete draft and sign-off before mutation. The later
+#648 final acceptance revision must also consume this contract. Existing
+links/statuses remain intact; neither this design publication nor a previous
+readiness review approves a changed issue body.
 
 ## Open questions and review checkpoints
 
@@ -5047,12 +5240,16 @@ a child. All amended rendering/discovery/storage evidence precedes TRA-12.
 ### TRA-17. Switch terrain rendering to face-map cutouts and normal lighting
 
 - **Outcome/scope:** consume TRA-16 plans through the existing material ABI,
-  sample colour plus normal/cutout data, implement P-13's exact lighting/depth
-  equations and replace the legacy per-face material/adapter/picker clients.
-  Keep pure material/model code separate from the Vulkan definition.
+  sample colour plus normal/cutout atlas regions, implement P-13's exact
+  lighting/depth equations and replace the legacy per-face material/adapter/
+  picker clients. D-61/P-17 add deterministic offline packing beside the map
+  generator, a checked region manifest and the narrow shared-coverage/asset-
+  identity adaptations to the merged TRA-15/TRA-16 authorities. Preserve every
+  original source image. Keep pure material/model and preparation code
+  separate from the Vulkan definition and generic runtime loading.
 - **Phase:** amendment rendering proof. **Depends on:** TRA-8, TRA-14,
   TRA-15, TRA-16. **Ordering:** hard prerequisite to TRA-9–TRA-12.
-- **Relevant decisions:** D-29/D-44–D-50/D-54–D-58.
+- **Relevant decisions:** D-29/D-44–D-50/D-54–D-58/D-61; P-17.
 - **Acceptance:** retained real offscreen proof of all 16 IDs/four facings,
   ordinary/fog/mixed masks, overlap, transparent colour holes, integer slices,
   fractional transforms/scaling and shared pixel-edge ownership. Verify
@@ -5060,6 +5257,9 @@ a child. All amended rendering/discovery/storage evidence precedes TRA-12.
   world-fixed illumination across facings and isolated/combined depth effects.
   Independent discriminating probes and negative controls must reject wrong
   masks, order, colour/data treatment and picking; no self-approved goldens.
+  Add source extraction/hash preservation, checked region identity, exact
+  texel-edge/adjacency tests and real packed-versus-1×1 render/pick equivalence
+  under P-17. Retain the required CI time limits and separate opt-in judging.
 - **Migration:** remove old `PlannedFace`/polygon visual contracts and migrate
   repository tests/harnesses/material adapters; retain pure logical queries.
   Historical captures stay labelled with their original model/revision.
