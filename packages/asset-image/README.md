@@ -565,6 +565,27 @@ W ramp `(38, 128, 218)` is `(−√½, 0, √½)`.
 |---|---|---|---|---|
 | A `CoveragePlane` | whoever `buildBinaryCoverage` returned it to (the texture pipeline keeps one per loaded version) | nobody: built once, never written | any thread | the value's; sharing it copies nothing |
 
+## Image regions (TRA-17)
+
+`Hetoimasia.Asset.Image.Region` is the neutral primitive that makes every texture
+an atlas: a single image is a one-region atlas. An `ImageRegion` is a
+positive-extent rectangle (`mkImageRegion` refuses a zero extent and a far edge
+that does not fit 32 bits, on wide integers). A `RegionView` is a rectangle of one
+parent image's `CoveragePlane`, held by reference so a region, a quad or a cell
+never copies a bit of it; `mkRegionView` refuses a rectangle that is not inside the
+parent, and carries the parent texture's version and an opaque layout identity.
+`regionViewIdentity` folds the version, layout, parent extent and rectangle into
+one value, so a rectangle change on the same parent changes it.
+
+Sampling applies the asset-level rule to the region's own extent,
+`i = min (w - 1) (floor (clamp u 0 1 * w))` (`regionLocalIndex`), and only then adds
+the origin (`regionViewCoverageAt`): an interior boundary selects the higher texel,
+the region's outer edge its last, and a local index outside the region has no
+texel, so a lookup never reaches a neighbouring region. The module knows no
+terrain, game, device, Lua engine or account, owns no state, and claims nothing
+outside a rasterized quad. `Test.Asset.Image.Region` states every expectation by
+hand.
+
 ## BC7
 
 ### The BC7 image
