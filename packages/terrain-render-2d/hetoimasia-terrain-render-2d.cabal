@@ -214,6 +214,7 @@ test-suite terrain-render-2d-tests
         Test.TerrainRender2D.Fixtures
         Test.TerrainRender2D.MapAssets
         Test.TerrainRender2D.MapAssets.Reference
+        Test.TerrainRender2D.Material
         Test.TerrainRender2D.Oracle
         Test.TerrainRender2D.Projection
         Test.TerrainRender2D.Spec
