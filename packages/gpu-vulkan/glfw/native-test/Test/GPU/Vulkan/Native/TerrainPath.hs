@@ -357,6 +357,7 @@ specs profile = case profile of
          ]
       <> [spec defaultLight [Foreground] Dynamic (atZoom 0.125 (staircase cut FaceSouth)) | cut ← [1, 3, 5]]
       <> [exactBoundaryFixture shape facing | (shape, facing) ← exactBoundaryCases]
+      <> [edgeFixture zoom shape facing | (zoom, shape, facing) ← edgeCases]
       <> [ expecting (28, 4) (spec defaultLight [Foreground] Dynamic (atZoom 0.125 (followHeadroom FaceSouth)))
          , expecting (0, -33) (spec defaultLight [Foreground, Varies] Dynamic (deepFloor FaceSouth))
          ]
@@ -390,7 +391,7 @@ specs profile = case profile of
          ]
       -- The Q-13 negative control: the same exact-boundary fixtures drawn without the texel bias.
       <> [exactBoundaryWith UnbiasedIndex shape facing | (shape, facing) ← exactBoundaryCases]
-      <> [staleBiasFixture sc | sc ← snappedScenes]
+      <> [staleBiasFixture sc | sc ← staleBiasScenes]
 
 -- | The ramps and corners with pixel snapping on at zoom 1, the camera a fraction of a pixel off
 -- the pixel grid. At a whole-number scale a nearest-sampled quad cannot change when the view is
@@ -413,8 +414,23 @@ exactBoundary shape facing = (newScene ("exact-boundary-" <> show shape <> "-" <
 -- reference's own names, and their fixtures: judged exactly and drawn by the terrain material; drawn
 -- by the stale-bias control after an ordinary pass, which must be rejected on the snapped pass.
 snappedScenes ∷ [Scene]
-snappedScenes = [snapped {sceneName = "snapped-9-8", sceneZoom = 1.125}, snapped {sceneName = "snapped-5-4", sceneZoom = 1.25}]
+snappedScenes = [snapped {sceneName = "snapped-" <> label, sceneZoom = zoom} | (label, zoom) ← [("9-8", 1.125), ("5-4", 1.25), ("63-8", 7.875), ("8", 8)]]
 
+-- | The two scales where the measured counterexample lay: the stale-bias control is drawn at them.
+staleBiasScenes ∷ [Scene]
+staleBiasScenes = take 2 snappedScenes
+
+-- | The edge and diagonal fixture: an ordinary pass whose named probes the oracle decides, then the
+-- edge scene.
+edgeFixture ∷ Float → Int → ViewFacing → Spec
+edgeFixture zoom shape facing =
+  Spec (sceneName sc <> "-beside-ordinary") [shapeMatrixCell 0 FaceSouth 1, sc] Dynamic defaultLight [Foreground] [] Nothing
+  where
+    sc = edgeScene zoom shape facing
+
+-- | The scales and shapes of the edge fixtures: the minified endpoint 1/8, 1/2 and native scale.
+edgeCases ∷ [(Float, Int, ViewFacing)]
+edgeCases = [(0.125, 0, FaceSouth), (0.125, 15, FaceEast), (0.5, 0, FaceSouth), (0.5, 9, FaceWest), (1, 0, FaceSouth), (1, 5, FaceNorth)]
 staleBiasFixture ∷ Scene → Spec
 staleBiasFixture sc =
   Spec (sceneName sc <> "-beside-ordinary" <> suffixOf StaleBias) [shapeMatrixCell 0 FaceSouth 1, sc] StaleBias defaultLight [Foreground] [] Nothing

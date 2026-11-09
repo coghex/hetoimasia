@@ -41,6 +41,7 @@ module Hetoimasia.Terrain.Render2D.Scenes
   , viewportOffset
   , scaledTarget
   , snapped
+  , edgeScene
     -- * Layout
   , fitScene
   ) where
@@ -356,3 +357,16 @@ fitScene margin input =
     vx' = (fst centre / 48 + snd centre / 24) / 2
     vy' = (snd centre / 24 - fst centre / 48) / 2
     (px, py) = turn (4 - count) (vx', vy')
+
+-- | A single cell at a zoom in an ODD target with no pan, so the canvas corner lies on a half pixel and
+-- every pixel centre lies at a whole number of pixels from it: centres fall exactly on the quad's left
+-- and top edge (inside), on its right and bottom edge (outside, one pixel beyond the last) and, wherever
+-- the offsets are in the ratio of the canvas extents, exactly on the shared diagonal of its two
+-- triangles, with the pixels beside each. The expectation is the rule itself, exact. At zoom 1/8 (the
+-- minified endpoint) a pixel is eight texels and the quad twelve pixels wide.
+edgeScene ∷ Float → Int → ViewFacing → Scene
+edgeScene zoom shape facing =
+  (newScene ("edges-" <> show shape <> "-" <> show facing <> "@" <> show zoom) [Cell 0 0 0 1 shape "loam"] (oddOf (round (96 * zoom) + 16), oddOf (round (64 * zoom) + 16))) {sceneFacing = facing, sceneZoom = zoom}
+  where
+    oddOf n = if even n then n + 1 else (n ∷ Int)
+
