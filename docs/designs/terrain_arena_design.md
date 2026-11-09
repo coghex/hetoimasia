@@ -959,6 +959,10 @@ contain Ecce Homo's soil/stone choices or import concrete game modules. This
 settles the direction of Q-5; the concrete package/service interfaces and
 execution/lifetime contract still require specification.
 
+Generalized by the owner on 2026-11-09: this division is the general pattern
+for every system, not a terrain-only choice
+([vision](../vision.md) V-1).
+
 ### D-18. Synarchy presentation baseline
 
 Owner, directly in this pane on 2026-11-06, selected:
