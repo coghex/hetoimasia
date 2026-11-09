@@ -40,7 +40,7 @@ import Control.Monad (foldM, forM)
 import Crypto.Hash.SHA256 (hash)
 import Data.Array (Array, bounds, inRange, listArray, range, (!))
 import qualified Data.ByteString as ByteString
-import Data.List (partition, sortOn)
+import Data.List (nub, partition, sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import Data.Text (Text)
@@ -735,6 +735,9 @@ data Extra = Extra
   , extraRuns ∷ ![(String, Int, String)]
   , extraMarks ∷ ![(String, Maybe Bool)]
   , extraIndependent ∷ !(Maybe Independent)
+  , extraModel ∷ !(Int, Int)
+  -- ^ At the exempted pixels: those where the pure model was compared with the exact expectation, and those
+  -- where the oracle gave it no value to compare (counted, never hidden).
   , extraBand ∷ ![PassBand]
   -- ^ For each pass, its undecided band in texels (amendment v3, from the device's queried
   -- @subPixelPrecisionBits@ and the pass's own view scale), whether it is eligible, its undecided and
@@ -755,7 +758,7 @@ data Extra = Extra
   }
 
 emptyExtra ∷ Spec → Extra
-emptyExtra s = Extra s [] [] [] [] [] Nothing [] [] 0 0 0 [] Nothing Nothing [] Nothing []
+emptyExtra s = Extra s [] [] [] [] [] Nothing (0, 0) [] [] 0 0 0 [] Nothing Nothing [] Nothing []
 
 failed ∷ String → String → FixtureResult
 failed name why = FixtureResult (Text.pack name) [] [] [] (Just (Text.pack why))
@@ -938,6 +941,9 @@ data PassBand = PassBand
 -- | A pass's raster margin as recorded.
 data MarginRecord = MarginNotEligible | MarginIs !Double !Double | MarginUncomputable
 
+-- | The pure material model against the exact expectation at one exempted pixel.
+data BandedModel = NotBanded | ModelAgrees | ModelDisagrees String | ModelNotEvaluable
+
 -- | A pick as the judge compares it: nothing selectable, or a known cell and the part of it.
 data PickSummary = SNoHit | SLoading | SHit (Integer, Integer, Integer) Role
   deriving stock (Eq, Show)
@@ -1084,6 +1090,20 @@ renderSnapshot ctx s parts = do
                   let indeterminate = NearTexelBoundary (AtPass (probePass (probeAt probed)))
                    in probed {probeExpectation = Indeterminate indeterminate, probeVerdict = ProbeIndeterminate indeterminate}
             _ → probed
+          -- At every banded pixel the pure material model (through the oracle's expectation, which the model
+          -- supplies) is compared with the independent exact expectation: only the device read-back is exempt.
+          bandedModel probed = case (drop (probePass (probeAt probed)) oracleGrids, drop (probePass (probeAt probed)) exactGrids) of
+            (bandGrid : _, exactGrid : _)
+              | inRange (bounds bandGrid) at
+              , Ambiguous _ ← bandGrid ! at →
+                  case (probeExpectation probed, exactGrid ! at) of
+                    (Expected (Rgba8 r g b _) _, ExpectedHit {expectedLinear = lin}) → let (er, eg, eb) = shadedByte lin in if all (\(e, o) → abs (fromIntegral e - fromIntegral o) <= (3 ∷ Int)) [(er, r), (eg, g), (eb, b)] then ModelAgrees else ModelDisagrees (show at <> ": the model gives " <> show (r, g, b) <> ", the exact expectation " <> show (er, eg, eb))
+                    (Expected (Rgba8 r g b _) _, ExpectedClear) → if all (<= 3) [r, g, b] then ModelAgrees else ModelDisagrees (show at <> ": the model gives " <> show (r, g, b) <> " where the exact expectation is clear")
+                    _ → ModelNotEvaluable
+              where
+                at = (probeX (probeAt probed), probeY (probeAt probed))
+            _ → NotBanded
+          modelChecks = map bandedModel (resultProbes result0)
           result = result0 {resultProbes = map bandedProbe (resultProbes result0)}
       let perPass = splitPasses (map (sceneTarget . partScene) parts) (resultProbes result)
           independents = [judgeIndependent (sceneTarget (partScene part)) (grid !) (observedFrom (fst (sceneTarget (partScene part))) probes) | (part, grid, probes) ← zip3 parts grids perPass]
@@ -1111,10 +1131,12 @@ renderSnapshot ctx s parts = do
           -- The pick against the hand expectation on a stride of every pass's pixels.
           pickResults =
             [ (length judged, [show pixel <> ": the pick found " <> show got <> ", expected " <> show want | (pixel, want, got) ← judged, got /= want], length [() | (_, SLoading, _) ← judged], length [() | pixel ← pixels, Nothing ← [pickWanted art light part grid pixel]])
-            | (part, grid) ← zip parts exactGrids
+            | (part, grid, bandGrid) ← zip3 parts exactGrids oracleGrids
             , let (gw, gh) = sceneTarget (partScene part)
             , let step = max 1 ((gw * gh) `div` 600)
-            , let pixels = [(x, y) | (i, (x, y)) ← zip [0 ∷ Int ..] [(x, y) | y ← [0 .. gh - 1], x ← [0 .. gw - 1]], i `mod` step == 0]
+            -- The strided pixels, and EVERY pixel the device band leaves undecided (the picker is compared
+            -- with the exact expectation at all of them: only the device read-back is exempt).
+            , let pixels = nub ([(x, y) | (i, (x, y)) ← zip [0 ∷ Int ..] [(x, y) | y ← [0 .. gh - 1], x ← [0 .. gw - 1]], i `mod` step == 0] <> [p | p ← range (bounds bandGrid), Ambiguous _ ← [bandGrid ! p]])
             , let judged = [(pixel, want, got) | pixel ← pixels, Just want ← [pickWanted art light part grid pixel], let got = case specVariant s of { PickLoadingAsMiss → (case pickerAt part pixel of { SLoading → SNoHit; other → other }); BackmostPick → fromMaybe want (pickThroughNearer (grid ! pixel)); PickThroughFog → fromMaybe want (pickThroughFog (grid ! pixel)); _ → pickerAt part pixel }]
             ]
           pickCompared = sum [n | (n, _, _, _) ← pickResults]
@@ -1159,6 +1181,9 @@ renderSnapshot ctx s parts = do
                       differing = length [() | y ← [0 .. rh - 1], x ← [0 .. rw - 1], seenFirst x y /= seenLast x y]
                    in [ "the final pass does not restore the first: " <> show differing <> " pixels differ" | differing > 0 || sceneTarget (partScene firstPart) /= sceneTarget (partScene lastPart) || partScene firstPart /= partScene lastPart ]
             _ → []
+          modelCompared = length [() | ModelAgrees ← modelChecks] + length [() | ModelDisagrees _ ← modelChecks]
+          modelNotEvaluable = length [() | ModelNotEvaluable ← modelChecks]
+          modelProblems = ["the pure material model disagrees with the exact expectation at an exempted pixel: " <> show (take 3 [why | ModelDisagrees why ← modelChecks]) | ModelDisagrees _ ← take 1 [m | m@(ModelDisagrees _) ← modelChecks]]
           passBands =
             [ PassBand
                 { pbBand = fromRational (undecidedBand bits (partPlan part)) ∷ Double
@@ -1194,6 +1219,7 @@ renderSnapshot ctx s parts = do
                   <> ["the pick disagreed with the expectation at " <> show (length pickProblems) <> " pixels, e.g. " <> show (take 3 pickProblems) | not (isControl (specVariant s)), not (null pickProblems)]
                   <> cameraProblems
                   <> restoreProblems
+                  <> [problem | not (isControl (specVariant s)), problem ← modelProblems]
                   <> [problem | not (isControl (specVariant s)), problem ← rasterProblems]
                   <> pendingProblems
                   <> pathProblems
@@ -1226,6 +1252,7 @@ renderSnapshot ctx s parts = do
               , extraRuns = runFacts
               , extraMarks = markFacts
               , extraIndependent = Just independent
+              , extraModel = (modelCompared, modelNotEvaluable)
               , extraBand = passBands
               , extraPassMismatches = [(indMismatchCount i, take 4 (indMismatches i)) | i ← independents]
               , extraPickCompared = pickCompared
@@ -1469,6 +1496,8 @@ writeRecord ctx format seconds results = do
             , ( "pick_against_expectation"
               , JObject
                   [ ("compared", JNumber (show (extraPickCompared extra)))
+                  , ("model_compared_at_exempted_pixels", JNumber (show (fst (extraModel extra))))
+                  , ("model_not_evaluable_at_exempted_pixels", JNumber (show (snd (extraModel extra))))
                   , ("undecided_conservative_ring", JNumber (show (extraPickUndecided extra)))
                   , ("mismatches", JNumber (show (extraPickMismatches extra)))
                   , ("first_mismatches", JArray (map JString (extraPickFirst extra)))
