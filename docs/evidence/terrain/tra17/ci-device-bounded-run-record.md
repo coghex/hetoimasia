@@ -9,11 +9,11 @@ Verdict: **pass**.
 - target standing: no target
 - actions: ran the terrain-ci evidence
 - device calls, in order: vkCreateInstance, vkCreateDebugUtilsMessengerEXT, vkEnumeratePhysicalDevices, vkCreateDevice, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
-- Vulkan calls: 945, on 1 thread(s)
+- Vulkan calls: 947, on 1 thread(s)
 - frames presented: 0, presentations retired: 0
 - verdict issues: []
 - error reports: 0
-- seconds, from the loader integration to the verdict: 1.467637984
+- seconds, from the loader integration to the verdict: 2.421873854
 - probe record: /__w/hetoimasia/hetoimasia/receipts/evidence/test.vulkan-native/terrain-ci/tra17-terrain-ci-probes.json
 - failure: none
 - depth format: Depth32Float
