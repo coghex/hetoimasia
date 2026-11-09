@@ -905,6 +905,10 @@ data Ticks = Ticks
     -- ^ Whether the scheduler stands at the boundary just before this tick: everything before it has
     -- finished and it has not begun (or it is past, or zero). Where the owner starts the work it holds
     -- the tick for.
+  , ticksGranted ∷ Word64 → STM Bool
+    -- ^ Whether this tick has been granted and waits, unbegun, only for what the owner holds it for: 'ticksQuiet', and the
+    -- application's grant for it accepted and not applied. Where a provider commits what a request held for the tick is to
+    -- do, so that a tick nobody has granted has done nothing (the request is eligible to settle there).
   , ticksWatch ∷ Word64 → STM ()
   , ticksOpen ∷ STM Bool
   , ticksTaskGone ∷ TaskId → STM Bool

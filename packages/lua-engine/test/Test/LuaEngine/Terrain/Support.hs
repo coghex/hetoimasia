@@ -15,6 +15,12 @@ module Test.LuaEngine.Terrain.Support
   , gameplayOver
   , soilOverStone
   , terrainPrelude
+  , Case (..)
+  , Verdict (..)
+  , caseLua
+  , checkCases
+  , limitHeld
+  , untilPrinted
   , Gate
   , newGate
   , gatedProbe
@@ -26,15 +32,19 @@ module Test.LuaEngine.Terrain.Support
 
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
+import Control.Exception (onException)
 import Control.Monad (when)
+import Data.List (find)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Unique (Unique, newUnique)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Terrain
 import Hetoimasia.Terrain.Runtime
-import Test.LuaEngine.Facade.Support (VmShape (..), gameplayShape, presentationShape)
+import Test.Hspec (Expectation, expectationFailure)
+import Test.LuaEngine.Facade.Support (VmShape (..), World, advanceClock, errLines, gameplayShape, outLines, presentationShape, pumpUntil)
 import Test.Support.Bounded (bounded)
 
 -- | The real service and the adapter over it.
@@ -117,3 +127,52 @@ awaitReached gate = bounded (takeMVar (gateArrived gate))
 -- | Let a held owner go, and every later arrival through.
 openGate ∷ Gate → IO ()
 openGate gate = disarmGate gate >> putMVar (gateOpen gate) ()
+
+-- Cases ---------------------------------------------------------------------------------------------------
+
+-- | What a case's call is expected to do.
+data Verdict
+  = -- | The call returned (nothing raised).
+    Accepted
+  | -- | The call raised an ordinary error whose text holds each of these.
+    Refused [Text]
+
+-- | A label, the Lua expression the case evaluates under @pcall@, and what it must come to.
+data Case = Case Text Text Verdict
+
+-- | The Lua line that runs a case and prints @label => ok ; results@ or @label => false ; error@.
+caseLua ∷ Case → Text
+caseLua (Case label expression _) = "try(" <> Text.pack (show (Text.unpack label)) <> ", function() return " <> expression <> " end)"
+
+-- | Check what the cases printed against what they must come to, reporting every mismatch together.
+checkCases ∷ [Case] → [Text] → Expectation
+checkCases cases printed = case concatMap check cases of
+  [] → pure ()
+  failures → expectationFailure (unlines failures)
+  where
+    check (Case label _ verdict) = case [Text.drop (Text.length prefix) line | line ← printed, prefix `Text.isPrefixOf` line] of
+      [seen] → case verdict of
+        Accepted
+          | "true" `Text.isPrefixOf` seen → []
+          | otherwise → [show label <> " must be accepted, but: " <> Text.unpack seen]
+        Refused reasons
+          | "false ; " `Text.isPrefixOf` seen && all (`Text.isInfixOf` seen) reasons → []
+          | otherwise → [show label <> " must be refused with " <> show reasons <> ", but: " <> Text.unpack seen]
+      other → ["the case " <> show label <> " printed " <> show (length other) <> " lines"]
+      where
+        prefix = label <> " => "
+
+-- | What the service itself holds of a named limit, from its own structures.
+limitHeld ∷ Service → String → IO Integer
+limitHeld service name = do
+  rows ← inspectLimits service
+  pure (maybe (-1) (toInteger . limitRowHeld) (find ((== name) . limitRowName) rows))
+
+-- | Advance the presentation clock until the instance has printed this line, and when it does not in time say what it did print.
+untilPrinted ∷ World → Text → IO ()
+untilPrinted world marker =
+  pumpUntil world (advanceClock world 2000000000 >> (elem marker <$> outLines world))
+    `onException` do
+      printed ← outLines world
+      warned ← errLines world
+      putStrLn ("waiting for " <> show marker <> "; printed: " <> show printed <> "; warned: " <> show warned)

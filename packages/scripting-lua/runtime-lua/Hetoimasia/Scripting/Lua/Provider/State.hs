@@ -1320,7 +1320,15 @@ modelReply = \case
 -- defect is recorded for the owner to raise, once, and settles nothing: the provider's work is
 -- proved over, and the request stays as it was until the owner's failure revokes it.
 replyTo ∷ ProviderState → RequestId → Checked → STM ReplyAnswer
-replyTo service identity checked = do
+replyTo service = replyToAs service True
+
+-- | 'replyTo', and whether a resource reply proves the provider's work over at once. It does for 'completeRequest': the provider
+-- has nothing more to tell, and learns that interest ended before the build only through 'submissionSettled'. It does not for
+-- the opt-in settlement seam: the resource is the provider's until the owner has built it, so a request that ends first still
+-- has its work told ('workCancel') and the provider reclaims what it offered, at that very cancel, and never waits for a
+-- take, a boundary or a thread of its own.
+replyToAs ∷ ProviderState → Bool → RequestId → Checked → STM ReplyAnswer
+replyToAs service endsWork identity checked = do
   st ← readTVar (psVar service)
   let session = pSession st
       unsettled = maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests session))
@@ -1348,10 +1356,8 @@ replyTo service identity checked = do
               writeTVar (psVar service) st {pCounts = (pCounts st) {countDuplicateHeld = countDuplicateHeld (pCounts st) + 1}}
               pure ReplyLate
             else do
-              writeTVar (psVar service) $
-                endWork identity st
-                  { pAdopting = Map.insert identity (Adopting key number build value bytes False) (pAdopting st)
-                  }
+              let adopting = st {pAdopting = Map.insert identity (Adopting key number build value bytes False) (pAdopting st)}
+              writeTVar (psVar service) (if endsWork then endWork identity adopting else adopting)
               pure ReplyAdoption
     _ → applyChecked service identity checked
   where
@@ -1456,7 +1462,7 @@ eligibleOf service identity = do
       , maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests (pSession st))) →
           case recDue record of
             Nothing → pure True
-            Just due → ticksQuiet (psTicks service) (dueTick due)
+            Just due → ticksGranted (psTicks service) (dueTick due)
     _ → pure False
 
 -- | Settle a request by the opt-in settlement seam, in the caller's transaction ('Settling'): a reply that is
@@ -1469,7 +1475,7 @@ settleWith service ask schema identity reply = do
   eligible ← eligibleOf service identity
   case checkReplyPure (psLimits service) schema ask reply of
     checked@(CheckedDefect _) → replyTo service identity checked
-    checked@(CheckedResource {}) → replyTo service identity checked
+    checked@(CheckedResource {}) → replyToAs service False identity checked
     checked → applyCheckedAs service eligible identity checked
 
 -- | How many provider defects are kept for the owner to raise: it fails with the first, and the rest are

@@ -459,8 +459,12 @@ test-suite lua-engine-tests
         Test.LuaEngine.Texture.Publication
         Test.LuaEngine.Texture.Png
         Test.LuaEngine.Terrain.Basics
+        Test.LuaEngine.Terrain.Domain
+        Test.LuaEngine.Terrain.Names
+        Test.LuaEngine.Terrain.Ownership
         Test.LuaEngine.Terrain.Spec
         Test.LuaEngine.Terrain.Support
+        Test.LuaEngine.Terrain.Validation
         Test.LuaEngine.Texture.Spec
         Test.LuaEngine.Texture.Stages
         Test.LuaEngine.Texture.Teardown

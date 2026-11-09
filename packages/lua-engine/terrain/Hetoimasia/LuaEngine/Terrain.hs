@@ -262,6 +262,15 @@ data Ask
   | AskSurface !ArenaLease !Column
   | AskRemove !ArenaLease !TileCoord !(Maybe Precondition)
 
+-- | An instance's two terrain clients. The service makes the lease of an attach by the arena's own creator an /owner/ lease, but
+-- an attach always yields a nonowner attachment (the lease of the open is the arena's only owner lease, and releasing it closes
+-- the arena whatever the creator attached to): so an instance opens as its owner client and attaches as another client, made the
+-- first time it attaches. Both end with the instance.
+data Clients = Clients
+  { clOwner ∷ !Client
+  , clAttach ∷ !(Maybe Client)
+  }
+
 data Pending = Pending
   { pdAsk ∷ !Ask
   , pdRequest ∷ !(TVar (Maybe Request))
@@ -271,7 +280,7 @@ data Env = Env
   { envFacade ∷ !TerrainFacade
   , envVm ∷ !TerrainVm
   , envSession ∷ !Int
-  , envClients ∷ !(TVar (Map Text Client))
+  , envClients ∷ !(TVar (Map Text Clients))
   , envAsks ∷ !(TVar (Word64, Map Word64 Pending))
   , envRetire ∷ !(TVar [Request])
   , envIssued ∷ !(TVar (Map Word64 Text))
@@ -311,7 +320,7 @@ services env =
         start env context openName openAsk (AskOpen client (nameKey env root name) (sourceSpec definition))
     , tsAttachCheck = \_ _ _ owner values → permanent env (const attachAsk) owner values
     , tsAttachStart = \identity root name context → do
-        client ← clientOf env identity
+        client ← attachClientOf env identity
         start env context attachName attachAsk (AskAttach client (nameKey env root name))
     , tsCellCheck = \identity key _ owner values → leaseCheck env identity key readAsk owner values
     , tsCellStart = \_ key cell context → withArena env key $ \lease →
@@ -380,7 +389,7 @@ declare ∷ Env → Text → Text → IO ()
 declare env identity _root =
   registerClient (service env) >>= \case
     Left refused → throwIO (TerrainCompositionRefused ("an instance's terrain client was refused: " <> Text.pack (show refused)))
-    Right client → atomically (modifyTVar' (envClients env) (Map.insert identity client))
+    Right client → atomically (modifyTVar' (envClients env) (Map.insert identity (Clients client Nothing)))
 
 forget ∷ Env → Text → IO ()
 forget env identity = do
@@ -388,14 +397,32 @@ forget env identity = do
     held ← Map.lookup identity <$> readTVar (envClients env)
     modifyTVar' (envClients env) (Map.delete identity)
     pure held
-  forM_ found (endClient (service env))
+  forM_ found $ \clients → do
+    forM_ (clAttach clients) (endClient (service env))
+    endClient (service env) (clOwner clients)
   drainRetired env
 
 clientOf ∷ Env → Text → IO Client
-clientOf env identity =
+clientOf env identity = clOwner <$> clientsOf env identity
+
+clientsOf ∷ Env → Text → IO Clients
+clientsOf env identity =
   Map.lookup identity <$> readTVarIO (envClients env) >>= \case
     Just found → pure found
     Nothing → throwIO (TerrainCompositionRefused "no terrain client was declared for the instance")
+
+-- | The client an instance attaches as, made on first use.
+attachClientOf ∷ Env → Text → IO Client
+attachClientOf env identity = do
+  clients ← clientsOf env identity
+  case clAttach clients of
+    Just found → pure found
+    Nothing →
+      registerClient (service env) >>= \case
+        Left refused → throwIO (TerrainCompositionRefused ("an instance's attach client was refused: " <> Text.pack (show refused)))
+        Right made → do
+          atomically (modifyTVar' (envClients env) (Map.insert identity clients {clAttach = Just made}))
+          pure made
 
 -- | The name the service holds for an instance's name: in the session's and the instance's content root's namespace.
 nameKey ∷ Env → Text → Text → Text
