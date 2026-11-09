@@ -375,14 +375,15 @@ extent and non-finite input, and adjacent cells kept distinct at both supported
 axis extremes; the follow and manual cutaway camera as pure state, with the
 separate 25-level headroom, known-empty against unavailable anchor columns, exact
 manual depth, zoom clamping and jumps whose late completions cannot move a newer
-view; the visible faces of all 16 shapes in all four facings, cutaway caps and no
-geometry above the cut, partial-shape contacts decided by the shared wall
-coverage, the 250-level band and deep slices without enumerating the volume,
+view; the whole-cell 96 x 64 quads of all 16 shapes in all four facings through the
+corrected cutout and normal maps, no cap or extra mesh and no geometry above the
+cut, the 250-level band and deep slices without enumerating the volume,
 unavailable data kept distinct from air with bounded demand and identical
 geometry across chunk and vertical-region seams; deterministic distinct 24-bit
-depth keys checked against an independent exact ray-casting oracle over roof,
-cavity, ramp, corner and disconnected-span scenes and over generated scenes;
-picking that matches the drawn, pixel-snapped quad; every plan limit refused
+depth keys; coverage-based picking that matches the drawn, pixel-snapped quad,
+checked against an independent hand model of the quad contract; the terrain
+atlases (deterministic generation, exact per-region recovery, the checked region
+manifest) and the material's settings, push block, model and adaptation; every plan limit refused
 rather than truncated; and, through external clients, that the camera, plan and
 view cannot be forged and the private modules are unreachable. It is mandatory
 but outside the floor, like `test.terrain`, and runs through
@@ -391,7 +392,7 @@ library depends on the pure terrain, math, render-2d and render-api packages
 alone. Its package directory and Cabal file are inputs of `test.workflow` as well,
 because the owned-start guard scans every test suite of the packages
 `cabal.project` lists. It proves geometry, order and picking on the CPU, not what
-a GPU draws: that remains TRA-8's offscreen proof. See
+a GPU draws: that is TRA-17's offscreen proof (`tra17-terrain`, run directly, and its bounded required selection `tra17-terrain-ci`). See
 [the package's contract](../packages/terrain-render-2d/README.md).
 
 `test.terrain-runtime` runs the scoped transactional terrain service's own suite

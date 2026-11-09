@@ -4868,6 +4868,13 @@ agreement as specified above. The old per-face solid-renderer measurement is
 not that proof. This evidence is required during implementation before the
 affected qualification and final arena acceptance can pass.
 
+Measured outcome (TRA-17, #659, offscreen on one device, material and geometry path
+only, not runtime qualification): the amended cell-quad, atlas-region, lit and
+depth-shaded material is measured in
+[the TRA-17 evidence](../evidence/terrain/tra17/README.md), which states which
+obligations pass and which remain. This links the measurement and changes no
+owner decision.
+
 The broader historical “full Synarchy port” memory reconciliation is not an
 implementation dependency for this explicitly approved first arena. Fidelity
 beyond this arc remains uncommitted; MEMORY.md is unchanged.
