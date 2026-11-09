@@ -107,10 +107,13 @@ Accepted direction. A small 2D consumer arrives early to test reuse before the
 architecture becomes deeply 3D-specific. Game compatibility belongs in adapters.
 FND-3/FND-4 in the renderer report preserve the remaining consumer work.
 
-The original migration proposal remains captured Synarchy scenes followed by
-a bounded live scenario, with full game compatibility in a later focused arc.
-Refine concrete acceptance criteria alongside the 2D consumer without turning
-the minimal renderer into a full game port.
+Superseded by the owner on 2026-11-09: the original migration proposal was
+captured Synarchy scenes followed by a bounded live scenario, with full game
+compatibility in a later focused arc. That is not the path. Ecce Homo is
+rebuilt on Hetoimasia piece by piece, with Synarchy as the reference rather
+than a compatibility target ([vision](vision.md) V-1); the current piece is
+the [terrain arena](designs/terrain_arena_design.md). Source compatibility,
+save compatibility and a migration date remain uncommitted.
 
 ### D-3. Use Kanban's existing interactive issue/PR workflows
 

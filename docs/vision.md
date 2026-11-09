@@ -30,10 +30,20 @@ the session. This deferral does not assign an authoritative world to Lua
 tables or promise rollback of Lua mutations. The milestone's scope and
 service contracts are in the Lua-first engine design, D-41–D-43.
 
+Owner decision 2026-11-09: Hetoimasia is the engine on which Ecce Homo is
+being rebuilt, piece by piece. Synarchy is the reference: its code and behavior
+are evidence of what each system should do, not a compatibility contract and
+not a source to copy wholesale. Source compatibility, save compatibility and a
+migration date remain uncommitted. The reasons for the rebuild are a full
+lighting system that Synarchy's renderer cannot support, and uniform sprite
+assets regenerated from 3D models with `~/work/moskophoros`. This does not
+change the boundary above: engine packages never contain or import Ecce Homo.
+The current piece is the [terrain arena](designs/terrain_arena_design.md).
+
 Preserve Synarchy's useful reasoning about GLFW, logging, monotonic time,
 shaders and rendering deliberately. Reuse is selective; its coupled environment
-and game managers are not the new architecture. A future 2D module should make
-migrating game behavior practical without promising source compatibility.
+and game managers are not the new architecture. Each rebuilt system should make
+recreating the game's behavior practical without promising source compatibility.
 See [foundation direction](engine_foundation_design.md) and [AGENTS](../AGENTS.md).
 
 Owner decision 2026-09-26: use flexible subsystem-local `Base`/`Types`

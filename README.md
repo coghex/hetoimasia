@@ -1,7 +1,9 @@
 # Hetoimasia
 
 A modular Haskell/Vulkan game engine with Lua scripting and planned separate
-2D and 3D rendering modules. Synarchy is a potential future client.
+2D and 3D rendering modules. Ecce Homo is being rebuilt on it piece by piece,
+with Synarchy as the reference: evidence of what each system should do, not a
+compatibility contract and not a source to copy wholesale.
 
 **Current implementation:** logging, scoped CPU resources, failures and bounded
 recovery, monotonic scheduling, application composition, supervised workers,
