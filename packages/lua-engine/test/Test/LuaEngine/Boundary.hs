@@ -246,6 +246,7 @@ spec = describe "the package and import boundary" $ do
                      , "hetoimasia-lua-engine"
                      , "hetoimasia-lua-engine:facade"
                      , "hetoimasia-lua-engine:request"
+                     , "hetoimasia-lua-engine:terrain-names"
                      , "hetoimasia-scripting-lua"
                      , "hetoimasia-scripting-lua:runtime-lua"
                      , "hetoimasia-terrain"
@@ -260,7 +261,19 @@ spec = describe "the package and import boundary" $ do
     sources `shouldSatisfy` ((>= 1) . length)
     imported ← importedBy sources
     [file <> ": " <> name | (file, name) ← imported, not (permittedTerrain name)] `shouldBe` []
-    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+    -- the arbitration of an open's name is the one implementation module the adapter imports: from a private sub-library of its own
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name, name /= "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"] `shouldBe` []
+
+  it "keeps the arbitration of an open's name in a private sub-library that imports base libraries only, and that only the terrain sublibrary and this suite depend on" $ do
+    (sort <$> fieldEntries "library terrain-names" "build-depends:") `shouldReturn` ["base", "containers", "stm", "text"]
+    fieldEntries "library terrain-names" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"]
+    root ← above "cabal.project"
+    cabal ← readFile (root </> "packages" </> "lua-engine" </> "hetoimasia-lua-engine.cabal")
+    ("library terrain-names\n    import: language\n    visibility: private\n" `isInfixOf` cabal) `shouldBe` True
+    sources ← sourcesUnder "terrain-names"
+    sources `shouldSatisfy` ((>= 1) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, "Hetoimasia." `isPrefixOf` name] `shouldBe` []
 
   it "keeps the facade and the session free of any terrain package: the terrain operations are abstract there, and only the terrain sublibrary binds the service" $ do
     facade ← sourcesUnder "facade" >>= importedBy
@@ -461,7 +474,7 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Terrain.Residency"
                  , "Hetoimasia.Terrain.Runtime"
                  , "Hetoimasia.Terrain.Runtime.Settlement"
-               , "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"
+                 , "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"
                  , "Hetoimasia.Terrain.Shape"
                  , "Hetoimasia.Terrain.Source"
                  ]
@@ -575,6 +588,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.Terrain.Residency"
                , "Hetoimasia.Terrain.Runtime"
                , "Hetoimasia.Terrain.Runtime.Settlement"
+               , "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"
                , "Hetoimasia.Terrain.Source"
                , "Hetoimasia.Asset.Image"
                , "Hetoimasia.Asset.Image.DataMap"
