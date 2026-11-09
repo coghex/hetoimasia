@@ -55,7 +55,7 @@ concrete precondition
   shows an image file decoded by the asset epic's `asset-image`, drawn
   through `render-2d`.
 - **Users and operators:** game and adapter authors building 2D presentation
-  (a later Synarchy client among them), the later text arc and `render-3d`
+  (Ecce Homo's rebuilt systems among them), the later text arc and `render-3d`
   arc, and maintainers reading retained evidence.
 - **Arc label:** `render-2d` (proposed; no such label exists yet).
 
