@@ -1009,7 +1009,10 @@ renderSnapshot ctx s parts = do
           -- Two grids per pass from the same exact expectation: the one the device read-back is judged
           -- by (an unsnapped scene's pixel near an interior threshold is 'Ambiguous' there, and
           -- nowhere else) and the exact one the pure pick is compared with at EVERY pixel.
-          grids = zipWith (gridOf (expectedForDevice (ctxSubPixelBits ctx))) [0 ..] parts
+          grids = zipWith (gridOf (expectedForDevice (ctxSubPixelBits ctx) 3)) [0 ..] parts
+          -- The oracle path's band is judged by the oracle's own tolerance (one 8-bit step): texels that
+          -- differ by two or three steps are the same to the independent judge and different to the oracle.
+          oracleGrids = zipWith (gridOf (expectedForDevice (ctxSubPixelBits ctx) 1)) [0 ..] parts
           exactGrids = zipWith (gridOf expectedAt) [0 ..] parts
           gridOf expectation index part =
             let sc = partScene part
@@ -1030,7 +1033,7 @@ renderSnapshot ctx s parts = do
           altGrid part alt = case scenePlan (styleAssets (ctxStyle ctx)) alt of
             Right altPlan →
               let (gw, gh) = sceneTarget alt
-               in Just ((listArray ((0, 0), (gw - 1, gh - 1)) [expectedForDevice (ctxSubPixelBits ctx) art light alt (partCamera part) altPlan (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected) !)
+               in Just ((listArray ((0, 0), (gw - 1, gh - 1)) [expectedForDevice (ctxSubPixelBits ctx) 3 art light alt (partCamera part) altPlan (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected) !)
             Left _ → Nothing
           named = case parts of
             part : _ → chooseNamed (partScene part) (firstGrid !) (case grids of _ : g : _ → Just (g !); _ → Nothing) (alternative part) determinate (specNeeds s)
@@ -1071,7 +1074,7 @@ renderSnapshot ctx s parts = do
       -- biased threshold, between texels that differ) the oracle's probe is the model fault
       -- NearTexelBoundary, counted and never compared. Outside that set an oracle mismatch stands as a
       -- failure (a further sampling counterexample). The oracle's generic bands are unchanged.
-      let bandedProbe probed = case drop (probePass (probeAt probed)) grids of
+      let bandedProbe probed = case drop (probePass (probeAt probed)) oracleGrids of
             grid : _
               | inRange (bounds grid) (probeX (probeAt probed), probeY (probeAt probed))
               , Ambiguous _ ← grid ! (probeX (probeAt probed), probeY (probeAt probed)) →

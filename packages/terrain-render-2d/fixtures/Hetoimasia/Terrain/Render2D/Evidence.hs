@@ -500,7 +500,7 @@ shadedByte (r, g, b) = (srgbEncode r, srgbEncode g, srgbEncode b)
 -- the pure material model are compared with at every pixel. The device's own exemption, which applies
 -- to a few samples of unsnapped scenes only, is 'expectedForDevice'.
 expectedAt ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
-expectedAt art light sc camera plan pixel = fst (decidedAt 0 art light sc camera plan pixel)
+expectedAt art light sc camera plan pixel = fst (decidedAt 0 0 art light sc camera plan pixel)
 
 -- | The expectation the device read-back is judged by: 'expectedAt', except a pixel the device may
 -- legitimately read differently becomes 'Ambiguous' (owner amendment v3). Only a pixel of a scene that
@@ -510,9 +510,11 @@ expectedAt art light sc camera plan pixel = fst (decidedAt 0 art light sc camera
 -- @k - 1/128@, @k = 1 .. n - 1@. A snapped scene, a scene whose vertices are all on the grid (the
 -- exact-boundary and edge fixtures), an outer edge and a shared diagonal are never exempt: a
 -- disagreement there is a counterexample. The first argument is @b@, the device's queried
--- @subPixelPrecisionBits@.
-expectedForDevice ∷ Int → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
-expectedForDevice bits art light sc camera plan pixel = case decidedAt (undecidedBand bits sc) art light sc camera plan pixel of
+-- @subPixelPrecisionBits@; the second is the per-channel tolerance (in 8-bit steps) the band's
+-- "texels that differ" is judged by: the declared tolerance for the independent judge, the oracle's own
+-- for its path.
+expectedForDevice ∷ Int → Int → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
+expectedForDevice bits tolerance art light sc camera plan pixel = case decidedAt (undecidedBand bits sc) tolerance art light sc camera plan pixel of
   (_, True) | deviceEligible bits sc camera plan → Ambiguous "an interior texel threshold within the vertex-quantisation band"
   (expected, _) → expected
 
@@ -571,8 +573,8 @@ rasterMargin bits sc camera plan
 
 -- | The exact expectation and whether any quad it examined has a texel offset within the band of an
 -- interior threshold.
-decidedAt ∷ Rational → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → (Expected, Bool)
-decidedAt band art light sc camera plan pixel = case pixelWorldPoint plan pixel of
+decidedAt ∷ Rational → Int → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → (Expected, Bool)
+decidedAt band tolerance art light sc camera plan pixel = case pixelWorldPoint plan pixel of
   Nothing → (ExpectedClear, False)
   Just (sx, sy) → go [] False quads sx sy
   where
@@ -616,7 +618,7 @@ decidedAt band art light sc camera plan pixel = case pixelWorldPoint plan pixel 
                       else Just (shadedByte (handShade light count (srgbDecode cr, srgbDecode cg, srgbDecode cb) (mr, mg, mb) (hqDepth q)))
               differs a b = case (a, b) of
                 (Nothing, Nothing) → False
-                (Just (r1, g1, b1), Just (r2, g2, b2)) → any (\(x, y) → abs (fromIntegral x - fromIntegral y) > (3 ∷ Int)) [(r1, r2), (g1, g2), (b1, b2)]
+                (Just (r1, g1, b1), Just (r2, g2, b2)) → any (\(x, y) → abs (fromIntegral x - fromIntegral y) > tolerance) [(r1, r2), (g1, g2), (b1, b2)]
                 _ → True
               exact = outcomeAt u v
            in or [differs exact (outcomeAt u' v') | u' ← candidates 96 fu, v' ← candidates 64 fv]

@@ -186,7 +186,7 @@ judge _ assets art scene = do
               Just False → disagreement expected found
               Nothing → Nothing
             covered = case expected of ExpectedHit {} → 1; _ → 0
-            banded = case expectedForDevice testSubPixelBits art defaultHandLight scene camera plan pixel of Ambiguous _ → 1; _ → 0
+            banded = case expectedForDevice testSubPixelBits 3 art defaultHandLight scene camera plan pixel of Ambiguous _ → 1; _ → 0
          in acc
               { jCompared = jCompared acc + 1
               , jAmbiguous = jAmbiguous acc + banded
