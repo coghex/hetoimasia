@@ -368,6 +368,31 @@ spec = describe "the private page codec against independent bytes" $ do
       case runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 wBound) of
         Left (Bad KeyOrder (PageNo 6)) → pure ()
         other → expectationFailure ("a child reaching the upper separator was followed: " <> either show (const "answered") other)
+  describe "a child's checksum" $ do
+    it "refuses a child whose page carries another checksum than its parent records, also for a page that was just loaded through another pointer" $ do
+      let add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
+          runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
+          sepL = runKeyBytes 1000
+          sepR = runKeyBytes 5000
+          leaf6 = buildPage 1 7 6 1 0 0 1 (leafPayload [(runKeyBytes 1000, bias 1001)])
+          good = getLe32' leaf6 4092
+          entry k crc = BS.concat [BS.singleton 24, k, le64' 6, le32' crc]
+          parentOf crcs = buildPage 1 7 5 2 0 1 (length crcs) (BS.concat [entry k crc | (k, crc) ← crcs])
+          wOnly crcs = add (add (emptyWindow ident0 0) 5 (parentOf crcs)) 6 leaf6
+          lookupWith crcs = runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 (wOnly crcs))
+      -- the checksum the parent records is the page's: it is followed
+      case lookupWith [(sepL, good)] of
+        Right (Just _, _) → pure ()
+        other → expectationFailure ("a child with its recorded checksum was refused: " <> either show (const "answered another way") other)
+      -- another checksum: the same page, another version of it
+      case lookupWith [(sepL, good + 1)] of
+        Left (Bad (ChildChecksum want have) (PageNo 6)) → (want, have) `shouldBe` (good + 1, good)
+        other → expectationFailure ("a child with another checksum was followed: " <> either show (const "answered") other)
+      -- a page already loaded through a pointer that records its checksum is not taken from the cache for a pointer that records another
+      let twice = lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL >> lookupKey TreeRuns (Just (Disk (PageNo 5))) sepR
+      case runM twice (newEdit 0 (wOnly [(sepL, good), (sepR, good + 7)])) of
+        Left (Bad (ChildChecksum want have) (PageNo 6)) → (want, have) `shouldBe` (good + 7, good)
+        other → expectationFailure ("a cached page was used for a pointer that records another checksum: " <> either show (const "answered") other)
   describe "rebalancing" $ do
     it "refuses a root collapse that would follow a cycle or a child of the wrong level" $ do
       let runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
