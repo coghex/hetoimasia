@@ -170,6 +170,7 @@ module Hetoimasia.Terrain.Connectivity
   , ComponentKey
   , keyOrigin
   , keyParameters
+  , mkComponentKey
   , VoidLookup (..)
   , lookupVoid
   , componentOf

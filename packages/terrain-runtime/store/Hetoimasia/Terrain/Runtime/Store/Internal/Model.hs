@@ -1,0 +1,893 @@
+-- | The store as one pure state machine: the committed roots, the readers pinned to
+-- older versions, the one active transaction, the allowance and its growth, and the
+-- conditions that pause new history.
+--
+-- Nothing here performs I/O, runs a thread, reads a clock or takes a lock. The later
+-- terrain owner holds the one current 'Store' and feeds it the outcomes its workers
+-- and its requests report; every transition returns the next value or a typed
+-- refusal and leaves the argument untouched.
+--
+-- = The transaction
+--
+-- @
+--   plan -> admit -> ( dispatch -> complete )* -> publish
+--                       \\                         ^
+--                        cancel (a request)       | eligible only when every page is
+--                        \\                        |  Written and no I/O is outstanding
+--                         abort (after drain)
+-- @
+--
+-- At most one transaction is active. 'admit' claims the plan's pages (they are
+-- /staged/: unreachable from the committed roots, claimed by this transaction
+-- alone). A page's outcome is supplied by the owner: 'WriteDone' or 'WriteFailed'.
+-- Completing every page makes the transaction eligible for the owner's decision; an
+-- I/O completion is not a publication, and 'publish' is the owner's. Cancellation is
+-- a request: it is recorded and releases nothing. 'abort' releases the claims only
+-- once no write is in flight, and it needs no write: the committed roots were never
+-- changed, so the old content, knowledge and frontier are exactly as they were.
+-- After 'publish' the new roots are authoritative and a late cancellation or
+-- outcome of that transaction changes nothing. A duplicate or stale outcome (an
+-- unknown transaction, a page the transaction does not hold, a result already
+-- recorded) changes nothing and is reported as such.
+--
+-- = Readers
+--
+-- A reader pins the record trees of one committed version. Writes, publication and
+-- reclamation cannot change its answers: replaced record pages are retired and
+-- reclaimed only once the oldest pinned version has passed the retirement entry's
+-- version. A token for a released reader, another store or another incarnation
+-- reads nothing.
+--
+-- = The allowance and growth
+--
+-- See "Hetoimasia.Terrain.Runtime.Store.Internal.State" for the page states and the
+-- accounting. Growth is proposed purely, begun (serialised with mutation), recorded
+-- as reserved when the effect owner reports it, and committed only then; a growth
+-- that fails keeps the old allowance, and any extra reservation it had obtained
+-- stays accounted as pending until its release is reported.
+--
+-- State, ownership and lifetime: values; the terrain owner is the only writer of
+-- the current 'Store', on its one thread.
+module Hetoimasia.Terrain.Runtime.Store.Internal.Model
+  ( -- * The store
+    Store
+  , newStore
+  , storeFromRoots
+  , storeConfig
+  , storeIdentity
+  , storeRoots
+  , storeVersion
+  , storeHeader
+  , oldestPin
+  , committedRoot
+
+    -- * Usage
+  , Usage (..)
+  , usage
+  , controlBytes
+
+    -- * Planning
+  , planEdit
+  , planRemoval
+  , planDiscovery
+  , planDiscoveryWith
+  , planMaintenanceWith
+  , planMaintenance
+  , providerAt
+  , missingAt
+
+    -- * The transaction
+  , TxnId
+  , txnSerial
+  , AdmitRefusal (..)
+  , admit
+  , EventResult (..)
+  , WriteOutcome (..)
+  , dispatchWrite
+  , completeWrite
+  , requestCancel
+  , Eligibility (..)
+  , eligibility
+  , Published (..)
+  , PublishRefusal (..)
+  , publish
+  , AbortRefusal (..)
+  , abortTransaction
+  , activePages
+  , ActiveView (..)
+  , activeView
+
+    -- * Conditions
+  , Condition (..)
+  , conditions
+  , pauseFor
+  , clearCondition
+
+    -- * Readers
+  , ReaderToken
+  , ReaderRefusal (..)
+  , StaleReader (..)
+  , acquireReader
+  , releaseReader
+  , readerVersion
+  , readerWindow
+  , ReadOutcome (..)
+  , maxRangeRecords
+  , readerLookup
+  , readerFloorRun
+  , readerRange
+  , readerProviderFor
+  , readerMissing
+
+    -- * Growth
+  , GrowthProposal
+  , gpFrom
+  , gpTo
+  , GrowthDecision (..)
+  , GrowthRefusal (..)
+  , proposeGrowth
+  , beginGrowth
+  , growthReserved
+  , commitGrowth
+  , growthFailed
+  , growthReleased
+  , growthReleaseFailed
+  , GrowthView (..)
+  , growthView
+
+    -- * Feasibility
+  , Counterexample (..)
+  , minimumRemovalFeasible
+  , minimumRemovalPages
+  , minimumRemovalRam
+  ) where
+
+import Data.ByteString (ByteString)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
+import Data.Set (Set)
+import qualified Data.Set as Set
+import Data.Word (Word64)
+import Hetoimasia.Terrain.Cell (Column)
+import Hetoimasia.Terrain.Coordinate (TileCoord)
+import Hetoimasia.Terrain.Discovery
+  ( Allowance (..)
+  , Authority
+  , Candidate
+  , Env
+  , Header (..)
+  , Provider
+  , Record
+  , RecordKey (..)
+  , Refusal
+  , Report (..)
+  , StageOutcome (NoChange, EditSuspended)
+  , Step (..)
+  , allowanceOf
+  , candidateReport
+  , envLimits
+  , stageRemoval
+  , stepDiscovery
+  , worstEditWrites
+  )
+import Data.Int (Int64)
+import qualified Hetoimasia.Terrain.Discovery as Discovery
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format
+import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
+import Hetoimasia.Terrain.Runtime.Store.Internal.State
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
+
+-- ---------------------------------------------------------------------------
+-- The store
+
+data PageState = PsStaged | PsInFlight | PsWritten | PsFailed
+  deriving stock (Eq, Show)
+
+data Active = Active
+  { acId ∷ !TxnId
+  , acPlan ∷ !Plan
+  , acPages ∷ !(Map PageNo PageState)
+  , acCancel ∷ !Bool
+  }
+
+-- | A transaction's identity: the store's reader-independent serial. Outcomes
+-- carry it, so one for another transaction or an earlier one changes nothing.
+newtype TxnId = TxnId Word64
+  deriving stock (Eq, Ord, Show)
+
+txnSerial ∷ TxnId → Word64
+txnSerial (TxnId n) = n
+
+-- | Why new history is paused. The first three of these pause an arena; none is
+-- cleared by another's recovery.
+data Condition = CondCapacity | CondIo | CondIntegrity
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
+
+data GrowthState
+  = GrowthIdle
+  | -- | A proposal is being executed; the flag says whether the extra reservation
+    -- has been obtained.
+    GrowthExecuting !GrowthProposal !Bool
+  | -- | Extra reservation obtained by a growth that did not commit, awaiting
+    -- release by the effect owner.
+    GrowthReleasing !Word64
+
+-- | A validated proposal to enlarge the allowance of the same store.
+data GrowthProposal = GrowthProposal
+  { gpIdentity ∷ !StoreIdentity
+  , gpFrom ∷ !Word64
+  , gpTo ∷ !Word64
+  , gpConfig ∷ !StoreConfig
+  }
+  deriving stock (Eq, Show)
+
+-- | The store.
+data Store = Store
+  { sCfg ∷ !StoreConfig
+  , sIdent ∷ !StoreIdentity
+  , sRoots ∷ !Roots
+  , sReaders ∷ !(Map Word64 Pins)
+  , sNextReader ∷ !Word64
+  , sActive ∷ !(Maybe Active)
+  , sNextTxn ∷ !Word64
+  , sGrowth ∷ !GrowthState
+  , sConditions ∷ !(Set Condition)
+  }
+
+-- | A fresh store: no page, no record, no reader, revisions zero.
+newStore ∷ StoreConfig → StoreIdentity → Store
+newStore cfg ident =
+  Store
+    { sCfg = cfg
+    , sIdent = ident
+    , sRoots = emptyRoots (siArena ident)
+    , sReaders = Map.empty
+    , sNextReader = 1
+    , sActive = Nothing
+    , sNextTxn = 1
+    , sGrowth = GrowthIdle
+    , sConditions = Set.empty
+    }
+
+-- | A store over given committed roots, with no reader, transaction or pause. This
+-- is a seam of the private library for the suite (to reach states, such as revisions
+-- at their limit, that no sequence of public operations reaches in a test's time);
+-- it is not in the public interface and checks nothing about the roots.
+storeFromRoots ∷ StoreConfig → StoreIdentity → Roots → Store
+storeFromRoots cfg ident roots = (newStore cfg ident) {sRoots = roots}
+
+storeConfig ∷ Store → StoreConfig
+storeConfig = sCfg
+
+storeIdentity ∷ Store → StoreIdentity
+storeIdentity = sIdent
+
+-- | The committed root set.
+storeRoots ∷ Store → Roots
+storeRoots = sRoots
+
+storeVersion ∷ Store → Word64
+storeVersion = rVersion . sRoots
+
+-- | The discovery control header of the committed version.
+storeHeader ∷ Store → Header
+storeHeader = rHeader . sRoots
+
+-- | The oldest version a reader still pins, if any.
+oldestPin ∷ Store → Maybe Word64
+oldestPin s = case Map.elems (sReaders s) of
+  [] → Nothing
+  ps → Just (minimum (map pinVersion ps))
+
+-- | A tree's committed root page.
+committedRoot ∷ Store → TreeId → Maybe PageNo
+committedRoot = rootOf . sRoots
+
+-- ---------------------------------------------------------------------------
+-- Usage
+
+-- | The allowance, by what holds it. Every figure is a count of whole pages times
+-- the page size, except the overhead, which is the conservative format and
+-- reservation overhead the configuration states.
+data Usage = Usage
+  { usAllowanceBytes ∷ !Word64
+  , usOverheadBytes ∷ !Word64
+  , usUsedBytes ∷ !Word64
+  -- ^ Live, retired, loose and staged pages and the overhead: free extents are not
+  -- used bytes.
+  , usLiveBytes ∷ !Word64
+  , usStagedBytes ∷ !Word64
+  , usRetiredBytes ∷ !Word64
+  -- ^ Pending reclaim: a subset of the used bytes, not free capacity.
+  , usLooseBytes ∷ !Word64
+  , usFreeBytes ∷ !Word64
+  -- ^ Free extents and the untouched tail, less what a pending transaction staged.
+  , usProtectedBytes ∷ !Word64
+  , usAvailableBytes ∷ !Word64
+  -- ^ What ordinary history may still take: the free bytes less the protected
+  -- reserve.
+  , usPendingGrowthBytes ∷ !Word64
+  , usReaders ∷ !Int
+  , usPinnedVersions ∷ !Int
+  , usHighWater ∷ !Word64
+  }
+  deriving stock (Eq, Show)
+
+-- | The usage of the store now.
+usage ∷ Store → Usage
+usage s =
+  Usage
+    { usAllowanceBytes = allowance
+    , usOverheadBytes = overhead
+    , usUsedBytes = allowance - freeBytes
+    , usLiveBytes = rLivePages r * pageSizeW
+    , usStagedBytes = staged * pageSizeW
+    , usRetiredBytes = rRetiredPages r * pageSizeW
+    , usLooseBytes = fromIntegral (length (rLoose r)) * pageSizeW
+    , usFreeBytes = freeBytes
+    , usProtectedBytes = min protectedReserveBytes freeBytes
+    , usAvailableBytes = if freeBytes > protectedReserveBytes then freeBytes - protectedReserveBytes else 0
+    , usPendingGrowthBytes = pending
+    , usReaders = Map.size (sReaders s)
+    , usPinnedVersions = Set.size (Set.fromList (map pinVersion (Map.elems (sReaders s))))
+    , usHighWater = rHw r
+    }
+  where
+    r = sRoots s
+    cfg = sCfg s
+    allowance = cfgAllowanceBytes cfg
+    usable = cfgUsablePages cfg
+    overhead = allowance - usable * pageSizeW
+    staged = maybe 0 (fromIntegral . mClaimed . plMeasure . acPlan) (sActive s) ∷ Word64
+    poolPages = freePool cfg r
+    freeBytes = (if poolPages > staged then poolPages - staged else 0) * pageSizeW
+    pending = case sGrowth s of
+      GrowthIdle → 0
+      GrowthExecuting p True → gpTo p - gpFrom p
+      GrowthExecuting _ False → 0
+      GrowthReleasing b → b
+
+-- | The RAM the store's control records hold: the root record, one record per
+-- pinned reader and the active transaction's record.
+controlBytes ∷ Store → Int
+controlBytes s =
+  rootRecordBytes
+    + fromIntegral (hBytes (rHeader (sRoots s)))
+    + Map.size (sReaders s) * readerRecordBytes
+    + maybe 0 (const activeRecordBytes) (sActive s)
+
+-- ---------------------------------------------------------------------------
+-- Planning
+
+-- | Plan an ordinary candidate against the committed roots.
+planEdit ∷ Store → Window → Candidate → Planned
+planEdit s win = planCandidate (sCfg s) (sIdent s) (sRoots s) win Ordinary
+
+-- | Plan the reclamation of the oldest retired pages the readers no longer hold.
+planMaintenance ∷ Store → Window → Planned
+planMaintenance = planMaintenanceWith standardBounds
+
+-- | 'planMaintenance' under given bounds.
+planMaintenanceWith ∷ Bounds → Store → Window → Planned
+planMaintenanceWith bounds s = planReclaimWith bounds (sCfg s) (sIdent s) (sRoots s) (oldestPin s)
+
+-- | The provider #661's operations read the committed records through. A record the
+-- window cannot supply is 'Unavailable', never absent.
+providerAt ∷ Store → Window → Provider
+providerAt s win = providerFor win (committedRoot s)
+
+-- | Why a record is unavailable: the page to fetch, or an integrity failure.
+missingAt ∷ Store → Window → RecordKey → Either IntegrityWhy (Maybe PageNo)
+missingAt s win = missingPage win (committedRoot s)
+
+-- | Plan the removal of one whole cell with its minimum connection obligation, as
+-- one candidate. Removing air or an already removed cell is 'NoWork'.
+planRemoval ∷ Env → Store → Window → TileCoord → Planned
+planRemoval env s win tile =
+  case stageRemoval env (rHeader (sRoots s)) (providerAt s win) (editAllowance env) tile of
+    Left refusal → Refused (refusalOf refusal)
+    Right NoChange → NoWork
+    Right (EditSuspended key) → suspended s win key
+    Right (Discovery.Staged cand) → planEdit s win cand
+
+-- | Plan one discovery batch: as many structural updates as #661's limits and this
+-- plan's page and RAM bounds allow (at most 64), the continuation staying in the
+-- obligation records. When a batch does not fit the transaction bounds it is
+-- planned again with fewer writes, so a bound that is tighter than 64 updates
+-- stops the batch earlier.
+planDiscovery ∷ Env → Store → Window → Planned
+planDiscovery = planDiscoveryWith standardBounds
+
+-- | 'planDiscovery' under given bounds.
+planDiscoveryWith ∷ Bounds → Env → Store → Window → Planned
+planDiscoveryWith bounds env s win = go (allowWrites full) (8 ∷ Int)
+  where
+    full = allowanceOf (envLimits env)
+    go writes tries =
+      case stepDiscovery env (rHeader (sRoots s)) (providerAt s win) full {allowWrites = writes} of
+        Left refusal → Refused (refusalOf refusal)
+        Right Idle → NoWork
+        Right (Stalled key) → suspended s win key
+        Right (Progress cand _) → case planDeltaWith bounds (sCfg s) (sIdent s) (sRoots s) win Ordinary (deltaOf cand) of
+          Refused why
+            | tries > 0 && tooBig why && reportWrites (candidateReport cand) > 1 →
+                go (max worstEdgeWritesMin (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
+          other → other
+    tooBig (Capacity (TxnPagesExceeded _)) = True
+    tooBig (Capacity (TxnRamExceeded _)) = True
+    tooBig (Integrity (BookkeepingOverflow _)) = True
+    tooBig _ = False
+    worstEdgeWritesMin = 3
+
+editAllowance ∷ Env → Allowance
+editAllowance = allowanceOf . envLimits
+
+suspended ∷ Store → Window → RecordKey → Planned
+suspended s win key = case missingAt s win key of
+  Right (Just p) → Pending p
+  Right Nothing → Refused (Integrity CorruptCounters)
+  Left why → Refused (Integrity why)
+
+refusalOf ∷ Refusal → PlanRefusal
+refusalOf = refusalToPlan
+
+-- ---------------------------------------------------------------------------
+-- Admission and the transaction
+
+-- | Why a plan was not admitted. A refusal changes nothing.
+data AdmitRefusal
+  = -- | Another mutating transaction is active, or a growth is being executed.
+    BusyTransaction
+  | BusyGrowth
+  | -- | The plan was made against another version, authority or store.
+    StalePlan
+  | -- | New history is paused for a condition.
+    Paused !Condition
+  | -- | The pages the plan stages do not fit the allowance beside the protected
+    -- reserve: pages needed, available.
+    NoCapacity !Word64 !Word64
+  deriving stock (Eq, Show)
+
+-- | Claim a plan's pages for the one active transaction. The plan must have been
+-- made against exactly the committed roots; an ordinary plan must leave the
+-- protected reserve untouched; a paused store admits nothing ordinary.
+admit ∷ Plan → Store → Either AdmitRefusal (TxnId, Store)
+admit plan s
+  | isJust (sActive s) = Left BusyTransaction
+  | growing (sGrowth s) = Left BusyGrowth
+  | plIdentity plan /= PlanIdentity (sIdent s) (rVersion (sRoots s)) (hAuthority (rHeader (sRoots s))) = Left StalePlan
+  | Just c ← blocking = Left (Paused c)
+  | claim > availablePages (sCfg s) (plClass plan) (sRoots s) = Left (NoCapacity claim (availablePages (sCfg s) (plClass plan) (sRoots s)))
+  | otherwise =
+      let tid = TxnId (sNextTxn s)
+          pages = Map.fromList [(p, PsStaged) | (p, _) ← plPages plan]
+       in Right (tid, s {sActive = Just (Active tid plan pages False), sNextTxn = sNextTxn s + 1})
+  where
+    claim = fromIntegral (mClaimed (plMeasure plan)) ∷ Word64
+    growing GrowthIdle = False
+    growing (GrowthReleasing _) = False
+    growing (GrowthExecuting _ _) = True
+    blocking = case plClass plan of
+      Ordinary → listToMaybe' (Set.toDescList (sConditions s))
+      Maintenance → if Set.member CondIntegrity (sConditions s) then Just CondIntegrity else Nothing
+    listToMaybe' (x : _) = Just x
+    listToMaybe' [] = Nothing
+
+-- | What a reported outcome did.
+data EventResult
+  = Applied
+  | -- | The same outcome was already recorded.
+    Duplicate
+  | -- | The transaction or the page is not one the store holds (stale, published,
+    -- aborted or foreign): nothing changed.
+    Unknown
+  deriving stock (Eq, Show)
+
+-- | What the owner's worker reports for one page write.
+data WriteOutcome = WriteDone | WriteFailed
+  deriving stock (Eq, Show)
+
+withActive ∷ TxnId → Store → (Active → (EventResult, Active)) → (EventResult, Store)
+withActive tid s f = case sActive s of
+  Just a | acId a == tid → let (r, a') = f a in (r, s {sActive = Just a'})
+  _ → (Unknown, s)
+
+-- | A page's write was handed to a worker.
+dispatchWrite ∷ TxnId → PageNo → Store → (EventResult, Store)
+dispatchWrite tid p s = withActive tid s $ \a → case Map.lookup p (acPages a) of
+  Just PsStaged → (Applied, a {acPages = Map.insert p PsInFlight (acPages a)})
+  Just _ → (Duplicate, a)
+  Nothing → (Unknown, a)
+
+-- | A page's write finished or failed. Only an in-flight page can complete.
+completeWrite ∷ TxnId → PageNo → WriteOutcome → Store → (EventResult, Store)
+completeWrite tid p outcome s = withActive tid s $ \a → case Map.lookup p (acPages a) of
+  Just PsInFlight → (Applied, a {acPages = Map.insert p (if outcome == WriteDone then PsWritten else PsFailed) (acPages a)})
+  Just PsStaged → (Unknown, a)
+  Just _ → (Duplicate, a)
+  Nothing → (Unknown, a)
+
+-- | A request to cancel. It is recorded and releases nothing: the claims stay until
+-- 'abortTransaction' once the I/O has drained, or the owner publishes anyway.
+requestCancel ∷ TxnId → Store → (EventResult, Store)
+requestCancel tid s = withActive tid s $ \a →
+  if acCancel a then (Duplicate, a) else (Applied, a {acCancel = True})
+
+-- | Whether the owner may decide to publish.
+data Eligibility
+  = Eligible
+  | -- | Pages not yet written or still in flight.
+    StillWriting !Int
+  | -- | Pages whose writes failed.
+    WriteFailures [PageNo]
+  | NoSuchTransaction
+  deriving stock (Eq, Show)
+
+-- | A transaction is eligible only when every page it must write has completed
+-- successfully and none is in flight. This is not publication.
+eligibility ∷ TxnId → Store → Eligibility
+eligibility tid s = case sActive s of
+  Just a | acId a == tid →
+    let states = Map.toList (acPages a)
+        failed = [p | (p, PsFailed) ← states]
+        unwritten = length [() | (_, st) ← states, st /= PsWritten, st /= PsFailed]
+     in if not (null failed)
+          then WriteFailures failed
+          else if unwritten > 0 then StillWriting unwritten else Eligible
+  _ → NoSuchTransaction
+
+-- | What publishing made authoritative.
+data Published = Published
+  { pubEffects ∷ !Effects
+  , pubVersion ∷ !Word64
+  , pubRetiredPages ∷ !Word64
+  }
+  deriving stock (Eq, Show)
+
+data PublishRefusal
+  = PublishNoSuchTransaction
+  | PublishNotEligible !Eligibility
+  | -- | The committed roots are no longer the plan's base.
+    PublishStale
+  deriving stock (Eq, Show)
+
+-- | The owner's publication of an eligible transaction: the new roots become
+-- authoritative at once, the replaced record pages are retired (their pending
+-- obligation is in the new roots' retirement tree) and the transaction ends. The
+-- owner decides it against cancellation and closure exactly once; this function is
+-- that decision's effect.
+publish ∷ TxnId → Store → Either PublishRefusal (Published, Store)
+publish tid s = case sActive s of
+  Just a | acId a == tid → case eligibility tid s of
+    Eligible
+      | plIdentity (acPlan a) /= PlanIdentity (sIdent s) (rVersion (sRoots s)) (hAuthority (rHeader (sRoots s))) → Left PublishStale
+      | otherwise →
+          let p = acPlan a
+              next = plNext p
+           in Right
+                ( Published (plEffects p) (rVersion next) (fromIntegral (mReplacedRecord (plMeasure p)))
+                , s {sRoots = next, sActive = Nothing}
+                )
+    other → Left (PublishNotEligible other)
+  _ → Left PublishNoSuchTransaction
+
+data AbortRefusal
+  = AbortNoSuchTransaction
+  | -- | Writes are still in flight: the pages and buffers are in use and stay
+    -- claimed until they drain.
+    AbortStillInFlight !Int
+  deriving stock (Eq, Show)
+
+-- | Abandon a transaction that has not published. It needs no write: the committed
+-- roots were never changed. It is refused while any write is in flight, so no page
+-- or buffer is released while it is in use.
+abortTransaction ∷ TxnId → Store → Either AbortRefusal Store
+abortTransaction tid s = case sActive s of
+  Just a | acId a == tid →
+    let inflight = length [() | (_, PsInFlight) ← Map.toList (acPages a)]
+     in if inflight > 0 then Left (AbortStillInFlight inflight) else Right s {sActive = Nothing}
+  _ → Left AbortNoSuchTransaction
+
+-- | The encoded pages the active transaction must write.
+activePages ∷ TxnId → Store → Maybe [(PageNo, ByteString)]
+activePages tid s = case sActive s of
+  Just a | acId a == tid → Just (plPages (acPlan a))
+  _ → Nothing
+
+-- | What the owner may inspect of the active transaction.
+data ActiveView = ActiveView
+  { avId ∷ !TxnId
+  , avStaged ∷ !Int
+  , avInFlight ∷ !Int
+  , avWritten ∷ !Int
+  , avFailed ∷ !Int
+  , avCancelRequested ∷ !Bool
+  , avClaimedPages ∷ !Int
+  , avBase ∷ !Authority
+  }
+  deriving stock (Eq, Show)
+
+activeView ∷ Store → Maybe ActiveView
+activeView s = do
+  a ← sActive s
+  let states = map snd (Map.toList (acPages a))
+      count st = length (filter (== st) states)
+  Just
+    ActiveView
+      { avId = acId a
+      , avStaged = count PsStaged
+      , avInFlight = count PsInFlight
+      , avWritten = count PsWritten
+      , avFailed = count PsFailed
+      , avCancelRequested = acCancel a
+      , avClaimedPages = mClaimed (plMeasure (acPlan a))
+      , avBase = pidBase (plIdentity (acPlan a))
+      }
+
+-- ---------------------------------------------------------------------------
+-- Conditions
+
+-- | The conditions that pause new history now.
+conditions ∷ Store → [Condition]
+conditions = Set.toAscList . sConditions
+
+-- | Record a condition (the effect owner's report): idempotent.
+pauseFor ∷ Condition → Store → Store
+pauseFor c s = s {sConditions = Set.insert c (sConditions s)}
+
+-- | Clear one condition after the owner has verified it is gone. A larger
+-- allowance clears only the capacity condition, through 'commitGrowth'; this is the
+-- explicit path for the others.
+clearCondition ∷ Condition → Store → Store
+clearCondition c s = s {sConditions = Set.delete c (sConditions s)}
+
+-- ---------------------------------------------------------------------------
+-- Readers
+
+-- | A pin on one committed version, unforgeable outside this module.
+data ReaderToken = ReaderToken
+  { rtStore ∷ !StoreIdentity
+  , rtSerial ∷ !Word64
+  , rtVersion ∷ !Word64
+  }
+  deriving stock (Eq, Show)
+
+data ReaderRefusal = TooManyReaders !Int
+  deriving stock (Eq, Show)
+
+data StaleReader = StaleReader
+  deriving stock (Eq, Show)
+
+-- | Pin the committed version. The pin is accounted and bounded.
+acquireReader ∷ Store → Either ReaderRefusal (ReaderToken, Store)
+acquireReader s
+  | Map.size (sReaders s) >= maxReaders = Left (TooManyReaders maxReaders)
+  | otherwise =
+      let r = sRoots s
+          pins = Pins (rVersion r) (rRuns r) (rLinks r) (rTodo r)
+          n = sNextReader s
+       in Right (ReaderToken (sIdent s) n (rVersion r), s {sReaders = Map.insert n pins (sReaders s), sNextReader = n + 1})
+
+-- | Release a pin. Releasing twice, or a token of another store, changes nothing.
+releaseReader ∷ ReaderToken → Store → (EventResult, Store)
+releaseReader tok s
+  | rtStore tok /= sIdent s = (Unknown, s)
+  | Map.member (rtSerial tok) (sReaders s) = (Applied, s {sReaders = Map.delete (rtSerial tok) (sReaders s)})
+  | otherwise = (Duplicate, s)
+
+pinsOf ∷ Store → ReaderToken → Either StaleReader Pins
+pinsOf s tok
+  | rtStore tok /= sIdent s = Left StaleReader
+  | otherwise = case Map.lookup (rtSerial tok) (sReaders s) of
+      Just p | pinVersion p == rtVersion tok → Right p
+      _ → Left StaleReader
+
+-- | The version a live token pins.
+readerVersion ∷ Store → ReaderToken → Either StaleReader Word64
+readerVersion s tok = pinVersion <$> pinsOf s tok
+
+-- | An empty window for a reader's version.
+readerWindow ∷ Store → ReaderToken → Either StaleReader Window
+readerWindow s tok = emptyWindow . pinVersion <$> pinsOf s tok
+
+rootsOfPins ∷ Pins → TreeId → Maybe PageNo
+rootsOfPins p TreeRuns = pinRuns p
+rootsOfPins p TreeLinks = pinLinks p
+rootsOfPins p TreeTodo = pinTodo p
+rootsOfPins _ _ = Nothing
+
+-- | What a bounded read through a window answered.
+data ReadOutcome a
+  = -- | The answer (a confirmed absence is an answer: @Nothing@ or an empty list).
+    Read !a
+  | -- | A page is missing from the window: fetch it, add it and read again. The
+    -- read is pending, never answered as absent.
+    ReadNeeds !PageNo
+  | -- | A page contradicts its place in the tree: an integrity failure, never an
+    -- empty or absent answer.
+    ReadCorrupt !IntegrityWhy
+  | -- | The token is not a live pin of this store.
+    ReadStale
+  deriving stock (Eq, Show)
+
+readOutcome ∷ Either Stop a → ReadOutcome a
+readOutcome (Right a) = Read a
+readOutcome (Left (Need p)) = ReadNeeds p
+readOutcome (Left (Bad err p)) = ReadCorrupt (BadPage err p)
+readOutcome (Left (TooTall t)) = ReadCorrupt (BrokenInvariant t)
+readOutcome (Left (Invariant t)) = ReadCorrupt (BrokenInvariant t)
+
+withPins ∷ Store → ReaderToken → (Pins → Either Stop a) → ReadOutcome a
+withPins s tok f = case pinsOf s tok of
+  Left StaleReader → ReadStale
+  Right p → readOutcome (f p)
+
+-- | The pinned record for a key.
+readerLookup ∷ Store → ReaderToken → Window → RecordKey → ReadOutcome (Maybe Record)
+readerLookup s tok win key = withPins s tok (\p → lookupRecord win (rootsOfPins p) key)
+
+-- | The pinned removed run of a column at or below a level.
+readerFloorRun ∷ Store → ReaderToken → Window → Column → Int64 → ReadOutcome (Maybe (Int64, Int64))
+readerFloorRun s tok win col z = withPins s tok (\p → floorRun win (rootsOfPins p) col z)
+
+-- | A bounded ordered read of one record tree from a start (a key, or strictly after
+-- one): at most 'maxRangeRecords' records, each costing one bounded successor lookup.
+readerRange ∷ Store → ReaderToken → Window → TreeId → RangeStart → Int → ReadOutcome [(RecordKey, Record)]
+readerRange s tok win tree start limit = withPins s tok (\p → rangeRecords win (rootsOfPins p) tree start (min limit maxRangeRecords))
+
+-- | The most records one ranged read returns.
+maxRangeRecords ∷ Int
+maxRangeRecords = 256
+
+-- | The provider over a pinned version.
+readerProviderFor ∷ Store → ReaderToken → Window → Either StaleReader Provider
+readerProviderFor s tok win = (\p → providerFor win (rootsOfPins p)) <$> pinsOf s tok
+
+-- | Why a pinned record is unavailable: the page to fetch, or an integrity failure.
+readerMissing ∷ Store → ReaderToken → Window → RecordKey → Either StaleReader (Either IntegrityWhy (Maybe PageNo))
+readerMissing s tok win key = (\p → missingPage win (rootsOfPins p) key) <$> pinsOf s tok
+
+-- ---------------------------------------------------------------------------
+-- Growth
+
+-- | What a request to enlarge the allowance decided, before any provider work.
+data GrowthDecision
+  = -- | The same size: an idempotent success that changes nothing.
+    GrowthNoOp
+  | -- | A well-formed size below the current allowance: the request settles as
+    -- @storage_size_not_increased@.
+    GrowthNotIncreased
+  | -- | A malformed, misaligned, too small or out-of-range size: a validation
+    -- refusal before any provider work.
+    GrowthInvalid !ConfigError
+  | GrowthProposed !GrowthProposal
+  deriving stock (Eq, Show)
+
+-- | Propose a larger allowance for this store.
+proposeGrowth ∷ Store → Integer → GrowthDecision
+proposeGrowth s bytes = case growConfig (sCfg s) bytes of
+  Left err → GrowthInvalid err
+  Right cfg
+    | cfgAllowanceBytes cfg == cfgAllowanceBytes (sCfg s) → GrowthNoOp
+    | cfgAllowanceBytes cfg < cfgAllowanceBytes (sCfg s) → GrowthNotIncreased
+    | otherwise → GrowthProposed (GrowthProposal (sIdent s) (cfgAllowanceBytes (sCfg s)) (cfgAllowanceBytes cfg) cfg)
+
+data GrowthRefusal
+  = GrowthBusyTransaction
+  | GrowthAlreadyExecuting
+  | -- | An earlier growth's extra reservation is still to be released.
+    GrowthReleasePending
+  | -- | The proposal was made against another allowance or store: re-propose.
+    GrowthStale
+  | GrowthNotExecuting
+  | GrowthNotReserved
+  deriving stock (Eq, Show)
+
+-- | Begin executing a proposal: serialised with mutation, against the allowance as
+-- it is now.
+beginGrowth ∷ GrowthProposal → Store → Either GrowthRefusal Store
+beginGrowth p s
+  | isJust (sActive s) = Left GrowthBusyTransaction
+  | GrowthExecuting _ _ ← sGrowth s = Left GrowthAlreadyExecuting
+  | GrowthReleasing _ ← sGrowth s = Left GrowthReleasePending
+  | gpIdentity p /= sIdent s || gpFrom p /= cfgAllowanceBytes (sCfg s) = Left GrowthStale
+  | otherwise = Right s {sGrowth = GrowthExecuting p False}
+
+-- | The effect owner obtained the additional reservation. It is accounted as
+-- pending and is not spendable until 'commitGrowth'.
+growthReserved ∷ Store → Either GrowthRefusal Store
+growthReserved s = case sGrowth s of
+  GrowthExecuting p _ → Right s {sGrowth = GrowthExecuting p True}
+  _ → Left GrowthNotExecuting
+
+-- | Publish the larger allowance. Only a growth whose reservation was reported
+-- obtained commits; it clears the capacity pause and nothing else.
+commitGrowth ∷ Store → Either GrowthRefusal Store
+commitGrowth s = case sGrowth s of
+  GrowthExecuting p True
+    | gpFrom p /= cfgAllowanceBytes (sCfg s) → Left GrowthStale
+    | otherwise →
+        Right s {sCfg = gpConfig p, sGrowth = GrowthIdle, sConditions = Set.delete CondCapacity (sConditions s)}
+  GrowthExecuting _ False → Left GrowthNotReserved
+  _ → Left GrowthNotExecuting
+
+-- | The growth failed or was cancelled before commitment: the old allowance and
+-- roots stand. An extra reservation it had obtained stays accounted as pending
+-- until the owner reports its release.
+growthFailed ∷ Store → Store
+growthFailed s = case sGrowth s of
+  GrowthExecuting p True → s {sGrowth = GrowthReleasing (gpTo p - gpFrom p)}
+  GrowthExecuting _ False → s {sGrowth = GrowthIdle}
+  _ → s
+
+-- | The extra reservation was released.
+growthReleased ∷ Store → Store
+growthReleased s = case sGrowth s of
+  GrowthReleasing _ → s {sGrowth = GrowthIdle}
+  _ → s
+
+-- | The release itself failed: the pending reservation stays accounted and reported.
+growthReleaseFailed ∷ Store → Store
+growthReleaseFailed = id
+
+-- | What a status request may report of growth.
+data GrowthView = GrowthView
+  { gvExecuting ∷ !Bool
+  , gvPendingBytes ∷ !Word64
+  , gvReleasing ∷ !Bool
+  }
+  deriving stock (Eq, Show)
+
+growthView ∷ Store → GrowthView
+growthView s = case sGrowth s of
+  GrowthIdle → GrowthView False 0 False
+  GrowthExecuting p r → GrowthView True (if r then gpTo p - gpFrom p else 0) False
+  GrowthReleasing b → GrowthView False b True
+
+-- ---------------------------------------------------------------------------
+-- Feasibility
+
+-- | A requirement that cannot be met by a configuration: what, the figure needed and
+-- the figure available. It is retained for the design decision, never relaxed.
+data Counterexample = Counterexample
+  { cxWhat ∷ !String
+  , cxNeeded ∷ !Integer
+  , cxAvailable ∷ !Integer
+  }
+  deriving stock (Eq, Show)
+
+-- | The most pages the supported minimum explicit removal writes at the format
+-- bounds: its worst-case record writes each at the worst cost of an update on the
+-- tallest tree, one retirement list page and the bookkeeping reserve.
+minimumRemovalPages ∷ Int
+minimumRemovalPages = worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve
+
+-- | The most RAM the minimum explicit removal reserves: a full window, its pages and
+-- the control records.
+minimumRemovalRam ∷ Int
+minimumRemovalRam =
+  minimumRemovalPages * pageSize
+    + maxWindowPages * windowPageBytes
+    + worstEditWrites * maxEntryBytes
+    + maxWindowPages * 16
+    + rootRecordBytes
+    + activeRecordBytes
+    + 1024
+    + maxWindowPages * 8
+    + 4096
+    + 128
+
+-- | Whether the supported minimum explicit removal fits a configuration in an empty
+-- workspace: its pages within the transaction bound, its RAM within the
+-- transaction bound, and its claim within the allowance beside the protected
+-- reserve.
+minimumRemovalFeasible ∷ StoreConfig → Either Counterexample ()
+minimumRemovalFeasible cfg
+  | minimumRemovalPages > maxTxnPages = Left (Counterexample "pages written by the minimum removal" (toInteger minimumRemovalPages) (toInteger maxTxnPages))
+  | minimumRemovalRam > txnRamLimit = Left (Counterexample "RAM reserved by the minimum removal" (toInteger minimumRemovalRam) (toInteger txnRamLimit))
+  | need > have = Left (Counterexample "allowance pages for the minimum removal beside the protected reserve" need have)
+  | otherwise = Right ()
+  where
+    need = toInteger maxClaimPages + toInteger reservePages
+    have = toInteger (cfgUsablePages cfg)

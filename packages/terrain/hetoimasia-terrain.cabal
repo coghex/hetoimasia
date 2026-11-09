@@ -116,6 +116,7 @@ test-suite terrain-tests
         Test.Terrain.Shape
         Test.Terrain.Source
         Test.Terrain.Spec
+        Test.Terrain.StorageCompat
     build-depends:
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9,

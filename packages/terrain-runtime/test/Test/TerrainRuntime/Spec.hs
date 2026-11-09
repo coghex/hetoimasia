@@ -13,6 +13,17 @@ import qualified Test.TerrainRuntime.Opacity as Opacity
 import qualified Test.TerrainRuntime.Oracle as Oracle
 import qualified Test.TerrainRuntime.Races as Races
 import qualified Test.TerrainRuntime.Revalidation as Revalidation
+import qualified Test.TerrainRuntime.Store.AdmissionSpec as StoreAdmission
+import qualified Test.TerrainRuntime.Store.Allowance as StoreAllowance
+import qualified Test.TerrainRuntime.Store.Boundary as StoreBoundary
+import qualified Test.TerrainRuntime.Store.Bounds as StoreBounds
+import qualified Test.TerrainRuntime.Store.Codec as StoreCodec
+import qualified Test.TerrainRuntime.Store.Cycles as StoreCycles
+import qualified Test.TerrainRuntime.Store.Evidence as StoreEvidence
+import qualified Test.TerrainRuntime.Store.Faults as StoreFaults
+import qualified Test.TerrainRuntime.Store.Readers as StoreReaders
+import qualified Test.TerrainRuntime.Store.Replay as StoreReplay
+import qualified Test.TerrainRuntime.Store.Trees as StoreTrees
 import Test.Hspec (Spec)
 
 spec ∷ Spec
@@ -30,3 +41,14 @@ spec = do
   Oracle.spec
   Interleaving.spec
   Closure.spec
+  StoreCodec.spec
+  StoreTrees.spec
+  StoreReplay.spec
+  StoreFaults.spec
+  StoreReaders.spec
+  StoreCycles.spec
+  StoreEvidence.spec
+  StoreAllowance.spec
+  StoreAdmission.spec
+  StoreBounds.spec
+  StoreBoundary.spec
