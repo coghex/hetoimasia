@@ -423,19 +423,22 @@ transaction of the model event it mirrors, and no production decision reads it:
 * **every accepted load job**, from its admission to its report (completed, failed or acknowledged),
   whether it is running, queued or waiting for victims: the resident reservation and the scratch the
   model **granted** it at that moment (400 and 258 for a one-cell read in a fresh region), so a later
-  reduction while the job still holds them is seen; the **least its coverage can hold**, worked out from
-  the cells it loads and the data layer's own sizes and not from the model's cost functions (a column
-  index entry is 48 bytes, a segment 32 of metadata and at least 2 of payload, the scratch a 256-byte
-  frame and two bytes a cell: 82 and 258), so a grant that was too small is seen; and the load-job
-  slot (1 once the owner runs it, from its dispatch, and 0 while it waits). The owner marks a job it
-  runs and ends it with its report, so a model that forgets a running job is seen;
+  reduction while the job still holds them is seen (a stability check of the model against its own grant,
+  not an expectation); and, once the owner **runs** it, the **least the job holds**, worked out from the
+  coverage the owner is given to load and the data layer's own sizes and not from the model's cost
+  functions (a column index entry is 48 bytes, a segment 32 of metadata and at least 2 of payload, the
+  scratch a 256-byte frame and two bytes a cell: 82 and 258) together with the load-job slot (1 from its
+  dispatch, 0 while it waits: a waiting job holds only a promise, so it contributes no expectation). The
+  owner marks a job it runs and ends it with its report, so a model that forgets a running job is seen;
 * the **preparation** the owner is running (a removal's resident growth, 62 bytes, staging, 512, and
   retained edit, 64, and the command record it reads under), from its start to the owner's safe point;
 * each **handoff duplicate** (the bytes the owner copies, 64 for one removal), from the transfer's
   admission to its outcome;
-* each outstanding **borrow** and the regions the snapshot handed out covers, and each **view** with an
-  accepted demand and the regions that demand describes (admitted and pending, from the receipt): the
-  service's own account of what it lent and accepted.
+* each outstanding **borrow**, the regions the snapshot handed out covers and the **accounted bytes it backs**
+  (its payload, segment metadata and column index entries, measured on the snapshot value at hand-out, never
+  read from the retained-bank ledger), until its borrower releases it, whether its arena is live or closed and
+  retiring behind it; and each **view** with an accepted demand and the regions that demand describes
+  (admitted and pending, from the receipt): the service's own account of what it lent and accepted.
 
 Every inspection type (`Census`, `ArenaCensus`, `RequestCensus`, `RunningWork`, `JobWork`,
 `PreparationWork`, `HandoffWork`) is abstract with read-only accessors that are functions, never field
@@ -450,11 +453,11 @@ of a uniform one) and its edit and staging reservations as stated; the staging b
 request records exactly what the service's requests hold; the command slots exactly the
 service's requests that hold a model record; and the snapshot holds exactly the service's
 outstanding snapshots. The running work is compared in its own amounts, entity by entity and bank by
-bank: **every accepted job**, running or waiting, must be charged at least what it was granted and at least
-what its coverage can hold, resident and scratch (a charge one byte short fails, as does a waiting job whose
+bank: every job the owner runs must be charged at least what its coverage needs, and every accepted job, running or
+waiting, at least what the model granted it (a charge one byte short fails, as does a waiting job whose
 charge was released early); the load-job slots at least the jobs the owner runs; the resident bank's
 reservations (counting what still waits for victims) at least every job's plus the removals' growth;
-the staging bank's reservations at least the removals' staging plus every job's scratch; each handoff
+the staging bank's reservations at least the removals' staging plus the running jobs' scratch; the retained-snapshot bank at least the backing of every snapshot handed out and still borrowed (per snapshot and in total, live and retiring incarnations alike) plus one record for each request the service holds; the view pin slots zero (the service never pins a view's revision); the service-wide limits (arenas, leases, views, clients, command slots, the retained bank) against enumerations that read only the service's own structures; each handoff
 duplicate at least the bytes the owner copied; the model must still hold, with its growth, the request the
 owner is preparing; each borrow's hold must name at least the regions of the snapshot handed out and
 each view's description at least the regions of the accepted demand; and the staging bank's
