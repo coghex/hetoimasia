@@ -183,3 +183,44 @@ Negative controls (a mutation applied locally to the library, never committed, f
 | a free extent past the used space is handed out | 1 failure |
 
 Limits: the proof is bounded by the pages a plan writes (at most 256) times the pinned readers (at most 16) times the tree height, and a plan that cannot afford the extra window pages is refused with the typed window result, never accepted unproven. A record that is consistently forged across every record that mentions a page, including the committed trees themselves, cannot be told from the truth by any local check; what is guaranteed is that no single forged record, and no inconsistency between a record and the trees a reader can still reach, lets a plan overwrite or free such a page.
+
+
+## Review round 6 (Codex, CHANGES_REQUESTED at `0f2da543`)
+
+Two findings, both valid. A probe kept its key as a slice of the 4,096-byte page it was decoded from while `windowProbeBytes` accounted 160 bytes a probe and no bound counted probes: 1,200 valid pages through `addProbe` and `planRemoval` returned `Planned` reporting 683,673 bytes while the retained buffers alone were 4,915,200. And the supply accepted a record page that no committed or pinned root reached even when a retirement entry still owned it: a free record naming retired page 122 (the free-page count preserved, the roots unchanged) let the 49th later plan overwrite it, the publication then owned the page twice and the next maintenance failed with `RetiredPageLive`.
+
+## Round 7: both closed as classes (before the seventh review)
+
+*Memory.* Every `ByteString` that crosses a window, probe, overlay or plan boundary was audited: a window now copies the buffer it is given (a caller's buffer may be a slice of a large read), a probe copies its key, an overlay node is packed into a buffer of its own or is a parsed view of an accounted window page, and plan output and decoded records are fresh values. A probe is accounted at its measured retention (`probeBytes` 320; 500 probes read as slices of one large buffer held about 260 bytes each), a window may hold at most 512 probes (`ProbesExceeded`) and the worst-case RAM figures include them.
+
+*Ownership.* The supply, loose and maintenance paths now go through one proof over every owner (committed trees, pinned trees, retirement lists, outstanding retirement entries, free extents for loose pages, the supply itself). What was missing was an index from a page to the retirement entry that owns it, which cannot be had by reading the entries (a long-held reader keeps hundreds of them): every retired page is now also recorded in the retirement tree under `0xFF` and its number, valued with its entry's version, so one bounded lookup answers it. A commit indexes what it replaced, reclamation frees a page only if the index holds it under that entry and removes it as it frees it, and the retired backlog is bounded (16,384 pages; an ordinary plan past it is refused until maintenance runs; maintenance is never refused). `Test.TerrainRuntime.Store.Ownership` holds 17 tamper examples with re-sealed records, one per owner class; the independent traversal (`Reference.ownership`) checks the index against the lists after every step of every suite.
+
+The negative controls (a mutation applied locally to the library, never committed, file restored; the ownership, retirement and bound examples run against each) all fail the suite except where another layer refuses the same forgery first, which is recorded:
+
+| Mutation | Result |
+| --- | --- |
+| pinned roots are not consulted when proving a page unreachable | 2 failures |
+| a candidate overwrites supplied pages without the proof | 7 failures |
+| maintenance overwrites supplied pages without the proof | 2 failures |
+| reclamation checks a retired page against the committed roots only | 1 failure |
+| a retirement list's stamp is not compared with its entry's version | 1 failure |
+| a reference at or past the used space is followed | 2 failures |
+| a retirement list page past the used space is read | 1 failure |
+| a page that is not a page of this store is treated as live | the suite aborts (its histories cannot be built) |
+| a pinned read is not bounded by its version's used space | 1 failure |
+| a retirement list page is never looked for under its version | 2 failures |
+| an entry's count is not compared with its list | 1 failure |
+| a reachable tree page is never refused | 5 failures |
+| a free extent past the used space is handed out | 1 failure (the extent wholly past the used space) |
+| a page a retirement entry still owns may be overwritten | 3 failures |
+| replaced pages are not indexed as retired | 21 failures |
+| a freed page need not be indexed under its entry | 2 failures |
+| a loose page that is also a free extent is accepted | 1 failure |
+| the retired backlog is not bounded | 1 failure |
+| the probes a window holds are not bounded | 1 failure |
+| a probe keeps its key as a slice of the page buffer | 1 failure |
+| a window keeps the caller's buffer | 1 failure |
+| a loose page listed twice is not checked by the loose list's own check | not caught alone: the supply's distinctness check refuses it first (both layers kept) |
+| the double-free overlap check is removed | not caught alone: the retired-page index refuses a freed page that is loose or claimed, and the allocator tree's own neighbour check refuses a free one (both layers kept) |
+
+Limits: the proof is bounded by the pages a plan writes (at most 256), the readers (at most 16), the tree height (at most 8) and one index lookup per page. A record that is consistently forged across every record that mentions a page, including the committed trees and the index together, cannot be told from the truth by any local check; what is guaranteed is that no single forged record, and no inconsistency between two records that describe the same page, lets a plan overwrite or free a page that a root, a pinned reader or a retirement entry still owns.
