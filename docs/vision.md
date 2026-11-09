@@ -40,6 +40,15 @@ assets regenerated from 3D models with `~/work/moskophoros`. This does not
 change the boundary above: engine packages never contain or import Ecce Homo.
 The current piece is the [terrain arena](designs/terrain_arena_design.md).
 
+Owner decision 2026-11-09: "Haskell mechanisms, Lua rules", the division the
+terrain arena settled in its
+[D-17](designs/terrain_arena_design.md#d-17-haskell-mechanisms-lua-arena-rules),
+is the general pattern for every system, not a terrain-only choice. The engine
+supplies reusable Haskell mechanisms through narrow services; Lua defines the
+game's rules, recipes and authored choices and drives those services. Engine
+libraries hold no Ecce Homo-specific rule or content. A system's design departs
+from this division only by an explicit owner decision recorded in that design.
+
 Preserve Synarchy's useful reasoning about GLFW, logging, monotonic time,
 shaders and rendering deliberately. Reuse is selective; its coupled environment
 and game managers are not the new architecture. Each rebuilt system should make

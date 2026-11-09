@@ -98,13 +98,16 @@ reintroduce a universal environment or mutable registry.
 ### D-1. Build a fresh modular Haskell/Vulkan/Lua engine
 
 Accepted by the owner. Synarchy remains a separate working project and a source
-of experience. Reuse isolated lessons deliberately; do not copy its game
-managers or EngineEnv.
+of experience. Since the owner's decision of 2026-11-09 it is also the
+reference for rebuilding Ecce Homo on this engine ([vision](vision.md) V-1):
+evidence of what each system should do, not a compatibility contract. Reuse
+isolated lessons deliberately; do not copy its game managers or EngineEnv.
 
 ### D-2. Support separate 2D and 3D modules over shared infrastructure
 
 Accepted direction. A small 2D consumer arrives early to test reuse before the
-architecture becomes deeply 3D-specific. Game compatibility belongs in adapters.
+architecture becomes deeply 3D-specific. No game compatibility target exists
+(vision V-1, 2026-11-09); game-specific glue stays outside engine packages.
 FND-3/FND-4 in the renderer report preserve the remaining consumer work.
 
 Superseded by the owner on 2026-11-09: the original migration proposal was
@@ -173,5 +176,8 @@ makes deterministic authoritative simulation a requirement: initially qualify
 identical results on the same build/platform for identical initial state,
 content, seed, tick-assigned inputs and scheduling configuration. Engine timing
 and ownership contracts must support that application guarantee; UI/presentation
-remain independently paced. A later Synarchy migration must preserve or
-explicitly migrate save and simulation contracts.
+remain independently paced. Superseded by the owner on 2026-11-09 (vision
+V-1): this section used to require a later Synarchy migration to preserve or
+explicitly migrate save and simulation contracts. No migration is planned and
+save compatibility is uncommitted; a rebuilt Ecce Homo system that carries
+saved or simulation state defines its own contract in its own design.
