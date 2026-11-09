@@ -1,6 +1,6 @@
 # TRA-20 evidence: the temporary store's pure model
 
-Implementation head `7f179551` (the branch is merged with origin/master at `4ee27aa4` with no source change; issue #662, PR #675 for `Closes #662`). Every figure below is the output of one suite run, not a paraphrase; the suite is `hetoimasia-terrain-runtime:terrain-runtime-tests` and these are observations of the pure model and the codec. **They are not physical filesystem, durability, preallocation, latency or RSS figures**, and none is proof of live request settlement or crash recovery.
+Implementation head `646d073c` (the branch is merged with origin/master at `f3cf9956` with no source change; issue #662, PR #675 for `Closes #662`). Every figure below is the output of one suite run, not a paraphrase; the suite is `hetoimasia-terrain-runtime:terrain-runtime-tests` and these are observations of the pure model and the codec. **They are not physical filesystem, durability, preallocation, latency or RSS figures**, and none is proof of live request settlement or crash recovery.
 
 ## Commands
 
@@ -15,7 +15,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain
 $(cabal list-bin --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests) --match "TRA-20 evidence"
 ```
 
-Results: `terrain-runtime-tests` 375 examples, 0 failures; `terrain-tests` 901/0; `terrain-render-2d-tests` 649/0.
+Results: `terrain-runtime-tests` 376 examples, 0 failures; `terrain-tests` 901/0; `terrain-render-2d-tests` 649/0.
 
 ## Fixtures, seeds and references
 
@@ -51,10 +51,10 @@ EVIDENCE exhaustion maxPagesPerTransaction=21 totalPagesFreed=1522
 EVIDENCE cycles CycleReport {crSeed = 101, crCommits = 186, crAborts = 52, crFailedWrites = 24, crReads = 57, crReclaims = 36, crMaxReaders = 6, crMaxPages = 18, crMaxWindow = 17, crMaxRam = 671959, crMaxSteps = 136, crPagesWritten = 2402, crHighWater = 1402, crRecords = 893}
 EVIDENCE cycles CycleReport {crSeed = 202, crCommits = 177, crAborts = 50, crFailedWrites = 22, crReads = 51, crReclaims = 37, crMaxReaders = 6, crMaxPages = 19, crMaxWindow = 19, crMaxRam = 684291, crMaxSteps = 114, crPagesWritten = 2378, crHighWater = 1424, crRecords = 914}
 EVIDENCE cycles CycleReport {crSeed = 303, crCommits = 194, crAborts = 49, crFailedWrites = 28, crReads = 24, crReclaims = 42, crMaxReaders = 5, crMaxPages = 19, crMaxWindow = 18, crMaxRam = 682100, crMaxSteps = 110, crPagesWritten = 2546, crHighWater = 1465, crRecords = 921}
-EVIDENCE allocation a one-record edit plan history500runs=437008B history20000runs=941096B ratio=2.1534983341266063
+EVIDENCE allocation a one-record edit plan history500runs=451328B history20000runs=983240B ratio=2.1785486386840613
 EVIDENCE allocation a pinned point read history500runs=131864B history20000runs=229824B ratio=1.7428866104471274
 EVIDENCE allocation a usage and control report history500runs=1232B history20000runs=1232B ratio=1.0
-EVIDENCE allocation a reclamation step over an equal retirement list history500runs=154968B history20000runs=148192B ratio=0.956274843838728
+EVIDENCE allocation a reclamation step over an equal retirement list history500runs=176232B history20000runs=170400B ratio=0.9669072586136457
 EVIDENCE allocation control: a map of every record key history500runs=35304B history20000runs=1361640B ratio=38.569000679809655
 ```
 
@@ -113,6 +113,14 @@ After review round 3 (the two repairs):
 | root collapse follows single children without level or bounds checks | 1 of 375 examples fail |
 | a run node's level is not range-checked | 1 of 375 examples fail |
 
+After the round 4 sweep (the allocator's supply):
+
+| Protected behavior broken | Result |
+| --- | --- |
+| a free extent may reach past the used page space | 1 of 376 examples fail |
+| a loose page may lie outside the used page space | 1 of 376 examples fail |
+| a page may be handed out twice by one supply | 1 of 376 examples fail |
+
 ## Limits of this evidence
 
 The model is checked against references written independently of it, at routine scale. Nothing here measures a file, a filesystem, an fsync, a descriptor, a worker, latency or process memory (TRA-21), the live owner's publication and request settlement (TRA-22) or the Lua control (TRA-23). The memory figures are the accounted bytes of the representation (validated page buffers, packed new pages, a few parsed nodes), checked against the live heap of a window of 310 dense pages (`holds a window of dense pages in memory close to what it accounts`); they are not a process-RSS claim. The tree height bound (8 levels) is shown unreachable below about 36 GiB of leaves by the derivation in `Format.maxLevel`, not by building a 36 GiB store.
@@ -128,3 +136,7 @@ Three findings, all valid and repaired in `560c3c78`: output pages were assemble
 ## Review round 3 (Codex, CHANGES_REQUESTED at `8f44876e`)
 
 Two findings, both valid and repaired in `d5f50cc5` and `7f179551`: the root collapse after a deletion followed single-child nodes with an unchecked load, so a malformed subtree containing a cycle never terminated (the collapse now carries the expected level, one lower per step, and the inherited separator bounds; `refuses a root collapse that would follow a cycle or a child of the wrong level` fails instead of hanging under a wall-clock guard if the cycle is followed again); and a run node's level was accepted for any `Int64`, in link keys and in parent values (now `levelMin <= lo < levelMaxExclusive`, with boundary and out-of-range fixtures for both: `refuses a run node whose level is outside the supported coordinate range...`).
+
+## Round 4 sweep (before the fourth review)
+
+Rounds 1-3 kept finding one class: a value read from an untrusted page used without a range, level or cycle check. Before round 4 every bounded loop and every node, level, index and page-number read in the store model was walked (`Tree.hs` descents, collapse, rebalance, range and successor reads; `Plan.hs` supply, overlap, free-extent insertion and reclamation; `Page.hs` and `Records.hs` decoders; `Model.hs` readers). Every tree descent now carries its expected level and its parent's separator bounds, and a bounded range read is clamped to 256 records. The sweep found one more site: the allocator's supply decoded free extents against the whole page space instead of the used space and trusted the free tree and the loose list to be disjoint, so a valid-checksum free-extent page reaching past the high-water mark, an overlapping extent or a page both loose and free could be handed out twice. The supply now refuses each as `Integrity` (`refuses a supply that names a page outside the used space...`, three scenarios), and a free neighbour that does not decode is corruption rather than absence (unreachable behind the page decoder's validation; defense in depth, no example). Each check has a negative control above except the overlap-with-previous-extent condition, which the distinct-supply check backs (a cross-leaf overlap needs a two-leaf free tree).
