@@ -17,7 +17,7 @@ import Hetoimasia.Scripting.Lua.Admission (ExpectedFailure (expectedCode))
 import Hetoimasia.Scripting.Lua.Provider (ProviderReply (..))
 import Hetoimasia.Terrain.Query (QueryError (TooManyRuns))
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
-import Hetoimasia.Terrain.Runtime (Failure (..), Point (PointCaptured), Precondition (..))
+import Hetoimasia.Terrain.Runtime (Failure (..), Point (PointCaptured), Precondition (..), closeService)
 import Hetoimasia.Terrain.Source (SourceError (TooManyMaterials), definitionHeaderBytes, materialRecordBytes)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -136,6 +136,30 @@ stoppedUnderPressure =
         , "  local ok, r, e = pcall(api.terrain.cell, self.a, {x = 2, y = 0, z = 0})"
         , "  if ok then print('try', ok, r == nil and e and e.code or 'accepted')"
         , "  else print('try', ok, string.find(tostring(r), 'stopping', 1, true) ~= nil, string.find(tostring(r), 'busy', 1, true) ~= nil) end"
+        , "end"
+        ]
+    }
+
+-- | An instance with a request bank of two that fills it and then asks for a third read on every update, saying what each answer was:
+-- the service is closed by the example in between.
+closedUnderPressure ∷ Script
+closedUnderPressure =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    self.a = t.value"
+        , "    self.r1 = api.terrain.cell(self.a, {x = 0, y = 0, z = 0})"
+        , "    self.r2 = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
+        , "    self.s = 1"
+        , "  end"
+        , "elseif self.s == 1 then"
+        , "  local ok, r, e = pcall(api.terrain.cell, self.a, {x = 2, y = 0, z = 0})"
+        , "  if ok then print('closed try', ok, r == nil and e and e.code or 'accepted')"
+        , "  else print('closed try', ok, string.find(tostring(r), 'closed', 1, true) ~= nil, string.find(tostring(r), 'busy', 1, true) ~= nil) end"
         , "end"
         ]
     }
@@ -360,6 +384,15 @@ spec = describe "Terrain matrices" $ do
           setAdmission world AdmissionStopping
           untilPrinted world "try\tfalse\ttrue\tfalse"
           setAdmission world AdmissionOpen
+
+  it "refuses a call of a closed service as an ordinary error, never busy, while the request bank is full" $
+    withRig $ \rig →
+      withWorld (counts [(RequestsPerInstance, 2), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource closedUnderPressure)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "closed try\ttrue\tbusy"
+          closeService (rgService rig)
+          untilPrinted world "closed try\tfalse\ttrue\tfalse"
 
   it "keeps a cancelled request's place charged until its record is taken" $ do
     gate ← newGate
