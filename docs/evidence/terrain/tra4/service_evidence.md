@@ -246,3 +246,37 @@ the model refuses the completion), so the in-suite 400-to-1 control is the evide
 Also: an arena whose edits coalesced (charged 80, holding 64) returns every account when it retires, and the property
 ends with every bank (occupied and reserved), slot and arena at zero. The suite is 245 examples, run 40 times at
 `+RTS -N4` on the final code.
+
+## Round 15 (round 14 requested changes: the oracle's job, waiting-job and staging expectations)
+
+Round 14 found three gaps in the oracle, fixed as one family: an expectation must come from what the service
+holds or from the work's own data, and the model's charge is only ever the side being tested.
+
+* The record's job amounts were recomputed with the model's cost functions and omitted the region's metadata
+  (144 against 400 granted), so a charge reduced from 400 to 399 passed. Every accepted job is now recorded with
+  what the model **granted** it at admission (so any later reduction is seen) and, separately, the **least its
+  coverage can hold** from the data layer's own sizes (48 a column index entry, 32 + 2 a segment, a 256-byte
+  frame and two bytes a cell of scratch: 82 and 258 for a one-cell read), not the model's functions. The oracle
+  requires the larger of the two.
+* Waiting and queued jobs hold a reservation and scratch too: the record covers every accepted job (slot 1 only
+  once the owner runs it), and the totals and the per-job rows include them.
+* The staging expectation took interests, holds and view descriptions from the model's own entity lists. The
+  service now records the regions each borrow's snapshot covers and each view's accepted demand describes (from
+  the receipt), and the expectation is built from those, the request table (command records and one interest
+  for each region a held request demands) and the owner's duplicates; the ledger is still compared exactly with
+  the model's entity lists, named as a consistency check, not as an independent expectation. A camera demand's
+  interests exist only in the model's records and are not claimed.
+
+Gated amounts: at `PointJob` with a second read admitted: jobs (granted 400/258, least 82/258, slot 1) and
+(granted 400/258, least 82/258, slot 0); a two-region borrow: hold 2; a two-region view demand: description 2.
+
+Controls that fail (in the suite): the running job charged 399/258, 400/257 and 1/1; the waiting job's 400 and 258
+released while the running one is charged in full (and 399, 257); a borrow's hold shortened from two regions to one
+with its staging charge, or dropped; a view's description shortened or dropped. Negative controls against production
+code (each broken once locally on a committed tree, run, reverted; none committed): NC63 (the model charges one
+hold region too few: 51 failures, the borrow example and the Limits example among them), NC64 (waiting jobs never
+recorded: the three waiting-job examples), NC65 (the borrow's regions never recorded: the borrow example), NC66
+(the model releases a queued job's scratch charge: the waiting-job example, the view example and the property's
+coverage checks).
+
+The suite is 251 examples, run 40 times at `+RTS -N4` on the final code.

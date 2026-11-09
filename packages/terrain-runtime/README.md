@@ -89,7 +89,7 @@ values.
 | Snapshot holds and the borrower count | The port acquires and releases | The owner (for closure) | Any | `specHoldRegions` per hold | Released on every exit of `withSnapshot`; closure waits for the count to reach zero |
 | Victim queue | The port appends (from admission decisions); the owner drains | The owner | Port, owner | Bounded by the banks | Drained by the owner, which discards the detail and then reports the release |
 | Defect record | Any thread that detects one | Inspection | Any | The latest 16 | Kept for the life of the service |
-| Running-work record (`RunningWork`: each load job's reservation, scratch and slot; the preparation; each handoff duplicate) | The owner thread alone, in the transaction that starts or ends the work, from the values the work holds | Inspection only (`inspectCensusSTM`); no production decision reads it | The owner | One preparation, one job per dispatch, one duplicate per changed region | Each entry ends with the work it describes (a job's report, the owner's safe point, a transfer's outcome); the owner's terminal step empties it |
+| Running-work record (`RunningWork`: every accepted load job as granted and as its coverage must hold it; the preparation; each handoff duplicate; each borrow's regions; each view description's regions) | The owner thread (running marks, preparation, handoffs, a job's end) and the port transactions that admit the work (a job's grant, a borrow, a view's demand), each in the transaction of the model event it mirrors | Inspection only (`inspectCensusSTM`); no production decision reads it | Owner and port | What the model bounds (jobs, holds, views) plus one preparation and one duplicate per changed region | Each entry ends with the work it describes (a job's report, the owner's safe point, a transfer's outcome, a borrow's release, a view's clearing); the owner's terminal step empties the owner's |
 
 The owner runs bounded quanta: one dispatched load job, one staged computation or
 one commit at a time. Waiting for a host's eligibility, for a load or for a caller is
@@ -416,22 +416,32 @@ arena's resident detail holds in every vertical region (a region's fixed metadat
 entry per column and each segment's metadata and payload, measured on the `Resident` value),
 each arena's retained-changes bytes, live or retiring, every request the service holds
 (table and withdrawn ghosts) with whether it holds a removal reservation, its
-outstanding snapshots, and **the owner's record of the work it runs**. That record
-(`RunningWork`, the owner's ruling of 2026-11-08 on the issue, comment 6728512155) is written
-by the owner thread, in the transaction that starts or ends the work, from the values the
-work itself holds, and no production decision reads it: each load job (what its coverage
-can store, 48 bytes a column, 32 a segment and 64 of payload a segment, so 144 for a one-cell
-read; its scratch, a 256-byte frame and two bytes a cell, 258; and its one load-job slot) from
-its dispatch to its report (completed, failed or acknowledged); the preparation the owner is
-running (a removal's resident growth, 62 bytes, staging, 512, and retained edit, 64, and the
-command record it reads under) from its start to the owner's safe point; and each handoff
-duplicate (the bytes the owner copies, 64 for one removal) from the transfer's admission to
-its outcome. Every inspection type (`Census`, `ArenaCensus`, `RequestCensus`, `RunningWork`,
-`JobWork`, `PreparationWork`, `HandoffWork`) is abstract with read-only accessors that are
-functions, never field labels: an external client cannot construct, forge or update one, and
-none carries an authority, a handle or a snapshot. Reading them takes no hold, interest or
-reservation and changes no residency, LRU order or scheduling.
-The check requires: each region charged at least what its detail
+outstanding snapshots, and **the service's record of the work it runs and holds**. That record
+(`RunningWork`, the owner's ruling of 2026-11-08 on the issue, comment 6728512155) is written in the
+transaction of the model event it mirrors, and no production decision reads it:
+
+* **every accepted load job**, from its admission to its report (completed, failed or acknowledged),
+  whether it is running, queued or waiting for victims: the resident reservation and the scratch the
+  model **granted** it at that moment (400 and 258 for a one-cell read in a fresh region), so a later
+  reduction while the job still holds them is seen; the **least its coverage can hold**, worked out from
+  the cells it loads and the data layer's own sizes and not from the model's cost functions (a column
+  index entry is 48 bytes, a segment 32 of metadata and at least 2 of payload, the scratch a 256-byte
+  frame and two bytes a cell: 82 and 258), so a grant that was too small is seen; and the load-job
+  slot (1 once the owner runs it, from its dispatch, and 0 while it waits). The owner marks a job it
+  runs and ends it with its report, so a model that forgets a running job is seen;
+* the **preparation** the owner is running (a removal's resident growth, 62 bytes, staging, 512, and
+  retained edit, 64, and the command record it reads under), from its start to the owner's safe point;
+* each **handoff duplicate** (the bytes the owner copies, 64 for one removal), from the transfer's
+  admission to its outcome;
+* each outstanding **borrow** and the regions the snapshot handed out covers, and each **view** with an
+  accepted demand and the regions that demand describes (admitted and pending, from the receipt): the
+  service's own account of what it lent and accepted.
+
+Every inspection type (`Census`, `ArenaCensus`, `RequestCensus`, `RunningWork`, `JobWork`,
+`PreparationWork`, `HandoffWork`) is abstract with read-only accessors that are functions, never field
+labels: an external client cannot construct, forge or update one, and none carries an authority, a handle
+or a snapshot. Reading them takes no hold, interest or reservation and changes no residency, LRU order or
+scheduling. The check requires: each region charged at least what its detail
 holds, and no region held by the service with no model record (nor charged, unless
 evicting, when the service holds none); each arena (live or retiring) charged at least its
 own retained changes, and the edit bank at least their sum; a removal's resident growth at
@@ -439,31 +449,35 @@ least the worst case of a segment (two bytes a cell for a dense segment, less th
 of a uniform one) and its edit and staging reservations as stated; the staging bank's
 request records exactly what the service's requests hold; the command slots exactly the
 service's requests that hold a model record; and the snapshot holds exactly the service's
-outstanding snapshots. The owner's running work is compared in its own amounts, entity by
-entity and bank by bank: each running load job must be charged, in the model, at least its
-coverage's resident reservation and its scratch (the model reserves 400 for the one-cell read
-above, 144 plus the region's 256-byte metadata, and 258 of scratch), the load-job slots at
-least the jobs the owner runs, the resident bank's reservations (counting what still waits for
-victims) at least the jobs' reservations plus the removals' growth, the staging bank's
-reservations at least the removals' staging plus the jobs' scratch, each handoff duplicate at
-least the bytes the owner copied (the staging bank's occupied bytes exactly the request
-records, interests, holds, view descriptions and duplicates), and the model must still hold,
-with its growth, the request the owner is preparing. Only what exists nowhere but in the model
-(interests, hold and view records) is taken from the model's entity lists. These comparisons
+outstanding snapshots. The running work is compared in its own amounts, entity by entity and bank by
+bank: **every accepted job**, running or waiting, must be charged at least what it was granted and at least
+what its coverage can hold, resident and scratch (a charge one byte short fails, as does a waiting job whose
+charge was released early); the load-job slots at least the jobs the owner runs; the resident bank's
+reservations (counting what still waits for victims) at least every job's plus the removals' growth;
+the staging bank's reservations at least the removals' staging plus every job's scratch; each handoff
+duplicate at least the bytes the owner copied; the model must still hold, with its growth, the request the
+owner is preparing; each borrow's hold must name at least the regions of the snapshot handed out and
+each view's description at least the regions of the accepted demand; and the staging bank's
+occupied bytes at least what the service's own records need (the request records, one interest for each region
+each held request demands, one hold record for each region each borrow covers, each view's description and
+the duplicates). A camera demand's interests exist only in the model's own records, so they are not claimed;
+the ledger is also compared exactly with the model's own entity lists (consistency of the model with itself,
+named as such, not an independent expectation). These comparisons
 run after every step of the property, inside every held borrow, at every job (where the record
-must also hold the job, with a slot and non-zero amounts) and, with releases injected, inside
-the preparation hook right after each cancellation, lease release or client end, before the
-owner resumes. The property ends with every bank, occupied as well as reserved, every slot and
-every arena at zero: no charge, a coalescing excess included, outlives its holder.
-`Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job, handoff and
-preparation, and holds the controls that must fail: a model that charges the running job 1
-byte of resident and 1 of scratch instead of 400 and 258 (and one byte short of each figure),
-a job the model forgot while it runs, a 64-byte handoff duplicate zeroed (or not charged at
-all), a preparation whose request the model dropped or for which it reserved no growth, a
-model rebuilt without the arena beside the service's real census (every bank disagrees), and
-two arenas' retained charges swapped. It also shows that reading the census changes neither the
-model, its clock, its requests nor its limits, and that an arena with coalesced edits, charged
-more than it holds, returns every account when it retires.
+must also show the job running, with a slot and non-zero amounts) and, with releases
+injected, inside the preparation hook right after each cancellation, lease release or
+client end, before the owner resumes. The property ends with every bank, occupied as well as reserved,
+every slot and every arena at zero: no charge, a coalescing excess included, outlives its holder.
+`Test.TerrainRuntime.Oracle` pins the record's literal amounts at a gated job (running and waiting), handoff,
+preparation, borrow and view, and holds the controls that must fail: a model that charges the running job
+1 byte of resident and 1 of scratch instead of 400 and 258 (and one byte short of each figure), a waiting job
+whose 400 and 258 were released while another job runs (and one byte short), a job the model forgot while it
+runs, a 64-byte handoff duplicate zeroed (or not charged at all), a preparation whose request the model dropped
+or for which it reserved no growth, a borrow's hold shortened from two regions to one (the staging charge with
+it) or dropped, a view's description shortened or dropped, a model rebuilt without the arena beside the
+service's real census (every bank disagrees), and two arenas' retained charges swapped. It also shows that
+reading the census changes neither the model, its clock, its requests nor its limits, and that an arena with
+coalesced edits, charged more than it holds, returns every account when it retires.
 `Test.TerrainRuntime.Budgets` pins D-42: a twelve-region camera demand over a resident bank of about two
 regions is admitted best effort with a pending remainder (asserted, so the example cannot pass
 without capacity pressure), and an explicit query and a removal are admitted and complete
