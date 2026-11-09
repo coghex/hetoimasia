@@ -79,6 +79,22 @@ import Hetoimasia.Terrain.Runtime
   )
 import Hetoimasia.Terrain.Segment (maxSegmentLevels)
 
+-- | The unit prices the design states for records the service keeps (P-5 and the #639
+-- accounting: a command record 128 bytes and 32 a region, an interest 64, a hold record
+-- 64 a region, a view description 128 and 64 a region, a removal's retained edit 64, 16 for
+-- the interval and 48 for the column entry, and its staging 512). They are literals here,
+-- stated from the design, and not the model's own functions: the expected side of every
+-- comparison below names no model accessor and no cost function.
+commandRecord, descriptionOf ∷ Word64 → Word64
+commandRecord n = 128 + 32 * n
+descriptionOf n = 128 + 64 * n
+
+interestRecord, holdRecord, removalRetained, removalStaging ∷ Word64
+interestRecord = 64
+holdRecord = 64
+removalRetained = 64
+removalStaging = 512
+
 -- | The most a whole-cell removal can raise the payload of the segment it edits: a dense
 -- segment of 'maxSegmentLevels' cells is two bytes a cell, a uniform one two bytes in
 -- all. The model reserves exactly this for each removal.
@@ -221,9 +237,9 @@ chargedOf m =
     , cStaging = bankLedger m StagingBank
     , cResidentDeferred = sumW (map jobDeferred (modelJobs m)) + sumW (map requestResidentDeferred (modelRequests m))
     , cEntityStaging =
-        len (modelInterests m) * interestRecordBytes
-          + sumW [len regions * holdRecordBytes | (_, _, _, regions) ← modelHolds m]
-          + sumW [descriptionBytes (len (viewDemand v)) | v ← modelViews m]
+        len (modelInterests m) * interestRecord
+          + sumW [len regions * holdRecord | (_, _, _, regions) ← modelHolds m]
+          + sumW [descriptionOf (len (viewDemand v)) | v ← modelViews m]
     , cCommandSlots = slotInUse m CommandSlot
     , cLoadSlots = slotInUse m LoadJobSlot
     , cBorrows = len [() | (_, _, Borrow, _) ← modelHolds m]
@@ -271,33 +287,45 @@ disagreements h c =
     <> concatMap handoffDisagreements (heldHandoffs h)
     <> maybe [] preparationDisagreements (heldPreparation h)
   where
-    -- What the service's requests hold in the model: one record each, and a removal's
-    -- reservations.
+    -- ===== EXPECTED SIDE: built from `h` (what the service holds) and the design's prices only =====
+    -- (check: no model accessor, no ledger and no cost function of the residency model appears
+    -- between this marker and the END marker; see the pull request body)
+    -- What the service's requests hold in the model: one record each, and a removal's reservations.
     held' = [r | r ← heldRequests h, hrModelRecord r]
     removals = len [() | r ← held', hrRemoval r]
     -- Every accepted job, running or not, must be charged what it was granted, or what its
     -- coverage can hold if that is more.
     jobsResident = sumW (map hjMustResident (heldJobs h))
     jobsScratch = sumW (map hjMustScratch (heldJobs h))
-    jobSlots = sumW (map hjSlots (heldJobs h))
     duplicates = sumW (map hhDuplicate (heldHandoffs h))
-    -- What the staging bank must hold for records the service itself keeps: the request
-    -- table's command records and, for each held request, one interest for each region
-    -- it demands; each outstanding borrow's hold, one record for each region its snapshot
-    -- covers; each view's description; and the owner's duplicates. A camera demand's
-    -- interests exist only in the model's own records, so they are not claimed here.
-    stagingHeld =
-      sumW [commandRecordBytes (fromIntegral (hrRegions r)) + fromIntegral (hrRegions r) * interestRecordBytes | r ← held']
-        + sumW [n * holdRecordBytes | (_, n) ← heldHolds h]
-        + sumW [descriptionBytes n | (_, n) ← heldViews h]
-        + duplicates
-    modelGrowth = sumW [g | (_, _, g) ← cRequests c]
-    -- Resident detail, region by region: what the arena's detail itself holds there (a
-    -- region's fixed metadata, an index entry per column and each segment) against what
-    -- the model charges for that region. A region the owner has discarded but the model
-    -- has not yet released (it is evicting) is still charged until its victim is released.
+    -- Resident detail, region by region: what the arena's detail itself holds there (a region's
+    -- fixed metadata, an index entry per column and each segment).
     serviceRegions = [((haArena a, region), bytes) | a ← heldArenas h, (region, bytes) ← Map.toList (haRegionBytes a)]
+    -- The request table's command records and, for each held request, one interest for each region
+    -- it demands; each outstanding borrow's hold, one record for each region its snapshot covers;
+    -- each view's description; and the owner's duplicates. A camera demand's interests exist only
+    -- in the model's own records, so they are not claimed here.
+    recordsHeld = sumW [commandRecord (fromIntegral (hrRegions r)) | r ← held']
+    stagingHeld =
+      recordsHeld
+        + sumW [fromIntegral (hrRegions r) * interestRecord | r ← held']
+        + sumW [n * holdRecord | (_, n) ← heldHolds h]
+        + sumW [descriptionOf n | (_, n) ← heldViews h]
+        + duplicates
+    expectResidentOccupied = sumW (map snd serviceRegions)
+    expectResidentGrowth = removals * removalGrowthBound
+    expectResidentReserved = jobsResident + removals * removalGrowthBound
+    expectEditOccupied = sumW (map haRetained (heldArenas h))
+    expectEditReserved = removals * removalRetained
+    expectStagingReserved = removals * removalStaging + jobsScratch
+    expectCommandSlots = len held'
+    expectLoadSlots = sumW (map hjSlots (heldJobs h))
+    expectBorrows = fromIntegral (heldBorrows h) ∷ Word64
+    -- ===== END EXPECTED SIDE =====
+    modelGrowth = sumW [g | (_, _, g) ← cRequests c]
     modelRegionBytes = Map.fromList [((crArena r, crRegion r), (crBytes r, crEvicting r)) | r ← cRegions c]
+    -- A region the owner has discarded but the model has not yet released (it is evicting) is
+    -- still charged until its victim is released.
     regionRows =
       [ ("resident bytes of region " <> show key <> ": the model", modelBytes, bytes, AtLeast)
       | (key, bytes) ← serviceRegions
@@ -312,7 +340,6 @@ disagreements h c =
            | (key, (bytes, False)) ← Map.toList modelRegionBytes
            , key `notElem` map fst serviceRegions
            ]
-    resident = sumW (map snd serviceRegions)
     -- Each arena's retained changes, live or retiring, against the arena's own charge.
     arenaRows =
       [ ("retained bytes of arena " <> show (haArena a) <> ": the model", charged, haRetained a, AtLeast)
@@ -321,26 +348,21 @@ disagreements h c =
       , aid == haArena a
       ]
     rows =
-      [ ("resident bank occupied (every arena's resident detail, retiring included)", ledgerOccupied (cResident c), resident, AtLeast)
-      , ("resident growth reserved for the removals the service holds (each at least the worst case of a segment)", modelGrowth, removals * removalGrowthBound, AtLeast)
-      , -- Reserved and deferred together: the jobs' reservations (what their coverage can store)
-        -- and the removals' growth, however much of it still waits for victims.
-        ("resident bank reserved (every accepted job's reservation and the removals' growth)", ledgerReserved (cResident c) + cResidentDeferred c, jobsResident + removals * removalGrowthBound, AtLeast)
-      , ("edit bank occupied (every arena's retained changes, retiring included)", ledgerOccupied (cEdit c), sumW (map haRetained (heldArenas h)), AtLeast)
-      , ("edit bank reserved by removals", ledgerReserved (cEdit c), removals * removalRetainedBytes, Exact)
-      , -- Independent: what the service's own records need.
-        ("staging bank occupied (request records and interests, borrows, view descriptions, duplicates, from the service)", ledgerOccupied (cStaging c), stagingHeld, AtLeast)
+      [ ("resident bank occupied (every arena's resident detail, retiring included)", ledgerOccupied (cResident c), expectResidentOccupied, AtLeast)
+      , ("resident growth reserved for the removals the service holds (each at least the worst case of a segment)", modelGrowth, expectResidentGrowth, AtLeast)
+      , -- Reserved and deferred together: every accepted job's reservation and the removals' growth,
+        -- however much of it still waits for victims.
+        ("resident bank reserved (every accepted job's reservation and the removals' growth)", ledgerReserved (cResident c) + cResidentDeferred c, expectResidentReserved, AtLeast)
+      , ("edit bank occupied (every arena's retained changes, retiring included)", ledgerOccupied (cEdit c), expectEditOccupied, AtLeast)
+      , ("edit bank reserved by removals", ledgerReserved (cEdit c), expectEditReserved, Exact)
+      , ("staging bank occupied (request records and interests, borrows, view descriptions, duplicates, from the service)", ledgerOccupied (cStaging c), stagingHeld, AtLeast)
       , -- The ledger against the model's own entity lists (interests, holds, views, camera interests
         -- included): consistency of the model with itself, not an independent expectation.
-        ( "staging bank occupied (the ledger against the model's own entities)"
-        , ledgerOccupied (cStaging c)
-        , sumW [commandRecordBytes (fromIntegral (hrRegions r)) | r ← held'] + cEntityStaging c + duplicates
-        , Exact
-        )
-      , ("staging bank reserved (each removal's staging reservation and every accepted job's scratch)", ledgerReserved (cStaging c), removals * removalStagingBytes + jobsScratch, AtLeast)
-      , ("command slots (every request the service holds a model record for)", cCommandSlots c, len held', Exact)
-      , ("load-job slots (every job the owner is running)", cLoadSlots c, jobSlots, AtLeast)
-      , ("snapshot holds", cBorrows c, fromIntegral (heldBorrows h), Exact)
+        ("staging bank occupied (the ledger against the model's own entities)", ledgerOccupied (cStaging c), recordsHeld + cEntityStaging c + duplicates, Exact)
+      , ("staging bank reserved (each removal's staging reservation and every accepted job's scratch)", ledgerReserved (cStaging c), expectStagingReserved, AtLeast)
+      , ("command slots (every request the service holds a model record for)", cCommandSlots c, expectCommandSlots, Exact)
+      , ("load-job slots (every job the owner is running)", cLoadSlots c, expectLoadSlots, AtLeast)
+      , ("snapshot holds", cBorrows c, expectBorrows, Exact)
       ]
     -- Every accepted job is charged, in its own amounts, for as long as the model holds it: a
     -- running job the model has forgotten, or any job charged less than it was granted (or
