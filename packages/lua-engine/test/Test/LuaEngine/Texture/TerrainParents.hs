@@ -68,6 +68,45 @@ spec = describe "a terrain's two atlas parents through the texture pipeline" $ d
       forM_ calls (retireTexture (ssFake session))
       awaitOwner vm "i" (== OwnerReading 0 0)
       sessionNow session `shouldReturn` 0
+
+  it "rolls a partial acquisition back: a required second parent refused on bytes leaves the first parent's reservation to be released, the bank returns to the prior terrain's charges, and the prior parents stay live" $
+    withSession ((config terrainProfile atlases) {cfgLeases = 8, cfgJobs = 8, cfgPool = (2, 8)}) $ \session _ runtime → do
+      vm ← startVm session runtime "terrain" OnArrival
+      admitDriver session vm "i"
+      -- A prior terrain's two parents are live (decoded size each).
+      loadAs session vm "i" "priorColour" "colour.png" >>= (`shouldBe` "i start priorColour started")
+      loadAs session vm "i" "priorNormal" "normal.png" >>= (`shouldBe` "i start priorNormal started")
+      settle session vm 0 "priorColour"
+      settle session vm 1 "priorNormal"
+      ownerNow vm "i" >>= (\reading → (ownerTexturesHeld reading, ownerNominalHeld reading) `shouldBe` (2, colourBytes + normalBytes))
+      -- A new terrain: its colour parent's reservation fits beside the prior pair and is held while its read waits.
+      closeGate (ssProbe session) "colour.png"
+      loadAs session vm "i" "newColour" "colour.png" >>= (`shouldBe` "i start newColour started")
+      let Bytes reservation = textureReservationBytes terrainProfile
+      ownerNow vm "i" >>= (\reading → ownerNominalHeld reading `shouldBe` colourBytes + normalBytes + reservation)
+      -- Its REQUIRED normal parent does not fit: refused on bytes, nothing charged for the refusal.
+      refused ← loadAs session vm "i" "newNormal" "normal.png"
+      refused `shouldSatisfy` Text.isInfixOf "texture bytes"
+      ownerNow vm "i" >>= (\reading → ownerNominalHeld reading `shouldBe` colourBytes + normalBytes + reservation)
+      -- The acquisition fails as a whole: the caller rolls the colour parent's pending request back (cancelled). The bank returns to exactly the prior
+      -- terrain's charges, and its two parents are live and unchanged.
+      command session vm "i" "cancel" "newColour"
+      awaitNote session "i cancel newColour cancelled"
+      command session vm "i" "take" "newColour"
+      awaitNote session "i take newColour {status=cancelled}"
+      openGate (ssProbe session) "colour.png"
+      awaitOwner vm "i" (\reading → (ownerTexturesHeld reading, ownerNominalHeld reading) == (2, colourBytes + normalBytes))
+      sessionNow session `shouldReturn` colourBytes + normalBytes
+      -- The prior parents release and retire as before: the bank returns to zero only at the backend's proofs.
+      forM_ (zip [1 ..] ["priorColour", "priorNormal"]) $ \(position, key) → do
+        command session vm "i" "release" key
+        awaitNote session ("i release " <> key <> " retiring")
+        awaitReleaseCalls (ssFake session) position
+      ownerNow vm "i" >>= (\reading → ownerNominalHeld reading `shouldBe` colourBytes + normalBytes)
+      calls ← releaseCalls (ssFake session)
+      forM_ calls (retireTexture (ssFake session))
+      awaitOwner vm "i" (== OwnerReading 0 0)
+      sessionNow session `shouldReturn` 0
   where
     colourBytes, normalBytes ∷ Word64
     colourBytes = 288 * 64 * 4

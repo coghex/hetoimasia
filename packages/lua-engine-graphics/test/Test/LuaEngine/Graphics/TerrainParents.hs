@@ -1,16 +1,19 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | TRA-17 requirement 6 over the real texture pipeline (headless rig, #672's backend): a terrain's two atlas parents are
--- uploaded as terrain-sized images, the terrain adapter is built over the handles the pipeline delivered, and the lifetime
--- the adapter relies on holds. Three independent examples:
+-- uploaded as terrain-sized images and the terrain adapter is built over the handles the pipeline delivered. Three
+-- independent examples:
 --
--- * the original lease is released while a batch still reads the pair, and the textures stay unretired until completion;
--- * the adaptation over those handles is made and is unchanged by the release, the pending work and the reclamation;
--- * pressure (no room for another image) leaves nothing partial: the refused job holds no image, the parents are untouched,
---   and it proceeds when a released parent is reclaimed.
+-- * the adaptation over those handles is unchanged by the release of the original ownership and by the reclamation;
+-- * a REQUIRED parent whose registration is refused fails its acquisition and rolls back: no native image is left for it,
+--   the parent already delivered with it is untouched until the caller releases it, and a prior terrain's parents and
+--   adaptation are unchanged;
+-- * a required parent that waits for room under pressure and is then withdrawn leaves nothing partial the same way.
 --
--- The terrain adapter allocates no texture, holds no lease and calls no recorder: it is a pure function of handles this
--- pipeline admitted, so what keeps a handle valid is exactly what is exercised here.
+-- No holder count is set by hand here: what holds a texture while a frame that names it is recorded or pending is read
+-- from the real recorder in @Test.Render.TwoD.Vulkan.TerrainParents@ (render-2d-vulkan's suite), and the byte banks'
+-- charges from the real pipeline in @Test.LuaEngine.Texture.TerrainParents@ (lua-engine's suite). The terrain adapter
+-- allocates no texture, holds no lease and calls no recorder: it is a pure function of handles this pipeline admitted.
 module Test.LuaEngine.Graphics.TerrainParents (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
@@ -18,8 +21,8 @@ import qualified Data.Text as Text
 import Hetoimasia.Asset.Image (DecodedImage (..))
 import Hetoimasia.LuaEngine.Graphics.Texture (textureHandleOf)
 import Hetoimasia.Render.Api.Texture (TextureHandle)
-import Hetoimasia.LuaEngine.Graphics.Texture.Backend (BackendReading (..))
-import Hetoimasia.LuaEngine.Texture.Backend (BackendTexture (..), RetirementState (..))
+import Hetoimasia.LuaEngine.Graphics.Texture.Port (Fault (..))
+import Hetoimasia.LuaEngine.Texture.Backend (BackendTexture (..), RetirementState (..), UploadWork (..))
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), loadAtlasStyle)
 import Hetoimasia.Terrain.Render2D.Evidence (scenePlan)
 import Hetoimasia.Terrain.Render2D.Material
@@ -32,88 +35,113 @@ import Test.LuaEngine.Graphics.Rig
 
 spec ∷ Spec
 spec = describe "a terrain's two atlas parents through the texture pipeline" $ do
-  it "keeps both parents unretired while a batch still reads them after the original lease is released, and retires them only at completion" $
+  it "builds the terrain adaptation over the delivered handles, and the release of the original ownership and its reclamation leave that adaptation unchanged" $
     withRig terrainConfig $ \rig → do
-      (colour, normal, _) ← deliverParents rig
-      -- A batch's version still maps both slots (the retained reader), and reclamation is held: the actual completion point.
-      setVersionHolders (rigFake rig) 2
-      hold (rigFake rig) HoldReclaim
-      holdBarrier (rigFake rig)
-      colourReading ← textureRelease colour
-      normalReading ← textureRelease normal
-      -- Authority is gone at once, both are marked released, and nothing was released natively yet.
-      awaitFake (rigFake rig) (\r → length (readingMarkedNow r) == 2)
-      eventCount (rigFake rig) "release attempted" `shouldReturn` 0
-      release (rigFake rig) HoldAdoption
-      awaitBackend rig (\r → length (filter (== "retiring") (readingTextureStages r)) == 2)
-      -- The table released; the batch's version still maps the slots: pending, never complete.
-      mapM_ (\reading → atomically reading >>= (`shouldBe` True) . isPending) [colourReading, normalReading]
-      -- The batches completed and the slots are reclaimed: now, and only now, both are retired.
-      setVersionHolders (rigFake rig) 0
-      release (rigFake rig) HoldReclaim
-      atomically (colourReading >>= \case ProviderComplete → pure (); _ → retry)
-      atomically (normalReading >>= \case ProviderComplete → pure (); _ → retry)
-
-  it "builds the terrain adaptation over the delivered handles, and the release, the pending work and the reclamation leave that adaptation unchanged" $
-    withRig terrainConfig $ \rig → do
-      style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
-      -- The parents are the committed atlases' own sizes, so the adaptation is the real one.
-      (decodedWidth (styleColourImage style), decodedHeight (styleColourImage style)) `shouldBe` (288, 64)
-      (decodedWidth (styleNormalImage style), decodedHeight (styleNormalImage style)) `shouldBe` (768, 384)
+      terrain ← terrainOver
       (colour, normal, handles) ← deliverParents rig
-      let (colourHandle, normalHandle) = handles
-      colourParent ← either (fail . show) pure (bindColourParent (styleColour style) colourHandle)
-      normalParent ← either (fail . show) pure (bindDataParent (styleNormal style) normalHandle)
-      let textures = packedTextures colourParent normalParent
-          assets = styleAssets style
-          scene = rampsCorners FaceSouth
-      plan ← either (fail . show) pure (scenePlan assets scene)
-      adapted ← either (fail . describeMaterialRefusal) pure (adaptCells textures defaultLightSettings assets plan)
-      atlasColourHandles textures `shouldBe` [colourHandle]
+      made ← adaptOver terrain handles
       -- Every quad of the adaptation is routed by the delivered colour texture's handle, and it has records to draw with.
-      adaptedQuads adapted `shouldSatisfy` (not . null)
-      adaptedQuads adapted `shouldSatisfy` all ((== colourHandle) . adaptedColourHandle)
-      adaptedRecords adapted `shouldSatisfy` (not . null)
-      -- The original leases are released while a batch still reads them and reclamation is held.
-      setVersionHolders (rigFake rig) 2
-      hold (rigFake rig) HoldReclaim
+      adaptedQuads (madeAdapted made) `shouldSatisfy` (not . null)
+      adaptedQuads (madeAdapted made) `shouldSatisfy` all ((== fst handles) . adaptedColourHandle)
+      atlasColourHandles (madeTextures made) `shouldBe` [fst handles]
+      -- The original leases are released: the adaptation was made from the handles, not from the leases, so the same inputs
+      -- give the same value before and after the textures' retirement.
       readings ← mapM textureRelease [colour, normal]
-      awaitFake (rigFake rig) (\r → length (readingMarkedNow r) == 2)
-      -- The adaptation was made from the handles, not from the leases: the same inputs give the same value now.
-      adaptCells textures defaultLightSettings assets plan `shouldBe` Right adapted
-      setVersionHolders (rigFake rig) 0
-      release (rigFake rig) HoldReclaim
       mapM_ (\reading → atomically (reading >>= \case ProviderComplete → pure (); _ → retry)) readings
-      adaptCells textures defaultLightSettings assets plan `shouldBe` Right adapted
+      adaptAgain terrain made `shouldBe` Right (madeAdapted made)
 
-  it "refuses room for a third image with nothing partial held, leaves the parents untouched, and proceeds when a released parent is reclaimed" $
-    withRig terrainConfig {fcImages = 2} $ \rig → do
-      (colour, normal, _) ← deliverParents rig
-      third ← newProbe
-      _ ← submit rig third 288 64 255
+  it "rolls a required parent's refused registration back: no image left for it, the parent delivered with it untouched, and a prior terrain unchanged" $
+    withRig terrainConfig $ \rig → do
+      terrain ← terrainOver
+      -- A prior terrain's parents are delivered and adapted.
+      (priorColour, priorNormal, priorHandles) ← deliverParents rig
+      prior ← adaptOver terrain priorHandles
+      -- A new terrain: its colour parent is delivered, its normal parent's registration is refused.
+      colourProbe ← newProbe
+      _ ← submit rig colourProbe 288 64 255
+      _ ← awaitTerminal colourProbe
+      newColour ← delivered colourProbe
+      awaitFake (rigFake rig) ((== 3) . readingImagesAlive)
+      inject (rigFake rig) (FailRegister (FaultFatal "the table refused the image"))
+      normalProbe ← newProbe
+      _ ← submit rig normalProbe 768 384 255
+      failed ← awaitTerminal normalProbe
+      failed `shouldSatisfy` \case SeFailed text → Text.isInfixOf "the table refused the image" text; _ → False
+      -- Nothing partial: the failed parent's image was discarded, and the three delivered are exactly what is alive.
+      awaitFake (rigFake rig) ((== 3) . readingImagesAlive)
+      -- The caller rolls the acquisition back by releasing the parent that did arrive; the prior terrain is untouched.
+      rollback ← textureRelease newColour
+      atomically (rollback >>= \case ProviderComplete → pure (); _ → retry)
+      awaitFake (rigFake rig) ((== 2) . readingImagesAlive)
+      adaptAgain terrain prior `shouldBe` Right (madeAdapted prior)
+      readings ← mapM textureRelease [priorColour, priorNormal]
+      mapM_ (\reading → atomically (reading >>= \case ProviderComplete → pure (); _ → retry)) readings
+
+  it "rolls back a required parent that waits for room under pressure and is then withdrawn: no image for it, the parent beside it and a prior terrain unchanged" $
+    withRig terrainConfig {fcImages = 3} $ \rig → do
+      terrain ← terrainOver
+      (priorColour, priorNormal, priorHandles) ← deliverParents rig
+      prior ← adaptOver terrain priorHandles
+      colourProbe ← newProbe
+      _ ← submit rig colourProbe 288 64 255
+      _ ← awaitTerminal colourProbe
+      newColour ← delivered colourProbe
+      -- The third image is the colour parent: no room for the required normal parent, which waits.
+      normalProbe ← newProbe
+      work ← submit rig normalProbe 768 384 255
       awaitEventCount (rigFake rig) "allocation pressure" 1
-      terminals third `shouldReturn` []
-      -- Only the two parents' images were ever allocated: the refused job holds no native image (nothing partial).
-      allocations ← length . filter (Text.isPrefixOf "allocated") <$> events (rigFake rig)
-      allocations `shouldBe` 2
-      reading ← readingNow rig
-      readingJobs reading `shouldBe` 1
-      -- The parents are untouched by the refusal: still delivered, not marked released.
-      awaitFake (rigFake rig) (null . readingMarkedNow)
-      -- Releasing one parent and reclaiming it makes room: the refused job proceeds and is delivered.
-      colourReading ← textureRelease colour
-      atomically (colourReading >>= \case ProviderComplete → pure (); _ → retry)
-      awaitTerminal third >>= (`shouldSatisfy` \case SeReady _ → True; _ → False)
-      -- The other parent was never touched by any of it.
-      reading' ← textureRelease normal
-      atomically (reading' >>= \case ProviderComplete → pure (); _ → retry)
+      terminals normalProbe `shouldReturn` []
+      allocated ← length . filter (Text.isPrefixOf "allocated") <$> events (rigFake rig)
+      allocated `shouldBe` 3
+      -- The acquisition is withdrawn: the waiting parent never gets an image, and the colour parent is released by the caller.
+      uploadCancel work
+      awaitFake (rigFake rig) ((== 3) . readingImagesAlive)
+      rollback ← textureRelease newColour
+      atomically (rollback >>= \case ProviderComplete → pure (); _ → retry)
+      awaitFake (rigFake rig) ((== 2) . readingImagesAlive)
+      adaptAgain terrain prior `shouldBe` Right (madeAdapted prior)
+      readings ← mapM textureRelease [priorColour, priorNormal]
+      mapM_ (\reading → atomically (reading >>= \case ProviderComplete → pure (); _ → retry)) readings
+
+-- | The committed style and the inputs of the adaptation, loaded once for an example.
+data Terrain = Terrain
+  { terrainStyle ∷ !AtlasStyle
+  }
+
+terrainOver ∷ IO Terrain
+terrainOver = do
+  style ← loadAtlasStyle 5 [("loam", "colour.loam"), ("granite", "colour.granite")]
+  -- The parents are the committed atlases' own sizes, so the adaptation is the real one.
+  (decodedWidth (styleColourImage style), decodedHeight (styleColourImage style)) `shouldBe` (288, 64)
+  (decodedWidth (styleNormalImage style), decodedHeight (styleNormalImage style)) `shouldBe` (768, 384)
+  pure (Terrain style)
+
+data Made = Made
+  { madeTextures ∷ !AtlasTextures
+  , madeAdapted ∷ !Adapted
+  }
+
+-- | The adaptation of a real plan over these parent handles.
+adaptOver ∷ Terrain → (TextureHandle, TextureHandle) → IO Made
+adaptOver terrain (colourHandle, normalHandle) = do
+  let style = terrainStyle terrain
+  colourParent ← either (fail . show) pure (bindColourParent (styleColour style) colourHandle)
+  normalParent ← either (fail . show) pure (bindDataParent (styleNormal style) normalHandle)
+  let textures = packedTextures colourParent normalParent
+  plan ← either (fail . show) pure (scenePlan (styleAssets style) (rampsCorners FaceSouth))
+  adapted ← either (fail . describeMaterialRefusal) pure (adaptCells textures defaultLightSettings (styleAssets style) plan)
+  pure (Made textures adapted)
+
+-- | The same adaptation again, from the same inputs.
+adaptAgain ∷ Terrain → Made → Either MaterialRefusal Adapted
+adaptAgain terrain made = do
+  let style = terrainStyle terrain
+  plan ← either (const (Left StaleAssets)) Right (scenePlan (styleAssets style) (rampsCorners FaceSouth))
+  adaptCells (madeTextures made) defaultLightSettings (styleAssets style) plan
 
 -- | Staging for the largest parent (768 x 384 x 4 bytes) and one more beside it.
 terrainConfig ∷ FakeConfig
 terrainConfig = defaultFakeConfig {fcStagingBytes = 4 * 1024 * 1024}
-
-isPending ∷ RetirementState → Bool
-isPending = \case ProviderPending → True; _ → False
 
 -- | The two parents through the pipeline: the colour atlas (288 x 64) and the normal atlas (768 x 384), each delivered, with the
 -- renderer handles their identities name.
