@@ -48,18 +48,30 @@ largeStore n = do
       chunks xs = let (a, b) = splitAt 40 xs in a : chunks b
   h0 ← foldM (\h ws → commitW h ws >>= committed "building the links") (newH (specOf (128 * 1024 * 1024) Nothing) ident0) (chunks initial)
   let ref0 = Map.fromList [(k, a) | i ← [0 .. n - 1], let (k, a, _) = linkOf' i]
-      -- rounds of 60 dispersed replacements until 14,100 pages are retired
-      round' (h, ref, r) = do
+      -- rounds of 60 dispersed replacements; while recycling, maintenance frees pages that later rounds reuse
+      -- (lowest first), so the live pages of the links tree end up scattered through the page space, between
+      -- the retired ones; then the retirement is allowed to build up to 14,100 pages
+      round' maintain (h, ref, r) = do
         let idxs = [(r * 7 + j * 197) `mod` n | j ← [0 .. 59]]
             ws = [(k, Just (if Map.lookup k ref == Just a then b else a)) | i ← idxs, let (k, a, b) = linkOf' i]
-        (h', out) ← commitW h ws
-        case out of
-          Committed _ → Right (h', foldl (\m (k, v) → maybe m (\x → Map.insert k x m) v) ref ws, r + 1)
+        (h1, out) ← commitW h ws
+        h2 ← case out of
+          Committed _ → Right h1
           other → Left ("history was not built: " <> show other)
+        h3 ← if maintain then maintainSteps (3 ∷ Int) h2 else Right h2
+        Right (h3, foldl (\m (k, v) → maybe m (\x → Map.insert k x m) v) ref ws, r + 1)
+      maintainSteps 0 h = Right h
+      maintainSteps k h = do
+        (p, _, _) ← fillWith h (planMaintenance (hStore h))
+        case p of
+          Planned plan → commitPlan h plan >>= maintainSteps (k - 1)
+          _ → Right h
+      recycle st@(_, _, r) | r >= 150 = Right st
+                           | otherwise = round' True st >>= recycle
       go st@(h, _, _)
         | rRetiredPages (storeRoots (hStore h)) >= 14100 = Right st
-        | otherwise = round' st >>= go
-  (h, ref, r) ← go (h0, ref0, 0)
+        | otherwise = round' False st >>= go
+  (h, ref, r) ← recycle (h0, ref0, 0) >>= go
   Right (h, ref, r)
   where
     committed what (h, out) = case out of
@@ -98,12 +110,52 @@ spec = describe "planning on large valid stores (deep trees, thousands of retire
   it "builds a store that is deep, full of retirement and valid" $ do
     must (checkH h0)
     rRetiredPages (storeRoots (hStore h0)) `shouldSatisfy` (>= 14100)
-    rounds `shouldSatisfy` (> 40)
+    rounds `shouldSatisfy` (> 150)
   it "plans every batch size across the bounds, dispersed and clustered: committed or shrunk, never an integrity result" $ do
     let sizes = [1, 2, 3, 5, 8, 13, 21, 34, 40, 48, 52, 56, 58, 60, 62, 63, 64, 66, 70, 80, 100, 150, 220, 300]
     fates ← must $ mapM (\(k, d) → (\(_, _, f) → (k, d, f)) <$> settleBatch h0 ref0 (batchOf ref0 12000 k d)) [(k, d) | k ← sizes, d ← [True, False]]
     putStrLn ("LARGE batch fates (writes, dispersed, fate): " <> show fates)
+    -- how close each batch came to the bookkeeping reserve, and what refused the ones that were refused
+    forM_ [(k, d) | k ← [40, 56, 64, 80, 100, 150, 220, 300], d ← [True, False]] $ \(k, d) → do
+      p ← must (fillPlan h0 (deltaFor (hStore h0) True False 1 (batchOf ref0 12000 k d)) Ordinary)
+      putStrLn ("LARGE plan " <> show (k, d) <> ": " <> case p of
+        Planned pl → "bookkeeping " <> show (mBookkeepingPages (plMeasure pl)) <> " record pages " <> show (mRecordPages (plMeasure pl)) <> " replaced " <> show (mReplacedRecord (plMeasure pl))
+        other → take 120 (show other))
     [x | x@(_, _, Defect _) ← fates] `shouldBe` []
+  -- The reserve of a production plan is 68 pages and the retirement tree of this store is wide, so the bookkeeping a
+  -- batch needs stays below it. The boundary is the same code path under a smaller reserve ('bdReserve',
+  -- 'bdReserveMax'), which these examples set: a batch whose bookkeeping outgrows the reserve is answered by a larger
+  -- supply when the bound allows it and otherwise by the shrinkable result, and never by an integrity result.
+  it "answers a bookkeeping need past the reserve with a larger supply, or a shrinkable result, never an integrity result" $ do
+    let withBounds rsv rsvMax h ws = do
+          let bounds = standardBounds {bdReserve = rsv, bdReserveMax = rsvMax}
+          (p, _, _) ← fillWith h (\w → planDeltaPinned bounds (hCfg h) (hIdent h) (storeRoots (hStore h)) [] w Ordinary (deltaFor (hStore h) True False 1 ws))
+          pure p
+        ws64 = batchOf ref0 12000 64 True
+    -- a larger supply when the bound allows: planned, with more bookkeeping pages than the reserve
+    allowed ← must (withBounds 3 64 h0 ws64)
+    case allowed of
+      Planned pl → do
+        (mBookkeepingPages (plMeasure pl) > 3) `shouldBe` True
+        h' ← must (commitPlan h0 pl)
+        must (checkH h')
+      other → expectationFailure ("a bookkeeping need past the reserve was not answered with a larger supply: " <> take 200 (show other))
+    -- when the bound does not allow it: the shrinkable capacity result, and a smaller batch gets past it
+    refused ← must (withBounds 3 3 h0 ws64)
+    case refused of
+      Refused why → do
+        why `shouldSatisfy` shrinkable
+        case why of
+          Capacity (BookkeepingExceeded n) → (n > 3) `shouldBe` True
+          other → expectationFailure ("not the bookkeeping result: " <> show other)
+      other → expectationFailure ("a bookkeeping need past the bound was not refused as capacity: " <> take 200 (show other))
+    -- halved as discovery does, the batch makes progress: some size commits under the same bounds
+    let sizes = takeWhile (>= 1) (iterate (`div` 2) 64)
+    outcomes ← must (mapM (\k → (\p → (k, p)) <$> withBounds 3 3 h0 (batchOf ref0 12000 k True)) sizes)
+    let planned = [k | (k, Planned _) ← outcomes]
+        integrity = [(k, why) | (k, Refused why@(Integrity _)) ← outcomes]
+    integrity `shouldBe` []
+    planned `shouldSatisfy` (not . null)
   it "keeps committing random batches, the checker agreeing after every commit, and maintenance drains the store" $
     forM_ [1, 2, 3 ∷ Word64] $ \seed → do
       let step (h, ref, g, shrunk) i = do

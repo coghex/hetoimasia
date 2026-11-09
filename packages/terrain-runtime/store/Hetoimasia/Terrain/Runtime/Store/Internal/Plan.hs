@@ -347,13 +347,17 @@ data Bounds = Bounds
   , bdRamBytes ∷ !Int
   , bdWindowPages ∷ !Int
   , bdWindowBytes ∷ !Int
+  , bdReserve ∷ !Int
+  -- ^ the bookkeeping pages a candidate plan first asks for ('bookkeepingReserve' in production)
+  , bdReserveMax ∷ !Int
+  -- ^ the most it may ask for after counting ('maxBookkeepingPages' in production)
   }
   deriving stock (Eq, Show)
 
 -- | 256 pages (1 MiB of new encoded pages), 4 MiB of RAM, 512 window pages and 1.25 MiB
 -- of window bytes.
 standardBounds ∷ Bounds
-standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes
+standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages
 
 -- ---------------------------------------------------------------------------
 -- The planning monad
@@ -778,11 +782,11 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
           retry ∷ Int → Int → P (Maybe Plan)
           retry fuel rsv = case attempt rsv of
             Left (OutMoreBookkeeping need)
-              | need > maxBookkeepingPages → refuse (Capacity (BookkeepingExceeded need))
-              | fuel > 0 → retry (fuel - 1) (min maxBookkeepingPages (need + bookkeepingSlack))
+              | need > bdReserveMax bounds → refuse (Capacity (BookkeepingExceeded need))
+              | fuel > 0 → retry (fuel - 1) (min (bdReserveMax bounds) (need + bookkeepingSlack))
               | otherwise → refuse (Capacity (BookkeepingExceeded need))
             r → r
-       in retry (3 ∷ Int) bookkeepingReserve
+       in retry (3 ∷ Int) (bdReserve bounds)
   where
     protectedFor Ordinary = reservePages
     protectedFor Maintenance = 0
@@ -1019,7 +1023,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
     chunkSizes n = let top = min n maxReclaimPages in takeWhile (>= 1) (iterate (`div` 2) top)
     tryChunk e ret prefix remaining version' edit c = do
       let freed = take c remaining
-          m = bookkeepingReserve + 4 * c
+          m = bdReserve bounds + 4 * c
           lp = retList ret
           done' = fromIntegral (retDone ret) + c
           finished = done' == fromIntegral (retCount ret)
