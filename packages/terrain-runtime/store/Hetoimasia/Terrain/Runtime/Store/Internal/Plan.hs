@@ -915,8 +915,8 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
               ps ← case pgBody page of
                 List stamp xs | pgTree page == TreeRetire && stamp == e && length xs == fromIntegral (retCount ret) → Right xs
                 _ → refuse (Integrity MalformedRetirement)
-              let remaining = drop (fromIntegral (retDone ret)) ps
-              attempt e ret remaining version' e0 (chunkSizes (length remaining))
+              let (prefix, remaining) = splitAt (fromIntegral (retDone ret)) ps
+              attempt e ret prefix remaining version' e0 (chunkSizes (length remaining))
     -- A page a retirement entry names must be a record-tree page no committed or pinned
     -- tree reaches any more: it lies inside the used space, is classified as a record
     -- page (never a list page, a bookkeeping page or nothing) and is not the page the path
@@ -935,11 +935,16 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
         )
         pages
       unreachable cfg roots pins RetiredPageLive win pages edit0
-    attempt _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
-    attempt e ret remaining version' edit (c : cs) = case tryChunk e ret remaining version' edit c of
+    attempt _ _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
+    attempt e ret prefix remaining version' edit (c : cs) = case tryChunk e ret prefix remaining version' edit c of
       Right plan → Right (Planned plan)
-      Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret remaining version' edit cs
+      Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret prefix remaining version' edit cs
       Left o → Left o
+    goneFromIndex root edit pg = do
+      (mv, edit') ← phase edit (lookupKey TreeRetire root (retiredKey pg))
+      case mv of
+        Nothing → Right edit'
+        Just _ → refuse (Integrity (RetiredIndexMismatch pg))
     unindexRetired ver (root, edit) pg = do
       (mv, edit1) ← phase edit (lookupKey TreeRetire root (retiredKey pg))
       if fmap (\v → getBe64 v 0) mv /= Just ver then refuse (Integrity (RetiredIndexMismatch pg)) else pure ()
@@ -949,7 +954,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
     tooBig (Capacity (TxnRamExceeded _)) = True
     tooBig _ = False
     chunkSizes n = let top = min n maxReclaimPages in takeWhile (>= 1) (iterate (`div` 2) top)
-    tryChunk e ret remaining version' edit c = do
+    tryChunk e ret prefix remaining version' edit c = do
       let freed = take c remaining
           m = bookkeepingReserve + 4 * c
           lp = retList ret
@@ -975,7 +980,11 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       -- every page this entry frees is indexed under this entry's version, and leaves the
       -- index as it leaves the entry: an entry that names a page that is not retired under it
       -- (a forged list or a lowered version) is refused before anything is freed
-      (retireRootI, bkEditI) ← foldM (unindexRetired e) (retireRoot, bkEdit2) freed
+      (retireRootI, bkEditI0) ← foldM (unindexRetired e) (retireRoot, bkEdit2) freed
+      -- an entry is finished only when none of its pages is still indexed: the pages its progress
+      -- field says were reclaimed already must be gone from the index, or a forged progress field
+      -- would drop a page from the obligation for good
+      bkEditI ← if finished then foldM (goneFromIndex retireRoot) bkEditI0 prefix else pure bkEditI0
       (retireRoot1, bkEdit3) ←
         if finished
           then phase bkEditI (deleteKey TreeRetire retireRootI (be64 e))

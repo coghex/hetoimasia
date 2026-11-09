@@ -293,6 +293,18 @@ unpackBody isLeaf count0 payload0
               Nothing → []
       Nothing → []
 
+-- | Whether an internal page's separator is a well-formed key of its tree: a record tree's
+-- key decodes (a column, level and category within the coordinate range), a free extent's key
+-- is a page number, a retirement tree's key is a version or a retired page's marker and number.
+-- A separator that is not would make a descent skip records that exist and answer absent.
+validateSeparator ∷ TreeId → ByteString → Either PageError ()
+validateSeparator tree k = case tree of
+  TreeFree → ok (BS.length k == 8)
+  TreeRetire → ok (BS.length k == 8 || (BS.length k == 9 && BS.index k 0 == 0xFF))
+  _ → ok (decodeKey tree k /= Nothing)
+  where
+    ok b = if b then Right () else Left MalformedKey
+
 -- | The structure inside a decoded page: ordering and the checks that need only
 -- the page itself.
 validateBody ∷ TreeId → Word64 → Page → Either PageError ()
@@ -301,7 +313,10 @@ validateBody tree total (Page _ _ _ body) = case body of
     increasing (map fst es)
     mapM_ (uncurry (validateEntry tree total)) es
     adjacent tree es
-  Inner es → increasing (map fst es)
+  Inner es → do
+    increasing (map fst es)
+    -- a separator is a key of the tree it indexes (the least key its child may hold)
+    mapM_ (validateSeparator tree . fst) es
   List _ ps → if and (zipWith (<) ps (drop 1 ps)) then Right () else Left KeyOrder
   where
     increasing ks = if and (zipWith (<) ks (drop 1 ks)) then Right () else Left KeyOrder

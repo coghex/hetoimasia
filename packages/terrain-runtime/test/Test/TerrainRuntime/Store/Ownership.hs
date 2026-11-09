@@ -37,6 +37,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), enc
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (windowInsert)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
@@ -418,6 +419,23 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       case m of
         Refused (Capacity (RetirementBacklog _ _)) → expectationFailure "maintenance must never be refused for the backlog it lowers"
         _ → pure ()
+    it "refuses a retirement entry whose progress field was re-sealed past pages that were not reclaimed" $ do
+      (h, _, _) ← fixture
+      (leaf, entries, (k0, v0)) ← firstRetire h
+      let (lp, cnt) = (getBe64' v0 0, getLe16' v0 8)
+      cnt `shouldSatisfy` (>= 2)
+      lpage ← parsed h (PageNo lp)
+      ps ← case rpBody lpage of
+        RefList _ xs → pure xs
+        other → expectationFailure (show other) >> fail "list"
+      -- done 0 -> 1: the first page is skipped, the rest reclaimed, the entry deleted and its list released: the
+      -- first page would stay indexed and charged as retired for good
+      forM_ [1, cnt - 1] $ \done → do
+        forged ← forge h leaf (Page TreeRetire 0 leaf (Leaf [(k, if k == k0 then BS.concat [be64 lp, le16' cnt, le16' done] else x) | (k, x) ← entries]))
+        (out, _, _) ← must (fillWith forged (planMaintenance (hStore forged)))
+        case out of
+          Refused (Integrity (RetiredIndexMismatch (PageNo q))) → ps `shouldSatisfy` (q `elem`)
+          other → expectationFailure ("a progress field of " <> show done <> " skipping pages still indexed was not refused: " <> take 200 (show other))
     it "refuses a retirement list that names a bookkeeping page or a page past the used space" $ do
       (h, _, _) ← fixture
       (_, _, (k0, v0)) ← firstRetire h
@@ -458,6 +476,26 @@ spec = describe "page ownership against forged records with valid checksums" $ d
             Refused (Integrity MalformedRetirement) → pure ()
             bad → expectationFailure ("a retirement entry with " <> what <> " was not refused as malformed: " <> take 200 (show bad))
   describe "child references and the used page space (the trees)" $ do
+    it "refuses a re-sealed internal page whose separator is no key of its tree, instead of answering that a record that exists is absent" $ do
+      (h, _, _) ← fixture
+      runsRoot ← maybe (expectationFailure "runs root" >> fail "runs") pure (rRuns (storeRoots (hStore h)))
+      rootPage ← parsed h runsRoot
+      children ← case rpBody rootPage of
+        RefInner cs@(_ : _) → pure cs
+        other → expectationFailure ("an inner runs root expected: " <> take 100 (show other)) >> fail "root"
+      -- every separator of the root is 24 bytes of 0xFF: well ordered, valid checksum, no decoder accepts it
+      let child = case children of ((_, c) : _) → PageNo c; [] → runsRoot
+      forged ← forge h runsRoot (Page TreeRuns (rpLevel rootPage) runsRoot (Inner [(BS.replicate 24 0xFF, child)]))
+      bytes ← page forged runsRoot
+      case windowInsert (cfgUsablePages (hCfg forged)) runsRoot bytes (storeWindow (hStore forged)) of
+        Left MalformedKey → pure ()
+        other → expectationFailure ("a malformed separator was accepted into a window: " <> take 200 (show other))
+      -- so a reader's lookup of a record that exists is an integrity failure, never an absent answer
+      (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore forged)))
+      length children `shouldSatisfy` (>= 1)
+      case readAll forged {hStore = s1} tok of
+        Left msg → msg `shouldContain` "MalformedKey"
+        Right found → expectationFailure ("a read through a malformed separator answered: " <> show (length found) <> " records")
     it "refuses a root of a tree the plan visits that lies past the used page space" $ do
       (h, _, _) ← fixture
       let hw = rHw (storeRoots (hStore h))

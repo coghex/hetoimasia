@@ -261,8 +261,8 @@ spec = describe "the private page codec against independent bytes" $ do
       let inner lvl es = buildPage 1 7 0 2 0 lvl (length es) (BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64' c] | (k, c) ← es])
           list ps = buildPage 1 7 0 3 4 0 (length ps) (BS.concat (le64' 3 : map le64' ps))
           dec = decodePage ident0 total (PageNo 0)
-          k1 = be64' 1
-          k2 = be64' 2
+          k1 = encodeKey (runKey 0 0 1)
+          k2 = encodeKey (runKey 0 0 2)
       either (const False) (const True) (dec (inner 1 [(k1, 5), (k2, 6)])) `shouldBe` True
       dec (inner 1 [(k1, 0)]) `shouldBe` Left (BadReference (PageNo 0))
       dec (inner 1 [(k1, total)]) `shouldBe` Left (BadReference (PageNo total))
@@ -271,6 +271,23 @@ spec = describe "the private page codec against independent bytes" $ do
       dec (inner 8 [(k1, 5)]) `shouldBe` Left (BadLevel 8)
       dec (inner 1 [(k2, 5), (k1, 6)]) `shouldBe` Left KeyOrder
       dec (inner 1 [(k1, 5), (k1, 6)]) `shouldBe` Left KeyOrder
+      -- a separator must be a key of its own tree: a re-sealed internal page whose separator no decoder
+      -- of that tree accepts would make a descent skip records that exist
+      let innerOf t lvl es = buildPage 1 7 0 2 t lvl (length es) (BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64' c] | (k, c) ← es])
+          badSeparators ∷ [(String, Word8, ByteString)]
+          badSeparators =
+            [ ("runs: 24 bytes of 0xFF", 0, BS.replicate 24 0xFF)
+            , ("runs: too short", 0, BS.replicate 7 1)
+            , ("links: a tag that is neither", 1, BS.pack [7, 0, 0])
+            , ("todo: not eight bytes", 2, BS.replicate 3 1)
+            , ("free: not eight bytes", 3, BS.replicate 7 1)
+            , ("retire: nine bytes without the marker", 4, BS.replicate 9 1)
+            ]
+      forM_ badSeparators $ \(what, t, k) → (what, dec (innerOf t 1 [(k, 5)])) `shouldBe` (what, Left MalformedKey)
+      -- and the separators of each tree's own keys are accepted
+      either (const False) (const True) (dec (innerOf 0 1 [(encodeKey (runKey 0 0 5), 5)])) `shouldBe` True
+      either (const False) (const True) (dec (innerOf 3 1 [(be64' 5, 5)])) `shouldBe` True
+      either (const False) (const True) (dec (innerOf 4 1 [(be64' 3, 5), (BS.cons 0xFF (be64' 5), 6)])) `shouldBe` True
       either (const False) (const True) (dec (list [3, 4, 9])) `shouldBe` True
       dec (list [4, 3]) `shouldBe` Left KeyOrder
       dec (list [3, 3]) `shouldBe` Left KeyOrder
@@ -284,12 +301,12 @@ spec = describe "the private page codec against independent bytes" $ do
   describe "structures that could loop" $ do
     it "stops a cyclic or level-violating tree instead of following it" $ do
       let pageNo n = PageNo n
-          inner lvl no child = buildPage 1 7 no 2 0 lvl 1 (BS.concat [BS.singleton 8, be64' 0, le64' child])
+          inner lvl no child = buildPage 1 7 no 2 0 lvl 1 (BS.concat [BS.singleton 24, BS.concat [bias 0, bias 0, bias 0], le64' child])
           p = inner 1 5 6
           q = inner 1 6 5
           add win no bs = either (error . show) id (windowInsert total (pageNo no) bs win)
           w = add (add (emptyWindow ident0 0) 5 p) 6 q
-      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.replicate 24 0)) (newEdit 0 w) of
+      case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 0, bias 0, bias 0])) (newEdit 0 w) of
         Left (Bad (BadLevel 1) (PageNo 6)) → pure ()
         other → expectationFailure ("a cycle was not stopped: " <> either show (const "answered") other)
       -- a child that violates its parent's bounds is refused too
