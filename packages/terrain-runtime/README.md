@@ -600,7 +600,10 @@ internal page claims 1 to 7, so a malformed or cyclic structure cannot loop), th
 count and payload end against the bytes available, every entry's lengths against
 the bounds before it is sliced, that the entries end exactly at the stated end and
 the padding is zero, strictly increasing keys, every child or list reference inside
-the page space and never the page itself, and the structure of each leaf entry (a
+the page space and never the page itself, **an internal page's separators as keys of the tree
+it indexes** (a record tree's key decodes; a free extent's key is a page number; a retirement key is
+a version or a retired page's marker and number: a separator no decoder accepts would make a
+descent skip records that exist and answer that they are absent), and the structure of each leaf entry (a
 well-formed key and value of the tree's own category: coordinates in range,
 `lo < hi` inside the level limits (a link's run-node level too, in a key and in a parent value), a class size of at least 1, adjacent runs and free
 extents already coalesced). A **valid checksum never rescues a malformed page**: the
@@ -770,7 +773,9 @@ Only a page that no owner but the allocator claims is written, and a refusal wri
   `0xFF` and its page number, valued with the version of the entry that owns it; the entries
   sort before them. A commit indexes every page it replaced (a page already indexed is
   `DoubleFree`); reclamation frees a page only if the index holds it under that entry's version
-  (`RetiredIndexMismatch`) and removes it as it frees it. The index is bounded by bounding the
+  (`RetiredIndexMismatch`) and removes it as it frees it. An entry is finished only when none of the
+  pages its progress field says were already reclaimed is still indexed, so a re-sealed progress field
+  cannot drop a page from the obligation for good (`RetiredIndexMismatch`). The index is bounded by bounding the
   backlog: an ordinary plan that would take the retired pages past `maxRetiredPages` (16,384)
   is refused with `RetirementBacklog` until a reader releases and maintenance reclaims; a
   maintenance transaction never adds to it.
@@ -801,7 +806,7 @@ The sites, and what stops a forged record at each (tests are in
 | tree roots and every child reference | used-space bound in every descent; tree, level, bounds (earlier rounds) | a root past the used space; a child past it, for a plan, a committed read and a pinned read; `Codec`: bounds, cycles, levels |
 | a reader's pinned roots | pinned used space, proof against pinned trees | the pinned-read half of the child test; the pinned extent and lowered-version tests |
 | decoded buffers held past their decode | copies, accounted, bounded | `Bounds`: `keeps nothing of a page buffer behind a probe...` |
-| counters | arithmetic only (a negative count is refused); never used to find a page | `Codec` revision and counter wrap tests |
+| counters (live, retired, free, loose list) | the identity `hw = live + retired + free + loose` and the empty-tree implications are checked at every plan and maintenance transaction (`CorruptCounters`, whatever the sign). A counter forged consistently (a transfer between two) can change only capacity and reporting (`freePool`, the retired backlog bound, the usage report), never which page is overwritten | a re-sealed counter moved up and down (`Ownership`); a consistent transfer writes only dead pages |
 
 ### The allowance
 
