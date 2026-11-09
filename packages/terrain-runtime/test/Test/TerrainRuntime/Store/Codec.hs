@@ -16,6 +16,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.List (sort)
 import qualified Data.Map.Strict as Map
+import Data.Int (Int64)
 import Data.Word (Word64, Word8)
 import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Connectivity (Axis (..), mkComponentKey)
@@ -27,7 +28,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Records (encodeKey)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (decodeKey, decodeValue, encodeKey, encodeValue, levelMaxExclusive, levelMin)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
@@ -297,6 +298,40 @@ spec = describe "the private page codec against independent bytes" $ do
         Left (Need (PageNo 6)) → pure ()
         other → expectationFailure ("a missing page must be pending: " <> either show (const "answered") other)
   describe "rebalancing" $ do
+    it "refuses a root collapse that would follow a cycle or a child of the wrong level" $ do
+      let runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
+          sepL = runKeyBytes 1000
+          sepR = runKeyBytes 5000
+          inner no lvl cs = buildPage 1 7 no 2 0 lvl (length' cs) (BS.concat [BS.concat [BS.singleton 24, k, le64' c] | (k, c) ← cs])
+          length' = fromIntegral . length
+          add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
+          root = inner 3 2 [(sepL, 1), (sepR, 2)]
+          -- the left subtree holds one entry; the right one is a two-page cycle of level-1 pages
+          leftInner = inner 1 1 [(sepL, 4)]
+          leaf = buildPage 1 7 4 1 0 0 1 (leafPayload [(runKeyBytes 1000, bias 1001)])
+          cycA = inner 2 1 [(sepR, 5)]
+          cycB = inner 5 1 [(sepR, 2)]
+          w = foldl (\acc (no, bs) → add acc no bs) (emptyWindow ident0 0) [(3, root), (1, leftInner), (4, leaf), (2, cycA), (5, cycB)]
+      -- the deletion empties the left subtree, leaving a one-child root whose collapse reaches the cycle
+      case runM (deleteKey TreeRuns (Just (Disk (PageNo 3))) (runKeyBytes 1000)) (newEdit 1000000 w) of
+        Left (Bad (BadLevel _) _) → pure ()
+        Left (Bad err _) → expectationFailure ("a different refusal: " <> show err)
+        other → expectationFailure ("the collapse was not refused: " <> either show (const "a plan was produced") other)
+    it "refuses a run node whose level is outside the supported coordinate range, in keys and in parent values" $ do
+      let col = columnAt 3 (-4)
+          limit = 4611686018427387904 ∷ Int64
+          bad = [limit, maxBound, negate limit - 1]
+          good = [limit - 1, 0, negate limit]
+      forM_ bad $ \lo → do
+        decodeKey TreeLinks (encodeKey (KeyLink (RunNode col lo))) `shouldBe` Nothing
+        decodeKey TreeRuns (encodeKey (runKey 3 (-4) (toInteger lo))) `shouldBe` Nothing
+        decodeValue (KeyLink srcNodeWith) (encodeValue (RecChild (RunNode col lo))) `shouldBe` Nothing
+      forM_ good $ \lo → do
+        decodeKey TreeLinks (encodeKey (KeyLink (RunNode col lo))) `shouldBe` Just (KeyLink (RunNode col lo))
+        decodeValue (KeyLink srcNodeWith) (encodeValue (RecChild (RunNode col lo))) `shouldBe` Just (RecChild (RunNode col lo))
+      levelMin `shouldBe` negate (2 ^ (62 ∷ Int))
+      levelMaxExclusive `shouldBe` 2 ^ (62 ∷ Int)
+
     it "refuses a sibling whose keys break its parent's separators before merging it into a new page" $ do
       let runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
           entries from = [(runKeyBytes lo, bias (lo + 1)) | lo ← [from, from + 10 .. from + 10 * 29]]

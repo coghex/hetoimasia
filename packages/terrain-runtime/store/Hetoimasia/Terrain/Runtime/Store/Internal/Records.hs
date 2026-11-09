@@ -151,7 +151,11 @@ getNode bs = case BS.uncons bs of
     origin ← getTile bs 1
     ps ← sequence [optionalAt (25 + 9 * i) axis | (i, axis) ← zip [0 ..] [AxisX, AxisY, AxisZ]]
     SrcNode <$> mkComponentKey origin [p | Just p ← ps]
-  Just (1, _) | BS.length bs == 25 → RunNode <$> getColumn bs 1 <*> Just (getBiased bs 17)
+  Just (1, _) | BS.length bs == 25 → do
+    col ← getColumn bs 1
+    let lo = getBiased bs 17
+    -- a run node's level lies in the supported coordinate range, like a run's own
+    if toInteger lo >= levelMin && toInteger lo < levelMaxExclusive then Just (RunNode col lo) else Nothing
   _ → Nothing
   where
     optionalAt off axis = case BS.index bs off of
@@ -173,7 +177,7 @@ decodeKey TreeRuns bs
   | BS.length bs == 24 = do
       col ← getColumn bs 0
       let lo = getBiased bs 16
-      if toInteger lo >= levelMin then Just (KeyRun col lo) else Nothing
+      if toInteger lo >= levelMin && toInteger lo < levelMaxExclusive then Just (KeyRun col lo) else Nothing
 decodeKey TreeLinks bs = KeyLink <$> getNode bs
 decodeKey TreeTodo bs
   | BS.length bs == 8 = Just (KeyTodo (getBe64 bs 0))

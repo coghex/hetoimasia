@@ -686,13 +686,17 @@ deleteKey tree root@(Just r0) k = do
         Nothing → pure Nothing
         Just r → Just <$> collapse r
   where
-    collapse ref = do
-      n ← load tree Nothing ref
-      case nBody n of
-        NInner [(_, c)] → do
-          discard ref
-          collapse c
-        _ → pure ref
+    -- Follow single-child roots down, checking each child's level (one lower than its
+    -- parent's, so the walk is bounded by the tree height and a cycle cannot loop) and the
+    -- separator bounds its parent promises, exactly as every other descent does.
+    collapse ref = load tree Nothing ref >>= collapseFrom Nothing Nothing ref
+    collapseFrom lo hi ref n = case nBody n of
+      NInner es@[(_, c)] | nLevel n > 0 → do
+        let (clo, chi) = childBounds lo hi es 0
+        cn ← loadChecked tree clo chi (Just (nLevel n - 1)) c
+        discard ref
+        collapseFrom clo chi c cn
+      _ → pure ref
     del ref lo hi lvl = do
       n ← loadChecked tree lo hi lvl ref
       case nBody n of
