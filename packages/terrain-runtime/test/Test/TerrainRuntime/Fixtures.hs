@@ -20,6 +20,7 @@ module Test.TerrainRuntime.Fixtures
   , newGate
   , newDisarmedGate
   , armGate
+  , disarmGate
   , openGate
   , gatedProbe
   , awaitReached
@@ -140,6 +141,11 @@ newDisarmedGate = Gate <$> newEmptyMVar <*> newEmptyMVar <*> newTVarIO False
 
 armGate ∷ Gate → IO ()
 armGate gate = atomically (writeTVar (gateArmed gate) True)
+
+-- | Stop holding the owner at the gate's point (one already held stays held until the
+-- gate opens).
+disarmGate ∷ Gate → IO ()
+disarmGate gate = atomically (writeTVar (gateArmed gate) False)
 
 -- | Idempotent and non-blocking.
 openGate ∷ Gate → IO ()

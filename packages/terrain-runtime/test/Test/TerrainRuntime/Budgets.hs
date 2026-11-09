@@ -5,7 +5,9 @@ module Test.TerrainRuntime.Budgets (spec) where
 
 import Control.Concurrent (yield)
 import Control.Concurrent.STM
-import Control.Monad (forM_)
+import Control.Exception (finally)
+import Control.Monad (forM, forM_)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Hetoimasia.Terrain.Cell (Cell (..))
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), decomposeTile, mkLocalCoord)
@@ -155,6 +157,44 @@ spec = describe "Budgets against real owned data" $ do
       okOf (clearViewDemand svc view)
       closeView svc view
       settleChecks svc
+  -- #639's scheduling assumption, through the service: foreground work is dispatched ahead
+  -- of background (camera) work, but a job passed over by 'limitAgingQuanta' dispatches is
+  -- served ahead of the foreground work still queued behind it. The owner is held at the
+  -- first job while a camera job and five explicit reads queue; the order the owner then
+  -- runs them in is observed at the probe, on the owner's own thread.
+  it "serves a background job that was passed over for the aging quanta ahead of the foreground work still queued" $ do
+    gate <- newDisarmedGate
+    order <- newIORef []
+    let recorder = Probe $ \point → do
+          case point of
+            PointJob _ loaded → modifyIORef' order (loaded :)
+            _ → pure ()
+          probePoint (gatedProbe (\p → case p of PointJob {} → True; _ → False) gate) point
+        regionOf k = let (x, y, z) = spread k in fst (decomposeTile (tile x y z))
+        cell k = let (x, y, z) = spread k in tile x y z
+    withServiceUsing (tightConfig (2, 1, 2) 20 512) alwaysAdmitting recorder $ \svc → (\act → act `finally` openGate gate) $ do
+      (client, lease) <- openMain svc "main"
+      view <- okOf (openView svc client)
+      armGate gate
+      first <- okOf (cellAt svc lease (cell 0))
+      awaitReached gate
+      disarmGate gate
+      -- A background job first, then five foreground reads in distinct regions.
+      receipt <- okOf (setViewDemand svc view lease [oneCell (regionOf 6)])
+      receiptAdmitted receipt `shouldBe` [regionOf 6]
+      foreground <- forM [1 .. 5] $ \k → okOf (cellAt svc lease (cell k))
+      openGate gate
+      _ <- await svc first
+      forM_ foreground (await svc)
+      waitFor (inspectModelSTM svc >>= \m → check (null (modelJobs m)))
+      ran <- reverse <$> readIORef order
+      -- Foreground first; the background job, passed over by three dispatches (the aging
+      -- quanta of these limits), then goes ahead of the two foreground jobs still queued.
+      ran `shouldBe` map regionOf [0, 1, 2, 3, 6, 4, 5]
+      okOf (clearViewDemand svc view)
+      closeView svc view
+      settleChecks svc
+
   -- D-42 (the owner's rule for camera demand): a demand larger than the banks is never
   -- refused as invalid. It is admitted best effort, in the producer's order, and the
   -- remainder stays pending; it must not block or starve explicit work. Here the demand
