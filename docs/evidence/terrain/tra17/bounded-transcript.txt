@@ -1,0 +1,33 @@
+vulkan: ghc 9.14.1, cabal 3.18.1.0
+vulkan: native prefix /Users/vincentcoghlan/.cache/hetoimasia/native/glfw
+vulkan: VK_DRIVER_FILES=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulkan/share/vulkan/icd.d/MoltenVK_icd.json
+vulkan: VK_LAYER_PATH=/Users/vincentcoghlan/.cache/hetoimasia/native/glfw/vulkan/share/vulkan/explicit_layer.d
+vulkan: validation features synchronization
+vulkan: VMA binding calls unsafe (VulkanMemoryAllocator -safe-foreign-calls), build directory /Users/vincentcoghlan/worktrees/coghex/hetoimasia/issue-659-terrain-face-map-material/dist-vulkan
+vulkan: repository revision 3f7b6f996efa13310fc56692bb17c6a6dd351a45
+vulkan: source digest 822a60dc0964600463d57a1642281146eb555a4008d7e06635c4c362cc61b78e
+journal: ## TRA-17: the bounded required selection of the terrain material's evidence: the 16 shape identities in the south facing, mixed and fog cells, a roof over a cavity in four submissions and both wrappers, ramps, a depth-effect stack, and a reversed-order control, judged as the complete qualification is
+journal: the terrain-ci evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/evC/terrain-ci
+journal: terrain-ci probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/evC/terrain-ci/tra17-terrain-ci-probes.json
+journal: terrain-ci depth format: Depth32Float
+journal: terrain-ci fixture matrix-FaceSouth-0.25: 10560 probes, 10560 determinate, 0 not counted; passed
+journal: terrain-ci fixture mixed-FaceSouth@0.25: 2640 probes, 2640 determinate, 0 not counted; passed
+journal: terrain-ci fixture roof-cut1-FaceWest@0.125: 1176 probes, 936 determinate, 240 not counted; passed
+journal: terrain-ci fixture roof-cut1-FaceWest@0.125-scrambled: 1176 probes, 936 determinate, 240 not counted; passed
+journal: terrain-ci fixture roof-cut1-FaceWest@0.125-two-materials: 1176 probes, 936 determinate, 240 not counted; passed
+journal: terrain-ci fixture roof-cut1-FaceWest@0.125-retained: 1176 probes, 936 determinate, 240 not counted; passed
+journal: terrain-ci fixture roof-cut1-FaceWest@0.125-ordered-wrapper: 1176 probes, 936 determinate, 240 not counted; passed
+journal: terrain-ci fixture ramps-FaceEast@0.125: 1404 probes, 1197 determinate, 207 not counted; passed
+journal: terrain-ci fixture depth-stack-FaceSouth@0.25@black-under-haze: 4788 probes, 4788 determinate, 0 not counted; passed
+journal: terrain-ci fixture spans-FaceSouth@0.125-control-reversed-overlap: 1008 probes, 1008 determinate, 0 not counted; passed
+
+TRA-17 the terrain material's bounded window-free evidence
+  opened no window, created no surface and acquired no image [✔]
+  rendered every fixture and read back every target once its batch had completed, every determinate probe within its tolerance and every named behaviour distinguished from its contrast, or reports where D32_SFLOAT is unavailable [✔]
+  wrote a lossless PNG for every target and the probe record where they are kept [✔]
+  retired cleanly, with every Vulkan call on the owner's thread [✔]
+  reached a verdict after the last callback with no issue and no error, synchronization validation included [✔]
+
+Finished in 0.0014 seconds
+5 examples, 0 failures
+vulkan-native-tests tra17-terrain-ci: every check passed
