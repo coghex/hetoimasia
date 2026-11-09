@@ -1,6 +1,6 @@
 # TRA-20 evidence: the temporary store's pure model
 
-Implementation head `560c3c78` (the branch is merged with origin/master at `8f44876e` with no source change; issue #662, PR #675 for `Closes #662`). Every figure below is the output of one suite run, not a paraphrase; the suite is `hetoimasia-terrain-runtime:terrain-runtime-tests` and these are observations of the pure model and the codec. **They are not physical filesystem, durability, preallocation, latency or RSS figures**, and none is proof of live request settlement or crash recovery.
+Implementation head `7f179551` (the branch is merged with origin/master at `4ee27aa4` with no source change; issue #662, PR #675 for `Closes #662`). Every figure below is the output of one suite run, not a paraphrase; the suite is `hetoimasia-terrain-runtime:terrain-runtime-tests` and these are observations of the pure model and the codec. **They are not physical filesystem, durability, preallocation, latency or RSS figures**, and none is proof of live request settlement or crash recovery.
 
 ## Commands
 
@@ -15,7 +15,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain
 $(cabal list-bin --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests) --match "TRA-20 evidence"
 ```
 
-Results: `terrain-runtime-tests` 373 examples, 0 failures; `terrain-tests` 901/0; `terrain-render-2d-tests` 649/0.
+Results: `terrain-runtime-tests` 375 examples, 0 failures; `terrain-tests` 901/0; `terrain-render-2d-tests` 649/0.
 
 ## Fixtures, seeds and references
 
@@ -106,6 +106,13 @@ After review round 2 (the three repairs):
 | rebalancing loads its siblings without their separator bounds | 1 of 373 examples fail |
 | an output page's number keeps its whole parsed page alive | 1 of 373 examples fail |
 
+After review round 3 (the two repairs):
+
+| Protected behavior broken | Result |
+| --- | --- |
+| root collapse follows single children without level or bounds checks | 1 of 375 examples fail |
+| a run node's level is not range-checked | 1 of 375 examples fail |
+
 ## Limits of this evidence
 
 The model is checked against references written independently of it, at routine scale. Nothing here measures a file, a filesystem, an fsync, a descriptor, a worker, latency or process memory (TRA-21), the live owner's publication and request settlement (TRA-22) or the Lua control (TRA-23). The memory figures are the accounted bytes of the representation (validated page buffers, packed new pages, a few parsed nodes), checked against the live heap of a window of 310 dense pages (`holds a window of dense pages in memory close to what it accounts`); they are not a process-RSS claim. The tree height bound (8 levels) is shown unreachable below about 36 GiB of leaves by the derivation in `Format.maxLevel`, not by building a 36 GiB store.
@@ -117,3 +124,7 @@ Six findings, all valid and repaired in `12fad45f`: the discovery header's retai
 ## Review round 2 (Codex, CHANGES_REQUESTED at `84ae4eff`)
 
 Three findings, all valid and repaired in `560c3c78`: output pages were assembled as parsed pages and encoded lazily, so a returned plan retained every parsed page through the lazy page number of each output pair (a dense 180-leaf plan held 3.9 MB while reporting 2.8 MB; pages are now numbered, encoded and forced one at a time, and `holds a dense 180-leaf plan within the RAM it reports...` measures the live heap); a retirement list could name a page that was free, loose or consumed by the same plan's supply, which the free-extent insertion could not see (the pages are now checked before the supply is consumed; `refuses to free a page that is already free, loose or claimed...`); and rebalancing loaded its siblings without their parent's separator bounds, so a malformed sibling could be merged into a page `decodePage` rejects (`refuses a sibling whose keys break its parent's separators...`).
+
+## Review round 3 (Codex, CHANGES_REQUESTED at `8f44876e`)
+
+Two findings, both valid and repaired in `d5f50cc5` and `7f179551`: the root collapse after a deletion followed single-child nodes with an unchecked load, so a malformed subtree containing a cycle never terminated (the collapse now carries the expected level, one lower per step, and the inherited separator bounds; `refuses a root collapse that would follow a cycle or a child of the wrong level` fails instead of hanging under a wall-clock guard if the cycle is followed again); and a run node's level was accepted for any `Int64`, in link keys and in parent values (now `levelMin <= lo < levelMaxExclusive`, with boundary and out-of-range fixtures for both: `refuses a run node whose level is outside the supported coordinate range...`).

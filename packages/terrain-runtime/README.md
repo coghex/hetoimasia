@@ -586,7 +586,7 @@ the bounds before it is sliced, that the entries end exactly at the stated end a
 the padding is zero, strictly increasing keys, every child or list reference inside
 the page space and never the page itself, and the structure of each leaf entry (a
 well-formed key and value of the tree's own category: coordinates in range,
-`lo < hi` inside the level limits, a class size of at least 1, adjacent runs and free
+`lo < hi` inside the level limits (a link's run-node level too, in a key and in a parent value), a class size of at least 1, adjacent runs and free
 extents already coalesced). A **valid checksum never rescues a malformed page**: the
 same structure checks refuse a re-sealed page. A refusal is an explicit
 `PageError`; it is never an empty index, absent history, air or the pristine source.
@@ -607,7 +607,7 @@ integrity failure. Updates copy the changed path into an overlay and never touch
 committed page. A node that falls under a quarter of a payload after a deletion is
 repacked with a neighbour (both checked against the separators their parent promises before they are merged) (merged, or split evenly), so every non-root node is at
 least a quarter full; an insertion that overflows splits by bytes; a root that
-splits adds a level and a root left with one child gives it back. A tree is at most
+splits adds a level and a root left with one child gives it back (the collapse walks down one level at a time, checking each child's level and its parent's separator bounds, so a malformed or cyclic subtree is refused, never followed). A tree is at most
 **8 levels** (0 to 7); a plan that would need more is refused with a typed
 `TreeTooTall`, never truncated. A legitimate tree needs a ninth level only past
 about 6.7e7 records (more than 36 GiB of leaves), so the default 1 GiB allowance and
