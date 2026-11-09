@@ -22,7 +22,7 @@ import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), decodePage, encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RangeStart (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (decodeKey, encodeKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
@@ -200,7 +200,7 @@ judgeMutated h tok ref keys page offset newByte mutated = do
       -- a child pointer that was changed leaves its old child referenced by nothing: that page is unreachable now,
       -- and saying so is true (the damage is the pointer, which a read through it reports)
       childrenOf bs = case decodePage (hIdent h) total (PageNo page) bs of
-        Right (Page _ _ _ (Inner cs)) → Set.fromList (map snd cs)
+        Right (Page _ _ _ (Inner cs)) → Set.fromList (map (childPage . snd) cs)
         _ → Set.empty
       orphaned = childrenOf original `Set.difference` childrenOf mutated
       every n xs = [x | (i, x) ← zip [0 ∷ Int ..] xs, i `mod` n == 0]
@@ -276,10 +276,10 @@ spec = describe "a re-sealed byte of a live page never changes what a read answe
           Right (Page _ 0 _ (Leaf ls)) → map fst ls
           _ → []
     firstLeaf ← case es of
-      ((_, c0) : _) → pure (leafKeys c0)
+      ((_, c0) : _) → pure (leafKeys (childPage c0))
       [] → fail "no children"
     secondLeaf ← case es of
-      (_ : (_, c1) : _) → pure (leafKeys c1)
+      (_ : (_, c1) : _) → pure (leafKeys (childPage c1))
       _ → fail "no second child"
     firstLeaf `shouldSatisfy` ((> 6) . length)
     secondLeaf `shouldSatisfy` ((> 6) . length)

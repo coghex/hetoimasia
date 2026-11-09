@@ -20,7 +20,7 @@ import GHC.Stats (RTSStats (..), GCDetails (..), getRTSStats, getRTSStatsEnabled
 import Hetoimasia.Terrain.Discovery (Record, RecordKey (..), maxBatchUpdates)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (encodeKey, encodeValue)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
@@ -209,12 +209,15 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         leafKey ∷ Int → Int → RecordKey
         leafKey l i = runKey (toInteger l) 0 (100 * toInteger i)
         leafPage l = Page TreeRuns 0 (PageNo (fromIntegral l)) (Leaf [(encodeKey (leafKey l i), encodeValue (runRec (100 * toInteger i + 3))) | i ← [1 .. perLeaf]])
+        -- an internal entry records the checksum its child page carries
+        childOf ∷ Page → Child
+        childOf pg = Child (pgNo pg) (getLe32' (either (error . show) id (encodePage ident0 pg)) 4092)
         innerPage ∷ Word64 → [Int] → Page
-        innerPage no ls = Page TreeRuns 1 (PageNo no) (Inner [(encodeKey (leafKey l 1), PageNo (fromIntegral l)) | l ← ls])
+        innerPage no ls = Page TreeRuns 1 (PageNo no) (Inner [(encodeKey (leafKey l 1), childOf (leafPage l)) | l ← ls])
         half = leaves `div` 2
         left = innerPage (fromIntegral leaves) [0 .. half - 1]
         right = innerPage (fromIntegral leaves + 1) [half .. leaves - 1]
-        rootPage = Page TreeRuns 2 (PageNo (fromIntegral leaves + 2)) (Inner [(encodeKey (leafKey 0 1), PageNo (fromIntegral leaves)), (encodeKey (leafKey half 1), PageNo (fromIntegral leaves + 1))])
+        rootPage = Page TreeRuns 2 (PageNo (fromIntegral leaves + 2)) (Inner [(encodeKey (leafKey 0 1), childOf left), (encodeKey (leafKey half 1), childOf right)])
         pages = [leafPage l | l ← [0 .. leaves - 1]] ++ [left, right, rootPage]
         h0 = newH smallSpec ident0
         disk = foldl (\dk pg → diskWrite (pgNo pg) (either (error . show) id (encodePage ident0 pg)) dk) (hDisk h0) pages

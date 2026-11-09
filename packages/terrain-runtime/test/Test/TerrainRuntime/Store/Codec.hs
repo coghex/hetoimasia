@@ -261,7 +261,7 @@ spec = describe "the private page codec against independent bytes" $ do
       let dec = decodePage ident0 total (PageNo 0)
       -- a leaf entry claiming a 60-byte value with one byte left; an internal entry claiming a 24-byte key and no child
       dec (buildPage 1 7 0 1 0 0 1 (BS.pack [1, 60, 7])) `shouldBe` Left (BadLength 3)
-      dec (buildPage 1 7 0 2 0 1 1 (BS.concat [BS.singleton 24, BS.replicate 10 1])) `shouldBe` Left (BadLength 11)
+      dec (buildPage 1 7 0 2 0 1 1 (BS.concat [BS.singleton 24, BS.replicate 14 1])) `shouldBe` Left (BadLength 15)
     it "refuses each field of a retired-page index entry wrong in turn, and an internal page's key lengths" $ do
       let leaf t es = buildPage 1 7 0 1 t 0 (length es) (leafPayload es)
           dec = decodePage ident0 total (PageNo 0)
@@ -278,11 +278,11 @@ spec = describe "the private page codec against independent bytes" $ do
       dec (leaf 4 [(marked 5, BS.snoc ver 0)]) `shouldBe` Left MalformedValue
       dec (leaf 4 [(marked 6, ver), (marked 5, ver)]) `shouldBe` Left KeyOrder
       -- an internal page's separator lengths are checked before it is sliced
-      let innerRaw kl = buildPage 1 7 0 2 0 1 1 (BS.concat [BS.singleton kl, BS.replicate (fromIntegral kl) 1, le64' 5])
+      let innerRaw kl = buildPage 1 7 0 2 0 1 1 (BS.concat [BS.singleton kl, BS.replicate (fromIntegral kl) 1, le64' 5, le32' 0])
       dec (innerRaw 0) `shouldBe` Left (KeyLength 0)
       dec (innerRaw 65) `shouldBe` Left (KeyLength 65)
     it "refuses internal and list pages with bad references, levels or order" $ do
-      let inner lvl es = buildPage 1 7 0 2 0 lvl (length es) (BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64' c] | (k, c) ← es])
+      let inner lvl es = buildPage 1 7 0 2 0 lvl (length es) (BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64' c, le32' 0] | (k, c) ← es])
           list ps = buildPage 1 7 0 3 4 0 (length ps) (BS.concat (le64' 3 : map le64' ps))
           dec = decodePage ident0 total (PageNo 0)
           k1 = encodeKey (runKey 0 0 1)
@@ -297,7 +297,7 @@ spec = describe "the private page codec against independent bytes" $ do
       dec (inner 1 [(k1, 5), (k1, 6)]) `shouldBe` Left KeyOrder
       -- a separator must be a key of its own tree: a re-sealed internal page whose separator no decoder
       -- of that tree accepts would make a descent skip records that exist
-      let innerOf t lvl es = buildPage 1 7 0 2 t lvl (length es) (BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64' c] | (k, c) ← es])
+      let innerOf t lvl es = buildPage 1 7 0 2 t lvl (length es) (BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64' c, le32' 0] | (k, c) ← es])
           badSeparators ∷ [(String, Word8, ByteString)]
           badSeparators =
             [ ("runs: 24 bytes of 0xFF", 0, BS.replicate 24 0xFF)
@@ -325,9 +325,11 @@ spec = describe "the private page codec against independent bytes" $ do
   describe "structures that could loop" $ do
     it "stops a cyclic or level-violating tree instead of following it" $ do
       let pageNo n = PageNo n
-          inner lvl no child = buildPage 1 7 no 2 0 lvl 1 (BS.concat [BS.singleton 24, BS.concat [bias 0, bias 0, bias 0], le64' child])
-          p = inner 1 5 6
-          q = inner 1 6 5
+          inner lvl no child crc = buildPage 1 7 no 2 0 lvl 1 (BS.concat [BS.singleton 24, BS.concat [bias 0, bias 0, bias 0], le64' child, le32' crc])
+          -- an internal entry records the checksum of its child: the first hop is recorded truly, the second (back to
+          -- the first page) cannot be, and is never followed
+          q = inner 1 6 5 0
+          p = inner 1 5 6 (getLe32' q 4092)
           add win no bs = either (error . show) id (windowInsert total (pageNo no) bs win)
           w = add (add (emptyWindow ident0 0) 5 p) 6 q
       case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 0, bias 0, bias 0])) (newEdit 0 w) of
@@ -335,8 +337,9 @@ spec = describe "the private page codec against independent bytes" $ do
         other → expectationFailure ("a cycle was not stopped: " <> either show (const "answered") other)
       -- a child that violates its parent's bounds is refused too
       let leafAt no k = buildPage 1 7 no 1 0 0 1 (leafPayload [(k, bias 9)])
-          parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, BS.concat [bias 5, bias 5, bias 5], le64' 6])
-          w2 = add (add (emptyWindow ident0 0) 5 parent) 6 (leafAt 6 (BS.concat [bias 0, bias 0, bias 0]))
+          leaf6 = leafAt 6 (BS.concat [bias 0, bias 0, bias 0])
+          parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, BS.concat [bias 5, bias 5, bias 5], le64' 6, le32' (getLe32' leaf6 4092)])
+          w2 = add (add (emptyWindow ident0 0) 5 parent) 6 leaf6
       case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit 0 w2) of
         Left (Bad KeyOrder (PageNo 6)) → pure ()
         other → expectationFailure ("bounds not enforced: " <> either show (const "answered") other)
@@ -348,12 +351,12 @@ spec = describe "the private page codec against independent bytes" $ do
     it "refuses a child of another tree and a child whose keys reach the parent's upper separator" $ do
       let add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
           runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
-          inner no cs = buildPage 1 7 no 2 0 1 (length cs) (BS.concat [BS.concat [BS.singleton 24, k, le64' c] | (k, c) ← cs])
+          inner no cs = buildPage 1 7 no 2 0 1 (length cs) (BS.concat [BS.concat [BS.singleton 24, k, le64' c, le32' (getLe32' cb 4092)] | (k, (c, cb)) ← cs])
           sepL = runKeyBytes 1000
           sepR = runKeyBytes 5000
           -- a runs parent whose child is a leaf of the links tree
           linksLeaf = buildPage 1 7 6 1 1 0 1 (leafPayload [(BS.concat [BS.singleton 1, bias 0, bias 0, bias 1000], BS.concat [BS.singleton 0, be64' 1, BS.singleton 0])])
-          wOther = add (add (emptyWindow ident0 0) 5 (inner 5 [(sepL, 6)])) 6 linksLeaf
+          wOther = add (add (emptyWindow ident0 0) 5 (inner 5 [(sepL, (6, linksLeaf))])) 6 linksLeaf
       case runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 wOther) of
         Left (Bad KindMismatch (PageNo 6)) → pure ()
         other → expectationFailure ("a child of another tree was followed: " <> either show (const "answered") other)
@@ -361,7 +364,7 @@ spec = describe "the private page codec against independent bytes" $ do
       let leafKeys no ks = buildPage 1 7 no 1 0 0 (length ks) (leafPayload [(k, bias (lo + 1)) | (k, lo) ← ks])
           left = leafKeys 6 [(runKeyBytes 1000, 1000), (runKeyBytes 5000, 5000)]
           right = leafKeys 7 [(runKeyBytes 5000, 5000)]
-          wBound = add (add (add (emptyWindow ident0 0) 5 (inner 5 [(sepL, 6), (sepR, 7)])) 6 left) 7 right
+          wBound = add (add (add (emptyWindow ident0 0) 5 (inner 5 [(sepL, (6, left)), (sepR, (7, right))])) 6 left) 7 right
       case runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 wBound) of
         Left (Bad KeyOrder (PageNo 6)) → pure ()
         other → expectationFailure ("a child reaching the upper separator was followed: " <> either show (const "answered") other)
@@ -370,15 +373,17 @@ spec = describe "the private page codec against independent bytes" $ do
       let runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
           sepL = runKeyBytes 1000
           sepR = runKeyBytes 5000
-          inner no lvl cs = buildPage 1 7 no 2 0 lvl (length' cs) (BS.concat [BS.concat [BS.singleton 24, k, le64' c] | (k, c) ← cs])
+          inner no lvl cs = buildPage 1 7 no 2 0 lvl (length' cs) (BS.concat [BS.concat [BS.singleton 24, k, le64' c, le32' crc] | (k, c, crc) ← cs])
           length' = fromIntegral . length
+          crcOf = (`getLe32'` 4092)
           add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
-          root = inner 3 2 [(sepL, 1), (sepR, 2)]
-          -- the left subtree holds one entry; the right one is a two-page cycle of level-1 pages
-          leftInner = inner 1 1 [(sepL, 4)]
+          -- the left subtree holds one entry; the right one is a two-page cycle of level-1 pages (the
+          -- record of the checksum of the page the cycle comes back to cannot be true, and is never followed)
           leaf = buildPage 1 7 4 1 0 0 1 (leafPayload [(runKeyBytes 1000, bias 1001)])
-          cycA = inner 2 1 [(sepR, 5)]
-          cycB = inner 5 1 [(sepR, 2)]
+          leftInner = inner 1 1 [(sepL, 4, crcOf leaf)]
+          cycB = inner 5 1 [(sepR, 2, 0)]
+          cycA = inner 2 1 [(sepR, 5, crcOf cycB)]
+          root = inner 3 2 [(sepL, 1, crcOf leftInner), (sepR, 2, crcOf cycA)]
           w = foldl (\acc (no, bs) → add acc no bs) (emptyWindow ident0 0) [(3, root), (1, leftInner), (4, leaf), (2, cycA), (5, cycB)]
       -- the deletion empties the left subtree, leaving a one-child root whose collapse reaches the cycle
       -- (a generous wall-clock guard turns a regression that loops into a failure, not a hang)
@@ -412,7 +417,7 @@ spec = describe "the private page codec against independent bytes" $ do
           right = buildPage 1 7 2 1 0 0 30 (leafPayload (entries 100))
           sepLeft = runKeyBytes 1000
           sepRight = runKeyBytes 5000
-          parent = buildPage 1 7 3 2 0 1 2 (BS.concat [BS.concat [BS.singleton 24, k, le64' c] | (k, c) ← [(sepLeft, 1), (sepRight, 2)]])
+          parent = buildPage 1 7 3 2 0 1 2 (BS.concat [BS.concat [BS.singleton 24, k, le64' c, le32' (getLe32' cb 4092)] | (k, (c, cb)) ← [(sepLeft, (1, left)), (sepRight, (2, right))]])
           add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
           w = add (add (add (emptyWindow ident0 0) 3 parent) 1 left) 2 right
       -- an ordinary lookup already refuses the malformed sibling

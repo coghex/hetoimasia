@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 -- | The copy-on-write B+tree over immutable pages: bounded reads through a window
 -- of validated page buffers, and updates that never touch a committed page.
 --
@@ -74,7 +76,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , overlayNodeBytes
   , hotNodes
   , hotNodeBytes
-  , Ref (..)
+  , Ref (.., Disk)
   , liftStop
   , failInvariant
 
@@ -103,9 +105,10 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (getLe32)
 
 -- ---------------------------------------------------------------------------
 -- Window
@@ -248,9 +251,18 @@ data Stop
     Over !Int
   deriving stock (Eq, Show)
 
--- | A reference to a node: a committed page or an overlay page.
-data Ref = Disk !PageNo | Fresh !Int
+-- | A reference to a node: a committed page (with the checksum its parent records for it, when
+-- a parent does: a root is named by the root record and has none) or an overlay page.
+data Ref = DiskRef !PageNo !(Maybe Word32) | Fresh !Int
   deriving stock (Eq, Ord, Show)
+
+-- | A committed page with no recorded checksum (a tree's root).
+pattern Disk ∷ PageNo → Ref
+pattern Disk p ← DiskRef p _
+  where
+    Disk p = DiskRef p Nothing
+
+{-# COMPLETE Disk, Fresh #-}
 
 data NBody
   = NLeaf [(ByteString, ByteString)]
@@ -286,13 +298,14 @@ packNode (Node t l body) = case body of
   NLeaf es → Stored t l True (length es) (packBody (Left es))
   NInner es → Stored t l False (length es) (packBody (Right [(k, refCode r) | (k, r) ← es]))
   where
-    refCode (Disk (PageNo p)) = (0, p)
-    refCode (Fresh i) = (1, fromIntegral i)
+    refCode (DiskRef (PageNo p) (Just crc)) = (0, p, crc)
+    refCode (DiskRef (PageNo p) Nothing) = (2, p, 0)
+    refCode (Fresh i) = (1, fromIntegral i, 0)
 
 unpackNode ∷ Stored → Node
 unpackNode (Stored t l leaf n pl) = case unpackBody leaf n pl of
   Left es → Node t l (NLeaf es)
-  Right es → Node t l (NInner [(k, if tag == 0 then Disk (PageNo c) else Fresh (fromIntegral c)) | (k, (tag, c)) ← es])
+  Right es → Node t l (NInner [(k, case tag of 0 → DiskRef (PageNo c) (Just crc); 2 → DiskRef (PageNo c) Nothing; _ → Fresh (fromIntegral c)) | (k, (tag, c, crc)) ← es])
 
 -- | The working state of one plan: the window, the new pages (packed, accounted and
 -- bounded by a byte budget), the committed pages replaced and the visits made.
@@ -385,11 +398,13 @@ load tree expectLevel ref = do
   putEdit e {eSteps = eSteps e + 1}
   node ← case ref of
     Fresh i → maybe (stop (Invariant tree)) pure (freshNode e i)
-    Disk p → case lookup p (eHot e) of
-      Just hot | nTree hot == tree → pure hot
+    DiskRef p expected → case lookup p (eHot e) of
+      Just hot | nTree hot == tree, hotAgrees expected p e → pure hot
       _ | let PageNo n = p, n >= wBelow (eWin e) → stop (Bad (BadReference p) p)
       _ → case Map.lookup p (wPages (eWin e)) of
           Nothing → stop (Need p)
+          -- the page a parent points at is the version it recorded, not another valid page
+          Just vp | Just want <- expected, pageCrcOf (vpBytes vp) /= want → stop (Bad (ChildChecksum want (pageCrcOf (vpBytes vp))) p)
           Just vp → case nodeOfPage tree p (Page (vpTree vp) (vpLevel vp) p (bodyOfValid (vpBytes vp))) of
             Left err → stop (Bad err p)
             Right n → do
@@ -401,15 +416,25 @@ load tree expectLevel ref = do
     _ → pure node
 
 refPage ∷ Ref → PageNo
-refPage (Disk p) = p
+refPage (DiskRef p _) = p
 refPage (Fresh _) = PageNo maxBound
+
+-- | The checksum a page carries: its last four bytes.
+pageCrcOf ∷ ByteString → Word32
+pageCrcOf bs = getLe32 bs pageChecksumOffset
+
+-- | A cached node is used only for the checksum its parent records: a page reached through a
+-- pointer that names another checksum is looked up in the window and refused there.
+hotAgrees ∷ Maybe Word32 → PageNo → Edit → Bool
+hotAgrees Nothing _ _ = True
+hotAgrees (Just want) p e = maybe False (\vp → pageCrcOf (vpBytes vp) == want) (Map.lookup p (wPages (eWin e)))
 
 nodeOfPage ∷ TreeId → PageNo → Page → Either PageError Node
 nodeOfPage tree _ (Page t level _ body)
   | t /= tree = Left KindMismatch
   | otherwise = case body of
       Leaf es → Right (Node tree 0 (NLeaf es))
-      Inner es → Right (Node tree level (NInner [(k, Disk c) | (k, c) ← es]))
+      Inner es → Right (Node tree level (NInner [(k, DiskRef c (Just crc)) | (k, Child c crc) ← es]))
       List _ _ → Left KindMismatch
 
 -- | The keys a node holds must lie in the range its parent promises.
@@ -669,7 +694,7 @@ freshNode e i = case lookup i (eFreshHot e) of
 packedBytes ∷ Node → Int
 packedBytes (Node _ _ body) = overlayNodeBytes (case body of
   NLeaf es → sum [2 + BS.length k + BS.length v | (k, v) ← es]
-  NInner es → sum [1 + BS.length k + 9 | (k, _) ← es])
+  NInner es → sum [1 + BS.length k + 13 | (k, _) ← es])
 
 -- | Set a new page, accounting its packed bytes and refusing the plan when the new
 -- pages would hold more than the budget. The page is kept parsed in a small hot set;
@@ -723,7 +748,7 @@ discard (Disk p) = do
 
 bodyBytesOf ∷ NBody → Int
 bodyBytesOf (NLeaf es) = sum (map entryBytes es)
-bodyBytesOf (NInner es) = sum [1 + BS.length k + 8 | (k, _) ← es]
+bodyBytesOf (NInner es) = sum [1 + BS.length k + 12 | (k, _) ← es]
 
 nodeBytesOf ∷ Node → Int
 nodeBytesOf = bodyBytesOf . nBody
@@ -808,7 +833,7 @@ insertKey tree root k v = do
             Nothing → stop (Invariant tree)
             Just (l, r@((sk, _) : _)) → twoNodes ref n (NLeaf l) (NLeaf r) sk
             Just _ → stop (Invariant tree)
-          NInner es → case splitEven (\(sk, _) → 1 + BS.length sk + 8) es of
+          NInner es → case splitEven (\(sk, _) → 1 + BS.length sk + 12) es of
             Nothing → stop (Invariant tree)
             Just (l, r@((sk, _) : _)) → twoNodes ref n (NInner l) (NInner r) sk
             Just _ → stop (Invariant tree)
@@ -953,24 +978,30 @@ assignPages encode e roots supply0 = do
     else do
       let (used, rest) = splitAt (length order) supply0
           numbering = Map.fromList (zip order used) ∷ Map Int PageNo
-          resolve (Disk p) = Right p
-          resolve (Fresh i) = maybe (Left (Invariant TreeFree)) Right (Map.lookup i numbering)
-          toPage i = do
+          resolvePage (DiskRef p _) = Right p
+          resolvePage (Fresh i) = maybe (Left (Invariant TreeFree)) Right (Map.lookup i numbering)
+          -- a child's entry carries the checksum of the child's page: a committed child brings the one its
+          -- parent recorded, a new child the one it was just encoded with (children are encoded first)
+          resolveChild _ (DiskRef p (Just crc)) = Right (Child p crc)
+          resolveChild _ (DiskRef _ Nothing) = Left (Invariant TreeFree)
+          resolveChild crcs (Fresh i) = Child <$> resolvePage (Fresh i) <*> maybe (Left (Invariant TreeFree)) Right (Map.lookup i crcs)
+          toPage crcs i = do
             n ← maybe (Left (Invariant TreeFree)) Right (freshNode e i)
             no ← maybe (Left (Invariant TreeFree)) Right (Map.lookup i numbering)
             body ← case nBody n of
               NLeaf es → Right (Leaf es)
-              NInner es → Inner <$> traverse (\(sk, c) → (,) sk <$> resolve c) es
+              NInner es → Inner <$> traverse (\(sk, c) → (,) sk <$> resolveChild crcs c) es
             Right (Page (nTree n) (nLevel n) no body)
-          step acc i = do
-            page ← toPage i
+          step (acc, crcs) i = do
+            page ← toPage crcs i
             bytes ← either (\err → Left (Bad err (pgNo page))) Right (encode page)
             -- force the buffer now, so the parsed page it came from can go
             -- and the page number, which would otherwise keep the whole parsed page alive
             let PageNo no = pgNo page
-            no `seq` BS.length bytes `seq` Right ((PageNo no, bytes) : acc)
-      encoded ← foldM' step [] order
-      rootNos ← traverse (traverse resolve) roots
+                crc = pageCrcOf bytes
+            no `seq` crc `seq` BS.length bytes `seq` Right ((PageNo no, bytes) : acc, Map.insert i crc crcs)
+      (encoded, _) ← foldM' step ([], Map.empty) order
+      rootNos ← traverse (traverse resolvePage) roots
       Right (reverse encoded, rootNos, rest)
   where
     foldM' f z xs = go z xs

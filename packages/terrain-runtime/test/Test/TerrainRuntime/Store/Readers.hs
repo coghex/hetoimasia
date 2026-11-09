@@ -197,7 +197,7 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     rootBytes ← pageOf runsRoot
     -- a live page below the root: a child of the runs root, so a shared subtree, not only a root
     child ← case parsePage a (siSource (hIdent h3)) rootBytes of
-      Right (RefPage _ _ _ (RefInner ((_, c) : _)) _) → pure c
+      Right (RefPage _ _ _ (RefInner ((_, c, _) : _)) _) → pure c
       other → expectationFailure ("an inner runs root expected: " <> show other) >> fail "child"
     freeRoot ← maybe (expectationFailure "a free root expected" >> fail "free") pure (rFree roots)
     let PageNo rr = runsRoot

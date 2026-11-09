@@ -193,5 +193,8 @@ data PageError
   | BadReference !PageNo
   | Overflow
   | KindMismatch
+  | -- | A child page's checksum is not the one its parent records for it: the checksum the
+    -- parent expects, the one the page carries.
+    ChildChecksum !Word32 !Word32
   | EntryTooLarge !Int
   deriving stock (Eq, Show)

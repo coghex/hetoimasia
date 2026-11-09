@@ -24,7 +24,8 @@
 -- @
 --
 -- Leaf entries are @keyLen(1) valueLen(1) key value@; internal entries are
--- @keyLen(1) key childPage(8)@, the key being the least key the child may hold; a
+-- @keyLen(1) key childPage(8) childCrc(4)@, the key being the least key the child may hold and
+-- the checksum the child page must carry; a
 -- list is the eight-byte version of the retirement entry that names it, then a
 -- strictly increasing sequence of eight-byte page numbers.
 --
@@ -45,6 +46,7 @@
 -- State, ownership and lifetime: none. Pure functions over strict byte strings.
 module Hetoimasia.Terrain.Runtime.Store.Internal.Page
   ( Body (..)
+  , Child (..)
   , Page (..)
   , bodyBytes
   , entryBytes
@@ -59,19 +61,29 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Page
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Word (Word64, Word8)
+import Data.Word (Word32, Word64, Word8)
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Crc32c (crc32c)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records
 
+-- | A child of an internal page: its page number and the checksum its page carries.
+data Child = Child
+  { childPage ∷ !PageNo
+  , childCrc ∷ !Word32
+  }
+  deriving stock (Eq, Show)
+
 -- | A page's content.
 data Body
   = -- | Sorted key and value byte strings.
     Leaf [(ByteString, ByteString)]
-  | -- | Sorted separator keys, each with its child page.
-    Inner [(ByteString, PageNo)]
+  | -- | Sorted separator keys, each with its child: the page and the checksum the child
+    -- page must carry (its last four bytes). A pointer names a version of its child, not only
+    -- a place: a stale page that is valid in itself (a replaced copy of the same node, with
+    -- keys inside the same bounds) carries another checksum and is refused when it is loaded.
+    Inner [(ByteString, Child)]
   | -- | The version of the retirement entry that names the page, and a strictly
     -- increasing list of page numbers (retirement work). The version lets a page be
     -- told apart from a live list without a sweep of the retirement tree.
@@ -92,8 +104,8 @@ entryBytes ∷ (ByteString, ByteString) → Int
 entryBytes (k, v) = 2 + BS.length k + BS.length v
 
 -- | The bytes one internal entry takes.
-innerEntryBytes ∷ (ByteString, PageNo) → Int
-innerEntryBytes (k, _) = 1 + BS.length k + 8
+innerEntryBytes ∷ (ByteString, Child) → Int
+innerEntryBytes (k, _) = 1 + BS.length k + 12
 
 -- | The payload bytes of a body.
 bodyBytes ∷ Body → Int
@@ -143,9 +155,9 @@ encodePage ident (Page tree level (PageNo no) body)
       | BS.length k < 1 || BS.length k > maxKeyBytes = Left (KeyLength (BS.length k))
       | BS.length v > maxValueBytes = Left (ValueLength (BS.length v))
       | otherwise = Right (BS.concat [BS.pack [fromIntegral (BS.length k), fromIntegral (BS.length v)], k, v])
-    innerEntry (k, PageNo c)
+    innerEntry (k, Child (PageNo c) crc)
       | BS.length k < 1 || BS.length k > maxKeyBytes = Left (KeyLength (BS.length k))
-      | otherwise = Right (BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64 c])
+      | otherwise = Right (BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64 c, le32 crc])
 
 -- | Decode and fully validate one page. The arguments are the identity the page
 -- must be bound to, the number of pages in the page space (the bound of every
@@ -216,12 +228,13 @@ decodePage ident total expected bs
         go k rest acc = case BS.uncons rest of
           Just (kl, body)
             | kl < 1 || fromIntegral kl > maxKeyBytes → Left (KeyLength (fromIntegral kl))
-            | BS.length body < fromIntegral kl + 8 → Left (BadLength (BS.length rest))
+            | BS.length body < fromIntegral kl + 12 → Left (BadLength (BS.length rest))
             | otherwise →
                 let key = BS.take (fromIntegral kl) body
                     child = PageNo (getLe64 body (fromIntegral kl))
+                    crc = getLe32 body (fromIntegral kl + 8)
                  in if refOk self child
-                      then go (k - 1 ∷ Int) (BS.drop (fromIntegral kl + 8) body) ((key, child) : acc)
+                      then go (k - 1 ∷ Int) (BS.drop (fromIntegral kl + 12) body) ((key, Child child crc) : acc)
                       else Left (BadReference child)
           Nothing → Left (BadLength 0)
     listEntries self n payload
@@ -257,7 +270,7 @@ bodyOfValid bs = case BS.index bs 6 of
     inner 0 _ = []
     inner n p = case BS.uncons p of
       Just (kl, body) →
-        (BS.take (fromIntegral kl) body, PageNo (getLe64 body (fromIntegral kl))) : inner (n - 1 ∷ Int) (BS.drop (fromIntegral kl + 8) body)
+        (BS.take (fromIntegral kl) body, Child (PageNo (getLe64 body (fromIntegral kl))) (getLe32 body (fromIntegral kl + 8))) : inner (n - 1 ∷ Int) (BS.drop (fromIntegral kl + 12) body)
       Nothing → []
 
 -- | A node's entries packed into one byte string (the form an overlay page is kept in):
@@ -265,12 +278,12 @@ bodyOfValid bs = case BS.index bs 6 of
 -- target(8)@ where the tag says whether the target is a committed page (0) or an
 -- overlay page (1). One packed page costs its bytes and a small header, not a list
 -- cell, a pair and two string headers per entry.
-packBody ∷ Either [(ByteString, ByteString)] [(ByteString, (Word8, Word64))] → ByteString
+packBody ∷ Either [(ByteString, ByteString)] [(ByteString, (Word8, Word64, Word32))] → ByteString
 packBody (Left es) = BS.concat [BS.concat [BS.pack [fromIntegral (BS.length k), fromIntegral (BS.length v)], k, v] | (k, v) ← es]
-packBody (Right es) = BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, BS.singleton t, le64 c] | (k, (t, c)) ← es]
+packBody (Right es) = BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, BS.singleton t, le64 c, le32 crc] | (k, (t, c, crc)) ← es]
 
 -- | The inverse of 'packBody' for @count@ entries of the stated kind.
-unpackBody ∷ Bool → Int → ByteString → Either [(ByteString, ByteString)] [(ByteString, (Word8, Word64))]
+unpackBody ∷ Bool → Int → ByteString → Either [(ByteString, ByteString)] [(ByteString, (Word8, Word64, Word32))]
 unpackBody isLeaf count0 payload0
   | isLeaf = Left (leaf count0 payload0)
   | otherwise = Right (inner count0 payload0)
@@ -289,7 +302,7 @@ unpackBody isLeaf count0 payload0
         let k = BS.take (fromIntegral kl) body
             rest = BS.drop (fromIntegral kl) body
          in case BS.uncons rest of
-              Just (t, tgt) → (k, (t, getLe64 tgt 0)) : inner (n - 1 ∷ Int) (BS.drop 8 tgt)
+              Just (t, tgt) → (k, (t, getLe64 tgt 0, getLe32 tgt 8)) : inner (n - 1 ∷ Int) (BS.drop 12 tgt)
               Nothing → []
       Nothing → []
 

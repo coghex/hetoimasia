@@ -33,7 +33,7 @@ import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
@@ -150,12 +150,12 @@ victims h = do
   runsRoot ← maybe (expectationFailure "a runs root expected" >> fail "runs") pure (rRuns roots)
   runsPage ← parsed h runsRoot
   let (child, grandchild) = case rpBody runsPage of
-        RefInner ((_, c) : _) → (Just c, Nothing)
+        RefInner ((_, c, _) : _) → (Just c, Nothing)
         _ → (Nothing, Nothing)
   leafBelow ← case child of
     Just c → do
       pg ← parsed h (PageNo c)
-      pure (case rpBody pg of RefInner ((_, g) : _) → Just g; _ → Nothing)
+      pure (case rpBody pg of RefInner ((_, g, _) : _) → Just g; _ → Nothing)
     Nothing → pure grandchild
   (_, _, (_, firstValue)) ← firstRetire h
   let lists = [getBe64' firstValue 0]
@@ -190,10 +190,10 @@ retireLeafFor h key = do
         pg ← parsed h p
         case rpBody pg of
           RefLeaf es → pure (p, es)
-          RefInner cs → case reverse (takeWhile ((<= key) . fst) cs) of
-            ((_, c) : _) → go (PageNo c)
+          RefInner cs → case reverse (takeWhile (\(k, _, _) → k <= key) cs) of
+            ((_, c, _) : _) → go (PageNo c)
             [] → case cs of
-              ((_, c) : _) → go (PageNo c)
+              ((_, c, _) : _) → go (PageNo c)
               [] → expectationFailure "empty inner page" >> fail "inner"
           RefList _ _ → expectationFailure "a list in the tree" >> fail "list"
   go root
@@ -525,7 +525,7 @@ spec = describe "page ownership against forged records with valid checksums" $ d
         RefInner cs@(_ : _) → pure cs
         other → expectationFailure ("an inner runs root expected: " <> take 100 (show other)) >> fail "root"
       -- every separator of the root is 24 bytes of 0xFF: well ordered, valid checksum, no decoder accepts it
-      let child = case children of ((_, c) : _) → PageNo c; [] → runsRoot
+      let child = case children of ((_, c, crc) : _) → Child (PageNo c) crc; [] → Child runsRoot 0
       forged ← forge h runsRoot (Page TreeRuns (rpLevel rootPage) runsRoot (Inner [(BS.replicate 24 0xFF, child)]))
       bytes ← page forged runsRoot
       case windowInsert (cfgUsablePages (hCfg forged)) runsRoot bytes (storeWindow (hStore forged)) of
@@ -557,10 +557,10 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       runsRoot ← maybe (expectationFailure "runs root" >> fail "runs") pure (rRuns (storeRoots (hStore h1)))
       rootPage ← parsed h1 runsRoot
       seps ← case rpBody rootPage of
-        RefInner cs@(_ : _) → pure (map fst cs)
+        RefInner cs@(_ : _) → pure (map (\(k, _, _) → k) cs)
         other → expectationFailure ("an inner runs root expected: " <> take 100 (show other)) >> fail "root"
       let past = PageNo (rHw (storeRoots (hStore h1)))
-      forgedC ← forge h1 runsRoot (Page TreeRuns (rpLevel rootPage) runsRoot (Inner [(k, past) | k ← seps]))
+      forgedC ← forge h1 runsRoot (Page TreeRuns (rpLevel rootPage) runsRoot (Inner [(k, Child past 0) | k ← seps]))
       outC ← planOn forgedC
       case outC of
         Refused (Integrity (BadPage (BadReference q) _)) → q `shouldBe` past
@@ -570,10 +570,10 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       pinnedRoot ← maybe (expectationFailure "pinned root" >> fail "pinned") pure (pinRuns pins)
       pinnedPage ← parsed h1 pinnedRoot
       pseps ← case rpBody pinnedPage of
-        RefInner cs@(_ : _) → pure (map fst cs)
+        RefInner cs@(_ : _) → pure (map (\(k, _, _) → k) cs)
         other → expectationFailure ("an inner pinned root expected: " <> take 100 (show other)) >> fail "pinned root"
       let added = PageNo hwPinned
-      forgedP ← forge h1 pinnedRoot (Page TreeRuns (rpLevel pinnedPage) pinnedRoot (Inner [(k, added) | k ← pseps]))
+      forgedP ← forge h1 pinnedRoot (Page TreeRuns (rpLevel pinnedPage) pinnedRoot (Inner [(k, Child added 0) | k ← pseps]))
       case readAll forgedP tok of
         Left msg → msg `shouldContain` "BadReference"
         Right _ → expectationFailure "a pinned read followed a reference past its version's used space"

@@ -124,7 +124,7 @@ spec = describe "windows, tokens and accounting bound to their store" $ do
     rootBytes ← maybe (expectationFailure "root" >> fail "root") pure (diskRead (hDisk h0) rootNo)
     root ← either (\e → expectationFailure (show e) >> fail "root") pure (parsePage a (siSource (hIdent h0)) rootBytes)
     case rpBody root of
-      RefInner ((_, c0) : (sep1, c1) : _) → do
+      RefInner ((_, c0, _) : (sep1, c1, _) : _) → do
         -- the first key of the second leaf is its separator; delete that key
         sepKey ← maybe (expectationFailure "separator" >> fail "key") pure (decodeKey TreeRuns sep1)
         (h1, _) ← must (commitDelta h0 Ordinary (deltaFor (hStore h0) True False 1 [(sepKey, Nothing)]))
@@ -140,7 +140,7 @@ spec = describe "windows, tokens and accounting bound to their store" $ do
         newRootBytes ← maybe (expectationFailure "new root" >> fail "root") pure (diskRead (hDisk h1) root1)
         newRoot ← either (\e → expectationFailure (show e) >> fail "root") pure (parsePage a (siSource (hIdent h1)) newRootBytes)
         case rpBody newRoot of
-          RefInner ((_, n0) : (s', n1) : _) → do
+          RefInner ((_, n0, _) : (s', n1, _) : _) → do
             s' `shouldBe` sep1
             let wRootLeaf1 = addP (addP (storeWindow s1) root1) (PageNo n1)
             -- an exact lookup that finds nothing is not answered (absent) from the root and the second leaf alone: the

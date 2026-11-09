@@ -786,6 +786,16 @@ Only a page that no owner but the allocator claims is written, and a refusal wri
 * **The used space bounds every reference.** A tree root, a child reference or a retirement
   list at or past the high-water mark has never been numbered: every descent, plan or read
   (through a reader's own used space for a pinned read) refuses it with `BadReference`.
+* **An absence is concluded only from checked separators.** A lookup that finds nothing, a floor,
+  a ceiling, the start of a ranged scan and the unreachability of a page are each concluded from the
+  leaf (or node) a key leads to, which is only as true as the separators that led there. Before any
+  such conclusion the neighbouring subtrees of the landing node are loaded through their own
+  separators (`validateLanding`), so a separator moved to another valid key, raised or lowered, the first
+  or a later one, is checked against the leaves on both sides of it and surfaces as an integrity
+  failure, never as an absent record; a key below the first separator descends into the first child.
+  The regression is a re-seal fuzz (`Fuzz`): fixed seeds change one byte of one live page of the runs
+  tree and recompute its checksum, and every lookup, floor, ceiling, ranged scan and page-reachability
+  answer must be the reference's or an integrity failure (a record of a changed leaf is excused as data).
 * **No decoded buffer outlives its decode unaccounted.** A window keeps its own copy of the 4 KiB
   buffer it is given (a caller's buffer may be a slice of a much larger read) and a probe keeps a
   copy of its key, never a slice of the page; a hot or new node is either a parsed view of a

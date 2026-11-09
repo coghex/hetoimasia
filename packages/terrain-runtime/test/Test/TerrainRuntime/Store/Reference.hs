@@ -161,7 +161,7 @@ diskWrites (Disk _ n) = n
 
 data RefBody
   = RefLeaf [(ByteString, ByteString)]
-  | RefInner [(ByteString, Word64)]
+  | RefInner [(ByteString, Word64, Word32)]
   | RefList Word64 [Word64]
   deriving stock (Eq, Show)
 
@@ -211,9 +211,9 @@ parsePage arena source bs
     inner n p = do
       if BS.null p then Left "short inner" else Right ()
       let kl = fromIntegral (BS.index p 0)
-      if BS.length p < 1 + kl + 8 then Left "short inner entry" else Right ()
-      rest ← inner (n - 1 ∷ Int) (BS.drop (1 + kl + 8) p)
-      Right ((BS.take kl (BS.drop 1 p), getLe64' p (1 + kl)) : rest)
+      if BS.length p < 1 + kl + 12 then Left "short inner entry" else Right ()
+      rest ← inner (n - 1 ∷ Int) (BS.drop (1 + kl + 12) p)
+      Right ((BS.take kl (BS.drop 1 p), getLe64' p (1 + kl), getLe32' p (1 + kl + 8)) : rest)
 
 -- ---------------------------------------------------------------------------
 -- Traversal
@@ -249,16 +249,24 @@ walkTree arena source rd (Just root) = go root Nothing Nothing Nothing True
                       order = [ "page " <> show p <> " leaf keys out of order" | not (strictly ks) ]
                       bounds = [ "page " <> show p <> " leaf outside bounds" | not (inside lo hi ks) ]
                    in TreeWalk [p] es 1 (own ++ lvl ++ occ ++ order ++ bounds)
-                RefInner es →
-                  let ks = map fst es
+                RefInner es3 →
+                  let es = [(k, c) | (k, c, _) ← es3]
+                      ks = map fst es
                       order = [ "page " <> show p <> " separators out of order" | not (strictly ks) ]
                       bounds = [ "page " <> show p <> " separators outside bounds" | not (inside lo hi ks) ]
                       kids = [ go c (Just k) (nextSep i es hi) (Just (rpLevel pg - 1)) False | (i, (k, c)) ← zip [0 ∷ Int ..] es ]
+                      -- the checksum the parent records is the checksum the child page carries
+                      crcs = [ "page " <> show p <> " records checksum " <> show want <> " for child " <> show c <> " which carries " <> show have
+                             | (_, c, want) ← es3
+                             , Just cb ← [rd (PageNo c)]
+                             , let have = getLe32' cb 4092
+                             , have /= want
+                             ]
                    in TreeWalk
                         (p : concatMap twPages kids)
                         (concatMap twLeaves kids)
                         (1 + maximum (0 : map twHeight kids))
-                        (own ++ lvl ++ occ ++ order ++ bounds ++ concatMap twViolations kids)
+                        (own ++ lvl ++ occ ++ order ++ bounds ++ crcs ++ concatMap twViolations kids)
                 RefList _ _ → TreeWalk [p] [] 0 ["page " <> show p <> " is a list inside a tree"]
     nextSep i es hi = if i + 1 < length es then Just (fst (es !! (i + 1))) else hi
     strictly ks = and (zipWith (<) ks (drop 1 ks))

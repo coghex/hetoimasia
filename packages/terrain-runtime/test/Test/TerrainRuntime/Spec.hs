@@ -22,6 +22,7 @@ import qualified Test.TerrainRuntime.Store.Cycles as StoreCycles
 import qualified Test.TerrainRuntime.Store.Evidence as StoreEvidence
 import qualified Test.TerrainRuntime.Store.Faults as StoreFaults
 import qualified Test.TerrainRuntime.Store.Fuzz as StoreFuzz
+import qualified Test.TerrainRuntime.Store.FuzzTrees as StoreFuzzTrees
 import qualified Test.TerrainRuntime.Store.History as StoreHistory
 import qualified Test.TerrainRuntime.Store.Identity as StoreIdentity
 import qualified Test.TerrainRuntime.Store.Ownership as StoreOwnership
@@ -54,6 +55,7 @@ spec = do
   StoreOwnership.spec
   StoreHistory.spec
   StoreFuzz.spec
+  StoreFuzzTrees.spec
   StoreCycles.spec
   StoreEvidence.spec
   StoreAllowance.spec
