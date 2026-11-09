@@ -327,6 +327,11 @@ data Settling = Settling
     -- is what eligibility says); one that is not yet eligible is held for its position, as 'completeRequest'
     -- holds it. A resource reply is not settled here: the owner builds the resource into the reserved lease
     -- at its next boundary and settles then, as for 'completeRequest'.
+  , settlingSettleKeeping ∷ ProviderReply → STM ReplyAnswer
+    -- ^ 'settlingSettle' for a reply made while the provider still holds something borrowed for the request: it settles the request as
+    -- 'settlingSettle' does, but does not prove the provider's work over, so the request's retirement obligation ('workRetirement')
+    -- stays until the provider reports its work complete, and the request's places are not returned before. For a reply that is not a
+    -- resource.
   , settlingJudge ∷ ProviderReply → Bool
     -- ^ Whether the host would take this reply as the request's settlement: the very judgement 'settlingSettle' passes, as a pure
     -- function that writes nothing. A provider uses it before it commits anything, on the largest reply it can make, to refuse a request

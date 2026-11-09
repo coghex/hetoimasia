@@ -7,18 +7,20 @@ module Test.LuaEngine.Terrain.Matrix (spec) where
 
 import Control.Exception (finally)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Control.Monad (forM_)
+import Control.Monad (forM_, replicateM_, void)
 import Data.Maybe (isJust)
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
+import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
+import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (CountLimit (CopiedValueDepth, RequestsPerInstance, RequestsPerVm, SceneDepth), fixedM1Profile)
 import Hetoimasia.LuaEngine.Terrain (issuePick, terrainCodes, terrainFailureReply)
 import Hetoimasia.Scripting.Lua.Admission (ExpectedFailure (expectedCode))
 import Hetoimasia.Scripting.Lua.Provider (ProviderReply (..))
-import Hetoimasia.Terrain.Query (QueryError (TooManyRuns))
-import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
-import Hetoimasia.Terrain.Runtime (Failure (..), Point (PointCaptured), Precondition (..), Probe (..), closeService)
+import Hetoimasia.Terrain.Query (QueryError (TooManyRuns), QueryLimits (..), defaultQueryLimits)
+import Hetoimasia.Terrain.Residency (ArenaId (..), LimitsSpec (..), Revision (..), mkLimits)
+import Hetoimasia.Terrain.Runtime (Config (..), Failure (..), Point (PointCaptured), Precondition (..), Probe (..), closeService, defaultConfig)
 import Hetoimasia.Terrain.Source (SourceError (TooManyMaterials), definitionHeaderBytes, materialRecordBytes)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -221,6 +223,81 @@ permanentUnderPressure calls =
         , "end"
         ]
     }
+
+-- | The creator opens @shared@ and, when the example says so, releases it.
+closedCreator ∷ Script
+closedCreator =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('shared', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then local t = settle(api, self.q) if t then self.a = t.value print('creator ready') self.s = 1 end"
+        , "elseif self.s == 1 then TEST_WAIT('close') print('release', api.terrain.release(self.a)) self.s = 2 end"
+        ]
+    }
+
+-- | The attached instance (a request bank of one) attaches, reads a cell (the owner is held where the read has captured its answer),
+-- takes whatever the read settles as once the arena has been closed under it, and asks again until a place is free.
+closedAttached ∷ Script
+closedAttached =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.attach('shared')"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t and t.status == 'success' then self.b = t.value self.r = api.terrain.cell(self.b, {x = 0, y = 0, z = 0}) print('read issued') self.s = 1"
+        , "  elseif t then print('attach failed', t.status, t.error and t.error.code) self.s = 5 end"
+        , "elseif self.s == 1 then"
+        , "  if api.request.ready(self.r) then"
+        , "    local t = api.request.take(self.r)"
+        , "    print('settled', t.status, t.error and t.error.code)"
+        , "    local r, e = api.terrain.cell(self.b, {x = 1, y = 0, z = 0})"
+        , "    print('after taking', r == nil and e.code or 'accepted')"
+        , "    self.s = 2"
+        , "  end"
+        , "elseif self.s == 2 then"
+        , "  local r = api.terrain.cell(self.b, {x = 1, y = 0, z = 0})"
+        , "  if r ~= nil then print('free') self.s = 3 else print('still busy') end"
+        , "end"
+        ]
+    }
+
+-- | An instance that opens an arena and reads a cell: the owner is held where the read has captured its answer.
+heldRead ∷ Script
+heldRead =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.a = t.value self.r = api.terrain.cell(self.a, {x = 0, y = 0, z = 0}) print('read issued') self.s = 1 end"
+        , "end"
+        ]
+    }
+
+-- | The service limited to two regions for one request.
+fewRegions ∷ Config
+fewRegions = defaultConfig {configLimits = either (error . show) id (mkLimits approved)}
+  where
+    mib = 1024 * 1024
+    approved =
+      LimitsSpec
+        { specResidentBytes = 256 * mib
+        , specEditBytes = 16 * mib
+        , specStagingBytes = 128 * mib
+        , specLoadJobs = 128
+        , specQueuedCommands = 256
+        , specPinsPerView = 2
+        , specAgingQuanta = 8
+        , specQueryRegions = 2
+        , specExtentX = 16
+        , specExtentY = 16
+        , specExtentZ = 32
+        , specHoldRegions = 2
+        , specCameraRegions = 16
+        }
 
 -- | An instance that releases its arena twice at once, and once more after the release has retired.
 releasesTwice ∷ Script
@@ -475,6 +552,82 @@ spec = describe "Terrain matrices" $ do
           forM_ ["cell", "remove", "column"] $ \label →
             forM_ ["full", "free"] $ \phase →
               printed `shouldContain` [label <> " " <> phase <> "\trefused\ttrue"]
+          readIORef captured `shouldReturn` 1
+
+  it "keeps the place of a read that an arena's closure failed charged until the owner has finished preparing it" $ do
+    gate ← newGate
+    withRigProbe defaultConfigForRaces (gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate) $ \rig →
+      withWorld (counts [(RequestsPerInstance, 1), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource closedCreator), ("lua/attached.lua", scriptSource closedAttached)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \creatorVm →
+         withFvm world runtime (presentationOver rig) $ \attachedVm → (`finally` openGate gate) $ do
+          creatorSpawn ← spawn world creatorVm "modules-test" mainPath
+          -- the creator's arena is published: the attached instance's attach finds it
+          untilPrintedBy world creatorSpawn "creator ready"
+          attachedSpawn ← spawn world attachedVm "modules-test" "lua/attached.lua"
+          -- it reads, and its read is being prepared (the owner is held where it captured its answer) when the creator releases the arena
+          untilPrintedBy world attachedSpawn "read issued"
+          awaitReached gate
+          signalRig rig "close"
+          -- the read settles arena_closed; taken, its place is still charged: the owner has not finished with what the read borrowed
+          untilPrinted world "after taking\tbusy"
+          outLines world >>= \printed → printed `shouldContain` ["settled\tfailure\tarena_closed"]
+          pumpUntil world (advanceClock world 2000000000 >> ((>= 3) . length . filter (== "still busy") <$> outLines world))
+          outLines world >>= \printed → printed `shouldNotContain` ["free"]
+          openGate gate
+          untilPrinted world "free"
+
+  forM_
+    [ ("the service's closure failed", \_ rig → closeService (rgService rig))
+    , ("an epoch cancelled", \fvm _ → void (advanceRequestEpoch (scheduledEndpoint (fvOwner fvm))))
+    , ("its instance's end left", \_ _ → pure ())
+    ]
+    $ \(how, event) →
+      it ("does not let an instance end while the owner is still preparing a read that " <> how) $ do
+        gate ← newGate
+        withRigProbe defaultConfigForRaces (gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate) $ \rig →
+          withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource heldRead)]) $ \world _ runtime →
+            withFvm world runtime (presentationOver rig) $ \fvm → (`finally` openGate gate) $ do
+              spawned ← spawn world fvm "modules-test" mainPath
+              untilPrintedBy world spawned "read issued"
+              awaitReached gate
+              -- the read is ended some way while the owner is preparing it, and its instance is asked to end
+              event fvm rig
+              stopSpawned spawned
+              pumpUntil world (advanceClock world 2000000000 >> ((== Just Instance.Stopping) <$> phaseOf spawned))
+              -- the instance is not over while the owner holds what the read borrowed: its end waits for the work's retirement
+              replicateM_ 5 (advanceClock world 2000000000)
+              phaseOf spawned >>= (`shouldBe` Just Instance.Stopping)
+              openGate gate
+              pumpUntil world (advanceClock world 2000000000 >> ((/= Just Instance.Stopping) <$> phaseOf spawned))
+
+  it "refuses a column range over the service's configured level limit as an ordinary error before any bank, with the bank full or free" $ do
+    captured ← newIORef (0 ∷ Int)
+    let probe = Probe $ \point → case point of
+          PointCaptured {} → atomicModifyIORef' captured (\seen → (seen + 1, ()))
+          _ → pure ()
+        calls = ["api.terrain.column, A, {x = 0, y = 0, z_min = 0, z_max = 2}"]
+    withRigProbe defaultConfig {configQueryLimits = defaultQueryLimits {limitRangeLevels = 1}} probe $ \rig →
+      withWorld (counts [(RequestsPerInstance, 1), (RequestsPerVm, 1)]) (Layout [("lua/main.lua", scriptSource (permanentUnderPressure calls))]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          forM_ ["full", "free"] $ \phase → printed `shouldContain` ["column " <> phase <> "\trefused\ttrue"]
+          readIORef captured `shouldReturn` 1
+
+  it "refuses a column range over the service's per-request region limit as an ordinary error before any bank, with the bank full or free" $ do
+    captured ← newIORef (0 ∷ Int)
+    let probe = Probe $ \point → case point of
+          PointCaptured {} → atomicModifyIORef' captured (\seen → (seen + 1, ()))
+          _ → pure ()
+        calls = ["api.terrain.column, A, {x = 0, y = 0, z_min = 0, z_max = 96}"]
+    withRigProbe fewRegions probe $ \rig →
+      withWorld (counts [(RequestsPerInstance, 1), (RequestsPerVm, 1)]) (Layout [("lua/main.lua", scriptSource (permanentUnderPressure calls))]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          forM_ ["full", "free"] $ \phase → printed `shouldContain` ["column " <> phase <> "\trefused\ttrue"]
           readIORef captured `shouldReturn` 1
 
   it "answers a second release of one's own arena without error, before and after the first has retired" $

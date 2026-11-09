@@ -64,6 +64,7 @@ module Hetoimasia.LuaEngine.Terrain
 
 import Control.Concurrent.STM
 import Control.Exception (Exception, finally, mask, mask_, onException, throwIO)
+import Control.Applicative ((<|>))
 import Control.Monad (filterM, forM_, unless, void, when)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
@@ -127,7 +128,7 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SNil), Value (..), capability)
 import Hetoimasia.Terrain.Cell (Cell (..), Column, IntervalError, MaterialId, ZRange, materialIdString, maxMaterialIdBytes, mkColumn, mkZRange, zRangeHi, zRangeLo)
 import Hetoimasia.Terrain.Coordinate (TileCoord, axisValue, decomposeTile, localX, localY, localZ, regionLevels, tileCoord)
 import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..))
-import Hetoimasia.Terrain.Residency (Revision (..), limitExtent)
+import Hetoimasia.Terrain.Residency (Revision (..), limitExtent, limitQueryRegions)
 import Hetoimasia.Terrain.Runtime
   ( Answer (..)
   , ArenaLease
@@ -181,6 +182,11 @@ data TerrainFacade = TerrainFacade
   -- ^ The opens in flight, by the service's name: how an open finds, before it asks the service, a claim whose request the host has
   -- already settled as cancelled (the service has not been told yet) and lets it go, so that a name is free from the host's terminal
   -- settlement and not from the later notification.
+  , tfFailedOpens ∷ !(TVar (Map Text [STM Bool]))
+  -- ^ The names of opens the service failed (an invalid definition) whose settlement the host has not made yet (on logical time it is held
+  -- for the request's assigned tick), each with whether it is still pending. The service holds no claim for such an open, so the adapter
+  -- holds it, shared by every VM of the service: another open of the name before the host's settlement is @name_in_use@, as it is while a
+  -- successful open stands, and the name is free from the settlement.
   , tfOffered ∷ !(TVar (Map Text (Set Unique)))
   -- ^ The names whose open the service committed and the host has not yet adopted or let go, each with the opens (by incarnation:
   -- every open request has its own identity) that hold it back: shared by every VM of the service, so that an attach, whichever VM
@@ -207,6 +213,18 @@ letGo ∷ TerrainFacade → Text → Link → STM ()
 letGo facade name link =
   modifyTVar' (tfOffered facade) (Map.update (\held → let rest = Set.delete (lkId link) held in if Set.null rest then Nothing else Just rest) name)
 
+-- | An open the service failed holds its name until the host has settled it.
+holdFailed ∷ TerrainFacade → Text → Link → STM ()
+holdFailed facade name link = modifyTVar' (tfFailedOpens facade) (Map.insertWith (<>) name [not <$> lkSettled link])
+
+-- | Whether an open the service failed is still waiting for the host's settlement of the name, forgetting those the host has settled.
+failedOpenPending ∷ TerrainFacade → Text → STM Bool
+failedOpenPending facade name = do
+  held ← Map.findWithDefault [] name <$> readTVar (tfFailedOpens facade)
+  live ← filterM id held
+  modifyTVar' (tfFailedOpens facade) (if null live then Map.delete name else Map.insert name live)
+  pure (not (null live))
+
 -- | Whether some open still holds a name back from attach.
 heldBack ∷ TerrainFacade → Text → STM Bool
 heldBack facade name = Map.member name <$> readTVar (tfOffered facade)
@@ -217,7 +235,8 @@ newTerrainFacade profile svc config = do
   picks ← newTerrainPicks
   claims ← newTVarIO Map.empty
   offered ← newTVarIO Map.empty
-  pure (TerrainFacade profile svc config picks noTerrainHooks [] claims offered)
+  failed ← newTVarIO Map.empty
+  pure (TerrainFacade profile svc config picks noTerrainHooks [] claims failed offered)
 
 -- | The windows a test may hold or fail: told, never consulted for an answer.
 data TerrainHooks = TerrainHooks
@@ -327,6 +346,8 @@ data Link = Link
   , lkSettling ∷ !Settling
   , lkLease ∷ !(TVar LeaseCell)
   , lkTerminal ∷ !(TVar Bool)
+  , lkSettled ∷ !(STM Bool)
+  -- ^ The host has settled this request: its terminal settlement was made, not only delivered to the host's seam.
   , lkId ∷ !Unique
   -- ^ The identity of this request's incarnation of the name it opens: what it holds in 'tfOffered', and all it ever lets go of.
   }
@@ -431,7 +452,7 @@ services env =
         firstRefusal
           [ leaseCheck env identity key readAsk owner values
           , answerCheck env terrainColumnValueSchema (LargestColumn (levelsOf ask)) owner values
-          , pure (either Just (const (extentRefusal env (columnPlaces ask))) (columnOf ask))
+          , pure (either Just (const (rangeRefusal env ask <|> extentRefusal env (columnPlaces ask))) (columnOf ask))
           ]
     , tsColumnStart = \_ key ask context → withArena env key $ \lease →
         case columnOf ask of
@@ -542,7 +563,9 @@ attachClientOf env identity = do
           atomically (modifyTVar' (envClients env) (Map.insert identity clients {clAttach = Just made}))
           pure (Right (made, True))
 
--- | The name the service holds for an instance's name: in the session's and the instance's content root's namespace.
+-- | The name the service holds for an instance's name: in the session's and the instance's content root's namespace. It cannot exceed
+-- the 256 characters the service holds: a session's identity is at most 19 digits, a content root at most 64 characters
+-- ('validRootId') and a script's name at most 128, and the two separators and the prefix add three, so at most 214.
 nameKey ∷ Env → Text → Text → Text
 nameKey env root name = "s" <> Text.pack (show (envSession env)) <> "/" <> root <> "/" <> name
 
@@ -599,6 +622,16 @@ extentRefusal env places
   where
     (ex, ey, ez) = limitExtent (configLimits (tfConfig (envFacade env)))
     inside (lx, ly, hiZ) = lx < ex && ly < ey && hiZ <= ez
+
+-- | The service's own limits on a column's range, from its configuration: the most levels one range may name, and the most regions one
+-- request may demand (a request that names more is refused by the service, permanently).
+rangeRefusal ∷ Env → TerrainColumnAsk → Maybe Text
+rangeRefusal env ask
+  | levelsOf ask > limitRangeLevels (configQueryLimits config) = Just "the range spans more levels than this service returns"
+  | toInteger (length (columnPlaces ask)) > toInteger (limitQueryRegions (configLimits config)) = Just "the range spans more regions than this service reads at once"
+  | otherwise = Nothing
+  where
+    config = tfConfig (envFacade env)
 
 -- | What a cell asks of its region: its column's place and the levels it needs.
 cellPlaces ∷ TileCoord → [(Int, Int, Int)]
@@ -818,6 +851,7 @@ submit env submission = mask_ $ do
       settling
       <$> newTVarIO NoLease
       <*> newTVarIO False
+      <*> pure (submissionSettled submission)
       <*> newUnique
   noted ← newTVarIO False
   let -- What decides a commit, read in the transaction that makes it: the session still takes new work, the request is still
@@ -875,33 +909,43 @@ submit env submission = mask_ $ do
   case pdAsk found of
     AskOpen _ name _ → releaseStale env name
     _ → pure ()
-  hookSubmitting (hooks env)
-  admitted ← case pdAsk found of
-    AskOpen client name spec → openArenaWith (service env) ep client name spec
-    AskAttach client name → attachArenaWith (service env) ep client name
-    AskCell lease tile → cellWith (service env) ep lease tile
-    AskColumn lease column range → columnWith (service env) ep lease column range
-    AskSurface lease column → surfaceWith (service env) ep lease column
-    AskRemove lease tile precondition → removeWith (service env) ep lease tile precondition
-  case admitted of
-    Left refused → throwIO (declination refused)
-    Right request → do
-      atomically (writeTVar (pdRequest found) (Just request) >> note)
-      case pdAsk found of
-        AskOpen _ name _ → do
-          let claim = Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)
-          atomically $ do
-            pruneClaims (envFacade env)
-            over ← clDone claim
-            -- A request that has already ended needs no claim: only what is still open can be found stale.
-            unless over (modifyTVar' (tfClaims (envFacade env)) (Map.insertWith (<>) name [claim]))
-        _ → pure ()
-      hookSubmitted (hooks env)
-      pure
-        ProviderWork
-          { workCancel = cancelWork env link request
-          , workRetirement = retirement env link
-          }
+  duplicate ← case pdAsk found of
+    AskOpen _ name _ → atomically (failedOpenPending (envFacade env) name)
+    _ → pure False
+  if duplicate
+    then do
+      -- An open the service failed still holds its name until the host settles it: this one is a duplicate of it, answered here and never
+      -- handed to the service, which has no claim to find.
+      atomically (settlingSettle settling (failureReply NameInUse) >> writeTVar (lkTerminal link) True)
+      pure ProviderWork {workCancel = pure (), workRetirement = pure ProviderComplete}
+    else do
+    hookSubmitting (hooks env)
+    admitted ← case pdAsk found of
+      AskOpen client name spec → openArenaWith (service env) ep client name spec
+      AskAttach client name → attachArenaWith (service env) ep client name
+      AskCell lease tile → cellWith (service env) ep lease tile
+      AskColumn lease column range → columnWith (service env) ep lease column range
+      AskSurface lease column → surfaceWith (service env) ep lease column
+      AskRemove lease tile precondition → removeWith (service env) ep lease tile precondition
+    case admitted of
+      Left refused → throwIO (declination refused)
+      Right request → do
+        atomically (writeTVar (pdRequest found) (Just request) >> note)
+        case pdAsk found of
+          AskOpen _ name _ → do
+            let claim = Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)
+            atomically $ do
+              pruneClaims (envFacade env)
+              over ← clDone claim
+              -- A request that has already ended needs no claim: only what is still open can be found stale.
+              unless over (modifyTVar' (tfClaims (envFacade env)) (Map.insertWith (<>) name [claim]))
+          _ → pure ()
+        hookSubmitted (hooks env)
+        pure
+          ProviderWork
+            { workCancel = cancelWork env link request
+            , workRetirement = retirement env link
+            }
 
 -- | The largest answer a read or a removal can have, as the reply the host judges: a revision at the greatest integer, every field
 -- present, and for a column as many runs as the range has levels and the service returns (more is @too_large@, a failure that
@@ -987,7 +1031,16 @@ settleInto ∷ Env → Link → Settlement → STM ()
 settleInto env link = \case
   Cancelled → settlingCancel (lkSettling link) >> writeTVar (lkTerminal link) True
   Failed failure → do
-    _ ← settlingSettle (lkSettling link) (failureReply failure)
+    -- The service may still hold what it borrowed for the request: the preparation that was running when it was failed (an arena closed,
+    -- the service closed) keeps the request as a ghost, which the withdrawal that precedes this settlement has just made. Its work is not
+    -- over because it has answered: the settlement does not prove it so, and the retirement obligation stays ('retirement'). Without a ghost
+    -- the settlement proves the work over, as every other does.
+    ghosts ← any Terrain.censusGhost . Terrain.censusRequests <$> Terrain.inspectCensusSTM (service env)
+    _ ← (if ghosts then settlingSettleKeeping else settlingSettle) (lkSettling link) (failureReply failure)
+    -- An open the service failed holds no claim of its own: the adapter holds its name until the host has settled it.
+    case failure of
+      NameInUse → pure ()
+      _ → forM_ (lkName link) (\name → holdFailed (envFacade env) name link)
     writeTVar (lkTerminal link) True
   Succeeded answer → case answer of
     AOpened lease → offer lease

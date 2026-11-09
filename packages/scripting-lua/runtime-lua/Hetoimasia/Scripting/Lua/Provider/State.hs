@@ -77,6 +77,7 @@ module Hetoimasia.Scripting.Lua.Provider.State
   , eligibleOf
   , settleWith
   , settleWithFinal
+  , settleKeeping
   , replyTo
   , settlementFields
   , deliverable
@@ -1412,7 +1413,14 @@ applyChecked service = applyCheckedAs service False
 -- | 'applyChecked', and whether the reply is a settlement whose position was reached: such a reply is never
 -- held for the request's tick, it settles (the opt-in settlement seam's commit, 'Settling').
 applyCheckedAs ∷ ProviderState → Bool → RequestId → Checked → STM ReplyAnswer
-applyCheckedAs service settleNow identity checked = do
+applyCheckedAs service = applyCheckedFor service False
+
+-- | 'applyCheckedAs', and whether the reply leaves the provider's work as it was: a settlement the provider makes while it still has
+-- something borrowed for the request (the service's preparation that was running when the request was failed) does not prove its work
+-- over: it is polled for its retirement ('workRetirement') as the work of a withdrawn request is, and its request's places are returned
+-- only when the provider reports it complete.
+applyCheckedFor ∷ ProviderState → Bool → Bool → RequestId → Checked → STM ReplyAnswer
+applyCheckedFor service keepsWork settleNow identity checked = do
   st ← readTVar (psVar service)
   let session = pSession st
       reply = modelReply checked
@@ -1449,7 +1457,7 @@ applyCheckedAs service settleNow identity checked = do
               released = found {recHeld = Just held, recFailure = failureOf}
           released' ← dropGate service released
           writeTVar (psVar service) $
-            endWork identity $
+            endsWork identity $
               st
                 { pSession = session'
                 , pRecs = Map.insert identity released' (pRecs st)
@@ -1467,7 +1475,7 @@ applyCheckedAs service settleNow identity checked = do
             _ → pRecs st
           -- It stays in the places not yet served: the tick's service wakes the waiters for it in the order of
           -- the places, and until then it is not visible to them ('settledNumber').
-          settled = endWork identity st {pSession = session', pRecs = recorded}
+          settled = endsWork identity st {pSession = session', pRecs = recorded}
       writeTVar (psVar service) $ case answer of
         Left (UnknownRequest _) → st {pSession = session'}
         _ → settled
@@ -1482,6 +1490,11 @@ applyCheckedAs service settleNow identity checked = do
         Left (PayloadTooLarge _ _) → ReplyRefusedValue
         Left (ReplyRefused _) → ReplyLate
         Left _ → ReplyLate
+  where
+    endsWork = if keepsWork then withdrawWork else endWork
+    -- The provider's work is not proved over: it is polled for its retirement, as the work of a request whose interest was withdrawn is, and
+    -- is over when the provider says so.
+    withdrawWork found st' = st' {pWork = Map.adjust (\work → if workEnded work then work else work {workWantsCancel = True}) found (pWork st')}
 
 -- | Whether a request may be settled by the opt-in settlement seam now ('Settling'): read-only. It is waiting for
 -- its answer (it has not settled, no completion is held for it, no resource is waiting to be built into its
@@ -1526,6 +1539,21 @@ eligibleOf service identity = do
 -- whatever its tick; any other is held for its position.
 settleWith ∷ ProviderState → Admission → Schema → RequestId → ProviderReply → STM ReplyAnswer
 settleWith service ask schema = settleWithFinal service ask schema (pure Nothing)
+
+-- | 'settleWith' for a reply that leaves the provider's work outstanding ('applyCheckedFor'): the provider still holds something borrowed
+-- for the request, and says when it is over through its retirement. A resource reply is not made through it.
+settleKeeping ∷ ProviderState → Admission → Schema → RequestId → ProviderReply → STM ReplyAnswer
+settleKeeping service ask schema identity reply = do
+  eligible ← eligibleOf service identity
+  case checkReplyPure (psLimits service) schema ask reply of
+    checked@(CheckedDefect _) → replyTo service identity checked
+    checked → do
+      st ← readTVar (psVar service)
+      if Map.member identity (pAdopting st)
+        then do
+          writeTVar (psVar service) st {pCounts = (pCounts st) {countDuplicateHeld = countDuplicateHeld (pCounts st) + 1}}
+          pure ReplyLate
+        else applyCheckedFor service True eligible identity checked
 
 -- | 'settleWith' for a resource reply that carries the provider's last look at the settlement ('adoptingFinal'): taken in the very
 -- transaction that settles the request once the owner has built the resource. A resource reply made when the request is eligible is

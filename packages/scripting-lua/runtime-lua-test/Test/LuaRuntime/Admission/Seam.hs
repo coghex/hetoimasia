@@ -16,7 +16,7 @@ import Hetoimasia.Scripting.Lua.Scheduled (grantScheduledStep, scheduledEndpoint
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
-import Test.LuaRuntime.Request.Support (diagnostics, onSubmit, submissions)
+import Test.LuaRuntime.Request.Support (awaitDiagnostic, diagnostics, finishWork, onSubmit, submissions)
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Test.LuaRuntime.Support (bounded, expectFatal, requiredPolicy, withBoundary)
@@ -90,6 +90,26 @@ spec = describe "the settlement seam and the declining hand-off" $ do
       d ← diagnostics owner
       rdDefects d `shouldBe` 0
       atomically (settlingSettle settling (ProviderResult (VInteger 7))) >>= (`shouldBe` ReplySettled)
+
+  it "settles a request without proving the provider's work over, so that its places return only when the provider's retirement says so" $ bounded $ do
+    fixture ← newAFix 4
+    withBoundary $ \_ runtime → settleAll fixture $ do
+      owner ← startAdmitting fixture runtime "keeps" [admitter] aConfig (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+      admitAdmitter fixture owner "i" "admitter"
+      seam ← newIORef Nothing
+      onSubmit (afFake fixture) (captured seam)
+      acommand fixture owner "i" "start" "a"
+      awaitNote fixture "cmd start a started"
+      Just settling ← readIORef seam
+      atomically (settlingSettleKeeping settling (ProviderResult (VInteger 7))) >>= (`shouldBe` ReplySettled)
+      acommand fixture owner "i" "take" "a"
+      awaitNote fixture "cmd take a {status=success,value={v=7}}"
+      -- the request settled and was taken, and the provider has not said its work is over (it still holds what it borrowed): the work stays
+      d ← diagnostics owner
+      rdWorkPending d `shouldBe` 1
+      -- the provider's retirement says so: the work is over
+      finishWork (afFake fixture) 0
+      awaitDiagnostic owner ((== 0) . rdWorkPending)
 
   it "treats every reply that comes while a resource reply waits to be built as a duplicate, whatever it is" $ bounded $ do
     fixture ← newAFix 4

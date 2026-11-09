@@ -14,10 +14,12 @@ import Control.Monad (unless, void, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
+import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Profile (CountLimit (CopiedValueDepth, CopiedValueElements, LuaIntegerMaximum, SceneDepth, SceneSprites))
 import Hetoimasia.LuaEngine.Terrain (TerrainFacade (..), TerrainHooks (..), noTerrainHooks)
+import qualified Hetoimasia.Scripting.Lua.Instance as Instance
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
 import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Test.LuaEngine.Request.Profiles (counts)
@@ -67,6 +69,43 @@ attacher =
         , "    print('attach', t.status, t.error and t.error.code)"
         , "    if t.status == 'failure' and t.error.code == 'not_found' then self.q = api.terrain.attach('shared') else self.q = nil end"
         , "  end"
+        , "end"
+        ]
+    }
+
+-- | A gameplay instance whose init opens a name with a definition the service fails (a duplicate material), due at tick 1.
+failsLogically ∷ Script
+failsLogically =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.q = api.terrain.open('dup', { materials = { 'a', 'a' }, layers = {} })", "print('invalid open issued')"]
+    , scUpdate = ["if self.q then local t = settle(api, self.q) if t then print('invalid open', t.status, t.error and t.error.code) self.q = nil end end"]
+    }
+
+-- | A gameplay instance whose init opens a valid name, due at tick 1.
+opensLogically ∷ Script
+opensLogically =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.q = api.terrain.open('held', DEF)", "print('held open issued')"]
+    , scUpdate = ["if self.q then local t = settle(api, self.q) if t then print('held open', t.status, t.error and t.error.code) self.q = nil end end"]
+    }
+
+-- | A presentation instance that, when the example says so, opens a name, twice (the second on a second signal), saying each answer.
+reopensOnSignal ∷ Text → Script
+reopensOnSignal name =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0"]
+    , scUpdate =
+        [ "if self.s == 0 then TEST_WAIT('first') self.q = api.terrain.open('" <> name <> "', DEF) self.s = 1"
+        , "elseif self.s == 1 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('first answer', t.status, t.error and t.error.code) self.s = 2 end"
+        , "elseif self.s == 2 then TEST_WAIT('second') self.q = api.terrain.open('" <> name <> "', DEF) self.s = 3"
+        , "elseif self.s == 3 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('second answer', t.status, t.error and t.error.code) self.s = 4 end"
         , "end"
         ]
     }
@@ -994,4 +1033,48 @@ spec = describe "Terrain windows and banks" $ do
             _ ← admitOnly world second "modules-test" mainPath
             untilPrinted world "opened\tsuccess"
             openGate gate
+
+  it "holds the name of an open the service failed until the host settles it, against another VM's open, and frees it then" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsLogically), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
+        withFvm world runtime (gameplayOver rig) $ \gameplayVm →
+          withFvm world runtime (presentationOver rig) $ \shown → do
+            _ ← spawn world gameplayVm "modules-test" mainPath
+            _ ← admitOnly world shown "modules-test" "lua/other.lua"
+            -- the definition failed in the service at once, and the host holds that failure for tick 1: the name is still the first open's
+            signalRig rig "first"
+            untilPrinted world "first answer\tfailure\tname_in_use"
+            -- the tick is granted and the first open is settled: the name is free
+            pumpUntil world (tickBy control gameplayVm 1 >> (elem "invalid open\tfailure\tdefinition" <$> outLines world))
+            signalRig rig "second"
+            untilPrinted world "second answer\tsuccess\tnil"
+
+  it "frees the name of a pending logical open that an epoch cancelled, for another VM's open of it" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensLogically), ("lua/other.lua", scriptSource (reopensOnSignal "held"))]) $ \world _ runtime →
+        withFvm world runtime (gameplayOver rig) $ \gameplayVm →
+          withFvm world runtime (presentationOver rig) $ \shown → do
+            _ ← spawn world gameplayVm "modules-test" mainPath
+            _ ← admitOnly world shown "modules-test" "lua/other.lua"
+            -- the open is held for tick 1 and holds the name: a duplicate is refused
+            signalRig rig "first"
+            untilPrinted world "first answer\tfailure\tname_in_use"
+            -- the owner's requests move to a new epoch: the open is cancelled, and the name is free from the host's settlement
+            void (advanceRequestEpoch (scheduledEndpoint (fvOwner gameplayVm)))
+            signalRig rig "second"
+            untilPrinted world "second answer\tsuccess\tnil"
+
+  it "frees the name of a pending logical open whose instance ended, for another VM's open of it" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensLogically), ("lua/other.lua", scriptSource (reopensOnSignal "held"))]) $ \world control runtime →
+        withFvm world runtime (gameplayOver rig) $ \gameplayVm →
+          withFvm world runtime (presentationOver rig) $ \shown → do
+            opener' ← spawn world gameplayVm "modules-test" mainPath
+            _ ← admitOnly world shown "modules-test" "lua/other.lua"
+            signalRig rig "first"
+            untilPrinted world "first answer\tfailure\tname_in_use"
+            stopSpawned opener'
+            pumpUntil world (tickBy control gameplayVm 1 >> ((/= Just Instance.Active) <$> phaseOf opener'))
+            signalRig rig "second"
+            untilPrinted world "second answer\tsuccess\tnil"
 
