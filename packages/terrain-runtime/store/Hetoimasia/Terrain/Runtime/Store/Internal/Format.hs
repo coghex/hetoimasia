@@ -22,6 +22,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Format
   , maxTxnPages
   , maxTxnBytes
   , minNodeBytes
+  , probeBytes
 
     -- * Identities
   , PageNo (..)
@@ -93,6 +94,11 @@ maxEntryBytes = 2 + maxKeyBytes + maxValueBytes
 -- 36 GiB can never reach the bound; a larger one meets the typed refusal.
 maxLevel ∷ Int
 maxLevel = 7
+
+-- | The accounted bytes of one page probe a window keeps: its map entry, tag, level and
+-- the key it keeps, copied out of the page buffer (at most 'maxKeyBytes').
+probeBytes ∷ Int
+probeBytes = 256 + maxKeyBytes
 
 -- | The most page numbers one retirement list page holds.
 maxListPages ∷ Int

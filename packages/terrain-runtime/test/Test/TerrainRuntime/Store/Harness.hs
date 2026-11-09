@@ -127,7 +127,7 @@ fillWith h f = go (storeWindow (hStore h)) 0
           Left e → Left ("page " <> show p <> " refused: " <> show e)
           Right w' → go w' (n + 1 ∷ Int)
       -- a page the plan only has to classify: a page never written is nothing
-      PendingProbe p → go (windowProbe total p (maybe BS.empty id (diskRead (hDisk h) p)) w) (n + 1 ∷ Int)
+      PendingProbes ps → go (foldl (\w' p → windowProbe total p (maybe BS.empty id (diskRead (hDisk h) p)) w') w ps) (n + 1 ∷ Int)
       other → Right (other, w, n)
 
 fillPlan ∷ H → Delta → TxClass → Either String Planned
@@ -189,7 +189,7 @@ runPlanned h p = case p of
   Refused r → Right (h, Refusal' r)
   BlockedByReader a b → Left ("blocked by reader " <> show (a, b))
   Pending q → Left ("unfilled pending " <> show q)
-  PendingProbe q → Left ("unfilled probe " <> show q)
+  PendingProbes q → Left ("unfilled probes " <> show q)
 
 -- | Reclaim until nothing more can be reclaimed, returning the number of
 -- transactions. Stops on a block by a reader or a refusal.
@@ -206,7 +206,7 @@ reclaimAll = go 0
             BlockedByReader {} → Right (h, n)
             Refused r → Left ("reclaim refused: " <> show r)
             Pending _ → Left "pending after fill"
-            PendingProbe _ → Left "pending probe after fill"
+            PendingProbes _ → Left "pending probes after fill"
 
 -- | The independent checks of the committed store against the disk: the partition,
 -- the counters and every tree's structure.

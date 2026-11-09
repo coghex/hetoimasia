@@ -51,6 +51,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , windowProbe
   , windowProbeOf
   , windowProbeBytes
+  , windowProbeCount
   , windowSize
   , windowVersion
   , windowIdentity
@@ -173,31 +174,32 @@ windowBytes w = Map.size (wPages w) * (pageSize + windowPageOverhead)
 windowPageOverhead ∷ Int
 windowPageOverhead = 128
 
--- | The accounted bytes of the probes a window holds: a map entry, the tag and the
--- key a probe keeps (at most 'maxKeyBytes').
+-- | The accounted bytes of the probes a window holds, 'probeBytes' each.
 windowProbeBytes ∷ Window → Int
-windowProbeBytes w = Map.size (wProbes w) * (probeOverhead + maxKeyBytes)
-
--- | The accounted overhead of one probe beyond its key.
-probeOverhead ∷ Int
-probeOverhead = 96
+windowProbeBytes w = Map.size (wProbes w) * probeBytes
 
 -- | Decode a page read for a page number against the window's store and add it. A page
--- that fails any check is refused and the window is unchanged.
+-- that fails any check is refused and the window is unchanged. The window keeps its own
+-- copy of the buffer: a caller's buffer may be a slice of something far larger (a read of
+-- many pages), and what a window retains must be exactly the 4 KiB it accounts.
 windowInsert ∷ Word64 → PageNo → ByteString → Window → Either PageError Window
 windowInsert total no bytes w = do
   page ← decodePage (wIdent w) total no bytes
-  Right w {wPages = Map.insert no (VPage (pgTree page) (pgLevel page) bytes) (wPages w)}
+  Right w {wPages = Map.insert no (VPage (pgTree page) (pgLevel page) (BS.copy bytes)) (wPages w)}
 
 -- | Classify a page read for a page number and keep only the classification. A page
 -- that does not decode as a page of this store at that number is 'ProbeNone': nothing
--- reaches it, so nothing is lost by overwriting or freeing it. This never refuses.
+-- reaches it, so nothing is lost by overwriting or freeing it. This never refuses. The
+-- key a probe keeps is copied out of the page buffer: a slice of the 4 KiB input would
+-- keep all of it alive behind a figure that accounts for a few dozen bytes.
 windowProbe ∷ Word64 → PageNo → ByteString → Window → Window
-windowProbe total no bytes w = w {wProbes = Map.insert no probe (wProbes w)}
+windowProbe total no bytes w = w {wProbes = Map.insert no (detach probe) (wProbes w)}
   where
     probe = case decodePage (wIdent w) total no bytes of
       Left _ → ProbeNone
       Right page → probeOfPage page
+    detach (ProbeTree t l k) = let k' = BS.copy k in BS.length k' `seq` ProbeTree t l k'
+    detach other = other
 
 probeOfPage ∷ Page → Probe
 probeOfPage (Page tree level _ body) = case body of
@@ -205,6 +207,10 @@ probeOfPage (Page tree level _ body) = case body of
   Inner ((k, _) : _) → ProbeTree tree level k
   List v _ → ProbeList v
   _ → ProbeNone
+
+-- | The probes a window holds.
+windowProbeCount ∷ Window → Int
+windowProbeCount = Map.size . wProbes
 
 -- | What a page is, if the window has it (as a full page or as a probe).
 windowProbeOf ∷ PageNo → Window → Maybe Probe

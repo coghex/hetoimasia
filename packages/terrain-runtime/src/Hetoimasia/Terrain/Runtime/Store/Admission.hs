@@ -195,7 +195,7 @@ worstTransactionCharge ∷ RamCharge
 worstTransactionCharge =
   RamCharge
     { ramIoBuffers = maxTxnPages * pageSize
-    , ramDecodedCopies = maxWindowBytes + overlayWorstBytes
+    , ramDecodedCopies = maxWindowBytes + worstOwnershipBytes + overlayWorstBytes
     , ramKeys = 3 * maxBatchUpdates * maxEntryBytes
     , ramScratch = (maxListPages + bookkeepingReserve) * 16 + maxClaimPages * 8 + 4096 + (2 * hotNodes + 1) * hotNodeBytes
     , ramPagePins = maxWindowPages * 16

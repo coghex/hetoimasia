@@ -41,6 +41,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Records
   , encodeRetire
   , decodeRetire
   , Retire (..)
+  , retiredKey
+  , decodeRetiredPage
   , be64
   , getBe64
   , le16
@@ -260,6 +262,24 @@ decodeRetire total k v
       Just (version, Retire (PageNo p) c d)
 decodeRetire _ _ _ = Nothing
 
+-- | The key under which the retirement tree records that a page is retired and not yet
+-- reclaimed: a marker byte past every version key, then the page number. The value is the
+-- version of the entry that owns the page. A page is looked up here to learn, in one
+-- bounded descent, whether a retirement obligation still owns it.
+retiredKey ∷ PageNo → ByteString
+retiredKey (PageNo p) = BS.cons 0xFF (be64 p)
+
+-- | A retired-page record: the page and the version of its entry.
+decodeRetiredPage ∷ Word64 → ByteString → ByteString → Maybe (Word64, Word64)
+decodeRetiredPage total k v
+  | BS.length k == 9 && BS.index k 0 == 0xFF && BS.length v == 8
+  , let p = getBe64 k 1
+  , p < total
+  , let version = getBe64 v 0
+  , version >= 1 =
+      Just (p, version)
+decodeRetiredPage _ _ _ = Nothing
+
 -- ---------------------------------------------------------------------------
 -- Entry validation
 
@@ -268,7 +288,9 @@ decodeRetire _ _ _ = Nothing
 validateEntry ∷ TreeId → Word64 → ByteString → ByteString → Either PageError ()
 validateEntry tree total k v = case tree of
   TreeFree → maybe (Left MalformedValue) (const (Right ())) (decodeFree total k v)
-  TreeRetire → maybe (Left MalformedValue) (const (Right ())) (decodeRetire total k v)
+  TreeRetire
+    | BS.length k == 9 → maybe (Left MalformedValue) (const (Right ())) (decodeRetiredPage total k v)
+    | otherwise → maybe (Left MalformedValue) (const (Right ())) (decodeRetire total k v)
   _ → do
     key ← maybe (Left MalformedKey) Right (decodeKey tree k)
     _ ← maybe (Left MalformedValue) Right (decodeValue key v)

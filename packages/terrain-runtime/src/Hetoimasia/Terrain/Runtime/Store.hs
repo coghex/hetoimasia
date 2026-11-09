@@ -14,8 +14,8 @@
 -- plan <- 'planRemoval' env store window tile        -- or 'planDiscovery', 'planMaintenance'
 -- case plan of
 --   'Pending' page   -> fetch the page, 'addPage' it to the window, plan again
---   'PendingProbe' page -> fetch the page, 'addProbe' it to the window (it may not be a page
---                       at all), plan again: the plan must first prove nothing reaches it
+--   'PendingProbes' pages -> fetch each page, 'addProbe' it to the window (it may not be a page
+--                       at all), plan again: the plan must first prove no owner claims it
 --   'Planned' p      -> 'admit' p store, write 'planPages', report each outcome with
 --                       'dispatchWrite' and 'completeWrite', then 'publish' (or 'abortTransaction')
 --   'NoWork'         -> nothing to append

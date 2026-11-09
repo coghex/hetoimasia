@@ -243,7 +243,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     -- ... and the plan alone retains its output pages and little else: no parsed page survives it
     (if held <= output + output `div` 4 + fromIntegral (windowBytes win) then pure () else expectationFailure ("held " <> show held <> " but the output is " <> show output))
   it "bounds a plan's RAM below 4 MiB by construction, component by component" $ do
-    let w = RamCharge (maxTxnPages * pageSize) (maxWindowPages * windowPageBytes) (3 * maxBatchUpdates * maxEntryBytes) ((maxListPages + bookkeepingReserve) * 16 + maxClaimPages * 8 + 4096) (maxWindowPages * 16) (rootRecordBytes + activeRecordBytes + 128) (1024 + maxWindowPages * 8)
+    let w = RamCharge (maxTxnPages * pageSize) (maxWindowPages * windowPageBytes + worstOwnershipBytes) (3 * maxBatchUpdates * maxEntryBytes) ((maxListPages + bookkeepingReserve) * 16 + maxClaimPages * 8 + 4096) (maxWindowPages * 16) (rootRecordBytes + activeRecordBytes + 128) (1024 + maxWindowPages * 8)
     ramTotal w `shouldSatisfy` (< txnRamLimit)
     ramTotal w `shouldSatisfy` (> 3 * 1024 * 1024)
     ramIoBuffers w `shouldBe` 1024 * 1024
@@ -298,4 +298,46 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         "a usage and control report" → big `shouldSatisfy` (<= small + 4096)
         -- the control shows the observation would notice a history-sized structure
         "control: a map of every record key" → ratio `shouldSatisfy` (> 10.0)
+        -- an edit proves each page it writes is owned by no retirement entry by one descent of
+        -- the retired-page index per page: in a small history they share one leaf, in a large
+        -- one each meets its own, so the ratio is bounded by the pages written and not by the
+        -- history (see the plateau example below)
+        "a one-record edit plan" → (name, ratio < 12.0) `shouldBe` (name, True)
         _ → (name, ratio < 3.0) `shouldBe` (name, True)
+  it "keeps nothing of a page buffer behind a probe, and bounds the probes a window may hold" $ do
+    enabled ← getRTSStatsEnabled
+    enabled `shouldBe` True
+    let cfg = either (error . show) id (mkStoreConfig smallSpec)
+        total = cfgUsablePages cfg
+        roots = storeRoots (hStore (newH smallSpec ident0))
+        leaf n = Page TreeRuns 0 (PageNo n) (Leaf [(encodeKey (runKey 0 0 (10 * toInteger n)), encodeValue (runRec (10 * toInteger n + 3)))])
+        -- each buffer is a slice of one large read, the shape that keeps the whole read alive
+        bigRead ∷ Word64 → BS.ByteString
+        bigRead n = BS.concat [either (error . show) id (encodePage ident0 (leaf i)) | i ← [1 .. n]]
+        sliceOf ∷ BS.ByteString → Word64 → BS.ByteString
+        sliceOf big i = BS.take pageSize (BS.drop (fromIntegral (i - 1) * pageSize) big)
+        probes n = let big = bigRead n in foldl (\w i → windowProbe total (PageNo i) (sliceOf big i) w) (emptyWindow ident0 0) [1 .. n]
+    liveBefore ← liveBytes
+    w ← evaluate (let w' = probes 500 in windowProbeCount w' `seq` w')
+    liveAfter ← liveBytes
+    windowProbeCount w `shouldBe` 500
+    -- what the probes really retain stays inside what they account, and far below the pages they were read from
+    let held = liveAfter - liveBefore
+    (if held <= fromIntegral (windowProbeBytes w) then pure () else expectationFailure ("held " <> show held <> " but accounted " <> show (windowProbeBytes w)))
+    held `shouldSatisfy` (< 500 * fromIntegral pageSize `div` 4)
+    -- a window never keeps the caller's buffer: one page of a large read keeps one page
+    liveBefore2 ← liveBytes
+    w2 ← evaluate (let big = bigRead 500 in either (error . show) id (windowInsert total (PageNo 1) (sliceOf big 1) (emptyWindow ident0 0)))
+    liveAfter2 ← liveBytes
+    windowSize w2 `shouldBe` 1
+    (liveAfter2 - liveBefore2) `shouldSatisfy` (< 4 * fromIntegral pageSize)
+    -- a window with more probes than a plan may hold is refused, not planned through
+    let d = deltaFor (hStore (newH smallSpec ident0)) True False 1 [(runKey 0 0 1, Just (runRec 3))]
+        manyProbes = foldl (\x i → windowProbe total (PageNo i) (BS.replicate pageSize 0) x) (emptyWindow ident0 0) [1 .. fromIntegral (maxWindowProbes + 1)]
+    windowProbeCount manyProbes `shouldBe` maxWindowProbes + 1
+    planDelta cfg ident0 roots manyProbes Ordinary d `shouldBe` Refused (Capacity (ProbesExceeded (maxWindowProbes + 1)))
+    -- exactly the bound is accepted
+    let atBound = foldl (\x i → windowProbe total (PageNo i) (BS.replicate pageSize 0) x) (emptyWindow ident0 0) [1 .. fromIntegral maxWindowProbes]
+    case planDelta cfg ident0 roots atBound Ordinary d of
+      Planned _ → pure ()
+      other → expectationFailure (show other)

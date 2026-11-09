@@ -23,7 +23,7 @@
 -- * the readers' pinned roots and used space: the pinned-reader tests.
 module Test.TerrainRuntime.Store.Ownership (spec) where
 
-import Control.Monad (foldM, forM_, when)
+import Control.Monad (foldM, forM, forM_, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
@@ -115,6 +115,18 @@ livePages h = Set.fromList (concatMap (twPages . walkOf) [TreeRuns, TreeLinks, T
   where
     walkOf t = walkTree (arenaOf h) (sourceOf h) (diskRead (hDisk h)) ((\(PageNo p) → p) <$> committedRoot (hStore h) t)
 
+-- | Every retired page with its entry's version, by the independent traversal of the
+-- retirement lists.
+retiredPagesOf ∷ H → IO [(Word64, [Word64])]
+retiredPagesOf h = do
+  let walk = walkTree (arenaOf h) (sourceOf h) (diskRead (hDisk h)) ((\(PageNo p) → p) <$> rRetire (storeRoots (hStore h)))
+  entries ← pure [(getBe64' k 0, getBe64' v 0) | (k, v) ← twLeaves walk, BS.length k == 8]
+  forM entries $ \(ver, lp) → do
+    pg ← parsed h (PageNo lp)
+    case rpBody pg of
+      RefList _ xs → pure (ver, xs)
+      other → expectationFailure (show other) >> fail "list"
+
 -- | The live pages worth forging a supply to name: a root of every tree, a page below a
 -- root, a leaf and a retirement list page.
 victims ∷ H → IO [(String, Word64)]
@@ -132,11 +144,8 @@ victims h = do
       pg ← parsed h (PageNo c)
       pure (case rpBody pg of RefInner ((_, g) : _) → Just g; _ → Nothing)
     Nothing → pure grandchild
-  retireRoot ← maybe (expectationFailure "a retirement root expected" >> fail "retire") pure (rRetire roots)
-  rr ← parsed h retireRoot
-  let lists = case rpBody rr of
-        RefLeaf ((_, v) : _) → [getBe64' v 0]
-        _ → []
+  (_, _, (_, firstValue)) ← firstRetire h
+  let lists = [getBe64' firstValue 0]
   pure $
     named "the runs root" (rRuns roots)
       <> named "the links root" (rLinks roots)
@@ -159,6 +168,38 @@ offerOnly h v = do
   h' ← forge h freeRoot (Page TreeFree 0 freeRoot (Leaf [(be64 v, be64 1)]))
   pure (withRoots h' (\r → r {rLoose = []}))
 
+-- | The retirement tree's leaf holding a key, found by descending from the root by the
+-- independent reference parser.
+retireLeafFor ∷ H → ByteString → IO (PageNo, [(ByteString, ByteString)])
+retireLeafFor h key = do
+  root ← maybe (expectationFailure "a retirement root expected" >> fail "retire") pure (rRetire (storeRoots (hStore h)))
+  let go p = do
+        pg ← parsed h p
+        case rpBody pg of
+          RefLeaf es → pure (p, es)
+          RefInner cs → case reverse (takeWhile ((<= key) . fst) cs) of
+            ((_, c) : _) → go (PageNo c)
+            [] → case cs of
+              ((_, c) : _) → go (PageNo c)
+              [] → expectationFailure "empty inner page" >> fail "inner"
+          RefList _ _ → expectationFailure "a list in the tree" >> fail "list"
+  go root
+
+-- | The leaf of the retirement tree that holds its oldest entry: the leaf, everything in it, and
+-- the entry (the entries sort before the index of retired pages).
+firstRetire ∷ H → IO (PageNo, [(ByteString, ByteString)], (ByteString, ByteString))
+firstRetire h = do
+  (leaf, es) ← retireLeafFor h (be64 0)
+  case [x | x@(k, _) ← es, BS.length k == 8] of
+    (x : _) → pure (leaf, es, x)
+    [] → expectationFailure "a retirement entry expected" >> fail "retire"
+
+-- | Forge the retirement tree so that it no longer records a page as retired.
+dropIndex ∷ H → Word64 → IO H
+dropIndex h v = do
+  (leaf, es) ← retireLeafFor h (BS.cons 0xFF (be64 v))
+  forge h leaf (Page TreeRetire 0 leaf (Leaf [(k, x) | (k, x) ← es, k /= BS.cons 0xFF (be64 v)]))
+
 spec ∷ Spec
 spec = describe "page ownership against forged records with valid checksums" $ do
   describe "free extents (the allocator tree)" $ do
@@ -173,7 +214,7 @@ spec = describe "page ownership against forged records with valid checksums" $ d
         -- a maintenance transaction writes bookkeeping pages from the same supply
         (maintenance, _, _) ← must (fillWith forged (planMaintenance (hStore forged)))
         refusedLive ("a free extent offering " <> what <> ", to maintenance") v maintenance
-    it "refuses a free extent that offers a page only a pinned reader reaches, and the same plan unpinned would overwrite it" $ do
+    it "refuses a free extent that offers a page only a pinned reader reaches, by the retirement index and, with the index forged away, by the pinned tree" $ do
       (h0, ref0, g0) ← fixture
       (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h0)))
       let h1 = h0 {hStore = s1}
@@ -184,10 +225,18 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       onlyPinned `shouldSatisfy` (not . null)
       forM_ (take 3 onlyPinned) $ \v → do
         forged ← offerOnly h2 v
+        -- the pinned reader's tree reaches it
         refusedLive "a free extent offering a pinned page" v =<< planOn forged
-        -- without the reader's roots the page looks free and is overwritten: the pinned
-        -- roots are what stop it
-        unpinned ← planUnpinned forged
+        -- a store that knows no reader still knows it is retired: the retirement index owns it
+        retired ← planUnpinned forged
+        case retired of
+          Refused (Integrity (SuppliedPageRetired (PageNo q) _)) → q `shouldBe` v
+          other → expectationFailure ("a retired page offered by the allocator was not refused as retired: " <> take 200 (show other))
+        -- with its index record forged away the only thing left that knows is the pinned tree
+        unindexed ← dropIndex forged v
+        refusedLive "a free extent offering a pinned page, its retirement index record dropped" v =<< planOn unindexed
+        -- and a store that also knows no pinned reader would overwrite it
+        unpinned ← planUnpinned unindexed
         case unpinned of
           Planned plan → map fst (plPages plan) `shouldSatisfy` (PageNo v `elem`)
           other → expectationFailure ("the unpinned plan should accept the forged extent: " <> take 200 (show other))
@@ -211,17 +260,31 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       forM_ vs $ \(what, v) → do
         let forged = withRoots h (\r → r {rLoose = PageNo v : rLoose r})
         refusedLive ("a loose page naming " <> what) v =<< planOn forged
-    it "refuses a loose list that holds a page twice, wherever the second one sits" $ do
+    it "refuses a loose list that holds a page twice among the pages a plan takes" $ do
       (h, _, _) ← fixture
       freeRoot ← maybe (expectationFailure "free root" >> fail "free") pure (rFree (storeRoots (hStore h)))
       pg ← parsed h freeRoot
       let dead = case rpBody pg of
             RefLeaf es → concat [[s .. s + l - 1] | (k, v) ← es, let s = getBe64' k 0, let l = getBe64' v 0]
             _ → []
-      length dead `shouldSatisfy` (> 100)
-      -- more loose pages than any plan takes (at most 17 + 1 + 68), the first of them listed again at the end
-      let loose = map PageNo (take 100 dead) <> [PageNo (head' dead)]
+      length dead `shouldSatisfy` (> 10)
+      -- the first loose page listed again straight after itself
+      let loose = map PageNo (take 3 dead) <> [PageNo (head' dead)] <> map PageNo (take 50 (drop 3 dead))
       refusedCorrupt "a loose page listed twice" =<< planOn (withRoots h (\r → r {rLoose = loose}))
+    it "refuses a loose page that is also a free extent, even when the extent is not one the plan takes" $ do
+      (h, _, _) ← fixture
+      freeRoot ← maybe (expectationFailure "free root" >> fail "free") pure (rFree (storeRoots (hStore h)))
+      pg ← parsed h freeRoot
+      let extents = case rpBody pg of
+            RefLeaf es → [(getBe64' k 0, getBe64' v 0) | (k, v) ← es]
+            _ → []
+      length extents `shouldSatisfy` (> 1)
+      -- a page of the last (highest) extent, which the lowest-first supply does not reach
+      let (s, _) = last extents
+      out ← planOn (withRoots h (\r → r {rLoose = [PageNo s]}))
+      case out of
+        Refused (Integrity (SuppliedPageDoubleOwned (PageNo q))) → q `shouldBe` s
+        other → expectationFailure ("a loose page that is also free was not refused: " <> take 200 (show other))
   describe "retirement entries and their list pages" $ do
     it "refuses a retirement entry whose version was lowered past a pinned reader, with or without its list's stamp" $ do
       (h0, ref0, g0) ← fixture
@@ -229,47 +292,131 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       let pinned = storeVersion s1
       (hA, _) ← must (reclaimAll (h0 {hStore = s1}))
       (h2, ref2, _) ← must (foldM (\s _ → churn s 30) (hA, ref0, g0) [1 .. 4 ∷ Int])
-      retireRoot ← maybe (expectationFailure "retire root" >> fail "retire") pure (rRetire (storeRoots (hStore h2)))
-      rr ← parsed h2 retireRoot
-      (entries, lp, cnt, e) ← case rpBody rr of
-        RefLeaf es@((k, v) : _) → pure (es, getBe64' v 0, getLe16' v 8, getBe64' k 0)
-        other → expectationFailure ("a retirement leaf expected: " <> take 100 (show other)) >> fail "retire"
+      (leaf, es, (k0, v0)) ← firstRetire h2
+      let (lp, cnt, e) = (getBe64' v0 0, getLe16' v0 8, getBe64' k0 0)
       -- the oldest entry still waiting is newer than the reader's version (the reclamation that ran first only
       -- consumed entries it could, and its own commits changed no record page)
       e `shouldSatisfy` (> pinned)
       -- the entry now claims the version the reader pins: nothing newer holds its pages
-      let lowered = (be64 pinned, snd (head' entries)) : drop 1 entries
-      h3 ← forge h2 retireRoot (Page TreeRetire 0 retireRoot (Leaf lowered))
+      let lowerEntry = [(if k == k0 then be64 pinned else k, x) | (k, x) ← es]
+      h3 ← forge h2 leaf (Page TreeRetire 0 leaf (Leaf lowerEntry))
       -- the list still carries the true version: the entry and the list contradict each other
       (stampMismatch, _, _) ← must (fillWith h3 (planMaintenance (hStore h3)))
       stampMismatch `shouldBe'` Refused (Integrity MalformedRetirement)
-      -- the list is forged to agree with the lowered entry: only the reader's tree can say
+      -- the list is forged to agree with the lowered entry: the retired-page index still says the
+      -- pages belong to the true version
       lpage ← parsed h3 (PageNo lp)
       ps ← case rpBody lpage of
         RefList _ xs → pure xs
         other → expectationFailure (show other) >> fail "list"
       length ps `shouldBe` fromIntegral cnt
       h4 ← forge h3 (PageNo lp) (Page TreeRetire 0 (PageNo lp) (List pinned (map PageNo ps)))
-      (agreed, _, _) ← must (fillWith h4 (planMaintenance (hStore h4)))
-      case agreed of
+      -- the pinned reader's tree reaches the pages the entry now says are free to reclaim
+      (pinnedRefusal, _, _) ← must (fillWith h4 (planMaintenance (hStore h4)))
+      case pinnedRefusal of
         Refused (Integrity (RetiredPageLive (PageNo q))) → ps `shouldSatisfy` (q `elem`)
         other → expectationFailure ("a lowered version past a pinned reader was not refused as live: " <> take 300 (show other))
+      -- without the reader's roots the retired-page index still says the pages belong to the true version
+      (indexed, _, _) ← must (fillWith h4 (planReclaimWith standardBounds (hCfg h4) (hIdent h4) (storeRoots (hStore h4)) (Just pinned)))
+      case indexed of
+        Refused (Integrity (RetiredIndexMismatch (PageNo q))) → ps `shouldSatisfy` (q `elem`)
+        other → expectationFailure ("a lowered version contradicting the retired-page index was not refused: " <> take 300 (show other))
+      -- the index forged to agree as well: only the reader's tree can say
+      let lowerIndex = [(k, if BS.length k == 9 && getBe64' x 0 == e then be64 pinned else x) | (k, x) ← lowerEntry]
+      h5 ← forge h4 leaf (Page TreeRetire 0 leaf (Leaf lowerIndex))
+      (agreed, _, _) ← must (fillWith h5 (planMaintenance (hStore h5)))
+      case agreed of
+        Refused (Integrity (RetiredPageLive (PageNo q))) → ps `shouldSatisfy` (q `elem`)
+        other → expectationFailure ("a lowered version past a pinned reader, index forged too, was not refused as live: " <> take 300 (show other))
       -- the committed trees alone cannot tell: without the reader's roots the entry is accepted
-      (accepted, _, _) ← must (fillWith h4 (planReclaimWith standardBounds (hCfg h4) (hIdent h4) (storeRoots (hStore h4)) (Just pinned)))
+      (accepted, _, _) ← must (fillWith h5 (planReclaimWith standardBounds (hCfg h5) (hIdent h5) (storeRoots (hStore h5)) (Just pinned)))
       case accepted of
         Planned _ → pure ()
         other → expectationFailure ("the committed-only check should accept the forged entry: " <> take 200 (show other))
       -- and the reader still answers from its version, with its pages in place
-      seen ← must (readAll h4 tok)
+      seen ← must (readAll h5 tok)
       Map.fromList seen `shouldBe` ref0
       when (ref2 == ref0) $ expectationFailure "the later commits changed nothing"
+    it "refuses to overwrite a retired page the allocator offers while its retirement entry still owns it, with no reader pinned" $ do
+      (h, _, _) ← fixture
+      retired ← retiredPagesOf h
+      length retired `shouldSatisfy` (> 1)
+      -- a page of the oldest entry (the one maintenance would reclaim next) and of the newest
+      forM_ [("the newest entry", last retired), ("the oldest entry", head' retired)] $ \(what, (ver, pages)) → do
+        v ← case pages of
+          (x : _) → pure x
+          [] → expectationFailure "an empty list" >> fail "list"
+        forged ← offerOnly h v
+        out ← planOn forged
+        case out of
+          Refused (Integrity (SuppliedPageRetired (PageNo q) ev)) → (q, ev) `shouldBe` (v, ver)
+          other → expectationFailure ("a retired page of " <> what <> " offered by the allocator was not refused: " <> take 200 (show other))
+      -- maintenance writes bookkeeping pages from the same supply: offer it a page of the newest entry
+      case last retired of
+        (ver, v : _) → do
+          forged ← offerOnly h v
+          (m, _, _) ← must (fillWith forged (planMaintenance (hStore forged)))
+          case m of
+            Refused (Integrity (SuppliedPageRetired (PageNo q) ev)) → (q, ev) `shouldBe` (v, ver)
+            other → expectationFailure ("maintenance was offered a retired page: " <> take 200 (show other))
+        _ → expectationFailure "an entry with pages expected"
+    it "refuses a loose page that a retirement entry still owns" $ do
+      (h, _, _) ← fixture
+      retired ← retiredPagesOf h
+      case last retired of
+        (ver, v : _) → do
+          out ← planOn (withRoots h (\r → r {rLoose = PageNo v : rLoose r}))
+          case out of
+            Refused (Integrity (SuppliedPageRetired (PageNo q) ev)) → (q, ev) `shouldBe` (v, ver)
+            other → expectationFailure ("a retired page in the loose list was not refused: " <> take 200 (show other))
+        _ → expectationFailure "an entry with pages expected"
+    it "refuses a retirement list that names a page the retired-page index holds under another entry" $ do
+      (h, _, _) ← fixture
+      (_, _, (k0, v0)) ← firstRetire h
+      let (lp, cnt, e) = (getBe64' v0 0, getLe16' v0 8, getBe64' k0 0)
+      lpage ← parsed h (PageNo lp)
+      ps ← case rpBody lpage of
+        RefList _ xs → pure xs
+        other → expectationFailure (show other) >> fail "list"
+      length ps `shouldBe` fromIntegral cnt
+      retired ← retiredPagesOf h
+      -- a page another, newer entry retired: indexed, but under that entry's version
+      dead ← case last retired of
+        (ver, v : _) | ver /= e → pure v
+        _ → expectationFailure "a newer entry with pages expected" >> fail "retired"
+      forged ← forge h (PageNo lp) (Page TreeRetire 0 (PageNo lp) (List e (map PageNo (sortUnique (dead : drop 1 ps)))))
+      (out, _, _) ← must (fillWith forged (planMaintenance (hStore forged)))
+      case out of
+        Refused (Integrity (RetiredIndexMismatch (PageNo q))) → q `shouldBe` dead
+        other → expectationFailure ("a list naming an unindexed page was not refused: " <> take 200 (show other))
+    it "refuses to retire a page the retired-page index already holds" $ do
+      (h, _, _) ← fixture
+      roots ← pure (storeRoots (hStore h))
+      runsRoot ← maybe (expectationFailure "runs root" >> fail "runs") pure (rRuns roots)
+      let PageNo rr = runsRoot
+      (leaf, es) ← retireLeafFor h (BS.cons 0xFF (be64 rr))
+      -- the live runs root is also indexed as retired under some version: the next commit replaces it
+      let withIndex = Map.toAscList (Map.insert (BS.cons 0xFF (be64 rr)) (be64 1) (Map.fromList es))
+      forged ← forge h leaf (Page TreeRetire 0 leaf (Leaf withIndex))
+      out ← planOn forged
+      case out of
+        Refused (Integrity (DoubleFree (PageNo q))) → q `shouldBe` rr
+        other → expectationFailure ("a page retired twice was not refused: " <> take 200 (show other))
+    it "refuses an ordinary plan that would take the retired backlog past its bound, and never maintenance" $ do
+      (h, _, _) ← fixture
+      let full = withRoots h (\r → r {rRetiredPages = fromIntegral maxRetiredPages})
+      out ← planOn full
+      case out of
+        Refused (Capacity (RetirementBacklog _ _)) → pure ()
+        other → expectationFailure ("a full backlog was not refused: " <> take 200 (show other))
+      (m, _, _) ← must (fillWith full (planMaintenance (hStore full)))
+      case m of
+        Refused (Capacity (RetirementBacklog _ _)) → expectationFailure "maintenance must never be refused for the backlog it lowers"
+        _ → pure ()
     it "refuses a retirement list that names a bookkeeping page or a page past the used space" $ do
       (h, _, _) ← fixture
-      retireRoot ← maybe (expectationFailure "retire root" >> fail "retire") pure (rRetire (storeRoots (hStore h)))
-      rr ← parsed h retireRoot
-      (lp, cnt, e) ← case rpBody rr of
-        RefLeaf ((k, v) : _) → pure (getBe64' v 0, getLe16' v 8, getBe64' k 0)
-        other → expectationFailure (show other) >> fail "retire"
+      (_, _, (k0, v0)) ← firstRetire h
+      let (lp, cnt, e) = (getBe64' v0 0, getLe16' v0 8, getBe64' k0 0)
       lpage ← parsed h (PageNo lp)
       ps ← case rpBody lpage of
         RefList _ xs → pure xs
@@ -287,13 +434,10 @@ spec = describe "page ownership against forged records with valid checksums" $ d
           bad → expectationFailure ("a retirement list naming " <> what <> " was not refused: " <> take 200 (show bad))
     it "refuses a retirement entry whose list page lies past the used space, is not a list, or does not hold the pages it counts" $ do
       (h, _, _) ← fixture
-      retireRoot ← maybe (expectationFailure "retire root" >> fail "retire") pure (rRetire (storeRoots (hStore h)))
-      rr ← parsed h retireRoot
-      (entries, e, lp, cnt, done) ← case rpBody rr of
-        RefLeaf es@((k, v) : _) → pure (es, getBe64' k 0, getBe64' v 0, getLe16' v 8, getLe16' v 10)
-        other → expectationFailure (show other) >> fail "retire"
+      (leaf, entries, (k0, v0)) ← firstRetire h
+      let (e, lp, cnt, done) = (getBe64' k0 0, getBe64' v0 0, getLe16' v0 8, getLe16' v0 10)
       let entryValue list c d = BS.concat [be64 list, le16' c, le16' d]
-          retarget v = forge h retireRoot (Page TreeRetire 0 retireRoot (Leaf ((be64 e, v) : drop 1 entries)))
+          retarget v = forge h leaf (Page TreeRetire 0 leaf (Leaf [(k, if k == be64 e then v else x) | (k, x) ← entries]))
           hw = rHw (storeRoots (hStore h))
       runsRoot ← maybe (expectationFailure "runs root" >> fail "runs") pure (rRuns (storeRoots (hStore h)))
       forM_

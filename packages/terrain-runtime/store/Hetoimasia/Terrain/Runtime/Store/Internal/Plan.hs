@@ -105,6 +105,7 @@ import qualified Data.ByteString as BS
 import Control.Monad (foldM)
 import Data.Int (Int64)
 import Data.List (nub)
+import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word16, Word64)
@@ -228,11 +229,12 @@ data Planned
   | -- | A page the plan needs is not in the window: fetch it, add it and plan
     -- again from the same window.
     Pending !PageNo
-  | -- | A page the plan has to classify is not in the window: read it, 'windowProbe' it
+  | -- | Pages the plan has to classify are not in the window: read each, 'windowProbe' it
     -- (never 'windowInsert': it may not be a page at all) and plan again from the same
-    -- window. The plan is about to overwrite or free the page and must first prove that
-    -- no committed or pinned root reaches it.
-    PendingProbe !PageNo
+    -- window. The plan is about to overwrite or free these pages and must first prove that
+    -- no owner but the allocator claims them. All of the missing ones are named at once, so
+    -- the plan is not rerun for each.
+    PendingProbes ![PageNo]
   | Refused !PlanRefusal
   deriving stock (Eq, Show)
 
@@ -277,6 +279,12 @@ data CapacityWhy
     OverlayExceeded !Int
   | TreeTooTall !TreeId
   | ListTooLarge !Int
+  | -- | The window holds more page probes than a plan may: the figure.
+    ProbesExceeded !Int
+  | -- | Too much retirement is outstanding to prove a supply against it, or to add to:
+    -- the entries and the retired pages they hold. A reader's pin holds them; a release
+    -- and a maintenance transaction lower them.
+    RetirementBacklog !Int !Int
   deriving stock (Eq, Show)
 
 data IntegrityWhy
@@ -291,6 +299,14 @@ data IntegrityWhy
     -- pinned root, or the allocator's records contradict each other: writing it would
     -- destroy a page a reader can still read, so nothing is written.
     SuppliedPageLive !PageNo
+  | -- | A page the allocator supplied for a write is still owned by an outstanding
+    -- retirement entry (the version of the entry): no root reaches it, but its retirement
+    -- obligation has not been consumed.
+    SuppliedPageRetired !PageNo !Word64
+  | -- | A page taken from the loose list is also a free extent: it would have two owners.
+    SuppliedPageDoubleOwned !PageNo
+  | -- | A retirement entry frees a page its index does not record under the entry's version.
+    RetiredIndexMismatch !PageNo
   | MalformedRetirement
   | BookkeepingOverflow !Int
   | LooseOverflow !Int
@@ -321,7 +337,7 @@ standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes
 -- ---------------------------------------------------------------------------
 -- The planning monad
 
-data Out = OutNeed !PageNo | OutProbe !PageNo | OutRefuse !PlanRefusal
+data Out = OutNeed !PageNo | OutProbes ![PageNo] | OutRefuse !PlanRefusal
 
 type P a = Either Out a
 
@@ -341,7 +357,7 @@ settle ∷ P (Maybe Plan) → Planned
 settle (Right (Just p)) = Planned p
 settle (Right Nothing) = NoWork
 settle (Left (OutNeed p)) = Pending p
-settle (Left (OutProbe p)) = PendingProbe p
+settle (Left (OutProbes ps)) = PendingProbes ps
 settle (Left (OutRefuse r)) = Refused r
 
 -- ---------------------------------------------------------------------------
@@ -375,11 +391,12 @@ takeSupply cfg roots m = do
   let loose = take m (rLoose roots)
       nl = length loose
       needFree = m - nl
-  -- every loose page lies inside the used page space, as every page the store ever numbered
-  -- does, and no page is loose twice (the list is bounded by 'looseCap')
-  let looseAll = rLoose roots
-      looseSet = Set.fromList looseAll
-  if any (\(PageNo p) → p >= rHw roots) looseAll || Set.size looseSet /= length looseAll then failInvariant TreeFree else pure ()
+  -- every loose page this supply takes lies inside the used page space, as every page the
+  -- store ever numbered does, and none is listed twice: a page further down the list is
+  -- checked when it reaches the front, so what is read is bounded by the supply, not by the
+  -- list
+  let looseSet = Set.fromList loose
+  if any (\(PageNo p) → p >= rHw roots) loose || Set.size looseSet /= length loose then failInvariant TreeFree else pure ()
   (extents, got) ← if needFree <= 0 then pure ([], 0) else readExtents (fmap Disk (rFree roots)) needFree
   let remaining = needFree - fromIntegral got
       tailPages = cfgUsablePages cfg - min (cfgUsablePages cfg) (rHw roots)
@@ -506,11 +523,13 @@ pinRootFor _ = const Nothing
 -- A page found is refused with the given constructor, and a page whose probe is not
 -- in the window is asked for. The work is bounded by the pages given and the readers.
 unreachable ∷ StoreConfig → Roots → [Pins] → (PageNo → IntegrityWhy) → Window → [PageNo] → Edit → P Edit
-unreachable cfg roots pins why win pages edit0 = foldM one edit0 pages
+unreachable cfg roots pins why win pages edit0 = case [pg | pg ← pages, isNothing (windowProbeOf pg win)] of
+  missing@(_ : _) → Left (OutProbes missing)
+  [] → foldM one edit0 pages
   where
     total = cfgTotalPages cfg
     one edit pg = case windowProbeOf pg win of
-      Nothing → Left (OutProbe pg)
+      Nothing → Left (OutProbes [pg])
       Just ProbeNone → Right edit
       Just (ProbeList v) → do
         (mv, edit') ← phase edit (lookupKey TreeRetire (fmap Disk (rRetire roots)) (be64 v))
@@ -522,6 +541,30 @@ unreachable cfg roots pins why win pages edit0 = foldM one edit0 pages
          in foldM (\e r → do
                       (found, e') ← phase e (livePageAt tree (fmap Disk r) key level)
                       if found == Just pg then refuse (Integrity (why pg)) else Right e') edit rootsOf
+
+-- | The one proof of ownership every page a plan is about to overwrite passes, against
+-- every owner there is: the committed trees and every pinned reader's tree and the
+-- retirement lists ('unreachable'), the retirement tree's index of retired pages (a page a
+-- retirement entry still owns), the free extents (for a page taken from the loose list)
+-- and the supply itself (checked when the supply is taken). A page offered by the allocator
+-- is refused unless no owner but the allocator claims it, and nothing is written.
+-- @fromLoose@ are the pages taken from the loose list.
+provenFree ∷ StoreConfig → Roots → [Pins] → Window → Set.Set PageNo → [PageNo] → Edit → P Edit
+provenFree cfg roots pins win fromLoose pages edit0 = do
+  edit1 ← unreachable cfg roots pins SuppliedPageLive win pages edit0
+  edit2 ← foldM notRetired edit1 pages
+  foldM looseNotFree edit2 [pg | pg ← pages, Set.member pg fromLoose]
+  where
+    notRetired edit pg = do
+      (mv, edit') ← phase edit (lookupKey TreeRetire (fmap Disk (rRetire roots)) (retiredKey pg))
+      case mv of
+        Just v → refuse (Integrity (SuppliedPageRetired pg (getBe64 v 0)))
+        Nothing → Right edit'
+    looseNotFree edit pg@(PageNo n) = do
+      (mext, edit') ← phase edit (floorKey TreeFree (fmap Disk (rFree roots)) (be64 n) >>= neighbour)
+      case mext of
+        Just (s, l) | s <= n && n < s + l → refuse (Integrity (SuppliedPageDoubleOwned pg))
+        _ → Right edit'
 
 isRecordTree ∷ TreeId → Bool
 isRecordTree t = t == TreeRuns || t == TreeLinks || t == TreeTodo
@@ -603,6 +646,11 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
       listN = length replacedRec
       needRetire = listN > 0
   if listN > maxListPages then refuse (Capacity (ListTooLarge listN)) else pure ()
+  -- the backlog of retired pages is bounded: an ordinary plan that would add past it waits
+  -- for a reader to release and for maintenance to reclaim
+  if cls == Ordinary && toInteger (rRetiredPages roots) + toInteger listN > toInteger maxRetiredPages
+    then refuse (Capacity (RetirementBacklog (fromIntegral (min (toInteger (maxBound ∷ Int)) (toInteger (rRetiredPages roots)))) listN))
+    else pure ()
   if d == 0 && not needRetire
     then
       if next == hdr
@@ -626,9 +674,12 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
       let retireRoot0 = fmap Disk (rRetire roots)
       (retireRoot1, bkEdit1) ← case listPage of
         Nothing → pure (retireRoot0, bkEdit0)
-        Just lp →
+        Just lp → do
           let (k, v) = encodeRetire version' (Retire lp (fromIntegral listN) 0)
-           in phase bkEdit0 (insertKey TreeRetire retireRoot0 k v)
+          (entryRoot, entryEdit) ← phase bkEdit0 (insertKey TreeRetire retireRoot0 k v)
+          -- every replaced page is indexed by its number under this entry's version; a page
+          -- already indexed is owned by two entries
+          foldM (indexRetired version') (entryRoot, entryEdit) replacedRec
       (freeRoot1, bkEdit2) ← phase bkEdit1 (consume (fmap Disk (rFree roots)) tk)
       (pagesBk, bkNos, slack) ← assign ident bkEdit2 [retireRoot1, freeRoot1] afterList
       let bkUsed = length pagesBk
@@ -640,7 +691,7 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
       -- No page may be overwritten that a committed or a pinned root still reaches,
       -- whatever the allocator's records say: the pages below the used space that this
       -- plan writes are each proven unreachable first.
-      bkEdit3 ← unreachable cfg roots pins SuppliedPageLive win [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit2
+      bkEdit3 ← provenFree cfg roots pins win (Set.fromList (take (tkLoose tk) (tkPages tk))) [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit2
       (rr', rl', rt') ← case recNos of
         [a, b, c] → Right (a, b, c)
         _ → refuse (Integrity CorruptCounters)
@@ -697,6 +748,11 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
   where
     protectedFor Ordinary = reservePages
     protectedFor Maintenance = 0
+    indexRetired ver (root, edit) pg = do
+      (existing, edit1) ← phase edit (lookupKey TreeRetire root (retiredKey pg))
+      case existing of
+        Just _ → refuse (Integrity (DoubleFree pg))
+        Nothing → phase edit1 (insertKey TreeRetire root (retiredKey pg) (be64 ver))
 
 headerOnly ∷ StoreConfig → StoreIdentity → Roots → TxClass → Delta → Header → Word64 → Edit → [(RecordKey, Maybe Record)] → P Plan
 headerOnly _ ident roots cls cand next version' edit writes = do
@@ -747,6 +803,7 @@ checkWindow bounds ident roots win = do
   if windowVersion win /= rVersion roots then refuse (Stale (StaleWindow (windowVersion win) (rVersion roots))) else pure ()
   if windowSize win > bdWindowPages bounds then refuse (Capacity (WindowExceeded (windowSize win))) else pure ()
   if windowBytes win > bdWindowBytes bounds then refuse (Capacity (WindowBytesExceeded (windowBytes win))) else pure ()
+  if windowProbeCount win > maxWindowProbes then refuse (Capacity (ProbesExceeded (windowProbeCount win))) else pure ()
 
 bumpWord ∷ Word64 → Maybe Word64
 bumpWord w = if w == maxBound then Nothing else Just (w + 1)
@@ -827,7 +884,7 @@ planReclaimPinned bounds cfg ident roots pins = reclaimWith bounds cfg ident roo
 reclaimWith ∷ Bounds → StoreConfig → StoreIdentity → Roots → [Pins] → Maybe Word64 → Window → Planned
 reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
   Left (OutNeed p) → Pending p
-  Left (OutProbe p) → PendingProbe p
+  Left (OutProbes ps) → PendingProbes ps
   Left (OutRefuse r) → Refused r
   Right r → r
   where
@@ -841,6 +898,8 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       (firstEntry, e0) ← phase (newEdit overlayBudgetBookkeeping win) (ceilKey TreeRetire False retireRoot BS.empty)
       case firstEntry of
         Nothing → pure NoWork
+        -- the retired-page index sorts after every entry: no entry key first means none left
+        Just (k, _) | BS.length k /= 8 → pure NoWork
         Just (k, v) → do
           (e, ret) ← maybe (refuse (Integrity MalformedRetirement)) pure (decodeRetire total k v)
           case oldest of
@@ -866,11 +925,13 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
     -- reader still pins (its version lowered past the reader) is corruption.
     notLive pages edit0 = do
       mapM_ (\pg@(PageNo n) → if n >= rHw roots then refuse (Integrity (RetiredPageLive pg)) else Right ()) pages
+      case [pg | pg ← pages, isNothing (windowProbeOf pg win)] of
+        missing@(_ : _) → Left (OutProbes missing)
+        [] → Right ()
       mapM_
         ( \pg → case windowProbeOf pg win of
-            Nothing → Left (OutProbe pg)
             Just (ProbeTree t _ _) | isRecordTree t → Right ()
-            Just _ → refuse (Integrity (RetiredPageLive pg))
+            _ → refuse (Integrity (RetiredPageLive pg))
         )
         pages
       unreachable cfg roots pins RetiredPageLive win pages edit0
@@ -879,6 +940,10 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       Right plan → Right (Planned plan)
       Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret remaining version' edit cs
       Left o → Left o
+    unindexRetired ver (root, edit) pg = do
+      (mv, edit1) ← phase edit (lookupKey TreeRetire root (retiredKey pg))
+      if fmap (\v → getBe64 v 0) mv /= Just ver then refuse (Integrity (RetiredIndexMismatch pg)) else pure ()
+      phase edit1 (deleteKey TreeRetire root (retiredKey pg))
     tooBig (Integrity (BookkeepingOverflow _)) = True
     tooBig (Capacity (TxnPagesExceeded _)) = True
     tooBig (Capacity (TxnRamExceeded _)) = True
@@ -886,7 +951,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
     chunkSizes n = let top = min n maxReclaimPages in takeWhile (>= 1) (iterate (`div` 2) top)
     tryChunk e ret remaining version' edit c = do
       let freed = take c remaining
-          m = bookkeepingReserve + 2 * c
+          m = bookkeepingReserve + 4 * c
           lp = retList ret
           done' = fromIntegral (retDone ret) + c
           finished = done' == fromIntegral (retCount ret)
@@ -907,18 +972,22 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
         Left p → refuse (Integrity (DoubleFree p))
         Right r → Right r
       let retireRoot = fmap Disk (rRetire roots)
+      -- every page this entry frees is indexed under this entry's version, and leaves the
+      -- index as it leaves the entry: an entry that names a page that is not retired under it
+      -- (a forged list or a lowered version) is refused before anything is freed
+      (retireRootI, bkEditI) ← foldM (unindexRetired e) (retireRoot, bkEdit2) freed
       (retireRoot1, bkEdit3) ←
         if finished
-          then phase bkEdit2 (deleteKey TreeRetire retireRoot (be64 e))
+          then phase bkEditI (deleteKey TreeRetire retireRootI (be64 e))
           else
             let (k', v') = encodeRetire e (ret {retDone = fromIntegral done' ∷ Word16})
-             in phase bkEdit2 (insertKey TreeRetire retireRoot k' v')
+             in phase bkEditI (insertKey TreeRetire retireRootI k' v')
       (encoded, bkNos, slack) ← assign ident bkEdit3 [retireRoot1, freeRoot2] (tkPages tk)
       let bkUsed = length encoded
       if bkUsed > m then refuse (Integrity (BookkeepingOverflow bkUsed)) else pure ()
       if bkUsed > bdPages bounds then refuse (Capacity (TxnPagesExceeded bkUsed)) else pure ()
       -- the pages this maintenance writes are as unreachable as any other plan's
-      bkEdit4 ← unreachable cfg roots pins SuppliedPageLive win [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit3
+      bkEdit4 ← provenFree cfg roots pins win (Set.fromList (take (tkLoose tk) (tkPages tk))) [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit3
       (retire', free') ← case bkNos of
         [a, b] → Right (a, b)
         _ → refuse (Integrity CorruptCounters)

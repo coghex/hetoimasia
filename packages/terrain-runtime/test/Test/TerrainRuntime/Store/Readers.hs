@@ -12,6 +12,7 @@
 module Test.TerrainRuntime.Store.Readers (spec) where
 
 import Control.Monad (foldM, forM_, when)
+import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Int (Int64)
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
@@ -157,7 +158,7 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     (h3, _, _) ← must (foldM (\s _ → churn s 30) (h2, ref1, g1) [1 .. 3 ∷ Int])
     let ArenaId a = siArena (hIdent h3)
         o = ownership a (siSource (hIdent h3)) (hStore h3) (diskRead (hDisk h3))
-        entries = sortOn' [(getBe64' k 0, (getBe64' v 0, getLe16' v 8)) | (TreeRetire, ls) ← owLeaves o, (k, v) ← ls]
+        entries = sortOn' [(getBe64' k 0, (getBe64' v 0, getLe16' v 8)) | (TreeRetire, ls) ← owLeaves o, (k, v) ← ls, BS.length k == 8]
         freeStarts = [getBe64' k 0 | (TreeFree, ls) ← owLeaves o, (k, _) ← ls]
         loosePage = case rLoose (storeRoots (hStore h3)) of
           (PageNo p : _) → [p]
@@ -190,7 +191,7 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     let ArenaId a = siArena (hIdent h3)
         roots = storeRoots (hStore h3)
         o = ownership a (siSource (hIdent h3)) (hStore h3) (diskRead (hDisk h3))
-        entries = sortOn' [(getBe64' k 0, (getBe64' v 0, getLe16' v 8)) | (TreeRetire, ls) ← owLeaves o, (k, v) ← ls]
+        entries = sortOn' [(getBe64' k 0, (getBe64' v 0, getLe16' v 8)) | (TreeRetire, ls) ← owLeaves o, (k, v) ← ls, BS.length k == 8]
         pageOf (PageNo n) = maybe (expectationFailure ("page " <> show n) >> fail "page") pure (diskRead (hDisk h3) (PageNo n))
     runsRoot ← maybe (expectationFailure "a runs root expected" >> fail "runs") pure (rRuns roots)
     rootBytes ← pageOf runsRoot

@@ -940,6 +940,7 @@ minimumRemovalRam ∷ Int
 minimumRemovalRam =
   minimumRemovalPages * pageSize
     + maxWindowBytes
+    + worstOwnershipBytes
     + overlayWorstBytes
     + (2 * hotNodes + 1) * hotNodeBytes
     + worstEditWrites * maxEntryBytes

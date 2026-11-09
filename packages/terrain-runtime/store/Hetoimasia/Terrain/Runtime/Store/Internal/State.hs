@@ -50,6 +50,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , maxWindowPages
   , windowPageBytes
   , maxWindowBytes
+  , maxWindowProbes
+  , maxRetiredPages
+  , worstOwnershipBytes
   , overlayWorstBytes
   , overlayBudgetRecord
   , overlayBudgetBookkeeping
@@ -146,6 +149,25 @@ windowPageBytes = pageSize + 128
 -- it really holds; a plan that needs more is refused with a typed result.
 maxWindowBytes ∷ Int
 maxWindowBytes = 1310720
+
+-- | The most page probes a plan's window may hold: every page it writes below the used
+-- space is probed once ('maxTxnPages'), and a reclamation chunk probes the pages it
+-- frees beside the bookkeeping pages it writes.
+maxWindowProbes ∷ Int
+maxWindowProbes = 512
+
+-- | The most retired pages that may be outstanding when an ordinary plan adds more. Every
+-- retired page is indexed in the retirement tree by its number, so a plan can prove in one
+-- descent that a page it overwrites is not still owned by an entry; the index is bounded by
+-- bounding the backlog (a reader's pin holds it). A plan that would add past it is refused
+-- with a typed result until a reader releases and maintenance has reclaimed. Maintenance
+-- never adds to it.
+maxRetiredPages ∷ Int
+maxRetiredPages = 16384
+
+-- | The most accounted bytes of the ownership proof: the probes a window keeps.
+worstOwnershipBytes ∷ Int
+worstOwnershipBytes = maxWindowProbes * probeBytes
 
 -- | The most accounted bytes of new (overlay) pages the record trees of one plan may
 -- hold while it works: the 256 pages it may write at their packed size and a margin.
