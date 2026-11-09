@@ -231,6 +231,7 @@ test-suite terrain-render-2d-tests
         Test.TerrainRender2D.Material
         Test.TerrainRender2D.Oracle
         Test.TerrainRender2D.Projection
+        Test.TerrainRender2D.ModelAtBand
         Test.TerrainRender2D.ReferenceTint
         Test.TerrainRender2D.TexelRule
         Test.TerrainRender2D.Spec
