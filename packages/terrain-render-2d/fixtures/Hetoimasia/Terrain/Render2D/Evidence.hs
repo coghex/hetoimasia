@@ -30,9 +30,10 @@
 -- The art is supplied by the caller from the independently decoded source images: this module
 -- reads no file and calls neither the atlas nor the planner.
 --
--- A pixel centre within a sixteenth of a texel of a texel boundary of a quad it depends on is
--- 'Ambiguous', never a guess, unless the caller states that the scene's centres lie exactly on
--- boundaries (then the rule decides: the higher texel on an interior boundary).
+-- A pixel centre within 1/1000 texel of the threshold of a texel boundary of a quad it depends on (the
+-- boundary less the 1/128 texel bias) or of a canvas edge is 'Ambiguous', never a guess, unless the
+-- caller states that the scene's centres lie on boundaries on purpose, or that every pixel must be
+-- decided (then the rule decides, exactly, in rational arithmetic).
 --
 -- State, ownership and lifetime: none. Every value is immutable.
 module Hetoimasia.Terrain.Render2D.Evidence
@@ -437,7 +438,8 @@ data Expected
       , expectedLinear ∷ !(Double, Double, Double)
       , expectedTexel ∷ !(Int, Int)
       }
-  | -- | The point is within a sixteenth of a texel boundary, or the model cannot decide it.
+  | -- | The point is within 1/1000 texel of the threshold of a texel boundary or of the canvas's edge, or
+  -- the model cannot decide it.
     Ambiguous !String
   deriving stock (Eq, Show)
 
@@ -516,10 +518,9 @@ expectedAtMode exact art light sc camera plan pixel = case pixelWorldPoint plan 
           let (cx, cy) = hqCorner q
               fu = sx - fromInteger cx
               fv = sy - fromInteger cy
-              nearBoundary t = let f = t - fromInteger (floor t) in f < 1 / 16 || f > 15 / 16
            in case (texelOf 96 fu, texelOf 64 fv) of
                 (Just u, Just v)
-                  | not exact && (nearBoundary fu || nearBoundary fv) → Ambiguous ("a texel boundary of " <> show (hqCell q) <> " " <> show (hqRole q))
+                  | not exact && (undecided 96 fu || undecided 64 fv) → Ambiguous ("a texel boundary of " <> show (hqCell q) <> " " <> show (hqRole q))
                   | otherwise →
                       let (cr, cg, cb, ca) = artColour art (hqColour q) u v
                           (mr, mg, mb, ma) = artMap art (hqMap q) u v
@@ -538,6 +539,23 @@ texelOf ∷ RealFrac a ⇒ Int → a → Maybe Int
 texelOf n t
   | t < 0 || t >= fromIntegral n = Nothing
   | otherwise = Just (min (n - 1) (floor (t + fromRational texelBias)))
+
+-- | Whether a canvas offset @t@ along an axis of @n@ texels is too close to what decides its texel for
+-- a device whose float32 interpolation is not exact to be judged: within 'undecidedBand' of the
+-- threshold @k - texelBias@ of any interior texel boundary @k@, or of the canvas's outer edge. Only the
+-- banded 'expectedAt' (an unsnapped scene at a fractional scale or pan, whose pixel centres wander
+-- across texel boundaries by no rule of the scene) skips such a pixel and counts it as ambiguous;
+-- 'expectedAtExact' decides every pixel.
+undecided ∷ RealFrac a ⇒ Int → a → Bool
+undecided n t = nearThreshold || t < band || t > fromIntegral n - band
+  where
+    band = fromRational undecidedBand
+    biased = t + fromRational texelBias
+    nearThreshold = let f = biased - fromInteger (floor biased) in f < band || f > 1 - band
+
+-- | The half-width of the undecided band, in texels: 1/1000, the owner's 2026-11-09 amendment v2.
+undecidedBand ∷ Rational
+undecidedBand = 1 / 1000
 
 -- | The expectation at every pixel of a scene's target, row by row, top to bottom.
 expectedImage ∷ ArtSource → HandLight → Scene → CellPlan → [[Expected]]

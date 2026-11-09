@@ -93,16 +93,16 @@ samplingSpec = describe "sampling" $ do
     -- u = 0.5 -> i 2; u = 0.75 -> i 3; u = 1 -> i 3, the last, parent column 4 (uncovered), and
     -- not parent column 5, which belongs to no texel of the region.
     map (\u → regionViewCoverageSample r u 0) [0, 0.25, 0.5, 0.75, 1] `shouldBe` map Just [True, False, True, False, False]
-    -- More than the bias below the boundary the lower texel is selected: 0.2499 -> i 0 (covered).
-    regionViewCoverageSample r 0.2499 0 `shouldBe` Just True
+    -- More than the bias below the boundary the lower texel is selected: 0.24 -> i 0 (covered).
+    regionViewCoverageSample r 0.24 0 `shouldBe` Just True
   it "selects the higher texel within the bias below an interior boundary, the lower beyond it" $ do
-    -- The rule: i = min (w - 1) (floor (clamp u 0 1 × w + 1/10000)). The bias is 1/10000 of a texel,
-    -- so for 4 texels the lower texel is kept only below 1/4 - 1/40000 = 0.249975 exactly.
-    texelBias `shouldBe` 1 % 10000
-    texelIndex 4 0.2499749999 `shouldBe` Just 0
-    texelIndex 4 0.2499750001 `shouldBe` Just 1
-    texelIndexExact 4 (1 % 4 - 1 % 40000) `shouldBe` 1 -- exactly on the bias: floor 1
-    texelIndexExact 4 (1 % 4 - 1 % 40000 - 1 % 1000000000) `shouldBe` 0
+    -- The rule: i = min (w - 1) (floor (clamp u 0 1 × w + 1/128)). The bias is 1/128 of a texel,
+    -- so for 4 texels the lower texel is kept only below 1/4 - 1/512 = 127/512 = 0.248046875 exactly.
+    texelBias `shouldBe` 1 % 128
+    texelIndex 4 (127 / 512 - 1.0e-9) `shouldBe` Just 0
+    texelIndex 4 (127 / 512) `shouldBe` Just 1
+    texelIndexExact 4 (127 % 512) `shouldBe` 1 -- exactly on the bias: floor 1
+    texelIndexExact 4 (127 % 512 - 1 % 1000000000) `shouldBe` 0
   it "selects the higher texel at every interior boundary even where the nearest Double lies below it" $
     mapM_
       ( \(n, k) →

@@ -26,7 +26,7 @@ import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), loadAtlasStyl
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Material
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightSettings, pushBlockBytes)
-import Hetoimasia.Terrain.Render2D.Vulkan.Material (lightPush, terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl, terrainMaterialUnbiasedControl)
+import Hetoimasia.Terrain.Render2D.Vulkan.Material (lightPush, terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl, terrainMaterialUnbiasedControl, terrainMaterialStaleBiasControl)
 import Test.Hspec (Spec, beforeAll, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 -- | The style's two packed parents bound to registered textures 3 (colour) and 4 (normal).
@@ -92,6 +92,11 @@ spec = describe "Terrain material, device-free (TRA-17)" $ do
     it "declares the unbiased-index negative control with the same layout, so only the texel bias differs" $ do
       definedFacts terrainMaterialUnbiasedControl `shouldBe` definedFacts terrainMaterial
       definedPush terrainMaterialUnbiasedControl `shouldBe` definedPush terrainMaterial
+    it "declares the stale-bias negative control with the same layout, compiled to its own shaders" $ do
+      definedFacts terrainMaterialStaleBiasControl `shouldBe` definedFacts terrainMaterial
+      definedPush terrainMaterialStaleBiasControl `shouldBe` definedPush terrainMaterial
+      definedTranslucent terrainMaterialStaleBiasControl `shouldSatisfy` (/= definedTranslucent terrainMaterial)
+      definedTranslucent terrainMaterialStaleBiasControl `shouldSatisfy` (/= definedTranslucent terrainMaterialUnbiasedControl)
     it "compiles the unbiased control to different shaders than the terrain material, whose shader carries the bias" $ do
       definedTranslucent terrainMaterialUnbiasedControl `shouldSatisfy` (/= definedTranslucent terrainMaterial)
       definedCutout terrainMaterialUnbiasedControl `shouldSatisfy` isJust

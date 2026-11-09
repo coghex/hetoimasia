@@ -25,10 +25,12 @@
 -- 'texelIndex' is THE texel-index rule of every terrain consumer, stated here once. For a
 -- region of width @w@ and a normalized coordinate @u@,
 --
--- > i = min (w - 1) (floor (clamp u 0 1 × w + texelBias))      texelBias = 1/10000
+-- > i = min (w - 1) (floor (clamp u 0 1 × w + texelBias))      texelBias = 1/128
 --
 -- and the same for the other axis. The bias is the owner's 2026-11-09 Q-13 decision: without
--- it float32 interpolation selects the lower texel at exact interior boundaries on the device.
+-- it float32 interpolation selects the lower texel at exact interior boundaries on the device (and
+-- 1/10000 was measured too small at pixel-snapped zooms 9/8 and 5/4: the device read the lower texel
+-- within 1.02e-4 texel of a boundary; amendment v2 of the same day chose 1/128).
 -- The shader's colour and normal samples, CPU coverage and picking and the independent
 -- expected model all use this one rule, evaluated here and in the expected model exactly, in
 -- rational arithmetic. An interior texel boundary selects the higher index, the region's outer
@@ -223,10 +225,10 @@ regionViewIdentity view = RegionIdentity (digest 14695981039346656037 fnv) (dige
     fnv h w = (h `xor` w) * 1099511628211
     mix h w = rotateL (h `xor` w) 23 * 0x9E3779B97F4A7C15 + w
 
--- | The texel bias of the sampling rule, in texels: @1/10000@. Named here once; the shader's
+-- | The texel bias of the sampling rule, in texels: @1/128@. Named here once; the shader's
 -- literal is made from it and every other consumer applies 'texelIndex' or 'texelIndexExact'.
 texelBias ∷ Rational
-texelBias = 1 % 10000
+texelBias = 1 % 128
 
 -- | The rule for an exact coordinate: @min (n - 1) (floor (clamp u 0 1 × n + texelBias))@, in an
 -- extent of @n@ (at least 1) texels.

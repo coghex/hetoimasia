@@ -39,7 +39,7 @@
 -- bottom edges outside. The two triangles share the diagonal, which lies
 -- inside the rectangle, so a centre on it is covered by the quad. A centre on
 -- an outer edge shared by two adjacent quads therefore belongs to exactly one.
--- The texel index along an axis is 'texelIndexExact' (the one rule, with its 1/10000 bias,
+-- The texel index along an axis is 'texelIndexExact' (the one rule, with its 1/128 bias,
 -- defined in "Hetoimasia.Asset.Image.Region") of the exact rational position of the centre
 -- across the drawn rectangle: an interior texel boundary selects the higher index, nothing
 -- is sampled outside the rectangle merely because UVs clamp, and no floating rounding can

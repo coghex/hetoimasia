@@ -370,7 +370,7 @@ fractionalOcclusion = describe "omission of hidden cells under the transforms as
         full = planScene unproved scene
     tilesOf plan `shouldSatisfy` Set.member rear
     -- The pixel centre (159, 125) lies on the rounded edge shared by the rear block and its right
-    -- neighbour. Under the texel rule with its 1/10000 bias (the higher texel on a boundary) the
+    -- neighbour. Under the texel rule with its 1/128 bias (the higher texel on a boundary) the
     -- edge texel is the neighbour's, and the plan that kept the rear block answers it exactly so.
     hitCellOf (pickPixel plan (159, 125)) `shouldBe` Just (tileAt 1 0 0)
     hitCellOf (pickPixel plan (159, 125)) `shouldBe` hitCellOf (pickPixel full (159, 125))

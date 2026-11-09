@@ -31,12 +31,13 @@ module Hetoimasia.Terrain.Render2D.Vulkan.Material
   , terrainMaterialEquivalent
   , terrainMaterialInsetControl
   , terrainMaterialUnbiasedControl
+  , terrainMaterialStaleBiasControl
   , lightPush
   ) where
 
 import Hetoimasia.Render.TwoD.Vulkan.Material
 import Hetoimasia.Terrain.Render2D.Material (recordLayout)
-import Hetoimasia.Terrain.Render2D.Vulkan.Source (lightPush, terrainSource, terrainSourceEquivalent, terrainSourceInsetControl, terrainSourceUnbiasedControl)
+import Hetoimasia.Terrain.Render2D.Vulkan.Source (lightPush, terrainSource, terrainSourceEquivalent, terrainSourceInsetControl, terrainSourceUnbiasedControl, terrainSourceStaleBiasControl)
 
 -- | The terrain material, cutout-capable, with its checked variants.
 terrainMaterial ∷ DefinedMaterial
@@ -89,5 +90,19 @@ terrainMaterialUnbiasedControl =
          , declaredRecord = recordLayout
          , declaredPush = lightPush
          , declaredSource = terrainSourceUnbiasedControl
+         }
+   )
+
+-- | A negative control's material, never a terrain material: the terrain's own declaration with the
+-- first amendment's @1/10000@ bias, measured too small at pixel-snapped zooms 9/8 and 5/4. The
+-- evidence shows its judge rejecting it there; nothing draws terrain with it.
+terrainMaterialStaleBiasControl ∷ DefinedMaterial
+terrainMaterialStaleBiasControl =
+  $( defineMaterial
+       MaterialDeclaration
+         { declaredCutoutCapable = True
+         , declaredRecord = recordLayout
+         , declaredPush = lightPush
+         , declaredSource = terrainSourceStaleBiasControl
          }
    )

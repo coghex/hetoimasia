@@ -6,7 +6,7 @@
 -- its keys, the picker, the atlas adaptation or the material. Here its frontmost covered quad at
 -- every pixel it can decide is compared with what the picker finds, for every shape in every
 -- facing, roofs and cavities, disconnected spans, ramps and corners, cutaways, and mixed and fog
--- cells. A pixel the model calls ambiguous (a texel boundary within a sixteenth) is counted and
+-- cells. A pixel the model calls ambiguous (within 1/1000 texel of a texel threshold or a canvas edge) is counted and
 -- never compared; a scene whose compared or covered count is zero fails, so no scene passes
 -- without judging anything.
 module Test.TerrainRender2D.Expectation (spec) where

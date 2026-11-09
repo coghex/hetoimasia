@@ -107,7 +107,7 @@ import Hetoimasia.Terrain.Render2D.Camera (CameraState, camClip, camFacing, camR
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Scenes
-import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl, terrainMaterialUnbiasedControl)
+import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl, terrainMaterialStaleBiasControl, terrainMaterialUnbiasedControl)
 import Hetoimasia.Terrain.Shape (allViewFacings)
 import Test.GPU.Vulkan.Native.OrderedPath
   ( Evidence
@@ -192,9 +192,12 @@ data Variant
   | -- | A control: the region coordinate interpolated between half-texel-inset endpoints, which
     -- shifts the interior texel boundaries (a third, control-only material).
     HalfTexelInset
-  | -- | A control: the shader's texel index without the 1/10000 bias (a fourth, control-only material),
+  | -- | A control: the shader's texel index without the 1/128 bias (a fourth, control-only material),
     -- the rule the Q-13 counterexample was measured under; judged on the exact-boundary scenes.
     UnbiasedIndex
+  | -- | A control: the shader's texel index with the first amendment's 1/10000 bias (a fifth,
+    -- control-only material), which the device measured too small at pixel-snapped zooms 9/8 and 5/4.
+    StaleBias
   | -- | A control: every quad's map region is the next region of the normal atlas (a wrong, in effect
     -- rotated, mask: another shape's silhouette and normals).
     WrongMapRegion
@@ -223,10 +226,11 @@ suffixOf = \case
   PickThroughFog → "-control-pick-through-fog"
   HalfTexelInset → "-control-half-texel-inset"
   UnbiasedIndex → "-control-unbiased-index"
+  StaleBias → "-control-stale-bias-1e-4"
   BackmostPick → "-control-pick-through-nearer"
 
 isControl ∷ Variant → Bool
-isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, UnbiasedIndex, WrongMapRegion, PickThroughFog, BackmostPick]
+isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, UnbiasedIndex, StaleBias, WrongMapRegion, PickThroughFog, BackmostPick]
 
 -- | What a fixture must show, each by a named probe that is determinate for the oracle and differs
 -- from its contrast.
@@ -370,9 +374,8 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Clipped] Dynamic (viewportOffset 0.125)
          , spec defaultLight [Foreground] Dynamic (capTarget (96, 64) (atZoom 0.125 scaledTarget))
          , spec defaultLight [Foreground] Dynamic snappedZoom2
-         , exactly (spec defaultLight [Foreground, SnapSensitive] Dynamic (snapped {sceneName = "snapped-9-8", sceneZoom = 1.125}))
-         , exactly (spec defaultLight [Foreground, SnapSensitive] Dynamic (snapped {sceneName = "snapped-5-4", sceneZoom = 1.25}))
          ]
+      <> [exactly (spec defaultLight [Foreground, SnapSensitive] Dynamic sc) | sc ← snappedScenes]
       -- Lighting: the fixed world sun with the camera turned, and the sun varied at a fixed camera.
       <> [spec defaultLight [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners facing)) | facing ← [FaceSouth, FaceWest]]
       <> [spec light [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners FaceSouth)) | light ← lights, lightLabel light /= "dark"]
@@ -396,6 +399,7 @@ specs profile = case profile of
          ]
       -- The Q-13 negative control: the same exact-boundary fixtures drawn without the texel bias.
       <> [exactBoundaryWith UnbiasedIndex shape facing | (shape, facing) ← exactBoundaryCases]
+      <> [staleBiasFixture sc | sc ← snappedScenes]
 
 -- | The ramps and corners with pixel snapping on at zoom 1, the camera a fraction of a pixel off
 -- the pixel grid. At a whole-number scale a nearest-sampled quad cannot change when the view is
@@ -413,6 +417,16 @@ snappedZoom2 = snapped
 -- pixel is two texels wide). The expectation is the rule itself, in exact arithmetic.
 exactBoundary ∷ Int → ViewFacing → Scene
 exactBoundary shape facing = (newScene ("exact-boundary-" <> show shape <> "-" <> show facing) [Cell 0 0 0 1 shape "loam"] (64, 48)) {sceneFacing = facing, sceneZoom = 0.5}
+
+-- | The snapped scenes at the fractional scales where 1/10000 was measured too small, with the
+-- reference's own names, and their fixtures: judged exactly and drawn by the terrain material; drawn
+-- by the stale-bias control after an ordinary pass, which must be rejected on the snapped pass.
+snappedScenes ∷ [Scene]
+snappedScenes = [snapped {sceneName = "snapped-9-8", sceneZoom = 1.125}, snapped {sceneName = "snapped-5-4", sceneZoom = 1.25}]
+
+staleBiasFixture ∷ Scene → Spec
+staleBiasFixture sc =
+  Spec (sceneName sc <> "-beside-ordinary" <> suffixOf StaleBias) [shapeMatrixCell 0 FaceSouth 1, sc] StaleBias defaultLight [Foreground] (Just 1) [] Nothing
 
 -- | The shapes and facings of the exact-boundary fixtures and of their negative control.
 exactBoundaryCases ∷ [(Int, ViewFacing)]
@@ -471,6 +485,7 @@ data Ctx = Ctx
   , ctxSecond ∷ !MaterialRef
   , ctxInset ∷ !MaterialRef
   , ctxUnbiased ∷ !MaterialRef
+  , ctxStale ∷ !MaterialRef
   , ctxDevice ∷ !Text
   }
 
@@ -573,6 +588,7 @@ prepare profile host directory device style singles = do
                   second ← Render.registerMaterial renderer terrainMaterialEquivalent
                   inset ← Render.registerMaterial renderer terrainMaterialInsetControl
                   unbiased ← Render.registerMaterial renderer terrainMaterialUnbiasedControl
+                  stale ← Render.registerMaterial renderer terrainMaterialStaleBiasControl
                   pure
                     ( Right
                         Ctx
@@ -596,6 +612,7 @@ prepare profile host directory device style singles = do
                           , ctxSecond = second
                           , ctxInset = inset
                           , ctxUnbiased = unbiased
+                          , ctxStale = stale
                           , ctxDevice = device
                           }
                     )
@@ -726,8 +743,9 @@ runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
             ReversedKeys → [reversedKey (adaptedInstance (ctxPrimary ctx) adapted e) | e ← entries]
             HalfTexelInset → [adaptedInstance (ctxInset ctx) adapted e | e ← entries]
             UnbiasedIndex → [adaptedInstance (ctxUnbiased ctx) adapted e | e ← entries]
+            StaleBias → [adaptedInstance (ctxStale ctx) adapted e | e ← entries]
             _ → [adaptedInstance (ctxPrimary ctx) adapted e | e ← entries]
-          held = [(ref, adaptedMaterialData adapted) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxInset ctx, ctxUnbiased ctx]]
+          held = [(ref, adaptedMaterialData adapted) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxInset ctx, ctxUnbiased ctx, ctxStale ctx]]
       view ← either (\refused → Left ("the view: " <> describeMaterialRefusal refused)) Right (terrainView plan adapted held [WorldLayer DepthEnabled instances])
       pure (Part sc plan camera shape (Pass (OffscreenTarget (shapeRef shape)) (ClearColour 0 0 0 1) [view]) adapted)
     reversedKey inst = inst {instanceDepthKey = 16777215 - instanceDepthKey inst}
@@ -862,7 +880,7 @@ renderSnapshot ctx s parts = do
       marks ← registeredMarks (ctxTextures ctx)
       buffers ← retainedBuffers (ctxRetained ctx)
       let shapes = map partShape parts
-          models = Map.fromList ([(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx]] <> [(ctxInset ctx, terrainModelInsetControl), (ctxUnbiased ctx, terrainModelUnbiasedControl)])
+          models = Map.fromList ([(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx]] <> [(ctxInset ctx, terrainModelInsetControl), (ctxUnbiased ctx, terrainModelUnbiasedControl), (ctxStale ctx, terrainModelStaleBiasControl)])
           decodedAt = (`Map.lookup` ctxDecoded ctx)
           art = styleArt (ctxStyle ctx)
           light = lightHand (specLight s)
@@ -959,7 +977,7 @@ renderSnapshot ctx s parts = do
           centreOf (x, y) = (x - gridW `div` 2) ^ (2 ∷ Int) + (y - gridH `div` 2) ^ (2 ∷ Int)
           controlDiffers
             | specVariant s `elem` [BackmostPick, PickThroughFog] = Just (not (null pickProblems))
-            | specVariant s == UnbiasedIndex = Just (any ((> 0) . indMismatchCount) (drop 1 independents))
+            | specVariant s `elem` [UnbiasedIndex, StaleBias] = Just (any ((> 0) . indMismatchCount) (drop 1 independents))
             | isControl (specVariant s) = Just (any mismatchAt namedPixels)
             | otherwise = Nothing
           readbackMissing = not (completeReadback (map (sceneTarget . partScene) parts) (resultProbes result))
@@ -991,7 +1009,7 @@ renderSnapshot ctx s parts = do
           -- ('rejected' and 'controlDiffers', above), and only the first, ordinary pass keeps its
           -- oracle verdicts.
           finished
-            | specVariant s == UnbiasedIndex = assessed {resultProbes = concat (take 1 perPass)}
+            | specVariant s `elem` [UnbiasedIndex, StaleBias] = assessed {resultProbes = concat (take 1 perPass)}
             | otherwise = assessed
           factsExtra =
             Extra

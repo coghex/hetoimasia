@@ -31,7 +31,7 @@
 -- after the local texel is chosen, so a region never reads a neighbour; each atlas has one level.
 -- Both samples are unconditional, as the implicit derivatives require.
 --
--- @texelBias@ is @1/10000@ of a texel, the owner's 2026-11-09 Q-13 decision, and 'texelIndex' of
+-- @texelBias@ is @1/128@ of a texel, the owner's 2026-11-09 Q-13 decision (amendment v2), and 'texelIndex' of
 -- "Hetoimasia.Asset.Image.Region" is the rule's one definition: the shader's colour and normal
 -- samples (its literal is made from the constant), CPU coverage and picking and the independent
 -- expected model all use it, so an interior texel boundary selects the higher texel even though
@@ -93,6 +93,7 @@ module Hetoimasia.Terrain.Render2D.Material
   , terrainModel
   , terrainModelInsetControl
   , terrainModelUnbiasedControl
+  , terrainModelStaleBiasControl
   ) where
 
 import Data.ByteString (ByteString)
@@ -400,6 +401,12 @@ terrainModel = modelWith (centreWith (fromRational texelBias))
 -- independent judge, which states the specified rule, rejects it.
 terrainModelUnbiasedControl ∷ MaterialModel
 terrainModelUnbiasedControl = modelWith (centreWith 0)
+
+-- | The model of the stale-bias negative control (never a terrain rule): the first amendment's
+-- @1/10000@ bias, which the device measured too small at pixel-snapped zooms 9/8 and 5/4. As for the
+-- unbiased control, the oracle is given this model so it agrees with the control's own material.
+terrainModelStaleBiasControl ∷ MaterialModel
+terrainModelStaleBiasControl = modelWith (centreWith 1.0e-4)
 
 -- | The texel the local index selects, at its centre, in the atlas, with this bias in texels: the
 -- origin is added after.

@@ -28,13 +28,14 @@ module Hetoimasia.Terrain.Render2D.Vulkan.Source
   , terrainSourceEquivalent
   , terrainSourceInsetControl
   , terrainSourceUnbiasedControl
+  , terrainSourceStaleBiasControl
   , lightPush
   ) where
 
 import Hetoimasia.Asset.Image.Region (texelBias)
 import Hetoimasia.Render.TwoD.Vulkan.MaterialSources (PushField (..), PushType (..))
 
--- | The texel bias as a GLSL float literal, made from the one definition 'texelBias' (1/10000 of a
+-- | The texel bias as a GLSL float literal, made from the one definition 'texelBias' (1/128 of a
 -- texel, the owner's 2026-11-09 Q-13 decision) so the shader and every CPU consumer share it.
 biasLiteral ∷ String
 biasLiteral = glslFloat (fromRational texelBias ∷ Double)
@@ -56,6 +57,12 @@ terrainSource = terrainSourceWith biasLiteral
 -- evidence's exact-boundary fixtures must reject on the recorded device.
 terrainSourceUnbiasedControl ∷ String
 terrainSourceUnbiasedControl = terrainSourceWith "0.0"
+
+-- | A NEGATIVE CONTROL, never the terrain's own material: 'terrainSource' with the first amendment's
+-- @1/10000@ bias, which the device measured too small at pixel-snapped zooms 9/8 and 5/4 (it read the
+-- lower texel within 1.02e-4 texel of a boundary). The evidence's snapped fixtures must reject it.
+terrainSourceStaleBiasControl ∷ String
+terrainSourceStaleBiasControl = terrainSourceWith "1.0e-4"
 
 terrainSourceWith ∷ String → String
 terrainSourceWith bias =
