@@ -6,11 +6,12 @@
 -- adapter are held at named points by gates, so an example decides which side wins by what it does and never by how long it waits.
 module Test.LuaEngine.Terrain.Windows (spec) where
 
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
 import Data.Either (isLeft)
-import Control.Monad (unless, when)
-import Data.IORef (atomicModifyIORef', newIORef, writeIORef)
+import Control.Monad (unless, void, when)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
@@ -20,6 +21,7 @@ import Hetoimasia.LuaEngine.Terrain (TerrainFacade (..), TerrainHooks (..), noTe
 import Test.LuaEngine.Request.Profiles (counts)
 import Hetoimasia.Terrain.Residency (LimitsSpec (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
+import Test.Support.Bounded (bounded)
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -514,18 +516,26 @@ exhausting =
 spec ∷ Spec
 spec = describe "Terrain windows and banks" $ do
   it "commits nothing, and fails the host, when the removal's revision is one no Lua integer holds (a provider defect, never a wrapped number)" $ do
+    staged ← newEmptyMVar
+    commits ← newIORef (0 ∷ Int)
+    reached ← newIORef False
+    let -- the owner stages the removal (where the host records its defect), and commits nothing
+        probe = Probe $ \point → case point of
+          PointStaging _ → void (tryPutMVar staged ())
+          PointCommitted _ _ → atomicModifyIORef' commits (\seen → (seen + 1, ()))
+          _ → pure ()
     (_, ExceptionWithContext _ raised) ←
       fatalWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource remover)]) $ \world _ runtime →
-        withRigConfig defaultConfig {configFirstRevision = 9223372036854775807} $ \rig →
+        withRigProbe defaultConfig {configFirstRevision = 9223372036854775807} probe $ \rig →
           withFvm world runtime (presentationOver rig) $ \fvm → do
             _ ← spawn world fvm "modules-test" mainPath
             untilPrinted world "issued"
-            -- the owner fails at its next boundary, and the failure is the host's defect
-            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
-            either (\failure → show failure `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack) (const (expectationFailure "the owner did not fail")) failed
-            -- nothing was committed: an observer of the service, which is alive, finds the cell as it was, at the revision it had
-            observeCell rig (arenaName rig "modules-test" "main") (0, 0, 0) `shouldReturn` (9223372036854775807, Just "soil")
+            bounded (takeMVar staged)
+            writeIORef reached True
+    -- the owner failed with the host's defect, the body ran to its end, and the service committed nothing
     show raised `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack
+    readIORef reached `shouldReturn` True
+    readIORef commits `shouldReturn` 0
 
   it "answers retained-edit exhaustion as the same immediate busy, evicts no earlier edit and still serves a read" $
     withRigConfig smallEdits $ \rig →
@@ -773,9 +783,20 @@ spec = describe "Terrain windows and banks" $ do
             printed `shouldSatisfy` any (\line → "attach after close => false ; " `Text.isPrefixOf` line && "closed" `Text.isInfixOf` line)
 
   it "lets removals through up to the revision ceiling, a removal of air at the ceiling included, and refuses the one that would pass it with nothing committed" $ do
+    staged ← newEmptyMVar
+    stagings ← newIORef (0 ∷ Int)
+    commits ← newIORef (0 ∷ Int)
+    reached ← newIORef False
+    let -- the fourth removal, the one the ceiling refuses, is staged and never committed
+        probe = Probe $ \point → case point of
+          PointStaging _ → do
+            n ← atomicModifyIORef' stagings (\seen → (seen + 1, seen + 1))
+            when (n == 4) (void (tryPutMVar staged ()))
+          PointCommitted _ _ → atomicModifyIORef' commits (\seen → (seen + 1, ()))
+          _ → pure ()
     (_, ExceptionWithContext _ raised) ←
       fatalWorld (counts [(LuaIntegerMaximum, 40)]) (Layout [("lua/main.lua", scriptSource atCeiling)]) $ \world _ runtime →
-        withRigConfig defaultConfig {configFirstRevision = 39} $ \rig →
+        withRigProbe defaultConfig {configFirstRevision = 39} probe $ \rig →
           withFvm world runtime (presentationOver rig) $ \fvm → do
             _ ← spawn world fvm "modules-test" mainPath
             untilPrinted world "issued"
@@ -785,12 +806,15 @@ spec = describe "Terrain windows and banks" $ do
             -- at the ceiling a removal of air still succeeds, unchanged, at the revision it finds: it needs no revision beyond the ceiling
             printed `shouldContain` ["air removal at the ceiling\tsuccess\tfalse\t40"]
             -- the arena stands at the ceiling: a removal that would change it needs the next revision and is refused, a defect of the host's
-            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
-            either (\failure → show failure `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack) (const (expectationFailure "the owner did not fail")) failed
-            observeCell rig (arenaName rig "modules-test" "c") (0, 0, -1) `shouldReturn` (40, Just "soil")
+            bounded (takeMVar staged)
+            writeIORef reached True
     show raised `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack
+    readIORef reached `shouldReturn` True
+    -- and nothing of it was committed: the three removals that ended at or below the ceiling committed (two of them unchanged), the fourth did not
+    readIORef commits `shouldReturn` 3
 
   it "leaves no arena or lease behind when the host's adoption of an offered lease fails" $ do
+    reached ← newIORef False
     (_, ExceptionWithContext _ _) ←
       fatalWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener)]) $ \world _ runtime →
         withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopting = ioError (userError "adoption failed")} $ \rig →
@@ -800,7 +824,8 @@ spec = describe "Terrain windows and banks" $ do
             failed `shouldSatisfy` isLeft
             limitHeld (rgService rig) "arenas" `shouldReturn` 0
             limitHeld (rgService rig) "leases" `shouldReturn` 0
-    pure ()
+            writeIORef reached True
+    readIORef reached `shouldReturn` True
 
   it "gives a logical read ordered after a removal of the same cell the post-removal value and revision, reads prepared before the commit included" $
     withRig $ \rig →
@@ -889,31 +914,36 @@ spec = describe "Terrain windows and banks" $ do
           length (censusRequests census) `shouldBe` 0
           inspectInvariants (rgService rig) `shouldReturn` []
 
-  it "leaves no arena or lease behind when the host fails an open between building its lease and settling the request" $ do
-    (_, ExceptionWithContext _ _) ←
-      fatalWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener)]) $ \world _ runtime →
-        withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = ioError (userError "publication failed")} $ \rig →
-          withFvm world runtime (presentationOver rig) $ \fvm → do
-            _ ← admitOnly world fvm "modules-test" mainPath
-            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
-            failed `shouldSatisfy` isLeft
-            limitHeld (rgService rig) "arenas" `shouldReturn` 0
-            limitHeld (rgService rig) "leases" `shouldReturn` 0
-    pure ()
+  it "releases at once the lease an open built, when its instance stops between the build and the settlement, and leaves no arena or lease" $ do
+    gate ← newGate
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = holdAt gate} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → (`finally` openGate gate) $ do
+          spawned ← admitOnly world fvm "modules-test" mainPath
+          -- the host has built the lease into the instance's and not yet settled the request (the handle is not published): the instance stops
+          pumpUntilReached world gate
+          stopSpawned spawned
+          openGate gate
+          failure ← settledFailure spawned
+          isJust failure `shouldBe` False
+          -- the lease that was built and never published was released with the request's end: no arena and no lease are left
+          limitHeld (rgService rig) "arenas" `shouldReturn` 0
+          limitHeld (rgService rig) "leases" `shouldReturn` 0
 
-  it "leaves only the creator's lease behind when the host fails an attach between building its lease and settling the request" $ do
-    (_, ExceptionWithContext _ _) ←
-      fatalWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource attacher)]) $ \world _ runtime →
-        withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = ioError (userError "publication failed")} $ \rig → do
-          Right client ← registerClient (rgService rig)
-          Right opening ← openArena (rgService rig) client (arenaName rig "modules-test" "shared") soilOverStoneSpec
-          Right _ ← await (rgService rig) opening
-          withFvm world runtime (presentationOver rig) $ \fvm → do
-            _ ← admitOnly world fvm "modules-test" mainPath
-            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
-            failed `shouldSatisfy` isLeft
-            -- the attach's lease, built and not published, was released: the creator's is the only lease left, and its arena is live
-            limitHeld (rgService rig) "arenas" `shouldReturn` 1
-            limitHeld (rgService rig) "leases" `shouldReturn` 1
-    pure ()
-
+  it "releases at once the lease an attach built, when its instance stops between the build and the settlement, leaving only the creator's lease" $ do
+    gate ← newGate
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = holdAt gate} $ \rig → do
+      Right client ← registerClient (rgService rig)
+      Right opening ← openArena (rgService rig) client (arenaName rig "modules-test" "shared") soilOverStoneSpec
+      Right _ ← await (rgService rig) opening
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource attacher)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → (`finally` openGate gate) $ do
+          spawned ← admitOnly world fvm "modules-test" mainPath
+          pumpUntilReached world gate
+          stopSpawned spawned
+          openGate gate
+          failure ← settledFailure spawned
+          isJust failure `shouldBe` False
+          -- the attach's lease, built and never published, was released: the creator's is the only lease left, and its arena is live
+          limitHeld (rgService rig) "arenas" `shouldReturn` 1
+          limitHeld (rgService rig) "leases" `shouldReturn` 1
