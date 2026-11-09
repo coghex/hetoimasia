@@ -45,6 +45,8 @@ module Hetoimasia.Terrain.Render2D.Scenes
   , edgeScene
   , depthStack
   , pendingScene
+  , mixedShapeCell
+  , fogShapes
   , seamScene
   , seamScenesNegative
   , extremeScene
@@ -494,3 +496,25 @@ snappedAt label zoom = (if zoom >= 4 then shiftPan (dx, dy) else id) snapped {sc
     ax = 4.5 / (48 * z)
     ay = 4.5 / (24 * z)
     (dx, dy) = ((ax + ay) / 2, (ay - ax) / 2)
+
+
+-- | One cell of a shape whose solid is KNOWN beside an undiscovered void: the mixed cell, a known part and
+-- a fog part each with its own map, for the shape in the facing (shape 0, the full block, has no mixed
+-- form and is an ordinary cell). Every shape, every facing.
+mixedShapeCell ∷ Int → ViewFacing → Scene
+mixedShapeCell shape facing =
+  (singleShape shape facing)
+    { sceneName = "mixed-shape-" <> show shape <> "-" <> show facing
+    , sceneKnow = [((0, 0, 0), KnownSolid)]
+    }
+
+-- | The sixteen shapes of the matrix, every cell confirmed undiscovered: full fog, the generic fog quad
+-- (blank colour, the generic map) in the facing, whatever shape the terrain holds.
+fogShapes ∷ ViewFacing → Scene
+fogShapes facing =
+  base
+    { sceneName = "fog-shapes-" <> show facing
+    , sceneKnow = [((cellX c, cellY c, z), Undisc) | c ← sceneCells base, z ← [cellZ0 c .. cellZ1 c - 1]]
+    }
+  where
+    base = shapeMatrix facing 0.25

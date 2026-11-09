@@ -473,6 +473,16 @@ matrixExtensions =
     <> [spec defaultLight [Foreground, Varies] ColourHoles (shapeMatrixCell shape facing 1) | (shape, facing) ← [(5, FaceSouth), (9, FaceWest), (0, FaceEast)]]
     <> [(specMany "matrix-FaceSouth-0.25-colour-holes" [Foreground, Varies] [shapeMatrixCell shape FaceSouth 0.25 | shape ← [0 .. 15]]) {specVariant = ColourHoles}]
     <> [spec defaultLight [Foreground, Varies] ColourHoles (atZoom 0.125 (rampsCorners FaceSouth)), spec defaultLight [Foreground, Varies] ColourHoles (mixedScene FaceSouth)]
+    -- The full shape x facing x role matrix on the device, packed and single-image: every ordinary shape
+    -- (above), every applicable MIXED known/fog map (15 shapes, shape 0 has none) and full fog, per facing.
+    <> [ (specMany ("matrix-mixed-" <> show facing <> "-0.25" <> suffix) [Foreground, Varies] [atZoom 0.25 (mixedShapeCell shape facing) | shape ← [1 .. 15]]) {specVariant = variant}
+       | facing ← allViewFacings
+       , (suffix, variant) ← [("", Dynamic), ("-single-images", FromSingleImages)]
+       ]
+    <> [ (specMany ("matrix-fog-" <> show facing <> "-0.25" <> suffix) [Foreground] [fogShapes facing]) {specVariant = variant}
+       | facing ← allViewFacings
+       , (suffix, variant) ← [("", Dynamic), ("-single-images", FromSingleImages)]
+       ]
     <> sequences
 
 -- | The base of the supplied sequences: ramps and corners at zoom 1/8.

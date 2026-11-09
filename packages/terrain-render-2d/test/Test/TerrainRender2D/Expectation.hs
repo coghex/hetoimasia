@@ -48,6 +48,9 @@ spec = describe "Expectation" $ do
             <> [snappedAt (show zoom) zoom | zoom ← [0.125, 1.125, 1.25, 7.875, 8]]
             -- Seams across the region lattice, the zero seam and the legal coordinate extremes.
             <> [pendingScene facing | facing ← facings]
+            -- Every applicable mixed known/fog map in every facing, and full fog.
+            <> [atZoom 0.25 (mixedShapeCell shape facing) | shape ← [1 .. 15], facing ← facings]
+            <> [fogShapes facing | facing ← facings]
             <> [seamScene facing | facing ← facings]
             <> [seamScenesNegative facing | facing ← facings]
             <> [extremeScene high facing | high ← [True, False], facing ← [FaceSouth, FaceWest]]
