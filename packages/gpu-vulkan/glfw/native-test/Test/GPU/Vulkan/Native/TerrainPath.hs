@@ -402,7 +402,7 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Varies] WholeCellMask (atZoom 0.125 (rampsCorners FaceSouth))
          , spec defaultLight [Foreground, Varies] WrongFacingLight (atZoom 0.125 (rampsCorners FaceWest))
          , spec (mkLight "neither-effect-haze" 225 45 0.35 1 4 0.5 0.8 (0.72, 0.85, 0.95)) [Foreground, Varies] DepthReset (depthStack FaceSouth)
-         , spec defaultLight [Foreground, Varies] WrongOrder (depthStack FaceSouth)
+         , spec (mkLight "both-short-range" 225 45 0.35 1 4 0.5 0.8 (0.72, 0.85, 0.95)) [Foreground, Varies] WrongOrder (depthStack FaceSouth)
          , spec defaultLight [Foreground, Varies] SwappedColourOrigins (atZoom 0.25 (shapeMatrix FaceSouth 1))
          , spec defaultLight [Foreground, Varies] WholeAtlasRegion (atZoom 0.125 (rampsCorners FaceSouth))
          , spec defaultLight [Foreground, Varies] WrongTreatment (atZoom 0.125 (rampsCorners FaceSouth))
