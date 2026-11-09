@@ -126,7 +126,7 @@ import Test.GPU.Vulkan.Native.RetainedPath (RetainedHost (..), buildersWith)
 import Test.GPU.Vulkan.Native.TerrainJudge
 
 import Hetoimasia.Asset.Image (DecodedImage (..))
-import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), SingleImages (..), bindSingleImages, loadAtlasStyle, loadSingleImages)
+import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), SingleImages (..), bindSingleImages, holedStyle, loadAtlasStyle, loadSingleImages)
 import Hetoimasia.Terrain.Render2D.CellPick (CellHit (..), CellPickQuery (..), CellPickResult (..), pickCells)
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Material
@@ -178,6 +178,12 @@ data Variant
     ReleasedWhilePending
   | -- | 'ReleasedWhilePending' for retained chunks: two retained chunks and a dynamic remainder.
     RetainedReleasedWhilePending
+  | -- | The same terrain drawn with transparent holes punched in the colour art of loam and granite
+    -- (a colour atlas of its own, its coverage and assets rebuilt): a pixel is covered only where the
+    -- colour texel and the map texel are both opaque, and the holes are independent of the maps'.
+    ColourHoles
+  | -- | A control: drawn from the plain atlas and plan, judged against the holed art (colour holes ignored).
+    HolesIgnored
   | -- | A control: the depth keys' order inverted.
     ReversedKeys
   | -- | A control: every quad's map region is the full-block map (the whole-cell mask).
@@ -225,6 +231,8 @@ suffixOf = \case
   Retained → "-retained"
   OrderedWrapper → "-ordered-wrapper"
   ReversedKeys → "-control-reversed-overlap"
+  ColourHoles → "-colour-holes"
+  HolesIgnored → "-control-colour-holes-ignored"
   ReleasedWhilePending → "-released-while-pending"
   RetainedReleasedWhilePending → "-retained-released-while-pending"
   WholeCellMask → "-control-whole-cell-mask"
@@ -243,7 +251,7 @@ suffixOf = \case
   PickLoadingAsMiss → "-control-loading-as-miss"
 
 isControl ∷ Variant → Bool
-isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, UnbiasedIndex, StaleBias, WrongMapRegion, PickThroughFog, PickLoadingAsMiss, BackmostPick]
+isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, HolesIgnored, UnbiasedIndex, StaleBias, WrongMapRegion, PickThroughFog, PickLoadingAsMiss, BackmostPick]
 
 -- | What a fixture must show, each by a named probe that is determinate for the oracle and differs
 -- from its contrast.
@@ -396,6 +404,7 @@ specs profile = case profile of
          ]
       -- The Q-13 negative control: the same exact-boundary fixtures drawn without the texel bias.
       <> [spec defaultLight [Foreground] PickLoadingAsMiss (pendingScene FaceSouth)]
+      <> [spec defaultLight [Foreground, Varies] HolesIgnored (shapeMatrixCell 5 FaceSouth 1)]
       <> [exactBoundaryWith UnbiasedIndex shape facing | (shape, facing) ← exactBoundaryCases]
       <> [staleBiasFixture sc | sc ← staleBiasScenes]
       -- Last: these release the atlases' ownership (marked while their frames are pending), so nothing may
@@ -458,6 +467,11 @@ matrixExtensions =
     <> [spec defaultLight [Foreground] Dynamic (seamScenesNegative facing) | facing ← [FaceSouth, FaceNorth]]
     <> [spec defaultLight [Foreground, Varies] Dynamic (extremeScene high facing) | high ← [True, False], facing ← [FaceSouth, FaceEast]]
     <> [spec defaultLight [Foreground, Varies] Dynamic (pendingScene facing) | facing ← allViewFacings]
+    -- Transparent holes in the colour art, independent of the maps' holes: native scale for visible holes,
+    -- the matrix, ramps and mixed parts at the usual scales.
+    <> [spec defaultLight [Foreground, Varies] ColourHoles (shapeMatrixCell shape facing 1) | (shape, facing) ← [(5, FaceSouth), (9, FaceWest), (0, FaceEast)]]
+    <> [(specMany "matrix-FaceSouth-0.25-colour-holes" [Foreground, Varies] [shapeMatrixCell shape FaceSouth 0.25 | shape ← [0 .. 15]]) {specVariant = ColourHoles}]
+    <> [spec defaultLight [Foreground, Varies] ColourHoles (atZoom 0.125 (rampsCorners FaceSouth)), spec defaultLight [Foreground, Varies] ColourHoles (mixedScene FaceSouth)]
     <> sequences
 
 -- | The base of the supplied sequences: ramps and corners at zoom 1/8.
@@ -535,6 +549,10 @@ data Ctx = Ctx
   , ctxNormalH ∷ !Api.TextureHandle
   , ctxSingle ∷ !SingleImages
   , ctxSingleTextures ∷ !AtlasTextures
+  , ctxHoled ∷ !AtlasStyle
+  -- ^ The style with transparent colour holes, its colour atlas registered as a texture of its own.
+  , ctxHoledAtlas ∷ !AtlasTextures
+  , ctxHoledH ∷ !Api.TextureHandle
   , ctxUnmarked ∷ !Api.TextureHandle
   -- ^ The colour atlas registered a second time with its cutout mark overridden off.
   , ctxNormalAsColour ∷ !Api.TextureHandle
@@ -607,13 +625,15 @@ timed action = do
 -- | Make the renderer, the registries, the textures and both materials.
 prepare ∷ Profile → RetainedHost → FilePath → Text → AtlasStyle → SingleImages → IO (Either Text Ctx)
 prepare profile host directory device style singles = do
-  let images =
+  let holedOf = either (error . ("the holed style: " <>)) id (holedStyle style)
+      images =
         [ (styleColourImage style, Rgba8Srgb, DefaultMark)
         , (styleNormalImage style, Rgba8Linear, DefaultMark)
         , (styleColourImage style, Rgba8Srgb, OverrideMark False)
         , (styleNormalAsColour style, Rgba8Srgb, DefaultMark)
         ]
           <> [(decoded, if take 7 identity == "colour." then Rgba8Srgb else Rgba8Linear, DefaultMark) | (identity, decoded, _) ← singleImages singles]
+          <> [(styleColourImage holedOf, Rgba8Srgb, DefaultMark)]
   made ← OrderedPath.hostAct (retainedBase host) "making the renderer and the atlas textures" $ \construction → do
     renderer ← Render.makeRenderer (buildersWith (retainedSubmit host) construction) terrainConfiguration
     made' ← traverse (\(decoded, format, _) → constructImage construction (ImageDescription TextureImage format (decodedWidth decoded) (decodedHeight decoded) 1)) images
@@ -637,11 +657,12 @@ prepare profile host directory device style singles = do
               case registered of
                 Left failure → pure (Left failure)
                 Right entries@((colourH, colourD) : (normalH, normalD) : (unmarkedH, unmarkedD) : (asColourH, asColourD) : rest)
-                  | length rest == length (singleImages singles) →
+                  | length rest == length (singleImages singles) + 1
+                  , Just (holedEntry, _) ← Just (case reverse rest of lastEntry : _ → (lastEntry, ()); [] → error "no holed atlas entry") →
                       let singleHandles = Map.fromList (zip [identity | (identity, _, _) ← singleImages singles] (map fst rest))
-                       in case ((,,) <$> either (Left . show) Right (bindColourParent (styleColour style) colourH) <*> either (Left . show) Right (bindDataParent (styleNormal style) normalH) <*> bindSingleImages singles singleHandles) of
+                       in case ((,,,) <$> either (Left . show) Right (bindColourParent (styleColour style) colourH) <*> either (Left . show) Right (bindDataParent (styleNormal style) normalH) <*> bindSingleImages singles singleHandles <*> either (Left . show) Right (bindColourParent (styleColour holedOf) (fst holedEntry))) of
                  Left refused → pure (Left ("a parent could not be bound to its texture: " <> Text.pack refused))
-                 Right (colourBound, normalBound, singleBound) → do
+                 Right (colourBound, normalBound, singleBound, holedColourBound) → do
                   retained ← newRetained
                   primary ← Render.registerMaterial renderer terrainMaterial
                   second ← Render.registerMaterial renderer terrainMaterialEquivalent
@@ -663,10 +684,13 @@ prepare profile host directory device style singles = do
                           , ctxNormalH = normalH
                           , ctxSingle = singles
                           , ctxSingleTextures = singleBound
+                          , ctxHoled = holedOf
+                          , ctxHoledAtlas = packedTextures holedColourBound normalBound
+                          , ctxHoledH = fst holedEntry
                           , ctxUnmarked = unmarkedH
                           , ctxNormalAsColour = asColourH
                           , ctxAll = map fst entries
-                          , ctxDecoded = Map.fromList ([(colourH, colourD), (normalH, normalD), (unmarkedH, unmarkedD), (asColourH, asColourD)] <> [(h, d) | ((h, _), (_, d, _)) ← zip rest (singleImages singles)])
+                          , ctxDecoded = Map.fromList ([(colourH, colourD), (normalH, normalD), (unmarkedH, unmarkedD), (asColourH, asColourD)] <> [(h, d) | ((h, _), (_, d, _)) ← zip rest (singleImages singles)] <> [(fst holedEntry, snd holedEntry)])
                           , ctxPrimary = primary
                           , ctxSecond = second
                           , ctxInset = inset
@@ -784,6 +808,7 @@ runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
         Right parts → renderSnapshot ctx s parts
   where
     assets = case specVariant s of
+      ColourHoles → styleAssets (ctxHoled ctx)
       FromSingleImages → singleAssets (ctxSingle ctx)
       _ → styleAssets (ctxStyle ctx)
     planOf (index, sc) = case scenePlan assets sc of
@@ -791,6 +816,7 @@ runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
       Right plan → Right (index - 1, sc, plan, shapeOf index sc)
     texturesFor variant = case variant of
       FromSingleImages → ctxSingleTextures ctx
+      ColourHoles → ctxHoledAtlas ctx
       OrderedWrapper → withColourHandle (ctxUnmarked ctx) (ctxAtlas ctx)
       _ → ctxAtlas ctx
     draw variant (index, sc, plan, shape) = do
@@ -954,7 +980,10 @@ renderSnapshot ctx s parts = do
       let shapes = map partShape parts
           models = Map.fromList ([(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx]] <> [(ctxInset ctx, terrainModelInsetControl), (ctxUnbiased ctx, terrainModelUnbiasedControl), (ctxStale ctx, terrainModelStaleBiasControl)])
           decodedAt = (`Map.lookup` ctxDecoded ctx)
-          art = styleArt (ctxStyle ctx)
+          art = case specVariant s of
+            ColourHoles → styleArt (ctxHoled ctx)
+            HolesIgnored → styleArt (ctxHoled ctx)
+            _ → styleArt (ctxStyle ctx)
           light = lightHand (specLight s)
           -- Two grids per pass from the same exact expectation: the one the device read-back is judged
           -- by (an unsnapped scene's pixel near an interior threshold is 'Ambiguous' there, and

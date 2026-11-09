@@ -26,6 +26,7 @@ import Hetoimasia.Terrain.MapGen.Png (decodeRgba)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Test.Hspec
 import Test.TerrainRender2D.Art (loadFile)
+import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), holedStyle, loadAtlasStyle)
 import Test.TerrainRender2D.CellFixtures (loadAtlasParents, pickPixel)
 import Test.TerrainRender2D.Fixtures (tileAt)
 
@@ -53,6 +54,29 @@ spec = describe "Expectation" $ do
       verdict ← judge manifest assets art scene
       (sceneName scene, jMismatches verdict) `shouldBe` (sceneName scene, [])
       (sceneName scene, jCompared verdict > 0, jCovered verdict > 0) `shouldBe` (sceneName scene, True, True)
+  it "picks and models colour-alpha holes independently of the map's holes, and the holes change the answer" $ do
+    (manifest, assets, art) ← setupAll
+    style ← loadAtlasStyle 7 [("loam", "colour.loam"), ("granite", "colour.granite")]
+    holed ← either fail pure (holedStyle style)
+    let scenes = [shapeMatrix FaceSouth 1, rampsCorners FaceSouth, rampsCorners FaceEast, mixedScene FaceSouth]
+    forM_ scenes $ \scene → do
+      verdict ← judge manifest (styleAssets holed) (styleArt holed) scene
+      (sceneName scene, jMismatches verdict) `shouldBe` (sceneName scene, [])
+      jCovered verdict `shouldSatisfy` (> 0)
+      -- Where the colour art has a hole the map does not, a pixel that the plain art draws is not drawn.
+      plan ← either (\e → fail (show e)) pure (scenePlan assets scene)
+      holedPlan ← either (\e → fail (show e)) pure (scenePlan (styleAssets holed) scene)
+      let camera = sceneCameraFollowed scene
+          (w, h) = sceneTarget scene
+          differing =
+            length
+              [ ()
+              | y ← [0 .. h - 1], x ← [0 .. w - 1]
+              , let plain = expectedAt art defaultHandLight scene camera plan (x, y)
+                    withHoles = expectedAt (styleArt holed) defaultHandLight scene camera holedPlan (x, y)
+              , plain /= withHoles
+              ]
+      differing `shouldSatisfy` (> 50)
   it "answers loading exactly where a pending cell could lie in front, and not where it is proved behind" $ do
     (manifest, assets, art) ← setupAll
     verdicts ← forM facings $ \facing → judge manifest assets art (pendingScene facing)

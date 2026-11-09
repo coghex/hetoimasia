@@ -14,6 +14,8 @@
 module Hetoimasia.Terrain.Render2D.AtlasFixtures
   ( AtlasStyle (..)
   , loadAtlasStyle
+  , holedStyle
+  , holeAt
   , loadSingleImageStyle
   , SingleImages (..)
   , loadSingleImages
@@ -59,6 +61,8 @@ data AtlasStyle = AtlasStyle
   , styleNormalAsColour ∷ !DecodedImage
   -- ^ The same file decoded wrongly, as colour (sRGB, premultiplied): the negative control's
   -- wrong colour-versus-data treatment. Never the style's own texture.
+  , styleMaterialIds ∷ ![(MaterialId, String)]
+  -- ^ The authored materials the style adopted, with their colour region identities.
   , styleAssets ∷ !AssetSnapshot
   , styleArt ∷ !ArtSource
   -- ^ The source canvases, decoded independently of the atlases.
@@ -135,6 +139,7 @@ loadAtlasStyle version materials = do
       , styleColourImage = colourImage
       , styleNormalImage = normalImage
       , styleNormalAsColour = normalAsColour
+      , styleMaterialIds = ids
       , styleAssets = assets
       , styleArt = ArtSource {artColour = texelOf colourTable, artMap = texelOf table}
       }
@@ -223,3 +228,50 @@ loadSingleImageStyle version materials = do
   let handles = Map.fromList [(identity, textureHandle (fromIntegral (100 + index)) 1) | (index, (identity, _, _)) ← zip [0 ∷ Int ..] (singleImages images)]
   textures ← either (ioError . userError) pure (bindSingleImages images handles)
   pure (singleAssets images, textures, handles)
+
+
+-- | Whether the colour texel at this local position of a region is a hole in the holed style: an
+-- opaque-looking texel of the colour art made fully transparent, in 8 x 8 blocks, on a pattern that
+-- has nothing to do with any shape's map (so colour holes and map holes are independent).
+holeAt ∷ Int → Int → Bool
+holeAt x y = (x `div` 8 + y `div` 8) `mod` 3 == 0
+
+-- | The same style with transparent holes punched in the colour art of loam and granite: the colour
+-- atlas image, its binary coverage plane and content identity, the adopted assets and the
+-- independent source art all agree on the holes (a texel is a hole in each, by 'holeAt'). The normal
+-- atlas is untouched, so a covered pixel needs the colour texel AND the map texel opaque.
+holedStyle ∷ AtlasStyle → Either String AtlasStyle
+holedStyle style = do
+  level ← case decodedLevels (styleColourImage style) of
+    first : _ → Right first
+    [] → Left "the colour atlas holds no level"
+  let atlasW = fromIntegral (decodedWidth (styleColourImage style)) ∷ Int
+      manifest = styleManifest style
+      regionOf identity = case findRegion manifest identity of
+        Just (_, r) → Right (fromIntegral (regionX r) ∷ Int, fromIntegral (regionY r) ∷ Int, fromIntegral (regionW r) ∷ Int, fromIntegral (regionH r) ∷ Int)
+        Nothing → Left ("no region " <> identity)
+  regions ← traverse regionOf ["colour.loam", "colour.granite"]
+  let holeIndexes =
+        [ 4 * ((ry + y) * atlasW + (rx + x)) + c
+        | (rx, ry, rw, rh) ← regions
+        , y ← [0 .. rh - 1]
+        , x ← [0 .. rw - 1]
+        , holeAt x y
+        , c ← [0 .. 3]
+        ]
+      holed = ByteString.pack [if i `elem'` marks then 0 else b | (i, b) ← zip [0 ..] (ByteString.unpack level)]
+      marks = holeIndexSet holeIndexes
+      elem' i set = Map.member i set
+      newImage = (styleColourImage style) {decodedLevels = holed : drop 1 (decodedLevels (styleColourImage style))}
+      (w, h) = (decodedWidth newImage, decodedHeight newImage)
+  plane ← either (Left . show) Right (buildBinaryCoverage w h holed)
+  let old = styleColour style
+      colour = old {parentCoverage = plane, parentContent = parentContentDigest ColourParent (w, h) holed}
+  assets ← either (Left . show) Right (atlasAssetSnapshot (parentTextureVersion old) manifest colour (styleNormal style) (styleMaterialIds style))
+  let art = styleArt style
+      holedArt name x y = case lookup name [("loam", ()), ("granite", ())] of
+        Just () | holeAt x y → (0, 0, 0, 0)
+        _ → artColour art name x y
+  pure style {styleColour = colour, styleColourImage = newImage, styleAssets = assets, styleArt = art {artColour = holedArt}}
+  where
+    holeIndexSet = Map.fromList . map (\i → (i, ()))
