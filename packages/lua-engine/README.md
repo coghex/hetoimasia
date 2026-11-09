@@ -1340,131 +1340,6 @@ window, with the consumer registered first; input produced earlier is gated by t
 polls never enables its window's input, so it never overflows. A packet that cannot be delivered after its batch was taken is the
 engine's failure, not an empty poll.
 
-### The terrain calls (TRA-5)
-
-`api.terrain` exists only when the composition injected terrain (`sxTerrain`); a facade without it has no `terrain` field, no
-terrain handle type and no terrain `api.request` operation, and its namespace, request kinds and behavior are exactly what they
-were. Either role may call it. The concrete operations are [the terrain adapter's](#the-terrain-adapter) over the TRA-4 service
-(`hetoimasia-terrain-runtime`); the facade (`Hetoimasia.LuaEngine.Facade.Terrain`) owns every Lua-visible rule and imports no terrain
-module. Every call is a dot call with exactly its declared arguments; a request-producing call answers `request, nil` or
-`nil, {code = "busy", message = TEXT}` (exactly two values, nothing accepted, nothing reserved).
-
-| Call | Contract |
-| --- | --- |
-| `api.terrain.open(name, definition)` | request a session- and content-root-local named arena. The result is this instance's **owner** lease, the arena's only owner lease |
-| `api.terrain.attach(name)` | request this instance's **attachment** lease to an existing arena of the same session and content root, including when the instance is the creator. A missing arena and a pending open answer `not_found`, without waiting |
-| `api.terrain.cell(arena, {x=, y=, z=})` | the content revision, and air or an authored material and shape |
-| `api.terrain.column(arena, {x=, y=, z_min=, z_max=})` | the complete coalesced runs, air included, of the half-open range `[z_min, z_max)` at one revision; more than 1,024 runs settles `too_large`, never a truncated answer |
-| `api.terrain.surface(arena, {x=, y=})` | the highest occupied cell after edits, explicitly absent for an empty column |
-| `api.terrain.remove(arena, {x=, y=, z=} [, pick])` | remove one whole cell, a buried cell or a slope included; air is a no-op; an optional `pick` carries displayed-snapshot consistency |
-| `api.terrain.release(arena)` | non-waiting release of this instance's lease through the host's release path: `done`, `retiring` or `already_released`, repeatable |
-
-**Results** (`api.request.take`, `{status = "success", value = V}`; a failure is `{status = "failure", error = {code, message}}`;
-the kinds are `terrain_arena`, `terrain_cell`, `terrain_column`, `terrain_surface` and `terrain_remove`, each with its own handle
-type, so `ready`, `take`, `cancel` and `wait` dispatch by kind as for every other request):
-
-| Kind | `value` |
-| --- | --- |
-| arena | the arena handle (`terrain_arena`) |
-| cell | `{revision = INT, air = BOOL, material = TEXT?, shape = INT?}`; the material and shape are present exactly when `air` is false |
-| column | `{revision = INT, runs = {{z_min = INT, z_max = INT, air = BOOL, material = TEXT?, shape = INT?}, ...}}` |
-| surface | `{revision = INT, occupied = BOOL, z = INT?, material = TEXT?, shape = INT?}` |
-| remove | `{changed = BOOL, revision = INT}` |
-
-Records are fresh copies; material identifiers are the authored text and shapes are the authored identities 0 to 15 (0 and 15
-distinct). A content revision that does not fit a Lua integer is a host defect, never a wrapped value.
-
-**Definitions** are bounded plain data: `{materials = {TEXT...}, layers = {{z_min = INT?, z_max = INT?, material = TEXT, shape = INT}...},
-patches = {{x=, y=, z_min=, z_max=, value = {air = true} | {material = TEXT, shape = INT}}...}?}`. An omitted layer end means the
-supported extreme (the last supported cell is covered by an omitted upper end). Soil over stone is an ordinary pair of layers.
-
-**What is refused, and as what.** The layer that runs first classifies a rejection:
-
-* *The copy and the decode* are ordinary Lua errors, raised before admission, with no request, arena, name or credit left behind and
-  no authored metamethod run: wrong arity or fields, a sparse list, a metatable, a cycle, a function, a value of the wrong type or of
-  the float subtype (an integral float included), invalid UTF-8, an arena name that is empty or over 128 characters, a material
-  identifier that is empty or over 64 UTF-8 bytes, a cell coordinate outside `[-2^62, 2^62 - 1]`, a lower interval end outside it,
-  an upper end above `2^62`, a shape outside 0 to 15, a `column` range that is empty or inverted, a handle of another kind or another
-  instance, and a copy over the bounds (`argumentLimits`: 2 MiB of encoding beside the profile's depth and element limits, the
-  tighter of each applies).
-* *The validator* (`hetoimasia-terrain`'s `mkSource`) refuses a definition that decoded completely as the expected `definition`
-  failure: an empty or inverted interval, overlapping or unordered layers, overlapping patches, an unknown material, a duplicate
-  material identifier, a material identifier with a control character, and a definition over 256 KiB or 8,192 authored runs.
-
-**Expected failures** are `not_found`, `arena_closed`, `stale_view`, `definition`, `source_failure`, `too_large` and `name_in_use`.
-Terrain requests are `OptionalRequest`s: these settle as structured results and do not fail the instance, read or unread. A lease
-whose arena was closed by someone else (the creator released its owner lease or ended) is not a retired handle: its new requests are
-admitted and its in-flight ones settle `arena_closed`; releasing it stays safe. Only the caller's own released lease, and a foreign,
-wrong-kind or forged handle, is an ordinary error. Any other outcome of the service (an unknown code, a revision that is not a Lua
-integer, an answer over the declared ceilings) is a provider defect and fails the owner; it is never given a code, never busy and
-never air.
-
-**Who may call, and when.** An instance of the facade, in `init` and in an update, while the session's admission is open; refused (an
-ordinary error, never busy) at a module's top level (through a captured facade or an import that a hook started included), in
-`shutdown` and after a stop. `release` and `cancel` are finite-hook cleanup and are available in `shutdown` and after a stop;
-`request.wait` is update-only and cooperative.
-
-**Time.** A presentation instance's requests settle on arrival. A gameplay instance's request is due at the next logical tick
-(`init` originates at tick 0), ordered by assigned sequence, with no `tick_offset`. A logical request is **eligible** only when its
-due tick has been granted and waits, unbegun, at the boundary for this request: the terrain owner then commits the edit and settles
-the request in one transaction (below), and the tick begins. Until then nothing is committed, so an early prepared removal changes
-neither terrain nor `ready` or `take`, and a cancel before the position leaves terrain unchanged. A request that is late holds the
-gameplay owner's due tick: that tick and later ticks and updates do not begin until the request completes, is cancelled or its
-requester ends. No Lua callback waits for it; the presentation VM, the terrain owner's other admitted work, `cancel`, `release`
-and the drain carry on.
-
-**Admission.** The host reserves request places, the result lease (open and attach) and the session's gate in its one atomic
-admission; the terrain service's own admission is the next step of the same masked hand-off, and when it is busy (arenas, leases,
-retained edits, any bank) the hand-off declines (`SubmissionDeclined`) and the host takes the whole admission back: no handle, no
-lease, no credit, no name claim, no edit, and `nil, busy`. A permanent fact that changed since the argument check is declined the
-same way and read as an ordinary error. Exhausted retained-edit capacity is therefore the same immediate busy, never a final
-refusal, and nothing already retained is evicted. Permanent validation, ownership and stop refusals are decided before any bank.
-
-**The commit point.** The service's `Endpoint` is attached to the host's `Settling` seam: the service reads the request's
-eligibility, commits the edit and delivers the settlement in one transaction that also decides cancellation, the parent session's
-admission and the arena's closure, so exactly one of a script's cancel and the commit wins: cancel first leaves no edit, commit first
-answers `already_settled`. Nothing runs Lua or terrain IO inside the host's STM and nothing waits for the terrain owner on a Lua
-thread.
-
-**Leases and names.** A successful open or attach offers the service's lease to the request; the host builds it into the lease the
-request reserved (the adoption) on the owner's thread and settles then. A request cancelled or ended between the offer and the build
-leaves the offered lease with the adapter, which releases it at that very cancel: no arena, name or lease is left to Lua's
-collection, a finalizer, `shutdown` or a successful `take`. The creator's owner lease is the only owner lease: the service marks an
-attach by the creator's own client as an owner lease, so the adapter makes each instance's attachments through a second client of its
-own (registered on first use), and releasing the open's lease, or the creator's end, closes the arena whatever the creator attached
-to. Releasing an attachment ends only that client's interest. A name is claimed in the admission of its open, blocks duplicates
-(`name_in_use`) while the open is pending (a gameplay open held for its position included) and is invisible to attach until the open
-succeeds; a failed or cancelled open frees it at its terminal settlement, even while the result is untaken; a successful open holds it
-until the arena closes. The service keeps one name table: the adapter prefixes the session and the instance's content root, so a name
-that exists only under another root or session is `not_found` and says nothing of it.
-
-**Pick.** The optional third argument of `remove` is an opaque `terrain_pick` capability. The facade checks the type; the adapter
-checks that it is a live authority of the calling instance and forwards its incarnation and revision to the service as the
-removal's content precondition, so a stale one is the recoverable `stale_view` and nothing is removed. There is no Lua constructor
-and no view, camera or picking: TRA-10 issues the real token. The adapter's `issuePick` is a host fixture for the seam.
-
-**State, owner, lifetime.**
-
-| State | Owner and writer | Lifetime |
-| --- | --- | --- |
-| the terrain `Service`, its owner thread | the assembly | borrowed; closed after the session |
-| the VM's lending and lease scope | the session, one per VM, shared with graphics | the owner's |
-| an instance's terrain clients (owner, attach) | the adapter; written when the facade declares and forgets the instance | the instance's |
-| the typed ask of a request in flight | the adapter, by ticket | from the binding's start to the hand-off |
-| an offered lease | the adapter until adopted or released | one transition out of offered |
-| the service's untaken result of a request | the service | until the host's record is taken or discarded and its work is over (`tsDrain` returns it) |
-
-The lease capacity one instance needs in the shared scope is `configMaxLeases + RequestsPerInstance + 1` (`terrainLeaseCapacity`):
-every lease the service can hold at once, the places that reserve one before the service admits it, and one of headroom. With
-graphics injected the scope is graphics' own with its capacity grown by that; with terrain alone it is made by the session.
-
-**What proves it.** `lua-engine-tests` (`test.lua-engine`), `Test.LuaEngine.Terrain.*`: real Lua instances of real supervised owners
-over the real terrain service, with the service owner's probe holding the commit where an example needs a race decided: the whole
-surface in both roles, every copy and decode rejection and each validator rejection, two instances sharing and losing an arena, names
-and claims, cancel against commit, a late removal holding its tick, the 1,024-run boundary and a full request bank, and the
-composition of the shared scope. The settlement seam and the declining hand-off are `lua-runtime-tests`'
-`Test.LuaRuntime.Admission.Seam`.
-
 ### Content roots
 
 Two calls name content, and their default roots are different on purpose.
@@ -1628,15 +1503,6 @@ failing sinks, shutdown output and a facade made in part (`Sinks`); and a separa
 own examples prove what it added for this: the caller's instance, the segment notification, the named module phase, the
 two-word elapsed wait and the shared bounded output.
 
-## The terrain adapter
-
-`library terrain` of this package (`Hetoimasia.LuaEngine.Terrain`, `packages/lua-engine/terrain/`) is the concrete composition of the
-facade's abstract terrain operations over the terrain service: `terrainInjection` builds the `TerrainInjection` a session is composed
-with from a `TerrainFacade` (the profile, the assembly's `Service` and the `Config` it was made with, the pick authorities, the test
-hooks). It depends on the facade, the request adapter, the host's public runtime modules and the two terrain packages, imports no
-game, window, GPU or console package, and neither terrain package imports Lua. See [the terrain calls](#the-terrain-calls-tra-5) for
-what a script sees and what the adapter does for each request.
-
 ## The session coordinator (LFE-13)
 
 `Hetoimasia.LuaEngine.Session` (the `session` sublibrary) composes one or two roles' VMs into one **session**: how the
@@ -1679,7 +1545,6 @@ uninterruptibly masked is refused before anything is acquired: the protocol's wa
 | `sxRuntime`, `sxControl` | the Lua runtime the owners start on, and the supervision control of the driving thread |
 | `sxHarness` | `noHarness` for a real composition; see [the harness](#the-harness) |
 | `sxGraphics` | the graphics a composition injects (LFE-21): `Nothing` for every CPU-only caller, whose facades are exactly as before, or a `GraphicsInjection`, the abstract function the session calls once for each role's VM, over that VM's own request policy (already gated on the session's admission) and a transaction that says whether the role still takes new work (the authority a publication commits with), to make its `GraphicsServices` (its lending and lease scope, its handle types, its request endpoints and the four operations). The pipeline, the window provider and everything under them are the assembly's, made before the session and closed after it; the session never closes them. The concrete injection is [the graphics adapter's](../lua-engine-graphics/README.md#the-graphics-facade-lfe-21) |
-| `sxTerrain` | the terrain a composition injects (TRA-5): `Nothing` for every caller without it, whose facades are exactly as before, or a `TerrainInjection` (the lease capacity its services need per instance, and the function the session calls once for each role's VM to make its `TerrainServices`). A VM has exactly one lending and one lease scope (`composeVmServices`): graphics makes it when it is injected, with room for terrain's leases beside its own; with terrain alone the session makes it; with neither a VM has none. The service is the assembly's and is never closed by the session. The concrete injection is [the terrain adapter's](#the-terrain-adapter) |
 
 The pool, the anchored root and the output belong to the assembly outside `runSession`, which closes and drains the actual pool before it releases the inventory and the root, and closes the output last, after the producers have stopped. A pool shutdown failure after `runSession` returns is the assembly's evidence and makes the eventual exit fail. A session-local `retired` does not claim that these shared services were destroyed.
 
