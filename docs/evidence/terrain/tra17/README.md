@@ -20,14 +20,14 @@ control or a recorded band.
 
 | | |
 | --- | --- |
-| Device | Apple M3 Max (Vulkan through MoltenVK 1.2.11 on macOS), surface-free, no window |
-| Device limit read | `subPixelPrecisionBits = 8`, **queried from the session** (`RootsView.viewSubPixelPrecisionBits`) and recorded per pass; a standalone `vulkaninfo` printed 4 and did not reflect the session's device |
+| Device | Apple M3 Max, Vulkan through the driver the session reports: `driverName = MoltenVK`, `driverInfo = 1.4.2` (the pinned Homebrew MoltenVK), surface-free, no window; every value is queried from the rendering session's physical device and stored in each record |
+| Device limit read | `subPixelPrecisionBits = 8`, **queried from the session** (`RootsView.viewSubPixelPrecisionBits`, with `viewDriverName` and `viewDriverInfo`) and recorded per pass; a standalone `vulkaninfo` printed 4 and did not reflect the session's device |
 | Depth | `Depth32Float` (an unsupported depth is a failure, never a skip) |
-| Tested head | `8d6e496a639164339c6b8b7dc4f06b49472d6ef0` on a clean tree, master already merged |
-| Source digest | `a7766bac7af0ace6b2dba18089a73d7e11b050ae789d09a8fefdca86a6ea0b0e` (identical on CI) |
+| Tested head | `7e48253fb843162054e52f6d85b18426bd963181` on a clean tree, master (`c9e29d70`) already merged |
+| Source digest | `4c3a4bd0a4551144870a5e9db1c5f49033710a0814b51937396aef47e0257633` |
 | Tolerance | 3 8-bit steps per channel, declared before any pixel is read (the oracle's own probe tolerance, one step, judges the oracle path) |
-| Full run | `tra17-terrain`: 116 fixtures, 56.8 s scenario; opt-in, excluded from `--complete` |
-| Bounded run | `tra17-terrain-ci`: 11 fixtures, 1.7 s scenario |
+| Full run | `tra17-terrain`: 132 fixtures, 63.7 s scenario; opt-in, excluded from `--complete` |
+| Bounded run | `tra17-terrain-ci`: 11 fixtures, 1.7 s scenario; the CI timeline and CI-device records (`ci-timeline.md`, `ci-device-bounded-run-record.md`, `*-ci-device.json`) are those of the CI candidate `47e3182c` (source digest `a7766bac...`), an earlier head: CI at the final head is recorded in the pull request |
 | Atlas layout identity | `263cb64032502aa0` |
 
 Reproduce (macOS, under the standing per-command consent; on Linux use the runner's isolated display):
@@ -101,8 +101,9 @@ needs no margin: a pixel centre on it is covered by exactly one of the two trian
 colour do not change.
 
 Undecided pixels in the full run occur in two unsnapped fractional fixtures only, `sequence-zoom` (618 of 6418
-covered, 9.6 %) and `fractional@0.1875` (136 of 844, 16.1 %); every other fixture has none. On CI's device
-(`llvmpipe (LLVM 20.1.2, 256 bits)`, which also reports `b = 8`) the bounded scenario has none.
+covered, 9.6 %) and `fractional@0.1875` (136 of 844, 16.1 %); every other fixture has none. The device band exempts DEVICE read-back only: the pure picker and the pure material model are compared with the exact
+expectation at every pixel of these fixtures, banded or not (`Expectation`, `ModelAtBand`). On CI's device at the
+earlier candidate (`llvmpipe (LLVM 20.1.2, 256 bits)`, which also reports `b = 8`) the bounded scenario has none.
 
 ## What passes
 
@@ -117,6 +118,7 @@ covered, 9.6 %) and `fractional@0.1875` (136 of 844, 16.1 %); every other fixtur
   draw); at the whole scale 8 it cannot be: every texel and quad edge is the origin plus whole pixels, so rounding
   the origin by less than half a pixel moves no pixel centre across an edge except at an exact tie, which depends
   on the rounding rule, and that fixture is judged exactly without the discrimination need.
+- **The shape x facing x role matrix**: the 16 identities, the 15 mixed known/fog maps and the full-fog map in every facing, drawn from the packed atlases AND from the 49 single images, each pass non-vacuous with its picks.
 - **Ordinary, full-fog and mixed known/fog parts**, hidden air against hidden solid indistinguishable as fog, known
   ramp sides beside unknown void, **pending information** ahead of and behind known terrain (picks: loading where a
   pending cell could lie in front, a hit where it is proved behind; the one-pixel conservative ring around a nearer
@@ -151,9 +153,12 @@ covered, 9.6 %) and `fractional@0.1875` (136 of 844, 16.1 %); every other fixtur
 
 - **UNEXERCISED on the device**: a wrong composition order of darkening and haze has no negative control (the
   depth-effect reset control is built); packed against single-image atlases on the GPU beyond the 49-image style that
-  draws and picks as the packed one does; a streamed or live background (#645); texture-byte-bank pressure and the Lua
-  lease release, which are #672's pipeline's contract and which the terrain adapter never calls (it allocates no
-  texture; the adapter's own all-or-none, one-charge-per-parent and unadmitted-parent refusals are CPU tests).
+  draws and picks as the packed one does; a streamed or live background (#645); the terrain adapter allocates no texture, so
+  the lifetime of its parents is shown through #672's real pipeline instead of on the device: the lua-engine-graphics
+  headless rig (`Test.LuaEngine.Graphics.TerrainParents`: original lease released while a batch still reads the parents,
+  an adaptation built over the delivered handles, pressure with nothing partial) and the real byte banks
+  (`Test.LuaEngine.Texture.TerrainParents`); the adapter's own all-or-none, one-charge-per-parent and
+  unadmitted-parent refusals are CPU tests.
 - **Reference lighting**: Synarchy's lighting (`ShaderCode.hs` at `3777d437`, lines 255-301) is not reproduced and no
   parity is claimed.
 - Live view ownership, streaming and retirement (#645), the Lua bindings (#646), the arena and its shortcuts (#647) and
@@ -238,8 +243,24 @@ covered, 9.6 %) and `fractional@0.1875` (136 of 844, 16.1 %); every other fixtur
 | matrix-FaceSouth-0.25-colour-holes | pass | 1818 | 0 | 0 | 0.0% | yes | 0.0088 | 0/10560 |  |
 | ramps-FaceSouth@0.125-colour-holes | pass | 317 | 0 | 0 | 0.0% | yes | 0.0166 | 0/798 |  |
 | mixed-FaceSouth@0.25-colour-holes | pass | 1076 | 0 | 0 | 0.0% | yes | 0.0088 | 0/660 |  |
+| matrix-mixed-FaceSouth-0.25 | pass | 3600 | 0 | 0 | 0.0% | yes | 0.0088 | 0/9900 |  |
+| matrix-mixed-FaceSouth-0.25-single-images | pass | 3600 | 0 | 0 | 0.0% | yes | 0.0088 | 0/9900 |  |
+| matrix-mixed-FaceWest-0.25 | pass | 3600 | 0 | 0 | 0.0% | yes | 0.0088 | 0/9900 |  |
+| matrix-mixed-FaceWest-0.25-single-images | pass | 3600 | 0 | 0 | 0.0% | yes | 0.0088 | 0/9900 |  |
+| matrix-mixed-FaceNorth-0.25 | pass | 3600 | 0 | 0 | 0.0% | yes | 0.0088 | 0/9900 |  |
+| matrix-mixed-FaceNorth-0.25-single-images | pass | 3600 | 0 | 0 | 0.0% | yes | 0.0088 | 0/9900 |  |
+| matrix-mixed-FaceEast-0.25 | pass | 3600 | 0 | 0 | 0.0% | yes | 0.0088 | 0/9900 |  |
+| matrix-mixed-FaceEast-0.25-single-images | pass | 3600 | 0 | 0 | 0.0% | yes | 0.0088 | 0/9900 |  |
+| matrix-fog-FaceSouth-0.25 | pass | 3840 | 0 | 0 | 0.0% | yes | 0.0088 | 0/628 |  |
+| matrix-fog-FaceSouth-0.25-single-images | pass | 3840 | 0 | 0 | 0.0% | yes | 0.0088 | 0/628 |  |
+| matrix-fog-FaceWest-0.25 | pass | 3648 | 0 | 0 | 0.0% | yes | 0.0088 | 0/609 |  |
+| matrix-fog-FaceWest-0.25-single-images | pass | 3648 | 0 | 0 | 0.0% | yes | 0.0088 | 0/609 |  |
+| matrix-fog-FaceNorth-0.25 | pass | 3840 | 0 | 0 | 0.0% | yes | 0.0088 | 0/628 |  |
+| matrix-fog-FaceNorth-0.25-single-images | pass | 3840 | 0 | 0 | 0.0% | yes | 0.0088 | 0/628 |  |
+| matrix-fog-FaceEast-0.25 | pass | 3648 | 0 | 0 | 0.0% | yes | 0.0088 | 0/609 |  |
+| matrix-fog-FaceEast-0.25-single-images | pass | 3648 | 0 | 0 | 0.0% | yes | 0.0088 | 0/609 |  |
 | sequence-pan | pass | 1711 | 0 | 0 | 0.0% | yes | 0.0166 | 0/3192 |  |
-| sequence-zoom | pass | 6418 | 0 | 618 | 9.6% | yes | 0.0062..0.0166 | 0/2665 |  |
+| sequence-zoom | pass | 6418 | 0 | 618 | 9.6% | yes | 0.0062..0.0166 | 0/3252 |  |
 | sequence-rotation | pass | 1684 | 0 | 0 | 0.0% | yes | 0.0166 | 0/2874 |  |
 | sequence-manual-follow-manual | pass | 1287 | 0 | 0 | 0.0% | yes | 0.0166 | 0/2394 |  |
 | sequence-jump | pass | 1688 | 0 | 0 | 0.0% | yes | 0.0166 | 0/3192 |  |
@@ -249,9 +270,9 @@ covered, 9.6 %) and `fractional@0.1875` (136 of 844, 16.1 %); every other fixtur
 | deep-FaceSouth | pass | 1140 | 0 | 0 | 0.0% | yes | 0.0166 | 0/637 |  |
 | zoom-0.125 | pass | 409 | 0 | 0 | 0.0% | yes | 0.0166 | 0/798 |  |
 | zoom-8.0 | pass | 6144 | 0 | 0 | 0.0% | yes | 0.0012 | 0/615 |  |
-| fractional@0.1875 | pass | 844 | 0 | 136 | 16.1% | yes | 0.0114 | 0/702 |  |
+| fractional@0.1875 | pass | 844 | 0 | 136 | 16.1% | yes | 0.0114 | 0/797 |  |
 | viewport@0.125 | pass | 350 | 0 | 0 | 0.0% | yes | 0.0166 | 0/672 |  |
-| scaled@0.125 | pass | 435 | 0 | 0 | 0.0% | yes | 0.0088 | 0/624 |  |
+| scaled@0.125 | pass | 435 | 0 | 0 | 0.0% | yes | 0.0166 | 0/624 |  |
 | snapped | pass | 6044 | 0 | 0 | 0.0% | no | - | 0/615 |  |
 | snapped-1-8 | pass | 412 | 0 | 0 | 0.0% | no | - | 0/615 |  |
 | snapped-9-8 | pass | 6123 | 0 | 0 | 0.0% | no | - | 0/615 |  |
