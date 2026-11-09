@@ -1,6 +1,6 @@
 # TRA-20 evidence: the temporary store's pure model
 
-Implementation head `646d073c` (the branch is merged with origin/master at `f3cf9956` with no source change; issue #662, PR #675 for `Closes #662`). Every figure below is the output of one suite run, not a paraphrase; the suite is `hetoimasia-terrain-runtime:terrain-runtime-tests` and these are observations of the pure model and the codec. **They are not physical filesystem, durability, preallocation, latency or RSS figures**, and none is proof of live request settlement or crash recovery.
+Implementation head `64a8ed36` (issue #662, PR #675 for `Closes #662`). Every figure below is the output of one suite run, not a paraphrase; the suite is `hetoimasia-terrain-runtime:terrain-runtime-tests` and these are observations of the pure model and the codec. **They are not physical filesystem, durability, preallocation, latency or RSS figures**, and none is proof of live request settlement or crash recovery.
 
 ## Commands
 
@@ -15,7 +15,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain
 $(cabal list-bin --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests) --match "TRA-20 evidence"
 ```
 
-Results: `terrain-runtime-tests` 376 examples, 0 failures; `terrain-tests` 901/0; `terrain-render-2d-tests` 649/0.
+Results: `terrain-runtime-tests` 379 examples, 0 failures; `terrain-tests` 901/0; `terrain-render-2d-tests` 649/0.
 
 ## Fixtures, seeds and references
 
@@ -51,10 +51,10 @@ EVIDENCE exhaustion maxPagesPerTransaction=21 totalPagesFreed=1522
 EVIDENCE cycles CycleReport {crSeed = 101, crCommits = 186, crAborts = 52, crFailedWrites = 24, crReads = 57, crReclaims = 36, crMaxReaders = 6, crMaxPages = 18, crMaxWindow = 17, crMaxRam = 671959, crMaxSteps = 136, crPagesWritten = 2402, crHighWater = 1402, crRecords = 893}
 EVIDENCE cycles CycleReport {crSeed = 202, crCommits = 177, crAborts = 50, crFailedWrites = 22, crReads = 51, crReclaims = 37, crMaxReaders = 6, crMaxPages = 19, crMaxWindow = 19, crMaxRam = 684291, crMaxSteps = 114, crPagesWritten = 2378, crHighWater = 1424, crRecords = 914}
 EVIDENCE cycles CycleReport {crSeed = 303, crCommits = 194, crAborts = 49, crFailedWrites = 28, crReads = 24, crReclaims = 42, crMaxReaders = 5, crMaxPages = 19, crMaxWindow = 18, crMaxRam = 682100, crMaxSteps = 110, crPagesWritten = 2546, crHighWater = 1465, crRecords = 921}
-EVIDENCE allocation a one-record edit plan history500runs=451328B history20000runs=983240B ratio=2.1785486386840613
-EVIDENCE allocation a pinned point read history500runs=131864B history20000runs=229824B ratio=1.7428866104471274
+EVIDENCE allocation a one-record edit plan history500runs=451328B history20000runs=983728B ratio=2.179629892229155
+EVIDENCE allocation a pinned point read history500runs=136848B history20000runs=229824B ratio=1.6794107330761137
 EVIDENCE allocation a usage and control report history500runs=1232B history20000runs=1232B ratio=1.0
-EVIDENCE allocation a reclamation step over an equal retirement list history500runs=176232B history20000runs=170400B ratio=0.9669072586136457
+EVIDENCE allocation a reclamation step over an equal retirement list history500runs=472328B history20000runs=466496B ratio=0.9876526481597534
 EVIDENCE allocation control: a map of every record key history500runs=35304B history20000runs=1361640B ratio=38.569000679809655
 ```
 
@@ -121,6 +121,15 @@ After the round 4 sweep (the allocator's supply):
 | a loose page may lie outside the used page space | 1 of 376 examples fail |
 | a page may be handed out twice by one supply | 1 of 376 examples fail |
 
+After review round 4 (the three repairs):
+
+| Protected behavior broken | Result |
+| --- | --- |
+| reclamation frees a page the committed trees still reach | 1 of 379 examples fail |
+| a shrink is classified by building a replacement configuration first | 1 of 379 examples fail |
+| a cache entry may be charged less than its own record | 1 of 379 examples fail |
+| a grant may be charged less than its own record | 1 of 379 examples fail |
+
 ## Limits of this evidence
 
 The model is checked against references written independently of it, at routine scale. Nothing here measures a file, a filesystem, an fsync, a descriptor, a worker, latency or process memory (TRA-21), the live owner's publication and request settlement (TRA-22) or the Lua control (TRA-23). The memory figures are the accounted bytes of the representation (validated page buffers, packed new pages, a few parsed nodes), checked against the live heap of a window of 310 dense pages (`holds a window of dense pages in memory close to what it accounts`); they are not a process-RSS claim. The tree height bound (8 levels) is shown unreachable below about 36 GiB of leaves by the derivation in `Format.maxLevel`, not by building a 36 GiB store.
@@ -140,3 +149,7 @@ Two findings, both valid and repaired in `d5f50cc5` and `7f179551`: the root col
 ## Round 4 sweep (before the fourth review)
 
 Rounds 1-3 kept finding one class: a value read from an untrusted page used without a range, level or cycle check. Before round 4 every bounded loop and every node, level, index and page-number read in the store model was walked (`Tree.hs` descents, collapse, rebalance, range and successor reads; `Plan.hs` supply, overlap, free-extent insertion and reclamation; `Page.hs` and `Records.hs` decoders; `Model.hs` readers). Every tree descent now carries its expected level and its parent's separator bounds, and a bounded range read is clamped to 256 records. The sweep found one more site: the allocator's supply decoded free extents against the whole page space instead of the used space and trusted the free tree and the loose list to be disjoint, so a valid-checksum free-extent page reaching past the high-water mark, an overlapping extent or a page both loose and free could be handed out twice. The supply now refuses each as `Integrity` (`refuses a supply that names a page outside the used space...`, three scenarios), and a free neighbour that does not decode is corruption rather than absence (unreachable behind the page decoder's validation; defense in depth, no example). Each check has a negative control above except the overlap-with-previous-extent condition, which the distinct-supply check backs (a cross-leaf overlap needs a two-leaf free tree).
+
+## Review round 4 (Codex, CHANGES_REQUESTED at `1e1f85d2`)
+
+Three findings, all valid, repaired in `64a8ed36`: reclamation freed any page a retirement entry named that was not free, loose or claimed, so a valid-checksum entry naming a live root made authoritative data reusable (now each candidate must lie inside the used space, be a tree page and not be the page the committed tree of its header reaches on the path of its first key, checked by `livePageAt` through the window; `refuses to reclaim a page the committed trees still reach...` covers the runs root, a live page below it, the free tree's root and the retirement tree's root, and a loose or list page is refused as well); cache credits of zero or a few bytes were granted while allocating an entry and map node each (every cache entry is now charged at least a page, every grant at least 128 bytes in the staging and control accounts); a shrink with large configured overhead was classified `GrowthInvalid (OverheadInvalid ..)` because the replacement configuration was built first (the size rules now come first, and a replacement is built only for an increase).
