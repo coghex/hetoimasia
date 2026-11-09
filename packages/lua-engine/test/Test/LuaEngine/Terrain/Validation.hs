@@ -8,6 +8,7 @@
 module Test.LuaEngine.Terrain.Validation (spec) where
 
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -92,8 +93,9 @@ spec = describe "Terrain validation" $ do
           checkCases decodeCases printed
           -- No metamethod ran.
           printed `shouldContain` ["trap\tfalse"]
-          -- and no refusal kept a place of the request bank
-          printed `shouldContain` ["places after the refusals\t16"]
+          -- and no refusal kept a place of the request bank: the accepted boundary cases hold theirs, and every other place is free
+          let accepted = length [() | Case _ _ Accepted ← decodeCases]
+          printed `shouldContain` ["places after the refusals\t" <> Text.pack (show (16 - accepted))]
           -- Nothing a refused call did reached the service: the one arena the example opened, and its one lease, are all it holds.
           limitHeld (rgService rig) "arenas" `shouldReturn` 1
           limitHeld (rgService rig) "leases" `shouldReturn` 1
@@ -112,7 +114,7 @@ spec = describe "Terrain validation" $ do
             ]
               <> map (("    " <>) . caseLua) decodeCases
               <> [ "    print('trap', hit)"
-                 , -- every refused call above was refused before admission: had one kept a place of the request bank, the sixteen reads below would not all be taken
+                 , -- every refused call above was refused before admission: had one kept a place of the request bank, the the sixteen reads below would not all be taken
                    "    local taken = 0"
                  , "    for i = 1, 16 do if api.terrain.cell(A, {x = i, y = 0, z = 0}) ~= nil then taken = taken + 1 end end"
                  , "    print('places after the refusals', taken)"
