@@ -16,7 +16,9 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.List (sort)
 import qualified Data.Map.Strict as Map
+import Control.Exception (evaluate)
 import Data.Int (Int64)
+import System.Timeout (timeout)
 import Data.Word (Word64, Word8)
 import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Connectivity (Axis (..), mkComponentKey)
@@ -313,10 +315,13 @@ spec = describe "the private page codec against independent bytes" $ do
           cycB = inner 5 1 [(sepR, 2)]
           w = foldl (\acc (no, bs) → add acc no bs) (emptyWindow ident0 0) [(3, root), (1, leftInner), (4, leaf), (2, cycA), (5, cycB)]
       -- the deletion empties the left subtree, leaving a one-child root whose collapse reaches the cycle
-      case runM (deleteKey TreeRuns (Just (Disk (PageNo 3))) (runKeyBytes 1000)) (newEdit 1000000 w) of
-        Left (Bad (BadLevel _) _) → pure ()
-        Left (Bad err _) → expectationFailure ("a different refusal: " <> show err)
-        other → expectationFailure ("the collapse was not refused: " <> either show (const "a plan was produced") other)
+      -- (a generous wall-clock guard turns a regression that loops into a failure, not a hang)
+      outcome ← timeout 20000000 (evaluate (either Left (const (Right ())) (runM (deleteKey TreeRuns (Just (Disk (PageNo 3))) (runKeyBytes 1000)) (newEdit 1000000 w))))
+      case outcome of
+        Nothing → expectationFailure "the collapse did not terminate"
+        Just (Left (Bad (BadLevel _) _)) → pure ()
+        Just (Left err) → expectationFailure ("a different refusal: " <> show err)
+        Just (Right ()) → expectationFailure "the collapse was not refused: a plan was produced"
     it "refuses a run node whose level is outside the supported coordinate range, in keys and in parent values" $ do
       let col = columnAt 3 (-4)
           limit = 4611686018427387904 ∷ Int64
