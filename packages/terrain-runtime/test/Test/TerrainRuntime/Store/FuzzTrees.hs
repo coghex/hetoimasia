@@ -107,13 +107,12 @@ referenceOf h tree =
    in (sortOn fst (twLeaves walk), twPages walk)
 
 -- | One mutation of one page of a tree, every operation judged.
-judge ∷ H → TreeId → [(BS.ByteString, BS.ByteString)] → [Word64] → Word64 → Int → Word64 → (Tally, [String])
-judge h tree ref pagesOfTree page offset newByte = (tallyOf verdicts, ["page " <> show page <> " byte " <> show offset <> "=" <> show newByte <> ": " <> d <> " | new children " <> show [(q, describePg q) | q ← Set.toList (childrenOf mutated `Set.difference` childrenOf original)] | Defect d ← take 1 verdicts'])
+judge ∷ H → TreeId → [(BS.ByteString, BS.ByteString)] → [Word64] → Word64 → Int → BS.ByteString → (Tally, [String])
+judge h tree ref pagesOfTree page offset mutated = (tallyOf verdicts, ["page " <> show page <> " at " <> show offset <> ": " <> d <> " | new children " <> show [(q, describePg q) | q ← Set.toList (childrenOf mutated `Set.difference` childrenOf original)] | Defect d ← take 1 verdicts'])
   where
     total = cfgUsablePages (hCfg h)
     ident = hIdent h
     original = fromMaybe BS.empty (diskRead (hDisk h) (PageNo page))
-    mutated = reseal (BS.concat [BS.take offset original, BS.singleton (fromIntegral newByte), BS.drop (offset + 1) original])
     disk' = diskWrite (PageNo page) mutated (hDisk h)
     rootRef = Disk (fromMaybe (PageNo 0) (rootOf (storeRoots (hStore h)) tree))
     keysOfLeaf bs = case decodePage ident total (PageNo page) bs of
@@ -254,13 +253,29 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
           runSeed seed = forM (take 50 (iterate (snd . nextWord) (mkRng seed))) $ \g → do
             let (w1, g1) = nextWord g
                 (w2, g2) = nextWord g1
-                (w3, _) = nextWord g2
+                (w3, g3) = nextWord g2
+                (w4, _) = nextWord g3
                 pick' xs w = xs !! fromIntegral (w `mod` fromIntegral (length xs))
                 page
                   | w1 `mod` 10 < 6 && not (null inner) = pick' inner (w1 `div` 10)
                   | otherwise = pick' leaves (w1 `div` 10)
+                original = fromMaybe BS.empty (diskRead (hDisk h) (PageNo page))
                 offset = if w2 `mod` 2 == 0 then 40 + fromIntegral ((w2 `div` 2) `mod` 120) else 24 + fromIntegral ((w2 `div` 2) `mod` 4000)
-            pure (judge h tree ref treePages page offset (w3 `mod` 256))
+                byteMutation = reseal (BS.concat [BS.take offset original, BS.singleton (fromIntegral (w3 `mod` 256)), BS.drop (offset + 1) original])
+                -- a third of the mutations of internal pages retarget one child pointer to a page that was
+                -- replaced and is dead (the loose pages) or to another page of the tree: still one field
+                retarget = case parsedAt page of
+                  Just (Page _ lv _ (Inner es)) | lv >= 1, not (null es) →
+                    let i = fromIntegral (w3 `mod` fromIntegral (length es))
+                        at = 40 + sum [1 + BS.length k + 12 | (k, _) ← take i es] + 1 + BS.length (fst (es !! i))
+                        targets = [q | PageNo q ← rLoose (storeRoots (hStore h))] ++ treePages
+                        t = pick' targets w4
+                     in Just (at, reseal (BS.concat [BS.take at original, le64' t, BS.drop (at + 8) original]))
+                  _ → Nothing
+                (offset', mutated) = case retarget of
+                  Just r | w1 `mod` 3 == 0 → r
+                  _ → (offset, byteMutation)
+            pure (judge h tree ref treePages page offset' mutated)
       treePages `shouldSatisfy` (not . null)
       tallies ← mapM runSeed [11, 22, 33, 44, 55]
       let tally = mconcat (map fst (concat tallies))
