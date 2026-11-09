@@ -98,6 +98,8 @@ import Hetoimasia.Render.TwoD.Vulkan.Textures
   , Textures
   , newTextures
   , registerTexture
+  , markReleased
+  , isReleased
   , registeredMark
   , registeredMarks
   , releaseTextureNow
@@ -117,7 +119,6 @@ import Test.GPU.Vulkan.Native.OrderedPath
   , awaitPlaceholder
   , configuration
   , finishEvidence
-  , runValidatedWith
   )
 import qualified Test.GPU.Vulkan.Native.OrderedPath as OrderedPath
 import Test.GPU.Vulkan.Native.OrderedPath.Fixtures (Fixture (..), NamedProbe (..), TargetShape (..), colourFormatOf, depthShape)
@@ -171,6 +172,12 @@ data Variant
     Retained
   | -- | The colour atlas registered unmarked, so the same instances take the ordered path.
     OrderedWrapper
+  | -- | The same terrain drawn while its original texture ownership is released between the submission
+    -- of the frame and its completion (the device work pending): the frame must still complete and read
+    -- back correctly, and the releases are real only after completion.
+    ReleasedWhilePending
+  | -- | 'ReleasedWhilePending' for retained chunks: two retained chunks and a dynamic remainder.
+    RetainedReleasedWhilePending
   | -- | A control: the depth keys' order inverted.
     ReversedKeys
   | -- | A control: every quad's map region is the full-block map (the whole-cell mask).
@@ -218,6 +225,8 @@ suffixOf = \case
   Retained → "-retained"
   OrderedWrapper → "-ordered-wrapper"
   ReversedKeys → "-control-reversed-overlap"
+  ReleasedWhilePending → "-released-while-pending"
+  RetainedReleasedWhilePending → "-retained-released-while-pending"
   WholeCellMask → "-control-whole-cell-mask"
   WrongFacingLight → "-control-wrong-facing-light"
   DepthReset → "-control-depth-reset"
@@ -389,6 +398,11 @@ specs profile = case profile of
       <> [spec defaultLight [Foreground] PickLoadingAsMiss (pendingScene FaceSouth)]
       <> [exactBoundaryWith UnbiasedIndex shape facing | (shape, facing) ← exactBoundaryCases]
       <> [staleBiasFixture sc | sc ← staleBiasScenes]
+      -- Last: these release the atlases' ownership (marked while their frames are pending), so nothing may
+      -- draw from the atlases after them.
+      <> [ spec defaultLight [Foreground, Varies] ReleasedWhilePending (mixedScene FaceSouth)
+         , spec defaultLight [Foreground, Overlap] RetainedReleasedWhilePending (atZoom 0.125 (roofOverCavity 1 FaceWest))
+         ]
 
 -- | The ramps and corners with pixel snapping on at zoom 1, the camera a fraction of a pixel off
 -- the pixel grid. At a whole-number scale a nearest-sampled quad cannot change when the view is
@@ -690,6 +704,9 @@ data Extra = Extra
   , extraMarks ∷ ![(String, Maybe Bool)]
   , extraIndependent ∷ !(Maybe Independent)
   , extraPickCompared ∷ !Int
+  , extraPickUndecided ∷ !Int
+  -- ^ Sampled pixels the picking contract leaves undecided: the one-device-pixel conservative ring
+  -- around a nearer pending cell's canvas. Never compared.
   , extraPickMismatches ∷ !Int
   , extraPickFirst ∷ ![String]
   , extraRejected ∷ !(Maybe Bool)
@@ -700,7 +717,7 @@ data Extra = Extra
   }
 
 emptyExtra ∷ Spec → Extra
-emptyExtra s = Extra s [] [] [] [] [] Nothing 0 0 [] Nothing Nothing [] Nothing []
+emptyExtra s = Extra s [] [] [] [] [] Nothing 0 0 0 [] Nothing Nothing [] Nothing []
 
 failed ∷ String → String → FixtureResult
 failed name why = FixtureResult (Text.pack name) [] [] [] (Just (Text.pack why))
@@ -755,7 +772,7 @@ runSpec ∷ Ctx → Spec → IO (FixtureResult, Extra)
 runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
   Left why → pure (failed (specName s) why, emptyExtra s)
   Right planned → case specVariant s of
-    Retained → case planned of
+    variant' | variant' `elem` [Retained, RetainedReleasedWhilePending] → case planned of
       [(_, sc, plan, shape)] → retainedFixture ctx s sc plan shape
       _ → pure (failed (specName s) "a retained fixture draws one scene", emptyExtra s)
     variant → do
@@ -977,7 +994,21 @@ renderSnapshot ctx s parts = do
           expectedPath = if specVariant s == OrderedWrapper then "Ordered" else "Cutout"
           pathProblems = ["a run took the " <> path <> " path, expected " <> expectedPath | (path, _, _) ← runFacts, path /= expectedPath]
       markFacts ← traverse (\(label, handle) → (,) label <$> registeredMark (ctxTextures ctx) handle) [("colour atlas", ctxColourH ctx), ("normal atlas", ctxNormalH ctx), ("colour atlas, mark overridden off", ctxUnmarked ctx)]
-      result ← runValidatedWith models (retainedBase (ctxHost ctx)) (terrainSuite (ctxProfile ctx)) (ctxDirectory ctx) Depth32Float (ctxRenderer ctx) marks buffers decodedAt (Text.pack name) shapes (map snd named) valid
+      -- For a variant that releases ownership while the work is pending, the atlases' original
+      -- ownership is released between the submission and the wait; the frame must then complete and
+      -- read back as if nothing had happened (the draw holds what it reads), and the release is real
+      -- only after completion (teardown's table release). Nothing else changes.
+      let releasing = specVariant s `elem` [ReleasedWhilePending, RetainedReleasedWhilePending]
+          between
+            | releasing = do
+                marked ← traverse (markReleased (ctxTextures ctx)) [ctxColourH ctx, ctxNormalH ctx]
+                standing ← atomically (traverse (isReleased (ctxTextures ctx)) [ctxColourH ctx, ctxNormalH ctx])
+                pure $
+                  if and marked && and standing
+                    then Right ()
+                    else Left "the atlases' original ownership was not released while the frame was pending"
+            | otherwise = pure (Right ())
+      result ← OrderedPath.runValidatedBetween models (retainedBase (ctxHost ctx)) (terrainSuite (ctxProfile ctx)) (ctxDirectory ctx) Depth32Float (ctxRenderer ctx) marks buffers decodedAt between (Text.pack name) shapes (map snd named) valid
       let perPass = splitPasses (map (sceneTarget . partScene) parts) (resultProbes result)
           independents = [judgeIndependent (sceneTarget (partScene part)) (grid !) (observedFrom (fst (sceneTarget (partScene part))) probes) | (part, grid, probes) ← zip3 parts grids perPass]
           independent = foldr1 plus independents
@@ -1003,16 +1034,17 @@ renderSnapshot ctx s parts = do
           plus a b = Independent (indCompared a + indCompared b) (indAmbiguous a + indAmbiguous b) (indCovered a + indCovered b) (indReveals a + indReveals b) (indOverlaps a + indOverlaps b) (indMismatchCount a + indMismatchCount b) (take 12 (indMismatches a <> indMismatches b))
           -- The pick against the hand expectation on a stride of every pass's pixels.
           pickResults =
-            [ (length judged, [show pixel <> ": the pick found " <> show got <> ", expected " <> show want | (pixel, want, got) ← judged, got /= want], length [() | (_, SLoading, _) ← judged])
+            [ (length judged, [show pixel <> ": the pick found " <> show got <> ", expected " <> show want | (pixel, want, got) ← judged, got /= want], length [() | (_, SLoading, _) ← judged], length [() | pixel ← pixels, Nothing ← [pickWanted art light part grid pixel]])
             | (part, grid) ← zip parts exactGrids
             , let (gw, gh) = sceneTarget (partScene part)
             , let step = max 1 ((gw * gh) `div` 600)
             , let pixels = [(x, y) | (i, (x, y)) ← zip [0 ∷ Int ..] [(x, y) | y ← [0 .. gh - 1], x ← [0 .. gw - 1]], i `mod` step == 0]
             , let judged = [(pixel, want, got) | pixel ← pixels, Just want ← [pickWanted art light part grid pixel], let got = case specVariant s of { PickLoadingAsMiss → (case pickerAt part pixel of { SLoading → SNoHit; other → other }); BackmostPick → fromMaybe want (pickThroughNearer (grid ! pixel)); PickThroughFog → fromMaybe want (pickThroughFog (grid ! pixel)); _ → pickerAt part pixel }]
             ]
-          pickCompared = sum [n | (n, _, _) ← pickResults]
-          pickProblems = concat [p | (_, p, _) ← pickResults]
-          pickLoadingSeen = sum [n | (_, _, n) ← pickResults]
+          pickCompared = sum [n | (n, _, _, _) ← pickResults]
+          pickProblems = concat [p | (_, p, _, _) ← pickResults]
+          pickLoadingSeen = sum [n | (_, _, n, _) ← pickResults]
+          pickUndecided = sum [n | (_, _, _, n) ← pickResults]
           pendingProblems = ["a scene with pending cells whose sampled pixels hold no loading pick: it exercises nothing" | any (not . null . pendingCells . partScene) parts, pickLoadingSeen == 0]
           rejected
             | isControl (specVariant s) = Just (indMismatchCount independent > 0 || not (null pickProblems))
@@ -1094,6 +1126,7 @@ renderSnapshot ctx s parts = do
               , extraMarks = markFacts
               , extraIndependent = Just independent
               , extraPickCompared = pickCompared
+              , extraPickUndecided = pickUndecided
               , extraPickMismatches = length pickProblems
               , extraPickFirst = take 4 pickProblems
               , extraRejected = rejected
@@ -1312,6 +1345,7 @@ writeRecord ctx format seconds results = do
             , ( "pick_against_expectation"
               , JObject
                   [ ("compared", JNumber (show (extraPickCompared extra)))
+                  , ("undecided_conservative_ring", JNumber (show (extraPickUndecided extra)))
                   , ("mismatches", JNumber (show (extraPickMismatches extra)))
                   , ("first_mismatches", JArray (map JString (extraPickFirst extra)))
                   ]
