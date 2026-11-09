@@ -25,6 +25,7 @@ busy =
         , "    local n = select('#', api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}))"
         , "    local r, e = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0})"
         , "    print('busy', n, r == nil, e.code, type(e.message))"
+        , "    print('long column with a full bank', (pcall(api.terrain.column, self.arena, {x = 0, y = 0, z_min = 0, z_max = 8193})))"
         , "    self.s = 1"
         , "  end"
         , "elseif self.s == 1 then"
@@ -108,6 +109,8 @@ spec = describe "Terrain limits" $ do
           untilPrinted world "after taking\ttrue\ttrue"
           printed ← outLines world
           printed `shouldContain` ["busy\t2\ttrue\tbusy\tstring"]
+          -- a permanent refusal is not hidden by the full bank: the overlong range is the ordinary error it is with room
+          printed `shouldContain` ["long column with a full bank\tfalse"]
 
   it "answers a column of exactly 1,024 runs, refuses 1,025 as too_large with no partial answer, and answers a narrowed range in full" $
     withRig $ \rig →

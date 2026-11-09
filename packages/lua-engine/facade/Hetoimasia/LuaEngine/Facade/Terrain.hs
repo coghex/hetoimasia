@@ -107,6 +107,11 @@ surfaceSchema = SRecord [("x", SInteger), ("y", SInteger)]
 
 -- The decode -------------------------------------------------------------------------------------------
 
+-- | The most levels one column request may span: the service's limit, which is a permanent fact of the request and so an ordinary
+-- error here, decided before any temporary bank is asked.
+terrainColumnLevels ∷ Int
+terrainColumnLevels = 8192
+
 -- | A field a record may leave out: absent, or nil.
 optionalField ∷ Text → [(Text, Value)] → Maybe Value
 optionalField name fields = case lookup name fields of
@@ -229,7 +234,12 @@ decodeColumn = \case
     y ← requiredField "y" fields >>= coordinate "y"
     lo ← requiredField "z_min" fields >>= lowerEnd "z_min"
     hi ← requiredField "z_max" fields >>= upperEnd "z_max"
-    if hi <= lo then Left "z_max must be greater than z_min" else Right (TerrainColumnAsk x y lo hi)
+    if hi <= lo
+      then Left "z_max must be greater than z_min"
+      else
+        if toInteger hi - toInteger lo > toInteger terrainColumnLevels
+          then Left ("a column range spans at most " <> Text.pack (show terrainColumnLevels) <> " levels")
+          else Right (TerrainColumnAsk x y lo hi)
   _ → Left "a column must be a table with x, y, z_min and z_max"
 
 decodeSurface ∷ Value → Either Text (Int64, Int64)

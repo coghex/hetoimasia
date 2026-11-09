@@ -5,6 +5,8 @@
 -- compositions keep their namespace and request kinds.
 module Test.LuaEngine.Terrain.Composition (spec) where
 
+import Control.Exception (finally)
+
 import Data.Unique (newUnique)
 import Hetoimasia.LuaEngine.Facade
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
@@ -14,6 +16,7 @@ import Hetoimasia.Scripting.Lua.Admission (newRequestHandles)
 import Hetoimasia.Scripting.Lua.Lease (newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Test.Hspec
+import Test.LuaEngine.Facade.Graphics (answerTexture, awaitHanded, files, finishAll, injection, newGfx)
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
 import Hetoimasia.Terrain.Runtime (defaultConfig)
@@ -45,7 +48,10 @@ scopeOnly = GraphicsInjection $ \vm → do
       }
 
 spec ∷ Spec
-spec = describe "Terrain composition" $ do
+spec = composition >> coexist
+
+composition ∷ Spec
+composition = describe "Terrain composition" $ do
   let compose graphics terrain = do
         handles ← newRequestHandles
         requests ← either (\refused → expectationFailure' (show refused)) pure (m1Requests fixedM1Profile handles)
@@ -76,3 +82,44 @@ spec = describe "Terrain composition" $ do
       fmap (const ()) scope `shouldBe` Just ()
   where
     terrainInjection' = fst . maybe (error "no injection") id . shTerrain . presentationOver
+
+-- | One instance that holds a texture and a terrain arena in the one scope: releasing either leaves the other usable.
+both ∷ Script
+both =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.t = api.content.texture('images/quad.png')", "self.a = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  if api.request.ready(self.t) and api.request.ready(self.a) then"
+        , "    local t, a = api.request.take(self.t), api.request.take(self.a)"
+        , "    print('held', t.status, a.status)"
+        , "    self.tex = t.value.texture self.arena = a.value"
+        , "    print('texture release', api.texture.release(self.tex))"
+        , "    self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) self.s = 1"
+        , "  end"
+        , "elseif self.s == 1 then"
+        , "  local c = settle(api, self.q)"
+        , "  if c then print('cell after the texture release', c.status, c.value.material) print('arena release', api.terrain.release(self.arena)) print('done') self.s = 2 end"
+        , "end"
+        ]
+    }
+
+coexist ∷ Spec
+coexist = describe "Terrain with graphics in one VM" $
+  it "holds a texture and an arena in the one shared scope, and releases each without disturbing the other" $
+    withRig $ \rig → do
+      gx ← newGfx
+      ( withWorld fixedM1Profile (Layout (("lua/main.lua", scriptSource both) : files)) $ \world _ runtime →
+          withFvm world runtime ((presentationOver rig) {shGraphics = Just (injection gx)}) $ \fvm → do
+            spawned ← spawn world fvm "modules-test" mainPath
+            awaitHanded gx 1
+            answerTexture gx 0
+            untilPrintedBy world spawned "done"
+            printed ← outLines world
+            printed `shouldContain` ["held\tsuccess\tsuccess"]
+            printed `shouldContain` ["cell after the texture release\tsuccess\tsoil"]
+            printed `shouldContain` ["arena release\tdone"]
+            finishAll gx
+        )
+        `finally` finishAll gx

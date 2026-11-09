@@ -11,6 +11,7 @@ import qualified Test.LuaEngine.Terrain.Ownership as Ownership
 import qualified Test.LuaEngine.Terrain.Picks as Picks
 import qualified Test.LuaEngine.Terrain.Races as Races
 import qualified Test.LuaEngine.Terrain.Validation as Validation
+import qualified Test.LuaEngine.Terrain.Windows as Windows
 import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
@@ -25,3 +26,4 @@ spec = describe "Terrain" $ do
   Limits.spec
   Isolation.spec
   Picks.spec
+  Windows.spec

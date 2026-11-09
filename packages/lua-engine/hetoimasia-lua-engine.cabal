@@ -470,6 +470,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Terrain.Spec
         Test.LuaEngine.Terrain.Support
         Test.LuaEngine.Terrain.Validation
+        Test.LuaEngine.Terrain.Windows
         Test.LuaEngine.Texture.Spec
         Test.LuaEngine.Texture.Stages
         Test.LuaEngine.Texture.Teardown

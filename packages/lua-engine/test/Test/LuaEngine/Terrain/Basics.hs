@@ -3,7 +3,7 @@
 -- | Real Lua clients of the real terrain service: open, attach, the three reads, a removal and release, in both roles.
 module Test.LuaEngine.Terrain.Basics (spec) where
 
-import qualified Data.Text as Text
+import Data.Text (Text)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -44,6 +44,20 @@ roundTrip =
         ]
     }
 
+-- | What the round trip must print: the authored material and shape, the complete runs (air included), the surface, the removal's
+-- committed revision, the same cell after it, and the release.
+expected ∷ [Text]
+expected =
+  [ "open\ttrue"
+  , "opened\tsuccess"
+  , "cell\tsuccess\t0\tfalse\tsoil\t0"
+  , "column\tsuccess\t0\t-5:-3:false:stone,-3:1:false:soil,1:3:true:nil"
+  , "surface\tsuccess\ttrue\t0\tsoil"
+  , "remove\tsuccess\ttrue\t1"
+  , "after\tsuccess\t1\ttrue"
+  , "release\tdone"
+  ]
+
 spec ∷ Spec
 spec = describe "Terrain basics" $ do
   it "runs the whole surface from a gameplay instance, each request settling at its assigned tick" $
@@ -53,7 +67,7 @@ spec = describe "Terrain basics" $ do
           _ ← spawn world fvm "modules-test" mainPath
           pumpUntil world (tickBy control fvm 1 >> (elem "release\tdone" <$> outLines world))
           found ← outLines world
-          mapM_ (putStrLn . Text.unpack) found
+          found `shouldBe` expected
 
   it "runs the whole surface from a presentation instance" $
     withRig $ \rig →
@@ -62,4 +76,4 @@ spec = describe "Terrain basics" $ do
           _ ← spawn world fvm "modules-test" mainPath
           pumpUntil world (advanceClock world 2000000000 >> (elem "release\tdone" <$> outLines world))
           found ← outLines world
-          mapM_ (putStrLn . Text.unpack) found
+          found `shouldBe` expected

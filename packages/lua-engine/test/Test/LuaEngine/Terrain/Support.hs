@@ -25,6 +25,8 @@ module Test.LuaEngine.Terrain.Support
   , caseLua
   , checkCases
   , limitHeld
+  , observeCell
+  , arenaName
   , untilPrinted
   , untilPrintedBy
   , Gate
@@ -45,7 +47,7 @@ import Control.Monad (when)
 import Data.List (find)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Unique (Unique, newUnique)
+import Data.Unique (Unique, hashUnique, newUnique)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.LuaEngine.Facade (terrainPickType)
@@ -53,6 +55,9 @@ import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Registration (Binding, asynchronousNativeRequestIn)
 import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger), Value (VInteger))
 import Hetoimasia.LuaEngine.Terrain
+import Hetoimasia.Terrain.Cell (Cell (..), materialIdString)
+import Hetoimasia.Terrain.Coordinate (tileCoord)
+import Hetoimasia.Terrain.Residency (Revision (..))
 import Hetoimasia.Terrain.Runtime
 import Test.Hspec (Expectation, expectationFailure)
 import Hetoimasia.Scripting.Lua.Instance (InstanceFailure (failureMessage))
@@ -86,14 +91,14 @@ withRigHooks ∷ Config → Probe → TerrainHooks → (Rig → IO a) → IO a
 withRigHooks config probe terrainHooks body =
   withWorkerGroup $ \group →
     withTerrainService config (Ports alwaysAdmitting (standaloneSupervisor group) quiet probe) $ \service → do
-      picks ← newTerrainPicks
+      facade ← newTerrainFacade fixedM1Profile service config
       session ← newUnique
       body
         Rig
           { rgService = service
-          , rgFacade = TerrainFacade fixedM1Profile service config picks terrainHooks [pickFixture] 4096
+          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture]}
           , rgSession = session
-          , rgPicks = picks
+          , rgPicks = tfPicks facade
           }
 
 presentationOver, gameplayOver ∷ Rig → VmShape
@@ -249,3 +254,21 @@ holdAt gate = do
   when armed $ do
     _ ← tryPutMVar (gateArrived gate) ()
     takeMVar (gateOpen gate)
+
+-- | The name the service holds for an arena a Lua instance of this rig's session opened under this content root.
+arenaName ∷ Rig → Text → Text → Text
+arenaName rig root name = "s" <> Text.pack (show (hashUnique (rgSession rig))) <> "/" <> root <> "/" <> name
+
+-- | What an independent observer of the service, a client of its own with its own attachment, sees of one cell of a named arena: the
+-- content revision, and the cell's material (nothing for air). Read through the service's public port alone.
+observeCell ∷ Rig → Text → (Integer, Integer, Integer) → IO (Integer, Maybe String)
+observeCell rig key (x, y, z) = do
+  let service = rgService rig
+  Right client ← registerClient service
+  Right attaching ← attachArena service client key
+  Right lease ← await service attaching
+  Right reading ← cellAt service lease (either (error . show) id (tileCoord x y z))
+  Right answer ← await service reading
+  endClient service client
+  let Revision revision = cellRevision answer
+  pure (toInteger revision, case cellValue answer of Air → Nothing; Solid material _ → Just (materialIdString material))

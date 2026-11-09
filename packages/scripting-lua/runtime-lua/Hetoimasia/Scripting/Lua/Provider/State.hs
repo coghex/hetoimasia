@@ -1453,9 +1453,11 @@ applyCheckedAs service settleNow identity checked = do
 eligibleOf ∷ ProviderState → RequestId → STM Bool
 eligibleOf service identity = do
   st ← readTVar (psVar service)
+  open ← ticksOpen (psTicks service)
   case Map.lookup identity (pRecs st) of
     Just record
       | not (pClosed st)
+      , open
       , isNothing (recHeld record)
       , isNothing (recEnded record)
       , Map.notMember identity (pAdopting st)
