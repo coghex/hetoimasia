@@ -69,7 +69,7 @@ cabal test hetoimasia-tests --test-show-details=direct
   rule belongs there, and a domain fixture such as the bounded record provider stays beside it, not in
   `hetoimasia-test-support`.
 - `terrain-render-2d-tests` (`packages/terrain-render-2d/test/`, group `test.terrain-render-2d`, the CPU project) owns the
-  pure planner and picker (TRA-7), the terrain material's CPU model (TRA-8) and, in `Test.TerrainRender2D.MapAssets` (TRA-14),
+  pure planner and picker (TRA-7), the terrain material's pure model, presentation settings and atlas adaptation (TRA-17) and, in `Test.TerrainRender2D.MapAssets` (TRA-14),
   the canonical cutout and unit-normal map assets: the committed catalog under `samples/ecce-homo/content/textures/facemap/`
   against an independent reference worked from the P-9 height table with hand-stated normal bytes, the rotated lookup, the
   tie rule, joined cells, the sampling and colour-coverage model and the reproduced N/E reference defect, and the generator
@@ -393,7 +393,7 @@ cabal test hetoimasia-tests --test-show-details=direct
 
 - The Vulkan native backend and window integration packages, the 2D
   renderer's Vulkan recorder (`packages/render-2d-vulkan`), the terrain
-  material for it (`packages/terrain-render-2d-vulkan`, TRA-8, with the pure
+  material for it (`packages/terrain-render-2d-vulkan`, TRA-17, with the pure
   `packages/terrain` and `packages/terrain-render-2d` as prerequisites), and the
   triangle, sprites, image2d and scene3d samples, build only through `cabal.project.vulkan`, by
   `bash tools/vulkan/run.sh`. Its test mode runs their headless suites
@@ -407,15 +407,29 @@ cabal test hetoimasia-tests --test-show-details=direct
   same standing approval, as `glfw-native-tests`; on Linux its runner starts an
   isolated X11 display, and `test.vulkan-wayland` runs it on the isolated
   headless Wayland compositor. See [gpu_backend.md](gpu_backend.md#the-native-suite).
-  Its `tra8-terrain` scenario (TRA-8, Q-13; `--private-roots tra8-terrain`, in the
-  complete profile) draws plans of the terrain arena's faces through the existing
-  fixed-quad and material ABI into surface-free targets with a real `D32_SFLOAT`
-  depth image and judges every pixel against the render-2d oracle and against an
-  independent line-of-sight expectation; it creates no window, must finish inside
-  the 20-second child deadline, and fails (never skips) where the device chooses
-  another depth format. It reads the approved artwork under
-  `samples/ecce-homo/content/textures/`. Its evidence is under
-  `docs/evidence/terrain/tra8/`.
+  Its terrain material scenarios (TRA-17, Q-13) draw the cell-quad plans of the
+  terrain arena through the existing fixed-quad and material ABI over the packed
+  colour and normal atlases into surface-free targets with a real `D32_SFLOAT`
+  depth image and judge every pixel against the render-2d oracle (given the
+  material's model) and against an independent hand model of the quad contract; they
+  create no window and fail (never skip) where the device chooses another depth
+  format. `tra17-terrain-ci` is the bounded required selection (in the complete
+  profile, inside the 20-second child deadline). **`tra17-terrain` is the complete
+  Q-13 qualification and is run directly, not part of `--complete`**
+  (`optInScenarios` in `Test.GPU.Vulkan.Native.Private`, an explicit documented
+  exclusion, not an Hspec filter); a direct child run has no parent deadline:
+
+  ```sh
+  HETOIMASIA_NATIVE_SESSION=desktop HETOIMASIA_VALIDATION_EVIDENCE=DIR \
+    bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --private-roots tra17-terrain
+  ```
+
+  It reads the committed atlases under `samples/ecce-homo/content/textures/terrain-atlas/`
+  through the bounded decoder. The terrain case's own upload configuration allows a
+  4 MiB single upload request (the packed normal atlas is 1,179,648 bytes); it is
+  the harness's staging bound, not a texture-admission bank. Its evidence is under
+  `docs/evidence/terrain/tra17/`; the replaced `tra8-terrain` captures under
+  `docs/evidence/terrain/tra8/` are labelled history of the per-face model.
   Every helper thread `diagnostics-tests`, `native-tests`, `integration-tests`,
   `render-2d-vulkan-tests` and the `allocator-parity-probe` start is an owned start
   through `Test.Support.Owned` (#595): however the scope that needed it ends (a return, a
