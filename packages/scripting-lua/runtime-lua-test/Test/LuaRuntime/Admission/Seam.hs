@@ -6,6 +6,7 @@ module Test.LuaRuntime.Admission.Seam (spec) where
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
 import Control.Exception (throwIO)
+import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Control.Monad (forM_, unless, void, when)
@@ -17,7 +18,7 @@ import Hetoimasia.Scripting.Lua.Scheduled (grantScheduledStep, scheduledEndpoint
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
-import Test.LuaRuntime.Instance.Support (expectControl, grantOne)
+import Test.LuaRuntime.Instance.Support (awaitSettled, expectControl, failureOf', grantOne)
 import Test.LuaRuntime.Request.Support (awaitDiagnostic, diagnostics, finishWork, onSubmit, submissions)
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
@@ -26,6 +27,14 @@ import Test.LuaRuntime.Support (bounded, expectFatal, requiredPolicy, withBounda
 -- | The seam of the request the provider was last handed.
 captured ∷ IORef (Maybe Settling) → Submission → IO ()
 captured ref submission = writeIORef ref (submissionSettling submission)
+
+-- | The endpoint and the attributed text an instance failed with, if it failed with a required request's.
+requestFailure ∷ InstanceSettlement → Maybe (Text, Text)
+requestFailure settlement = do
+  failure ← failureOf' settlement
+  case failureError failure of
+    ErrorRequest endpoint why → Just (endpoint, why)
+    _ → Nothing
 
 spec ∷ Spec
 spec = describe "the settlement seam and the declining hand-off" $ do
@@ -279,6 +288,35 @@ spec = describe "the settlement seam and the declining hand-off" $ do
           acommand fixture owner "i" "take" "a"
           awaitNote fixture cutTaken
           awaitNote fixture "release r1"
+
+  -- A required request's expected failure fails its instance (`latchRequired`): the instance's failure carries the bounded message, whichever
+  -- path settled the request at its tick.
+  forM_ [("held for its tick", False), ("a failed last look at an early resource reply at the tick", True)] $ \(path, resource) →
+    it ("fails the instance of a required request with the failure cut to the bound when it is " <> path) $ bounded $ do
+      fixture ← newAFix 4
+      when resource (setPolicy fixture (\held → held {polLease = Just InstanceOwned}))
+      valid ← newTVarIO True
+      withBoundary $ \control runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "cut required" [admitter] aConfig (admissionGrant fixture 8 (SettleAtAssignedTick Nothing)) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        seam ← newIORef Nothing
+        onSubmit (afFake fixture) (captured seam)
+        if resource then acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing else acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        Just settling ← readIORef seam
+        if resource
+          then do
+            let final = readTVar valid >>= \ok → pure (if ok then Nothing else Just longFailure)
+            atomically (settlingSettleFinal settling final (ProviderResource (VInteger 4) (Adoption (\_ → resourceFor fixture "r1")))) >>= (`shouldBe` ReplyAdoption)
+            awaitNote fixture "acquire r1"
+            awaitDiagnostic owner ((>= 1) . rdHeldNow)
+            atomically (writeTVar valid False)
+          else atomically (settlingSettle settling (ProviderExpected longFailure)) >>= (`shouldBe` ReplyHeld)
+        grantOne control owner
+        settlement ← awaitSettled (afBase fixture) "i"
+        requestFailure settlement `shouldBe` Just (if resource then "res" else "path", "(example) not_found: " <> Text.replicate 1022 "é" <> "...")
+        d ← diagnostics owner
+        rdLatched d `shouldBe` 1
 
   it "treats every reply that comes while a resource reply waits to be built as a duplicate, whatever it is" $ bounded $ do
     fixture ← newAFix 4
