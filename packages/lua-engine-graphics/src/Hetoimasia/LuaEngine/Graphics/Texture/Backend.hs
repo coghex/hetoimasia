@@ -28,8 +28,24 @@
 -- on a frame, never on Lua, a window or a peer instance. It never calls Lua; the sink it answers
 -- through is the pipeline's, whose operations are single transactions.
 --
+-- = What one pump step costs
+--
+-- A step examines /candidates/: the jobs ('sJobs'), the textures that have a step or wait on something
+-- ('sActive') and the table's bootstrap, in that order, and takes the first that has something to do. A texture
+-- the backend has delivered and nobody has released ('TexLive', and the two offer stages before it) has nothing the
+-- pump could do for it until a release is asked, so it is not a candidate: the transaction that asks (the lease's
+-- release, the close, the owner's end, the offer's answer) puts it in 'sActive' in the same step that moves its
+-- stage. The cost of a step is therefore the jobs in flight plus the textures being released, held or retired, and
+-- never the textures retained; the work for a scenario grows with the number of textures it creates and releases,
+-- not with the square. 'withBackendObserved' lets an example count the candidates examined.
+--
 -- = The invariants
 --
+-- * /A texture the pump can leave alone is not scanned, and is never missed/. Every texture in 'sTextures' whose
+--   stage is not 'TexOffered', 'TexOfferedReleased' or 'TexLive' is in 'sActive' (keyed by the same 'TexId'), and
+--   'sActive' holds nothing 'sTextures' does not. The only writes that take a texture out of those three stages
+--   are 'releaseTexture', 'deliver', 'closeAndDrain' and 'ownerEnded', and each puts it in 'sActive' in the
+--   same transaction; a texture leaves both maps together, when it is forgotten.
 -- * /Admission before tracking/. A job exists the moment 'backendUpload' returns, so cancellation
 --   from then on finds it. Nothing native exists before the pump has issued the allocation.
 -- * /Intent before issuance, tracking before escape/. Every native object is recorded in its job
@@ -59,6 +75,8 @@ module Hetoimasia.LuaEngine.Graphics.Texture.Backend
   ( -- * The backend
     Backend
   , withBackend
+  , withBackendObserved
+  , Examined (..)
   , textureBackend
 
     -- * Observation
@@ -149,7 +167,21 @@ type TexId = Word64
 data Backend image ticket = Backend
   { bPort ∷ !(Port image ticket)
   , bState ∷ !(TVar (State image ticket))
+  , bExamined ∷ !(Examined → STM ())
+    -- ^ Called, inside the pump's transaction, once for each candidate it examines. It never affects a decision.
   }
+
+-- | A candidate the pump examined while it looked for its next step.
+data Examined
+  = -- | A job (accepted upload).
+    ExaminedJob
+  | -- | A texture that has a step or waits on something.
+    ExaminedTexture
+  | -- | The table's bootstrap.
+    ExaminedBoot
+  | -- | A texture the close's drain read.
+    ExaminedDrain
+  deriving (Eq, Ord, Show, Enum, Bounded)
 
 data Lifecycle = Running' | Stopping'
   deriving (Eq, Show)
@@ -167,6 +199,9 @@ data State image ticket = State
   , sEvidence ∷ ![(Text, ExceptionWithContext SomeException)]
   , sLate ∷ !Int
     -- ^ Sink answers that were 'SinkLate'.
+  , sActive ∷ !(Map TexId Tex)
+    -- ^ The textures of 'sTextures' the pump has to look at: every one whose stage is not 'TexOffered',
+    -- 'TexOfferedReleased' or 'TexLive' (see "What one pump step costs").
   }
 
 -- | The table's bootstrap: whether slot 0's placeholder is bound.
@@ -227,7 +262,8 @@ data Phase ticket
 
 -- | A texture the backend registered and offered, until it is proved retired.
 data Tex = Tex
-  { tRegistration ∷ !Registration
+  { tId ∷ !TexId
+  , tRegistration ∷ !Registration
   , tStage ∷ !(TVar TexStage)
   }
 
@@ -262,9 +298,15 @@ instance Exception BackendDefect
 -- texture is proved retired (or failed to be). Only then does the pump stop. A cancellation delivered
 -- while it drains is remembered and raised once the drain is over.
 withBackend ∷ ∀ image ticket a. Port image ticket → (Backend image ticket → IO a) → IO a
-withBackend port body = withWorkerGroup $ \group → do
-  var ← newTVarIO (State Running' Map.empty 0 Map.empty 0 BootIdle Nothing Nothing [] 0)
-  let backend = Backend port var
+withBackend = withBackendObserved (\_ → pure ())
+
+-- | 'withBackend' with an observer of the pump's work: called inside the pump's (and the close's) transactions
+-- once for each candidate examined. A transaction that retries or restarts calls it again, so a count kept from it
+-- is the work attempted, which a deterministic example bounds; it is never an input to a decision.
+withBackendObserved ∷ ∀ image ticket a. (Examined → STM ()) → Port image ticket → (Backend image ticket → IO a) → IO a
+withBackendObserved examined port body = withWorkerGroup $ \group → do
+  var ← newTVarIO (State Running' Map.empty 0 Map.empty 0 BootIdle Nothing Nothing [] 0 Map.empty)
+  let backend = Backend port var examined
   result ← mask $ \restore → do
     outcome ← tryWithContext @SomeException $ restore $ do
       started ← startWorker group (workerDefinition "texture-backend-pump" (\_ → pure ()) (\token () → pumpWorker backend token))
@@ -550,14 +592,15 @@ abandonAll backend why = do
       stage ← readTVar (tStage tex)
       unless (terminalStage stage) $
         writeTVar (tStage tex) (TexFailed (toException (BackendDefect ("the texture was not proved retired: " <> why))))
-    writeTVar (bState backend) st {sJobs = Map.empty, sTextures = Map.empty, sLifecycle = Stopping'}
+    writeTVar (bState backend) st {sJobs = Map.empty, sTextures = Map.empty, sActive = Map.empty, sLifecycle = Stopping'}
     pure (Map.elems (sJobs st))
   forM_ jobs $ \job → unless (jLate job) $ do
     unless (jRetiredSent job) (void (tryWithContext @SomeException (sinkBuffersRetired (jSink job))))
     void (tryWithContext @SomeException (sinkFailed (jSink job) (UploadFailure why)))
 
 -- | The next thing for the pump, in one transaction: the first job or texture with something to do, the
--- table's bootstrap, and otherwise a wait on every variable read, or a stop.
+-- table's bootstrap, and otherwise a wait on every variable read, or a stop. The textures it looks at are the
+-- active ones; a retained texture's release arrives as a write to the state, which this transaction reads.
 nextStep ∷ ∀ image ticket. Backend image ticket → StopToken → STM Step
 nextStep backend token = do
   st ← readTVar (bState backend)
@@ -567,7 +610,7 @@ nextStep backend token = do
     _ → do
       let candidates =
             [jobStep backend standing jid job | (jid, job) ← Map.toAscList (sJobs st)]
-              <> [textureStep backend tid tex | (tid, tex) ← Map.toAscList (sTextures st)]
+              <> [textureStep backend tid tex | (tid, tex) ← Map.toAscList (sActive st)]
               <> [bootStep backend]
       found ← firstJust candidates
       case found of
@@ -602,6 +645,8 @@ ownerEnded backend why = do
     (bState backend)
     st
       { sEnded = Just why
+      , -- Every texture not proved retired is failed below, and a failed texture is the pump's to forget.
+        sActive = sTextures st
       , sJobs = Map.map (failWith ("the graphics owner ended: " <> why)) (sJobs st)
       , sBoot = case sBoot st of
           BootReady → BootReady
@@ -630,6 +675,7 @@ disposing = \case
 -- | One job's next step, if it has one.
 jobStep ∷ ∀ image ticket. Backend image ticket → Standing → JobId → Job image ticket → STM (Maybe Step)
 jobStep backend standing jid job = do
+  bExamined backend ExaminedJob
   st ← readTVar (bState backend)
   waiting ← case jWait job of
     Nothing → pure False
@@ -802,7 +848,7 @@ refusalText = \case
 -- owner step, after the previous step's table refresh, so a descriptor written at the end of one step is seen at the
 -- start of the next and a wake that fires between the owner's poll and its refresh cannot be missed.
 bootStep ∷ Backend image ticket → STM (Maybe Step)
-bootStep backend = readTVar (bState backend) >>= \st → case sBoot st of
+bootStep backend = bExamined backend ExaminedBoot >> readTVar (bState backend) >>= \st → case sBoot st of
   BootIdle → pure Nothing
   BootReady → pure Nothing
   BootStopped → pure Nothing
@@ -991,17 +1037,17 @@ deliver backend jid tid registration sink = do
           -- already failed stays failed.
           case stage of
             TexOffered → writeTVar (tStage offered) TexLive
-            TexOfferedReleased → writeTVar (tStage offered) TexReleaseRequested
+            TexOfferedReleased → writeTVar (tStage offered) TexReleaseRequested >> activate backend offered
             _ → pure ()
           modifySTMState backend (\st → st {sJobs = Map.delete jid (sJobs st)})
         Right SinkLate → atomically $ do
           -- The pipeline ended the job: it took nothing, and the texture is still the backend's.
-          modifySTMState backend (\st → st {sTextures = Map.delete tid (sTextures st), sLate = sLate st + 1})
+          modifySTMState backend (\st → (dropTexture tid st) {sLate = sLate st + 1})
           modifyJob backend jid (\found → found {jLate = True, jCancel = True, jPhase = PRegistered})
         Left caught@(ExceptionWithContext _ (SomeException raised)) → do
           atomically $ do
             latchSTM backend "answering the pipeline's sink" caught
-            modifySTMState backend (\st → st {sTextures = Map.delete tid (sTextures st)})
+            modifySTMState backend (dropTexture tid)
             modifyJob backend jid (\found → (failWith ("the sink raised: " <> Text.pack (show raised)) found) {jPhase = PRegistered})
           rethrowIfAsync caught
 
@@ -1041,8 +1087,18 @@ claimTexture backend registration = do
   st ← readTVar (bState backend)
   stage ← newTVar TexOffered
   let tid = sNextTexture st
-  writeTVar (bState backend) st {sTextures = Map.insert tid (Tex registration stage) (sTextures st), sNextTexture = tid + 1}
+  writeTVar (bState backend) st {sTextures = Map.insert tid (Tex tid registration stage) (sTextures st), sNextTexture = tid + 1}
   pure tid
+
+-- | Put a texture whose stage was just moved out of 'TexOffered', 'TexOfferedReleased' or 'TexLive' in the pump's
+-- reach. Called in the transaction that moves the stage; a texture already forgotten is not put back.
+activate ∷ Backend image ticket → Tex → STM ()
+activate backend tex = modifySTMState backend $ \st →
+  if Map.member (tId tex) (sTextures st) then st {sActive = Map.insert (tId tex) tex (sActive st)} else st
+
+-- | A texture leaves both maps together.
+dropTexture ∷ TexId → State image ticket → State image ticket
+dropTexture tid st = st {sTextures = Map.delete tid (sTextures st), sActive = Map.delete tid (sActive st)}
 
 -- | The release the lease calls, once: revoke at once (the logical release a publication's check sees),
 -- ask the table to release when the holds allow, and answer the reading of the retirement. Never waits.
@@ -1059,6 +1115,8 @@ releaseTexture backend tex = do
     request next = do
       markReleased backend (tRegistration tex)
       writeTVar (tStage tex) next
+      -- The pump looks at this texture from now on: it did not before, and nothing but this write tells it so.
+      activate backend tex
 
 retirementOf ∷ TVar TexStage → STM RetirementState
 retirementOf stage =
@@ -1070,6 +1128,7 @@ retirementOf stage =
 -- | A texture's next step, if it has one.
 textureStep ∷ ∀ image ticket. Backend image ticket → TexId → Tex → STM (Maybe Step)
 textureStep backend tid tex = do
+  bExamined backend ExaminedTexture
   stage ← readTVar (tStage tex)
   case stage of
     TexReleaseRequested →
@@ -1139,7 +1198,7 @@ textureStep backend tid tex = do
       let raised = toException (BackendDefect why)
       latchSTM backend "texture release" (plain raised)
       writeTVar (tStage tex) (TexFailed raised)
-    forget = modifySTMState backend (\st → st {sTextures = Map.delete tid (sTextures st)})
+    forget = modifySTMState backend (dropTexture tid)
 
 -- The close ---------------------------------------------------------------------------------------------------
 
@@ -1157,6 +1216,7 @@ closeAndDrain backend = do
         TexLive → do
           markReleased backend (tRegistration tex)
           writeTVar (tStage tex) TexReleaseRequested
+          activate backend tex
         -- An offer in flight is released when it is taken ('deliver'); when it is refused it is the job's.
         TexOffered → do
           markReleased backend (tRegistration tex)
@@ -1177,6 +1237,7 @@ closeAndDrain backend = do
       st ← readTVar (bState backend)
       unless (Map.null (sJobs st)) retry
       for_ (Map.elems (sTextures st)) $ \tex → do
+        bExamined backend ExaminedDrain
         stage ← readTVar (tStage tex)
         unless (terminalStage stage) retry
 

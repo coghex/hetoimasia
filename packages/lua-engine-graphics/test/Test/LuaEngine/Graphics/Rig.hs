@@ -70,6 +70,7 @@ import System.Timeout (timeout)
 import Text.Read (readMaybe)
 import Test.HUnit.Lang (assertFailure)
 import Test.LuaEngine.Graphics.Fake
+import Test.LuaEngine.Graphics.Work (tallyExamined)
 import Test.Support.Owned (withOwnedThreadOpening)
 
 -- | A backend over a fake owner, with the pipeline's port it hands out.
@@ -127,7 +128,7 @@ withRigOver fake body = do
 -- fake's owner and manages its holds itself.
 withBackendOnRaw ∷ Fake → (Rig → IO a) → IO a
 withBackendOnRaw fake body =
-  withBackend (fakePort fake) $ \backend → body (Rig fake backend (textureBackend backend))
+  withBackendObserved (tallyExamined (fakeWork fake)) (fakePort fake) $ \backend → body (Rig fake backend (textureBackend backend))
 
 openEveryHold ∷ Fake → IO ()
 openEveryHold fake = latchHolds fake >> forM_ [minBound .. maxBound] (release fake) >> releaseAllTickets fake >> setVersionHolders fake 0
