@@ -362,15 +362,32 @@ Numbered source references were rechecked at `b0e5e35c78`. Requirements 8–9
 remain unchanged. The manager arranges re-approval; amended prerequisites and
 Q-13 remain implementation/qualification gates.
 
-**Amendment processing cursor:** new-child filing is complete. #645 revision
-v2, #659's atlas amendment and #647 revision v2 are posted. The manager's
-`request-user-het-terrain-20261106-1838-apply645-prompt.txt` directs the next
-separate sign-off packet: **#646's atlas follow-up**, checking its existing
-`72828f2f` body against D-61/P-17 and #672. Its approved body/metadata remain
-unchanged until a separate comment amendment is signed off. #648/other
-remaining P-16 artifacts remain outstanding unless separately confirmed.
-The manager arranges readiness reviews; this cursor grants no approval or
-implementation/visual qualification.
+**TRA-10 amendment revision v2 applied 2026-11-09:** [#646] now carries the
+[owner-decision amendment](https://github.com/coghex/hetoimasia/issues/646#issuecomment-6731935937),
+marker `owner-decision:646-terrain-atlas-v2`. Verified `het-manager` sign-off
+`mnru9r5fb3xhuzgmeuwibd3x6a` (reply to draft
+`q55ydyr9fgktedsgs3uszfv8yi`) and the subsequent apply646 dispatch authorize
+this exact comment, with the approved issue body and metadata untouched.
+Comment SHA-256:
+`6d0c7585b2a8151f3af9c4db217aba7ffacd79b7d1d21cdff52d8c6e22137aec`;
+verbatim effective-spec SHA-256:
+`5e262f23110631edea7ecc6c59e6534dd3e6c269a4c0d8136911bf30140efd78`.
+The post and unchanged body/metadata were verified. This carries D-61/P-17's
+checked parent/region mapping, shared coverage, region-aware pick authority
+and #672's unchanged byte-only admission through the Lua view facade. The
+approved qualification alignment extends #645's `--terrain-views-full` mode
+with Lua atlas judgments while retaining the required CI limit. Requirements
+2, 5, 6 and 8 remain unchanged. The manager arranges re-approval; this is not
+implementation or amended Q-13 qualification.
+
+**Amendment processing cursor:** new-child filing is complete. #645 and #646
+revision v2, #659's atlas amendment and #647 revision v2 are posted. The
+manager's `request-user-het-terrain-20261106-1838-apply646-prompt.txt` directs a
+stop after recording/reporting #646: **do not start another artifact until
+asked**. #648/other remaining P-16 artifacts remain outstanding unless
+separately confirmed. The manager arranges readiness reviews; this cursor
+does not mark later artifacts complete or grant implementation/visual
+qualification.
 
 ## Epic contract
 
