@@ -13,6 +13,7 @@ module Test.TerrainRender2D.CellFixtures
   , loadAssetsWith
   , loadAssetsExtra
   , planeFromFormula
+  , wholeImageView
   , stoneId
   , soilId
   , catalogPlane
@@ -56,6 +57,7 @@ import Data.Ord (comparing)
 import qualified Data.Set as Set
 import Data.Word (Word64)
 import Hetoimasia.Asset.Image.DataMap (CoveragePlane, NormalEncoding (..), buildBinaryCoverage)
+import Hetoimasia.Asset.Image.Region (RegionView, fullImageView)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld)
 import Hetoimasia.Terrain.Cell (Column (..), MaterialId, mkMaterialId)
@@ -100,6 +102,11 @@ catalogPlane relative = do
     Right (96, 64, texels) → either (\e → fail (relative <> ": " <> show e)) pure (buildBinaryCoverage 96 64 texels)
     other → fail (relative <> ": not a 96x64 RGBA PNG: " <> either id (const "wrong size") other)
 
+-- | The whole-image view of a plane: a single image is a one-region atlas, and the per-image
+-- fixtures are exactly that, at the given parent version.
+wholeImageView ∷ Word64 → CoveragePlane → RegionView
+wholeImageView version plane = either (\e → error ("wholeImageView: " <> show e)) id (fullImageView version plane)
+
 -- | The plane of a formula: a texel is covered where it is true. A technical
 -- test fixture, labelled as such; it never stands in for the catalog in the
 -- all-16-ID, four-facing acceptance cases.
@@ -122,11 +129,11 @@ loadAssetsWith version overrides = do
   granite ← override (AssetColour (ColourMaterial soilId)) <$> catalogPlane (texturesDirectory </> "granite.png")
   maps ← forM catalogKeys $ \key → do
     plane ← override (AssetMap key) <$> catalogPlane (texturesDirectory </> "facemap" </> mapFileName key)
-    asset ← orFail (mkMapAsset key version version (Just UnitNormalRgbV1) plane)
+    asset ← orFail (mkMapAsset key version version (Just UnitNormalRgbV1) (wholeImageView version plane))
     pure (key, asset)
-  blank ← orFail (mkColourAsset ColourBlank version version blankPlane)
-  stone ← orFail (mkColourAsset (ColourMaterial stoneId) version version loam)
-  soil ← orFail (mkColourAsset (ColourMaterial soilId) version version granite)
+  blank ← orFail (mkColourAsset ColourBlank version version (wholeImageView version blankPlane))
+  stone ← orFail (mkColourAsset (ColourMaterial stoneId) version version (wholeImageView version loam))
+  soil ← orFail (mkColourAsset (ColourMaterial soilId) version version (wholeImageView version granite))
   orFail (mkAssetSnapshot version blank [(stoneId, stone), (soilId, soil)] maps)
   where
     override key plane = maybe plane id (lookup key overrides)
@@ -141,14 +148,14 @@ loadAssetsExtra version n = do
   granite ← catalogPlane (texturesDirectory </> "granite.png")
   maps ← forM catalogKeys $ \key → do
     plane ← catalogPlane (texturesDirectory </> "facemap" </> mapFileName key)
-    asset ← orFail (mkMapAsset key version version (Just UnitNormalRgbV1) plane)
+    asset ← orFail (mkMapAsset key version version (Just UnitNormalRgbV1) (wholeImageView version plane))
     pure (key, asset)
-  blank ← orFail (mkColourAsset ColourBlank version version blankPlane)
-  stone ← orFail (mkColourAsset (ColourMaterial stoneId) version version loam)
-  soil ← orFail (mkColourAsset (ColourMaterial soilId) version version granite)
+  blank ← orFail (mkColourAsset ColourBlank version version (wholeImageView version blankPlane))
+  stone ← orFail (mkColourAsset (ColourMaterial stoneId) version version (wholeImageView version loam))
+  soil ← orFail (mkColourAsset (ColourMaterial soilId) version version (wholeImageView version granite))
   extras ← forM [1 .. n] $ \i → do
     let material = either (error . show) id (mkMaterialId ("unused" <> show i))
-    asset ← orFail (mkColourAsset (ColourMaterial material) version version loam)
+    asset ← orFail (mkColourAsset (ColourMaterial material) version version (wholeImageView version loam))
     pure (material, asset)
   orFail (mkAssetSnapshot version blank ([(stoneId, stone), (soilId, soil)] <> extras) maps)
   where

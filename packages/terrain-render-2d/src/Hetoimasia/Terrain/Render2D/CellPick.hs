@@ -63,7 +63,7 @@ module Hetoimasia.Terrain.Render2D.CellPick
   ) where
 
 import Data.Word (Word32)
-import Hetoimasia.Asset.Image.DataMap (coverageAt)
+import Hetoimasia.Asset.Image.Region (regionViewCoverageAt)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld, viewportContains, windowToTarget)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
@@ -157,14 +157,15 @@ pickCells plan (CellPickQuery presented point@(V2 px py))
           covered ← coveredBy centre quad
           if covered then Right (Just quad) else firstCovered centre rest
 
-    -- The texel the centre selects, exactly, in both planes.
+    -- The texel the centre selects, exactly, in both regions: the local index is taken in the
+    -- region's own 96 x 64 extent, and the region adds its origin when it reads its parent's plane.
     coveredBy (cx, cy) quad = do
       let TargetRect l t r b = cqTarget quad
           tx = texel 96 ((cx - l) / (r - l))
           ty = texel 64 ((cy - t) / (b - t))
       colour ← maybe (Left CellPickUnrepresentable) Right (colourCoverage assets (cqColour quad))
       maps ← maybe (Left CellPickUnrepresentable) Right (mapCoverage assets (cqMap quad))
-      case (coverageAt colour tx ty, coverageAt maps tx ty) of
+      case (regionViewCoverageAt colour tx ty, regionViewCoverageAt maps tx ty) of
         (Just a, Just b') → Right (a && b')
         _ → Left CellPickUnrepresentable
 

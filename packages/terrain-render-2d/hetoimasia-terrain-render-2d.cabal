@@ -40,6 +40,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.Terrain.Render2D.Assets
+        Hetoimasia.Terrain.Render2D.AtlasAssets
         Hetoimasia.Terrain.Render2D.Camera
         Hetoimasia.Terrain.Render2D.CellPick
         Hetoimasia.Terrain.Render2D.Cells
@@ -62,6 +63,7 @@ library
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-api ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-atlas ==0.1.0.0,
         hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0
 
 -- The offline map bake (TRA-14): the frontmost-facet cutout and unit-normal map
