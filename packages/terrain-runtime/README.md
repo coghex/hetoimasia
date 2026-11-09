@@ -586,7 +586,7 @@ the bounds before it is sliced, that the entries end exactly at the stated end a
 the padding is zero, strictly increasing keys, every child or list reference inside
 the page space and never the page itself, and the structure of each leaf entry (a
 well-formed key and value of the tree's own category: coordinates in range,
-`lo < hi` inside the level limits, a class size of at least 1, adjacent runs and free
+`lo < hi` inside the level limits (a link's run-node level too, in a key and in a parent value), a class size of at least 1, adjacent runs and free
 extents already coalesced). A **valid checksum never rescues a malformed page**: the
 same structure checks refuse a re-sealed page. A refusal is an explicit
 `PageError`; it is never an empty index, absent history, air or the pristine source.
@@ -605,9 +605,9 @@ through a window of validated page buffers: a page it needs and does not have is
 its place (a wrong tree, a wrong level, a key outside its parent's separators) is an
 integrity failure. Updates copy the changed path into an overlay and never touch a
 committed page. A node that falls under a quarter of a payload after a deletion is
-repacked with a neighbour (merged, or split evenly), so every non-root node is at
+repacked with a neighbour (both checked against the separators their parent promises before they are merged) (merged, or split evenly), so every non-root node is at
 least a quarter full; an insertion that overflows splits by bytes; a root that
-splits adds a level and a root left with one child gives it back. A tree is at most
+splits adds a level and a root left with one child gives it back (the collapse walks down one level at a time, checking each child's level and its parent's separator bounds, so a malformed or cyclic subtree is refused, never followed). A tree is at most
 **8 levels** (0 to 7); a plan that would need more is refused with a typed
 `TreeTooTall`, never truncated. A legitimate tree needs a ninth level only past
 about 6.7e7 records (more than 36 GiB of leaves), so the default 1 GiB allowance and
@@ -649,7 +649,9 @@ At most **one** mutating transaction is active. A plan takes
 `d + 1 + 68` pages from the supply (loose pages first, then free extents lowest
 first, then the untouched tail), writes the pages it needs and returns the rest as
 loose pages, so the allocator's own updates need no fixed point and never overwrite a
-committed page. It writes at most **256 pages (1 MiB), index, allocator and
+committed page. The supply is checked as it is read: a loose page or free extent outside
+the used page space, a free extent overlapping the one before it, or any page that would be
+handed out twice is corruption (an `Integrity` refusal), never an allocation. It writes at most **256 pages (1 MiB), index, allocator and
 retirement pages included**; reserves at most **4 MiB of RAM**; reads through a window of at
 most **1.25 MiB of validated page buffers** (about 310 pages); and a discovery batch performs at most **64 structural
 updates**, where a structural update is #661's: one connection inspected, at most one
@@ -672,7 +674,10 @@ accounted at 28,000 bytes each; the encoded output is 4 KiB a written page. The 
 header is charged at its fixed 128-byte record size: its byte total counts the retained
 *history*, which lives in pages, and is not transaction memory, so a history of any size
 plans like an empty one. A plan whose window or new pages would hold more is refused
-(`WindowBytesExceeded`, `OverlayExceeded`) with nothing changed.
+(`WindowBytesExceeded`, `OverlayExceeded`) with nothing changed. A plan numbers and encodes its new
+pages one at a time and forces each output buffer and page number before the next page is
+built, so no parsed page outlives the plan (a dense 180-leaf plan's measured live heap is
+checked against what it reports).
 
 A removal and its minimum connection obligation are **one** candidate, and so are a
 discovery batch's knowledge, exposed-boundary records and remaining obligations: the
@@ -707,7 +712,9 @@ the OS accepted it, not an `fsync` or power-loss durability.
 each with an accounted record). Writes, publication and reclamation cannot change its
 answers. A commit retires only the record pages it replaced, in one retirement entry
 keyed by its version; an entry is reclaimable once the oldest pinned version is at
-least that version (`BlockedByReader` otherwise). `planMaintenance` frees an entry's
+least that version (`BlockedByReader` otherwise). `planMaintenance` first checks that no page it frees is
+already free, loose or claimed by its own supply (a corrupt retirement list is
+`DoubleFree`, never a page with two owners) and frees an entry's
 pages incrementally (at most 64 per transaction, fewer when a bound is tighter), is a
 maintenance transaction and **may spend the protected reserve**. A token of a released
 reader, of another store or of another incarnation reads nothing (`ReadStale`).
