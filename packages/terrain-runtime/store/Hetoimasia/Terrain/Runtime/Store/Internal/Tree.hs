@@ -434,6 +434,59 @@ loadChecked tree lo hi lvl ref = do
 -- ---------------------------------------------------------------------------
 -- Reads
 
+-- | A sibling subtree of the node a descent is in: its reference, the bounds its separators
+-- give it and its level.
+data Sib = Sib !Ref !(Maybe ByteString) !(Maybe ByteString) !(Maybe Int)
+
+-- | The bounds of the child at an index, and the nearest sibling subtrees on each side of it:
+-- the neighbours inside the same node, else the ones the descent inherited.
+childContext ∷ Maybe ByteString → Maybe ByteString → [(ByteString, Ref)] → Int → Int → Maybe Sib → Maybe Sib → (Maybe ByteString, Maybe ByteString, Maybe Sib, Maybe Sib)
+childContext lo hi es i lv ls rs =
+  let (lo', hi') = childBounds lo hi es i
+      left = if i > 0 then (let (a, b) = childBounds lo hi es (i - 1) in Just (Sib (snd (es !! (i - 1))) a b (Just (lv - 1)))) else ls
+      right = if i + 1 < length es then (let (a, b) = childBounds lo hi es (i + 1) in Just (Sib (snd (es !! (i + 1))) a b (Just (lv - 1)))) else rs
+   in (lo', hi', left, right)
+
+-- | The leaf at one end of a subtree, loaded through the separators that bound it.
+extremeLeaf ∷ TreeId → Bool → Ref → Maybe ByteString → Maybe ByteString → Maybe Int → M [(ByteString, ByteString)]
+extremeLeaf tree leftmost ref lo hi lvl = do
+  n ← loadChecked tree lo hi lvl ref
+  case nBody n of
+    NLeaf es → pure es
+    NInner [] → failInvariant tree
+    NInner es →
+      let i = if leftmost then 0 else length es - 1
+          (lo', hi') = childBounds lo hi es i
+       in extremeLeaf tree leftmost (snd (es !! i)) lo' hi' (Just (nLevel n - 1))
+
+-- | An absence, a floor, a ceiling, the start of a scan and the unreachability of a page are
+-- all concluded from the leaf (or node) a key leads to. That is only as true as the separators
+-- that led there, which are checked against the leaves they separate only when those leaves
+-- are loaded: a separator moved to another valid key sends a read to a neighbour that holds
+-- no such record and the record reads as absent. So a conclusion is drawn only after the
+-- landing node's neighbouring subtrees are loaded too, each through its own separators and
+-- so checked against the bound it shares with the landing node. A key below the first
+-- separator belongs to the first child, never to nothing.
+validateLanding ∷ TreeId → Maybe Ref → ByteString → Int → M ()
+validateLanding _ Nothing _ _ = pure ()
+validateLanding tree (Just root) key stopLevel = go root Nothing Nothing Nothing Nothing Nothing
+  where
+    -- the landing node itself is not loaded here (a page being proved unreachable may not be in the
+    -- window): its neighbours are, through the separators the descent used
+    go ref lo hi lvl ls rs = do
+      n ← loadChecked tree lo hi lvl ref
+      case nBody n of
+        NLeaf _ → pure ()
+        NInner es → do
+          let i = maybe 0 id (chooseChild key es)
+              (lo', hi', ls', rs') = childContext lo hi es i (nLevel n) ls rs
+          if nLevel n - 1 <= stopLevel
+            then sides ls' rs'
+            else go (snd (es !! i)) lo' hi' (Just (nLevel n - 1)) ls' rs'
+    sides ls rs = do
+      mapM_ (\(Sib r a b l) → extremeLeaf tree False r a b l) ls
+      mapM_ (\(Sib r a b l) → extremeLeaf tree True r a b l) rs
+
 -- | The page a tree currently holds at a level on the path of a key, if the tree has
 -- one there: the root when its level is the target, else the child reference of the
 -- node one level above (not loaded: only the interior path is read). Every step is
@@ -442,8 +495,14 @@ loadChecked tree lo hi lvl ref = do
 -- store: a page reachable at all is on the path of its own first key.
 livePageAt ∷ TreeId → Maybe Ref → ByteString → Int → M (Maybe PageNo)
 livePageAt _ Nothing _ _ = pure Nothing
-livePageAt tree (Just root) key target = go root Nothing Nothing Nothing
+livePageAt tree (Just root) key target = do
+  r ← walk
+  -- a page is declared unreachable only once the neighbouring subtrees of the node its key
+  -- leads to have been checked against the separators that led there
+  validateLanding tree (Just root) key target
+  pure r
   where
+    walk = go root Nothing Nothing Nothing
     go ref lo hi lvl = do
       n ← loadChecked tree lo hi lvl ref
       case compare (nLevel n) target of
@@ -451,12 +510,13 @@ livePageAt tree (Just root) key target = go root Nothing Nothing Nothing
         LT → pure Nothing
         GT → case nBody n of
           NLeaf _ → pure Nothing
-          NInner es → case chooseChild key es of
-            Nothing → pure Nothing
-            Just i →
-              let (lo', hi') = childBounds lo hi es i
-                  child = snd (es !! i)
-               in if nLevel n - 1 == target then pure (Just (refPage child)) else go child lo' hi' (Just (nLevel n - 1))
+          -- a key below the first separator belongs to the first child (whose own keys then fail its
+          -- bounds if the separator is not a lower bound of them): it is never absent from the index
+          NInner es →
+            let i = maybe 0 id (chooseChild key es)
+                (lo', hi') = childBounds lo hi es i
+                child = snd (es !! i)
+             in if nLevel n - 1 == target then pure (Just (refPage child)) else go child lo' hi' (Just (nLevel n - 1))
 
 -- | The index of the last separator at most the key, if any.
 chooseChild ∷ ByteString → [(ByteString, a)] → Maybe Int
@@ -481,26 +541,29 @@ lookupKey tree (Just root) k = go root Nothing Nothing Nothing
     go ref lo hi lvl = do
       n ← loadChecked tree lo hi lvl ref
       case nBody n of
-        NLeaf es → pure (lookup k es)
-        NInner es → case chooseChild k es of
-          Nothing → pure Nothing
-          Just i →
-            let (lo', hi') = childBounds lo hi es i
-             in go (snd (es !! i)) lo' hi' (Just (nLevel n - 1))
+        NLeaf es → case lookup k es of
+          Just v → pure (Just v)
+          -- an absence is concluded only after the leaf's neighbours were checked against its bounds
+          Nothing → validateLanding tree (Just root) k 0 >> pure Nothing
+        -- absence is concluded only from a leaf that passed its bounds: a key below the first
+        -- separator is looked for in the first child, which is validated like any other
+        NInner es →
+          let i = maybe 0 id (chooseChild k es)
+              (lo', hi') = childBounds lo hi es i
+           in go (snd (es !! i)) lo' hi' (Just (nLevel n - 1))
 
 -- | The greatest entry whose key is at most the given key.
 floorKey ∷ TreeId → Maybe Ref → ByteString → M (Maybe (ByteString, ByteString))
 floorKey _ Nothing _ = pure Nothing
-floorKey tree (Just root) k = go root Nothing Nothing Nothing
+floorKey tree (Just root) k = validateLanding tree (Just root) k 0 >> go root Nothing Nothing Nothing
   where
     go ref lo hi lvl = do
       n ← loadChecked tree lo hi lvl ref
       case nBody n of
         NLeaf es → pure (lastMaybe (takeWhile ((<= k) . fst) es))
-        NInner es → case chooseChild k es of
-          Nothing → pure Nothing
-          Just i → do
-            let (lo', hi') = childBounds lo hi es i
+        NInner es → do
+            let i = maybe 0 id (chooseChild k es)
+                (lo', hi') = childBounds lo hi es i
             r ← go (snd (es !! i)) lo' hi' (Just (nLevel n - 1))
             case r of
               Just _ → pure r
@@ -525,7 +588,7 @@ floorKey tree (Just root) k = go root Nothing Nothing Nothing
 -- | The least entry whose key is at least (or, when strict, greater than) the key.
 ceilKey ∷ TreeId → Bool → Maybe Ref → ByteString → M (Maybe (ByteString, ByteString))
 ceilKey _ _ Nothing _ = pure Nothing
-ceilKey tree strict (Just root) k = go root Nothing Nothing Nothing
+ceilKey tree strict (Just root) k = validateLanding tree (Just root) k 0 >> go root Nothing Nothing Nothing
   where
     keep key = if strict then key > k else key >= k
     go ref lo hi lvl = do
@@ -561,6 +624,7 @@ ceilKey tree strict (Just root) k = go root Nothing Nothing Nothing
 rangeKeys ∷ TreeId → Maybe Ref → Bool → ByteString → Maybe ByteString → Int → M [(ByteString, ByteString)]
 rangeKeys _ Nothing _ _ _ _ = pure []
 rangeKeys tree (Just root) strictStart start end limit = do
+  validateLanding tree (Just root) start 0
   (es, _, _) ← go root Nothing Nothing Nothing limit
   pure es
   where

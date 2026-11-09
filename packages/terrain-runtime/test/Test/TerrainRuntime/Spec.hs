@@ -21,6 +21,7 @@ import qualified Test.TerrainRuntime.Store.Codec as StoreCodec
 import qualified Test.TerrainRuntime.Store.Cycles as StoreCycles
 import qualified Test.TerrainRuntime.Store.Evidence as StoreEvidence
 import qualified Test.TerrainRuntime.Store.Faults as StoreFaults
+import qualified Test.TerrainRuntime.Store.Fuzz as StoreFuzz
 import qualified Test.TerrainRuntime.Store.History as StoreHistory
 import qualified Test.TerrainRuntime.Store.Identity as StoreIdentity
 import qualified Test.TerrainRuntime.Store.Ownership as StoreOwnership
@@ -52,6 +53,7 @@ spec = do
   StoreReaders.spec
   StoreOwnership.spec
   StoreHistory.spec
+  StoreFuzz.spec
   StoreCycles.spec
   StoreEvidence.spec
   StoreAllowance.spec

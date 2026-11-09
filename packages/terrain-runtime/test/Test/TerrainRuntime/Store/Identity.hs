@@ -143,8 +143,11 @@ spec = describe "windows, tokens and accounting bound to their store" $ do
           RefInner ((_, n0) : (s', n1) : _) → do
             s' `shouldBe` sep1
             let wRootLeaf1 = addP (addP (storeWindow s1) root1) (PageNo n1)
-            -- the exact lookup is answered (absent) from the root and the second leaf alone
-            lookupRecord wRootLeaf1 rootFor sepKey `shouldSatisfy` either (const False) (== Nothing)
+            -- an exact lookup that finds nothing is not answered (absent) from the root and the second leaf alone: the
+            -- previous leaf is checked against the separator it shares first, and the lookup waits for it
+            case lookupRecord wRootLeaf1 rootFor sepKey of
+              Left (Need (PageNo p)) → p `shouldBe` n0
+              other → expectationFailure ("an absence needs the previous leaf: " <> show other)
             -- the floor lookup needs the previous leaf, and says so
             case floorRun wRootLeaf1 rootFor col lo of
               Left (Need (PageNo p)) → p `shouldBe` n0
@@ -154,7 +157,14 @@ spec = describe "windows, tokens and accounting bound to their store" $ do
             -- with it, the floor answers: the previous leaf's last run is in another column,
             -- so this column has no run at or below the level
             let wAll = addP wRootLeaf1 (PageNo n0)
-            floorRun wAll rootFor col lo `shouldSatisfy` either (const False) (== Nothing)
+            -- (the lookup then waits for the leaf on the other side, too, and answers once it has it)
+            let fillFor ∷ ∀ b. Window → (Window → Either Stop b) → Either Stop b
+                fillFor w f = case f w of
+                  Left (Need q) → fillFor (addP w q) f
+                  Left e → Left e
+                  Right r → Right r
+            fillFor wAll (\w → lookupRecord w rootFor sepKey) `shouldSatisfy` either (const False) (== Nothing)
+            fillFor wAll (\w → floorRun w rootFor col lo) `shouldSatisfy` either (const False) (== Nothing)
           _ → expectationFailure "expected an internal root"
         _ ← pure (c0, c1, keys)
         pure ()
