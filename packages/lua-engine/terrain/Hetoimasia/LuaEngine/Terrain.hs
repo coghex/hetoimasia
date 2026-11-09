@@ -280,6 +280,9 @@ newtype TerrainResource = TerrainResource {resourceLease ∷ Maybe ArenaLease}
 data LeaseCell
   = NoLease
   | Offered !ArenaLease
+  | -- | The host's interest ended and the lease is being revoked: the service's release has not completed, so the arena is still the
+    -- open's and its name still held back, until whoever revokes it has finished.
+    Revoking !ArenaLease
   | Adopted
   | Disposed
   deriving (Eq)
@@ -371,8 +374,8 @@ services env =
     , tsAttachCheck = \_ _ _ owner values → permanent env (const attachAsk) owner values
     , tsAttachStart = \identity root name context → do
         attachClientOf env identity >>= \case
-          Nothing → pure (TerrainStarted (M1Busy "request capacity is not available: the terrain service has all of its clients"))
-          Just (client, fresh) → do
+          Left refusal → pure refusal
+          Right (client, fresh) → do
             -- A client made for this attach is the attach's to give back when it is not accepted: nothing stays charged for a request
             -- that was refused (busy in the host's banks or the service's), and an exception leaves none behind either.
             let giveBack = when fresh $ do
@@ -474,19 +477,22 @@ clientsOf env identity =
     Nothing → throwIO (TerrainCompositionRefused "no terrain client was declared for the instance")
 
 -- | The client an instance attaches as, made on first use.
-attachClientOf ∷ Env → Text → IO (Maybe (Client, Bool))
+attachClientOf ∷ Env → Text → IO (Either TerrainStart (Client, Bool))
 attachClientOf env identity = do
   clients ← clientsOf env identity
   case clAttach clients of
-    Just found → pure (Just (found, False))
+    Just found → pure (Right (found, False))
     Nothing →
       registerClient (service env) >>= \case
         -- The service's client bank is full: temporary pressure, answered as busy before anything is reserved.
-        Left (RefusedBusy _) → pure Nothing
+        Left (RefusedBusy _) → pure (Left (TerrainStarted (M1Busy "request capacity is not available: the terrain service has all of its clients")))
+        -- The service is stopping, or an identity of it is spent: the same ordinary refusals every other call gets from the service.
+        Left RefusedClosed → pure (Left (TerrainRefused "the terrain service is closed"))
+        Left RefusedExhausted → pure (Left (TerrainRefused "an identity of the terrain service is exhausted"))
         Left refused → throwIO (TerrainCompositionRefused ("an instance's attach client was refused: " <> Text.pack (show refused)))
         Right made → do
           atomically (modifyTVar' (envClients env) (Map.insert identity clients {clAttach = Just made}))
-          pure (Just (made, True))
+          pure (Right (made, True))
 
 -- | The name the service holds for an instance's name: in the session's and the instance's content root's namespace.
 nameKey ∷ Env → Text → Text → Text
@@ -712,7 +718,11 @@ submit env submission = mask_ $ do
             AskRemove lease _ _ → representable lease 1
             AskOpen {} → pure True
       -- A revision that cannot be handed to Lua is decided before anything is committed: it is the host's defect, recorded for the
-      -- owner to raise, and the request is not eligible, so the service commits nothing.
+      -- owner to raise, and the request is not eligible, so the service commits nothing. It cannot be left to the commit: a settlement
+      -- the host rejects there abandons the transaction (nothing committed) but the service takes it for a provider defect and fails
+      -- as a whole, and the host's request is never told. A removal may advance the revision by one, and whether it changes anything is
+      -- not known to the host before the commit (removing air keeps the revision), so a removal is refused, conservatively, when the
+      -- arena's revision stands at the ceiling: no edit that could pass it is ever committed.
       representable lease advance =
         Terrain.inspectArenaSTM (service env) lease >>= \case
           Just view | Terrain.viewRevision view `exceeds` advance → do
@@ -780,7 +790,7 @@ done ∷ Link → STM Bool
 done link = do
   answered ← readTVar (lkTerminal link)
   cell ← readTVar (lkLease link)
-  pure (answered && case cell of Offered _ → False; _ → True)
+  pure (answered && case cell of Offered _ → False; Revoking _ → False; _ → True)
 
 -- | Forget the claims of requests that have ended, so the registry holds only what is still open: bounded by the opens in flight,
 -- whatever came and went, and empty once every instance has been forgotten.
@@ -874,9 +884,11 @@ adoptionFor env link =
     -- The service's lease is released through its non-waiting release: the creator's final owner lease closes the arena, an
     -- attachment ends its client's interest only. It waits for no borrower and for nothing of the owner.
     releaseResource resource = forM_ (resourceLease resource) $ \lease → do
-      atomically (forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name)))
       hookReleasing (hooks env)
-      Terrain.releaseLease (service env) lease >>= either (throwIO . TerrainCompositionRefused . ("a lease's release was refused: " <>) . Text.pack . show) pure
+      released ← Terrain.releaseLease (service env) lease
+      -- Only once the service has revoked the lease is the name no longer held back from attach.
+      atomically (forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name)))
+      either (throwIO . TerrainCompositionRefused . ("a lease's release was refused: " <>) . Text.pack . show) pure released
 
 -- | Withdraw interest in a request: ask the service to cancel it, and give back an offered lease nobody adopted.
 cancelWork ∷ Env → Link → Request → IO ()
@@ -889,15 +901,23 @@ tellCancelled ∷ Env → Link → Request → IO ()
 tellCancelled env link request = mask_ $ do
   _ ← cancel (service env) request
   atomically (writeTVar (lkTerminal link) True)
-  offered ← atomically $
+  -- The lease is revoked before anything else is published about it: until the service has released it the arena is still the open's,
+  -- its name still held back from attach and its claim still standing. Whoever finds the lease offered takes the revocation; one that
+  -- finds it being revoked (another opener, while the first is held at its release) finishes it, and the release is idempotent.
+  claimed ← atomically $
     readTVar (lkLease link) >>= \case
-      Offered lease → do
-        forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name))
-        Just lease <$ writeTVar (lkLease link) Disposed
+      Offered lease → Just (lease, True) <$ writeTVar (lkLease link) (Revoking lease)
+      Revoking lease → pure (Just (lease, False))
       _ → pure Nothing
-  forM_ offered $ \lease → do
-    hookReleasing (hooks env)
+  forM_ claimed $ \(lease, first) → do
+    when first (hookReleasing (hooks env))
     void (Terrain.releaseLease (service env) lease)
+    atomically $
+      readTVar (lkLease link) >>= \case
+        Revoking _ → do
+          writeTVar (lkLease link) Disposed
+          forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name))
+        _ → pure ()
 
 -- | The provider's own reading of where its work has got to, after interest was withdrawn: over when the service has reached
 -- its terminal outcome for the request and no offered lease is waiting for a release.
@@ -909,6 +929,7 @@ retirement link = do
   where
     isOffered = \case
       Offered _ → True
+      Revoking _ → True
       _ → False
 
 -- The start ------------------------------------------------------------------------------------------------------

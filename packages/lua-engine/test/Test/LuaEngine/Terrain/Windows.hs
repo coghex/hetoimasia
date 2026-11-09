@@ -8,7 +8,6 @@ module Test.LuaEngine.Terrain.Windows (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
-import Data.Either (isLeft)
 import Control.Monad (unless)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
@@ -137,8 +136,9 @@ copied =
         , "  local t = settle(api, self.q)"
         , "  if t then self.arena = t.value self.c = api.terrain.cell(self.arena, {x = 0, y = 0, z = -5}) self.d = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) self.s = 1 end"
         , "elseif self.s == 1 then"
-        , "  local c, d = settle(api, self.c), settle(api, self.d)"
-        , "  if c and d then print('deep', c.value.material) print('top', d.value.material) print('done') self.s = 2 end"
+        , "  self.cr = self.cr or settle(api, self.c)"
+        , "  self.dr = self.dr or settle(api, self.d)"
+        , "  if self.cr and self.dr then print('deep', self.cr.value.material) print('top', self.dr.value.material) print('done') self.s = 2 end"
         , "end"
         ]
     }
@@ -227,6 +227,55 @@ manyLayers count =
         [ "if self.s == 0 and self.q then"
         , "  local t = settle(api, self.q)"
         , "  if t then print('many', t.status, t.error and t.error.code) print('done') self.s = 1 end"
+        , "end"
+        ]
+    }
+
+-- | An instance that asks for the arena of another VM, then opens the name of an open its own earlier sibling cancelled after the offer.
+attachThenOpen ∷ Script
+attachThenOpen =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.attach('offered')"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('attach', t.status, t.error and t.error.code) self.q = api.terrain.open('offered', DEF) self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('reopen', t.status, t.error and t.error.code) self.s = 2 end"
+        , "end"
+        ]
+    }
+
+-- | An instance that, on its second update, attaches after the service has been closed.
+attachAfterClose ∷ Script
+attachAfterClose =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0"]
+    , scUpdate =
+        [ "if self.s == 0 then print('ready') self.s = 1"
+        , "elseif self.s == 1 then try('attach after close', api.terrain.attach, 'x') print('done') self.s = 2 end"
+        ]
+    }
+
+-- | An instance that opens an arena one below the revision ceiling and removes an air cell, a solid cell, and then another solid cell.
+atCeiling ∷ Script
+atCeiling =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('c', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.arena = t.value self.r = api.terrain.remove(self.arena, {x = 0, y = 0, z = 1}) self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  local r = settle(api, self.r)"
+        , "  if r then print('air removal', r.status, r.value.changed, r.value.revision) self.r = api.terrain.remove(self.arena, {x = 0, y = 0, z = 0}) self.s = 2 end"
+        , "elseif self.s == 2 then"
+        , "  local r = settle(api, self.r)"
+        , "  if r then print('solid removal', r.status, r.value.changed, r.value.revision) self.r = api.terrain.remove(self.arena, {x = 0, y = 0, z = -1}) print('issued') self.s = 3 end"
         , "end"
         ]
     }
@@ -373,8 +422,8 @@ spec = describe "Terrain windows and banks" $ do
             untilPrinted world "issued"
             -- the owner fails at its next boundary, and the failure is the host's defect
             failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
-            failed `shouldSatisfy` isLeft
-            -- nothing was committed under the rejected settlement: an observer of the service finds the cell as it was, at its revision
+            either (\failure → show failure `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack) (const (expectationFailure "the owner did not fail")) failed
+            -- nothing was committed: an observer of the service, which is alive, finds the cell as it was, at the revision it had
             observeCell rig (arenaName rig "modules-test" "main") (0, 0, 0) `shouldReturn` (9223372036854775807, Just "soil")
     show raised `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack
 
@@ -594,6 +643,50 @@ spec = describe "Terrain windows and banks" $ do
           outLines world >>= \printed → do
             printed `shouldContain` ["many\tfailure\tdefinition"]
           limitHeld (rgService rig) "arenas" `shouldReturn` 0
+
+  it "keeps an arena attachable-never and its name held while the lease of a cancelled open is being revoked, and lets another opener finish the revocation" $ do
+    releaseGate ← newGate
+    (`finally` openGate releaseGate) $
+      withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookReleasing = holdAt releaseGate} $ \rig →
+        withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource cancelAfterOffer), ("lua/second.lua", scriptSource attachThenOpen)]) $ \world _ runtime →
+          withFvm world runtime (presentationOver rig) $ \first →
+            withFvm world runtime (presentationOver rig) $ \second → do
+              -- the lease was offered and the script cancelled the open; the service's release of the lease is held
+              _ ← admitOnly world first "modules-test" mainPath
+              awaitReached releaseGate
+              _ ← spawn world second "modules-test" "lua/second.lua"
+              -- the arena is still live, but it is not an open's that settled: nobody can attach to it...
+              untilPrinted world "attach\tfailure\tnot_found"
+              -- ...and its name is free for another open, which finishes the revocation itself
+              untilPrinted world "reopen\tsuccess\tnil"
+              openGate releaseGate
+
+  it "answers an attach's refusal as ordinary when the service is closed before the instance's first attach client" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource attachAfterClose)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "ready"
+          closeService (rgService rig)
+          untilPrinted world "done"
+          outLines world >>= \printed →
+            printed `shouldSatisfy` any (\line → "attach after close => false ; " `Text.isPrefixOf` line && "closed" `Text.isInfixOf` line)
+
+  it "lets removals through up to the revision ceiling, air included, and refuses the one that could pass it with nothing committed" $ do
+    (_, ExceptionWithContext _ raised) ←
+      fatalWorld (counts [(LuaIntegerMaximum, 40)]) (Layout [("lua/main.lua", scriptSource atCeiling)]) $ \world _ runtime →
+        withRigConfig defaultConfig {configFirstRevision = 39} $ \rig →
+          withFvm world runtime (presentationOver rig) $ \fvm → do
+            _ ← spawn world fvm "modules-test" mainPath
+            untilPrinted world "issued"
+            printed ← outLines world
+            -- below the ceiling air changes nothing, and a solid cell takes the revision to the ceiling itself
+            printed `shouldContain` ["air removal\tsuccess\tfalse\t39", "solid removal\tsuccess\ttrue\t40"]
+            -- the arena stands at the ceiling: the next removal could pass it and is refused, a defect of the host's
+            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
+            either (\failure → show failure `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack) (const (expectationFailure "the owner did not fail")) failed
+            observeCell rig (arenaName rig "modules-test" "c") (0, 0, -1) `shouldReturn` (40, Just "soil")
+    show raised `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack
 
   it "gives a logical read ordered after a removal of the same cell the post-removal value and revision, reads prepared before the commit included" $
     withRig $ \rig →

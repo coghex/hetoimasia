@@ -4,7 +4,9 @@
 module Test.LuaRuntime.Admission.Seam (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
 import Control.Exception (throwIO)
+import qualified Data.Text as Text
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Control.Monad (void)
 import Hetoimasia.Scripting.Lua.Admission
@@ -15,8 +17,9 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Request.Support (diagnostics, onSubmit, submissions)
+import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, expectFatal, requiredPolicy, withBoundary)
 
 -- | The seam of the request the provider was last handed.
 captured ∷ IORef (Maybe Settling) → Submission → IO ()
@@ -111,3 +114,21 @@ spec = describe "the settlement seam and the declining hand-off" $ do
       atomically (settlingSettle earlier (ProviderResult (VInteger 1))) >>= (`shouldBe` ReplySettled)
       atomically (settlingEligible later) >>= (`shouldBe` True)
       atomically (settlingSettle later (ProviderResult (VInteger 2))) >>= (`shouldBe` ReplySettled)
+
+  it "treats a final verdict the service did not declare as the provider's defect, fatal even for an optional request, and builds nothing into the lease" $ bounded $ do
+    fixture ← newAFix 4
+    setPolicy fixture (\held → held {polLease = Just InstanceOwned, polNecessity = OptionalRequest})
+    ExceptionWithContext _ failure ← expectFatal $ \control runtime → settleAll fixture $ do
+      owner ← startAdmitting fixture runtime "final" [admitter] aConfig (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+      admitAdmitter fixture owner "i" "admitter"
+      seam ← newIORef Nothing
+      onSubmit (afFake fixture) (captured seam)
+      acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+      awaitNote fixture "cmd start a started"
+      Just settling ← readIORef seam
+      let invalid = pure (Just (ExpectedFailure "unheard_of" "message" Nothing Nothing))
+      atomically (settlingSettleFinal settling invalid (ProviderResource (VInteger 4) (Adoption (\_ → resourceFor fixture "r1")))) >>= (`shouldBe` ReplyAdoption)
+      awaitScheduledTerminal control owner
+    (fromException failure :: Maybe ProviderDefect) `shouldSatisfy` \case
+      Just (ProviderDefect why) → not (Text.null why)
+      Nothing → False

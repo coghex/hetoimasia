@@ -1051,7 +1051,11 @@ finishAdoption service identity adopting = do
             , pAdopting = Map.delete identity (pAdopting st')
             }
           case Map.lookup identity (pRecs st') >>= \record → (,) record <$> recAdmission record of
-            Just (record, ask) → () <$ applyCheckedAs service (adoptingNow adopting) identity (checkReplyPure (psLimits service) (recSchema record) ask (ProviderExpected failure))
+            Just (record, ask) → case checkReplyPure (psLimits service) (recSchema record) ask (ProviderExpected failure) of
+              -- A final verdict the service did not declare is the provider's defect, exactly as any other reply of it is: recorded for
+              -- the owner to raise, never a settlement of the request.
+              defect@(CheckedDefect _) → () <$ replyTo service identity defect
+              checked → () <$ applyCheckedAs service (adoptingNow adopting) identity checked
             Nothing → pure ()
           pure Nothing
         Nothing → do
