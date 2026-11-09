@@ -14,6 +14,7 @@ import qualified Test.TerrainRender2D.CellsWork as CellsWork
 import qualified Test.TerrainRender2D.Expectation as Expectation
 import qualified Test.TerrainRender2D.MapAssets as MapAssets
 import qualified Test.TerrainRender2D.Material as Material
+import qualified Test.TerrainRender2D.ReferenceTint as ReferenceTint
 import qualified Test.TerrainRender2D.Projection as Projection
 
 spec ∷ Spec
@@ -23,6 +24,7 @@ spec = describe "TerrainRender2D" $ do
   MapAssets.spec
   Material.spec
   Expectation.spec
+  ReferenceTint.spec
   Atlas.spec
   AtlasAssets.spec
   Cells.spec

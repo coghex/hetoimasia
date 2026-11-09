@@ -230,6 +230,7 @@ test-suite terrain-render-2d-tests
         Test.TerrainRender2D.Material
         Test.TerrainRender2D.Oracle
         Test.TerrainRender2D.Projection
+        Test.TerrainRender2D.ReferenceTint
         Test.TerrainRender2D.Spec
     build-depends:
         base >=4.22 && <4.23,
