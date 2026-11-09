@@ -266,6 +266,8 @@ data TerrainHooks = TerrainHooks
   , hookCancelling ∷ IO ()
   -- ^ The host settled a request as cancelled (a script's cancel won) and the adapter is about to ask the service to cancel it: the
   -- window in which the service's own commit and the host's settlement are arbitrated by the request's eligibility alone.
+  , hookArriving ∷ IO ()
+  -- ^ An open is about to take the critical section that arbitrates its name: before it can be held back by another open's.
   , hookChecked ∷ IO ()
   -- ^ An open has consulted the failed opens and is about to be admitted by the service: inside the critical section that arbitrates the name,
   -- where no other open of this facade can be admitted.
@@ -279,7 +281,7 @@ data TerrainHooks = TerrainHooks
   }
 
 noTerrainHooks ∷ TerrainHooks
-noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ())
+noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ())
 
 -- | Why a VM's terrain could not be composed: a failure of the composition, never a script's.
 newtype TerrainCompositionRefused = TerrainCompositionRefused Text
@@ -941,7 +943,8 @@ submit env submission = mask_ $ do
   -- the arbitration of every adapter open; the admission it covers is the service's non-waiting one, so a VM waits only for another VM's
   -- admission of an open, never for a terrain owner.)
   outcome ← case pdAsk found of
-    AskOpen _ name _ →
+    AskOpen _ name _ → do
+      hookArriving (hooks env)
       withMVar (tfOpenLock (envFacade env)) $ \_ → do
         duplicate ← atomically (failedOpenPending (envFacade env) name)
         if duplicate

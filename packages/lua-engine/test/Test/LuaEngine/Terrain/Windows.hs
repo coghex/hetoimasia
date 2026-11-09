@@ -8,6 +8,7 @@ module Test.LuaEngine.Terrain.Windows (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent (yield)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
 import Data.Either (isLeft)
 import Control.Monad (replicateM_, unless, void, when)
@@ -82,6 +83,18 @@ failsLogically =
     , scUpdate = ["if self.q then local t = settle(api, self.q) if t then print('invalid open', t.status, t.error and t.error.code) self.q = nil end end"]
     }
 
+-- | A gameplay instance that opens a name with a definition the service fails at its first tick (due tick 2), saying so and its answer.
+failsAtFirstTick ∷ Script
+failsAtFirstTick =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0"]
+    , scUpdate =
+        [ "if self.s == 0 then self.q = api.terrain.open('dup', { materials = { 'a', 'a' }, layers = {} }) print('invalid open issued') self.s = 1"
+        , "elseif self.q then local t = settle(api, self.q) if t then print('invalid open', t.status, t.error and t.error.code) self.q = nil end end"
+        ]
+    }
+
 -- | A gameplay instance whose init opens eight names with a definition the service fails, due at tick 1; at tick 1 it opens eight others.
 manyFailing ∷ Script
 manyFailing =
@@ -94,15 +107,6 @@ manyFailing =
         , "  print('second round issued') self.s = 1"
         , "elseif self.s == 1 then print('second round settled') self.s = 2 end"
         ]
-    }
-
--- | A presentation instance whose init opens @dup@ with a definition the service fails (a duplicate material).
-opensInvalidNow ∷ Script
-opensInvalidNow =
-  script
-    { scPrelude = terrainPrelude
-    , scInit = ["self.q = api.terrain.open('dup', { materials = { 'a', 'a' }, layers = {} })", "print('invalid open issued')"]
-    , scUpdate = ["if self.q then local t = settle(api, self.q) if t then print('invalid open', t.status, t.error and t.error.code) self.q = nil end end"]
     }
 
 -- | A gameplay instance whose init opens a valid name, due at tick 1.
@@ -1103,34 +1107,41 @@ spec = describe "Terrain windows and banks" $ do
 
   it "arbitrates the name of a failed open and of a normal open as one decision: no open is admitted between another's consultation and its admission" $ do
     gate ← newGate
-    armed ← newIORef True
+    armed ← newIORef False
     events ← newIORef ([] ∷ [String])
     let note event = modifyIORef' events (event :)
         holdFirst = do
           note "checked"
           go ← atomicModifyIORef' armed (\a → (False, a))
           when go (holdAt gate)
-    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensInvalidNow), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world _ runtime →
-        withFvm world runtime (presentationOver rig) $ \shown →
-          withFvm world runtime (presentationOver rig) $ \otherVm → (`finally` openGate gate) $ do
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookArriving = note "arriving", hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsAtFirstTick), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
+        withFvm world runtime (gameplayOver rig) $ \gameplayVm →
+          withFvm world runtime (presentationOver rig) $ \shown → (`finally` (openGate gate >> signalRig rig "first" >> signalRig rig "second")) $ do
+            _ ← spawn world gameplayVm "modules-test" mainPath
             _ ← admitOnly world shown "modules-test" "lua/other.lua"
-            -- the normal open has consulted the failed opens (none) and is about to be admitted: held inside the critical section
+            -- the open the service fails (an invalid definition) is the first to arrive, at tick 1: it has consulted the failed opens (none) and
+            -- is held inside the critical section, before its admission
+            writeIORef armed True
+            grantTick gameplayVm
+            awaitReached gate
+            -- another VM's open of the name arrives while it is held, and the clock runs: it has every opportunity to be admitted
             signalRig rig "first"
-            pumpUntilReached world gate
-            -- the other VM's open of the name (an invalid definition) is issued while it is held
-            _ ← admitOnly world otherVm "modules-test" mainPath
-            -- and the clock runs while it is held: the other VM has every opportunity to be admitted
-            replicateM_ 20 (advanceClock world 2000000000)
-            -- released, the first open is admitted and the second after it: the second's consultation did not come between the first's
-            -- consultation and its admission (without the critical section it comes first, while the first is held)
+            pumpUntil world (advanceClock world 2000000000 >> ((>= 2) . length . filter (== "arriving") <$> readIORef events))
+            replicateM_ 200 (advanceClock world 2000000000 >> yield)
+            -- it has not even consulted the failed opens (without the critical section it has, and is admitted, before the invalid open is)
+            readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving"]
+            -- released, the invalid open is admitted first and fails its definition at once; the host holds that failure for tick 2, and
+            -- with it the name: the other open consults after it, finds it, and is never admitted (a duplicate is answered before the hook
+            -- that precedes an admission)
             openGate gate
-            pumpUntil world (advanceClock world 2000000000 >> ((>= 4) . length <$> readIORef events))
-            readIORef events >>= \seen → reverse seen `shouldBe` ["checked", "submitting", "checked", "submitting"]
-            untilPrinted world "first answer\tsuccess\tnil"
-            untilPrinted world "invalid open\tfailure\tdefinition"
-            -- the other instance goes on to the second wait it has in its script: let it
+            awaitTickDone control gameplayVm
+            untilPrinted world "first answer\tfailure\tname_in_use"
+            readIORef events >>= \seen → reverse seen `shouldBe` ["arriving", "checked", "arriving", "submitting"]
+            -- the tick is granted and the failed open is settled: the name is free, and the second open of it is admitted
+            pumpUntil world (tickBy control gameplayVm 1 >> (elem "invalid open\tfailure\tdefinition" <$> outLines world))
             signalRig rig "second"
+            untilPrinted world "second answer\tsuccess\tnil"
 
   it "keeps the failed opens' names only while the host has not settled them, whatever names they used, and none once their instance is forgotten" $
     withRig $ \rig →
