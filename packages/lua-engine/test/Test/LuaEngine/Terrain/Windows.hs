@@ -96,6 +96,15 @@ manyFailing =
         ]
     }
 
+-- | A presentation instance whose init opens @dup@ with a definition the service fails (a duplicate material).
+opensInvalidNow ∷ Script
+opensInvalidNow =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.q = api.terrain.open('dup', { materials = { 'a', 'a' }, layers = {} })", "print('invalid open issued')"]
+    , scUpdate = ["if self.q then local t = settle(api, self.q) if t then print('invalid open', t.status, t.error and t.error.code) self.q = nil end end"]
+    }
+
 -- | A gameplay instance whose init opens a valid name, due at tick 1.
 opensLogically ∷ Script
 opensLogically =
@@ -1102,23 +1111,22 @@ spec = describe "Terrain windows and banks" $ do
           go ← atomicModifyIORef' armed (\a → (False, a))
           when go (holdAt gate)
     withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookChecked = holdFirst, hookSubmitting = note "submitting"} $ \rig →
-      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failsLogically), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world control runtime →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensInvalidNow), ("lua/other.lua", scriptSource (reopensOnSignal "dup"))]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \shown →
-          withFvm world runtime (gameplayOver rig) $ \gameplayVm → (`finally` openGate gate) $ do
+          withFvm world runtime (presentationOver rig) $ \otherVm → (`finally` openGate gate) $ do
             _ ← admitOnly world shown "modules-test" "lua/other.lua"
             -- the normal open has consulted the failed opens (none) and is about to be admitted: held inside the critical section
             signalRig rig "first"
             pumpUntilReached world gate
             -- the other VM's open of the name (an invalid definition) is issued while it is held
-            _ ← admitOnly world gameplayVm "modules-test" mainPath
-            grantTick gameplayVm
+            _ ← admitOnly world otherVm "modules-test" mainPath
             -- released, the first open is admitted and the second after it: the second's consultation did not come between the first's
             -- consultation and its admission (without the critical section it comes first, while the first is held)
             openGate gate
             pumpUntil world (advanceClock world 2000000000 >> ((>= 4) . length <$> readIORef events))
             readIORef events >>= \seen → reverse seen `shouldBe` ["checked", "submitting", "checked", "submitting"]
             untilPrinted world "first answer\tsuccess\tnil"
-            pumpUntil world (tickBy control gameplayVm 1 >> (elem "invalid open\tfailure\tdefinition" <$> outLines world))
+            untilPrinted world "invalid open\tfailure\tdefinition"
             -- the other instance goes on to the second wait it has in its script: let it
             signalRig rig "second"
 
