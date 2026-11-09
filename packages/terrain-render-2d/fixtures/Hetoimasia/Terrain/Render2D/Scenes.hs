@@ -482,9 +482,15 @@ pendingScene facing =
 
 
 -- | The snapped scene at a zoom. At a large scale (4 and above) the origin is moved off the pixel grid
--- by a fraction of a tile first (about 1.8 pixels at scale 8, where a tile is 384 pixels wide), because
--- a texel then spans several pixels and only an origin off the grid lets snapping change which pixel
--- centres fall in which texel: without it the lattice lands every origin on a whole pixel and snapping
--- changes nothing.
+-- by about half a pixel on each axis first: the lattice puts every origin on a whole pixel at a whole
+-- scale, a texel spans several pixels, and snapping changes a picture only by moving the quad up to half
+-- a pixel, so the largest change it can make needs the origin half a pixel from the grid. A world pan of
+-- @(dx, dy)@ tiles moves the screen by @((dx - dy) * 48 z, (dx + dy) * 24 z)@ pixels; the pan below makes
+-- both 4.5 pixels.
 snappedAt ∷ String → Float → Scene
-snappedAt label zoom = (if zoom >= 4 then shiftPan (0.0048, 0.0226) else id) snapped {sceneName = "snapped-" <> label, sceneZoom = zoom}
+snappedAt label zoom = (if zoom >= 4 then shiftPan (dx, dy) else id) snapped {sceneName = "snapped-" <> label, sceneZoom = zoom}
+  where
+    z = realToFrac zoom ∷ Double
+    ax = 4.5 / (48 * z)
+    ay = 4.5 / (24 * z)
+    (dx, dy) = ((ax + ay) / 2, (ay - ax) / 2)
