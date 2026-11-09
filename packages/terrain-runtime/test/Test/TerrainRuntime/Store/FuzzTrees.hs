@@ -22,7 +22,7 @@ import Data.Word (Word64)
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
@@ -203,6 +203,48 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
     length [() | k ← retireKeys, BS.length k == 9] `shouldSatisfy` (> 50)
     length [() | k ← retireKeys, BS.length k == 8] `shouldSatisfy` (> 1)
     must (checkH h)
+  it "refuses a pointer that names a stale valid page of the same tree and level, where it used to answer from the stale page" $ do
+    let total = cfgUsablePages (hCfg h)
+        hw = rHw (storeRoots (hStore h))
+        decodeAt p = either (const Nothing) Just . decodePage (hIdent h) total (PageNo p) =<< diskRead (hDisk h) (PageNo p)
+        staleLeaves tree lo hi =
+          [ (q, ls)
+          | PageNo q ← rLoose (storeRoots (hStore h))
+          , q < hw
+          , Just (Page t 0 _ (Leaf ls@(_ : _))) ← [decodeAt q]
+          , t == tree
+          , all (\(k, _) → maybe True (<= k) lo && maybe True (k <) hi) ls
+          ]
+        -- every internal page above leaves, every child of it, and a stale leaf of the same tree that fits its bounds
+        candidates tree =
+          [ (p, i, es, q, ls)
+          | p ← snd (referenceOf h tree)
+          , Just (Page _ 1 _ (Inner es)) ← [decodeAt p]
+          , (i, (k, Child c _)) ← zip [0 ∷ Int ..] es
+          , let hi = if i + 1 < length es then Just (fst (es !! (i + 1))) else Nothing
+          , (q, ls) ← take 1 (filter (\(qq, _) → PageNo qq /= c) (staleLeaves tree (Just k) hi))
+          ]
+    results ← forM [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree → do
+      let ref = fst (referenceOf h tree)
+          rootRef = Disk (fromMaybe (PageNo 0) (rootOf (storeRoots (hStore h)) tree))
+      forM (take 6 (candidates tree)) $ \(p, i, es, q, staleEntries) → do
+        -- the parent now names the stale page, with the checksum it recorded for the page that was there
+        let es' = [if j == i then (k, Child (PageNo q) crc) else (k, Child c crc) | (j, (k, Child c crc)) ← zip [0 ∷ Int ..] es]
+            lv = maybe 1 pgLevel (decodeAt p)
+        bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h) (Page tree lv (PageNo p) (Inner es')))
+        let disk' = diskWrite (PageNo p) bytes (hDisk h)
+            -- keys the stale page holds that the reference answers differently
+            differing = [k | (k, v) ← staleEntries, lookup k ref /= Just v]
+        -- a lookup of any key in the stale page's range either fails as corrupt or is the reference's answer: never the stale answer
+        let verdicts = [through h disk' (lookupKey tree (Just rootRef) k) | k ← map fst staleEntries]
+            stale = [k | (k, Right got) ← zip (map fst staleEntries) verdicts, got /= lookup k ref]
+        stale `shouldBe` []
+        pure (tree, length differing, length [() | Left _ ← verdicts])
+    let flat = concat results
+    putStrLn ("FUZZTREES stale pointers " <> show flat)
+    -- the retirement tree, whose pages are rewritten every commit, has such pages; the stale ones differ from the reference
+    [d | (TreeRetire, d, _) ← flat] `shouldSatisfy` (any (> 0))
+    [e | (_, _, e) ← flat] `shouldSatisfy` (any (> 0))
   forM_' [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree →
     it ("reads exactly as the reference or fails as corrupt, " <> show tree) $ do
       let (ref, treePages) = referenceOf h tree
