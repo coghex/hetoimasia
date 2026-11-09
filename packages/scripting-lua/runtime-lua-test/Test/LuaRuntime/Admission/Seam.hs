@@ -13,7 +13,7 @@ import Hetoimasia.Scripting.Lua.Admission
 import Hetoimasia.Scripting.Lua.Lease (Ownership (..))
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Scheduled (grantScheduledStep, scheduledEndpoint)
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
+import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Request.Support (diagnostics, onSubmit, submissions)
@@ -69,6 +69,27 @@ spec = describe "the settlement seam and the declining hand-off" $ do
       awaitNote fixture "cmd cancel b cancelled"
       atomically (settlingEligible second) >>= (`shouldBe` False)
       submissions (afFake fixture) >>= (`shouldBe` 2)
+
+  it "judges a reply as its settlement would, without writing anything, so a provider can refuse before it commits" $ bounded $ do
+    fixture ← newAFix 4
+    withBoundary $ \_ runtime → settleAll fixture $ do
+      owner ← startAdmitting fixture runtime "judges" [admitter] aConfig (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+      admitAdmitter fixture owner "i" "admitter"
+      seam ← newIORef Nothing
+      onSubmit (afFake fixture) (captured seam)
+      acommand fixture owner "i" "start" "a"
+      awaitNote fixture "cmd start a started"
+      Just settling ← readIORef seam
+      -- A reply the request's result schema takes is one the host would settle with; one it does not take, and a failure with no
+      -- code the service declared, are the provider's defects.
+      settlingJudge settling (ProviderResult (VInteger 7)) `shouldBe` True
+      settlingJudge settling (ProviderResult (VText "not an integer")) `shouldBe` False
+      settlingJudge settling (ProviderFailure "an accounting defect") `shouldBe` False
+      -- Judging wrote nothing: the request is still waiting, no defect was recorded, and its settlement is still the first.
+      atomically (settlingEligible settling) >>= (`shouldBe` True)
+      d ← diagnostics owner
+      rdDefects d `shouldBe` 0
+      atomically (settlingSettle settling (ProviderResult (VInteger 7))) >>= (`shouldBe` ReplySettled)
 
   it "treats every reply that comes while a resource reply waits to be built as a duplicate, whatever it is" $ bounded $ do
     fixture ← newAFix 4

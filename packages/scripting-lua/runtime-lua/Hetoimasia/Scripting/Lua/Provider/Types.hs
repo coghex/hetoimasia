@@ -318,12 +318,19 @@ data Settling = Settling
   , settlingSettle ∷ ProviderReply → STM ReplyAnswer
     -- ^ Settle the request with this reply, in the caller's transaction. The reply is checked exactly as
     -- 'completeRequest' checks one, but purely, so a reply that fails the check (a value over the ceilings, a
-    -- failure with a code the service did not declare) is a provider defect and is raised with @throwSTM@: the
-    -- transaction is abandoned with nothing committed and nothing settled, and the defect is the owner's. A
+    -- failure with a code the service did not declare) is a provider defect: it is recorded for the owner to raise
+    -- (once, whatever follows), settles nothing, and answers 'ReplyDefective'. The caller decides what that means for
+    -- its own transaction: a provider whose settlement is part of an atomic change must see to it, beforehand
+    -- ('settlingJudge'), that the reply it will make is one the host takes, because abandoning the transaction (with
+    -- @throwSTM@) abandons the record of the defect with it. A
     -- request that is eligible is settled by it at once (on logical time too: the position was reached, which
     -- is what eligibility says); one that is not yet eligible is held for its position, as 'completeRequest'
     -- holds it. A resource reply is not settled here: the owner builds the resource into the reserved lease
     -- at its next boundary and settles then, as for 'completeRequest'.
+  , settlingJudge ∷ ProviderReply → Bool
+    -- ^ Whether the host would take this reply as the request's settlement: the very judgement 'settlingSettle' passes, as a pure
+    -- function that writes nothing. A provider uses it before it commits anything, on the largest reply it can make, to refuse a request
+    -- whose answer the owner's value ceilings could never carry, instead of finding out in the transaction that commits the change.
   , settlingCancel ∷ STM ()
     -- ^ Cancel the request, in the caller's transaction, as its script's own cancel would: the provider has itself ended its
     -- interest in the request (the lease it was made through was released, its client ended) and has no answer for it. The

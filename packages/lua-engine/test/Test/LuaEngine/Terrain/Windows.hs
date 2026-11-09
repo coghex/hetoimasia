@@ -9,12 +9,13 @@ module Test.LuaEngine.Terrain.Windows (spec) where
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
 import Data.Either (isLeft)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
+import Data.IORef (atomicModifyIORef', newIORef, writeIORef)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
-import Hetoimasia.LuaEngine.Profile (CountLimit (LuaIntegerMaximum))
+import Hetoimasia.LuaEngine.Profile (CountLimit (CopiedValueDepth, CopiedValueElements, LuaIntegerMaximum, SceneDepth, SceneSprites))
 import Hetoimasia.LuaEngine.Terrain (TerrainFacade (..), TerrainHooks (..), noTerrainHooks)
 import Test.LuaEngine.Request.Profiles (counts)
 import Hetoimasia.Terrain.Residency (LimitsSpec (..), mkLimits)
@@ -261,7 +262,8 @@ attachAfterClose =
         ]
     }
 
--- | An instance that opens an arena one below the revision ceiling and removes an air cell, a solid cell, and then another solid cell.
+-- | An instance that opens an arena one below the revision ceiling and removes an air cell, a solid cell (reaching the ceiling), an air
+-- cell again (at the ceiling), and then another solid cell (which would pass it).
 atCeiling ∷ Script
 atCeiling =
   script
@@ -276,7 +278,10 @@ atCeiling =
         , "  if r then print('air removal', r.status, r.value.changed, r.value.revision) self.r = api.terrain.remove(self.arena, {x = 0, y = 0, z = 0}) self.s = 2 end"
         , "elseif self.s == 2 then"
         , "  local r = settle(api, self.r)"
-        , "  if r then print('solid removal', r.status, r.value.changed, r.value.revision) self.r = api.terrain.remove(self.arena, {x = 0, y = 0, z = -1}) print('issued') self.s = 3 end"
+        , "  if r then print('solid removal', r.status, r.value.changed, r.value.revision) self.r = api.terrain.remove(self.arena, {x = 0, y = 0, z = 1}) self.s = 3 end"
+        , "elseif self.s == 3 then"
+        , "  local r = settle(api, self.r)"
+        , "  if r then print('air removal at the ceiling', r.status, r.value.changed, r.value.revision) self.r = api.terrain.remove(self.arena, {x = 0, y = 0, z = -1}) print('issued') self.s = 4 end"
         , "end"
         ]
     }
@@ -354,6 +359,100 @@ ordered =
         , "  print('column', k.value.revision, table.concat(runs, ','))"
         , "  print('surface', u.value.revision, u.value.z, u.value.material)"
         , "  self.s = 2"
+        , "end"
+        ]
+    }
+
+-- | An instance that opens @offered@ and, once it has, releases the arena it was given.
+opensThenReleases ∷ Script
+opensThenReleases =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('offered', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('first opened', t.status) print('first release', api.terrain.release(t.value)) self.s = 1 end"
+        , "end"
+        ]
+    }
+
+-- | An instance that attaches to @offered@ over and over while it is not found, saying each answer.
+observer ∷ Script
+observer =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.q = api.terrain.attach('offered')"]
+    , scUpdate =
+        [ "if self.q then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    print('observer', t.status, t.error and t.error.code)"
+        , "    if t.status == 'failure' and t.error.code == 'not_found' then self.q = api.terrain.attach('offered') else self.q = nil end"
+        , "  end"
+        , "end"
+        ]
+    }
+
+-- | An instance that opens an arena and, one update after it says it is ready, reads a cell twice: the service is closed in between the
+-- host's precheck of the first read and the service's admission of it.
+closesBetween ∷ Script
+closesBetween =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.arena = t.value print('opened') self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  print('ready') self.s = 2"
+        , "elseif self.s == 2 then"
+        , "  local ok, e = pcall(api.terrain.cell, self.arena, {x = 0, y = 0, z = 0})"
+        , "  print('call', ok, string.find(tostring(e), 'closed', 1, true) ~= nil)"
+        , "  local ok2, e2 = pcall(api.terrain.cell, self.arena, {x = 0, y = 0, z = 0})"
+        , "  print('again', ok2, string.find(tostring(e2), 'closed', 1, true) ~= nil)"
+        , "  print('done') self.s = 3"
+        , "end"
+        ]
+    }
+
+-- | An arena whose column (0, 0) alternates solid and air for eight levels from level 0 (as few layers as the smallest valid copied-value
+-- limits let a script hand over), read in a VM with those limits: the eight-run answer of the wide range is one the host could never
+-- deliver, and a one-level range is one it can.
+tightReads ∷ Script
+tightReads =
+  script
+    { scPrelude =
+        terrainPrelude
+          <> [ "local ALT = { materials = { 'soil' }, layers = {"
+             , "  { z_min = 0, z_max = 1, material = 'soil', shape = 0 }, { z_min = 2, z_max = 3, material = 'soil', shape = 0 },"
+             , "  { z_min = 4, z_max = 5, material = 'soil', shape = 0 }, { z_min = 6, z_max = 7, material = 'soil', shape = 0 } } }"
+             ]
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('tight', ALT)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    self.arena = t.value"
+        , "    local ok, e = pcall(api.terrain.column, self.arena, {x = 0, y = 0, z_min = 0, z_max = 8})"
+        , "    print('wide column', ok, string.find(tostring(e), 'narrow the range', 1, true) ~= nil)"
+        , "    local okNarrow, narrow = pcall(api.terrain.column, self.arena, {x = 0, y = 0, z_min = 0, z_max = 1})"
+        , "    print('narrow column call', okNarrow)"
+        , "    if okNarrow then self.q = narrow self.s = 1 else self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) self.s = 2 end"
+        , "  end"
+        , "elseif self.s == 1 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('narrow column', t.status, #t.value.runs) self.q = api.terrain.cell(self.arena, {x = 0, y = 0, z = 0}) self.s = 2 end"
+        , "elseif self.s == 2 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('cell', t.status) self.q = api.terrain.remove(self.arena, {x = 0, y = 0, z = 0}) self.s = 3 end"
+        , "elseif self.s == 3 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('remove', t.status, t.value.changed) self.q = api.terrain.surface(self.arena, {x = 0, y = 0}) self.s = 4 end"
+        , "elseif self.s == 4 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('surface', t.status) print('done') self.s = 5 end"
         , "end"
         ]
     }
@@ -673,7 +772,7 @@ spec = describe "Terrain windows and banks" $ do
           outLines world >>= \printed →
             printed `shouldSatisfy` any (\line → "attach after close => false ; " `Text.isPrefixOf` line && "closed" `Text.isInfixOf` line)
 
-  it "lets removals through up to the revision ceiling, air included, and refuses the one that could pass it with nothing committed" $ do
+  it "lets removals through up to the revision ceiling, a removal of air at the ceiling included, and refuses the one that would pass it with nothing committed" $ do
     (_, ExceptionWithContext _ raised) ←
       fatalWorld (counts [(LuaIntegerMaximum, 40)]) (Layout [("lua/main.lua", scriptSource atCeiling)]) $ \world _ runtime →
         withRigConfig defaultConfig {configFirstRevision = 39} $ \rig →
@@ -683,7 +782,9 @@ spec = describe "Terrain windows and banks" $ do
             printed ← outLines world
             -- below the ceiling air changes nothing, and a solid cell takes the revision to the ceiling itself
             printed `shouldContain` ["air removal\tsuccess\tfalse\t39", "solid removal\tsuccess\ttrue\t40"]
-            -- the arena stands at the ceiling: the next removal could pass it and is refused, a defect of the host's
+            -- at the ceiling a removal of air still succeeds, unchanged, at the revision it finds: it needs no revision beyond the ceiling
+            printed `shouldContain` ["air removal at the ceiling\tsuccess\tfalse\t40"]
+            -- the arena stands at the ceiling: a removal that would change it needs the next revision and is refused, a defect of the host's
             failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
             either (\failure → show failure `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack) (const (expectationFailure "the owner did not fail")) failed
             observeCell rig (arenaName rig "modules-test" "c") (0, 0, -1) `shouldReturn` (40, Just "soil")
@@ -711,3 +812,108 @@ spec = describe "Terrain windows and banks" $ do
           printed `shouldContain` ["removal\tsuccess\ttrue\t1"]
           printed `shouldContain` ["cell\ttrue\t1"]
           printed `shouldContain` ["column\t1\t-5:-3:false,-3:0:false,0:3:true"]
+
+  it "keeps a later open of a name hidden from attach until it settles, though an earlier open of the name lets go of its own hold after it was offered" $ do
+    releaseGate ← newGate
+    adoptGate ← newGate
+    armed ← newIORef False
+    let -- the first adoption after the example arms it is held, and none after
+        holdFirstAdoption = do
+          go ← atomicModifyIORef' armed (\a → (False, a))
+          when go (holdAt adoptGate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookRevoked = holdAt releaseGate, hookAdopting = holdFirstAdoption} $ \rig →
+        withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opensThenReleases), ("lua/second.lua", scriptSource reopens), ("lua/observer.lua", scriptSource observer)]) $ \world _ runtime →
+          withFvm world runtime (presentationOver rig) $ \first →
+            withFvm world runtime (presentationOver rig) $ \second →
+              withFvm world runtime (presentationOver rig) $ \third → do
+                (`finally` (openGate releaseGate >> openGate adoptGate)) $ do
+                  -- the first instance's arena is released: the service has freed the name, and the open has not yet let go of its hold
+                  _ ← admitOnly world first "modules-test" mainPath
+                  pumpUntilReached world releaseGate
+                  -- a later open of the name is committed and offered, and the host's adoption of it is held
+                  writeIORef armed True
+                  _ ← admitOnly world second "modules-test" "lua/second.lua"
+                  pumpUntilReached world adoptGate
+                  _ ← spawn world third "modules-test" "lua/observer.lua"
+                  untilPrinted world "observer\tfailure\tnot_found"
+                  -- the first open lets go now: it is its own hold it lets go of, and the later open's stands
+                  openGate releaseGate
+                  asked ← length . filter (== "observer\tfailure\tnot_found") <$> outLines world
+                  pumpUntil world (advanceClock world 2000000000 >> ((> asked + 2) . length . filter (== "observer\tfailure\tnot_found") <$> outLines world))
+                  outLines world >>= \printed → printed `shouldNotContain` ["observer\tsuccess\tnil"]
+                  openGate adoptGate
+                  untilPrinted world "observer\tsuccess\tnil"
+
+  it "refuses a read whose largest answer the VM's copied-value limits could never carry as an ordinary error, and never fails the host" $
+    mapM_
+      ( \(depth, narrowCarried) →
+          withRig $ \rig →
+            withWorld (counts [(CopiedValueDepth, depth), (SceneDepth, 3), (CopiedValueElements, 30), (SceneSprites, 1)]) (Layout [("lua/main.lua", scriptSource tightReads)]) $ \world _ runtime →
+              withFvm world runtime (presentationOver rig) $ \fvm → do
+                spawned ← spawn world fvm "modules-test" mainPath
+                untilPrintedBy world spawned "done"
+                printed ← outLines world
+                -- the wide range is refused by the host's own judgement of its largest answer, before the service is handed it
+                printed `shouldContain` ["wide column\tfalse\ttrue"]
+                -- depth 4 carries a one-run column answer; depth 3 carries no column answer at all, and refuses each range the same way
+                printed `shouldContain` ["narrow column call\t" <> (if narrowCarried then "true" else "false")]
+                when narrowCarried (printed `shouldContain` ["narrow column\tsuccess\t1"])
+                -- what fits is unaffected, and the instance was never failed
+                printed `shouldContain` ["cell\tsuccess", "remove\tsuccess\ttrue", "surface\tsuccess"]
+      )
+      [(4, True), (3, False)]
+
+  it "answers a service that closed after the host's precheck as the same permanent refusal, with nothing reserved, and a closed service before it the same way" $ do
+    gate ← newGate
+    armed ← newIORef False
+    let holdFirst = do
+          go ← atomicModifyIORef' armed (\a → (False, a))
+          when go (holdAt gate)
+    withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookSubmitting = holdFirst} $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource closesBetween)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "ready"
+          -- the next update's read passes the precheck (the service admits), is admitted by the host, and is held before the service's own
+          -- admission: the service closes there
+          writeIORef armed True
+          pumpUntilReached world gate
+          closeService (rgService rig)
+          openGate gate
+          untilPrinted world "done"
+          printed ← outLines world
+          -- the service refused the hand-off: a permanent, ordinary refusal that names the closure; and the next call is refused by the precheck
+          printed `shouldContain` ["call\tfalse\ttrue", "again\tfalse\ttrue"]
+          -- the refused hand-off left no request in the service (a closed service holds nothing it was asked since), and the service is coherent
+          census ← atomically (inspectCensusSTM (rgService rig))
+          length (censusRequests census) `shouldBe` 0
+          inspectInvariants (rgService rig) `shouldReturn` []
+
+  it "leaves no arena or lease behind when the host fails an open between building its lease and settling the request" $ do
+    (_, ExceptionWithContext _ _) ←
+      fatalWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener)]) $ \world _ runtime →
+        withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = ioError (userError "publication failed")} $ \rig →
+          withFvm world runtime (presentationOver rig) $ \fvm → do
+            _ ← admitOnly world fvm "modules-test" mainPath
+            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
+            failed `shouldSatisfy` isLeft
+            limitHeld (rgService rig) "arenas" `shouldReturn` 0
+            limitHeld (rgService rig) "leases" `shouldReturn` 0
+    pure ()
+
+  it "leaves only the creator's lease behind when the host fails an attach between building its lease and settling the request" $ do
+    (_, ExceptionWithContext _ _) ←
+      fatalWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource attacher)]) $ \world _ runtime →
+        withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopted = ioError (userError "publication failed")} $ \rig → do
+          Right client ← registerClient (rgService rig)
+          Right opening ← openArena (rgService rig) client (arenaName rig "modules-test" "shared") soilOverStoneSpec
+          Right _ ← await (rgService rig) opening
+          withFvm world runtime (presentationOver rig) $ \fvm → do
+            _ ← admitOnly world fvm "modules-test" mainPath
+            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
+            failed `shouldSatisfy` isLeft
+            -- the attach's lease, built and not published, was released: the creator's is the only lease left, and its arena is live
+            limitHeld (rgService rig) "arenas" `shouldReturn` 1
+            limitHeld (rgService rig) "leases" `shouldReturn` 1
+    pure ()
+

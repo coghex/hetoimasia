@@ -461,8 +461,10 @@ test-suite lua-engine-tests
         Test.LuaEngine.Terrain.Basics
         Test.LuaEngine.Terrain.Composition
         Test.LuaEngine.Terrain.Domain
+        Test.LuaEngine.Terrain.Fixture
         Test.LuaEngine.Terrain.Isolation
         Test.LuaEngine.Terrain.Limits
+        Test.LuaEngine.Terrain.Matrix
         Test.LuaEngine.Terrain.Names
         Test.LuaEngine.Terrain.Ownership
         Test.LuaEngine.Terrain.Picks

@@ -20,6 +20,9 @@ module Test.LuaEngine.Terrain.Support
   , gameplayOver
   , soilOverStone
   , terrainPrelude
+  , Step (..)
+  , stepsScript
+  , tightRigConfig
   , Case (..)
   , Verdict (..)
   , caseLua
@@ -34,17 +37,19 @@ module Test.LuaEngine.Terrain.Support
   , gatedProbe
   , removalProbe
   , awaitReached
+  , pumpUntilReached
   , openGate
   , armGate
   , disarmGate
   ) where
 
-import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar, tryTakeMVar)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (onException)
 import Control.Monad (void, when)
 import Data.List (find)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Unique (Unique, hashUnique, newUnique)
@@ -53,17 +58,18 @@ import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.LuaEngine.Facade (terrainPickType)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Registration (Binding, asynchronousNativeRequestIn)
-import qualified Data.Set as Set
+import qualified Data.Map.Strict as Map
 import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SText), Value (VInteger, VText))
 import Hetoimasia.LuaEngine.Terrain
 import Hetoimasia.Terrain.Cell (Cell (..), materialIdString)
 import Hetoimasia.Terrain.Coordinate (tileCoord)
-import Hetoimasia.Terrain.Residency (Revision (..))
+import Hetoimasia.Terrain.Residency (LimitsSpec (..), Revision (..), mkLimits)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Hetoimasia.Terrain.Runtime
 import Test.Hspec (Expectation, expectationFailure)
 import Hetoimasia.Scripting.Lua.Instance (InstanceFailure (failureMessage))
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
-import Test.LuaEngine.Facade.Support (Spawned, VmShape (..), World, advanceClock, errLines, gameplayShape, outLines, phaseOf, presentationShape, pumpUntil, settledFailure)
+import Test.LuaEngine.Facade.Support (Script (..), Spawned, VmShape (..), World, advanceClock, errLines, gameplayShape, outLines, phaseOf, presentationShape, pumpUntil, script, settledFailure)
 import Test.Support.Bounded (bounded)
 
 -- | The real service and the adapter over it.
@@ -128,7 +134,7 @@ awaitOfferFixture ∷ TerrainFacade → Binding
 awaitOfferFixture facade =
   asynchronousNativeRequestIn "terrain_test_await_offer" [SText] [] $ \_ values → case values of
     [VText name] →
-      [] <$ bounded (atomically (readTVar (tfOffered facade) >>= \held → if any (Text.isSuffixOf ("/" <> name)) (Set.toList held) then pure () else retry))
+      [] <$ bounded (atomically (readTVar (tfOffered facade) >>= \held → if any (Text.isSuffixOf ("/" <> name)) (Map.keys held) then pure () else retry))
     _ → pure []
 
 -- | Lua for the soil-over-stone definition the examples share: stone below level -3, four soil levels from -3 to 1.
@@ -142,6 +148,83 @@ terrainPrelude =
   [ "local DEF = " <> soilOverStone
   , "local function settle(api, r) if r ~= nil and api.request.ready(r) then return api.request.take(r) end end"
   ]
+
+-- Steps -----------------------------------------------------------------------------------------------------
+
+-- | One step of a 'stepsScript': a label, the body of a Lua function of @(A, api)@ (the arena the script opened, and the api) that
+-- returns a request or nothing, and the body of a function of the settled value that returns the text to print after the status.
+data Step = Step
+  { stLabel ∷ Text
+  , stStart ∷ Text
+  , stShow ∷ Text
+  }
+
+-- | A script that opens @definition@ (a Lua expression) as @main@ and then runs each step in turn. A step whose function returns a
+-- request is read: its label, status and the text its show function makes of the value (or the failure's code) are printed at its
+-- settlement, and the value is kept as @V[label]@ for later steps. One that returns nothing is unread, and the next step follows at
+-- once. @done@ is printed after the last step.
+stepsScript ∷ Text → [Text] → [Step] → Script
+stepsScript definition prelude list =
+  script
+    { scPrelude =
+        terrainPrelude
+          <> prelude
+          <> ["local V = {}", "local STEPS = {"]
+          <> [ "  { " <> Text.pack (show (Text.unpack (stLabel step))) <> ", function(A, api) " <> stStart step <> " end, function(v) " <> stShow step <> " end },"
+             | step ← list
+             ]
+          <> ["}", "local label, show, i = nil, nil, 0"]
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', " <> definition <> ")"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.arena = t.value V.arena = t.value self.s = 1 self.q = nil end"
+        , "elseif self.s == 1 then"
+        , "  if self.q then"
+        , "    local t = settle(api, self.q)"
+        , "    if t then"
+        , "      if t.status == 'success' then V[label] = t.value print(label, t.status, show(t.value)) else print(label, t.status, t.error and t.error.code) end"
+        , "      self.q = nil"
+        , "    end"
+        , "  end"
+        , "  if not self.q then"
+        , "    i = i + 1"
+        , "    local step = STEPS[i]"
+        , "    if step then label = step[1] show = step[3] self.q = step[2](self.arena, api)"
+        , "    else print('done') self.s = 2 end"
+        , "  end"
+        , "end"
+        ]
+    }
+
+-- | The service configuration of the offload examples: validated limits whose resident bank holds only a few regions of a small extent, so
+-- that touching more of them evicts what was resident and later reads reload it from the source and the retained removals.
+tightRigConfig ∷ Config
+tightRigConfig = defaultConfig {configLimits = limits, configRetainedBytes = fromInteger (stagingFor residentBank)}
+  where
+    spare = 2
+    edit = 4096
+    spec bytes staging =
+      LimitsSpec
+        { specResidentBytes = bytes
+        , specEditBytes = edit
+        , specStagingBytes = staging
+        , specLoadJobs = 4
+        , specQueuedCommands = 6
+        , specPinsPerView = 2
+        , specAgingQuanta = 3
+        , specQueryRegions = 4
+        , specExtentX = 2
+        , specExtentY = 1
+        , specExtentZ = 2
+        , specHoldRegions = 2
+        , specCameraRegions = 4
+        }
+    valid bytes staging = either (const Nothing) Just (mkLimits (spec bytes staging))
+    smallest = fromMaybe (error "no resident bank satisfies the minimum budgets") (listToMaybe [r | r ← [100, 200 .. 4000000], Just _ ← [valid r 1000000]])
+    stagingFor bytes = fromMaybe (error "no staging bank satisfies the minimum budgets") (listToMaybe [t | t ← [1000, 2000 .. 4000000], Just _ ← [valid bytes t]])
+    residentBank = smallest + spare * 400
+    limits = fromMaybe (error "tight limits are invalid") (valid residentBank (3 * stagingFor residentBank))
 
 -- Gates -----------------------------------------------------------------------------------------------------
 
@@ -171,6 +254,11 @@ gatedProbe selects gate = Probe $ \point →
 -- | Wait, bounded, until the owner has arrived at the gate.
 awaitReached ∷ Gate → IO ()
 awaitReached gate = bounded (takeMVar (gateArrived gate))
+
+-- | Drive the world's clock, bounded, until the owner has arrived at the gate: for an owner that only reaches it at a boundary a
+-- clock tick brings.
+pumpUntilReached ∷ World → Gate → IO ()
+pumpUntilReached world gate = pumpUntil world (advanceClock world 2000000000 >> (isJust <$> tryTakeMVar (gateArrived gate)))
 
 -- | Let a held owner go, and every later arrival through. Idempotent, so a scope can open it as part of its stop.
 openGate ∷ Gate → IO ()

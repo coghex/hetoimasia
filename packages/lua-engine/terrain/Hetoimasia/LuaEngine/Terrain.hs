@@ -51,6 +51,7 @@ module Hetoimasia.LuaEngine.Terrain
   , terrainLeaseCapacity
   , TerrainCompositionRefused (..)
   , terrainCodes
+  , terrainFailureReply
     -- * Pick authorities (the seam TRA-10 fills)
   , TerrainPicks
   , newTerrainPicks
@@ -65,13 +66,14 @@ import Control.Concurrent.STM
 import Control.Exception (Exception, finally, mask, mask_, onException, throwIO)
 import Control.Monad (filterM, forM_, unless, void, when)
 import Data.Int (Int64)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Unique (hashUnique)
+import Data.Unique (Unique, hashUnique, newUnique)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Resource (acquirePart, releaseRank)
 import Hetoimasia.LuaEngine.Facade
@@ -121,9 +123,9 @@ import Hetoimasia.Scripting.Lua.Provider
   )
 import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, RequestContext, capabilityType)
 import Hetoimasia.Scripting.Lua.Value (Schema (SNil), Value (..), capability)
-import Hetoimasia.Terrain.Cell (Cell (..), Column, IntervalError, MaterialId, ZRange, materialIdString, mkColumn, mkZRange, zRangeHi, zRangeLo)
+import Hetoimasia.Terrain.Cell (Cell (..), Column, IntervalError, MaterialId, ZRange, materialIdString, maxMaterialIdBytes, mkColumn, mkZRange, zRangeHi, zRangeLo)
 import Hetoimasia.Terrain.Coordinate (TileCoord, axisValue, tileCoord)
-import Hetoimasia.Terrain.Query (Occupied (..), Run (..))
+import Hetoimasia.Terrain.Query (Occupied (..), QueryLimits (..), Run (..))
 import Hetoimasia.Terrain.Residency (Revision (..))
 import Hetoimasia.Terrain.Runtime
   ( Answer (..)
@@ -131,7 +133,7 @@ import Hetoimasia.Terrain.Runtime
   , CellAnswer (..)
   , Client
   , ColumnAnswer (..)
-  , Config (configMaxLeases)
+  , Config (configMaxLeases, configQueryLimits)
   , Failure (..)
   , Precondition (..)
   , RemoveAnswer (..)
@@ -178,9 +180,11 @@ data TerrainFacade = TerrainFacade
   -- ^ The opens in flight, by the service's name: how an open finds, before it asks the service, a claim whose request the host has
   -- already settled as cancelled (the service has not been told yet) and lets it go, so that a name is free from the host's terminal
   -- settlement and not from the later notification.
-  , tfOffered ∷ !(TVar (Set Text))
-  -- ^ The names whose open the service committed and the host has not yet adopted or let go: shared by every VM of the service, so
-  -- that an attach, whichever VM makes it, is not eligible while the arena it would find is not yet the open's settled result.
+  , tfOffered ∷ !(TVar (Map Text (Set Unique)))
+  -- ^ The names whose open the service committed and the host has not yet adopted or let go, each with the opens (by incarnation:
+  -- every open request has its own identity) that hold it back: shared by every VM of the service, so that an attach, whichever VM
+  -- makes it, is not eligible while the arena it would find is not yet the open's settled result. An open lets go only of its own
+  -- entry, so a late cleanup of an earlier open of the name never shows a later open's arena before it has settled.
   }
 
 -- | An open the service holds a name for: whether the host has settled it without telling the service, and the telling.
@@ -193,12 +197,25 @@ data Claim = Claim
   , clCancel ∷ IO ()
   }
 
+-- | An open's name is held back from attach, from the service's commit of the open until the host has adopted or let go of its lease.
+holdBack ∷ TerrainFacade → Text → Link → STM ()
+holdBack facade name link = modifyTVar' (tfOffered facade) (Map.insertWith Set.union name (Set.singleton (lkId link)))
+
+-- | Let go of this open's own hold on a name, and of nothing another open of the name holds.
+letGo ∷ TerrainFacade → Text → Link → STM ()
+letGo facade name link =
+  modifyTVar' (tfOffered facade) (Map.update (\held → let rest = Set.delete (lkId link) held in if Set.null rest then Nothing else Just rest) name)
+
+-- | Whether some open still holds a name back from attach.
+heldBack ∷ TerrainFacade → Text → STM Bool
+heldBack facade name = Map.member name <$> readTVar (tfOffered facade)
+
 -- | A composition over a service, with no pick authority issued, no hooks and no extra bindings.
 newTerrainFacade ∷ Profile → Service → Config → IO TerrainFacade
 newTerrainFacade profile svc config = do
   picks ← newTerrainPicks
   claims ← newTVarIO Map.empty
-  offered ← newTVarIO Set.empty
+  offered ← newTVarIO Map.empty
   pure (TerrainFacade profile svc config picks noTerrainHooks [] claims offered)
 
 -- | The windows a test may hold or fail: told, never consulted for an answer.
@@ -215,10 +232,17 @@ data TerrainHooks = TerrainHooks
   , hookCancelling ∷ IO ()
   -- ^ The host settled a request as cancelled (a script's cancel won) and the adapter is about to ask the service to cancel it: the
   -- window in which the service's own commit and the host's settlement are arbitrated by the request's eligibility alone.
+  , hookSubmitting ∷ IO ()
+  -- ^ The host admitted a request (its places are reserved) and the hand-off is about to ask the service, masked: the window between a
+  -- permanent precheck and the service's own admission, in which the service can close.
+  , hookRevoked ∷ IO ()
+  -- ^ The service has released the lease of an open (the script's release of its arena, or a cancelled open's revocation) and the open
+  -- has not yet let go of its hold on the name (the name is free for the service's next open): the window in which a later open of the
+  -- same name can already be offered.
   }
 
 noTerrainHooks ∷ TerrainHooks
-noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ())
+noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ()) (pure ())
 
 -- | Why a VM's terrain could not be composed: a failure of the composition, never a script's.
 newtype TerrainCompositionRefused = TerrainCompositionRefused Text
@@ -297,6 +321,8 @@ data Link = Link
   , lkSettling ∷ !Settling
   , lkLease ∷ !(TVar LeaseCell)
   , lkTerminal ∷ !(TVar Bool)
+  , lkId ∷ !Unique
+  -- ^ The identity of this request's incarnation of the name it opens: what it holds in 'tfOffered', and all it ever lets go of.
   }
 
 -- The per-VM state ----------------------------------------------------------------------------------------
@@ -522,9 +548,16 @@ leaseAsk source =
     , askLease = Just (InstanceOwned, \_ key → VCapability (capability terrainArenaType key))
     }
 
--- | The host's permanent facts for an ask, decided before any action and reserving nothing.
+-- | The host's permanent facts for an ask, decided before any action and reserving nothing: the service is still admitting work (a
+-- closed service is a permanent refusal, never the busy a full bank of the host's would answer first), and the host's own facts. It is
+-- a precheck: the service decides its admission again, atomically with the admission, and a service that closed since refuses the
+-- hand-off the same way ('declination'), leaving nothing reserved.
 permanent ∷ Env → ([Value] → M1Ask) → ArgumentCheck
-permanent env askOf owner values = m1ArgumentCheck (tvRequests (envVm env)) askOf owner values
+permanent env askOf owner values = do
+  admitting ← atomically (Terrain.serviceAdmitting (service env))
+  if admitting
+    then m1ArgumentCheck (tvRequests (envVm env)) askOf owner values
+    else pure (Just "the terrain service is closed")
 
 -- | A lease handle's check: another instance's handle (alive, retiring or ended) and a handle of another kind are refused as
 -- ordinary errors; the host's own permanent facts follow. A lease whose arena was closed by someone else is not refused here:
@@ -617,6 +650,10 @@ columnOf (TerrainColumnAsk x y lo hi) = do
   range ← either (\(_ ∷ IntervalError) → Left "the range is not a valid interval of supported levels") Right (mkZRange (toInteger lo) (toInteger hi))
   Right (column, range)
 
+-- | A terrain failure as the reply the host judges, for the examples that name every failure the service can settle.
+terrainFailureReply ∷ Failure → ProviderReply
+terrainFailureReply = failureReply
+
 -- | A terrain failure as the reply the host judges: the declared code with a fixed, bounded message, or a reply that is a
 -- provider defect (no code), for what the service never declared.
 failureReply ∷ Failure → ProviderReply
@@ -696,6 +733,12 @@ submit env submission = mask_ $ do
     pure (Map.lookup ticket held)
   found ← maybe (throwIO (TerrainCompositionRefused "a terrain request's ask was lost")) pure pending
   settling ← maybe (throwIO (TerrainCompositionRefused "a terrain request was handed with no settlement seam")) pure (submissionSettling submission)
+  -- The largest reply this ask can have must be one the host takes, or the request is refused here, before the service is handed it:
+  -- a settlement the host rejects at the commit abandons the transaction and takes the whole service down with the host's defect
+  -- unrecorded. The refusal is an ordinary error naming the range, decided by the host's own judgement of the reply.
+  forM_ (worstReply env (pdAsk found)) $ \reply →
+    unless (settlingJudge settling reply) $
+      throwIO (DeclinedRefused "the VM's copied-value limits cannot carry the answer of this call: narrow the range")
   link ←
     Link
       (case pdAsk found of AskAttach _ name → Just name; _ → Nothing)
@@ -703,6 +746,8 @@ submit env submission = mask_ $ do
       settling
       <$> newTVarIO NoLease
       <*> newTVarIO False
+      <*> newUnique
+  noted ← newTVarIO False
   let -- What decides a commit, read in the transaction that makes it: the session still takes new work, the request is still
       -- waiting (and its tick granted, on logical time), and a read or removal does not need a revision no Lua integer holds.
       eligible = do
@@ -712,27 +757,45 @@ submit env submission = mask_ $ do
           then pure False
           else case pdAsk found of
             AskAttach {} → pure True
-            AskCell lease _ → representable lease 0
-            AskColumn lease _ _ → representable lease 0
-            AskSurface lease _ → representable lease 0
-            AskRemove lease _ _ → representable lease 1
             AskOpen {} → pure True
-      -- A revision that cannot be handed to Lua is decided before anything is committed: it is the host's defect, recorded for the
-      -- owner to raise, and the request is not eligible, so the service commits nothing. It cannot be left to the commit: a settlement
-      -- the host rejects there abandons the transaction (nothing committed) but the service takes it for a provider defect and fails
-      -- as a whole, and the host's request is never told. A removal may advance the revision by one, and whether it changes anything is
-      -- not known to the host before the commit (removing air keeps the revision), so a removal is refused, conservatively, when the
-      -- arena's revision stands at the ceiling: no edit that could pass it is ever committed.
-      representable lease advance =
-        Terrain.inspectArenaSTM (service env) lease >>= \case
-          Just view | Terrain.viewRevision view `exceeds` advance → do
-            _ ← settlingSettle settling (ProviderFailure "terrain: a content revision is not a Lua integer")
-            pure False
-          _ → pure True
+            _ → fromMaybe False <$> representableNow
+      -- Whether the revision this request will hand to Lua is one a Lua integer holds, from the arena as the service has it. A read hands
+      -- the arena's revision; a removal hands the next one when it changes content and the same one when it removes air, which only the
+      -- service's staging knows ('Terrain.stagedRemovalChanges'): Nothing until it has staged the removal, when there is nothing to decide.
+      representableNow ∷ STM (Maybe Bool)
+      representableNow = do
+        needs ← case pdAsk found of
+          AskCell lease _ → pure (Just (lease, 0))
+          AskColumn lease _ _ → pure (Just (lease, 0))
+          AskSurface lease _ → pure (Just (lease, 0))
+          AskRemove lease _ _ →
+            readTVar (pdRequest found) >>= \case
+              Nothing → pure Nothing
+              Just request → fmap (\changes → (lease, if changes then 1 else 0)) <$> Terrain.stagedRemovalChanges (service env) request
+          _ → pure Nothing
+        case needs of
+          Nothing → pure Nothing
+          Just (lease, advance) →
+            Terrain.inspectArenaSTM (service env) lease >>= \case
+              Just view → pure (Just (not (Terrain.viewRevision view `exceeds` advance)))
+              Nothing → pure (Just True)
       exceeds (Revision w) advance = w > min (tvIntegerCeiling (envVm env)) (fromIntegral (maxBound ∷ Int64)) - advance
+      -- A revision that cannot be handed to Lua is the host's defect, and it is recorded where it is first known: when the service stages
+      -- the request (its readiness, a transaction that commits, which the owner's choosing of work is not), or, for a request staged before
+      -- the hand-off returned, when it returns. The request is not eligible, so the service commits nothing. It cannot be left to the
+      -- commit: a settlement the host rejects there abandons the transaction (nothing committed) but the service takes it for a provider
+      -- defect and fails as a whole, and the host's request is never told. Recorded once.
+      note = do
+        recorded ← readTVar noted
+        unless recorded $
+          representableNow >>= \case
+            Just False → do
+              writeTVar noted True
+              void (settlingSettle settling (ProviderFailure "terrain: a content revision is not a Lua integer"))
+            _ → pure ()
       ep =
         Endpoint
-          { endpointReady = pure ()
+          { endpointReady = note
           , endpointEligible = eligible
           , endpointSettle = settleInto env link
           }
@@ -740,6 +803,7 @@ submit env submission = mask_ $ do
   case pdAsk found of
     AskOpen _ name _ → releaseStale env name
     _ → pure ()
+  hookSubmitting (hooks env)
   admitted ← case pdAsk found of
     AskOpen client name spec → openArenaWith (service env) ep client name spec
     AskAttach client name → attachArenaWith (service env) ep client name
@@ -750,7 +814,7 @@ submit env submission = mask_ $ do
   case admitted of
     Left refused → throwIO (declination refused)
     Right request → do
-      atomically (writeTVar (pdRequest found) (Just request))
+      atomically (writeTVar (pdRequest found) (Just request) >> note)
       case pdAsk found of
         AskOpen _ name _ → do
           let claim = Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)
@@ -766,6 +830,24 @@ submit env submission = mask_ $ do
           { workCancel = cancelWork env link request
           , workRetirement = retirement link
           }
+
+-- | The largest answer a read or a removal can have, as the reply the host judges: a revision at the greatest integer, every field
+-- present, and for a column as many runs as the range has levels and the service will return (more is @too_large@, a failure that
+-- carries no answer). Nothing for a request whose result is a lease or a failure.
+worstReply ∷ Env → Ask → Maybe ProviderReply
+worstReply env = \case
+  AskCell {} → Just (ProviderResult (VRecord (("revision", greatest) : solid)))
+  AskColumn _ _ range →
+    let levels = max 1 (toInteger (zRangeHi range) - toInteger (zRangeLo range))
+        runs = fromInteger (min (toInteger (limitReturnedRuns (configQueryLimits (tfConfig (envFacade env))))) levels)
+     in Just (ProviderResult (VRecord [("revision", greatest), ("runs", VList (replicate runs (VRecord ([("z_min", greatest), ("z_max", greatest)] <> solid))))]))
+  AskSurface {} → Just (ProviderResult (VRecord [("revision", greatest), ("occupied", VBoolean True), ("z", greatest), ("material", longest), ("shape", greatest)]))
+  AskRemove {} → Just (ProviderResult (VRecord [("changed", VBoolean True), ("revision", greatest)]))
+  _ → Nothing
+  where
+    greatest = VInteger maxBound
+    longest = VText (Text.replicate maxMaterialIdBytes "m")
+    solid = [("air", VBoolean False), ("material", longest), ("shape", greatest)]
 
 -- | Let go of the claims on a name whose request the host has already settled without the service being told: the service is told
 -- now, which frees the name, before another open asks for it.
@@ -832,7 +914,7 @@ settleInto env link = \case
     AAttached lease → do
       -- An attach is decided against the names that have settled for the service, and an open the host has not yet published is not one
       -- for the host: it answers not_found without waiting, and the service's lease for it is let go at the next drain.
-      pending ← maybe (pure False) (\name → Set.member name <$> readTVar (tfOffered (envFacade env))) (lkAttach link)
+      pending ← maybe (pure False) (heldBack (envFacade env)) (lkAttach link)
       if pending
         then do
           modifyTVar' (envDropped env) (lease :)
@@ -841,15 +923,20 @@ settleInto env link = \case
         else offer lease
     other → do
       settled ← settlingSettle (lkSettling link) (answerReply (tvIntegerCeiling (envVm env)) other)
-      -- A reply the host rejects abandons the very transaction that is committing the change: nothing of it is written.
-      when (settled `elem` [ReplyDefective, ReplyRefusedValue]) (throwSTM (SettlementRejected (Text.pack (show settled))))
+      -- A reply the host rejects abandons the very transaction that is committing a change: nothing of it is written. The prechecks
+      -- ('worstReply', the revision's eligibility) make that unreachable, so it is a defect of this adapter. A read commits nothing: the
+      -- host has recorded its rejection as the defect it is, which the owner raises, and that record is kept.
+      when (isRemoved other && settled `elem` [ReplyDefective, ReplyRefusedValue]) (throwSTM (SettlementRejected (Text.pack (show settled))))
       writeTVar (lkTerminal link) True
   where
+    isRemoved = \case
+      ARemoved _ → True
+      _ → False
     -- The service's lease is offered to the request, and the host is told it is a resource reply: it builds the lease at its next
     -- boundary and settles then. Whatever the host answers, the lease stays offered until it is adopted or disposed of.
     offer lease = do
       writeTVar (lkLease link) (Offered lease)
-      forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.insert name))
+      forM_ (lkName link) (\name → holdBack (envFacade env) name link)
       settled ← settlingSettleFinal (lkSettling link) (publishable lease) (ProviderResource VNil (adoptionFor env link))
       when (settled `elem` [ReplyDefective, ReplyRefusedValue]) (throwSTM (SettlementRejected (Text.pack (show settled))))
       writeTVar (lkTerminal link) True
@@ -857,7 +944,7 @@ settleInto env link = \case
     -- the arena is still there, or the request settles arena_closed instead. Either way the open's name stops being held back from
     -- attach in the same step, so what is visible and what has settled are one.
     publishable lease = do
-      forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name))
+      forM_ (lkName link) (\name → letGo (envFacade env) name link)
       view ← Terrain.inspectArenaSTM (service env) lease
       pure (maybe (Just closedFailure) (const Nothing) view)
 
@@ -886,8 +973,9 @@ adoptionFor env link =
     releaseResource resource = forM_ (resourceLease resource) $ \lease → do
       hookReleasing (hooks env)
       released ← Terrain.releaseLease (service env) lease
+      hookRevoked (hooks env)
       -- Only once the service has revoked the lease is the name no longer held back from attach.
-      atomically (forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name)))
+      atomically (forM_ (lkName link) (\name → letGo (envFacade env) name link))
       either (throwIO . TerrainCompositionRefused . ("a lease's release was refused: " <>) . Text.pack . show) pure released
 
 -- | Withdraw interest in a request: ask the service to cancel it, and give back an offered lease nobody adopted.
@@ -912,11 +1000,12 @@ tellCancelled env link request = mask_ $ do
   forM_ claimed $ \(lease, first) → do
     when first (hookReleasing (hooks env))
     void (Terrain.releaseLease (service env) lease)
+    when first (hookRevoked (hooks env))
     atomically $
       readTVar (lkLease link) >>= \case
         Revoking _ → do
           writeTVar (lkLease link) Disposed
-          forM_ (lkName link) (\name → modifyTVar' (tfOffered (envFacade env)) (Set.delete name))
+          forM_ (lkName link) (\name → letGo (envFacade env) name link)
         _ → pure ()
 
 -- | The provider's own reading of where its work has got to, after interest was withdrawn: over when the service has reached

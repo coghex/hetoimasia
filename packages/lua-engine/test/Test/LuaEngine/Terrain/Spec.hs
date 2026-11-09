@@ -4,8 +4,10 @@ module Test.LuaEngine.Terrain.Spec (spec) where
 import qualified Test.LuaEngine.Terrain.Basics as Basics
 import qualified Test.LuaEngine.Terrain.Composition as Composition
 import qualified Test.LuaEngine.Terrain.Domain as Domain
+import qualified Test.LuaEngine.Terrain.Fixture as Fixture
 import qualified Test.LuaEngine.Terrain.Isolation as Isolation
 import qualified Test.LuaEngine.Terrain.Limits as Limits
+import qualified Test.LuaEngine.Terrain.Matrix as Matrix
 import qualified Test.LuaEngine.Terrain.Names as Names
 import qualified Test.LuaEngine.Terrain.Ownership as Ownership
 import qualified Test.LuaEngine.Terrain.Picks as Picks
@@ -17,6 +19,7 @@ import Test.Hspec (Spec, describe)
 spec ∷ Spec
 spec = describe "Terrain" $ do
   Basics.spec
+  Fixture.spec
   Composition.spec
   Validation.spec
   Domain.spec
@@ -27,3 +30,4 @@ spec = describe "Terrain" $ do
   Isolation.spec
   Picks.spec
   Windows.spec
+  Matrix.spec

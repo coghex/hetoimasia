@@ -1,0 +1,452 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+-- | The matrices of the acceptance section: every expected failure read and unread, the banks a smaller validated profile reaches, the
+-- permanent refusals that stay permanent under pressure, the places that stay charged until their work is retired, and releasing twice.
+-- Each runs real Lua instances over the real service.
+module Test.LuaEngine.Terrain.Matrix (spec) where
+
+import Control.Exception (finally)
+import Control.Monad (forM_)
+import Data.Maybe (isJust)
+import qualified Hetoimasia.Scripting.Lua.Instance as Instance
+import Data.Text (Text)
+import qualified Data.Text as Text
+import Hetoimasia.LuaEngine.Profile (CountLimit (RequestsPerInstance, RequestsPerVm), fixedM1Profile)
+import Hetoimasia.LuaEngine.Terrain (issuePick, terrainCodes, terrainFailureReply)
+import Hetoimasia.Scripting.Lua.Admission (ExpectedFailure (expectedCode))
+import Hetoimasia.Scripting.Lua.Provider (ProviderReply (..))
+import Hetoimasia.Terrain.Query (QueryError (TooManyRuns))
+import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
+import Hetoimasia.Terrain.Runtime (Failure (..), Point (PointCaptured), Precondition (..))
+import Hetoimasia.Terrain.Source (SourceError (TooManyMaterials), definitionHeaderBytes, materialRecordBytes)
+import Test.Hspec
+import Test.LuaEngine.Facade.Support
+import Test.LuaEngine.Request.Profiles (counts)
+import Test.LuaEngine.Terrain.Support
+
+-- | An arena whose column (0, 0) alternates solid and air from level 0 for a thousand levels: a column answer over two thousand levels
+-- has more than the 1,024 runs the service returns.
+altPrelude ∷ [Text]
+altPrelude =
+  [ "local PATCHES = {}"
+  , "for k = 0, 1023 do PATCHES[#PATCHES + 1] = { x = 0, y = 0, z_min = 2 * k, z_max = 2 * k + 1, value = { material = 'soil', shape = 0 } } end"
+  , "local ALT = { materials = { 'soil' }, layers = {}, patches = PATCHES }"
+  ]
+
+-- | Every expected failure a script can reach, read and then the same call unread, each followed by the next step: the instance runs on.
+failures ∷ Script
+failures =
+  stepsScript
+    "DEF"
+    altPrelude
+    [ Step "alt opened" "return api.terrain.open('alt', ALT)" "return 'ok'"
+    , Step "attached" "return api.terrain.attach('main')" "return 'ok'"
+    , Step "not_found read" "return api.terrain.attach('nope')" "return 'ok'"
+    , Step "not_found unread" "api.terrain.attach('nope') return nil" "return 'ok'"
+    , Step "name_in_use read" "return api.terrain.open('main', DEF)" "return 'ok'"
+    , Step "name_in_use unread" "api.terrain.open('main', DEF) return nil" "return 'ok'"
+    , Step "definition read" "return api.terrain.open('bad', { materials = { 'a', 'a' }, layers = {} })" "return 'ok'"
+    , Step "definition unread" "api.terrain.open('bad', { materials = { 'a', 'a' }, layers = {} }) return nil" "return 'ok'"
+    , Step "too_large read" "return api.terrain.column(V['alt opened'], {x = 0, y = 0, z_min = 0, z_max = 2048})" "return 'ok'"
+    , Step "too_large unread" "api.terrain.column(V['alt opened'], {x = 0, y = 0, z_min = 0, z_max = 2048}) return nil" "return 'ok'"
+    , Step "stale_view read" "return api.terrain.remove(A, {x = 0, y = 0, z = 0}, TEST_PICK(1))" "return 'ok'"
+    , Step "stale_view unread" "api.terrain.remove(A, {x = 0, y = 0, z = 0}, TEST_PICK(1)) return nil" "return 'ok'"
+    , Step "released" "api.terrain.release(A) return nil" "return 'ok'"
+    , Step "arena_closed read" "return api.terrain.cell(V['attached'], {x = 0, y = 0, z = 0})" "return 'ok'"
+    , Step "arena_closed unread" "api.terrain.cell(V['attached'], {x = 0, y = 0, z = 0}) return nil" "return 'ok'"
+    , Step "alive" "return api.terrain.attach('still')" "return 'ok'"
+    ]
+
+-- | An instance with a request bank of two: an arena, two reads left untaken, and then each call asked while the bank is full.
+fullBank ∷ Script
+fullBank =
+  script
+    { scPrelude =
+        terrainPrelude
+          <> [ "local function busy(label, ...)"
+             , "  local res = table.pack(...)"
+             , "  print(label, res.n, res[1] == nil, res[2] and res[2].code)"
+             , "end"
+             ]
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    local A = t.value"
+        , "    self.a = api.terrain.cell(A, {x = 0, y = 0, z = 0})"
+        , "    self.b = api.terrain.cell(A, {x = 1, y = 0, z = 0})"
+        , "    busy('cell', api.terrain.cell(A, {x = 2, y = 0, z = 0}))"
+        , "    busy('column', api.terrain.column(A, {x = 0, y = 0, z_min = 0, z_max = 3}))"
+        , "    busy('surface', api.terrain.surface(A, {x = 0, y = 0}))"
+        , "    busy('remove', api.terrain.remove(A, {x = 0, y = 0, z = 0}))"
+        , "    busy('open', api.terrain.open('second', DEF))"
+        , "    busy('attach', api.terrain.attach('main'))"
+        , "    print('done') self.s = 1"
+        , "  end"
+        , "end"
+        ]
+    }
+
+-- | The first instance opens @shared@ and shares its handle; the second attaches to it, fills its request bank of two, and then uses the
+-- first's handle.
+foreignUnderPressure ∷ Script
+foreignUnderPressure =
+  script
+    { scPrelude = terrainPrelude <> ["SHARED = SHARED or {}"]
+    , scInit = ["self.s = 0", "if api.instance_id == 'inst-1' then self.q = api.terrain.open('shared', DEF) end"]
+    , scUpdate =
+        [ "if api.instance_id == 'inst-1' then"
+        , "  if self.s == 0 then local t = settle(api, self.q) if t then SHARED.h = t.value self.s = 1 end end"
+        , "else"
+        , "  if self.s == 0 and SHARED.h then self.q = api.terrain.attach('shared') self.s = 1"
+        , "  elseif self.s == 1 then"
+        , "    local t = settle(api, self.q)"
+        , "    if t then"
+        , "      self.b = t.value"
+        , "      self.r1 = api.terrain.cell(self.b, {x = 0, y = 0, z = 0})"
+        , "      self.r2 = api.terrain.cell(self.b, {x = 1, y = 0, z = 0})"
+        , "      local full = select('#', api.terrain.cell(self.b, {x = 2, y = 0, z = 0}))"
+        , "      print('bank full', full)"
+        , "      local ok, e = pcall(api.terrain.cell, SHARED.h, {x = 0, y = 0, z = 0})"
+        , "      print('foreign under pressure', ok, string.find(tostring(e), 'another instance', 1, true) ~= nil, string.find(tostring(e), 'busy', 1, true) ~= nil)"
+        , "      print('done') self.s = 2"
+        , "    end"
+        , "  end"
+        , "end"
+        ]
+    }
+
+-- | An instance with a request bank of two that fills it and then asks for a third read on every update, saying what each answer was.
+stoppedUnderPressure ∷ Script
+stoppedUnderPressure =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    self.a = t.value"
+        , "    self.r1 = api.terrain.cell(self.a, {x = 0, y = 0, z = 0})"
+        , "    self.r2 = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
+        , "    self.s = 1"
+        , "  end"
+        , "elseif self.s == 1 then"
+        , "  local ok, r, e = pcall(api.terrain.cell, self.a, {x = 2, y = 0, z = 0})"
+        , "  if ok then print('try', ok, r == nil and e and e.code or 'accepted')"
+        , "  else print('try', ok, string.find(tostring(r), 'stopping', 1, true) ~= nil, string.find(tostring(r), 'busy', 1, true) ~= nil) end"
+        , "end"
+        ]
+    }
+
+-- | An instance that cancels a full bank of reads: a cancelled request keeps its place until its record is taken.
+cancelledStayCharged ∷ Script
+cancelledStayCharged =
+  script
+    { scPrelude = terrainPrelude <> ["local function code(...) local r, e = ... return r == nil and e and e.code or 'accepted' end"]
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    self.a = t.value self.held = {}"
+        , "    self.held[1] = api.terrain.cell(self.a, {x = 0, y = 0, z = 0})"
+        , "    self.held[2] = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
+        , "    print('full', code(api.terrain.cell(self.a, {x = 2, y = 0, z = 0})))"
+        , "    for i = 1, 2 do print('cancel', api.request.cancel(self.held[i])) end"
+        , "    print('cancelled, untaken', code(api.terrain.cell(self.a, {x = 2, y = 0, z = 0})))"
+        , "    self.s = 1"
+        , "  end"
+        , "elseif self.s == 1 then"
+        , "  for i = 1, 2 do api.request.take(self.held[i]) end"
+        , "  local r = api.terrain.cell(self.a, {x = 2, y = 0, z = 0})"
+        , "  print('taken', r ~= nil)"
+        , "  print('done') self.s = 2"
+        , "end"
+        ]
+    }
+
+-- | An instance that releases its arena twice at once, and once more after the release has retired.
+releasesTwice ∷ Script
+releasesTwice =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.n = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    self.a = t.value"
+        , "    print('first release', api.terrain.release(self.a))"
+        , "    print('second release', api.terrain.release(self.a))"
+        , "    self.s = 1"
+        , "  end"
+        , "elseif self.s == 1 then"
+        , "  self.n = self.n + 1"
+        , "  if self.n >= 4 then print('late release', api.terrain.release(self.a)) print('done') self.s = 2 end"
+        , "end"
+        ]
+    }
+
+-- | Definitions whose decode and whose validator could both reject: the decode layer rejects first, as an ordinary error, and a definition
+-- only the validator rejects is the expected failure.
+precedence ∷ Script
+precedence =
+  stepsScript
+    "DEF"
+    []
+    [ Step "both" "local ok, e = pcall(api.terrain.open, 'p', { materials = { 'a', 'a' }, layers = { { material = 'a', shape = 1.0 } } }) print('both layers', ok, string.find(tostring(e), 'float', 1, true) ~= nil) return nil" "return 'ok'"
+    , Step "validator only" "return api.terrain.open('q', { materials = { 'a', 'a' }, layers = {} })" "return 'ok'"
+    ]
+
+-- | The accounted bytes of a definition of this many materials, each named by 64 bytes: the validator's byte accounting.
+accounted ∷ Int → Int
+accounted materials = fromIntegral definitionHeaderBytes + materials * (fromIntegral materialRecordBytes + 64)
+
+-- | The most materials, of 64 bytes each, a definition may name within the validator's 256 KiB.
+mostWithin256KiB ∷ Int
+mostWithin256KiB = last (takeWhile ((<= 256 * 1024) . accounted) [0 .. 4095])
+
+-- | A definition of exactly the most materials the 256 KiB bound allows, and of one more.
+bounded256 ∷ Script
+bounded256 =
+  stepsScript
+    "DEF"
+    [ "local function mats(n) local m = {} for i = 1, n do m[i] = 'm' .. string.format('%063d', i) end return m end" ]
+    [ Step "at the bound" ("return api.terrain.open('at', { materials = mats(" <> Text.pack (show mostWithin256KiB) <> "), layers = {} })") "return 'ok'"
+    , Step "past the bound" ("return api.terrain.open('past', { materials = mats(" <> Text.pack (show (mostWithin256KiB + 1)) <> "), layers = {} })") "return 'ok'"
+    ]
+
+-- | The creator opens an arena and reads it on every update; the second instance attaches and says so, and is stopped by the example.
+sharedCreator ∷ Script
+sharedCreator =
+  script
+    { scPrelude = terrainPrelude <> ["SHARED = SHARED or {}"]
+    , scInit = ["self.s = 0", "if api.instance_id == 'inst-1' then self.q = api.terrain.open('shared', DEF) end"]
+    , scUpdate =
+        [ "if api.instance_id == 'inst-1' then"
+        , "  if self.s == 0 then"
+        , "    local t = settle(api, self.q)"
+        , "    if t then self.a = t.value SHARED.opened = true self.s = 1 self.q = api.terrain.cell(self.a, {x = 0, y = 0, z = 0}) end"
+        , "  else"
+        , "    local t = settle(api, self.q)"
+        , "    if t then print('creator read', t.status) self.q = api.terrain.cell(self.a, {x = 0, y = 0, z = 0}) end"
+        , "  end"
+        , "else"
+        , "  if self.s == 0 and SHARED.opened then self.q = api.terrain.attach('shared') self.s = 1"
+        , "  elseif self.s == 1 then local t = settle(api, self.q) if t then print('attached', t.status) self.s = 2 end end"
+        , "end"
+        ]
+    }
+
+-- | The first instance opens an arena and shares its @api.terrain@; the second calls that captured table with the first's handle.
+capturedFacade ∷ Script
+capturedFacade =
+  script
+    { scPrelude = terrainPrelude <> ["SHARED = SHARED or {}"]
+    , scInit = ["self.s = 0", "if api.instance_id == 'inst-1' then self.q = api.terrain.open('captured', DEF) end"]
+    , scUpdate =
+        [ "if api.instance_id == 'inst-1' then"
+        , "  if self.s == 0 then local t = settle(api, self.q) if t then SHARED.terrain = api.terrain SHARED.h = t.value self.s = 1 end end"
+        , "elseif SHARED.h and self.s == 0 then"
+        , "  self.s = 1"
+        , "  local ok, e = pcall(function() return SHARED.terrain.cell(SHARED.h, {x = 0, y = 0, z = 0}) end)"
+        , "  print('captured facade', ok, string.sub(tostring(e), 1, 160))"
+        , "  print('done')"
+        , "end"
+        ]
+    }
+
+-- | An instance with a request bank of two, full of results nobody has taken, that cancels, releases its arena and goes on.
+fullQueue ∷ Script
+fullQueue =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    self.a = t.value self.held = {}"
+        , "    self.held[1] = api.terrain.cell(self.a, {x = 0, y = 0, z = 0})"
+        , "    self.held[2] = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
+        , "    print('full', select('#', api.terrain.cell(self.a, {x = 2, y = 0, z = 0})))"
+        , "    print('cancel', api.request.cancel(self.held[1]))"
+        , "    print('release', api.terrain.release(self.a))"
+        , "    print('done') self.s = 1"
+        , "  end"
+        , "end"
+        ]
+    }
+
+-- | An instance with an unread expected terrain failure, and then a required request of another service that fails.
+unrelatedRequired ∷ Script
+unrelatedRequired =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.unread = api.terrain.attach('nope')"]
+    , scUpdate =
+        [ "self.s = self.s + 1"
+        , "if self.s < 6 then print('alive', self.s)"
+        , "elseif self.s == 6 then self.r = api.content.data('missing.bin') print('required issued') end"
+        ]
+    }
+
+spec ∷ Spec
+spec = describe "Terrain matrices" $ do
+  it "reads, and leaves unread, each expected failure a script can reach, and the instance runs its next update after each" $
+    withRig $ \rig → do
+      -- the one authority this example issues is for the first arena of a fresh service at a revision it never has: a stale view
+      _ ← issuePick (rgPicks rig) "inst-1" (Precondition (ArenaId 0) (Revision 5))
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failures)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          forM_ [("not_found", "not_found read"), ("name_in_use", "name_in_use read"), ("definition", "definition read"), ("too_large", "too_large read"), ("stale_view", "stale_view read"), ("arena_closed", "arena_closed read")] $ \(code, label) →
+            printed `shouldContain` [label <> "\tfailure\t" <> code]
+          -- an unread failure prints nothing and fails nothing: the instance went on to its next step, and the last one
+          forM_ ["not_found unread", "name_in_use unread", "definition unread", "too_large unread", "stale_view unread", "arena_closed unread"] $ \label →
+            printed `shouldNotSatisfy` any ((label <> "\t") `Text.isPrefixOf`)
+          printed `shouldContain` ["alive\tfailure\tnot_found"]
+
+  it "maps every failure the service can settle to a code the host declared, source_failure included, or to the host's own defect" $ do
+    forM_ [NotFound, ArenaClosed, StaleView, Definition (TooManyMaterials 4095), TooLarge (TooManyRuns 1024), SourceFailure "a region could not be read", NameInUse] $ \failure →
+      case terrainFailureReply failure of
+        ProviderExpected found → expectedCode found `shouldSatisfy` (`elem` terrainCodes)
+        other → expectationFailure (show failure <> " was not an expected failure: " <> take 80 (show other))
+    -- the seven codes are exactly the ones the failures above map to
+    terrainCodes `shouldMatchList` ["not_found", "arena_closed", "stale_view", "definition", "source_failure", "too_large", "name_in_use"]
+    -- what the service never declared to a script is the host's defect, never a code
+    forM_ [Superseded "overtaken", HostFailure "an accounting defect"] $ \failure →
+      case terrainFailureReply failure of
+        ProviderFailure _ → pure ()
+        other → expectationFailure (show failure <> " must be a defect, found " <> take 80 (show other))
+
+  it "reaches each request bank of a smaller validated profile with exactly two values, and no call that was refused busy reached the service" $
+    withRig $ \rig →
+      withWorld (counts [(RequestsPerInstance, 2), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource fullBank)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          forM_ ["cell", "column", "surface", "remove", "open", "attach"] $ \label →
+            printed `shouldContain` [label <> "\t2\ttrue\tbusy"]
+          -- the refused opens made no arena and no lease, and the refused attach holds no client: only the one arena, its lease and the owner client
+          limitHeld (rgService rig) "arenas" `shouldReturn` 1
+          limitHeld (rgService rig) "leases" `shouldReturn` 1
+          limitHeld (rgService rig) "clients" `shouldReturn` 1
+
+  it "refuses another instance's handle as an ordinary error, never busy, while the caller's request bank is full" $
+    withRig $ \rig →
+      withWorld (counts [(RequestsPerInstance, 2), (RequestsPerVm, 4)]) (Layout [("lua/main.lua", scriptSource foreignUnderPressure)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "done"
+          printed ← outLines world
+          printed `shouldContain` ["bank full\t2"]
+          printed `shouldContain` ["foreign under pressure\tfalse\ttrue\tfalse"]
+
+  it "refuses a call of a stopping session as an ordinary error, never busy, while the request bank is full" $
+    withRig $ \rig →
+      withWorld (counts [(RequestsPerInstance, 2), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource stoppedUnderPressure)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          -- the bank is full and the session takes work: busy
+          untilPrinted world "try\ttrue\tbusy"
+          -- the session stops, the bank is as full, and the answer is the refusal of a stopping session
+          setAdmission world AdmissionStopping
+          untilPrinted world "try\tfalse\ttrue\tfalse"
+          setAdmission world AdmissionOpen
+
+  it "keeps a cancelled request's place charged until its record is taken" $ do
+    gate ← newGate
+    -- the owner is held where the first read has captured its answer, so that neither read has settled in the service when the script cancels them
+    withRigProbe defaultConfigForRaces (gatedProbe (\p → case p of PointCaptured {} → True; _ → False) gate) $ \rig →
+      withWorld (counts [(RequestsPerInstance, 2), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource cancelledStayCharged)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → (`finally` openGate gate) $ do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          printed `shouldBe` ["full\tbusy", "cancel\tcancelled", "cancel\tcancelled", "cancelled, untaken\tbusy", "taken\ttrue", "done"]
+
+  it "answers a second release of one's own arena without error, before and after the first has retired" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource releasesTwice)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          printed `shouldContain` ["first release\tdone"]
+          printed `shouldSatisfy` any (\line → "second release\t" `Text.isPrefixOf` line && any (`Text.isSuffixOf` line) ["retiring", "already_released"])
+          printed `shouldContain` ["late release\talready_released"]
+
+  it "refuses, as an ordinary error before anything is admitted, a definition both layers could reject, and settles a definition only the validator rejects" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource precedence)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          printed `shouldContain` ["both layers\tfalse\ttrue", "validator only\tfailure\tdefinition"]
+          -- the refused call reached no request: only the validator-only open did, and it left no arena
+          limitHeld (rgService rig) "arenas" `shouldReturn` 1
+
+  it "accepts a definition of exactly the validator's 256 KiB and settles one byte-accounted past it as a definition failure" $ do
+    mostWithin256KiB `shouldSatisfy` (< 4095)
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource bounded256)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          printed `shouldContain` ["at the bound\tsuccess\tok", "past the bound\tfailure\tdefinition"]
+
+  it "leaves the creator alive and its arena served when an attached instance ends" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource sharedCreator)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          attached ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "attached\tsuccess"
+          stopSpawned attached
+          seen ← length . filter (== "creator read\tsuccess") <$> outLines world
+          pumpUntil world (advanceClock world 2000000000 >> ((> seen + 2) . length . filter (== "creator read\tsuccess") <$> outLines world))
+          limitHeld (rgService rig) "arenas" `shouldReturn` 1
+
+  it "refuses another instance's captured api.terrain table as an ordinary error" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource capturedFacade)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "done"
+          outLines world >>= \printed → printed `shouldSatisfy` any (\line → "captured facade\tfalse\t" `Text.isPrefixOf` line)
+
+  it "still permits cancel, release and an orderly end with the request queue full" $
+    withRig $ \rig →
+      withWorld (counts [(RequestsPerInstance, 2), (RequestsPerVm, 2)]) (Layout [("lua/main.lua", scriptSource fullQueue)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          printed `shouldContain` ["full\t2"]
+          printed `shouldSatisfy` any (\line → "cancel\t" `Text.isPrefixOf` line)
+          printed `shouldContain` ["release\tdone"]
+          stopSpawned spawned
+          settledFailure spawned >>= \failure → isJust failure `shouldBe` False
+          limitHeld (rgService rig) "arenas" `shouldReturn` 0
+
+  it "does not weaken the failure of an unrelated required request: an unread terrain failure fails nothing, and the required one still fails the instance" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource unrelatedRequired)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          pumpUntil world (advanceClock world 2000000000 >> ((== Just Instance.Failed) <$> phaseOf spawned))
+          printed ← outLines world
+          -- five updates ran with the unread failure settled; only the required request's failure ended the instance
+          printed `shouldContain` ["alive\t5"]
+          failure ← settledFailure spawned
+          fmap fst (requestFailureOf failure) `shouldBe` Just "data"

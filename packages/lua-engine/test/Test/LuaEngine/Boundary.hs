@@ -568,6 +568,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Scene"
                , "Hetoimasia.Terrain.Cell"
                , "Hetoimasia.Terrain.Coordinate"
+               , "Hetoimasia.Terrain.Query"
                , "Hetoimasia.Terrain.Residency"
                , "Hetoimasia.Terrain.Runtime"
                , "Hetoimasia.Terrain.Source"

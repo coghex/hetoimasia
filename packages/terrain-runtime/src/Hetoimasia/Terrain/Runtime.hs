@@ -149,6 +149,8 @@ module Hetoimasia.Terrain.Runtime
   , inspectReadmissionWaitsSTM
   , inspectArena
   , inspectArenaSTM
+  , stagedRemovalChanges
+  , serviceAdmitting
   , ArenaView (..)
   ) where
 
@@ -172,6 +174,7 @@ import Hetoimasia.Terrain.Residency (ArenaId, Model, RegionDemand, Revision)
 import Hetoimasia.Terrain.Palette (Palette)
 import Hetoimasia.Terrain.Resident (Resident, columnIndexBytes, residentColumns, residentSegments)
 import Hetoimasia.Terrain.Segment (segmentMetadataBytes, segmentPayloadBytes, segmentStart)
+import Hetoimasia.Terrain.Runtime.Internal.Content (Prepared (..))
 import Hetoimasia.Terrain.Runtime.Internal.Core
 import Hetoimasia.Terrain.Runtime.Internal.Owner (ownerDefinition)
 import Hetoimasia.Terrain.Runtime.Internal.Snapshot
@@ -403,6 +406,27 @@ withSnapshot svc lease regions body =
 -- holds to the accounting model; empty when coherent.
 inspectInvariants ∷ Service → IO [String]
 inspectInvariants svc = invariants (serviceConfig svc) <$> readTVarIO (serviceState svc)
+
+-- | Whether the removal this request has staged would change content: @Just True@ for a staged removal that will advance the
+-- arena's revision by one, @Just False@ for a staged removal of air, which commits as unchanged at the revision it finds, and
+-- @Nothing@ for a request that has staged no removal (a read, an open, an attach, one not yet staged, one settled, or another
+-- service's). Read-only, and a transaction so that a host's eligibility callback can use it inside the arbitration: it decides
+-- before the commit whether a removal needs a revision the host cannot publish. It stages, admits and commits nothing.
+stagedRemovalChanges ∷ Service → Request → STM (Maybe Bool)
+stagedRemovalChanges svc (Request tag rid)
+  | tag /= serviceTag svc = pure Nothing
+  | otherwise = do
+      st <- readSt svc
+      pure $ case Map.lookup rid (stateRequests st) of
+        Just req | StagedPhase sg <- reqPhase req, StagedRemoval prepared <- stagedWork sg → Just (preparedChanged prepared)
+        _ → Nothing
+
+-- | Whether the service is admitting new work: it is running (not closing or closed) and its parent session is still open. Read-only,
+-- and a transaction, so that a host can ask it where a permanent refusal is decided, before it reserves anything of its own; it is
+-- only a precheck. Every admission asks the same question again, atomically with its own effect, so a service that closes between
+-- the host's check and the hand-off still refuses it ('RefusedClosed') and leaves nothing behind.
+serviceAdmitting ∷ Service → STM Bool
+serviceAdmitting svc = either (const False) (const True) <$> admitting svc
 
 -- | The accounting model as it is now.
 inspectModel ∷ Service → IO Model

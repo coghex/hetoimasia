@@ -73,6 +73,7 @@ module Hetoimasia.Scripting.Lua.Provider.State
   , checkReply
   , checkReplyFor
   , checkReplyPure
+  , replyDeliverable
   , eligibleOf
   , settleWith
   , settleWithFinal
@@ -1223,6 +1224,14 @@ optedExpected limits opted found
            in if fitsLimits limits (admitFailureFrame opted candidate) && fitsLimits (admitReplyLimits opted) (admitFailureFrame opted candidate)
                 then Just candidate
                 else if bound <= 0 then Nothing else go (bound `div` 2)
+
+-- | Whether a reply would be taken as the settlement of a request admitted through the opt-in 'Admission': not a provider defect
+-- (a value over the owner's ceilings or the admission's, a failure with a code the service did not declare). The judgement
+-- 'settleWith' makes, writing nothing.
+replyDeliverable ∷ ValueLimits → Schema → Admission → ProviderReply → Bool
+replyDeliverable limits schema opted reply = case checkReplyPure limits schema opted reply of
+  CheckedDefect _ → False
+  _ → True
 
 -- | 'checkReplyFor' for a request admitted through the opt-in 'Admission', as a pure judgement: the same
 -- contract, the same verdicts, for a reply a trusted adapter built itself and a transaction must judge
