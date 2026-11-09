@@ -1108,6 +1108,8 @@ spec = describe "Terrain windows and banks" $ do
             pumpUntilReached world gate
             -- the other VM's open of the name (an invalid definition) must wait for it: it is not admitted, so it has not even been issued
             _ ← admitOnly world gameplayVm "modules-test" mainPath
+            -- its init runs at the first tick of its logical owner: granted without waiting for it, as the init waits for the open in the first
+            grantTick gameplayVm
             replicateM_ 5 (advanceClock world 2000000000)
             outLines world >>= \printed → printed `shouldNotContain` ["invalid open issued"]
             -- released, the normal open is admitted first and wins the name; the other is admitted after it and fails its definition
