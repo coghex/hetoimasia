@@ -7,6 +7,7 @@ module Test.Asset.Image.Region (spec) where
 
 import qualified Data.ByteString as ByteString
 import Data.Either (isLeft)
+import Data.Ratio ((%))
 import Data.Word (Word32)
 import Hetoimasia.Asset.Image.DataMap (CoveragePlane, buildBinaryCoverage, coverageSample)
 import Hetoimasia.Asset.Image.Region
@@ -92,8 +93,28 @@ samplingSpec = describe "sampling" $ do
     -- u = 0.5 -> i 2; u = 0.75 -> i 3; u = 1 -> i 3, the last, parent column 4 (uncovered), and
     -- not parent column 5, which belongs to no texel of the region.
     map (\u → regionViewCoverageSample r u 0) [0, 0.25, 0.5, 0.75, 1] `shouldBe` map Just [True, False, True, False, False]
-    -- Just below the boundary the lower texel is selected: 0.2499999 -> i 0 (covered).
-    regionViewCoverageSample r 0.2499999 0 `shouldBe` Just True
+    -- More than the bias below the boundary the lower texel is selected: 0.2499 -> i 0 (covered).
+    regionViewCoverageSample r 0.2499 0 `shouldBe` Just True
+  it "selects the higher texel within the bias below an interior boundary, the lower beyond it" $ do
+    -- The rule: i = min (w - 1) (floor (clamp u 0 1 × w + 1/10000)). The bias is 1/10000 of a texel,
+    -- so for 4 texels the lower texel is kept only below 1/4 - 1/40000 = 0.249975 exactly.
+    texelBias `shouldBe` 1 % 10000
+    texelIndex 4 0.2499749999 `shouldBe` Just 0
+    texelIndex 4 0.2499750001 `shouldBe` Just 1
+    texelIndexExact 4 (1 % 4 - 1 % 40000) `shouldBe` 1 -- exactly on the bias: floor 1
+    texelIndexExact 4 (1 % 4 - 1 % 40000 - 1 % 1000000000) `shouldBe` 0
+  it "selects the higher texel at every interior boundary even where the nearest Double lies below it" $
+    mapM_
+      ( \(n, k) →
+          texelIndex n (fromRational (toInteger k % toInteger n)) `shouldBe` Just k
+      )
+      [(n, k) | n ← [3, 7, 64, 96, 1000], k ← [1 .. n - 1]]
+  it "keeps the outer edge on the last texel and the origin edge on the first" $ do
+    texelIndex 96 1 `shouldBe` Just 95
+    texelIndex 96 0 `shouldBe` Just 0
+    texelIndex 96 (-0.00001) `shouldBe` Just 0
+    texelIndex 1 1 `shouldBe` Just 0
+    texelIndex 0 0.5 `shouldBe` Nothing
   it "clamps coordinates outside the unit square to the region's edge texels" $ do
     regionViewCoverageSample r (-3) 0 `shouldBe` Just True
     regionViewCoverageSample r 3 0 `shouldBe` Just False
@@ -106,7 +127,7 @@ samplingSpec = describe "sampling" $ do
       Right whole →
         mapM_
           (\(u, v) → regionViewCoverageSample whole u v `shouldBe` coverageSample stripes u v)
-          [(u, v) | u ← [0, 0.124999, 0.125, 0.5, 0.875, 1], v ← [0, 0.25, 0.999, 1]]
+          [(u, v) | u ← [0, 0.12, 0.125, 0.5, 0.875, 1], v ← [0, 0.25, 0.9, 1]]
   it "localises the index to the region's own extent, not the parent's" $
     -- A 2-wide region at column 6: local 0 -> parent 6 (uncovered), local 1 -> parent 7 (covered).
     map (\u → regionViewCoverageSample (view (region 6 0 2 4)) u 0) [0, 0.49, 0.5, 1] `shouldBe` map Just [False, False, True, True]

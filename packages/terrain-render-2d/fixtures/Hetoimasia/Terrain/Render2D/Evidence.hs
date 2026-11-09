@@ -64,6 +64,7 @@ module Hetoimasia.Terrain.Render2D.Evidence
   , Expected (..)
   , handQuads
   , expectedAt
+  , expectedAtExact
   , expectedImage
   , handSides
   , handTurnSide
@@ -80,6 +81,7 @@ import qualified Data.Map.Strict as Map
 import Data.List (nub, sortOn)
 import Data.Ord (Down (..))
 import Data.Word (Word8)
+import Hetoimasia.Asset.Image.Region (texelBias)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld, viewportContains)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
@@ -482,34 +484,43 @@ shadedByte (r, g, b) = (srgbEncode r, srgbEncode g, srgbEncode b)
 
 -- | What the pixel at this column and row shows.
 expectedAt ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
-expectedAt art light sc camera plan pixel = case pixelWorldPoint plan pixel of
+expectedAt = expectedAtMode False
+
+-- | The same in exact 'Rational' arithmetic with no ambiguity band: a pixel centre that lies exactly
+-- on a texel boundary is decided by the rule itself (an interior boundary selects the higher texel,
+-- the outer edge of a canvas the last, a point outside it no texel). For scenes whose pixel centres
+-- are placed on boundaries on purpose; the device must agree with the rule there.
+expectedAtExact ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
+expectedAtExact = expectedAtMode True
+
+expectedAtMode ∷ Bool → ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
+expectedAtMode exact art light sc camera plan pixel = case pixelWorldPoint plan pixel of
   Nothing → ExpectedClear
-  Just (sx, sy) → decide (fromRational sx ∷ Double) (fromRational sy ∷ Double)
+  Just (sx, sy)
+    | exact → decide sx sy
+    | otherwise → decide (fromRational sx ∷ Double) (fromRational sy ∷ Double)
   where
     quads = sortOn (Down . hqKey) (handQuads sc camera)
     count = turnsOf (camFacing camera)
+    decide ∷ RealFrac a ⇒ a → a → Expected
     decide sx sy = go [] quads
       where
         -- Whether a farther quad's two texels at the point are opaque (decided away from boundaries).
         covers b =
           let (bx, by) = hqCorner b
-              u' = floor (sx - fromInteger bx) ∷ Int
-              v' = floor (sy - fromInteger by) ∷ Int
-           in u' >= 0 && v' >= 0 && u' < 96 && v' < 64 && (\(_, _, _, ca) → ca /= 0) (artColour art (hqColour b) u' v') && (\(_, _, _, ma) → ma /= 0) (artMap art (hqMap b) u' v')
+           in case (texelOf 96 (sx - fromInteger bx), texelOf 64 (sy - fromInteger by)) of
+                (Just u', Just v') → (\(_, _, _, ca) → ca /= 0) (artColour art (hqColour b) u' v') && (\(_, _, _, ma) → ma /= 0) (artMap art (hqMap b) u' v')
+                _ → False
         go _ [] = ExpectedClear
         go skipped (q : rest) =
           let (cx, cy) = hqCorner q
               fu = sx - fromInteger cx
               fv = sy - fromInteger cy
-              u = floor fu ∷ Int
-              v = floor fv ∷ Int
               nearBoundary t = let f = t - fromInteger (floor t) in f < 1 / 16 || f > 15 / 16
-           in if u < 0 || v < 0 || u >= 96 || v >= 64
-                then go skipped rest
-                else
-                  if nearBoundary fu || nearBoundary fv
-                    then Ambiguous ("a texel boundary of " <> show (hqCell q) <> " " <> show (hqRole q))
-                    else
+           in case (texelOf 96 fu, texelOf 64 fv) of
+                (Just u, Just v)
+                  | not exact && (nearBoundary fu || nearBoundary fv) → Ambiguous ("a texel boundary of " <> show (hqCell q) <> " " <> show (hqRole q))
+                  | otherwise →
                       let (cr, cg, cb, ca) = artColour art (hqColour q) u v
                           (mr, mg, mb, ma) = artMap art (hqMap q) u v
                        in if ca == 0 || ma == 0
@@ -517,6 +528,16 @@ expectedAt art light sc camera plan pixel = case pixelWorldPoint plan pixel of
                             else
                               let shaded = handShade light count (srgbDecode cr, srgbDecode cg, srgbDecode cb) (mr, mg, mb) (hqDepth q)
                                in ExpectedHit {expectedFront = q, expectedSkipped = skipped, expectedBehind = [b | b ← rest, covers b], expectedLinear = shaded, expectedTexel = (u, v)}
+                _ → go skipped rest
+
+-- | The texel the canvas offset @t@ (in canvas texels from the canvas corner) selects along an axis
+-- of @n@ texels: nothing outside the canvas (@t < 0@ or @t >= n@, the half-open rule of the
+-- rasterized quad), otherwise the one texel rule, @min (n - 1) (floor (t + 'texelBias'))@, the
+-- bias being the owner's 2026-11-09 Q-13 decision. Over 'Rational' this is exact.
+texelOf ∷ RealFrac a ⇒ Int → a → Maybe Int
+texelOf n t
+  | t < 0 || t >= fromIntegral n = Nothing
+  | otherwise = Just (min (n - 1) (floor (t + fromRational texelBias)))
 
 -- | The expectation at every pixel of a scene's target, row by row, top to bottom.
 expectedImage ∷ ArtSource → HandLight → Scene → CellPlan → [[Expected]]

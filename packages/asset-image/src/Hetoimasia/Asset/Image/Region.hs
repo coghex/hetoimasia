@@ -22,13 +22,22 @@
 --
 -- = Sampling
 --
--- 'regionLocalIndex' is the asset-level rule applied to the region's own extent: for a
--- normalized coordinate @u@, @i = min (w - 1) (floor (clamp u 0 1 × w))@, and the same for the
--- other axis, exactly as 'Hetoimasia.Asset.Image.DataMap.sampleIndex' defines it. The local
--- index is applied /before/ the origin is added: 'regionViewCoverageAt' reads parent texel
--- @(originX + i, originY + j)@. An interior texel boundary selects the higher index, and the
--- region's outer edge selects its last texel, so a coordinate never reaches a neighbouring
--- region. A coordinate outside a rasterized quad is not claimed by this module.
+-- 'texelIndex' is THE texel-index rule of every terrain consumer, stated here once. For a
+-- region of width @w@ and a normalized coordinate @u@,
+--
+-- > i = min (w - 1) (floor (clamp u 0 1 × w + texelBias))      texelBias = 1/10000
+--
+-- and the same for the other axis. The bias is the owner's 2026-11-09 Q-13 decision: without
+-- it float32 interpolation selects the lower texel at exact interior boundaries on the device.
+-- The shader's colour and normal samples, CPU coverage and picking and the independent
+-- expected model all use this one rule, evaluated here and in the expected model exactly, in
+-- rational arithmetic. An interior texel boundary selects the higher index, the region's outer
+-- edge selects its last texel, and a coordinate more than the bias below a boundary still
+-- selects the lower texel. The index is applied /before/ the origin is added:
+-- 'regionViewCoverageAt' reads parent texel @(originX + i, originY + j)@, so a coordinate
+-- never reaches a neighbouring region. A coordinate outside a rasterized quad is not claimed
+-- by this module. ('Hetoimasia.Asset.Image.DataMap.sampleIndex' is the asset-level rule without
+-- the bias and is not what a terrain region samples with.)
 --
 -- State, ownership and lifetime: none. Immutable values; the plane's owner decides how long it
 -- lives, and a view keeps it alive only while the view is.
@@ -59,14 +68,18 @@ module Hetoimasia.Asset.Image.Region
   , regionViewIdentity
 
     -- * Sampling
+  , texelBias
+  , texelIndex
+  , texelIndexExact
   , regionLocalIndex
   , regionViewCoverageAt
   , regionViewCoverageSample
   ) where
 
 import Data.Bits (rotateL, xor)
+import Data.Ratio ((%))
 import Data.Word (Word32, Word64)
-import Hetoimasia.Asset.Image.DataMap (CoveragePlane, coverageAt, coverageHeight, coverageWidth, sampleIndex)
+import Hetoimasia.Asset.Image.DataMap (CoveragePlane, coverageAt, coverageHeight, coverageWidth)
 
 -- | A positive-extent rectangle of an image, in texels, top row first: its origin is its top-left
 -- texel. Only 'mkImageRegion' makes one.
@@ -210,10 +223,29 @@ regionViewIdentity view = RegionIdentity (digest 14695981039346656037 fnv) (dige
     fnv h w = (h `xor` w) * 1099511628211
     mix h w = rotateL (h `xor` w) 23 * 0x9E3779B97F4A7C15 + w
 
+-- | The texel bias of the sampling rule, in texels: @1/10000@. Named here once; the shader's
+-- literal is made from it and every other consumer applies 'texelIndex' or 'texelIndexExact'.
+texelBias ∷ Rational
+texelBias = 1 % 10000
+
+-- | The rule for an exact coordinate: @min (n - 1) (floor (clamp u 0 1 × n + texelBias))@, in an
+-- extent of @n@ (at least 1) texels.
+texelIndexExact ∷ Word32 → Rational → Word32
+texelIndexExact n u = fromInteger (min (toInteger n - 1) (floor (clamped * toRational n + texelBias)))
+  where
+    clamped = min 1 (max 0 u)
+
+-- | The rule for a 'Double' coordinate, evaluated exactly (the coordinate's own value, never a
+-- rounded product): 'Nothing' for a coordinate that is not a number and for an extent of zero.
+texelIndex ∷ Word32 → Double → Maybe Word32
+texelIndex n u
+  | n == 0 || isNaN u = Nothing
+  | otherwise = Just (texelIndexExact n (toRational (min 1 (max 0 u))))
+
 -- | The local texel indices a normalized coordinate pair selects in the region's own extent, or
 -- 'Nothing' for a coordinate that is not a number. The origin is not added.
 regionLocalIndex ∷ ImageRegion → Double → Double → Maybe (Word32, Word32)
-regionLocalIndex region u v = (,) <$> sampleIndex (regionWidth region) u <*> sampleIndex (regionHeight region) v
+regionLocalIndex region u v = (,) <$> texelIndex (regionWidth region) u <*> texelIndex (regionHeight region) v
 
 -- | Whether the region's own texel @(i, j)@ is covered: the parent's texel at the origin plus
 -- the local index. 'Nothing' outside the region, so a local index never reaches a neighbour.

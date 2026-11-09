@@ -107,7 +107,7 @@ import Hetoimasia.Terrain.Render2D.Camera (CameraState, camClip, camFacing, camR
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Scenes
-import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl)
+import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl, terrainMaterialUnbiasedControl)
 import Hetoimasia.Terrain.Shape (allViewFacings)
 import Test.GPU.Vulkan.Native.OrderedPath
   ( Evidence
@@ -192,6 +192,9 @@ data Variant
   | -- | A control: the region coordinate interpolated between half-texel-inset endpoints, which
     -- shifts the interior texel boundaries (a third, control-only material).
     HalfTexelInset
+  | -- | A control: the shader's texel index without the 1/10000 bias (a fourth, control-only material),
+    -- the rule the Q-13 counterexample was measured under; judged on the exact-boundary scenes.
+    UnbiasedIndex
   | -- | A control: every quad's map region is the next region of the normal atlas (a wrong, in effect
     -- rotated, mask: another shape's silhouette and normals).
     WrongMapRegion
@@ -219,10 +222,11 @@ suffixOf = \case
   WrongMapRegion → "-control-wrong-map-region"
   PickThroughFog → "-control-pick-through-fog"
   HalfTexelInset → "-control-half-texel-inset"
+  UnbiasedIndex → "-control-unbiased-index"
   BackmostPick → "-control-pick-through-nearer"
 
 isControl ∷ Variant → Bool
-isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, WrongMapRegion, PickThroughFog, BackmostPick]
+isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, UnbiasedIndex, WrongMapRegion, PickThroughFog, BackmostPick]
 
 -- | What a fixture must show, each by a named probe that is determinate for the oracle and differs
 -- from its contrast.
@@ -236,6 +240,9 @@ data Spec = Spec
   , specVariant ∷ !Variant
   , specLight ∷ !Light
   , specNeeds ∷ ![Need]
+  , specExactFrom ∷ !(Maybe Int)
+  -- ^ The index of the first scene judged in exact arithmetic, that scene and the later ones having
+  -- their pixel centres on texel boundaries on purpose.
   , specLater ∷ ![Light]
   -- ^ The lights of the second and later scenes of a fixture (the first scene has 'specLight'); a
   -- scene without one uses 'specLight'. Each pass's view holds the push block of its own light.
@@ -245,7 +252,7 @@ data Spec = Spec
 
 -- | A fixture of one scene.
 spec ∷ Light → [Need] → Variant → Scene → Spec
-spec light needs variant sc = Spec (sceneName sc <> (if lightLabel light == "default" then "" else "@" <> lightLabel light) <> suffixOf variant) [sc] variant light needs [] Nothing
+spec light needs variant sc = Spec (sceneName sc <> (if lightLabel light == "default" then "" else "@" <> lightLabel light) <> suffixOf variant) [sc] variant light needs Nothing [] Nothing
 
 -- | The light of the scene at this index of a fixture.
 lightOf ∷ Spec → Int → Light
@@ -257,14 +264,14 @@ lightOf s index = case drop (index - 1) (specLater s) of
 -- first under the default light, the second under this one, so that a pixel of one differs from
 -- the same pixel of the other and two views sharing a registered material keep their own pushes.
 twoLights ∷ Light → Scene → Spec
-twoLights second sc = Spec (sceneName sc <> "@" <> lightLabel second <> "-beside-default") [sc, sc] Dynamic defaultLight [Foreground, LightsDiffer] [second] Nothing
+twoLights second sc = Spec (sceneName sc <> "@" <> lightLabel second <> "-beside-default") [sc, sc] Dynamic defaultLight [Foreground, LightsDiffer] Nothing [second] Nothing
 
 expecting ∷ (Integer, Integer) → Spec → Spec
 expecting camera s = s {specCamera = Just camera}
 
 -- | A fixture of several scenes, each drawn in a pass of its own into a small target.
 specMany ∷ String → [Need] → [Scene] → Spec
-specMany name needs scs = Spec name scs Dynamic defaultLight needs [] Nothing
+specMany name needs scs = Spec name scs Dynamic defaultLight needs Nothing [] Nothing
 
 -- | A scene of cells at one column at levels 0 to 8, the cut at the top, for the depth effects:
 -- every level a loam cell of shape 0, so nearer levels overlap farther ones along the view.
@@ -348,6 +355,7 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Overlap, Varies] Dynamic (atZoom 0.125 (rampsCorners FaceEast))
          ]
       <> [spec defaultLight [Foreground] Dynamic (atZoom 0.125 (staircase cut FaceSouth)) | cut ← [1, 3, 5]]
+      <> [exactBoundaryFixture shape facing | (shape, facing) ← exactBoundaryCases]
       <> [ expecting (28, 4) (spec defaultLight [Foreground] Dynamic (atZoom 0.125 (followHeadroom FaceSouth)))
          , expecting (0, -33) (spec defaultLight [Foreground, Varies] Dynamic (deepFloor FaceSouth))
          ]
@@ -378,6 +386,8 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Varies] PickThroughFog (fogOverKnown FaceSouth)
          , spec defaultLight [Foreground, Overlap] BackmostPick (atZoom 0.125 (disconnectedSpans FaceSouth))
          ]
+      -- The Q-13 negative control: the same exact-boundary fixtures drawn without the texel bias.
+      <> [exactBoundaryWith UnbiasedIndex shape facing | (shape, facing) ← exactBoundaryCases]
 
 -- | The ramps and corners with pixel snapping on at zoom 1, the camera a fraction of a pixel off
 -- the pixel grid. At a whole-number scale a nearest-sampled quad cannot change when the view is
@@ -389,6 +399,27 @@ specs profile = case profile of
 -- tolerance or a dropped fixture.
 snappedZoom2 ∷ Scene
 snappedZoom2 = snapped
+
+-- | A single cell of a shape at zoom 1/2 in an even target with no pan, so the canvas corner lies on
+-- a whole device pixel and every pixel centre lies exactly on a texel boundary of the canvas (a
+-- pixel is two texels wide). The expectation is the rule itself, in exact arithmetic.
+exactBoundary ∷ Int → ViewFacing → Scene
+exactBoundary shape facing = (newScene ("exact-boundary-" <> show shape <> "-" <> show facing) [Cell 0 0 0 1 shape "loam"] (64, 48)) {sceneFacing = facing, sceneZoom = 0.5}
+
+-- | The shapes and facings of the exact-boundary fixtures and of their negative control.
+exactBoundaryCases ∷ [(Int, ViewFacing)]
+exactBoundaryCases = [(0, FaceSouth), (5, FaceSouth), (15, FaceWest), (9, FaceEast)]
+
+-- | A fixture of two passes: the first an ordinary scene whose named probes the oracle decides, the
+-- second the exact-boundary scene the oracle cannot decide and the independent expectation does.
+exactBoundaryFixture ∷ Int → ViewFacing → Spec
+exactBoundaryFixture = exactBoundaryWith Dynamic
+
+-- | The same fixture drawn by a variant: with 'UnbiasedIndex' it is the Q-13 negative control, which
+-- must be rejected on the exact-boundary pass on the device where the counterexample was measured.
+exactBoundaryWith ∷ Variant → Int → ViewFacing → Spec
+exactBoundaryWith variant shape facing =
+  Spec ("exact-boundary-" <> show shape <> "-" <> show facing <> "-beside-ordinary" <> suffixOf variant) [shapeMatrixCell 0 FaceSouth 1, exactBoundary shape facing] variant defaultLight [Foreground] (Just 1) [] Nothing
 
 -- | One cell of a shape in a facing at a zoom, in a target sized to its hexagon.
 shapeMatrixCell ∷ Int → ViewFacing → Float → Scene
@@ -431,6 +462,7 @@ data Ctx = Ctx
   , ctxPrimary ∷ !MaterialRef
   , ctxSecond ∷ !MaterialRef
   , ctxInset ∷ !MaterialRef
+  , ctxUnbiased ∷ !MaterialRef
   , ctxDevice ∷ !Text
   }
 
@@ -532,6 +564,7 @@ prepare profile host directory device style singles = do
                   primary ← Render.registerMaterial renderer terrainMaterial
                   second ← Render.registerMaterial renderer terrainMaterialEquivalent
                   inset ← Render.registerMaterial renderer terrainMaterialInsetControl
+                  unbiased ← Render.registerMaterial renderer terrainMaterialUnbiasedControl
                   pure
                     ( Right
                         Ctx
@@ -554,6 +587,7 @@ prepare profile host directory device style singles = do
                           , ctxPrimary = primary
                           , ctxSecond = second
                           , ctxInset = inset
+                          , ctxUnbiased = unbiased
                           , ctxDevice = device
                           }
                     )
@@ -683,8 +717,9 @@ runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
             Scrambled → [adaptedInstance (ctxPrimary ctx) adapted e | e ← scramble entries]
             ReversedKeys → [reversedKey (adaptedInstance (ctxPrimary ctx) adapted e) | e ← entries]
             HalfTexelInset → [adaptedInstance (ctxInset ctx) adapted e | e ← entries]
+            UnbiasedIndex → [adaptedInstance (ctxUnbiased ctx) adapted e | e ← entries]
             _ → [adaptedInstance (ctxPrimary ctx) adapted e | e ← entries]
-          held = [(ref, adaptedMaterialData adapted) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxInset ctx]]
+          held = [(ref, adaptedMaterialData adapted) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxInset ctx, ctxUnbiased ctx]]
       view ← either (\refused → Left ("the view: " <> describeMaterialRefusal refused)) Right (terrainView plan adapted held [WorldLayer DepthEnabled instances])
       pure (Part sc plan camera shape (Pass (OffscreenTarget (shapeRef shape)) (ClearColour 0 0 0 1) [view]) adapted)
     reversedKey inst = inst {instanceDepthKey = 16777215 - instanceDepthKey inst}
@@ -819,7 +854,7 @@ renderSnapshot ctx s parts = do
       marks ← registeredMarks (ctxTextures ctx)
       buffers ← retainedBuffers (ctxRetained ctx)
       let shapes = map partShape parts
-          models = Map.fromList ([(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx]] <> [(ctxInset ctx, terrainModelInsetControl)])
+          models = Map.fromList ([(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxUnbiased ctx]] <> [(ctxInset ctx, terrainModelInsetControl)])
           decodedAt = (`Map.lookup` ctxDecoded ctx)
           art = styleArt (ctxStyle ctx)
           light = lightHand (specLight s)
@@ -828,7 +863,8 @@ renderSnapshot ctx s parts = do
             let sc = partScene part
                 (gw, gh) = sceneTarget sc
                 lightHere = lightHand (lightOf s index)
-             in listArray ((0, 0), (gw - 1, gh - 1)) [expectedAt art lightHere sc (partCamera part) (partPlan part) (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected
+                expectation = if maybe False (index >=) (specExactFrom s) then expectedAtExact else expectedAt
+             in listArray ((0, 0), (gw - 1, gh - 1)) [expectation art lightHere sc (partCamera part) (partPlan part) (x, y) | x ← [0 .. gw - 1], y ← [0 .. gh - 1]] ∷ Array (Int, Int) Expected
           oracle = newOracleWith models (oracleInput valid marks shapes decodedAt)
           determinate probe = case expect oracle probe of
             e@(Expected _ _) → Just e
@@ -915,6 +951,7 @@ renderSnapshot ctx s parts = do
           centreOf (x, y) = (x - gridW `div` 2) ^ (2 ∷ Int) + (y - gridH `div` 2) ^ (2 ∷ Int)
           controlDiffers
             | specVariant s `elem` [BackmostPick, PickThroughFog] = Just (not (null pickProblems))
+            | specVariant s == UnbiasedIndex = Just (any ((> 0) . indMismatchCount) (drop 1 independents))
             | isControl (specVariant s) = Just (any mismatchAt namedPixels)
             | otherwise = Nothing
           readbackMissing = not (completeReadback (map (sceneTarget . partScene) parts) (resultProbes result))

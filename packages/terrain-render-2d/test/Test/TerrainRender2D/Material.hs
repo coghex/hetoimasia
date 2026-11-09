@@ -202,11 +202,13 @@ modelSpec = describe "the model" $ do
       sampled (0, 0) `shouldSatisfy` closeTo 1e-12 (expectedAt 0 0)
       sampled (1, 1) `shouldSatisfy` closeTo 1e-12 (expectedAt 95 63)
       sampled (0.5, 0.5) `shouldSatisfy` closeTo 1e-12 (expectedAt 48 32)
-    it "selects the higher texel on an interior boundary and the lower just below it" $ do
-      -- 1/96 is the boundary between local texels 0 and 1: it selects 1. The Double just below
-      -- it selects 0. The same on the other axis at 1/64.
+    it "selects the higher texel on an interior boundary, within the 1/10000 texel bias below it, and the lower beyond" $ do
+      -- 1/96 is the boundary between local texels 0 and 1: it selects 1, and so does a coordinate a
+      -- billionth below it (96 x 1e-9 texels, far inside the bias). 2e-6 below it is 1.92e-4 texels,
+      -- beyond the bias, and selects 0. The same on the other axis at 1/64.
       sampled (1 / 96, 0) `shouldSatisfy` closeTo 1e-12 (expectedAt 1 0)
-      sampled (1 / 96 - 1.0e-9, 0) `shouldSatisfy` closeTo 1e-12 (expectedAt 0 0)
+      sampled (1 / 96 - 1.0e-9, 0) `shouldSatisfy` closeTo 1e-12 (expectedAt 1 0)
+      sampled (1 / 96 - 2.0e-6, 0) `shouldSatisfy` closeTo 1e-12 (expectedAt 0 0)
       sampled (0, 1 / 64) `shouldSatisfy` closeTo 1e-12 (expectedAt 0 1)
     it "clamps coordinates outside the unit square to the region's outer texels" $ do
       sampled (-3, -3) `shouldSatisfy` closeTo 1e-12 (expectedAt 0 0)

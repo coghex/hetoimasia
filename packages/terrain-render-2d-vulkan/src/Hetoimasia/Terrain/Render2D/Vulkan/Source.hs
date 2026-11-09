@@ -27,10 +27,20 @@ module Hetoimasia.Terrain.Render2D.Vulkan.Source
   ( terrainSource
   , terrainSourceEquivalent
   , terrainSourceInsetControl
+  , terrainSourceUnbiasedControl
   , lightPush
   ) where
 
+import Hetoimasia.Asset.Image.Region (texelBias)
 import Hetoimasia.Render.TwoD.Vulkan.MaterialSources (PushField (..), PushType (..))
+
+-- | The texel bias as a GLSL float literal, made from the one definition 'texelBias' (1/10000 of a
+-- texel, the owner's 2026-11-09 Q-13 decision) so the shader and every CPU consumer share it.
+biasLiteral ∷ String
+biasLiteral = glslFloat (fromRational texelBias ∷ Double)
+
+glslFloat ∷ Double → String
+glslFloat = show
 
 -- | The three @vec4@ members of the push block, in the order the host packs them.
 lightPush ∷ [PushField]
@@ -38,16 +48,26 @@ lightPush = [PushField "lightSun" PushVec4, PushField "lightDepth" PushVec4, Pus
 
 -- | The material function's source.
 terrainSource ∷ String
-terrainSource =
+terrainSource = terrainSourceWith biasLiteral
+
+-- | A NEGATIVE CONTROL, never the terrain's own material: 'terrainSource' with the texel bias
+-- removed, the rule the Q-13 counterexample was measured under. At an exact interior texel
+-- boundary float32 interpolation lands a hair below it and this selects the lower texel, which the
+-- evidence's exact-boundary fixtures must reject on the recorded device.
+terrainSourceUnbiasedControl ∷ String
+terrainSourceUnbiasedControl = terrainSourceWith "0.0"
+
+terrainSourceWith ∷ String → String
+terrainSourceWith bias =
   unlines
     [ "vec4 material(vec4 texel, vec2 uv, uint parameter, MaterialRecord record) {"
     , "    vec2 unit = clamp(uv, 0.0, 1.0);"
     , "    vec2 colourExtent = vec2(float(record.words[2]), float(record.words[3]));"
-    , "    vec2 colourLocal = min(colourExtent - 1.0, floor(unit * colourExtent));"
+    , "    vec2 colourLocal = min(colourExtent - 1.0, floor(unit * colourExtent + " <> bias <> "));"
     , "    vec2 colourAt = (vec2(float(record.words[0]), float(record.words[1])) + colourLocal + 0.5)"
     , "        / vec2(float(record.words[4]), float(record.words[5]));"
     , "    vec2 normalExtent = vec2(float(record.words[8]), float(record.words[9]));"
-    , "    vec2 normalLocal = min(normalExtent - 1.0, floor(unit * normalExtent));"
+    , "    vec2 normalLocal = min(normalExtent - 1.0, floor(unit * normalExtent + " <> bias <> "));"
     , "    vec2 normalAt = (vec2(float(record.words[6]), float(record.words[7])) + normalLocal + 0.5)"
     , "        / vec2(float(record.words[10]), float(record.words[11]));"
     , "    vec4 colour = sampleTexture(record.handles[0], colourAt);"
@@ -78,11 +98,11 @@ terrainSourceEquivalent =
     [ "vec4 material(vec4 texel, vec2 uv, uint parameter, MaterialRecord record) {"
     , "    vec2 inside = min(max(uv, 0.0), 1.0);"
     , "    vec2 cExtent = vec2(float(record.words[2]), float(record.words[3]));"
-    , "    vec2 cLocal = min(floor(cExtent * inside), cExtent - 1.0);"
+    , "    vec2 cLocal = min(floor(" <> biasLiteral <> " + cExtent * inside), cExtent - 1.0);"
     , "    vec2 cAt = (0.5 + cLocal + vec2(float(record.words[0]), float(record.words[1])))"
     , "        / vec2(float(record.words[4]), float(record.words[5]));"
     , "    vec2 nExtent = vec2(float(record.words[8]), float(record.words[9]));"
-    , "    vec2 nLocal = min(floor(nExtent * inside), nExtent - 1.0);"
+    , "    vec2 nLocal = min(floor(" <> biasLiteral <> " + nExtent * inside), nExtent - 1.0);"
     , "    vec2 nAt = (0.5 + nLocal + vec2(float(record.words[6]), float(record.words[7])))"
     , "        / vec2(float(record.words[10]), float(record.words[11]));"
     , "    vec4 base = sampleTexture(record.handles[0], cAt);"

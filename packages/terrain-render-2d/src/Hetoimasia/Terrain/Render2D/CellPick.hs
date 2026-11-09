@@ -39,11 +39,11 @@
 -- bottom edges outside. The two triangles share the diagonal, which lies
 -- inside the rectangle, so a centre on it is covered by the quad. A centre on
 -- an outer edge shared by two adjacent quads therefore belongs to exactly one.
--- The texel index along an axis is @min (n - 1) (floor (u × n))@ with @u@ the
--- exact rational position of the centre across the drawn rectangle: an interior
--- texel boundary selects the higher index, nothing is sampled outside the
--- rectangle merely because UVs clamp, and no floating rounding can move a
--- centre across a boundary. This is the CPU convention; whether a device's
+-- The texel index along an axis is 'texelIndexExact' (the one rule, with its 1/10000 bias,
+-- defined in "Hetoimasia.Asset.Image.Region") of the exact rational position of the centre
+-- across the drawn rectangle: an interior texel boundary selects the higher index, nothing
+-- is sampled outside the rectangle merely because UVs clamp, and no floating rounding can
+-- move a centre across a boundary. This is the CPU convention; whether a device's
 -- rasterizer agrees at every edge is TRA-17's proof, and a disagreement found
 -- there is a counterexample, not a reason to change this rule.
 --
@@ -63,7 +63,7 @@ module Hetoimasia.Terrain.Render2D.CellPick
   ) where
 
 import Data.Word (Word32)
-import Hetoimasia.Asset.Image.Region (regionViewCoverageAt)
+import Hetoimasia.Asset.Image.Region (regionViewCoverageAt, texelIndexExact)
 import Hetoimasia.Math.Vector (V2 (..))
 import Hetoimasia.Render.TwoD.Mapping (targetToWorld, viewportContains, windowToTarget)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
@@ -169,8 +169,8 @@ pickCells plan (CellPickQuery presented point@(V2 px py))
         (Just a, Just b') → Right (a && b')
         _ → Left CellPickUnrepresentable
 
-    texel ∷ Integer → Rational → Word32
-    texel n u = fromInteger (min (n - 1) (floor (max 0 (min 1 u) * fromInteger n)))
+    texel ∷ Word32 → Rational → Word32
+    texel = texelIndexExact
 
     isLoading centre front = pendingAhead || unresolvedAheadOf centre
       where

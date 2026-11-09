@@ -26,10 +26,17 @@
 -- == Sampling
 --
 -- For each region separately, with @(w, h)@ its own extent (96 x 64) and @(u, v)@ the
--- interpolated UV, @i = min (w - 1) (floor (clamp u 0 1 * w))@ and @j@ likewise, and the sample
+-- interpolated UV, @i = min (w - 1) (floor (clamp u 0 1 * w + texelBias))@ and @j@ likewise, and the sample
 -- is at @(origin + (i + 1/2, j + 1/2)) / atlasExtent@, nearest, level zero. The origin is added
 -- after the local texel is chosen, so a region never reads a neighbour; each atlas has one level.
 -- Both samples are unconditional, as the implicit derivatives require.
+--
+-- @texelBias@ is @1/10000@ of a texel, the owner's 2026-11-09 Q-13 decision, and 'texelIndex' of
+-- "Hetoimasia.Asset.Image.Region" is the rule's one definition: the shader's colour and normal
+-- samples (its literal is made from the constant), CPU coverage and picking and the independent
+-- expected model all use it, so an interior texel boundary selects the higher texel even though
+-- float32 interpolation lands a hair below it on the device. A coordinate more than the bias
+-- below a boundary still selects the lower texel.
 --
 -- == The colour
 --
@@ -93,6 +100,7 @@ import Data.Word (Word32, Word64)
 import Hetoimasia.Asset.Image.DataMap (NormalEncoding (..), coverageHeight, coverageWidth)
 import Hetoimasia.Asset.Image.Region
   ( RegionView
+  , texelBias
   , regionHeight
   , regionOriginX
   , regionOriginY
@@ -388,7 +396,7 @@ terrainModel = modelWith centre
     -- The texel the local index selects, at its centre, in the atlas: the origin is added after.
     centre origin extent atlas coordinate = (fromIntegral origin + local + 0.5) / fromIntegral atlas
       where
-        local = fromIntegral (min (extent - 1) (floor (clamp01 coordinate * fromIntegral extent) ∷ Word32)) ∷ Double
+        local = fromIntegral (min (extent - 1) (floor (clamp01 coordinate * fromIntegral extent + fromRational texelBias) ∷ Word32)) ∷ Double
 
 -- | The model of the negative control's rule (never a terrain rule): the region coordinate
 -- interpolated between the half-texel-inset endpoints, @(origin + 1/2 + u (w - 1)) / atlasExtent@,
