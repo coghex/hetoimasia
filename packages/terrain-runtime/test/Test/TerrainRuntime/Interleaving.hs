@@ -24,7 +24,7 @@ import Hetoimasia.Terrain.Source (SourceSpec)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures
-import Test.TerrainRuntime.Usage (jobStartDisagreements, usageDisagreements)
+import Test.TerrainRuntime.Usage (jobStartDisagreements, usageSTM)
 
 data World = World
   { wClients ∷ IORef [Client]
@@ -167,8 +167,7 @@ checkAll svc world = do
     -- own arenas (live and retiring), regions, jobs, requests, interests, holds and
     -- views, and the service's own view of each arena the harness still holds a lease on.
     -- (the service's own census and the model, read in one transaction).
-    (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
-    let usage = usageDisagreements census model
+    (model, usage) <- atomically ((,) <$> inspectModelSTM svc <*> usageSTM svc)
     unless (null usage) $ atomicModifyIORef' (wTrouble world) (\t → (("usage: " <> show usage) : t, ()))
     usage `shouldBe` []
     when (any ((== ArenaRetiringPhase) . arenaPhase) (modelArenas model)) (modifyIORef' (wRetiring world) (+ 1))
@@ -198,8 +197,7 @@ inside hook = readIORef hook >>= mapM_ (\(svc, world) → do
 -- property failure. Safe on the owner's own thread.
 usageHere ∷ Service → World → String → IO ()
 usageHere svc world where' = do
-  (model, census) <- atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
-  let usage = usageDisagreements census model
+  usage <- atomically (usageSTM svc)
   unless (null usage) $ atomicModifyIORef' (wTrouble world) (\t → ((where' <> ": " <> show usage) : t, ()))
 
 -- | The owner is about to run a load job: it recorded the job (with its slot and its

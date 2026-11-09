@@ -516,8 +516,10 @@ data RunningWork = RunningWork
   { rwJobs ∷ !(Map JobId JobWork)
   , rwPreparation ∷ !(Maybe PreparationWork)
   , rwHandoffs ∷ !(Map RegionKey HandoffWork)
-  , -- | The regions each outstanding borrow covers, from the snapshot it handed out.
-    rwHolds ∷ !(Map HoldId Word64)
+  , -- | Each outstanding borrow: the regions its snapshot covers and the accounted bytes
+    -- the snapshot backs (its payload, its segment metadata and its column index entries),
+    -- both read from the snapshot value handed out, at hand-out.
+    rwHolds ∷ !(Map HoldId (Word64, Word64))
   , -- | The regions each registered view's latest accepted demand describes, from the
     -- receipt the service gave for it.
     rwViews ∷ !(Map ViewId Word64)
@@ -527,10 +529,11 @@ noRunningWork ∷ RunningWork
 noRunningWork = RunningWork Map.empty Nothing Map.empty Map.empty Map.empty
 
 -- | An accepted load job: its identity, where, the resident bytes and the scratch the
--- model granted it at admission, the least its coverage can hold (resident: 48 bytes a
--- column index and 32 plus 2 a segment; scratch: a 256-byte frame and two bytes a cell),
--- and the load-job slot it holds (1 while the owner runs it, 0 while it is queued or
--- waiting for victims).
+-- model granted it at admission, the least the job holds once the owner runs it, from the
+-- coverage it loads (resident: 48 bytes a column index and 32 plus 2 a segment; scratch: a
+-- 256-byte frame and two bytes a cell; both 0 while it waits: a waiting job holds only a
+-- promise), and the load-job slot it holds (1 while the owner runs it, 0 while it is queued
+-- or waiting for victims).
 data JobWork = JobWork !JobId !ArenaId !RegionCoord !Word64 !Word64 !Word64 !Word64 !Word64
   deriving stock (Eq, Show)
 
@@ -609,9 +612,10 @@ runningPreparation = rwPreparation
 runningHandoffs ∷ RunningWork → [HandoffWork]
 runningHandoffs = Map.elems . rwHandoffs
 
--- | Each outstanding borrow and how many regions its snapshot covers.
-runningHolds ∷ RunningWork → [(HoldId, Word64)]
-runningHolds = Map.toList . rwHolds
+-- | Each outstanding borrow, how many regions its snapshot covers and how many accounted
+-- bytes the snapshot backs.
+runningHolds ∷ RunningWork → [(HoldId, Word64, Word64)]
+runningHolds work = [(hid, regions, bytes) | (hid, (regions, bytes)) ← Map.toList (rwHolds work)]
 
 -- | Each view with an accepted demand and how many regions that demand describes.
 runningViews ∷ RunningWork → [(ViewId, Word64)]

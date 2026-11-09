@@ -38,7 +38,12 @@ snap svc = atomically ((,) <$> inspectModelSTM svc <*> inspectCensusSTM svc)
 
 -- | The same, as plain data.
 look ∷ Service → IO (Model, Held, Charged)
-look svc = (\(m, c) → (m, heldOf c, chargedOf m)) <$> snap svc
+look svc =
+  atomically $ do
+    census <- inspectCensusSTM svc
+    m <- inspectModelSTM svc
+    retained <- inspectRetainedChargesSTM svc
+    pure (m, heldOf census, withRetained retained (chargedOf m))
 
 -- | A ledger with some of its reserved or occupied bytes taken away.
 lessReserved, lessOccupied ∷ Word64 → Ledger → Ledger
@@ -224,7 +229,7 @@ spec = describe "The accounting oracle and its controls" $ do
     it "is recorded as granted, holds no slot, and the honest model charges it" $
       withWaiting $ \svc → do
         (_, held, charged) <- look svc
-        sort [(hjGrantedResident j, hjGrantedScratch j, hjSlots j) | j ← heldJobs held] `shouldBe` [(400, 258, 0), (400, 258, 1)]
+        sort [(hjGrantedResident j, hjGrantedScratch j, hjResident j, hjScratch j, hjSlots j) | j ← heldJobs held] `shouldBe` [(400, 258, 0, 0, 0), (400, 258, 82, 258, 1)]
         disagreements held charged `shouldBe` []
     it "fails the comparison when the model releases only the waiting job's 400 bytes of resident and 258 of scratch" $
       withWaiting $ \svc → do
@@ -256,7 +261,7 @@ spec = describe "The accounting oracle and its controls" $ do
         let regions = [fst (decomposeTile (tile 1 1 1)), fst (decomposeTile (tile 1 1 33))]
         outcome <- withSnapshot svc lease regions $ \_ → do
           (_, held, charged) <- look svc
-          map snd (heldHolds held) `shouldBe` [2]
+          [n | (_, n, _) ← heldHolds held] `shouldBe` [2]
           disagreements held charged `shouldBe` []
           -- the model's record of the borrow shortened to one region, its staging charge with it
           let shortened =
@@ -270,7 +275,51 @@ spec = describe "The accounting oracle and its controls" $ do
           -- and a model that lost the borrow altogether
           mentions "no such borrow" (disagreements held charged {cHolds = []}) `shouldBe` True
         either (expectationFailure . show) pure outcome
-    it "records the regions a view's accepted demand describes, and a model that names fewer fails the comparison" $
+    -- The retained bank charges each outstanding snapshot its backing. The service records what the
+  -- snapshot it hands out backs, read from the snapshot value at hand-out (one column index entry,
+  -- 48, and one uniform segment, 32 of metadata and 2 of payload, for one cell read: 82), and the
+  -- comparison with the bank's charge holds while the borrow is held, in a live arena and in a closed
+  -- one that is retiring behind the borrow.
+  describe "a snapshot's backing in the retained bank" $ do
+    let withBorrow act =
+          withService defaultConfig $ \svc → do
+            (_, lease) <- openMain svc "main"
+            _ <- readCell svc lease (tile 1 1 1)
+            outcome <- withSnapshot svc lease [fst (decomposeTile (tile 1 1 1))] $ \_ → act svc lease
+            either (expectationFailure . show) pure outcome
+        zeroed (total, per) = (total - sum (map snd per), [(h, 0) | (h, _) ← per])
+        reduced n (total, per) = (total - n, [(h, b - n) | (h, b) ← per])
+        withCharges f (m, held, charged) = (m, held, charged {cRetained = f <$> cRetained charged})
+    it "is recorded from the snapshot handed out, and the honest bank charges at least that" $
+      withBorrow $ \svc _ → do
+        (_, held, charged) <- look svc
+        [(n, bytes) | (_, n, bytes) ← heldHolds held] `shouldBe` [(1, 82)]
+        disagreements held charged `shouldBe` []
+        fmap (map snd . snd) (cRetained charged) `shouldBe` Just [82]
+    it "fails the comparison when the snapshot's charge is zeroed, or one byte short (82 to 81), while the borrow is held" $
+      withBorrow $ \svc _ → do
+        (_, held, charged) <- look svc
+        let (_, _, zero) = withCharges zeroed (undefined, held, charged)
+            (_, _, short) = withCharges (reduced 1) (undefined, held, charged)
+            foundZero = disagreements held zero
+            foundShort = disagreements held short
+        mentions "backing" foundZero `shouldBe` True
+        mentions "retained bank" foundZero `shouldBe` True
+        mentions "backing" foundShort `shouldBe` True
+        mentions "retained bank" foundShort `shouldBe` True
+        -- and a bank that forgot the snapshot altogether
+        mentions "charges nothing" (disagreements held charged {cRetained = fmap (\(total, _) → (total - 82, [])) (cRetained charged)}) `shouldBe` True
+    it "is still recorded and compared after the arena is closed, while the borrower keeps it retiring" $
+      withBorrow $ \svc lease → do
+        releaseLease svc lease >>= (`shouldBe` Right ())
+        (m, held, charged) <- look svc
+        map haRetiring (heldArenas held) `shouldSatisfy` or
+        [bytes | (_, _, bytes) ← heldHolds held] `shouldBe` [82]
+        disagreements held charged `shouldBe` []
+        let (_, _, short) = withCharges (reduced 1) (m, held, charged)
+        mentions "backing" (disagreements held short) `shouldBe` True
+
+  it "records the regions a view's accepted demand describes, and a model that names fewer fails the comparison" $
       withService defaultConfig $ \svc → do
         (client, lease) <- openMain svc "main"
         view <- okOf (openView svc client)
@@ -327,5 +376,5 @@ spec = describe "The accounting oracle and its controls" $ do
       usageDisagreements census' m `shouldBe` []
       settleChecks svc
   where
-    usageOf svc = atomically (usageDisagreements <$> inspectCensusSTM svc <*> inspectModelSTM svc)
+    usageOf svc = atomically (usageSTM svc)
     settledSTM host = readTVar (hostSettled host) >>= \settled → check (not (null settled))

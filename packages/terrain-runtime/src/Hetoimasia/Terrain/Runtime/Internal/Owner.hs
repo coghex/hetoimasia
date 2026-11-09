@@ -386,7 +386,7 @@ dispatchJob svc = do
   dispatched <- atomically $ do
     outcome <- applyEvent svc R.Dispatch
     forM_ outcome $ \report → case R.reportDecision report of
-      R.Dispatched jid _ _ → startJobWork svc jid
+      R.Dispatched jid _ cover → startJobWork svc jid cover
       _ → pure ()
     pure outcome
   case dispatched of

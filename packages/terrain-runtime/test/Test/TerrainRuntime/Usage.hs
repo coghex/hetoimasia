@@ -35,10 +35,13 @@ module Test.TerrainRuntime.Usage
   , chargedOf
   , disagreements
   , usageDisagreements
+  , usageSTM
+  , withRetained
   , jobStartDisagreements
   , removalGrowthBound
   ) where
 
+import Control.Concurrent.STM (STM)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Word (Word64)
@@ -57,9 +60,14 @@ import Hetoimasia.Terrain.Runtime
   , censusRetainedBytes
   , censusRetiring
   , censusRunning
+  , censusSettled
   , handoffWorkArena
   , handoffWorkDuplicate
   , handoffWorkRegion
+  , inspectCensusSTM
+  , inspectModelSTM
+  , inspectRetainedChargesSTM
+  , Service
   , jobWorkArena
   , jobWorkGrantedResident
   , jobWorkGrantedScratch
@@ -89,11 +97,14 @@ commandRecord, descriptionOf ∷ Word64 → Word64
 commandRecord n = 128 + 32 * n
 descriptionOf n = 128 + 64 * n
 
-interestRecord, holdRecord, removalRetained, removalStaging ∷ Word64
+interestRecord, holdRecord, removalRetained, removalStaging, resultRecord ∷ Word64
 interestRecord = 64
 holdRecord = 64
 removalRetained = 64
 removalStaging = 512
+-- | The retained bank's record for each request the service holds (the design's figure for a
+-- result or record not charged elsewhere).
+resultRecord = 160
 
 -- | The most a whole-cell removal can raise the payload of the segment it edits: a dense
 -- segment of 'maxSegmentLevels' cells is two bytes a cell, a uniform one two bytes in
@@ -115,10 +126,13 @@ data HeldRequest = HeldRequest
   { hrRegions ∷ Int
   , hrRemoval ∷ Bool
   , hrModelRecord ∷ Bool
+  , -- | Settled, its result waiting to be taken.
+    hrSettled ∷ Bool
   }
 
--- | An accepted load job: what the model granted it, the least its coverage can hold, and
--- the load-job slot it holds (1 while the owner runs it).
+-- | An accepted load job: what the model granted it at admission (a stability check of the model
+-- against itself, not an expectation), the least the owner's running of it holds (0 while it
+-- waits) and the load-job slot it holds (1 while the owner runs it).
 data HeldJob = HeldJob
   { hjJob ∷ JobId
   , hjArena ∷ ArenaId
@@ -130,11 +144,6 @@ data HeldJob = HeldJob
   , hjSlots ∷ Word64
   }
 
--- | The most the job must be charged: what it was granted or, if that was too little,
--- what its coverage can hold.
-hjMustResident, hjMustScratch ∷ HeldJob → Word64
-hjMustResident j = max (hjGrantedResident j) (hjResident j)
-hjMustScratch j = max (hjGrantedScratch j) (hjScratch j)
 
 -- | The preparation the owner is running: the request, and for a removal the resident
 -- growth its buffers can hold.
@@ -157,8 +166,10 @@ data Held = Held
   , heldJobs ∷ [HeldJob]
   , heldPreparation ∷ Maybe HeldPreparation
   , heldHandoffs ∷ [HeldHandoff]
-  , -- | Each outstanding borrow and the regions its snapshot covers.
-    heldHolds ∷ [(HoldId, Word64)]
+  , -- | Each outstanding borrow, the regions its snapshot covers and the accounted bytes it
+    -- backs, both read from the snapshot value when it was handed out (never from the
+    -- retained-bank ledger or the model's hold).
+    heldHolds ∷ [(HoldId, Word64, Word64)]
   , -- | Each view with an accepted demand and the regions it describes.
     heldViews ∷ [(ViewId, Word64)]
   }
@@ -168,7 +179,7 @@ heldOf ∷ Census → Held
 heldOf census =
   Held
     { heldArenas = [HeldArena (censusArena a) (censusRetiring a) (censusRegionBytes a) (censusRetainedBytes a) | a ← censusArenas census]
-    , heldRequests = [HeldRequest (censusRegions r) (censusRemoval r) (censusModelRecord r) | r ← censusRequests census]
+    , heldRequests = [HeldRequest (censusRegions r) (censusRemoval r) (censusModelRecord r) (censusSettled r) | r ← censusRequests census]
     , heldBorrows = censusBorrows census
     , heldJobs = [HeldJob (jobWorkJob j) (jobWorkArena j) (jobWorkRegion j) (jobWorkGrantedResident j) (jobWorkGrantedScratch j) (jobWorkResident j) (jobWorkScratch j) (jobWorkSlots j) | j ← runningJobs running]
     , heldPreparation = (\p → HeldPreparation (preparationRequest p) (preparationRemoval p) (preparationResident p)) <$> runningPreparation running
@@ -223,6 +234,10 @@ data Charged = Charged
     cHolds ∷ [(HoldId, Word64)]
   , -- | Each view and the regions in the description the model keeps for it.
     cViews ∷ [(ViewId, Word64)]
+  , cViewPins ∷ Word64
+  , -- | The retained bank's charge and each outstanding snapshot's charge, as the service
+    -- accounts them ('withRetained'); absent when not read.
+    cRetained ∷ Maybe (Word64, [(HoldId, Word64)])
   }
 
 chargedOf ∷ Model → Charged
@@ -245,7 +260,22 @@ chargedOf m =
     , cBorrows = len [() | (_, _, Borrow, _) ← modelHolds m]
     , cHolds = [(h, len regions) | (h, _, Borrow, regions) ← modelHolds m]
     , cViews = [(viewId v, len (viewDemand v)) | v ← modelViews m]
+    , cViewPins = slotInUse m ViewPinSlot
+    , cRetained = Nothing
     }
+
+-- | The retained bank's charges, read from the service, added to the model's.
+withRetained ∷ (Word64, [(HoldId, Word64)]) → Charged → Charged
+withRetained charges c = c {cRetained = Just charges}
+
+-- | Every disagreement, in one transaction: the service's census, the model and the retained
+-- bank's charges, each read once.
+usageSTM ∷ Service → STM [String]
+usageSTM svc = do
+  census <- inspectCensusSTM svc
+  model <- inspectModelSTM svc
+  retained <- inspectRetainedChargesSTM svc
+  pure (disagreements (heldOf census) (withRetained retained (chargedOf model)))
 
 sumW ∷ [Word64] → Word64
 sumW = sum
@@ -293,10 +323,9 @@ disagreements h c =
     -- What the service's requests hold in the model: one record each, and a removal's reservations.
     held' = [r | r ← heldRequests h, hrModelRecord r]
     removals = len [() | r ← held', hrRemoval r]
-    -- Every accepted job, running or not, must be charged what it was granted, or what its
-    -- coverage can hold if that is more.
-    jobsResident = sumW (map hjMustResident (heldJobs h))
-    jobsScratch = sumW (map hjMustScratch (heldJobs h))
+    -- The jobs the owner runs hold at least what the coverage they load needs.
+    jobsResident = sumW (map hjResident (heldJobs h))
+    jobsScratch = sumW (map hjScratch (heldJobs h))
     duplicates = sumW (map hhDuplicate (heldHandoffs h))
     -- Resident detail, region by region: what the arena's detail itself holds there (a region's
     -- fixed metadata, an index entry per column and each segment).
@@ -309,7 +338,7 @@ disagreements h c =
     stagingHeld =
       recordsHeld
         + sumW [fromIntegral (hrRegions r) * interestRecord | r ← held']
-        + sumW [n * holdRecord | (_, n) ← heldHolds h]
+        + sumW [n * holdRecord | (_, n, _) ← heldHolds h]
         + sumW [descriptionOf n | (_, n) ← heldViews h]
         + duplicates
     expectResidentOccupied = sumW (map snd serviceRegions)
@@ -321,6 +350,11 @@ disagreements h c =
     expectCommandSlots = len held'
     expectLoadSlots = sumW (map hjSlots (heldJobs h))
     expectBorrows = fromIntegral (heldBorrows h) ∷ Word64
+    -- The retained bank: the backing of every snapshot handed out and still borrowed (live or
+    -- retiring incarnations alike: a hold ends only when its borrower releases it), and one record
+    -- for each request the service holds except a settled read whose record the model charges.
+    backingHeld = sumW [bytes | (_, _, bytes) ← heldHolds h]
+    expectRetained = backingHeld + resultRecord * len [() | r ← heldRequests h, not (hrSettled r && hrModelRecord r)]
     -- ===== END EXPECTED SIDE =====
     modelGrowth = sumW [g | (_, _, g) ← cRequests c]
     modelRegionBytes = Map.fromList [((crArena r, crRegion r), (crBytes r, crEvicting r)) | r ← cRegions c]
@@ -350,20 +384,24 @@ disagreements h c =
     rows =
       [ ("resident bank occupied (every arena's resident detail, retiring included)", ledgerOccupied (cResident c), expectResidentOccupied, AtLeast)
       , ("resident growth reserved for the removals the service holds (each at least the worst case of a segment)", modelGrowth, expectResidentGrowth, AtLeast)
-      , -- Reserved and deferred together: every accepted job's reservation and the removals' growth,
+      , -- Reserved and deferred together: the running jobs' reservations and the removals' growth,
         -- however much of it still waits for victims.
-        ("resident bank reserved (every accepted job's reservation and the removals' growth)", ledgerReserved (cResident c) + cResidentDeferred c, expectResidentReserved, AtLeast)
+        ("resident bank reserved (the running jobs' reservations and the removals' growth)", ledgerReserved (cResident c) + cResidentDeferred c, expectResidentReserved, AtLeast)
       , ("edit bank occupied (every arena's retained changes, retiring included)", ledgerOccupied (cEdit c), expectEditOccupied, AtLeast)
       , ("edit bank reserved by removals", ledgerReserved (cEdit c), expectEditReserved, Exact)
       , ("staging bank occupied (request records and interests, borrows, view descriptions, duplicates, from the service)", ledgerOccupied (cStaging c), stagingHeld, AtLeast)
       , -- The ledger against the model's own entity lists (interests, holds, views, camera interests
         -- included): consistency of the model with itself, not an independent expectation.
         ("staging bank occupied (the ledger against the model's own entities)", ledgerOccupied (cStaging c), recordsHeld + cEntityStaging c + duplicates, Exact)
-      , ("staging bank reserved (each removal's staging reservation and every accepted job's scratch)", ledgerReserved (cStaging c), expectStagingReserved, AtLeast)
+      , ("staging bank reserved (each removal's staging reservation and the running jobs' scratch)", ledgerReserved (cStaging c), expectStagingReserved, AtLeast)
       , ("command slots (every request the service holds a model record for)", cCommandSlots c, expectCommandSlots, Exact)
       , ("load-job slots (every job the owner is running)", cLoadSlots c, expectLoadSlots, AtLeast)
       , ("snapshot holds", cBorrows c, expectBorrows, Exact)
+      , ("view pin slots (the service never pins a view's revision)", cViewPins c, 0, Exact)
       ]
+        <> [ ("retained bank (outstanding snapshots' backing and the request records)", used, expectRetained, AtLeast)
+           | Just (used, _) ← [cRetained c]
+           ]
     -- Every accepted job is charged, in its own amounts, for as long as the model holds it: a
     -- running job the model has forgotten, or any job charged less than it was granted (or
     -- less than its coverage can hold), is under-charged.
@@ -373,16 +411,33 @@ disagreements h c =
         | hjSlots j > 0
         ]
       x : _ →
-        [ "job " <> show (hjArena j, hjRegion j) <> " " <> what <> ": the model counts " <> show counted <> " but the service holds " <> show held
-        | (what, counted, held) ← [("resident reservation", cjResident x, hjMustResident j), ("scratch", cjScratch x, hjMustScratch j)]
+        -- what the owner's running of it holds (the expectation) ...
+        [ "job " <> show (hjArena j, hjRegion j) <> " " <> what <> " (what its coverage holds): the model counts " <> show counted <> " but the service holds " <> show held
+        | hjSlots j > 0
+        , (what, counted, held) ← [("resident reservation", cjResident x, hjResident j), ("scratch", cjScratch x, hjScratch j)]
         , counted < held
         ]
+          -- ... and, for every accepted job, running or waiting, the model against its own grant: a
+          -- charge reduced while the job still holds the reservation (stability, not an expectation).
+          <> [ "job " <> show (hjArena j, hjRegion j) <> " " <> what <> " (as granted at admission): the model counts " <> show counted <> " but granted " <> show held
+             | (what, counted, held) ← [("resident reservation", cjResident x, hjGrantedResident j), ("scratch", cjScratch x, hjGrantedScratch j)]
+             , counted < held
+             ]
     -- Each borrow's hold covers the regions of its snapshot.
-    holdDisagreements (hid, n) = case lookup hid (cHolds c) of
-      Nothing → ["the service lends a snapshot of " <> show n <> " regions (" <> show hid <> ") but the model holds no such borrow"]
-      Just charged
-        | charged < n → ["hold " <> show hid <> ": the model names " <> show charged <> " regions but the snapshot covers " <> show n]
-        | otherwise → []
+    holdDisagreements (hid, n, bytes) =
+      ( case lookup hid (cHolds c) of
+          Nothing → ["the service lends a snapshot of " <> show n <> " regions (" <> show hid <> ") but the model holds no such borrow"]
+          Just charged
+            | charged < n → ["hold " <> show hid <> ": the model names " <> show charged <> " regions but the snapshot covers " <> show n]
+            | otherwise → []
+      )
+        <> case cRetained c of
+          Nothing → []
+          Just (_, perSnapshot) → case lookup hid perSnapshot of
+            Nothing → ["the service lends a snapshot backing " <> show bytes <> " bytes (" <> show hid <> ") but the retained bank charges nothing for it"]
+            Just charged
+              | charged < bytes → ["snapshot " <> show hid <> " backing: the retained bank charges " <> show charged <> " but the snapshot backs " <> show bytes]
+              | otherwise → []
     -- Each view's description names the regions of the accepted demand.
     viewDisagreements (vid, n) = case lookup vid (cViews c) of
       Nothing → ["the service accepted a demand of " <> show n <> " regions for " <> show vid <> " but the model holds no view"]
@@ -421,7 +476,7 @@ jobStartDisagreements census m arena region =
   ]
     <> [ what <> " of the recorded job is zero"
        | j ← recorded
-       , (what, n) ← [("resident reservation", hjMustResident j), ("scratch", hjMustScratch j), ("slot", hjSlots j)]
+       , (what, n) ← [("resident reservation", hjResident j), ("scratch", hjScratch j), ("slot", hjSlots j)]
        , n == 0
        ]
     <> usageDisagreements census m

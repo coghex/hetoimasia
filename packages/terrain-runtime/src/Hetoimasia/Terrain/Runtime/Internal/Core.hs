@@ -377,15 +377,17 @@ data LimitRow = LimitRow
   }
   deriving stock (Eq, Show)
 
--- | Every service-wide limit with its count and the independent enumeration.
+-- | Every service-wide limit with its count and an enumeration that reads only the service's own
+-- structures (its arena maps, name claims, client records, request table and the record of the
+-- snapshots it handed out), never the accounting model or the retained-bank ledger.
 limitRows ∷ Config → St → [LimitRow]
 limitRows config st =
-  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (length (R.modelArenas model)) + w (length [() | req ← requestsAndGhosts, isOpenCmd req, not (isDone req)]))
+  [ LimitRow "arenas" (w (configMaxArenas config)) (w (arenaUse st)) (w (Map.size (stateArenas st)) + w (length (Map.keys (stateRetiring st))) + w (length [() | ClaimPending _ ← Map.elems (stateNames st)]))
   , LimitRow "leases" (w (configMaxLeases config)) (w (leasesInUse st)) (sum [w (Set.size (clientLeases c)) | c ← Map.elems (stateClients st)] + w (length [() | req ← requestsAndGhosts, isAcquisition req, not (isDone req)]))
   , LimitRow "views" (w (configMaxViews config)) (w (Map.size (stateViews st))) (sum [w (Set.size (clientViews c)) | c ← Map.elems (stateClients st)])
   , LimitRow "clients" (w (configMaxClients config)) (w (Map.size (stateClients st))) (w (length (Map.keys (stateClients st))))
-  , LimitRow "command slots" slotLimit (fromIntegral (R.slotInUse model R.CommandSlot) + w (slotsHeldHere st)) (fromIntegral (R.slotInUse model R.CommandSlot) + sum (map slotOf requestsAndGhosts))
-  , LimitRow "retained bank" (configRetainedBytes config) (retainedBankUse st) (sum (Map.elems (stateSnapshots st)) + sum (map recordOf requestsAndGhosts))
+  , LimitRow "command slots" slotLimit (fromIntegral (R.slotInUse model R.CommandSlot) + w (slotsHeldHere st)) (w (length [() | req ← requestsAndGhosts, reqModel req]) + sum (map slotOf requestsAndGhosts))
+  , LimitRow "retained bank" (configRetainedBytes config) (retainedBankUse st) (sum [bytes | (_, bytes) ← Map.elems (rwHolds (stateWork st))] + sum (map recordOf requestsAndGhosts))
   ]
   where
     model = stateModel st
@@ -644,30 +646,26 @@ syncWork model rw =
     added = Map.fromList [(R.jobId j, jobWorkOfModel j) | j ← jobs, not (Map.member (R.jobId j) (rwJobs rw))]
     liveViews = Set.fromList (map R.viewId (R.modelViews model))
 
--- | A job as granted: what the model reserved for it and its scratch now, and the least
--- its coverage can hold. The least is worked out from the cells the job loads and the data
--- layer's sizes, not from the model's cost functions: a column index entry is 'columnIndexBytes'
--- (48), a segment is 32 bytes of metadata and at least two of payload (a uniform one), and the
--- scratch is a 256-byte frame and two bytes a cell.
+-- | A job as granted: what the model reserved for it and its scratch at this moment (so a
+-- later reduction is seen). The least the job holds is not claimed here: a job that waits
+-- holds nothing the service owns, only a promise. The owner records that when it runs the
+-- job ('startJobWork'), from the coverage it is given to load.
 jobWorkOfModel ∷ R.JobInfo → JobWork
-jobWorkOfModel j =
-  JobWork
-    (R.jobId j)
-    (R.jobArena j)
-    (R.jobRegion j)
-    (R.jobActive j + R.jobDeferred j)
-    (R.jobScratch j)
-    (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2))
-    (256 + 2 * R.coverageCells cover)
-    0
-  where
-    cover = R.jobCoverage j
+jobWorkOfModel j = JobWork (R.jobId j) (R.jobArena j) (R.jobRegion j) (R.jobActive j + R.jobDeferred j) (R.jobScratch j) 0 0 0
 
--- | The owner starts running a load job: it holds a load-job slot from now to its report.
-startJobWork ∷ Service → R.JobId → STM ()
-startJobWork svc jid =
+-- | The owner starts running a load job: it holds a load-job slot from now to its report,
+-- and the least it can hold is worked out from the coverage it is given to load (the
+-- decision's value, which is also the input of the work itself) and the data layer's own
+-- sizes, not the model's cost functions: a column index entry is 'columnIndexBytes' (48), a
+-- segment is 32 bytes of metadata and at least two of payload (a uniform one), and the
+-- scratch is a 256-byte frame and two bytes a cell.
+startJobWork ∷ Service → R.JobId → R.Coverage → STM ()
+startJobWork svc jid cover =
   modifySt svc $ \st →
-    st {stateWork = (stateWork st) {rwJobs = Map.adjust (\(JobWork a b c d e f g _) → JobWork a b c d e f g 1) jid (rwJobs (stateWork st))}}
+    st {stateWork = (stateWork st) {rwJobs = Map.adjust running jid (rwJobs (stateWork st))}}
+  where
+    running (JobWork a b c d e _ _ _) =
+      JobWork a b c d e (R.coverageColumns cover * fromIntegral columnIndexBytes + R.coverageSegments cover * (32 + 2)) (256 + 2 * R.coverageCells cover) 1
 
 -- | The job's report (completed, failed or acknowledged) ends its record, in the
 -- transaction that reports it.
@@ -955,9 +953,17 @@ acquireSnapshotSTM svc lease regions =
                           , stateBorrowers = stateBorrowers cur + 1
                           , stateSnapshots = Map.insert (HoldId hid) backing (stateSnapshots cur)
                           , -- what the snapshot handed out covers, for inspection
-                            stateWork = (stateWork cur) {rwHolds = Map.insert (HoldId hid) (fromIntegral (Set.size (Set.fromList (snapRegions snapshot)))) (rwHolds (stateWork cur))}
+                            stateWork = (stateWork cur) {rwHolds = Map.insert (HoldId hid) (fromIntegral (Set.size (Set.fromList (snapRegions snapshot))), snapshotBacking snapshot) (rwHolds (stateWork cur))}
                           }
                       pure (Right (HoldId hid, snapshot))
+
+-- | The accounted bytes a snapshot backs, measured on the snapshot value that was handed out:
+-- the payload and segment metadata and column index entries of the resident detail it keeps
+-- alive. Read from what the snapshot holds, never from the retained-bank ledger.
+snapshotBacking ∷ Snapshot → Word64
+snapshotBacking snapshot =
+  let stats = residentStats (snapResident snapshot)
+   in fromIntegral (statPayloadBytes stats) + fromIntegral (statMetadataBytes stats)
 
 -- | Return a borrow. Idempotent.
 releaseSnapshotSTM ∷ Service → HoldId → STM ()

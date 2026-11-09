@@ -15,12 +15,12 @@ import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
-import Test.TerrainRuntime.Usage (Held (..), HeldArena (..), chargedOf, disagreements, heldOf, jobStartDisagreements, usageDisagreements)
+import Test.TerrainRuntime.Usage (Held (..), HeldArena (..), chargedOf, disagreements, heldOf, jobStartDisagreements, usageDisagreements, usageSTM)
 
 -- | Every disagreement between the model's ledgers and what the service holds, read in
 -- one transaction.
 usageOf ∷ Service → IO [String]
-usageOf svc = atomically (usageDisagreements <$> inspectCensusSTM svc <*> inspectModelSTM svc)
+usageOf svc = atomically (usageSTM svc)
 
 arenasRow ∷ Service → IO LimitRow
 arenasRow svc =

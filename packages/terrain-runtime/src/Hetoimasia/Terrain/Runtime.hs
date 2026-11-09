@@ -97,6 +97,7 @@ module Hetoimasia.Terrain.Runtime
   , inspectModelSTM
   , inspectDefects
   , inspectSnapshotBytes
+  , inspectRetainedChargesSTM
   , inspectRetryMemory
   , inspectLimits
   , LimitRow (..)
@@ -496,6 +497,14 @@ inspectCensusSTM svc = do
         (Map.size (stateSnapshots st))
         (stateWork st)
     )
+
+-- | The retained bank's charge as the service accounts it: the total, and the bytes charged for
+-- each outstanding borrow's snapshot. Plain numbers, read-only, for verification: the charged side
+-- of a comparison with the backing recorded when each snapshot was handed out.
+inspectRetainedChargesSTM ∷ Service → STM (Word64, [(R.HoldId, Word64)])
+inspectRetainedChargesSTM svc = do
+  st <- readSt svc
+  pure (retainedBankUse st, Map.toList (stateSnapshots st))
 
 inspectSnapshotBytes ∷ Service → IO (Word64, Word64)
 inspectSnapshotBytes svc = do
