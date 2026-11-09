@@ -15,8 +15,11 @@ capability, a logger and a diagnostics seam). The Lua request endpoint is TRA-5;
 this package supplies a Lua-independent settlement seam it can attach to.
 
 This is the **baseline** service of design P-16: it retains edits in RAM only. The
-temporary store of TRA-20–TRA-23 replaces that retention later; nothing here builds
-it.
+temporary store of TRA-20–TRA-23 replaces that retention later. Its pure model
+(TRA-20) lives beside the service in this package and is described in
+[the temporary store](#the-temporary-store-tra-20); nothing in the service uses it
+until the terrain owner adopts it (TRA-22), so the service's behavior, admission
+outcomes and tests are unchanged.
 
 ## Using it
 
@@ -505,6 +508,276 @@ record of the owner's running work) with record-update syntax or import a privat
 refused for the specific diagnostic that names the cause. Retained gated traces with before and after
 accounting are in
 [the TRA-4 evidence](../../docs/evidence/terrain/tra4/service_evidence.md).
+
+## The temporary store (TRA-20)
+
+The store is the **pure model** of the disk backing of design P-15 (D-40, D-41,
+D-43, D-52, D-59): the private page format, the copy-on-write indexes over it, the
+allocator and retirement work, staged transaction planning, pinned readers,
+reclamation, the allowance and its growth, and the edit bank's storage-aware
+admission. It performs **no file I/O, starts no thread, runs no STM and reads no
+clock**. The baseline service above is unchanged and still retains its edits in RAM
+until the terrain owner adopts the store (TRA-22); nothing here is wired into it.
+
+| Surface | What it is |
+| --- | --- |
+| `Hetoimasia.Terrain.Runtime.Store` | the narrow public interface: configuration, windows, `Store`, planning, the transaction, readers, growth, feasibility |
+| `Hetoimasia.Terrain.Runtime.Store.Admission` | the edit bank's division and its all-or-nothing, backed-only-eviction credits |
+| private library `store` (`store/`) | the codec, trees, allocator, planner and state machine; visible to no client; this package's suite reaches it to check them against independent references |
+
+A client, such as the later storage backend, holds a `Store` value, plans through a
+`Window` (a bounded set of validated page buffers for one store and one version), writes the pages a `Plan`
+names, and reports outcomes:
+
+```haskell
+plan <- planRemoval env store window tile      -- or planDiscovery, planMaintenance
+case plan of
+  Pending page  -> fetch it, addPage it to the window, plan again
+  Planned p     -> admit p store            -- one active transaction, claims its pages
+                   -- write planPages p; report dispatchWrite / completeWrite
+                   -- publish tid store      (the owner's decision) or abortTransaction
+  NoWork        -> nothing to append (a no-op appends no history)
+  Refused why   -> classifyPlan why           -- busy, invalid, disk, integrity, replan, too large
+```
+
+### The page format
+
+A page is exactly **4,096 bytes** and immutable once written. Header fields are
+little-endian; keys inside entries are order-preserving big-endian (a signed number
+has its sign bit flipped) so that the byte order of a key is its logical order.
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 0 | 4 | magic `HTRP` |
+| 4 | 2 | format version (1; any other is refused) |
+| 6 | 1 | kind: 1 leaf, 2 internal, 3 retirement list |
+| 7 | 1 | tree: 0 runs, 1 links, 2 todo, 3 free, 4 retire (a list page is tree 4) |
+| 8 | 8 | arena incarnation |
+| 16 | 8 | source identity |
+| 24 | 8 | the page's own number |
+| 32 | 1 | level: 0 for a leaf or a list, 1 to 7 for an internal page |
+| 33 | 1 | reserved, zero |
+| 34 | 2 | entry count (at least 1) |
+| 36 | 2 | end of the payload (40 + payload bytes, at most 4,092) |
+| 38 | 2 | reserved, zero |
+| 40 | to 4,092 | payload, then zero padding |
+| 4092 | 4 | CRC32C of bytes 0 to 4,091 (Castagnoli, reflected polynomial `0x82F63B78`, initial and final `0xFFFFFFFF`) |
+
+Leaf entries are `keyLen(1) valueLen(1) key value` (key 1 to 64 bytes, value at most
+64); internal entries are `keyLen(1) key childPage(8)`, the key being the least key
+the child may hold; a list is a strictly increasing run of eight-byte page numbers
+(at most 506). The records of each tree:
+
+| Tree | Key | Value |
+| --- | --- | --- |
+| runs | column x(8) y(8), lower level(8): 24 | upper level(8) |
+| links | `0` tile(24) and three optional parameters `present(1) coord(8)` (52), or `1` column(16) level(8) (25) | `0` size(8) known(1), or `1` parent node key |
+| todo | sequence(8) | tile(24) done(1), `done` in 1 to 6 |
+| free | start page(8) | length(8), at least 1 |
+| retire | the version that replaced the pages(8) | list page(8) count(2) done(2), `done` below `count` |
+
+**What a decode checks, in order**, before anything uses the page: the buffer length
+(short and oversized are refused before they are read), the checksum, magic,
+version, kind, tree, arena, source and the page's own number (a page read from the
+wrong place is refused), the reserved bytes, the level against the kind (an
+internal page claims 1 to 7, so a malformed or cyclic structure cannot loop), the
+count and payload end against the bytes available, every entry's lengths against
+the bounds before it is sliced, that the entries end exactly at the stated end and
+the padding is zero, strictly increasing keys, every child or list reference inside
+the page space and never the page itself, and the structure of each leaf entry (a
+well-formed key and value of the tree's own category: coordinates in range,
+`lo < hi` inside the level limits, a class size of at least 1, adjacent runs and free
+extents already coalesced). A **valid checksum never rescues a malformed page**: the
+same structure checks refuse a re-sealed page. A refusal is an explicit
+`PageError`; it is never an empty index, absent history, air or the pristine source.
+Page numbers convert to file offsets only through `pageFileOffset` and
+`rangeFileEnd`, which check the page space, the allowance and the native signed
+offset limit with no wrapping. This is an internal session format: not a game-save
+schema, not `Show`/`Read`, never read by another run.
+
+### The indexes
+
+Five B+trees share one generic implementation over the page window: the three record
+categories of #661 (`KeyRun`, `KeyLink`, `KeyTodo`), the **free** tree of free page
+extents (coalesced) and the **retire** tree of retirement work. A tree reads only
+through a window of validated page buffers: a page it needs and does not have is the
+**pending** result (`Pending page`), never an empty answer; a page that contradicts
+its place (a wrong tree, a wrong level, a key outside its parent's separators) is an
+integrity failure. Updates copy the changed path into an overlay and never touch a
+committed page. A node that falls under a quarter of a payload after a deletion is
+repacked with a neighbour (merged, or split evenly), so every non-root node is at
+least a quarter full; an insertion that overflows splits by bytes; a root that
+splits adds a level and a root left with one child gives it back. A tree is at most
+**8 levels** (0 to 7); a plan that would need more is refused with a typed
+`TreeTooTall`, never truncated. A legitimate tree needs a ninth level only past
+about 6.7e7 records (more than 36 GiB of leaves), so the default 1 GiB allowance and
+every allowance below 36 GiB can never reach it. One update costs at most
+`2 * 8 + 1 = 17` new pages at that height (a copy of the path, a split at every level
+and a new root). A write that changes nothing (the same value, a deletion of an
+absent key) copies no page.
+
+### Page states, ownership and accounting
+
+Every page below the high-water mark is in exactly one state:
+
+| State | Meaning | Reachable by |
+| --- | --- | --- |
+| live | in a committed tree or a retirement list | the committed roots |
+| retired | replaced by a commit, listed in a retirement entry | readers pinned before the commit |
+| free | a free extent of the allocator tree | nobody |
+| loose | an owner-private bookkeeping page, kept in the root set for the next plan | nobody |
+
+Pages at or above the high-water mark, below the usable page count, are the untouched
+tail: free, taken by raising the mark with no allocator record. The identity
+`hw = live + retired + free + loose` holds after every commit, and the suite checks
+it from the bytes of the disk by an independent traversal, not from the counters.
+**Used** bytes are live, retired, loose and staged pages plus the overhead; **free
+reserved extents are not used bytes**; **pending reclaim** (the retired pages) is a
+subset of used and never extra free capacity; a page reached by several roots is one
+page; each reader and control record has its own accounted cost (`controlBytes`).
+
+*Why loose pages are safe to reuse.* A reader pins the **record** trees only; the
+allocator and retirement trees are the owner's, read only while planning against the
+committed roots. A bookkeeping page a commit replaced is unreachable from the new
+roots and from every reader, so the next plan may take it at once. This is what
+stops reclamation from retiring its own metadata forever. Record pages a commit
+replaced are never loose: they go to a retirement entry and wait for the readers.
+
+### Transactions
+
+At most **one** mutating transaction is active. A plan takes
+`d + 1 + 68` pages from the supply (loose pages first, then free extents lowest
+first, then the untouched tail), writes the pages it needs and returns the rest as
+loose pages, so the allocator's own updates need no fixed point and never overwrite a
+committed page. It writes at most **256 pages (1 MiB), index, allocator and
+retirement pages included**; reserves at most **4 MiB of RAM**; reads through a window of at
+most **1.25 MiB of validated page buffers** (about 310 pages); and a discovery batch performs at most **64 structural
+updates**, where a structural update is #661's: one connection inspected, at most one
+pair of classes joined, and the obligation's progress. The batch keeps its
+continuation in the obligation records; when a tighter bound stops it earlier, it is
+planned again with fewer writes, never truncated.
+
+| RAM item | Sub-budget of the 64 MiB edit bank |
+| --- | --- |
+| encoded I/O buffers, keys, scratch | staging (8 MiB, 4 MiB protected for a foreground mutation) |
+| the window's page buffers and the plan's new pages (held packed) | caches (48 MiB), pinned while the plan runs |
+| page-pin records, root and control records, retained continuation | control and frontier (8 MiB) |
+
+*What the RAM figure counts.* It is the memory a plan really holds: the window keeps the
+validated 4 KiB buffer of each page it read (a small header more, at most 1.25 MiB) and
+parses entries from a buffer only while a node is visited; the new pages a plan builds
+are held **packed** (their entries as one byte string, about 4.2 KiB each, 256 pages at
+most when it ends) except for the last eight per tree edit, which stay parsed and are
+accounted at 28,000 bytes each; the encoded output is 4 KiB a written page. The discovery
+header is charged at its fixed 128-byte record size: its byte total counts the retained
+*history*, which lives in pages, and is not transaction memory, so a history of any size
+plans like an empty one. A plan whose window or new pages would hold more is refused
+(`WindowBytesExceeded`, `OverlayExceeded`) with nothing changed.
+
+A removal and its minimum connection obligation are **one** candidate, and so are a
+discovery batch's knowledge, exposed-boundary records and remaining obligations: the
+plan applies every write of the candidate or none. A plan names its base (the store,
+the committed version and the authority); a transaction's token carries its store, so an
+outcome for another store's transaction with the same serial changes nothing; an `admit` of a plan whose base is no
+longer the committed root is `StalePlan`, never relabelled. Revision arithmetic is
+checked (`RevisionArithmetic`, `VersionArithmetic`); a candidate that changes no page
+and no header is `NoWork`.
+
+```text
+plan -> admit -> ( dispatchWrite -> completeWrite )* -> publish
+                    |                                    ^
+                    cancel (a request)                   | only when every page is Written
+                    abort (after the writes have drained)
+```
+
+`admit` stages the plan's pages (unreachable from the committed roots, claimed by this
+transaction alone). The owner reports each page's outcome (`WriteDone`,
+`WriteFailed`). A transaction is `Eligible` only when every page completed and none
+is in flight; **an I/O completion is not publication**. A cancellation is a request:
+it is recorded and releases nothing. `abortTransaction` releases the claims once no
+write is in flight and **needs no write**: the committed roots were never changed, so
+the old content, knowledge and frontier are exactly as they were. After `publish` the
+new roots are authoritative and a late cancellation or outcome changes nothing;
+duplicate, stale and foreign outcomes change nothing. A successful write here means
+the OS accepted it, not an `fsync` or power-loss durability.
+
+### Readers and reclamation
+
+`acquireReader` pins the record trees of one committed version (at most 16 per store,
+each with an accounted record). Writes, publication and reclamation cannot change its
+answers. A commit retires only the record pages it replaced, in one retirement entry
+keyed by its version; an entry is reclaimable once the oldest pinned version is at
+least that version (`BlockedByReader` otherwise). `planMaintenance` frees an entry's
+pages incrementally (at most 64 per transaction, fewer when a bound is tighter), is a
+maintenance transaction and **may spend the protected reserve**. A token of a released
+reader, of another store or of another incarnation reads nothing (`ReadStale`).
+
+### The allowance
+
+`mkStoreConfig` validates the per-arena allowance (default **1 GiB**, at least
+**64 MiB**, a multiple of **1 MiB**, inside the native signed file-offset limit, binary
+units) and a stated overhead (default 1/256 of it, at least 1 MiB), which counts as
+used. **8 MiB inside the allowance is protected** for allocator and reclamation
+progress: an ordinary transaction (an edit or a discovery batch) is admitted only if
+the free pool beside its worst-case claim (324 pages) leaves the reserve intact, and
+that claim is reserved before any work, so a refusal (`DiskFull`) precedes any change
+and leaves the prior contents and every discovery obligation intact. The owner maps it
+to `storage_full` and the pause. `minimumRemovalFeasible` shows the supported minimum
+removal (7 record writes at the tallest height, a list page and the bookkeeping
+reserve: 188 pages, 3.0 MiB of RAM) fits any accepted configuration in an empty
+workspace; if a configuration could not hold it, the counterexample is returned for a
+design decision and no budget is relaxed.
+
+*Growth* is a conservative, serialised, accounted proposal: `proposeGrowth` is pure
+(equal size is `GrowthNoOp`, an idempotent success; a well-formed smaller size is
+`GrowthNotIncreased`, which the owner maps to `storage_size_not_increased`; a malformed,
+misaligned, too small or out-of-range size is `GrowthInvalid`, a validation refusal
+before any provider work); `beginGrowth` is refused while a transaction is active;
+`growthReserved` records the extra reservation as pending, not spendable;
+`commitGrowth` enlarges the allowance only after that and clears **only** the capacity
+pause. A failure before commitment keeps the old allowance and records, and an extra
+reservation it had obtained stays accounted until its release is reported (a failed
+release keeps it, and another growth is refused until it is released). Nothing grows
+or deletes history by itself, and an integrity or I/O pause is not cleared by a larger
+allowance.
+
+### Edit-bank admission
+
+`Hetoimasia.Terrain.Runtime.Store.Admission` divides the 64 MiB edit bank into 48 MiB
+caches, 8 MiB staging (4 MiB protected for a foreground mutation) and 8 MiB control,
+shared across arenas, and validates that a worst-case foreground transaction could
+always be funded. `reserve` funds all the credits of a request or none. A cached copy
+is `Backed` (a copy of a written page) or `RamOnly` (the only copy: a staged page
+whose write has not completed, or a baseline authoritative record); eviction releases
+only backed, unpinned copies, least recently used first, and `dropEntry` refuses a
+`RamOnly` one, so eviction never deletes authoritative history or pending discovery.
+Camera work cannot take the protected staging or hold a control record, so a
+foreground mutation's credits are protected from camera reads or reclaimable by
+evicting backed copies, and no request waits in a circle. The failure classes stay
+apart: temporary pressure (`RefusedBusy`), a request that can never fit
+(`RefusedInvalid`), disk exhaustion, integrity failure, a plan to redo and a pause an
+explicit recovery clears (`classifyPlan`, `classifyAdmit`). The baseline's 64 MiB
+edit bank, its lifetime retained-edit charge and its `RetainedEditsExhausted` outcome
+are unchanged until TRA-22 (checked in `terrain-tests`).
+
+### Ownership of the store's state
+
+| State | Owner and writers | Readers | Lifetime |
+| --- | --- | --- | --- |
+| the committed roots, counters, loose pages and header | the terrain owner alone, only through `publish` of an admitted plan | planning and readers (as copies) | the arena's incarnation |
+| the staged claim and its buffers | the one active transaction | the owner | `admit` to `publish` or `abortTransaction` after the writes drain |
+| reader pins | the owner (`acquireReader`, `releaseReader`) | the reader's token | until released; an arena close drains them before the file closes |
+| a window | the caller of one plan or read | that plan or read | one store and one version; a window of another arena, source or version is refused by every read and plan, and never carried across a publication |
+| the edit-bank occupancy | the owner | the owner | the service |
+
+### What later slices supply
+
+TRA-21: the temporary file, its descriptor lifecycle, real preallocation and free-space
+checks, the I/O workers, short-write loops and filesystem overhead qualification.
+TRA-22: opening, the live owner's root publication, write-backed request settlement,
+discovery scheduling, pause and retry orchestration and close and reset. TRA-23: the
+Lua facade and status. No result of this model is proof of physical preallocation,
+durable writes, live settlement or crash recovery.
 
 ## Consumers
 
