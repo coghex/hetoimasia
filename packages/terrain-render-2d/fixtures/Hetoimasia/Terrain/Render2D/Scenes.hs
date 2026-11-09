@@ -42,6 +42,7 @@ module Hetoimasia.Terrain.Render2D.Scenes
   , scaledTarget
   , snapped
   , edgeScene
+  , depthStack
     -- * Layout
   , fitScene
   ) where
@@ -369,4 +370,16 @@ edgeScene zoom shape facing =
   (newScene ("edges-" <> show shape <> "-" <> show facing <> "@" <> show zoom) [Cell 0 0 0 1 shape "loam"] (oddOf (round (96 * zoom) + 16), oddOf (round (64 * zoom) + 16))) {sceneFacing = facing, sceneZoom = zoom}
   where
     oddOf n = if even n then n + 1 else (n ∷ Int)
+
+
+-- | A scene of cells at one column at levels 0 to 8, the cut at the top, for the depth effects:
+-- every level a loam cell of shape 0, so nearer levels overlap farther ones along the view.
+depthStack ∷ ViewFacing → Scene
+depthStack facing =
+  atZoom 0.25 $
+    (newScene ("depth-stack-" <> show facing) [Cell x 0 z (z + 1) 5 (if even z then "loam" else "granite") | (x, z) ← zip [0 .. 8] [0 .. 8]] (64, 64))
+      { sceneFacing = facing
+      , sceneMode = ManualAt 8 8
+      , sceneAnchor = (4, 0)
+      }
 

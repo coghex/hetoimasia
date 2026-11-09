@@ -274,17 +274,6 @@ expecting camera s = s {specCamera = Just camera}
 specMany ∷ String → [Need] → [Scene] → Spec
 specMany name needs scs = Spec name scs Dynamic defaultLight needs [] Nothing
 
--- | A scene of cells at one column at levels 0 to 8, the cut at the top, for the depth effects:
--- every level a loam cell of shape 0, so nearer levels overlap farther ones along the view.
-depthStack ∷ ViewFacing → Scene
-depthStack facing =
-  atZoom 0.25 $
-    (newScene ("depth-stack-" <> show facing) [Cell x 0 z (z + 1) 5 (if even z then "loam" else "granite") | (x, z) ← zip [0 .. 8] [0 .. 8]] (64, 64))
-      { sceneFacing = facing
-      , sceneMode = ManualAt 8 8
-      , sceneAnchor = (4, 0)
-      }
-
 mixedScene ∷ ViewFacing → Scene
 mixedScene facing =
   atZoom 0.25 $

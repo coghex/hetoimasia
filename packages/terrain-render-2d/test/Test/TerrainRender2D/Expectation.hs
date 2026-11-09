@@ -9,7 +9,7 @@
 -- cells. Every pixel is compared, exactly; a pixel the device would be allowed to read differently
 -- (an unsnapped scene within 1/1000 texel of an interior threshold) is only counted as banded; a scene whose compared or covered count is zero fails, so no scene passes
 -- without judging anything.
-module Test.TerrainRender2D.Expectation (spec) where
+module Test.TerrainRender2D.Expectation (spec, setupAll) where
 
 import Control.Monad (forM, forM_)
 import qualified Data.ByteString as ByteString
