@@ -266,6 +266,12 @@ lightOf s index = case drop (index - 1) (specLater s) of
 twoLights ∷ Light → Scene → Spec
 twoLights second sc = Spec (sceneName sc <> "@" <> lightLabel second <> "-beside-default") [sc, sc] Dynamic defaultLight [Foreground, LightsDiffer] Nothing [second] Nothing
 
+-- | A fixture whose every scene is judged in exact arithmetic, the pixel centres of a snapped,
+-- fractionally zoomed scene lying within a hair of texel boundaries that the banded expectation
+-- would leave undecided.
+exactly ∷ Spec → Spec
+exactly s = s {specExactFrom = Just 0}
+
 expecting ∷ (Integer, Integer) → Spec → Spec
 expecting camera s = s {specCamera = Just camera}
 
@@ -364,6 +370,8 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Clipped] Dynamic (viewportOffset 0.125)
          , spec defaultLight [Foreground] Dynamic (capTarget (96, 64) (atZoom 0.125 scaledTarget))
          , spec defaultLight [Foreground] Dynamic snappedZoom2
+         , exactly (spec defaultLight [Foreground, SnapSensitive] Dynamic (snapped {sceneName = "snapped-9-8", sceneZoom = 1.125}))
+         , exactly (spec defaultLight [Foreground, SnapSensitive] Dynamic (snapped {sceneName = "snapped-5-4", sceneZoom = 1.25}))
          ]
       -- Lighting: the fixed world sun with the camera turned, and the sun varied at a fixed camera.
       <> [spec defaultLight [Foreground, Varies] Dynamic (atZoom 0.125 (rampsCorners facing)) | facing ← [FaceSouth, FaceWest]]
