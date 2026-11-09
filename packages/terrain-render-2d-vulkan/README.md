@@ -38,7 +38,9 @@ Declared through the renderer's checked `defineMaterial` (R2D-11):
   path is decided by the registered mark of its colour atlas, never forced by the
   material.
 - **The function** takes, for each region separately, the texel the UV selects in
-  the region's own 96 x 64 extent, adds the origin afterwards, and samples that
+  the region's own 96 x 64 extent, `floor (clamp u 0 1 * w + 1/128)` (the bias is the
+  owner's 2026-11-09 Q-13 amendment v2; the GLSL literal is made from `texelBias`, the
+  rule's one definition in the region primitive), adds the origin afterwards, and samples that
   texel's centre, `(origin + (i + 1/2, j + 1/2)) / atlasExtent`, nearest at level
   zero; both samples are unconditional (the sampler's derivatives need uniform
   control flow). It decodes the normal as `normalize (round (255 c) - 128)` (a
@@ -46,6 +48,12 @@ Declared through the renderer's checked `defineMaterial` (R2D-11):
   the darkening and haze in linear light and returns premultiplied linear colour.
   `terrainMaterialEquivalent` is the same function with every commutative
   operation written the other way round and its own SPIR-V.
+- **Negative controls, never terrain materials**: `terrainMaterialInsetControl` (half-texel-inset
+  interpolation), `terrainMaterialUnbiasedControl` (the texel rule with no bias: it reads the
+  lower texel at exact boundaries, 92 to 106 pixels of about 4,400 in the exact-boundary fixtures
+  on the recorded device) and `terrainMaterialStaleBiasControl` (the first amendment's 1/10000: it
+  still reads the lower texel at 12 and 15 pixels of the snapped 9/8 and 5/4 fixtures). The device
+  evidence shows its judge rejecting each.
 
 Nothing is added to the renderer: no descriptor binding, no vertex or instance
 format (the 64-byte instance and its parameter word are the engine's), no depth

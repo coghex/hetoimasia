@@ -577,10 +577,15 @@ parent, and carries the parent texture's version and an opaque layout identity.
 `regionViewIdentity` folds the version, layout, parent extent and rectangle into
 one value, so a rectangle change on the same parent changes it.
 
-Sampling applies the asset-level rule to the region's own extent,
-`i = min (w - 1) (floor (clamp u 0 1 * w))` (`regionLocalIndex`), and only then adds
-the origin (`regionViewCoverageAt`): an interior boundary selects the higher texel,
-the region's outer edge its last, and a local index outside the region has no
+Sampling applies the texel rule to the region's own extent,
+`i = min (w - 1) (floor (clamp u 0 1 * w + texelBias))` with `texelBias = 1/128`
+(`texelIndex`, `texelIndexExact`, `regionLocalIndex`; the owner's 2026-11-09 Q-13
+amendment v2, defined once there, and the one rule the terrain shader, picker and
+expected model share), and only then adds the origin (`regionViewCoverageAt`): an
+interior boundary selects the higher texel (as does a coordinate within the bias below
+it; float32 interpolation on the device lands a hair below a boundary, and 1/10000 was
+measured too small at pixel-snapped zooms 9/8 and 5/4), the region's outer edge its
+last, and a local index outside the region has no
 texel, so a lookup never reaches a neighbouring region. The module knows no
 terrain, game, device, Lua engine or account, owns no state, and claims nothing
 outside a rasterized quad. `Test.Asset.Image.Region` states every expectation by

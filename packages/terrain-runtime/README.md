@@ -71,6 +71,22 @@ is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).
 
+### Two read-only queries for a host's precheck
+
+Both are transactions, write nothing and change no behaviour of the service. They were added for TRA-5 (#641) at the manager's
+authorization under the owner's 2026-11-09 decision.
+
+* `stagedRemovalChanges service request` answers whether the removal the request has **staged** would change content: `Just True` for a
+  removal that will advance the arena's revision by one, `Just False` for a removal of air, which commits as unchanged at the revision
+  it finds, and `Nothing` for any request that has staged no removal (a read, an open or an attach, one not yet staged, one settled, or
+  another service's). A host's eligibility callback uses it to decide, before the commit, whether a removal needs a revision the host
+  cannot publish, so that a no-op removal at that revision succeeds without a defect.
+* `serviceAdmitting service` answers whether the service is running and its parent session open. A host asks it where a permanent
+  refusal is decided, before it reserves anything of its own. It is a precheck only: every admission asks the same question again,
+  atomically with its own effect (`RefusedClosed`), so a service that closes between the host's check and the hand-off still refuses it
+  and leaves nothing behind. `Closure` examples cover running, the session's end, closing and closed, and the closure between check and
+  admission.
+
 ## State, owner, thread and lifetime
 
 All mutable state is one record behind one `TVar`. Admission, cancellation, release
