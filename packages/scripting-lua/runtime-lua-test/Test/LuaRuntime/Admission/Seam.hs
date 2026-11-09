@@ -3,12 +3,12 @@
 -- provider that cannot reserve its own banks inside the engine's admission declines the request and the admission is taken back whole.
 module Test.LuaRuntime.Admission.Seam (spec) where
 
-import Control.Concurrent.STM (atomically, retry)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
 import Control.Exception (throwIO)
 import qualified Data.Text as Text
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, unless, void)
 import Hetoimasia.Scripting.Lua.Admission
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease (Ownership (..))
@@ -164,6 +164,40 @@ spec = describe "the settlement seam and the declining hand-off" $ do
           rdWorkPending d `shouldBe` 1
           finishWork (afFake fixture) 0
           awaitDiagnostic owner ((== 0) . rdWorkPending)
+
+  -- A resource reply made before its request's tick is built at once and its success held for the tick: the provider's last look at the
+  -- settlement is taken again where the tick settles it, since the resource may have become invalid in between.
+  forM_ [(True, "still holds"), (False, "no longer holds")] $ \(holds, how) →
+    it ("takes the provider's last look at an early resource reply again at the tick, and publishes the success only if the resource " <> how) $ bounded $ do
+      fixture ← newAFix 4
+      setPolicy fixture (\held → held {polLease = Just InstanceOwned, polNecessity = OptionalRequest})
+      valid ← newTVarIO True
+      withBoundary $ \control runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "early resource" [admitter] aConfig (admissionGrant fixture 8 (SettleAtAssignedTick Nothing)) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        seam ← newIORef Nothing
+        onSubmit (afFake fixture) (captured seam)
+        acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+        awaitNote fixture "cmd start a started"
+        Just settling ← readIORef seam
+        let final = readTVar valid >>= \ok → pure (if ok then Nothing else Just (ExpectedFailure "not_found" "gone" Nothing Nothing))
+        atomically (settlingSettleFinal settling final (ProviderResource (VInteger 4) (Adoption (\_ → resourceFor fixture "r1")))) >>= (`shouldBe` ReplyAdoption)
+        -- built before the tick, and the success is held for it
+        awaitNote fixture "acquire r1"
+        -- built and held (the last look at the build is taken and the success is held for the tick)
+        awaitDiagnostic owner ((>= 1) . rdHeldNow)
+        -- the resource becomes invalid before the tick is granted
+        unless holds (atomically (writeTVar valid False))
+        grantOne control owner
+        acommand fixture owner "i" "take" "a"
+        line ← lineStarting fixture "cmd take a "
+        if holds
+          then line `shouldSatisfy` Text.isInfixOf "status=success"
+          else do
+            line `shouldSatisfy` Text.isInfixOf "status=failure"
+            line `shouldSatisfy` Text.isInfixOf "not_found"
+            -- and the resource that was built is released
+            awaitNote fixture "release r1"
 
   it "treats every reply that comes while a resource reply waits to be built as a duplicate, whatever it is" $ bounded $ do
     fixture ← newAFix 4

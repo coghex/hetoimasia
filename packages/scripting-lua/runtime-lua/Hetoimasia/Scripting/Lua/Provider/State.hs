@@ -576,6 +576,7 @@ admit service requester endpoint placement = do
                         , recDue = slot
                         , recHeld = Nothing
                         , recHeldKeeps = False
+                        , recFinal = Nothing
                         , recGated = dueTick <$> slot
                         , recEnded = Nothing
                         , recAdmission = Nothing
@@ -859,6 +860,7 @@ admitOptIn service requester endpoint ask = (OptInAccepted <$> attempt) `catchST
               , recDue = slot
               , recHeld = Nothing
               , recHeldKeeps = False
+              , recFinal = Nothing
               , recGated = dueTick <$> slot
               , recEnded = Nothing
               , recAdmission = Just ask
@@ -1064,7 +1066,7 @@ finishAdoption service identity adopting = do
           pure Nothing
         Nothing → do
           writeTVar (psVar service) st'
-            { pRecs = Map.adjust (\record → record {recAdopted = True}) identity (pRecs st')
+            { pRecs = Map.adjust (\record → record {recAdopted = True, recFinal = if adoptingNow adopting then Nothing else adoptingFinal adopting}) identity (pRecs st')
             , pHeld = Map.adjust (\held → held {heldLease = Nothing, heldCredits = filter (not . creditTransfers) (heldCredits held)}) identity (pHeld st')
             , pAdopting = Map.delete identity (pAdopting st')
             , pCounts = (pCounts st') {countAdopted = countAdopted (pCounts st') + 1}
@@ -1793,20 +1795,53 @@ serveDue service identities = do
       Just record
         | Just held ← recHeld record
         , maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests (pSession st))) → do
-            let (session, _) = applyReplyIn identity held (pSession st)
-            writeTVar (psVar service) $
-              -- A completion made while the provider's work remained does not become proof that it is over by being served: the work is still
-              -- polled for its retirement (it was marked at the hold), and the request's places return when the provider says so.
-              (if recHeldKeeps record then id else endWork identity)
-                st
-                { pSession = session
-                , pRecs = Map.insert identity record {recHeld = Nothing, recHeldKeeps = False} (pRecs st)
-                , pCounts = (pCounts st) {countSettledAtTick = countSettledAtTick (pCounts st) + 1}
-                }
-            -- The completion became a settlement now: a required request's expected failure is
-            -- eligible, and fails its instance at the owner's next safe boundary.
-            latchRequired service record
-            pure [recNumber record]
+            -- The provider's last look at a resource reply that was held for this tick is taken now, in the transaction that settles it: the
+            -- resource may have become invalid since the reply, and a success that no longer holds is not published.
+            verdict ← fromMaybe (pure Nothing) (recFinal record)
+            st1 ← readTVar (psVar service)
+            let failing = do
+                  failure ← verdict
+                  ask ← recAdmission record
+                  pure (failure, checkReplyPure (psLimits service) (recSchema record) ask (ProviderExpected failure))
+                cleared = record {recHeld = Nothing, recHeldKeeps = False, recFinal = Nothing}
+            case failing of
+              -- A verdict the service did not declare is the provider's defect, as at the build: recorded for the owner to raise, never a
+              -- settlement; the resource built for the request is released.
+              Just (_, defect@(CheckedDefect _)) → do
+                _ ← replyTo service identity defect
+                st2 ← readTVar (psVar service)
+                writeTVar (psVar service) st2
+                  { pRecs = Map.insert identity cleared {recAdopted = False} (pRecs st2)
+                  , pDiscards = pDiscards st2 <> adoptedOf record
+                  }
+                pure []
+              Just (failure, checked) → do
+                let (session, _) = applyReplyIn identity (modelReply checked) (pSession st1)
+                writeTVar (psVar service) $
+                  endWork identity
+                    st1
+                      { pSession = session
+                      , pRecs = Map.insert identity cleared {recAdopted = False, recFailure = Just failure} (pRecs st1)
+                      , pDiscards = pDiscards st1 <> adoptedOf record
+                      , pCounts = (pCounts st1) {countSettledAtTick = countSettledAtTick (pCounts st1) + 1}
+                      }
+                latchRequired service record {recFailure = Just failure}
+                pure [recNumber record]
+              Nothing → do
+                let (session, _) = applyReplyIn identity held (pSession st1)
+                writeTVar (psVar service) $
+                  -- A completion made while the provider's work remained does not become proof that it is over by being served: the work is
+                  -- still polled for its retirement (it was marked at the hold), and the request's places return when the provider says so.
+                  (if recHeldKeeps record then id else endWork identity)
+                    st1
+                      { pSession = session
+                      , pRecs = Map.insert identity cleared (pRecs st1)
+                      , pCounts = (pCounts st1) {countSettledAtTick = countSettledAtTick (pCounts st1) + 1}
+                      }
+                -- The completion became a settlement now: a required request's expected failure is
+                -- eligible, and fails its instance at the owner's next safe boundary.
+                latchRequired service record
+                pure [recNumber record]
         -- A request the opt-in settlement seam settled at its position reaches its waiters now, in the order
         -- of the places, as a held completion does.
         | maybe False requestSettled (Map.lookup identity (sessionRequests (pSession st))) → pure [recNumber record]

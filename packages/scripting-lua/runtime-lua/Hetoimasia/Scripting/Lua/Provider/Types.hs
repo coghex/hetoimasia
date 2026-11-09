@@ -1050,6 +1050,10 @@ data Rec = Rec
   , recAdopted ∷ !Bool
     -- ^ The resource was built into that lease: a success carries the lease, and taking it does
     -- not release it.
+  , recFinal ∷ !(Maybe (STM (Maybe ExpectedFailure)))
+    -- ^ The provider's last look at the settlement of a resource reply that was held for its tick: the settlement is made when the tick serves
+    -- it, so the look is taken again there, in the transaction that settles, and a verdict of failure settles that failure instead and releases
+    -- the resource that was built.
   }
 
 -- | The accounting of a provider's work on one request.
