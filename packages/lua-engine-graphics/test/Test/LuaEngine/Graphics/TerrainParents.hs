@@ -17,6 +17,22 @@
 module Test.LuaEngine.Graphics.TerrainParents (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
+import Control.Exception (finally)
+import Data.Word (Word64)
+import Hetoimasia.LuaEngine.Profile
+  ( ByteLimit (..)
+  , Bytes (..)
+  , Count (..)
+  , CountLimit (..)
+  , Profile
+  , ProfileSpec (..)
+  , fixedM1Profile
+  , profileSpec
+  , validateProfile
+  )
+import Hetoimasia.LuaEngine.Texture (OwnerReading (..), ownerReading)
+import Test.LuaEngine.Graphics.Composition
+import Test.LuaEngine.Graphics.Png (solid)
 import qualified Data.Text as Text
 import Hetoimasia.Asset.Image (DecodedImage (..))
 import Hetoimasia.LuaEngine.Graphics.Texture (textureHandleOf)
@@ -102,6 +118,95 @@ spec = describe "a terrain's two atlas parents through the texture pipeline" $ d
       adaptAgain terrain prior `shouldBe` Right (madeAdapted prior)
       readings ← mapM textureRelease [priorColour, priorNormal]
       mapM_ (\reading → atomically (reading >>= \case ProviderComplete → pure (); _ → retry)) readings
+
+  it "refuses a REQUIRED parent on texture bytes through the real banks, rolls the acquisition back, and leaves a prior terrain's adaptation, handles and images unchanged" $
+    composedWith terrainBanks terrainFiles terrainConfig $ \fake _ comp vm → do
+      terrain ← terrainOver
+      admit comp vm "i"
+      owner ← ownerOf vm "i"
+      let identityOf key = do
+            command comp vm "i" "use" key
+            line ← awaitNoteContaining comp ("i use " <> key <> " ")
+            pure (read (Text.unpack (last (Text.words line))) ∷ Word64)
+          loadTaken key path = do
+            commandLoad comp vm "i" key path False
+            command comp vm "i" "wait_take" key
+            taken ← awaitNoteContaining comp ("i wait_take " <> key <> " ")
+            taken `shouldSatisfy` Text.isInfixOf "status=success"
+      -- A prior terrain: both parents delivered through the real pipeline, banks charged at their decoded sizes, adapted.
+      loadTaken "priorColour" "colour.png"
+      loadTaken "priorNormal" "normal.png"
+      priorHandles ← (,) <$> (textureHandleOf <$> identityOf "priorColour") <*> (textureHandleOf <$> identityOf "priorNormal")
+      prior ← adaptOver terrain priorHandles
+      held ← atomically (ownerReading owner)
+      (ownerTexturesHeld held, ownerNominalHeld held) `shouldBe` (2, colourBytes + normalBytes)
+      awaitFake fake ((== 2) . readingImagesAlive)
+      -- A new terrain: its colour parent's reservation fits beside the prior pair and is held while its read waits.
+      holdReadsOf comp "colour.png"
+      commandLoad comp vm "i" "newColour" "colour.png" False
+      _ ← awaitNoteContaining comp "i start newColour started"
+      readsEntered comp "colour.png" 2
+      -- Its REQUIRED normal parent does not fit: refused on texture BYTES by the real bank, with nothing charged for it.
+      commandLoad comp vm "i" "newNormal" "normal.png" False
+      refused ← awaitNoteContaining comp "i start newNormal "
+      refused `shouldSatisfy` Text.isInfixOf "texture bytes"
+      -- The acquisition fails as a whole and the caller rolls the colour parent's pending request back.
+      command comp vm "i" "cancel" "newColour"
+      _ ← awaitNoteContaining comp "i cancel newColour cancelled"
+      command comp vm "i" "take" "newColour"
+      _ ← awaitNoteContaining comp "i take newColour {status=cancelled}"
+      releaseReadsOf comp "colour.png"
+      atomically (ownerReading owner >>= \r → if (ownerTexturesHeld r, ownerNominalHeld r) == (2, colourBytes + normalBytes) then pure () else retry)
+      -- No image was made for the rolled-back parents, and the prior terrain is untouched: same handles, same adaptation.
+      awaitFake fake ((== 2) . readingImagesAlive)
+      adaptAgain terrain prior `shouldBe` Right (madeAdapted prior)
+      -- It releases and retires as before: the banks return only on the backend's proof.
+      mapM_ (\key → command comp vm "i" "release" key) ["priorColour", "priorNormal"]
+      atomically (ownerReading owner >>= \r → if ownerTexturesHeld r == 0 then pure () else retry)
+  where
+    colourBytes, normalBytes ∷ Word64
+    colourBytes = 288 * 64 * 4
+    normalBytes = 768 * 384 * 4
+
+-- | The composition of 'Test.LuaEngine.Graphics.Composed' under a given profile, files and fake owner.
+composedWith ∷ Profile → Files → FakeConfig → (Fake → Rig → Composition → Vm → IO a) → IO a
+composedWith profile files cfg body = do
+  fake ← newFake cfg
+  value ←
+    bounded . withFakeOwner fake $
+      withBackendOnRaw fake $ \rig →
+        withComposition profile files (rigPort rig) $ \comp _ runtime → do
+          vm ← startVm comp runtime "terrain-vm"
+          body fake rig comp vm `finally` (releaseAllReads comp >> openEveryHold fake)
+  problems ← atomically (leaked fake)
+  problems `shouldBe` []
+  pure value
+
+-- | The two parents' files: flat images compress to almost nothing, so they fit the encoded-byte limit at atlas size.
+terrainFiles ∷ Files
+terrainFiles = [("colour.png", solid 288 64 (40, 30, 20, 255)), ("normal.png", solid 768 384 (40, 30, 20, 255))]
+
+-- | The fixed profile with the PNG limits the atlas sizes need and an instance bank that holds a terrain's two decoded
+-- parents (1,253,376 bytes) and one more pending reservation (1,179,648), but not two.
+terrainBanks ∷ Profile
+terrainBanks = case validateProfile changed of
+  Right profile → profile
+  Left refused → error ("the terrain profile is refused: " <> show refused)
+  where
+    base = profileSpec fixedM1Profile
+    counts = [(PngPixels, 294912), (PngAxisMaximum, 768)]
+    bytesChanged =
+      [ (PngEncodedBytes, 1048576)
+      , (PngInflatedScanlineBytes, 2097152)
+      , (PngPipelineWorkspaceBytes, 8388608)
+      , (TextureBytesPerUiInstance, 2500000)
+      , (TextureBytesPerSession, 5000000)
+      ]
+    changed =
+      base
+        { specCounts = \limit → maybe (specCounts base limit) Count (lookup limit counts)
+        , specBytes = \limit → maybe (specBytes base limit) Bytes (lookup limit bytesChanged)
+        }
 
 -- | The committed style and the inputs of the adaptation, loaded once for an example.
 data Terrain = Terrain
