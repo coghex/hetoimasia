@@ -33,7 +33,7 @@ import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
@@ -95,10 +95,46 @@ parsed h p = do
   either (\e → expectationFailure (show e) >> fail "parse") pure (parsePage (arenaOf h) (sourceOf h) bs)
 
 -- | Overwrite a page with a re-encoded body: a forged page whose checksum is valid.
+--
+-- A forgery of the ownership records is a *consistent* one: the checksums above the page (its
+-- parent's entry, and so on up, and the root record when it is a root) are made to agree with it,
+-- as a forger who wants the page read would make them (a forgery that leaves them is refused where the
+-- page is loaded, which "Test.TerrainRuntime.Store.Fuzz" and "Test.TerrainRuntime.Store.FuzzTrees"
+-- show); 'forgeLoose' leaves the chain as it is.
 forge ∷ H → PageNo → Page → IO H
 forge h p pg = do
+  h1 ← forgeLoose h p pg
+  pure (resignChain h1 p)
+
+forgeLoose ∷ H → PageNo → Page → IO H
+forgeLoose h p pg = do
   bs ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h) pg)
   pure h {hDisk = diskWrite p bs (hDisk h)}
+
+-- | Make the checksums above a page agree with the page as it is on the disk now.
+resignChain ∷ H → PageNo → H
+resignChain h0 p0 = foldl (\h t → resign h t p0) h0 [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire]
+  where
+    total = cfgUsablePages (hCfg h0)
+    ident = hIdent h0
+    crcOf h p = (\bs → getLe32' bs 4092) <$> diskRead (hDisk h) p
+    decodeAt h p = either (const Nothing) Just . decodePage ident total p =<< diskRead (hDisk h) p
+    resign h t p
+      | rootOf (storeRoots (hStore h)) t == Just p =
+          maybe h (\c → h {hStore = modifyRoots (\r → r {rRootCrcs = [(t', c') | (t', c') ← rRootCrcs r, t' /= t] ++ [(t, c)]}) (hStore h)}) (crcOf h p)
+      | otherwise = case [(q, es) | Just root ← [rootOf (storeRoots (hStore h)) t], q ← descend h root, Just (Page _ _ _ (Inner es)) ← [decodeAt h q], any ((== p) . childPage . snd) es] of
+          ((q, es) : _) → case (crcOf h p, decodeAt h q) of
+            (Just c, Just (Page tt lv _ _)) →
+              let es' = [(k, if childPage ch == p then Child p c else ch) | (k, ch) ← es]
+               in case encodePage ident (Page tt lv q (Inner es')) of
+                    Right bs → resign h {hDisk = diskWrite q bs (hDisk h)} t q
+                    Left _ → h
+            _ → h
+          [] → h
+    -- every page of a tree reachable by its internal entries, from a root
+    descend h q = q : case decodeAt h q of
+      Just (Page _ _ _ (Inner es)) → concatMap (descend h . childPage . snd) es
+      _ → []
 
 -- | The same store over other root fields, the live-page counter recomputed so that the
 -- counters still agree with each other: a test that forges a page-ownership record is not a
@@ -573,7 +609,13 @@ spec = describe "page ownership against forged records with valid checksums" $ d
         RefInner cs@(_ : _) → pure (map (\(k, _, _) → k) cs)
         other → expectationFailure ("an inner pinned root expected: " <> take 100 (show other)) >> fail "pinned root"
       let added = PageNo hwPinned
-      forgedP ← forge h1 pinnedRoot (Page TreeRuns (rpLevel pinnedPage) pinnedRoot (Inner [(k, Child added 0) | k ← pseps]))
+      forgedP0 ← forge h1 pinnedRoot (Page TreeRuns (rpLevel pinnedPage) pinnedRoot (Inner [(k, Child added 0) | k ← pseps]))
+      -- the reader's pin records the checksum of the root it pinned: a forger who wants the page read updates it too
+      let PageNo pr = pinnedRoot
+          forgedP = case diskRead (hDisk forgedP0) pinnedRoot of
+            Just bs → forgedP0 {hStore = modifyPins (\pn → if pinRuns pn == Just pinnedRoot then pn {pinCrcs = [(t', c') | (t', c') ← pinCrcs pn, t' /= TreeRuns] ++ [(TreeRuns, getLe32' bs 4092)]} else pn) (hStore forgedP0)}
+            Nothing → forgedP0
+      pr `shouldSatisfy` (>= 0)
       case readAll forgedP tok of
         Left msg → msg `shouldContain` "BadReference"
         Right _ → expectationFailure "a pinned read followed a reference past its version's used space"

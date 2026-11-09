@@ -84,11 +84,13 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
     -- * Roots
   , Roots (..)
   , rootOf
+  , rootTrust
+  , pinTrust
   , emptyRoots
   , Pins (..)
   ) where
 
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import Hetoimasia.Terrain.Discovery (Authority (..), Header (..))
 import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
@@ -355,6 +357,10 @@ data Roots = Roots
   , rLivePages ∷ !Word64
   , rRetiredPages ∷ !Word64
   , rLoose ∷ [PageNo]
+  , rRootCrcs ∷ [(TreeId, Word32)]
+  -- ^ The checksum each tree's root page must carry, as published with the root: the anchor of the
+  -- checksum chain (an internal entry records its child's, the root record records the roots'). A tree
+  -- with no entry here is read unchecked (a root set made by hand).
   }
   deriving stock (Eq, Show)
 
@@ -365,6 +371,14 @@ rootOf r TreeLinks = rLinks r
 rootOf r TreeTodo = rTodo r
 rootOf r TreeFree = rFree r
 rootOf r TreeRetire = rRetire r
+
+-- | What a window must hold for a root set: the checksum each root page carries, by page number.
+rootTrust ∷ Roots → [(PageNo, Word32)]
+rootTrust r = [(p, c) | (t, c) ← rRootCrcs r, Just p ← [rootOf r t]]
+
+-- | The same for the record roots a reader pins.
+pinTrust ∷ Pins → [(PageNo, Word32)]
+pinTrust p = [(pg, c) | (t, c) ← pinCrcs p, Just pg ← [case t of TreeRuns → pinRuns p; TreeLinks → pinLinks p; TreeTodo → pinTodo p; _ → Nothing]]
 
 -- | The roots of a fresh arena incarnation: no page, no record, revisions zero.
 emptyRoots ∷ ArenaId → Roots
@@ -382,6 +396,7 @@ emptyRoots arena =
     , rLivePages = 0
     , rRetiredPages = 0
     , rLoose = []
+    , rRootCrcs = []
     }
 
 -- | The record trees' roots a reader pins, with the version they belong to.
@@ -390,6 +405,7 @@ data Pins = Pins
   , pinRuns ∷ !(Maybe PageNo)
   , pinLinks ∷ !(Maybe PageNo)
   , pinTodo ∷ !(Maybe PageNo)
+  , pinCrcs ∷ [(TreeId, Word32)]
   , pinHw ∷ !Word64
   -- ^ The used page space of the pinned version: no pinned tree reaches a page at or past it.
   }

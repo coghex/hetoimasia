@@ -108,7 +108,7 @@ import Data.List (nub)
 import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Word (Word16, Word64)
+import Data.Word (Word16, Word32, Word64)
 import Hetoimasia.Terrain.Cell (Column)
 import Hetoimasia.Terrain.Discovery
   ( Authority (..)
@@ -618,7 +618,7 @@ planDeltaWith bounds cfg ident roots = planDeltaPinned bounds cfg ident roots []
 -- from every one of these before it is numbered into the plan.
 planDeltaPinned ∷ Bounds → StoreConfig → StoreIdentity → Roots → [Pins] → Window → TxClass → Delta → Planned
 planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
-  let win = windowBelow (rHw roots) win0
+  let win = windowTrust (rootTrust roots) (windowBelow (rHw roots) win0)
   checkWindow bounds ident roots win
   checkCounters roots
   let base = dlBase cand
@@ -722,6 +722,7 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
               , rLivePages = fromInteger live'
               , rRetiredPages = fromInteger retired'
               , rLoose = loose'
+              , rRootCrcs = rootCrcsAfter roots encoded [(TreeRuns, rr'), (TreeLinks, rl'), (TreeTodo, rt'), (TreeFree, free'), (TreeRetire, retire')]
               }
           windowN = windowSize win
           steps = editSteps edit1 + editSteps bkEdit3
@@ -811,6 +812,15 @@ checkCounters roots = do
   if total /= toInteger (rHw roots) then refuse (Integrity CorruptCounters) else pure ()
   if (rFree roots == Nothing) /= (rFreePages roots == 0) then refuse (Integrity CorruptCounters) else pure ()
   if (rRetire roots == Nothing) /= (rRetiredPages roots == 0) then refuse (Integrity CorruptCounters) else pure ()
+
+-- | The checksums the roots a transaction publishes must carry: a root it wrote carries the checksum of
+-- the page it just encoded, a root it left alone keeps the one the root record already held.
+rootCrcsAfter ∷ Roots → [(PageNo, ByteString)] → [(TreeId, Maybe PageNo)] → [(TreeId, Word32)]
+rootCrcsAfter roots encoded news =
+  [ (t, c)
+  | (t, Just no) ← news
+  , Just c ← [maybe (lookup t (rRootCrcs roots)) (Just . pageCrcOf) (lookup no encoded)]
+  ]
 
 checkWindow ∷ Bounds → StoreIdentity → Roots → Window → P ()
 checkWindow bounds ident roots win = do
@@ -904,7 +914,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
   Right r → r
   where
     total = cfgTotalPages cfg
-    win = windowBelow (rHw roots) win0
+    win = windowTrust (rootTrust roots) (windowBelow (rHw roots) win0)
     reclaimM ∷ P Planned
     reclaimM = do
       checkWindow bounds ident roots win
@@ -1042,6 +1052,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
               , rLivePages = fromInteger live'
               , rRetiredPages = fromInteger retired'
               , rLoose = loose'
+              , rRootCrcs = rootCrcsAfter roots encoded [(TreeRuns, rRuns roots), (TreeLinks, rLinks roots), (TreeTodo, rTodo roots), (TreeFree, free'), (TreeRetire, retire')]
               }
           windowN = windowSize win
           ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes bkEdit4) written 0 (length replBk + c) m

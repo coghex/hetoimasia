@@ -49,6 +49,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , Probe (..)
   , emptyWindow
   , windowBelow
+  , windowTrust
+  , pageCrcOf
   , windowInsert
   , windowProbe
   , windowProbeOf
@@ -148,17 +150,25 @@ data Window = Window
   , wPages ∷ !(Map PageNo VPage)
   , wProbes ∷ !(Map PageNo Probe)
   , wBelow ∷ !Word64
+  , wRoots ∷ !(Map PageNo Word32)
+  -- ^ The checksum each root page must carry, by page number, as the root record publishes it.
   }
   deriving stock (Eq, Show)
 
 -- | An empty window for a store and a version.
 emptyWindow ∷ StoreIdentity → Word64 → Window
-emptyWindow ident v = Window ident v Map.empty Map.empty maxBound
+emptyWindow ident v = Window ident v Map.empty Map.empty maxBound Map.empty
 
 -- | The window of a version whose used page space is the first @n@ pages: a
 -- reference to a page at or past @n@ is refused, never read.
 windowBelow ∷ Word64 → Window → Window
 windowBelow n w = w {wBelow = n}
+
+-- | The window of a root set whose root pages carry given checksums: a root page is loaded only
+-- if it carries the checksum the root record published for it, as a child is loaded only if it
+-- carries the checksum its parent recorded. A root set made by hand has none and is read unchecked.
+windowTrust ∷ [(PageNo, Word32)] → Window → Window
+windowTrust cs w = w {wRoots = Map.fromList cs}
 
 -- | The version the window was filled for.
 windowVersion ∷ Window → Word64
@@ -398,7 +408,7 @@ load tree expectLevel ref = do
   putEdit e {eSteps = eSteps e + 1}
   node ← case ref of
     Fresh i → maybe (stop (Invariant tree)) pure (freshNode e i)
-    DiskRef p expected → case lookup p (eHot e) of
+    DiskRef p recorded → let expected = case recorded of Just c → Just c; Nothing → Map.lookup p (wRoots (eWin e)) in case lookup p (eHot e) of
       Just hot | nTree hot == tree, hotAgrees expected p e → pure hot
       _ | let PageNo n = p, n >= wBelow (eWin e) → stop (Bad (BadReference p) p)
       _ → case Map.lookup p (wPages (eWin e)) of

@@ -54,6 +54,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , newStore
   , storeFromRoots
   , modifyRoots
+  , modifyPins
   , storeConfig
   , storeIdentity
   , storeRoots
@@ -267,6 +268,11 @@ newStore cfg ident =
 storeFromRoots ∷ StoreConfig → StoreIdentity → Roots → Store
 storeFromRoots cfg ident roots = (newStore cfg ident) {sRoots = roots}
 
+-- | The same store with every reader's pinned roots changed: the same kind of seam, to forge what a
+-- reader pinned. It checks nothing.
+modifyPins ∷ (Pins → Pins) → Store → Store
+modifyPins f s = s {sReaders = Map.map f (sReaders s)}
+
 -- | The same store (its readers, transaction and pauses kept) over changed committed
 -- roots: another seam of the private library for the suite, to forge a root set a
 -- test then plans against. It checks nothing about the roots.
@@ -408,7 +414,12 @@ windowRefusal ident version win
 
 -- | A window as the committed version reads it: no page at or past its used space.
 below ∷ Store → Window → Window
-below s = windowBelow (rHw (sRoots s))
+below s = windowBelow (rHw (sRoots s)) . windowTrust (rootTrust (sRoots s))
+
+-- | A window as a reader's pinned version reads it: bounded by that version's used space and holding the
+-- checksums its root pages must carry.
+pinView ∷ Pins → Window → Window
+pinView p = windowBelow (pinHw p) . windowTrust (pinTrust p)
 
 -- | A window for the committed version of the store.
 storeWindow ∷ Store → Window
@@ -717,7 +728,7 @@ acquireReader s
   | Map.size (sReaders s) >= maxReaders = Left (TooManyReaders maxReaders)
   | otherwise =
       let r = sRoots s
-          pins = Pins (rVersion r) (rRuns r) (rLinks r) (rTodo r) (rHw r)
+          pins = Pins (rVersion r) (rRuns r) (rLinks r) (rTodo r) (rRootCrcs r) (rHw r)
           n = sNextReader s
        in Right (ReaderToken (sIdent s) n (rVersion r), s {sReaders = Map.insert n pins (sReaders s), sNextReader = n + 1})
 
@@ -784,16 +795,16 @@ withPins s tok win f = case pinsOf s tok of
 
 -- | The pinned record for a key.
 readerLookup ∷ Store → ReaderToken → Window → RecordKey → ReadOutcome (Maybe Record)
-readerLookup s tok win key = withPins s tok win (\p → lookupRecord (windowBelow (pinHw p) win) (rootsOfPins p) key)
+readerLookup s tok win key = withPins s tok win (\p → lookupRecord (pinView p win) (rootsOfPins p) key)
 
 -- | The pinned removed run of a column at or below a level.
 readerFloorRun ∷ Store → ReaderToken → Window → Column → Int64 → ReadOutcome (Maybe (Int64, Int64))
-readerFloorRun s tok win col z = withPins s tok win (\p → floorRun (windowBelow (pinHw p) win) (rootsOfPins p) col z)
+readerFloorRun s tok win col z = withPins s tok win (\p → floorRun (pinView p win) (rootsOfPins p) col z)
 
 -- | A bounded ordered read of one record tree from a start (a key, or strictly after
 -- one): at most 'maxRangeRecords' records, each costing one bounded successor lookup.
 readerRange ∷ Store → ReaderToken → Window → TreeId → RangeStart → Int → ReadOutcome [(RecordKey, Record)]
-readerRange s tok win tree start limit = withPins s tok win (\p → rangeRecords (windowBelow (pinHw p) win) (rootsOfPins p) tree start (min limit maxRangeRecords))
+readerRange s tok win tree start limit = withPins s tok win (\p → rangeRecords (pinView p win) (rootsOfPins p) tree start (min limit maxRangeRecords))
 
 -- | The most records one ranged read returns.
 maxRangeRecords ∷ Int
@@ -807,13 +818,13 @@ data PinRefusal = PinStale | PinWindow !WindowRefusal
 readerProviderFor ∷ Store → ReaderToken → Window → Either PinRefusal Provider
 readerProviderFor s tok win = do
   p ← either (const (Left PinStale)) Right (pinsOf s tok)
-  maybe (Right (providerFor (windowBelow (pinHw p) win) (rootsOfPins p))) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
+  maybe (Right (providerFor (pinView p win) (rootsOfPins p))) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
 
 -- | Why a pinned record is unavailable: the page to fetch, or an integrity failure.
 readerMissing ∷ Store → ReaderToken → Window → RecordKey → Either PinRefusal (Either IntegrityWhy (Maybe PageNo))
 readerMissing s tok win key = do
   p ← either (const (Left PinStale)) Right (pinsOf s tok)
-  maybe (Right (missingPage (windowBelow (pinHw p) win) (rootsOfPins p) key)) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
+  maybe (Right (missingPage (pinView p win) (rootsOfPins p) key)) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
 
 -- ---------------------------------------------------------------------------
 -- Growth

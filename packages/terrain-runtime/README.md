@@ -580,7 +580,7 @@ has its sign bit flipped) so that the byte order of a key is its logical order.
 | 4092 | 4 | CRC32C of bytes 0 to 4,091 (Castagnoli, reflected polynomial `0x82F63B78`, initial and final `0xFFFFFFFF`) |
 
 Leaf entries are `keyLen(1) valueLen(1) key value` (key 1 to 64 bytes, value at most
-64); internal entries are `keyLen(1) key childPage(8)`, the key being the least key
+64); internal entries are `keyLen(1) key childPage(8) childCrc(4)` (at most 77 bytes, so at most 52 children a page; a 24-byte key leaves room for 109), the key being the least key
 the child may hold; a list is the eight-byte version of the retirement entry that
 names it, then a strictly increasing run of eight-byte page numbers (at most 505). The records of each tree:
 
@@ -786,6 +786,15 @@ Only a page that no owner but the allocator claims is written, and a refusal wri
 * **The used space bounds every reference.** A tree root, a child reference or a retirement
   list at or past the high-water mark has never been numbered: every descent, plan or read
   (through a reader's own used space for a pinned read) refuses it with `BadReference`.
+* **A pointer names a version of its child.** Every internal entry records the checksum its child
+  page carries (the four bytes at the end of that page), and a node loaded through a parent is refused
+  (`ChildChecksum`) when its page carries another: a stale page that is valid in itself (a replaced copy
+  of the same node, in the same tree and at the same level, its keys inside the same bounds) can no
+  longer stand in for the page a pointer meant, and a re-sealed change to a child page fails the
+  record its parent holds. A new page's entries get the checksums of the children encoded before
+  it; a root is named by the root record and carries none. The residual, out of the model, is a
+  *consistent* re-seal of a parent and its child together (and of the root record): the trees then say a
+  different thing consistently, which no local check can tell from a different true history.
 * **An absence is concluded only from checked separators.** A lookup that finds nothing, a floor,
   a ceiling, the start of a ranged scan and the unreachability of a page are each concluded from the
   leaf (or node) a key leads to, which is only as true as the separators that led there. Before any
@@ -793,9 +802,14 @@ Only a page that no owner but the allocator claims is written, and a refusal wri
   separators (`validateLanding`), so a separator moved to another valid key, raised or lowered, the first
   or a later one, is checked against the leaves on both sides of it and surfaces as an integrity
   failure, never as an absent record; a key below the first separator descends into the first child.
-  The regression is a re-seal fuzz (`Fuzz`): fixed seeds change one byte of one live page of the runs
-  tree and recompute its checksum, and every lookup, floor, ceiling, ranged scan and page-reachability
-  answer must be the reference's or an integrity failure (a record of a changed leaf is excused as data).
+  The cost is bounded by the height: a conclusion reads the landing path (at most 8 pages) and, for each
+  side, the extreme leaf of the nearest sibling subtree (at most 7 pages each, shared with what is already
+  in the window), so at most `2 * (height - 1)` more pages than before, 2 in a two-level tree and 4 in a
+  three-level one; they count as read steps and against the window, and a plan that cannot afford them is
+  refused with the typed window result. The regression is a re-seal fuzz (`Fuzz`, `FuzzTrees`): fixed seeds
+  change one field of one live page of each of the five trees (a byte, or a child pointer retargeted to a
+  dead page) and recompute its checksum, and every lookup, floor, ceiling, ranged scan and
+  page-reachability answer must be the reference's or an integrity failure.
 * **No decoded buffer outlives its decode unaccounted.** A window keeps its own copy of the 4 KiB
   buffer it is given (a caller's buffer may be a slice of a much larger read) and a probe keeps a
   copy of its key, never a slice of the page; a hot or new node is either a parsed view of a
@@ -817,6 +831,7 @@ The sites, and what stops a forged record at each (tests are in
 | retirement entry list page, count, done | list inside the used space, a list page, the stamped version and the counted length | list past the used space, not a list, wrong counts |
 | retirement list pages | inside the used space, record pages only, indexed under the entry, unreachable from committed and pinned roots, not already free, loose or claimed | names a bookkeeping page or a page past the used space; names a page another entry retired; `Readers`: a double free; a page the committed trees reach |
 | the retired-page index | a commit refuses to index a page twice; reclamation refuses a page the index does not hold under its entry | a page retired twice; the backlog bound (and never for maintenance) |
+| a child pointer (which version of the child it means) | the child's checksum is recorded in the entry and compared when the node is loaded (`ChildChecksum`); a cached node is used only for the checksum its pointer records | `Fuzz` / `FuzzTrees`: a pointer retargeted to a stale valid page of the same tree and level answers as corrupt, never from the stale page; `Codec`: `a child's checksum` |
 | tree roots and every child reference | used-space bound in every descent; tree, level, bounds (earlier rounds) | a root past the used space; a child past it, for a plan, a committed read and a pinned read; `Codec`: bounds, cycles, levels |
 | a reader's pinned roots | pinned used space, proof against pinned trees | the pinned-read half of the child test; the pinned extent and lowered-version tests |
 | decoded buffers held past their decode | copies, accounted, bounded | `Bounds`: `keeps nothing of a page buffer behind a probe...` |
