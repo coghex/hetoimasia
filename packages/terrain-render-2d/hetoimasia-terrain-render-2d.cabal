@@ -46,15 +46,11 @@ library
         Hetoimasia.Terrain.Render2D.Cells
         Hetoimasia.Terrain.Render2D.Facts
         Hetoimasia.Terrain.Render2D.Knowledge
-        Hetoimasia.Terrain.Render2D.Pick
-        Hetoimasia.Terrain.Render2D.Plan
         Hetoimasia.Terrain.Render2D.Projection
     -- The exact planar polygon arithmetic and the overlap ordering the public
     -- modules share; a client cannot import them.
     other-modules:
         Hetoimasia.Terrain.Render2D.Internal.Cells
-        Hetoimasia.Terrain.Render2D.Internal.Order
-        Hetoimasia.Terrain.Render2D.Internal.Polygon
     build-depends:
         base >=4.22 && <4.23,
         containers >=0.8 && <0.9,
@@ -157,16 +153,19 @@ library terrain-material
     hs-source-dirs: material
     exposed-modules:
         Hetoimasia.Terrain.Render2D.Material
+        Hetoimasia.Terrain.Render2D.Presentation
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        hetoimasia-asset-image ==0.1.0.0,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-2d-oracle ==0.1.0.0,
         hetoimasia-render-api ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
-        hetoimasia-terrain-render-2d ==0.1.0.0
+        hetoimasia-terrain-render-2d ==0.1.0.0,
+        hetoimasia-terrain-render-2d:terrain-mapbake ==0.1.0.0
 
 -- Scenes and independent expectations (TRA-8): what the CPU suite and the
 -- native evidence scenario both build their fixtures from, through the public
@@ -177,7 +176,6 @@ library terrain-fixtures
     visibility: public
     hs-source-dirs: fixtures
     exposed-modules:
-        Hetoimasia.Terrain.Render2D.Agreement
         Hetoimasia.Terrain.Render2D.Evidence
         Hetoimasia.Terrain.Render2D.Scenes
     build-depends:
@@ -214,17 +212,10 @@ test-suite terrain-render-2d-tests
         Test.TerrainRender2D.CellsProgress
         Test.TerrainRender2D.CellsWork
         Test.TerrainRender2D.Fixtures
-        Test.TerrainRender2D.Generated
         Test.TerrainRender2D.MapAssets
         Test.TerrainRender2D.MapAssets.Reference
-        Test.TerrainRender2D.Material
         Test.TerrainRender2D.Oracle
-        Test.TerrainRender2D.Opacity
-        Test.TerrainRender2D.Ordering
-        Test.TerrainRender2D.Pick
-        Test.TerrainRender2D.Planning
         Test.TerrainRender2D.Projection
-        Test.TerrainRender2D.Scenes
         Test.TerrainRender2D.Spec
     build-depends:
         base >=4.22 && <4.23,

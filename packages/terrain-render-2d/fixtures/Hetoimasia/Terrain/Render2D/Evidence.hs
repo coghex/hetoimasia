@@ -1,41 +1,38 @@
--- | Scenes and independent expectations for the terrain material's evidence
--- (TRA-8): the cells of a fixture, the camera it is seen from, and what a
--- viewer must see at every pixel centre, worked out here without the planner,
--- its faces, its depth keys or its picking.
+-- | Scenes and independent expectations for the terrain material's evidence (TRA-17): the cells
+-- of a fixture, the camera it is seen from, the discovery knowledge of its cells, and what a
+-- viewer must see at every pixel centre, worked out here without the planner, its depth keys,
+-- its picker, the material's model or the render-2d oracle.
 --
--- The CPU suite and the native evidence scenario both build their scenes and
--- their hand-stated expectations from this component, through the public terrain
--- and planner interfaces, so neither imports the other's spec. It is a test
--- component's support library; no engine library depends on it.
+-- The CPU suite and the native evidence scenario both build their scenes and their hand-stated
+-- expectations from this component, through the public terrain and planner interfaces, so neither
+-- imports the other's spec. It is a test component's support library; no engine library depends
+-- on it.
 --
 -- == The independent model
 --
--- A cell is the closed convex solid under its top surface: the unit footprint,
--- from its base up to the lower envelope of one 45° ramp for each lowered side
--- (north @z <= y@, east @z <= 1 - x@, south @z <= 1 - y@, west @z <= x@, in the
--- cell's frame) and the flat top at 1. The identities are stated by hand: bit 1
--- is north, 2 east, 4 south, 8 west; only 0, with no bit, has the flat top as its
--- surface, and 15 takes all four ramps, a central peak. A view turns the
--- scene by whole quarter turns about the anchor tile, taking north to east to
--- south to west and an offset @(dx, dy)@ to @(-dy, dx)@; the cell keeps its
--- identity and the viewer sees its turned mask.
+-- The cell-quad contract draws, for each potentially visible cell, one whole 96 x 64 canvas (or, for
+-- a known solid beside an undiscovered void, two: the fog part then the known part) through two
+-- atlas regions: a colour region and a map region of the view-turned shape. A texel is drawn where
+-- the colour texel and the map texel are both opaque. Quads are painted far to near, nearer being
+-- the larger of the integer key @(viewX + viewY, z, viewX, viewY)@ of the cell in the view frame,
+-- and at one cell fog is behind the known solid. A pixel therefore shows the nearest quad whose
+-- two texels are both opaque, and its colour is lit by the map texel's normal and given the depth
+-- effects of the presentation settings.
 --
--- A pixel centre is a point of the render world (the camera's centre plus the
--- pixel's offset from the target's centre over the zoom). Its line of sight
--- through the relative frame is @(a + t, b + t, 3t)@ with
--- @a = (sx/48 + sy/24)/2@ and @b = (sy/24 - sx/48)/2@, and a larger @t@ is
--- nearer. The line meets a cell's solid in an interval of @t@ that this module
--- clips against each half-space exactly, in 'Rational'; the nearest cell by the
--- interval's end is the geometric frontmost, and the colour is the art texel at
--- the pixel's place in that cell's sheet, falling through to the next cell
--- behind where the texel is transparent. A pixel whose line only grazes a solid,
--- or ends on two cells' edges at once, is 'Ambiguous', never a guess.
+-- Everything is stated here by hand. The identities' lowered sides are bits (1 north, 2 east,
+-- 4 south, 8 west); a view turns the scene about the anchor tile by whole quarter turns, taking
+-- north to east to south to west and an offset @(dx, dy)@ to @(-dy, dx)@; a cell keeps its identity
+-- and the viewer sees the map of its turned shape. A canvas sits with its top-left corner at
+-- @(48 (vx - vy) - 48, 24 (vx + vy - 1) - 16 (z - ref) - 16)@ in the render world, where @(vx, vy)@
+-- is the cell's offset from the anchor in the view frame and @ref@ the camera's vertical
+-- reference; a pixel centre is a render-world point (through the view's own mapping, which has its
+-- own tests and oracle), and the canvas texel under it is the floor of its offset from that corner.
+-- The art is supplied by the caller from the independently decoded source images: this module
+-- reads no file and calls neither the atlas nor the planner.
 --
--- Hidden faces need no model: a face covered by a neighbour lies behind its
--- cell's own frontmost surface along every line of sight that reaches it. A
--- scene whose art has transparent texels must not have two solids in contact,
--- because the planner does not emit the covered face and the line of sight
--- would otherwise land on it; 'contacts' reports them.
+-- A pixel centre within a sixteenth of a texel of a texel boundary of a quad it depends on is
+-- 'Ambiguous', never a guess, unless the caller states that the scene's centres lie exactly on
+-- boundaries (then the rule decides: the higher texel on an interior boundary).
 --
 -- State, ownership and lifetime: none. Every value is immutable.
 module Hetoimasia.Terrain.Render2D.Evidence
@@ -43,34 +40,44 @@ module Hetoimasia.Terrain.Render2D.Evidence
     Cell (..)
   , Scene (..)
   , Mode (..)
+  , Know (..)
   , newScene
   , sceneSource
   , sceneFacts
+  , sceneKnowledge
   , sceneCamera
   , sceneCameraFollowed
   , sceneSetup
+  , sceneInputs
   , scenePlan
   , sceneMaterials
-  , contacts
 
     -- * Art
   , Rgba
-  , ArtPixels (..)
-  , diagnosticSheet
+  , ArtSource (..)
 
-    -- * Expectations
-  , Hit (..)
-  , Kind (..)
+    -- * The independent model
+  , HandLight (..)
+  , defaultHandLight
+  , Role (..)
+  , HandQuad (..)
   , Expected (..)
+  , handQuads
   , expectedAt
-  , expectedAtFast
   , expectedImage
   , handSides
   , handTurnSide
+  , handViewShape
+  , turnsOf
   , pixelWorldPoint
+  , srgbDecode
+  , srgbEncode
+  , handShade
+  , shadedByte
   ) where
 
-import Data.List (nub, sort, sortOn)
+import qualified Data.Map.Strict as Map
+import Data.List (nub, sortOn)
 import Data.Ord (Down (..))
 import Data.Word (Word8)
 import Hetoimasia.Math.Vector (V2 (..))
@@ -78,11 +85,14 @@ import Hetoimasia.Render.TwoD.Mapping (targetToWorld, viewportContains)
 import Hetoimasia.Render.TwoD.Metrics (PixelExtent (..), TargetMetrics (..))
 import Hetoimasia.Render.TwoD.Settings (ViewSettings (..), defaultViewSettings)
 import Hetoimasia.Render.TwoD.Snapshot (Viewport (..))
+import Hetoimasia.Terrain.Cell (Column (..))
 import Hetoimasia.Terrain.Changes (emptyChanges)
 import Hetoimasia.Terrain.Coordinate (axisFromInteger, axisValue)
+import Hetoimasia.Terrain.Render2D.Assets (AssetSnapshot)
 import Hetoimasia.Terrain.Render2D.Camera
+import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Facts
-import Hetoimasia.Terrain.Render2D.Plan
+import Hetoimasia.Terrain.Render2D.Knowledge
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..), rvMapping, rvSetup)
 import Hetoimasia.Terrain.Shape (ViewFacing (..))
 import Hetoimasia.Terrain.Source
@@ -130,6 +140,11 @@ data Scene = Scene
   -- ^ Origin and extent in framebuffer pixels.
   , sceneSnap ∷ !Bool
   -- ^ Whether the view snaps to the device pixel grid.
+  , sceneKnow ∷ ![((Integer, Integer, Integer), Know)]
+  -- ^ The unit cells whose knowledge is not the default discovered: a solid known beside an
+  -- undiscovered void, or a confirmed undiscovered cell (whose terrain, if any, is never read).
+  , sceneFogOnly ∷ ![(Integer, Integer, Integer)]
+  -- ^ Cells that hold no terrain at all and are confirmed undiscovered: hidden air.
   }
   deriving stock (Eq, Show)
 
@@ -151,6 +166,8 @@ newScene name cells (w, h) =
     , sceneScale = 1
     , sceneViewport = (0, 0, fromIntegral w, fromIntegral h)
     , sceneSnap = False
+    , sceneKnow = []
+    , sceneFogOnly = []
     }
 
 -- | The authored materials of a scene's cells, each once.
@@ -202,87 +219,94 @@ sceneSetup sc =
     (lw, lh) = sceneLogical sc
     (vx, vy, vw, vh) = sceneViewport sc
 
--- | The camera of a scene as planning leaves it: following scenes adopt their
--- anchor column's surface.
-scenePlan ∷ Scene → Either PlanError Plan
-scenePlan sc =
-  planTerrain
-    PlanRequest
-      { requestVersions = Versions 1 1 1
-      , requestMaterialVersion = 1
-      , requestCamera = camera
-      , requestSetup = sceneSetup sc
-      , requestConfig = defaultPlanConfig
-      }
-    (sceneFacts sc)
-  where
-    camera = sceneCameraFollowed sc
-
 -- | 'sceneCamera', then, for a following scene, the adoption of the surface.
 sceneCameraFollowed ∷ Scene → CameraState
 sceneCameraFollowed sc = case sceneMode sc of
   FollowSurface → either (\e → error ("scene follow: " <> show e)) stepCamera (refollow defaultCameraConfig (sceneFacts sc) (sceneCamera sc))
   ManualAt _ _ → sceneCamera sc
 
--- | Pairs of unit cells of a scene that share a face of positive area: one
--- coordinate differing by one and the other two equal. Edge and vertex contact
--- covers no face and is not reported.
-contacts ∷ Scene → [(Cell, Cell)]
-contacts sc =
-  [ (a, b)
-  | (i, (a, za)) ← indexed
-  , (j, (b, zb)) ← indexed
-  , i < j
-  , let differences = [abs (cellX a - cellX b), abs (cellY a - cellY b), abs (za - zb)]
-  , sort differences == [0, 0, 1]
-  ]
+-- | What the discovery knowledge says of a unit cell.
+data Know
+  = -- | Discovered whole: ordinary.
+    KnownAll
+  | -- | The solid is known, its empty component is not: mixed for a shaped solid.
+    KnownSolid
+  | -- | Confirmed undiscovered: generic fog, whatever the terrain holds.
+    Undisc
+  deriving stock (Eq, Ord, Show)
+
+-- | The discovery knowledge of a scene: every cell discovered except those it lists.
+sceneKnowledge ∷ Scene → Knowledge
+sceneKnowledge sc =
+  either (\e → error ("scene knowledge: " <> show e)) id $
+    mkKnowledge
+      KnowledgeSpec
+        { specRevision = 1
+        , specDefault = CellDiscovered
+        , specRegions = []
+        , specColumns =
+            [ (Column (axis x) (axis y), [(z, z + 1, state) | ((x', y', z), state) ← entries, (x', y') == (x, y)])
+            | (x, y) ← nub [(x, y) | ((x, y, _), _) ← entries]
+            ]
+        }
   where
-    indexed = zip [0 ∷ Int ..] [(c, z) | c ← sceneCells sc, z ← [cellZ0 c .. cellZ1 c - 1]]
+    axis n = either (\e → error ("scene axis: " <> show e)) id (axisFromInteger n)
+    entries = [(p, stateOf k) | (p, k) ← sceneKnow sc] <> [(p, CellUndiscovered) | p ← sceneFogOnly sc]
+    stateOf = \case
+      KnownAll → CellDiscovered
+      KnownSolid → CellSolidKnown
+      Undisc → CellUndiscovered
+
+-- | The inputs a planner reads for a scene and an adopted style.
+sceneInputs ∷ AssetSnapshot → Scene → CellInputs
+sceneInputs assets sc =
+  CellInputs
+    { inputsRequest =
+        CellRequest
+          { crVersions = Versions 1 1 1
+          , crCamera = sceneCameraFollowed sc
+          , crSetup = sceneSetup sc
+          , crConfig = defaultCellConfig
+          }
+    , inputsFacts = sceneFacts sc
+    , inputsKnowledge = sceneKnowledge sc
+    , inputsAssets = assets
+    }
+
+-- | The cell-quad plan of a scene against a style's assets.
+scenePlan ∷ AssetSnapshot → Scene → Either CellError CellPlan
+scenePlan assets = planCells . sceneInputs assets
 
 -- ---------------------------------------------------------------------------
 -- Art
 
 type Rgba = (Word8, Word8, Word8, Word8)
 
--- | A sheet's texels as bytes: its extent and the texel at a column and a row.
-data ArtPixels = ArtPixels
-  { artWidth ∷ !Int
-  , artHeight ∷ !Int
-  , artTexel ∷ Int → Int → Rgba
+-- | The independently decoded source images a caller supplies: a colour canvas by its authored
+-- material name (@blanktexture@ for fog) and a map by its identifier (@shape.07@, @mixed.07.known@),
+-- each as the texel at a column and a row of its 96 x 64 canvas.
+data ArtSource = ArtSource
+  { artColour ∷ String → Int → Int → Rgba
+  , artMap ∷ String → Int → Int → Rgba
   }
-
--- | A technical diagnostic sheet, not artwork: 96 × 64, every opaque texel
--- distinct from its neighbours by at least 6 steps of a channel (red steps 6 with
--- the column, green 7 with the row, blue 1 with their sum, wrapping), so a
--- mirrored, flipped, shifted or transposed sampling cannot agree with it and a
--- sampling shifted by one texel is farther than any tolerance; blocks of 6 × 6 texels on a lattice of 24 × 20 from (9, 5) are
--- transparent (binary alpha), the places a transparent part of a quad must
--- show what lies behind.
-diagnosticSheet ∷ ArtPixels
-diagnosticSheet = ArtPixels 96 64 texel
-  where
-    texel x y
-      | (x - 9) `mod` 24 < 6 && (y - 5) `mod` 20 < 6 && x >= 9 && y >= 5 = (0, 0, 0, 0)
-      | otherwise = (byte (6 * x + 20), byte (7 * y + 30), byte (x + y + 40), 255)
-    byte ∷ Int → Word8
-    byte = fromIntegral
 
 -- ---------------------------------------------------------------------------
 -- The independent model
 
--- | The lowered sides of a stored shape identity, by hand: bit 1 north, 2 east,
--- 4 south, 8 west. Identity 15 takes all four, so it is the central peak and not
--- a flat top; identity 0 takes none.
+-- | The lowered sides of a stored shape identity, by hand: bit 1 north, 2 east, 4 south, 8 west.
 handSides ∷ Int → [Char]
 handSides shape = [name | (bit, name) ← [(1, 'N'), (2, 'E'), (4, 'S'), (8, 'W')], shape `div` bit `mod` 2 == 1]
 
--- | A side after a number of positive quarter turns: north to east to south to
--- west to north.
+-- | A side after a number of positive quarter turns: north to east to south to west to north.
 handTurnSide ∷ Int → Char → Char
 handTurnSide count side = order !! ((index + count) `mod` 4)
   where
     order = "NESW"
     index = length (takeWhile (/= side) order)
+
+-- | The shape identity a view shows: the lowered sides turned, by hand.
+handViewShape ∷ Int → Int → Int
+handViewShape count shape = sum [bit | side ← map (handTurnSide count) (handSides shape), (bit, name) ← [(1, 'N'), (2, 'E'), (4, 'S'), (8, 'W')], name == side]
 
 -- | The positive quarter turns a facing applies: south 0, west 3, north 2, east 1.
 turnsOf ∷ ViewFacing → Int
@@ -292,185 +316,203 @@ turnsOf = \case
   FaceNorth → 2
   FaceEast → 1
 
--- | One quarter turn of an offset between tile centres, repeated.
 turnPair ∷ Int → (Integer, Integer) → (Integer, Integer)
 turnPair count (dx, dy) = iterate (\(a, b) → (negate b, a)) (dx, dy) !! (count `mod` 4)
 
--- | Which face of the view-frame solid a line of sight leaves by.
-data Kind = Top | EastWall | SouthWall
-  deriving stock (Eq, Ord, Show)
-
--- | The cell a line of sight meets and where.
-data Hit = Hit
-  { hitCell ∷ !(Integer, Integer, Integer)
-  -- ^ The world tile.
-  , hitKind ∷ !Kind
-  , hitSurface ∷ !Char
-  -- ^ The plane the line leaves by, by hand: @F@ the flat top, @N@, @E@, @S@ or
-  -- @W@ a ramp (the view-frame side it is lowered on), @e@ the East wall, @s@ the South wall.
-  , hitExit ∷ !Rational
-  -- ^ The line parameter at which it leaves the solid: larger is nearer.
+-- | The presentation settings as the expectation takes them: plain numbers, stated here, so no
+-- value is read from the production settings type.
+data HandLight = HandLight
+  { lightAzimuth ∷ !Double
+  , lightElevation ∷ !Double
+  , lightAmbient ∷ !Double
+  , lightStrength ∷ !Double
+  , lightRange ∷ !Double
+  , lightDarkening ∷ !Double
+  , lightHaze ∷ !Double
+  , lightHazeSrgb ∷ !(Double, Double, Double)
   }
   deriving stock (Eq, Show)
 
--- | What a pixel centre shows.
-data Expected
-  = -- | Nothing: the clear colour.
-    ExpectedClear
-  | -- | The frontmost solid by geometry, and the texel the viewer sees: the
-    -- frontmost whose texel is not transparent.
-    ExpectedHit
-      { expectedFront ∷ !Hit
-      -- ^ What a pick finds: the geometric frontmost.
-      , expectedAll ∷ ![Hit]
-      -- ^ Every solid on the line of sight, nearest first.
-      , expectedShown ∷ !(Maybe (Hit, Rgba))
-      -- ^ What is drawn; 'Nothing' when every solid on the line has a transparent texel there.
-      }
-  | -- | The line grazes a solid or ends on two faces at once.
-    Ambiguous !String
+-- | The approved defaults, stated again.
+defaultHandLight ∷ HandLight
+defaultHandLight = HandLight 225 45 0.35 1 250 0.15 0.60 (0.72, 0.85, 0.95)
+
+-- | The sRGB transfer function's decoding of a byte.
+srgbDecode ∷ Word8 → Double
+srgbDecode byte = decode (fromIntegral byte / 255)
+  where
+    decode c
+      | c <= 0.04045 = c / 12.92
+      | otherwise = ((c + 0.055) / 1.055) ** 2.4
+
+-- | The encoding of a linear component to an 8-bit sRGB byte, clamped.
+srgbEncode ∷ Double → Word8
+srgbEncode l = round (max 0 (min 255 (255 * encode (max 0 (min 1 l)))))
+  where
+    encode v
+      | v <= 0.0031308 = 12.92 * v
+      | otherwise = 1.055 * v ** (1 / 2.4) - 0.055
+
+-- | What a quad shows.
+data Role = Ordinary | MixedKnown | MixedFog | FullFog
+  deriving stock (Eq, Ord, Show)
+
+-- | One quad the model expects the plan to draw, stated by hand.
+data HandQuad = HandQuad
+  { hqCell ∷ !(Integer, Integer, Integer)
+  , hqRole ∷ !Role
+  , hqColour ∷ !String
+  -- ^ The colour canvas: an authored material, or @blanktexture@.
+  , hqMap ∷ !String
+  -- ^ The map identifier.
+  , hqCorner ∷ !(Integer, Integer)
+  -- ^ The canvas's top-left corner in the render world.
+  , hqKey ∷ !(Integer, Integer, Integer, Integer, Int)
+  -- ^ The painter's key: nearer is larger.
+  , hqDepth ∷ !Integer
+  -- ^ The cell's depth below the cut.
+  }
   deriving stock (Eq, Show)
 
--- | The render-world point of a pixel's centre, through the view's own mapping
--- (render-2d's, which has its own tests and oracle), or 'Nothing' outside the
--- viewport.
-pixelWorldPoint ∷ Plan → (Int, Int) → Maybe (Rational, Rational)
-pixelWorldPoint plan (px, py)
-  | not (viewportContains (setupViewport (rvSetup view)) target) = Nothing
-  | otherwise = case targetToWorld (rvMapping view) target of
-      Just (V2 x y) → Just (toRational x, toRational y)
-      Nothing → Nothing
-  where
-    view = planView plan
-    target = V2 (fromIntegral px + 0.5) (fromIntegral py + 0.5)
+two ∷ Int → String
+two n = (if n < 10 then "0" else "") <> show n
 
--- | What the pixel at this column and row shows, given a scene, its camera, the
--- plan the camera and setup produce (only its view centre is read from it) and
--- each material's art.
-expectedAt ∷ (String → Maybe ArtPixels) → Scene → CameraState → Plan → (Int, Int) → Expected
-expectedAt art sc camera plan pixel = case pixelWorldPoint plan pixel of
-  Nothing → ExpectedClear
-  Just (sx, sy) → expectedAtPoint art sc camera (sx, sy)
-
--- | 'expectedAt' in 'Double' arithmetic, for every pixel of an image: the same
--- model, each decision made at the same margin (a fraction of a hundredth of a
--- pixel, far above the arithmetic's error), so a pixel the exact model decides
--- and this one does not is rare and never a disagreement. The CPU suite holds the
--- two to each other.
-expectedAtFast ∷ (String → Maybe ArtPixels) → Scene → CameraState → Plan → (Int, Int) → Expected
-expectedAtFast art sc camera plan pixel = case pixelWorldPoint plan pixel of
-  Nothing → ExpectedClear
-  Just (sx, sy) → expectedAtPoint art sc camera (fromRational sx ∷ Double, fromRational sy ∷ Double)
-
-expectedAtPoint ∷ (RealFrac a) ⇒ (String → Maybe ArtPixels) → Scene → CameraState → (a, a) → Expected
-expectedAtPoint art sc camera (sx, sy) =
-  case (ambiguity, geometric) of
-    (Just why, _) → Ambiguous why
-    (_, []) → ExpectedClear
-    (_, front : _) → case firstOpaque geometric of
-      Left why → Ambiguous why
-      Right shown →
-        ExpectedHit
-          { expectedFront = fst front
-          , expectedAll = map fst geometric
-          , expectedShown = shown
-          }
+-- | Every quad a scene's knowledge and cut draw, by hand: known cells at or below the cut and
+-- within the 250-level band, in each role their knowledge gives, and the fog cells.
+handQuads ∷ Scene → CameraState → [HandQuad]
+handQuads sc camera = concatMap quadsOf cells
   where
     anchorX = toInteger (axisValue (camAnchorX camera))
     anchorY = toInteger (axisValue (camAnchorY camera))
     clip = toInteger (axisValue (camClip camera))
     ref = camRef camera
     count = turnsOf (camFacing camera)
-    a0 = (sx / 48 + sy / 24) / 2
-    b0 = (sy / 24 - sx / 48) / 2
-    -- Every level of every cell at or below the cut whose hexagon (a pixel
-    -- wider) holds the point: the other cells cannot be on the line of sight.
-    unitCells = [(c, z) | c ← sceneCells sc, z ← [cellZ0 c .. cellZ1 c - 1], z <= clip, inHexagon c z]
-    inHexagon c z =
-      let (vx, vy) = turnPair count (cellX c - anchorX, cellY c - anchorY)
-          ox = 48 * fromInteger (vx - vy)
-          oy = 24 * (fromInteger (vx + vy) - 1) - 16 * fromInteger (z - ref)
-       in sx >= ox - 49 && sx <= ox + 49 && sy >= oy - 17 && sy <= oy + 49
-    results = [(c, z, intersect c z) | (c, z) ← unitCells]
-    geometric =
-      sortOn (Down . hitExit . fst)
-        [ (hit, (c, z))
-        | (c, z, Right (Just hit)) ← results
-        ]
-    ambiguity = case [why | (_, _, Left why) ← results] of
-      why : _ → Just why
-      [] → case geometric of
-        (first, _) : (second, _) : _ | abs (hitExit first - hitExit second) < margin → Just "two solids leave the line of sight at the same point"
-        _ → Nothing
-    -- The nearest solid whose texel is not transparent; ambiguous when a texel is
-    -- within a sixteenth of a texel of its boundary, where nearest sampling is
-    -- not decided by the line of sight alone.
-    firstOpaque candidates = case candidates of
-      [] → Right Nothing
-      (hit, (c, z)) : rest → case texelAt c z of
-        Left why → Left why
-        Right rgba
-          | opaque rgba → Right (Just (hit, rgba))
-          | otherwise → firstOpaque rest
-    opaque (_, _, _, alpha) = alpha /= 0
-    -- The texel of a cell's sheet at the pixel's place: the sheet is placed at
-    -- the cell origin's projection less (48, 16).
-    texelAt c z = case art (cellMaterial c) of
-      Nothing → Left ("no sheet for " <> cellMaterial c)
-      Just sheet →
-        let (vx, vy) = turnPair count (cellX c - anchorX, cellY c - anchorY)
-            ox = 48 * (fromInteger vx - 1 / 2 - (fromInteger vy - 1 / 2))
-            oy = 24 * ((fromInteger vx - 1 / 2) + (fromInteger vy - 1 / 2)) - 16 * fromInteger (z - ref)
-            fu = sx - (ox - 48)
-            fv = sy - (oy - 16)
-            u = floor fu ∷ Integer
-            v = floor fv ∷ Integer
-            nearBoundary t = let f = t - fromInteger (floor t) in f < 1 / 16 || f > 15 / 16
-         in
-          if u < 0 || v < 0 || u >= toInteger (artWidth sheet) || v >= toInteger (artHeight sheet)
-            then Left "the line of sight leaves the sheet"
-            else
-              if nearBoundary fu || nearBoundary fv
-                then Left "a texel boundary"
-                else Right (artTexel sheet (fromInteger u) (fromInteger v))
-    intersect c z =
-      let (vx, vy) = turnPair count (cellX c - anchorX, cellY c - anchorY)
-          sides = map (handTurnSide count) (handSides (cellShape c))
-          zrel = fromInteger (z - ref)
-          lx0 = a0 - fromInteger vx + 1 / 2
-          ly0 = b0 - fromInteger vy + 1 / 2
-          lowers = [negate lx0, negate ly0, zrel / 3]
-          uppers =
-            [(1 - lx0, (EastWall, 'e')), (1 - ly0, (SouthWall, 's')), ((1 + zrel) / 3, (Top, 'F'))]
-              <> [ case side of
-                     'N' → ((ly0 + zrel) / 2, (Top, 'N'))
-                     'E' → ((1 - lx0 + zrel) / 4, (Top, 'E'))
-                     'S' → ((1 - ly0 + zrel) / 4, (Top, 'S'))
-                     _ → ((lx0 + zrel) / 2, (Top, 'W'))
-                 | side ← sides
-                 ]
-          tlo = maximum lowers
-          thi = minimum (map fst uppers)
-          binding = nub [face | (value, face) ← uppers, value - thi < margin]
-       in if thi < tlo - margin
-            then Right Nothing
-            else
-              if abs (thi - tlo) <= margin
-                then Left "the line of sight only grazes a solid"
-                else case binding of
-                  [(kind, surface)] → Right (Just (Hit (cellX c, cellY c, z) kind surface (toRational thi)))
-                  _ → Left "the line of sight leaves a solid along an edge between faces"
+    know = Map.fromList (sceneKnow sc)
+    solids = [((cellX c, cellY c, z), (cellShape c, cellMaterial c)) | c ← sceneCells sc, z ← [cellZ0 c .. cellZ1 c - 1]]
+    cells =
+      [(p, Just solid, Map.findWithDefault KnownAll p know) | (p, solid) ← solids, Map.lookup p know /= Just Undisc]
+        <> [(p, Nothing, Undisc) | (p, _) ← solids, Map.lookup p know == Just Undisc]
+        <> [(p, Nothing, Undisc) | p ← sceneFogOnly sc]
+    inBand (_, _, z) = z <= clip && clip - z <= 250
+    corner (x, y, z) =
+      let (vx, vy) = turnPair count (x - anchorX, y - anchorY)
+       in (48 * (vx - vy) - 48, 24 * (vx + vy - 1) - 16 * (z - ref) - 16, vx, vy)
+    quadsOf (p, solid, k)
+      | not (inBand p) = []
+      | otherwise = case (k, solid) of
+          (Undisc, _) → [fog p FullFog 0]
+          (KnownAll, Just (shape, material)) → [known p Ordinary material (ordinaryMap shape) 1]
+          (KnownSolid, Just (shape, material))
+            | shape == 0 → [known p Ordinary material (ordinaryMap shape) 1]
+            | otherwise →
+                [ fog p MixedFog 0 `withMap` ("mixed." <> two (handViewShape count shape) <> ".fog")
+                , known p MixedKnown material ("mixed." <> two (handViewShape count shape) <> ".known") 1
+                ]
+          _ → []
+    ordinaryMap shape = "shape." <> two (handViewShape count shape)
+    withMap q m = q {hqMap = m}
+    known p role material mapId part =
+      let (cx, cy, vx, vy) = corner p
+          (_, _, z) = p
+       in HandQuad p role material mapId (cx, cy) (vx + vy, z, vx, vy, part) (clip - z)
+    fog p role part =
+      let (cx, cy, vx, vy) = corner p
+          (_, _, z) = p
+       in HandQuad p role "blanktexture" "shape.00" (cx, cy) (vx + vy, z, vx, vy, part) (clip - z)
 
--- | How near, in line-of-sight units (a pixel is about a fiftieth), two answers
--- must be to be called the same point: a fraction of a hundredth of a pixel,
--- where a 32-bit device may decide either way.
-margin ∷ Fractional a ⇒ a
-margin = 1 / 4096
+-- | What a pixel centre shows.
+data Expected
+  = -- | Nothing: the clear colour.
+    ExpectedClear
+  | -- | The nearest covered quad (what a pick finds), the nearer quads whose canvas holds the
+    -- point but whose colour or map texel is transparent (the reveals, nearest first), the colour
+    -- drawn (lit premultiplied linear light) and the front quad's texel.
+    ExpectedHit
+      { expectedFront ∷ !HandQuad
+      , expectedSkipped ∷ ![HandQuad]
+      , expectedLinear ∷ !(Double, Double, Double)
+      , expectedTexel ∷ !(Int, Int)
+      }
+  | -- | The point is within a sixteenth of a texel boundary, or the model cannot decide it.
+    Ambiguous !String
+  deriving stock (Eq, Show)
+
+-- | The render-world point of a pixel's centre, through the view's own mapping, or 'Nothing'
+-- outside the viewport.
+pixelWorldPoint ∷ CellPlan → (Int, Int) → Maybe (Rational, Rational)
+pixelWorldPoint plan (px, py)
+  | not (viewportContains (setupViewport (rvSetup view)) target) = Nothing
+  | otherwise = case targetToWorld (rvMapping view) target of
+      Just (V2 x y) → Just (toRational x, toRational y)
+      Nothing → Nothing
+  where
+    view = cellPlanView plan
+    target = V2 (fromIntegral px + 0.5) (fromIntegral py + 0.5)
+
+-- | The shaded linear colour by hand: the sampled premultiplied linear colour @t@, the map's unit
+-- normal from its bytes, the quarter-turned sun, the cell's depth and the settings, in the
+-- specified order (a fresh derivation, sharing nothing with the material's model).
+handShade ∷ HandLight → Int → (Double, Double, Double) → (Word8, Word8, Word8) → Integer → (Double, Double, Double)
+handShade light count (tr, tg, tb) (nr, ng, nb) depth = (channel tr fr, channel tg fg, channel tb fb)
+  where
+    a = lightAzimuth light * pi / 180
+    e = lightElevation light * pi / 180
+    (wx, wy, wz) = (sin a * cos e, negate (cos a) * cos e, sin e)
+    (sx, sy) = iterate (\(x, y) → (negate y, x)) (wx, wy) !! (count `mod` 4)
+    sunStrength = if lightElevation light > 0 then lightStrength light else 0
+    byte b = fromIntegral b - 128 ∷ Double
+    (bx, by, bz) = (byte nr, byte ng, byte nb)
+    len = sqrt (bx * bx + by * by + bz * bz)
+    dotted = (bx * sx + by * sy + bz * wz) / len
+    p = max 0 (min 1 dotted)
+    bright = lightAmbient light + (1 - lightAmbient light) * sunStrength * p
+    t = max 0 (min 1 (fromInteger depth / lightRange light))
+    darken = 1 - lightDarkening light * t
+    blend = lightHaze light * t * t
+    (hr, hg, hb) = lightHazeSrgb light
+    toLinear v = if v <= 0.04045 then v / 12.92 else ((v + 0.055) / 1.055) ** 2.4
+    (fr, fg, fb) = (toLinear hr, toLinear hg, toLinear hb)
+    channel texel haze = (1 - blend) * texel * bright * darken + blend * haze
+
+-- | The 8-bit sRGB bytes of a linear colour.
+shadedByte ∷ (Double, Double, Double) → (Word8, Word8, Word8)
+shadedByte (r, g, b) = (srgbEncode r, srgbEncode g, srgbEncode b)
+
+-- | What the pixel at this column and row shows.
+expectedAt ∷ ArtSource → HandLight → Scene → CameraState → CellPlan → (Int, Int) → Expected
+expectedAt art light sc camera plan pixel = case pixelWorldPoint plan pixel of
+  Nothing → ExpectedClear
+  Just (sx, sy) → decide (fromRational sx ∷ Double) (fromRational sy ∷ Double)
+  where
+    quads = sortOn (Down . hqKey) (handQuads sc camera)
+    count = turnsOf (camFacing camera)
+    decide sx sy = go [] quads
+      where
+        go _ [] = ExpectedClear
+        go skipped (q : rest) =
+          let (cx, cy) = hqCorner q
+              fu = sx - fromInteger cx
+              fv = sy - fromInteger cy
+              u = floor fu ∷ Int
+              v = floor fv ∷ Int
+              nearBoundary t = let f = t - fromInteger (floor t) in f < 1 / 16 || f > 15 / 16
+           in if u < 0 || v < 0 || u >= 96 || v >= 64
+                then go skipped rest
+                else
+                  if nearBoundary fu || nearBoundary fv
+                    then Ambiguous ("a texel boundary of " <> show (hqCell q) <> " " <> show (hqRole q))
+                    else
+                      let (cr, cg, cb, ca) = artColour art (hqColour q) u v
+                          (mr, mg, mb, ma) = artMap art (hqMap q) u v
+                       in if ca == 0 || ma == 0
+                            then go (skipped <> [q]) rest
+                            else
+                              let shaded = handShade light count (srgbDecode cr, srgbDecode cg, srgbDecode cb) (mr, mg, mb) (hqDepth q)
+                               in ExpectedHit {expectedFront = q, expectedSkipped = skipped, expectedLinear = shaded, expectedTexel = (u, v)}
 
 -- | The expectation at every pixel of a scene's target, row by row, top to bottom.
-expectedImage ∷ (String → Maybe ArtPixels) → Scene → [[Expected]]
-expectedImage art sc = [[expectedAt art sc camera plan (x, y) | x ← [0 .. w - 1]] | y ← [0 .. h - 1]]
+expectedImage ∷ ArtSource → HandLight → Scene → CellPlan → [[Expected]]
+expectedImage art light sc plan = [[expectedAt art light sc camera plan (x, y) | x ← [0 .. w - 1]] | y ← [0 .. h - 1]]
   where
     camera = sceneCameraFollowed sc
-    plan = either (\e → error ("scene plan: " <> show e)) id (scenePlan sc)
     (w, h) = sceneTarget sc
