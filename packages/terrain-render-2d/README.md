@@ -226,11 +226,15 @@ digests every atlas name and extent and every identity with its rectangle.
 `RegionView` is a checked rectangle of **one shared coverage plane per loaded
 parent**, never copied per region, quad or cell. The local texel is chosen in the
 region's own extent, `i = min (w - 1) (floor (clamp u 0 1 * w + 1/128))` (the owner's
-2026-11-09 Q-13 amendment v2; `texelBias` in the region primitive is its one
-definition, used by the shader's colour and normal samples, CPU coverage and picking
-and the expected model), and only then is the origin added, so an interior boundary
-selects the higher texel, the outer edge the region's last, and a region never reads
-a neighbour. `Assets` holds a region
+2026-11-09 Q-13 amendments; `Hetoimasia.Terrain.Render2D.TexelRule` in this package's main
+library is its one definition, evaluated exactly with the coordinate converted by
+`toRational` before the product, and used by the shader's colour and normal samples (the
+GLSL literal is made from it), CPU coverage and picking and the material's pure model; the
+independent expected model of the evidence restates 1/128 by hand in `Rational` and imports
+nothing from it; the neutral region primitive stays unbiased and a terrain consumer passes
+its integer index to `regionViewCoverageAt`), and only then is the origin added, so an
+interior boundary selects the higher texel, the outer edge the region's last, and a region
+never reads a neighbour. `Assets` holds a region
 for each colour and map; its identity folds in the parent version, the rectangle,
 the layout identity, the parent extent and the normal profile, so a rectangle
 change on the same parent invalidates a stale identity. `AtlasAssets` builds the

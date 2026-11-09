@@ -14,6 +14,11 @@ destroys it.
   (`selectDevice`), and why a later surface is refused (`TargetRejection`).
   It names no binding type, and its examples hold its extension names to the
   binding's.
+  A `DeviceOffer` also carries the device's reported
+  `VkPhysicalDeviceLimits.subPixelPrecisionBits` (`offerSubPixelPrecisionBits`), a
+  read-only fact the plan carries unchanged (`planSubPixelPrecisionBits`) and the roots'
+  view reports (`viewSubPixelPrecisionBits`) for evidence that must know the rasterizer's
+  vertex quantisation (TRA-17's undecided band); no selection or creation depends on it.
 - `Hetoimasia.GPU.Vulkan.Native.Roots` owns one session's instance, explicit
   messenger, shared device and per-target surface records, keyed by the GPU
   model's `TargetId`, over an open native layer (`RootOps`). It creates parent

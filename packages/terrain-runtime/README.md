@@ -590,7 +590,7 @@ names it, then a strictly increasing run of eight-byte page numbers (at most 505
 | links | `0` tile(24) and three optional parameters `present(1) coord(8)` (52), or `1` column(16) level(8) (25) | `0` size(8) known(1), or `1` parent node key |
 | todo | sequence(8) | tile(24) done(1), `done` in 1 to 6 |
 | free | start page(8) | length(8), at least 1 |
-| retire | the version that replaced the pages(8) | list page(8) count(2) done(2), `done` below `count` |
+| retire | the version that replaced the pages(8): 8 bytes; or `0xFF` and a retired page number(8): 9 bytes | list page(8) count(2) done(2), `done` below `count`; or the version of the entry that owns the page(8) |
 
 **What a decode checks, in order**, before anything uses the page: the buffer length
 (short and oversized are refused before they are read), the checksum, magic,
@@ -744,44 +744,63 @@ reader, of another store or of another incarnation reads nothing (`ReadStale`).
 ### Ownership: what no persisted record is trusted for
 
 The store decides which pages are live, free, pinned or reclaimable from records it wrote
-itself, and any of them can be re-sealed with a valid checksum and name the wrong page.
-It therefore trusts none of them to say a page is *safe to overwrite*. One test decides
-that, at the one place a page is overwritten:
+itself, and any of them can be re-sealed with a valid checksum and name the wrong page. It
+therefore trusts none of them to say a page is *safe to overwrite*. **One proof**, at the one
+place a page is overwritten or freed, asks every owner a page can have:
 
-* **A probe, not a page.** A plan that is about to write a page below the used space
-  (a supplied loose page or free extent) or to free one (a retirement entry's page) asks
-  for it with `PendingProbe`; the owner reads it and calls `addProbe`, which keeps only a
-  classification: *nothing a store could read* (it does not decode as a page of this store
-  at that number: garbage, never written, another store's), a tree page with the first key
-  it holds, or a retirement list with the version it is stamped with. A probe is a few
-  bytes, never the 4 KiB buffer, and costs no window page.
-* **Reachable means on the path of its first key.** A tree page is looked for at its level
-  on the path of its first key in the committed tree it belongs to and, for a record tree,
-  in each pinned reader's tree (at most 16, each at most 8 steps per page); a list is looked
-  for under its stamped version in the committed retirement tree. A page found is
-  `SuppliedPageLive` (or `RetiredPageLive` when reclamation was freeing it) and **nothing is
-  written**. The pages written by a plan are at most 256, so the proof is bounded; its
-  steps, probes and pages read through the window are part of the measured bounds.
+| Owner | Decided by | A page it owns is refused as |
+| --- | --- | --- |
+| a committed tree (live roots) | the page is on the path of its own first key at its level in the tree it belongs to | `SuppliedPageLive` |
+| a pinned reader's tree (at most 16) | the same descent from each pinned record root | `SuppliedPageLive` / `RetiredPageLive` |
+| a retirement list | looked for under the version it is stamped with in the retirement tree | `SuppliedPageLive` |
+| an outstanding retirement entry | **one lookup in the retired-page index** (below) | `SuppliedPageRetired` |
+| the free extents, for a page taken from the loose list | one floor lookup in the allocator tree | `SuppliedPageDoubleOwned` |
+| the supply itself | the pages a plan takes are distinct; each loose page is inside the used space; extents are ordered, disjoint and inside the used space | `BrokenInvariant` |
+
+Only a page that no owner but the allocator claims is written, and a refusal writes nothing.
+
+* **A probe, not a page.** A plan that is about to write a page below the used space, or to
+  free one, asks for all of them at once with `PendingProbes`; the owner reads each and calls
+  `addProbe`, which keeps only a classification: *nothing a store could read* (it does not
+  decode as a page of this store at that number: garbage, never written, another store's), a
+  tree page with the first key it holds, or a retirement list with the version it is stamped
+  with. A probe is accounted at `probeBytes` (320) and a window may hold at most 512
+  (`ProbesExceeded` past that); costs no window page.
+* **The retired-page index.** Every retired page is also recorded in the retirement tree under
+  `0xFF` and its page number, valued with the version of the entry that owns it; the entries
+  sort before them. A commit indexes every page it replaced (a page already indexed is
+  `DoubleFree`); reclamation frees a page only if the index holds it under that entry's version
+  (`RetiredIndexMismatch`) and removes it as it frees it. The index is bounded by bounding the
+  backlog: an ordinary plan that would take the retired pages past `maxRetiredPages` (16,384)
+  is refused with `RetirementBacklog` until a reader releases and maintenance reclaims; a
+  maintenance transaction never adds to it.
 * **The used space bounds every reference.** A tree root, a child reference or a retirement
   list at or past the high-water mark has never been numbered: every descent, plan or read
-  (through a reader's own used space for a pinned read) refuses it with `BadReference`, so
-  the untouched tail can never be reachable.
-* **The loose list is checked whole**: every page inside the used space, none twice, none
-  also in a free extent.
+  (through a reader's own used space for a pinned read) refuses it with `BadReference`.
+* **No decoded buffer outlives its decode unaccounted.** A window keeps its own copy of the 4 KiB
+  buffer it is given (a caller's buffer may be a slice of a much larger read) and a probe keeps a
+  copy of its key, never a slice of the page; a hot or new node is either a parsed view of a
+  window page (accounted as that page) or packed into a buffer of its own; a plan's output pages,
+  keys and records are built fresh or decoded into values. The audit is by `grep` of every
+  `ByteString` that crosses a window, probe, overlay or plan boundary; the regression is
+  `keeps nothing of a page buffer behind a probe...` (500 probes read as slices of one large buffer
+  retain less than they account and far less than the pages; a window given one page of a large
+  read keeps one page; 513 probes are refused, 512 accepted).
 
 The sites, and what stops a forged record at each (tests are in
 `Test.TerrainRuntime.Store.Ownership` unless named):
 
 | Site (record trusted) | Guard | Tamper test |
 | --- | --- | --- |
-| loose list (root set) | `takeSupply` checks, probe proof before any write | loose page is live; loose list holds a page twice |
-| free extents (allocator tree) | extent inside the used space, ordered, disjoint; probe proof before any write, for a plan and for maintenance | extent offers a live page (every tree root, a page below a root, a list page); a page only a pinned reader reaches; a garbage page is overwritten, not refused; `Readers`: supply outside the used space |
-| retirement entry version | the list's stamp must equal it; reclaimed pages proven unreachable from every pinned tree | version lowered past a pinned reader, with and without its list's stamp |
+| loose list (root set) | taken pages inside the used space, distinct, not also a free extent; the proof above | loose page is live; loose page is retired; loose list holds a page twice; loose page is also a free extent |
+| free extents (allocator tree) | extent inside the used space, ordered, disjoint; the proof above, for a plan and for maintenance | extent offers a live page (every tree root, a page below a root, a list page); a retired page of the oldest or the newest entry with no reader pinned; a page only a pinned reader reaches, and with its index record dropped; wholly past the used space; a garbage page is overwritten, not refused |
+| retirement entry version | the list's stamp must equal it; the freed pages are indexed under it; and unreachable from every pinned tree | version lowered past a pinned reader: key only, key and stamp, key and stamp and index |
 | retirement entry list page, count, done | list inside the used space, a list page, the stamped version and the counted length | list past the used space, not a list, wrong counts |
-| retirement list pages | inside the used space, record pages only, unreachable from committed and pinned roots, not already free, loose or claimed | names a bookkeeping page or a page past the used space; `Readers`: a double free; a page the committed trees reach |
-| a retirement list as a supplied page | looked for under its stamped version | extent offers a retirement list page |
+| retirement list pages | inside the used space, record pages only, indexed under the entry, unreachable from committed and pinned roots, not already free, loose or claimed | names a bookkeeping page or a page past the used space; names a page another entry retired; `Readers`: a double free; a page the committed trees reach |
+| the retired-page index | a commit refuses to index a page twice; reclamation refuses a page the index does not hold under its entry | a page retired twice; the backlog bound (and never for maintenance) |
 | tree roots and every child reference | used-space bound in every descent; tree, level, bounds (earlier rounds) | a root past the used space; a child past it, for a plan, a committed read and a pinned read; `Codec`: bounds, cycles, levels |
-| a reader's pinned roots | pinned used space, proof against pinned trees | the pinned-read part of the child test; the pinned extent and lowered-version tests |
+| a reader's pinned roots | pinned used space, proof against pinned trees | the pinned-read half of the child test; the pinned extent and lowered-version tests |
+| decoded buffers held past their decode | copies, accounted, bounded | `Bounds`: `keeps nothing of a page buffer behind a probe...` |
 | counters | arithmetic only (a negative count is refused); never used to find a page | `Codec` revision and counter wrap tests |
 
 ### The allowance
