@@ -162,7 +162,7 @@ diskWrites (Disk _ n) = n
 data RefBody
   = RefLeaf [(ByteString, ByteString)]
   | RefInner [(ByteString, Word64)]
-  | RefList [Word64]
+  | RefList Word64 [Word64]
   deriving stock (Eq, Show)
 
 data RefPage = RefPage
@@ -195,7 +195,7 @@ parsePage arena source bs
       body ← case kind of
         1 → RefLeaf <$> leaf count payload
         2 → RefInner <$> inner count payload
-        3 → Right (RefList [getLe64' payload (8 * i) | i ← [0 .. count - 1]])
+        3 → Right (RefList (getLe64' payload 0) [getLe64' payload (8 + 8 * i) | i ← [0 .. count - 1]])
         _ → Left "kind"
       Right (RefPage tree level (getLe64' bs 24) body (used - 40))
   where
@@ -259,7 +259,7 @@ walkTree arena source rd (Just root) = go root Nothing Nothing Nothing True
                         (concatMap twLeaves kids)
                         (1 + maximum (0 : map twHeight kids))
                         (own ++ lvl ++ occ ++ order ++ bounds ++ concatMap twViolations kids)
-                RefList _ → TreeWalk [p] [] 0 ["page " <> show p <> " is a list inside a tree"]
+                RefList _ _ → TreeWalk [p] [] 0 ["page " <> show p <> " is a list inside a tree"]
     nextSep i es hi = if i + 1 < length es then Just (fst (es !! (i + 1))) else hi
     strictly ks = and (zipWith (<) ks (drop 1 ks))
     inside lo hi ks = all (\k → maybe True (<= k) lo && maybe True (k <) hi) ks
@@ -288,13 +288,13 @@ ownership arena source store rd = Ownership live retired free loose violations h
     walkOf t = maybe (TreeWalk [] [] 0 []) id (lookup t walks)
     retireEntries = [(getBe64' k 0, getBe64' v 0, getLe16' v 8, getLe16' v 10) | (k, v) ← twLeaves (walkOf TreeRetire), BS.length k == 8, BS.length v == 12]
     listPages = [lp | (_, lp, _, _) ← retireEntries]
-    listWalk = [(lp, parseList lp c d) | (_, lp, c, d) ← retireEntries]
-    parseList lp c d = case rd (PageNo lp) of
+    listWalk = [(lp, parseList ver lp c d) | (ver, lp, c, d) ← retireEntries]
+    parseList ver lp c d = case rd (PageNo lp) of
       Nothing → Left ("retirement list page missing " <> show lp)
       Just bs → case parsePage arena source bs of
         Left e → Left ("retirement list page " <> show lp <> ": " <> e)
         Right pg → case rpBody pg of
-          RefList ps | length ps == fromIntegral c → Right (drop (fromIntegral d) ps)
+          RefList stamp ps | stamp == ver && length ps == fromIntegral c → Right (drop (fromIntegral d) ps)
           _ → Left ("retirement list page " <> show lp <> " does not match its entry")
     retired = concat [ps | (_, Right ps) ← listWalk]
     free = concat [[s .. s + l - 1] | (k, v) ← twLeaves (walkOf TreeFree), BS.length k == 8, BS.length v == 8, let s = getBe64' k 0, let l = getBe64' v 0]

@@ -83,7 +83,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Plan
   , planCandidate
   , planDelta
   , planDeltaWith
+  , planDeltaPinned
   , planReclaimWith
+  , planReclaimPinned
   , planReclaim
   , freePool
   , availablePages
@@ -100,7 +102,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Control.Monad (foldM)
 import Data.Int (Int64)
+import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word16, Word64)
@@ -224,6 +228,11 @@ data Planned
   | -- | A page the plan needs is not in the window: fetch it, add it and plan
     -- again from the same window.
     Pending !PageNo
+  | -- | A page the plan has to classify is not in the window: read it, 'windowProbe' it
+    -- (never 'windowInsert': it may not be a page at all) and plan again from the same
+    -- window. The plan is about to overwrite or free the page and must first prove that
+    -- no committed or pinned root reaches it.
+    PendingProbe !PageNo
   | Refused !PlanRefusal
   deriving stock (Eq, Show)
 
@@ -275,8 +284,13 @@ data IntegrityWhy
   | BrokenInvariant !TreeId
   | CorruptCounters
   | DoubleFree !PageNo
-  | -- | A retirement entry names a page the committed trees still reach, a list page or a page outside the used space.
+  | -- | A retirement entry names a page a committed or pinned tree still reaches, a list
+    -- page, a bookkeeping page or a page outside the used space.
     RetiredPageLive !PageNo
+  | -- | A page the allocator supplied for a write is reachable from a committed or a
+    -- pinned root, or the allocator's records contradict each other: writing it would
+    -- destroy a page a reader can still read, so nothing is written.
+    SuppliedPageLive !PageNo
   | MalformedRetirement
   | BookkeepingOverflow !Int
   | LooseOverflow !Int
@@ -307,7 +321,7 @@ standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes
 -- ---------------------------------------------------------------------------
 -- The planning monad
 
-data Out = OutNeed !PageNo | OutRefuse !PlanRefusal
+data Out = OutNeed !PageNo | OutProbe !PageNo | OutRefuse !PlanRefusal
 
 type P a = Either Out a
 
@@ -327,6 +341,7 @@ settle ∷ P (Maybe Plan) → Planned
 settle (Right (Just p)) = Planned p
 settle (Right Nothing) = NoWork
 settle (Left (OutNeed p)) = Pending p
+settle (Left (OutProbe p)) = PendingProbe p
 settle (Left (OutRefuse r)) = Refused r
 
 -- ---------------------------------------------------------------------------
@@ -360,8 +375,11 @@ takeSupply cfg roots m = do
   let loose = take m (rLoose roots)
       nl = length loose
       needFree = m - nl
-  -- a loose page lies inside the used page space, as every page the store ever numbered does
-  if any (\(PageNo p) → p >= rHw roots) loose then failInvariant TreeFree else pure ()
+  -- every loose page lies inside the used page space, as every page the store ever numbered
+  -- does, and no page is loose twice (the list is bounded by 'looseCap')
+  let looseAll = rLoose roots
+      looseSet = Set.fromList looseAll
+  if any (\(PageNo p) → p >= rHw roots) looseAll || Set.size looseSet /= length looseAll then failInvariant TreeFree else pure ()
   (extents, got) ← if needFree <= 0 then pure ([], 0) else readExtents (fmap Disk (rFree roots)) needFree
   let remaining = needFree - fromIntegral got
       tailPages = cfgUsablePages cfg - min (cfgUsablePages cfg) (rHw roots)
@@ -375,6 +393,8 @@ takeSupply cfg roots m = do
       -- no page may be handed out twice: free extents never overlap each other, the loose
       -- list or the untouched tail, whatever the pages they were read from claim
       if Set.size (Set.fromList supply) /= length supply then failInvariant TreeFree else pure ()
+      -- nor is a free page also loose, whether or not the loose page is in this supply
+      if any (`Set.member` looseSet) freePagesList then failInvariant TreeFree else pure ()
       pure (Just (Take supply nl extents bump))
   where
     readExtents root need = go root need (BS.empty, False) 0 []
@@ -462,6 +482,50 @@ runsOf = foldr add []
     add (PageNo p) ((s, n) : rest) | p + 1 == s = (p, n + 1) : rest
     add (PageNo p) acc = (p, 1) : acc
 
+-- | The record roots a reader pins, for a tree: none for a bookkeeping tree, which no
+-- reader reads.
+pinRootFor ∷ TreeId → Pins → Maybe PageNo
+pinRootFor TreeRuns = pinRuns
+pinRootFor TreeLinks = pinLinks
+pinRootFor TreeTodo = pinTodo
+pinRootFor _ = const Nothing
+
+-- | Prove that none of the pages is reachable from the committed roots or from any
+-- pinned reader's roots, by the one test the store has for it: a page that is
+-- reachable at all is on the path of its own first key, so each page is classified
+-- from a probe (never swept for) and looked for at the one place it could be.
+--
+-- * a page that does not decode as a page of this store at that number is reachable
+--   from nowhere: it could never have been read;
+-- * a tree page is looked for at its level on the path of its first key in the
+--   committed tree it belongs to and, for a record tree, in each pinned tree (at most
+--   'maxReaders', each at most 'maxLevel' + 1 steps);
+-- * a retirement list is looked for under the version it is stamped with in the
+--   committed retirement tree.
+--
+-- A page found is refused with the given constructor, and a page whose probe is not
+-- in the window is asked for. The work is bounded by the pages given and the readers.
+unreachable ∷ StoreConfig → Roots → [Pins] → (PageNo → IntegrityWhy) → Window → [PageNo] → Edit → P Edit
+unreachable cfg roots pins why win pages edit0 = foldM one edit0 pages
+  where
+    total = cfgTotalPages cfg
+    one edit pg = case windowProbeOf pg win of
+      Nothing → Left (OutProbe pg)
+      Just ProbeNone → Right edit
+      Just (ProbeList v) → do
+        (mv, edit') ← phase edit (lookupKey TreeRetire (fmap Disk (rRetire roots)) (be64 v))
+        case mv >>= decodeRetire total (be64 v) of
+          Just (_, ret) | retList ret == pg → refuse (Integrity (why pg))
+          _ → Right edit'
+      Just (ProbeTree tree level key) →
+        let rootsOf = nub (rootOf roots tree : [pinRootFor tree p | p ← pins, isRecordTree tree])
+         in foldM (\e r → do
+                      (found, e') ← phase e (livePageAt tree (fmap Disk r) key level)
+                      if found == Just pg then refuse (Integrity (why pg)) else Right e') edit rootsOf
+
+isRecordTree ∷ TreeId → Bool
+isRecordTree t = t == TreeRuns || t == TreeLinks || t == TreeTodo
+
 -- ---------------------------------------------------------------------------
 -- Candidates
 
@@ -504,7 +568,14 @@ planDelta = planDeltaWith standardBounds
 
 -- | 'planDelta' under given bounds.
 planDeltaWith ∷ Bounds → StoreConfig → StoreIdentity → Roots → Window → TxClass → Delta → Planned
-planDeltaWith bounds cfg ident roots win cls cand = settle $ do
+planDeltaWith bounds cfg ident roots = planDeltaPinned bounds cfg ident roots []
+
+-- | 'planDeltaWith' while readers pin older versions: the record roots they pin. A
+-- page the plan is about to write is proven unreachable from the committed roots and
+-- from every one of these before it is numbered into the plan.
+planDeltaPinned ∷ Bounds → StoreConfig → StoreIdentity → Roots → [Pins] → Window → TxClass → Delta → Planned
+planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
+  let win = windowBelow (rHw roots) win0
   checkWindow bounds ident roots win
   let base = dlBase cand
       hdr = rHeader roots
@@ -562,17 +633,21 @@ planDeltaWith bounds cfg ident roots win cls cand = settle $ do
       (pagesBk, bkNos, slack) ← assign ident bkEdit2 [retireRoot1, freeRoot1] afterList
       let bkUsed = length pagesBk
       if bkUsed > bookkeepingReserve then refuse (Integrity (BookkeepingOverflow bkUsed)) else pure ()
-      listPages ← traverse (\lp → encodeOut ident (Page TreeRetire 0 lp (List replacedRec))) (maybe [] pure listPage)
+      listPages ← traverse (\lp → encodeOut ident (Page TreeRetire 0 lp (List version' replacedRec))) (maybe [] pure listPage)
       let encoded = pagesRec ++ listPages ++ pagesBk
           written = length encoded
       if written > bdPages bounds then refuse (Capacity (TxnPagesExceeded written)) else pure ()
+      -- No page may be overwritten that a committed or a pinned root still reaches,
+      -- whatever the allocator's records say: the pages below the used space that this
+      -- plan writes are each proven unreachable first.
+      bkEdit3 ← unreachable cfg roots pins SuppliedPageLive win [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit2
       (rr', rl', rt') ← case recNos of
         [a, b, c] → Right (a, b, c)
         _ → refuse (Integrity CorruptCounters)
       (retire', free') ← case bkNos of
         [a, b] → Right (a, b)
         _ → refuse (Integrity CorruptCounters)
-      let replBk = Set.toAscList (editReplaced bkEdit2)
+      let replBk = Set.toAscList (editReplaced bkEdit3)
           used = fromIntegral written ∷ Integer
           live' = toInteger (rLivePages roots) + used - toInteger listN - toInteger (length replBk)
           retired' = toInteger (rRetiredPages roots) + toInteger listN
@@ -597,8 +672,8 @@ planDeltaWith bounds cfg ident roots win cls cand = settle $ do
               , rLoose = loose'
               }
           windowN = windowSize win
-          steps = editSteps edit1 + editSteps bkEdit2
-          ram = ramFor windowN (windowBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit2) written (length writes) (listN + length replBk) m
+          steps = editSteps edit1 + editSteps bkEdit3
+          ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m
       if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
       let measure =
             Measure
@@ -742,12 +817,22 @@ planReclaim = planReclaimWith standardBounds
 
 -- | 'planReclaim' under given bounds.
 planReclaimWith ∷ Bounds → StoreConfig → StoreIdentity → Roots → Maybe Word64 → Window → Planned
-planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
+planReclaimWith bounds cfg ident roots = reclaimWith bounds cfg ident roots []
+
+-- | 'planReclaimWith' with the readers' pinned roots: the oldest pinned version is
+-- theirs, and a page the entry names is also proven unreachable from each of them.
+planReclaimPinned ∷ Bounds → StoreConfig → StoreIdentity → Roots → [Pins] → Window → Planned
+planReclaimPinned bounds cfg ident roots pins = reclaimWith bounds cfg ident roots pins (if null pins then Nothing else Just (minimum (map pinVersion pins)))
+
+reclaimWith ∷ Bounds → StoreConfig → StoreIdentity → Roots → [Pins] → Maybe Word64 → Window → Planned
+reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
   Left (OutNeed p) → Pending p
+  Left (OutProbe p) → PendingProbe p
   Left (OutRefuse r) → Refused r
   Right r → r
   where
     total = cfgTotalPages cfg
+    win = windowBelow (rHw roots) win0
     reclaimM ∷ P Planned
     reclaimM = do
       checkWindow bounds ident roots win
@@ -762,31 +847,33 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
             Just o | o < e → pure (BlockedByReader e o)
             _ → do
               let PageNo lp0 = retList ret
+              -- the list lies inside the used space, like every page the store ever numbered
+              if lp0 >= rHw roots then refuse (Integrity MalformedRetirement) else pure ()
               page ← case windowPage (retList ret) win of
                 Nothing → Left (OutNeed (PageNo lp0))
                 Just p → Right p
+              -- the list is the one this entry's version stamped, with the pages it counts
               ps ← case pgBody page of
-                List xs | pgTree page == TreeRetire && length xs == fromIntegral (retCount ret) → Right xs
+                List stamp xs | pgTree page == TreeRetire && stamp == e && length xs == fromIntegral (retCount ret) → Right xs
                 _ → refuse (Integrity MalformedRetirement)
               let remaining = drop (fromIntegral (retDone ret)) ps
               attempt e ret remaining version' e0 (chunkSizes (length remaining))
-    -- A page a retirement entry names must be one the committed trees no longer reach: it
-    -- lies inside the used space, is a tree page (never a list page) and is not the page
-    -- its own first key leads to in the tree its header names. A forged entry naming a
-    -- live root, a shared live subtree, a bookkeeping page or a list page is corruption.
-    notLive pages edit0 = go edit0 pages
-      where
-        go edit [] = Right edit
-        go edit (pg@(PageNo n) : rest)
-          | n >= rHw roots = refuse (Integrity (RetiredPageLive pg))
-          | otherwise = do
-              page ← maybe (Left (OutNeed pg)) Right (windowPage pg win)
-              firstKey ← case pgBody page of
-                Leaf ((k, _) : _) → Right k
-                Inner ((k, _) : _) → Right k
-                _ → refuse (Integrity (RetiredPageLive pg))
-              (found, edit') ← phase edit (livePageAt (pgTree page) (fmap Disk (rootOf roots (pgTree page))) firstKey (pgLevel page))
-              if found == Just pg then refuse (Integrity (RetiredPageLive pg)) else go edit' rest
+    -- A page a retirement entry names must be a record-tree page no committed or pinned
+    -- tree reaches any more: it lies inside the used space, is classified as a record
+    -- page (never a list page, a bookkeeping page or nothing) and is not the page the path
+    -- of its own first key leads to in any tree that could still be read. A forged entry
+    -- naming a live root, a shared live subtree, a bookkeeping page, a list page or a page a
+    -- reader still pins (its version lowered past the reader) is corruption.
+    notLive pages edit0 = do
+      mapM_ (\pg@(PageNo n) → if n >= rHw roots then refuse (Integrity (RetiredPageLive pg)) else Right ()) pages
+      mapM_
+        ( \pg → case windowProbeOf pg win of
+            Nothing → Left (OutProbe pg)
+            Just (ProbeTree t _ _) | isRecordTree t → Right ()
+            Just _ → refuse (Integrity (RetiredPageLive pg))
+        )
+        pages
+      unreachable cfg roots pins RetiredPageLive win pages edit0
     attempt _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
     attempt e ret remaining version' edit (c : cs) = case tryChunk e ret remaining version' edit c of
       Right plan → Right (Planned plan)
@@ -830,10 +917,12 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
       let bkUsed = length encoded
       if bkUsed > m then refuse (Integrity (BookkeepingOverflow bkUsed)) else pure ()
       if bkUsed > bdPages bounds then refuse (Capacity (TxnPagesExceeded bkUsed)) else pure ()
+      -- the pages this maintenance writes are as unreachable as any other plan's
+      bkEdit4 ← unreachable cfg roots pins SuppliedPageLive win [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit3
       (retire', free') ← case bkNos of
         [a, b] → Right (a, b)
         _ → refuse (Integrity CorruptCounters)
-      let replBk = Set.toAscList (editReplaced bkEdit3 `Set.union` (if finished then Set.singleton lp else Set.empty))
+      let replBk = Set.toAscList (editReplaced bkEdit4 `Set.union` (if finished then Set.singleton lp else Set.empty))
           written = bkUsed
           freeTaken = sum [t | (_, _, t) ← tkExtents tk]
           live' = toInteger (rLivePages roots) + toInteger written - toInteger (length replBk)
@@ -858,7 +947,7 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
               , rLoose = loose'
               }
           windowN = windowSize win
-          ram = ramFor windowN (windowBytes win) (editFreshBytes bkEdit3) written 0 (length replBk + c) m
+          ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes bkEdit4) written 0 (length replBk + c) m
       if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
       let measure =
             Measure
@@ -871,7 +960,7 @@ planReclaimWith bounds cfg ident roots oldest win = case reclaimM of
               , mSlack = length slack
               , mClaimed = fromIntegral claim
               , mLooseTaken = tkLoose tk
-              , mReadSteps = editSteps bkEdit3
+              , mReadSteps = editSteps bkEdit4
               , mWindowPages = windowN
               , mRam = ram
               , mUpdates = 0

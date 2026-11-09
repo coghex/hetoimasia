@@ -368,5 +368,7 @@ data Pins = Pins
   , pinRuns ∷ !(Maybe PageNo)
   , pinLinks ∷ !(Maybe PageNo)
   , pinTodo ∷ !(Maybe PageNo)
+  , pinHw ∷ !Word64
+  -- ^ The used page space of the pinned version: no pinned tree reaches a page at or past it.
   }
   deriving stock (Eq, Show)

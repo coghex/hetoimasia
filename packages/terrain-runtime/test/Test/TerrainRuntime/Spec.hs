@@ -22,6 +22,7 @@ import qualified Test.TerrainRuntime.Store.Cycles as StoreCycles
 import qualified Test.TerrainRuntime.Store.Evidence as StoreEvidence
 import qualified Test.TerrainRuntime.Store.Faults as StoreFaults
 import qualified Test.TerrainRuntime.Store.Identity as StoreIdentity
+import qualified Test.TerrainRuntime.Store.Ownership as StoreOwnership
 import qualified Test.TerrainRuntime.Store.Readers as StoreReaders
 import qualified Test.TerrainRuntime.Store.Replay as StoreReplay
 import qualified Test.TerrainRuntime.Store.Trees as StoreTrees
@@ -48,6 +49,7 @@ spec = do
   StoreFaults.spec
   StoreIdentity.spec
   StoreReaders.spec
+  StoreOwnership.spec
   StoreCycles.spec
   StoreEvidence.spec
   StoreAllowance.spec

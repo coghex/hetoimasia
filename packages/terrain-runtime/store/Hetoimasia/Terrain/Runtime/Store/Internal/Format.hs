@@ -96,7 +96,7 @@ maxLevel = 7
 
 -- | The most page numbers one retirement list page holds.
 maxListPages ∷ Int
-maxListPages = pagePayloadBytes `div` 8
+maxListPages = (pagePayloadBytes - 8) `div` 8
 
 -- | The most new encoded pages one transaction writes, metadata included: 1 MiB.
 maxTxnPages ∷ Int

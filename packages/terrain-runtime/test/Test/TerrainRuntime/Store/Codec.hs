@@ -171,10 +171,10 @@ spec = describe "the private page codec against independent bytes" $ do
       either (const False) (const True) (decode ok) `shouldBe` True
       -- a component that is its own parent is a malformed value, whatever its checksum
       decode (buildPage 1 7 0 1 1 0 1 (leafPayload [(key, BS.cons 1 key)])) `shouldBe` Left MalformedValue
-      let list = Page TreeRetire 0 (PageNo 0) (List [PageNo i | i ← [1 .. fromIntegral maxListPages]])
-      maxListPages `shouldBe` 506
+      let list = Page TreeRetire 0 (PageNo 0) (List 1 [PageNo i | i ← [1 .. fromIntegral maxListPages]])
+      maxListPages `shouldBe` 505
       either (const False) (const True) (encodePage ident0 list) `shouldBe` True
-      either (const False) (const True) (encodePage ident0 (Page TreeRetire 0 (PageNo 0) (List [PageNo i | i ← [1 .. 507]]))) `shouldBe` False
+      either (const False) (const True) (encodePage ident0 (Page TreeRetire 0 (PageNo 0) (List 1 [PageNo i | i ← [1 .. 506]]))) `shouldBe` False
   describe "decode refusals (a valid checksum never rescues a malformed page)" $ do
     it "refuses a short, oversized or empty buffer before reading it" $ do
       decode (BS.take 4095 runPage) `shouldBe` Left (ShortPage 4095)
@@ -259,7 +259,7 @@ spec = describe "the private page codec against independent bytes" $ do
       dec (leaf 4 [(be64' 3, BS.concat [be64' total, le16' 4, le16' 0])]) `shouldBe` Left MalformedValue
     it "refuses internal and list pages with bad references, levels or order" $ do
       let inner lvl es = buildPage 1 7 0 2 0 lvl (length es) (BS.concat [BS.concat [BS.singleton (fromIntegral (BS.length k)), k, le64' c] | (k, c) ← es])
-          list ps = buildPage 1 7 0 3 4 0 (length ps) (BS.concat (map le64' ps))
+          list ps = buildPage 1 7 0 3 4 0 (length ps) (BS.concat (le64' 3 : map le64' ps))
           dec = decodePage ident0 total (PageNo 0)
           k1 = be64' 1
           k2 = be64' 2
@@ -276,7 +276,11 @@ spec = describe "the private page codec against independent bytes" $ do
       dec (list [3, 3]) `shouldBe` Left KeyOrder
       dec (list [0]) `shouldBe` Left (BadReference (PageNo 0))
       dec (list [total]) `shouldBe` Left (BadReference (PageNo total))
-      dec (buildPage 1 7 0 3 0 0 1 (le64' 5)) `shouldBe` Left (BadLevel 0)
+      dec (buildPage 1 7 0 3 0 0 1 (BS.concat [le64' 3, le64' 5])) `shouldBe` Left (BadLevel 0)
+      -- a list is stamped with the version of the entry that names it: never zero, and the payload is the stamp and the pages
+      dec (buildPage 1 7 0 3 4 0 2 (BS.concat [le64' 0, le64' 3, le64' 4])) `shouldBe` Left MalformedValue
+      dec (buildPage 1 7 0 3 4 0 2 (BS.concat [le64' 3, le64' 4])) `shouldBe` Left (BadLength 16)
+      dec (list [3, 4]) `shouldBe` Right (Page TreeRetire 0 (PageNo 0) (List 3 [PageNo 3, PageNo 4]))
   describe "structures that could loop" $ do
     it "stops a cyclic or level-violating tree instead of following it" $ do
       let pageNo n = PageNo n

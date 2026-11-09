@@ -14,6 +14,8 @@
 -- plan <- 'planRemoval' env store window tile        -- or 'planDiscovery', 'planMaintenance'
 -- case plan of
 --   'Pending' page   -> fetch the page, 'addPage' it to the window, plan again
+--   'PendingProbe' page -> fetch the page, 'addProbe' it to the window (it may not be a page
+--                       at all), plan again: the plan must first prove nothing reaches it
 --   'Planned' p      -> 'admit' p store, write 'planPages', report each outcome with
 --                       'dispatchWrite' and 'completeWrite', then 'publish' (or 'abortTransaction')
 --   'NoWork'         -> nothing to append
@@ -70,6 +72,7 @@ module Hetoimasia.Terrain.Runtime.Store
   , Window
   , storeWindow
   , addPage
+  , addProbe
   , windowSize
   , windowBytes
   , windowVersion
@@ -204,7 +207,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), bodyBytes, decodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, windowBytes, windowInsert, windowPageNumbers, windowSize, windowVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, windowBytes, windowInsert, windowPageNumbers, windowProbe, windowSize, windowVersion)
 
 -- The accessors below are functions, never record fields, so a client cannot rewrite
 -- a plan, a growth proposal or a root set with record-update syntax.
@@ -253,6 +256,13 @@ growthTo = gpTo
 addPage ∷ StoreConfig → PageNo → ByteString → Window → Either PageError Window
 addPage cfg = windowInsert (cfgTotalPages cfg)
 
+-- | Add what a page is, read for a 'PendingProbe': the plan is about to overwrite or free
+-- it and only needs to know whether a committed or pinned tree can reach it. A buffer that
+-- is not a valid page of this store at that number is recorded as nothing, never refused,
+-- and only its classification is kept, never the 4 KiB.
+addProbe ∷ StoreConfig → PageNo → ByteString → Window → Window
+addProbe cfg = windowProbe (cfgTotalPages cfg)
+
 -- | The kind of a page.
 data PageKind = LeafPage | InternalPage | ListPage
   deriving stock (Eq, Show)
@@ -275,5 +285,5 @@ describePage cfg ident no bytes = do
   let (kind, n) = case body of
         Leaf es → (LeafPage, length es)
         Inner es → (InternalPage, length es)
-        List ps → (ListPage, length ps)
+        List _ ps → (ListPage, length ps)
   Right (PageDescription tree level kind n (bodyBytes body))

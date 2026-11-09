@@ -168,14 +168,14 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     -- plan's supply takes first, so it is no longer free once consumed), and a loose page
     forM_ [("a free page", [last freeStarts]), ("the lowest free page, taken by the plan's own supply", take 1 freeStarts), ("a loose page", loosePage)] $ \(what, victim) →
       case (entries, victim) of
-        ((_, (lp, count)) : _, fs : _) → do
+        ((ek, (lp, count)) : _, fs : _) → do
           listPage ← maybe (expectationFailure "list page" >> fail "list") pure (diskRead (hDisk h3) (PageNo lp))
           ps ← case parsePage a (siSource (hIdent h3)) listPage of
-            Right (RefPage _ _ _ (RefList xs) _) → pure xs
+            Right (RefPage _ _ _ (RefList _ xs) _) → pure xs
             other → expectationFailure (show other) >> fail "list"
           length ps `shouldBe` fromIntegral count
           let tampered = sortOn' (fs : drop 1 ps)
-          bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) (Page TreeRetire 0 (PageNo lp) (List (map PageNo tampered))))
+          bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) (Page TreeRetire 0 (PageNo lp) (List ek (map PageNo tampered))))
           let h4 = h3 {hDisk = diskWrite (PageNo lp) bytes (hDisk h3)}
           (outcome, _, _) ← must (fillWith h4 (planMaintenance (hStore h4)))
           case outcome of
@@ -204,13 +204,13 @@ spec = describe "pinned readers, retirement and reclamation" $ do
               <> [("the retirement tree's root", n) | Just (PageNo n) ← [rRetire roots]]
     forM_ victims $ \(what, victim) →
       case entries of
-        ((_, (lp, count)) : _) → do
+        ((ek, (lp, count)) : _) → do
           listPage ← maybe (expectationFailure "list page" >> fail "list") pure (diskRead (hDisk h3) (PageNo lp))
           ps ← case parsePage a (siSource (hIdent h3)) listPage of
-            Right (RefPage _ _ _ (RefList xs) _) → pure xs
+            Right (RefPage _ _ _ (RefList _ xs) _) → pure xs
             other → expectationFailure (show other) >> fail "list"
           length ps `shouldBe` fromIntegral count
-          bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) (Page TreeRetire 0 (PageNo lp) (List (map PageNo (sortOn' (victim : drop 1 ps))))))
+          bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) (Page TreeRetire 0 (PageNo lp) (List ek (map PageNo (sortOn' (victim : drop 1 ps))))))
           let h4 = h3 {hDisk = diskWrite (PageNo lp) bytes (hDisk h3)}
           (outcome, _, _) ← must (fillWith h4 (planMaintenance (hStore h4)))
           case outcome of

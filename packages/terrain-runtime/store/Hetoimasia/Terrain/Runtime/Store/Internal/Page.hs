@@ -25,7 +25,8 @@
 --
 -- Leaf entries are @keyLen(1) valueLen(1) key value@; internal entries are
 -- @keyLen(1) key childPage(8)@, the key being the least key the child may hold; a
--- list is a strictly increasing sequence of eight-byte page numbers.
+-- list is the eight-byte version of the retirement entry that names it, then a
+-- strictly increasing sequence of eight-byte page numbers.
 --
 -- = What a decode checks
 --
@@ -71,8 +72,10 @@ data Body
     Leaf [(ByteString, ByteString)]
   | -- | Sorted separator keys, each with its child page.
     Inner [(ByteString, PageNo)]
-  | -- | A strictly increasing list of page numbers (retirement work).
-    List [PageNo]
+  | -- | The version of the retirement entry that names the page, and a strictly
+    -- increasing list of page numbers (retirement work). The version lets a page be
+    -- told apart from a live list without a sweep of the retirement tree.
+    List !Word64 [PageNo]
   deriving stock (Eq, Show)
 
 -- | A decoded, validated page.
@@ -96,17 +99,17 @@ innerEntryBytes (k, _) = 1 + BS.length k + 8
 bodyBytes ∷ Body → Int
 bodyBytes (Leaf es) = sum (map entryBytes es)
 bodyBytes (Inner es) = sum (map innerEntryBytes es)
-bodyBytes (List ps) = 8 * length ps
+bodyBytes (List _ ps) = 8 + 8 * length ps
 
 kindOf ∷ Body → Int
 kindOf (Leaf _) = 1
 kindOf (Inner _) = 2
-kindOf (List _) = 3
+kindOf (List _ _) = 3
 
 countOf ∷ Body → Int
 countOf (Leaf es) = length es
 countOf (Inner es) = length es
-countOf (List ps) = length ps
+countOf (List _ ps) = length ps
 
 -- | Encode a page, refusing a body that does not fit or breaks a bound.
 encodePage ∷ StoreIdentity → Page → Either PageError ByteString
@@ -135,7 +138,7 @@ encodePage ident (Page tree level (PageNo no) body)
   where
     payloadOf (Leaf es) = BS.concat <$> traverse leafEntry es
     payloadOf (Inner es) = BS.concat <$> traverse innerEntry es
-    payloadOf (List ps) = Right (BS.concat [le64 p | PageNo p ← ps])
+    payloadOf (List v ps) = Right (BS.concat (le64 v : [le64 p | PageNo p ← ps]))
     leafEntry (k, v)
       | BS.length k < 1 || BS.length k > maxKeyBytes = Left (KeyLength (BS.length k))
       | BS.length v > maxValueBytes = Left (ValueLength (BS.length v))
@@ -179,7 +182,7 @@ decodePage ident total expected bs
           Inner <$> innerEntries no count payload
         _ → do
           if level /= 0 || tree /= TreeRetire then Left (BadLevel level) else Right ()
-          List <$> listEntries no count payload
+          uncurry List <$> listEntries no count payload
       let page = Page tree level no body
       validateBody tree total page
       Right page
@@ -222,12 +225,13 @@ decodePage ident total expected bs
                       else Left (BadReference child)
           Nothing → Left (BadLength 0)
     listEntries self n payload
-      | BS.length payload /= 8 * n = Left (BadLength (BS.length payload))
+      | BS.length payload /= 8 + 8 * n = Left (BadLength (BS.length payload))
+      | getLe64 payload 0 < 1 = Left MalformedValue
       | otherwise =
-          let ps = [PageNo (getLe64 payload (8 * i)) | i ← [0 .. n - 1]]
+          let ps = [PageNo (getLe64 payload (8 + 8 * i)) | i ← [0 .. n - 1]]
            in case filter (not . refOk self) ps of
                 (bad : _) → Left (BadReference bad)
-                [] → Right ps
+                [] → Right (getLe64 payload 0, ps)
     refOk self child@(PageNo c) = child /= self && c < total
 
 -- | The body of a page buffer that 'decodePage' already validated, parsed again without
@@ -237,7 +241,7 @@ bodyOfValid ∷ ByteString → Body
 bodyOfValid bs = case BS.index bs 6 of
   1 → Leaf (leaf count payload)
   2 → Inner (inner count payload)
-  _ → List [PageNo (getLe64 payload (8 * i)) | i ← [0 .. count - 1]]
+  _ → List (getLe64 payload 0) [PageNo (getLe64 payload (8 + 8 * i)) | i ← [0 .. count - 1]]
   where
     count = fromIntegral (getLe16 bs 34) ∷ Int
     used = fromIntegral (getLe16 bs 36) ∷ Int
@@ -298,7 +302,7 @@ validateBody tree total (Page _ _ _ body) = case body of
     mapM_ (uncurry (validateEntry tree total)) es
     adjacent tree es
   Inner es → increasing (map fst es)
-  List ps → if and (zipWith (<) ps (drop 1 ps)) then Right () else Left KeyOrder
+  List _ ps → if and (zipWith (<) ps (drop 1 ps)) then Right () else Left KeyOrder
   where
     increasing ks = if and (zipWith (<) ks (drop 1 ks)) then Right () else Left KeyOrder
     adjacent TreeRuns es = pairs runOk es

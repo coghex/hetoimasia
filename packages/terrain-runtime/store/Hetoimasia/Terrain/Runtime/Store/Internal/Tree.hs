@@ -44,8 +44,13 @@
 module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   ( -- * Window
     Window
+  , Probe (..)
   , emptyWindow
+  , windowBelow
   , windowInsert
+  , windowProbe
+  , windowProbeOf
+  , windowProbeBytes
   , windowSize
   , windowVersion
   , windowIdentity
@@ -114,54 +119,111 @@ data VPage = VPage
   }
   deriving stock (Eq, Show)
 
+-- | What a page that was read only to be classified is: nothing a store could reach
+-- (it does not decode as a page of this store at that number), a tree page with the
+-- first key it holds, or a retirement list with the version of its entry. A probe is
+-- a few bytes, never the 4 KiB buffer.
+data Probe
+  = ProbeNone
+  | ProbeTree !TreeId !Int !ByteString
+  | ProbeList !Word64
+  deriving stock (Eq, Show)
+
 -- | Validated pages the caller has supplied, for one store and one version of it. A
 -- window is the continuation of one plan or read; it is bound to the arena and source
 -- it was made for (a page of another store is refused on insertion and a plan or read
 -- through a window of another store or version is refused) and it is never carried
 -- across a published version, because a page number may then name other content.
-data Window = Window !StoreIdentity !Word64 !(Map PageNo VPage)
+--
+-- It also holds the probes of pages a plan only had to classify (a page it was about
+-- to overwrite or free), and the used page space of the version it serves: a page at
+-- or past it has never been numbered, so no tree may reach one.
+data Window = Window
+  { wIdent ∷ !StoreIdentity
+  , wVersion ∷ !Word64
+  , wPages ∷ !(Map PageNo VPage)
+  , wProbes ∷ !(Map PageNo Probe)
+  , wBelow ∷ !Word64
+  }
   deriving stock (Eq, Show)
 
 -- | An empty window for a store and a version.
 emptyWindow ∷ StoreIdentity → Word64 → Window
-emptyWindow ident v = Window ident v Map.empty
+emptyWindow ident v = Window ident v Map.empty Map.empty maxBound
+
+-- | The window of a version whose used page space is the first @n@ pages: a
+-- reference to a page at or past @n@ is refused, never read.
+windowBelow ∷ Word64 → Window → Window
+windowBelow n w = w {wBelow = n}
 
 -- | The version the window was filled for.
 windowVersion ∷ Window → Word64
-windowVersion (Window _ v _) = v
+windowVersion = wVersion
 
 -- | The store the window was made for.
 windowIdentity ∷ Window → StoreIdentity
-windowIdentity (Window i _ _) = i
+windowIdentity = wIdent
 
 -- | The accounted bytes a window holds: each page's 4 KiB buffer and the map entry
 -- and headers around it ('windowPageOverhead').
 windowBytes ∷ Window → Int
-windowBytes (Window _ _ m) = Map.size m * (pageSize + windowPageOverhead)
+windowBytes w = Map.size (wPages w) * (pageSize + windowPageOverhead)
 
 -- | The accounted overhead of one page in a window beyond its buffer.
 windowPageOverhead ∷ Int
 windowPageOverhead = 128
 
+-- | The accounted bytes of the probes a window holds: a map entry, the tag and the
+-- key a probe keeps (at most 'maxKeyBytes').
+windowProbeBytes ∷ Window → Int
+windowProbeBytes w = Map.size (wProbes w) * (probeOverhead + maxKeyBytes)
+
+-- | The accounted overhead of one probe beyond its key.
+probeOverhead ∷ Int
+probeOverhead = 96
+
 -- | Decode a page read for a page number against the window's store and add it. A page
 -- that fails any check is refused and the window is unchanged.
 windowInsert ∷ Word64 → PageNo → ByteString → Window → Either PageError Window
-windowInsert total no bytes (Window ident v m) = do
-  page ← decodePage ident total no bytes
-  Right (Window ident v (Map.insert no (VPage (pgTree page) (pgLevel page) bytes) m))
+windowInsert total no bytes w = do
+  page ← decodePage (wIdent w) total no bytes
+  Right w {wPages = Map.insert no (VPage (pgTree page) (pgLevel page) bytes) (wPages w)}
+
+-- | Classify a page read for a page number and keep only the classification. A page
+-- that does not decode as a page of this store at that number is 'ProbeNone': nothing
+-- reaches it, so nothing is lost by overwriting or freeing it. This never refuses.
+windowProbe ∷ Word64 → PageNo → ByteString → Window → Window
+windowProbe total no bytes w = w {wProbes = Map.insert no probe (wProbes w)}
+  where
+    probe = case decodePage (wIdent w) total no bytes of
+      Left _ → ProbeNone
+      Right page → probeOfPage page
+
+probeOfPage ∷ Page → Probe
+probeOfPage (Page tree level _ body) = case body of
+  Leaf ((k, _) : _) → ProbeTree tree level k
+  Inner ((k, _) : _) → ProbeTree tree level k
+  List v _ → ProbeList v
+  _ → ProbeNone
+
+-- | What a page is, if the window has it (as a full page or as a probe).
+windowProbeOf ∷ PageNo → Window → Maybe Probe
+windowProbeOf p w = case Map.lookup p (wProbes w) of
+  Just pr → Just pr
+  Nothing → (\pg → probeOfPage pg) <$> windowPage p w
 
 windowSize ∷ Window → Int
-windowSize (Window _ _ m) = Map.size m
+windowSize = Map.size . wPages
 
 windowPageNumbers ∷ Window → [PageNo]
-windowPageNumbers (Window _ _ m) = Map.keys m
+windowPageNumbers = Map.keys . wPages
 
 windowMember ∷ PageNo → Window → Bool
-windowMember p (Window _ _ m) = Map.member p m
+windowMember p w = Map.member p (wPages w)
 
 -- | A page the window holds, parsed into a value.
 windowPage ∷ PageNo → Window → Maybe Page
-windowPage p (Window _ _ m) = (\vp → Page (vpTree vp) (vpLevel vp) p (bodyOfValid (vpBytes vp))) <$> Map.lookup p m
+windowPage p w = (\vp → Page (vpTree vp) (vpLevel vp) p (bodyOfValid (vpBytes vp))) <$> Map.lookup p (wPages w)
 
 -- ---------------------------------------------------------------------------
 -- The plan monad
@@ -319,8 +381,8 @@ load tree expectLevel ref = do
     Fresh i → maybe (stop (Invariant tree)) pure (freshNode e i)
     Disk p → case lookup p (eHot e) of
       Just hot | nTree hot == tree → pure hot
-      _ → case eWin e of
-        Window _ _ m → case Map.lookup p m of
+      _ | let PageNo n = p, n >= wBelow (eWin e) → stop (Bad (BadReference p) p)
+      _ → case Map.lookup p (wPages (eWin e)) of
           Nothing → stop (Need p)
           Just vp → case nodeOfPage tree p (Page (vpTree vp) (vpLevel vp) p (bodyOfValid (vpBytes vp))) of
             Left err → stop (Bad err p)
@@ -342,7 +404,7 @@ nodeOfPage tree _ (Page t level _ body)
   | otherwise = case body of
       Leaf es → Right (Node tree 0 (NLeaf es))
       Inner es → Right (Node tree level (NInner [(k, Disk c) | (k, c) ← es]))
-      List _ → Left KindMismatch
+      List _ _ → Left KindMismatch
 
 -- | The keys a node holds must lie in the range its parent promises.
 checkBounds ∷ Maybe ByteString → Maybe ByteString → Ref → Node → M ()

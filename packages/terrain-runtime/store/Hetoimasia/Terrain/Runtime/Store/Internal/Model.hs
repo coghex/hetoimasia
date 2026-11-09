@@ -53,12 +53,15 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
     Store
   , newStore
   , storeFromRoots
+  , modifyRoots
   , storeConfig
   , storeIdentity
   , storeRoots
   , storeVersion
   , storeHeader
   , oldestPin
+  , pinnedRoots
+  , pinsOf
   , committedRoot
 
     -- * Usage
@@ -146,6 +149,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   ) where
 
 import Data.ByteString (ByteString)
+import Data.List (nub)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
@@ -263,6 +267,12 @@ newStore cfg ident =
 storeFromRoots ∷ StoreConfig → StoreIdentity → Roots → Store
 storeFromRoots cfg ident roots = (newStore cfg ident) {sRoots = roots}
 
+-- | The same store (its readers, transaction and pauses kept) over changed committed
+-- roots: another seam of the private library for the suite, to forge a root set a
+-- test then plans against. It checks nothing about the roots.
+modifyRoots ∷ (Roots → Roots) → Store → Store
+modifyRoots f s = s {sRoots = f (sRoots s)}
+
 storeConfig ∷ Store → StoreConfig
 storeConfig = sCfg
 
@@ -285,6 +295,10 @@ oldestPin ∷ Store → Maybe Word64
 oldestPin s = case Map.elems (sReaders s) of
   [] → Nothing
   ps → Just (minimum (map pinVersion ps))
+
+-- | The record roots every pinned reader holds, one for each distinct pin.
+pinnedRoots ∷ Store → [Pins]
+pinnedRoots = nub . Map.elems . sReaders
 
 -- | A tree's committed root page.
 committedRoot ∷ Store → TreeId → Maybe PageNo
@@ -368,7 +382,7 @@ controlBytes s =
 
 -- | Plan an ordinary candidate against the committed roots.
 planEdit ∷ Store → Window → Candidate → Planned
-planEdit s win = planCandidate (sCfg s) (sIdent s) (sRoots s) win Ordinary
+planEdit s win = planDeltaPinned standardBounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s) win Ordinary . deltaOf
 
 -- | Plan the reclamation of the oldest retired pages the readers no longer hold.
 planMaintenance ∷ Store → Window → Planned
@@ -376,7 +390,7 @@ planMaintenance = planMaintenanceWith standardBounds
 
 -- | 'planMaintenance' under given bounds.
 planMaintenanceWith ∷ Bounds → Store → Window → Planned
-planMaintenanceWith bounds s = planReclaimWith bounds (sCfg s) (sIdent s) (sRoots s) (oldestPin s)
+planMaintenanceWith bounds s = planReclaimPinned bounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s)
 
 -- | Why a window cannot be used for a store or a pinned version.
 data WindowRefusal
@@ -392,6 +406,10 @@ windowRefusal ident version win
   | windowVersion win /= version = Just (WindowOfAnotherVersion (windowVersion win) version)
   | otherwise = Nothing
 
+-- | A window as the committed version reads it: no page at or past its used space.
+below ∷ Store → Window → Window
+below s = windowBelow (rHw (sRoots s))
+
 -- | A window for the committed version of the store.
 storeWindow ∷ Store → Window
 storeWindow s = emptyWindow (sIdent s) (rVersion (sRoots s))
@@ -400,11 +418,11 @@ storeWindow s = emptyWindow (sIdent s) (rVersion (sRoots s))
 -- window cannot supply is 'Unavailable', never absent. A window of another store or
 -- version is refused, never read.
 providerAt ∷ Store → Window → Either WindowRefusal Provider
-providerAt s win = maybe (Right (providerFor win (committedRoot s))) Left (windowRefusal (sIdent s) (rVersion (sRoots s)) win)
+providerAt s win = maybe (Right (providerFor (below s win) (committedRoot s))) Left (windowRefusal (sIdent s) (rVersion (sRoots s)) win)
 
 -- | Why a record is unavailable: the page to fetch, or an integrity failure.
 missingAt ∷ Store → Window → RecordKey → Either WindowRefusal (Either IntegrityWhy (Maybe PageNo))
-missingAt s win key = maybe (Right (missingPage win (committedRoot s) key)) Left (windowRefusal (sIdent s) (rVersion (sRoots s)) win)
+missingAt s win key = maybe (Right (missingPage (below s win) (committedRoot s) key)) Left (windowRefusal (sIdent s) (rVersion (sRoots s)) win)
 
 -- | Plan the removal of one whole cell with its minimum connection obligation, as
 -- one candidate. Removing air or an already removed cell is 'NoWork'.
@@ -434,7 +452,7 @@ planDiscoveryWith bounds env s win = withWindow s win $ \prov → go prov (allow
         Left refusal → Refused (refusalOf refusal)
         Right Idle → NoWork
         Right (Stalled key) → suspended s win key
-        Right (Progress cand _) → case planDeltaWith bounds (sCfg s) (sIdent s) (sRoots s) win Ordinary (deltaOf cand) of
+        Right (Progress cand _) → case planDeltaPinned bounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s) win Ordinary (deltaOf cand) of
           Refused why
             | tries > 0 && tooBig why && reportWrites (candidateReport cand) > 1 →
                 go prov (max worstEdgeWritesMin (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
@@ -454,7 +472,7 @@ withWindow ∷ Store → Window → (Provider → Planned) → Planned
 withWindow s win f = case windowRefusal (sIdent s) (rVersion (sRoots s)) win of
   Just WindowOfAnotherStore → Refused (Stale ForeignWindow)
   Just (WindowOfAnotherVersion a b) → Refused (Stale (StaleWindow a b))
-  Nothing → f (providerFor win (committedRoot s))
+  Nothing → f (providerFor (below s win) (committedRoot s))
 
 suspended ∷ Store → Window → RecordKey → Planned
 suspended s win key = case missingAt s win key of
@@ -699,7 +717,7 @@ acquireReader s
   | Map.size (sReaders s) >= maxReaders = Left (TooManyReaders maxReaders)
   | otherwise =
       let r = sRoots s
-          pins = Pins (rVersion r) (rRuns r) (rLinks r) (rTodo r)
+          pins = Pins (rVersion r) (rRuns r) (rLinks r) (rTodo r) (rHw r)
           n = sNextReader s
        in Right (ReaderToken (sIdent s) n (rVersion r), s {sReaders = Map.insert n pins (sReaders s), sNextReader = n + 1})
 
@@ -766,16 +784,16 @@ withPins s tok win f = case pinsOf s tok of
 
 -- | The pinned record for a key.
 readerLookup ∷ Store → ReaderToken → Window → RecordKey → ReadOutcome (Maybe Record)
-readerLookup s tok win key = withPins s tok win (\p → lookupRecord win (rootsOfPins p) key)
+readerLookup s tok win key = withPins s tok win (\p → lookupRecord (windowBelow (pinHw p) win) (rootsOfPins p) key)
 
 -- | The pinned removed run of a column at or below a level.
 readerFloorRun ∷ Store → ReaderToken → Window → Column → Int64 → ReadOutcome (Maybe (Int64, Int64))
-readerFloorRun s tok win col z = withPins s tok win (\p → floorRun win (rootsOfPins p) col z)
+readerFloorRun s tok win col z = withPins s tok win (\p → floorRun (windowBelow (pinHw p) win) (rootsOfPins p) col z)
 
 -- | A bounded ordered read of one record tree from a start (a key, or strictly after
 -- one): at most 'maxRangeRecords' records, each costing one bounded successor lookup.
 readerRange ∷ Store → ReaderToken → Window → TreeId → RangeStart → Int → ReadOutcome [(RecordKey, Record)]
-readerRange s tok win tree start limit = withPins s tok win (\p → rangeRecords win (rootsOfPins p) tree start (min limit maxRangeRecords))
+readerRange s tok win tree start limit = withPins s tok win (\p → rangeRecords (windowBelow (pinHw p) win) (rootsOfPins p) tree start (min limit maxRangeRecords))
 
 -- | The most records one ranged read returns.
 maxRangeRecords ∷ Int
@@ -789,13 +807,13 @@ data PinRefusal = PinStale | PinWindow !WindowRefusal
 readerProviderFor ∷ Store → ReaderToken → Window → Either PinRefusal Provider
 readerProviderFor s tok win = do
   p ← either (const (Left PinStale)) Right (pinsOf s tok)
-  maybe (Right (providerFor win (rootsOfPins p))) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
+  maybe (Right (providerFor (windowBelow (pinHw p) win) (rootsOfPins p))) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
 
 -- | Why a pinned record is unavailable: the page to fetch, or an integrity failure.
 readerMissing ∷ Store → ReaderToken → Window → RecordKey → Either PinRefusal (Either IntegrityWhy (Maybe PageNo))
 readerMissing s tok win key = do
   p ← either (const (Left PinStale)) Right (pinsOf s tok)
-  maybe (Right (missingPage win (rootsOfPins p) key)) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
+  maybe (Right (missingPage (windowBelow (pinHw p) win) (rootsOfPins p) key)) (Left . PinWindow) (windowRefusal (sIdent s) (pinVersion p) win)
 
 -- ---------------------------------------------------------------------------
 -- Growth

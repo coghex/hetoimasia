@@ -164,7 +164,7 @@ spec = describe "TRA-20 evidence" $ do
       where
         go acc [] = Right acc
         go acc (y : ys) = f acc y >>= \acc' → go acc' ys
-    fmap' p = case p of Planned _ → "Planned"; NoWork → "NoWork"; Pending _ → "Pending"; Refused r → "Refused " <> show r; BlockedByReader _ _ → "Blocked"
+    fmap' p = case p of Planned _ → "Planned"; NoWork → "NoWork"; Pending _ → "Pending"; PendingProbe _ → "Pending"; Refused r → "Refused " <> show r; BlockedByReader _ _ → "Blocked"
 
 faultFixture ∷ IO (H, Map.Map RecordKey Record, Plan)
 faultFixture = do

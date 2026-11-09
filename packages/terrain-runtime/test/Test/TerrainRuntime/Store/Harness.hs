@@ -47,6 +47,7 @@ module Test.TerrainRuntime.Store.Harness
   ) where
 
 import Control.Monad (foldM)
+import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64, Word8)
 import Hetoimasia.Terrain.Cell (Column, mkColumn)
@@ -125,10 +126,12 @@ fillWith h f = go (storeWindow (hStore h)) 0
         Just bs → case windowInsert total p bs w of
           Left e → Left ("page " <> show p <> " refused: " <> show e)
           Right w' → go w' (n + 1 ∷ Int)
+      -- a page the plan only has to classify: a page never written is nothing
+      PendingProbe p → go (windowProbe total p (maybe BS.empty id (diskRead (hDisk h) p)) w) (n + 1 ∷ Int)
       other → Right (other, w, n)
 
 fillPlan ∷ H → Delta → TxClass → Either String Planned
-fillPlan h d cls = (\(p, _, _) → p) <$> fillWith h (\w → planDelta (hCfg h) (hIdent h) (storeRoots (hStore h)) w cls d)
+fillPlan h d cls = (\(p, _, _) → p) <$> fillWith h (\w → planDeltaPinned standardBounds (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) w cls d)
 
 -- | A delta over the committed header: the next header advances the store revision
 -- (and the content and knowledge revisions as the flags say), as #661 does.
@@ -186,6 +189,7 @@ runPlanned h p = case p of
   Refused r → Right (h, Refusal' r)
   BlockedByReader a b → Left ("blocked by reader " <> show (a, b))
   Pending q → Left ("unfilled pending " <> show q)
+  PendingProbe q → Left ("unfilled probe " <> show q)
 
 -- | Reclaim until nothing more can be reclaimed, returning the number of
 -- transactions. Stops on a block by a reader or a refusal.
@@ -202,6 +206,7 @@ reclaimAll = go 0
             BlockedByReader {} → Right (h, n)
             Refused r → Left ("reclaim refused: " <> show r)
             Pending _ → Left "pending after fill"
+            PendingProbe _ → Left "pending probe after fill"
 
 -- | The independent checks of the committed store against the disk: the partition,
 -- the counters and every tree's structure.
