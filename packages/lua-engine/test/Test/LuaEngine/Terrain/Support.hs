@@ -41,7 +41,7 @@ module Test.LuaEngine.Terrain.Support
 
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar)
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (onException)
 import Control.Monad (void, when)
 import Data.List (find)
@@ -53,7 +53,8 @@ import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.LuaEngine.Facade (terrainPickType)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Registration (Binding, asynchronousNativeRequestIn)
-import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger), Value (VInteger))
+import qualified Data.Set as Set
+import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SText), Value (VInteger, VText))
 import Hetoimasia.LuaEngine.Terrain
 import Hetoimasia.Terrain.Cell (Cell (..), materialIdString)
 import Hetoimasia.Terrain.Coordinate (tileCoord)
@@ -96,7 +97,7 @@ withRigHooks config probe terrainHooks body =
       body
         Rig
           { rgService = service
-          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture]}
+          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture facade]}
           , rgSession = session
           , rgPicks = tfPicks facade
           }
@@ -112,12 +113,22 @@ presentationOverSession rig session = (presentationOver rig) {shTerrain = Just (
 -- | How a fixture hands a script a pick authority the host issued: @TEST_PICK(key)@. It is a host-created fixture of the seam
 -- and nothing Lua can construct: a real script has no such function.
 pickChunk ∷ [Text]
-pickChunk = ["TEST_PICK = hetoimasia_engine.terrain_test_pick"]
+pickChunk = ["TEST_PICK = hetoimasia_engine.terrain_test_pick", "TEST_AWAIT_OFFER = hetoimasia_engine.terrain_test_await_offer"]
 
 pickFixture ∷ Binding
 pickFixture =
   asynchronousNativeRequestIn "terrain_test_pick" [SInteger] [SCapability terrainPickType] $ \_ values → case values of
     [VInteger key] → pure [pickValue (fromIntegral key)]
+    _ → pure []
+
+-- | How a fixture holds a script where an offer of the service's open is already made and the host has not adopted it:
+-- @TEST_AWAIT_OFFER(name)@ returns once the service holds an offered lease for the open of that name. It runs on the script's own
+-- thread, waits on the adapter's own state and nothing else, and a real script has no such function.
+awaitOfferFixture ∷ TerrainFacade → Binding
+awaitOfferFixture facade =
+  asynchronousNativeRequestIn "terrain_test_await_offer" [SText] [] $ \_ values → case values of
+    [VText name] →
+      [] <$ bounded (atomically (readTVar (tfOffered facade) >>= \held → if any (Text.isSuffixOf ("/" <> name)) (Set.toList held) then pure () else retry))
     _ → pure []
 
 -- | Lua for the soil-over-stone definition the examples share: stone below level -3, four soil levels from -3 to 1.

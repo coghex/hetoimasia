@@ -5,13 +5,16 @@
 -- adapter are held at named points by gates, so an example decides which side wins by what it does and never by how long it waits.
 module Test.LuaEngine.Terrain.Windows (spec) where
 
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally)
 import Control.Monad (unless)
 import Data.Maybe (isJust)
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
-import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
+import Hetoimasia.LuaEngine.Profile (CountLimit (LuaIntegerMaximum))
+import Hetoimasia.LuaEngine.Terrain (TerrainFacade (..), TerrainHooks (..), noTerrainHooks)
+import Test.LuaEngine.Request.Profiles (counts)
 import Hetoimasia.Terrain.Residency (LimitsSpec (..), mkLimits)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Source (LayerSpec (..), SourceSpec (..))
@@ -146,6 +149,64 @@ failing inInit =
     , scInit = ["self.s = 0", "self.q = api.terrain.open('f', DEF)"] <> ["error('init failed')" | inInit]
     , scUpdate = ["if self.s == 0 then local t = settle(api, self.q) if t then self.arena = t.value print('opened') self.s = 1 end end"]
     , scShutdown = ["error('shutdown failed')" | not inInit]
+    }
+
+-- | A presentation instance that opens a name, waits until the service has committed the open and offered its lease, and cancels it
+-- before the host has adopted it; another instance then opens the same name.
+cancelAfterOffer ∷ Script
+cancelAfterOffer =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.q = api.terrain.open('offered', DEF)", "TEST_AWAIT_OFFER('offered')", "print('cancel', api.request.cancel(self.q))"]
+    }
+
+-- | The second instance of the example above.
+reopens ∷ Script
+reopens =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.q = api.terrain.open('offered', DEF)"]
+    , scUpdate = ["if self.q then local t = settle(api, self.q) if t then print('reopen', t.status, t.error and t.error.code) self.q = nil end end"]
+    }
+
+-- | An instance that opens a name once and asks for it again many times, and opens invalid definitions, all failing at once.
+failingOpens ∷ Script
+failingOpens =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('dup', DEF)", "self.n = 0"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.arena = t.value self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  self.pending = {}"
+        , "  for i = 1, 8 do self.pending[#self.pending + 1] = api.terrain.open('dup', DEF) end"
+        , "  for i = 1, 8 do self.pending[#self.pending + 1] = api.terrain.open('bad' .. i, { materials = {}, layers = {} }) end"
+        , "  self.s = 2"
+        , "elseif self.s == 2 then"
+        , "  local left = 0"
+        , "  for i, r in ipairs(self.pending) do if r and settle(api, r) then self.pending[i] = false elseif r then left = left + 1 end end"
+        , "  if left == 0 then print('done') self.s = 3 end"
+        , "end"
+        ]
+    }
+
+-- | One cell read of a freshly opened arena, which says its revision.
+firstRead ∷ Script
+firstRead =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('r', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then self.c = api.terrain.cell(t.value, {x = 0, y = 0, z = 0}) self.s = 1 end"
+        , "elseif self.s == 1 then"
+        , "  local c = settle(api, self.c)"
+        , "  if c then print('revision', c.status, c.value.revision) print('done') self.s = 2 end"
+        , "end"
+        ]
     }
 
 -- | An instance that finds the service's clients, arenas or leases all taken.
@@ -445,6 +506,53 @@ spec = describe "Terrain windows and banks" $ do
                 limitHeld (rgService rig) "clients" `shouldReturn` 0
       )
       [True, False]
+
+  it "frees a cancelled open's name while the service has not been told, also when its lease was already offered" $ do
+    tellGate ← newGate
+    (`finally` openGate tellGate) $
+      withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookCancelling = holdAt tellGate} $ \rig →
+        withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource cancelAfterOffer), ("lua/second.lua", scriptSource reopens)]) $ \world _ runtime →
+          withFvm world runtime (presentationOver rig) $ \first →
+            withFvm world runtime (presentationOver rig) $ \second → do
+              -- the service committed the open and offered its lease; the script cancelled it before the host adopted it, and the
+              -- telling of the service is held
+              _ ← admitOnly world first "modules-test" mainPath
+              awaitReached tellGate
+              _ ← spawn world second "modules-test" "lua/second.lua"
+              untilPrinted world "reopen\tsuccess\tnil"
+              openGate tellGate
+
+  it "keeps no claim of an open that has ended: repeated duplicate and invalid opens leave the registry empty once the instance is forgotten" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource failingOpens)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "done"
+          -- what is left is bounded by what is still open: the one arena the instance holds has ended its request
+          forgetInstance (fvFacade fvm) (spId spawned)
+          (Map.size <$> readTVarIO (tfClaims (rgFacade rig))) >>= (`shouldBe` 0)
+
+  it "publishes a revision the profile's integer ceiling holds, and settles a host defect for the first one above it" $ do
+    mapM_
+      ( \(first, expectDefect) →
+          if expectDefect
+            then do
+              (_, ExceptionWithContext _ raised) ←
+                fatalWorld (counts [(LuaIntegerMaximum, 40)]) (Layout [("lua/main.lua", scriptSource firstRead)]) $ \world _ runtime →
+                  withRigConfig defaultConfig {configFirstRevision = first} $ \rig →
+                    withFvm world runtime (presentationOver rig) $ \fvm → do
+                      _ ← spawn world fvm "modules-test" mainPath
+                      pumpUntil world (advanceClock world 2000000000 >> (pure False))
+              show raised `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack
+            else
+              withWorld (counts [(LuaIntegerMaximum, 40)]) (Layout [("lua/main.lua", scriptSource firstRead)]) $ \world _ runtime →
+                withRigConfig defaultConfig {configFirstRevision = first} $ \rig →
+                  withFvm world runtime (presentationOver rig) $ \fvm → do
+                    _ ← spawn world fvm "modules-test" mainPath
+                    untilPrinted world "done"
+                    outLines world >>= \printed → printed `shouldContain` ["revision\tsuccess\t40"]
+      )
+      [(40, False), (41, True)]
 
   it "gives a logical read ordered after a removal of the same cell the post-removal value and revision, reads prepared before the commit included" $
     withRig $ \rig →

@@ -585,6 +585,9 @@ data TerrainVm = TerrainVm
   -- ^ The VM's one lending, shared with every other service of the VM that leases resources (graphics, when injected).
   , tvLeases ∷ !Leases
   -- ^ The VM's one lease scope, shared likewise: the terrain leases are charged in the same scope as the VM's other leases.
+  , tvIntegerCeiling ∷ !Word64
+  -- ^ The largest integer a script of this VM may be handed, from the VM's validated profile: a content revision above it is a
+  -- host defect, never published.
   , tvSession ∷ !Unique
   -- ^ The identity of the session this VM belongs to, the same for both roles of one session and for no other session: the
   -- terrain namespace is the session's and the instance's content root.

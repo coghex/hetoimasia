@@ -444,7 +444,7 @@ composeVmServices profile role requests takesWork session graphicsInjection terr
       pure (Just (lending, leases, terrainCapacity))
     (Nothing, Nothing) → pure Nothing
   terrain ← case (terrainInjection, scope) of
-    (Just injection, Just (lending, leases, _)) → Just <$> injectTerrain injection (TerrainVm role requests takesWork lending leases session)
+    (Just injection, Just (lending, leases, _)) → Just <$> injectTerrain injection (TerrainVm role requests takesWork lending leases (let Count largest = countLimit profile LuaIntegerMaximum in largest) session)
     _ → pure Nothing
   pure (VmServices graphics terrain scope)
 

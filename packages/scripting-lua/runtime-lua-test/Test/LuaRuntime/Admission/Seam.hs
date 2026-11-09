@@ -3,14 +3,19 @@
 -- provider that cannot reserve its own banks inside the engine's admission declines the request and the admission is taken back whole.
 module Test.LuaRuntime.Admission.Seam (spec) where
 
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (throwIO)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Control.Monad (void)
+import Hetoimasia.Scripting.Lua.Admission
+import Hetoimasia.Scripting.Lua.Lease (Ownership (..))
 import Hetoimasia.Scripting.Lua.Provider
+import Hetoimasia.Scripting.Lua.Scheduled (grantScheduledStep, scheduledEndpoint)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
-import Test.Hspec (Spec, describe, it, shouldBe)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Request.Support (diagnostics, onSubmit, submissions)
+import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
 
 -- | The seam of the request the provider was last handed.
@@ -61,3 +66,48 @@ spec = describe "the settlement seam and the declining hand-off" $ do
       awaitNote fixture "cmd cancel b cancelled"
       atomically (settlingEligible second) >>= (`shouldBe` False)
       submissions (afFake fixture) >>= (`shouldBe` 2)
+
+  it "treats every reply that comes while a resource reply waits to be built as a duplicate, whatever it is" $ bounded $ do
+    fixture ← newAFix 4
+    setPolicy fixture (\held → held {polLease = Just InstanceOwned})
+    withBoundary $ \_ runtime → settleAll fixture $ do
+      owner ← startAdmitting fixture runtime "duplicate" [admitter] aConfig (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+      admitAdmitter fixture owner "i" "admitter"
+      seam ← newIORef Nothing
+      onSubmit (afFake fixture) (captured seam)
+      acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+      awaitNote fixture "cmd start a started"
+      Just settling ← readIORef seam
+      -- in one transaction, so the owner cannot have built the resource between the two replies
+      (first, second) ←
+        atomically $ do
+          one ← settlingSettle settling (ProviderResource (VInteger 4) (Adoption (\_ → resourceFor fixture "r1")))
+          two ← settlingSettle settling (ProviderResult (VInteger 9))
+          pure (one, two)
+      (first, second) `shouldBe` (ReplyAdoption, ReplyLate)
+      -- the first reply is the one: the request settles with the resource, and the duplicate replaced nothing
+      awaitNote fixture "acquire r1"
+      acommand fixture owner "i" "wait_take" "a"
+      line ← lineStarting fixture "cmd wait_take a "
+      line `shouldSatisfy` (/= "")
+
+  it "lets a request commit only when every earlier place of its tick has been answered, whichever was answered first" $ bounded $ do
+    fixture ← newAFix 4
+    withBoundary $ \_ runtime → settleAll fixture $ do
+      owner ← startAdmitting fixture runtime "ordered" [admitter] aConfig (admissionGrant fixture 8 (SettleAtAssignedTick Nothing)) requiredPolicy
+      admitAdmitter fixture owner "i" "admitter"
+      seams ← newIORef []
+      onSubmit (afFake fixture) (\submission → modifyIORef' seams (<> [submissionSettling submission]))
+      acommand fixture owner "i" "start" "a"
+      awaitNote fixture "cmd start a started"
+      acommand fixture owner "i" "start" "b"
+      awaitNote fixture "cmd start b started"
+      Just earlier : Just later : _ ← readIORef seams
+      -- the tick is granted: both requests are waiting at its boundary, the later one's provider is ready first
+      void (grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1))
+      atomically (settlingEligible earlier >>= \ok → if ok then pure () else retry)
+      atomically (settlingEligible later) >>= (`shouldBe` False)
+      -- the earlier place is answered, and only then may the later one commit
+      atomically (settlingSettle earlier (ProviderResult (VInteger 1))) >>= (`shouldBe` ReplySettled)
+      atomically (settlingEligible later) >>= (`shouldBe` True)
+      atomically (settlingSettle later (ProviderResult (VInteger 2))) >>= (`shouldBe` ReplySettled)

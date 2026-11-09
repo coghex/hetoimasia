@@ -63,7 +63,7 @@ module Hetoimasia.LuaEngine.Terrain
 
 import Control.Concurrent.STM
 import Control.Exception (Exception, finally, mask, mask_, onException, throwIO)
-import Control.Monad (forM_, void, when)
+import Control.Monad (filterM, forM_, unless, void, when)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -186,6 +186,10 @@ data TerrainFacade = TerrainFacade
 -- | An open the service holds a name for: whether the host has settled it without telling the service, and the telling.
 data Claim = Claim
   { clStale ∷ STM Bool
+  -- ^ The host has settled the request without the service's telling (it was cancelled, or its requester ended) and the service
+  -- still holds the claim: whether the offered lease was adopted does not matter, an adopted open is the arena's own claim.
+  , clDone ∷ STM Bool
+  -- ^ The request reached its end for the adapter: the service answered it (or was told) and no offered lease waits to be adopted.
   , clCancel ∷ IO ()
   }
 
@@ -494,6 +498,7 @@ drainRetired ∷ Env → IO ()
 drainRetired env = do
   requests ← atomically (swapTVar (envRetire env) [])
   forM_ (reverse requests) (retire (service env))
+  atomically (pruneClaims (envFacade env))
   dropped ← atomically (swapTVar (envDropped env) [])
   forM_ (reverse dropped) (Terrain.releaseLease (service env))
 
@@ -627,9 +632,9 @@ closedFailure ∷ ExpectedFailure
 closedFailure = ExpectedFailure "arena_closed" "the arena has closed" Nothing Nothing
 
 -- | A revision as a Lua integer, when it is one.
-revisionOf ∷ Revision → Maybe Int64
-revisionOf (Revision w)
-  | w <= fromIntegral (maxBound ∷ Int64) = Just (fromIntegral w)
+revisionOf ∷ Word64 → Revision → Maybe Int64
+revisionOf ceiling' (Revision w)
+  | w <= min ceiling' (fromIntegral (maxBound ∷ Int64)) = Just (fromIntegral w)
   | otherwise = Nothing
 
 cellFields ∷ Cell → [(Text, Value)]
@@ -641,8 +646,8 @@ materialText ∷ MaterialId → Text
 materialText = Text.pack . materialIdString
 
 -- | The reply for an answer that is not a lease, or a defect for one that cannot be handed to Lua.
-answerReply ∷ Answer → ProviderReply
-answerReply = \case
+answerReply ∷ Word64 → Answer → ProviderReply
+answerReply ceiling' = \case
   ACell answer → withRevision (cellRevision answer) $ \revision → VRecord (("revision", VInteger revision) : cellFields (cellValue answer))
   AColumn answer → withRevision (columnRevision answer) $ \revision →
     VRecord
@@ -663,7 +668,7 @@ answerReply = \case
   AOpened _ → ProviderFailure "terrain: a lease answer reached the value conversion"
   AAttached _ → ProviderFailure "terrain: a lease answer reached the value conversion"
   where
-    withRevision revision build = case revisionOf revision of
+    withRevision revision build = case revisionOf ceiling' revision of
       Just found → ProviderResult (build found)
       Nothing → ProviderFailure "terrain: a content revision is not a Lua integer"
 
@@ -714,7 +719,7 @@ submit env submission = mask_ $ do
             _ ← settlingSettle settling (ProviderFailure "terrain: a content revision is not a Lua integer")
             pure False
           _ → pure True
-      exceeds (Revision w) advance = w > fromIntegral (maxBound ∷ Int64) - advance
+      exceeds (Revision w) advance = w > min (tvIntegerCeiling (envVm env)) (fromIntegral (maxBound ∷ Int64)) - advance
       ep =
         Endpoint
           { endpointReady = pure ()
@@ -737,10 +742,13 @@ submit env submission = mask_ $ do
     Right request → do
       atomically (writeTVar (pdRequest found) (Just request))
       case pdAsk found of
-        AskOpen _ name _ →
-          atomically $
-            modifyTVar' (tfClaims (envFacade env)) $
-              Map.insertWith (<>) name [Claim ((&&) <$> submissionSettled submission <*> (not <$> readTVar (lkTerminal link))) (tellCancelled env link request)]
+        AskOpen _ name _ → do
+          let claim = Claim (stale link (submissionSettled submission)) (done link) (tellCancelled env link request)
+          atomically $ do
+            pruneClaims (envFacade env)
+            over ← clDone claim
+            -- A request that has already ended needs no claim: only what is still open can be found stale.
+            unless over (modifyTVar' (tfClaims (envFacade env)) (Map.insertWith (<>) name [claim]))
         _ → pure ()
       hookSubmitted (hooks env)
       pure
@@ -753,13 +761,34 @@ submit env submission = mask_ $ do
 -- now, which frees the name, before another open asks for it.
 releaseStale ∷ Env → Text → IO ()
 releaseStale env name = do
-  stale ← atomically $ do
+  tells ← atomically $ do
+    pruneClaims (envFacade env)
     held ← Map.findWithDefault [] name <$> readTVar (tfClaims (envFacade env))
     flags ← mapM clStale held
-    let kept = [claim | (claim, False) ← zip held flags]
-    modifyTVar' (tfClaims (envFacade env)) (if null kept then Map.delete name else Map.insert name kept)
     pure [clCancel claim | (claim, True) ← zip held flags]
-  sequence_ stale
+  sequence_ tells
+
+-- | The host has settled the request without the service's telling, and the offered lease (if any) was not adopted.
+stale ∷ Link → STM Bool → STM Bool
+stale link settled = do
+  ended ← settled
+  cell ← readTVar (lkLease link)
+  pure (ended && case cell of Adopted → False; Disposed → False; _ → True)
+
+-- | The request reached its end: the service has answered it and no offered lease is waiting for the host.
+done ∷ Link → STM Bool
+done link = do
+  answered ← readTVar (lkTerminal link)
+  cell ← readTVar (lkLease link)
+  pure (answered && case cell of Offered _ → False; _ → True)
+
+-- | Forget the claims of requests that have ended, so the registry holds only what is still open: bounded by the opens in flight,
+-- whatever came and went, and empty once every instance has been forgotten.
+pruneClaims ∷ TerrainFacade → STM ()
+pruneClaims facade = do
+  held ← readTVar (tfClaims facade)
+  kept ← traverse (filterM (fmap not . clDone)) held
+  writeTVar (tfClaims facade) (Map.filter (not . null) kept)
 
 -- | What the service's refusal of an admitted request is to the script: busy for a bank with no room, an ordinary error for
 -- anything permanent.
@@ -801,7 +830,7 @@ settleInto env link = \case
           writeTVar (lkTerminal link) True
         else offer lease
     other → do
-      settled ← settlingSettle (lkSettling link) (answerReply other)
+      settled ← settlingSettle (lkSettling link) (answerReply (tvIntegerCeiling (envVm env)) other)
       -- A reply the host rejects abandons the very transaction that is committing the change: nothing of it is written.
       when (settled `elem` [ReplyDefective, ReplyRefusedValue]) (throwSTM (SettlementRejected (Text.pack (show settled))))
       writeTVar (lkTerminal link) True

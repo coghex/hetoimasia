@@ -9,8 +9,9 @@ import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
 
--- | One instance: a duplicate open fails as name_in_use (read, and unread), an attach of a name that does not exist or is only
--- being opened is not_found, and a cancelled open releases its name at once, whatever its untaken result still holds.
+-- | One instance: a duplicate open fails as name_in_use (read, and unread), an attach after the arena is released is not_found, and a
+-- cancelled open releases its name at once, whatever its untaken result still holds. An attach to an open still pending is decided
+-- against held boundaries in the Windows examples, never by this script's race with the service.
 names ∷ Script
 names =
   script
@@ -19,18 +20,12 @@ names =
     , scUpdate =
         [ "if self.s == 0 then"
         , "  self.first = api.terrain.open('n', DEF)"
-        , "  -- the first open is pending: it blocks a duplicate and is invisible to attach"
+        , "  -- the first open is pending: it blocks a duplicate (whether it has settled when the duplicate is decided is not up to the script)"
         , "  self.dup = api.terrain.open('n', DEF)"
-        , "  self.att = api.terrain.attach('n')"
         , "  self.s = 1"
         , "elseif self.s == 1 then"
-        , "  if not self.d then self.d = settle(api, self.dup) end"
-        , "  if not self.a then self.a = settle(api, self.att) end"
-        , "  if self.d and self.a then"
-        , "    print('duplicate open', self.d.status, self.d.error and self.d.error.code)"
-        , "    print('attach to a pending open', self.a.status, self.a.error and self.a.error.code)"
-        , "    self.s = 2"
-        , "  end"
+        , "  local t = settle(api, self.dup)"
+        , "  if t then print('duplicate open', t.status, t.error and t.error.code) self.s = 2 end"
         , "elseif self.s == 2 then"
         , "  local t = settle(api, self.first)"
         , "  if t then"
@@ -79,7 +74,7 @@ spec = namesSpec >> heldSpec
 
 namesSpec ∷ Spec
 namesSpec = describe "Terrain names" $ do
-  it "claims a name with its open, hides a pending open from attach, and frees it at the terminal settlement" $
+  it "claims a name with its open, keeps it for the arena's life, and frees it at the terminal settlement" $
     withRig $ \rig →
       withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource names)]) $ \world _ runtime →
         withFvm world runtime (presentationOver rig) $ \fvm → do
@@ -88,8 +83,6 @@ namesSpec = describe "Terrain names" $ do
           printed ← outLines world
           printed
             `shouldBe` [ "duplicate open\tfailure\tname_in_use"
-                       , -- the open committed before the attach was decided: a race the example cannot hold; the held case is the next example
-                         "attach to a pending open\tsuccess\tnil"
                        , "first open\tsuccess"
                        , "attach after open\tsuccess"
                        , "release\tdone"

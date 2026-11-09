@@ -1489,8 +1489,22 @@ eligibleOf service identity = do
       , maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests (pSession st))) →
           case recDue record of
             Nothing → pure True
-            Just due → ticksGranted (psTicks service) (dueTick due)
+            Just due → do
+              granted ← ticksGranted (psTicks service) (dueTick due)
+              -- The assigned sequence orders what commits: a request whose tick is granted waits for every earlier place of the same
+              -- tick that is still waiting for its answer, so that two requests answered in the opposite order of their places still
+              -- commit in the order they were assigned, whichever arena or provider path each took.
+              pure (granted && not (any (waitingBefore st due) (Map.elems (pRecs st))))
     _ → pure False
+  where
+    waitingBefore st due other = case recDue other of
+      Just found
+        | dueTick found == dueTick due
+        , dueSequence found < dueSequence due →
+            isNothing (recHeld other)
+              && isNothing (recEnded other)
+              && maybe False (isNothing . requestSettlement) (Map.lookup (recIdentity other) (sessionRequests (pSession st)))
+      _ → False
 
 -- | Settle a request by the opt-in settlement seam, in the caller's transaction ('Settling'): a reply that is
 -- judged purely, then applied. A defect (a reply the service did not declare) is recorded for the owner to
@@ -1509,7 +1523,15 @@ settleWithFinal service ask schema final identity reply = do
   case checkReplyPure (psLimits service) schema ask reply of
     checked@(CheckedDefect _) → replyTo service identity checked
     checked@(CheckedResource {}) → replyToAs service (ReplyMode False (Just final) eligible) identity checked
-    checked → applyCheckedAs service eligible identity checked
+    checked → do
+      st ← readTVar (psVar service)
+      -- A reply that comes while a resource reply is waiting to be built is a duplicate whatever it is: the first accepted reply is the
+      -- one, and nothing replaces it before its adoption settles.
+      if Map.member identity (pAdopting st)
+        then do
+          writeTVar (psVar service) st {pCounts = (pCounts st) {countDuplicateHeld = countDuplicateHeld (pCounts st) + 1}}
+          pure ReplyLate
+        else applyCheckedAs service eligible identity checked
 
 -- | How many provider defects are kept for the owner to raise: it fails with the first, and the rest are
 -- evidence; a provider that goes on answering wrongly cannot grow what the service keeps.
