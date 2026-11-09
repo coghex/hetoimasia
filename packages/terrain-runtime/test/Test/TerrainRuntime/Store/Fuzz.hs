@@ -14,6 +14,7 @@ module Test.TerrainRuntime.Store.Fuzz (spec, fuzzOnce, judgeMutated, Finding (..
 import Control.Monad (forM, forM_)
 import qualified Data.ByteString as BS
 import Data.List (sortOn)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word64)
@@ -23,7 +24,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RangeStart (..))
-import Hetoimasia.Terrain.Runtime.Store.Internal.Records (decodeKey)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (decodeKey, encodeKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Test.Hspec
@@ -61,6 +62,25 @@ through h disk tok act = start
               Right w' → go w' (n + 1)
           other → Left (show other)
 
+-- | Run a tree operation through a window filled from the (mutated) disk; a refused page, or a
+-- stop that is not a missing page, is an integrity failure (@Left@).
+throughM ∷ H → Disk → ReaderToken → M a → Either String a
+throughM h disk tok act = start
+  where
+    total = cfgUsablePages (hCfg h)
+    hw = rHw (storeRoots (hStore h))
+    start = either (const (Left "stale")) (\w → go (windowBelow hw w) (0 ∷ Int)) (readerWindow (hStore h) tok)
+    go w n
+      | n > 4000 = Left "did not settle"
+      | otherwise = case runM act (newEdit 0 w) of
+          Right (a, _) → Right a
+          Left (Need p) → case diskRead disk p of
+            Nothing → Left ("page not on disk " <> show p)
+            Just bs → case windowInsert total p bs w of
+              Left e → Left ("refused " <> show e)
+              Right w' → go w' (n + 1)
+          Left stop' → Left (show stop')
+
 reseal ∷ BS.ByteString → BS.ByteString
 reseal bs = let body = BS.take 4092 bs in BS.append body (le32' (refCrc32c body))
 
@@ -74,7 +94,10 @@ fuzzOnce h tok ref keys page offset newByte = do
 judgeMutated ∷ H → ReaderToken → Map.Map RecordKey Record → [RecordKey] → Word64 → Int → Word64 → BS.ByteString → Either String [Finding]
 judgeMutated h tok ref keys page offset newByte mutated = do
   original ← maybe (Left "page missing") Right (diskRead (hDisk h) (PageNo page))
-  let disk' = diskWrite (PageNo page) mutated (hDisk h)
+  let ArenaId arenaNo = siArena (hIdent h)
+      rootRef = fromMaybe (PageNo 0) (committedRoot (hStore h) TreeRuns)
+      livePagesBelow = [q | q ← twPages (walkTree arenaNo (siSource (hIdent h)) (diskRead (hDisk h)) ((\(PageNo r) → r) <$> committedRoot (hStore h) TreeRuns))]
+      disk' = diskWrite (PageNo page) mutated (hDisk h)
       total = cfgUsablePages (hCfg h)
       keysOf bs = case decodePage (hIdent h) total (PageNo page) bs of
         Right (Page TreeRuns 0 _ (Leaf es)) → [k | (kb, _) ← es, Just k ← [decodeKey TreeRuns kb]]
@@ -110,6 +133,43 @@ judgeMutated h tok ref keys page offset newByte mutated = do
                 Left e → Left e
                 Right [] → Right (reverse acc)
                 Right rs → go (RangeAfter (fst (last rs))) (reverse rs ++ acc) (n + 1)
+      sortedKeys = sortOn encodeKey keys
+      ceilRef k = case [x | x ← sortedKeys, encodeKey x >= encodeKey k] of
+        (x : _) → Just x
+        [] → Nothing
+      -- the least key at or after a key, from the tree's own ceiling
+      judgeCeil k =
+        case throughM h disk' tok (ceilKey TreeRuns False (Just (Disk rootRef)) (encodeKey k)) of
+          Left _ → []
+          Right got
+            | Set.member k allowed → []
+            | otherwise →
+                let want = ceilRef k
+                    gotKey = got >>= \(kb, _) → decodeKey TreeRuns kb
+                 in ["ceiling of " <> show k <> " answered " <> show gotKey <> " but the reference's is " <> show want | gotKey /= want, maybe True (\x → not (Set.member x allowed)) want, maybe True (\x → not (Set.member x allowed)) gotKey]
+      -- a ranged read that starts at a key must return what follows it
+      judgeRange k = case through h disk' tok (\w → readerRange (hStore h) tok w TreeRuns (RangeFrom k) 12) of
+        Left _ → []
+        Right got →
+          let want = take 12 [x | x ← sortedKeys, encodeKey x >= encodeKey k]
+              gotKeys = map fst got
+           in ["a scan from " <> show k <> " answered " <> show (length gotKeys) <> " records that are not the reference's " | gotKeys /= want, not (any (`Set.member` allowed) (want ++ gotKeys))]
+      -- a page the tree reaches is never declared unreachable
+      judgeLive = concat
+        [ case throughM h disk' tok (livePageAt TreeRuns (Just (Disk rootRef)) kb lvl) of
+            Left _ → []
+            Right Nothing → ["a live page " <> show q <> " was declared unreachable"]
+            Right (Just found) → ["page " <> show q <> " was found as " <> show found | found /= PageNo q]
+        | q ← take 10 (every 5 livePagesBelow)
+        , Just (kb, lvl) ← [firstKeyOf q]
+        , not (Set.member (PageNo q) mutatedSet)
+        ]
+      mutatedSet = Set.singleton (PageNo page)
+      every n xs = [x | (i, x) ← zip [0 ∷ Int ..] xs, i `mod` n == 0]
+      firstKeyOf q = case decodePage (hIdent h) total (PageNo q) =<< maybe (Left BadMagic) Right (diskRead (hDisk h) (PageNo q)) of
+        Right (Page _ lv _ (Leaf ((kb, _) : _))) → Just (kb, lv)
+        Right (Page _ lv _ (Inner ((kb, _) : _))) → Just (kb, lv)
+        _ → Nothing
       judgeScan = case fullScan of
         Left _ → []
         Right got →
@@ -117,7 +177,7 @@ judgeMutated h tok ref keys page offset newByte mutated = do
               missing = [k | k ← Map.keys ref, not (Set.member k allowed), Map.lookup k gotMap /= Map.lookup k ref]
               extra = [k | k ← Map.keys gotMap, not (Set.member k allowed), not (Map.member k ref)]
            in ["scan: " <> show (length missing) <> " records absent or different, " <> show (length extra) <> " extra" | not (null missing && null extra)]
-  let findings = concatMap judgeLookup sample ++ concatMap judgeFloor (take 12 sample) ++ judgeScan
+  let findings = concatMap judgeLookup sample ++ concatMap judgeFloor (take 12 sample) ++ concatMap judgeCeil (take 16 sample) ++ concatMap judgeRange (take 10 sample) ++ judgeLive ++ judgeScan
   Right [Finding page offset newByte f | f ← take 3 findings]
 
 spec ∷ Spec
