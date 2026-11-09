@@ -75,8 +75,9 @@ maxValueBytes ∷ Int
 maxValueBytes = 64
 
 -- | The most bytes one leaf entry takes: a one-byte key length, a one-byte value
--- length, the key and the value. An internal entry is smaller (a key and an
--- eight-byte page number).
+-- length, the key and the value. An internal entry is smaller: a one-byte key length,
+-- the key, the child's page number (8) and its checksum (4), whose size is defined once
+-- as 'Hetoimasia.Terrain.Runtime.Store.Internal.Page.innerKeyBytes'.
 maxEntryBytes ∷ Int
 maxEntryBytes = 2 + maxKeyBytes + maxValueBytes
 
