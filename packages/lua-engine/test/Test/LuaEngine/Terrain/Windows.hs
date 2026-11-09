@@ -8,6 +8,7 @@ module Test.LuaEngine.Terrain.Windows (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
+import Data.Either (isLeft)
 import Control.Monad (unless)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
@@ -687,6 +688,18 @@ spec = describe "Terrain windows and banks" $ do
             either (\failure → show failure `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack) (const (expectationFailure "the owner did not fail")) failed
             observeCell rig (arenaName rig "modules-test" "c") (0, 0, -1) `shouldReturn` (40, Just "soil")
     show raised `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack
+
+  it "leaves no arena or lease behind when the host's adoption of an offered lease fails" $ do
+    (_, ExceptionWithContext _ _) ←
+      fatalWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource opener)]) $ \world _ runtime →
+        withRigHooks defaultConfigForRaces noProbeForRaces noTerrainHooks {hookAdopting = ioError (userError "adoption failed")} $ \rig →
+          withFvm world runtime (presentationOver rig) $ \fvm → do
+            _ ← admitOnly world fvm "modules-test" mainPath
+            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
+            failed `shouldSatisfy` isLeft
+            limitHeld (rgService rig) "arenas" `shouldReturn` 0
+            limitHeld (rgService rig) "leases" `shouldReturn` 0
+    pure ()
 
   it "gives a logical read ordered after a removal of the same cell the post-removal value and revision, reads prepared before the commit included" $
     withRig $ \rig →
