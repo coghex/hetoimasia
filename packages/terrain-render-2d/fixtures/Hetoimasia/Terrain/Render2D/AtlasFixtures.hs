@@ -40,9 +40,9 @@ import Hetoimasia.Render.Api.Texture (TextureHandle)
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Terrain.MapBake.Catalog (catalogKeys, mapIdentifier)
 import Hetoimasia.Terrain.Render2D.Assets (AssetSnapshot, ColourRef (..), mkAssetSnapshot, mkColourAsset, mkMapAsset)
-import Hetoimasia.Asset.Image.Region (fullImageView)
+import Hetoimasia.Asset.Image.Region (fullImageViewWith)
 import Hetoimasia.Terrain.Render2D.Material (AtlasTextures (..), bindColourParent, bindDataParent, packedTextures)
-import Hetoimasia.Terrain.Render2D.AtlasAssets (ParentAtlas (..), ParentKind (..), atlasAssetSnapshot)
+import Hetoimasia.Terrain.Render2D.AtlasAssets (ParentAtlas (..), ParentKind (..), atlasAssetSnapshot, parentContentDigest)
 import Hetoimasia.Terrain.Render2D.Evidence (ArtSource (..))
 import System.Directory (doesDirectoryExist, getCurrentDirectory)
 import System.FilePath (takeDirectory, (</>))
@@ -105,7 +105,8 @@ loadAtlasStyle version materials = do
           Just encoding → either (failWith file . show) pure (checkNormalEncoding encoding w h level)
           Nothing → pure ()
         plane ← either (failWith file . show) pure (buildBinaryCoverage w h level)
-        pure (ParentAtlas version version plane profile (case policy of DecodeColour → ColourParent; DecodeData → DataParent) (length (decodedLevels image)), image)
+        let kind = case policy of DecodeColour → ColourParent; DecodeData → DataParent
+        pure (ParentAtlas version version plane profile kind (parentContentDigest kind (w, h) level) (length (decodedLevels image)), image)
   (colour, colourImage) ← parent "colour.png" DecodeColour Nothing
   (normal, normalImage) ← parent "normal.png" DecodeData (Just UnitNormalRgbV1)
   (_, normalAsColour) ← parent "normal.png" DecodeColour Nothing
@@ -179,12 +180,13 @@ loadSingleImages version materials = do
       _ → pure ()
     plane ← either (failWith identity . show) pure (buildBinaryCoverage (decodedWidth image) (decodedHeight image) level)
     let parentVersion = 1000 + fromIntegral index ∷ Word64
-        parent = ParentAtlas parentVersion parentVersion plane (if isColour then Nothing else Just UnitNormalRgbV1) (if isColour then ColourParent else DataParent) 1
+        kind = if isColour then ColourParent else DataParent
+        parent = ParentAtlas parentVersion parentVersion plane (if isColour then Nothing else Just UnitNormalRgbV1) kind (parentContentDigest kind (decodedWidth image, decodedHeight image) level) 1
     pure (identity, image, parent)
   let table = Map.fromList [(identity, parent) | (identity, _, parent) ← loaded]
       viewOf identity = do
         parent ← maybe (failWith identity "not loaded") pure (Map.lookup identity table)
-        view ← either (failWith identity . show) pure (fullImageView (parentCoverageVersion parent) (parentCoverage parent))
+        view ← either (failWith identity . show) pure (fullImageViewWith (parentContent parent) (parentCoverageVersion parent) (parentCoverage parent))
         pure (parentCoverageVersion parent, view)
       colourAsset ref identity = do
         (v, view) ← viewOf identity

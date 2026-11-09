@@ -19,6 +19,7 @@ import Hetoimasia.Render.TwoD.Material (MaterialFacts (..), MaterialRecord (..),
 import Hetoimasia.Render.TwoD.Material.Backend (materialRef)
 import Hetoimasia.Render.TwoD.Oracle.Material (Colour (..), MaterialInput (..), MaterialModel (..))
 import Hetoimasia.Render.TwoD.Snapshot (Instance (..), Sampler (..))
+import Hetoimasia.Asset.Image.Region (fullImageViewWith)
 import Hetoimasia.Terrain.Render2D.Assets (ColourRef (..))
 import Hetoimasia.Terrain.Render2D.AtlasAssets (AtlasAssetError (..), ParentAtlas (..), ParentKind (..), atlasAssetSnapshot)
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), loadAtlasStyle, loadSingleImageStyle)
@@ -410,6 +411,41 @@ adaptationSpec = describe "adapting a cell plan" $ do
       let build colour normal = atlasAssetSnapshot 5 (styleManifest style) colour normal [(stoneId, "colour.loam")]
       build (styleColour style) (styleNormal style) {parentLevels = 2} `shouldBe` Left (AtlasParentLevels "normal" 2)
       build (styleColour style) {parentKind = DataParent} (styleNormal style) `shouldBe` Left (AtlasParentKind "colour" DataParent)
+    it "tells two different parents of one version and extent apart by their content, and refuses swapped or ambiguous bindings" $ do
+      (assets, textures, handles) ← loadSingleImageStyle 5 [("stone", "colour.loam"), ("soil", "colour.granite")]
+      let plan = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 0 KnownAll])
+          loamT = [t | t ← atlasColour textures, Just (ptHandle t) == Map.lookup "colour.loam" handles]
+          graniteT = [t | t ← atlasColour textures, Just (ptHandle t) == Map.lookup "colour.granite" handles]
+      -- Same extent (96 x 64), different images: their digests differ.
+      map ptContent loamT /= map ptContent graniteT `shouldBe` True
+      -- Forced to one version, the parents are still told apart by content: the stone (loam) quad
+      -- draws with the loam handle, never the granite one.
+      let sameVersion t = t {ptVersion = 1000}
+          forced = textures {atlasColour = map sameVersion (atlasColour textures)}
+      case (loamT, graniteT) of
+        (l : _, g : _) → ptHandle l `shouldSatisfy` (/= ptHandle g)
+        _ → expectationFailure "no loam or granite binding"
+      -- A colour binding that is really a data parent (same list slot, matching extent) is not
+      -- accepted for a colour region; and a duplicated binding is ambiguous, not first-wins.
+      case atlasColour textures of
+        t : _ → do
+          adaptCells textures {atlasColour = [t {ptKind = DataParent}]} defaultLightSettings assets plan `shouldSatisfy` isLeft
+          adaptCells textures {atlasColour = atlasColour textures <> atlasColour textures} defaultLightSettings assets plan `shouldSatisfy` (\r → case r of Left (AmbiguousTexture _ _) → True; _ → False)
+        [] → expectationFailure "no colour bindings"
+      forced `shouldSatisfy` (const True)
+    it "resolves two different 96 x 64 parents of the same version to their own handles (the equal-version collision)" $ do
+      let plane = planeFromFormula (\_ _ → True)
+          viewOf content = either (error . show) id (fullImageViewWith content 5 plane)
+          textureOf handleNo content kind = ParentTexture (textureHandle handleNo 1) 5 (96, 64) content kind
+          bindings = AtlasTextures [textureOf 10 111 ColourParent, textureOf 11 222 ColourParent] [textureOf 20 333 DataParent, textureOf 21 444 DataParent]
+          handlesOf colourContent normalContent = case quadRecord bindings 0 (viewOf colourContent) (viewOf normalContent) of
+            Right (MaterialRecord hs _) → hs
+            Left why → error (describeMaterialRefusal why)
+      handlesOf 111 333 `shouldBe` [textureHandle 10 1, textureHandle 20 1]
+      handlesOf 222 444 `shouldBe` [textureHandle 11 1, textureHandle 21 1]
+      handlesOf 222 333 `shouldBe` [textureHandle 11 1, textureHandle 20 1]
+      -- A parent whose content is bound nowhere is refused, not matched to the first of its size.
+      quadRecord bindings 0 (viewOf 999) (viewOf 333) `shouldBe` Left (NoTextureForParent "colour" 5 (96, 64))
     it "gives every region of a single-image style the handle of its own image: distinct images never share a handle" $ do
       (assets, textures, handles) ← loadSingleImageStyle 5 [("stone", "colour.loam"), ("soil", "colour.granite")]
       let scenes =

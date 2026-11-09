@@ -46,6 +46,9 @@ module Hetoimasia.Asset.Image.Region
     -- * Views over a parent's coverage
   , RegionView
   , mkRegionView
+  , mkRegionViewWith
+  , regionViewContent
+  , fullImageViewWith
   , fullImageView
   , regionViewRegion
   , regionViewParent
@@ -123,6 +126,9 @@ data RegionView = RegionView
   { rvParent ∷ !CoveragePlane
   , rvVersion ∷ !Word64
   , rvLayout ∷ !Word64
+  , rvContent ∷ !Word64
+  -- ^ A digest of the parent image's decoded content, so two different images of one version and
+  -- extent are distinct parents; zero where the caller supplies none.
   , rvRegion ∷ !ImageRegion
   }
   deriving stock (Eq, Show)
@@ -131,10 +137,14 @@ data RegionView = RegionView
 -- version is the parent texture's, the layout the opaque identity of the arrangement the
 -- rectangle came from (a manifest's digest, for instance); neither is interpreted here.
 mkRegionView ∷ Word64 → Word64 → CoveragePlane → ImageRegion → Either RegionRefusal RegionView
-mkRegionView version layout plane region
+mkRegionView = mkRegionViewWith 0
+
+-- | 'mkRegionView' for a parent whose decoded content has this digest.
+mkRegionViewWith ∷ Word64 → Word64 → Word64 → CoveragePlane → ImageRegion → Either RegionRefusal RegionView
+mkRegionViewWith content version layout plane region
   | far (regionOriginX region) (regionWidth region) > toInteger pw || far (regionOriginY region) (regionHeight region) > toInteger ph =
       Left (RegionOutOfBounds region pw ph)
-  | otherwise = Right (RegionView plane version layout region)
+  | otherwise = Right (RegionView plane version layout content region)
   where
     pw = coverageWidth plane
     ph = coverageHeight plane
@@ -143,9 +153,13 @@ mkRegionView version layout plane region
 -- | The view of a whole image: its one region covers the parent from the origin. A single image
 -- is a one-region atlas, with layout identity zero.
 fullImageView ∷ Word64 → CoveragePlane → Either RegionRefusal RegionView
-fullImageView version plane = do
+fullImageView = fullImageViewWith 0
+
+-- | 'fullImageView' of an image whose decoded content has this digest.
+fullImageViewWith ∷ Word64 → Word64 → CoveragePlane → Either RegionRefusal RegionView
+fullImageViewWith content version plane = do
   region ← mkImageRegion 0 0 (coverageWidth plane) (coverageHeight plane)
-  mkRegionView version 0 plane region
+  mkRegionViewWith content version 0 plane region
 
 regionViewRegion ∷ RegionView → ImageRegion
 regionViewRegion = rvRegion
@@ -159,6 +173,10 @@ regionViewParentVersion = rvVersion
 
 regionViewLayout ∷ RegionView → Word64
 regionViewLayout = rvLayout
+
+-- | The parent's content digest (zero if none was supplied).
+regionViewContent ∷ RegionView → Word64
+regionViewContent = rvContent
 
 -- | The parent image's width and height.
 regionViewParentExtent ∷ RegionView → (Word32, Word32)
@@ -180,6 +198,7 @@ regionViewIdentity view = RegionIdentity (digest 14695981039346656037 fnv) (dige
     inputs =
       [ rvVersion view
       , rvLayout view
+      , rvContent view
       , fromIntegral pw
       , fromIntegral ph
       , fromIntegral (regionOriginX region)

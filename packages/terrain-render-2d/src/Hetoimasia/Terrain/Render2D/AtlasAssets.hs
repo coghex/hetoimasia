@@ -25,13 +25,17 @@ module Hetoimasia.Terrain.Render2D.AtlasAssets
   , ParentKind (..)
   , AtlasAssetError (..)
   , describeAtlasAssetError
+  , parentContentDigest
   , blankColourRegion
   , atlasAssetSnapshot
   ) where
 
-import Data.Word (Word32, Word64)
+import Data.Bits (shiftR, xor)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
+import Data.Word (Word32, Word64, Word8)
 import Hetoimasia.Asset.Image.DataMap (CoveragePlane, NormalEncoding (..), coverageHeight, coverageWidth)
-import Hetoimasia.Asset.Image.Region (RegionRefusal, mkRegionView, regionRefusalText)
+import Hetoimasia.Asset.Image.Region (RegionRefusal, mkRegionViewWith, regionRefusalText)
 import Hetoimasia.Terrain.Atlas.Manifest
 import Hetoimasia.Terrain.Cell (MaterialId)
 import Hetoimasia.Terrain.MapBake.Catalog (catalogKeys, mapIdentifier)
@@ -50,6 +54,9 @@ data ParentAtlas = ParentAtlas
   , parentCoverage ∷ !CoveragePlane
   , parentProfile ∷ !(Maybe NormalEncoding)
   , parentKind ∷ !ParentKind
+  , parentContent ∷ !Word64
+  -- ^ A digest of the decoded image (kind, extent and every byte of level zero): the parent's
+  -- identity, so two different images of one version and extent are never conflated.
   , parentLevels ∷ !Int
   -- ^ The mip levels the decode holds: sampling at texel centres at level zero is specified only
   -- for a single-level parent, so any other count is refused.
@@ -87,6 +94,16 @@ describeAtlasAssetError = \case
   AtlasRegionRefused identity why → "region " <> identity <> ": " <> regionRefusalText why
   AtlasUnknownColour identity → "no colour region " <> identity
   AtlasAsset why → "asset refused: " <> show why
+
+-- | The digest of a decoded parent: FNV-1a over its kind, extent and every byte of level zero. It
+-- identifies the image, so two different images of one version and extent differ; it is not a
+-- security boundary (a stale or mismatched binding is a wrong answer, not an attack).
+parentContentDigest ∷ ParentKind → (Word32, Word32) → ByteString → Word64
+parentContentDigest kind (w, h) bytes = ByteString.foldl' step (foldl' step 14695981039346656037 header) bytes
+  where
+    header ∷ [Word8]
+    header = [case kind of ColourParent → 1; DataParent → 2] <> concat [[fromIntegral (v `shiftR` (8 * k)) | k ← [0 .. 3]] | v ← [w, h]]
+    step acc byte = (acc `xor` fromIntegral byte) * 1099511628211
 
 -- | The colour region of the generic blank (fog) artwork.
 blankColourRegion ∷ String
@@ -130,7 +147,7 @@ atlasAssetSnapshot version manifest colourParent normalParent materials = do
       [] → Left (AtlasUnknownColour identity)
       r : _ → do
         rectangle ← first (AtlasRegionRefused identity) (regionRectangle r)
-        first (AtlasRegionRefused identity) (mkRegionView (parentCoverageVersion parent) (manifestLayout manifest) (parentCoverage parent) rectangle)
+        first (AtlasRegionRefused identity) (mkRegionViewWith (parentContent parent) (parentCoverageVersion parent) (manifestLayout manifest) (parentCoverage parent) rectangle)
     materialAsset colourView (material, identity) = do
       view ← colourView identity
       asset ← first AtlasAsset (mkColourAsset (ColourMaterial material) (parentTextureVersion colourParent) (parentCoverageVersion colourParent) view)

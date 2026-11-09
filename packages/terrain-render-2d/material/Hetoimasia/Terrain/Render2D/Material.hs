@@ -97,6 +97,7 @@ import Hetoimasia.Asset.Image.Region
   , regionOriginX
   , regionOriginY
   , regionViewParentExtent
+  , regionViewContent
   , regionViewParentVersion
   , regionViewRegion
   , regionWidth
@@ -122,6 +123,10 @@ data ParentTexture = ParentTexture
   { ptHandle ∷ !TextureHandle
   , ptVersion ∷ !Word64
   , ptExtent ∷ !(Word32, Word32)
+  , ptContent ∷ !Word64
+  -- ^ The parent's content digest: the identity that tells two different images of one version and
+  -- extent apart.
+  , ptKind ∷ !ParentKind
   }
   deriving stock (Eq, Show)
 
@@ -149,7 +154,7 @@ bindDataParent parent handle
   | otherwise = Right (bound parent handle)
 
 bound ∷ ParentAtlas → TextureHandle → ParentTexture
-bound parent handle = ParentTexture handle (parentCoverageVersion parent) (coverageWidth plane, coverageHeight plane)
+bound parent handle = ParentTexture handle (parentCoverageVersion parent) (coverageWidth plane, coverageHeight plane) (parentContent parent) (parentKind parent)
   where
     plane = parentCoverage parent
 
@@ -205,6 +210,8 @@ data MaterialRefusal
   | -- | No texture is bound to the parent a region lives in: the kind of parent, its coverage
     -- version and its extent.
     NoTextureForParent !String !Word64 !(Word32, Word32)
+  | -- | More than one binding matches the parent of a region: the kind of parent and its version.
+    AmbiguousTexture !String !Word64
   | -- | The assets are not the ones the plan was made against.
     StaleAssets
   | -- | The camera is not representable in 32 bits.
@@ -219,6 +226,7 @@ describeMaterialRefusal = \case
   NoMapRegion key → "the assets hold no map region for " <> show key
   RegionNotCanvas w h → "a region is " <> show w <> " x " <> show h <> ", not a 96 x 64 canvas"
   TooManyRecords n → "the plan needs more than " <> show n <> " distinct material records"
+  AmbiguousTexture kind version → "more than one " <> kind <> " texture is bound to the parent of version " <> show version
   NoTextureForParent kind version extent → "no " <> kind <> " texture is bound to the parent of version " <> show version <> " and extent " <> show extent
   StaleAssets → "the assets are not the ones the plan was made against"
   UnrepresentableView → "the camera is not representable in 32 bits"
@@ -245,9 +253,16 @@ quadRecord textures depth colour normal = do
 -- The texture bound to the parent a region lives in, by the parent's identity.
 resolveParent ∷ String → [ParentTexture] → RegionView → Either MaterialRefusal ParentTexture
 resolveParent kind bindings view =
-  case [t | t ← bindings, ptVersion t == regionViewParentVersion view, ptExtent t == regionViewParentExtent view] of
-    t : _ → Right t
+  case [ t
+       | t ← bindings
+       , ptVersion t == regionViewParentVersion view
+       , ptExtent t == regionViewParentExtent view
+       , ptContent t == regionViewContent view
+       , ptKind t == (if kind == "colour" then ColourParent else DataParent)
+       ] of
+    [t] → Right t
     [] → Left (NoTextureForParent kind (regionViewParentVersion view) (regionViewParentExtent view))
+    _ → Left (AmbiguousTexture kind (regionViewParentVersion view))
 
 -- | A planned quad with the table entry that draws it.
 data AdaptedQuad = AdaptedQuad
