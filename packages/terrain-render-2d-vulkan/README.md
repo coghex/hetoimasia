@@ -39,8 +39,9 @@ Declared through the renderer's checked `defineMaterial` (R2D-11):
   material.
 - **The function** takes, for each region separately, the texel the UV selects in
   the region's own 96 x 64 extent, `floor (clamp u 0 1 * w + 1/128)` (the bias is the
-  owner's 2026-11-09 Q-13 amendment v2; the GLSL literal is made from `texelBias`, the
-  rule's one definition in the region primitive), adds the origin afterwards, and samples that
+  owner's 2026-11-09 Q-13 amendments; the GLSL literal is made from `texelBias`, the
+  rule's one definition in `Hetoimasia.Terrain.Render2D.TexelRule` of the terrain main
+  library), adds the origin afterwards, and samples that
   texel's centre, `(origin + (i + 1/2, j + 1/2)) / atlasExtent`, nearest at level
   zero; both samples are unconditional (the sampler's derivatives need uniform
   control flow). It decodes the normal as `normalize (round (255 c) - 128)` (a
