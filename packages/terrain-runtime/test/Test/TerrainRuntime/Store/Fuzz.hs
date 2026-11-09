@@ -9,7 +9,7 @@
 -- value or key is a different record, which no structure can tell from an intended one);
 -- every other record must still read exactly. Fixed seeds, bounded: nothing here is
 -- timing-dependent.
-module Test.TerrainRuntime.Store.Fuzz (spec, fuzzOnce, judgeMutated, Finding (..)) where
+module Test.TerrainRuntime.Store.Fuzz (spec, fuzzOnce, judgeMutated, Finding (..), Tally (..)) where
 
 import Control.Monad (forM, forM_)
 import qualified Data.ByteString as BS
@@ -43,6 +43,30 @@ data Finding = Finding
   , fdWhat ∷ String
   }
   deriving stock (Show)
+
+-- | What one read came to: an integrity failure, exactly the reference's answer, an answer excused as
+-- data (a record of a changed leaf), or a defect.
+data Verdict = IntegrityError | EqualAnswer | Excused | Defect String
+
+-- | How many reads came to each, over a run.
+data Tally = Tally
+  { tMutations ∷ !Int
+  , tReads ∷ !Int
+  , tIntegrity ∷ !Int
+  , tEqual ∷ !Int
+  , tExcused ∷ !Int
+  , tDefects ∷ !Int
+  }
+  deriving stock (Show)
+
+instance Semigroup Tally where
+  Tally a b c d e f <> Tally a' b' c' d' e' f' = Tally (a + a') (b + b') (c + c') (d + d') (e + e') (f + f')
+
+instance Monoid Tally where
+  mempty = Tally 0 0 0 0 0 0
+
+tallyOf ∷ [Verdict] → Tally
+tallyOf vs = Tally 1 (length vs) (length [() | IntegrityError ← vs]) (length [() | EqualAnswer ← vs]) (length [() | Excused ← vs]) (length [() | Defect _ ← vs])
 
 -- | Fill a window from the (mutated) disk until the read answers: a page that is refused, or a
 -- read that reports corruption, is an integrity failure (@Left@).
@@ -85,13 +109,13 @@ reseal ∷ BS.ByteString → BS.ByteString
 reseal bs = let body = BS.take 4092 bs in BS.append body (le32' (refCrc32c body))
 
 -- | One mutation: the page, the byte and its new value, then every read judged.
-fuzzOnce ∷ H → ReaderToken → Map.Map RecordKey Record → [RecordKey] → Word64 → Int → Word64 → Either String [Finding]
+fuzzOnce ∷ H → ReaderToken → Map.Map RecordKey Record → [RecordKey] → Word64 → Int → Word64 → Either String ([Finding], Tally)
 fuzzOnce h tok ref keys page offset newByte = do
   original ← maybe (Left "page missing") Right (diskRead (hDisk h) (PageNo page))
   judgeMutated h tok ref keys page offset newByte (reseal (BS.concat [BS.take offset original, BS.singleton (fromIntegral newByte), BS.drop (offset + 1) original]))
 
 -- | Judge every read over a disk in which a page was replaced by given (valid) bytes.
-judgeMutated ∷ H → ReaderToken → Map.Map RecordKey Record → [RecordKey] → Word64 → Int → Word64 → BS.ByteString → Either String [Finding]
+judgeMutated ∷ H → ReaderToken → Map.Map RecordKey Record → [RecordKey] → Word64 → Int → Word64 → BS.ByteString → Either String ([Finding], Tally)
 judgeMutated h tok ref keys page offset newByte mutated = do
   original ← maybe (Left "page missing") Right (diskRead (hDisk h) (PageNo page))
   let ArenaId arenaNo = siArena (hIdent h)
@@ -113,19 +137,19 @@ judgeMutated h tok ref keys page offset newByte mutated = do
       nearBoundaries = [keys !! i | i ← [0, 7 .. 260], i < length keys]
       sample = [keys !! ((offset * 31 + i * 197) `mod` length keys) | i ← [0 .. 39]] ++ Set.toList allowed
       judgeLookup k = case through h disk' tok (\w → readerLookup (hStore h) tok w k) of
-        Left _ → []
+        Left _ → [IntegrityError]
         Right got
-          | Set.member k allowed → []
-          | got == Map.lookup k ref → []
-          | otherwise → ["lookup " <> show k <> " answered " <> show got <> " but the reference holds " <> show (Map.lookup k ref)]
+          | Set.member k allowed → [Excused]
+          | got == Map.lookup k ref → [EqualAnswer]
+          | otherwise → [Defect ("lookup " <> show k <> " answered " <> show got <> " but the reference holds " <> show (Map.lookup k ref))]
       judgeFloor k = case k of
         KeyRun col _ → case through h disk' tok (\w → readerFloorRun (hStore h) tok w col 25) of
-          Left _ → []
+          Left _ → [IntegrityError]
           Right got
-            | Set.member k allowed → []
-            | got == fmap (const (10, 20)) (Map.lookup k ref) → []
-            | otherwise → ["floor of " <> show k <> " answered " <> show got]
-        _ → []
+            | Set.member k allowed → [Excused]
+            | got == fmap (const (10, 20)) (Map.lookup k ref) → [EqualAnswer]
+            | otherwise → [Defect ("floor of " <> show k <> " answered " <> show got)]
+        _ → [Excused]
       -- the whole tree by ranged reads, from the first key
       fullScan = go (RangeFrom firstKey) [] (0 ∷ Int)
         where
@@ -142,26 +166,31 @@ judgeMutated h tok ref keys page offset newByte mutated = do
       -- the least key at or after a key, from the tree's own ceiling
       judgeCeil k =
         case throughM h disk' tok (ceilKey TreeRuns False (Just (Disk rootRef)) (encodeKey k)) of
-          Left _ → []
+          Left _ → [IntegrityError]
           Right got
-            | Set.member k allowed → []
+            | Set.member k allowed → [Excused]
             | otherwise →
                 let want = ceilRef k
                     gotKey = got >>= \(kb, _) → decodeKey TreeRuns kb
-                 in ["ceiling of " <> show k <> " answered " <> show gotKey <> " but the reference's is " <> show want | gotKey /= want, maybe True (\x → not (Set.member x allowed)) want, maybe True (\x → not (Set.member x allowed)) gotKey]
+                    touchesChanged = maybe False (`Set.member` allowed) want || maybe False (`Set.member` allowed) gotKey
+                 in if gotKey == want then [EqualAnswer]
+                    else if touchesChanged then [Excused]
+                    else [Defect ("ceiling of " <> show k <> " answered " <> show gotKey <> " but the reference's is " <> show want)]
       -- a ranged read that starts at a key must return what follows it
       judgeRange k = case through h disk' tok (\w → readerRange (hStore h) tok w TreeRuns (RangeFrom k) 12) of
-        Left _ → []
+        Left _ → [IntegrityError]
         Right got →
           let want = take 12 [x | x ← sortedKeys, encodeKey x >= encodeKey k]
               gotKeys = map fst got
-           in ["a scan from " <> show k <> " answered " <> show (length gotKeys) <> " records that are not the reference's " | gotKeys /= want, not (any (`Set.member` allowed) (want ++ gotKeys))]
+           in if gotKeys == want then [EqualAnswer]
+              else if any (`Set.member` allowed) (want ++ gotKeys) then [Excused]
+              else [Defect ("a scan from " <> show k <> " answered " <> show (length gotKeys) <> " records that are not the reference's")]
       -- a page the tree reaches is never declared unreachable
       judgeLive = concat
         [ case throughM h disk' tok (livePageAt TreeRuns (Just (Disk rootRef)) kb lvl) of
-            Left _ → []
-            Right Nothing → ["a live page " <> show q <> " was declared unreachable"]
-            Right (Just found) → ["page " <> show q <> " was found as " <> show found | found /= PageNo q]
+            Left _ → [IntegrityError]
+            Right Nothing → [Defect ("a live page " <> show q <> " was declared unreachable")]
+            Right (Just found) → if found == PageNo q then [EqualAnswer] else [Defect ("page " <> show q <> " was found as " <> show found)]
         | q ← take 10 (every 5 livePagesBelow)
         , Just (kb, lvl) ← [firstKeyOf q]
         , not (Set.member (PageNo q) mutatedSet)
@@ -180,14 +209,14 @@ judgeMutated h tok ref keys page offset newByte mutated = do
         Right (Page _ lv _ (Inner ((kb, _) : _))) → Just (kb, lv)
         _ → Nothing
       judgeScan = case fullScan of
-        Left _ → []
+        Left _ → [IntegrityError]
         Right got →
           let gotMap = Map.fromList got
               missing = [k | k ← Map.keys ref, not (Set.member k allowed), Map.lookup k gotMap /= Map.lookup k ref]
               extra = [k | k ← Map.keys gotMap, not (Set.member k allowed), not (Map.member k ref)]
-           in ["scan: " <> show (length missing) <> " records absent or different, " <> show (length extra) <> " extra" | not (null missing && null extra)]
-  let findings = concatMap judgeLookup sample ++ concatMap judgeFloor (take 12 sample) ++ concatMap judgeCeil nearBoundaries ++ concatMap judgeRange (every 3 nearBoundaries) ++ judgeLive ++ judgeScan
-  Right [Finding page offset newByte f | f ← take 3 findings]
+           in if null missing && null extra then [EqualAnswer] else [Defect ("scan: " <> show (length missing) <> " records absent or different, " <> show (length extra) <> " extra")]
+  let verdicts = concatMap judgeLookup sample ++ concatMap judgeFloor (take 12 sample) ++ concatMap judgeCeil nearBoundaries ++ concatMap judgeRange (every 3 nearBoundaries) ++ judgeLive ++ judgeScan
+  Right ([Finding page offset newByte f | Defect f ← take 3 [v | v@(Defect _) ← verdicts]], tallyOf verdicts)
 
 spec ∷ Spec
 spec = describe "a re-sealed byte of a live page never changes what a read answers (except as data)" $ do
@@ -220,8 +249,15 @@ spec = describe "a re-sealed byte of a live page never changes what a read answe
                   | otherwise = leafPages !! fromIntegral ((w1 `div` 10) `mod` fromIntegral (length leafPages))
                 offset = if w2 `mod` 2 == 0 then structural (w2 `div` 2) else 24 + fromIntegral (w2 `div` 2 `mod` 4000)
                 newByte = w3 `mod` 256
-            pure (either (\e → [Finding page offset newByte e]) id (fuzzOnce h tok ref keys page offset newByte))
-    found ← fmap concat (fmap concat (mapM runSeed [101, 202, 303, 404, 505, 606]))
+            pure (either (\e → ([Finding page offset newByte e], mempty)) id (fuzzOnce h tok ref keys page offset newByte))
+    results ← fmap concat (mapM runSeed [101, 202, 303, 404, 505, 606])
+    let found = concatMap fst results
+        tally = mconcat (map snd results)
+    -- the counts the run is judged by: both outcomes happen, and nothing else
+    putStrLn ("FUZZ " <> show tally)
+    tMutations tally `shouldBe` 360
+    tIntegrity tally `shouldSatisfy` (> 0)
+    tEqual tally `shouldSatisfy` (> 0)
     case found of
       [] → pure ()
       fs → expectationFailure (unlines (map show (take 12 fs)) <> show (length fs) <> " findings")
@@ -257,8 +293,11 @@ spec = describe "a re-sealed byte of a live page never changes what a read answe
       bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h0) (Page TreeRuns lvl (PageNo rootNo) (Inner es')))
       case judgeMutated h tok ref keys rootNo 0 0 bytes of
         Left e → expectationFailure (what <> ": " <> e)
-        Right [] → pure ()
-        Right fs → expectationFailure (what <> ": " <> unlines (map show fs))
+        Right ([], tally) → do
+          -- the reads of a moved separator are integrity failures or exactly the reference's answers
+          putStrLn ("FUZZ separator " <> what <> ": " <> show tally)
+          tDefects tally `shouldBe` 0
+        Right (fs, _) → expectationFailure (what <> ": " <> unlines (map show fs))
       -- and the records it hid are integrity failures, not answers: no read of the first leaf's first record succeeds
       let disk' = diskWrite (PageNo rootNo) bytes (hDisk h0)
           firstKey = case keys of (k : _) → k; [] → KeyTodo 0
