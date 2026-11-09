@@ -95,6 +95,7 @@ module Hetoimasia.Terrain.Render2D.Material
   , terrainModelInsetControl
   , terrainModelUnbiasedControl
   , terrainModelStaleBiasControl
+  , terrainModelWrongOrderControl
   ) where
 
 import Data.ByteString (ByteString)
@@ -409,6 +410,13 @@ terrainModelUnbiasedControl = modelWith (centreWith 0)
 terrainModelStaleBiasControl ∷ MaterialModel
 terrainModelStaleBiasControl = modelWith (centreWith (1 / 10000))
 
+-- | The model of the wrong-composition-order negative control (never a terrain rule): the haze blended first and the
+-- darkening applied over the hazed colour, instead of the specified lit, darkened, then hazed. As for the other
+-- controls the oracle is given this model for the control's own material, and the independent judge, which states
+-- the specified order, rejects the draw where both effects are on.
+terrainModelWrongOrderControl ∷ MaterialModel
+terrainModelWrongOrderControl = modelWithOrder True (centreWith texelBias)
+
 -- | The texel the local index selects, at its centre, in the atlas, with this bias in texels: the
 -- origin is added after.
 centreWith ∷ Rational → Word32 → Word32 → Word32 → Double → Double
@@ -430,7 +438,11 @@ terrainModelInsetControl = modelWith inset
 -- The shared body of both models, over the rule that maps a region's origin, extent and parent
 -- extent and a coordinate to the sampled coordinate.
 modelWith ∷ (Word32 → Word32 → Word32 → Double → Double) → MaterialModel
-modelWith centre = MaterialModel $ \input → case materialRecord input of
+modelWith = modelWithOrder False
+
+-- | 'modelWith' that composes the depth effects in the wrong order when the flag is set (the control only).
+modelWithOrder ∷ Bool → (Word32 → Word32 → Word32 → Double → Double) → MaterialModel
+modelWithOrder hazeFirst centre = MaterialModel $ \input → case materialRecord input of
   MaterialRecord [colourHandle, normalHandle] ws
     | [cx, cy, cw, ch, caw, cah, nx, ny, nw, nh, naw, nah, depth] ← ws
     , all (> 0) [cw, ch, caw, cah, nw, nh, naw, nah] → do
@@ -459,6 +471,8 @@ modelWith centre = MaterialModel $ \input → case materialRecord input of
             blend = haze * t * t
             (fr, fg, fb) = hazeLight
             alpha = ta * m
-            channel texel light = (1 - blend) * texel * m * brightness * darken + blend * light * alpha
+            channel texel light
+              | hazeFirst = ((1 - blend) * texel * m * brightness + blend * light * alpha) * darken
+              | otherwise = (1 - blend) * texel * m * brightness * darken + blend * light * alpha
         pure (Colour (channel tr fr) (channel tg fg) (channel tb fb) alpha)
   _ → Right (Colour 0 0 0 0)

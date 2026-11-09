@@ -26,7 +26,7 @@ import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), loadAtlasStyl
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Material
 import Hetoimasia.Terrain.Render2D.Presentation (defaultLightSettings, pushBlockBytes)
-import Hetoimasia.Terrain.Render2D.Vulkan.Material (lightPush, terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl, terrainMaterialUnbiasedControl, terrainMaterialStaleBiasControl)
+import Hetoimasia.Terrain.Render2D.Vulkan.Material (lightPush, terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl, terrainMaterialUnbiasedControl, terrainMaterialStaleBiasControl, terrainMaterialWrongOrderControl)
 import Test.Hspec (Spec, beforeAll, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 -- | The style's two packed parents bound to registered textures 3 (colour) and 4 (normal).
@@ -97,6 +97,10 @@ spec = describe "Terrain material, device-free (TRA-17)" $ do
       definedPush terrainMaterialStaleBiasControl `shouldBe` definedPush terrainMaterial
       definedTranslucent terrainMaterialStaleBiasControl `shouldSatisfy` (/= definedTranslucent terrainMaterial)
       definedTranslucent terrainMaterialStaleBiasControl `shouldSatisfy` (/= definedTranslucent terrainMaterialUnbiasedControl)
+    it "declares the wrong-composition-order negative control with the same layout, compiled to its own shaders" $ do
+      definedFacts terrainMaterialWrongOrderControl `shouldBe` definedFacts terrainMaterial
+      definedPush terrainMaterialWrongOrderControl `shouldBe` definedPush terrainMaterial
+      definedTranslucent terrainMaterialWrongOrderControl `shouldSatisfy` (/= definedTranslucent terrainMaterial)
     it "compiles the unbiased control to different shaders than the terrain material, whose shader carries the bias" $ do
       definedTranslucent terrainMaterialUnbiasedControl `shouldSatisfy` (/= definedTranslucent terrainMaterial)
       definedCutout terrainMaterialUnbiasedControl `shouldSatisfy` isJust

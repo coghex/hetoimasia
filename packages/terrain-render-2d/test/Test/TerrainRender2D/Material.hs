@@ -284,6 +284,15 @@ modelSpec = describe "the model" $ do
           f = [0.47700, 0.69207, 0.89001]
           expected = [0.85 * t' * 0.925 + 0.15 * fc | (t', fc) ← zip [0.5, 0.25, 0.125] f]
       take 3 (atDepth full 125) `shouldSatisfy` closeTo 1e-4 expected
+    it "composes the wrong-order control differently: haze first, then darkening over the hazed colour, and the same at depth zero" $ do
+      -- The same inputs: rgb = (0.85 * T + 0.15 * F) * 0.925 for the control, against 0.85 * T * 0.925 + 0.15 * F.
+      let full = defaultLightInput {inputAmbient = 1}
+          f = [0.47700, 0.69207, 0.89001]
+          atWith model depth = channels (either (error . show) id (runMaterialModel model (inputWith (recordAt depth) (push' full FaceSouth) (0, 0) (const someColour) (const up))))
+          wrong = [(0.85 * t' + 0.15 * fc) * 0.925 | (t', fc) ← zip [0.5, 0.25, 0.125] f]
+      take 3 (atWith terrainModelWrongOrderControl 125) `shouldSatisfy` closeTo 1e-4 wrong
+      take 3 (atWith terrainModelWrongOrderControl 125) `shouldSatisfy` (not . closeTo 1e-3 (take 3 (atWith terrainModel 125)))
+      atWith terrainModelWrongOrderControl 0 `shouldSatisfy` closeTo 1e-9 (atWith terrainModel 0)
     it "bounds depth by the configured range, not by the viewport: a depth beyond it is the full range" $ do
       let short = defaultLightInput {inputAmbient = 1, inputHaze = 0, inputDepthRange = 10}
       atDepth short 5 `shouldSatisfy` closeTo 1e-6 [0.5 * 0.925, 0.25 * 0.925, 0.125 * 0.925, 1]

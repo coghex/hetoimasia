@@ -29,6 +29,7 @@ module Hetoimasia.Terrain.Render2D.Vulkan.Source
   , terrainSourceInsetControl
   , terrainSourceUnbiasedControl
   , terrainSourceStaleBiasControl
+  , terrainSourceWrongOrderControl
   , lightPush
   ) where
 
@@ -64,8 +65,20 @@ terrainSourceUnbiasedControl = terrainSourceWith "0.0"
 terrainSourceStaleBiasControl ∷ String
 terrainSourceStaleBiasControl = terrainSourceWith "1.0e-4"
 
+-- | A NEGATIVE CONTROL, never the terrain's own material: 'terrainSource' with the depth effects composed in the
+-- wrong order, haze first and darkening over the hazed colour, instead of the specified lit, darkened, then hazed
+-- (haze over the darkened colour). The evidence's depth fixtures, where both effects are on, must reject it.
+terrainSourceWrongOrderControl ∷ String
+terrainSourceWrongOrderControl =
+  terrainSourceComposed biasLiteral "((1.0 - haze) * colour.rgb * data.a * bright + haze * pushed.lightHaze.xyz * alpha) * darken"
+
 terrainSourceWith ∷ String → String
 terrainSourceWith bias =
+  terrainSourceComposed bias "(1.0 - haze) * colour.rgb * data.a * bright * darken + haze * pushed.lightHaze.xyz * alpha"
+
+-- | The material function with this bias literal and this expression for the premultiplied colour.
+terrainSourceComposed ∷ String → String → String
+terrainSourceComposed bias composition =
   unlines
     [ "vec4 material(vec4 texel, vec2 uv, uint parameter, MaterialRecord record) {"
     , "    vec2 unit = clamp(uv, 0.0, 1.0);"
@@ -89,7 +102,7 @@ terrainSourceWith bias =
     , "    float darken = 1.0 - pushed.lightDepth.y * t;"
     , "    float haze = pushed.lightDepth.z * t * t;"
     , "    float alpha = colour.a * data.a;"
-    , "    vec3 rgb = (1.0 - haze) * colour.rgb * data.a * bright * darken + haze * pushed.lightHaze.xyz * alpha;"
+    , "    vec3 rgb = " <> composition <> ";"
     , "    return vec4(rgb, alpha);"
     , "}"
     ]

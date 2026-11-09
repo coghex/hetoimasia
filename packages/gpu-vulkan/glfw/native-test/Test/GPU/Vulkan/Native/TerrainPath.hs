@@ -111,7 +111,7 @@ import Hetoimasia.Terrain.Render2D.Camera (CameraState, camClip, camFacing, camR
 import Hetoimasia.Terrain.Render2D.Projection (ViewSetup (..))
 import Hetoimasia.Terrain.Render2D.Evidence
 import Hetoimasia.Terrain.Render2D.Scenes
-import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl, terrainMaterialStaleBiasControl, terrainMaterialUnbiasedControl)
+import Hetoimasia.Terrain.Render2D.Vulkan.Material (terrainMaterial, terrainMaterialEquivalent, terrainMaterialInsetControl, terrainMaterialStaleBiasControl, terrainMaterialUnbiasedControl, terrainMaterialWrongOrderControl)
 import Hetoimasia.Terrain.Shape (allViewFacings)
 import Test.GPU.Vulkan.Native.OrderedPath
   ( Evidence
@@ -194,6 +194,9 @@ data Variant
     WrongFacingLight
   | -- | A control: every depth word is zero (the depth effects reset).
     DepthReset
+  | -- | A control: the depth effects composed in the wrong order, haze first and darkening over it (a sixth,
+    -- control-only material).
+    WrongOrder
   | -- | A control: the loam and granite colour regions' origins are swapped.
     SwappedColourOrigins
   | -- | A control: the normal region is the whole atlas, so the UV spans neighbours (whole-atlas
@@ -240,6 +243,7 @@ suffixOf = \case
   WholeCellMask → "-control-whole-cell-mask"
   WrongFacingLight → "-control-wrong-facing-light"
   DepthReset → "-control-depth-reset"
+  WrongOrder → "-control-wrong-composition-order"
   SwappedColourOrigins → "-control-swapped-region-origins"
   WholeAtlasRegion → "-control-whole-atlas-clamping"
   WrongTreatment → "-control-normal-as-colour"
@@ -253,7 +257,7 @@ suffixOf = \case
   PickLoadingAsMiss → "-control-loading-as-miss"
 
 isControl ∷ Variant → Bool
-isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, HolesIgnored, UnbiasedIndex, StaleBias, WrongMapRegion, PickThroughFog, PickLoadingAsMiss, BackmostPick]
+isControl variant = variant `elem` [ReversedKeys, WholeCellMask, WrongFacingLight, DepthReset, WrongOrder, SwappedColourOrigins, WholeAtlasRegion, WrongTreatment, HalfTexelInset, HolesIgnored, UnbiasedIndex, StaleBias, WrongMapRegion, PickThroughFog, PickLoadingAsMiss, BackmostPick]
 
 -- | What a fixture must show, each by a named probe that is determinate for the oracle and differs
 -- from its contrast.
@@ -398,6 +402,7 @@ specs profile = case profile of
          , spec defaultLight [Foreground, Varies] WholeCellMask (atZoom 0.125 (rampsCorners FaceSouth))
          , spec defaultLight [Foreground, Varies] WrongFacingLight (atZoom 0.125 (rampsCorners FaceWest))
          , spec (mkLight "neither-effect-haze" 225 45 0.35 1 4 0.5 0.8 (0.72, 0.85, 0.95)) [Foreground, Varies] DepthReset (depthStack FaceSouth)
+         , spec defaultLight [Foreground, Varies] WrongOrder (depthStack FaceSouth)
          , spec defaultLight [Foreground, Varies] SwappedColourOrigins (atZoom 0.25 (shapeMatrix FaceSouth 1))
          , spec defaultLight [Foreground, Varies] WholeAtlasRegion (atZoom 0.125 (rampsCorners FaceSouth))
          , spec defaultLight [Foreground, Varies] WrongTreatment (atZoom 0.125 (rampsCorners FaceSouth))
@@ -580,6 +585,7 @@ data Ctx = Ctx
   , ctxInset ∷ !MaterialRef
   , ctxUnbiased ∷ !MaterialRef
   , ctxStale ∷ !MaterialRef
+  , ctxWrongOrder ∷ !MaterialRef
   , ctxDevice ∷ !Text
   }
 
@@ -689,6 +695,7 @@ prepare profile host directory device (subPixelBits, driverName, driverInfo) sty
                   inset ← Render.registerMaterial renderer terrainMaterialInsetControl
                   unbiased ← Render.registerMaterial renderer terrainMaterialUnbiasedControl
                   stale ← Render.registerMaterial renderer terrainMaterialStaleBiasControl
+                  wrongOrder ← Render.registerMaterial renderer terrainMaterialWrongOrderControl
                   pure
                     ( Right
                         Ctx
@@ -718,6 +725,7 @@ prepare profile host directory device (subPixelBits, driverName, driverInfo) sty
                           , ctxInset = inset
                           , ctxUnbiased = unbiased
                           , ctxStale = stale
+                          , ctxWrongOrder = wrongOrder
                           , ctxDevice = device
                           }
                     )
@@ -863,8 +871,9 @@ runSpec ctx s = case traverse planOf (zip [1 ..] (specScenes s)) of
             HalfTexelInset → [adaptedInstance (ctxInset ctx) adapted e | e ← entries]
             UnbiasedIndex → [adaptedInstance (ctxUnbiased ctx) adapted e | e ← entries]
             StaleBias → [adaptedInstance (ctxStale ctx) adapted e | e ← entries]
+            WrongOrder → [adaptedInstance (ctxWrongOrder ctx) adapted e | e ← entries]
             _ → [adaptedInstance (ctxPrimary ctx) adapted e | e ← entries]
-          held = [(ref, adaptedMaterialData adapted) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxInset ctx, ctxUnbiased ctx, ctxStale ctx]]
+          held = [(ref, adaptedMaterialData adapted) | ref ← [ctxPrimary ctx, ctxSecond ctx, ctxInset ctx, ctxUnbiased ctx, ctxStale ctx, ctxWrongOrder ctx]]
       view ← either (\refused → Left ("the view: " <> describeMaterialRefusal refused)) Right (terrainView plan adapted held [WorldLayer DepthEnabled instances])
       pure (Part sc plan camera shape (Pass (OffscreenTarget (shapeRef shape)) (ClearColour 0 0 0 1) [view]) adapted)
     reversedKey inst = inst {instanceDepthKey = 16777215 - instanceDepthKey inst}
@@ -1022,7 +1031,7 @@ renderSnapshot ctx s parts = do
       marks ← registeredMarks (ctxTextures ctx)
       buffers ← retainedBuffers (ctxRetained ctx)
       let shapes = map partShape parts
-          models = Map.fromList ([(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx]] <> [(ctxInset ctx, terrainModelInsetControl), (ctxUnbiased ctx, terrainModelUnbiasedControl), (ctxStale ctx, terrainModelStaleBiasControl)])
+          models = Map.fromList ([(ref, terrainModel) | ref ← [ctxPrimary ctx, ctxSecond ctx]] <> [(ctxInset ctx, terrainModelInsetControl), (ctxUnbiased ctx, terrainModelUnbiasedControl), (ctxStale ctx, terrainModelStaleBiasControl), (ctxWrongOrder ctx, terrainModelWrongOrderControl)])
           decodedAt = (`Map.lookup` ctxDecoded ctx)
           art = case specVariant s of
             ColourHoles → styleArt (ctxHoled ctx)

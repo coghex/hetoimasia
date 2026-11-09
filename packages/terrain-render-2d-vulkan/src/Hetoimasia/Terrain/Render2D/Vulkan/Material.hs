@@ -32,12 +32,13 @@ module Hetoimasia.Terrain.Render2D.Vulkan.Material
   , terrainMaterialInsetControl
   , terrainMaterialUnbiasedControl
   , terrainMaterialStaleBiasControl
+  , terrainMaterialWrongOrderControl
   , lightPush
   ) where
 
 import Hetoimasia.Render.TwoD.Vulkan.Material
 import Hetoimasia.Terrain.Render2D.Material (recordLayout)
-import Hetoimasia.Terrain.Render2D.Vulkan.Source (lightPush, terrainSource, terrainSourceEquivalent, terrainSourceInsetControl, terrainSourceUnbiasedControl, terrainSourceStaleBiasControl)
+import Hetoimasia.Terrain.Render2D.Vulkan.Source (lightPush, terrainSource, terrainSourceEquivalent, terrainSourceInsetControl, terrainSourceUnbiasedControl, terrainSourceStaleBiasControl, terrainSourceWrongOrderControl)
 
 -- | The terrain material, cutout-capable, with its checked variants.
 terrainMaterial ∷ DefinedMaterial
@@ -104,5 +105,19 @@ terrainMaterialStaleBiasControl =
          , declaredRecord = recordLayout
          , declaredPush = lightPush
          , declaredSource = terrainSourceStaleBiasControl
+         }
+   )
+
+-- | A negative control's material, never a terrain material: the terrain's own declaration with the depth
+-- effects composed in the wrong order (haze first, then darkening). The evidence shows its judge rejecting it
+-- on the depth stack, where both effects are on; nothing draws terrain with it.
+terrainMaterialWrongOrderControl ∷ DefinedMaterial
+terrainMaterialWrongOrderControl =
+  $( defineMaterial
+       MaterialDeclaration
+         { declaredCutoutCapable = True
+         , declaredRecord = recordLayout
+         , declaredPush = lightPush
+         , declaredSource = terrainSourceWrongOrderControl
          }
    )
