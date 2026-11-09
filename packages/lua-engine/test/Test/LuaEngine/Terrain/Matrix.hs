@@ -299,6 +299,20 @@ fewRegions = defaultConfig {configLimits = either (error . show) id (mkLimits ap
         , specCameraRegions = 16
         }
 
+-- | Calls at the edges of the supported coordinate range: the highest and lowest cells, columns and surfaces the facade accepts.
+edges ∷ Script
+edges =
+  stepsScript
+    "DEF"
+    []
+    [ Step "column at the top" "return api.terrain.column(A, {x = 0, y = 0, z_min = (1 << 62) - 4, z_max = 1 << 62})" "return 'ok'"
+    , Step "cell at the top" "return api.terrain.cell(A, {x = 0, y = 0, z = (1 << 62) - 1})" "return 'ok'"
+    , Step "surface at the high corner" "return api.terrain.surface(A, {x = (1 << 62) - 1, y = (1 << 62) - 1})" "return 'ok'"
+    , Step "surface at the low corner" "return api.terrain.surface(A, {x = -(1 << 62), y = -(1 << 62)})" "return 'ok'"
+    , Step "cell at the low corner" "return api.terrain.cell(A, {x = -(1 << 62), y = -(1 << 62), z = -(1 << 62)})" "return 'ok'"
+    , Step "remove at the top" "return api.terrain.remove(A, {x = (1 << 62) - 1, y = 0, z = (1 << 62) - 1})" "return 'ok'"
+    ]
+
 -- | An instance that releases its arena twice at once, and once more after the release has retired.
 releasesTwice ∷ Script
 releasesTwice =
@@ -629,6 +643,16 @@ spec = describe "Terrain matrices" $ do
           printed ← outLines world
           forM_ ["full", "free"] $ \phase → printed `shouldContain` ["column " <> phase <> "\trefused\ttrue"]
           readIORef captured `shouldReturn` 1
+
+  it "accepts the cells, columns and surfaces at the edges of the supported coordinate range, so that no region the service would call unsupported is ever demanded" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource edges)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "done"
+          printed ← outLines world
+          forM_ ["column at the top", "cell at the top", "surface at the high corner", "surface at the low corner", "cell at the low corner", "remove at the top"] $ \label →
+            printed `shouldContain` [label <> "\tsuccess\tok"]
 
   it "answers a second release of one's own arena without error, before and after the first has retired" $
     withRig $ \rig →
