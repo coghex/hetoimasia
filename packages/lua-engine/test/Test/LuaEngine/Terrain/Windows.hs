@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- | The windows between a request's commit and its settlement, the session's gate in the commit, the service's banks seen through Lua,
 -- the ownership of a handle after many have been issued, and the order of logical reads after a removal. The terrain owner and the
@@ -6,7 +7,8 @@
 module Test.LuaEngine.Terrain.Windows (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, try)
+import Data.Either (isLeft)
 import Control.Monad (unless)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
@@ -209,6 +211,26 @@ firstRead =
         ]
     }
 
+-- | A definition of exactly this many authored layers, and one more: the validator's bound on authored runs, through Lua.
+manyLayers ∷ Int → Script
+manyLayers count =
+  script
+    { scPrelude = terrainPrelude
+    , scInit =
+        [ "self.s = 0"
+        , "local layers = {}"
+        , "for i = 0, " <> Text.pack (show (count - 1)) <> " do layers[#layers + 1] = { z_min = i, z_max = i + 1, material = 'soil', shape = 0 } end"
+        , "local ok, q, e = pcall(api.terrain.open, 'many', { materials = { 'soil' }, layers = layers })"
+        , "if not ok then print('raised', string.sub(tostring(q), 1, 120)) print('done') self.s = 2 else self.q = q end"
+        ]
+    , scUpdate =
+        [ "if self.s == 0 and self.q then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then print('many', t.status, t.error and t.error.code) print('done') self.s = 1 end"
+        , "end"
+        ]
+    }
+
 -- | An instance that finds the service's clients, arenas or leases all taken.
 pressed ∷ Script
 pressed =
@@ -350,7 +372,10 @@ spec = describe "Terrain windows and banks" $ do
             _ ← spawn world fvm "modules-test" mainPath
             untilPrinted world "issued"
             -- the owner fails at its next boundary, and the failure is the host's defect
-            pumpUntil world (advanceClock world 2000000000 >> (pure False))
+            failed ← try @SomeException (pumpUntil world (advanceClock world 2000000000 >> (pure False)))
+            failed `shouldSatisfy` isLeft
+            -- nothing was committed under the rejected settlement: an observer of the service finds the cell as it was, at its revision
+            observeCell rig (arenaName rig "modules-test" "main") (0, 0, 0) `shouldReturn` (9223372036854775807, Just "soil")
     show raised `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack
 
   it "answers retained-edit exhaustion as the same immediate busy, evicts no earlier edit and still serves a read" $
@@ -553,6 +578,22 @@ spec = describe "Terrain windows and banks" $ do
                     outLines world >>= \printed → printed `shouldContain` ["revision\tsuccess\t40"]
       )
       [(40, False), (41, True)]
+
+  it "accepts a definition of exactly the validator's 8,192 authored runs through Lua and refuses one more as a definition failure, leaving no arena" $ do
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource (manyLayers 8192))]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "done"
+          outLines world >>= \printed → printed `shouldContain` ["many\tsuccess\tnil"]
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource (manyLayers 8193))]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          _ ← spawn world fvm "modules-test" mainPath
+          untilPrinted world "done"
+          outLines world >>= \printed → do
+            printed `shouldContain` ["many\tfailure\tdefinition"]
+          limitHeld (rgService rig) "arenas" `shouldReturn` 0
 
   it "gives a logical read ordered after a removal of the same cell the post-removal value and revision, reads prepared before the commit included" $
     withRig $ \rig →
