@@ -107,7 +107,8 @@ module Hetoimasia.Scripting.Lua.Admission
   ) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), mask, mask_, rethrowIO, someExceptionContext)
+import Control.Monad (void)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, mask, mask_, rethrowIO, someExceptionContext)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Word (Word64)
@@ -179,7 +180,21 @@ startAdmitted context ask name arguments afterCompletion = do
             completion = Completion $ \reply → do
               checked ← checkReplyFor (psLimits service) (endpointResult endpoint) (Just ask) reply
               atomically (replyTo service (admittedIdentity found) checked)
-        handed ← guarded (restore (endpointSubmit endpoint (Submission arguments completion info (settledNumber service (admittedNumber found)))))
+            settling =
+              Settling
+                { settlingEligible = eligibleOf service (admittedIdentity found)
+                , settlingSettle = settleWith service ask (endpointResult endpoint) (admittedIdentity found)
+                , settlingCancel = void (cancelOf service (admittedRequester found) (admittedNumber found))
+                }
+        handed ←
+          guarded . restore . endpointSubmit endpoint $
+            Submission
+              { submissionArguments = arguments
+              , submissionCompletion = completion
+              , submissionInfo = info
+              , submissionSettled = settledNumber service (admittedNumber found)
+              , submissionSettling = Just settling
+              }
         case handed of
           Left failure → do
             -- Taking the admission back runs the provider's credit releases: one that raises is
@@ -188,14 +203,31 @@ startAdmitted context ask name arguments afterCompletion = do
             let secondaries = case withdrawn of
                   Right raised → [("lua credit release", ExceptionWithContext (someExceptionContext one) one) | one ← raised]
                   Left other → [("lua credit release", other)]
-            composed ← composeCleanup (Just failure) secondaries
-            maybe (rethrowIO failure) rethrowIO composed
+            -- A provider that declined the request (it was busy, or a permanent fact changed since the argument check)
+            -- is answered as data or as the ordinary error it is, with the admission taken back whole: nothing stays
+            -- reserved, no handle exists and the instance has no latent failure. Anything else it raised is a failure of
+            -- the host, as it always was.
+            case (declinedBy failure, secondaries) of
+              (Just why, []) → declineAs why
+              _ → do
+                composed ← composeCleanup (Just failure) secondaries
+                maybe (rethrowIO failure) rethrowIO composed
           Right provided → do
             atomically (commitSubmitted service (admittedIdentity found) provided [afterCompletion])
             -- A request revoked while the provider was being handed it has interest to withdraw
             -- now that there is a provider to tell.
             raiseAmong "lua request cancel" =<< tellProviders service
             pure (Started (RequestHandle (admittedNumber found)))
+
+-- | What a provider that raised from its hand-off declined the request with, if it did.
+declinedBy ∷ ExceptionWithContext SomeException → Maybe SubmissionDeclined
+declinedBy (ExceptionWithContext _ raised) = fromException raised
+
+-- | Answer a declined request: busy for a provider bank with no room, the ordinary error for a permanent refusal.
+declineAs ∷ SubmissionDeclined → IO Started
+declineAs = \case
+  DeclinedBusy bank → pure (Unavailable (BankCredit bank))
+  DeclinedRefused why → refuseOrdinarily (RequestCreditRefused why)
 
 -- | The permanent reason an opt-in request would be refused if it were asked now, as the
 -- bounded text a precondition refuses with, or 'Nothing'. It reads engine-owned state in one

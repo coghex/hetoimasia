@@ -72,6 +72,9 @@ module Hetoimasia.Scripting.Lua.Provider.State
   , Checked (..)
   , checkReply
   , checkReplyFor
+  , checkReplyPure
+  , eligibleOf
+  , settleWith
   , replyTo
   , settlementFields
   , deliverable
@@ -1131,38 +1134,13 @@ checkEvaluated limits schema ask reply = case ask of
       other → other
     optedIn opted = case reply of
       ProviderFailure _ → pure (CheckedDefect "the provider answered a failure with no code its service supplies")
-      ProviderExpected found → guardedVerdict (expected opted found)
+      ProviderExpected found → guardedVerdict (optedExpected limits opted found)
       ProviderResult value → result opted value Nothing
       ProviderResource value recipe → result opted value (Just recipe)
     result opted value recipe = do
-      -- The combiner shapes what a script is handed only for a result whose resource the owner builds
-      -- into the reserved lease: a plain result is handed as it is, and it is that record that is measured.
-      let adopting = isJust recipe && isJust (admitLease opted)
-          combined found = case admitCombine opted of
-            Just make | adopting → make found 0
-            _ → found
-          frame found = admitSuccessFrame opted (combined found)
-          -- What is retained is the provider's own value, whatever the combiner hands the script in its
-          -- place: for a result whose resource is built, that value too is bounded by the owner's limits
-          -- and the admission's ceilings, as the plain record it would be.
-          plain found = admitSuccessFrame opted found
-          retainedFits found = not adopting || (fitsLimits limits (plain found) && fitsLimits (admitReplyLimits opted) (plain found))
-          retainedBytes found = either (const 0) id (valuesFootprint limits [VRecord (plain found)])
-          -- The ceilings are the crossing's: the complete record a script is handed, and the value kept.
-          withinCeilings found = fitsLimits (admitReplyLimits opted) (frame found) && retainedFits found
+      let (frame, withinCeilings) = optedFraming limits opted recipe
       judged ← judgeWith frame withinCeilings limits schema (ProviderResult value)
-      pure $ case judged of
-        CheckedResult bytes found → case recipe of
-          Just made | adopting → CheckedResource (max bytes (retainedBytes found)) found made
-          _ → CheckedResult bytes found
-        CheckedOversize _ → CheckedDefect "the provider's result is over the ceilings its service declares"
-        CheckedMalformed why → CheckedDefect (Text.take 480 why)
-        _ → CheckedDefect "the provider's result could not be checked"
-    expected opted found
-      | expectedCode found `notElem` admitExpectedCodes opted = CheckedDefect ("the provider answered a failure whose code " <> Text.take 64 (expectedCode found) <> " its service does not supply")
-      | any (longerThan (admitPathBytes opted)) (catMaybes [expectedRoot found, expectedPath found]) = CheckedDefect "the provider answered a failure whose root or path is over its bound"
-      | otherwise = maybe (CheckedDefect "the provider answered a failure whose envelope cannot be delivered within the limits") CheckedExpected (fitFailure opted found)
-    longerThan bound text = ByteString.length (Encoding.encodeUtf8 text) > bound
+      pure (optedResultVerdict limits opted recipe judged)
     -- The verdict on a failure is evaluated here, inside the guard, as a result's is: a field that
     -- throws when it is first looked at is a provider defect, and an asynchronous exception is
     -- never taken for one.
@@ -1172,15 +1150,73 @@ checkEvaluated limits schema ask reply = case ask of
         Left failure@(ExceptionWithContext _ raised)
           | Just (async ∷ SomeAsyncException) ← fromException raised → throwIO async
           | otherwise → CheckedDefect . ("the provider answered a failure that could not be evaluated: " <>) . Text.take 200 <$> renderCaught failure
+
+-- | The record a script is handed for an opted-in result of a value, and whether the value is within the
+-- ceilings the admission declares beside the owner's: what the result is measured against. The ceilings
+-- are the crossing's: the complete record a script is handed, and the value kept.
+optedFraming ∷ ValueLimits → Admission → Maybe Adoption → (Value → [(Text, Value)], Value → Bool)
+optedFraming limits opted recipe = (frame, withinCeilings)
+  where
+    -- The combiner shapes what a script is handed only for a result whose resource the owner builds
+    -- into the reserved lease: a plain result is handed as it is, and it is that record that is measured.
+    adopting = isJust recipe && isJust (admitLease opted)
+    combined found = case admitCombine opted of
+      Just make | adopting → make found 0
+      _ → found
+    frame found = admitSuccessFrame opted (combined found)
+    -- What is retained is the provider's own value, whatever the combiner hands the script in its
+    -- place: for a result whose resource is built, that value too is bounded by the owner's limits
+    -- and the admission's ceilings, as the plain record it would be.
+    plain found = admitSuccessFrame opted found
+    retainedFits found = not adopting || (fitsLimits limits (plain found) && fitsLimits (admitReplyLimits opted) (plain found))
+    withinCeilings found = fitsLimits (admitReplyLimits opted) (frame found) && retainedFits found
+
+-- | What an opted-in result's judgement comes to: the checked result or resource, or a provider defect.
+optedResultVerdict ∷ ValueLimits → Admission → Maybe Adoption → Checked → Checked
+optedResultVerdict limits opted recipe judged = case judged of
+  CheckedResult bytes found → case recipe of
+    Just made | adopting → CheckedResource (max bytes (retainedBytes found)) found made
+    _ → CheckedResult bytes found
+  CheckedOversize _ → CheckedDefect "the provider's result is over the ceilings its service declares"
+  CheckedMalformed why → CheckedDefect (Text.take 480 why)
+  _ → CheckedDefect "the provider's result could not be checked"
+  where
+    adopting = isJust recipe && isJust (admitLease opted)
+    retainedBytes found = either (const 0) id (valuesFootprint limits [VRecord (admitSuccessFrame opted found)])
+
+-- | The verdict on an expected failure of an opted-in request: it must carry a code the service supplies and
+-- a root and path within their bound (its message is cut, visibly, until the envelope fits).
+optedExpected ∷ ValueLimits → Admission → ExpectedFailure → Checked
+optedExpected limits opted found
+  | expectedCode found `notElem` admitExpectedCodes opted = CheckedDefect ("the provider answered a failure whose code " <> Text.take 64 (expectedCode found) <> " its service does not supply")
+  | any (longerThan (admitPathBytes opted)) (catMaybes [expectedRoot found, expectedPath found]) = CheckedDefect "the provider answered a failure whose root or path is over its bound"
+  | otherwise = maybe (CheckedDefect "the provider answered a failure whose envelope cannot be delivered within the limits") CheckedExpected (fitFailure (admitMessageBytes opted))
+  where
+    longerThan bound text = ByteString.length (Encoding.encodeUtf8 text) > bound
     -- The failure's envelope as a script is handed it must fit the owner's ceilings. A message
     -- that makes it too long is cut at a character, visibly, until it does.
-    fitFailure opted found = go (admitMessageBytes opted)
+    fitFailure = go
       where
         go bound =
           let candidate = found {expectedMessage = truncateVisibly bound (expectedMessage found)}
            in if fitsLimits limits (admitFailureFrame opted candidate) && fitsLimits (admitReplyLimits opted) (admitFailureFrame opted candidate)
                 then Just candidate
                 else if bound <= 0 then Nothing else go (bound `div` 2)
+
+-- | 'checkReplyFor' for a request admitted through the opt-in 'Admission', as a pure judgement: the same
+-- contract, the same verdicts, for a reply a trusted adapter built itself and a transaction must judge
+-- (the opt-in settlement seam, 'Settling'). It evaluates nothing under a guard, so a reply whose lazy field
+-- throws raises when the verdict is forced: that is the caller's to abandon the transaction on.
+checkReplyPure ∷ ValueLimits → Schema → Admission → ProviderReply → Checked
+checkReplyPure limits schema opted = \case
+  ProviderFailure _ → CheckedDefect "the provider answered a failure with no code its service supplies"
+  ProviderExpected found → optedExpected limits opted found
+  ProviderResult value → result value Nothing
+  ProviderResource value recipe → result value (Just recipe)
+  where
+    result value recipe =
+      let (frame, withinCeilings) = optedFraming limits opted recipe
+       in optedResultVerdict limits opted recipe (judgePure frame withinCeilings limits schema value)
 
 -- | Cut text to at most this many UTF-8 bytes, at a character, and visibly: the end of what is
 -- kept is an ellipsis, so a reader can tell the text was cut.
@@ -1203,22 +1239,25 @@ judgeWith ∷ (Value → [(Text, Value)]) → (Value → Bool) → ValueLimits �
 judgeWith frame ceilings limits schema = \case
   ProviderFailure why → pure (CheckedFailure why)
   ProviderResult value → do
-    judged ← guarded (pure (judge value))
+    judged ← guarded (pure (judgePure frame ceilings limits schema value))
     case judged of
       Right verdict → pure verdict
       Left failure@(ExceptionWithContext _ raised)
         | Just (async ∷ SomeAsyncException) ← fromException raised → throwIO async
         | otherwise → CheckedMalformed . ("the result could not be evaluated: " <>) <$> renderCaught failure
   other → pure (CheckedMalformed ("the reply is not a result or a failure: " <> Text.pack (take 32 (show other))))
-  where
-    -- What is measured is the record a script is handed on taking it, not the bare value, so
-    -- that a result which is retained is a result that can be delivered within the limits.
-    judge value = case valuesFootprint limits [VRecord (frame value)] of
-      Left _ → CheckedOversize (limitBytes limits + 1)
-      Right _ | not (ceilings value) → CheckedOversize (limitBytes limits + 1)
-      Right bytes → case conformValue plainContext schema value of
-        Left (_, rule) → CheckedMalformed ("the result does not conform to the endpoint's schema: " <> Text.pack (show rule))
-        Right () → CheckedResult bytes value
+
+-- | The judgement of a value alone, purely.
+judgePure ∷ (Value → [(Text, Value)]) → (Value → Bool) → ValueLimits → Schema → Value → Checked
+judgePure frame ceilings limits schema value =
+  -- What is measured is the record a script is handed on taking it, not the bare value, so
+  -- that a result which is retained is a result that can be delivered within the limits.
+  case valuesFootprint limits [VRecord (frame value)] of
+    Left _ → CheckedOversize (limitBytes limits + 1)
+    Right _ | not (ceilings value) → CheckedOversize (limitBytes limits + 1)
+    Right bytes → case conformValue plainContext schema value of
+      Left (_, rule) → CheckedMalformed ("the result does not conform to the endpoint's schema: " <> Text.pack (show rule))
+      Right () → CheckedResult bytes value
 
 -- | A result carries no capability, so nothing of a VM is consulted.
 plainContext ∷ Context
@@ -1324,7 +1363,12 @@ replyTo service identity checked = do
 -- assigned ticks, or settle it. The one place a reply reaches the model, whether it arrived from
 -- a provider's thread or was completed by the owner after building its resource.
 applyChecked ∷ ProviderState → RequestId → Checked → STM ReplyAnswer
-applyChecked service identity checked = do
+applyChecked service = applyCheckedAs service False
+
+-- | 'applyChecked', and whether the reply is a settlement whose position was reached: such a reply is never
+-- held for the request's tick, it settles (the opt-in settlement seam's commit, 'Settling').
+applyCheckedAs ∷ ProviderState → Bool → RequestId → Checked → STM ReplyAnswer
+applyCheckedAs service settleNow identity checked = do
   st ← readTVar (psVar service)
   let session = pSession st
       reply = modelReply checked
@@ -1343,7 +1387,7 @@ applyChecked service identity checked = do
       holdable = case record >>= recDue of
         Just due → Map.lookup due (pDue st) == Just identity
         Nothing → False
-  case (record, unsettled && holdable) of
+  case (record, unsettled && holdable && not settleNow) of
     -- An owner that settles at ticks keeps the first completion that arrives before its tick.
     (Just found, True)
       | isJust (recHeld found) → do
@@ -1370,9 +1414,15 @@ applyChecked service identity checked = do
           pure (if refusedValue then ReplyRefusedValue else ReplyHeld)
     _ → do
       let (session', answer) = applyReplyIn identity reply session
-          recorded = case (answer, record) of
-            (Right (), Just found) → Map.insert identity found {recFailure = failureOf} (pRecs st)
+      -- A settlement at its position hands back the hold its request had on the tick, and is no longer due.
+      released ← case (settleNow, answer, record) of
+        (True, Right (), Just found) → Just <$> dropGate service found
+        _ → pure Nothing
+      let recorded = case (answer, record) of
+            (Right (), Just found) → Map.insert identity ((fromMaybe found released) {recFailure = failureOf}) (pRecs st)
             _ → pRecs st
+          -- It stays in the places not yet served: the tick's service wakes the waiters for it in the order of
+          -- the places, and until then it is not visible to them ('settledNumber').
           settled = endWork identity st {pSession = session', pRecs = recorded}
       writeTVar (psVar service) $ case answer of
         Left (UnknownRequest _) → st {pSession = session'}
@@ -1388,6 +1438,39 @@ applyChecked service identity checked = do
         Left (PayloadTooLarge _ _) → ReplyRefusedValue
         Left (ReplyRefused _) → ReplyLate
         Left _ → ReplyLate
+
+-- | Whether a request may be settled by the opt-in settlement seam now ('Settling'): read-only. It is waiting for
+-- its answer (it has not settled, no completion is held for it, no resource is waiting to be built into its
+-- lease), the owner takes answers, and for an owner on logical time the scheduler stands at the boundary just
+-- before its assigned tick. A request cancelled, ended by its requester, replaced by an epoch change or taken
+-- by the owner's exit is settled in the model, so it is not eligible and nothing may be committed for it.
+eligibleOf ∷ ProviderState → RequestId → STM Bool
+eligibleOf service identity = do
+  st ← readTVar (psVar service)
+  case Map.lookup identity (pRecs st) of
+    Just record
+      | not (pClosed st)
+      , isNothing (recHeld record)
+      , isNothing (recEnded record)
+      , Map.notMember identity (pAdopting st)
+      , maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests (pSession st))) →
+          case recDue record of
+            Nothing → pure True
+            Just due → ticksQuiet (psTicks service) (dueTick due)
+    _ → pure False
+
+-- | Settle a request by the opt-in settlement seam, in the caller's transaction ('Settling'): a reply that is
+-- judged purely, then applied. A defect (a reply the service did not declare) is recorded for the owner to
+-- raise and settles nothing, exactly as a defective 'completeRequest' is ('replyTo'); a resource reply waits for
+-- the owner to build the resource, as every resource reply does. A request that is eligible settles now,
+-- whatever its tick; any other is held for its position.
+settleWith ∷ ProviderState → Admission → Schema → RequestId → ProviderReply → STM ReplyAnswer
+settleWith service ask schema identity reply = do
+  eligible ← eligibleOf service identity
+  case checkReplyPure (psLimits service) schema ask reply of
+    checked@(CheckedDefect _) → replyTo service identity checked
+    checked@(CheckedResource {}) → replyTo service identity checked
+    checked → applyCheckedAs service eligible identity checked
 
 -- | How many provider defects are kept for the owner to raise: it fails with the first, and the rest are
 -- evidence; a provider that goes on answering wrongly cannot grow what the service keeps.
@@ -1563,7 +1646,14 @@ settledNumber service number = do
   st ← readTVar (psVar service)
   pure $ case Map.lookup number (pByNumber st) >>= \identity → Map.lookup identity (pRecs st) of
     Nothing → True
-    Just record → isSettled st record
+    -- A request the opt-in settlement seam settled at its position stays hidden until the tick serves it.
+    Just record → isSettled st record && not (stillDue st record)
+
+-- | Whether a request's place has not been served yet: its tick has not taken it.
+stillDue ∷ PState → Rec → Bool
+stillDue st record = case recDue record of
+  Just due → Map.lookup due (pDue st) == Just (recIdentity record)
+  Nothing → False
 
 -- Serving ticks -------------------------------------------------------------------------
 
@@ -1605,6 +1695,9 @@ serveDue service identities = do
             -- eligible, and fails its instance at the owner's next safe boundary.
             latchRequired service record
             pure [recNumber record]
+        -- A request the opt-in settlement seam settled at its position reaches its waiters now, in the order
+        -- of the places, as a held completion does.
+        | maybe False requestSettled (Map.lookup identity (sessionRequests (pSession st))) → pure [recNumber record]
       _ → pure []
   pure (concat settled)
 

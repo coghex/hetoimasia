@@ -249,6 +249,7 @@ runPrepared environment lifetime stop link prepared graphics hook =
                   , sxControl = control
                   , sxHarness = noHarness
                   , sxGraphics = injection
+                  , sxTerrain = Nothing
                   }
               -- The handle is bound before any VM exists; the callback never blocks.
               callback session = do

@@ -1,0 +1,732 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+-- | The terrain operations of the M1 Lua facade (TRA-5), composed over the real terrain service (TRA-4, @hetoimasia-terrain-runtime@).
+--
+-- = What this is
+--
+-- The CPU facade ("Hetoimasia.LuaEngine.Facade") owns every Lua-visible rule of @api.terrain@: who may call, in which role and
+-- phase, with what arguments, and what an ordinary error is. It imports no terrain module and is handed 'TerrainServices',
+-- abstract operations. This module is the concrete composition of those operations over a terrain 'Service' and nothing else:
+-- 'terrainInjection' is the value a session is composed with ('Hetoimasia.LuaEngine.Session.sxTerrain'), and the session calls
+-- it once for each role's VM. Neither terrain library imports Lua, and the generic Lua host imports no terrain module.
+--
+-- = Who owns what
+--
+-- * The terrain 'Service', its owner thread and everything under it are the /assembly's/: borrowed here, made before the session
+--   and closed after it. A session never closes it.
+-- * A VM's /lending and lease scope/ are the session's (one for the VM, shared with graphics when it is injected); the terrain
+--   leases are charged in it, with a capacity derived from the service's lease cap ('terrainLeaseCapacity').
+-- * An instance's /terrain client/ is registered when the facade declares the instance and ended when the facade forgets it.
+--   The table that holds them is written by the declaring thread and read by the instance's owner thread, in STM.
+-- * A /name/ is local to its session and content root: the adapter prefixes the service's one name table with the session and
+--   the instance's root, so a name opened under another root or session is not found, and the miss reveals nothing.
+--
+-- = Requests, settlement and cancellation
+--
+-- Every terrain request is admitted by the host's opt-in admission first (request places, the result lease where one is
+-- reserved, the session's gate), and the service is handed the request after it, in the one masked hand-off. When the service
+-- refuses it as busy the hand-off declines ('DeclinedBusy'), and the host takes the whole admission back (no handle, no lease,
+-- no credit left); a permanent refusal that arrived since the argument check is declined the same way and read by the script
+-- as an ordinary error. The service's own admission is atomic: a refused request creates no request, work, name claim or edit.
+--
+-- The service's settlement seam is attached to the host's: the service reads the request's eligibility ('settlingEligible') and
+-- delivers its terminal outcome ('settlingSettle') in the one transaction that commits an edit and decides cancellation, the
+-- parent session's admission and the arena's closure, so exactly one of a script's cancel and the commit wins. Nothing here runs
+-- Lua or terrain IO inside the host's STM, waits for the terrain owner on a Lua thread, or calls another VM.
+--
+-- = The lease
+--
+-- A successful open or attach offers the service's lease to the request; the host builds it into the lease the request reserved
+-- (the adoption), on the owner's thread, and only then settles the result. A request cancelled or ended between the offer and the
+-- adoption leaves the offered lease with this adapter, which releases it when the host withdraws its interest, so no arena, name
+-- or lease is left to Lua's collection, a finalizer or a successful @take@. Releasing a lease reaches the service's non-waiting
+-- release: the creator's final owner lease closes the arena and cancels its requests; an attachment ends only its client's interest.
+module Hetoimasia.LuaEngine.Terrain
+  ( -- * Composing
+    TerrainFacade (..)
+  , TerrainHooks (..)
+  , noTerrainHooks
+  , terrainInjection
+  , terrainLeaseCapacity
+  , TerrainCompositionRefused (..)
+  , terrainCodes
+    -- * Pick authorities (the seam TRA-10 fills)
+  , TerrainPicks
+  , newTerrainPicks
+  , issuePick
+  , pickValue
+    -- * The leased resource
+  , TerrainResource
+  , resourceLease
+  ) where
+
+import Control.Concurrent.STM
+import Control.Exception (Exception, finally, mask, mask_, throwIO)
+import Control.Monad (forM_, void)
+import Data.Int (Int64)
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
+import Data.Text (Text)
+import qualified Data.Text as Text
+import Data.Unique (hashUnique)
+import Data.Word (Word64)
+import Hetoimasia.Foundation.Resource (acquirePart, releaseRank)
+import Hetoimasia.LuaEngine.Facade
+  ( TerrainCell (..)
+  , TerrainColumnAsk (..)
+  , TerrainDefinition (..)
+  , TerrainInjection (..)
+  , TerrainLayer (..)
+  , TerrainPatch (..)
+  , TerrainPatchValue (..)
+  , TerrainServices (..)
+  , TerrainStart (..)
+  , TerrainVm (..)
+  , terrainArenaType
+  , terrainCellValueSchema
+  , terrainColumnValueSchema
+  , terrainPickType
+  , terrainRemoveValueSchema
+  , terrainSurfaceValueSchema
+  )
+import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (RequestsPerInstance), Profile, countLimit)
+import Hetoimasia.LuaEngine.Request
+  ( M1Ask (..)
+  , m1Ask
+  , m1ArgumentCheck
+  , startM1
+  )
+import Hetoimasia.Scripting.Lua.Admission (Credit (..), CreditEnd (..), ExpectedFailure (..), Necessity (OptionalRequest))
+import Hetoimasia.Scripting.Lua.Lease
+  ( Ownership (InstanceOwned)
+  , ReleaseAnswer (..)
+  , leaseCapabilityType
+  , releaseLease
+  , withLeaseOr
+  )
+import Hetoimasia.Scripting.Lua.Provider
+  ( Adoption (..)
+  , ProviderReply (..)
+  , ProviderWork (..)
+  , RequestEndpoint (..)
+  , RetirementState (..)
+  , Settling (..)
+  , Submission (..)
+  , SubmissionDeclined (..)
+  )
+import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, RequestContext)
+import Hetoimasia.Scripting.Lua.Value (Schema (SNil), Value (..), capability)
+import Hetoimasia.Terrain.Cell (Cell (..), Column, IntervalError, MaterialId, ZRange, materialIdString, mkColumn, mkZRange, zRangeHi, zRangeLo)
+import Hetoimasia.Terrain.Coordinate (TileCoord, axisValue, tileCoord)
+import Hetoimasia.Terrain.Query (Occupied (..), Run (..))
+import Hetoimasia.Terrain.Residency (Revision (..))
+import Hetoimasia.Terrain.Runtime
+  ( Answer (..)
+  , ArenaLease
+  , CellAnswer (..)
+  , Client
+  , ColumnAnswer (..)
+  , Config (configMaxLeases)
+  , Failure (..)
+  , Precondition (..)
+  , RemoveAnswer (..)
+  , Refused (..)
+  , Request
+  , Service
+  , Settlement (..)
+  , SurfaceAnswer (..)
+  , endClient
+  , registerClient
+  )
+import qualified Hetoimasia.Terrain.Runtime as Terrain
+import Hetoimasia.Terrain.Runtime.Settlement
+  ( Endpoint (..)
+  , attachArenaWith
+  , cancel
+  , cellWith
+  , columnWith
+  , openArenaWith
+  , removeWith
+  , retire
+  , surfaceWith
+  )
+import Hetoimasia.Terrain.Shape (shapeIdValue)
+import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..), SourceSpec (..))
+
+-- The composition -------------------------------------------------------------------------------------
+
+-- | The session's terrain service this composition borrows.
+data TerrainFacade = TerrainFacade
+  { tfProfile ∷ !Profile
+  -- ^ The validated profile every VM's request policy is read from.
+  , tfService ∷ !Service
+  -- ^ The assembly's terrain service.
+  , tfConfig ∷ !Config
+  -- ^ The configuration the service was made with: its lease cap derives the lease capacity.
+  , tfPicks ∷ !TerrainPicks
+  -- ^ The pick authorities the composition honours. Empty until a view adapter (TRA-10) or a test fixture issues one.
+  , tfHooks ∷ !TerrainHooks
+  -- ^ The test seams: 'noTerrainHooks' in production.
+  , tfExtraBindings ∷ ![Binding]
+  -- ^ Bindings a test fixture adds to the facade's hidden namespace (a host-created pick token). Empty in production.
+  , tfIssuedMemory ∷ !Int
+  -- ^ How many of the most recently issued arena handles a VM remembers the issuing instance of.
+  }
+
+-- | The windows a test may hold or fail: told, never consulted for an answer.
+data TerrainHooks = TerrainHooks
+  { hookAdopting ∷ IO ()
+  -- ^ The host is about to build an offered lease into its reserved lease, on the owner's thread.
+  , hookReleasing ∷ IO ()
+  -- ^ A lease's release is about to reach the service.
+  , hookSubmitted ∷ IO ()
+  -- ^ The service accepted a request and the hand-off is about to return, masked.
+  }
+
+noTerrainHooks ∷ TerrainHooks
+noTerrainHooks = TerrainHooks (pure ()) (pure ()) (pure ())
+
+-- | Why a VM's terrain could not be composed: a failure of the composition, never a script's.
+newtype TerrainCompositionRefused = TerrainCompositionRefused Text
+  deriving (Eq, Show)
+
+instance Exception TerrainCompositionRefused
+
+-- | The expected failure codes the terrain requests supply (D-19 and the manager's two authorizations): the only codes a
+-- terrain reply may carry. Any other outcome of the service is a defect of the host.
+terrainCodes ∷ [Text]
+terrainCodes = ["not_found", "arena_closed", "stale_view", "definition", "source_failure", "too_large", "name_in_use"]
+
+-- | The lease capacity one instance needs in the VM's shared scope for terrain: every lease the service can hold at once (its
+-- cap is service-wide, so one instance may hold them all, pending, live and retiring), the places its requests can reserve a
+-- lease for before the service has admitted them, and one of headroom, as graphics does. Derived, not chosen: it follows the
+-- service's cap and the profile's, and changes neither.
+terrainLeaseCapacity ∷ Profile → Config → Int
+terrainLeaseCapacity profile config = configMaxLeases config + fromIntegral perInstance + 1
+  where
+    Count perInstance = countLimit profile RequestsPerInstance
+
+-- The pick authorities -----------------------------------------------------------------------------------
+
+-- | The pick authorities issued so far: opaque tokens naming the instance they were issued to and the incarnation and
+-- content revision a displayed view was built from. The real issuer is the view adapter (TRA-10); a test fixture issues them
+-- from the host side. Lua has no constructor.
+newtype TerrainPicks = TerrainPicks (TVar (Word64, Map Word64 (Text, Precondition)))
+
+newTerrainPicks ∷ IO TerrainPicks
+newTerrainPicks = TerrainPicks <$> newTVarIO (1, Map.empty)
+
+-- | Issue an authority to this instance (by the identity the facade issued it) for this precondition. The key is the
+-- capability's.
+issuePick ∷ TerrainPicks → Text → Precondition → IO Word64
+issuePick (TerrainPicks var) identity precondition = atomically $ do
+  (next, held) ← readTVar var
+  writeTVar var (next + 1, Map.insert next (identity, precondition) held)
+  pure next
+
+-- | The value a host fixture hands a script for an issued authority.
+pickValue ∷ Word64 → Value
+pickValue key = VCapability (capability terrainPickType key)
+
+-- The leased resource ---------------------------------------------------------------------------------------
+
+-- | What the host's lease holds: the service's own lease, or nothing when the request that was to own it ended between the
+-- offer and the build (its offered lease was already released by this adapter).
+newtype TerrainResource = TerrainResource {resourceLease ∷ Maybe ArenaLease}
+
+-- | A request's offered lease: offered by the commit, adopted by the host, or disposed of by this adapter when the host
+-- withdrew its interest first. One transition out of offered, decided in one transaction.
+data LeaseCell
+  = NoLease
+  | Offered !ArenaLease
+  | Adopted
+  | Disposed
+  deriving (Eq)
+
+-- | What this adapter holds of one request while it is the service's: the host's seam, where the offered lease is, and
+-- whether the service has reached its terminal outcome.
+data Link = Link
+  { lkSettling ∷ !Settling
+  , lkLease ∷ !(TVar LeaseCell)
+  , lkTerminal ∷ !(TVar Bool)
+  }
+
+-- The per-VM state ----------------------------------------------------------------------------------------
+
+-- | One typed request, held between the binding's start and the service's hand-off.
+data Ask
+  = AskOpen !Client !Text !SourceSpec
+  | AskAttach !Client !Text
+  | AskCell !ArenaLease !TileCoord
+  | AskColumn !ArenaLease !Column !ZRange
+  | AskSurface !ArenaLease !Column
+  | AskRemove !ArenaLease !TileCoord !(Maybe Precondition)
+
+data Pending = Pending
+  { pdAsk ∷ !Ask
+  , pdRequest ∷ !(TVar (Maybe Request))
+  }
+
+data Env = Env
+  { envFacade ∷ !TerrainFacade
+  , envVm ∷ !TerrainVm
+  , envSession ∷ !Int
+  , envClients ∷ !(TVar (Map Text Client))
+  , envAsks ∷ !(TVar (Word64, Map Word64 Pending))
+  , envRetire ∷ !(TVar [Request])
+  , envIssued ∷ !(TVar (Map Word64 Text))
+  }
+
+service ∷ Env → Service
+service = tfService . envFacade
+
+hooks ∷ Env → TerrainHooks
+hooks = tfHooks . envFacade
+
+-- | The injection a session is composed with: for each role's VM, its own client table over the shared service, in the VM's own
+-- lending and lease scope.
+terrainInjection ∷ TerrainFacade → TerrainInjection
+terrainInjection config =
+  TerrainInjection
+    { tiLeaseCapacity = \profile → terrainLeaseCapacity profile (tfConfig config)
+    , injectTerrain = \vm → do
+        clients ← newTVarIO Map.empty
+        asks ← newTVarIO (1, Map.empty)
+        retiring ← newTVarIO []
+        issued ← newTVarIO Map.empty
+        let env = Env config vm (hashUnique (tvSession vm)) clients asks retiring issued
+        pure (services env)
+    }
+
+services ∷ Env → TerrainServices
+services env =
+  TerrainServices
+    { tsTypes = [leaseCapabilityType leases terrainArenaType, leaseCapabilityType leases terrainPickType]
+    , tsEndpoints = endpoints
+    , tsDeclare = declare env
+    , tsForget = forget env
+    , tsOpenCheck = \_ _ _ _ owner values → permanent env (const openAsk) owner values
+    , tsOpenStart = \identity root name definition context → do
+        client ← clientOf env identity
+        start env context openName openAsk (AskOpen client (nameKey env root name) (sourceSpec definition))
+    , tsAttachCheck = \_ _ _ owner values → permanent env (const attachAsk) owner values
+    , tsAttachStart = \identity root name context → do
+        client ← clientOf env identity
+        start env context attachName attachAsk (AskAttach client (nameKey env root name))
+    , tsCellCheck = \identity key _ owner values → leaseCheck env identity key readAsk owner values
+    , tsCellStart = \_ key cell context → withArena env key $ \lease →
+        startOr cell (\tile → start env context cellName readAsk (AskCell lease tile))
+    , tsColumnCheck = \identity key _ owner values → leaseCheck env identity key readAsk owner values
+    , tsColumnStart = \_ key ask context → withArena env key $ \lease →
+        case columnOf ask of
+          Left why → pure (TerrainRefused why)
+          Right (column, range) → start env context columnName readAsk (AskColumn lease column range)
+    , tsSurfaceCheck = \identity key _ _ owner values → leaseCheck env identity key readAsk owner values
+    , tsSurfaceStart = \_ key x y context → withArena env key $ \lease →
+        case mkColumn (toInteger x) (toInteger y) of
+          Left _ → pure (TerrainRefused "the column is outside the supported range")
+          Right column → start env context surfaceName readAsk (AskSurface lease column)
+    , tsRemoveCheck = \identity key _ pick owner values → do
+        refused ← pickCheck env identity pick
+        case refused of
+          Just why → pure (Just why)
+          Nothing → leaseCheck env identity key readAsk owner values
+    , tsRemoveStart = \identity key cell pick context → withArena env key $ \lease → do
+        precondition ← pickPrecondition env identity pick
+        case precondition of
+          Left why → pure (TerrainRefused why)
+          Right found → startOr cell (\tile → start env context removeName readAsk (AskRemove lease tile found))
+    , tsReleaseCheck = releaseCheck env
+    , tsRelease = \key → releaseWord <$> releaseLease leases key
+    , tsIssued = \identity key → atomically (modifyTVar' (envIssued env) (remember (tfIssuedMemory (envFacade env)) key identity))
+    , tsDrain = drainRetired env
+    , tsExtraBindings = tfExtraBindings (envFacade env)
+    }
+  where
+    leases = tvLeases (envVm env)
+    startOr cell run = case tileOf cell of
+      Left why → pure (TerrainRefused why)
+      Right tile → run tile
+    endpoints =
+      [ endpoint env openName SNil
+      , endpoint env attachName SNil
+      , endpoint env cellName terrainCellValueSchema
+      , endpoint env columnName terrainColumnValueSchema
+      , endpoint env surfaceName terrainSurfaceValueSchema
+      , endpoint env removeName terrainRemoveValueSchema
+      ]
+    releaseWord = \case
+      Released → "done"
+      Retiring → "retiring"
+      AlreadyReleased → "already_released"
+    remember bound key identity held = trim (Map.insert key identity held)
+      where
+        trim found
+          | Map.size found > max 1 bound = trim (Map.deleteMin found)
+          | otherwise = found
+
+-- | The endpoint names of the requests.
+openName, attachName, cellName, columnName, surfaceName, removeName ∷ Text
+openName = "terrain_open"
+attachName = "terrain_attach"
+cellName = "terrain_cell"
+columnName = "terrain_column"
+surfaceName = "terrain_surface"
+removeName = "terrain_remove"
+
+-- Declaring ---------------------------------------------------------------------------------------------------
+
+declare ∷ Env → Text → Text → IO ()
+declare env identity _root =
+  registerClient (service env) >>= \case
+    Left refused → throwIO (TerrainCompositionRefused ("an instance's terrain client was refused: " <> Text.pack (show refused)))
+    Right client → atomically (modifyTVar' (envClients env) (Map.insert identity client))
+
+forget ∷ Env → Text → IO ()
+forget env identity = do
+  found ← atomically $ do
+    held ← Map.lookup identity <$> readTVar (envClients env)
+    modifyTVar' (envClients env) (Map.delete identity)
+    pure held
+  forM_ found (endClient (service env))
+  drainRetired env
+
+clientOf ∷ Env → Text → IO Client
+clientOf env identity =
+  Map.lookup identity <$> readTVarIO (envClients env) >>= \case
+    Just found → pure found
+    Nothing → throwIO (TerrainCompositionRefused "no terrain client was declared for the instance")
+
+-- | The name the service holds for an instance's name: in the session's and the instance's content root's namespace.
+nameKey ∷ Env → Text → Text → Text
+nameKey env root name = "s" <> Text.pack (show (envSession env)) <> "/" <> root <> "/" <> name
+
+-- | The retire queue's drain: every request whose host record has been taken or discarded and whose work is over gives the
+-- service back the result it held, in IO, on whichever thread drains it. Never blocks.
+drainRetired ∷ Env → IO ()
+drainRetired env = do
+  requests ← atomically (swapTVar (envRetire env) [])
+  forM_ (reverse requests) (retire (service env))
+
+-- The asks ------------------------------------------------------------------------------------------------------
+
+openAsk, attachAsk, readAsk ∷ M1Ask
+openAsk = leaseAsk "terrain open"
+attachAsk = leaseAsk "terrain attach"
+readAsk = (m1Ask OptionalRequest "terrain read") {askCodes = terrainCodes}
+
+leaseAsk ∷ Text → M1Ask
+leaseAsk source =
+  (m1Ask OptionalRequest source)
+    { askCodes = terrainCodes
+    , askLease = Just (InstanceOwned, \_ key → VCapability (capability terrainArenaType key))
+    }
+
+-- | The host's permanent facts for an ask, decided before any action and reserving nothing.
+permanent ∷ Env → ([Value] → M1Ask) → ArgumentCheck
+permanent env askOf owner values = m1ArgumentCheck (tvRequests (envVm env)) askOf owner values
+
+-- | A lease handle's check: another instance's handle (alive, retiring or ended) and a handle of another kind are refused as
+-- ordinary errors; the host's own permanent facts follow. A lease whose arena was closed by someone else is not refused here:
+-- its request settles @arena_closed@.
+leaseCheck ∷ Env → Text → Word64 → M1Ask → ArgumentCheck
+leaseCheck env identity key ask owner values = do
+  issuer ← Map.lookup key <$> readTVarIO (envIssued env)
+  case issuer of
+    Just other | other /= identity → pure (Just "the arena belongs to another instance")
+    _ →
+      withLeaseOr
+        (tvLeases (envVm env))
+        key
+        (\why → pure (Just why))
+        (\(_ ∷ TerrainResource) → permanent env (const ask) owner values)
+
+-- | Borrow the service's lease from the host's, for a start. A lease that has ended since the check (it cannot, on the one
+-- thread that runs the instance, but the answer is data) is a refusal.
+withArena ∷ Env → Word64 → (ArenaLease → IO TerrainStart) → IO TerrainStart
+withArena env key use =
+  withLeaseOr (tvLeases (envVm env)) key (\why → pure (TerrainRefused why)) $ \resource →
+    case resourceLease resource of
+      Nothing → pure (TerrainRefused "the lease has ended")
+      Just lease → use lease
+
+releaseCheck ∷ Env → Text → Word64 → IO (Maybe Text)
+releaseCheck env identity key = do
+  issuer ← Map.lookup key <$> readTVarIO (envIssued env)
+  case issuer of
+    Just other | other /= identity → pure (Just "the arena belongs to another instance")
+    _ →
+      withLeaseOr
+        (tvLeases (envVm env))
+        key
+        (\why → pure (if Text.isInfixOf "another" why then Just why else Nothing))
+        (\(_ ∷ TerrainResource) → pure Nothing)
+
+-- The pick -----------------------------------------------------------------------------------------------------
+
+-- | Whether the authority is the calling instance's own live one.
+pickCheck ∷ Env → Text → Maybe Word64 → IO (Maybe Text)
+pickCheck env identity = \case
+  Nothing → pure Nothing
+  Just key → do
+    let TerrainPicks var = tfPicks (envFacade env)
+    (_, held) ← readTVarIO var
+    pure $ case Map.lookup key held of
+      Just (owner, _) | owner == identity → Nothing
+      Just _ → Just "the pick authority belongs to another instance"
+      Nothing → Just "the pick is not a live pick authority"
+
+pickPrecondition ∷ Env → Text → Maybe Word64 → IO (Either Text (Maybe Precondition))
+pickPrecondition env identity = \case
+  Nothing → pure (Right Nothing)
+  Just key → do
+    let TerrainPicks var = tfPicks (envFacade env)
+    (_, held) ← readTVarIO var
+    pure $ case Map.lookup key held of
+      Just (owner, precondition) | owner == identity → Right (Just precondition)
+      _ → Left "the pick is not a live pick authority of this instance"
+
+-- Conversions ----------------------------------------------------------------------------------------------------
+
+sourceSpec ∷ TerrainDefinition → SourceSpec
+sourceSpec definition =
+  SourceSpec
+    { specMaterials = map Text.unpack (tdMaterials definition)
+    , specLayers = map layer (tdLayers definition)
+    , specPatches = map patch (tdPatches definition)
+    }
+  where
+    layer l = LayerSpec (toInteger <$> tlMin l) (toInteger <$> tlMax l) (Text.unpack (tlMaterial l)) (fromIntegral (tlShape l))
+    patch p = PatchSpec (toInteger (tpX p)) (toInteger (tpY p)) (toInteger (tpMin p)) (toInteger (tpMax p)) (value (tpValue p))
+    value = \case
+      PatchAir → SpecAir
+      PatchSolid material shape → SpecSolid (Text.unpack material) (fromIntegral shape)
+
+tileOf ∷ TerrainCell → Either Text TileCoord
+tileOf (TerrainCell x y z) = either (const (Left "the cell is outside the supported range")) Right (tileCoord (toInteger x) (toInteger y) (toInteger z))
+
+columnOf ∷ TerrainColumnAsk → Either Text (Column, ZRange)
+columnOf (TerrainColumnAsk x y lo hi) = do
+  column ← either (const (Left "the column is outside the supported range")) Right (mkColumn (toInteger x) (toInteger y))
+  range ← either (\(_ ∷ IntervalError) → Left "the range is not a valid interval of supported levels") Right (mkZRange (toInteger lo) (toInteger hi))
+  Right (column, range)
+
+-- | A terrain failure as the reply the host judges: the declared code with a fixed, bounded message, or a reply that is a
+-- provider defect (no code), for what the service never declared.
+failureReply ∷ Failure → ProviderReply
+failureReply = \case
+  NotFound → expected "not_found" "no arena of this name is open in this content root"
+  ArenaClosed → expected "arena_closed" "the arena has closed"
+  StaleView → expected "stale_view" "the displayed snapshot is no longer the arena's content"
+  Definition err → expected "definition" ("the definition was refused: " <> Text.pack (take 400 (show err)))
+  TooLarge _ → expected "too_large" "the complete answer has more than 1024 runs: narrow the range"
+  SourceFailure why → expected "source_failure" (Text.take 400 why)
+  NameInUse → expected "name_in_use" "an arena of this name is open or being opened in this content root"
+  Superseded why → ProviderFailure ("terrain: a request was overtaken and cannot be admitted again: " <> Text.take 200 why)
+  HostFailure why → ProviderFailure ("terrain: " <> Text.take 200 why)
+  where
+    expected code message = ProviderExpected (ExpectedFailure code message Nothing Nothing)
+
+-- | A revision as a Lua integer, when it is one.
+revisionOf ∷ Revision → Maybe Int64
+revisionOf (Revision w)
+  | w <= fromIntegral (maxBound ∷ Int64) = Just (fromIntegral w)
+  | otherwise = Nothing
+
+cellFields ∷ Cell → [(Text, Value)]
+cellFields = \case
+  Air → [("air", VBoolean True)]
+  Solid material shape → [("air", VBoolean False), ("material", VText (materialText material)), ("shape", VInteger (fromIntegral (shapeIdValue shape)))]
+
+materialText ∷ MaterialId → Text
+materialText = Text.pack . materialIdString
+
+-- | The reply for an answer that is not a lease, or a defect for one that cannot be handed to Lua.
+answerReply ∷ Answer → ProviderReply
+answerReply = \case
+  ACell answer → withRevision (cellRevision answer) $ \revision → VRecord (("revision", VInteger revision) : cellFields (cellValue answer))
+  AColumn answer → withRevision (columnRevision answer) $ \revision →
+    VRecord
+      [ ("revision", VInteger revision)
+      , ("runs", VList [VRecord ([("z_min", VInteger (fromIntegral (zRangeLo range))), ("z_max", VInteger (fromIntegral (zRangeHi range)))] <> cellFields cell) | Run range cell ← columnAnswerRuns answer])
+      ]
+  ASurface answer → withRevision (surfaceRevision answer) $ \revision → case surfaceTop answer of
+    Nothing → VRecord [("revision", VInteger revision), ("occupied", VBoolean False)]
+    Just (Occupied level material shape) →
+      VRecord
+        [ ("revision", VInteger revision)
+        , ("occupied", VBoolean True)
+        , ("z", VInteger (axisValue level))
+        , ("material", VText (materialText material))
+        , ("shape", VInteger (fromIntegral (shapeIdValue shape)))
+        ]
+  ARemoved answer → withRevision (removeRevision answer) $ \revision → VRecord [("changed", VBoolean (removeChangedFlag answer)), ("revision", VInteger revision)]
+  AOpened _ → ProviderFailure "terrain: a lease answer reached the value conversion"
+  AAttached _ → ProviderFailure "terrain: a lease answer reached the value conversion"
+  where
+    withRevision revision build = case revisionOf revision of
+      Just found → ProviderResult (build found)
+      Nothing → ProviderFailure "terrain: a content revision is not a Lua integer"
+
+-- The service's endpoint ------------------------------------------------------------------------------------------
+
+endpoint ∷ Env → Text → Schema → RequestEndpoint
+endpoint env name schema = RequestEndpoint {endpointName = name, endpointResult = schema, endpointSubmit = submit env}
+
+-- | Hand a request to the service: one masked step from taking the typed ask to returning the work, so nothing separates an
+-- admitted request from the record that cancels it.
+submit ∷ Env → Submission → IO ProviderWork
+submit env submission = mask_ $ do
+  ticket ← case submissionArguments submission of
+    [VInteger found] → pure (fromIntegral found)
+    _ → throwIO (TerrainCompositionRefused "a terrain request was handed with no ticket")
+  pending ← atomically $ do
+    (next, held) ← readTVar (envAsks env)
+    writeTVar (envAsks env) (next, Map.delete ticket held)
+    pure (Map.lookup ticket held)
+  found ← maybe (throwIO (TerrainCompositionRefused "a terrain request's ask was lost")) pure pending
+  settling ← maybe (throwIO (TerrainCompositionRefused "a terrain request was handed with no settlement seam")) pure (submissionSettling submission)
+  link ← Link settling <$> newTVarIO NoLease <*> newTVarIO False
+  let ep =
+        Endpoint
+          { endpointReady = pure ()
+          , endpointEligible = settlingEligible settling
+          , endpointSettle = settleInto env link
+          }
+  admitted ← case pdAsk found of
+    AskOpen client name spec → openArenaWith (service env) ep client name spec
+    AskAttach client name → attachArenaWith (service env) ep client name
+    AskCell lease tile → cellWith (service env) ep lease tile
+    AskColumn lease column range → columnWith (service env) ep lease column range
+    AskSurface lease column → surfaceWith (service env) ep lease column
+    AskRemove lease tile precondition → removeWith (service env) ep lease tile precondition
+  case admitted of
+    Left refused → throwIO (declination refused)
+    Right request → do
+      atomically (writeTVar (pdRequest found) (Just request))
+      hookSubmitted (hooks env)
+      pure
+        ProviderWork
+          { workCancel = cancelWork env link request
+          , workRetirement = retirement link
+          }
+
+-- | What the service's refusal of an admitted request is to the script: busy for a bank with no room, an ordinary error for
+-- anything permanent.
+declination ∷ Refused → SubmissionDeclined
+declination = \case
+  RefusedBusy why → DeclinedBusy (Text.pack ("terrain " <> bankName why))
+  RefusedAuthority → DeclinedRefused "the arena handle is not this service's authority"
+  RefusedInvalid why → DeclinedRefused (Text.take 200 why)
+  RefusedExhausted → DeclinedRefused "an identity of the terrain service is exhausted"
+  RefusedClosed → DeclinedRefused "the terrain service is closed"
+  where
+    bankName = \case
+      Terrain.BusyModel _ → "bank"
+      Terrain.BusyRetainedEdits → "retained edits"
+      Terrain.BusyArenas → "arenas"
+      Terrain.BusyLeases → "leases"
+      Terrain.BusyViews → "views"
+      Terrain.BusyClients → "clients"
+      Terrain.BusyRetained → "retained results"
+
+-- | The service's terminal outcome of a request, in the very transaction that decides it: the host's seam is read and written
+-- in it, and nothing else is.
+settleInto ∷ Env → Link → Settlement → STM ()
+settleInto env link = \case
+  Cancelled → settlingCancel (lkSettling link) >> writeTVar (lkTerminal link) True
+  Failed failure → do
+    _ ← settlingSettle (lkSettling link) (failureReply failure)
+    writeTVar (lkTerminal link) True
+  Succeeded answer → case answer of
+    AOpened lease → offer lease
+    AAttached lease → offer lease
+    other → do
+      _ ← settlingSettle (lkSettling link) (answerReply other)
+      writeTVar (lkTerminal link) True
+  where
+    -- The service's lease is offered to the request, and the host is told it is a resource reply: it builds the lease at its next
+    -- boundary and settles then. Whatever the host answers, the lease stays offered until it is adopted or disposed of.
+    offer lease = do
+      writeTVar (lkLease link) (Offered lease)
+      _ ← settlingSettle (lkSettling link) (ProviderResource VNil (adoptionFor env link))
+      writeTVar (lkTerminal link) True
+
+-- | The recipe the host runs, on the owner's thread, to build the offered lease into the lease the request reserved. A request
+-- that ended between the offer and the build has had its offered lease released by 'cancelWork': the resource is then built over
+-- nothing, and the host, whose interest ended, releases it at once.
+adoptionFor ∷ Env → Link → Adoption
+adoptionFor env link =
+  Adoption $ \_ →
+    acquirePart
+      "terrain arena"
+      (releaseRank 0)
+      ( do
+          hookAdopting (hooks env)
+          atomically $
+            readTVar (lkLease link) >>= \case
+              Offered lease → TerrainResource (Just lease) <$ writeTVar (lkLease link) Adopted
+              _ → pure (TerrainResource Nothing)
+      )
+      releaseResource
+  where
+    -- The service's lease is released through its non-waiting release: the creator's final owner lease closes the arena, an
+    -- attachment ends its client's interest only. It waits for no borrower and for nothing of the owner.
+    releaseResource resource = forM_ (resourceLease resource) $ \lease → do
+      hookReleasing (hooks env)
+      Terrain.releaseLease (service env) lease >>= either (throwIO . TerrainCompositionRefused . ("a lease's release was refused: " <>) . Text.pack . show) pure
+
+-- | Withdraw interest in a request: ask the service to cancel it, and give back an offered lease nobody adopted.
+cancelWork ∷ Env → Link → Request → IO ()
+cancelWork env link request = mask_ $ do
+  _ ← cancel (service env) request
+  atomically (writeTVar (lkTerminal link) True)
+  offered ← atomically $
+    readTVar (lkLease link) >>= \case
+      Offered lease → Just lease <$ writeTVar (lkLease link) Disposed
+      _ → pure Nothing
+  forM_ offered $ \lease → do
+    hookReleasing (hooks env)
+    void (Terrain.releaseLease (service env) lease)
+
+-- | The provider's own reading of where its work has got to, after interest was withdrawn: over when the service has reached
+-- its terminal outcome for the request and no offered lease is waiting for a release.
+retirement ∷ Link → STM RetirementState
+retirement link = do
+  terminal ← readTVar (lkTerminal link)
+  held ← readTVar (lkLease link)
+  pure (if terminal && not (isOffered held) then ProviderComplete else ProviderPending)
+  where
+    isOffered = \case
+      Offered _ → True
+      _ → False
+
+-- The start ------------------------------------------------------------------------------------------------------
+
+-- | Start a terrain request: the typed ask is held under a ticket while the host admits it, and the service is handed the
+-- request after that. The credit returns the service's result to it when the host's record has been taken or discarded and
+-- its work is over.
+start ∷ Env → RequestContext → Text → M1Ask → Ask → IO TerrainStart
+start env context endpointName ask typed = mask $ \restore → do
+  drainRetired env
+  requestVar ← newTVarIO Nothing
+  ticket ← atomically $ do
+    (next, held) ← readTVar (envAsks env)
+    writeTVar (envAsks env) (next + 1, Map.insert next (Pending typed requestVar) held)
+    pure next
+  let credit =
+        Credit
+          { creditName = "terrain request"
+          , creditReserve = pure True
+          , creditRelease = \case
+              CreditUnused → pure ()
+              CreditSettled → readTVar requestVar >>= mapM_ (\request → modifyTVar' (envRetire env) (request :))
+          , creditTransfers = False
+          }
+      withCredit = ask {askCredits = askCredits ask <> [credit]}
+  started ←
+    restore (startM1 (tvRequests (envVm env)) withCredit context endpointName [VInteger (fromIntegral ticket)] (pure ()))
+      `finally` discard ticket
+  pure (TerrainStarted started)
+  where
+    discard ticket = atomically (modifyTVar' (envAsks env) (\(next, held) → (next, Map.delete ticket held)))

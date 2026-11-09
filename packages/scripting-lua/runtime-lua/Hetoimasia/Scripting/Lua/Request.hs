@@ -135,7 +135,15 @@ startRequest context name arguments afterCompletion = do
         completion = Completion $ \reply → do
           checked ← checkReply (psLimits service) (endpointResult endpoint) reply
           atomically (replyTo service (admittedIdentity found) checked)
-    handed ← guarded (restore (endpointSubmit endpoint (Submission arguments completion info (settledNumber service (admittedNumber found)))))
+    handed ←
+      guarded . restore . endpointSubmit endpoint $
+        Submission
+          { submissionArguments = arguments
+          , submissionCompletion = completion
+          , submissionInfo = info
+          , submissionSettled = settledNumber service (admittedNumber found)
+          , submissionSettling = Nothing
+          }
     case handed of
       Left failure → do
         void (atomically (withdrawAdmission service (admittedIdentity found)))

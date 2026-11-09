@@ -44,7 +44,7 @@ import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Time (MonotonicSource)
 import Hetoimasia.Foundation.Worker (Completion)
 import Hetoimasia.LuaEngine.Boot (Checkpoint)
-import Hetoimasia.LuaEngine.Facade (GraphicsInjection, Output)
+import Hetoimasia.LuaEngine.Facade (GraphicsInjection, Output, TerrainInjection)
 import Hetoimasia.LuaEngine.Manifest (Role)
 import Hetoimasia.LuaEngine.Profile (Profile)
 import Hetoimasia.LuaEngine.Session.Harness (Harness, InstanceKey, Point, Protection, Release)
@@ -82,6 +82,11 @@ data SessionSpec = SessionSpec
   -- ^ The graphics operations a composition injects (LFE-21): the abstract function that makes each role's VM its
   -- graphics services, owned and borrowed by the assembly and never closed by the session. 'Nothing' for a
   -- composition that injects none (every CPU-only caller): its facades have no graphics call, handle or request kind.
+  , sxTerrain ∷ !(Maybe TerrainInjection)
+  -- ^ The terrain operations a composition injects (TRA-5): the abstract function that makes each role's VM its terrain
+  -- services, owned and borrowed by the assembly and never closed by the session. 'Nothing' for a composition that injects
+  -- none: its facades have no @api.terrain@, no terrain handle type and no terrain request kind, exactly as before. When both
+  -- are injected the VM's one lending and lease scope is shared by both.
   }
 
 -- | The handle to a session, made before any VM exists.
