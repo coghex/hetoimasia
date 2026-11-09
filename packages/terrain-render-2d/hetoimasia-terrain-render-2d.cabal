@@ -204,6 +204,7 @@ test-suite terrain-render-2d-tests
     other-modules:
         Test.TerrainRender2D.Art
         Test.TerrainRender2D.Atlas
+        Test.TerrainRender2D.AtlasAssets
         Test.TerrainRender2D.Camera
         Test.TerrainRender2D.CellFixtures
         Test.TerrainRender2D.CellsClient
