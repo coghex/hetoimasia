@@ -14,6 +14,7 @@ import qualified Data.ByteString as ByteString
 import Data.Either (isLeft)
 import Data.Word (Word32, Word64, Word8)
 import GHC.Float (castWord32ToFloat)
+import qualified Hetoimasia.Render.Api.Texture as Api
 import Hetoimasia.Render.Api.Texture.Backend (textureHandle)
 import Hetoimasia.Render.TwoD.Material (MaterialFacts (..), MaterialRecord (..), MaterialRef, RecordLayout (..))
 import Hetoimasia.Render.TwoD.Material.Backend (materialRef)
@@ -25,6 +26,7 @@ import Hetoimasia.Terrain.Render2D.AtlasAssets (AtlasAssetError (..), ParentAtla
 import Hetoimasia.Terrain.Render2D.AtlasFixtures (AtlasStyle (..), loadAtlasStyle, loadSingleImageStyle)
 import Hetoimasia.Terrain.MapBake.Catalog (mapIdentifier)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Hetoimasia.Terrain.Render2D.Cells
 import Hetoimasia.Terrain.Render2D.Material
 import Hetoimasia.Terrain.Render2D.Presentation
@@ -477,6 +479,49 @@ adaptationSpec = describe "adapting a cell plan" $ do
         Left why → expectationFailure (describeMaterialRefusal why)
         Right adapted → length (adaptedRecords adapted) `shouldBe` 2
   describe "capacity" $ do
+    it "keeps a mixed cell's known and fog parts together under the record bound: all of them or none" $ do
+      (style, textures) ← boundStyle 5
+      let assets = styleAssets style
+          mixed = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 5 KnownSolid])
+      -- The known and the fog part are two distinct records: a bound of one refuses the cell whole.
+      adaptCellsWith 1 textures defaultLightSettings assets mixed `shouldBe` Left (TooManyRecords 1)
+      case adaptCellsWith 2 textures defaultLightSettings assets mixed of
+        Left why → expectationFailure (describeMaterialRefusal why)
+        Right adapted → length (adaptedQuads adapted) `shouldBe` 2
+    it "holds the same two parent textures however many regions and quads draw from them: one charge per physical texture" $ do
+      (style, textures) ← boundStyle 5
+      let assets = styleAssets style
+          small = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 5 KnownAll])
+          large = planScene assets (sceneOf FaceSouth 8 [OCell x y z 5 KnownAll | x ← [0 .. 3], y ← [0 .. 3], z ← [0 .. 3]])
+          handlesOf plan = case adaptCells textures defaultLightSettings assets plan of
+            Left why → Left (describeMaterialRefusal why)
+            Right adapted → Right (Set.fromList [h | MaterialRecord hs _ ← adaptedRecords adapted, h ← hs])
+          -- #672: a texture is charged its byte size, at least 4 KiB, once however many instances read it.
+          charge ∷ Set.Set Api.TextureHandle → Int
+          charge handles = sum [max 4096 (bytes h) | h ← Set.toList handles]
+          bytes ∷ Api.TextureHandle → Int
+          bytes h
+            | h == textureHandleOf (head' (atlasColour textures)) = 288 * 64 * 4
+            | otherwise = 768 * 384 * 4
+          head' xs = case xs of x : _ → x; [] → error "an atlas style binds its colour parent"
+          textureHandleOf = ptHandle
+      case (handlesOf small, handlesOf large) of
+        (Right few, Right many) → do
+          few `shouldBe` many
+          Set.size many `shouldBe` 2
+          charge many `shouldBe` 288 * 64 * 4 + 768 * 384 * 4
+        other → expectationFailure (show other)
+    it "refuses a plan whose second parent was never admitted, whole, and adapts it once both are bound" $ do
+      (style, textures) ← boundStyle 5
+      let assets = styleAssets style
+          plan = planScene assets (sceneOf FaceSouth 0 [OCell 0 0 0 5 KnownAll])
+          onlyColour = textures {atlasNormal = []}
+      -- The normal parent's byte charge was refused (or its interest never taken): nothing of the plan is adapted.
+      case adaptCells onlyColour defaultLightSettings assets plan of
+        Left (NoTextureForParent _ _ _) → pure ()
+        other → expectationFailure ("expected NoTextureForParent, got " <> either describeMaterialRefusal (const "an adaptation") other)
+      -- Admitting it afterwards adapts the whole plan: the refusal left nothing behind.
+      fmap (length . adaptedQuads) (adaptCells textures defaultLightSettings assets plan) `shouldBe` Right 1
     it "refuses the whole plan when it needs more distinct records than the bound, and adapts it at the bound" $ do
       (style, textures) ← boundStyle 5
       let assets = styleAssets style
