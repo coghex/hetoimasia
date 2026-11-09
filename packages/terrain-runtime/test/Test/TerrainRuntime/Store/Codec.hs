@@ -257,6 +257,11 @@ spec = describe "the private page codec against independent bytes" $ do
       dec (leaf 4 [(be64' 3, BS.concat [be64' 9, le16' 4, le16' 4])]) `shouldBe` Left MalformedValue
       dec (leaf 4 [(be64' 3, BS.concat [be64' 9, le16' 507, le16' 0])]) `shouldBe` Left MalformedValue
       dec (leaf 4 [(be64' 3, BS.concat [be64' total, le16' 4, le16' 0])]) `shouldBe` Left MalformedValue
+    it "refuses an entry whose declared lengths run past the payload, in a leaf and in an internal page" $ do
+      let dec = decodePage ident0 total (PageNo 0)
+      -- a leaf entry claiming a 60-byte value with one byte left; an internal entry claiming a 24-byte key and no child
+      dec (buildPage 1 7 0 1 0 0 1 (BS.pack [1, 60, 7])) `shouldBe` Left (BadLength 3)
+      dec (buildPage 1 7 0 2 0 1 1 (BS.concat [BS.singleton 24, BS.replicate 10 1])) `shouldBe` Left (BadLength 11)
     it "refuses each field of a retired-page index entry wrong in turn, and an internal page's key lengths" $ do
       let leaf t es = buildPage 1 7 0 1 t 0 (length es) (leafPayload es)
           dec = decodePage ident0 total (PageNo 0)
@@ -339,6 +344,27 @@ spec = describe "the private page codec against independent bytes" $ do
       case runM (lookupKey TreeRuns (Just (Disk (pageNo 5))) (BS.concat [bias 5, bias 5, bias 5])) (newEdit 0 (add (emptyWindow ident0 0) 5 parent)) of
         Left (Need (PageNo 6)) → pure ()
         other → expectationFailure ("a missing page must be pending: " <> either show (const "answered") other)
+  describe "a child against its parent" $ do
+    it "refuses a child of another tree and a child whose keys reach the parent's upper separator" $ do
+      let add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
+          runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
+          inner no cs = buildPage 1 7 no 2 0 1 (length cs) (BS.concat [BS.concat [BS.singleton 24, k, le64' c] | (k, c) ← cs])
+          sepL = runKeyBytes 1000
+          sepR = runKeyBytes 5000
+          -- a runs parent whose child is a leaf of the links tree
+          linksLeaf = buildPage 1 7 6 1 1 0 1 (leafPayload [(BS.concat [BS.singleton 1, bias 0, bias 0, bias 1000], BS.concat [BS.singleton 0, be64' 1, BS.singleton 0])])
+          wOther = add (add (emptyWindow ident0 0) 5 (inner 5 [(sepL, 6)])) 6 linksLeaf
+      case runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 wOther) of
+        Left (Bad KindMismatch (PageNo 6)) → pure ()
+        other → expectationFailure ("a child of another tree was followed: " <> either show (const "answered") other)
+      -- the left child holds a key at the right separator, which belongs to the right child
+      let leafKeys no ks = buildPage 1 7 no 1 0 0 (length ks) (leafPayload [(k, bias (lo + 1)) | (k, lo) ← ks])
+          left = leafKeys 6 [(runKeyBytes 1000, 1000), (runKeyBytes 5000, 5000)]
+          right = leafKeys 7 [(runKeyBytes 5000, 5000)]
+          wBound = add (add (add (emptyWindow ident0 0) 5 (inner 5 [(sepL, 6), (sepR, 7)])) 6 left) 7 right
+      case runM (lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL) (newEdit 0 wBound) of
+        Left (Bad KeyOrder (PageNo 6)) → pure ()
+        other → expectationFailure ("a child reaching the upper separator was followed: " <> either show (const "answered") other)
   describe "rebalancing" $ do
     it "refuses a root collapse that would follow a cycle or a child of the wrong level" $ do
       let runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
