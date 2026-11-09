@@ -26,6 +26,7 @@ module Test.TerrainRuntime.Store.Harness
   , commitPlan
   , runPlanned
   , reclaimAll
+  , reclaimAllWithin
   , checkH
 
     -- * Records
@@ -195,10 +196,14 @@ runPlanned h p = case p of
 -- | Reclaim until nothing more can be reclaimed, returning the number of
 -- transactions. Stops on a block by a reader or a refusal.
 reclaimAll ∷ H → Either String (H, Int)
-reclaimAll = go 0
+reclaimAll = reclaimAllWithin 400
+
+-- | 'reclaimAll' allowing a given number of transactions (a large store needs several hundred).
+reclaimAllWithin ∷ Int → H → Either String (H, Int)
+reclaimAllWithin limit = go 0
   where
     go n h
-      | n > (400 ∷ Int) = Left ("reclamation did not terminate: retired " <> show (usRetiredBytes (usage (hStore h))) <> " free " <> show (rFreePages (storeRoots (hStore h))) <> " loose " <> show (length (rLoose (storeRoots (hStore h)))) <> " version " <> show (storeVersion (hStore h)))
+      | n > limit = Left ("reclamation did not terminate: retired " <> show (usRetiredBytes (usage (hStore h))) <> " free " <> show (rFreePages (storeRoots (hStore h))) <> " loose " <> show (length (rLoose (storeRoots (hStore h)))) <> " version " <> show (storeVersion (hStore h)))
       | otherwise = do
           (p, _, _) ← fillWith h (planMaintenance (hStore h))
           case p of

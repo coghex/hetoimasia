@@ -74,6 +74,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Plan
   , InvalidWhy (..)
   , CapacityWhy (..)
   , IntegrityWhy (..)
+  , shrinkable
 
     -- * Planning
   , Bounds (..)
@@ -285,7 +286,28 @@ data CapacityWhy
     -- the entries and the retired pages they hold. A reader's pin holds them; a release
     -- and a maintenance transaction lower them.
     RetirementBacklog !Int !Int
+  | -- | The allocator and retirement trees would need more pages than a plan may take for them: the
+    -- figure. Every replaced record page is indexed in the retirement tree, so a batch that replaces
+    -- many dispersed pages needs more; a smaller batch replaces fewer ('shrinkable').
+    BookkeepingExceeded !Int
   deriving stock (Eq, Show)
+
+-- | Whether a refusal says the batch was too big, so that a plan of a smaller batch can get past it: the
+-- bounds on the pages, the RAM, the retired pages one transaction lists, the overlay, the window and the
+-- probes, and the bookkeeping those need. Everything else (a full disk, a backlog that waits for a reader,
+-- a tree too tall) a smaller batch does not change. An integrity result is never shrinkable.
+shrinkable ∷ PlanRefusal → Bool
+shrinkable (Capacity c) = case c of
+  TxnPagesExceeded _ → True
+  TxnRamExceeded _ → True
+  ListTooLarge _ → True
+  OverlayExceeded _ → True
+  WindowExceeded _ → True
+  WindowBytesExceeded _ → True
+  ProbesExceeded _ → True
+  BookkeepingExceeded _ → True
+  _ → False
+shrinkable _ = False
 
 data IntegrityWhy
   = BadPage !PageError !PageNo
@@ -308,7 +330,6 @@ data IntegrityWhy
   | -- | A retirement entry frees a page its index does not record under the entry's version.
     RetiredIndexMismatch !PageNo
   | MalformedRetirement
-  | BookkeepingOverflow !Int
   | LooseOverflow !Int
   | -- | #661's records are not a legitimate state.
     DiscoveryCorrupt !Integrity
@@ -337,7 +358,7 @@ standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes
 -- ---------------------------------------------------------------------------
 -- The planning monad
 
-data Out = OutNeed !PageNo | OutProbes ![PageNo] | OutRefuse !PlanRefusal
+data Out = OutNeed !PageNo | OutProbes ![PageNo] | OutRefuse !PlanRefusal | OutMoreBookkeeping !Int
 
 type P a = Either Out a
 
@@ -359,6 +380,7 @@ settle (Right Nothing) = NoWork
 settle (Left (OutNeed p)) = Pending p
 settle (Left (OutProbes ps)) = PendingProbes ps
 settle (Left (OutRefuse r)) = Refused r
+settle (Left (OutMoreBookkeeping n)) = Refused (Capacity (BookkeepingExceeded n))
 
 -- ---------------------------------------------------------------------------
 -- Capacity
@@ -657,96 +679,110 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
       if next == hdr
         then pure Nothing
         else Just <$> headerOnly cfg ident roots cls cand next version' edit1 writes
-    else do
-      let m = d + (if needRetire then 1 else 0) + bookkeepingReserve
-      -- The supply.
-      (mtake, bkEdit0) ← phase (newEdit overlayBudgetBookkeeping win) (takeSupply cfg roots m)
-      tk ← maybe (refuse (Capacity (DiskFull (fromIntegral m) (freePool cfg roots + fromIntegral (length (rLoose roots))) (protectedFor cls)))) pure mtake
-      let claim = fromIntegral m - fromIntegral (tkLoose tk) ∷ Word64
-      if freePool cfg roots < claim + protectedFor cls
-        then refuse (Capacity (DiskFull claim (freePool cfg roots) (protectedFor cls)))
-        else pure ()
-      let supply = tkPages tk
-      (pagesRec, recNos, afterRec) ← assign ident edit1 [rr, rl, rt] supply
-      (listPage, afterList) ← case (needRetire, afterRec) of
-        (True, lp : more) → Right (Just lp, more)
-        (True, []) → refuse (Integrity CorruptCounters)
-        (False, _) → Right (Nothing, afterRec)
-      let retireRoot0 = fmap Disk (rRetire roots)
-      (retireRoot1, bkEdit1) ← case listPage of
-        Nothing → pure (retireRoot0, bkEdit0)
-        Just lp → do
-          let (k, v) = encodeRetire version' (Retire lp (fromIntegral listN) 0)
-          (entryRoot, entryEdit) ← phase bkEdit0 (insertKey TreeRetire retireRoot0 k v)
-          -- every replaced page is indexed by its number under this entry's version; a page
-          -- already indexed is owned by two entries
-          foldM (indexRetired version') (entryRoot, entryEdit) replacedRec
-      (freeRoot1, bkEdit2) ← phase bkEdit1 (consume (fmap Disk (rFree roots)) tk)
-      (pagesBk, bkNos, slack) ← assign ident bkEdit2 [retireRoot1, freeRoot1] afterList
-      let bkUsed = length pagesBk
-      if bkUsed > bookkeepingReserve then refuse (Integrity (BookkeepingOverflow bkUsed)) else pure ()
-      listPages ← traverse (\lp → encodeOut ident (Page TreeRetire 0 lp (List version' replacedRec))) (maybe [] pure listPage)
-      let encoded = pagesRec ++ listPages ++ pagesBk
-          written = length encoded
-      if written > bdPages bounds then refuse (Capacity (TxnPagesExceeded written)) else pure ()
-      -- No page may be overwritten that a committed or a pinned root still reaches,
-      -- whatever the allocator's records say: the pages below the used space that this
-      -- plan writes are each proven unreachable first.
-      bkEdit3 ← provenFree cfg roots pins win (Set.fromList (take (tkLoose tk) (tkPages tk))) [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit2
-      (rr', rl', rt') ← case recNos of
-        [a, b, c] → Right (a, b, c)
-        _ → refuse (Integrity CorruptCounters)
-      (retire', free') ← case bkNos of
-        [a, b] → Right (a, b)
-        _ → refuse (Integrity CorruptCounters)
-      let replBk = Set.toAscList (editReplaced bkEdit3)
-          used = fromIntegral written ∷ Integer
-          live' = toInteger (rLivePages roots) + used - toInteger listN - toInteger (length replBk)
-          retired' = toInteger (rRetiredPages roots) + toInteger listN
-          freeTaken = sum [t | (_, _, t) ← tkExtents tk]
-          free'' = toInteger (rFreePages roots) - toInteger freeTaken
-          loose' = drop (tkLoose tk) (rLoose roots) ++ slack ++ replBk
-      if live' < 0 || free'' < 0 then refuse (Integrity CorruptCounters) else pure ()
-      if length loose' > looseCap then refuse (Integrity (LooseOverflow (length loose'))) else pure ()
-      let next' =
-            roots
-              { rVersion = version'
-              , rRuns = rr'
-              , rLinks = rl'
-              , rTodo = rt'
-              , rFree = free'
-              , rRetire = retire'
-              , rHeader = next
-              , rHw = rHw roots + tkBump tk
-              , rFreePages = fromInteger free''
-              , rLivePages = fromInteger live'
-              , rRetiredPages = fromInteger retired'
-              , rLoose = loose'
-              , rRootCrcs = rootCrcsAfter roots encoded [(TreeRuns, rr'), (TreeLinks, rl'), (TreeTodo, rt'), (TreeFree, free'), (TreeRetire, retire')]
-              }
-          windowN = windowSize win
-          steps = editSteps edit1 + editSteps bkEdit3
-          ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m
-      if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
-      let measure =
-            Measure
-              { mPagesWritten = written
-              , mRecordPages = length pagesRec
-              , mBookkeepingPages = bkUsed
-              , mListPages = length listPages
-              , mReplacedRecord = listN
-              , mReplacedBookkeeping = length replBk
-              , mSlack = length slack
-              , mClaimed = fromIntegral claim
-              , mLooseTaken = tkLoose tk
-              , mReadSteps = steps
-              , mWindowPages = windowN
-              , mRam = ram
-              , mUpdates = dlUpdates cand
-              , mRecordWrites = length writes
-              , mFreed = 0
-              }
-      pure (Just (finishPlan ident cls KindCandidate base next' cand encoded measure expected version'))
+    else
+      let attempt rsv = do
+            let m = d + (if needRetire then 1 else 0) + rsv
+            -- The supply.
+            (mtake, bkEdit0) ← phase (newEdit overlayBudgetBookkeeping win) (takeSupply cfg roots m)
+            tk ← maybe (refuse (Capacity (DiskFull (fromIntegral m) (freePool cfg roots + fromIntegral (length (rLoose roots))) (protectedFor cls)))) pure mtake
+            let claim = fromIntegral m - fromIntegral (tkLoose tk) ∷ Word64
+            if freePool cfg roots < claim + protectedFor cls
+              then refuse (Capacity (DiskFull claim (freePool cfg roots) (protectedFor cls)))
+              else pure ()
+            let supply = tkPages tk
+            (pagesRec, recNos, afterRec) ← assign ident edit1 [rr, rl, rt] supply
+            (listPage, afterList) ← case (needRetire, afterRec) of
+              (True, lp : more) → Right (Just lp, more)
+              (True, []) → refuse (Integrity CorruptCounters)
+              (False, _) → Right (Nothing, afterRec)
+            let retireRoot0 = fmap Disk (rRetire roots)
+            (retireRoot1, bkEdit1) ← case listPage of
+              Nothing → pure (retireRoot0, bkEdit0)
+              Just lp → do
+                let (k, v) = encodeRetire version' (Retire lp (fromIntegral listN) 0)
+                (entryRoot, entryEdit) ← phase bkEdit0 (insertKey TreeRetire retireRoot0 k v)
+                -- every replaced page is indexed by its number under this entry's version; a page
+                -- already indexed is owned by two entries
+                foldM (indexRetired version') (entryRoot, entryEdit) replacedRec
+            (freeRoot1, bkEdit2) ← phase bkEdit1 (consume (fmap Disk (rFree roots)) tk)
+            -- the pages the allocator and retirement edit really needs, counted before any is numbered: more
+            -- than the supply asks for a larger one (below), never a failed numbering
+            let bkNeed = freshCount bkEdit2 [retireRoot1, freeRoot1]
+            if bkNeed > length afterList then Left (OutMoreBookkeeping bkNeed) else pure ()
+            (pagesBk, bkNos, slack) ← assign ident bkEdit2 [retireRoot1, freeRoot1] afterList
+            let bkUsed = length pagesBk
+            listPages ← traverse (\lp → encodeOut ident (Page TreeRetire 0 lp (List version' replacedRec))) (maybe [] pure listPage)
+            let encoded = pagesRec ++ listPages ++ pagesBk
+                written = length encoded
+            if written > bdPages bounds then refuse (Capacity (TxnPagesExceeded written)) else pure ()
+            -- No page may be overwritten that a committed or a pinned root still reaches,
+            -- whatever the allocator's records say: the pages below the used space that this
+            -- plan writes are each proven unreachable first.
+            bkEdit3 ← provenFree cfg roots pins win (Set.fromList (take (tkLoose tk) (tkPages tk))) [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit2
+            (rr', rl', rt') ← case recNos of
+              [a, b, c] → Right (a, b, c)
+              _ → refuse (Integrity CorruptCounters)
+            (retire', free') ← case bkNos of
+              [a, b] → Right (a, b)
+              _ → refuse (Integrity CorruptCounters)
+            let replBk = Set.toAscList (editReplaced bkEdit3)
+                used = fromIntegral written ∷ Integer
+                live' = toInteger (rLivePages roots) + used - toInteger listN - toInteger (length replBk)
+                retired' = toInteger (rRetiredPages roots) + toInteger listN
+                freeTaken = sum [t | (_, _, t) ← tkExtents tk]
+                free'' = toInteger (rFreePages roots) - toInteger freeTaken
+                loose' = drop (tkLoose tk) (rLoose roots) ++ slack ++ replBk
+            if live' < 0 || free'' < 0 then refuse (Integrity CorruptCounters) else pure ()
+            if length loose' > looseCap then refuse (Integrity (LooseOverflow (length loose'))) else pure ()
+            let next' =
+                  roots
+                    { rVersion = version'
+                    , rRuns = rr'
+                    , rLinks = rl'
+                    , rTodo = rt'
+                    , rFree = free'
+                    , rRetire = retire'
+                    , rHeader = next
+                    , rHw = rHw roots + tkBump tk
+                    , rFreePages = fromInteger free''
+                    , rLivePages = fromInteger live'
+                    , rRetiredPages = fromInteger retired'
+                    , rLoose = loose'
+                    , rRootCrcs = rootCrcsAfter roots encoded [(TreeRuns, rr'), (TreeLinks, rl'), (TreeTodo, rt'), (TreeFree, free'), (TreeRetire, retire')]
+                    }
+                windowN = windowSize win
+                steps = editSteps edit1 + editSteps bkEdit3
+                ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m
+            if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
+            let measure =
+                  Measure
+                    { mPagesWritten = written
+                    , mRecordPages = length pagesRec
+                    , mBookkeepingPages = bkUsed
+                    , mListPages = length listPages
+                    , mReplacedRecord = listN
+                    , mReplacedBookkeeping = length replBk
+                    , mSlack = length slack
+                    , mClaimed = fromIntegral claim
+                    , mLooseTaken = tkLoose tk
+                    , mReadSteps = steps
+                    , mWindowPages = windowN
+                    , mRam = ram
+                    , mUpdates = dlUpdates cand
+                    , mRecordWrites = length writes
+                    , mFreed = 0
+                    }
+            pure (Just (finishPlan ident cls KindCandidate base next' cand encoded measure expected version'))
+          -- a short reserve is answered by a larger supply, a bounded number of times, then by a shrinkable
+          -- capacity result: a legitimate batch is never reported as corruption
+          retry ∷ Int → Int → P (Maybe Plan)
+          retry fuel rsv = case attempt rsv of
+            Left (OutMoreBookkeeping need)
+              | need > maxBookkeepingPages → refuse (Capacity (BookkeepingExceeded need))
+              | fuel > 0 → retry (fuel - 1) (min maxBookkeepingPages (need + bookkeepingSlack))
+              | otherwise → refuse (Capacity (BookkeepingExceeded need))
+            r → r
+       in retry (3 ∷ Int) bookkeepingReserve
   where
     protectedFor Ordinary = reservePages
     protectedFor Maintenance = 0
@@ -911,6 +947,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
   Left (OutNeed p) → Pending p
   Left (OutProbes ps) → PendingProbes ps
   Left (OutRefuse r) → Refused r
+  Left (OutMoreBookkeeping n) → Refused (Capacity (BookkeepingExceeded n))
   Right r → r
   where
     total = cfgTotalPages cfg
@@ -978,10 +1015,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       (mv, edit1) ← phase edit (lookupKey TreeRetire root (retiredKey pg))
       if fmap (\v → getBe64 v 0) mv /= Just ver then refuse (Integrity (RetiredIndexMismatch pg)) else pure ()
       phase edit1 (deleteKey TreeRetire root (retiredKey pg))
-    tooBig (Integrity (BookkeepingOverflow _)) = True
-    tooBig (Capacity (TxnPagesExceeded _)) = True
-    tooBig (Capacity (TxnRamExceeded _)) = True
-    tooBig _ = False
+    tooBig = shrinkable
     chunkSizes n = let top = min n maxReclaimPages in takeWhile (>= 1) (iterate (`div` 2) top)
     tryChunk e ret prefix remaining version' edit c = do
       let freed = take c remaining
@@ -1020,9 +1054,12 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
           else
             let (k', v') = encodeRetire e (ret {retDone = fromIntegral done' ∷ Word16})
              in phase bkEditI (insertKey TreeRetire retireRootI k' v')
+      -- counted before any page is numbered: more than the supply holds is a shrinkable capacity result
+      -- (a smaller chunk frees fewer pages), never a failed numbering
+      let bkNeed = freshCount bkEdit3 [retireRoot1, freeRoot2]
+      if bkNeed > length (tkPages tk) then refuse (Capacity (BookkeepingExceeded bkNeed)) else pure ()
       (encoded, bkNos, slack) ← assign ident bkEdit3 [retireRoot1, freeRoot2] (tkPages tk)
       let bkUsed = length encoded
-      if bkUsed > m then refuse (Integrity (BookkeepingOverflow bkUsed)) else pure ()
       if bkUsed > bdPages bounds then refuse (Capacity (TxnPagesExceeded bkUsed)) else pure ()
       -- the pages this maintenance writes are as unreachable as any other plan's
       bkEdit4 ← provenFree cfg roots pins win (Set.fromList (take (tkLoose tk) (tkPages tk))) [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit3

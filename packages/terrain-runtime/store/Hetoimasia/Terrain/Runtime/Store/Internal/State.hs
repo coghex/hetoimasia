@@ -46,6 +46,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , reservePages
   , defaultOffsetLimit
   , bookkeepingReserve
+  , maxBookkeepingPages
+  , bookkeepingSlack
   , maxClaimPages
   , maxWindowPages
   , windowPageBytes
@@ -130,6 +132,19 @@ defaultOffsetLimit = 2 ^ (63 ∷ Int) - 1
 -- loose.
 bookkeepingReserve ∷ Int
 bookkeepingReserve = 4 * (2 * (maxLevel + 1) + 1)
+
+-- | The most bookkeeping pages one candidate plan may take. The bookkeeping a plan needs is not
+-- bounded by the reserve alone: every replaced record page is also indexed in the retirement tree, one
+-- root-to-leaf path each. The plan counts the pages its bookkeeping edit really needs before it numbers
+-- any, takes up to this many when the reserve is short, and past it reports a shrinkable
+-- 'BookkeepingExceeded' (a smaller batch replaces fewer pages).
+maxBookkeepingPages ∷ Int
+maxBookkeepingPages = 4 * bookkeepingReserve
+
+-- | The pages taken beyond the count the first attempt needed: the larger supply takes more free
+-- extents, which the allocator tree's own edit may need a page or two more for.
+bookkeepingSlack ∷ Int
+bookkeepingSlack = 8
 
 -- | The most pages one plan takes from the allocator: every page it may write
 -- ('maxTxnPages') and the bookkeeping reserve.

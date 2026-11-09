@@ -468,10 +468,7 @@ planDiscoveryWith bounds env s win = withWindow s win $ \prov → go prov (allow
             | tries > 0 && tooBig why && reportWrites (candidateReport cand) > 1 →
                 go prov (max worstEdgeWritesMin (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
           other → other
-    tooBig (Capacity (TxnPagesExceeded _)) = True
-    tooBig (Capacity (TxnRamExceeded _)) = True
-    tooBig (Integrity (BookkeepingOverflow _)) = True
-    tooBig _ = False
+    tooBig = shrinkable
     worstEdgeWritesMin = 3
 
 editAllowance ∷ Env → Allowance
