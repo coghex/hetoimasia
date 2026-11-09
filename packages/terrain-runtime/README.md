@@ -580,7 +580,7 @@ has its sign bit flipped) so that the byte order of a key is its logical order.
 | 4092 | 4 | CRC32C of bytes 0 to 4,091 (Castagnoli, reflected polynomial `0x82F63B78`, initial and final `0xFFFFFFFF`) |
 
 Leaf entries are `keyLen(1) valueLen(1) key value` (key 1 to 64 bytes, value at most
-64); internal entries are `keyLen(1) key childPage(8) childCrc(4)` (at most 77 bytes, so at most 52 children a page; a 24-byte key leaves room for 109), the key being the least key
+64); internal entries are `keyLen(1) key childPage(8) childCrc(4)` (at most 77 bytes, so at most 52 children a page; a 24-byte key leaves room for 109); the size of an internal entry is defined once, `innerKeyBytes` in `Page.hs`, and every sizing decision (split, merge, redistribution, the accounting of a node, the page decoder) uses it, the key being the least key
 the child may hold; a list is the eight-byte version of the retirement entry that
 names it, then a strictly increasing run of eight-byte page numbers (at most 505). The records of each tree:
 
