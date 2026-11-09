@@ -211,6 +211,7 @@ test-suite terrain-render-2d-tests
         Test.TerrainRender2D.CellsEvidence
         Test.TerrainRender2D.CellsProgress
         Test.TerrainRender2D.CellsWork
+        Test.TerrainRender2D.Expectation
         Test.TerrainRender2D.Fixtures
         Test.TerrainRender2D.MapAssets
         Test.TerrainRender2D.MapAssets.Reference

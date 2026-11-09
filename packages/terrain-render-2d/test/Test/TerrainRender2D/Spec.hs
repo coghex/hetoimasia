@@ -11,6 +11,7 @@ import qualified Test.TerrainRender2D.CellsCoverage as CellsCoverage
 import qualified Test.TerrainRender2D.CellsEvidence as CellsEvidence
 import qualified Test.TerrainRender2D.CellsProgress as CellsProgress
 import qualified Test.TerrainRender2D.CellsWork as CellsWork
+import qualified Test.TerrainRender2D.Expectation as Expectation
 import qualified Test.TerrainRender2D.MapAssets as MapAssets
 import qualified Test.TerrainRender2D.Material as Material
 import qualified Test.TerrainRender2D.Projection as Projection
@@ -21,6 +22,7 @@ spec = describe "TerrainRender2D" $ do
   Camera.spec
   MapAssets.spec
   Material.spec
+  Expectation.spec
   Atlas.spec
   AtlasAssets.spec
   Cells.spec
