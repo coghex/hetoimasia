@@ -5,16 +5,16 @@ Verdict: **pass**.
 ## A surface-free session drawing the terrain arena's cell quads over a D32_SFLOAT depth image
 
 - windows: 0
-- roots at the end of the body: RootsView {viewInstance = RootLive, viewMessenger = RootLive, viewDevice = RootLive, viewAllocator = RootLive, viewDeviceName = Just "Apple M3 Max", viewSubPixelPrecisionBits = Just 8, viewQueueFamily = Just 0, viewTargets = [], viewAdmitting = True, viewLoss = Nothing}
+- roots at the end of the body: RootsView {viewInstance = RootLive, viewMessenger = RootLive, viewDevice = RootLive, viewAllocator = RootLive, viewDeviceName = Just "Apple M3 Max", viewDriverName = Just "MoltenVK", viewDriverInfo = Just "1.4.2", viewSubPixelPrecisionBits = Just 8, viewQueueFamily = Just 0, viewTargets = [], viewAdmitting = True, viewLoss = Nothing}
 - target standing: no target
 - actions: ran the terrain evidence
 - device calls, in order: vkCreateInstance, vkCreateDebugUtilsMessengerEXT, vkEnumeratePhysicalDevices, vkCreateDevice, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
-- Vulkan calls: 3107, on 1 thread(s)
+- Vulkan calls: 3889, on 1 thread(s)
 - frames presented: 0, presentations retired: 0
 - verdict issues: []
 - error reports: 0
-- seconds, from the loader integration to the verdict: 59.407411
-- probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full15/terrain/tra17-terrain-probes.json
+- seconds, from the loader integration to the verdict: 66.098887
+- probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full17/terrain/tra17-terrain-probes.json
 - failure: none
 - depth format: Depth32Float
 - matrix-FaceSouth-0.25: pass, 10560 probes, 10560 determinate
@@ -175,6 +175,46 @@ Verdict: **pass**.
 - mixed-FaceSouth@0.25-colour-holes: pass, 2640 probes, 2640 determinate
     - pass a quad's art covers the pixels its colour and map hold and nothing beside them
     - pass the lighting and the art differ across the covered surface
+- matrix-mixed-FaceSouth-0.25: pass, 9900 probes, 9900 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
+- matrix-mixed-FaceSouth-0.25-single-images: pass, 9900 probes, 9900 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
+- matrix-mixed-FaceWest-0.25: pass, 9900 probes, 8910 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
+- matrix-mixed-FaceWest-0.25-single-images: pass, 9900 probes, 9900 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
+- matrix-mixed-FaceNorth-0.25: pass, 9900 probes, 9900 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
+- matrix-mixed-FaceNorth-0.25-single-images: pass, 9900 probes, 9900 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
+- matrix-mixed-FaceEast-0.25: pass, 9900 probes, 9090 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
+- matrix-mixed-FaceEast-0.25-single-images: pass, 9900 probes, 9900 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
+- matrix-fog-FaceSouth-0.25: pass, 10664 probes, 10664 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+- matrix-fog-FaceSouth-0.25-single-images: pass, 10664 probes, 10664 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+- matrix-fog-FaceWest-0.25: pass, 10952 probes, 9944 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+- matrix-fog-FaceWest-0.25-single-images: pass, 10952 probes, 10952 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+- matrix-fog-FaceNorth-0.25: pass, 10664 probes, 10664 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+- matrix-fog-FaceNorth-0.25-single-images: pass, 10664 probes, 10664 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+- matrix-fog-FaceEast-0.25: pass, 10952 probes, 10124 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+- matrix-fog-FaceEast-0.25-single-images: pass, 10952 probes, 10952 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
 - sequence-pan: pass, 6384 probes, 6384 determinate
     - pass a quad's art covers the pixels its colour and map hold and nothing beside them
     - pass the lighting and the art differ across the covered surface
@@ -285,6 +325,9 @@ Verdict: **pass**.
 - depth-stack-FaceSouth@0.25@neither-effect-haze-control-depth-reset: pass, 4788 probes, 4788 determinate
     - pass a quad's art covers the pixels its colour and map hold and nothing beside them
     - pass the lighting and the art differ across the covered surface
+- depth-stack-FaceSouth@0.25@both-short-range-control-wrong-composition-order: pass, 4788 probes, 4788 determinate
+    - pass a quad's art covers the pixels its colour and map hold and nothing beside them
+    - pass the lighting and the art differ across the covered surface
 - matrix-FaceSouth-1.0@0.25-control-swapped-region-origins: pass, 8664 probes, 8664 determinate
     - pass a quad's art covers the pixels its colour and map hold and nothing beside them
     - pass the lighting and the art differ across the covered surface
@@ -334,8 +377,8 @@ Verdict: **pass**.
 
 ```
 ## TRA-17: a surface-free session draws the cell-quad plans of the terrain arena, adapted through the existing fixed-quad and material ABI over a packed colour atlas and a packed normal atlas, into offscreen targets that have a D32_SFLOAT depth image, reads each back after its batch completed and judges every pixel against the render-2d oracle given the terrain material's model and against a hand-stated expectation: the 16 shape identities in each of 4 facings, mixed and fog cells, roofs over cavities, disconnected spans, ramps, cutaways, the automatic follow, a deep floor, the zoom endpoints, a fractional camera, a viewport, a content scale and pixel snapping, lighting and depth-effect settings, equivalent submissions, ordered and cutout wrappers and retained chunks, and nine negative controls
-the terrain evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full15/terrain
-terrain probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full15/terrain/tra17-terrain-probes.json
+the terrain evidence is written into /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full17/terrain
+terrain probe record: /private/tmp/claude-501/-Users-vincentcoghlan-work-hetoimasia/f0831c1c-5b48-4100-8206-6b8ef038b217/scratchpad/ev_full17/terrain/tra17-terrain-probes.json
 terrain depth format: Depth32Float
 terrain fixture matrix-FaceSouth-0.25: 10560 probes, 10560 determinate, 0 not counted; passed
 terrain fixture matrix-FaceWest-0.25: 10560 probes, 9504 determinate, 1056 not counted; passed
@@ -396,6 +439,22 @@ terrain fixture shape-0-FaceEast@1.0-colour-holes: 7140 probes, 7140 determinate
 terrain fixture matrix-FaceSouth-0.25-colour-holes: 10560 probes, 10560 determinate, 0 not counted; passed
 terrain fixture ramps-FaceSouth@0.125-colour-holes: 1596 probes, 1596 determinate, 0 not counted; passed
 terrain fixture mixed-FaceSouth@0.25-colour-holes: 2640 probes, 2640 determinate, 0 not counted; passed
+terrain fixture matrix-mixed-FaceSouth-0.25: 9900 probes, 9900 determinate, 0 not counted; passed
+terrain fixture matrix-mixed-FaceSouth-0.25-single-images: 9900 probes, 9900 determinate, 0 not counted; passed
+terrain fixture matrix-mixed-FaceWest-0.25: 9900 probes, 8910 determinate, 990 not counted; passed
+terrain fixture matrix-mixed-FaceWest-0.25-single-images: 9900 probes, 9900 determinate, 0 not counted; passed
+terrain fixture matrix-mixed-FaceNorth-0.25: 9900 probes, 9900 determinate, 0 not counted; passed
+terrain fixture matrix-mixed-FaceNorth-0.25-single-images: 9900 probes, 9900 determinate, 0 not counted; passed
+terrain fixture matrix-mixed-FaceEast-0.25: 9900 probes, 9090 determinate, 810 not counted; passed
+terrain fixture matrix-mixed-FaceEast-0.25-single-images: 9900 probes, 9900 determinate, 0 not counted; passed
+terrain fixture matrix-fog-FaceSouth-0.25: 10664 probes, 10664 determinate, 0 not counted; passed
+terrain fixture matrix-fog-FaceSouth-0.25-single-images: 10664 probes, 10664 determinate, 0 not counted; passed
+terrain fixture matrix-fog-FaceWest-0.25: 10952 probes, 9944 determinate, 1008 not counted; passed
+terrain fixture matrix-fog-FaceWest-0.25-single-images: 10952 probes, 10952 determinate, 0 not counted; passed
+terrain fixture matrix-fog-FaceNorth-0.25: 10664 probes, 10664 determinate, 0 not counted; passed
+terrain fixture matrix-fog-FaceNorth-0.25-single-images: 10664 probes, 10664 determinate, 0 not counted; passed
+terrain fixture matrix-fog-FaceEast-0.25: 10952 probes, 10124 determinate, 828 not counted; passed
+terrain fixture matrix-fog-FaceEast-0.25-single-images: 10952 probes, 10952 determinate, 0 not counted; passed
 terrain fixture sequence-pan: 6384 probes, 6384 determinate, 0 not counted; passed
 terrain fixture sequence-zoom: 21924 probes, 20793 determinate, 1131 not counted; passed
 terrain fixture sequence-rotation: 5748 probes, 5311 determinate, 437 not counted; passed
@@ -436,6 +495,7 @@ terrain fixture spans-FaceSouth@0.125-control-reversed-overlap: 1008 probes, 100
 terrain fixture ramps-FaceSouth@0.125-control-whole-cell-mask: 1596 probes, 1596 determinate, 0 not counted; passed
 terrain fixture ramps-FaceWest@0.125-control-wrong-facing-light: 1404 probes, 1174 determinate, 230 not counted; passed
 terrain fixture depth-stack-FaceSouth@0.25@neither-effect-haze-control-depth-reset: 4788 probes, 4788 determinate, 0 not counted; passed
+terrain fixture depth-stack-FaceSouth@0.25@both-short-range-control-wrong-composition-order: 4788 probes, 4788 determinate, 0 not counted; passed
 terrain fixture matrix-FaceSouth-1.0@0.25-control-swapped-region-origins: 8664 probes, 8664 determinate, 0 not counted; passed
 terrain fixture ramps-FaceSouth@0.125-control-whole-atlas-clamping: 1596 probes, 1596 determinate, 0 not counted; passed
 terrain fixture ramps-FaceSouth@0.125-control-normal-as-colour: 1596 probes, 1596 determinate, 0 not counted; passed
