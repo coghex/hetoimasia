@@ -99,7 +99,7 @@ drainChecked = go 0 0
     go n longest h
       | n > (4000 ∷ Int) = Left "reclamation did not terminate"
       | otherwise = do
-          (p, _, _) ← fillWith h (planMaintenance (hStore h))
+          (p, _, _) ← fillRetry h (planMaintenance (hStore h))
           case p of
             Planned plan → do
               h' ← commitPlan h plan

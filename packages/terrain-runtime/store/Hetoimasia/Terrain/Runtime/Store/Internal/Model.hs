@@ -455,7 +455,7 @@ planDiscovery = planDiscoveryWith standardBounds
 
 -- | 'planDiscovery' under given bounds.
 planDiscoveryWith ∷ Bounds → Env → Store → Window → Planned
-planDiscoveryWith bounds env s win = withWindow s win $ \prov → go prov (allowWrites full) (8 ∷ Int)
+planDiscoveryWith bounds env s win = withWindow s win $ \prov → go prov (min (allowWrites full) (windowWork win)) (8 ∷ Int)
   where
     full = allowanceOf (envLimits env)
     go prov writes tries =

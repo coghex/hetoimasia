@@ -50,6 +50,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , emptyWindow
   , windowBelow
   , windowTrust
+  , limitWork
+  , reduceWork
+  , windowWork
   , windowUnchecked
   , pageCrcOf
   , windowInsert
@@ -155,12 +158,15 @@ data Window = Window
   -- ^ Test-only: roots with no recorded checksum are read unchecked. No production path sets it.
   , wRoots ∷ !(Map PageNo Word32)
   -- ^ The checksum each root page must carry, by page number, as the root record publishes it.
+  , wWork ∷ !Int
+  -- ^ The most units of work a plan through this window may take on (the pages one maintenance
+  -- transaction frees, the writes of one discovery batch): the caller's bounded retry, see 'limitWork'.
   }
   deriving stock (Eq, Show)
 
 -- | An empty window for a store and a version.
 emptyWindow ∷ StoreIdentity → Word64 → Window
-emptyWindow ident v = Window ident v Map.empty Map.empty maxBound False Map.empty
+emptyWindow ident v = Window ident v Map.empty Map.empty maxBound False Map.empty maxBound
 
 -- | The window of a version whose used page space is the first @n@ pages: a
 -- reference to a page at or past @n@ is refused, never read.
@@ -179,6 +185,25 @@ windowTrust cs w = w {wRoots = Map.fromList cs}
 -- and every window a store hands out is built by 'windowTrust' from a root record or a reader's pin.
 windowUnchecked ∷ Window → Window
 windowUnchecked w = w {wUnchecked = True}
+
+-- | Limit the work a plan through this window takes on. The window is the only state a caller carries
+-- between a plan and the next, so it is where a retry remembers that the larger unit of work did not
+-- fit: when a plan answers a window that outgrew its bounds ('WindowExceeded', 'WindowBytesExceeded',
+-- 'ProbesExceeded') the caller builds a fresh window for the same version with half of the work
+-- ('windowWork', halved, never below one) and plans again; a unit of one page or one write needs a
+-- bounded window, so the retry ends in at most @log2 64@ steps with the work done.
+limitWork ∷ Int → Window → Window
+limitWork n w = w {wWork = max 1 n}
+
+-- | The fresh window a retry continues with after a plan answered that the window @old@ outgrew its bounds:
+-- the same work as @old@ allowed, halved (the largest unit of work is 64, a page or a write), never below
+-- one. The caller builds @new@ for the same version, as for any plan.
+reduceWork ∷ Window → Window → Window
+reduceWork old new = limitWork (min 64 (wWork old) `div` 2) new
+
+-- | The work a plan through this window may take on ('maxBound' for a window nobody limited).
+windowWork ∷ Window → Int
+windowWork = wWork
 
 -- | The version the window was filled for.
 windowVersion ∷ Window → Word64

@@ -20,6 +20,7 @@ module Test.TerrainRuntime.Store.Harness
     -- * Planning
   , fillPlan
   , fillWith
+  , fillRetry
   , deltaFor
   , Outcome (..)
   , commitDelta
@@ -117,7 +118,30 @@ newH spec ident = case mkStoreConfig spec of
 -- | Plan through a window filled from the disk, fetching each pending page. It
 -- returns the outcome, the window and the pages fetched.
 fillWith ∷ H → (Window → Planned) → Either String (Planned, Window, Int)
-fillWith h f = go (storeWindow (hStore h)) 0
+fillWith h = fillFrom h (storeWindow (hStore h))
+
+-- | 'fillWith' as a caller of the public API drives it: a plan that answers that its window outgrew its
+-- bounds is planned again through a fresh window of the same version with half the work ('reduceWork'),
+-- down to a unit of one, which must fit. The outcome is what the last window gave.
+fillRetry ∷ H → (Window → Planned) → Either String (Planned, Window, Int)
+fillRetry h f = go (storeWindow (hStore h)) (0 ∷ Int)
+  where
+    go w0 k = do
+      (p, w, n) ← fillFrom h w0 f
+      case p of
+        Refused (Capacity c) | windowBound c →
+          if windowWork w0 <= 1 || k > 12
+            then Left ("a unit of work of one did not fit the window: " <> show c)
+            else go (reduceWork w (storeWindow (hStore h))) (k + 1)
+        other → Right (other, w, n)
+    windowBound c = case c of
+      WindowExceeded _ → True
+      WindowBytesExceeded _ → True
+      ProbesExceeded _ → True
+      _ → False
+
+fillFrom ∷ H → Window → (Window → Planned) → Either String (Planned, Window, Int)
+fillFrom h w00 f = go w00 0
   where
     total = cfgUsablePages (hCfg h)
     go w n

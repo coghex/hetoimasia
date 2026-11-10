@@ -1022,7 +1022,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       if fmap (\v → getBe64 v 0) mv /= Just ver then refuse (Integrity (RetiredIndexMismatch pg)) else pure ()
       phase edit1 (deleteKey TreeRetire root (retiredKey pg))
     tooBig = shrinkable
-    chunkSizes n = let top = min n maxReclaimPages in takeWhile (>= 1) (iterate (`div` 2) top)
+    chunkSizes n = let top = min n (min maxReclaimPages (windowWork win)) in takeWhile (>= 1) (iterate (`div` 2) top)
     tryChunk e ret prefix remaining version' edit c = do
       let freed = take c remaining
           m = bdReserve bounds + 4 * c

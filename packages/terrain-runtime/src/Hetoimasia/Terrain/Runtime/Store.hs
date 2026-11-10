@@ -19,6 +19,12 @@
 --   'Planned' p      -> 'admit' p store, write 'planPages', report each outcome with
 --                       'dispatchWrite' and 'completeWrite', then 'publish' (or 'abortTransaction')
 --   'NoWork'         -> nothing to append
+--   'Refused' ('Capacity' ('WindowExceeded' _ | 'WindowBytesExceeded' _ | 'ProbesExceeded' _))
+--                    -> the window outgrew its bounds while the plan read more than one unit of work
+--                       (the pages one maintenance transaction frees, the writes of one batch) needs:
+--                       build a fresh window for the same version, 'reduceWork' it from the old one
+--                       (the work halves, to one page or one write at the least) and plan again; a
+--                       unit of one needs a bounded window, so the retry ends with the work done
 --   'Refused' why    -> 'classifyPlan' (in "Hetoimasia.Terrain.Runtime.Store.Admission")
 -- @
 --
@@ -74,6 +80,9 @@ module Hetoimasia.Terrain.Runtime.Store
   , addPage
   , addProbe
   , windowSize
+  , limitWork
+  , reduceWork
+  , windowWork
   , windowBytes
   , windowVersion
   , windowPageNumbers
@@ -207,7 +216,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), bodyBytes, decodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, windowBytes, windowInsert, windowPageNumbers, windowProbe, windowSize, windowVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, limitWork, reduceWork, windowBytes, windowInsert, windowPageNumbers, windowProbe, windowSize, windowVersion, windowWork)
 
 -- The accessors below are functions, never record fields, so a client cannot rewrite
 -- a plan, a growth proposal or a root set with record-update syntax.

@@ -20,7 +20,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
-import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeKey, encodeRetire, encodeValue, retiredKey)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
@@ -43,7 +43,18 @@ groupN = 54
 
 -- | The store, the keys of the first link of each leaf of the links tree (in tree order), and the links' reference.
 scattered ∷ (H, [RecordKey], Map.Map RecordKey Record)
-scattered = (h, firstKeys, ref)
+scattered = scatteredWith False
+
+-- | The same store in the layout of round 12: the oldest retirement entry holds 64 dispersed pages (the rest
+-- are in lists of 505), and a free extent of 256 pages holds old versions of links leaves with distinct keys,
+-- so that the supply of a maintenance transaction (4 pages for each page it frees and the reserve) is made of
+-- pages each of which must be proven unreachable by reading the path of its own first key: a transaction
+-- that frees 64 pages needs a window of 311 pages, one that frees 32 needs 208.
+fragmented ∷ (H, [RecordKey], Map.Map RecordKey Record)
+fragmented = scatteredWith True
+
+scatteredWith ∷ Bool → (H, [RecordKey], Map.Map RecordKey Record)
+scatteredWith frag = (h, firstKeys, ref)
   where
     -- the links tree: the records sorted by their encoded keys, 40 to a leaf
     recs = sortOn fst [(encodeKey k, (k, encodeValue a, a)) | i ← [0 .. leavesN * perLeaf - 1], let (k, a, _) = linkOf i]
@@ -52,6 +63,12 @@ scattered = (h, firstKeys, ref)
     firstKeys = [k | ((_, (k, _, _)) : _) ← leafRecs]
     chunk _ [] = []
     chunk n xs = let (a, b) = splitAt n xs in a : chunk n b
+    -- groups of nearly equal size, none past @n@ (so none under-full when the total allows)
+    balanced n xs = let g = (length xs + n - 1) `div` n in chunkInto g xs
+    chunkInto g xs = [take (len i) (drop (start i) xs) | i ← [0 .. g - 1]]
+      where
+        len i = length xs `div` g + (if i < length xs `mod` g then 1 else 0)
+        start i = sum [len j | j ← [0 .. i - 1]]
     -- the page space: groups of 54 retired pages, each followed by one live leaf of the links tree
     leafPageNo j = fromIntegral (j * (groupN + 1) + groupN) ∷ Word64
     retiredNos = [fromIntegral p ∷ Word64 | p ← [0 .. leavesN * (groupN + 1) - 1], p `mod` fromIntegral (groupN + 1) /= fromIntegral groupN]
@@ -62,19 +79,23 @@ scattered = (h, firstKeys, ref)
     linkLeaves = zipWith linkLeaf [0 ..] leafRecs
     crcOf pg = getLe32' (either (error . show) id (encodePage ident0 pg)) 4092
     childOf pg = Child (pgNo pg) (crcOf pg)
-    innerGroups = chunk 54 linkLeaves
+    innerFan = if frag then 18 else 54
+    innerGroups = if frag then balanced innerFan linkLeaves else chunk innerFan linkLeaves
     linkInners = [Page TreeLinks 1 (PageNo (base + fromIntegral n)) (Inner [(firstKeyOf pg, childOf pg) | pg ← grp]) | (n, grp) ← zip [0 ∷ Int ..] innerGroups]
     firstKeyOf (Page _ _ _ (Leaf ((k, _) : _))) = k
     firstKeyOf (Page _ _ _ (Inner ((k, _) : _))) = k
     firstKeyOf _ = BS.empty
-    linkRoot = Page TreeLinks 2 (PageNo (base + 5)) (Inner [(firstKeyOf pg, childOf pg) | pg ← linkInners])
+    linkRoot = Page TreeLinks 2 (PageNo (base + fromIntegral (length linkInners))) (Inner [(firstKeyOf pg, childOf pg) | pg ← linkInners])
     -- the retirement lists: 29 entries of up to 505 retired pages
-    listsOf = chunk 505 retiredNos
+    oldest = [retiredNos !! (i * (retiredCount `div` 64)) | i ← [0 .. 63]]
+    listsOf = if frag then oldest : chunk 505 [q | q ← retiredNos, q `notElem` oldest] else chunk 505 retiredNos
     nLists = length listsOf
-    listBase = base + 6
+    listBase = base + fromIntegral (length linkInners) + 1
     listPages = [Page TreeRetire 0 (PageNo (listBase + fromIntegral n)) (List (fromIntegral n + 1) (map PageNo ps)) | (n, ps) ← zip [0 ∷ Int ..] listsOf]
     versionRecs = [encodeRetire (fromIntegral n + 1) (Retire (PageNo (listBase + fromIntegral n)) (fromIntegral (length ps)) 0) | (n, ps) ← zip [0 ∷ Int ..] listsOf]
-    versionOf p = fromIntegral (length (takeWhile (/= p) [q | ps ← listsOf, q ← ps]) `div` 505) + 1 ∷ Word64
+    versionOf p = fromIntegral (head' [n | (n, ps) ← zip [0 ∷ Int ..] listsOf, p `elem` ps]) + 1 ∷ Word64
+    head' (x : _) = x
+    head' [] = error "a retired page is in no list"
     indexRecs = [(retiredKey (PageNo p), be64 (versionOf p)) | p ← retiredNos]
     -- the retirement tree: leaves of 54 index records (the first also holds the 29 entries)
     idxGroups = chunk groupN indexRecs
@@ -84,12 +105,23 @@ scattered = (h, firstKeys, ref)
     retireLeafBase = listBase + fromIntegral nLists
     retireLeaves = [Page TreeRetire 0 (PageNo (retireLeafBase + fromIntegral n)) (Leaf rs) | (n, rs) ← zip [0 ∷ Int ..] idxLeafRecs]
     retireInnerBase = retireLeafBase + fromIntegral (length retireLeaves)
-    retireInners = [Page TreeRetire 1 (PageNo (retireInnerBase + fromIntegral n)) (Inner [(firstKeyOf pg, childOf pg) | pg ← grp]) | (n, grp) ← zip [0 ∷ Int ..] (chunk 136 retireLeaves)]
+    retireInners = [Page TreeRetire 1 (PageNo (retireInnerBase + fromIntegral n)) (Inner [(firstKeyOf pg, childOf pg) | pg ← grp]) | (n, grp) ← zip [0 ∷ Int ..] (if frag then balanced 60 retireLeaves else chunk 136 retireLeaves)]
     retireRoot = Page TreeRetire 2 (PageNo (retireInnerBase + fromIntegral (length retireInners))) (Inner [(firstKeyOf pg, childOf pg) | pg ← retireInners])
-    livePagesList = linkLeaves ++ linkInners ++ [linkRoot] ++ listPages ++ retireLeaves ++ retireInners ++ [retireRoot]
-    hw = retireInnerBase + fromIntegral (length retireInners) + 1
+    usedHw = retireInnerBase + fromIntegral (length retireInners) + 1
+    -- the free extent of the fragmented layout: 256 pages past the used space of the rest, each an old version of a
+    -- links leaf, and the leaf of the allocator tree that names it
+    extentPages = [Page TreeLinks 0 (PageNo (usedHw + fromIntegral i)) (Leaf [(k, v) | (k, (_, v, _)) ← take 1 lr]) | (i, lr) ← [(i, leafRecs !! ((4 * i + 2) `mod` leavesN)) | i ← [0 .. 255]]]
+    freeLeaf = Page TreeFree 0 (PageNo (usedHw + 256)) (Leaf [encodeFree usedHw 256])
+    livePagesList = linkLeaves ++ linkInners ++ [linkRoot] ++ listPages ++ retireLeaves ++ retireInners ++ [retireRoot] ++ [freeLeaf | frag]
+    -- a retired page of a legitimate store holds the old version of a record-tree page (maintenance refuses anything else)
+    oldPages = [Page TreeLinks 0 (PageNo q) (Leaf [(k, v) | (k, (_, v, _)) ← take 1 (leafRecs !! oldLeaf q)]) | q ← retiredNos]
+    oldLeaf q = case lookup q (zip oldest [0 ∷ Int ..]) of
+      Just i → (4 * i + 1) `mod` leavesN
+      Nothing → fromIntegral q `mod` leavesN
+    writtenPages = livePagesList ++ (if frag then extentPages ++ oldPages else [])
+    hw = if frag then usedHw + 257 else usedHw
     h0 = newH (specOf (128 * 1024 * 1024) Nothing) ident0
-    disk = foldl (\dk pg → diskWrite (pgNo pg) (either (error . show) id (encodePage ident0 pg)) dk) (hDisk h0) livePagesList
+    disk = foldl (\dk pg → diskWrite (pgNo pg) (either (error . show) id (encodePage ident0 pg)) dk) (hDisk h0) writtenPages
     roots0 = storeRoots (hStore h0)
     roots =
       roots0
@@ -99,7 +131,9 @@ scattered = (h, firstKeys, ref)
         , rHw = hw
         , rLivePages = fromIntegral (length livePagesList)
         , rRetiredPages = fromIntegral retiredCount
-        , rRootCrcs = [(TreeLinks, crcOf linkRoot), (TreeRetire, crcOf retireRoot)]
+        , rRootCrcs = [(TreeLinks, crcOf linkRoot), (TreeRetire, crcOf retireRoot)] ++ [(TreeFree, crcOf freeLeaf) | frag]
+        , rFree = if frag then Just (pgNo freeLeaf) else Nothing
+        , rFreePages = if frag then 256 else 0
         }
     h = h0 {hStore = storeFromRoots (hCfg h0) ident0 roots, hDisk = disk}
 
@@ -117,7 +151,10 @@ dispersed firstKeys k =
       [] → Nothing
 
 spec ∷ Spec
-spec = describe "the round-11 boundary at the real reserve: 64 dispersed link updates need more bookkeeping than 68" $ do
+spec = specBoundary >> specFragmented
+
+specBoundary ∷ Spec
+specBoundary = describe "the round-11 boundary at the real reserve: 64 dispersed link updates need more bookkeeping than 68" $ do
   let (h0, firstKeys, ref0) = scattered
       plan bounds ws = do
         (p, _, _) ← fillWith h0 (\w → planDeltaPinned bounds (hCfg h0) (hIdent h0) (storeRoots (hStore h0)) [] w Ordinary (deltaFor (hStore h0) True False 1 ws))
@@ -148,3 +185,39 @@ spec = describe "the round-11 boundary at the real reserve: 64 dispersed link up
     [(k, why) | (k, Refused why@(Integrity _)) ← outcomes] `shouldBe` []
     [k | (k, Refused why) ← outcomes, not (shrinkable why)] `shouldBe` []
     [k | (k, Planned _) ← outcomes] `shouldSatisfy` (not . null)
+
+-- | The fragmented layout: maintenance through the public API with the real limits.
+specFragmented ∷ Spec
+specFragmented = describe "round 12: maintenance on a fragmented valid store whose largest chunk outgrows the window" $ do
+  let (h0, _, _) = fragmented
+  it "is a valid store the independent checker accepts, with an oldest entry of 64 dispersed pages and a free extent of 256" $ do
+    must (checkH h0)
+    rFreePages (storeRoots (hStore h0)) `shouldBe` 256
+  it "plans without a retry only up to the window: the largest chunk outgrows it (the failure round 12 reproduced)" $ do
+    (p, _, _) ← must (fillWith h0 (planMaintenance (hStore h0)))
+    case p of
+      Refused (Capacity c) → c `shouldSatisfy` (\x → case x of WindowBytesExceeded _ → True; WindowExceeded _ → True; ProbesExceeded _ → True; _ → False)
+      Planned pl → expectationFailure ("PLANNED freed " <> show (mFreed (plMeasure pl)) <> " window " <> show (mWindowPages (plMeasure pl)) <> " bk " <> show (mBookkeepingPages (plMeasure pl)) <> " loose " <> show (mLooseTaken (plMeasure pl)) <> " claimed " <> show (mClaimed (plMeasure pl)) <> " steps " <> show (mReadSteps (plMeasure pl)))
+      other → expectationFailure ("the largest chunk was expected to outgrow the window: " <> take 200 (show other))
+  it "makes progress through the public API with the real limits: a retry with half the work frees a smaller chunk, and the store drains" $ do
+    (p, _, _) ← must (fillRetry h0 (planMaintenance (hStore h0)))
+    case p of
+      Planned pl → do
+        let freed = mFreed (plMeasure pl)
+        (freed > 0 && freed < 64) `shouldBe` True
+        h1 ← must (commitPlan h0 pl)
+        must (checkH h1)
+      other → expectationFailure ("maintenance made no progress: " <> take 300 (show other))
+    -- and every call of a long sequence does work or finds nothing left, never a capacity result that repeats
+    let go h n
+          | n > (6000 ∷ Int) = Left "the drain did not end"
+          | otherwise = do
+              (res, _, _) ← fillRetry h (planMaintenance (hStore h))
+              case res of
+                Planned pl → commitPlan h pl >>= \h' → go h' (n + 1)
+                NoWork → Right (h, n)
+                other → Left ("maintenance neither did work nor found nothing left: " <> take 200 (show other))
+    (drained, passes) ← must (go h0 0)
+    putStrLn ("SCATTERED fragmented drain: " <> show passes <> " transactions")
+    rRetiredPages (storeRoots (hStore drained)) `shouldBe` 0
+    must (checkH drained)
