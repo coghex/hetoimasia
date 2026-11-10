@@ -587,7 +587,9 @@ soft cap (`looseSoftCap`, 512) makes the next maintenance transaction a *spill*,
 writes), strictly lowers the list, and runs even when no retirement entry is left to reclaim (`NoWork` is answered only
 once the list is at the soft cap) and while a reader holds the oldest entry. A transaction of one page that frees pages
 adds at most `looseGrowthUnit` to a list at the soft cap or below, and an ordinary plan, a standalone removal included,
-adds none while the list holds what the plan claims, so neither reaches the cap on a valid store. A plan that
+adds none while the list holds what the plan claims, so neither reaches the cap on a valid store. The whole list
+(at most `looseCap` numbers) is validated at every plan and every maintenance transaction before any piece is used:
+every page inside the used space and no page listed twice, wherever it sits in the list. A plan that
 nevertheless answers `Capacity (LooseExceeded _)` is shrunk like any other batch, and at the smallest unit the caller
 runs maintenance and plans again; maintenance is never refused for it.
 
@@ -680,14 +682,22 @@ its place (a wrong tree, a wrong level, a key outside its parent's separators) i
 integrity failure. Updates copy the changed path into an overlay and never touch a
 committed page. A node that falls under a quarter of a payload after a deletion is
 repacked with a neighbour (both checked against the separators their parent promises before they are merged) (merged, or split evenly), so every non-root node is at
-least a quarter full; an insertion that overflows splits by bytes; a root that
+least a quarter full; an insertion that overflows splits by bytes. Insertion and deletion leave through ONE exit
+(`exitNode` for every node, `exitRoot` for the root): a node that fits is rewritten, an emptied one is dropped, a node
+that holds more than a payload is split into two halves (a deletion's repack can install a longer separator in its
+parent, so a deletion can split a node as an insertion can), a root that
 splits adds a level and a root left with one child gives it back (the collapse walks down one level at a time, checking each child's level and its parent's separator bounds, so a malformed or cyclic subtree is refused, never followed). A tree is at most
 **8 levels** (0 to 7); a plan that would need more is refused with a typed
 `TreeTooTall`, never truncated. A legitimate tree needs a ninth level only past
 about 6.7e7 records (more than 36 GiB of leaves), so the default 1 GiB allowance and
 every allowance below 36 GiB can never reach it. One update costs at most
 `2 * 8 + 1 = 17` new pages at that height (a copy of the path, a split at every level
-and a new root). A write that changes nothing (the same value, a deletion of an
+and a new root). The bounds of a window and of a plan (`workOneWindowPages`, `removalWindowPages`, `maxRetireInternals`,
+`looseGrowthUnit`) count a deletion's pages as rewrite-only: they assume a deletion never splits a node. That holds for
+this format's key sizes (the keys of the links tree are 52 and 25 bytes, the others have one size, so a parent cannot sit
+within a separator difference of full) and a test fails if it stops holding; a key size that makes it false must
+re-derive the bounds. A page is held to the minimum fill whenever it is reached from its parent, whether it is decoded or
+still in the hot cache after it was read as a root. A write that changes nothing (the same value, a deletion of an
 absent key) copies no page.
 
 ### Page states, ownership and accounting
@@ -886,7 +896,7 @@ The sites, and what stops a forged record at each (tests are in
 
 | Site (record trusted) | Guard | Tamper test |
 | --- | --- | --- |
-| loose list (root set) | taken pages inside the used space, distinct, not also a free extent; the proof above | loose page is live; loose page is retired; loose list holds a page twice; loose page is also a free extent |
+| loose list (root set) | the whole list validated at every plan and maintenance transaction (length, inside the used space, distinct); the pages taken or spilled also not a free extent, and the proof above | loose page is live; loose page is retired; loose list holds a page twice; loose page is also a free extent |
 | free extents (allocator tree) | extent inside the used space, ordered, disjoint; the proof above, for a plan and for maintenance | extent offers a live page (every tree root, a page below a root, a list page); a retired page of the oldest or the newest entry with no reader pinned; a page only a pinned reader reaches, and with its index record dropped; wholly past the used space; a garbage page is overwritten, not refused |
 | retirement entry version | the list's stamp must equal it; the freed pages are indexed under it; and unreachable from every pinned tree | version lowered past a pinned reader: key only, key and stamp, key and stamp and index |
 | retirement entry list page, count, done | list inside the used space, a list page, the stamped version and the counted length | list past the used space, not a list, wrong counts |
