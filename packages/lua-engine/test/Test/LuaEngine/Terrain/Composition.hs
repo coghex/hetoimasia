@@ -19,7 +19,7 @@ import Test.Hspec
 import Test.LuaEngine.Facade.Graphics (answerTexture, awaitHanded, files, finishAll, injection, newGfx)
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Terrain.Support
-import Hetoimasia.Terrain.Runtime (defaultConfig)
+import Hetoimasia.Terrain.Runtime (Config (..), defaultConfig)
 
 -- | A graphics injection that makes only its lease scope: what the composition needs of it. Its capacity is 100 beside what the
 -- VM's other services ask for.
@@ -69,13 +69,18 @@ composition = describe "Terrain composition" $ do
     withRig $ \rig → do
       VmServices _ terrain scope ← compose Nothing (Just (terrainInjection' rig))
       fmap (const ()) terrain `shouldBe` Just ()
-      fmap (\(_, _, capacity) → capacity) scope `shouldBe` Just (terrainLeaseCapacity fixedM1Profile defaultConfig)
+      fmap (\(_, _, capacity) → capacity) scope `shouldBe` Just (terrainLeaseCapacity fixedM1Profile (rgService rig))
+
+  it "derives the lease capacity from the lease cap the service itself was built with, not from a configuration a caller holds" $
+    withRig $ \defaultRig →
+      withRigConfig defaultConfig {configMaxLeases = configMaxLeases defaultConfig + 8} $ \widerRig →
+        terrainLeaseCapacity fixedM1Profile (rgService widerRig) - terrainLeaseCapacity fixedM1Profile (rgService defaultRig) `shouldBe` 8
 
   it "composes both over the graphics scope alone, its capacity grown by the terrain's, and allocates no second scope" $
     withRig $ \rig → do
       VmServices graphics terrain scope ← compose (Just scopeOnly) (Just (terrainInjection' rig))
       fmap (const ()) terrain `shouldBe` Just ()
-      let terrainCapacity = terrainLeaseCapacity fixedM1Profile defaultConfig
+      let terrainCapacity = terrainLeaseCapacity fixedM1Profile (rgService rig)
       fmap (\(_, _, capacity) → capacity) scope `shouldBe` Just (100 + terrainCapacity)
       fmap gsLeaseCapacity graphics `shouldBe` Just (100 + terrainCapacity)
       -- the scope the owner is configured with exists, and the capacity above is the one scope's: there is no second

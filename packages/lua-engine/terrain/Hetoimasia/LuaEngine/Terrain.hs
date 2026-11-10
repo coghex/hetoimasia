@@ -330,8 +330,8 @@ terrainCodes = ["not_found", "arena_closed", "stale_view", "definition", "source
 -- cap is service-wide, so one instance may hold them all, pending, live and retiring), the places its requests can reserve a
 -- lease for before the service has admitted them, and one of headroom, as graphics does. Derived, not chosen: it follows the
 -- service's cap and the profile's, and changes neither.
-terrainLeaseCapacity ∷ Profile → Config → Int
-terrainLeaseCapacity profile config = configMaxLeases config + fromIntegral perInstance + 1
+terrainLeaseCapacity ∷ Profile → Service → Int
+terrainLeaseCapacity profile svc = configMaxLeases (inspectConfig svc) + fromIntegral perInstance + 1
   where
     Count perInstance = countLimit profile RequestsPerInstance
 
@@ -446,7 +446,7 @@ hooks = tfHooks . envFacade
 terrainInjection ∷ TerrainFacade → TerrainInjection
 terrainInjection config =
   TerrainInjection
-    { tiLeaseCapacity = \profile → terrainLeaseCapacity profile (tfConfig config)
+    { tiLeaseCapacity = \profile → terrainLeaseCapacity profile (tfService config)
     , injectTerrain = \vm → do
         clients ← newTVarIO Map.empty
         asks ← newTVarIO (1, Map.empty)
