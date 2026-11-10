@@ -71,10 +71,10 @@ is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).
 
-### Two read-only queries for a host's precheck
+### Three read-only reads for a host's composition and precheck
 
-Both are transactions, write nothing and change no behaviour of the service. They were added for TRA-5 (#641) at the manager's
-authorization under the owner's 2026-11-09 decision.
+The two queries are transactions and the third is a pure read; none writes anything or changes any behaviour of the service. They were added for
+TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decision, and the owner's later decision for `inspectConfig`.
 
 * `stagedRemovalChanges service request` answers whether the removal the request has **staged** would change content: `Just True` for a
   removal that will advance the arena's revision by one, `Just False` for a removal of air, which commits as unchanged at the revision
@@ -86,6 +86,10 @@ authorization under the owner's 2026-11-09 decision.
   atomically with its own effect (`RefusedClosed`), so a service that closes between the host's check and the hand-off still refuses it
   and leaves nothing behind. `Closure` examples cover running, the session's end, closing and closed, and the closure between check and
   admission.
+* `inspectConfig service` answers the `Config` the service was built with: a pure read of its own immutable field, no transaction, no state. A
+  host that composes over a service asks it, instead of being handed a configuration that might differ from the one the service enforces
+  (the Lua adapter reads every limit it applies from it, and refuses a service configured above the caps Lua is promised). A terrain-runtime
+  example reports the limits a service was built with whatever configuration a caller holds.
 
 ## State, owner, thread and lifetime
 
