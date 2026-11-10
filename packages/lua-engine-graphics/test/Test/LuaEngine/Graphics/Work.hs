@@ -44,6 +44,7 @@ module Test.LuaEngine.Graphics.Work
   , charge
   , observe
   , commitIO
+  , Progression (..)
   , assertBoundedWork
   , pumpObserver
   , -- * Counted collections
@@ -284,14 +285,32 @@ csFromList meter xs = meter (1 + length xs) >> pure (CSeq (Seq.fromList xs))
 
 -- The bounds an example asserts ------------------------------------------------------------------------
 
+-- | How a scenario's threads advance, which decides what of its work an example may compare across sizes.
+data Progression
+  = -- | Threads run freely, as in production: the interleaving of the pump and the owner moves what an evaluation looked at before it
+    -- found a ready candidate (an isolated probe of the unchanged backend reproduced totals of 1,370 at 250 and 20,864 at 1000 for
+    -- two valid schedules, every peak below 20), so only what no interleaving moves is compared.
+    FreeRunning
+  | -- | The example advances the pump and the owner itself, one step at a time, in a named order and the same order at every size
+    -- ('Test.LuaEngine.Graphics.Rig.settle'): nothing is concurrent in what is measured, and every site's total is a function of the
+    -- scenario and the order, so every site is compared.
+    Stepped
+  deriving (Eq, Show)
+
 -- | What an example asserts of the work a scenario did at several sizes, given each size (the textures retained and released)
--- with its reading: at every size, the most one operation or pump evaluation charged at a site is a constant that does not
--- depend on the size ('peakBound'), and the committed units for each texture are bounded the same way ('committedBound'); and
--- for each pair of sizes one a quarter of the other, the committed total at the larger is at most six times that at the smaller,
--- a growth of four: a linear total gives four, the quadratic one it replaced sixteen. Attempted totals are shown on a failure and
--- never asserted.
-assertBoundedWork ∷ [(Int, WorkReading)] → Expectation
-assertBoundedWork sized = do
+-- with its reading:
+--
+-- * at every size, the most one operation or pump evaluation charged at a site is a constant that does not depend on the size
+--   ('peakBound'): the detector of a scan, whose cost in one operation is the size of what it scans;
+-- * at every size, the committed units for each texture are bounded the same way ('committedBound'): a total that is linear in
+--   the textures, with room for what a schedule adds; and
+-- * for each pair of sizes one a quarter of the other, the committed total at the larger is at most six times that at the smaller,
+--   a growth of four (a linear total gives four, the quadratic one it replaced sixteen), at every site when the progression is
+--   'Stepped' and at the sites whose count the scenario fixes ('fixedSites') when it is 'FreeRunning'.
+--
+-- Attempted totals are shown on a failure and never asserted.
+assertBoundedWork ∷ Progression → [(Int, WorkReading)] → Expectation
+assertBoundedWork progression sized = do
   mapM_
     ( \(n, reading) →
         mapM_
@@ -320,7 +339,7 @@ assertBoundedWork sized = do
                     (after <= 6 * before)
                     (failure large atLarge site ("committed units against six times those at " <> show small) after (6 * before))
           )
-          (Map.keys (rCommitted atSmall))
+          (if progression == Stepped then [minBound .. maxBound] else fixedSites)
     )
     [(a, b) | a@(small, _) ← sized, b@(large, _) ← sized, large == 4 * small]
   where
@@ -330,6 +349,10 @@ assertBoundedWork sized = do
         [ show site, " at ", show n, " textures: ", what, " ", show found, " exceeds ", show limit
         , "; committed ", show (rCommitted reading), "; peak ", show (rPeak reading), "; attempted ", show (rAttempted reading)
         ]
+
+-- | The sites whose committed total is fixed by what the scenario does, whatever the schedule.
+fixedSites ∷ [Site]
+fixedSites = [ImageMap, SlotOwners, EventLog, FreeSlots]
 
 -- | The most units one operation of a scenario, or one pump evaluation, may charge at a site, whatever the size. Measured after
 -- the change at 250 to 2000 textures: a peak of one to three at every site in the Lua scenario, and in a mass release the
@@ -352,18 +375,7 @@ peakBound = \case
   EventLog → 4
   FreeSlots → 4
 
--- | The most units of committed operations a site may be charged for each texture retained and released, whatever the size.
+-- | The most units of committed operations a site may be charged for each texture retained and released, whatever the size and the
+-- schedule: eight times what one operation may charge there, for the handful of committed operations a texture takes at a site.
 committedBound ∷ Site → Int
-committedBound = \case
-  PumpJobs → 24
-  PumpTextures → 128
-  PumpBoot → 2
-  PumpDrain → 1
-  OwnerUploads → 24
-  OwnerReleases → 80
-  Admission → 8
-  UploadHistory → 4
-  ImageMap → 16
-  SlotOwners → 8
-  EventLog → 16
-  FreeSlots → 8
+committedBound site = 8 * peakBound site

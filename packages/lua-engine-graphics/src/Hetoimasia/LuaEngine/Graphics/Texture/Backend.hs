@@ -83,6 +83,8 @@ module Hetoimasia.LuaEngine.Graphics.Texture.Backend
   , withBackend
   , withBackendObserved
   , Examined (..)
+  , withBackendUnpumped
+  , pumpOnce
   , textureBackend
 
     -- * Observation
@@ -322,16 +324,27 @@ withBackend = withBackendObserved (\_ → pure ()) (pure ())
 -- called, on the pump's thread after the transaction, for each evaluation that committed: what was seen since the last
 -- 'ExaminedEvaluation' is the work of that one evaluation, however many attempts it took. Neither is an input to a decision.
 withBackendObserved ∷ ∀ image ticket a. (Examined → STM ()) → IO () → Port image ticket → (Backend image ticket → IO a) → IO a
-withBackendObserved examined committed port body = withWorkerGroup $ \group → do
+withBackendObserved = withBackendWith True
+
+-- | 'withBackendObserved' without the pump's thread: the body advances the pump itself, one step at a time, with 'pumpOnce', and
+-- nothing else does, so what is measured has no concurrency in it. The scope's exit closes and drains as ever, so it waits, as it
+-- would for the pump, until every job has answered and every texture is retired: a body that leaves one pending has nothing to
+-- advance it. It is for an example that counts the pump's work under a schedule it names (#679); production starts the pump.
+withBackendUnpumped ∷ ∀ image ticket a. (Examined → STM ()) → IO () → Port image ticket → (Backend image ticket → IO a) → IO a
+withBackendUnpumped = withBackendWith False
+
+withBackendWith ∷ ∀ image ticket a. Bool → (Examined → STM ()) → IO () → Port image ticket → (Backend image ticket → IO a) → IO a
+withBackendWith pumped examined committed port body = withWorkerGroup $ \group → do
   var ← newTVarIO (State Running' Map.empty 0 Map.empty 0 BootIdle Nothing Nothing [] 0 Map.empty Map.empty)
   let backend = Backend port var examined committed
   result ← mask $ \restore → do
     outcome ← tryWithContext @SomeException $ restore $ do
-      started ← startWorker group (workerDefinition "texture-backend-pump" (\_ → pure ()) (\token () → pumpWorker backend token))
-      case started of
-        Started _ → pure ()
-        StartupFailed _ _ → throwIO (BackendDefect "the texture backend's pump did not start")
-        StartRejected _ → throwIO (BackendDefect "the texture backend's pump was not accepted")
+      when pumped $ do
+        started ← startWorker group (workerDefinition "texture-backend-pump" (\_ → pure ()) (\token () → pumpWorker backend token))
+        case started of
+          Started _ → pure ()
+          StartupFailed _ _ → throwIO (BackendDefect "the texture backend's pump did not start")
+          StartRejected _ → throwIO (BackendDefect "the texture backend's pump was not accepted")
       body backend
     closed ← tryWithContext @SomeException (closeAndDrain backend)
     latched ← latchedFailure backend
@@ -587,16 +600,29 @@ pumpWorker backend token = mask $ \restore → do
       abandonAll backend "the texture backend's pump failed and advances nothing again"
       rethrowIO caught
   where
-    loop = atomically (nextStep backend token) >>= \step → bCommitted backend >> case step of
-      StepDone → pure ()
-      StepProgress → loop
-      StepIO act → do
-        outcome ← tryWithContext @SomeException act
-        case outcome of
-          Right () → loop
-          Left caught@(ExceptionWithContext _ raised)
-            | Just (SomeAsyncException _) ← fromException raised → rethrowIO caught
-            | otherwise → latchIO backend "texture backend step" caught >> loop
+    loop = atomically (nextStep backend (stopRequested token)) >>= \step → bCommitted backend >> runStep backend step >>= \more → when more loop
+
+-- | One turn of the pump, without its thread: its next step if it has one, run as the pump runs it, and whether there was one. A
+-- pump with nothing to do waits; this answers 'False' instead, which is how a body that advances the pump itself
+-- ('withBackendUnpumped') finds it idle.
+pumpOnce ∷ ∀ image ticket. Backend image ticket → IO Bool
+pumpOnce backend =
+  atomically ((Just <$> nextStep backend (pure False)) `orElse` pure Nothing) >>= \case
+    Nothing → pure False
+    Just step → bCommitted backend >> runStep backend step
+
+-- | Run the step a transaction chose, as the pump does, and answer whether the pump goes on.
+runStep ∷ ∀ image ticket. Backend image ticket → Step → IO Bool
+runStep backend = \case
+  StepDone → pure False
+  StepProgress → pure True
+  StepIO act → do
+    outcome ← tryWithContext @SomeException act
+    case outcome of
+      Right () → pure True
+      Left caught@(ExceptionWithContext _ raised)
+        | Just (SomeAsyncException _) ← fromException raised → rethrowIO caught
+        | otherwise → latchIO backend "texture backend step" caught >> pure True
 
 -- | The pump will advance nothing again. Every job is told so, once, and every texture is reported failed to
 -- retire; no native object is claimed reclaimed, because none was proved so: what the pump had made stays the
@@ -619,8 +645,8 @@ abandonAll backend why = do
 -- | The next thing for the pump, in one transaction: the first job or texture with something to do, the
 -- table's bootstrap, and otherwise a wait on every variable read, or a stop. The textures it looks at are the
 -- active ones; a retained texture's release arrives as a write to the state, which this transaction reads.
-nextStep ∷ ∀ image ticket. Backend image ticket → StopToken → STM Step
-nextStep backend token = do
+nextStep ∷ ∀ image ticket. Backend image ticket → STM Bool → STM Step
+nextStep backend stopRequested' = do
   bExamined backend ExaminedEvaluation
   st ← readTVar (bState backend)
   standing ← portStanding (bPort backend)
@@ -639,7 +665,7 @@ nextStep backend token = do
       case found of
         Just step → pure step
         Nothing → do
-          stopping ← stopRequested token
+          stopping ← stopRequested'
           if stopping then pure StepDone else retry
 
 firstJust ∷ [STM (Maybe a)] → STM (Maybe a)

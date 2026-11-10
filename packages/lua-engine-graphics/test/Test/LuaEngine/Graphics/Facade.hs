@@ -52,7 +52,7 @@ import Test.LuaEngine.Graphics.FacadeScripts (isClear, manifestFor, quadExample)
 import qualified Test.LuaEngine.Graphics.Fake as Fake
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Rig (Rig (..), bounded, withRig)
-import Test.LuaEngine.Graphics.Work (WorkReading, assertBoundedWork, readWork)
+import Test.LuaEngine.Graphics.Work (Progression (..), WorkReading, assertBoundedWork, readWork)
 import Test.LuaEngine.Graphics.SceneHost
 import qualified Test.LuaEngine.Graphics.Window.Fake as WF
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
@@ -332,7 +332,7 @@ spec = describe "graphics facade" $ do
       -- At each site the most one operation or pump evaluation charged is a constant that does not depend on the size, the units of the
       -- operations that committed for each texture are bounded the same way, and the total at 1000 is at most six times the total at
       -- 250: see 'assertBoundedWork'.
-      assertBoundedWork [(250, small), (1000, large)]
+      assertBoundedWork FreeRunning [(250, small), (1000, large)]
 
   it "answers busy from the common request places for a window request whose own slot is free, with no native window made, and accepts the explicit retry once a place is returned" $ do
     outcome ← runFacade ((defaultShape requestBank) {shapeBoth = False, shapeParkOutput = True, shapeProfile = profileWith [(RequestsPerInstance, 2)]}) $ \fs → do

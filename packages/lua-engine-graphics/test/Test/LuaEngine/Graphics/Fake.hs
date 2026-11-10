@@ -27,6 +27,7 @@ module Test.LuaEngine.Graphics.Fake
   , setBarrier
   , withFakeOwner
   , withFakeOwnerAs
+  , ownerOnce
   , latchHolds
   , ownerLoop
 
@@ -69,6 +70,7 @@ import Control.Concurrent.STM
   , modifyTVar'
   , newTVar
   , newTVarIO
+  , orElse
   , readTVar
   , readTVarIO
   , retry
@@ -675,9 +677,19 @@ withFakeOwnerAs seam fake body = withOwnedThread (ownerLoop fake) (\thread _ →
 
 ownerLoop ∷ Fake → IO ()
 ownerLoop fake = do
-  step ← atomically nextWork
+  step ← atomically (ownerNext fake)
   step
   ownerLoop fake
+
+-- | One step of the owner, run on the calling thread, if it has one, and whether it had: the owner's thread waits when it has none,
+-- and this answers 'False' instead. It is how an example that counts the work of the pump and the owner advances the owner itself, under a
+-- schedule it names, with no thread of the owner's to race it (#679); such an example does not run 'withFakeOwner'.
+ownerOnce ∷ Fake → IO Bool
+ownerOnce fake = atomically ((Just <$> ownerNext fake) `orElse` pure Nothing) >>= maybe (pure False) (\step → step >> pure True)
+
+-- | The owner's next step, in one transaction: what no hold forbids, or a wait.
+ownerNext ∷ Fake → STM (IO ())
+ownerNext fake = nextWork
   where
     nextWork ∷ STM (IO ())
     nextWork = do

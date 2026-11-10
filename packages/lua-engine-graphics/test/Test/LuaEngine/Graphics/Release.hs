@@ -13,7 +13,7 @@ import Hetoimasia.LuaEngine.Graphics.Texture.Backend (BackendReading (..))
 import Test.Hspec
 import Test.LuaEngine.Graphics.Fake
 import Test.LuaEngine.Graphics.Rig
-import Test.LuaEngine.Graphics.Work (WorkReading, assertBoundedWork, readWork)
+import Test.LuaEngine.Graphics.Work (Progression (..), WorkReading, assertBoundedWork, readWork)
 
 spec ∷ Spec
 spec = describe "release and retirement" $ do
@@ -112,25 +112,33 @@ spec = describe "release and retirement" $ do
       released ← filter (Text.isPrefixOf "released ") <$> events (rigFake rig)
       map ((!! 1) . Text.words) released `shouldBe` map (Text.pack . show) [0 .. 39 ∷ Int]
 
-  it "does work linear in the textures a mass release leaves waiting for the release lane: the pump looks at the lowest of them, at 250, 500, 1000 and 2000" $ do
-    readings ← forM [250, 500, 1000, 2000] $ \n → (,) n <$> massRelease n
-    assertBoundedWork readings
+  describe "the work of a mass release, with the pump and the owner advanced one step at a time (#679)" $
+    forM'' [minBound .. maxBound] $ \schedule →
+      it ("does work linear in the textures a mass release leaves waiting for the release lane under the " <> show schedule <> " schedule, at 250, 500, 1000 and 2000") $ do
+        readings ← forM [250, 500, 1000, 2000] $ \n → (,) n <$> massRelease schedule n
+        assertBoundedWork Stepped readings
   where
     -- N textures delivered one at a time and all released at once while the scene's adoption is held: the release lane takes its 16 and
-    -- the rest wait for it; then the hold is let go and every one retires. The work the pump and the fake did is read at the end.
-    massRelease ∷ Int → IO WorkReading
-    massRelease n = withRig defaultFakeConfig {fcSlots = n + 24, fcImages = n + 24} $ \rig → do
+    -- the rest wait for it; then the hold is let go and every one retires. The pump and the owner take their steps on this thread, in
+    -- the order of the schedule, and nothing else runs; the work they did is read at the end.
+    massRelease ∷ Schedule → Int → IO WorkReading
+    massRelease schedule n = withSteppedRig defaultFakeConfig {fcSlots = n + 24, fcImages = n + 24} $ \rig → do
+      settle schedule rig
       textures ← forM [1 .. n] $ \_ → do
         probe ← newProbe
         _ ← submit rig probe 1 1 255
-        _ ← awaitTerminal probe
+        settle schedule rig
+        terminals probe >>= (`shouldSatisfy` (not . null))
         delivered probe
       holdBarrier (rigFake rig)
       readings ← forM textures textureRelease
-      awaitFake (rigFake rig) ((>= 16) . readingReleasesQueued)
+      settle schedule rig
+      readingReleasesQueued <$> atomically (readFake (rigFake rig)) `shouldReturn` 16
       release (rigFake rig) HoldAdoption
-      forM' readings $ \reading → atomically (reading >>= \case ProviderComplete → pure (); _ → retry)
+      settle schedule rig
+      forM' readings $ \reading → atomically reading >>= \case ProviderComplete → pure (); _ → expectationFailure "a texture released was not retired once nothing had a step"
       readWork (fakeWork (rigFake rig))
+    forM'' xs f = mapM_ f xs
     shouldBe' state expected = case (state, expected ∷ String) of
       (ProviderPending, "pending") → pure ()
       (ProviderComplete, "complete") → pure ()
