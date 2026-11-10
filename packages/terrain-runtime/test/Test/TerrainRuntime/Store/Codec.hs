@@ -393,6 +393,32 @@ spec = describe "the private page codec against independent bytes" $ do
       case runM twice (newEdit 0 (wOnly [(sepL, good), (sepR, good + 7)])) of
         Left (Bad (ChildChecksum want have) (PageNo 6)) → (want, have) `shouldBe` (good + 7, good)
         other → expectationFailure ("a cached page was used for a pointer that records another checksum: " <> either show (const "answered") other)
+    it "refuses an under-full child however the page was obtained: cold, and hot after it was loaded as a root in the same plan" $ do
+      -- a page first loaded as a ROOT (exempt from the minimum fill) and still hot when a parent names it as a child is the same page in
+      -- another role. The hot cache is keyed by page number, so the role-dependent check must not live only in the decoding branch.
+      let add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
+          runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
+          sepL = runKeyBytes 1000
+          small6 = buildPage 1 7 6 1 0 0 1 (leafPayload [(sepL, bias 1001)])
+          crc6 = getLe32' small6 4092
+          parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, sepL, le64' 6, le32' crc6])
+          crc5 = getLe32' parent 4092
+          -- both pages are roots of this window (a pinned version's root and the committed one), each with its published checksum
+          trusted = windowTrust [(PageNo 5, crc5), (PageNo 6, crc6)] (add (add (emptyWindow ident0 0) 5 parent) 6 small6)
+          viaParent = lookupKey TreeRuns (Just (Disk (PageNo 5))) sepL
+          asRoot = lookupKey TreeRuns (Just (Disk (PageNo 6))) sepL
+      -- cold: refused as under-full
+      case runM viaParent (newEdit 0 trusted) of
+        Left (Bad (UnderFull _) (PageNo 6)) → pure ()
+        other → expectationFailure ("a cold under-full child was not refused: " <> either show (const "answered") other)
+      -- the page read as the root first is a legal root
+      case runM asRoot (newEdit 0 trusted) of
+        Right (Just _, _) → pure ()
+        other → expectationFailure ("an under-full ROOT was refused: " <> either show (const "answered another way") other)
+      -- hot: loaded as a root, then reached as a child in the same plan, is refused alike
+      case runM (asRoot >> viaParent) (newEdit 0 trusted) of
+        Left (Bad (UnderFull _) (PageNo 6)) → pure ()
+        other → expectationFailure ("a hot under-full child was accepted: " <> either show (const "answered") other)
     it "refuses a root with no recorded checksum in every production window, and reads it only through the test-only unchecked window" $ do
       let add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
           runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]

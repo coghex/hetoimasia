@@ -536,15 +536,18 @@ load tree expectLevel ref = do
           Just vp | Just want <- expected, pageCrcOf (vpBytes vp) /= want → stop (Bad (ChildChecksum want (pageCrcOf (vpBytes vp))) p)
           Just vp → case nodeOfPage tree p (Page (vpTree vp) (vpLevel vp) p (bodyOfValid (vpBytes vp))) of
             Left err → stop (Bad err p)
-            Right n
-              -- a page reached from its parent (the level is expected) and not the root holds at least a quarter of a payload
-              | Just _ ← expectLevel, not (wUnchecked (eWin e)), underFull False (bodyBytesOf (nBody n)) → stop (Bad (UnderFull (bodyBytesOf (nBody n))) p)
-              | otherwise → do
-                  e2 ← getEdit
-                  putEdit e2 {eHot = take hotNodes ((p, n) : filter ((/= p) . fst) (eHot e2))}
-                  pure n
+            Right n → do
+              e2 ← getEdit
+              putEdit e2 {eHot = take hotNodes ((p, n) : filter ((/= p) . fst) (eHot e2))}
+              pure n
   case expectLevel of
     Just l | l /= nLevel node → stop (Bad (BadLevel (nLevel node)) (refPage ref))
+    _ → pure ()
+  -- A page reached from its parent (the level is expected) and not the root holds at least a quarter of a payload. This is the
+  -- ONE role-dependent check of a load, and it applies to every disk-backed node however it was obtained: a page first loaded as
+  -- a root (exempt) and still hot when a parent names it as a child is the same page in another role, and is refused alike.
+  case (ref, expectLevel) of
+    (DiskRef {}, Just _) | not (wUnchecked (eWin e)), underFull False (bodyBytesOf (nBody node)) → stop (Bad (UnderFull (bodyBytesOf (nBody node))) (refPage ref))
     _ → pure node
 
 refPage ∷ Ref → PageNo
