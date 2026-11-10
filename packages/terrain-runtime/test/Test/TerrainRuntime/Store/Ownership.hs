@@ -33,7 +33,7 @@ import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
@@ -110,31 +110,6 @@ forgeLoose ∷ H → PageNo → Page → IO H
 forgeLoose h p pg = do
   bs ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h) pg)
   pure h {hDisk = diskWrite p bs (hDisk h)}
-
--- | Make the checksums above a page agree with the page as it is on the disk now.
-resignChain ∷ H → PageNo → H
-resignChain h0 p0 = foldl (\h t → resign h t p0) h0 [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire]
-  where
-    total = cfgUsablePages (hCfg h0)
-    ident = hIdent h0
-    crcOf h p = (\bs → getLe32' bs 4092) <$> diskRead (hDisk h) p
-    decodeAt h p = either (const Nothing) Just . decodePage ident total p =<< diskRead (hDisk h) p
-    resign h t p
-      | rootOf (storeRoots (hStore h)) t == Just p =
-          maybe h (\c → h {hStore = modifyRoots (\r → r {rRootCrcs = [(t', c') | (t', c') ← rRootCrcs r, t' /= t] ++ [(t, c)]}) (hStore h)}) (crcOf h p)
-      | otherwise = case [(q, es) | Just root ← [rootOf (storeRoots (hStore h)) t], q ← descend h root, Just (Page _ _ _ (Inner es)) ← [decodeAt h q], any ((== p) . childPage . snd) es] of
-          ((q, es) : _) → case (crcOf h p, decodeAt h q) of
-            (Just c, Just (Page tt lv _ _)) →
-              let es' = [(k, if childPage ch == p then Child p c else ch) | (k, ch) ← es]
-               in case encodePage ident (Page tt lv q (Inner es')) of
-                    Right bs → resign h {hDisk = diskWrite q bs (hDisk h)} t q
-                    Left _ → h
-            _ → h
-          [] → h
-    -- every page of a tree reachable by its internal entries, from a root
-    descend h q = q : case decodeAt h q of
-      Just (Page _ _ _ (Inner es)) → concatMap (descend h . childPage . snd) es
-      _ → []
 
 -- | The same store over other root fields, the live-page counter recomputed so that the
 -- counters still agree with each other: a test that forges a page-ownership record is not a
@@ -469,6 +444,13 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       case m of
         Refused (Capacity (RetirementBacklog _ _)) → expectationFailure "maintenance must never be refused for the backlog it lowers"
         _ → pure ()
+      -- one page more than the bound is no state a plan writes: the next plan and the next maintenance transaction refuse it as
+      -- corrupt, so the retirement tree (and the window its index edit needs) is bounded by what the store checks
+      let over = withRoots h (\r → r {rHw = rHw r + fromIntegral maxRetiredPages + 1 - rRetiredPages r, rRetiredPages = fromIntegral maxRetiredPages + 1})
+      outOver ← planOn over
+      outOver `shouldBe` Refused (Integrity CorruptCounters)
+      (mOver, _, _) ← must (fillWith over (planMaintenance (hStore over)))
+      mOver `shouldBe` Refused (Integrity CorruptCounters)
     it "refuses a retirement entry whose progress field was re-sealed past pages that were not reclaimed" $ do
       (h, _, _) ← fixture
       (leaf, entries, (k0, v0)) ← firstRetire h

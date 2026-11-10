@@ -19,13 +19,14 @@ import Data.Word (Word64)
 import Hetoimasia.Terrain.Discovery (Record, RecordKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
+import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Test.TerrainRuntime.Store.Reference
 
 must ∷ Either String a → IO a
@@ -174,7 +175,7 @@ dispersed firstKeys k =
       [] → Nothing
 
 spec ∷ Spec
-spec = specBoundary >> specFragmented >> specFinal >> specBound >> specForged >> specAtOnce >> specFingerprint
+spec = specBoundary >> specFragmented >> specFinal >> specBound >> specForged >> specAtOnce >> specFingerprint >> specSparse
 
 specBoundary ∷ Spec
 specBoundary = describe "the round-11 boundary at the real reserve: 64 dispersed link updates need more bookkeeping than 68" $ do
@@ -354,10 +355,10 @@ specAtOnce = describe "round 13: the window a unit of work holds at once, under 
           ]
     bad `shouldBe` []
     -- and the standalone removal, which cannot shrink, for every record and allocator height and pin count, with the
-    -- retirement tree at minimum fill (at most 8 internal pages) as every tree a plan has written is
-    let badRemoval = [(hf, hrec, pins) | hf ← [1 .. maxLevel + 1], hrec ← [1 .. maxLevel + 1], pins ← [0 .. maxReaders], removalWindowPages 8 hf hrec pins * windowPageBytes + 188 * probeBytes > maxWindowBytes]
+    -- retirement tree at the minimum fill the store enforces and the backlog bound it checks (at most 17 internal pages)
+    let badRemoval = [(hf, hrec, pins) | hf ← [1 .. maxLevel + 1], hrec ← [1 .. maxLevel + 1], pins ← [0 .. maxReaders], removalWindowPages maxRetireInternals hf hrec pins * windowPageBytes + 188 * probeBytes > maxWindowBytes]
     badRemoval `shouldBe` []
-    putStrLn ("ATONCE bounds: unit of one at (8,8,8,16) = " <> show (workOneWindowPages 8 8 8 16) <> " pages, removal at (8,8,16) = " <> show (removalWindowPages 8 8 8 16) <> " pages, limit " <> show (maxWindowBytes `div` windowPageBytes))
+    putStrLn ("ATONCE bounds: unit of one at (8,8,8,16) = " <> show (workOneWindowPages 8 8 8 16) <> " pages, removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> " pages, limit " <> show (maxWindowBytes `div` windowPageBytes))
   it "makes progress at work one with a window of exactly the at-once bound, with 1 to 16 distinct pinned versions, on a store with no tail, and again after the readers release" $ do
     must (checkH hNo)
     (rFree (storeRoots (hStore hNo)) /= Nothing && rHw (storeRoots (hStore hNo)) == fromIntegral (cfgUsablePages (hCfg hNo)) ) `shouldBe` True
@@ -440,3 +441,37 @@ specFingerprint = describe "round 13: the facts a window carries are trusted onl
     -- facts proven against another state replace the ones a window carries, never merge with them
     let other = Facts fpAfter [FactUnreachable (PageNo 20)]
     windowFactCount (windowCheckpoint other w1) `shouldBe` 1
+
+-- | A sparse retirement tree is corruption, not a window result: a non-root page of the retirement tree below a quarter
+-- of a payload, re-sealed with every checksum above it, is refused when a plan descends to it; before the rule a
+-- store accepted it, and the one operation that cannot shrink (it indexes every replaced page) could answer the window
+-- result for good.
+specSparse ∷ Spec
+specSparse = describe "round 13: a sparse retirement tree fails closed as corruption" $
+  it "answers an integrity result, never a window result, for an under-full inner page and an under-full leaf of the retirement tree" $ do
+    let (h0, firstKeys, _) = fragmented
+        total = cfgUsablePages (hCfg h0)
+        ArenaId a = siArena (hIdent h0)
+        retirePages = twPages (walkTree a (siSource (hIdent h0)) (diskRead (hDisk h0)) ((\(PageNo r) → r) <$> rootOf (storeRoots (hStore h0)) TreeRetire))
+        rootNo = (\(PageNo r) → r) <$> rootOf (storeRoots (hStore h0)) TreeRetire
+        decodeAt q = either (const Nothing) Just . decodePage (hIdent h0) total (PageNo q) =<< diskRead (hDisk h0) (PageNo q)
+        inners = [(q, es) | q ← retirePages, Just q /= rootNo, Just (Page _ 1 _ (Inner es@(_ : _ : _ : _))) ← [decodeAt q]]
+        leavesOf = [(q, es) | q ← retirePages, Just (Page _ 0 _ (Leaf es@(_ : _ : _ : _))) ← [decodeAt q]]
+        commitOne h = commitDelta h Ordinary (deltaFor (hStore h) True False 1 [(firstKeys !! 40, Just (childRec (srcNode 7 7 9)))])
+    forgedInner ← case inners of
+      ((q, es) : _) → must (forgePage h0 (PageNo q) (Page TreeRetire 1 (PageNo q) (Inner (take 2 es))))
+      [] → expectationFailure "no non-root inner page of the retirement tree" >> fail "inner"
+    forgedLeaf ← case leavesOf of
+      ((q, es) : _) → must (forgePage h0 (PageNo q) (Page TreeRetire 0 (PageNo q) (Leaf (take 3 es))))
+      [] → expectationFailure "no leaf of the retirement tree" >> fail "leaf"
+    forM_ [("inner", forgedInner), ("leaf", forgedLeaf)] $ \(what, hf) → do
+      -- an ordinary plan, which indexes every page it replaces, and maintenance, which unindexes: Integrity either way
+      (_, out) ← must (commitOne hf)
+      case out of
+        Refusal' (Integrity (BadPage (UnderFull _) _)) → pure ()
+        other → expectationFailure ("a commit through an under-full " <> what <> " of the retirement tree was not refused as corruption: " <> take 200 (show other))
+      (m, _, _) ← must (fillWith hf (planMaintenance (hStore hf)))
+      case m of
+        Refused (Integrity (BadPage (UnderFull _) _)) → pure ()
+        Planned _ → pure () -- the oldest entry's pages may not lie in the forged page
+        other → expectationFailure ("maintenance through an under-full " <> what <> " was not refused as corruption: " <> take 200 (show other))

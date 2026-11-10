@@ -397,7 +397,8 @@ spec = describe "the private page codec against independent bytes" $ do
       let add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
           runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
           sepL = runKeyBytes 1000
-          leaf6 = buildPage 1 7 6 1 0 0 1 (leafPayload [(sepL, bias 1001)])
+          -- a child of a production window holds at least a quarter of a payload: 30 entries of 34 bytes
+          leaf6 = buildPage 1 7 6 1 0 0 30 (leafPayload [(runKeyBytes (1000 + 10 * i), bias (1003 + 10 * i)) | i ← [0 .. 29]])
           good = getLe32' leaf6 4092
           parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, sepL, le64' 6, le32' good])
           fill w = add (add w 5 parent) 6 leaf6

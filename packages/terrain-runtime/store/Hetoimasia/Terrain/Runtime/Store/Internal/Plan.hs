@@ -896,6 +896,10 @@ checkCounters roots = do
   if total /= toInteger (rHw roots) then refuse (Integrity CorruptCounters) else pure ()
   if (rFree roots == Nothing) /= (rFreePages roots == 0) then refuse (Integrity CorruptCounters) else pure ()
   if (rRetire roots == Nothing) /= (rRetiredPages roots == 0) then refuse (Integrity CorruptCounters) else pure ()
+  -- an ordinary plan refuses to add past the backlog bound and maintenance only lowers it, so a store a plan wrote never
+  -- retires more pages than the bound: the size of the retirement tree (and its internal pages) rests on this and on
+  -- the minimum fill every page keeps
+  if rRetiredPages roots > fromIntegral maxRetiredPages then refuse (Integrity CorruptCounters) else pure ()
 
 -- | The checksums the roots a transaction publishes must carry: a root it wrote carries the checksum of
 -- the page it just encoded, a root it left alone keeps the one the root record already held.

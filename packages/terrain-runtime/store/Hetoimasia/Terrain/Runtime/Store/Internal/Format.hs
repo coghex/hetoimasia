@@ -22,6 +22,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Format
   , maxTxnPages
   , maxTxnBytes
   , minNodeBytes
+  , underFull
   , probeBytes
 
     -- * Identities
@@ -118,6 +119,13 @@ maxTxnBytes = maxTxnPages * pageSize
 minNodeBytes ∷ Int
 minNodeBytes = pagePayloadBytes `div` 4
 
+-- | Whether a page of a tree holding this many payload bytes is under-full: any page but the root of its tree
+-- holds at least 'minNodeBytes', because every plan that removes an entry repacks a node that falls below it.
+-- The ONE definition of the rule: the store refuses such a page when it descends to it, and the independent
+-- checker of the test suite applies the same function.
+underFull ∷ Bool → Int → Bool
+underFull isRoot payload = not isRoot && payload < minNodeBytes
+
 -- | A page number: the page's index in the store's page space, not a byte offset.
 newtype PageNo = PageNo Word64
   deriving stock (Eq, Ord, Show)
@@ -202,4 +210,6 @@ data PageError
     -- 'Hetoimasia.Terrain.Runtime.Store.Internal.Tree.windowUnchecked'.
     RootChecksumMissing
   | EntryTooLarge !Int
+  | -- | A page of a tree that is not its root holds fewer payload bytes than the least every plan keeps ('minNodeBytes'): the bytes it holds. No plan writes one.
+    UnderFull !Int
   deriving stock (Eq, Show)

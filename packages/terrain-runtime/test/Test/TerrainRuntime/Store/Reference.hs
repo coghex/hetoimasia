@@ -60,7 +60,7 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Word (Word16, Word32, Word64, Word8)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), TreeId (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), TreeId (..), underFull)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..))
 
@@ -242,7 +242,7 @@ walkTree arena source rd (Just root) = go root Nothing Nothing Nothing True
         Right pg →
           let own = [ "page " <> show p <> " claims number " <> show (rpNo pg) | rpNo pg /= p ]
               lvl = [ "page " <> show p <> " level " <> show (rpLevel pg) | Just l ← [expectLevel], l /= rpLevel pg ]
-              occ = [ "page " <> show p <> " under-full: " <> show (rpPayload pg) | not isRoot, rpPayload pg < 4052 `div` 4 ]
+              occ = [ "page " <> show p <> " under-full: " <> show (rpPayload pg) | underFull isRoot (rpPayload pg) ]
            in case rpBody pg of
                 RefLeaf es →
                   let ks = map fst es

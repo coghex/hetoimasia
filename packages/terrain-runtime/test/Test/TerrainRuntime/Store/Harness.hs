@@ -27,6 +27,8 @@ module Test.TerrainRuntime.Store.Harness
   , heightOf
   , withPins
   , noTailOf
+  , resignChain
+  , forgePage
   , noTailWithOldLeaves
   , deltaFor
   , Outcome (..)
@@ -75,7 +77,7 @@ import Hetoimasia.Terrain.Discovery
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (encodeFree)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
@@ -436,3 +438,35 @@ noTailWithOldLeaves tree n h = do
     )
     h1
     (zip [0 ∷ Int ..] samples)
+
+-- | Make the checksums above a page agree with the page as it is on the disk now.
+resignChain ∷ H → PageNo → H
+resignChain h0 p0 = foldl (\h t → resign h t p0) h0 [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire]
+  where
+    total = cfgUsablePages (hCfg h0)
+    ident = hIdent h0
+    crcOf h p = (\bs → getLe32' bs 4092) <$> diskRead (hDisk h) p
+    decodeAt h p = either (const Nothing) Just . decodePage ident total p =<< diskRead (hDisk h) p
+    resign h t p
+      | rootOf (storeRoots (hStore h)) t == Just p =
+          maybe h (\c → h {hStore = modifyRoots (\r → r {rRootCrcs = [(t', c') | (t', c') ← rRootCrcs r, t' /= t] ++ [(t, c)]}) (hStore h)}) (crcOf h p)
+      | otherwise = case [(q, es) | Just root ← [rootOf (storeRoots (hStore h)) t], q ← descend h root, Just (Page _ _ _ (Inner es)) ← [decodeAt h q], any ((== p) . childPage . snd) es] of
+          ((q, es) : _) → case (crcOf h p, decodeAt h q) of
+            (Just c, Just (Page tt lv _ _)) →
+              let es' = [(k, if childPage ch == p then Child p c else ch) | (k, ch) ← es]
+               in case encodePage ident (Page tt lv q (Inner es')) of
+                    Right bs → resign h {hDisk = diskWrite q bs (hDisk h)} t q
+                    Left _ → h
+            _ → h
+          [] → h
+    -- every page of a tree reachable by its internal entries, from a root
+    descend h q = q : case decodeAt h q of
+      Just (Page _ _ _ (Inner es)) → concatMap (descend h . childPage . snd) es
+      _ → []
+
+-- | Overwrite a page with a re-encoded body whose checksum is valid, and make the checksums above it agree: the forgery
+-- of a forger who wants the page read.
+forgePage ∷ H → PageNo → Page → Either String H
+forgePage h p pg = do
+  bs ← either (Left . show) Right (encodePage (hIdent h) pg)
+  Right (resignChain h {hDisk = diskWrite p bs (hDisk h)} p)

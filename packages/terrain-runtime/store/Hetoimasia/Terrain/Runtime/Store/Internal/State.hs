@@ -69,6 +69,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , workOneWindowPages
   , workOneProbeBytes
   , removalWindowPages
+  , maxRetireInternals
 
     -- * Configuration
   , StoreSpec (..)
@@ -264,6 +265,11 @@ workOneWindowPages ∷ Int → Int → Int → Int → Int
 workOneWindowPages hr hf hrec pins =
   (hr + 1) + 2 * hr + 3 * hf + max ((1 + pins) * hrec) (max hr hf)
 
+-- | The most internal pages a retirement tree can have: at most @2 * maxRetiredPages@ records (an index record for
+-- each retired page and an entry for each list), at least 46 to a leaf and 47 to an internal page.
+maxRetireInternals ∷ Int
+maxRetireInternals = 17
+
 -- | The accounted bytes of the probes of a transaction of one page.
 workOneProbeBytes ∷ Int → Int → Int
 workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2) * probeBytes
@@ -271,9 +277,11 @@ workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2) * probeBytes
 -- | The pages a standalone explicit removal holds at once. It cannot shrink (it is atomic): its edit is held
 -- whole. At most 'worstEditWrites' writes (7) each read a path of @hrec@ pages and replace at most as many;
 -- each replaced page is indexed in the retirement tree, which reads one leaf for each (at most 7 * hrec + 1) and
--- the internal pages above them, at most @retireInternals@ — the one term that rests on the retirement tree
--- being at minimum fill, as every tree a plan has written is (a retirement tree bounded by 'maxRetiredPages' has
--- at most 8 internal pages); the allocator tree's edit, @3 * hf@; and ONE proof as above.
+-- the internal pages above them, at most @retireInternals@, which is 'maxRetireInternals': the store refuses a
+-- non-root page below a quarter of a payload when it descends to it ('UnderFull') and a root set that retires more
+-- than 'maxRetiredPages' pages, so a retirement tree holds at most twice that many records (an index record for
+-- each retired page and an entry for each list) at least 46 to a leaf and 47 children to an internal page, that is
+-- 712 leaves, 16 internal pages and a root; the allocator tree's edit, @3 * hf@; and ONE proof as above.
 removalWindowPages ∷ Int → Int → Int → Int → Int
 removalWindowPages retireInternals hf hrec pins =
   7 * hrec + (7 * hrec + 1) + retireInternals + 3 * hf + max ((1 + pins) * hrec) hf

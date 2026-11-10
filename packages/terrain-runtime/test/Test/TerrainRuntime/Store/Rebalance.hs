@@ -83,7 +83,7 @@ spec = describe "deletion against trees deep enough to merge and redistribute in
     must (compareRecords (Map.toList (Map.delete key0 ref)) h1)
     -- the publication is the committed version: a fresh read agrees
     rRuns (storeRoots (hStore h1)) `shouldSatisfy` (/= rRuns (storeRoots (hStore h)))
-  forM_ [(30 ∷ Int, [28, 90], 1 ∷ Word64), (30, [28, 28, 28, 28], 2), (30, [28, 90, 28, 60], 3), (40, [20, 90, 28, 100], 4)] $ \(perLeaf, counts, seed) →
+  forM_ [(30 ∷ Int, [28, 90], 1 ∷ Word64), (30, [28, 28, 28, 28], 2), (30, [28, 90, 28, 60], 3), (40, [28, 90, 28, 100], 4)] $ \(perLeaf, counts, seed) →
     it ("never refuses a legitimate deletion or reinsertion, and the checker agrees after every step (" <> show counts <> ", " <> show perLeaf <> " records a leaf)") $ do
       let (h0, ref0, _) = deepStore perLeaf counts
           original = ref0

@@ -11,11 +11,11 @@
 -- ceiling, a ranged read and the reachability of a page) are judged against the independent
 -- traversal of the unchanged disk: each answer is the reference's or an integrity failure
 -- (an answer about a record of a changed leaf is excused as data). Fixed seeds, bounded.
-module Test.TerrainRuntime.Store.FuzzTrees (spec) where
+module Test.TerrainRuntime.Store.FuzzTrees (spec, richStore, referenceOf, through) where
 
 import Control.Monad (foldM, forM)
 import qualified Data.ByteString as BS
-import Data.List (sortOn)
+import Data.List (isInfixOf, sortOn)
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Data.Word (Word64)
@@ -250,6 +250,32 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
     [e | (_, _, _, _, e) ← flat] `shouldSatisfy` (any (> 0))
     -- the forgery that records the stale page's own checksum is refused where the forged page is itself the root: the root record tells
     [e | (_, True, True, _, e) ← flat] `shouldSatisfy` (any (> 0))
+  it "refuses a re-sealed under-full non-root leaf and inner page when the store descends to it, in each tree kind, and answers the page it was" $ do
+    let total = cfgUsablePages (hCfg h)
+        decodeAt q = either (const Nothing) Just . decodePage (hIdent h) total (PageNo q) =<< diskRead (hDisk h) (PageNo q)
+    rows ← forM [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree → do
+      let (_, treePages) = referenceOf h tree
+          rootNo = (\(PageNo r) → r) <$> rootOf (storeRoots (hStore h)) tree
+          rootRef = Disk (fromMaybe (PageNo 0) (rootOf (storeRoots (hStore h)) tree))
+          nonRoot = [q | q ← treePages, Just q /= rootNo]
+          leaves = [(q, es) | q ← nonRoot, Just (Page _ 0 _ (Leaf es@(_ : _ : _))) ← [decodeAt q]]
+          inners = [(q, lv, es) | q ← nonRoot, Just (Page _ lv _ (Inner es@(_ : _ : _ : _))) ← [decodeAt q]]
+          refused forged firstKey = do
+            hf ← must (forgePage h (pgNo forged) forged)
+            -- the forgery is consistent (every checksum above agrees), and a read that descends to it is refused
+            pure (through hf (hDisk hf) (lookupKey tree (Just rootRef) firstKey))
+      leafRes ← case leaves of
+        ((q, es@((k0, _) : _)) : _) → (\r → [("leaf" ∷ String, r)]) <$> refused (Page tree 0 (PageNo q) (Leaf (take 1 es))) k0
+        _ → pure []
+      innerRes ← case inners of
+        ((q, lv, es@((k0, _) : _)) : _) → (\r → [("inner" ∷ String, r)]) <$> refused (Page tree lv (PageNo q) (Inner (take 2 es))) k0
+        _ → pure []
+      pure (tree, leafRes ++ innerRes)
+    putStrLn ("FUZZTREES under-full pages refused at descent: " <> show [(t, [(kind, either (take 60) (const "ANSWERED") r) | (kind, r) ← rs]) | (t, rs) ← rows])
+    -- every tree kind has a non-root leaf, and the trees with a non-root inner page are refused there too
+    [t | (t, rs) ← rows, null [() | ("leaf", _) ← rs]] `shouldBe` []
+    [(t, k) | (t, rs) ← rows, (k, r) ← rs, either (not . ("UnderFull" `isInfixOf`)) (const True) r] `shouldBe` []
+    length [() | (_, rs) ← rows, ("inner", _) ← rs] `shouldSatisfy` (>= 2)
   forM_' [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire] $ \tree →
     it ("a mutated root record never changes what a read answers, " <> show tree) $ do
       let roots = storeRoots (hStore h)
