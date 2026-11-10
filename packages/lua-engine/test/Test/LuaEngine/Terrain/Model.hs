@@ -18,13 +18,15 @@
 module Test.LuaEngine.Terrain.Model (spec) where
 
 import Control.Concurrent.STM (atomically)
+import Control.Exception (finally)
 import Control.Monad (forM_, replicateM_, void, when)
 import Data.Bits (shiftR, (.&.))
 import Data.List (find)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance
+import Hetoimasia.LuaEngine.Terrain (TerrainHooks (..), noTerrainHooks)
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
 import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Hetoimasia.LuaEngine.Profile (CountLimit (RequestsPerInstance, RequestsPerVm))
@@ -92,9 +94,18 @@ next x = (x * 1103515245 + 12345) .&. 0x7fffffff
 
 spec ∷ Spec
 spec = describe "Terrain lifecycle model" $
-  forM_ [1 .. 8 ∷ Int] $ \seed →
-    it ("keeps the service's use equal to what the live handles account for, over a bounded random sequence of two VMs' operations (seed " <> show seed <> ")") $
-      withRigConfig defaultConfig {configMaxClients = 8, configMaxLeases = 6, configMaxArenas = 2} $ \rig →
+  forM_ [1 .. 32 ∷ Int] $ \seed →
+    it ("keeps the service's use equal to what the live handles account for, over a bounded random sequence of two VMs' operations (seed " <> show seed <> ")") $ do
+      -- (every fourth seed holds the host's adoption of the arena's open, so that g's attach is answered not_found while the service has
+      -- committed the open and the host has not published it: the lease the service made for that attach is let go with its request)
+      let gated = seed `mod` 4 == 0
+      gate ← newGate
+      armed ← newIORef False
+      window ← newIORef False
+      let hold = do
+            go ← atomicModifyIORef' armed (\a → (False, a))
+            when go (holdAt gate)
+      (`finally` openGate gate) $ withRigHooks defaultConfig {configMaxClients = 8, configMaxLeases = 6, configMaxArenas = 2} noProbeForRaces noTerrainHooks {hookAdopting = hold} $ \rig →
         withWorld (counts [(RequestsPerInstance, 3), (RequestsPerVm, 5)]) (Layout [("lua/p.lua", scriptSource (scripted "p")), ("lua/g.lua", scriptSource (scripted "g"))]) $ \world control runtime →
           withFvm world runtime (presentationOver rig) $ \pv →
             withFvm world runtime (gameplayOver rig) $ \gv → do
@@ -130,7 +141,9 @@ spec = describe "Terrain lifecycle model" $
                     clients ← limitHeld (rgService rig) "clients"
                     clientsAtStart ← readIORef clientBaseline
                     handles ← (\a b → length (filter id [a, b])) <$> readIORef (sdHandle p) <*> readIORef (sdHandle g)
-                    (what, held <= bound, slots <= toInteger bound, leases <= toInteger handles, (clientsAtStart < 0 || clients == clientsAtStart), (held, bound, slots, leases, handles, clients)) `shouldSatisfy` (\(_, a, b, c, d, _) → a && b && c && d)
+                    -- (while the host's adoption of the open is held, the service's lease for the open is the one it holds beyond the handles)
+                    unpublished ← (\open → if open then 1 else 0) <$> readIORef window
+                    (what, held <= bound, slots <= toInteger bound, leases <= toInteger (handles + unpublished), (clientsAtStart < 0 || clients == clientsAtStart), (held, bound, slots, leases, handles, clients)) `shouldSatisfy` (\(_, a, b, c, d, _) → a && b && c && d)
                   -- One operation on a side.
                   operation label choice = do
                     let side = sideOf label
@@ -187,8 +200,19 @@ spec = describe "Terrain lifecycle model" $
               writeIORef gSpawnRef (Just gSpawn0)
               -- (on odd seeds g attaches while the open is still pending: the answer is not_found, the service's lease for that attach is
               -- let go at once, and g attaches again once the arena is published)
+              when gated (writeIORef armed True)
               void (command "p" "open")
-              when (odd seed) (void (command "g" "attach"))
+              when gated $ do
+                -- the service has committed the open; the host's adoption of it is held
+                awaitReached gate
+                writeIORef window True
+                void (command "g" "attach")
+                pumpUntil world (advance >> ((>= 1) . length . filter (Text.isPrefixOf "opened\tg\t") <$> outLines world))
+                check "after an attach to an open the host has not published"
+                outLines world >>= \printed → printed `shouldContain` ["opened\tg\tfailure"]
+                writeIORef window False
+                openGate gate
+              when (odd seed && not gated) (void (command "g" "attach"))
               pumpUntil world (advance >> elem "opened\tp\tsuccess" <$> outLines world)
               writeIORef (sdHandle p) True
               early ← length . filter (Text.isPrefixOf "opened\tg\t") <$> outLines world
@@ -204,7 +228,7 @@ spec = describe "Terrain lifecycle model" $
               -- a bounded random sequence of operations over both VMs
               seedRef ← newIORef seed
               -- (the first eight operations cover every kind once, in an order the seed shifts; the rest are drawn)
-              forM_ [0 .. 15 ∷ Int] $ \step → do
+              forM_ [0 .. 31 ∷ Int] $ \step → do
                 modifyIORef' seedRef next
                 a ← readIORef seedRef
                 modifyIORef' seedRef next
