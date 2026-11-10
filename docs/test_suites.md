@@ -527,6 +527,11 @@ cabal test hetoimasia-tests --test-show-details=direct
   (group `test.vulkan-headless`), a gated fake port inside the real request
   admission, leases and a Lua owner; the shared composition lives in the
   package's `test-common` directory, not in either suite's spec modules.
+  The `does work linear in the textures an instance retains and releases` example of `lua-engine-graphics-tests` bounds the
+  work of the backend's pump and of the fake owner by what they examine, never by time (#679): `withBackendObserved` and
+  `Test.LuaEngine.Graphics.Work` count candidates and records by site, each site is bounded per operation, and the total
+  at 500 textures is at most six times the total at 125. The thousand-texture example keeps its count, its sixteen request
+  places and its 8 s bound.
   Every helper thread `lua-engine-graphics-tests` and `lua-engine-graphics-native-tests` start is an owned start
   (#599): `withFakeOwner` and the peers rig's `mainLoop` (whose scope encloses the retirement and the windows' teardown, which
   may wait for a main-thread step), the backend scope forked by `withForkedScope` (whose `forkedJoin` may be made again, so the
