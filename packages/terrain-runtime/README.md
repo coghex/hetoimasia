@@ -580,6 +580,17 @@ maintenance its chunk) or waits for a reader's release and maintenance (`DiskFul
 `Hetoimasia.Terrain.Runtime.Store` documents the same loop beside `Pending`; the suites drive it as a caller
 does (`fillRetry`).
 
+**The loose list has a caller rule too.** A page a plan replaces in the allocator or retirement trees returns to the
+root set's loose list, which is capped (`looseCap`, 1,024). Maintenance drains it before anything else: a list above its
+soft cap (`looseSoftCap`, 512) makes the next maintenance transaction a *spill*, which only inserts up to
+`maxSpillPages` (8) loose pages into the allocator tree (each proven unreachable and unowned like a page a plan
+writes), strictly lowers the list, and runs even when no retirement entry is left to reclaim (`NoWork` is answered only
+once the list is at the soft cap) and while a reader holds the oldest entry. A transaction of one page that frees pages
+adds at most `looseGrowthUnit` to a list at the soft cap or below, and an ordinary plan, a standalone removal included,
+adds none while the list holds what the plan claims, so neither reaches the cap on a valid store. A plan that
+nevertheless answers `Capacity (LooseExceeded _)` is shrunk like any other batch, and at the smallest unit the caller
+runs maintenance and plans again; maintenance is never refused for it.
+
 **Every consumer of the planner must also handle `Checkpoint`.** A plan about to overwrite or free a page
 first proves that nobody but the allocator owns it (a path of its first key in the committed tree and in every
 pinned reader's tree, the retired-page index, the free extents); a plan that frees pages also verifies the
