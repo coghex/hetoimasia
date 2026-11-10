@@ -1061,10 +1061,15 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       -- index as it leaves the entry: an entry that names a page that is not retired under it
       -- (a forged list or a lowered version) is refused before anything is freed
       (retireRootI, bkEditI0) ← foldM (unindexRetired e) (retireRoot, bkEdit2) freed
-      -- an entry is finished only when none of its pages is still indexed: the pages its progress
-      -- field says were reclaimed already must be gone from the index, or a forged progress field
-      -- would drop a page from the obligation for good
-      bkEditI ← if finished then foldM (goneFromIndex e retireRoot) bkEditI0 prefix else pure bkEditI0
+      -- the pages the progress field says were reclaimed must be gone from the index, or a forged field would
+      -- drop a page from the obligation for good. Every transaction checks the last 'maxReclaimPages' of them,
+      -- so its window never depends on how much of the entry was consumed before (a transaction of one page
+      -- needs a window bounded by the tree heights, never by the history of the entry): a field forged forward
+      -- skips the pages in front of its new value, which lie inside those pages (the skipped pages are all
+      -- still indexed when a jump is longer than the span checked, and are all inside it when it is shorter),
+      -- so the first transaction after the forgery refuses it; a field forged backward asks for a page that is
+      -- no longer indexed under the entry, which unindexing refuses
+      bkEditI ← foldM (goneFromIndex e retireRoot) bkEditI0 (drop (length prefix - maxReclaimPages) prefix)
       (retireRoot1, bkEdit3) ←
         if finished
           then phase bkEditI (deleteKey TreeRetire retireRootI (be64 e))
