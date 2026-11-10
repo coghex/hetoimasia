@@ -596,8 +596,9 @@ made. A checkpoint always carries a new fact (a window that cannot hold the plan
 verifies. What a window holds at once is the edit and one proof, `workOneWindowPages` for a unit of one page and
 `removalWindowPages` for a standalone removal, which cannot shrink; both rest on `maxLevel` and `maxReaders`
 alone, and both are asserted against `maxWindowBytes / windowPageBytes` (310 pages) for every height 1 to 8 and
-every number of pinned readers (the removal's one term that rests on minimum fill, at most 8 internal pages of a
-retirement tree bounded by `maxRetiredPages`, is stated at its site).
+every number of pinned readers (the removal's retirement-tree term, at most 17 internal pages, rests on two
+checks the store makes: a non-root page below a quarter of a payload is refused when a plan descends to it
+(`UnderFull`), and a root set retiring more than `maxRetiredPages` pages is refused at every plan).
 
 ### The page format
 
