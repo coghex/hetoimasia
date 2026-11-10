@@ -6,6 +6,7 @@ module Test.LuaEngine.Graphics.Release (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
 import Control.Monad (forM)
+import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..), textureRefOf)
 import Hetoimasia.LuaEngine.Texture.Backend (BackendTexture (..), RetirementState (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Backend (BackendReading (..))
@@ -89,6 +90,28 @@ spec = describe "release and retirement" $ do
       refIndex old `shouldBe` refIndex new
       refGeneration old `shouldNotBe` refGeneration new
       textureIdentity oldTexture `shouldNotBe` textureIdentity newTexture
+  it "releases the textures waiting for a full release lane in the order of their ids, whatever the order they were asked in, and every one retires with no other wake" $
+    withRig defaultFakeConfig {fcSlots = 64, fcImages = 64} $ \rig → do
+      textures ← forM [1 .. 40 ∷ Int] $ \_ → do
+        probe ← newProbe
+        _ ← submit rig probe 1 1 255
+        _ ← awaitTerminal probe
+        delivered probe
+      holdBarrier (rigFake rig)
+      let (first, rest) = splitAt 16 textures
+      -- The first sixteen fill the release lane, which only the scene's adoption lets the owner run.
+      readingsFirst ← forM first textureRelease
+      awaitFake (rigFake rig) ((== 16) . readingReleasesQueued)
+      -- The other twenty-four are asked in the reverse of their order, and wait for the lane.
+      readingsRest ← forM (reverse rest) textureRelease
+      awaitBackend rig ((== 24) . length . filter (== "release-requested") . readingTextureStages)
+      readingReleasesQueued <$> atomically (readFake (rigFake rig)) `shouldReturn` 16
+      release (rigFake rig) HoldAdoption
+      -- Nothing but the lane taking the owner's answers moves the waiting textures on: each is submitted when the lane has room.
+      forM' (readingsFirst <> readingsRest) $ \reading → atomically (reading >>= \case ProviderComplete → pure (); _ → retry)
+      released ← filter (Text.isPrefixOf "released ") <$> events (rigFake rig)
+      map ((!! 1) . Text.words) released `shouldBe` map (Text.pack . show) [0 .. 39 ∷ Int]
+
   it "does work linear in the textures a mass release leaves waiting for the release lane: the pump looks at the lowest of them, at 250, 500, 1000 and 2000" $ do
     readings ← forM [250, 500, 1000, 2000] $ \n → (,) n <$> massRelease n
     assertBoundedWork readings
