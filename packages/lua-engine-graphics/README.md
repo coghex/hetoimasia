@@ -55,7 +55,7 @@ withTextureGraphics ∷ SceneSession → TextureGraphicsConfiguration → Vulkan
 
 | State | Owner | Writers | Readers | Thread | Lifetime / disposal |
 | --- | --- | --- | --- | --- | --- |
-| Backend state (`State`: jobs, textures, bootstrap, failure) | one `Backend` | the pipeline's decode worker (add a job), any thread that cancels or releases (one transaction each), the owner-thread actions (track what they made), the pump | any thread | STM | `withBackend`; empty at exit |
+| Backend state (`State`: jobs, textures, the active textures (those the pump may have a step for: every texture except the idle offered and live ones), bootstrap, failure) | one `Backend` | the pipeline's decode worker (add a job), any thread that cancels or releases (one transaction each), the owner-thread actions (track what they made), the pump | any thread | STM | `withBackend`; empty at exit |
 | The pump | the backend's worker group | — | — | one thread | started by `withBackend`; stopped after the drain |
 | Renderer, registry, table | the session | the bootstrap action; later scene adapters | any (registry reads) | owner thread (constructions) | the session's managed resources |
 | A native image | its job, then the table | the owner action that made it (records it in the job) | the pump | owner thread | destroyed by the owner once nothing holds it |
@@ -68,6 +68,24 @@ ticket, an action's outcome, the owner's standing, the bounded action queue itse
 retries wakes when the queue changes), or the owner's recorded progress (`portWatch`: the GPU model changes when a
 completion is recorded or a resource disposed). No timer, frame, Lua result poll, window or peer instance drives
 progress. Sink calls are single transactions and never enter Lua.
+
+### What a pump step costs
+
+A step examines *candidates* in a fixed order — the jobs in flight, the **active** textures, then the table's
+bootstrap — and takes the first that has something to do. A texture the backend has delivered and nobody has released
+(`TexLive`, and the two offer stages before it) has nothing the pump could do for it until a release is asked, so it is
+not a candidate. The transaction that asks moves it out of those stages and adds it to the active map in the same step:
+the lease's release (`releaseTexture`), the close (`closeAndDrain`), the owner's end (`ownerEnded`) and the offer's answer
+(`deliver`). Nothing else writes those stages, and a texture leaves the texture map and the active map together, when it
+is forgotten.
+
+So the cost of one step is the jobs in flight plus the textures being released, held or retired, and never the textures
+retained; a wake that finds nothing re-examines only those. The work for a scenario is linear in the textures it creates
+and releases. Measured on the fake owner at one-pixel textures, per texture created and released: about 13 jobs, 8 active
+textures and 4 bootstrap checks examined, the same at 125 and at 2,000 textures. `withBackendObserved` lets a test count
+candidates by kind (`Examined`), and the `does work linear in the textures an instance retains and releases` example of
+`lua-engine-graphics-tests` bounds that count. `readBackend` is an observer, not part of the pump: it reads every texture's
+stage once per call.
 
 ## The readiness predicate
 
