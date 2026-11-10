@@ -535,7 +535,7 @@ cabal test hetoimasia-tests --test-show-details=direct
   charged at each site, the committed units for each texture, and the sixfold bound at the sites its own operations fix. The mass-release
   examples (250 to 2000 textures released at once with the release lane full) run with no concurrency in what they measure: the pump and the
   fake owner are advanced by the example one step at a time (`withBackendUnpumped`, `pumpOnce`, `ownerOnce`, `settle`), in a named order
-  (`Alternating`, or `PumpToBlock`), the same at every size, and assert the sixfold bound at every site under each schedule separately. A
+  (`Alternating`, or `PumpToBlock`), the same at every size, and assert the sixfold bound at every site under each schedule separately. The seams that stepping needs live in the package's private `internal` sub-library, and `Test.LuaEngine.Graphics.Boundary` compiles external clients to show that the public library exposes none of them. A
   further example asserts that the textures waiting for a full lane are released in the order of their ids, whatever the order they were
   asked in. The attempts a scheduler restarts are reported and never asserted.
   Every helper thread `lua-engine-graphics-tests` and `lua-engine-graphics-native-tests` start is an owned start
