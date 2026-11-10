@@ -71,7 +71,7 @@ is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).
 
-### Three read-only reads for a host's composition and precheck
+### Three read-only reads for a host's composition and precheck, and two transactional forms
 
 The two queries are transactions and the third is a pure read; none writes anything or changes any behaviour of the service. They were added for
 TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decision, and the owner's later decision for `inspectConfig`.
@@ -90,6 +90,10 @@ TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decisio
   host that composes over a service asks it, instead of being handed a configuration that might differ from the one the service enforces
   (the Lua adapter reads every limit it applies from it, and refuses a service configured above the caps Lua is promised). A terrain-runtime
   example reports the limits a service was built with whatever configuration a caller holds.
+* `retireSTM service request` and `releaseArenaLeaseSTM service lease` are `retire` and `releaseLease` as transactions (`Settlement`): the same functions, writing the same
+  state, for a host that gives a result or a lease back from inside a transaction of its own. The Lua host gives a request's credit back in the
+  transaction that takes the result or accounts its work, on whichever thread does, so it retires the result in that transaction instead of
+  queueing it for a later call; a `terrain-runtime` example shows both forms.
 
 ## State, owner, thread and lifetime
 

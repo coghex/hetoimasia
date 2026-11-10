@@ -81,11 +81,13 @@ is forgotten.
 
 So the cost of one step is the jobs in flight plus the textures being released, held or retired, and never the textures
 retained; a wake that finds nothing re-examines only those. The work for a scenario is linear in the textures it creates
-and releases. Measured on the fake owner at one-pixel textures, per texture created and released: about 13 jobs, 8 active
-textures and 4 bootstrap checks examined, the same at 125 and at 2,000 textures. `withBackendObserved` lets a test count
-candidates by kind (`Examined`), and the `does work linear in the textures an instance retains and releases` example of
-`lua-engine-graphics-tests` bounds that count. `readBackend` is an observer, not part of the pump: it reads every texture's
-stage once per call.
+and releases: measured on the fake owner at one-pixel textures, a pump evaluation examines at most two jobs and two active
+textures at any size, and the committed evaluations examine about ten jobs and six active textures for each texture created
+and released, the same at 250 and at 1,000 textures. `withBackendObserved` takes the observers an example counts by
+(`Examined` as an evaluation begins and for each candidate, and a hook after each committed evaluation), and the
+`does work linear in the textures an instance retains and releases` example of `lua-engine-graphics-tests` bounds the
+largest work of one evaluation and the work of the committed ones, never the attempts a scheduler restarts. `readBackend` is
+an observer, not part of the pump: it reads every texture's stage once per call.
 
 ## The readiness predicate
 
