@@ -79,9 +79,8 @@ import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as ByteString
 import Data.Map.Strict (Map)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
-import Data.Sequence (Seq, ViewL (EmptyL, (:<)), (|>), (><))
-import qualified Data.Sequence as Seq
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -90,7 +89,32 @@ import Data.Word (Word32)
 import Hetoimasia.Asset.Image (TexelFormat (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld, newSceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
-import Test.LuaEngine.Graphics.Work (Site (..), Work, newWork, tally)
+import Test.LuaEngine.Graphics.Work
+  ( CList
+  , CMap
+  , CSeq
+  , Site (..)
+  , Work
+  , charge
+  , clCons
+  , clEmpty
+  , clObserve
+  , cmAdjust
+  , cmDelete
+  , cmEmpty
+  , cmInsert
+  , cmLookup
+  , cmObserve
+  , cmSize
+  , cmToList
+  , commitIO
+  , csAppendList
+  , csFromListInitial
+  , csPopFront
+  , csPush
+  , newWork
+  , observe
+  )
 import Test.Support.Owned (withOwnedThread)
 import Control.Concurrent (ThreadId)
 
@@ -177,14 +201,14 @@ data Fake = Fake
   , fActs ∷ !(TVar [Pending])
   , fReleases ∷ !(TVar [Pending])
   , fEpoch ∷ !(TVar Int)
-  , fEvents ∷ !(TVar [Text])
+  , fEvents ∷ !(TVar (CList Text))
     -- ^ The event log, newest first.
-  , fImages ∷ !(TVar (Map Int ImageState))
+  , fImages ∷ !(TVar (CMap Int ImageState))
   , fNextImage ∷ !(TVar Int)
-  , fUploads ∷ !(TVar (Map Int Upload))
+  , fUploads ∷ !(TVar (CMap Int Upload))
   , fNextTicket ∷ !(TVar Int)
   , fBound ∷ !(TVar Bool)
-  , fSlotsFree ∷ !(TVar (Seq Word32))
+  , fSlotsFree ∷ !(TVar (CSeq Word32))
   , fRetiring ∷ !(TVar (Set Word32))
   , fHolders ∷ !(TVar Int)
   , fMarked ∷ !(TVar (Set TextureRef))
@@ -205,12 +229,12 @@ data Fake = Fake
     -- ^ Set once the example's scope is stopping ('latchHolds'): from then on 'hold', 'holdTicket' and 'setVersionHolders'
     -- install nothing, so a worker that is cancelled before it installs its holds cannot reinstall them after the stop let go
     -- of every one (#599).
-  , fOpen ∷ !(TVar (Map Int Upload))
+  , fOpen ∷ !(TVar (CMap Int Upload))
     -- ^ The uploads that are queued or uploading, by ticket: the only ones admission, the owner's loop and a reading look at.
     -- Written wherever an upload's state leaves those two (a completion, a cancellation, the owner's end).
   , fAlive ∷ !(TVar Int)
     -- ^ How many images are allocated, uploaded or registered; written only by 'setImage'.
-  , fSlotOwner ∷ !(TVar (Map Word32 Int))
+  , fSlotOwner ∷ !(TVar (CMap Word32 Int))
     -- ^ The image each registered slot holds; written only with a registration and its release.
   , fWork ∷ !Work
   }
@@ -223,13 +247,13 @@ newFake cfg =
     <*> newTVarIO []
     <*> newTVarIO []
     <*> newTVarIO 0
-    <*> newTVarIO []
-    <*> newTVarIO Map.empty
+    <*> newTVarIO clEmpty
+    <*> newTVarIO cmEmpty
     <*> newTVarIO 0
-    <*> newTVarIO Map.empty
+    <*> newTVarIO cmEmpty
     <*> newTVarIO 0
     <*> newTVarIO False
-    <*> newTVarIO (Seq.fromList [1 .. fromIntegral (fcSlots cfg)])
+    <*> newTVarIO (csFromListInitial [1 .. fromIntegral (fcSlots cfg)])
     <*> newTVarIO Set.empty
     <*> newTVarIO 0
     <*> newTVarIO Set.empty
@@ -240,9 +264,9 @@ newFake cfg =
     <*> newTVarIO Set.empty
     <*> newSceneLedger
     <*> newTVarIO False
-    <*> newTVarIO Map.empty
+    <*> newTVarIO cmEmpty
     <*> newTVarIO 0
-    <*> newTVarIO Map.empty
+    <*> newTVarIO cmEmpty
     <*> newWork
 
 -- | The work this fake and the backend over it have done, by site.
@@ -301,8 +325,8 @@ endOwner ∷ Fake → Text → IO ()
 endOwner fake why = atomically $ do
   writeTVar (fStanding fake) (Ended why)
   open ← readTVar (fOpen fake)
-  forM_ (Map.elems open) $ \upload → writeTVar (upState upload) TicketCancelled
-  writeTVar (fOpen fake) Map.empty
+  forM_ (Map.elems (cmObserve open)) $ \upload → writeTVar (upState upload) TicketCancelled
+  writeTVar (fOpen fake) cmEmpty
   forM_ [fActs fake, fReleases fake] $ \lane → do
     queued ← readTVar lane
     writeTVar lane []
@@ -335,8 +359,8 @@ bump fake = modifyTVar' (fEpoch fake) (+ 1)
 
 record ∷ Fake → Text → STM ()
 record fake line = do
-  tally (fWork fake) EventAppend 1
-  modifyTVar' (fEvents fake) (line :)
+  seen ← readTVar (fEvents fake)
+  clCons (charge (fWork fake) EventLog) line seen >>= writeTVar (fEvents fake)
 
 -- | The first injection this predicate picks, removed.
 takeInjection ∷ Fake → (Injection → Maybe a) → STM (Maybe a)
@@ -378,7 +402,7 @@ readFake ∷ Fake → STM Reading
 readFake fake = do
   alive ← readTVar (fAlive fake)
   registered ← readTVar (fSlotOwner fake)
-  open ← Map.elems <$> readTVar (fOpen fake)
+  open ← Map.elems . cmObserve <$> readTVar (fOpen fake)
   acts ← readTVar (fActs fake)
   releases ← readTVar (fReleases fake)
   bound ← readTVar (fBound fake)
@@ -387,7 +411,7 @@ readFake fake = do
   pure
     Reading
       { readingImagesAlive = alive
-      , readingRegistrations = Map.size registered
+      , readingRegistrations = cmSize registered
       , readingStagingUsed = sum (map upBytes open)
       , readingActsQueued = length acts
       , readingReleasesQueued = length releases
@@ -410,8 +434,9 @@ aliveState = \case
 setImage ∷ Fake → Int → ImageState → STM ()
 setImage fake image new = do
   images ← readTVar (fImages fake)
-  let before = maybe 0 (fromEnum . aliveState) (Map.lookup image images)
-  writeTVar (fImages fake) (Map.insert image new images)
+  found ← cmLookup (charge (fWork fake) ImageMap) image images
+  let before = maybe 0 (fromEnum . aliveState) found
+  cmInsert (charge (fWork fake) ImageMap) image new images >>= writeTVar (fImages fake)
   modifyTVar' (fAlive fake) (+ (fromEnum (aliveState new) - before))
 
 awaitFake ∷ Fake → (Reading → Bool) → IO ()
@@ -424,7 +449,7 @@ noteEvent ∷ Fake → Text → IO ()
 noteEvent fake line = atomically (record fake line)
 
 events ∷ Fake → IO [Text]
-events fake = reverse <$> readTVarIO (fEvents fake)
+events fake = reverse . clObserve <$> readTVarIO (fEvents fake)
 
 eventCount ∷ Fake → Text → IO Int
 eventCount fake line = length . filter (== line) <$> events fake
@@ -432,17 +457,17 @@ eventCount fake line = length . filter (== line) <$> events fake
 -- | Block until the fake has recorded an event with this text as a prefix.
 awaitEvent ∷ Fake → Text → IO ()
 awaitEvent fake prefix = atomically $ do
-  seen ← readTVar (fEvents fake)
+  seen ← clObserve <$> readTVar (fEvents fake)
   unless (any (Text.isPrefixOf prefix) seen) retry
 
 -- | Block until the fake has recorded this exact line at least this many times.
 awaitEventCount ∷ Fake → Text → Int → IO ()
 awaitEventCount fake line wanted = atomically $ do
-  seen ← readTVar (fEvents fake)
+  seen ← clObserve <$> readTVar (fEvents fake)
   unless (length (filter (== line) seen) >= wanted) retry
 
 imageStates ∷ Fake → IO (Map Int ImageState)
-imageStates fake = readTVarIO (fImages fake)
+imageStates fake = cmObserve <$> readTVarIO (fImages fake)
 
 -- The port ------------------------------------------------------------------------------------------------------
 
@@ -453,14 +478,18 @@ fakePort fake =
     , portAct = admit (fActs fake) (fcActCapacity cfg)
     , portRelease = admitGated (fReleases fake) (fcReleaseCapacity cfg)
     , portUpload = admitUpload fake
-    , portTicket = \ticket → readTVar . upState . (Map.! ticket) =<< readTVar (fUploads fake)
+    , portTicket = \ticket → do
+        uploads ← readTVar (fUploads fake)
+        found ← cmLookup (observe (fWork fake) UploadHistory) ticket uploads
+        maybe (error ("the fake has no upload " <> show ticket)) (readTVar . upState) found
     , portCancel = \ticket → do
         uploads ← readTVar (fUploads fake)
-        let upload = uploads Map.! ticket
+        found ← cmLookup (observe (fWork fake) UploadHistory) ticket uploads
+        let upload = fromMaybe (error ("the fake has no upload " <> show ticket)) found
         readTVar (upState upload) >>= \case
           TicketQueued → do
             writeTVar (upState upload) TicketCancelled
-            modifyTVar' (fOpen fake) (Map.delete ticket)
+            readTVar (fOpen fake) >>= cmDelete (observe (fWork fake) OwnerUploads) ticket >>= writeTVar (fOpen fake)
             record fake ("upload cancelled " <> tshow ticket)
             bump fake
             pure CancelledNow
@@ -519,8 +548,7 @@ admitUpload fake image bytes = atomically $ do
   pressured ← spend fake (\case AdmitPressure n → Just (n, AdmitPressure); _ → Nothing)
   faulty ← takeInjection fake (\case AdmitFault refusal → Just refusal; _ → Nothing)
   standing ← readTVar (fStanding fake)
-  openUploads ← Map.elems <$> readTVar (fOpen fake)
-  tally (fWork fake) Admission (1 + length openUploads)
+  openUploads ← map snd <$> (readTVar (fOpen fake) >>= cmToList (charge (fWork fake) Admission))
   let open = length openUploads
       used = sum (map upBytes openUploads)
   case standing of
@@ -535,8 +563,8 @@ admitUpload fake image bytes = atomically $ do
           writeTVar (fNextTicket fake) (ticket + 1)
           state ← newTVar (if lost then TicketLost else TicketQueued)
           let upload = Upload image size state
-          modifyTVar' (fUploads fake) (Map.insert ticket upload)
-          unless lost (modifyTVar' (fOpen fake) (Map.insert ticket upload))
+          readTVar (fUploads fake) >>= cmInsert (charge (fWork fake) UploadHistory) ticket upload >>= writeTVar (fUploads fake)
+          unless lost (readTVar (fOpen fake) >>= cmInsert (charge (fWork fake) Admission) ticket upload >>= writeTVar (fOpen fake))
           record fake ("upload admitted " <> tshow ticket <> " image " <> tshow image <> " bytes " <> tshow size)
           bump fake
           pure (Right ticket)
@@ -550,7 +578,6 @@ deviceFor fake =
           failure ← takeInjection fake (\case FailAllocate fault → Just fault; _ → Nothing)
           pressure ← spend fake (\case PressureAllocate n → Just (n, PressureAllocate); _ → Nothing)
           alive ← readTVar (fAlive fake)
-          tally (fWork fake) Allocation 1
           case failure of
             Just fault → pure (Left fault)
             Nothing
@@ -574,19 +601,21 @@ deviceFor fake =
           failure ← takeInjection fake (\case FailRegister fault → Just fault; _ → Nothing)
           bound ← readTVar (fBound fake)
           images ← readTVar (fImages fake)
+          imageNow ← cmLookup (charge (fWork fake) ImageMap) image images
           free ← readTVar (fSlotsFree fake)
+          popped ← csPopFront (charge (fWork fake) FreeSlots) free
           case failure of
             Just fault → pure (Left fault)
             Nothing
               | not bound → pure (Left FaultNotReady)
-              | Map.lookup image images /= Just Uploaded → pure (Left (FaultFatal ("registering image " <> tshow image <> " whose upload had not completed")))
-              | EmptyL ← Seq.viewl free → pure (Left FaultPressure)
-              | slot :< rest ← Seq.viewl free → do
+              | imageNow /= Just Uploaded → pure (Left (FaultFatal ("registering image " <> tshow image <> " whose upload had not completed")))
+              | Nothing ← popped → pure (Left FaultPressure)
+              | Just (slot, rest) ← popped → do
                   generation ← readTVar (fNextGeneration fake)
                   writeTVar (fNextGeneration fake) (generation + 1)
                   writeTVar (fSlotsFree fake) rest
                   setImage fake image (Registered slot)
-                  modifyTVar' (fSlotOwner fake) (Map.insert slot image)
+                  readTVar (fSlotOwner fake) >>= cmInsert (charge (fWork fake) SlotOwners) slot image >>= writeTVar (fSlotOwner fake)
                   record fake ("registered " <> tshow image <> " slot " <> tshow slot <> " alpha " <> tshow (levelBinaryAlpha level) <> formatSuffix (levelFormat level))
                   bump fake
                   pure (Right (Registration (TextureRef slot generation) slot))
@@ -612,17 +641,17 @@ deviceFor fake =
     releaseNow registration = do
         failure ← takeInjection fake (\case FailRelease fault → Just fault; _ → Nothing)
         owners ← readTVar (fSlotOwner fake)
-        tally (fWork fake) ReleaseLookup 1
         let slot = registrationSlot registration
-        case (failure, Map.lookup slot owners) of
+        holder ← cmLookup (charge (fWork fake) SlotOwners) slot owners
+        case (failure, holder) of
           (Just fault, _) → pure (Left fault)
           (_, Just image) → do
             setImage fake image (ReleasedHandle slot)
-            modifyTVar' (fSlotOwner fake) (Map.delete slot)
+            cmDelete (charge (fWork fake) SlotOwners) slot owners >>= writeTVar (fSlotOwner fake)
             holders ← readTVar (fHolders fake)
             if holders > 0
               then modifyTVar' (fRetiring fake) (Set.insert slot)
-              else tally (fWork fake) SlotAppend 1 >> modifyTVar' (fSlotsFree fake) (|> slot)
+              else readTVar (fSlotsFree fake) >>= \free → csPush (charge (fWork fake) FreeSlots) free slot >>= writeTVar (fSlotsFree fake)
             record fake ("released " <> tshow image <> " slot " <> tshow slot)
             bump fake
             pure (Right ())
@@ -663,16 +692,16 @@ ownerLoop fake = do
       holders ← readTVar (fHolders fake)
       grants ← readTVar (fGrants fake)
       ticketHolds ← readTVar (fTicketHolds fake)
-      tally (fWork fake) OwnerUploads (1 + Map.size uploads)
-      states ← traverse (\(ticket, upload) → (,) (ticket, upload) <$> readTVar (upState upload)) (Map.toList uploads)
-      tally (fWork fake) OwnerReleases (1 + length releases)
+      uploadList ← cmToList (observe (fWork fake) OwnerUploads) uploads
+      states ← traverse (\(ticket, upload) → (,) (ticket, upload) <$> readTVar (upState upload)) uploadList
+      observe (fWork fake) OwnerReleases (1 + length releases)
       gated ← traverse (\pending → (,) pending <$> pendingGate pending) releases
       let readyRelease = case break snd gated of
             (before, (pending, _) : after) → ([pending], map fst before <> map fst after)
             (_, []) → ([], map fst gated)
       let canRun = standing == Running && (not (on HoldOwner) || grants > 0)
           spendGrant = when (on HoldOwner) (writeTVar (fGrants fake) (grants - 1))
-      case () of
+      chosen ← case () of
         _
           | canRun, pending : rest ← acts → do
               writeTVar (fActs fake) rest
@@ -690,8 +719,8 @@ ownerLoop fake = do
               lost ← readTVar (fInjected fake)
               _ <- pure lost
               writeTVar (upState upload) TicketComplete
-              modifyTVar' (fOpen fake) (Map.delete ticket)
-              modifyTVar' (fImages fake) (Map.adjust (\case Allocated → Uploaded; other → other) (upImage upload))
+              readTVar (fOpen fake) >>= cmDelete (charge (fWork fake) OwnerUploads) ticket >>= writeTVar (fOpen fake)
+              readTVar (fImages fake) >>= cmAdjust (charge (fWork fake) ImageMap) (\case Allocated → Uploaded; other → other) (upImage upload) >>= writeTVar (fImages fake)
               record fake ("upload completed " <> tshow ticket)
               bump fake
           | not (on HoldBind), not bound → pure . atomically $ do
@@ -700,11 +729,14 @@ ownerLoop fake = do
               bump fake
           | not (on HoldReclaim), holders == 0, not (Set.null retiring) → pure . atomically $ do
               free ← readTVar (fSlotsFree fake)
-              writeTVar (fSlotsFree fake) (free >< Seq.fromList (Set.toList retiring))
+              csAppendList (charge (fWork fake) FreeSlots) free (Set.toList retiring) >>= writeTVar (fSlotsFree fake)
               writeTVar (fRetiring fake) Set.empty
               record fake ("reclaimed " <> Text.intercalate "," (map tshow (Set.toList retiring)))
               bump fake
           | otherwise → retry
+      -- What the scan walked is the work of this evaluation only if it committed: the owner returns its charges and the loop
+      -- counts them after the transaction (a charge written here would be read by a transaction that waits).
+      pure (commitIO (fWork fake) OwnerUploads (1 + cmSize uploads) >> commitIO (fWork fake) OwnerReleases (1 + length releases) >> chosen)
     findFree blocked wanted states = case [(ticket, upload) | ((ticket, upload), state) ← states, state == wanted, ticket `Set.notMember` blocked] of
       first : _ → Just first
       [] → Nothing

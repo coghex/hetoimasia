@@ -168,12 +168,19 @@ data Backend image ticket = Backend
   { bPort ∷ !(Port image ticket)
   , bState ∷ !(TVar (State image ticket))
   , bExamined ∷ !(Examined → STM ())
-    -- ^ Called, inside the pump's transaction, once for each candidate it examines. It never affects a decision.
+    -- ^ Called, inside the pump's transaction, once as an evaluation begins and once for each candidate it examines. It never
+    -- affects a decision.
+  , bCommitted ∷ !(IO ())
+    -- ^ Called by the pump's thread, outside any transaction, after each evaluation of 'nextStep' that committed. An evaluation
+    -- that retried (the pump waiting) or restarted never reaches it, so what an observer saw since 'ExaminedEvaluation' is, here,
+    -- the work of a committed evaluation. It never affects a decision.
   }
 
 -- | A candidate the pump examined while it looked for its next step.
 data Examined
-  = -- | A job (accepted upload).
+  = -- | An evaluation of the pump's next step began (a restarted one begins again).
+    ExaminedEvaluation
+  | -- | A job (accepted upload).
     ExaminedJob
   | -- | A texture that has a step or waits on something.
     ExaminedTexture
@@ -298,15 +305,17 @@ instance Exception BackendDefect
 -- texture is proved retired (or failed to be). Only then does the pump stop. A cancellation delivered
 -- while it drains is remembered and raised once the drain is over.
 withBackend ∷ ∀ image ticket a. Port image ticket → (Backend image ticket → IO a) → IO a
-withBackend = withBackendObserved (\_ → pure ())
+withBackend = withBackendObserved (\_ → pure ()) (pure ())
 
--- | 'withBackend' with an observer of the pump's work: called inside the pump's (and the close's) transactions
--- once for each candidate examined. A transaction that retries or restarts calls it again, so a count kept from it
--- is the work attempted, which a deterministic example bounds; it is never an input to a decision.
-withBackendObserved ∷ ∀ image ticket a. (Examined → STM ()) → Port image ticket → (Backend image ticket → IO a) → IO a
-withBackendObserved examined port body = withWorkerGroup $ \group → do
+-- | 'withBackend' with an observer of the pump's work. The first is called inside the pump's (and the close's) transactions as
+-- an evaluation begins and once for each candidate examined; a transaction that retries or restarts calls it again, so a count
+-- kept from it is the work /attempted/, which depends on how often the scheduler restarted the transaction. The second is
+-- called, on the pump's thread after the transaction, for each evaluation that committed: what was seen since the last
+-- 'ExaminedEvaluation' is the work of that one evaluation, however many attempts it took. Neither is an input to a decision.
+withBackendObserved ∷ ∀ image ticket a. (Examined → STM ()) → IO () → Port image ticket → (Backend image ticket → IO a) → IO a
+withBackendObserved examined committed port body = withWorkerGroup $ \group → do
   var ← newTVarIO (State Running' Map.empty 0 Map.empty 0 BootIdle Nothing Nothing [] 0 Map.empty)
-  let backend = Backend port var examined
+  let backend = Backend port var examined committed
   result ← mask $ \restore → do
     outcome ← tryWithContext @SomeException $ restore $ do
       started ← startWorker group (workerDefinition "texture-backend-pump" (\_ → pure ()) (\token () → pumpWorker backend token))
@@ -569,7 +578,7 @@ pumpWorker backend token = mask $ \restore → do
       abandonAll backend "the texture backend's pump failed and advances nothing again"
       rethrowIO caught
   where
-    loop = atomically (nextStep backend token) >>= \case
+    loop = atomically (nextStep backend token) >>= \step → bCommitted backend >> case step of
       StepDone → pure ()
       StepProgress → loop
       StepIO act → do
@@ -603,6 +612,7 @@ abandonAll backend why = do
 -- active ones; a retained texture's release arrives as a write to the state, which this transaction reads.
 nextStep ∷ ∀ image ticket. Backend image ticket → StopToken → STM Step
 nextStep backend token = do
+  bExamined backend ExaminedEvaluation
   st ← readTVar (bState backend)
   standing ← portStanding (bPort backend)
   case standing of
