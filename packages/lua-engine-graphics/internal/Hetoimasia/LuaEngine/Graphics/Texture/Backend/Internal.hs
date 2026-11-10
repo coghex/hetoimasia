@@ -151,8 +151,8 @@ import Hetoimasia.Foundation.Worker
   , Completion (completionCleanup, completionLabel, completionResult)
   )
 import qualified Hetoimasia.Foundation.Resource as Resource
-import Hetoimasia.LuaEngine.Graphics.Texture.Port hiding (textureIdentity)
-import qualified Hetoimasia.LuaEngine.Graphics.Texture.Port as Port
+import Hetoimasia.LuaEngine.Graphics.Texture.Port.Internal hiding (textureIdentity)
+import qualified Hetoimasia.LuaEngine.Graphics.Texture.Port.Internal as Port
 import Hetoimasia.Asset.Image (TexelFormat)
 import Hetoimasia.LuaEngine.Texture.Backend
   ( BackendTexture (..)
