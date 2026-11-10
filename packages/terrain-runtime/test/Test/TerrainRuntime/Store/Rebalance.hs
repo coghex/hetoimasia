@@ -17,6 +17,7 @@ import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Discovery (Node (..), Record, RecordKey (..))
+import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), bodyBytes, encodePage, innerKeyBytes)
@@ -241,61 +242,22 @@ specAdversarial = describe "adversarial histories over both key kinds, at two an
     rows ← must (mapM (history 2800 900) [1, 2])
     putStrLn ("ADVERSARIAL three levels: (height at start, at end, commits) per seed " <> show rows <> "; commits " <> show (sum [c | (_, _, c) ← rows]))
     [r | r@(h0, _, _) ← rows, h0 /= 3] `shouldBe` []
-  it "splits a parent a deletion's repack left over-full: a longer separator (52 bytes for 25) in a parent within 27 bytes of full" $ do
-    -- the round-15 candidate, constructed: a links root within 27 bytes of a page whose children around the Src/Run boundary are a
-    -- full leaf of Src keys and a Run leaf at the minimum fill. Deleting one key of the small leaf under-fills it; the repack splits
-    -- the pair at its middle, inside the Src leaf, and installs a 52-byte Src key as the separator that held a 25-byte Run key.
-    let srcK j = linkKey (srcNode (toInteger (j `mod` 60)) (toInteger (j `div` 60)) 0)
-        runK j = linkKey (RunNode (columnAt (toInteger j) 0) 0)
-        val = rootRec 3 False
-        entryOf k = (encodeKey k, encodeValue val)
-        srcKs = sortOn encodeKey [srcK j | j ← [0 .. 4999 ∷ Int]]
-        runKs = sortOn encodeKey [runK j | j ← [0 .. 2999 ∷ Int]]
-        leafBytes es = bodyBytes (Leaf es)
-        takeFull ks = go [] ks
-          where
-            go acc (k : rest) | leafBytes (map entryOf (acc ++ [k])) <= pagePayloadBytes = go (acc ++ [k]) rest
-            go acc _ = acc
-        takeMin ks = case [take n ks | n ← [1 .. length ks], not (underFull False (leafBytes (map entryOf (take n ks))))] of
-          (x : _) → x
-          [] → []
-        bKs = takeMin runKs
-        chunk n xs = if null xs then [] else take n xs : chunk n (drop n xs)
-        otherSrc a = take a (chunk 20 srcKs)
-        otherRun b = take b (chunk 28 (drop (length bKs) runKs))
-        sepOf es = case es of
-          ((k, _) : _) → k
-          [] → BS.empty
-        window = [(a, b) | a ← [20 .. 70 ∷ Int], b ← [0 .. 40 ∷ Int], let t = 65 * (a + 1) + 38 * (b + 1), t <= pagePayloadBytes, t > pagePayloadBytes - 27]
-    (nSrc, nRun) ← case window of
-      (w : _) → pure w
-      [] → expectationFailure "no children count puts the parent within 27 bytes of full" >> fail "window"
-    let fullA = takeFull (drop (20 * nSrc) srcKs)
-        leafGroups = [map entryOf ks | ks ← otherSrc nSrc] ++ [map entryOf fullA] ++ [map entryOf bKs] ++ [map entryOf ks | ks ← otherRun nRun]
-        nLeaves = length leafGroups
-        leafPage l es = Page TreeLinks 0 (PageNo (fromIntegral (l ∷ Int))) (Leaf es)
-        crcOf pg = getLe32' (either (error . show) id (encodePage ident0 pg)) 4092
-        leafPages = zipWith leafPage [0 ..] leafGroups
-        rootPage = Page TreeLinks 1 (PageNo (fromIntegral nLeaves)) (Inner [(sepOf es, Child (pgNo pg) (crcOf pg)) | (es, pg) ← zip leafGroups leafPages])
-        h0 = newH smallSpec ident0
-        pages = leafPages ++ [rootPage]
-        disk = foldl (\dk pg → diskWrite (pgNo pg) (either (error . show) id (encodePage ident0 pg)) dk) (hDisk h0) pages
-        total = fromIntegral (length pages) ∷ Word64
-        roots0 = storeRoots (hStore h0)
-        roots = roots0 {rVersion = 1, rLinks = Just (pgNo rootPage), rHw = total, rLivePages = total, rRootCrcs = [(TreeLinks, crcOf rootPage)]}
-        h = h0 {hStore = storeFromRoots (hCfg h0) ident0 roots, hDisk = disk}
-        ref = Map.fromList [(k, val) | k ← concat (otherSrc nSrc) ++ fullA ++ bKs ++ concat (otherRun nRun)]
-        victim = case bKs of
-          (k : _) → k
-          [] → srcK (0 ∷ Int)
-    -- the shape the case needs
-    (bodyBytes (pgBody rootPage) <= pagePayloadBytes && bodyBytes (pgBody rootPage) > pagePayloadBytes - 27) `shouldBe` True
-    (leafBytes (map entryOf fullA) > pagePayloadBytes - 70) `shouldBe` True
-    underFull False (leafBytes (map entryOf (drop 1 bKs))) `shouldBe` True
+  it "a deletion's repack installs a longer separator (52 bytes for 25) in the parent: the pair is the full Src leaf and the LAST, minimum Run leaf" $ do
+    -- the round-15 candidate. rebalanceChild pairs an under-full child with its RIGHT sibling when it has one, so a longer separator
+    -- needs the under-full Run leaf to be the last child: the pair is then (full Src leaf, Run leaf), the repack splits it at its middle,
+    -- inside the Src leaf, and the parent's entry for the Run leaf now holds a 52-byte Src key where a 25-byte Run key was.
+    let (h, ref, victim, rootBytes, srcE, runE) = overfullFixture
     must (checkH h)
     h1 ← must (commitWrites h [(victim, Nothing)])
     must (checkH h1)
     must (compareRecords (Map.toList (Map.delete victim ref)) h1)
+    -- the parent grew by exactly the difference of the two separators, and still fits
+    rootAfter ← must (rootBytesOf h1)
+    rootAfter `shouldBe` rootBytes + (srcE - runE)
+    (rootAfter <= pagePayloadBytes) `shouldBe` True
+  it "TRIPWIRE: no count of Src children and one Run child puts a parent within one separator difference of full, so the over-full case cannot be built from this format's key sizes; if it ever can, build it" $ do
+    let (_, _, _, _, srcE, runE) = overfullFixture
+    [x | x ← [1 .. 200 ∷ Int], let t = x * srcE + runE, t <= pagePayloadBytes, t + (srcE - runE) > pagePayloadBytes] `shouldBe` []
   it "the exit every write shares: an over-full node is split into two legal halves, a fitting one rewritten, an emptied one dropped" $ do
     -- a repack of the children can replace a separator by a longer key, so a parent within a few bytes of full may exceed a page
     -- when a deletion rewrites it: the exit insertion and deletion share splits it
@@ -307,3 +269,63 @@ specAdversarial = describe "adversarial histories over both key kinds, at two an
     (kind2, halves) ← outcome 120
     kind2 `shouldBe` "two"
     all (\b → b <= pagePayloadBytes && not (underFull False b)) halves `shouldBe` True
+
+-- | A links tree of two levels whose root holds Src leaves and, LAST, a Run leaf at the minimum fill, the parent as full as the key
+-- sizes allow: the store, its records, the Run leaf's first key, the parent's bytes, and the sizes of a Src and of a Run separator.
+overfullFixture ∷ (H, Map.Map RecordKey Record, RecordKey, Int, Int, Int)
+overfullFixture = (h, ref, victim, bodyBytes (pgBody rootPage), srcE, runE)
+  where
+    srcK j = linkKey (srcNode (toInteger (j `mod` 60)) (toInteger (j `div` 60)) 0)
+    runK j = linkKey (RunNode (columnAt (toInteger j) 0) 0)
+    val = rootRec 3 False
+    entryOf k = (encodeKey k, encodeValue val)
+    srcKs = sortOn encodeKey [srcK j | j ← [0 .. 4999 ∷ Int]]
+    runKs = sortOn encodeKey [runK j | j ← [0 .. 99 ∷ Int]]
+    srcE = innerKeyBytes (encodeKey (srcK (0 ∷ Int)))
+    runE = innerKeyBytes (encodeKey (runK (0 ∷ Int)))
+    leafBytes es = bodyBytes (Leaf es)
+    takeFull ks = go [] ks
+      where
+        go acc (k : rest) | leafBytes (map entryOf (acc ++ [k])) <= pagePayloadBytes = go (acc ++ [k]) rest
+        go acc _ = acc
+    bKs = case [take n runKs | n ← [1 .. length runKs], not (underFull False (leafBytes (map entryOf (take n runKs))))] of
+      (x : _) → x
+      [] → []
+    -- the most Src children (the last of them a full leaf) that leave room for the one Run child
+    nSrc = last [x | x ← [1 .. 200 ∷ Int], x * srcE + runE <= pagePayloadBytes]
+    chunk n xs = if null xs then [] else take n xs : chunk n (drop n xs)
+    others = take (nSrc - 1) (chunk 20 srcKs)
+    fullA = takeFull (drop (20 * (nSrc - 1)) srcKs)
+    groups = [map entryOf ks | ks ← others] ++ [map entryOf fullA, map entryOf bKs]
+    leafPage l es = Page TreeLinks 0 (PageNo (fromIntegral (l ∷ Int))) (Leaf es)
+    crcOf pg = getLe32' (either (error . show) id (encodePage ident0 pg)) 4092
+    leafPages = zipWith leafPage [0 ..] groups
+    sepOf es = case es of
+      ((k, _) : _) → k
+      [] → BS.empty
+    rootPage = Page TreeLinks 1 (PageNo (fromIntegral (length groups))) (Inner [(sepOf es, Child (pgNo pg) (crcOf pg)) | (es, pg) ← zip groups leafPages])
+    h0 = newH smallSpec ident0
+    pages = leafPages ++ [rootPage]
+    disk = foldl (\dk pg → diskWrite (pgNo pg) (either (error . show) id (encodePage ident0 pg)) dk) (hDisk h0) pages
+    total = fromIntegral (length pages) ∷ Word64
+    roots0 = storeRoots (hStore h0)
+    roots = roots0 {rVersion = 1, rLinks = Just (pgNo rootPage), rHw = total, rLivePages = total, rRootCrcs = [(TreeLinks, crcOf rootPage)]}
+    h = h0 {hStore = storeFromRoots (hCfg h0) ident0 roots, hDisk = disk}
+    ref = Map.fromList [(k, val) | k ← concat others ++ fullA ++ bKs]
+    victim = case bKs of
+      (k : _) → k
+      [] → srcK (0 ∷ Int)
+
+-- | The payload bytes of the links root a store publishes, read from its disk by the reference parser.
+rootBytesOf ∷ H → Either String Int
+rootBytesOf h = case rLinks (storeRoots (hStore h)) of
+  Nothing → Left "no links root"
+  Just (PageNo p) → case diskRead (hDisk h) (PageNo p) of
+    Nothing → Left "the links root is not readable"
+    Just bs → do
+      pg ← parsePage a (siSource (hIdent h)) bs
+      case rpBody pg of
+        RefInner es → Right (sum [1 + BS.length k + 12 | (k, _, _) ← es])
+        _ → Left "the links root is not an inner page"
+  where
+    ArenaId a = siArena (hIdent h)
