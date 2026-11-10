@@ -25,6 +25,7 @@ component's test module is imported.
 | `Hetoimasia.LuaEngine.Graphics.Texture` | The composition: `withTextureGraphics` over a borrowed host, the session's renderer and texture registry, the backend, identities. |
 | `…Texture.Configuration` | The native configuration the fixed M1 profile maps to, and the checks of a host built for it. Pure. |
 | `…Texture.Backend` | The state machine and its one pump thread, over a `Port`. Nothing in it names Vulkan. |
+| `…Texture.Backend.Internal` | The implementation of the backend, with its contract, and what the package's own suite needs beyond the public module: an observed scope, an unpumped scope and `pumpOnce`, with which an example advances the pump itself. |
 | `…Texture.Port` | The boundary to the graphics owner, as values: the seam the lifecycle suite injects. |
 | `…Texture.Host` | The production `Port`, over a running `VulkanHost`. |
 | `Hetoimasia.LuaEngine.Graphics.Input` | The Lua input adapter (TRA-6): the source of one window's feed, the single consumer, the per-VM registry and the facade's `InputServices`. |
@@ -89,7 +90,8 @@ examines at most two jobs and two active textures in the one-pixel scenario at a
 to 2,000 with the lane full (a lane of 16, the ones the owner has to answer, and the lowest waiting), where it examined every texture
 waiting before. `withBackendObserved` takes the observers an example counts by (`Examined` as an evaluation begins and for each
 candidate, and a hook after each committed evaluation), and the `does work linear in …` examples of `lua-engine-graphics-tests` bound
-the largest work of one evaluation and the work of the committed ones, never the attempts a scheduler restarts. `readBackend` is an
+the largest work of one evaluation and the work of the committed ones, never the attempts a scheduler restarts; the mass release is
+measured with the pump and the fake owner stepped one at a time, under two named schedules, so that its totals are compared across sizes. `readBackend` is an
 observer, not part of the pump: it reads every texture's stage once per call.
 
 ## The readiness predicate
