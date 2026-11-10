@@ -168,7 +168,8 @@ import Hetoimasia.Terrain.Runtime.Settlement
   , columnWith
   , openArenaWith
   , removeWith
-  , retire
+  , releaseArenaLeaseSTM
+  , retireSTM
   , surfaceWith
   )
 import Hetoimasia.Terrain.Shape (shapeIdValue)
@@ -392,6 +393,9 @@ data Link = Link
   , lkTerminal ∷ !(TVar Bool)
   , lkSettled ∷ !(STM Bool)
   -- ^ The host has settled this request: its terminal settlement was made, not only delivered to the host's seam.
+  , lkDropped ∷ !(TVar [ArenaLease])
+  -- ^ The leases the service made for this request and the host did not publish (an attach that found its open still unpublished): given back in
+  -- the transaction that gives the request's credit back, when the service has recorded them.
   , lkId ∷ !Unique
   -- ^ The identity of this request's incarnation of the name it opens: what it holds in 'tfOffered', and all it ever lets go of.
   }
@@ -419,6 +423,7 @@ data Clients = Clients
 data Pending = Pending
   { pdAsk ∷ !Ask
   , pdRequest ∷ !(TVar (Maybe Request))
+  , pdDropped ∷ !(TVar [ArenaLease])
   }
 
 data Env = Env
@@ -427,12 +432,9 @@ data Env = Env
   , envSession ∷ !Int
   , envClients ∷ !(TVar (Map Text Clients))
   , envAsks ∷ !(TVar (Word64, Map Word64 Pending))
-  , envRetire ∷ !(TVar [Request])
   , envIssued ∷ !(TVar (Map Text (Set Word64)))
   -- ^ The arena handles each live instance was issued: ownership is positive, so another instance's handle is refused for as long
   -- as the caller lives, whether or not the issuing instance does. The memory is the handles the instance issued, ended with it.
-  , envDropped ∷ !(TVar [ArenaLease])
-  -- ^ Leases the service made for a request the host settled instead of publishing them: released at the next drain.
   }
 
 service ∷ Env → Service
@@ -450,10 +452,8 @@ terrainInjection config =
     , injectTerrain = \vm → do
         clients ← newTVarIO Map.empty
         asks ← newTVarIO (1, Map.empty)
-        retiring ← newTVarIO []
         issued ← newTVarIO Map.empty
-        dropped ← newTVarIO []
-        let env = Env config vm (hashUnique (tvSession vm)) clients asks retiring issued dropped
+        let env = Env config vm (hashUnique (tvSession vm)) clients asks issued
         pure (services env)
     }
 
@@ -613,15 +613,11 @@ attachClientOf env identity = do
 nameKey ∷ Env → Text → Text → Text
 nameKey env root name = "s" <> Text.pack (show (envSession env)) <> "/" <> root <> "/" <> name
 
--- | The retire queue's drain: every request whose host record has been taken or discarded and whose work is over gives the
--- service back the result it held, in IO, on whichever thread drains it. Never blocks.
+-- | What an operation of an instance sweeps: the claims of opens that have ended and the failed opens the host has settled. Never blocks. (A
+-- request's result and a lease the host did not publish are given back to the service in the transaction that settles or takes them, not
+-- here: nothing is queued for a later call.)
 drainRetired ∷ Env → IO ()
-drainRetired env = do
-  requests ← atomically (swapTVar (envRetire env) [])
-  forM_ (reverse requests) (retire (service env))
-  atomically (pruneClaims (names (envFacade env)) >> pruneFailedOpens (names (envFacade env)))
-  dropped ← atomically (swapTVar (envDropped env) [])
-  forM_ (reverse dropped) (Terrain.releaseLease (service env))
+drainRetired env = atomically (pruneClaims (names (envFacade env)) >> pruneFailedOpens (names (envFacade env)))
 
 -- The asks ------------------------------------------------------------------------------------------------------
 
@@ -896,6 +892,7 @@ submit env submission = mask_ $ do
       <$> newTVarIO NoLease
       <*> newTVarIO False
       <*> pure (submissionSettled submission)
+      <*> pure (pdDropped found)
       <*> newUnique
   noted ← newTVarIO False
   let -- What decides a commit, read in the transaction that makes it: the session still takes new work, the request is still
@@ -1075,7 +1072,8 @@ settleInto env link = \case
       pending ← maybe (pure False) (heldBack (envFacade env)) (lkAttach link)
       if pending
         then do
-          modifyTVar' (envDropped env) (lease :)
+          -- the lease the service made is the request's to give back with its credit: the service records it only after this callback
+          modifyTVar' (lkDropped link) (lease :)
           _ ← settlingSettle (lkSettling link) (failureReply NotFound)
           writeTVar (lkTerminal link) True
         else offer lease
@@ -1207,9 +1205,10 @@ start ∷ Env → RequestContext → Text → M1Ask → Ask → IO TerrainStart
 start env context endpointName ask typed = mask $ \restore → do
   drainRetired env
   requestVar ← newTVarIO Nothing
+  droppedVar ← newTVarIO []
   ticket ← atomically $ do
     (next, held) ← readTVar (envAsks env)
-    writeTVar (envAsks env) (next + 1, Map.insert next (Pending typed requestVar) held)
+    writeTVar (envAsks env) (next + 1, Map.insert next (Pending typed requestVar droppedVar) held)
     pure next
   let credit =
         Credit
@@ -1217,7 +1216,13 @@ start env context endpointName ask typed = mask $ \restore → do
           , creditReserve = pure True
           , creditRelease = \case
               CreditUnused → pure ()
-              CreditSettled → readTVar requestVar >>= mapM_ (\request → modifyTVar' (envRetire env) (request :))
+              -- The result the service held for the request is given back in the very transaction that gives the credit back, on the thread
+              -- that does: the taking script's, or the owner's accounting of the work, whichever comes last. Nothing is queued, so no VM's
+              -- later call is needed to retire what an idle VM took.
+              CreditSettled → do
+                readTVar requestVar >>= mapM_ (retireSTM (service env))
+                -- and the lease the service made for an attach the host answered without publishing it, which it records by now
+                readTVar droppedVar >>= mapM_ (releaseArenaLeaseSTM (service env))
           , creditTransfers = False
           }
       withCredit = ask {askCredits = askCredits ask <> [credit]}

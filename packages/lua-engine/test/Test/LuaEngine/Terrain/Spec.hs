@@ -8,6 +8,7 @@ import qualified Test.LuaEngine.Terrain.Fixture as Fixture
 import qualified Test.LuaEngine.Terrain.Isolation as Isolation
 import qualified Test.LuaEngine.Terrain.Limits as Limits
 import qualified Test.LuaEngine.Terrain.Matrix as Matrix
+import qualified Test.LuaEngine.Terrain.Model as Model
 import qualified Test.LuaEngine.Terrain.Names as Names
 import qualified Test.LuaEngine.Terrain.Ownership as Ownership
 import qualified Test.LuaEngine.Terrain.Picks as Picks
@@ -31,3 +32,4 @@ spec = describe "Terrain" $ do
   Picks.spec
   Windows.spec
   Matrix.spec
+  Model.spec

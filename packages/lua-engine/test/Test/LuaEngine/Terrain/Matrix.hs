@@ -5,6 +5,7 @@
 -- Each runs real Lua instances over the real service.
 module Test.LuaEngine.Terrain.Matrix (spec) where
 
+import Control.Concurrent.STM (atomically)
 import Control.Exception (finally)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Control.Monad (forM_, replicateM_, void)
@@ -20,7 +21,7 @@ import Hetoimasia.Scripting.Lua.Admission (ExpectedFailure (expectedCode))
 import Hetoimasia.Scripting.Lua.Provider (ProviderReply (..))
 import Hetoimasia.Terrain.Query (QueryError (TooManyRuns), QueryLimits (..), defaultQueryLimits)
 import Hetoimasia.Terrain.Residency (ArenaId (..), LimitsSpec (..), Revision (..), mkLimits)
-import Hetoimasia.Terrain.Runtime (Config (..), Failure (..), Point (PointCaptured), Precondition (..), Probe (..), closeService, defaultConfig)
+import Hetoimasia.Terrain.Runtime (Config (..), Failure (..), Point (PointCaptured), Precondition (..), Probe (..), censusRequests, closeService, defaultConfig, inspectCensusSTM)
 import Hetoimasia.Terrain.Source (SourceError (TooManyMaterials), SourceLimits (..), defaultSourceLimits, definitionHeaderBytes, materialRecordBytes)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -187,6 +188,29 @@ cancelledStayCharged =
         , "elseif self.s == 2 then"
         , "  local r = api.terrain.cell(self.a, {x = 1, y = 0, z = 0})"
         , "  if r ~= nil then print('free') self.s = 3 else print('still busy') end"
+        , "end"
+        ]
+    }
+
+-- | A read started, seen complete and taken in one invocation, before the owner's next boundary can account its work; the instance then does
+-- nothing more with terrain.
+takenInTheSameInvocation ∷ Script
+takenInTheSameInvocation =
+  script
+    { scPrelude = terrainPrelude
+    , scInit = ["self.s = 0", "self.q = api.terrain.open('main', DEF)"]
+    , scUpdate =
+        [ "if self.s == 0 then"
+        , "  local t = settle(api, self.q)"
+        , "  if t then"
+        , "    self.a = t.value"
+        , "    local r = api.terrain.cell(self.a, {x = 0, y = 0, z = 0})"
+        , "    TEST_AWAIT_SETTLED()"
+        , "    print('ready', api.request.ready(r))"
+        , "    print('take', api.request.take(r).status)"
+        , "    print('taken')"
+        , "    self.s = 1"
+        , "  end"
         , "end"
         ]
     }
@@ -584,6 +608,18 @@ spec = describe "Terrain matrices" $ do
           outLines world >>= \printed → printed `shouldNotContain` ["free"]
           openGate gate
           untilPrintedBy world spawned "free"
+
+  it "gives the service back the result of a read a script started, saw complete and took within one invocation, with no further terrain call from that VM" $
+    withRig $ \rig →
+      withWorld fixedM1Profile (Layout [("lua/main.lua", scriptSource takenInTheSameInvocation)]) $ \world _ runtime →
+        withFvm world runtime (presentationOver rig) $ \fvm → do
+          spawned ← spawn world fvm "modules-test" mainPath
+          untilPrintedBy world spawned "taken"
+          outLines world >>= \printed → printed `shouldContain` ["ready\ttrue", "take\tsuccess"]
+          -- the instance is idle: nothing of it calls terrain again, and the service holds nothing for the request it took
+          let held = length . censusRequests <$> atomically (inspectCensusSTM (rgService rig))
+          pumpUntil world (advanceClock world 2000000000 >> ((== 0) <$> held))
+          limitHeld (rgService rig) "command slots" `shouldReturn` 0
 
   it "refuses a call whose largest answer the VM's limits could never carry as an ordinary error before any bank, with the bank full or free, and no work reaches the service" $ do
     captured ← newIORef (0 ∷ Int)

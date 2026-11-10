@@ -11,6 +11,7 @@ module Test.LuaEngine.Terrain.Support
   , withRig
   , withRigConfig
   , refusesComposition
+  , sendCommand
   , withRigProbe
   , withRigHooks
   , holdAt
@@ -83,6 +84,8 @@ data Rig = Rig
   , rgPicks ∷ !TerrainPicks
   , rgTrace ∷ !(TVar [Text])
   -- ^ What the fixtures saw, newest first: a script reaching @TEST_WAIT@ and leaving it, for an example that says where a VM stopped.
+  , rgCommands ∷ !(TVar (Map.Map Text [Text]))
+  -- ^ The commands an example has queued for a scripted instance, by the instance's label: @TEST_CMD(label)@ answers the next, or @none@.
   , rgSignals ∷ !(TVar (Set.Set Text))
   -- ^ The names an example has signalled: @TEST_WAIT(name)@ returns once its name is among them.
   }
@@ -115,14 +118,16 @@ withRigHooks config probe terrainHooks body =
       session ← newUnique
       signals ← newTVarIO Set.empty
       trace ← newTVarIO []
+      commands ← newTVarIO Map.empty
       body
         Rig
           { rgService = service
-          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture facade, waitFixture signals trace]}
+          , rgFacade = facade {tfHooks = terrainHooks, tfExtraBindings = [pickFixture, awaitOfferFixture facade, waitFixture signals trace, awaitSettledFixture service, commandFixture commands]}
           , rgSession = session
           , rgPicks = tfPicks facade
           , rgSignals = signals
           , rgTrace = trace
+          , rgCommands = commands
           }
 
 presentationOver, gameplayOver ∷ Rig → VmShape
@@ -136,7 +141,7 @@ presentationOverSession rig session = (presentationOver rig) {shTerrain = Just (
 -- | How a fixture hands a script a pick authority the host issued: @TEST_PICK(key)@. It is a host-created fixture of the seam
 -- and nothing Lua can construct: a real script has no such function.
 pickChunk ∷ [Text]
-pickChunk = ["TEST_PICK = hetoimasia_engine.terrain_test_pick", "TEST_AWAIT_OFFER = hetoimasia_engine.terrain_test_await_offer", "TEST_WAIT = hetoimasia_engine.terrain_test_wait"]
+pickChunk = ["TEST_PICK = hetoimasia_engine.terrain_test_pick", "TEST_AWAIT_OFFER = hetoimasia_engine.terrain_test_await_offer", "TEST_WAIT = hetoimasia_engine.terrain_test_wait", "TEST_AWAIT_SETTLED = hetoimasia_engine.terrain_test_await_settled", "TEST_CMD = hetoimasia_engine.terrain_test_cmd"]
 
 pickFixture ∷ Binding
 pickFixture =
@@ -155,6 +160,31 @@ waitFixture signals trace =
       atomically (modifyTVar' trace ("released " <> name :))
       pure []
     _ → pure []
+
+-- | How a fixture holds a script until the service has settled every request it holds (and holds one): @TEST_AWAIT_SETTLED()@ returns
+-- then. The host's record of a request the service settles is settled in the same transaction, so a script may take it at once, within
+-- the invocation it was started in, before the owner's next boundary can account its work. It runs on the script's own thread, waits on
+-- the service's own state and nothing else, and a real script has no such function.
+awaitSettledFixture ∷ Service → Binding
+awaitSettledFixture service =
+  asynchronousNativeRequestIn "terrain_test_await_settled" [] [] $ \_ _ →
+    [] <$ bounded (atomically (inspectCensusSTM service >>= \census → let requests = censusRequests census in if not (null requests) && all censusSettled requests then pure () else retry))
+
+-- | How a fixture hands a scripted instance the next command an example queued for it: @TEST_CMD(label)@ answers it, or the text @none@. It
+-- never waits, and a real script has no such function.
+commandFixture ∷ TVar (Map.Map Text [Text]) → Binding
+commandFixture commands =
+  asynchronousNativeRequestIn "terrain_test_cmd" [SText] [SText] $ \_ values → case values of
+    [VText label] →
+      atomically $
+        readTVar commands >>= \queued → case Map.findWithDefault [] label queued of
+          next : rest → [VText next] <$ writeTVar commands (Map.insert label rest queued)
+          [] → pure [VText "none"]
+    _ → pure [VText "none"]
+
+-- | Queue a command for the scripted instance of this label.
+sendCommand ∷ Rig → Text → Text → IO ()
+sendCommand rig label command = atomically (modifyTVar' (rgCommands rig) (Map.insertWith (\new old → old <> new) label [command]))
 
 -- | Say that this name's moment has come: the scripts waiting on it go on.
 signalRig ∷ Rig → Text → IO ()
