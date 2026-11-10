@@ -258,6 +258,30 @@ specAdversarial = describe "adversarial histories over both key kinds, at two an
   it "TRIPWIRE: no count of Src children and one Run child puts a parent within one separator difference of full, so the over-full case cannot be built from this format's key sizes; if it ever can, build it" $ do
     let (_, _, _, _, srcE, runE) = overfullFixture
     [x | x ← [1 .. 200 ∷ Int], let t = x * srcE + runE, t <= pagePayloadBytes, t + (srcE - runE) > pagePayloadBytes] `shouldBe` []
+  it "collapses a root whose only two children a replacement-triggered repack merged, then keeps shrinking replacements legal (the round-15 sequence)" $ do
+    -- 52 RunNode link records with long values make a root over two leaves; deleting both ends thins the leaves; shorter values then
+    -- replace the rest in key order. A replacement can merge the root's two children: the root has one child then, and the write's
+    -- exit collapses it, so the next replacements rebalance a real pair and no page is published under the minimum fill.
+    let runK j = linkKey (RunNode (columnAt (toInteger j) 0) 0)
+        longV = childRec (srcNode 1 1 3)
+        shortV = rootRec 1 False
+        keys = [runK j | j ← [0 .. 51 ∷ Int]]
+        commitAll h ref ws = foldM (\(hh, rr) w → do
+                                       hh' ← must (commitWrites hh [w])
+                                       must (checkH hh')
+                                       let rr' = foldl (\m (k, v) → maybe (Map.delete k m) (\x → Map.insert k x m) v) rr [w]
+                                       must (compareRecords (Map.toList rr') hh')
+                                       pure (hh', rr')) (h, ref) ws
+        h0 = newH smallSpec ident0
+    (h1, ref1) ← commitAll h0 Map.empty [(k, Just longV) | k ← keys]
+    heightOf h1 TreeLinks `shouldBe` 2
+    let doomed = [k | (j, k) ← zip [0 ∷ Int ..] keys, j < 12 || (j >= 38 && j < 52)]
+        kept = [k | k ← keys, k `notElem` doomed]
+    (h2, ref2) ← commitAll h1 ref1 [(k, Nothing) | k ← doomed]
+    (h3, ref3) ← commitAll h2 ref2 [(k, Just shortV) | k ← kept]
+    must (checkH h3)
+    heightOf h3 TreeLinks `shouldBe` 1
+    Map.size ref3 `shouldBe` length kept
   it "the exit every write shares: an over-full node is split into two legal halves, a fitting one rewritten, an emptied one dropped" $ do
     -- a repack of the children can replace a separator by a longer key, so a parent within a few bytes of full may exceed a page
     -- when a deletion rewrites it: the exit insertion and deletion share splits it
