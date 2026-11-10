@@ -580,6 +580,25 @@ maintenance its chunk) or waits for a reader's release and maintenance (`DiskFul
 `Hetoimasia.Terrain.Runtime.Store` documents the same loop beside `Pending`; the suites drive it as a caller
 does (`fillRetry`).
 
+**Every consumer of the planner must also handle `Checkpoint`.** A plan about to overwrite or free a page
+first proves that nobody but the allocator owns it (a path of its first key in the committed tree and in every
+pinned reader's tree, the retired-page index, the free extents); a plan that frees pages also verifies the
+last 64 pages its entry consumed are gone from the index. Each proof is a read-only fact about the committed and
+pinned state, and the proofs are the only part of a plan whose window grows with the readers and the tree
+heights. A plan whose window would outgrow its bound while proving answers `Checkpoint facts` instead: build a
+fresh window of the same version with `windowCheckpoint facts old` (it drops the pages and probes, keeps the
+facts, the work limit and the trust) and plan again; the plan does not repeat a proof it carries a fact for. The
+`Facts` are opaque (no constructor reaches a client) and carry the state they were proven against (the store, the
+version, the committed roots and the pinned roots with their versions): a window trusts them only for exactly
+that state, so a reader acquired in between or a commit costs a proof again and never skips one it should have
+made. A checkpoint always carries a new fact (a window that cannot hold the plan's edit and ONE proof is the typed
+`WindowExceeded`), so a transaction takes at most as many checkpoints as the pages it writes plus the 64 it
+verifies. What a window holds at once is the edit and one proof, `workOneWindowPages` for a unit of one page and
+`removalWindowPages` for a standalone removal, which cannot shrink; both rest on `maxLevel` and `maxReaders`
+alone, and both are asserted against `maxWindowBytes / windowPageBytes` (310 pages) for every height 1 to 8 and
+every number of pinned readers (the removal's one term that rests on minimum fill, at most 8 internal pages of a
+retirement tree bounded by `maxRetiredPages`, is stated at its site).
+
 ### The page format
 
 A page is exactly **4,096 bytes** and immutable once written. Header fields are

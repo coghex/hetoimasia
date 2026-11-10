@@ -383,13 +383,20 @@ specAtOnce = describe "round 13: the window a unit of work holds at once, under 
       case q of
         Planned pl → (mWindowPages (plMeasure pl) <= lim0) `shouldBe` True
         other → expectationFailure ("no progress after the readers released, window " <> show lim0 <> ": " <> take 300 (show other))
-  it "answers the typed window result, never a checkpoint with no new fact, when the window cannot hold the edit and one proof" $ do
+  it "answers the typed window result, never a checkpoint with no new fact, for every window too small to hold the edit and one proof" $ do
     let (h0, _, _) = fragmented
-        tiny = standardBounds {bdWindowPages = 3, bdWindowBytes = 3 * windowPageBytes}
-    (p, _, _, cps) ← must (fillCounting h0 (limitWork 1 (storeWindow (hStore h0))) (planMaintenanceWith tiny (hStore h0)))
-    case p of
-      Refused (Capacity c) | windowResult c → pure ()
-      other → expectationFailure ("a window of 3 pages was not answered with the typed window result: " <> take 200 (show other) <> " after " <> show cps <> " checkpoints")
+    -- every size from 3 pages up to past the at-once bound: planned, or the typed window result; never a loop of checkpoints
+    results ← forM [3 .. 40] $ \lim → do
+      let tight = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
+      (p, _, _, cps) ← must (fillCounting h0 (limitWork 1 (storeWindow (hStore h0))) (planMaintenanceWith tight (hStore h0)))
+      case p of
+        Planned _ → pure (lim, True, cps)
+        Refused (Capacity c) | windowResult c → pure (lim, False, cps)
+        other → expectationFailure ("window " <> show lim <> ": " <> take 200 (show other)) >> fail "plan"
+    putStrLn ("ATONCE window sizes (pages, planned, checkpoints): " <> show [(l, ok, c) | (l, ok, c) ← results, l `mod` 4 == 3])
+    -- a window too small is refused as the typed result, and one big enough plans
+    [l | (l, ok, _) ← results, l == 3, ok] `shouldBe` []
+    [l | (l, ok, _) ← results, l == 40, not ok] `shouldBe` []
   it "plans through checkpoints exactly the plan one window would give, and takes at most as many checkpoints as pages it proves" $ do
     let (h0, _, _) = fragmented
         big = standardBounds {bdWindowPages = 100000, bdWindowBytes = 1000000000}
