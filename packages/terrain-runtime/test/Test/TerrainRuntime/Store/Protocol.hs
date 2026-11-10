@@ -187,8 +187,35 @@ spec = describe "the facade's caller protocol, followed exactly, for every start
       pendingObligations (storeHeader (hStore (runH b))) `shouldBe` 0
       must (checkH (runH a))
       must (checkH (runH b))
-      pure (lim, na, nb)
-    putStrLn ("PROTOCOL discovery: " <> show (length rows) <> " starting limits x 2 bounds (the tight window is " <> show (bdWindowPages tight) <> " pages); batches (standard, tight) at limits 1, 2, 3, 64: " <> show [r | r@(l, _, _) ← rows, l `elem` [1, 2, 3, 64]] <> "; total batches " <> show (sum [a + b | (_, a, b) ← rows]))
+      pure (lim, na, nb, maximum (0 : map (mWindowPages . plMeasure) (runPlans b)))
+    putStrLn ("PROTOCOL discovery: " <> show (length rows) <> " starting limits x 2 bounds (the tight window is " <> show (bdWindowPages tight) <> " pages); batches (standard, tight) at limits 1, 2, 3, 64: " <> show [(l, a, b) | (l, a, b, _) ← rows, l `elem` [1, 2, 3, 64]] <> "; total batches " <> show (sum [a + b | (_, a, b, _) ← rows]) <> "; the most pages a plan held in the tight window " <> show (maximum [m | (_, _, _, m) ← rows]) <> " of " <> show (bdWindowPages tight))
+    -- the tight window is not slack for the unit: no plan held more than it allows, and the bound is reached
+    (maximum [m | (_, _, _, m) ← rows] <= bdWindowPages tight) `shouldBe` True
+  it "plans the smallest unit of discovery (one connection inspection) in a window of exactly its at-once bound, over deep trees, a free space with no tail and 16 pinned versions, from a starting limit of 3 and of 64" $ do
+    (_, r1) ← withScene
+    let preloadKeys = [runKey x y 10 | x ← [500 .. 560], y ← [0 .. 99]]
+        chunks [] = []
+        chunks xs = let (q, rest) = splitAt 40 xs in q : chunks rest
+        preload h ks = do
+          (h', out) ← commitDelta h Ordinary (deltaFor (hStore h) False False 1 [(k, Just (runRec 20)) | k ← ks])
+          case out of
+            Committed _ → Right h'
+            other → Left ("preload: " <> show other)
+    hLoaded ← must (foldM preload (runH r1) (chunks preloadKeys))
+    hNoTail ← must (noTailWithOldLeaves TreeRuns 200 hLoaded)
+    (hP, _) ← must (withPins (\i → (runKey (toInteger (500 + 3 * i)) (toInteger (7 * i)) 10, runRec 30)) 16 hNoTail)
+    let hrec = recordHeight hP
+        hf = heightOf hP TreeFree
+        lim = discoveryUnitWindowPages (retireInternalsOf hP) hf hrec 16
+        bounds = tightBounds lim
+        env = runEnv r1
+    forM_ [3, 64] $ \start → do
+      (_, p, c) ← must (drive hP start (\hh w → planDiscoveryWith bounds env (hStore hh) w))
+      case p of
+        Planned pl → do
+          (mWindowPages (plMeasure pl) <= lim) `shouldBe` True
+          putStrLn ("PROTOCOL discovery at once: heights " <> show (hrec, hf, retireInternalsOf hP) <> ", 16 pinned, start " <> show start <> ", bound " <> show lim <> ", held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show (cCheckpoints c) <> " checkpoints, " <> show (cReductions c) <> " reductions")
+        other → expectationFailure ("start " <> show start <> ": " <> take 300 (show other))
   it "plans a standalone removal through the protocol at every starting limit 1..64 as it does with no limit (it is atomic and reads none)" $ do
     let run0 = newRun smallSpec sealedStack 64
         env = runEnv run0
