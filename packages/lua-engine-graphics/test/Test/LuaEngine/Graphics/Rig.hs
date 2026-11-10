@@ -66,7 +66,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64, Word8)
 import Hetoimasia.Asset.Image (TexelFormat (TexelRgba8Srgb))
-import Hetoimasia.LuaEngine.Graphics.Texture.Backend
+import Hetoimasia.LuaEngine.Graphics.Texture.Backend.Internal
 import Hetoimasia.LuaEngine.Texture.Backend
 import System.Environment (lookupEnv)
 import System.Timeout (timeout)

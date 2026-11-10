@@ -78,7 +78,7 @@ import qualified Data.Map.Strict as Map
 import Data.Sequence (Seq, ViewL (EmptyL, (:<)), (><), (|>))
 import qualified Data.Sequence as Seq
 import GHC.Conc (unsafeIOToSTM)
-import Hetoimasia.LuaEngine.Graphics.Texture.Backend (Examined (..))
+import Hetoimasia.LuaEngine.Graphics.Texture.Backend.Internal (Examined (..))
 import Test.Hspec (Expectation, expectationFailure)
 
 -- | Where work is charged.
@@ -175,7 +175,7 @@ forRef refs site change = case Map.lookup site refs of
   Just ref → atomicModifyIORef' ref (\now → (change now, ()))
   Nothing → pure ()
 
--- | The observers 'Hetoimasia.LuaEngine.Graphics.Texture.Backend.withBackendObserved' is given: what the pump looks at.
+-- | The observers 'Hetoimasia.LuaEngine.Graphics.Texture.Backend.Internal.withBackendObserved' is given: what the pump looks at.
 --
 -- An evaluation begins at 'ExaminedEvaluation' (a restarted one begins again, so what it examined before is forgotten), counts
 -- the candidates it examines of each kind, and charges them as committed when the backend reports it committed. Its peak is the
