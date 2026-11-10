@@ -113,8 +113,15 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , worstUpdatePages
   , splitEven
 
-    -- * The exits of a write (exposed for the suite)
+    -- * Exposed for the suite
   , exitProbe
+  , ProbeSpec (..)
+  , buildProbe
+  , shapeViolations
+  , exitRootProbe
+  , editDeleteSplits
+  , treeHeight
+  , getEditProbe
   ) where
 
 import Data.ByteString (ByteString)
@@ -440,6 +447,8 @@ data Edit = Edit
   , eSteps ∷ !Int
   , eFacts ∷ [Fact]
   -- ^ The facts this plan established so far (in this call, not those its window already carried).
+  , eDelSplits ∷ !Int
+  -- ^ The nodes the deletions of this plan split: the counter of the suite, read by nothing else.
   , eHot ∷ [(PageNo, Node)]
   -- ^ The last few committed nodes parsed, so a run of updates in one neighbourhood
   -- does not parse the same page again for every key. At most 'hotNodes' are held and
@@ -457,7 +466,7 @@ editFacts = reverse . eFacts
 -- | A fresh plan state over a window, whose new pages may hold at most the given
 -- accounted bytes.
 newEdit ∷ Int → Window → Edit
-newEdit budget w = Edit w IntMap.empty 0 IntMap.empty [] budget 0 Set.empty 0 [] []
+newEdit budget w = Edit w IntMap.empty 0 IntMap.empty [] budget 0 Set.empty 0 [] 0 []
 
 -- | The accounted bytes of the new pages the plan holds now.
 editFreshBytes ∷ Edit → Int
@@ -985,6 +994,9 @@ deleteKey tree root@(Just r0) k = do
     Nothing → pure root
     Just _ → do
       res ← del r0 Nothing Nothing Nothing
+      case res of
+        InsTwo {} → bumpDeleteSplit
+        _ → pure ()
       exitRoot tree res
   where
     del ref lo hi lvl = do
@@ -1004,7 +1016,7 @@ deleteKey tree root@(Just r0) k = do
                 then rebalance lo hi (nLevel n - 1) i replaced
                 else pure replaced
             -- a child that split (a repack of its children moved a longer separator into it) has two halves above the minimum
-            InsTwo c1 sep c2 → pure (take i es ++ [(fst (es !! i), c1), (sep, c2)] ++ drop (i + 1) es)
+            InsTwo c1 sep c2 → bumpDeleteSplit >> pure (take i es ++ [(fst (es !! i), c1), (sep, c2)] ++ drop (i + 1) es)
           exitNode tree ref n (NInner es')
     rebalance = rebalanceChild tree
 
@@ -1207,3 +1219,89 @@ assignPages encode e roots supply0 = do
 -- the path, a split at every level and a new root.
 worstUpdatePages ∷ Int → Int
 worstUpdatePages height = 2 * height + 1
+
+-- ---------------------------------------------------------------------------
+-- Exposed for the suite: building a tree of a given shape, checking a tree's shape, and the exits' answers
+
+-- | A tree of a given shape for the suite: leaves of entries and inner nodes of children, every node a new page of the plan.
+data ProbeSpec = PLeaf [(ByteString, ByteString)] | PInner [ProbeSpec]
+
+-- | Build the tree a spec describes (an inner node's separators are its children's first keys; its level is one above its
+-- first child's). The nodes are built as given: no fill rule is applied, so a spec may hold a node the store would refuse.
+buildProbe ∷ TreeId → ProbeSpec → M Ref
+buildProbe tree spec = fst <$> go spec
+  where
+    go (PLeaf es) = do
+      r ← fresh (Node tree 0 (NLeaf es))
+      pure (r, 0 ∷ Int)
+    go (PInner cs) = do
+      built ← mapM go cs
+      firsts ← mapM (firstKey . fst) built
+      let level = 1 + (case built of ((_, l) : _) → l; [] → 0)
+      r ← fresh (Node tree level (NInner (zip firsts (map fst built))))
+      pure (r, level)
+    firstKey r = do
+      n ← load tree Nothing r
+      case keysOf n of
+        (k : _) → pure k
+        [] → stop (Invariant tree)
+
+-- | Every way the tree under a root breaks the shape its writes keep: a node over a payload, a non-root node under a quarter of one,
+-- a root with one child, keys or separators out of order or outside the bounds their parent promises, a level that is not one
+-- below its parent's. Empty when the tree is legal.
+shapeViolations ∷ TreeId → Maybe Ref → M [String]
+shapeViolations _ Nothing = pure []
+shapeViolations tree (Just root) = go True Nothing Nothing Nothing root
+  where
+    asc ks = and (zipWith (<) ks (drop 1 ks))
+    go isRoot lo hi mlevel ref = do
+      n ← load tree Nothing ref
+      let bytes = nodeBytesOf n
+          ks = keysOf n
+          here =
+            ["level " <> show (nLevel n) <> " where " <> show l <> " was expected" | Just l ← [mlevel], l /= nLevel n]
+              ++ ["over-full: " <> show bytes | bytes > pagePayloadBytes]
+              ++ ["under-full: " <> show bytes | not isRoot, underFull False bytes]
+              ++ ["keys out of order" | not (asc ks)]
+              ++ ["empty node" | null ks]
+              ++ ["a key below its lower bound" | Just l ← [lo], any (< l) ks]
+              ++ ["a key at or past its upper bound" | Just h ← [hi], any (>= h) ks]
+      case nBody n of
+        NLeaf _ → pure (here ++ ["a leaf above level 0" | nLevel n /= 0])
+        NInner es → do
+          subs ← mapM (\i → let (clo, chi) = childBounds lo hi es i in go False clo chi (Just (nLevel n - 1)) (snd (es !! i))) [0 .. length es - 1]
+          pure (here ++ ["a root with one child" | isRoot, length es == 1] ++ concat subs)
+
+-- | What the exit shared by insertion and deletion answers for a root that split into two nodes at the given level: the level of the
+-- new root it makes, or the typed refusal ('TooTall') when that level is past 'maxLevel'.
+exitRootProbe ∷ Int → Either Stop Int
+exitRootProbe level = fst <$> runM act (newEdit maxBound (emptyWindow (StoreIdentity (ArenaId 1) 7) 0))
+  where
+    body = if level == 0 then NLeaf [(BS.singleton 1, BS.empty)] else NInner [(BS.singleton 1, Fresh 0)]
+    act = do
+      a ← fresh (Node TreeLinks level body)
+      b ← fresh (Node TreeLinks level body)
+      r ← exitRoot TreeLinks (InsTwo a (BS.singleton 2) b)
+      case r of
+        Just ref → nLevel <$> load TreeLinks Nothing ref
+        Nothing → stop (Invariant TreeLinks)
+
+-- | How many nodes the deletions of this plan split (a repack may install a longer separator, so a deletion can make a parent
+-- over-full).
+editDeleteSplits ∷ Edit → Int
+editDeleteSplits = eDelSplits
+
+-- | Count one split made by a deletion.
+bumpDeleteSplit ∷ M ()
+bumpDeleteSplit = do
+  e ← getEdit
+  putEdit e {eDelSplits = eDelSplits e + 1}
+
+-- | The levels of the tree under a root (0 when it has none).
+treeHeight ∷ TreeId → Maybe Ref → M Int
+treeHeight _ Nothing = pure 0
+treeHeight tree (Just r) = (\n → nLevel n + 1) <$> load tree Nothing r
+
+-- | The plan state, for the suite.
+getEditProbe ∷ M Edit
+getEditProbe = getEdit

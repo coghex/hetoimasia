@@ -69,7 +69,7 @@ commitWrites h ws = do
     Refusal' why → Left ("a legitimate operation was refused: " <> show why)
 
 spec ∷ Spec
-spec = specDeletion >> specChurn >> specAdversarial
+spec = specDeletion >> specChurn >> specAdversarial >> specTreeLevel
 
 specDeletion ∷ Spec
 specDeletion = describe "deletion against trees deep enough to merge and redistribute internal nodes" $ do
@@ -353,3 +353,165 @@ rootBytesOf h = case rLinks (storeRoots (hStore h)) of
         _ → Left "the links root is not an inner page"
   where
     ArenaId a = siArena (hIdent h)
+
+-- ---------------------------------------------------------------------------
+-- The tree level: every key size the tree accepts, not only the two the format uses today
+
+-- | Run a plan action over an empty window with an unbounded budget; the result and the plan state.
+runTree ∷ M a → IO (a, Edit)
+runTree act = case runM act (newEdit maxBound (emptyWindow ident0 0)) of
+  Right r → pure r
+  Left e → expectationFailure ("the plan stopped: " <> show e) >> fail "plan"
+
+specTreeLevel ∷ Spec
+specTreeLevel = describe "the tree level: a write's exits, whatever the key and value sizes" $ do
+  let longKey ∷ Int → BS.ByteString
+      longKey i = BS.pack ([1, fromIntegral (i `div` 256), fromIntegral (i `mod` 256)] ++ replicate (maxKeyBytes - 3) 0)
+      shortKey ∷ Int → BS.ByteString
+      shortKey i = BS.pack ([2, fromIntegral (i `div` 256), fromIntegral (i `mod` 256)] ++ replicate 17 0)
+      farKey ∷ Int → BS.ByteString
+      farKey i = BS.pack ([3, fromIntegral (i `div` 256), fromIntegral (i `mod` 256)] ++ replicate 17 0)
+      val8 = BS.replicate 8 7
+      leafOf ks = PLeaf [(k, val8) | k ← ks]
+      leafBytes ks = sum [2 + BS.length k + BS.length val8 | k ← ks]
+      -- 14 long entries of 74 bytes fill a leaf past a quarter of a payload; a leaf of 54 is full
+      fillerLeaves n = [leafOf (map longKey [100 * l .. 100 * l + 13]) | l ← [0 .. n - 1]]
+      fullLeaf = leafOf (map longKey [10000 .. 10053])
+      -- 34 short entries of 30 bytes are the minimum fill: one fewer is under it
+      minLeafKeys = map shortKey [0 .. 33]
+      -- the parent: 52 long separators (77 bytes each) and one short one (33): 4037 bytes, 44 under a page's payload less than the
+      -- difference of a long and a short separator
+      parentSpec = PInner (fillerLeaves 51 ++ [fullLeaf, leafOf minLeafKeys])
+      victim = shortKey 0
+      allKeys = concat [map longKey [100 * l .. 100 * l + 13] | l ← [0 .. 50 ∷ Int]] ++ map longKey [10000 .. 10053] ++ minLeafKeys
+  it "the shape the case needs: a parent within the difference of a long and a short separator of full, its last child a minimum leaf, its left sibling a full leaf" $ do
+    let sepLong = innerKeyBytes (longKey 0)
+        sepShort = innerKeyBytes (shortKey 0)
+    (52 * sepLong + sepShort <= pagePayloadBytes) `shouldBe` True
+    (52 * sepLong + sepShort + (sepLong - sepShort) > pagePayloadBytes) `shouldBe` True
+    (leafBytes minLeafKeys >= minNodeBytes && leafBytes (drop 1 minLeafKeys) < minNodeBytes) `shouldBe` True
+    (leafBytes (map longKey [10000 .. 10053]) <= pagePayloadBytes && leafBytes (map longKey [10000 .. 10054]) > pagePayloadBytes) `shouldBe` True
+    (viol, _) ← runTree (buildProbe TreeLinks parentSpec >>= \r → shapeViolations TreeLinks (Just r))
+    viol `shouldBe` []
+  it "splits a parent a deletion's repack made over-full, when the parent is the root: the tree grows a level, every key reads back" $ do
+    ((root, viol, height, found, splits), _) ← runTree $ do
+      r0 ← buildProbe TreeLinks parentSpec
+      h0 ← treeHeight TreeLinks (Just r0)
+      root ← deleteKey TreeLinks (Just r0) victim
+      viol ← shapeViolations TreeLinks root
+      height ← treeHeight TreeLinks root
+      found ← rangeKeys TreeLinks root False BS.empty Nothing maxBound
+      e ← getEditProbe
+      pure (h0, viol, height, map fst found, editDeleteSplits e)
+    root `shouldBe` 2
+    viol `shouldBe` []
+    height `shouldBe` 3
+    found `shouldBe` sortOn id (filter (/= victim) allKeys)
+    splits `shouldBe` 1
+  it "splits it likewise when the parent is not the root: the tree keeps its height, the root gains a child" $ do
+    let farLeaves = [leafOf (map farKey [100 * l .. 100 * l + 33]) | l ← [0 .. 30]]
+        twoLevel = PInner [parentSpec, PInner farLeaves]
+        farKeys = concat [map farKey [100 * l .. 100 * l + 33] | l ← [0 .. 30 ∷ Int]]
+    ((h0, viol, height, found, splits), _) ← runTree $ do
+      r0 ← buildProbe TreeLinks twoLevel
+      h0 ← treeHeight TreeLinks (Just r0)
+      root ← deleteKey TreeLinks (Just r0) victim
+      viol ← shapeViolations TreeLinks root
+      height ← treeHeight TreeLinks root
+      found ← rangeKeys TreeLinks root False BS.empty Nothing maxBound
+      e ← getEditProbe
+      pure (h0, viol, height, map fst found, editDeleteSplits e)
+    h0 `shouldBe` 3
+    viol `shouldBe` []
+    height `shouldBe` 3
+    found `shouldBe` sortOn id (filter (/= victim) (allKeys ++ farKeys))
+    splits `shouldBe` 1
+  it "answers a root that split past maxLevel with the typed refusal, and a root that split below it with a taller tree" $ do
+    exitRootProbe (maxLevel - 1) `shouldSatisfy` either (const False) (== maxLevel)
+    exitRootProbe maxLevel `shouldSatisfy` either (\e → case e of TooTall _ → True; _ → False) (const False)
+  -- The random histories. A family is a key generator, a value-size range and a starting tree; every operation is an insertion (a new key
+  -- or a replacement by a value of another size), a deletion, or every 500th a sweep of 40 neighbouring keys. After EVERY operation:
+  -- the structural check (no over-full page, no non-root page under a quarter of a payload, no one-child root, keys in order and inside
+  -- their parent's bounds, levels) and a read of every record against a Map.
+  let valueOf ∷ Int → Word64 → Int → BS.ByteString
+      valueOf i d lo = BS.replicate (lo + fromIntegral (d `mod` fromIntegral (maxValueBytes + 1 - lo))) (fromIntegral i)
+      -- the keys of the "mixed" family: lengths 1 and 2..64 spread evenly
+      mixedKey ∷ Int → BS.ByteString
+      mixedKey i
+        | i < 100 = BS.pack [fromIntegral (2 * i + 1)]
+        | otherwise =
+            let j = i - 100
+                len = 2 + (j * 13) `mod` (maxKeyBytes - 1)
+             in BS.pack ([fromIntegral (j `div` 256), fromIntegral (j `mod` 256)] ++ replicate (len - 2) (fromIntegral j))
+      -- the keys of the "banded" family: bands of 64-byte keys and of 12-byte keys alternate, so a repack at a band's edge installs a
+      -- longer or a shorter separator than the one it replaces
+      bandedKey ∷ Int → BS.ByteString
+      bandedKey i =
+        let band = (i `div` 150) `mod` 40
+            len = if even band then maxKeyBytes else 12
+         in BS.pack ([fromIntegral band, fromIntegral ((i `div` 256) `mod` 256), fromIntegral (i `mod` 256)] ++ replicate (len - 3) (fromIntegral i))
+      -- the keys of the "edge" family: the regions of the near-full parent above (long keys, short keys, far keys)
+      edgeKey ∷ Int → BS.ByteString
+      edgeKey r = case r `mod` 4 of
+        0 → shortKey ((r `div` 4) `mod` 120)
+        3 → farKey ((r `div` 4) `mod` 3200)
+        _ → longKey ((r `div` 4) `mod` 10100)
+      run ∷ (Int → BS.ByteString) → Int → Int → Maybe ProbeSpec → [BS.ByteString] → Word64 → Int → M (Maybe String, Int, Int)
+      run keyOf poolSize valueLo start startKeys seed nOps = do
+        root0 ← maybe (pure Nothing) (fmap Just . buildProbe TreeLinks) start
+        let loop (root, ref, g, n, tallest) i
+              | i > nOps = pure (Nothing, n, tallest)
+              | otherwise = do
+                  let phase = (i * 100) `div` nOps
+                      (r1, g1) = below 100 g
+                      (r2, g2) = below (fromIntegral poolSize) g1
+                      (r3, g3) = below 1000003 g2
+                      k = keyOf (fromIntegral r2)
+                      insertP | isJust' start = 45 | phase < 40 = 88 | phase < 65 = 50 | otherwise = 25
+                      sweep = i `mod` 500 == 0
+                  (root', ref') ←
+                    if sweep
+                      then do
+                        let ks = take 40 (drop (fromIntegral r3 `mod` max 1 (Map.size ref)) (Map.keys ref))
+                        rt ← foldM (\rr kk → deleteKey TreeLinks rr kk) root ks
+                        pure (rt, foldr Map.delete ref ks)
+                      else
+                        if r1 < insertP
+                          then do
+                            let v = valueOf (fromIntegral r2) r3 valueLo
+                            rt ← insertKey TreeLinks root k v
+                            pure (rt, Map.insert k v ref)
+                          else do
+                            rt ← deleteKey TreeLinks root k
+                            pure (rt, Map.delete k ref)
+                  viol ← shapeViolations TreeLinks root'
+                  found ← rangeKeys TreeLinks root' False BS.empty Nothing maxBound
+                  h ← treeHeight TreeLinks root'
+                  if not (null viol) || found /= Map.toList ref'
+                    then pure (Just ("operation " <> show i <> " (phase " <> show phase <> "): " <> show (take 3 viol) <> (if found /= Map.toList ref' then " and the records read back differ" else "")), n, tallest)
+                    else loop (root', ref', g3, n + 1, max tallest h) (i + 1)
+        loop (root0, Map.fromList [(k, val8) | k ← startKeys], mkRng (seed + 4100), 0 ∷ Int, 0 ∷ Int) 1
+      isJust' = maybe False (const True)
+      family name results = do
+        putStrLn ("TREE FUZZ " <> name <> ": (seed, failure, operations, tallest tree, deletions that split a node) " <> show results)
+        [(sd, f) | (sd, Just f, _, _, _) ← results] `shouldBe` []
+        pure (sum [n | (_, _, n, _, _) ← results], maximum [t | (_, _, _, t, _) ← results], sum [sp | (_, _, _, _, sp) ← results])
+      go name keyOf poolSize valueLo start startKeys seeds nOps = do
+        rs ← mapM (\seed → runTree (run keyOf poolSize valueLo start startKeys seed nOps) >>= \((f, ops, tallest), e) → pure (seed, f, ops, tallest, editDeleteSplits e)) seeds
+        family name rs
+  it "keeps the tree legal and complete through random histories of keys and values of every length (mixed lengths)" $ do
+    (ops, tallest, _) ← go "mixed" mixedKey 2600 0 Nothing [] [1, 2] 8000
+    ops `shouldBe` 16000
+    (tallest >= 2) `shouldBe` True
+  it "keeps the tree legal and complete through random histories over long keys and long values, deep enough for three levels" $ do
+    (ops, tallest, _) ← go "long" (\i → BS.pack ([fromIntegral (i `div` 256), fromIntegral (i `mod` 256)] ++ replicate (maxKeyBytes - 2) (fromIntegral i))) 6000 40 Nothing [] [3, 4] 14000
+    ops `shouldBe` 28000
+    (tallest >= 3) `shouldBe` True
+  it "keeps the tree legal and complete through random histories over alternating bands of long and short keys" $ do
+    (ops, _, _) ← go "banded" bandedKey 6000 0 Nothing [] [5, 6, 7, 8] 10000
+    ops `shouldBe` 40000
+  it "keeps the tree legal and complete through random histories that start at the edge: the near-full parent, where deletions split nodes" $ do
+    (ops, tallest, splits) ← go "edge" edgeKey 40400 0 (Just parentSpec) allKeys [9 .. 24] 1500
+    ops `shouldBe` 24000
+    putStrLn ("TREE FUZZ edge: deletions that split a node, all seeds: " <> show splits <> ", tallest tree " <> show tallest)
+    (splits > 0) `shouldBe` True
