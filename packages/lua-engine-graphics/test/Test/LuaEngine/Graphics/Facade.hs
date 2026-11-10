@@ -39,7 +39,6 @@ import Hetoimasia.LuaEngine.Manifest (Role (Presentation))
 import Hetoimasia.LuaEngine.Profile (ByteLimit (..), Bytes (Bytes), Count (Count), CountLimit (PngAxisMaximum, PngPixels, RequestsPerInstance), Profile, ProfileSpec (..), profileSpec, validateProfile)
 import Hetoimasia.LuaEngine.Scene (SceneContent (..), SceneRect (..), SceneSprite (..), TextureUse (..))
 import Hetoimasia.LuaEngine.Texture (TexturePipeline, TextureView (..), sessionNominal)
-import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Hetoimasia.LuaEngine.Session
 import Hetoimasia.Render.TwoD.Vulkan.Textures (newTextures)
@@ -53,7 +52,7 @@ import Test.LuaEngine.Graphics.FacadeScripts (isClear, manifestFor, quadExample)
 import qualified Test.LuaEngine.Graphics.Fake as Fake
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Rig (Rig (..), bounded, withRig)
-import Test.LuaEngine.Graphics.Work (Reading (..), Site (..), readWork)
+import Test.LuaEngine.Graphics.Work (WorkReading, assertBoundedWork, readWork)
 import Test.LuaEngine.Graphics.SceneHost
 import qualified Test.LuaEngine.Graphics.Window.Fake as WF
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
@@ -330,25 +329,10 @@ spec = describe "graphics facade" $ do
       -- released once, and the owner has seen each upload.
       forM_ [(250, smallLogged), (1000, largeLogged)] $ \(n, logged) →
         [length (filter (Text.isPrefixOf prefix) logged) | prefix ← ["allocated ", "registered ", "released ", "upload admitted "]] `shouldBe` replicate 4 n
-      -- At each site the most one operation or pump evaluation charged is a constant that does not depend on the size. A pump or a fake
-      -- that looks at what it retains, or at what came before, charges as many units in one operation as there are textures: hundreds
-      -- here. A maximum is the same however often the scheduler restarted a transaction, and it includes the complete unsuccessful
-      -- search the pump retries on.
-      forM_ [(250, small), (1000, large)] $ \(n, reading) →
-        forM_ (Map.toList (rPeak reading)) $ \(site, peak) →
-          unless (peak <= peakBound site) $
-            expectationFailure (workFailure n reading site "one operation charged" peak (peakBound site))
-      -- The units of the operations that committed, for each texture retained and released, are bounded the same way, and the total at
-      -- 1000 is at most six times the total at 250, a growth of four: a linear total gives four, the quadratic it replaced sixteen.
-      forM_ [(250, small), (1000, large)] $ \(n, reading) →
-        forM_ (Map.toList (rCommitted reading)) $ \(site, units) →
-          unless (units `div` n <= committedBound site) $
-            expectationFailure (workFailure n reading site "committed units per texture" (units `div` n) (committedBound site))
-      forM_ (Map.keys (rCommitted small)) $ \site → do
-        let atSmall = Map.findWithDefault 0 site (rCommitted small)
-            atLarge = Map.findWithDefault 0 site (rCommitted large)
-        unless (atLarge <= 6 * atSmall) $
-          expectationFailure (workFailure 1000 large site "committed units at 1000 against six times those at 250" atLarge (6 * atSmall))
+      -- At each site the most one operation or pump evaluation charged is a constant that does not depend on the size, the units of the
+      -- operations that committed for each texture are bounded the same way, and the total at 1000 is at most six times the total at
+      -- 250: see 'assertBoundedWork'.
+      assertBoundedWork [(250, small), (1000, large)]
 
   it "answers busy from the common request places for a window request whose own slot is free, with no native window made, and accepts the explicit retry once a place is returned" $ do
     outcome ← runFacade ((defaultShape requestBank) {shapeBoth = False, shapeParkOutput = True, shapeProfile = profileWith [(RequestsPerInstance, 2)]}) $ \fs → do
@@ -577,7 +561,7 @@ runFacadeLogged shape scenario = (\(result, logged, _) → (result, logged)) <$>
 
 -- | The same, with the work the backend's pump and the fake owner did by site (see "Test.LuaEngine.Graphics.Work"), read once the
 -- session has ended and nothing is left for either to do.
-runFacadeObserved ∷ Shape → (FS → IO ()) → IO (Either SomeException SessionOutcome, [Text], Reading)
+runFacadeObserved ∷ Shape → (FS → IO ()) → IO (Either SomeException SessionOutcome, [Text], WorkReading)
 runFacadeObserved shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
   result ← try @SomeException (runCore rig shape scenario)
   logged ← Fake.events (rigFake rig)
@@ -1021,49 +1005,6 @@ pixelScenario count fs = do
   -- The fake retires what is released; the session's bytes come back to zero.
   atomically (sessionNominal (fsPipeline fs) >>= \held → unless (held == 0) retry)
   requestStop (fsSession fs) StopQuit
-
--- | The most units one operation of the scenario, or one pump evaluation, may charge at a site, whatever the size. Measured after the
--- change at 250 and 1000 textures (a peak of one to three at every site), with room for the 16 request places that are in flight
--- together; a site that looks at everything retained charges the size of what is retained, hundreds.
-peakBound ∷ Site → Int
-peakBound = \case
-  PumpJobs → 24
-  PumpTextures → 24
-  PumpBoot → 4
-  PumpDrain → 2
-  OwnerUploads → 24
-  OwnerReleases → 24
-  Admission → 24
-  UploadHistory → 4
-  ImageMap → 4
-  SlotOwners → 4
-  EventLog → 4
-  FreeSlots → 4
-
--- | The most units of committed operations a site may be charged for each texture retained and released, whatever the size.
-committedBound ∷ Site → Int
-committedBound = \case
-  PumpJobs → 24
-  PumpTextures → 16
-  PumpBoot → 2
-  PumpDrain → 1
-  OwnerUploads → 24
-  OwnerReleases → 20
-  Admission → 8
-  UploadHistory → 4
-  ImageMap → 16
-  SlotOwners → 8
-  EventLog → 16
-  FreeSlots → 8
-
--- | What an example that exceeds a bound says: the site, the size, the figure and the limit, and the attempted units (every
--- restarted and retried attempt included), which the scheduler moves and no example asserts.
-workFailure ∷ Int → Reading → Site → String → Int → Int → String
-workFailure n reading site what found limit =
-  concat
-    [ show site, " at ", show n, " textures: ", what, " ", show found, " exceeds ", show limit
-    , "; committed ", show (rCommitted reading), "; peak ", show (rPeak reading), "; attempted ", show (rAttempted reading)
-    ]
 
 -- | A profile of two request places: two texture requests fill them and the window finds no place, its own slot free.
 requestBank ∷ ByteString

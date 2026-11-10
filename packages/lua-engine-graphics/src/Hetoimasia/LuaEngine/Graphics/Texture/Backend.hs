@@ -31,21 +31,27 @@
 -- = What one pump step costs
 --
 -- A step examines /candidates/: the jobs ('sJobs'), the textures that have a step or wait on something
--- ('sActive') and the table's bootstrap, in that order, and takes the first that has something to do. A texture
--- the backend has delivered and nobody has released ('TexLive', and the two offer stages before it) has nothing the
--- pump could do for it until a release is asked, so it is not a candidate: the transaction that asks (the lease's
--- release, the close, the owner's end, the offer's answer) puts it in 'sActive' in the same step that moves its
--- stage. The cost of a step is therefore the jobs in flight plus the textures being released, held or retired, and
--- never the textures retained; the work for a scenario grows with the number of textures it creates and releases,
--- not with the square. 'withBackendObserved' lets an example count the candidates examined.
+-- ('sActive'), the lowest texture waiting for the release lane ('sQueued'), and the table's bootstrap, in that order by
+-- id, and takes the first that has something to do. A texture the backend has delivered and nobody has released
+-- ('TexLive', and the two offer stages before it) has nothing the pump could do for it until a release is asked, so it
+-- is not a candidate: the transaction that asks (the lease's release, the close, the owner's end, the offer's answer)
+-- puts it in 'sActive' in the same step that moves its stage. A texture whose release was asked waits for the release
+-- lane ('TexReleaseRequested'), which refuses every one alike (full, or not started) within a transaction, so a mass
+-- release leaves the textures it has not yet submitted in 'sQueued' and the pump looks at the lowest of them: one that the
+-- lane refuses says all the later ones would be refused. The cost of a step is therefore the jobs in flight, the
+-- textures being released, held or retired and one waiting for the lane, and never the textures retained or the ones
+-- queued behind it; the work for a scenario grows with the number of textures it creates and releases, not with the
+-- square. 'withBackendObserved' lets an example count the candidates examined.
 --
 -- = The invariants
 --
 -- * /A texture the pump can leave alone is not scanned, and is never missed/. Every texture in 'sTextures' whose
---   stage is not 'TexOffered', 'TexOfferedReleased' or 'TexLive' is in 'sActive' (keyed by the same 'TexId'), and
---   'sActive' holds nothing 'sTextures' does not. The only writes that take a texture out of those three stages
---   are 'releaseTexture', 'deliver', 'closeAndDrain' and 'ownerEnded', and each puts it in 'sActive' in the
---   same transaction; a texture leaves both maps together, when it is forgotten.
+--   stage is 'TexReleaseRequested' is in 'sQueued', and every one whose stage is not 'TexOffered',
+--   'TexOfferedReleased', 'TexLive' or 'TexReleaseRequested' is in 'sActive' (keyed by the same 'TexId'); the two maps
+--   are disjoint and hold nothing 'sTextures' does not. The only writes that take a texture out of the idle stages
+--   are 'releaseTexture', 'deliver', 'closeAndDrain' and 'ownerEnded', and each puts it in the map its new stage
+--   belongs to in the same transaction ('activate'); the pump's own write that takes it out of 'TexReleaseRequested'
+--   moves it to 'sActive' the same way; a texture leaves every map together, when it is forgotten.
 -- * /Admission before tracking/. A job exists the moment 'backendUpload' returns, so cancellation
 --   from then on finds it. Nothing native exists before the pump has issued the allocation.
 -- * /Intent before issuance, tracking before escape/. Every native object is recorded in its job
@@ -208,7 +214,10 @@ data State image ticket = State
     -- ^ Sink answers that were 'SinkLate'.
   , sActive ∷ !(Map TexId Tex)
     -- ^ The textures of 'sTextures' the pump has to look at: every one whose stage is not 'TexOffered',
-    -- 'TexOfferedReleased' or 'TexLive' (see "What one pump step costs").
+    -- 'TexOfferedReleased', 'TexLive' or 'TexReleaseRequested' (see "What one pump step costs").
+  , sQueued ∷ !(Map TexId Tex)
+    -- ^ The textures of 'sTextures' in 'TexReleaseRequested': they wait for the release lane, which refuses every one
+    -- alike, so the pump looks only at the lowest.
   }
 
 -- | The table's bootstrap: whether slot 0's placeholder is bound.
@@ -314,7 +323,7 @@ withBackend = withBackendObserved (\_ → pure ()) (pure ())
 -- 'ExaminedEvaluation' is the work of that one evaluation, however many attempts it took. Neither is an input to a decision.
 withBackendObserved ∷ ∀ image ticket a. (Examined → STM ()) → IO () → Port image ticket → (Backend image ticket → IO a) → IO a
 withBackendObserved examined committed port body = withWorkerGroup $ \group → do
-  var ← newTVarIO (State Running' Map.empty 0 Map.empty 0 BootIdle Nothing Nothing [] 0 Map.empty)
+  var ← newTVarIO (State Running' Map.empty 0 Map.empty 0 BootIdle Nothing Nothing [] 0 Map.empty Map.empty)
   let backend = Backend port var examined committed
   result ← mask $ \restore → do
     outcome ← tryWithContext @SomeException $ restore $ do
@@ -601,7 +610,7 @@ abandonAll backend why = do
       stage ← readTVar (tStage tex)
       unless (terminalStage stage) $
         writeTVar (tStage tex) (TexFailed (toException (BackendDefect ("the texture was not proved retired: " <> why))))
-    writeTVar (bState backend) st {sJobs = Map.empty, sTextures = Map.empty, sActive = Map.empty, sLifecycle = Stopping'}
+    writeTVar (bState backend) st {sJobs = Map.empty, sTextures = Map.empty, sActive = Map.empty, sQueued = Map.empty, sLifecycle = Stopping'}
     pure (Map.elems (sJobs st))
   forM_ jobs $ \job → unless (jLate job) $ do
     unless (jRetiredSent job) (void (tryWithContext @SomeException (sinkBuffersRetired (jSink job))))
@@ -618,9 +627,13 @@ nextStep backend token = do
   case standing of
     Ended why | sEnded st == Nothing → ownerEnded backend why >> pure StepProgress
     _ → do
-      let candidates =
+      let -- The release lane refuses every texture waiting for it alike (full, or not started), so one that is refused
+          -- says all the later ones would be: only the lowest waiting texture is a candidate, in its place by id among
+          -- the others, and the next is when it is submitted.
+          reach = maybe (sActive st) (\(tid, tex) → Map.insert tid tex (sActive st)) (Map.lookupMin (sQueued st))
+          candidates =
             [jobStep backend standing jid job | (jid, job) ← Map.toAscList (sJobs st)]
-              <> [textureStep backend tid tex | (tid, tex) ← Map.toAscList (sActive st)]
+              <> [textureStep backend tid tex | (tid, tex) ← Map.toAscList reach]
               <> [bootStep backend]
       found ← firstJust candidates
       case found of
@@ -657,6 +670,7 @@ ownerEnded backend why = do
       { sEnded = Just why
       , -- Every texture not proved retired is failed below, and a failed texture is the pump's to forget.
         sActive = sTextures st
+      , sQueued = Map.empty
       , sJobs = Map.map (failWith ("the graphics owner ended: " <> why)) (sJobs st)
       , sBoot = case sBoot st of
           BootReady → BootReady
@@ -1100,15 +1114,23 @@ claimTexture backend registration = do
   writeTVar (bState backend) st {sTextures = Map.insert tid (Tex tid registration stage) (sTextures st), sNextTexture = tid + 1}
   pure tid
 
--- | Put a texture whose stage was just moved out of 'TexOffered', 'TexOfferedReleased' or 'TexLive' in the pump's
--- reach. Called in the transaction that moves the stage; a texture already forgotten is not put back.
+-- | Put a texture whose stage was just moved in the pump's reach, in the map its new stage belongs to: the queue for the
+-- release lane when it waits for the lane ('TexReleaseRequested'), the active textures otherwise. Called in the
+-- transaction that moves the stage; a texture already forgotten is not put back.
 activate ∷ Backend image ticket → Tex → STM ()
-activate backend tex = modifySTMState backend $ \st →
-  if Map.member (tId tex) (sTextures st) then st {sActive = Map.insert (tId tex) tex (sActive st)} else st
+activate backend tex = do
+  stage ← readTVar (tStage tex)
+  modifySTMState backend $ \st →
+    if not (Map.member (tId tex) (sTextures st))
+      then st
+      else case stage of
+        TexReleaseRequested → st {sQueued = Map.insert (tId tex) tex (sQueued st), sActive = Map.delete (tId tex) (sActive st)}
+        _ → st {sActive = Map.insert (tId tex) tex (sActive st), sQueued = Map.delete (tId tex) (sQueued st)}
 
--- | A texture leaves both maps together.
+-- | A texture leaves every map together.
 dropTexture ∷ TexId → State image ticket → State image ticket
-dropTexture tid st = st {sTextures = Map.delete tid (sTextures st), sActive = Map.delete tid (sActive st)}
+dropTexture tid st =
+  st {sTextures = Map.delete tid (sTextures st), sActive = Map.delete tid (sActive st), sQueued = Map.delete tid (sQueued st)}
 
 -- | The release the lease calls, once: revoke at once (the logical release a publication's check sees),
 -- ask the table to release when the holds allow, and answer the reading of the retirement. Never waits.
@@ -1143,7 +1165,7 @@ textureStep backend tid tex = do
   case stage of
     TexReleaseRequested →
       portRelease (bPort backend) (deliveredReleaseAction (tRegistration tex)) >>= \case
-        Right sub → Just StepProgress <$ writeTVar (tStage tex) (TexReleasing sub)
+        Right sub → Just StepProgress <$ (writeTVar (tStage tex) (TexReleasing sub) >> activate backend tex)
         Left (PortEnded why) → do
           _ ← noteEnded backend why
           Just StepProgress <$ failTexture ("the graphics owner ended before the release ran: " <> why)
@@ -1208,6 +1230,7 @@ textureStep backend tid tex = do
       let raised = toException (BackendDefect why)
       latchSTM backend "texture release" (plain raised)
       writeTVar (tStage tex) (TexFailed raised)
+      activate backend tex
     forget = modifySTMState backend (dropTexture tid)
 
 -- The close ---------------------------------------------------------------------------------------------------

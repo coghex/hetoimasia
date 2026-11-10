@@ -37,13 +37,14 @@
 module Test.LuaEngine.Graphics.Work
   ( Site (..)
   , Work
-  , Reading (..)
+  , WorkReading (..)
   , Meter
   , newWork
   , readWork
   , charge
   , observe
   , commitIO
+  , assertBoundedWork
   , pumpObserver
   , -- * Counted collections
     CMap
@@ -77,6 +78,7 @@ import Data.Sequence (Seq, ViewL (EmptyL, (:<)), (><), (|>))
 import qualified Data.Sequence as Seq
 import GHC.Conc (unsafeIOToSTM)
 import Hetoimasia.LuaEngine.Graphics.Texture.Backend (Examined (..))
+import Test.Hspec (Expectation, expectationFailure)
 
 -- | Where work is charged.
 data Site
@@ -107,7 +109,7 @@ data Site
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | What a site has been charged: the same three counts for each, read after the scenario.
-data Reading = Reading
+data WorkReading = WorkReading
   { rCommitted ∷ !(Map Site Int)
     -- ^ The units of operations that committed.
   , rPeak ∷ !(Map Site Int)
@@ -139,9 +141,9 @@ newWork =
     each make = Map.fromList <$> traverse (\site → (,) site <$> make) [minBound .. maxBound]
 
 -- | Every site's counts.
-readWork ∷ Work → IO Reading
+readWork ∷ Work → IO WorkReading
 readWork work =
-  Reading
+  WorkReading
     <$> traverse readTVarIO (wCommitted work)
     <*> traverse readIORef (wPeak work)
     <*> traverse readIORef (wAttempted work)
@@ -279,3 +281,89 @@ csToList meter (CSeq s) = meter (1 + Seq.length s) >> pure (foldr (:) [] s)
 -- | A queue made of these values, back to front: a cell for each.
 csFromList ∷ Meter → [a] → STM (CSeq a)
 csFromList meter xs = meter (1 + length xs) >> pure (CSeq (Seq.fromList xs))
+
+-- The bounds an example asserts ------------------------------------------------------------------------
+
+-- | What an example asserts of the work a scenario did at several sizes, given each size (the textures retained and released)
+-- with its reading: at every size, the most one operation or pump evaluation charged at a site is a constant that does not
+-- depend on the size ('peakBound'), and the committed units for each texture are bounded the same way ('committedBound'); and
+-- for each pair of sizes one a quarter of the other, the committed total at the larger is at most six times that at the smaller,
+-- a growth of four: a linear total gives four, the quadratic one it replaced sixteen. Attempted totals are shown on a failure and
+-- never asserted.
+assertBoundedWork ∷ [(Int, WorkReading)] → Expectation
+assertBoundedWork sized = do
+  mapM_
+    ( \(n, reading) →
+        mapM_
+          ( \(site, peak) →
+              unless' (peak <= peakBound site) (failure n reading site "one operation charged" peak (peakBound site))
+          )
+          (Map.toList (rPeak reading))
+    )
+    sized
+  mapM_
+    ( \(n, reading) →
+        mapM_
+          ( \(site, units) →
+              unless' (units `div` n <= committedBound site) (failure n reading site "committed units per texture" (units `div` n) (committedBound site))
+          )
+          (Map.toList (rCommitted reading))
+    )
+    sized
+  mapM_
+    ( \((small, atSmall), (large, atLarge)) →
+        mapM_
+          ( \site →
+              let before = Map.findWithDefault 0 site (rCommitted atSmall)
+                  after = Map.findWithDefault 0 site (rCommitted atLarge)
+               in unless'
+                    (after <= 6 * before)
+                    (failure large atLarge site ("committed units against six times those at " <> show small) after (6 * before))
+          )
+          (Map.keys (rCommitted atSmall))
+    )
+    [(a, b) | a@(small, _) ← sized, b@(large, _) ← sized, large == 4 * small]
+  where
+    unless' ok failed = if ok then pure () else expectationFailure failed
+    failure n reading site what found limit =
+      concat
+        [ show site, " at ", show n, " textures: ", what, " ", show found, " exceeds ", show limit
+        , "; committed ", show (rCommitted reading), "; peak ", show (rPeak reading), "; attempted ", show (rAttempted reading)
+        ]
+
+-- | The most units one operation of a scenario, or one pump evaluation, may charge at a site, whatever the size. Measured after
+-- the change at 250 to 2000 textures: a peak of one to three at every site in the Lua scenario, and in a mass release the
+-- pump's 33 (a lane of 16 in flight, the ones the owner has to answer, and the lowest waiting). Those are bounded by the depth of
+-- the owner's pipeline and not by the size: the pump submits a texture only when no lower one has a step, so those it examines
+-- are waiting on the owner, and the owner holds at most a lane's worth. A site that looks at everything retained, or at every
+-- texture waiting for the lane, charges the size, hundreds at these sizes.
+peakBound ∷ Site → Int
+peakBound = \case
+  PumpJobs → 24
+  PumpTextures → 96
+  PumpBoot → 4
+  PumpDrain → 2
+  OwnerUploads → 24
+  OwnerReleases → 24
+  Admission → 24
+  UploadHistory → 4
+  ImageMap → 4
+  SlotOwners → 4
+  EventLog → 4
+  FreeSlots → 4
+
+-- | The most units of committed operations a site may be charged for each texture retained and released, whatever the size.
+committedBound ∷ Site → Int
+committedBound = \case
+  PumpJobs → 24
+  PumpTextures → 128
+  PumpBoot → 2
+  PumpDrain → 1
+  OwnerUploads → 24
+  OwnerReleases → 80
+  Admission → 8
+  UploadHistory → 4
+  ImageMap → 16
+  SlotOwners → 8
+  EventLog → 16
+  FreeSlots → 8

@@ -5,12 +5,14 @@
 module Test.LuaEngine.Graphics.Release (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
+import Control.Monad (forM)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..), textureRefOf)
 import Hetoimasia.LuaEngine.Texture.Backend (BackendTexture (..), RetirementState (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Backend (BackendReading (..))
 import Test.Hspec
 import Test.LuaEngine.Graphics.Fake
 import Test.LuaEngine.Graphics.Rig
+import Test.LuaEngine.Graphics.Work (WorkReading, assertBoundedWork, readWork)
 
 spec ∷ Spec
 spec = describe "release and retirement" $ do
@@ -87,7 +89,25 @@ spec = describe "release and retirement" $ do
       refIndex old `shouldBe` refIndex new
       refGeneration old `shouldNotBe` refGeneration new
       textureIdentity oldTexture `shouldNotBe` textureIdentity newTexture
+  it "does work linear in the textures a mass release leaves waiting for the release lane: the pump looks at the lowest of them, at 250, 500, 1000 and 2000" $ do
+    readings ← forM [250, 500, 1000, 2000] $ \n → (,) n <$> massRelease n
+    assertBoundedWork readings
   where
+    -- N textures delivered one at a time and all released at once while the scene's adoption is held: the release lane takes its 16 and
+    -- the rest wait for it; then the hold is let go and every one retires. The work the pump and the fake did is read at the end.
+    massRelease ∷ Int → IO WorkReading
+    massRelease n = withRig defaultFakeConfig {fcSlots = n + 24, fcImages = n + 24} $ \rig → do
+      textures ← forM [1 .. n] $ \_ → do
+        probe ← newProbe
+        _ ← submit rig probe 1 1 255
+        _ ← awaitTerminal probe
+        delivered probe
+      holdBarrier (rigFake rig)
+      readings ← forM textures textureRelease
+      awaitFake (rigFake rig) ((>= 16) . readingReleasesQueued)
+      release (rigFake rig) HoldAdoption
+      forM' readings $ \reading → atomically (reading >>= \case ProviderComplete → pure (); _ → retry)
+      readWork (fakeWork (rigFake rig))
     shouldBe' state expected = case (state, expected ∷ String) of
       (ProviderPending, "pending") → pure ()
       (ProviderComplete, "complete") → pure ()
