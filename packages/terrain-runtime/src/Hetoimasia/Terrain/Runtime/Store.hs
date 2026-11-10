@@ -28,8 +28,14 @@
 --                    -> the window outgrew its bounds while the plan read more than one unit of work
 --                       (the pages one maintenance transaction frees, the writes of one batch) needs:
 --                       build a fresh window for the same version, 'reduceWork' it from the old one
---                       (the work halves, to one page or one write at the least) and plan again; a
---                       unit of one needs a bounded window, so the retry ends with the work done
+--                       (the work halves) and plan again. The limit counts units of the planner's own
+--                       work and a planner never does less than its atomic unit, so a limit below it
+--                       means the unit: one page for maintenance, the three writes of one connection
+--                       inspection for discovery ('windowWorkAtLeast'); a standalone removal is atomic
+--                       and reads no limit. The unit needs a bounded window, so the retry ends with
+--                       the work done and never in a refusal
+--   'Refused' ('Capacity' ('LooseExceeded' _)) -> shrink like any other batch; at the smallest unit run
+--                       maintenance, then plan again
 --   'Refused' why    -> 'classifyPlan' (in "Hetoimasia.Terrain.Runtime.Store.Admission")
 -- @
 --
