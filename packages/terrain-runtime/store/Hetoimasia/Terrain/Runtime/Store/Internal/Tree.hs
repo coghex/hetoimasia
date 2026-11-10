@@ -50,6 +50,16 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , emptyWindow
   , windowBelow
   , windowTrust
+  , Fact (..)
+  , Fingerprint (..)
+  , Facts (..)
+  , recordFact
+  , editFacts
+  , factBytes
+  , windowCheckpoint
+  , windowFactsFor
+  , windowKnows
+  , windowFactCount
   , limitWork
   , reduceWork
   , windowWork
@@ -158,6 +168,11 @@ data Window = Window
   -- ^ Test-only: roots with no recorded checksum are read unchecked. No production path sets it.
   , wRoots ∷ !(Map PageNo Word32)
   -- ^ The checksum each root page must carry, by page number, as the root record publishes it.
+  , wFacts ∷ !(Maybe Fingerprint)
+  -- ^ What the facts of 'wProven' were proven against; facts of any other state are not trusted.
+  , wProven ∷ !(Set Fact)
+  -- ^ Read-only facts established by earlier plans through windows of this version, carried through a
+  -- 'windowCheckpoint' (see 'Facts').
   , wWork ∷ !Int
   -- ^ The most units of work a plan through this window may take on (the pages one maintenance
   -- transaction frees, the writes of one discovery batch): the caller's bounded retry, see 'limitWork'.
@@ -166,7 +181,7 @@ data Window = Window
 
 -- | An empty window for a store and a version.
 emptyWindow ∷ StoreIdentity → Word64 → Window
-emptyWindow ident v = Window ident v Map.empty Map.empty maxBound False Map.empty maxBound
+emptyWindow ident v = Window ident v Map.empty Map.empty maxBound False Map.empty Nothing Set.empty maxBound
 
 -- | The window of a version whose used page space is the first @n@ pages: a
 -- reference to a page at or past @n@ is refused, never read.
@@ -205,6 +220,58 @@ reduceWork old new = limitWork (min 64 (wWork old) `div` 2) new
 windowWork ∷ Window → Int
 windowWork = wWork
 
+-- | A read-only fact about the committed and pinned state, established by a plan and remembered through a
+-- retry: the proofs that a page a plan is about to overwrite or free is not owned by anyone but the
+-- allocator ('FactUnreachable', 'FactNotRetired', 'FactNotFree'), that a page a retirement entry names is
+-- a record page no root reaches ('FactRetirable'), and that a page the entry consumed is gone from the
+-- retired-page index ('FactGone'). Each is a function of the committed roots, the pinned roots and the pages
+-- of their trees and of nothing the plan stages: a lookup is made from a committed root ('Disk'), never from
+-- the edit's own.
+data Fact
+  = FactUnreachable !PageNo
+  | FactRetirable !PageNo
+  | FactNotRetired !PageNo
+  | FactNotFree !PageNo
+  | FactGone !Word64 !PageNo
+  deriving stock (Eq, Ord, Show)
+
+-- | The state a set of facts was proven against: the store, the version, the committed roots with the
+-- checksums they carry and the pinned roots with their versions. A window trusts facts only for the very
+-- state it plans against, so a reader acquired or released in between, or a window kept across a version,
+-- costs a proof again and never skips one it should have made.
+data Fingerprint = Fingerprint !StoreIdentity !Word64 ![(PageNo, Word32)] ![(Word64, [(PageNo, Word32)])]
+  deriving stock (Eq, Show)
+
+-- | The facts a plan established before its window filled up, with what they were proven against. OPAQUE
+-- outside the store's own modules: a caller receives it in 'Hetoimasia.Terrain.Runtime.Store.Internal.Plan.Checkpoint'
+-- and gives it to 'windowCheckpoint', and has no way to make or change one.
+data Facts = Facts !Fingerprint ![Fact]
+  deriving stock (Eq, Show)
+
+-- | The accounted bytes of one remembered fact.
+factBytes ∷ Int
+factBytes = 24
+
+-- | The window of a retry after a plan filled its window while proving: a fresh window for the same store,
+-- version, trust, work and used space, holding none of the pages or probes of the old one and the facts the
+-- plan established (added to those it already had when they were proven against the same state).
+windowCheckpoint ∷ Facts → Window → Window
+windowCheckpoint (Facts fp fs) w =
+  let kept = if wFacts w == Just fp then wProven w else Set.empty
+   in w {wPages = Map.empty, wProbes = Map.empty, wFacts = Just fp, wProven = Set.union kept (Set.fromList fs)}
+
+-- | The window, with the facts it carries kept only if they were proven against this state.
+windowFactsFor ∷ Fingerprint → Window → Window
+windowFactsFor fp w = if wFacts w == Just fp then w else w {wFacts = Nothing, wProven = Set.empty}
+
+-- | Whether the window carries a fact (after 'windowFactsFor').
+windowKnows ∷ Fact → Window → Bool
+windowKnows f w = Set.member f (wProven w)
+
+-- | The facts a window carries.
+windowFactCount ∷ Window → Int
+windowFactCount = Set.size . wProven
+
 -- | The version the window was filled for.
 windowVersion ∷ Window → Word64
 windowVersion = wVersion
@@ -224,7 +291,7 @@ windowPageOverhead = 128
 
 -- | The accounted bytes of the probes a window holds, 'probeBytes' each.
 windowProbeBytes ∷ Window → Int
-windowProbeBytes w = Map.size (wProbes w) * probeBytes
+windowProbeBytes w = Map.size (wProbes w) * probeBytes + Set.size (wProven w) * factBytes
 
 -- | Decode a page read for a page number against the window's store and add it. A page
 -- that fails any check is refused and the window is unchanged. The window keeps its own
@@ -366,16 +433,26 @@ data Edit = Edit
   , eNext ∷ !Int
   , eReplaced ∷ !(Set PageNo)
   , eSteps ∷ !Int
+  , eFacts ∷ [Fact]
+  -- ^ The facts this plan established so far (in this call, not those its window already carried).
   , eHot ∷ [(PageNo, Node)]
   -- ^ The last few committed nodes parsed, so a run of updates in one neighbourhood
   -- does not parse the same page again for every key. At most 'hotNodes' are held and
   -- 'hotNodeBytes' each is accounted in a plan's scratch.
   }
 
+-- | Note a fact this plan has just established.
+recordFact ∷ Fact → Edit → Edit
+recordFact f e = e {eFacts = f : eFacts e}
+
+-- | The facts this plan established so far, oldest first.
+editFacts ∷ Edit → [Fact]
+editFacts = reverse . eFacts
+
 -- | A fresh plan state over a window, whose new pages may hold at most the given
 -- accounted bytes.
 newEdit ∷ Int → Window → Edit
-newEdit budget w = Edit w IntMap.empty 0 IntMap.empty [] budget 0 Set.empty 0 []
+newEdit budget w = Edit w IntMap.empty 0 IntMap.empty [] budget 0 Set.empty 0 [] []
 
 -- | The accounted bytes of the new pages the plan holds now.
 editFreshBytes ∷ Edit → Int

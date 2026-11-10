@@ -99,9 +99,10 @@ drainChecked = go 0 0
     go n longest h
       | n > (4000 ∷ Int) = Left "reclamation did not terminate"
       | otherwise = do
-          (p, _, _) ← fillRetry h (planMaintenance (hStore h))
+          (p, _, _, cps) ← fillRetryCounting h (planMaintenance (hStore h))
           case p of
             Planned plan → do
+              when (cps > mPagesWritten (plMeasure plan) + maxReclaimPages) (Left ("more checkpoints (" <> show cps <> ") than facts a transaction can make"))
               h' ← commitPlan h plan
               l ← looseWithin h'
               go (n + 1) (max longest l) h'

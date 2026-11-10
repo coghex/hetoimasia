@@ -97,6 +97,7 @@ constructors =
   , ("GrowthProposal", [store <> "GrowthProposal (GrowthProposal))"])
   , ("Roots", [store <> "Roots (Roots))"])
   , ("Window", [store <> "Window (Window))"])
+  , ("Facts", [store <> "Facts (Facts))"])
   , ("EditBankConfig", [admission <> "EditBankConfig (EditBankConfig))"])
   , ("Admission", [admission <> "Admission (Admission))"])
   , ("Grant", [admission <> "Grant (Grant))"])
@@ -110,6 +111,7 @@ forged =
   , ("ReaderToken", [store <> "ReaderToken)"], ["forged = ReaderToken"])
   , ("GrowthProposal", [store <> "GrowthProposal)"], ["forged = GrowthProposal"])
   , ("StoreConfig", [store <> "StoreConfig)"], ["forged = StoreConfig"])
+  , ("Facts", [store <> "Facts)"], ["forged = Facts"])
   ]
 
 recordUpdates ∷ [(String, [String], [String])]
@@ -145,6 +147,12 @@ supportedClient =
     , "import Hetoimasia.Terrain.Runtime.Store"
     , "import Hetoimasia.Terrain.Runtime.Store.Admission"
     , "import Hetoimasia.Terrain.Source"
+    , ""
+    , "-- a consumer of the planner handles the checkpoint: the facts it is handed are opaque and go back only through"
+    , "-- 'windowCheckpoint'"
+    , "checkpointStep ∷ Window → Planned → Maybe Window"
+    , "checkpointStep w (Checkpoint facts) = Just (windowCheckpoint facts w)"
+    , "checkpointStep _ _ = Nothing"
     , ""
     , "main ∷ IO ()"
     , "main = do"

@@ -16,6 +16,11 @@
 --   'Pending' page   -> fetch the page, 'addPage' it to the window, plan again
 --   'PendingProbes' pages -> fetch each page, 'addProbe' it to the window (it may not be a page
 --                       at all), plan again: the plan must first prove no owner claims it
+--   'Checkpoint' facts -> the window filled while the plan was proving that the pages it will
+--                       overwrite are owned by nobody but the allocator: build a fresh window of the
+--                       same version with 'windowCheckpoint' facts (it keeps what was proven and the
+--                       work limit, and drops the pages and probes) and plan again. A consumer MUST
+--                       handle it; the 'Facts' are opaque and only the planner makes them
 --   'Planned' p      -> 'admit' p store, write 'planPages', report each outcome with
 --                       'dispatchWrite' and 'completeWrite', then 'publish' (or 'abortTransaction')
 --   'NoWork'         -> nothing to append
@@ -83,6 +88,8 @@ module Hetoimasia.Terrain.Runtime.Store
   , limitWork
   , reduceWork
   , windowWork
+  , Facts
+  , windowCheckpoint
   , windowBytes
   , windowVersion
   , windowPageNumbers
@@ -216,7 +223,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), bodyBytes, decodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, limitWork, reduceWork, windowBytes, windowInsert, windowPageNumbers, windowProbe, windowSize, windowVersion, windowWork)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Facts, Window, limitWork, reduceWork, windowBytes, windowInsert, windowPageNumbers, windowProbe, windowCheckpoint, windowSize, windowVersion, windowWork)
 
 -- The accessors below are functions, never record fields, so a client cannot rewrite
 -- a plan, a growth proposal or a root set with record-update syntax.

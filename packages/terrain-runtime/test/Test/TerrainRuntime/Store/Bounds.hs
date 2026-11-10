@@ -296,6 +296,44 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     -- each smaller work plans a smaller batch than the full one, down to the least
     (sizes !! 3 < sizes !! 0) `shouldBe` True
     and (zipWith (>=) sizes (drop 1 sizes)) `shouldBe` True
+  it "plans a standalone removal, which cannot shrink, with a window of exactly its at-once bound, 16 distinct pinned versions and no tail left" $ do
+    -- the removal holds its whole edit at once; only the proofs of the pages it overwrites go through checkpoints
+    let run0 = newRun smallSpec sealedStack 64
+    r1 ← must (removeCell run0 (tileAt 1 1 3))
+    r2 ← must (removeCell r1 (tileAt 1 1 4))
+    -- unrelated runs far from the scene deepen the runs tree, and the head of the free extent holds old leaves of it
+    let preloadKeys = [runKey x y 10 | x ← [500 .. 560], y ← [0 .. 99]]
+        chunks [] = []
+        chunks xs = let (q, rest) = splitAt 40 xs in q : chunks rest
+        preload h ks = do
+          (h', out) ← commitDelta h Ordinary (deltaFor (hStore h) False False 1 [(k, Just (runRec 20)) | k ← ks])
+          case out of
+            Committed _ → Right h'
+            other → Left ("preload: " <> show other)
+    hLoaded ← must (foldM preload (runH r2) (chunks preloadKeys))
+    hNoTail ← must (noTailWithOldLeaves TreeRuns 200 hLoaded)
+    (hP, toks) ← must (withPins (\i → (runKey (toInteger (500 + 3 * i)) (toInteger (7 * i)) 10, runRec 30)) 16 hNoTail)
+    let hrec = maximum [heightOf hP t | t ← [TreeRuns, TreeLinks, TreeTodo]]
+        hf = heightOf hP TreeFree
+        internals = max 0 (heightOf hP TreeRetire - 1) * 1
+        lim = removalWindowPages internals hf hrec 16
+        bounds = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
+        env = runEnv r2
+        tile = tileAt 2 2 3
+    (p, _, _, cps) ← must (fillCounting hP (storeWindow (hStore hP)) (\w → planRemovalWith bounds env (hStore hP) w tile))
+    case p of
+      Planned pl → do
+        (mWindowPages (plMeasure pl) <= lim) `shouldBe` True
+        putStrLn ("REMOVAL at once: heights " <> show (hrec, hf, internals) <> ", window bound " <> show lim <> ", held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show cps <> " checkpoints, " <> show (mPagesWritten (plMeasure pl)) <> " pages written")
+      other → expectationFailure ("the removal did not fit its at-once bound of " <> show lim <> " pages: " <> take 300 (show other))
+    -- and after the readers release, the same removal plans under the bound of no readers
+    let released = hP {hStore = foldl (\st t → snd (releaseReader t st)) (hStore hP) toks}
+        lim0 = removalWindowPages internals hf hrec 0
+        bounds0 = standardBounds {bdWindowPages = lim0, bdWindowBytes = lim0 * windowPageBytes}
+    (q, _, _, _) ← must (fillCounting released (storeWindow (hStore released)) (\w → planRemovalWith bounds0 env (hStore released) w tile))
+    case q of
+      Planned _ → pure ()
+      other → expectationFailure ("the removal did not plan after the readers released, bound " <> show lim0 <> ": " <> take 300 (show other))
   it "fits the supported minimum removal at the format's worst-case height, in the smallest and default allowances" $ do
     forM_ [smallSpec, defaultStoreSpec, specOf (64 * 1024 * 1024) (Just (40 * 1024 * 1024))] $ \spec' → do
       cfg ← must (either (Left . show) Right (mkStoreConfig spec'))

@@ -21,7 +21,13 @@ module Test.TerrainRuntime.Store.Harness
   , fillPlan
   , fillWith
   , fillRetry
+  , fillRetryCounting
   , fillFrom
+  , fillCounting
+  , heightOf
+  , withPins
+  , noTailOf
+  , noTailWithOldLeaves
   , deltaFor
   , Outcome (..)
   , commitDelta
@@ -69,7 +75,9 @@ import Hetoimasia.Terrain.Discovery
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (encodeFree)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Test.TerrainRuntime.Store.Reference
@@ -125,16 +133,20 @@ fillWith h = fillFrom h (storeWindow (hStore h))
 -- bounds is planned again through a fresh window of the same version with half the work ('reduceWork'),
 -- down to a unit of one, which must fit. The outcome is what the last window gave.
 fillRetry ∷ H → (Window → Planned) → Either String (Planned, Window, Int)
-fillRetry h f = go (storeWindow (hStore h)) (0 ∷ Int)
+fillRetry h f = (\(p, w, n, _) → (p, w, n)) <$> fillRetryCounting h f
+
+-- | 'fillRetry' counting the checkpoints taken over all the windows it used.
+fillRetryCounting ∷ H → (Window → Planned) → Either String (Planned, Window, Int, Int)
+fillRetryCounting h f = go (storeWindow (hStore h)) (0 ∷ Int) 0
   where
-    go w0 k = do
-      (p, w, n) ← fillFrom h w0 f
+    go w0 k cps = do
+      (p, w, n, c) ← fillCounting h w0 f
       case p of
-        Refused (Capacity c) | windowBound c →
+        Refused (Capacity c') | windowBound c' →
           if windowWork w0 <= 1 || k > 12
-            then Left ("a unit of work of one did not fit the window: " <> show c)
-            else go (reduceWork w (storeWindow (hStore h))) (k + 1)
-        other → Right (other, w, n)
+            then Left ("a unit of work of one did not fit the window: " <> show c')
+            else go (reduceWork w (storeWindow (hStore h))) (k + 1) (cps + c)
+        other → Right (other, w, n, cps + c)
     windowBound c = case c of
       WindowExceeded _ → True
       WindowBytesExceeded _ → True
@@ -142,20 +154,27 @@ fillRetry h f = go (storeWindow (hStore h)) (0 ∷ Int)
       _ → False
 
 fillFrom ∷ H → Window → (Window → Planned) → Either String (Planned, Window, Int)
-fillFrom h w00 f = go w00 0
+fillFrom h w00 f = (\(p, w, n, _) → (p, w, n)) <$> fillCounting h w00 f
+
+-- | 'fillFrom' counting the checkpoints: a plan whose window filled while it was proving is continued through a
+-- fresh window that keeps the facts it established ('windowCheckpoint'), as a caller of the public API does.
+-- Returns the outcome, the last window, the pages and probes fetched and the checkpoints taken.
+fillCounting ∷ H → Window → (Window → Planned) → Either String (Planned, Window, Int, Int)
+fillCounting h w00 f = go w00 0 0
   where
     total = cfgUsablePages (hCfg h)
-    go w n
-      | n > 1500 = Left "planning did not settle: too many pending pages"
+    go w n k
+      | n > 40000 = Left "planning did not settle: too many pending pages"
       | otherwise = case f w of
       Pending p → case diskRead (hDisk h) p of
         Nothing → Left ("pending page not on disk: " <> show p)
         Just bs → case windowInsert total p bs w of
           Left e → Left ("page " <> show p <> " refused: " <> show e)
-          Right w' → go w' (n + 1 ∷ Int)
+          Right w' → go w' (n + 1 ∷ Int) k
       -- a page the plan only has to classify: a page never written is nothing
-      PendingProbes ps → go (foldl (\w' p → windowProbe total p (maybe BS.empty id (diskRead (hDisk h) p)) w') w ps) (n + 1 ∷ Int)
-      other → Right (other, w, n)
+      PendingProbes ps → go (foldl (\w' p → windowProbe total p (maybe BS.empty id (diskRead (hDisk h) p)) w') w ps) (n + 1 ∷ Int) k
+      Checkpoint fs → go (windowCheckpoint fs w) (n + 1) (k + 1 ∷ Int)
+      other → Right (other, w, n, k)
 
 fillPlan ∷ H → Delta → TxClass → Either String Planned
 fillPlan h d cls = (\(p, _, _) → p) <$> fillWith h (\w → planDeltaPinned standardBounds (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) w cls d)
@@ -217,6 +236,7 @@ runPlanned h p = case p of
   BlockedByReader a b → Left ("blocked by reader " <> show (a, b))
   Pending q → Left ("unfilled pending " <> show q)
   PendingProbes q → Left ("unfilled probes " <> show q)
+  Checkpoint _ → Left "unfilled checkpoint"
 
 -- | Reclaim until nothing more can be reclaimed, returning the number of
 -- transactions. Stops on a block by a reader or a refusal.
@@ -238,6 +258,7 @@ reclaimAllWithin limit = go 0
             Refused r → Left ("reclaim refused: " <> show r)
             Pending _ → Left "pending after fill"
             PendingProbes _ → Left "pending probes after fill"
+            Checkpoint _ → Left "checkpoint after fill"
 
 -- | The independent checks of the committed store against the disk: the partition,
 -- the counters and every tree's structure.
@@ -357,3 +378,61 @@ todoRec x y z d = RecTodo (Todo (tileAt x y z) d)
 -- constructor that reads such roots unchecked. A production window refuses them ('RootChecksumMissing').
 uncheckedWindow ∷ StoreIdentity → Word64 → Window
 uncheckedWindow ident v = windowUnchecked (emptyWindow ident v)
+
+-- | The levels of a tree of the store, from the page its root names.
+heightOf ∷ H → TreeId → Int
+heightOf h t = case rootOf (storeRoots (hStore h)) t >>= \r → diskRead (hDisk h) r >>= either (const Nothing) Just . parsePage a (siSource (hIdent h)) of
+  Just pg → rpLevel pg + 1
+  Nothing → 0
+  where
+    ArenaId a = siArena (hIdent h)
+
+-- | A store with @n@ readers pinned at distinct versions: each acquired, then a commit that rewrites a link, so
+-- that every pinned version has record paths of its own (the worst case for the proofs).
+withPins ∷ (Int → (RecordKey, Record)) → Int → H → Either String (H, [ReaderToken])
+withPins writeAt n h0 = go h0 [] [0 .. n - 1]
+  where
+    go h toks [] = Right (h, reverse toks)
+    go h toks (i : is) = do
+      (tok, s') ← either (Left . show) Right (acquireReader (hStore h))
+      let (key, val) = writeAt i
+      (h', out) ← commitDelta h {hStore = s'} Ordinary (deltaFor s' True False 1 [(key, Just val)])
+      case out of
+        Committed _ → go h' (tok : toks) is
+        other → Left ("a commit between pins: " <> show other)
+
+
+-- | The store with no tail left: one free extent runs from the used space to the last usable page, whose leaf of
+-- the allocator tree is the last page, so every page the allocator hands out lies below the used space and must
+-- be proven unreachable. The store must have no free extent yet.
+noTailOf ∷ H → Either String H
+noTailOf h = do
+  let roots = storeRoots (hStore h)
+      usable = fromIntegral (cfgUsablePages (hCfg h)) ∷ Word64
+      hw = rHw roots
+      len = usable - 1 - hw
+      leaf = Page TreeFree 0 (PageNo (usable - 1)) (Leaf [encodeFree hw len])
+  if rFree roots /= Nothing then Left "the store already has free extents" else Right ()
+  bytes ← either (Left . show) Right (encodePage (hIdent h) leaf)
+  let roots' = roots {rFree = Just (PageNo (usable - 1)), rFreePages = len, rHw = usable, rLivePages = rLivePages roots + 1, rRootCrcs = rRootCrcs roots ++ [(TreeFree, getLe32' bytes 4092)]}
+  Right h {hStore = modifyRoots (const roots') (hStore h), hDisk = diskWrite (PageNo (usable - 1)) bytes (hDisk h)}
+
+-- | 'noTailOf', the first pages of the free extent holding old versions of leaves of a tree of the store (one
+-- record each, spread through the tree), so that the proofs of the pages the allocator hands out read paths of
+-- that tree.
+noTailWithOldLeaves ∷ TreeId → Int → H → Either String H
+noTailWithOldLeaves tree n h = do
+  let hw0 = rHw (storeRoots (hStore h))
+      ArenaId a = siArena (hIdent h)
+      recs = twLeaves (walkTree a (siSource (hIdent h)) (diskRead (hDisk h)) ((\(PageNo p) → p) <$> rootOf (storeRoots (hStore h)) tree))
+      stride = max 1 (length recs `div` max 1 n)
+      samples = take n [r | (i, r) ← zip [0 ∷ Int ..] recs, i `mod` stride == 0]
+  h1 ← noTailOf h
+  foldM
+    ( \acc (i, r) → do
+        let pg = Page tree 0 (PageNo (hw0 + fromIntegral i)) (Leaf [r])
+        bytes ← either (Left . show) Right (encodePage (hIdent acc) pg)
+        Right acc {hDisk = diskWrite (pgNo pg) bytes (hDisk acc)}
+    )
+    h1
+    (zip [0 ∷ Int ..] samples)

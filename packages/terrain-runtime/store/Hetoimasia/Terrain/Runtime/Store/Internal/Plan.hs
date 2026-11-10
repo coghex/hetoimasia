@@ -75,6 +75,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Plan
   , CapacityWhy (..)
   , IntegrityWhy (..)
   , shrinkable
+  , fingerprintOf
 
     -- * Planning
   , Bounds (..)
@@ -105,7 +106,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Control.Monad (foldM)
 import Data.Int (Int64)
-import Data.List (nub)
+import Data.List (nub, sort)
 import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -236,6 +237,13 @@ data Planned
     -- no owner but the allocator claims them. All of the missing ones are named at once, so
     -- the plan is not rerun for each.
     PendingProbes ![PageNo]
+  | -- | The plan's window filled while it was proving that the pages it is about to overwrite or free are
+    -- owned by nobody but the allocator: the proofs made so far are read-only facts about the committed
+    -- and pinned state. Build a fresh window of the same version with 'windowCheckpoint' (it keeps the
+    -- facts, the work limit and the trust, and drops the pages and probes) and plan again: the plan does
+    -- not repeat a proof it carries a fact for. A checkpoint always carries at least one new fact; a window
+    -- that cannot hold the plan's edit and one proof is the typed 'WindowExceeded', never a checkpoint.
+    Checkpoint !Facts
   | Refused !PlanRefusal
   deriving stock (Eq, Show)
 
@@ -362,7 +370,7 @@ standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes bo
 -- ---------------------------------------------------------------------------
 -- The planning monad
 
-data Out = OutNeed !PageNo | OutProbes ![PageNo] | OutRefuse !PlanRefusal | OutMoreBookkeeping !Int
+data Out = OutNeed !PageNo | OutProbes ![PageNo] | OutRefuse !PlanRefusal | OutMoreBookkeeping !Int | OutCheckpoint !Facts
 
 type P a = Either Out a
 
@@ -385,6 +393,7 @@ settle (Left (OutNeed p)) = Pending p
 settle (Left (OutProbes ps)) = PendingProbes ps
 settle (Left (OutRefuse r)) = Refused r
 settle (Left (OutMoreBookkeeping n)) = Refused (Capacity (BookkeepingExceeded n))
+settle (Left (OutCheckpoint f)) = Checkpoint f
 
 -- ---------------------------------------------------------------------------
 -- Capacity
@@ -548,13 +557,14 @@ pinRootFor _ = const Nothing
 --
 -- A page found is refused with the given constructor, and a page whose probe is not
 -- in the window is asked for. The work is bounded by the pages given and the readers.
-unreachable ∷ StoreConfig → Roots → [Pins] → (PageNo → IntegrityWhy) → Window → [PageNo] → Edit → P Edit
-unreachable cfg roots pins why win pages edit0 = case [pg | pg ← pages, isNothing (windowProbeOf pg win)] of
-  missing@(_ : _) → Left (OutProbes missing)
-  [] → foldM one edit0 pages
+unreachable ∷ Bounds → Fingerprint → StoreConfig → Roots → [Pins] → (PageNo → IntegrityWhy) → (PageNo → Fact) → Window → [PageNo] → Edit → P Edit
+unreachable bounds fp cfg roots pins why mk win pages edit0 =
+  case [pg | pg ← pages, not (windowKnows (mk pg) win), isNothing (windowProbeOf pg win)] of
+    missing@(_ : _) → Left (OutProbes missing)
+    [] → proving bounds fp win mk one pages edit0
   where
     total = cfgTotalPages cfg
-    one edit pg = case windowProbeOf pg win of
+    one pg edit = case windowProbeOf pg win of
       Nothing → Left (OutProbes [pg])
       Just ProbeNone → Right edit
       Just (ProbeList v) → do
@@ -568,6 +578,37 @@ unreachable cfg roots pins why win pages edit0 = case [pg | pg ← pages, isNoth
                       (found, e') ← phase e (livePageAt tree (fmap Disk r) key level)
                       if found == Just pg then refuse (Integrity (why pg)) else Right e') edit rootsOf
 
+-- | What a window must hold to take one more page: it would outgrow its page or byte bound.
+windowFull ∷ Bounds → Window → Bool
+windowFull bounds win =
+  windowSize win + 1 > bdWindowPages bounds || windowBytes win + pageSize + windowPageOverhead > bdWindowBytes bounds
+
+-- | The state facts are proven against: what a window trusts them for (and nothing else).
+fingerprintOf ∷ StoreIdentity → Roots → [Pins] → Fingerprint
+fingerprintOf ident roots pins = Fingerprint ident (rVersion roots) (rootTrust roots) (sort [(pinVersion p, pinTrust p) | p ← pins])
+
+-- | The proofs a plan makes about pages, each a unit of its own that becomes a fact once made: a page the
+-- window already carries the fact for is skipped, and a proof that needs a page the window can no longer hold
+-- ends the call with a 'Checkpoint' of the facts made so far (in this call, across every kind of proof), so
+-- that a retry through a fresh window repeats none of them and holds at once only what the plan edits and ONE
+-- proof. A proof is a function of the committed and the pinned state alone: every lookup it makes starts from
+-- a committed root ('Disk'), never from a root the plan is staging, so it is the same before the plan stages
+-- its edits and after. No checkpoint carries no new fact: a window that cannot hold the edit and one proof
+-- is the typed window result.
+proving ∷ Bounds → Fingerprint → Window → (PageNo → Fact) → (PageNo → Edit → P Edit) → [PageNo] → Edit → P Edit
+proving bounds fp win mk prove pages edit0 = go edit0 pages
+  where
+    go edit [] = Right edit
+    go edit (pg : rest)
+      | windowKnows (mk pg) win = go edit rest
+      | otherwise = case prove pg edit of
+          Right edit' → go (recordFact (mk pg) edit') rest
+          Left (OutNeed _) | windowFull bounds win → checkpoint edit
+          Left o → Left o
+    checkpoint edit = case editFacts edit of
+      [] → Left (OutRefuse (Capacity (if windowSize win + 1 > bdWindowPages bounds then WindowExceeded (windowSize win) else WindowBytesExceeded (windowBytes win))))
+      fs → Left (OutCheckpoint (Facts fp fs))
+
 -- | The one proof of ownership every page a plan is about to overwrite passes, against
 -- every owner there is: the committed trees and every pinned reader's tree and the
 -- retirement lists ('unreachable'), the retirement tree's index of retired pages (a page a
@@ -575,18 +616,18 @@ unreachable cfg roots pins why win pages edit0 = case [pg | pg ← pages, isNoth
 -- and the supply itself (checked when the supply is taken). A page offered by the allocator
 -- is refused unless no owner but the allocator claims it, and nothing is written.
 -- @fromLoose@ are the pages taken from the loose list.
-provenFree ∷ StoreConfig → Roots → [Pins] → Window → Set.Set PageNo → [PageNo] → Edit → P Edit
-provenFree cfg roots pins win fromLoose pages edit0 = do
-  edit1 ← unreachable cfg roots pins SuppliedPageLive win pages edit0
-  edit2 ← foldM notRetired edit1 pages
-  foldM looseNotFree edit2 [pg | pg ← pages, Set.member pg fromLoose]
+provenFree ∷ Bounds → Fingerprint → StoreConfig → Roots → [Pins] → Window → Set.Set PageNo → [PageNo] → Edit → P Edit
+provenFree bounds fp cfg roots pins win fromLoose pages edit0 = do
+  edit1 ← unreachable bounds fp cfg roots pins SuppliedPageLive FactUnreachable win pages edit0
+  edit2 ← proving bounds fp win FactNotRetired notRetired pages edit1
+  proving bounds fp win FactNotFree looseNotFree [pg | pg ← pages, Set.member pg fromLoose] edit2
   where
-    notRetired edit pg = do
+    notRetired pg edit = do
       (mv, edit') ← phase edit (lookupKey TreeRetire (fmap Disk (rRetire roots)) (retiredKey pg))
       case mv of
         Just v → refuse (Integrity (SuppliedPageRetired pg (getBe64 v 0)))
         Nothing → Right edit'
-    looseNotFree edit pg@(PageNo n) = do
+    looseNotFree pg@(PageNo n) edit = do
       (mext, edit') ← phase edit (floorKey TreeFree (fmap Disk (rFree roots)) (be64 n) >>= neighbour)
       case mext of
         Just (s, l) | s <= n && n < s + l → refuse (Integrity (SuppliedPageDoubleOwned pg))
@@ -644,7 +685,8 @@ planDeltaWith bounds cfg ident roots = planDeltaPinned bounds cfg ident roots []
 -- from every one of these before it is numbered into the plan.
 planDeltaPinned ∷ Bounds → StoreConfig → StoreIdentity → Roots → [Pins] → Window → TxClass → Delta → Planned
 planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
-  let win = windowTrust (rootTrust roots ++ concatMap pinTrust pins) (windowBelow (rHw roots) win0)
+  let fp = fingerprintOf ident roots pins
+      win = windowFactsFor fp (windowTrust (rootTrust roots ++ concatMap pinTrust pins) (windowBelow (rHw roots) win0))
   checkWindow bounds ident roots win
   checkCounters roots
   let base = dlBase cand
@@ -722,7 +764,7 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
             -- No page may be overwritten that a committed or a pinned root still reaches,
             -- whatever the allocator's records say: the pages below the used space that this
             -- plan writes are each proven unreachable first.
-            bkEdit3 ← provenFree cfg roots pins win (Set.fromList (take (tkLoose tk) (tkPages tk))) [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit2
+            bkEdit3 ← provenFree bounds fp cfg roots pins win (Set.fromList (take (tkLoose tk) (tkPages tk))) [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit2
             (rr', rl', rt') ← case recNos of
               [a, b, c] → Right (a, b, c)
               _ → refuse (Integrity CorruptCounters)
@@ -954,10 +996,12 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
   Left (OutProbes ps) → PendingProbes ps
   Left (OutRefuse r) → Refused r
   Left (OutMoreBookkeeping n) → Refused (Capacity (BookkeepingExceeded n))
+  Left (OutCheckpoint f) → Checkpoint f
   Right r → r
   where
     total = cfgTotalPages cfg
-    win = windowTrust (rootTrust roots ++ concatMap pinTrust pins) (windowBelow (rHw roots) win0)
+    fp = fingerprintOf ident roots pins
+    win = windowFactsFor fp (windowTrust (rootTrust roots ++ concatMap pinTrust pins) (windowBelow (rHw roots) win0))
     reclaimM ∷ P Planned
     reclaimM = do
       checkWindow bounds ident roots win
@@ -994,7 +1038,8 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
     -- reader still pins (its version lowered past the reader) is corruption.
     notLive pages edit0 = do
       mapM_ (\pg@(PageNo n) → if n >= rHw roots then refuse (Integrity (RetiredPageLive pg)) else Right ()) pages
-      case [pg | pg ← pages, isNothing (windowProbeOf pg win)] of
+      let unproven = [pg | pg ← pages, not (windowKnows (FactRetirable pg) win)]
+      case [pg | pg ← unproven, isNothing (windowProbeOf pg win)] of
         missing@(_ : _) → Left (OutProbes missing)
         [] → Right ()
       mapM_
@@ -1002,8 +1047,8 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
             Just (ProbeTree t _ _) | isRecordTree t → Right ()
             _ → refuse (Integrity (RetiredPageLive pg))
         )
-        pages
-      unreachable cfg roots pins RetiredPageLive win pages edit0
+        unproven
+      unreachable bounds fp cfg roots pins RetiredPageLive FactRetirable win pages edit0
     attempt _ _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
     attempt e ret prefix remaining version' edit (c : cs) = case tryChunk e ret prefix remaining version' edit c of
       Right plan → Right (Planned plan)
@@ -1012,7 +1057,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
     -- a page reclaimed already is absent from the index, or was reused since and retired again under
     -- a newer version (its list keeps the number): only an index record under this entry's own version,
     -- or an older one, says the page was skipped
-    goneFromIndex ver root edit pg = do
+    goneFromIndex ver root pg edit = do
       (mv, edit') ← phase edit (lookupKey TreeRetire root (retiredKey pg))
       case mv of
         Just v | getBe64 v 0 <= ver → refuse (Integrity (RetiredIndexMismatch pg))
@@ -1069,7 +1114,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       -- still indexed when a jump is longer than the span checked, and are all inside it when it is shorter),
       -- so the first transaction after the forgery refuses it; a field forged backward asks for a page that is
       -- no longer indexed under the entry, which unindexing refuses
-      bkEditI ← foldM (goneFromIndex e retireRoot) bkEditI0 (drop (length prefix - maxReclaimPages) prefix)
+      bkEditI ← proving bounds fp win (FactGone e) (goneFromIndex e retireRoot) (drop (length prefix - maxReclaimPages) prefix) bkEditI0
       (retireRoot1, bkEdit3) ←
         if finished
           then phase bkEditI (deleteKey TreeRetire retireRootI (be64 e))
@@ -1084,7 +1129,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       let bkUsed = length encoded
       if bkUsed > bdPages bounds then refuse (Capacity (TxnPagesExceeded bkUsed)) else pure ()
       -- the pages this maintenance writes are as unreachable as any other plan's
-      bkEdit4 ← provenFree cfg roots pins win (Set.fromList (take (tkLoose tk) (tkPages tk))) [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit3
+      bkEdit4 ← provenFree bounds fp cfg roots pins win (Set.fromList (take (tkLoose tk) (tkPages tk))) [pg | (pg@(PageNo n), _) ← encoded, n < rHw roots] bkEdit3
       (retire', free') ← case bkNos of
         [a, b] → Right (a, b)
         _ → refuse (Integrity CorruptCounters)

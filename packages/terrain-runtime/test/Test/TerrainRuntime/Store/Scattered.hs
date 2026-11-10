@@ -23,7 +23,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Pa
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (limitWork)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
@@ -45,7 +45,7 @@ groupN = 54
 
 -- | The store, the keys of the first link of each leaf of the links tree (in tree order), and the links' reference.
 scattered ∷ (H, [RecordKey], Map.Map RecordKey Record)
-scattered = scatteredWith False Nothing
+scattered = scatteredWith False Nothing False
 
 -- | The same store in the layout of round 12: the oldest retirement entry holds 64 dispersed pages (the rest
 -- are in lists of 505), and a free extent of 256 pages holds old versions of links leaves with distinct keys,
@@ -53,21 +53,26 @@ scattered = scatteredWith False Nothing
 -- pages each of which must be proven unreachable by reading the path of its own first key: a transaction
 -- that frees 64 pages needs a window of 311 pages, one that frees 32 needs 208.
 fragmented ∷ (H, [RecordKey], Map.Map RecordKey Record)
-fragmented = scatteredWith True Nothing
+fragmented = scatteredWith True Nothing False
+
+-- | The fragmented layout on a store with NO tail: the free extent runs to the end of the usable pages, so every
+-- page the allocator hands out lies below the used space and must be proven unreachable.
+fragmentedNoTail ∷ (H, [RecordKey], Map.Map RecordKey Record)
+fragmentedNoTail = scatteredWith True Nothing True
 
 -- | The layout of round 13: the oldest entry lists 270 dispersed pages, all but the last consumed (its progress
 -- field at 269), and the consumed pages were reused and retired again under a newer entry; every page lies in a
 -- different leaf of the retirement index. The transaction that finishes the entry verifies its consumed pages are
 -- gone from the index: all 269 of them, in 269 leaves, was a window of 311 pages however little work it did.
 finalChunk ∷ Int → (H, [RecordKey], Map.Map RecordKey Record)
-finalChunk done = scatteredWith False (Just (done, False))
+finalChunk done = scatteredWith False (Just (done, False)) False
 
 -- | The same entry with its progress field forged to @done@ while every one of its pages is still indexed under it.
 forgedProgress ∷ Int → (H, [RecordKey], Map.Map RecordKey Record)
-forgedProgress done = scatteredWith False (Just (done, True))
+forgedProgress done = scatteredWith False (Just (done, True)) False
 
-scatteredWith ∷ Bool → Maybe (Int, Bool) → (H, [RecordKey], Map.Map RecordKey Record)
-scatteredWith frag fin = (h, firstKeys, ref)
+scatteredWith ∷ Bool → Maybe (Int, Bool) → Bool → (H, [RecordKey], Map.Map RecordKey Record)
+scatteredWith frag fin noTail = (h, firstKeys, ref)
   where
     -- the links tree: the records sorted by their encoded keys, 40 to a leaf
     recs = sortOn fst [(encodeKey k, (k, encodeValue a, a)) | i ← [0 .. leavesN * perLeaf - 1], let (k, a, _) = linkOf i]
@@ -128,7 +133,8 @@ scatteredWith frag fin = (h, firstKeys, ref)
     -- the free extent of the fragmented layout: 256 pages past the used space of the rest, each an old version of a
     -- links leaf, and the leaf of the allocator tree that names it
     extentPages = [Page TreeLinks 0 (PageNo (usedHw + fromIntegral i)) (Leaf [(k, v) | (k, (_, v, _)) ← take 1 lr]) | (i, lr) ← [(i, leafRecs !! ((4 * i + 2) `mod` leavesN)) | i ← [0 .. 255]]]
-    freeLeaf = Page TreeFree 0 (PageNo (usedHw + 256)) (Leaf [encodeFree usedHw 256])
+    extentLen = if noTail then cfgUsablePages (hCfg h0) - usedHw - 1 else 256
+    freeLeaf = Page TreeFree 0 (PageNo (usedHw + extentLen)) (Leaf [encodeFree usedHw extentLen])
     livePagesList = linkLeaves ++ linkInners ++ [linkRoot] ++ listPages ++ retireLeaves ++ retireInners ++ [retireRoot] ++ [freeLeaf | frag]
     -- a retired page of a legitimate store holds the old version of a record-tree page (maintenance refuses anything else)
     oldPages = [Page TreeLinks 0 (PageNo q) (Leaf [(k, v) | (k, (_, v, _)) ← take 1 (leafRecs !! oldLeaf q)]) | q ← retiredNos]
@@ -136,7 +142,7 @@ scatteredWith frag fin = (h, firstKeys, ref)
       Just i → (4 * i + 1) `mod` leavesN
       Nothing → fromIntegral q `mod` leavesN
     writtenPages = livePagesList ++ (if frag then extentPages else []) ++ (if frag || fin /= Nothing then oldPages else [])
-    hw = if frag then usedHw + 257 else usedHw
+    hw = if frag then usedHw + extentLen + 1 else usedHw
     h0 = newH (specOf (128 * 1024 * 1024) Nothing) ident0
     disk = foldl (\dk pg → diskWrite (pgNo pg) (either (error . show) id (encodePage ident0 pg)) dk) (hDisk h0) writtenPages
     roots0 = storeRoots (hStore h0)
@@ -150,7 +156,7 @@ scatteredWith frag fin = (h, firstKeys, ref)
         , rRetiredPages = fromIntegral retiredCount
         , rRootCrcs = [(TreeLinks, crcOf linkRoot), (TreeRetire, crcOf retireRoot)] ++ [(TreeFree, crcOf freeLeaf) | frag]
         , rFree = if frag then Just (pgNo freeLeaf) else Nothing
-        , rFreePages = if frag then 256 else 0
+        , rFreePages = if frag then extentLen else 0
         }
     h = h0 {hStore = storeFromRoots (hCfg h0) ident0 roots, hDisk = disk}
 
@@ -168,7 +174,7 @@ dispersed firstKeys k =
       [] → Nothing
 
 spec ∷ Spec
-spec = specBoundary >> specFragmented >> specFinal >> specBound >> specForged
+spec = specBoundary >> specFragmented >> specFinal >> specBound >> specForged >> specAtOnce >> specFingerprint
 
 specBoundary ∷ Spec
 specBoundary = describe "the round-11 boundary at the real reserve: 64 dispersed link updates need more bookkeeping than 68" $ do
@@ -210,18 +216,21 @@ specFragmented = describe "round 12: maintenance on a fragmented valid store who
   it "is a valid store the independent checker accepts, with an oldest entry of 64 dispersed pages and a free extent of 256" $ do
     must (checkH h0)
     rFreePages (storeRoots (hStore h0)) `shouldBe` 256
-  it "plans without a retry only up to the window: the largest chunk outgrows it (the failure round 12 reproduced)" $ do
-    (p, _, _) ← must (fillWith h0 (planMaintenance (hStore h0)))
+  it "plans the largest chunk through checkpoints: the window never holds the whole proof, and no work limit is needed" $ do
+    (p, _, steps, checkpoints) ← must (fillCounting h0 (storeWindow (hStore h0)) (planMaintenance (hStore h0)))
     case p of
-      Refused (Capacity c) → c `shouldSatisfy` (\x → case x of WindowBytesExceeded _ → True; WindowExceeded _ → True; ProbesExceeded _ → True; _ → False)
-      Planned pl → expectationFailure ("PLANNED freed " <> show (mFreed (plMeasure pl)) <> " window " <> show (mWindowPages (plMeasure pl)) <> " bk " <> show (mBookkeepingPages (plMeasure pl)) <> " loose " <> show (mLooseTaken (plMeasure pl)) <> " claimed " <> show (mClaimed (plMeasure pl)) <> " steps " <> show (mReadSteps (plMeasure pl)))
-      other → expectationFailure ("the largest chunk was expected to outgrow the window: " <> take 200 (show other))
-  it "makes progress through the public API with the real limits: a retry with half the work frees a smaller chunk, and the store drains" $ do
+      Planned pl → do
+        -- the 64-page chunk of the reviewer's layout (a window of 311 pages in one piece) is planned whole
+        mFreed (plMeasure pl) `shouldBe` 64
+        (mWindowPages (plMeasure pl) <= maxWindowBytes `div` windowPageBytes) `shouldBe` True
+        putStrLn ("SCATTERED fragmented chunk: window " <> show (mWindowPages (plMeasure pl)) <> ", " <> show checkpoints <> " checkpoints, " <> show steps <> " pages and probes fetched")
+      other → expectationFailure ("the largest chunk was not planned: " <> take 200 (show other))
+  it "makes progress through the public API with the real limits, and the store drains" $ do
     (p, _, _) ← must (fillRetry h0 (planMaintenance (hStore h0)))
     case p of
       Planned pl → do
         let freed = mFreed (plMeasure pl)
-        (freed > 0 && freed < 64) `shouldBe` True
+        (freed > 0) `shouldBe` True
         h1 ← must (commitPlan h0 pl)
         must (checkH h1)
       other → expectationFailure ("maintenance made no progress: " <> take 300 (show other))
@@ -229,9 +238,13 @@ specFragmented = describe "round 12: maintenance on a fragmented valid store who
     let go h n
           | n > (6000 ∷ Int) = Left "the drain did not end"
           | otherwise = do
-              (res, _, _) ← fillRetry h (planMaintenance (hStore h))
+              (res, _, _, cps) ← fillRetryCounting h (planMaintenance (hStore h))
               case res of
-                Planned pl → commitPlan h pl >>= \h' → go h' (n + 1)
+                Planned pl
+                  -- progress is enforced: a checkpoint carries a new fact, and a transaction proves at most the pages it writes
+                  -- and the span it verifies
+                  | cps > mPagesWritten (plMeasure pl) + maxReclaimPages → Left ("more checkpoints (" <> show cps <> ") than facts a transaction can make")
+                  | otherwise → commitPlan h pl >>= \h' → go h' (n + 1)
                 NoWork → Right (h, n)
                 other → Left ("maintenance neither did work nor found nothing left: " <> take 200 (show other))
     (drained, passes) ← must (go h0 0)
@@ -270,31 +283,43 @@ specFinal = describe "round 13: a partially consumed entry at every progress poi
       let go h n
             | n > (6000 ∷ Int) = Left "the drain did not end"
             | otherwise = do
-                (res, _, _) ← fillRetry h (planMaintenance (hStore h))
+                (res, _, _, cps) ← fillRetryCounting h (planMaintenance (hStore h))
                 case res of
-                  Planned pl → commitPlan h pl >>= \h' → go h' (n + 1)
+                  Planned pl
+                    | cps > mPagesWritten (plMeasure pl) + maxReclaimPages → Left ("more checkpoints (" <> show cps <> ") than facts a transaction can make")
+                    | otherwise → commitPlan h pl >>= \h' → go h' (n + 1)
                   NoWork → Right (h, n)
                   other → Left ("maintenance neither did work nor found nothing left: " <> take 200 (show other))
       (drained, _) ← must (go h0 0)
       rRetiredPages (storeRoots (hStore drained)) `shouldBe` 0
       must (checkH drained)
 
--- | The window a maintenance transaction of one page needs, measured on every store of this suite at work one,
--- against the bound derived in 'workOneWindowPages'.
+-- | The window a maintenance transaction of one page holds, on every layout and progress point: inside the window's
+-- bound, and the transaction still makes progress when the window is cut to the at-once bound, the pages it edits
+-- and ONE proof ('workOneWindowPages'): every proof beyond one is a fact it carries through a checkpoint.
 specBound ∷ Spec
 specBound = describe "the window a unit of work of one can need, as a bound" $
-  it "stays inside the derived bound on every layout and every progress point, and inside the window's" $ do
+  it "stays inside the window's bound on every layout and every progress point, and proceeds when cut to the at-once bound" $ do
     let layouts = [("fragmented", fst3 fragmented)] ++ [("final " <> show d, fst3 (finalChunk d)) | d ← [0, 64, 269]]
         fst3 (a, _, _) = a
+        limit = maxWindowBytes `div` windowPageBytes
     rows ← forM layouts $ \(name, h0) → do
-      (p, _, _) ← must (fillFrom h0 (limitWork 1 (storeWindow (hStore h0))) (planMaintenance (hStore h0)))
-      case p of
-        Planned pl → pure (name, mWindowPages (plMeasure pl))
-        NoWork → pure (name, 0)
+      (p, _, _, _) ← must (fillCounting h0 (limitWork 1 (storeWindow (hStore h0))) (planMaintenance (hStore h0)))
+      let hr = heightOf h0 TreeRetire
+          hf = max 1 (heightOf h0 TreeFree)
+          hrec = max 1 (maximum [heightOf h0 t | t ← [TreeRuns, TreeLinks, TreeTodo]])
+          lim = workOneWindowPages hr hf hrec 0
+          tight = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
+      (q, _, _, cps) ← must (fillCounting h0 (limitWork 1 (storeWindow (hStore h0))) (planMaintenanceWith tight (hStore h0)))
+      held ← case (p, q) of
+        (Planned a, Planned b) → do
+          (mWindowPages (plMeasure b) <= lim) `shouldBe` True
+          pure (mWindowPages (plMeasure a), lim, mWindowPages (plMeasure b), cps)
+        (NoWork, NoWork) → pure (0, lim, 0, cps)
         other → expectationFailure (name <> ": " <> take 200 (show other)) >> fail "plan"
-    putStrLn ("BOUND window pages at work one: " <> show rows <> " against the bound " <> show (workOneWindowPages 3 3 3 0))
-    [name | (name, n) ← rows, n > workOneWindowPages 3 3 3 0] `shouldBe` []
-    (workOneWindowPages 3 3 3 2 < maxWindowPages) `shouldBe` True
+      pure (name, held)
+    putStrLn ("BOUND window pages at work one (held in the byte limit, at-once bound, held when cut to it, checkpoints): " <> show rows <> " against the byte limit " <> show limit)
+    [name | (name, (n, _, _, _)) ← rows, n > limit] `shouldBe` []
 
 -- | The protection the span of every transaction keeps: a progress field forged forward past pages that are still
 -- indexed under the entry is refused by the first transaction after the forgery, whatever the length of the jump.
@@ -307,3 +332,104 @@ specForged = describe "round 13: a progress field forged forward is refused by t
       case p of
         Refused (Integrity (RetiredIndexMismatch _)) → pure ()
         other → expectationFailure ("a progress field of " <> show done <> " over pages still indexed was not refused: " <> take 200 (show other))
+
+windowResult ∷ CapacityWhy → Bool
+windowResult c = case c of
+  WindowExceeded _ → True
+  WindowBytesExceeded _ → True
+  _ → False
+
+specAtOnce ∷ Spec
+specAtOnce = describe "round 13: the window a unit of work holds at once, under checkpoints" $ do
+  let (hNo, firstKeys, _) = fragmentedNoTail
+      limitBounds lim = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
+  it "property: a unit of one page needs at most the byte limit for every tree height 1..8 and every number of pinned readers 0..maxReaders" $ do
+    let bad =
+          [ (hr, hf, hrec, pins)
+          | hr ← [1 .. maxLevel + 1]
+          , hf ← [1 .. maxLevel + 1]
+          , hrec ← [1 .. maxLevel + 1]
+          , pins ← [0 .. maxReaders]
+          , workOneWindowPages hr hf hrec pins * windowPageBytes + workOneProbeBytes hr hf > maxWindowBytes
+          ]
+    bad `shouldBe` []
+    -- and the standalone removal, which cannot shrink, for every record and allocator height and pin count, with the
+    -- retirement tree at minimum fill (at most 8 internal pages) as every tree a plan has written is
+    let badRemoval = [(hf, hrec, pins) | hf ← [1 .. maxLevel + 1], hrec ← [1 .. maxLevel + 1], pins ← [0 .. maxReaders], removalWindowPages 8 hf hrec pins * windowPageBytes + 188 * probeBytes > maxWindowBytes]
+    badRemoval `shouldBe` []
+    putStrLn ("ATONCE bounds: unit of one at (8,8,8,16) = " <> show (workOneWindowPages 8 8 8 16) <> " pages, removal at (8,8,16) = " <> show (removalWindowPages 8 8 8 16) <> " pages, limit " <> show (maxWindowBytes `div` windowPageBytes))
+  it "makes progress at work one with a window of exactly the at-once bound, with 1 to 16 distinct pinned versions, on a store with no tail, and again after the readers release" $ do
+    must (checkH hNo)
+    (rFree (storeRoots (hStore hNo)) /= Nothing && rHw (storeRoots (hStore hNo)) == fromIntegral (cfgUsablePages (hCfg hNo)) ) `shouldBe` True
+    forM_ [1, 2, 4, 8, 16] $ \pins → do
+      (hP, toks) ← must (withPins (\i → (firstKeys !! ((7 * i + 3) `mod` length firstKeys), childRec (srcNode (toInteger i + 20) 0 9))) pins hNo)
+      let hr = heightOf hP TreeRetire
+          hf = heightOf hP TreeFree
+          hrec = max (heightOf hP TreeLinks) (heightOf hP TreeRuns)
+          lim = workOneWindowPages hr hf hrec pins
+          bounds = limitBounds lim
+      (p, _, _, cps) ← must (fillCounting hP (limitWork 1 (storeWindow (hStore hP))) (planMaintenanceWith bounds (hStore hP)))
+      case p of
+        Planned pl → do
+          (mWindowPages (plMeasure pl) <= lim) `shouldBe` True
+          putStrLn ("ATONCE pins " <> show pins <> " heights " <> show (hr, hf, hrec) <> ": window bound " <> show lim <> ", window held " <> show (mWindowPages (plMeasure pl)) <> ", " <> show cps <> " checkpoints, freed " <> show (mFreed (plMeasure pl)))
+          h1 ← must (commitPlan hP pl)
+          must (checkH h1)
+        other → expectationFailure ("no progress with " <> show pins <> " pinned versions and a window of " <> show lim <> " pages: " <> take 300 (show other))
+      -- the readers release: the same store proceeds under the smaller bound of no readers
+      let released = hP {hStore = foldl (\st t → snd (releaseReader t st)) (hStore hP) toks}
+          lim0 = workOneWindowPages hr hf hrec 0
+      (q, _, _, _) ← must (fillCounting released (limitWork 1 (storeWindow (hStore released))) (planMaintenanceWith (limitBounds lim0) (hStore released)))
+      case q of
+        Planned pl → (mWindowPages (plMeasure pl) <= lim0) `shouldBe` True
+        other → expectationFailure ("no progress after the readers released, window " <> show lim0 <> ": " <> take 300 (show other))
+  it "answers the typed window result, never a checkpoint with no new fact, when the window cannot hold the edit and one proof" $ do
+    let (h0, _, _) = fragmented
+        tiny = standardBounds {bdWindowPages = 3, bdWindowBytes = 3 * windowPageBytes}
+    (p, _, _, cps) ← must (fillCounting h0 (limitWork 1 (storeWindow (hStore h0))) (planMaintenanceWith tiny (hStore h0)))
+    case p of
+      Refused (Capacity c) | windowResult c → pure ()
+      other → expectationFailure ("a window of 3 pages was not answered with the typed window result: " <> take 200 (show other) <> " after " <> show cps <> " checkpoints")
+  it "plans through checkpoints exactly the plan one window would give, and takes at most as many checkpoints as pages it proves" $ do
+    let (h0, _, _) = fragmented
+        big = standardBounds {bdWindowPages = 100000, bdWindowBytes = 1000000000}
+    (a, _, _, cpsA) ← must (fillCounting h0 (storeWindow (hStore h0)) (planMaintenanceWith standardBounds (hStore h0)))
+    (b, _, _, cpsB) ← must (fillCounting h0 (storeWindow (hStore h0)) (planMaintenanceWith big (hStore h0)))
+    cpsB `shouldBe` 0
+    case (a, b) of
+      (Planned pa, Planned pb) → do
+        -- the facts changed nothing: the same pages, the same bytes, the same measure of freed and written pages
+        plPages pa `shouldBe` plPages pb
+        mFreed (plMeasure pa) `shouldBe` mFreed (plMeasure pb)
+        mPagesWritten (plMeasure pa) `shouldBe` mPagesWritten (plMeasure pb)
+        -- progress is enforced: a checkpoint carries a fact each, and a transaction proves at most the pages it writes plus its span
+        (cpsA <= mPagesWritten (plMeasure pa) + maxReclaimPages) `shouldBe` True
+      other → expectationFailure ("the plans differ in kind: " <> take 300 (show other))
+
+-- | Facts are RAM a window carries, trusted only for the state they were proven against.
+specFingerprint ∷ Spec
+specFingerprint = describe "round 13: the facts a window carries are trusted only for the state they were proven against" $ do
+  it "keeps facts for the same state and drops them for any other: another version, another root, a reader acquired in between" $ do
+    let (h0, firstKeys, _) = fragmented
+        roots = storeRoots (hStore h0)
+        fp = fingerprintOf (hIdent h0) roots []
+        facts = Facts fp [FactUnreachable (PageNo 9), FactGone 3 (PageNo 11)]
+        w1 = windowCheckpoint facts (storeWindow (hStore h0))
+    windowFactCount w1 `shouldBe` 2
+    windowKnows (FactUnreachable (PageNo 9)) (windowFactsFor fp w1) `shouldBe` True
+    -- a reader acquired between two calls changes what the facts were proven against
+    (_, s1) ← either (\e → expectationFailure (show e) >> fail "reader") pure (acquireReader (hStore h0))
+    let fpPinned = fingerprintOf (hIdent h0) (storeRoots s1) (pinnedRoots s1)
+    (fpPinned /= fp) `shouldBe` True
+    windowFactCount (windowFactsFor fpPinned w1) `shouldBe` 0
+    -- a commit changes the version and the roots
+    (h1, out) ← either (\e → expectationFailure e >> fail "commit") pure (commitDelta h0 Ordinary (deltaFor (hStore h0) True False 1 [(firstKeys !! 5, Just (childRec (srcNode 3 3 9)))]))
+    case out of
+      Committed _ → pure ()
+      other → expectationFailure (show other)
+    let fpAfter = fingerprintOf (hIdent h1) (storeRoots (hStore h1)) []
+    (fpAfter /= fp) `shouldBe` True
+    windowFactCount (windowFactsFor fpAfter w1) `shouldBe` 0
+    -- facts proven against another state replace the ones a window carries, never merge with them
+    let other = Facts fpAfter [FactUnreachable (PageNo 20)]
+    windowFactCount (windowCheckpoint other w1) `shouldBe` 1

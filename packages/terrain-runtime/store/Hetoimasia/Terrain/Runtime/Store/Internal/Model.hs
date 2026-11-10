@@ -73,6 +73,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
     -- * Planning
   , planEdit
   , planRemoval
+  , planRemovalWith
   , planDiscovery
   , planDiscoveryWith
   , planMaintenanceWith
@@ -388,7 +389,11 @@ controlBytes s =
 
 -- | Plan an ordinary candidate against the committed roots.
 planEdit ∷ Store → Window → Candidate → Planned
-planEdit s win = planDeltaPinned standardBounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s) win Ordinary . deltaOf
+planEdit = planEditWith standardBounds
+
+-- | 'planEdit' under given bounds.
+planEditWith ∷ Bounds → Store → Window → Candidate → Planned
+planEditWith bounds s win = planDeltaPinned bounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s) win Ordinary . deltaOf
 
 -- | Plan the reclamation of the oldest retired pages the readers no longer hold.
 planMaintenance ∷ Store → Window → Planned
@@ -438,12 +443,16 @@ missingAt s win key = maybe (Right (missingPage (below s win) (committedRoot s) 
 -- | Plan the removal of one whole cell with its minimum connection obligation, as
 -- one candidate. Removing air or an already removed cell is 'NoWork'.
 planRemoval ∷ Env → Store → Window → TileCoord → Planned
-planRemoval env s win tile = withWindow s win $ \prov →
+planRemoval = planRemovalWith standardBounds
+
+-- | 'planRemoval' under given bounds.
+planRemovalWith ∷ Bounds → Env → Store → Window → TileCoord → Planned
+planRemovalWith bounds env s win tile = withWindow s win $ \prov →
   case stageRemoval env (rHeader (sRoots s)) prov (editAllowance env) tile of
     Left refusal → Refused (refusalOf refusal)
     Right NoChange → NoWork
     Right (EditSuspended key) → suspended s win key
-    Right (Discovery.Staged cand) → planEdit s win cand
+    Right (Discovery.Staged cand) → planEditWith bounds s win cand
 
 -- | Plan one discovery batch: as many structural updates as #661's limits and this
 -- plan's page and RAM bounds allow (at most 64), the continuation staying in the

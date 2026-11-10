@@ -67,6 +67,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , looseSoftCap
   , maxReclaimPages
   , workOneWindowPages
+  , workOneProbeBytes
+  , removalWindowPages
 
     -- * Configuration
   , StoreSpec (..)
@@ -243,29 +245,38 @@ looseSoftCap = 512
 maxReclaimPages ∷ Int
 maxReclaimPages = 64
 
--- | The most window pages a maintenance transaction of ONE page (the work limit of a retry that bottomed out)
--- can need on a valid store, from the heights of the retirement tree (@hr@), the allocator tree (@hf@) and the
--- record trees (@hrec@) and the number of readers pinned at distinct versions (@pins@). It reads:
+-- | The pages a maintenance transaction of ONE page holds in its window AT ONCE, from the heights of the
+-- retirement tree (@hr@), the allocator tree (@hf@) and the record trees (@hrec@) and the readers pinned at
+-- distinct versions (@pins@). It rests on 'maxLevel' (every height is at most @maxLevel + 1@) and
+-- 'maxReaders' alone: a tree the load path accepts need not be at minimum fill. The window holds what the
+-- transaction edits and ONE proof; every proof beyond it is a fact the plan carries through a checkpoint, so no
+-- proof is ever held with another:
 --
 -- * the oldest entry and its list: @hr + 1@;
--- * the verification of the last 'maxReclaimPages' consumed pages in the retired-page index: one leaf each
---   and the internal pages above them, of which a retirement tree bounded by 'maxRetiredPages' has at most 8:
---   @maxReclaimPages + 8@;
 -- * the unindexing of the page and the update or removal of the entry: @2 * hr@;
--- * the proof that the page it frees and each bookkeeping page it writes below the used space is unreachable:
---   the path of its first key in the committed tree and in every pinned one, @(1 + pins) * hrec@ pages for each
---   of at most @b = 3 * hr + 3 * hf + 1@ pages (the pages one removal, one insertion and one update replace);
--- * the allocator tree's own edit: @3 * hf@.
+-- * the allocator tree's own edit: @3 * hf@;
+-- * the largest proof: that the page is unreachable, a path in the committed tree and in each pinned one,
+--   @(1 + pins) * hrec@; that the retired-page index does not own it or has dropped it, @hr@; that the free
+--   extents do not contain it, @hf@.
 --
--- It does not depend on how much of the entry was consumed before, on the length of its list or on the size of
--- the free extents: that is the point of checking a bounded span of the consumed pages in every transaction.
--- With three-level trees and no pinned reader it is 148 pages and stays inside the window's bound
--- ('maxWindowPages' and 'maxWindowBytes') for up to two readers pinned at distinct versions, whose
--- tree paths a proof must also read; past that a window that cannot hold even one page's proofs is the typed
--- 'WindowExceeded' result and not a stall the caller can retry past.
+-- The probes it holds are at most @3 * hr + 3 * hf + 2@ ('workOneProbeBytes').
 workOneWindowPages ∷ Int → Int → Int → Int → Int
 workOneWindowPages hr hf hrec pins =
-  (hr + 1) + (maxReclaimPages + 8) + 2 * hr + (3 * hr + 3 * hf + 1) * (1 + pins) * hrec + 3 * hf
+  (hr + 1) + 2 * hr + 3 * hf + max ((1 + pins) * hrec) (max hr hf)
+
+-- | The accounted bytes of the probes of a transaction of one page.
+workOneProbeBytes ∷ Int → Int → Int
+workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2) * probeBytes
+
+-- | The pages a standalone explicit removal holds at once. It cannot shrink (it is atomic): its edit is held
+-- whole. At most 'worstEditWrites' writes (7) each read a path of @hrec@ pages and replace at most as many;
+-- each replaced page is indexed in the retirement tree, which reads one leaf for each (at most 7 * hrec + 1) and
+-- the internal pages above them, at most @retireInternals@ — the one term that rests on the retirement tree
+-- being at minimum fill, as every tree a plan has written is (a retirement tree bounded by 'maxRetiredPages' has
+-- at most 8 internal pages); the allocator tree's edit, @3 * hf@; and ONE proof as above.
+removalWindowPages ∷ Int → Int → Int → Int → Int
+removalWindowPages retireInternals hf hrec pins =
+  7 * hrec + (7 * hrec + 1) + retireInternals + 3 * hf + max ((1 + pins) * hrec) hf
 
 -- ---------------------------------------------------------------------------
 -- Configuration
