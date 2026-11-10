@@ -112,6 +112,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , assignPages
   , worstUpdatePages
   , splitEven
+
+    -- * The exits of a write (exposed for the suite)
+  , exitProbe
   ) where
 
 import Data.ByteString (ByteString)
@@ -123,6 +126,7 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
+import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (getLe32)
@@ -901,7 +905,7 @@ splitEven size xs
 -- ---------------------------------------------------------------------------
 -- Insert
 
-data Ins = InsOne !Ref | InsTwo !Ref !ByteString !Ref
+data Ins = InsNone | InsOne !Ref | InsTwo !Ref !ByteString !Ref
 
 -- | Insert or replace an entry and return the new root. An entry already holding
 -- the value changes nothing (no copy, no replaced page): a no-op appends nothing.
@@ -914,34 +918,25 @@ insertKey tree root k v = do
       Nothing → Just <$> fresh (Node tree 0 (NLeaf [(k, v)]))
       Just r → do
         res ← ins r Nothing Nothing Nothing
-        case res of
-          InsOne r' → pure (Just r')
-          InsTwo a sep b → do
-            na ← load tree Nothing a
-            let level = nLevel na + 1
-            if level > maxLevel
-              then stop (TooTall tree)
-              else do
-                lowest ← firstOf na
-                Just <$> fresh (Node tree level (NInner [(lowest, a), (sep, b)]))
+        exitRoot tree res
   where
-    firstOf n = case keysOf n of
-      (x : _) → pure x
-      [] → stop (Invariant tree)
     ins ref lo hi lvl = do
       n ← loadChecked' lo hi lvl ref
       case nBody n of
         NLeaf es → do
           let es' = insertSorted (k, v) es
-          finish ref n (NLeaf es')
+          exitNode tree ref n (NLeaf es')
         NInner es → do
           let i = maybe 0 id (chooseChild k es)
               (clo, chi) = childBounds lo hi es i
               below = maybe False (k <) (firstSep es)
               (clo', chi') = if below then (lo, chi) else (clo, chi)
           r ← ins (snd (es !! i)) clo' chi' (Just (nLevel n - 1))
+          -- an insertion never empties a child
+          when' (case r of InsNone → True; _ → False) (stop (Invariant tree))
           let relabel (sk, c) = if i == 0 && below then (k, c) else (sk, c)
               es' = case r of
+                InsNone → es
                 InsOne c → take i es ++ [relabel (fst (es !! i), c)] ++ drop (i + 1) es
                 InsTwo c1 sep c2 → take i es ++ [relabel (fst (es !! i), c1), (sep, c2)] ++ drop (i + 1) es
           -- a child that shrank (a value replaced by a shorter one, a first separator replaced by a shorter key) is
@@ -952,8 +947,8 @@ insertKey tree root k v = do
               if nodeBytesOf cn < minNodeBytes && length es' >= 2
                 then rebalanceChild tree lo hi (nLevel n - 1) i es'
                 else pure es'
-            InsTwo {} → pure es'
-          finish ref n (NInner es'')
+            _ → pure es'
+          exitNode tree ref n (NInner es'')
     -- A freshly inserted key may sit below the node's lowest key only on the
     -- leftmost spine, whose bounds are open; the check there tolerates it.
     loadChecked' lo hi lvl ref = do
@@ -964,21 +959,6 @@ insertKey tree root k v = do
           | maybe False (k0 <) lo → stop (Bad KeyOrder (refPage ref))
           | maybe False (\h → last ks >= h) hi → stop (Bad KeyOrder (refPage ref))
           | otherwise → pure node
-    finish ref n body
-      | bodyBytesOf body <= pagePayloadBytes = InsOne <$> rewrite ref n {nBody = body}
-      | otherwise = case body of
-          NLeaf es → case splitEven entryBytes es of
-            Nothing → stop (Invariant tree)
-            Just (l, r@((sk, _) : _)) → twoNodes ref n (NLeaf l) (NLeaf r) sk
-            Just _ → stop (Invariant tree)
-          NInner es → case splitEven (innerKeyBytes . fst) es of
-            Nothing → stop (Invariant tree)
-            Just (l, r@((sk, _) : _)) → twoNodes ref n (NInner l) (NInner r) sk
-            Just _ → stop (Invariant tree)
-    twoNodes ref n l r sep = do
-      a ← rewrite ref n {nBody = l}
-      b ← fresh n {nBody = r}
-      pure (InsTwo a sep b)
 
 firstSep ∷ [(ByteString, a)] → Maybe ByteString
 firstSep ((s, _) : _) = Just s
@@ -1002,43 +982,107 @@ deleteKey tree root@(Just r0) k = do
     Nothing → pure root
     Just _ → do
       res ← del r0 Nothing Nothing Nothing
-      case res of
-        Nothing → pure Nothing
-        Just r → Just <$> collapse r
+      exitRoot tree res
   where
-    -- Follow single-child roots down, checking each child's level (one lower than its
-    -- parent's, so the walk is bounded by the tree height and a cycle cannot loop) and the
-    -- separator bounds its parent promises, exactly as every other descent does.
-    collapse ref = load tree Nothing ref >>= collapseFrom Nothing Nothing ref
-    collapseFrom lo hi ref n = case nBody n of
-      NInner es@[(_, c)] | nLevel n > 0 → do
-        let (clo, chi) = childBounds lo hi es 0
-        cn ← loadChecked tree clo chi (Just (nLevel n - 1)) c
-        discard ref
-        collapseFrom clo chi c cn
-      _ → pure ref
     del ref lo hi lvl = do
       n ← loadChecked tree lo hi lvl ref
       case nBody n of
-        NLeaf es → case filter ((/= k) . fst) es of
-          [] → discard ref >> pure Nothing
-          es' → Just <$> rewrite ref n {nBody = NLeaf es'}
+        NLeaf es → exitNode tree ref n (NLeaf (filter ((/= k) . fst) es))
         NInner es → do
           i ← maybe (stop (Invariant tree)) pure (chooseChild k es)
           let (clo, chi) = childBounds lo hi es i
           r ← del (snd (es !! i)) clo chi (Just (nLevel n - 1))
           es' ← case r of
-            Nothing → pure (take i es ++ drop (i + 1) es)
-            Just c → do
+            InsNone → pure (take i es ++ drop (i + 1) es)
+            InsOne c → do
               cn ← load tree (Just (nLevel n - 1)) c
               let replaced = take i es ++ [(fst (es !! i), c)] ++ drop (i + 1) es
               if nodeBytesOf cn < minNodeBytes && length es >= 2
                 then rebalance lo hi (nLevel n - 1) i replaced
                 else pure replaced
-          case es' of
-            [] → discard ref >> pure Nothing
-            _ → Just <$> rewrite ref n {nBody = NInner es'}
+            -- a child that split (a repack of its children moved a longer separator into it) has two halves above the minimum
+            InsTwo c1 sep c2 → pure (take i es ++ [(fst (es !! i), c1), (sep, c2)] ++ drop (i + 1) es)
+          exitNode tree ref n (NInner es')
     rebalance = rebalanceChild tree
+
+-- | What the shared exit of a write does with an inner node of @n@ children whose separators are the given keys: @\"none\"@
+-- (emptied, dropped), @\"one\"@ (fits a page, rewritten) or @\"two\"@ plus the payload bytes of the two halves (split).
+exitProbe ∷ [ByteString] → Either Stop (String, [Int])
+exitProbe seps = fst <$> runM act (newEdit maxBound (emptyWindow (StoreIdentity (ArenaId 1) 7) 0))
+  where
+    body = NInner [(k, Fresh 0) | k ← seps]
+    act = do
+      r ← fresh (Node TreeLinks 1 body)
+      res ← exitNode TreeLinks r (Node TreeLinks 1 body) body
+      case res of
+        InsNone → pure ("none", [])
+        InsOne _ → pure ("one", [bodyBytesOf body])
+        InsTwo a _ b → do
+          na ← load TreeLinks Nothing a
+          nb ← load TreeLinks Nothing b
+          pure ("two", [bodyBytesOf (nBody na), bodyBytesOf (nBody nb)])
+
+-- | Run an action when a condition holds.
+when' ∷ Bool → M () → M ()
+when' c act = if c then act else pure ()
+
+-- | THE exit of every node a write produces, shared by insertion and deletion: an emptied node is dropped, a node that fits
+-- a page is rewritten, a node that holds more than a payload is split into two halves that are reported upward (each at least
+-- @(payload + 1 - maxEntry) / 2@ bytes, far above the minimum). Every write can make a node larger (an entry added, a
+-- separator replaced by a longer key, a value by a longer one) or smaller, and the next level up repacks a child that fell
+-- under the minimum: neither direction is left to the caller.
+exitNode ∷ TreeId → Ref → Node → NBody → M Ins
+exitNode tree ref n body
+  | emptyBody body = discard ref >> pure InsNone
+  | bodyBytesOf body <= pagePayloadBytes = InsOne <$> rewrite ref n {nBody = body}
+  | otherwise = case body of
+      NLeaf es → case splitEven entryBytes es of
+        Just (l, r@((sk, _) : _)) → twoNodes (NLeaf l) (NLeaf r) sk
+        _ → stop (Invariant tree)
+      NInner es → case splitEven (innerKeyBytes . fst) es of
+        Just (l, r@((sk, _) : _)) → twoNodes (NInner l) (NInner r) sk
+        _ → stop (Invariant tree)
+  where
+    emptyBody (NLeaf es) = null es
+    emptyBody (NInner es) = null es
+    twoNodes l r sep = do
+      a ← rewrite ref n {nBody = l}
+      b ← fresh n {nBody = r}
+      pure (InsTwo a sep b)
+
+-- | THE exit of every write that returns a root, shared by insertion and deletion: an emptied tree has no root, a root that
+-- fits stays (a root left with one child collapses, 'collapseRoot'), and a root that split becomes the two children of a
+-- new root.
+exitRoot ∷ TreeId → Ins → M (Maybe Ref)
+exitRoot tree res = case res of
+  InsNone → pure Nothing
+  InsOne r → Just <$> collapseRoot tree r
+  InsTwo a sep b → do
+    na ← load tree Nothing a
+    let level = nLevel na + 1
+    if level > maxLevel
+      then stop (TooTall tree)
+      else do
+        lowest ← case keysOf na of
+          (x : _) → pure x
+          [] → stop (Invariant tree)
+        Just <$> fresh (Node tree level (NInner [(lowest, a), (sep, b)]))
+
+-- | THE exit of every write that returns a root: a root left with one child collapses to that child (the child is the
+-- root then, exempt from the minimum fill). Follows single-child roots down, checking each child's level (one lower
+-- than its parent's, so the walk is bounded by the tree height and a cycle cannot loop) and the separator bounds its
+-- parent promises, exactly as every other descent does. A deletion and an insertion both end here: a repack of the
+-- root's only two children by either can leave a root with one.
+collapseRoot ∷ TreeId → Ref → M Ref
+collapseRoot tree ref0 = load tree Nothing ref0 >>= go Nothing Nothing ref0
+  where
+    go lo hi ref n = case nBody n of
+      NInner es@[(_, c)] | nLevel n > 0 → do
+        let (clo, chi) = childBounds lo hi es 0
+        cn ← loadChecked tree clo chi (Just (nLevel n - 1)) c
+        discard ref
+        go clo chi c cn
+      _ → pure ref
 
 -- | THE step that keeps minimum fill, shared by every write that can shrink a node (a deletion, a value replaced by a
 -- shorter one, a separator replaced by a shorter key): repack the under-full child at index @i@ of a node with a
@@ -1070,7 +1114,9 @@ rebalanceChild tree lo hi childLevel i es = do
           Nothing → Nothing
           Just parts → Just (map NInner parts)
   case repacked of
-    Nothing → pure es
+    -- unreachable: the pair holds one node under the minimum and one that fits a page, so at most 5,065 bytes, and a split
+    -- with both halves within a page exists for any total up to two pages
+    Nothing → stop (Invariant tree)
     Just bodies → do
       mapM_ discard [ra, rb]
       refs ← mapM (fresh . Node tree childLevel) bodies

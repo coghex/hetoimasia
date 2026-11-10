@@ -300,6 +300,37 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       -- the first loose page listed again straight after itself
       let loose = map PageNo (take 3 dead) <> [PageNo (head' dead)] <> map PageNo (take 50 (drop 3 dead))
       refusedCorrupt "a loose page listed twice" =<< planOn (withRoots h (\r → r {rLoose = loose}))
+    it "validates the WHOLE loose list before anything uses it: a duplicate in the supply, the untaken middle or the spill is refused, by maintenance and by an ordinary plan" $ do
+      (h, _, _) ← fixture
+      let roots = storeRoots (hStore h)
+          grow = looseSoftCap + maxSpillPages + 20 - length (rLoose roots)
+          fresh = [PageNo (rHw roots + fromIntegral i) | i ← [0 .. grow - 1]]
+          big = withRoots h (\r → r {rHw = rHw r + fromIntegral grow, rLoose = rLoose r ++ fresh})
+          looseBig = rLoose (storeRoots (hStore big))
+          n = length looseBig
+          at i v = withRoots big (\r → r {rLoose = take i looseBig ++ [PageNo v] ++ drop (i + 1) looseBig})
+          PageNo firstP = head' looseBig
+          PageNo middleP = looseBig !! (n `div` 2)
+          maintain hh = (\(m, _, _) → m) <$> must (fillWith hh (planMaintenance (hStore hh)))
+          refusedDouble what out = case out of
+            Refused (Integrity (SuppliedPageDoubleOwned _)) → pure ()
+            other → expectationFailure (what <> " was not refused as owned twice: " <> take 200 (show other))
+      must (checkH big)
+      -- (place, what it duplicates): the spill's last place and the untaken middle, the supply's first place and the middle,
+      -- the middle and the supply, the middle against the middle, and the reviewer's case (the last entry, the middle)
+      forM_ [("the spill repeating the middle", n - 1, middleP), ("the spill repeating the supply", n - 1, firstP), ("the supply repeating the middle", 0, middleP), ("the middle repeating the supply", n `div` 2, firstP), ("the middle repeating the middle", n `div` 2 + 3, middleP), ("the first spill place repeating the middle", n - maxSpillPages, middleP)] $ \(what, i, v) → do
+        out <- maintain (at i v)
+        refusedDouble ("maintenance, " <> what) out
+        planned <- planOn (at i v)
+        refusedDouble ("an ordinary plan, " <> what) planned
+      -- a page past the used space in the untaken middle
+      beyond <- maintain (at (n `div` 2) (rHw (storeRoots (hStore big)) + 9))
+      case beyond of
+        Refused (Integrity (SuppliedPageLive _)) → pure ()
+        other → expectationFailure ("a middle page past the used space was not refused: " <> take 200 (show other))
+      -- a list past the cap
+      let tooLong = withRoots h (\r → r {rLoose = replicate (looseCap + 1) (PageNo 1)})
+      planOn tooLong >>= refusedCorrupt "a list past the cap"
     it "proves every loose page maintenance hands to the allocator tree, at the first, the middle and the last place of the spill" $ do
       (h, _, _) ← fixture
       let roots = storeRoots (hStore h)

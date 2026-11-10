@@ -903,6 +903,17 @@ checkCounters roots = do
   -- retires more pages than the bound: the size of the retirement tree (and its internal pages) rests on this and on
   -- the minimum fill every page keeps
   if rRetiredPages roots > fromIntegral maxRetiredPages then refuse (Integrity CorruptCounters) else pure ()
+  -- the loose list is at most 'looseCap' numbers of the root set: the WHOLE list is validated here, at every plan and every
+  -- maintenance transaction, before anything uses a piece of it (the supply takes its front, a spill its back, and the entries
+  -- between stay loose and are supplied later): every page inside the used space and no page listed twice
+  let loose = rLoose roots
+  if length loose > looseCap then refuse (Integrity CorruptCounters) else pure ()
+  case [pg | pg@(PageNo n) ← loose, n >= rHw roots] of
+    (pg : _) → refuse (Integrity (SuppliedPageLive pg))
+    [] → pure ()
+  case [pg | (pg, cnt) ← Map.toList (Map.fromListWith (+) [(pg', 1 ∷ Int) | pg' ← loose]), cnt > 1] of
+    (pg : _) → refuse (Integrity (SuppliedPageDoubleOwned pg))
+    [] → pure ()
 
 -- | The checksums the roots a transaction publishes must carry: a root it wrote carries the checksum of
 -- the page it just encoded, a root it left alone keeps the one the root record already held.

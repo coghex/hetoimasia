@@ -12,6 +12,8 @@
 module Test.TerrainRuntime.Store.Rebalance (spec) where
 
 import Control.Monad (foldM, forM_, when)
+import qualified Data.ByteString as BS
+import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Discovery (Node (..), Record, RecordKey (..))
@@ -21,7 +23,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Pa
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (encodeKey, encodeValue)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (splitEven)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
@@ -66,7 +68,7 @@ commitWrites h ws = do
     Refusal' why → Left ("a legitimate operation was refused: " <> show why)
 
 spec ∷ Spec
-spec = specDeletion >> specChurn
+spec = specDeletion >> specChurn >> specAdversarial
 
 specDeletion ∷ Spec
 specDeletion = describe "deletion against trees deep enough to merge and redistribute internal nodes" $ do
@@ -183,3 +185,70 @@ specChurn = describe "minimum fill under every write that can shrink a node" $ d
             Right (h', ref', g2)
       _ ← must (foldM step (h0, ref0, mkRng (4000 + seed)) [1 .. 100 ∷ Int])
       pure ()
+
+-- | The adversarial history behind the round-15 findings: deletions that thin both ends of the tree (and so the root's children),
+-- then shorter and longer values replaced in key order and in reverse, then a random mix, over keys on both sides of the
+-- SrcNode / RunNode boundary (52 and 25 bytes), the tree held at two and at three levels. After EVERY commit the independent
+-- checker (which refuses an under-full non-root page, an over-full page and a root with one child) and a read of every record.
+specAdversarial ∷ Spec
+specAdversarial = describe "adversarial histories over both key kinds, at two and three levels" $ do
+  let srcKey ∷ Int → RecordKey
+      srcKey j = linkKey (srcNode (toInteger (j `mod` 60) - 30) (toInteger (j `div` 60) - 30) 0)
+      runKeyOf2 ∷ Int → RecordKey
+      runKeyOf2 j = linkKey (RunNode (columnAt (toInteger j) 0) 0)
+      longVal ∷ Int → Record
+      longVal j = childRec (srcNode (toInteger (j `mod` 40)) (toInteger (j `div` 40)) 3)
+      shortVal ∷ Int → Record
+      shortVal j = rootRec (fromIntegral (j + 1)) False
+      commitCheck h ref ws = do
+        (h', out) ← commitDelta h Ordinary (deltaFor (hStore h) True False 1 ws)
+        case out of
+          Committed _ → pure ()
+          other → Left ("a legitimate write was refused: " <> show other)
+        let ref' = foldl (\m (k, v) → maybe (Map.delete k m) (\x → Map.insert k x m) v) ref ws
+        checkH h'
+        compareRecords (Map.toList ref') h'
+        Right (h', ref')
+      chunks _ [] = []
+      chunks n xs = let (a, b) = splitAt n xs in a : chunks n b
+      history nSrc nRun seed = do
+        let keysAll = sortOn encodeKey ([srcKey j | j ← [0 .. nSrc - 1]] ++ [runKeyOf2 (j + 10) | j ← [0 .. nRun - 1]])
+            initial = [(k, Just (if even i then longVal i else shortVal i)) | (i, k) ← zip [0 ∷ Int ..] keysAll]
+        (h0, ref0) ← foldM (\(h, ref) ws → commitCheck h ref ws) (newH smallSpec ident0, Map.empty) (chunks 40 initial)
+        let total = length keysAll
+            thin = take (total `div` 5) keysAll ++ drop (total - total `div` 5) keysAll
+            -- ranges deleted from both ends, ten keys a commit
+            deletes = [[(k, Nothing) | k ← grp] | grp ← chunks 10 thin]
+            kept = [k | k ← keysAll, k `notElem` thin]
+            replaceIn order = [[(k, Just (if (i + j) `mod` 3 == 0 then shortVal i else longVal (i + j))) | (j, (i, k)) ← zip [0 ∷ Int ..] grp] | grp ← chunks 6 (zip [0 ∷ Int ..] order)]
+            phases = deletes ++ replaceIn kept ++ replaceIn (reverse kept) ++ randomPhase kept
+            randomPhase ks = fst (foldl (\(acc, g) _ → let (ix, g1) = below (fromIntegral (length ks)) g; (r, g2) = below 3 g1; k = ks !! fromIntegral ix in (acc ++ [[(k, Just (case r of 0 → shortVal (fromIntegral ix); 1 → longVal (fromIntegral ix); _ → shortVal (fromIntegral ix + 7)))]], g2)) ([], mkRng (9000 + seed)) [1 .. 80 ∷ Int])
+        (hEnd, _, n) ← foldM (\(h, ref, c) ws → (\(h', ref') → (h', ref', c + 1)) <$> commitCheck h ref ws) (h0, ref0, length (chunks 40 initial)) phases
+        Right (heightOf h0 TreeLinks, heightOf hEnd TreeLinks, n ∷ Int)
+  it "keeps the root and every page legal through 2-level histories (6 seeds), the checker and a full read after every commit" $ do
+    rows ← must (mapM (history 700 500) [1 .. 6])
+    putStrLn ("ADVERSARIAL two levels: (height at start, at end, commits) per seed " <> show rows <> "; commits " <> show (sum [c | (_, _, c) ← rows]))
+    [r | r@(h0, _, _) ← rows, h0 /= 2] `shouldBe` []
+  it "keeps the root legal through small histories whose root has two children that merge (the reviewer's shape, many sizes)" $ do
+    let sizes = [(a, b) | a ← [30, 40, 50, 60, 80, 100], b ← [20, 30, 40, 60]]
+    rows ← must (mapM (\(a, b, sd) → history a b sd) [(a, b, sd) | (a, b) ← sizes, sd ← [1, 2, 3, 4]])
+    let twoLevel = [r | r@(h0, _, _) ← rows, h0 == 2]
+        collapsed = [r | r@(h0, h1, _) ← rows, h1 < h0]
+    putStrLn ("ADVERSARIAL small: histories " <> show (length rows) <> ", starting at height 2: " <> show (length twoLevel) <> ", ending lower (root merged and collapsed): " <> show (length collapsed) <> ", commits " <> show (sum [c | (_, _, c) ← rows]))
+    -- the class is reached: some root really merged its only two children and collapsed
+    null collapsed `shouldBe` False
+  it "keeps the root and every page legal through 3-level histories (2 seeds), the checker and a full read after every commit" $ do
+    rows ← must (mapM (history 2800 900) [1, 2])
+    putStrLn ("ADVERSARIAL three levels: (height at start, at end, commits) per seed " <> show rows <> "; commits " <> show (sum [c | (_, _, c) ← rows]))
+    [r | r@(h0, _, _) ← rows, h0 /= 3] `shouldBe` []
+  it "the exit every write shares: an over-full node is split into two legal halves, a fitting one rewritten, an emptied one dropped" $ do
+    -- a repack of the children can replace a separator by a longer key, so a parent within a few bytes of full may exceed a page
+    -- when a deletion rewrites it: the exit insertion and deletion share splits it
+    let sepsOf n = [BS.pack (1 : replicate 24 (fromIntegral (i `mod` 250)) ++ [fromIntegral (i `div` 250)]) | i ← [0 .. n - 1 ∷ Int]]
+        outcome n = either (\e → expectationFailure (show e) >> fail "exit") pure (exitProbe (sepsOf n))
+    outcome 0 >>= (`shouldBe` ("none", []))
+    (kind1, _) ← outcome 20
+    kind1 `shouldBe` "one"
+    (kind2, halves) ← outcome 120
+    kind2 `shouldBe` "two"
+    all (\b → b <= pagePayloadBytes && not (underFull False b)) halves `shouldBe` True
