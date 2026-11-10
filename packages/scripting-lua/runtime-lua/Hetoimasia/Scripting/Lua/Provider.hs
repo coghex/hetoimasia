@@ -95,6 +95,8 @@ module Hetoimasia.Scripting.Lua.Provider
   , ProviderWork (..)
   , RetirementState (..)
   , Completion (..)
+  , Settling (..)
+  , SubmissionDeclined (..)
   , ProviderReply (..)
   , ExpectedFailure (..)
   , Adoption (..)

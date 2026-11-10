@@ -172,9 +172,6 @@ import Hetoimasia.LuaEngine.Facade
   , EngineFailure (..)
   , FacadeEndpoints (..)
   , FacadeSpec (..)
-  , GraphicsInjection (..)
-  , GraphicsServices (..)
-  , GraphicsVm (..)
   , InstanceIds
   , SessionEndpoints (..)
   , declareInstance
@@ -939,7 +936,10 @@ withRoleVm env info body = do
         -- The composition's graphics for this VM, if it injected any: made over this VM's own gated request policy, so
         -- a texture or window admission is refused once the session takes no new work. It acquires nothing that
         -- needs a release here: the pipeline and the provider it is made over are the assembly's.
-        graphics ← traverse (\injection → injectGraphics injection (GraphicsVm role requests (takesWork env role))) (sxGraphics spec)
+        -- The VM has exactly one lending and one lease scope (an instance's holdings are one collection), whichever services lease
+        -- through it: graphics and terrain are composed over it together ('composeVmServices').
+        Facade.VmServices graphics terrain scope ←
+          Facade.composeVmServices profile role requests (takesWork env role) (envIdentity env) (sxGraphics spec) (sxTerrain spec)
         probeAt env (Acquiring role BuildFacade)
         facade ← mask_ $ do
           made ←
@@ -958,6 +958,7 @@ withRoleVm env info body = do
                 , fsIds = envIds env
                 , fsTickDuration = riTick info
                 , fsGraphics = graphics
+                , fsTerrain = terrain
                 }
               >>= either (refuse "the facade" . Text.pack . show) pure
           register env role BuildFacade (\registered → registered {regReleases = buildRelease env role BuildFacade : regReleases registered})
@@ -991,10 +992,10 @@ withRoleVm env info body = do
               (scheduledSpec config ownerPolicy schedulerBounds)
                 { scheduledInstances = Just instances
                 , scheduledRequestHandles = Just handles
-                , scheduledLending = gsLending <$> graphics
-                , scheduledLeases = gsLeases <$> graphics
+                , scheduledLending = (\(lending, _, _) → lending) <$> scope
+                , scheduledLeases = (\(_, leases, _) → leases) <$> scope
                 , -- the collection holds every live instance at the lease capacity, which is derived from the byte limits
-                  scheduledMemberLimit = maximum (defaultMemberLimit : [liveBound * gsLeaseCapacity services | Just services ← [graphics]])
+                  scheduledMemberLimit = maximum (defaultMemberLimit : [liveBound * capacity | Just (_, _, capacity) ← [scope]])
                 , scheduledRequests = Just (RequestGrant (facadeRequestEndpoints facade) (fromIntegral perVm) timing)
                 , scheduledLoader = Just (coordinatorPlan coordinator)
                 , scheduledClock = sxClock spec

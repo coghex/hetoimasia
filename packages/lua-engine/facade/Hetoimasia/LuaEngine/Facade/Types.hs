@@ -57,6 +57,34 @@ module Hetoimasia.LuaEngine.Facade.Types
   , graphicsWindowRequestType
   , graphicsTextureValueSchema
   , graphicsWindowValueSchema
+    -- * Injected terrain
+  , TerrainVm (..)
+  , TerrainInjection (..)
+  , TerrainServices (..)
+  , TerrainStart (..)
+  , TerrainCell (..)
+  , TerrainColumnAsk (..)
+  , TerrainDefinition (..)
+  , TerrainLayer (..)
+  , TerrainPatch (..)
+  , TerrainPatchValue (..)
+  , terrainArenaType
+  , terrainPickType
+  , terrainArenaRequestType
+  , terrainCellRequestType
+  , terrainColumnRequestType
+  , terrainSurfaceRequestType
+  , terrainRemoveRequestType
+  , terrainArenaValueSchema
+  , terrainCellValueSchema
+  , terrainColumnValueSchema
+  , terrainSurfaceValueSchema
+  , terrainRemoveValueSchema
+  , terrainNameLimit
+  , terrainMaterialBytesLimit
+  , terrainCellLow
+  , terrainCellHigh
+  , terrainEndpointHigh
     -- * Injected input
   , graphicsInputResetType
   , InputServices (..)
@@ -83,6 +111,7 @@ import Control.Concurrent.STM (STM, TVar)
 import Control.Exception (Exception, SomeException)
 import Data.ByteString (ByteString)
 import Data.Int (Int64)
+import Data.Unique (Unique)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Word (Word64)
@@ -100,7 +129,7 @@ import Hetoimasia.Scripting.Lua.Lending (Lending)
 import Hetoimasia.Scripting.Lua.Owner (ModulePhase)
 import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint)
 import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, CapabilityType, RequestContext)
-import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SRecord))
+import Hetoimasia.Scripting.Lua.Value (Schema (SBoolean, SCapability, SInteger, SList, SOptional, SRecord, SText))
 
 -- Services injected from outside -------------------------------------------------------------------
 
@@ -302,6 +331,9 @@ data Facade = Facade
   , fcGraphics ∷ !(Maybe GraphicsServices)
   -- ^ The graphics operations of this VM, when the composition injected any. 'Nothing' keeps every call of the
   -- facade as it was and adds none.
+  , fcTerrain ∷ !(Maybe TerrainServices)
+  -- ^ The terrain operations of this VM, when the composition injected any. 'Nothing' keeps every call, field,
+  -- handle type and request kind of the facade as it was: no @api.terrain@, no terrain operation of @api.request@.
   }
 
 -- Injected graphics ---------------------------------------------------------------------------------
@@ -374,6 +406,10 @@ data GraphicsVm = GraphicsVm
   , gvTakesWork ∷ !(STM Bool)
   -- ^ Whether the session still takes new work for this role, as a transaction: the authority a publication reads in the
   -- very transaction that commits it, so that a stop that wins between the check and the commit refuses the whole scene.
+  , gvSharedCapacity ∷ !Int
+  -- ^ The leases per instance that the VM's other services (terrain, when injected) hold in the same scope: the scope this
+  -- injection makes must have room for them beside its own, since a VM has exactly one lending and one lease scope. Zero when
+  -- graphics is the VM's only leasing service.
   }
 
 -- | How a composition injects graphics: a function from one VM to its services. The session coordinator holds it
@@ -421,6 +457,198 @@ data GraphicsServices = GraphicsServices
   -- ^ The presentation-input operations (TRA-6), when the composition opted in. 'Nothing' keeps the facade exactly as it
   -- was: no @api.input@ field, no handle type. Input is a part of the graphics services because a window exists only
   -- through them, so input without a window provider cannot be composed.
+  }
+
+-- Injected terrain -----------------------------------------------------------------------------------
+
+-- | The handle type of an arena lease (the success value of @api.terrain.open@ and @api.terrain.attach@).
+terrainArenaType ∷ Text
+terrainArenaType = "terrain_arena"
+
+-- | The handle type of an opaque displayed-view authority (the optional third argument of @api.terrain.remove@). TRA-10
+-- supplies the real issuer; this facade only names the type and has the injected service check it.
+terrainPickType ∷ Text
+terrainPickType = "terrain_pick"
+
+-- | The request handle types, one for each kind of terrain result, so that @api.request@ dispatches by kind.
+terrainArenaRequestType, terrainCellRequestType, terrainColumnRequestType, terrainSurfaceRequestType, terrainRemoveRequestType ∷ Text
+terrainArenaRequestType = "terrain_arena_request"
+terrainCellRequestType = "terrain_cell_request"
+terrainColumnRequestType = "terrain_column_request"
+terrainSurfaceRequestType = "terrain_surface_request"
+terrainRemoveRequestType = "terrain_remove_request"
+
+-- | What @take@ hands as the success value of an open or an attach: the arena handle itself.
+terrainArenaValueSchema ∷ Schema
+terrainArenaValueSchema = SCapability terrainArenaType
+
+-- | A cell: the content revision it was read at, and air or an authored material with its shape.
+-- @{revision = INTEGER, air = BOOLEAN, material = TEXT?, shape = INTEGER?}@; the material and shape are present exactly when
+-- @air@ is false.
+terrainCellValueSchema ∷ Schema
+terrainCellValueSchema = SRecord [("revision", SInteger), ("air", SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger)]
+
+-- | A column: the revision and the complete coalesced runs of the half-open range, air included, in ascending order.
+-- @{revision = INTEGER, runs = LIST of {z_min = INTEGER, z_max = INTEGER, air = BOOLEAN, material = TEXT?, shape = INTEGER?}}@.
+terrainColumnValueSchema ∷ Schema
+terrainColumnValueSchema =
+  SRecord
+    [ ("revision", SInteger)
+    , ("runs", SList (SRecord [("z_min", SInteger), ("z_max", SInteger), ("air", SBoolean), ("material", SOptional SText), ("shape", SOptional SInteger)]))
+    ]
+
+-- | A surface: the revision, and the highest occupied cell, explicitly absent for an empty column.
+-- @{revision = INTEGER, occupied = BOOLEAN, z = INTEGER?, material = TEXT?, shape = INTEGER?}@.
+terrainSurfaceValueSchema ∷ Schema
+terrainSurfaceValueSchema = SRecord [("revision", SInteger), ("occupied", SBoolean), ("z", SOptional SInteger), ("material", SOptional SText), ("shape", SOptional SInteger)]
+
+-- | A removal: whether anything changed and the committed content revision. @{changed = BOOLEAN, revision = INTEGER}@.
+terrainRemoveValueSchema ∷ Schema
+terrainRemoveValueSchema = SRecord [("changed", SBoolean), ("revision", SInteger)]
+
+-- | The longest arena name, in characters. The terrain service accepts 256; the adapter prefixes the content root, which is at
+-- most 64 characters, and the namespace's separator, so a name is bounded below what is left of that.
+terrainNameLimit ∷ Int
+terrainNameLimit = 128
+
+-- | The longest material identifier, in UTF-8 bytes (the terrain validator's limit).
+terrainMaterialBytesLimit ∷ Int
+terrainMaterialBytesLimit = 64
+
+-- | The lowest and highest supported cell coordinate, and the highest exclusive interval endpoint (one past the highest cell).
+terrainCellLow, terrainCellHigh, terrainEndpointHigh ∷ Int64
+terrainCellLow = negate (2 ^ (62 ∷ Int))
+terrainCellHigh = 2 ^ (62 ∷ Int) - 1
+terrainEndpointHigh = 2 ^ (62 ∷ Int)
+
+-- | A cell coordinate, as the facade read it: three checked Lua integers within @[-2^62, 2^62 - 1]@.
+data TerrainCell = TerrainCell !Int64 !Int64 !Int64
+  deriving (Eq, Show)
+
+-- | A column request: the column and the half-open range of levels @[z_min, z_max)@, the range checked to be a valid interval
+-- and the corners within the supported bounds. The range's length is the service's to bound (8,192 levels).
+data TerrainColumnAsk = TerrainColumnAsk !Int64 !Int64 !Int64 !Int64
+  deriving (Eq, Show)
+
+-- | What a copied definition is, after the facade's decode checks: nothing about overlap, order or whether a material is
+-- declared (those are the terrain validator's, and its refusal is the expected @definition@ failure).
+data TerrainDefinition = TerrainDefinition
+  { tdMaterials ∷ ![Text]
+  , tdLayers ∷ ![TerrainLayer]
+  , tdPatches ∷ ![TerrainPatch]
+  }
+  deriving (Eq, Show)
+
+-- | A base layer: the half-open interval, an omitted end meaning the supported extreme, and the material and shape.
+data TerrainLayer = TerrainLayer
+  { tlMin ∷ !(Maybe Int64)
+  , tlMax ∷ !(Maybe Int64)
+  , tlMaterial ∷ !Text
+  , tlShape ∷ !Int64
+  }
+  deriving (Eq, Show)
+
+-- | A bounded per-column override of the base.
+data TerrainPatch = TerrainPatch
+  { tpX ∷ !Int64
+  , tpY ∷ !Int64
+  , tpMin ∷ !Int64
+  , tpMax ∷ !Int64
+  , tpValue ∷ !TerrainPatchValue
+  }
+  deriving (Eq, Show)
+
+-- | What a patch overrides with: air, or a material and its shape.
+data TerrainPatchValue
+  = PatchAir
+  | PatchSolid !Text !Int64
+  deriving (Eq, Show)
+
+-- | What a request-producing terrain service answered once the facade's checks passed.
+data TerrainStart
+  = -- | The host's answer: the request, or busy with nothing reserved.
+    TerrainStarted !M1Start
+  | -- | A permanent refusal that reached the admission after the check passed (an ended owner, a stopping service): nothing was
+    -- reserved. The facade raises it as the ordinary error it is.
+    TerrainRefused !Text
+  deriving (Eq, Show)
+
+-- | What the composition is told of the VM it makes terrain services for.
+data TerrainVm = TerrainVm
+  { tvRole ∷ !Role
+  -- ^ The VM's role. Either role's instances may create, attach, query and remove.
+  , tvRequests ∷ !M1Requests
+  -- ^ The VM's request policy, already gated on the session's admission: the one the services admit with.
+  , tvTakesWork ∷ !(STM Bool)
+  -- ^ Whether the session still takes new work for this role, as a transaction.
+  , tvLending ∷ !Lending
+  -- ^ The VM's one lending, shared with every other service of the VM that leases resources (graphics, when injected).
+  , tvLeases ∷ !Leases
+  -- ^ The VM's one lease scope, shared likewise: the terrain leases are charged in the same scope as the VM's other leases.
+  , tvIntegerCeiling ∷ !Word64
+  -- ^ The largest integer a script of this VM may be handed, from the VM's validated profile: a content revision above it is a
+  -- host defect, never published.
+  , tvSession ∷ !Unique
+  -- ^ The identity of the session this VM belongs to, the same for both roles of one session and for no other session: the
+  -- terrain namespace is the session's and the instance's content root.
+  }
+
+-- | How a composition injects terrain: the lease capacity its services need, per instance, in the VM's one shared scope, and
+-- a function from one VM to its services. The session holds it as an abstract value and calls it once for each role's VM; it
+-- reaches no global and no registry.
+data TerrainInjection = TerrainInjection
+  { tiLeaseCapacity ∷ !(Profile → Int)
+  -- ^ The most leases one instance of a VM can hold at once through these services (pending, live and retiring), for the
+  -- profile: what the VM's shared lease scope must add for them.
+  , injectTerrain ∷ TerrainVm → IO TerrainServices
+  }
+
+-- | The narrow terrain operations of one VM, supplied by a composition. The CPU facade validates the caller, role, phase,
+-- session admission, arity and every argument's shape, and decides which Lua error a refusal is; these do what only the
+-- terrain service can: check that a handle is the calling instance's own live arena lease, check the provider's own facts,
+-- start the request and release. Every operation names the calling instance by the identity the facade issued it and its
+-- content root.
+data TerrainServices = TerrainServices
+  { tsTypes ∷ ![CapabilityType]
+  -- ^ The handle types over the VM's shared leases: the arena lease ('terrainArenaType') and the pick authority ('terrainPickType').
+  , tsEndpoints ∷ ![RequestEndpoint]
+  -- ^ The terrain endpoints of the owner's request grant.
+  , tsDeclare ∷ Text → Text → IO ()
+  -- ^ An instance was declared, with its content root: make its client.
+  , tsForget ∷ Text → IO ()
+  -- ^ An instance was forgotten, once its settlement was observed: end its client.
+  , tsOpenCheck ∷ Text → Text → Text → TerrainDefinition → ArgumentCheck
+  -- ^ Instance, root, name, definition: whether the open is refused for good (an ended owner), as an ordinary error.
+  , tsOpenStart ∷ Text → Text → Text → TerrainDefinition → RequestContext → IO TerrainStart
+  , tsAttachCheck ∷ Text → Text → Text → ArgumentCheck
+  , tsAttachStart ∷ Text → Text → Text → RequestContext → IO TerrainStart
+  , tsCellCheck ∷ Text → Word64 → TerrainCell → ArgumentCheck
+  -- ^ Instance, arena handle key, cell: whether the handle is refused (another instance's, of another kind, forged, or the
+  -- caller's own already released): the text of an ordinary error, before any provider is asked. A lease whose arena was
+  -- closed by someone else is not refused: its request settles @arena_closed@.
+  , tsCellStart ∷ Text → Word64 → TerrainCell → RequestContext → IO TerrainStart
+  , tsColumnCheck ∷ Text → Word64 → TerrainColumnAsk → ArgumentCheck
+  , tsColumnStart ∷ Text → Word64 → TerrainColumnAsk → RequestContext → IO TerrainStart
+  , tsSurfaceCheck ∷ Text → Word64 → Int64 → Int64 → ArgumentCheck
+  , tsSurfaceStart ∷ Text → Word64 → Int64 → Int64 → RequestContext → IO TerrainStart
+  , tsRemoveCheck ∷ Text → Word64 → TerrainCell → Maybe Word64 → ArgumentCheck
+  -- ^ Instance, arena handle key, cell, the optional pick authority's key.
+  , tsRemoveStart ∷ Text → Word64 → TerrainCell → Maybe Word64 → RequestContext → IO TerrainStart
+  , tsReleaseCheck ∷ Text → Word64 → IO (Maybe Text)
+  -- ^ Whether this instance may release this arena handle: refused before any provider is asked for a handle another instance
+  -- was issued (alive, retiring or completely retired) and a lease of another kind. A lease of the calling instance that has
+  -- already ended is not refused: releasing it again answers the existing disposition.
+  , tsRelease ∷ Word64 → IO Text
+  -- ^ Release an arena lease by key through the host's release path: @done@, @retiring@ or @already_released@.
+  , tsIssued ∷ Text → Word64 → IO ()
+  -- ^ An arena handle was taken by this instance, recorded before the script is handed it: the issuing instance of a handle
+  -- outlives the lease's slot.
+  , tsDrain ∷ IO ()
+  -- ^ Give the service back what the requests whose results were taken or discarded held, now: called after a terrain request
+  -- is taken or cancelled, never blocking. Whatever is not drained here is drained by the next terrain call and when the
+  -- instance is forgotten.
+  , tsExtraBindings ∷ ![Binding]
+  -- ^ Bindings a test fixture adds to the hidden namespace (a host-created pick-token fixture). Empty in production.
   }
 
 -- Injected input -------------------------------------------------------------------------------------

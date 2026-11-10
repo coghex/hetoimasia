@@ -102,6 +102,30 @@ module Hetoimasia.LuaEngine.Facade
   , graphicsWindowRequestType
   , graphicsTextureValueSchema
   , graphicsWindowValueSchema
+  , TerrainVm (..)
+  , TerrainInjection (..)
+  , TerrainServices (..)
+  , TerrainStart (..)
+  , TerrainCell (..)
+  , TerrainColumnAsk (..)
+  , TerrainDefinition (..)
+  , TerrainLayer (..)
+  , TerrainPatch (..)
+  , TerrainPatchValue (..)
+  , terrainArenaType
+  , terrainPickType
+  , terrainArenaRequestType
+  , terrainCellRequestType
+  , terrainColumnRequestType
+  , terrainSurfaceRequestType
+  , terrainRemoveRequestType
+  , terrainArenaValueSchema
+  , terrainCellValueSchema
+  , terrainColumnValueSchema
+  , terrainSurfaceValueSchema
+  , terrainRemoveValueSchema
+  , terrainNameLimit
+  , terrainMaterialBytesLimit
   , graphicsInputResetType
   , InputServices (..)
   , InputPoll (..)
@@ -146,6 +170,9 @@ module Hetoimasia.LuaEngine.Facade
   , FacadeSpec (..)
   , Facade
   , facadeGraphics
+  , facadeTerrain
+  , VmServices (..)
+  , composeVmServices
   , FacadeRefused (..)
   , newFacade
   , facadeRole
@@ -177,11 +204,12 @@ module Hetoimasia.LuaEngine.Facade
   , FacadeDefect (..)
   ) where
 
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (STM, atomically, newTVarIO, readTVar, writeTVar)
 import Data.List (nub)
 import Data.Maybe (isJust, listToMaybe)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import Data.Unique (Unique)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.ByteString as ByteString
@@ -212,6 +240,7 @@ import Hetoimasia.LuaEngine.Facade.Input (inputBindings, packetSchema, pollMaxim
 import Hetoimasia.LuaEngine.Facade.Content (contentBindings, dataHandleName, lexicalResolver, moduleHandleName, validRootId)
 import Hetoimasia.LuaEngine.Facade.Output
 import Hetoimasia.LuaEngine.Facade.Request (requestBindings)
+import Hetoimasia.LuaEngine.Facade.Terrain (terrainBindings, terrainHandleTypes)
 import Hetoimasia.LuaEngine.Facade.Session (captureStatus, failureValue, forgetStatus, sessionBindings, statusSchema, statusValue)
 import Hetoimasia.LuaEngine.Facade.Source (builderIdentity, builderSource, engineChunk, engineChunkName)
 import Hetoimasia.LuaEngine.Facade.Time (forgetSamples, segmentStarted, timeBindings)
@@ -232,6 +261,8 @@ import Hetoimasia.LuaEngine.Profile
   )
 import Hetoimasia.LuaEngine.Request (M1Requests, m1HandleType, m1Profile)
 import Hetoimasia.Scripting.Lua.Admission (callerInstance)
+import Hetoimasia.Scripting.Lua.Lease (Leases, newLeases)
+import Hetoimasia.Scripting.Lua.Lending (Lending, newLending)
 import Hetoimasia.Scripting.Lua.Instance (BehaviorFacade (FacadeBuilder), InstanceConfig (instanceOnSegment), instanceLocal)
 import Hetoimasia.Scripting.Lua.Output (authoredLinesWith)
 import Hetoimasia.Scripting.Lua.Owner
@@ -284,6 +315,9 @@ data FacadeSpec = FacadeSpec
   , fsGraphics ∷ !(Maybe GraphicsServices)
   -- ^ The graphics operations of this VM, made by the composition's 'GraphicsInjection', or 'Nothing' for a
   -- composition that injects none: the facade then has no graphics call, handle or request kind, exactly as before.
+  , fsTerrain ∷ !(Maybe TerrainServices)
+  -- ^ The terrain operations of this VM, made by the composition's 'TerrainInjection', or 'Nothing' for a composition that
+  -- injects none: the facade then has no @api.terrain@, no terrain handle type and no terrain request kind, exactly as before.
   }
 
 -- | Why a facade could not be made.
@@ -334,6 +368,7 @@ newFacade spec = case limits of
             , fcSession = fsSession spec
             , fcStatus = StatusState captures
             , fcGraphics = fsGraphics spec
+            , fcTerrain = fsTerrain spec
             }
   where
     profile = m1Profile (fsRequests spec)
@@ -382,9 +417,44 @@ newFacade spec = case limits of
         (machineBytes RoleFailureRecordBytes)
     machineBytes limit = let Bytes n = bytesLimit profile limit in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
 
+-- | What a VM's leasing services are composed into: the graphics services and the terrain services the composition injected, and
+-- the VM's one lending and lease scope with the capacity it was made with (per instance), shared by both.
+data VmServices = VmServices
+  { vsGraphics ∷ !(Maybe GraphicsServices)
+  , vsTerrain ∷ !(Maybe TerrainServices)
+  , vsScope ∷ !(Maybe (Lending, Leases, Int))
+  -- ^ The one scope the owner is configured with ('scheduledLending', 'scheduledLeases') and the capacity its collection must
+  -- hold every live instance at. 'Nothing' for a VM with no leasing service.
+  }
+
+-- | Compose a VM's graphics and terrain services over one lending and one lease scope. A VM has exactly one (an instance's
+-- holdings are one collection, whichever service leases through it), so the services are made around it, in the order their
+-- capacities need: terrain's capacity is told to graphics, which makes the scope with room for both when it is injected; a VM
+-- with terrain alone has the scope made here with terrain's capacity; a VM with neither has none. Nothing is allocated twice,
+-- nothing is overwritten, and the cross-instance ownership checks of the leases are the host's own.
+composeVmServices ∷ Profile → Role → M1Requests → STM Bool → Unique → Maybe GraphicsInjection → Maybe TerrainInjection → IO VmServices
+composeVmServices profile role requests takesWork session graphicsInjection terrainInjection = do
+  let terrainCapacity = maybe 0 (\injection → tiLeaseCapacity injection profile) terrainInjection
+  graphics ← traverse (\injection → injectGraphics injection (GraphicsVm role requests takesWork terrainCapacity)) graphicsInjection
+  scope ← case (graphics, terrainInjection) of
+    (Just found, _) → pure (Just (gsLending found, gsLeases found, gsLeaseCapacity found))
+    (Nothing, Just _) → do
+      lending ← newLending
+      leases ← newLeases lending terrainCapacity
+      pure (Just (lending, leases, terrainCapacity))
+    (Nothing, Nothing) → pure Nothing
+  terrain ← case (terrainInjection, scope) of
+    (Just injection, Just (lending, leases, _)) → Just <$> injectTerrain injection (TerrainVm role requests takesWork lending leases (let Count largest = countLimit profile LuaIntegerMaximum in largest) session)
+    _ → pure Nothing
+  pure (VmServices graphics terrain scope)
+
 -- | The injected graphics operations of this facade, if any: the owner's lending and leases come from them.
 facadeGraphics ∷ Facade → Maybe GraphicsServices
 facadeGraphics = fcGraphics
+
+-- | The injected terrain operations of this facade, if any.
+facadeTerrain ∷ Facade → Maybe TerrainServices
+facadeTerrain = fcTerrain
 
 -- | The VM's role.
 facadeRole ∷ Facade → Role
@@ -441,6 +511,7 @@ declareInstance facade content
               case outcome of
                 DeclareAccepted → do
                   mapM_ (\graphics → gsDeclare graphics identity) (fcGraphics facade)
+                  mapM_ (\terrain → tsDeclare terrain identity content) (fcTerrain facade)
                   pure (Right (Declared identity (builderFacade identity)))
                 DeclareDuplicate → pure (Left IdsExhausted)
                 DeclareFull bound → pure (Left (TooManyInstances bound))
@@ -467,6 +538,7 @@ forgetInstance facade identity = do
   mapM_ (forgetSamples facade) number
   mapM_ (forgetStatus facade) number
   mapM_ (\graphics → gsForget graphics identity) (fcGraphics facade)
+  mapM_ (\terrain → tsForget terrain identity) (fcTerrain facade)
 
 -- Installing ---------------------------------------------------------------------------------------
 
@@ -498,7 +570,7 @@ installFacade facade others types config = do
     config
       { vmRegistration = registered
       , vmPolicy = nub (vmPolicy config <> [engineNamespaceName] <> [nameOf found | found ← others])
-      , vmInitialChunks = vmInitialChunks config <> [(engineChunkName, engineChunk (isJust (fcGraphics facade)) (isJust (facadeInput facade)) (limitPrintBytes (fcLimits facade)))]
+      , vmInitialChunks = vmInitialChunks config <> [(engineChunkName, engineChunk (isJust (fcGraphics facade)) (isJust (facadeInput facade)) (isJust (fcTerrain facade)) (limitPrintBytes (fcLimits facade)))]
       , vmExports = vmExports config <> [builderSource]
       , vmExportLimits = facadeExportLimits facade
       , vmValueLimits = limits
@@ -507,6 +579,7 @@ installFacade facade others types config = do
     handleTypes =
       [m1HandleType (fcRequests facade) moduleHandleName, m1HandleType (fcRequests facade) dataHandleName]
         <> maybe [] (\graphics → graphicsHandleTypes facade <> gsTypes graphics) (fcGraphics facade)
+        <> maybe [] (\terrain → terrainHandleTypes facade <> tsTypes terrain) (fcTerrain facade)
         <> maybe [] isTypes (facadeInput facade)
     nameOf = namespaceName
 
@@ -532,6 +605,7 @@ facadeNamespace facade limits =
         <> timeBindings facade
         <> sessionBindings facade
         <> maybe [] (graphicsBindings facade) (fcGraphics facade)
+        <> maybe [] (terrainBindings facade) (fcTerrain facade)
         <> maybe [] (\input → inputBindings facade input limits) (facadeInput facade)
     )
 
@@ -559,7 +633,9 @@ facadeRefusedWait facade refusal =
 -- | The request endpoints to grant the owner: the module coordinator's and the data service's.
 facadeRequestEndpoints ∷ Facade → [RequestEndpoint]
 facadeRequestEndpoints facade =
-  [coordinatorEndpoint (fcCoordinator facade), dataEndpoint (fcData facade)] <> maybe [] gsEndpoints (fcGraphics facade)
+  [coordinatorEndpoint (fcCoordinator facade), dataEndpoint (fcData facade)]
+    <> maybe [] gsEndpoints (fcGraphics facade)
+    <> maybe [] tsEndpoints (fcTerrain facade)
 
 -- | The lexical-root resolver over the session's inventory, for the coordinator's specification.
 inventoryResolver ∷ Inventory → [Text] → ImportResolver

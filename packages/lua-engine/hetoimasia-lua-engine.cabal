@@ -175,6 +175,7 @@ library facade
         Hetoimasia.LuaEngine.Facade.Request
         Hetoimasia.LuaEngine.Facade.Session
         Hetoimasia.LuaEngine.Facade.Source
+        Hetoimasia.LuaEngine.Facade.Terrain
         Hetoimasia.LuaEngine.Facade.Time
         Hetoimasia.LuaEngine.Facade.Types
     build-depends:
@@ -228,6 +229,52 @@ library texture
         hetoimasia-lua-engine:request,
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
+
+-- The terrain composition (TRA-5): the concrete operations behind @api.terrain@, over the terrain service of
+-- @hetoimasia-terrain-runtime@. It is a sublibrary of its own, in a source directory of its own, for the reason the
+-- texture pipeline is: the facade names only abstract terrain operations and imports no terrain module, and this is where
+-- the service is bound to them. It depends on the facade for the operations it implements, on the request adapter for the
+-- policy, on the terrain packages for the service and the pure source and query values, and on the host's public runtime
+-- modules for the provider, settlement and lease surface. Neither terrain package imports Lua, and the generic Lua host
+-- imports no terrain, game or graphics package. It imports no module of a game, a window, a GPU, Vulkan or GLFW, and
+-- installs nothing in a VM.
+-- The arbitration of an open's name behind the terrain adapter (TRA-5): an implementation module, in a private sub-library that only the
+-- adapter and this package's own suite depend on, so that the adapter's public interface stays small and the suite decides the
+-- arbitration's windows with threads of its own.
+library terrain-names
+    import: language
+    visibility: private
+    default-extensions: OverloadedStrings
+    hs-source-dirs: terrain-names
+    exposed-modules:
+        Hetoimasia.LuaEngine.Terrain.Internal.Arbitration
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2
+
+library terrain
+    import: language
+    visibility: public
+    default-extensions: OverloadedStrings
+    hs-source-dirs: terrain
+    exposed-modules:
+        Hetoimasia.LuaEngine.Terrain
+    build-depends:
+        base >=4.22 && <4.23,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:facade,
+        hetoimasia-lua-engine:terrain-names,
+        hetoimasia-lua-engine:request,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-runtime ==0.1.0.0
 
 -- The M1 scene schema (LFE-19): the plain-table scene a script hands over, checked and copied into
 -- bounded immutable CPU data, its sRGB and Float32 conversions, and the translation to the renderer's
@@ -429,6 +476,22 @@ test-suite lua-engine-tests
         Test.LuaEngine.Texture.Ownership
         Test.LuaEngine.Texture.Publication
         Test.LuaEngine.Texture.Png
+        Test.LuaEngine.Terrain.Basics
+        Test.LuaEngine.Terrain.Composition
+        Test.LuaEngine.Terrain.Domain
+        Test.LuaEngine.Terrain.Fixture
+        Test.LuaEngine.Terrain.Isolation
+        Test.LuaEngine.Terrain.Limits
+        Test.LuaEngine.Terrain.Matrix
+        Test.LuaEngine.Terrain.Model
+        Test.LuaEngine.Terrain.Names
+        Test.LuaEngine.Terrain.Ownership
+        Test.LuaEngine.Terrain.Picks
+        Test.LuaEngine.Terrain.Races
+        Test.LuaEngine.Terrain.Spec
+        Test.LuaEngine.Terrain.Support
+        Test.LuaEngine.Terrain.Validation
+        Test.LuaEngine.Terrain.Windows
         Test.LuaEngine.Texture.Spec
         Test.LuaEngine.Texture.Stages
         Test.LuaEngine.Texture.Teardown
@@ -455,6 +518,8 @@ test-suite lua-engine-tests
         hetoimasia-lua-engine:scene,
         hetoimasia-lua-engine:session,
         hetoimasia-lua-engine:session-harness,
+        hetoimasia-lua-engine:terrain,
+        hetoimasia-lua-engine:terrain-names,
         hetoimasia-lua-engine:texture,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,
@@ -463,6 +528,8 @@ test-suite lua-engine-tests
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-runtime ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0,
         hspec >=2.11 && <3,
         QuickCheck >=2.15 && <2.19,

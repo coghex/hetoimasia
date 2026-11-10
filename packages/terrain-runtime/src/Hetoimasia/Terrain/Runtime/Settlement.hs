@@ -31,6 +31,8 @@ module Hetoimasia.Terrain.Runtime.Settlement
     -- * Cancelling and retiring
   , cancel
   , retire
+  , retireSTM
+  , releaseArenaLeaseSTM
   ) where
 
 import Control.Concurrent.STM
@@ -82,3 +84,17 @@ cancel svc request = atomically (cancelRequest svc request)
 -- The ordinary 'Hetoimasia.Terrain.Runtime.await' does this itself.
 retire ∷ Service → Request → IO ()
 retire svc request = atomically (retireRequest svc request)
+
+-- | 'retire' as a transaction, for a host whose own release of the request's result is made in one (the Lua host gives a request's credit back
+-- in the transaction that takes the result or accounts its work, on whichever thread does): the retirement is then part of that release, never
+-- left queued for a later call. The same function, writing the same state; it does nothing for a request that is not settled.
+retireSTM ∷ Service → Request → STM ()
+retireSTM = retireRequest
+
+-- | 'Hetoimasia.Terrain.Runtime.releaseLease' as a transaction, for a host that gives a lease back from inside one (the Lua host does, for a
+-- lease the service made for an open it then settled instead of publishing): the lease is released in that transaction and never left
+-- queued for a later call. The same release, idempotent, and a lease of another service is refused.
+releaseArenaLeaseSTM ∷ Service → ArenaLease → STM (Either Refused ())
+releaseArenaLeaseSTM svc (ArenaLease tag lid)
+  | tag /= serviceTag svc = pure (Left RefusedAuthority)
+  | otherwise = Right <$> releaseLeaseSTM svc lid

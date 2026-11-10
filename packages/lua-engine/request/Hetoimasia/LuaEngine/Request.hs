@@ -55,6 +55,7 @@ module Hetoimasia.LuaEngine.Request
   , m1Ask
   , offsetFromLua
   , m1Admission
+  , m1ReplyCheck
 
     -- * Asking
   , M1Start (..)
@@ -94,6 +95,7 @@ import Hetoimasia.LuaEngine.Profile
   )
 import Hetoimasia.Scripting.Lua.Admission
 import Hetoimasia.Scripting.Lua.Lease (Ownership)
+import Hetoimasia.Scripting.Lua.Provider (ProviderReply)
 import Hetoimasia.Scripting.Lua.Registration
   ( ArgumentCheck
   , Binding
@@ -286,6 +288,16 @@ m1ArgumentCheck ∷ M1Requests → ([Value] → M1Ask) → ArgumentCheck
 m1ArgumentCheck m1 askOf owner values = case contextRequests owner of
   Nothing → pure Nothing
   Just context → preflightAdmission context (m1Admission m1 (askOf values))
+
+-- | A binding's precondition for the largest reply a call can make: a call whose reply the owner's value limits could never carry is
+-- refused, as an ordinary error and before any bank is asked, whatever the pressure of the banks. The service says what the largest
+-- reply is, from what it has decoded.
+m1ReplyCheck ∷ M1Requests → M1Ask → Schema → ProviderReply → ArgumentCheck
+m1ReplyCheck m1 ask schema reply owner _ = case contextRequests owner of
+  Nothing → pure Nothing
+  Just context → do
+    carried ← preflightDeliverable context (m1Admission m1 ask) schema reply
+    pure (if carried then Nothing else Just "the VM's copied-value limits cannot carry the answer of this call: narrow the range")
 
 -- | The two values a request-producing binding answers.
 m1StartResults ∷ Text → M1Start → [Value]

@@ -19,14 +19,26 @@ module Hetoimasia.LuaEngine.Facade.Request
   ) where
 
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Control.Monad (forM_)
 import Hetoimasia.LuaEngine.Facade.Bindings (callingIn, instanceCheck)
 import Hetoimasia.LuaEngine.Facade.Caller (Caller (..), Calling (InInstance), Stage (..))
 import Hetoimasia.LuaEngine.Facade.Content (dataHandleName, moduleHandleName)
 import Hetoimasia.LuaEngine.Facade.Types
-  ( Facade (fcGraphics)
+  ( Facade (fcGraphics, fcTerrain)
   , InstanceRecord (recordId)
   , GraphicsServices (gsIssued)
+  , TerrainServices (tsDrain, tsIssued)
+  , terrainArenaRequestType
+  , terrainArenaValueSchema
+  , terrainCellRequestType
+  , terrainCellValueSchema
+  , terrainColumnRequestType
+  , terrainColumnValueSchema
+  , terrainRemoveRequestType
+  , terrainRemoveValueSchema
+  , terrainSurfaceRequestType
+  , terrainSurfaceValueSchema
   , graphicsTextureRequestType
   , graphicsTextureValueSchema
   , graphicsWindowRequestType
@@ -61,7 +73,17 @@ requestBindings facade =
   operations facade "module" moduleHandleName SExportTable
     <> operations facade "data" dataHandleName SBytes
     <> maybe [] (const graphicsOperations) (fcGraphics facade)
+    <> maybe [] (const terrainOperations) (fcTerrain facade)
   where
+    -- The terrain results are five kinds, each with its own handle type and value, so that @api.request@ dispatches by the kind
+    -- of the handle (TRA-5): an arena lease (open and attach), a cell, a column, a surface and a removal. A facade with no
+    -- terrain has no such operation and no such handle.
+    terrainOperations =
+      operations facade "terrain_arena" terrainArenaRequestType terrainArenaValueSchema
+        <> operations facade "terrain_cell" terrainCellRequestType terrainCellValueSchema
+        <> operations facade "terrain_column" terrainColumnRequestType terrainColumnValueSchema
+        <> operations facade "terrain_surface" terrainSurfaceRequestType terrainSurfaceValueSchema
+        <> operations facade "terrain_remove" terrainRemoveRequestType terrainRemoveValueSchema
     -- A texture request's value and a window request's are different things again, so the injected graphics add
     -- their own pair of kinds (LFE-21); a facade with no graphics has no such operation and no such handle.
     graphicsOperations =
@@ -89,14 +111,19 @@ operations facade kind handleType value =
           TakenPending → pure [VRecord [("status", VText "pending")]]
           Taken terminal → do
             recordIssued context terminal
+            drained
             pure [terminalRecord terminal]
       _ → pure []
     cancelled context = \case
       [VCapability found] →
         cancelAdmitted context (capabilityKey found) >>= \case
-          CancelWon → pure [VText "cancelled"]
-          CancelAlreadySettled → pure [VText "already_settled"]
+          CancelWon → drained >> pure [VText "cancelled"]
+          CancelAlreadySettled → drained >> pure [VText "already_settled"]
       _ → pure []
+    -- A terrain request that was taken or cancelled gives the service back what it held, here, so the next call finds it free.
+    drained
+      | "terrain_" `Text.isPrefixOf` kind, Just services ← fcTerrain facade = tsDrain services
+      | otherwise = pure ()
     -- A texture handle is recorded against its instance before the script is handed it: the issuing instance must
     -- outlive the lease's slot, which the collection deletes once the texture has retired, so that another instance
     -- holding the handle is still refused when it releases it.
@@ -108,6 +135,14 @@ operations facade kind handleType value =
               callingIn facade context >>= \case
                 InInstance caller → gsIssued services (recordId (callerRecord caller)) key
                 _ → pure ()
+      -- An arena handle is recorded against its instance before the script is handed it: the issuing instance must outlive the
+      -- lease's slot, so that another instance holding the handle is still refused when it releases it.
+      TerminalSuccess (VCapability issued)
+        | kind == "terrain_arena"
+        , Just services ← fcTerrain facade →
+            callingIn facade context >>= \case
+              InInstance caller → tsIssued services (recordId (callerRecord caller)) (capabilityKey issued)
+              _ → pure ()
       _ → pure ()
     serving caller = case callerStage caller of
       StageServing → Nothing

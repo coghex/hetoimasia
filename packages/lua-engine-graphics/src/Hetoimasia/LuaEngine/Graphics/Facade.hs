@@ -189,10 +189,13 @@ graphicsInjection ∷ ∀ target. Typeable target ⇒ GraphicsFacade target → 
 graphicsInjection config = GraphicsInjection $ \vm → do
   let requests = gvRequests vm
       profile = gfProfile config
+      capacity = facadeLeaseCapacity profile
   texture ← either (\_ → throwIO (GraphicsCompositionRefused "the request policy and the texture pipeline were built from different profiles")) pure (textureService requests (gfPipeline config))
   limits ← either (\refused → throwIO (GraphicsCompositionRefused ("the scene limits were refused: " <> Text.pack (show refused)))) pure (sceneLimits profile)
   lending ← newLending
-  leases ← newLeases lending (facadeLeaseCapacity profile)
+  -- One lending and one lease scope for the VM: when terrain is injected too, its leases are charged in this scope, so the
+  -- capacity is the graphics capacity plus what the other services of the VM can hold at once.
+  leases ← newLeases lending (capacity + gvSharedCapacity vm)
   owners ← newTVarIO (Map.empty ∷ Map Text Owners)
   -- The instance each recent texture handle was issued to: bounded ('gfIssuedMemory').
   issued ← newTVarIO emptyIssued
@@ -217,7 +220,7 @@ graphicsInjection config = GraphicsInjection $ \vm → do
     GraphicsServices
       { gsLending = lending
       , gsLeases = leases
-      , gsLeaseCapacity = facadeLeaseCapacity profile
+      , gsLeaseCapacity = capacity + gvSharedCapacity vm
       , gsTypes = [leaseCapabilityType leases textureHandleType, leaseCapabilityType leases windowHandleType]
       , gsEndpoints = [textureEndpoint texture, windowEndpoint window]
       , gsDeclare = \identity → do
