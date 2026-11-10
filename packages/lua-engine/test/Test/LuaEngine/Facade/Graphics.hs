@@ -7,7 +7,16 @@
 -- the two-value busy answer, the exact request records and the three release answers. A refused call must have asked
 -- the providers for nothing, so the fake counts every check and every start it is given. The real providers, leases and
 -- windows are the graphics adapter's suites; nothing here is evidence of them.
-module Test.LuaEngine.Facade.Graphics (spec) where
+module Test.LuaEngine.Facade.Graphics
+  ( spec
+  , Gfx
+  , newGfx
+  , injection
+  , awaitHanded
+  , answerTexture
+  , finishAll
+  , files
+  ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (finally)
@@ -141,12 +150,13 @@ injection = injectionOpt False
 injectionOpt ∷ Bool → Gfx → GraphicsInjection
 injectionOpt withInput gx = GraphicsInjection $ \vm → do
   lending ← newLending
-  leases ← newLeases lending 17
+  -- the VM's one scope: this fake's own 17 beside what the VM's other services (terrain) hold in it
+  leases ← newLeases lending (17 + gvSharedCapacity vm)
   pure
     GraphicsServices
       { gsLending = lending
       , gsLeases = leases
-      , gsLeaseCapacity = 17
+      , gsLeaseCapacity = 17 + gvSharedCapacity vm
       , gsTypes = [leaseCapabilityType leases graphicsTextureType, leaseCapabilityType leases graphicsWindowType]
       , gsEndpoints = [endpointOf "texture" (SRecord [("width", SInteger), ("height", SInteger)]), endpointOf "window" SNil]
       , gsDeclare = \identity → note gx ("declare " <> identity)

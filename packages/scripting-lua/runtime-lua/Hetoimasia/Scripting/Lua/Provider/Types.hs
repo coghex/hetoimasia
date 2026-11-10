@@ -65,6 +65,8 @@ module Hetoimasia.Scripting.Lua.Provider.Types
   , Submission (..)
   , ProviderWork (..)
   , Completion (..)
+  , Settling (..)
+  , SubmissionDeclined (..)
   , ProviderReply (..)
   , ReplyAnswer (..)
 
@@ -265,6 +267,80 @@ data Submission = Submission
     -- offered a resource reply and finds the request settled with the resource never built knows no
     -- lease will ever own it: the work is reported over when the reply is accepted, so this is the one
     -- way to learn that interest ended in between, without waiting for the settled result to be taken.
+  , submissionSettling ∷ !(Maybe Settling)
+    -- ^ The opt-in settlement seam, for a request admitted through the opt-in 'Admission' only: how a
+    -- provider whose answer carries a change it commits learns that the request is eligible to settle, and
+    -- settles it in the very transaction that commits the change. 'Nothing' for every other request, and a
+    -- provider that never reads it behaves exactly as before.
+  }
+
+-- | What a provider raises from 'endpointSubmit' to decline a request it was handed, before it accepted any work, instead of
+-- failing the host: the admission is taken back whole (every bank it reserved is returned unused, the reserved lease is
+-- abandoned and no handle exists) and the call is answered as data. Only a request admitted through the opt-in
+-- 'Admission' takes it so; for any other request it is the failure of application code any other exception is.
+--
+-- A provider that cannot reserve its own banks inside the engine's admission transaction (its admission is an IO action of
+-- its own) uses it for the one refusal that is the script's to read: its banks are full (busy), or a permanent fact changed
+-- between the argument check and the hand-off (a refusal the script reads as an ordinary error). It must have changed nothing
+-- when it raises it: the engine does not undo the provider's own state.
+data SubmissionDeclined
+  = -- | A temporary bank of the provider's has no room: the name of the bank, as the busy answer names it.
+    DeclinedBusy !Text
+  | -- | A permanent fact refuses the request: the reason, as the ordinary error a script reads.
+    DeclinedRefused !Text
+  deriving (Eq, Show)
+
+instance Exception SubmissionDeclined
+
+-- | The opt-in settlement seam of one request: the two halves of one arbitration between the provider's
+-- commit and the request's own cancellation, its requester's end, an epoch change and the owner's exit.
+--
+-- A provider that applies a change at the request's settlement (a terrain edit, say) cannot do it with
+-- 'Completion': that is one IO reply after the provider's own commit, so a cancel could win in between and
+-- the change would stand under a request settled as cancelled, or the reply could be refused after the
+-- change was made. Here the provider reads 'settlingEligible' and calls 'settlingSettle' in the one
+-- transaction that decides its own commit, so exactly one of the two wins: when the cancel (or any other
+-- end of the request) committed first the request is not eligible and nothing is committed; when the
+-- commit came first the request is settled and a cancel answers that it came too late.
+--
+-- Both are transactions that never block and never retry, run on whatever thread the provider commits on
+-- (never Lua, never the owner's thread), and write only the owner's own accounting of the request.
+data Settling = Settling
+  { settlingEligible ∷ STM Bool
+    -- ^ Whether the request may be settled now, read-only: it is still waiting for its answer (not settled,
+    -- not held, not being adopted), the owner and the requester are taking answers, and, for an owner on
+    -- logical time, the scheduler stands at the boundary just before the request's assigned tick, which the
+    -- request holds (so the tick does not begin until the request is settled, cancelled or ended). An owner on
+    -- elapsed time is eligible whenever the request is waiting.
+  , settlingSettleFinal ∷ STM (Maybe ExpectedFailure) → ProviderReply → STM ReplyAnswer
+    -- ^ 'settlingSettle' for a resource reply with the provider's last look, taken in the transaction that settles the request once
+    -- the owner has built the resource ('adoptingFinal'). For a reply that is not a resource it is 'settlingSettle'.
+  , settlingSettle ∷ ProviderReply → STM ReplyAnswer
+    -- ^ Settle the request with this reply, in the caller's transaction. The reply is checked exactly as
+    -- 'completeRequest' checks one, but purely, so a reply that fails the check (a value over the ceilings, a
+    -- failure with a code the service did not declare) is a provider defect: it is recorded for the owner to raise
+    -- (once, whatever follows), settles nothing, and answers 'ReplyDefective'. The caller decides what that means for
+    -- its own transaction: a provider whose settlement is part of an atomic change must see to it, beforehand
+    -- ('settlingJudge'), that the reply it will make is one the host takes, because abandoning the transaction (with
+    -- @throwSTM@) abandons the record of the defect with it. A
+    -- request that is eligible is settled by it at once (on logical time too: the position was reached, which
+    -- is what eligibility says); one that is not yet eligible is held for its position, as 'completeRequest'
+    -- holds it. A resource reply is not settled here: the owner builds the resource into the reserved lease
+    -- at its next boundary and settles then, as for 'completeRequest'.
+  , settlingSettleKeeping ∷ ProviderReply → STM ReplyAnswer
+    -- ^ 'settlingSettle' for a reply made while the provider still holds something borrowed for the request: it settles the request as
+    -- 'settlingSettle' does, but does not prove the provider's work over, so the request's retirement obligation ('workRetirement')
+    -- stays until the provider reports its work complete, and the request's places are not returned before. For a reply that is not a
+    -- resource.
+  , settlingJudge ∷ ProviderReply → Bool
+    -- ^ Whether the host would take this reply as the request's settlement: the very judgement 'settlingSettle' passes, as a pure
+    -- function that writes nothing. A provider uses it before it commits anything, on the largest reply it can make, to refuse a request
+    -- whose answer the owner's value ceilings could never carry, instead of finding out in the transaction that commits the change.
+  , settlingCancel ∷ STM ()
+    -- ^ Cancel the request, in the caller's transaction, as its script's own cancel would: the provider has itself ended its
+    -- interest in the request (the lease it was made through was released, its client ended) and has no answer for it. The
+    -- request settles as cancelled and its tick's hold is given back; a request that settled already keeps its settlement.
+    -- The provider's work is not proved over by it.
   }
 
 -- | What the engine holds of a provider's work on one request, so that interest in it can
@@ -576,6 +652,12 @@ data Adopting = Adopting
     -- ^ The owner is building the resource now. A claimed entry stays until the building is
     -- finished or failed, so the reservation it builds into is not discharged under it, and
     -- nothing that ends the request drops it.
+  , adoptingFinal ∷ !(Maybe (STM (Maybe ExpectedFailure)))
+    -- ^ The provider's last look, taken in the very transaction that settles the request once the resource is built: 'Nothing' lets
+    -- the success settle, a failure settles that failure instead (and the caller releases the resource it built). It is how what a
+    -- success makes visible (an arena a name names) and what it needs to be alive are one transaction with the settlement.
+  , adoptingNow ∷ !Bool
+    -- ^ The reply was made at its position (it was eligible), so its settlement is not held for the tick.
   }
 
 -- Refusals --------------------------------------------------------------------------
@@ -844,6 +926,10 @@ data Ticks = Ticks
     -- ^ Whether the scheduler stands at the boundary just before this tick: everything before it has
     -- finished and it has not begun (or it is past, or zero). Where the owner starts the work it holds
     -- the tick for.
+  , ticksGranted ∷ Word64 → STM Bool
+    -- ^ Whether this tick has been granted and waits, unbegun, only for what the owner holds it for: 'ticksQuiet', and the
+    -- application's grant for it accepted and not applied. Where a provider commits what a request held for the tick is to
+    -- do, so that a tick nobody has granted has done nothing (the request is eligible to settle there).
   , ticksWatch ∷ Word64 → STM ()
   , ticksOpen ∷ STM Bool
   , ticksTaskGone ∷ TaskId → STM Bool
@@ -945,6 +1031,10 @@ data Rec = Rec
   , recDue ∷ !(Maybe DueSlot)
   , recHeld ∷ !(Maybe (Reply Value))
     -- ^ The provider's completion, held until the request's tick: no settlement yet.
+  , recHeldKeeps ∷ !Bool
+    -- ^ The held completion was made while the provider's work remained ('settlingSettleKeeping'): it does not prove the work over, whatever
+    -- becomes of the request (its tick serves it, a cancel, the requester's end, an epoch or the owner's close), and the work stays polled
+    -- for its retirement until the provider says so.
   , recGated ∷ !(Maybe Word64)
     -- ^ The tick this request keeps from beginning, until it is complete.
   , recEnded ∷ !(Maybe (Settlement Value, CancelCause))
@@ -960,6 +1050,10 @@ data Rec = Rec
   , recAdopted ∷ !Bool
     -- ^ The resource was built into that lease: a success carries the lease, and taking it does
     -- not release it.
+  , recFinal ∷ !(Maybe (STM (Maybe ExpectedFailure)))
+    -- ^ The provider's last look at the settlement of a resource reply that was held for its tick: the settlement is made when the tick serves
+    -- it, so the look is taken again there, in the transaction that settles, and a verdict of failure settles that failure instead and releases
+    -- the resource that was built.
   }
 
 -- | The accounting of a provider's work on one request.

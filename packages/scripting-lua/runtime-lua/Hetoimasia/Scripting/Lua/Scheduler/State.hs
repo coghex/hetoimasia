@@ -80,6 +80,7 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , tickHeld
   , oweTickIn
   , tickQuietIn
+  , tickGrantedIn
   , releaseOwedIn
   , tickOwed
 
@@ -976,6 +977,17 @@ tickQuietIn tick state
       EmptyL → True
     noReadyTask = not (any ((== Ready) . taskState) (Map.elems (sessionTasks session)))
     noStartableAdmission = Seq.null (sessionQueued session) || not (slotFree state)
+
+-- | Whether this tick has been granted and waits at the head of the grants, unbegun, only for what the owner holds it for: the
+-- scheduler stands at the boundary just before it ('tickQuietIn') and the application's grant for it has been accepted and not
+-- applied. It is the point at which work an owner holds a tick for is to be done: a tick nobody has granted is not reached,
+-- whatever else is quiet, so a position that has not been granted has done nothing. A tick that has begun already is not this.
+tickGrantedIn ∷ Word64 → SchedState v → Bool
+tickGrantedIn tick state = tickQuietIn tick state && ssTick state + 1 == tick && headWaits
+  where
+    headWaits = case Seq.viewl (ssGrants state) of
+      grant :< _ → not (grantApplied grant)
+      EmptyL → False
 
 -- | Whether the owner needs something finished before this tick is complete.
 tickOwed ∷ Word64 → SchedState v → Bool

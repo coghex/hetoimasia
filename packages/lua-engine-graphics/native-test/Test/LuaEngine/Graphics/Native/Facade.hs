@@ -317,6 +317,7 @@ withFacadeSessionWith withInput env entry judge scenario = do
                   , sxControl = control
                   , sxHarness = noHarness
                   , sxGraphics = Just injection
+                  , sxTerrain = Nothing
                   }
           -- The scenario's thread is owned by the call (#599): ended and joined however the session's run ends, a cancellation
           -- delivered before the scenario started included.

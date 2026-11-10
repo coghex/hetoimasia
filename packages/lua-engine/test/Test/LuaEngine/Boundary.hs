@@ -238,6 +238,49 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permittedFacade name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
+  it "has a terrain sublibrary over the facade, the request adapter, the terrain packages, the foundation and the host's public modules, and nothing else" $ do
+    (sort <$> fieldEntries "library terrain" "build-depends:")
+      `shouldReturn` [ "base"
+                     , "containers"
+                     , "hetoimasia-foundation"
+                     , "hetoimasia-lua-engine"
+                     , "hetoimasia-lua-engine:facade"
+                     , "hetoimasia-lua-engine:request"
+                     , "hetoimasia-lua-engine:terrain-names"
+                     , "hetoimasia-scripting-lua"
+                     , "hetoimasia-scripting-lua:runtime-lua"
+                     , "hetoimasia-terrain"
+                     , "hetoimasia-terrain-runtime"
+                     , "stm"
+                     , "text"
+                     ]
+    fieldEntries "library terrain" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Terrain"]
+
+  it "imports, in the terrain sublibrary, only the configuration boundary, the facade and the request adapter, the terrain packages' and the foundation's public modules, the host's public modules and base libraries: no private module, content, window, GPU, GLFW, Vulkan, console, sample or game" $ do
+    sources ← sourcesUnder "terrain"
+    sources `shouldSatisfy` ((>= 1) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, not (permittedTerrain name)] `shouldBe` []
+    -- the arbitration of an open's name is the one implementation module the adapter imports: from a private sub-library of its own
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name, name /= "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"] `shouldBe` []
+
+  it "keeps the arbitration of an open's name in a private sub-library that imports base libraries only, and that only the terrain sublibrary and this suite depend on" $ do
+    (sort <$> fieldEntries "library terrain-names" "build-depends:") `shouldReturn` ["base", "containers", "stm", "text"]
+    fieldEntries "library terrain-names" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"]
+    root ← above "cabal.project"
+    cabal ← readFile (root </> "packages" </> "lua-engine" </> "hetoimasia-lua-engine.cabal")
+    ("library terrain-names\n    import: language\n    visibility: private\n" `isInfixOf` cabal) `shouldBe` True
+    sources ← sourcesUnder "terrain-names"
+    sources `shouldSatisfy` ((>= 1) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, "Hetoimasia." `isPrefixOf` name] `shouldBe` []
+
+  it "keeps the facade and the session free of any terrain package: the terrain operations are abstract there, and only the terrain sublibrary binds the service" $ do
+    facade ← sourcesUnder "facade" >>= importedBy
+    session ← sourcesUnder "session" >>= importedBy
+    [file <> ": " <> name | (file, name) ← facade <> session, "Hetoimasia.Terrain" `isPrefixOf` name] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← facade <> session, name == "Hetoimasia.LuaEngine.Terrain"] `shouldBe` []
+
   it "has a session sublibrary over the configuration boundary, the facade and the services it composes, the content package, the foundation, the runtime's supervision and the host's public modules, and nothing else" $ do
     (sort <$> fieldEntries "library session" "build-depends:")
       `shouldReturn` [ "base"
@@ -346,7 +389,9 @@ spec = describe "the package and import boundary" $ do
       , not (permittedSuite name)
       ]
       `shouldBe` []
-    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+    -- no implementation module of the package is imported, but the arbitration of an open's name, which the suite decides with threads (a
+    -- private sub-library of the package, reached by nothing else)
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name, name /= "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"] `shouldBe` []
 
   it "is listed by the ordinary and CPU projects, held to -Werror, and by the Vulkan project only as the graphics adapter's CPU closure" $ do
     root ← above "cabal.project"
@@ -411,6 +456,27 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Content.ReadPool"
                  , "Hetoimasia.Foundation.Log"
                  , "Hetoimasia.Foundation.Resource"
+                 ]
+        || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
+    permittedTerrain name =
+      "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
+        || "Control." `isPrefixOf` name
+        || name == "Hetoimasia.LuaEngine.Terrain"
+        || name
+          `elem` [ "Hetoimasia.LuaEngine.Facade"
+                 , "Hetoimasia.LuaEngine.Profile"
+                 , "Hetoimasia.LuaEngine.Request"
+                 , "Hetoimasia.Foundation.Resource"
+                 , "Hetoimasia.Terrain.Cell"
+                 , "Hetoimasia.Terrain.Coordinate"
+                 , "Hetoimasia.Terrain.Query"
+                 , "Hetoimasia.Terrain.Residency"
+                 , "Hetoimasia.Terrain.Runtime"
+                 , "Hetoimasia.Terrain.Runtime.Settlement"
+                 , "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"
+                 , "Hetoimasia.Terrain.Shape"
+                 , "Hetoimasia.Terrain.Source"
                  ]
         || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
     permittedTexture name =
@@ -514,7 +580,16 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Session.Pacing"
                , "Hetoimasia.LuaEngine.Session.State"
                , "Hetoimasia.LuaEngine.Texture"
+               , "Hetoimasia.LuaEngine.Terrain"
                , "Hetoimasia.LuaEngine.Scene"
+               , "Hetoimasia.Terrain.Cell"
+               , "Hetoimasia.Terrain.Coordinate"
+               , "Hetoimasia.Terrain.Query"
+               , "Hetoimasia.Terrain.Residency"
+               , "Hetoimasia.Terrain.Runtime"
+               , "Hetoimasia.Terrain.Runtime.Settlement"
+               , "Hetoimasia.LuaEngine.Terrain.Internal.Arbitration"
+               , "Hetoimasia.Terrain.Source"
                , "Hetoimasia.Asset.Image"
                , "Hetoimasia.Asset.Image.DataMap"
                , "Hetoimasia.Math.Affine2"

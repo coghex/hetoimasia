@@ -253,6 +253,7 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , releaseOwed
   , tickIsOwed
   , tickQuietBefore
+  , tickGrantedBefore
   , watchKey
   , watchTick
   , setWatch
@@ -593,6 +594,11 @@ releaseOwed scheduler tick = modifyTVar' (schedState scheduler) (releaseOwedIn t
 -- it); a tick that has begun already, and tick zero, answer 'True'. Reads, and changes nothing.
 tickQuietBefore ∷ Scheduler v → Word64 → STM Bool
 tickQuietBefore scheduler tick = tickQuietIn tick <$> readTVar (schedState scheduler)
+
+-- | Whether this tick has been granted and waits, unbegun, only for what the owner holds it for ('tickGrantedIn'). Reads, and
+-- changes nothing.
+tickGrantedBefore ∷ Scheduler v → Word64 → STM Bool
+tickGrantedBefore scheduler tick = tickGrantedIn tick <$> readTVar (schedState scheduler)
 
 -- | Whether the owner needs something finished before this tick is complete.
 tickIsOwed ∷ Scheduler v → Word64 → STM Bool

@@ -426,6 +426,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Admission.Lease
         Test.LuaRuntime.Admission.Races
         Test.LuaRuntime.Admission.Release
+        Test.LuaRuntime.Admission.Seam
         Test.LuaRuntime.Admission.Settlement
         Test.LuaRuntime.Admission.Timing
         Test.LuaRuntime.Admission.Spec
