@@ -7,6 +7,7 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), ExceptionWithContext (..), Exception (..), SomeException, asyncExceptionFromException, asyncExceptionToException, catch, fromException, throwIO, try)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (find)
 import Control.Monad (forM_, void, when)
 import qualified Data.Text as T
 import Hetoimasia.Foundation.Log (LogEntry (..), callbackSink, defaultLogFilter, mkLogger)
@@ -354,6 +355,27 @@ spec = describe "Accounting and lifetime hardening" $ do
       _ <- await svc next'
       retire svc b
       inspectSnapshotBytes svc >>= (`shouldBe` (0, 330))
+      settleChecks svc
+
+  it "gives a result back, and a lease up, inside the caller's own transaction, as retire and releaseLease do" $
+    withService (defaultConfig {configRetainedBytes = 330}) $ \svc → do
+      (_, lease) <- openMain svc "main"
+      host <- newHost True
+      request <- okOf (removeWith svc (hostEndpoint svc Nothing host) lease (tile 1 1 1) Nothing)
+      waitFor (readTVar (hostSettled host) >>= \x → check (not (null x)))
+      inspectSnapshotBytes svc >>= (`shouldBe` (160, 330))
+      -- one transaction of the caller's: the result is retired and nothing else of the caller's is written
+      flag <- newTVarIO False
+      atomically (retireSTM svc request >> writeTVar flag True)
+      readTVarIO flag `shouldReturn` True
+      inspectSnapshotBytes svc >>= (`shouldBe` (0, 330))
+      -- the lease: released in a transaction of the caller's, idempotently, and a lease of another service is refused
+      leasesBefore <- heldLeases svc
+      released <- atomically (releaseArenaLeaseSTM svc lease)
+      released `shouldBe` Right ()
+      again <- atomically (releaseArenaLeaseSTM svc lease)
+      again `shouldBe` Right ()
+      heldLeases svc >>= \remaining → (leasesBefore, remaining) `shouldBe` (1, 0)
       settleChecks svc
 
   it "reserves a removal's result bytes at admission, so pending removals and snapshots cannot overfill the retained bank" $
@@ -811,3 +833,7 @@ data OwnerInterrupted = OwnerInterrupted
 instance Exception OwnerInterrupted where
   toException = asyncExceptionToException
   fromException = asyncExceptionFromException
+
+-- | The leases the service holds: its own enumeration of them.
+heldLeases ∷ Service → IO Word
+heldLeases svc = maybe 0 (fromIntegral . limitRowHeld) . find ((== "leases") . limitRowName) <$> inspectLimits svc

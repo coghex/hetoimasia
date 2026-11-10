@@ -651,8 +651,11 @@ spec = describe "Terrain windows and banks" $ do
             awaitReached gate
             -- an attach decided now finds a name only the service has settled: it answers not_found at once, without waiting for the adoption
             notFound ← length . filter (== "attach\tfailure\tnot_found") <$> outLines world
-            pumpUntil world (advanceClock world 2000000000 >> ((> notFound) . length . filter (== "attach\tfailure\tnot_found") <$> outLines world))
+            pumpUntil world (advanceClock world 2000000000 >> ((> notFound + 4) . length . filter (== "attach\tfailure\tnot_found") <$> outLines world))
             outLines world >>= \printed → printed `shouldNotContain` ["attach\tsuccess\tnil"]
+            -- the service made a lease for each of those attaches and the host answered without publishing it: each was given back with its
+            -- request's credit, so the leases the service holds are the open's, and at most the attach being asked now
+            limitHeld (rgService rig) "leases" >>= (`shouldSatisfy` (<= 3))
             openGate gate
             untilPrinted world "attach\tsuccess\tnil"
 
