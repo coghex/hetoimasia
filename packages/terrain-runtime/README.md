@@ -570,9 +570,16 @@ carries from one call to the next, so the retry for a window that outgrew its bo
 the window: when a plan answers `Refused (Capacity (WindowExceeded _ | WindowBytesExceeded _ | ProbesExceeded _))`
 the larger unit of work did not fit. The caller builds a fresh window for the same version, `reduceWork old fresh`
 (the work the plan may take on, `windowWork`, halves: the pages one maintenance transaction frees, the writes of
-one discovery batch; never below one), and plans again. A unit of one page or one write needs a bounded window,
-so the retry ends in at most six steps with the work done or the typed result for a window that cannot hold even
-that; a caller that retries the same window or restarts at the full work gets the same answer for ever (the
+one discovery batch), and plans again. The limit counts units of the planner's own work and a planner never does
+less than its **atomic unit**: a limit below it means the unit (`windowWorkAtLeast`; `State.hs` defines each unit
+once: `maintenanceUnitPages`, one page, and `discoveryUnitWrites`, the three writes of one connection inspection,
+which is #661's `worstEdgeWrites`). A standalone removal is one atomic edit and reads no work limit: a window it
+outgrows is a hard capacity result, bounded by `removalWindowPages`. The unit needs a bounded window (the discovery
+unit holds at most `discoveryUnitWindowPages`, 226 pages at the deepest trees and 16 pinned versions, inside the
+removal's 290 and the limit of 310), so the retry ends in at most six steps with the work done, and never in
+`Invalid`, `Integrity` or `Stale`: a driver that follows this protocol exactly succeeds from every starting limit
+from 1 to 64 (`Test.TerrainRuntime.Store.Protocol`; the table of the refusals `classifyPlan` maps to `FailInvalid`,
+none of which a valid store reaches, is in the evidence); a caller that retries the same window or restarts at the full work gets the same answer for ever (the
 failure round 12 found). Every other capacity result either is handled inside the call (`TxnPagesExceeded`,
 `TxnRamExceeded`, `ListTooLarge`, `OverlayExceeded`, `BookkeepingExceeded`: discovery halves its writes and
 maintenance its chunk) or waits for a reader's release and maintenance (`DiskFull`, `RetirementBacklog`: the
