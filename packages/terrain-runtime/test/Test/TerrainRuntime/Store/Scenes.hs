@@ -18,6 +18,7 @@ module Test.TerrainRuntime.Store.Scenes
   , newRun
   , removeCell
   , batchStep
+  , batchStepWith
   , drain
   , knowledgeThrough
   , compareKnowledge
@@ -119,10 +120,14 @@ removeCell run tile = do
 -- | One discovery batch through the store, mirrored on the reference with the same
 -- number of structural updates.
 batchStep ∷ Run → Either String (Run, Bool)
-batchStep run = do
-  let h = runH run
-      env = runEnv run
-  (planned, _, _) ← fillWith h (planDiscovery env (hStore h))
+batchStep = batchStepWith (\h env → (\(p, _, _) → (h, p)) <$> fillWith h (planDiscovery env (hStore h)))
+
+-- | 'batchStep' with the plan made by a given planner, which may commit pages of its own (maintenance) and returns the store it
+-- planned against.
+batchStepWith ∷ (H → Env → Either String (H, Planned)) → Run → Either String (Run, Bool)
+batchStepWith planWith run0 = do
+  (h, planned) ← planWith (runH run0) (runEnv run0)
+  let run = run0 {runH = h}
   case planned of
     NoWork → Right (run, False)
     Planned plan → do

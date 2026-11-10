@@ -63,6 +63,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , limitWork
   , reduceWork
   , windowWork
+  , windowWorkAtLeast
   , windowUnchecked
   , pageCrcOf
   , windowInsert
@@ -217,8 +218,10 @@ windowUnchecked w = w {wUnchecked = True}
 -- between a plan and the next, so it is where a retry remembers that the larger unit of work did not
 -- fit: when a plan answers a window that outgrew its bounds ('WindowExceeded', 'WindowBytesExceeded',
 -- 'ProbesExceeded') the caller builds a fresh window for the same version with half of the work
--- ('windowWork', halved, never below one) and plans again; a unit of one page or one write needs a
--- bounded window, so the retry ends in at most @log2 64@ steps with the work done.
+-- ('windowWork', halved, never below one) and plans again. The limit counts units of the planner's own work and a planner
+-- never does less than its atomic unit ('windowWorkAtLeast': one page for maintenance, the three writes of one connection
+-- inspection for discovery), so a limit below that unit means the unit; the unit needs a bounded window, so the retry ends
+-- in at most @log2 64@ steps with the work done.
 limitWork ∷ Int → Window → Window
 limitWork n w = w {wWork = max 1 n}
 
@@ -231,6 +234,12 @@ reduceWork old new = limitWork (min 64 (wWork old) `div` 2) new
 -- | The work a plan through this window may take on ('maxBound' for a window nobody limited).
 windowWork ∷ Window → Int
 windowWork = wWork
+
+-- | The work a planner takes on through this window when its own smallest atomic unit is @unit@: a limit below the unit means the
+-- unit, because a planner cannot do less than one of its atomic steps (a connection inspection stages three writes; asking for
+-- one or two would make it refuse a valid store). Every planner that reads the work limit reads it through this.
+windowWorkAtLeast ∷ Int → Window → Int
+windowWorkAtLeast unit w = max unit (wWork w)
 
 -- | A read-only fact about the committed and pinned state, established by a plan and remembered through a
 -- retry: the proofs that a page a plan is about to overwrite or free is not owned by anyone but the

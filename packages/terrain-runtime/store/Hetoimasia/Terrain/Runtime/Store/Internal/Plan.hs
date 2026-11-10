@@ -1090,7 +1090,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       if fmap (\v → getBe64 v 0) mv /= Just ver then refuse (Integrity (RetiredIndexMismatch pg)) else pure ()
       phase edit1 (deleteKey TreeRetire root (retiredKey pg))
     tooBig = shrinkable
-    chunkSizes n = let top = min n (min maxReclaimPages (windowWork win)) in takeWhile (>= 1) (iterate (`div` 2) top)
+    chunkSizes n = let top = min n (min maxReclaimPages (windowWorkAtLeast maintenanceUnitPages win)) in takeWhile (>= maintenanceUnitPages) (iterate (`div` 2) top)
     -- One maintenance transaction: the first @c@ pages of an entry's list freed, or (no entry) only the loose pages
     -- handed to the allocator tree. The latter strictly lowers the loose list: it only inserts into the allocator tree,
     -- its pages come from the loose list itself, and a transaction without deletes replaces no more pages than it

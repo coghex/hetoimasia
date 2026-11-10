@@ -9,7 +9,7 @@
 -- 69 bookkeeping pages against the reserve of 68. The plan used to number them from a supply of 68 and
 -- fail as 'BrokenInvariant'; it must now commit (taking a larger supply), and a batch that is too big must be
 -- shrinkable, and the halved batch must make progress.
-module Test.TerrainRuntime.Store.Scattered (spec) where
+module Test.TerrainRuntime.Store.Scattered (spec, scattered, fragmented) where
 
 import qualified Data.ByteString as BS
 import Data.List (sortOn)

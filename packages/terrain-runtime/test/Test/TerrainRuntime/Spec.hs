@@ -23,6 +23,7 @@ import qualified Test.TerrainRuntime.Store.Evidence as StoreEvidence
 import qualified Test.TerrainRuntime.Store.Faults as StoreFaults
 import qualified Test.TerrainRuntime.Store.Fuzz as StoreFuzz
 import qualified Test.TerrainRuntime.Store.FuzzTrees as StoreFuzzTrees
+import qualified Test.TerrainRuntime.Store.Protocol as StoreProtocol
 import qualified Test.TerrainRuntime.Store.Rebalance as StoreRebalance
 import qualified Test.TerrainRuntime.Store.Large as StoreLarge
 import qualified Test.TerrainRuntime.Store.Scattered as StoreScattered
@@ -60,6 +61,7 @@ spec = do
   StoreFuzz.spec
   StoreFuzzTrees.spec
   StoreRebalance.spec
+  StoreProtocol.spec
   StoreLarge.spec
   StoreScattered.spec
   StoreCycles.spec

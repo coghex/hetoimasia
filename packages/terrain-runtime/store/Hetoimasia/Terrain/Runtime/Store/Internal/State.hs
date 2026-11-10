@@ -72,6 +72,10 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , looseGrowthOrdinary
   , workOneProbeBytes
   , removalWindowPages
+  , editWindowPages
+  , discoveryUnitWindowPages
+  , maintenanceUnitPages
+  , discoveryUnitWrites
   , maxRetireInternals
 
     -- * Configuration
@@ -101,7 +105,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   ) where
 
 import Data.Word (Word32, Word64)
-import Hetoimasia.Terrain.Discovery (Authority (..), Header (..))
+import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), worstEdgeWrites, worstEditWrites)
 import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 
@@ -316,8 +320,31 @@ workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2 + maxSpillPages) * probeBytes
 -- each retired page and an entry for each list) at least 46 to a leaf and 47 children to an internal page, that is
 -- 712 leaves, 16 internal pages and a root; the allocator tree's edit, @3 * hf@; and ONE proof as above.
 removalWindowPages ∷ Int → Int → Int → Int → Int
-removalWindowPages retireInternals hf hrec pins =
-  7 * hrec + (7 * hrec + 1) + retireInternals + 3 * hf + max ((1 + pins) * hrec) hf
+removalWindowPages = editWindowPages worstEditWrites
+
+-- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'worstEditWrites').
+editWindowPages ∷ Int → Int → Int → Int → Int → Int
+editWindowPages writes retireInternals hf hrec pins =
+  writes * hrec + (writes * hrec + 1) + retireInternals + 3 * hf + max ((1 + pins) * hrec) hf
+
+-- | The pages the SMALLEST unit of a discovery batch holds at once: one connection inspection, at most 'discoveryUnitWrites'
+-- (3) record writes, an edit like a removal's but of fewer writes, so never more than 'removalWindowPages'.
+discoveryUnitWindowPages ∷ Int → Int → Int → Int → Int
+discoveryUnitWindowPages = editWindowPages discoveryUnitWrites
+
+-- | The ATOMIC unit of each planner that reads the window's work limit ('windowWorkAtLeast'): the least work the planner can
+-- do. A work limit counts units of the planner's own work (the pages a maintenance transaction frees, the record writes of
+-- a discovery batch) and never asks for less than this: a limit below it means this. The standalone removal reads no work
+-- limit: it is one atomic edit and cannot shrink.
+--
+-- The pages one maintenance transaction frees.
+maintenanceUnitPages ∷ Int
+maintenanceUnitPages = 1
+
+-- | The record writes of one connection inspection, the smallest batch discovery can stage: #661's own constant, the
+-- figure its planner refuses a smaller allowance with ('CapacityWrites').
+discoveryUnitWrites ∷ Int
+discoveryUnitWrites = worstEdgeWrites
 
 -- ---------------------------------------------------------------------------
 -- Configuration

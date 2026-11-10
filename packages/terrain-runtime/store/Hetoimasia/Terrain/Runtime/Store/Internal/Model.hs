@@ -464,7 +464,7 @@ planDiscovery = planDiscoveryWith standardBounds
 
 -- | 'planDiscovery' under given bounds.
 planDiscoveryWith ∷ Bounds → Env → Store → Window → Planned
-planDiscoveryWith bounds env s win = withWindow s win $ \prov → go prov (min (allowWrites full) (windowWork win)) (8 ∷ Int)
+planDiscoveryWith bounds env s win = withWindow s win $ \prov → go prov (min (allowWrites full) (windowWorkAtLeast discoveryUnitWrites win)) (8 ∷ Int)
   where
     full = allowanceOf (envLimits env)
     go prov writes tries =
@@ -474,11 +474,10 @@ planDiscoveryWith bounds env s win = withWindow s win $ \prov → go prov (min (
         Right (Stalled key) → suspended s win key
         Right (Progress cand _) → case planDeltaPinned bounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s) win Ordinary (deltaOf cand) of
           Refused why
-            | tries > 0 && tooBig why && reportWrites (candidateReport cand) > 1 →
-                go prov (max worstEdgeWritesMin (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
+            | tries > 0 && tooBig why && reportWrites (candidateReport cand) > discoveryUnitWrites →
+                go prov (max discoveryUnitWrites (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
           other → other
     tooBig = shrinkable
-    worstEdgeWritesMin = 3
 
 editAllowance ∷ Env → Allowance
 editAllowance = allowanceOf . envLimits
