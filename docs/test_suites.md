@@ -534,6 +534,8 @@ cabal test hetoimasia-tests --test-show-details=direct
   pump evaluation charged at each site, the committed units for each texture, and that the committed total at 1000 is at most
   six times that at 250; the attempts a scheduler restarts are reported and never asserted. It reads the same run of the
   thousand-texture scenario as the example that keeps its count, its sixteen request places and its 8 s bound.
+  A second example does the same for a mass release (250 to 2000 textures released at once with the release lane full), and a third
+  asserts that the textures waiting for a full lane are released in the order of their ids, whatever the order they were asked in.
   Every helper thread `lua-engine-graphics-tests` and `lua-engine-graphics-native-tests` start is an owned start
   (#599): `withFakeOwner` and the peers rig's `mainLoop` (whose scope encloses the retirement and the windows' teardown, which
   may wait for a main-thread step), the backend scope forked by `withForkedScope` (whose `forkedJoin` may be made again, so the
