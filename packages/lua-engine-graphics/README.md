@@ -25,7 +25,7 @@ component's test module is imported.
 | `Hetoimasia.LuaEngine.Graphics.Texture` | The composition: `withTextureGraphics` over a borrowed host, the session's renderer and texture registry, the backend, identities. |
 | `…Texture.Configuration` | The native configuration the fixed M1 profile maps to, and the checks of a host built for it. Pure. |
 | `…Texture.Backend` | The state machine and its one pump thread, over a `Port`. Nothing in it names Vulkan. |
-| `…Texture.Backend.Internal` | The implementation of the backend, with its contract, and what the package's own suite needs beyond the public module: an observed scope, an unpumped scope and `pumpOnce`, with which an example advances the pump itself. |
+| `…Texture.Backend.Internal`, `…Texture.Port.Internal` | The implementation of the backend and of its port, with their contracts, in the package's **private** `internal` sub-library: the public `Backend` and `Port` modules re-export what clients may use, and what the package's own suite needs beyond them (an observed scope, an unpumped scope, `pumpOnce`, with which an example advances the pump itself) is reachable by no client. `Test.LuaEngine.Graphics.Boundary` holds that boundary. |
 | `…Texture.Port` | The boundary to the graphics owner, as values: the seam the lifecycle suite injects. |
 | `…Texture.Host` | The production `Port`, over a running `VulkanHost`. |
 | `Hetoimasia.LuaEngine.Graphics.Input` | The Lua input adapter (TRA-6): the source of one window's feed, the single consumer, the per-VM registry and the facade's `InputServices`. |
