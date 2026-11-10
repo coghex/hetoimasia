@@ -65,6 +65,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , activeRecordBytes
   , looseCap
   , looseSoftCap
+  , maxSpillPages
   , maxReclaimPages
   , workOneWindowPages
   , workOneProbeBytes
@@ -242,6 +243,13 @@ looseCap = 1024
 looseSoftCap ∷ Int
 looseSoftCap = 512
 
+-- | The most loose pages one maintenance transaction hands to the allocator tree. Each is a free extent of its own
+-- (loose pages are not adjacent), so it costs a path of the allocator tree in the transaction's edit, which a window
+-- holds at once; and each is a page a plan puts in the allocator's hands, so it gets the same proofs as a page the
+-- plan writes ('workOneWindowPages' counts both).
+maxSpillPages ∷ Int
+maxSpillPages = 8
+
 -- | The most pages one reclamation transaction frees.
 maxReclaimPages ∷ Int
 maxReclaimPages = 64
@@ -255,15 +263,16 @@ maxReclaimPages = 64
 --
 -- * the oldest entry and its list: @hr + 1@;
 -- * the unindexing of the page and the update or removal of the entry: @2 * hr@;
--- * the allocator tree's own edit: @3 * hf@;
+-- * the allocator tree's own edit: @3 * hf@, and the free extents of the loose pages it spills ('maxSpillPages'), one
+--   path each: @maxSpillPages * hf@;
 -- * the largest proof: that the page is unreachable, a path in the committed tree and in each pinned one,
 --   @(1 + pins) * hrec@; that the retired-page index does not own it or has dropped it, @hr@; that the free
 --   extents do not contain it, @hf@.
 --
--- The probes it holds are at most @3 * hr + 3 * hf + 2@ ('workOneProbeBytes').
+-- The probes it holds are at most @3 * hr + 3 * hf + 2 + maxSpillPages@ ('workOneProbeBytes').
 workOneWindowPages ∷ Int → Int → Int → Int → Int
 workOneWindowPages hr hf hrec pins =
-  (hr + 1) + 2 * hr + 3 * hf + max ((1 + pins) * hrec) (max hr hf)
+  (hr + 1) + 2 * hr + 3 * hf + maxSpillPages * hf + max ((1 + pins) * hrec) (max hr hf)
 
 -- | The most internal pages a retirement tree can have: at most @2 * maxRetiredPages@ records (an index record for
 -- each retired page and an entry for each list), at least 46 to a leaf and 47 to an internal page.
@@ -272,7 +281,7 @@ maxRetireInternals = 17
 
 -- | The accounted bytes of the probes of a transaction of one page.
 workOneProbeBytes ∷ Int → Int → Int
-workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2) * probeBytes
+workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2 + maxSpillPages) * probeBytes
 
 -- | The pages a standalone explicit removal holds at once. It cannot shrink (it is atomic): its edit is held
 -- whole. At most 'worstEditWrites' writes (7) each read a path of @hrec@ pages and replace at most as many;

@@ -111,6 +111,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , freshCount
   , assignPages
   , worstUpdatePages
+  , splitEven
   ) where
 
 import Data.ByteString (ByteString)
@@ -943,7 +944,16 @@ insertKey tree root k v = do
               es' = case r of
                 InsOne c → take i es ++ [relabel (fst (es !! i), c)] ++ drop (i + 1) es
                 InsTwo c1 sep c2 → take i es ++ [relabel (fst (es !! i), c1), (sep, c2)] ++ drop (i + 1) es
-          finish ref n (NInner es')
+          -- a child that shrank (a value replaced by a shorter one, a first separator replaced by a shorter key) is
+          -- repacked by the same step a deletion uses; a child that split has two halves far above the minimum
+          es'' ← case r of
+            InsOne c → do
+              cn ← load tree (Just (nLevel n - 1)) c
+              if nodeBytesOf cn < minNodeBytes && length es' >= 2
+                then rebalanceChild tree lo hi (nLevel n - 1) i es'
+                else pure es'
+            InsTwo {} → pure es'
+          finish ref n (NInner es'')
     -- A freshly inserted key may sit below the node's lowest key only on the
     -- leftmost spine, whose bounds are open; the check there tolerates it.
     loadChecked' lo hi lvl ref = do
@@ -1028,39 +1038,46 @@ deleteKey tree root@(Just r0) k = do
           case es' of
             [] → discard ref >> pure Nothing
             _ → Just <$> rewrite ref n {nBody = NInner es'}
-    -- Repack the under-full child at index i with a neighbour: one merged node
-    -- when the pair fits a page, otherwise two nodes split evenly.
-    rebalance lo hi childLevel i es = do
-      let j = if i + 1 < length es then i + 1 else i - 1
-          (a, b) = (min i j, max i j)
-          (sa, ra) = es !! a
-          (_, rb) = es !! b
-          (alo, ahi) = childBounds lo hi es a
-          (blo, bhi) = childBounds lo hi es b
-      -- both siblings are checked against the separators their parent promises, so a
-      -- malformed one is refused and never merged into a replacement page
-      na ← loadChecked tree alo ahi (Just childLevel) ra
-      nb ← loadChecked tree blo bhi (Just childLevel) rb
-      combined ← case (nBody na, nBody nb) of
-        (NLeaf x, NLeaf y) → pure (Left (x ++ y))
-        (NInner x, NInner y) → pure (Right (x ++ y))
-        _ → stop (Invariant tree)
-      let repacked = case combined of
-            Left xs → case packEntries entryBytes xs of
-              Nothing → Nothing
-              Just parts → Just (map NLeaf parts)
-            Right xs → case packEntries (innerKeyBytes . fst) xs of
-              Nothing → Nothing
-              Just parts → Just (map NInner parts)
-      case repacked of
-        Nothing → pure es
-        Just bodies → do
-          mapM_ discardOrReuse [ra, rb]
-          refs ← mapM (fresh . Node tree childLevel) bodies
-          let firstKeys = [sa] ++ [k' | body ← drop 1 bodies, Just k' ← [firstKeyOf body]]
-              entries = zip firstKeys refs
-          pure (take a es ++ entries ++ drop (b + 1) es)
-    discardOrReuse = discard
+    rebalance = rebalanceChild tree
+
+-- | THE step that keeps minimum fill, shared by every write that can shrink a node (a deletion, a value replaced by a
+-- shorter one, a separator replaced by a shorter key): repack the under-full child at index @i@ of a node with a
+-- neighbour, one merged node when the pair fits a page, otherwise two nodes split evenly. A split of a node that
+-- holds more than a payload leaves each half at least @(payload + 1 - maxEntry) / 2@ bytes (the even split differs
+-- from half by at most one entry), far above 'minNodeBytes' even with entries of the maximum size; a merge holds a
+-- sibling that is itself at the minimum or more.
+rebalanceChild ∷ TreeId → Maybe ByteString → Maybe ByteString → Int → Int → [(ByteString, Ref)] → M [(ByteString, Ref)]
+rebalanceChild tree lo hi childLevel i es = do
+  let j = if i + 1 < length es then i + 1 else i - 1
+      (a, b) = (min i j, max i j)
+      (sa, ra) = es !! a
+      (_, rb) = es !! b
+      (alo, ahi) = childBounds lo hi es a
+      (blo, bhi) = childBounds lo hi es b
+  -- both siblings are checked against the separators their parent promises, so a
+  -- malformed one is refused and never merged into a replacement page
+  na ← loadChecked tree alo ahi (Just childLevel) ra
+  nb ← loadChecked tree blo bhi (Just childLevel) rb
+  combined ← case (nBody na, nBody nb) of
+    (NLeaf x, NLeaf y) → pure (Left (x ++ y))
+    (NInner x, NInner y) → pure (Right (x ++ y))
+    _ → stop (Invariant tree)
+  let repacked = case combined of
+        Left xs → case packEntries entryBytes xs of
+          Nothing → Nothing
+          Just parts → Just (map NLeaf parts)
+        Right xs → case packEntries (innerKeyBytes . fst) xs of
+          Nothing → Nothing
+          Just parts → Just (map NInner parts)
+  case repacked of
+    Nothing → pure es
+    Just bodies → do
+      mapM_ discard [ra, rb]
+      refs ← mapM (fresh . Node tree childLevel) bodies
+      let firstKeys = [sa] ++ [k' | body ← drop 1 bodies, Just k' ← [firstKeyOf body]]
+          entries = zip firstKeys refs
+      pure (take a es ++ entries ++ drop (b + 1) es)
+  where
     firstKeyOf (NLeaf ((x, _) : _)) = Just x
     firstKeyOf (NInner ((x, _) : _)) = Just x
     firstKeyOf _ = Nothing

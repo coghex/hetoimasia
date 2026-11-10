@@ -14,13 +14,14 @@ module Test.TerrainRuntime.Store.Rebalance (spec) where
 import Control.Monad (foldM, forM_, when)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Discovery (Record, RecordKey (..))
+import Hetoimasia.Terrain.Discovery (Node (..), Record, RecordKey (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), encodePage, innerKeyBytes)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (encodeKey, encodeValue)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (splitEven)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
@@ -65,7 +66,10 @@ commitWrites h ws = do
     Refusal' why → Left ("a legitimate operation was refused: " <> show why)
 
 spec ∷ Spec
-spec = describe "deletion against trees deep enough to merge and redistribute internal nodes" $ do
+spec = specDeletion >> specChurn
+
+specDeletion ∷ Spec
+specDeletion = describe "deletion against trees deep enough to merge and redistribute internal nodes" $ do
   it "redistributes two internal siblings whose combined entries do not fit one page (the round-10 case)" $ do
     let (h, ref, _) = deepStore 30 [28, 90]
         key0 = fst (Map.findMin ref)
@@ -117,3 +121,65 @@ spec = describe "deletion against trees deep enough to merge and redistribute in
       (drained, _) ← must (reclaimAll hEnd)
       must (checkH drained)
       must (compareRecords (Map.toList refEnd) drained)
+
+-- | Minimum fill is an invariant of EVERY write, not only of deletions: a value replaced by a shorter one, or a separator by
+-- a shorter key, shrinks a node, and the store refuses (and its checker flags) a non-root page below a quarter of a
+-- payload. These examples replace values with shorter and longer ones, and insert keys of both lengths below the
+-- first separator, in the links tree (the only tree whose keys and values vary in length), with the independent
+-- checker and a full read after EVERY commit.
+specChurn ∷ Spec
+specChurn = describe "minimum fill under every write that can shrink a node" $ do
+  let parentNode = srcNode 0 0 0
+      runKeyOf ∷ Int → RecordKey
+      runKeyOf j = linkKey (RunNode (columnAt (toInteger j) 0) 0)
+      longVal ∷ Int → Record
+      longVal j = childRec (srcNode (toInteger (j `mod` 40)) (toInteger (j `div` 40)) 3)
+      shortVal ∷ Int → Record
+      shortVal j = rootRec (fromIntegral (j + 1)) False
+      commitAndCheck h ref ws = do
+        (h', out) ← commitDelta h Ordinary (deltaFor (hStore h) True False 1 ws)
+        case out of
+          Committed _ → pure ()
+          other → Left ("a replacement was refused: " <> show other)
+        let ref' = foldl (\m (k, v) → maybe (Map.delete k m) (\x → Map.insert k x m) v) ref ws
+        checkH h'
+        compareRecords (Map.toList ref') h'
+        Right (h', ref')
+  it "replaces the values of 51 run links one by one by a short root record (the round-14 reproduction): checker and read after each" $ do
+    let keys = [runKeyOf j | j ← [0 .. 50]]
+        initial = [(k, Just (childRec parentNode)) | k ← keys] ++ [(linkKey parentNode, Just (rootRec 1 True))]
+    (h0, ref0) ← case commitAndCheck (newH smallSpec ident0) Map.empty initial of
+      Right r → pure r
+      Left e → expectationFailure e >> fail e
+    -- a store with a leaf near the minimum: many commits that each shorten one value
+    (hEnd, _) ← foldM (\(h, ref) k → must (commitAndCheck h ref [(k, Just (rootRec 1 False))])) (h0, ref0) (take 25 keys)
+    must (checkH hEnd)
+  it "splits a node that outgrew a page into halves far above the minimum, whatever the entry sizes (up to the maximum entry)" $ do
+    -- every size list whose total is one entry past a page, entries of 22 to the 130-byte maximum
+    let sizesOf seed = take 80 (iterate (\x → 22 + (x * 37 + seed) `mod` 109) (22 + seed `mod` 109))
+        cases = [xs' | seed ← [1 .. 400], let xs = sizesOf seed, let (pre, _) = span (<= 4052) (scanl1 (+) xs), let xs' = take (length pre + 1) xs, sum xs' > 4052, sum xs' <= 4052 + 130]
+    cases `shouldSatisfy` (not . null)
+    [xs | xs ← cases, Just (l, r) ← [splitEven id xs], any (< minNodeBytes) [sum l, sum r]] `shouldBe` []
+    [xs | xs ← cases, Nothing ← [splitEven id xs]] `shouldBe` []
+  it "keeps every page above the minimum through shortened and lengthened values and first separators, 300 commits, checked and read after each" $
+    forM_ [1, 2, 3 ∷ Word64] $ \seed → do
+      let n = 1200 ∷ Int
+          initial = [(runKeyOf (j + 100), Just (longVal j)) | j ← [0 .. n - 1]] ++ [(linkKey (srcNode (toInteger (j `mod` 100) - 50) (toInteger (j `div` 100) - 50) 0), Just (rootRec (fromIntegral (j + 1)) True)) | j ← [0 .. 300 ∷ Int]]
+          chunks [] = []
+          chunks xs = let (a, b) = splitAt 40 xs in a : chunks b
+      (h0, ref0) ← must (foldM (\(h, ref) ws → commitAndCheck h ref ws) (newH smallSpec ident0, Map.empty) (chunks initial))
+      let step (h, ref, g) i = do
+            let (r, g1) = below 100 g
+                (ix, g2) = below (fromIntegral n) g1
+                j = fromIntegral ix ∷ Int
+                key = runKeyOf (j + 100)
+                -- shorter or longer; a few inserts below the first separator (a key of the other kind, lower than all) and deletes
+                ws
+                  | r < 45 = [(key, Just (shortVal j))]
+                  | r < 80 = [(key, Just (longVal (j + i)))]
+                  | r < 90 = [(linkKey (RunNode (columnAt (toInteger (-1 - (j `mod` 20))) 0) 0), Just (if even j then shortVal j else longVal j))]
+                  | otherwise = [(key, Nothing)]
+            (h', ref') ← either (\e → Left ("seed " <> show seed <> " step " <> show i <> ": " <> e)) Right (commitAndCheck h ref ws)
+            Right (h', ref', g2)
+      _ ← must (foldM step (h0, ref0, mkRng (4000 + seed)) [1 .. 100 ∷ Int])
+      pure ()

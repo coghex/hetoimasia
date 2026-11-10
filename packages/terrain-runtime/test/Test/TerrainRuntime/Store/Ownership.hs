@@ -300,6 +300,63 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       -- the first loose page listed again straight after itself
       let loose = map PageNo (take 3 dead) <> [PageNo (head' dead)] <> map PageNo (take 50 (drop 3 dead))
       refusedCorrupt "a loose page listed twice" =<< planOn (withRoots h (\r → r {rLoose = loose}))
+    it "proves every loose page maintenance hands to the allocator tree, at the first, the middle and the last place of the spill" $ do
+      (h, _, _) ← fixture
+      let roots = storeRoots (hStore h)
+          grow = looseSoftCap + maxSpillPages - length (rLoose roots)
+          fresh = [PageNo (rHw roots + fromIntegral i) | i ← [0 .. grow - 1]]
+          big = withRoots h (\r → r {rHw = rHw r + fromIntegral grow, rLoose = rLoose r ++ fresh})
+          looseBig = rLoose (storeRoots (hStore big))
+          start = length looseBig - maxSpillPages
+          maintain hh = (\(m, _, _) → m) <$> must (fillWith hh (planMaintenance (hStore hh)))
+          at i v = withRoots big (\r → r {rLoose = take i looseBig ++ [PageNo v] ++ drop (i + 1) looseBig})
+      grow `shouldSatisfy` (> 0)
+      must (checkH big)
+      -- the unforged list: maintenance plans, the eight pages leave the loose list for the free tree, the checker agrees
+      m0 ← maintain big
+      case m0 of
+        Planned plan → do
+          h1 ← must (commitPlan big plan)
+          must (checkH h1)
+          (length (rLoose (storeRoots (hStore h1))) < length looseBig) `shouldBe` True
+        other → expectationFailure ("a loose list past its soft cap was not maintained: " <> take 200 (show other))
+      -- every live page, forged into each place of the spill: refused as live, never published as free
+      vs ← victims h
+      forM_ [(what, v, pos) | (what, v) ← vs, pos ← [0, 3, maxSpillPages - 1]] $ \(what, v, pos) → do
+        out ← maintain (at (start + pos) v)
+        case out of
+          Refused (Integrity (SuppliedPageLive (PageNo q))) | q == v → pure ()
+          other → expectationFailure ("a spilled page naming " <> what <> " at place " <> show pos <> " was not refused as live: " <> take 200 (show other))
+      -- a page past the used space, a page the supply takes again, a retired page, a free extent's page
+      let lastIx = length looseBig - 1
+      beyond ← maintain (at lastIx (rHw (storeRoots (hStore big)) + 5))
+      case beyond of
+        Refused (Integrity (SuppliedPageLive _)) → pure ()
+        other → expectationFailure ("a spilled page past the used space was not refused: " <> take 200 (show other))
+      let PageNo firstLoose = head' looseBig
+      again ← maintain (at lastIx firstLoose)
+      case again of
+        Refused (Integrity (SuppliedPageDoubleOwned _)) → pure ()
+        other → expectationFailure ("a spilled page the supply also takes was not refused: " <> take 200 (show other))
+      retired ← retiredPagesOf h
+      -- a page of the newest entry, which the oldest entry's chunk does not free
+      case reverse (concatMap snd retired) of
+        (rp : _) → do
+          out ← maintain (at lastIx rp)
+          case out of
+            Refused (Integrity (SuppliedPageRetired (PageNo q) _)) | q == rp → pure ()
+            Refused (Integrity (SuppliedPageLive (PageNo q))) | q == rp → pure ()
+            other → expectationFailure ("a spilled page a retirement entry owns was not refused: " <> take 200 (show other))
+        [] → expectationFailure "no retired page in the fixture"
+      freeRoot ← maybe (expectationFailure "free root" >> fail "free") pure (rFree roots)
+      pg ← parsed h freeRoot
+      let freePg = case rpBody pg of
+            RefLeaf ((k, _) : _) → getBe64' k 0
+            _ → 0
+      freeOut ← maintain (at lastIx freePg)
+      case freeOut of
+        Refused (Integrity (DoubleFree (PageNo q))) | q == freePg → pure ()
+        other → expectationFailure ("a spilled page that is a free extent was not refused: " <> take 200 (show other))
     it "refuses a loose page that is also a free extent, even when the extent is not one the plan takes" $ do
       (h, _, _) ← fixture
       freeRoot ← maybe (expectationFailure "free root" >> fail "free") pure (rFree (storeRoots (hStore h)))

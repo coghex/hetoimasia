@@ -298,6 +298,9 @@ data CapacityWhy
     -- figure. Every replaced record page is indexed in the retirement tree, so a batch that replaces
     -- many dispersed pages needs more; a smaller batch replaces fewer ('shrinkable').
     BookkeepingExceeded !Int
+  | -- | The loose list would outgrow its cap ('looseCap'): the length it would have. A smaller unit of work
+    -- replaces fewer bookkeeping pages, and a maintenance transaction hands a few loose pages on to the allocator tree.
+    LooseExceeded !Int
   deriving stock (Eq, Show)
 
 -- | Whether a refusal says the batch was too big, so that a plan of a smaller batch can get past it: the
@@ -314,6 +317,7 @@ shrinkable (Capacity c) = case c of
   WindowBytesExceeded _ → True
   ProbesExceeded _ → True
   BookkeepingExceeded _ → True
+  LooseExceeded _ → True
   _ → False
 shrinkable _ = False
 
@@ -338,7 +342,6 @@ data IntegrityWhy
   | -- | A retirement entry frees a page its index does not record under the entry's version.
     RetiredIndexMismatch !PageNo
   | MalformedRetirement
-  | LooseOverflow !Int
   | -- | #661's records are not a legitimate state.
     DiscoveryCorrupt !Integrity
   deriving stock (Eq, Show)
@@ -779,7 +782,7 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
                 free'' = toInteger (rFreePages roots) - toInteger freeTaken
                 loose' = drop (tkLoose tk) (rLoose roots) ++ slack ++ replBk
             if live' < 0 || free'' < 0 then refuse (Integrity CorruptCounters) else pure ()
-            if length loose' > looseCap then refuse (Integrity (LooseOverflow (length loose'))) else pure ()
+            if length loose' > looseCap then refuse (Capacity (LooseExceeded (length loose'))) else pure ()
             let next' =
                   roots
                     { rVersion = version'
@@ -1086,7 +1089,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       bkEditL ← notLive freed bkEdit0
       -- the excess of a long loose list goes to the allocator tree with the pages this transaction frees
       let looseAll = rLoose roots
-          excess = max 0 (length looseAll - looseSoftCap)
+          excess = min maxSpillPages (max 0 (length looseAll - looseSoftCap))
           spill = drop (length looseAll - excess) looseAll
           looseKept = take (length looseAll - excess) looseAll
       -- nothing a plan frees may already be free, loose or claimed by this plan's own supply
@@ -1096,10 +1099,18 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
         Nothing → Right ()
       -- a spilled page is loose, so it is not in the supply (the supply is far shorter than what is kept), and it
       -- must not already be a free extent
-      (spillOverlap, bkEditS) ← phase bkEditA (overlapOf (fmap Disk (rFree roots)) Set.empty spill)
+      (spillOverlap, bkEditS0) ← phase bkEditA (overlapOf (fmap Disk (rFree roots)) Set.empty spill)
       case spillOverlap of
         Just pg → refuse (Integrity (DoubleFree pg))
         Nothing → Right ()
+      -- a page handed to the allocator is proven like a page the plan writes: inside the used space, distinct from the
+      -- others and the supply, and unreachable from every committed and pinned tree, not owned by a retirement entry
+      -- and not a free extent (a loose entry that names live data publishes it as free otherwise)
+      mapM_ (\pg@(PageNo n) → if n >= rHw roots then refuse (Integrity (SuppliedPageLive pg)) else Right ()) spill
+      case [pg | (pg, cnt) ← Map.toList (Map.fromListWith (+) [(pg', 1 ∷ Int) | pg' ← spill ++ tkPages tk]), cnt > 1] of
+        (pg : _) → refuse (Integrity (SuppliedPageDoubleOwned pg))
+        [] → Right ()
+      bkEditS ← provenFree bounds fp cfg roots pins win (Set.fromList spill) spill bkEditS0
       (freeRoot1, bkEdit1) ← phase bkEditS (consume (fmap Disk (rFree roots)) tk)
       (freed1, bkEdit2) ← phase bkEdit1 (insertFreed (rHw roots) freeRoot1 (freed ++ spill))
       freeRoot2 ← case freed1 of
@@ -1145,7 +1156,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
           free'' = toInteger (rFreePages roots) - toInteger freeTaken + toInteger c + toInteger (length spill)
           loose' = drop (tkLoose tk) looseKept ++ slack ++ replBk
       if live' < 0 || retired' < 0 || free'' < 0 then refuse (Integrity CorruptCounters) else pure ()
-      if length loose' > looseCap then refuse (Integrity (LooseOverflow (length loose'))) else pure ()
+      if length loose' > looseCap then refuse (Capacity (LooseExceeded (length loose'))) else pure ()
       let hdr = rHeader roots
           base = hAuthority hdr
       expected ← maybe (refuse (Invalid RevisionArithmetic)) pure (nextAuthority base False False)
