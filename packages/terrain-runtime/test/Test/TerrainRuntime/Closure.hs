@@ -9,6 +9,7 @@ import Hetoimasia.Terrain.Residency
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Test.Hspec
+import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Fixtures
 
 victim ∷ (Integer, Integer, Integer)
@@ -274,5 +275,83 @@ spec = describe "Closure and authority" $ do
         awaitClosed svc
         settledOf host `shouldReturn` [Failed ArenaClosed]
         inspectInvariants svc >>= (`shouldBe` [])
+
+
+  describe "asking whether the service admits work" $ do
+    it "is true while it runs, and false once the parent session has ended, or the service is closing or closed" $ do
+      open <- newTVarIO True
+      withServiceUsing defaultConfig (SessionAdmission (readTVar open)) noProbe $ \svc → do
+        atomically (serviceAdmitting svc) `shouldReturn` True
+        -- the parent session ends: the answer follows it at once (the owner then closes the service, which it never reopens)
+        atomically (writeTVar open False)
+        atomically (serviceAdmitting svc) `shouldReturn` False
+        awaitClosed svc
+        atomically (serviceAdmitting svc) `shouldReturn` False
+        -- and it agrees with what an admission does: the same refusal, nothing created
+        registerClient svc >>= \r → refusedWith r `shouldBe` Just RefusedClosed
+        inspectInvariants svc >>= (`shouldBe` [])
+      withService defaultConfig $ \svc → do
+        atomically (serviceAdmitting svc) `shouldReturn` True
+        closeService svc
+        atomically (serviceAdmitting svc) `shouldReturn` False
+
+    it "is a precheck only: a service that closes after it still refuses the admission, atomically, and leaves nothing behind" $ do
+      withService defaultConfig $ \svc → do
+        (_, lease) <- openMain svc "main"
+        atomically (serviceAdmitting svc) `shouldReturn` True
+        -- the service closes between the precheck and the admission
+        closeService svc
+        modelBefore <- inspectModel svc
+        r <- cellAt svc lease (tile 0 0 0)
+        refusedWith r `shouldBe` Just RefusedClosed
+        modelAfter <- inspectModel svc
+        modelAfter `shouldBe` modelBefore
+        inspectInvariants svc >>= (`shouldBe` [])
+
+  describe "inspecting a staged removal" $
+    it "tells a host before the commit whether the removal changes content, and nothing for any other request" $ do
+      gate <- newDisarmedGate
+      withGatedService defaultConfig alwaysAdmitting (\p → case p of PointBeforeCommit _ → True; _ → False) gate $ \svc → do
+        (_, lease) <- openMain svc "main"
+        host <- newHost True
+        let (x, y, z) = victim
+            ep = hostEndpoint svc Nothing host
+        -- a removal of solid: staged and held at the commit, it will advance the revision
+        armGate gate
+        solid <- okOf (removeWith svc ep lease (tile x y z) Nothing)
+        awaitReached gate
+        atomically (stagedRemovalChanges svc solid) `shouldReturn` Just True
+        openGate gate
+        awaitSettled host 1
+        -- once settled it stages nothing
+        atomically (stagedRemovalChanges svc solid) `shouldReturn` Nothing
+        -- a removal of air commits as unchanged, and says so before the commit
+        gate2 <- newDisarmedGate
+        withGatedService defaultConfig alwaysAdmitting (\p → case p of PointBeforeCommit _ → True; _ → False) gate2 $ \svc2 → do
+          (_, lease2) <- openMain svc2 "main"
+          host2 <- newHost True
+          let ep2 = hostEndpoint svc2 Nothing host2
+          armGate gate2
+          air <- okOf (removeWith svc2 ep2 lease2 (tile 0 0 100) Nothing)
+          awaitReached gate2
+          atomically (stagedRemovalChanges svc2 air) `shouldReturn` Just False
+          -- another service's request, and the request of this service asked of the other, are nothing to it
+          atomically (stagedRemovalChanges svc2 solid) `shouldReturn` Nothing
+          openGate gate2
+          awaitSettled host2 1
+        -- a read stages an answer, never a removal
+        gate3 <- newDisarmedGate
+        withGatedService defaultConfig alwaysAdmitting (\p → case p of PointBeforeCommit _ → True; _ → False) gate3 $ \svc3 → do
+          (_, lease3) <- openMain svc3 "main"
+          host3 <- newHost True
+          armGate gate3
+          readReq <- okOf (cellWith svc3 (hostEndpoint svc3 Nothing host3) lease3 (tile x y z))
+          awaitReached gate3
+          atomically (stagedRemovalChanges svc3 readReq) `shouldReturn` Nothing
+          openGate gate3
+          awaitSettled host3 1
+        inspectInvariants svc >>= (`shouldBe` [])
   where
     isBusy = \case RefusedBusy _ → True; _ → False
+    -- Until the host has been told this many terminal outcomes.
+    awaitSettled host n = bounded (atomically (readTVar (hostSettled host) >>= \seen → check (length seen >= n)))

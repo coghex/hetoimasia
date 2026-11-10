@@ -52,6 +52,7 @@ import Test.LuaEngine.Graphics.FacadeScripts (isClear, manifestFor, quadExample)
 import qualified Test.LuaEngine.Graphics.Fake as Fake
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Rig (Rig (..), bounded, withRig)
+import Test.LuaEngine.Graphics.Work (Progression (..), WorkReading, assertBoundedWork, readWork)
 import Test.LuaEngine.Graphics.SceneHost
 import qualified Test.LuaEngine.Graphics.Window.Fake as WF
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
@@ -310,22 +311,28 @@ spec = describe "graphics facade" $ do
     outVerdict outcome `shouldBe` VerdictSuccess
     outFailures outcome `shouldBe` []
 
-  it "retains a thousand one-pixel textures at once in one instance through the production facade: each is charged the 4 KiB minimum, nothing is refused on a count, and every byte comes back when they are released" $ do
-    outcome ← runFacade ((defaultShape thousandPixels) {shapeBoth = False, shapeParkOutput = True, shapeTexture = Fake.defaultFakeConfig {Fake.fcSlots = 1024, Fake.fcImages = 1024}, shapeFiles = [("images/pixel.png", Png.solid 1 1 (10, 20, 30, 255))]}) $ \fs → do
-      -- The role prints nothing until it holds all thousand, and parks in the print: they are all held while this reads. (The
-      -- fake owner's table and image allowance have room for them: the example sizes them, as the native table's capacity is derived
-      -- from the bytes.)
-      awaitLine fs "held\t1000"
-      atomically (sessionNominal (fsPipeline fs)) `shouldReturn` 1000 * 4096
-      registered ← length . filter (Text.isPrefixOf "registered ") <$> Fake.events (rigFake (fsRig fs))
-      registered `shouldBe` 1000
-      void (tryPutMVar (fsGate fs) ())
-      awaitLine fs "released\t1000"
-      -- The fake retires what is released; the session's bytes come back to zero.
-      atomically (sessionNominal (fsPipeline fs) >>= \held → unless (held == 0) retry)
-      requestStop (fsSession fs) StopQuit
-    outVerdict outcome `shouldBe` VerdictSuccess
-    outFailures outcome `shouldBe` []
+  -- The thousand-texture scenario is run once, observed, and read by both examples that follow: the first for the contract the issue
+  -- keeps whole, the second for the work it did, which it compares with the same scenario at a quarter of the size.
+  beforeAll (runFacadeObserved (pixelShape 1000) (pixelScenario 1000)) $ do
+    it "retains a thousand one-pixel textures at once in one instance through the production facade: each is charged the 4 KiB minimum, nothing is refused on a count, and every byte comes back when they are released" $ \(result, _, _) → do
+      outcome ← either throwIO pure result
+      outVerdict outcome `shouldBe` VerdictSuccess
+      outFailures outcome `shouldBe` []
+
+    it "does work linear in the textures an instance retains and releases: no pump evaluation or fake operation looks at what is retained or came before, at 250 and 1000 one-pixel textures" $ \(largeResult, largeLogged, large) → do
+      (smallResult, smallLogged, small) ← runFacadeObserved (pixelShape 250) (pixelScenario 250)
+      forM_ [largeResult, smallResult] $ \result → do
+        outcome ← either throwIO pure result
+        outVerdict outcome `shouldBe` VerdictSuccess
+        outFailures outcome `shouldBe` []
+      -- What the scenario did, read from the fake owner's own log and never from a counter: each texture is allocated, registered and
+      -- released once, and the owner has seen each upload.
+      forM_ [(250, smallLogged), (1000, largeLogged)] $ \(n, logged) →
+        [length (filter (Text.isPrefixOf prefix) logged) | prefix ← ["allocated ", "registered ", "released ", "upload admitted "]] `shouldBe` replicate 4 n
+      -- At each site the most one operation or pump evaluation charged is a constant that does not depend on the size, the units of the
+      -- operations that committed for each texture are bounded the same way, and the total at 1000 is at most six times the total at
+      -- 250: see 'assertBoundedWork'.
+      assertBoundedWork FreeRunning [(250, small), (1000, large)]
 
   it "answers busy from the common request places for a window request whose own slot is free, with no native window made, and accepts the explicit retry once a place is returned" $ do
     outcome ← runFacade ((defaultShape requestBank) {shapeBoth = False, shapeParkOutput = True, shapeProfile = profileWith [(RequestsPerInstance, 2)]}) $ \fs → do
@@ -550,11 +557,17 @@ runFacadeEither shape scenario = fst <$> runFacadeLogged shape scenario
 
 -- | The same, with what the fake texture owner recorded.
 runFacadeLogged ∷ Shape → (FS → IO ()) → IO (Either SomeException SessionOutcome, [Text])
-runFacadeLogged shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
+runFacadeLogged shape scenario = (\(result, logged, _) → (result, logged)) <$> runFacadeObserved shape scenario
+
+-- | The same, with the work the backend's pump and the fake owner did by site (see "Test.LuaEngine.Graphics.Work"), read once the
+-- session has ended and nothing is left for either to do.
+runFacadeObserved ∷ Shape → (FS → IO ()) → IO (Either SomeException SessionOutcome, [Text], WorkReading)
+runFacadeObserved shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
   result ← try @SomeException (runCore rig shape scenario)
   logged ← Fake.events (rigFake rig)
   forM_ (shapeRecord shape) (\ref → writeIORef ref logged)
-  pure (result, logged)
+  work ← readWork (Fake.fakeWork (rigFake rig))
+  pure (result, logged, work)
 
 runCore ∷ Rig → Shape → (FS → IO ()) → IO SessionOutcome
 runCore rig shape scenario = do
@@ -643,6 +656,7 @@ runCore rig shape scenario = do
                     , sxControl = control
                     , sxHarness = noHarness
                     , sxGraphics = Just injection
+                    , sxTerrain = Nothing
                     }
             -- Both threads are owned by the call (#599). The main-step loop supplies what the session's exit needs (the windows'
             -- steps), so its scope encloses the session's run and is ended and joined after it; the scenario's thread is let
@@ -919,10 +933,10 @@ heldWindowBank =
     , "    end"
     ]
 
--- | A thousand textures of one pixel, each requested as the places allow, taken when ready and held; only when all
--- thousand are held does the role print (and park there), and then it releases every one.
-thousandPixels ∷ ByteString
-thousandPixels =
+-- | A count of textures of one pixel (the thousand of the example, or fewer), each requested as the places allow, taken when
+-- ready and held; only when all are held does the role print (and park there), and then it releases every one.
+pixelsOf ∷ Int → ByteString
+pixelsOf count =
   presentationOnly
     [ "    init=function(self, api)"
     , "      self.reqs = {}"
@@ -943,7 +957,7 @@ thousandPixels =
     , "        end"
     , "      end"
     , "      self.reqs = rest"
-    , "      while self.started < 1000 do"
+    , "      while self.started < " <> total <> " do"
     , "        local r, e = api.content.texture('images/pixel.png')"
     , "        if r == nil then"
     , "          if e.code ~= 'busy' then print('refused', e.code, e.message) self.done = true return end"
@@ -952,7 +966,7 @@ thousandPixels =
     , "        self.reqs[#self.reqs + 1] = r"
     , "        self.started = self.started + 1"
     , "      end"
-    , "      if #self.held == 1000 then"
+    , "      if #self.held == " <> total <> " then"
     , "        self.done = true"
     , "        print('held', #self.held)"
     , "        local released = 0"
@@ -964,6 +978,34 @@ thousandPixels =
     , "      end"
     , "    end"
     ]
+  where
+    total = Text.pack (show count)
+
+-- | An instance that retains this many one-pixel textures at once. The fake owner's table and image allowance have room for them
+-- (and a few more): the example sizes them, as the native table's capacity is derived from the bytes.
+pixelShape ∷ Int → Shape
+pixelShape count =
+  (defaultShape (pixelsOf count))
+    { shapeBoth = False
+    , shapeParkOutput = True
+    , shapeTexture = Fake.defaultFakeConfig {Fake.fcSlots = fromIntegral count + 24, Fake.fcImages = count + 24}
+    , shapeFiles = [("images/pixel.png", Png.solid 1 1 (10, 20, 30, 255))]
+    }
+
+-- | What 'pixelShape' of this count proves: all are held and each is charged the 4 KiB minimum, one registration for each reached the
+-- owner, and every byte comes back after the release.
+pixelScenario ∷ Int → FS → IO ()
+pixelScenario count fs = do
+  -- The role prints nothing until it holds all of them, and parks in the print: they are all held while this reads.
+  awaitLine fs (Text.pack ("held\t" <> show count))
+  atomically (sessionNominal (fsPipeline fs)) `shouldReturn` fromIntegral count * 4096
+  registered ← length . filter (Text.isPrefixOf "registered ") <$> Fake.events (rigFake (fsRig fs))
+  registered `shouldBe` count
+  void (tryPutMVar (fsGate fs) ())
+  awaitLine fs (Text.pack ("released\t" <> show count))
+  -- The fake retires what is released; the session's bytes come back to zero.
+  atomically (sessionNominal (fsPipeline fs) >>= \held → unless (held == 0) retry)
+  requestStop (fsSession fs) StopQuit
 
 -- | A profile of two request places: two texture requests fill them and the window finds no place, its own slot free.
 requestBank ∷ ByteString

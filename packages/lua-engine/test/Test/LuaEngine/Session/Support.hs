@@ -214,6 +214,7 @@ withSetup found body =
               , sxControl = control
               , sxHarness = suHarness found
               , sxGraphics = Nothing
+              , sxTerrain = Nothing
               }
         }
   where

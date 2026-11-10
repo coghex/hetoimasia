@@ -71,7 +71,7 @@ is a provider defect: the transaction is abandoned with nothing committed, the
 request ends without a second call into the host, and the defect reaches
 supervision (the owner ends).
 
-### Three read-only reads for a host's composition and precheck
+### Three read-only reads for a host's composition and precheck, and two transactional forms
 
 The two queries are transactions and the third is a pure read; none writes anything or changes any behaviour of the service. They were added for
 TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decision, and the owner's later decision for `inspectConfig`.
@@ -90,6 +90,10 @@ TRA-5 (#641) at the manager's authorization under the owner's 2026-11-09 decisio
   host that composes over a service asks it, instead of being handed a configuration that might differ from the one the service enforces
   (the Lua adapter reads every limit it applies from it, and refuses a service configured above the caps Lua is promised). A terrain-runtime
   example reports the limits a service was built with whatever configuration a caller holds.
+* `retireSTM service request` and `releaseArenaLeaseSTM service lease` are `retire` and `releaseLease` as transactions (`Settlement`): the same functions, writing the same
+  state, for a host that gives a result or a lease back from inside a transaction of its own. The Lua host gives a request's credit back in the
+  transaction that takes the result or accounts its work, on whichever thread does, so it retires the result in that transaction instead of
+  queueing it for a later call; a `terrain-runtime` example shows both forms.
 
 ## State, owner, thread and lifetime
 
@@ -559,6 +563,22 @@ case plan of
   NoWork        -> nothing to append (a no-op appends no history)
   Refused why   -> classifyPlan why           -- busy, invalid, disk, integrity, replan, too large
 ```
+
+**The caller protocol is a requirement on every consumer** (the storage backend of #663 and the owner of #665
+among them). A plan reads through the window the caller gives it, and the window is the only state the caller
+carries from one call to the next, so the retry for a window that outgrew its bounds is the caller's, through
+the window: when a plan answers `Refused (Capacity (WindowExceeded _ | WindowBytesExceeded _ | ProbesExceeded _))`
+the larger unit of work did not fit. The caller builds a fresh window for the same version, `reduceWork old fresh`
+(the work the plan may take on, `windowWork`, halves: the pages one maintenance transaction frees, the writes of
+one discovery batch; never below one), and plans again. A unit of one page or one write needs a bounded window,
+so the retry ends in at most six steps with the work done or the typed result for a window that cannot hold even
+that; a caller that retries the same window or restarts at the full work gets the same answer for ever (the
+failure round 12 found). Every other capacity result either is handled inside the call (`TxnPagesExceeded`,
+`TxnRamExceeded`, `ListTooLarge`, `OverlayExceeded`, `BookkeepingExceeded`: discovery halves its writes and
+maintenance its chunk) or waits for a reader's release and maintenance (`DiskFull`, `RetirementBacklog`: the
+`BlockedByReader` result names the reader), or is the typed refusal of a store beyond its format (`TreeTooTall`).
+`Hetoimasia.Terrain.Runtime.Store` documents the same loop beside `Pending`; the suites drive it as a caller
+does (`fillRetry`).
 
 ### The page format
 

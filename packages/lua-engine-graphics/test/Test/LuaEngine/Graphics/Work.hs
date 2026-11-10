@@ -1,0 +1,381 @@
+-- | The work the texture backend's pump and the fake owner do, counted by site, so that an example can bound it by what
+-- was examined and never by how long it took (#679).
+--
+-- A /unit/ is one record examined or one list cell traversed at the site named: a candidate the pump evaluated, an
+-- upload or release request the owner's loop read, an image or upload a scan walked. An operation that finds its record
+-- directly (a map lookup, a cons) is one unit; one that walks a collection is one unit and one for each record it walks, so
+-- that a scan of an empty collection is still the operation it was.
+--
+-- = Where a unit is charged: with the traversal, by construction
+--
+-- The fake owner keeps its history in the counted collections below ('CMap', 'CList', 'CSeq'), whose constructors are
+-- private. Every operation on one takes the meter of its site and charges what that operation traverses: a lookup or a
+-- cons one, a walk of the whole collection its size, an append at the tail the length of what it walks past. Code that
+-- scans a collection, or appends at its tail, therefore charges its traversal whatever site it sits at and without any
+-- other line changing; the only way past a charge is 'cmObserve' and its peers, which read a collection for an observer
+-- and are used only where no operation of the scenario is running. A mutation that restores a scan is a change of the
+-- operation at its call site (see the pull request's negative controls) and nothing else.
+--
+-- = What is asserted, and what is only reported
+--
+-- A transaction that retries, or that the runtime restarts because a variable it read changed, runs again, and a side
+-- effect of its attempt is not rolled back. How often that happens depends on the scheduler, so a total taken over attempts
+-- is a diagnostic and never an assertion ('rAttempted', shown when an example fails). An example asserts two measures that
+-- the scheduler does not move:
+--
+-- * 'rPeak': the most units a single operation or pump evaluation charged at the site. A maximum is the same whether an
+--   attempt ran once or five times, so it also covers the complete unsuccessful search a pump retries on, which a count
+--   of committed work would lose. A site that looks at everything retained has a peak that grows with the size.
+-- * 'rCommitted': the units of operations that committed, a total over the scenario. A committed operation is a logical
+--   one: a fake operation charges inside its own transaction, into a variable that a retry rolls back ('charge'); the
+--   owner's loop returns its charges from the transaction and commits them after it ('commitIO'); the pump's evaluation
+--   keeps what it saw since 'ExaminedEvaluation' and commits it when the backend reports the evaluation committed.
+--
+-- Owner, writers, readers, thread, lifetime: a 'Work' is made by 'Test.LuaEngine.Graphics.Fake.newFake' and lives as long
+-- as its fake. Every thread that traverses a site writes it; the example that bounds the work reads it ('readWork') after
+-- the scenario's scope ended, when no thread writes any more. It is never reset.
+module Test.LuaEngine.Graphics.Work
+  ( Site (..)
+  , Work
+  , WorkReading (..)
+  , Meter
+  , newWork
+  , readWork
+  , charge
+  , observe
+  , commitIO
+  , Progression (..)
+  , assertBoundedWork
+  , pumpObserver
+  , -- * Counted collections
+    CMap
+  , cmEmpty
+  , cmSize
+  , cmLookup
+  , cmInsert
+  , cmDelete
+  , cmAdjust
+  , cmToList
+  , cmObserve
+  , CList
+  , clEmpty
+  , clCons
+  , clSnoc
+  , clObserve
+  , CSeq
+  , csFromListInitial
+  , csToList
+  , csFromList
+  , csPopFront
+  , csPush
+  , csAppendList
+  ) where
+
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import Data.Sequence (Seq, ViewL (EmptyL, (:<)), (><), (|>))
+import qualified Data.Sequence as Seq
+import GHC.Conc (unsafeIOToSTM)
+import Hetoimasia.LuaEngine.Graphics.Texture.Backend.Internal (Examined (..))
+import Test.Hspec (Expectation, expectationFailure)
+
+-- | Where work is charged.
+data Site
+  = -- | The pump evaluated a job.
+    PumpJobs
+  | -- | The pump evaluated a texture that has a step or waits on something.
+    PumpTextures
+  | -- | The pump evaluated the table's bootstrap.
+    PumpBoot
+  | -- | The close's drain read a texture.
+    PumpDrain
+  | -- | The fake owner's loop read an open upload.
+    OwnerUploads
+  | -- | The fake owner's loop read a queued release request.
+    OwnerReleases
+  | -- | The fake's admission of an upload read the open uploads.
+    Admission
+  | -- | The fake looked up or recorded an upload in the history of every upload it admitted.
+    UploadHistory
+  | -- | The fake looked up or recorded an image's state.
+    ImageMap
+  | -- | The fake looked up or recorded the image a slot holds.
+    SlotOwners
+  | -- | The fake's event log added an event.
+    EventLog
+  | -- | The fake's queue of free slots took a slot or gave one back.
+    FreeSlots
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | What a site has been charged: the same three counts for each, read after the scenario.
+data WorkReading = WorkReading
+  { rCommitted ∷ !(Map Site Int)
+    -- ^ The units of operations that committed.
+  , rPeak ∷ !(Map Site Int)
+    -- ^ The most one operation (or one pump evaluation) charged, over every attempt.
+  , rAttempted ∷ !(Map Site Int)
+    -- ^ The units of every attempt, restarted and retried ones included: a diagnostic, never asserted.
+  }
+  deriving (Eq, Show)
+
+data Work = Work
+  { wCommitted ∷ !(Map Site (TVar Int))
+  , wPeak ∷ !(Map Site (IORef Int))
+  , wAttempted ∷ !(Map Site (IORef Int))
+  , wPending ∷ !(Map Site (IORef Int))
+    -- ^ What the pump's current evaluation has examined at each of its sites; reset as an evaluation begins.
+  }
+
+-- | A function that charges a number of units, at one site, for the operation that calls it.
+type Meter = Int → STM ()
+
+newWork ∷ IO Work
+newWork =
+  Work
+    <$> each (newTVarIO 0)
+    <*> each (newIORef 0)
+    <*> each (newIORef 0)
+    <*> each (newIORef 0)
+  where
+    each make = Map.fromList <$> traverse (\site → (,) site <$> make) [minBound .. maxBound]
+
+-- | Every site's counts.
+readWork ∷ Work → IO WorkReading
+readWork work =
+  WorkReading
+    <$> traverse readTVarIO (wCommitted work)
+    <*> traverse readIORef (wPeak work)
+    <*> traverse readIORef (wAttempted work)
+
+-- | Note an attempt's units, from inside a transaction that may be retried or restarted: the attempted total and the peak, which
+-- no restart moves. It is a side effect that is not rolled back.
+observe ∷ Work → Site → Int → STM ()
+observe work site units = unsafeIOToSTM $ do
+  forRef (wAttempted work) site (\now → now + units)
+  forRef (wPeak work) site (max units)
+
+-- | Note units and count them as committed, from a transaction that never waits. The committed count is a variable of the
+-- transaction, so a retried or restarted attempt does not keep it, and a transaction that waited would be woken by every other
+-- charge: the owner's loop and the pump therefore never use this ('commitIO' and the pump's own flush).
+charge ∷ Work → Site → Int → STM ()
+charge work site units = do
+  observe work site units
+  maybe (pure ()) (\var → modifyTVar' var (+ units)) (Map.lookup site (wCommitted work))
+
+-- | Count units as committed, after the transaction that observed them committed.
+commitIO ∷ Work → Site → Int → IO ()
+commitIO work site units = case Map.lookup site (wCommitted work) of
+  Just var | units /= 0 → atomically (modifyTVar' var (+ units))
+  _ → pure ()
+
+forRef ∷ Map Site (IORef Int) → Site → (Int → Int) → IO ()
+forRef refs site change = case Map.lookup site refs of
+  Just ref → atomicModifyIORef' ref (\now → (change now, ()))
+  Nothing → pure ()
+
+-- | The observers 'Hetoimasia.LuaEngine.Graphics.Texture.Backend.Internal.withBackendObserved' is given: what the pump looks at.
+--
+-- An evaluation begins at 'ExaminedEvaluation' (a restarted one begins again, so what it examined before is forgotten), counts
+-- the candidates it examines of each kind, and charges them as committed when the backend reports it committed. Its peak is the
+-- most any one evaluation examined. The close's drain is observed only: it waits in a transaction of its own.
+pumpObserver ∷ Work → (Examined → STM (), IO ())
+pumpObserver work = (examined, committed)
+  where
+    sites = [PumpJobs, PumpTextures, PumpBoot]
+    examined = \case
+      ExaminedEvaluation → unsafeIOToSTM (mapM_ (\site → forRef (wPending work) site (const 0)) sites)
+      ExaminedJob → candidate PumpJobs
+      ExaminedTexture → candidate PumpTextures
+      ExaminedBoot → candidate PumpBoot
+      ExaminedDrain → observe work PumpDrain 1
+    candidate site = unsafeIOToSTM $ do
+      forRef (wAttempted work) site (+ 1)
+      case Map.lookup site (wPending work) of
+        Just pending → do
+          seen ← atomicModifyIORef' pending (\now → (now + 1, now + 1))
+          forRef (wPeak work) site (max seen)
+        Nothing → pure ()
+    committed = mapM_ flush sites
+    flush site = case Map.lookup site (wPending work) of
+      Just pending → do
+        seen ← readIORef pending
+        writeIORef pending 0
+        commitIO work site seen
+      Nothing → pure ()
+
+-- Counted collections ----------------------------------------------------------------------------------
+
+-- | A map whose operations charge what they traverse.
+newtype CMap k v = CMap (Map k v)
+
+cmEmpty ∷ CMap k v
+cmEmpty = CMap Map.empty
+
+-- | Its size, which the map keeps: not a traversal.
+cmSize ∷ CMap k v → Int
+cmSize (CMap m) = Map.size m
+
+cmLookup ∷ Ord k ⇒ Meter → k → CMap k v → STM (Maybe v)
+cmLookup meter key (CMap m) = meter 1 >> pure (Map.lookup key m)
+
+cmInsert ∷ Ord k ⇒ Meter → k → v → CMap k v → STM (CMap k v)
+cmInsert meter key value (CMap m) = meter 1 >> pure (CMap (Map.insert key value m))
+
+cmDelete ∷ Ord k ⇒ Meter → k → CMap k v → STM (CMap k v)
+cmDelete meter key (CMap m) = meter 1 >> pure (CMap (Map.delete key m))
+
+cmAdjust ∷ Ord k ⇒ Meter → (v → v) → k → CMap k v → STM (CMap k v)
+cmAdjust meter change key (CMap m) = meter 1 >> pure (CMap (Map.adjust change key m))
+
+-- | Every entry, in key order: a walk of the whole map.
+cmToList ∷ Meter → CMap k v → STM [(k, v)]
+cmToList meter (CMap m) = meter (1 + Map.size m) >> pure (Map.toList m)
+
+-- | The map for an observer that runs when no operation does (an example reading what the fake did after its scope).
+cmObserve ∷ CMap k v → Map k v
+cmObserve (CMap m) = m
+
+-- | A list that is added to at its head, newest first.
+newtype CList a = CList [a]
+
+clEmpty ∷ CList a
+clEmpty = CList []
+
+-- | Add at the head: one cell.
+clCons ∷ Meter → a → CList a → STM (CList a)
+clCons meter x (CList xs) = meter 1 >> pure (CList (x : xs))
+
+-- | Add at the tail: a walk past every cell there is.
+clSnoc ∷ Meter → CList a → a → STM (CList a)
+clSnoc meter (CList xs) x = meter (1 + length xs) >> pure (CList (xs <> [x]))
+
+clObserve ∷ CList a → [a]
+clObserve (CList xs) = xs
+
+-- | A queue of values, taken from the front and added at the back.
+newtype CSeq a = CSeq (Seq a)
+
+-- | The queue as the fake is made with it, before any operation of a scenario runs.
+csFromListInitial ∷ [a] → CSeq a
+csFromListInitial = CSeq . Seq.fromList
+
+-- | The front, if any: one cell.
+csPopFront ∷ Meter → CSeq a → STM (Maybe (a, CSeq a))
+csPopFront meter (CSeq s) = meter 1 >> pure (case Seq.viewl s of
+  EmptyL → Nothing
+  x :< rest → Just (x, CSeq rest))
+
+-- | Add at the back: one cell.
+csPush ∷ Meter → CSeq a → a → STM (CSeq a)
+csPush meter (CSeq s) x = meter 1 >> pure (CSeq (s |> x))
+
+-- | Add several at the back: a cell for each.
+csAppendList ∷ Meter → CSeq a → [a] → STM (CSeq a)
+csAppendList meter (CSeq s) xs = meter (1 + length xs) >> pure (CSeq (s >< Seq.fromList xs))
+
+-- | Every value, front first: a walk of the whole queue.
+csToList ∷ Meter → CSeq a → STM [a]
+csToList meter (CSeq s) = meter (1 + Seq.length s) >> pure (foldr (:) [] s)
+
+-- | A queue made of these values, back to front: a cell for each.
+csFromList ∷ Meter → [a] → STM (CSeq a)
+csFromList meter xs = meter (1 + length xs) >> pure (CSeq (Seq.fromList xs))
+
+-- The bounds an example asserts ------------------------------------------------------------------------
+
+-- | How a scenario's threads advance, which decides what of its work an example may compare across sizes.
+data Progression
+  = -- | Threads run freely, as in production: the interleaving of the pump and the owner moves what an evaluation looked at before it
+    -- found a ready candidate (an isolated probe of the unchanged backend reproduced totals of 1,370 at 250 and 20,864 at 1000 for
+    -- two valid schedules, every peak below 20), so only what no interleaving moves is compared.
+    FreeRunning
+  | -- | The example advances the pump and the owner itself, one step at a time, in a named order and the same order at every size
+    -- ('Test.LuaEngine.Graphics.Rig.settle'): nothing is concurrent in what is measured, and every site's total is a function of the
+    -- scenario and the order, so every site is compared.
+    Stepped
+  deriving (Eq, Show)
+
+-- | What an example asserts of the work a scenario did at several sizes, given each size (the textures retained and released)
+-- with its reading:
+--
+-- * at every size, the most one operation or pump evaluation charged at a site is a constant that does not depend on the size
+--   ('peakBound'): the detector of a scan, whose cost in one operation is the size of what it scans;
+-- * at every size, the committed units for each texture are bounded the same way ('committedBound'): a total that is linear in
+--   the textures, with room for what a schedule adds; and
+-- * for each pair of sizes one a quarter of the other, the committed total at the larger is at most six times that at the smaller,
+--   a growth of four (a linear total gives four, the quadratic one it replaced sixteen), at every site when the progression is
+--   'Stepped' and at the sites whose count the scenario fixes ('fixedSites') when it is 'FreeRunning'.
+--
+-- Attempted totals are shown on a failure and never asserted.
+assertBoundedWork ∷ Progression → [(Int, WorkReading)] → Expectation
+assertBoundedWork progression sized = do
+  mapM_
+    ( \(n, reading) →
+        mapM_
+          ( \(site, peak) →
+              unless' (peak <= peakBound site) (failure n reading site "one operation charged" peak (peakBound site))
+          )
+          (Map.toList (rPeak reading))
+    )
+    sized
+  mapM_
+    ( \(n, reading) →
+        mapM_
+          ( \(site, units) →
+              unless' (units `div` n <= committedBound site) (failure n reading site "committed units per texture" (units `div` n) (committedBound site))
+          )
+          (Map.toList (rCommitted reading))
+    )
+    sized
+  mapM_
+    ( \((small, atSmall), (large, atLarge)) →
+        mapM_
+          ( \site →
+              let before = Map.findWithDefault 0 site (rCommitted atSmall)
+                  after = Map.findWithDefault 0 site (rCommitted atLarge)
+               in unless'
+                    (after <= 6 * before)
+                    (failure large atLarge site ("committed units against six times those at " <> show small) after (6 * before))
+          )
+          (if progression == Stepped then [minBound .. maxBound] else fixedSites)
+    )
+    [(a, b) | a@(small, _) ← sized, b@(large, _) ← sized, large == 4 * small]
+  where
+    unless' ok failed = if ok then pure () else expectationFailure failed
+    failure n reading site what found limit =
+      concat
+        [ show site, " at ", show n, " textures: ", what, " ", show found, " exceeds ", show limit
+        , "; committed ", show (rCommitted reading), "; peak ", show (rPeak reading), "; attempted ", show (rAttempted reading)
+        ]
+
+-- | The sites whose committed total is fixed by what the scenario does, whatever the schedule.
+fixedSites ∷ [Site]
+fixedSites = [ImageMap, SlotOwners, EventLog, FreeSlots]
+
+-- | The most units one operation of a scenario, or one pump evaluation, may charge at a site, whatever the size. Measured after
+-- the change at 250 to 2000 textures: a peak of one to three at every site in the Lua scenario, and in a mass release the
+-- pump's 33 (a lane of 16 in flight, the ones the owner has to answer, and the lowest waiting). Those are bounded by the depth of
+-- the owner's pipeline and not by the size: the pump submits a texture only when no lower one has a step, so those it examines
+-- are waiting on the owner, and the owner holds at most a lane's worth. A site that looks at everything retained, or at every
+-- texture waiting for the lane, charges the size, hundreds at these sizes.
+peakBound ∷ Site → Int
+peakBound = \case
+  PumpJobs → 24
+  PumpTextures → 96
+  PumpBoot → 4
+  PumpDrain → 2
+  OwnerUploads → 24
+  OwnerReleases → 24
+  Admission → 24
+  UploadHistory → 4
+  ImageMap → 4
+  SlotOwners → 4
+  EventLog → 4
+  FreeSlots → 4
+
+-- | The most units of committed operations a site may be charged for each texture retained and released, whatever the size and the
+-- schedule: eight times what one operation may charge there, for the handful of committed operations a texture takes at a site.
+committedBound ∷ Site → Int
+committedBound site = 8 * peakBound site

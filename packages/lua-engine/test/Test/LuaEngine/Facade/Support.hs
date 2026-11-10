@@ -101,7 +101,8 @@ module Test.LuaEngine.Facade.Support
 import Control.Concurrent (ThreadId, yield)
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Control.Concurrent.STM
-  ( TVar
+  ( STM
+  , TVar
   , atomically
   , modifyTVar'
   , newTVarIO
@@ -117,6 +118,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import Data.Unique (Unique, newUnique)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (unsafeComponent)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero, RequirePositive), MonotonicSource, durationFromNanoseconds, durationNanoseconds, scriptedInstant, scriptedSource)
@@ -480,15 +482,23 @@ data VmShape = VmShape
   -- ^ The enabled content roots.
   , shGraphics ∷ !(Maybe GraphicsInjection)
   -- ^ The graphics a composition injects into the VM, if any (LFE-21).
+  , shTakesWork ∷ !(STM Bool)
+  -- ^ Whether the session still takes new work for this role, as the injected gate the facade's services read in their own transactions.
+  , shInitialChunks ∷ ![Text]
+  -- ^ Lua a VM runs before the facade's own chunk, which still sees the hidden namespace of bindings: how a fixture hands a script a
+  -- host-made value.
+  , shTerrain ∷ !(Maybe (TerrainInjection, Unique))
+  -- ^ The terrain a composition injects into the VM, if any (TRA-5), with the identity of the session it belongs to: the
+  -- same for every VM of one session, so that both roles share a namespace and a second session does not.
   }
 
 -- | A gameplay VM whose tick is a millisecond, enabling the session's root.
 gameplayShape ∷ VmShape
-gameplayShape = VmShape Gameplay 1000000 ["modules-test"] Nothing
+gameplayShape = VmShape Gameplay 1000000 ["modules-test"] Nothing (pure True) [] Nothing
 
 -- | A presentation VM enabling the session's root.
 presentationShape ∷ VmShape
-presentationShape = VmShape Presentation 0 ["modules-test"] Nothing
+presentationShape = VmShape Presentation 0 ["modules-test"] Nothing (pure True) [] Nothing
 
 -- | One VM: its owner, coordinator, facade and loader endpoint.
 data Fvm = Fvm
@@ -569,7 +579,10 @@ withFvmRefusing world runtime shape body = do
                 when failing (throwIO (userError "the terminal latch failed"))
                 pure first
             }
-    graphics ← traverse (\injection → injectGraphics injection (GraphicsVm (shRole shape) requests (pure True))) (shGraphics shape)
+    -- The VM's leasing services over its one lending and lease scope, composed as a session composes them.
+    sessionKey ← maybe newUnique (pure . snd) (shTerrain shape)
+    VmServices graphics terrain scope ←
+      composeVmServices profile (shRole shape) requests (shTakesWork shape) sessionKey (shGraphics shape) (fst <$> shTerrain shape)
     facade ←
       newFacade
         FacadeSpec
@@ -586,18 +599,27 @@ withFvmRefusing world runtime shape body = do
           , fsIds = wIds world
           , fsTickDuration = tickDuration
           , fsGraphics = graphics
+          , fsTerrain = terrain
           }
         >>= either (throwIO . RefusedFacade) pure
     let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "facade-" <> roleText}
     config ← either (\refused → assertFailure ("the facade was not installed: " <> show refused)) pure (installFacade facade [] [] base)
+    let withChunks =
+          config
+            { vmInitialChunks =
+                [(chunkName ("harness chunk " <> Text.pack (show index)), Text.encodeUtf8 source) | (index, source) ← zip [(0 ∷ Int) ..] (shInitialChunks shape)]
+                  <> vmInitialChunks config
+            }
     let grant = RequestGrant (facadeRequestEndpoints facade) 64 (if shRole shape == Gameplay then SettleAtAssignedTick Nothing else SettleOnArrival)
         instances = facadeInstanceConfig facade (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8, instanceTickDuration = tickDuration})
         spec =
-          (scheduledSpec config requiredPolicy bounds)
+          (scheduledSpec withChunks requiredPolicy bounds)
             { scheduledInstances = Just instances
             , scheduledRequestHandles = Just handles
-            , scheduledLending = gsLending <$> graphics
-            , scheduledLeases = gsLeases <$> graphics
+            , scheduledLending = (\(lending, _, _) → lending) <$> scope
+            , scheduledLeases = (\(_, leases, _) → leases) <$> scope
+            , -- the collection holds every live instance (up to eight here) at the scope's lease capacity
+              scheduledMemberLimit = maximum (defaultMemberLimit : [8 * capacity | Just (_, _, capacity) ← [scope]])
             , scheduledRequests = Just grant
             , scheduledLoader = Just (coordinatorPlan coordinator)
             , scheduledClock = scriptedSource (scriptedInstant <$> clockDuration world)

@@ -55,8 +55,8 @@ builderSource =
 -- | The initial chunk, for a call that writes at most this many bytes, with the graphics layout (the texture
 -- request, the window request, the scene publication and the texture release) when a composition injected one, and
 -- with the presentation-input layout (@api.input.poll@ and @api.input.acknowledgeReset@) when it also opted in to input.
-engineChunk ∷ Bool → Bool → Int → ByteString
-engineChunk graphics input limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLinesWith limit <> body))
+engineChunk ∷ Bool → Bool → Bool → Int → ByteString
+engineChunk graphics input terrain limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLinesWith limit <> body))
   where
     ns = engineNamespaceName
     prelude =
@@ -82,6 +82,7 @@ engineChunk graphics input limit = Text.encodeUtf8 (Text.unlines (prelude <> ren
       ]
         <> graphicsLocals
         <> inputLocals
+        <> terrainLocals
         <> bodyTail
     -- The graphics layout (LFE-21): the same in either role, so that a logical instance's call is an ordinary error of
     -- the binding rather than a missing field. The window and the texture calls take exactly their declared arguments
@@ -113,6 +114,41 @@ engineChunk graphics input limit = Text.encodeUtf8 (Text.unlines (prelude <> ren
     inputMembers ∷ [Text]
     inputMembers
       | input = ["    input = { poll = guard(input_poll), acknowledgeReset = guard(input_acknowledge_reset) },"]
+      | otherwise = []
+    -- The terrain layout (TRA-5): present only when the composition injected terrain, and then the same in either role. Every
+    -- call but the optional pick of @remove@ takes exactly its declared arguments and passes them unchanged, so the host's arity
+    -- is the call's; @remove@ passes an omitted pick as an explicit nil, which is how the host counts it.
+    terrainLocals ∷ [Text]
+    terrainLocals
+      | terrain =
+          [ "local terrain_open, terrain_attach, terrain_cell, terrain_column = E.terrain_open, E.terrain_attach, E.terrain_cell, E.terrain_column"
+          , "local terrain_surface, terrain_remove, terrain_release = E.terrain_surface, E.terrain_remove, E.terrain_release"
+          , "local terrain_arena_ops = { ready = E.ready_terrain_arena, take = E.take_terrain_arena, cancel = E.cancel_terrain_arena, wait = E.wait_terrain_arena }"
+          , "local terrain_cell_ops = { ready = E.ready_terrain_cell, take = E.take_terrain_cell, cancel = E.cancel_terrain_cell, wait = E.wait_terrain_cell }"
+          , "local terrain_column_ops = { ready = E.ready_terrain_column, take = E.take_terrain_column, cancel = E.cancel_terrain_column, wait = E.wait_terrain_column }"
+          , "local terrain_surface_ops = { ready = E.ready_terrain_surface, take = E.take_terrain_surface, cancel = E.cancel_terrain_surface, wait = E.wait_terrain_surface }"
+          , "local terrain_remove_ops = { ready = E.ready_terrain_remove, take = E.take_terrain_remove, cancel = E.cancel_terrain_remove, wait = E.wait_terrain_remove }"
+          ]
+      | otherwise = []
+    terrainMembers ∷ [Text]
+    terrainMembers
+      | terrain =
+          [ "    terrain = {"
+          , "      open = starter1(terrain_open, terrain_arena_ops),"
+          , "      attach = starter1(terrain_attach, terrain_arena_ops),"
+          , "      cell = starter1(terrain_cell, terrain_cell_ops),"
+          , "      column = starter1(terrain_column, terrain_column_ops),"
+          , "      surface = starter1(terrain_surface, terrain_surface_ops),"
+          , "      remove = function(...)"
+          , "        check(id)"
+          , "        local request, refusal"
+          , "        if select('#', ...) == 2 then request, refusal = terrain_remove((...), (select(2, ...)), nil) else request, refusal = terrain_remove(...) end"
+          , "        if request ~= nil then kinds[request] = terrain_remove_ops end"
+          , "        return request, refusal"
+          , "      end,"
+          , "      release = guard(terrain_release),"
+          , "    },"
+          ]
       | otherwise = []
     bodyTail ∷ [Text]
     bodyTail =
@@ -174,6 +210,7 @@ engineChunk graphics input limit = Text.encodeUtf8 (Text.unlines (prelude <> ren
       ]
         <> graphicsMembers
         <> inputMembers
+        <> terrainMembers
         <> [ "    state = terminal,"
       , "    time = {"
       , "      tick = guard(tick),"

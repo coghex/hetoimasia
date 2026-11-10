@@ -18,6 +18,7 @@ import qualified Test.LuaEngine.Profile as Profile
 import qualified Test.LuaEngine.Request.Spec as Requests
 import qualified Test.LuaEngine.Scene.Spec as Scene
 import qualified Test.LuaEngine.Session.Spec as Session
+import qualified Test.LuaEngine.Terrain.Spec as Terrain
 import qualified Test.LuaEngine.Texture.Spec as Texture
 import Test.Hspec (Spec, describe)
 
@@ -32,6 +33,7 @@ spec = describe "LuaEngine" $ do
   Data.spec
   Modules.spec
   Texture.spec
+  Terrain.spec
   Scene.spec
   Facade.spec
   Session.spec

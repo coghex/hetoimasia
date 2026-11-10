@@ -527,11 +527,17 @@ cabal test hetoimasia-tests --test-show-details=direct
   (group `test.vulkan-headless`), a gated fake port inside the real request
   admission, leases and a Lua owner; the shared composition lives in the
   package's `test-common` directory, not in either suite's spec modules.
-  The `does work linear in the textures an instance retains and releases` example of `lua-engine-graphics-tests` bounds the
-  work of the backend's pump and of the fake owner by what they examine, never by time (#679): `withBackendObserved` and
-  `Test.LuaEngine.Graphics.Work` count candidates and records by site, each site is bounded per operation, and the total
-  at 500 textures is at most six times the total at 125. The thousand-texture example keeps its count, its sixteen request
-  places and its 8 s bound.
+  The `does work linear in …` examples of `lua-engine-graphics-tests` bound the work of the backend's pump and of the fake owner by what
+  they examine, never by time (#679). `withBackendObserved` and `Test.LuaEngine.Graphics.Work` charge candidates and records by site, and
+  the fake keeps its history in counted collections that charge what each operation traverses. The example over the Lua scenario (it reads
+  the same run of the thousand-texture scenario as the example that keeps its count, its sixteen request places and its 8 s bound, and
+  compares it with 250) asserts, with threads running freely, only what no interleaving moves: the most one operation or pump evaluation
+  charged at each site, the committed units for each texture, and the sixfold bound at the sites its own operations fix. The mass-release
+  examples (250 to 2000 textures released at once with the release lane full) run with no concurrency in what they measure: the pump and the
+  fake owner are advanced by the example one step at a time (`withBackendUnpumped`, `pumpOnce`, `ownerOnce`, `settle`), in a named order
+  (`Alternating`, or `PumpToBlock`), the same at every size, and assert the sixfold bound at every site under each schedule separately. The seams that stepping needs live in the package's private `internal` sub-library, and `Test.LuaEngine.Graphics.Boundary` compiles external clients to show that the public library exposes none of them. A
+  further example asserts that the textures waiting for a full lane are released in the order of their ids, whatever the order they were
+  asked in. The attempts a scheduler restarts are reported and never asserted.
   Every helper thread `lua-engine-graphics-tests` and `lua-engine-graphics-native-tests` start is an owned start
   (#599): `withFakeOwner` and the peers rig's `mainLoop` (whose scope encloses the retirement and the windows' teardown, which
   may wait for a main-thread step), the backend scope forked by `withForkedScope` (whose `forkedJoin` may be made again, so the

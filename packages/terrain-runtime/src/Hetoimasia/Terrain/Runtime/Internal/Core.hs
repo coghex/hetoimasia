@@ -31,6 +31,7 @@ module Hetoimasia.Terrain.Runtime.Internal.Core
 
     -- * Admission
   , Submission (..)
+  , admitting
   , admit
   , readAnswer
   , demandFor

@@ -2,6 +2,7 @@
 -- device, display or GLFW session; the real-device suite (@lua-engine-graphics-native-tests@) is separate.
 module Test.LuaEngine.Graphics.Spec (spec) where
 
+import qualified Test.LuaEngine.Graphics.Boundary as Boundary
 import qualified Test.LuaEngine.Graphics.Cancellation as Cancellation
 import qualified Test.LuaEngine.Graphics.Composed as Composed
 import qualified Test.LuaEngine.Graphics.Configuration as Configuration
@@ -27,6 +28,7 @@ import Test.Hspec (Spec)
 
 spec ∷ Spec
 spec = do
+  Boundary.spec
   Configuration.spec
   Stages.spec
   Cancellation.spec

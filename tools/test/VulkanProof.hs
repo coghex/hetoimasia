@@ -296,6 +296,7 @@ vulkanProject =
        , "packages/render-2d"
        , "packages/render-2d-oracle"
        , "packages/terrain"
+       , "packages/terrain-runtime"
        , "packages/terrain-render-2d"
        , "tools/test-support"
        , luaEngineGraphicsPackage
