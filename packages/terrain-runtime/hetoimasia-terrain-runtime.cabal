@@ -134,6 +134,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Store.History
         Test.TerrainRuntime.Store.Rebalance
         Test.TerrainRuntime.Store.Large
+        Test.TerrainRuntime.Store.Scattered
         Test.TerrainRuntime.Store.Identity
         Test.TerrainRuntime.Store.Ownership
         Test.TerrainRuntime.Store.Readers

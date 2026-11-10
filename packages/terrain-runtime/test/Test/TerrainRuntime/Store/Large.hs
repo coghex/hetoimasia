@@ -22,6 +22,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
+import Test.TerrainRuntime.Store.Bounds (wide)
 import Test.TerrainRuntime.Store.Reference
 
 must ∷ Either String a → IO a
@@ -78,6 +79,41 @@ largeStore n = do
       Committed _ → Right h
       other → Left (what <> ": " <> show other)
 
+-- | The most loose pages a legitimate store holds between transactions: maintenance hands what is past
+-- 'looseSoftCap' to the allocator tree, so after a transaction the list holds the soft cap and at most the
+-- bookkeeping pages that one transaction replaced beyond those it wrote ('maxBookkeepingPages' is a bound
+-- on both); an ordinary plan takes at least what it returns. Far below the cap ('looseCap', 1,024) at which a
+-- plan would be refused.
+looseBound ∷ Int
+looseBound = looseSoftCap + maxBookkeepingPages
+
+looseWithin ∷ H → Either String Int
+looseWithin h =
+  let n = length (rLoose (storeRoots (hStore h)))
+   in if n <= looseBound then Right n else Left ("the loose list holds " <> show n <> " pages, past the bound " <> show looseBound)
+
+-- | Maintenance to the end, the loose list checked after every transaction; the longest it was.
+drainChecked ∷ H → Either String (H, Int, Int)
+drainChecked = go 0 0
+  where
+    go n longest h
+      | n > (4000 ∷ Int) = Left "reclamation did not terminate"
+      | otherwise = do
+          (p, _, _) ← fillWith h (planMaintenance (hStore h))
+          case p of
+            Planned plan → do
+              h' ← commitPlan h plan
+              l ← looseWithin h'
+              go (n + 1) (max longest l) h'
+            NoWork → Right (h, n, longest)
+            BlockedByReader {} → Right (h, n, longest)
+            Refused r → Left ("maintenance was refused: " <> show r)
+            other → Left ("unexpected " <> take 100 (show other))
+
+-- | A store whose runs tree holds 3,000 runs, for the long drains.
+wideStore ∷ Either String (H, [RecordKey])
+wideStore = wide 3000
+
 -- | A batch of @k@ replacements of live links, dispersed (a stride that divides none of the keys) or clustered.
 batchOf ∷ Map.Map RecordKey Record → Int → Int → Bool → [(RecordKey, Maybe Record)]
 batchOf ref n k dispersed =
@@ -107,6 +143,7 @@ settleBatch h ref ws = go h ref ws (0 ∷ Int)
 spec ∷ Spec
 spec = describe "planning on large valid stores (deep trees, thousands of retired pages)" $ do
   (h0, ref0, rounds) ← runIO (must (largeStore 12000))
+  runIO (putStrLn ("LARGE loose list of the built store: " <> show (length (rLoose (storeRoots (hStore h0))))))
   it "builds a store that is deep, full of retirement and valid" $ do
     must (checkH h0)
     rRetiredPages (storeRoots (hStore h0)) `shouldSatisfy` (>= 14100)
@@ -180,6 +217,29 @@ spec = describe "planning on large valid stores (deep trees, thousands of retire
       -- a refusal is only ever the typed capacity result; and the store stays valid
       (take 17 stop == "INTEGRITY-OR-OTHE") `shouldBe` False
       must (checkH h1)
+  -- the loose list of a legitimate store stays below its cap through a long drain: every entry whose pages are all
+  -- reclaimed releases its list page, and a merge of tree nodes releases more pages than it writes, so a drain of
+  -- thousands of small entries (a reader pinned through thousands of commits, then released) used to grow the
+  -- loose list past the cap and be refused as corruption
+  it "drains thousands of small retirement entries without the loose list outgrowing its cap, never an integrity result" $ do
+    let (hw0, keys0) = case wideStore of
+          Right x → x
+          Left e → error e
+        single h i = do
+          let k = keys0 !! ((i * 197) `mod` length keys0)
+          (h', out) ← commitW h [(k, Just (runRec (if even i then 30 else 20)))]
+          case out of
+            Committed _ → Right h'
+            other → Left ("history was not built: " <> show other)
+    -- a reader pinned through 3,000 commits keeps every retired page: 3,000 entries
+    (tok, s1) ← either (\e → expectationFailure (show e) >> fail "reader") pure (acquireReader (hStore hw0))
+    hBuilt ← must (foldM single hw0 {hStore = s1} [1 .. 3000])
+    let released = hBuilt {hStore = snd (releaseReader tok (hStore hBuilt))}
+    must (checkH released)
+    (drained, passes, longest) ← must (drainChecked released)
+    putStrLn ("LARGE small entries: " <> show passes <> " maintenance transactions, the longest loose list " <> show longest)
+    must (checkH drained)
+    rRetiredPages (storeRoots (hStore drained)) `shouldBe` 0
   it "keeps committing random batches, the checker agreeing after every commit, and maintenance drains the store" $
     forM_ [1, 2, 3 ∷ Word64] $ \seed → do
       let step (h, ref, g, shrunk) i = do
@@ -188,13 +248,15 @@ spec = describe "planning on large valid stores (deep trees, thousands of retire
                 k = 1 + fromIntegral sz
                 ws = batchOf ref 12000 k (dispersed == 1)
             (h', ref', fate) ← either (\e → Left ("step " <> show (i ∷ Int) <> ": " <> e)) Right (settleBatch h ref ws)
+            -- the loose list stays within the pages one plan claims, after every step
+            either (\e → Left ("step " <> show i <> ": " <> e)) Right (() <$ looseWithin h')
             when (i `mod` 4 == 0) $ either (\e → Left ("step " <> show i <> ": " <> e)) Right (checkH h')
             Right (h', ref', g2, shrunk + (case fate of Shrank _ → 1; _ → 0 ∷ Int))
       (h1, ref1, _, shrunk) ← must (foldM step (h0, ref0, mkRng (900 + seed), 0) [1 .. 24])
-      putStrLn ("LARGE random history seed " <> show seed <> ": batches that shrank " <> show shrunk <> " of 24")
+      putStrLn ("LARGE random history seed " <> show seed <> ": batches that shrank " <> show shrunk <> " of 24, loose list " <> show (length (rLoose (storeRoots (hStore h1)))))
       must (checkH h1)
-      (drained, passes) ← must (reclaimAllWithin 4000 h1)
-      putStrLn ("LARGE drain seed " <> show seed <> ": " <> show passes <> " maintenance transactions")
+      (drained, passes, longest) ← must (drainChecked h1)
+      putStrLn ("LARGE drain seed " <> show seed <> ": " <> show passes <> " maintenance transactions, the longest loose list " <> show longest <> " pages (bound " <> show looseBound <> ")")
       rRetiredPages (storeRoots (hStore drained)) `shouldBe` 0
       must (checkH drained)
       must (compareRecords (Map.toList ref1) drained)

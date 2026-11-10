@@ -64,6 +64,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , rootRecordBytes
   , activeRecordBytes
   , looseCap
+  , looseSoftCap
   , maxReclaimPages
 
     -- * Configuration
@@ -228,6 +229,14 @@ activeRecordBytes = 512
 -- 'maxClaimPages' and a commit replaces at most as many bookkeeping pages.
 looseCap ∷ Int
 looseCap = 1024
+
+-- | The length past which a maintenance transaction hands the excess of the loose list to the allocator
+-- tree as free extents. Maintenance returns more pages to the loose list than it takes (every entry it
+-- finishes releases its list page, every merge of tree nodes replaces more pages than it writes), so a long
+-- drain of small entries would otherwise outgrow 'looseCap'; an ordinary plan takes at least what it adds.
+-- The list stays within this and the few pages one transaction adds.
+looseSoftCap ∷ Int
+looseSoftCap = 512
 
 -- | The most pages one reclamation transaction frees.
 maxReclaimPages ∷ Int

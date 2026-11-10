@@ -1035,13 +1035,24 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       if freePool cfg roots < claim then refuse (Capacity (DiskFull claim (freePool cfg roots) 0)) else pure ()
       -- nothing a plan frees may still be reachable from a committed tree
       bkEditL ← notLive freed bkEdit0
+      -- the excess of a long loose list goes to the allocator tree with the pages this transaction frees
+      let looseAll = rLoose roots
+          excess = max 0 (length looseAll - looseSoftCap)
+          spill = drop (length looseAll - excess) looseAll
+          looseKept = take (length looseAll - excess) looseAll
       -- nothing a plan frees may already be free, loose or claimed by this plan's own supply
       (overlap, bkEditA) ← phase bkEditL (overlapOf (fmap Disk (rFree roots)) (Set.fromList (tkPages tk ++ rLoose roots)) freed)
       case overlap of
         Just pg → refuse (Integrity (DoubleFree pg))
         Nothing → Right ()
-      (freeRoot1, bkEdit1) ← phase bkEditA (consume (fmap Disk (rFree roots)) tk)
-      (freed1, bkEdit2) ← phase bkEdit1 (insertFreed (rHw roots) freeRoot1 freed)
+      -- a spilled page is loose, so it is not in the supply (the supply is far shorter than what is kept), and it
+      -- must not already be a free extent
+      (spillOverlap, bkEditS) ← phase bkEditA (overlapOf (fmap Disk (rFree roots)) Set.empty spill)
+      case spillOverlap of
+        Just pg → refuse (Integrity (DoubleFree pg))
+        Nothing → Right ()
+      (freeRoot1, bkEdit1) ← phase bkEditS (consume (fmap Disk (rFree roots)) tk)
+      (freed1, bkEdit2) ← phase bkEdit1 (insertFreed (rHw roots) freeRoot1 (freed ++ spill))
       freeRoot2 ← case freed1 of
         Left p → refuse (Integrity (DoubleFree p))
         Right r → Right r
@@ -1077,8 +1088,8 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
           freeTaken = sum [t | (_, _, t) ← tkExtents tk]
           live' = toInteger (rLivePages roots) + toInteger written - toInteger (length replBk)
           retired' = toInteger (rRetiredPages roots) - toInteger c
-          free'' = toInteger (rFreePages roots) - toInteger freeTaken + toInteger c
-          loose' = drop (tkLoose tk) (rLoose roots) ++ slack ++ replBk
+          free'' = toInteger (rFreePages roots) - toInteger freeTaken + toInteger c + toInteger (length spill)
+          loose' = drop (tkLoose tk) looseKept ++ slack ++ replBk
       if live' < 0 || retired' < 0 || free'' < 0 then refuse (Integrity CorruptCounters) else pure ()
       if length loose' > looseCap then refuse (Integrity (LooseOverflow (length loose'))) else pure ()
       let hdr = rHeader roots

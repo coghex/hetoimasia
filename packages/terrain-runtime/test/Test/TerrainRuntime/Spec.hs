@@ -25,6 +25,7 @@ import qualified Test.TerrainRuntime.Store.Fuzz as StoreFuzz
 import qualified Test.TerrainRuntime.Store.FuzzTrees as StoreFuzzTrees
 import qualified Test.TerrainRuntime.Store.Rebalance as StoreRebalance
 import qualified Test.TerrainRuntime.Store.Large as StoreLarge
+import qualified Test.TerrainRuntime.Store.Scattered as StoreScattered
 import qualified Test.TerrainRuntime.Store.History as StoreHistory
 import qualified Test.TerrainRuntime.Store.Identity as StoreIdentity
 import qualified Test.TerrainRuntime.Store.Ownership as StoreOwnership
@@ -60,6 +61,7 @@ spec = do
   StoreFuzzTrees.spec
   StoreRebalance.spec
   StoreLarge.spec
+  StoreScattered.spec
   StoreCycles.spec
   StoreEvidence.spec
   StoreAllowance.spec
