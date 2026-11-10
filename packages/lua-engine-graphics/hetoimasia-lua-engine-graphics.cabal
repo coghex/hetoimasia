@@ -76,7 +76,29 @@ library
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-2d-vulkan ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
-        hetoimasia-scripting-lua:runtime-lua
+        hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-lua-engine-graphics:internal
+
+-- The texture backend and the port it runs over, in a private sub-library that only this package's public library and its own suites
+-- depend on (#679): the public Backend and Port modules re-export what clients may use, and what an example needs beyond them (an
+-- observed scope, an unpumped scope and one pump turn, with which it advances the pump itself and counts its work) is reachable from
+-- inside the package and by no client. Being private, it is visible to this package's components and to no client.
+library internal
+    import: language
+    visibility: private
+    hs-source-dirs: internal
+    exposed-modules:
+        Hetoimasia.LuaEngine.Graphics.Texture.Backend.Internal
+        Hetoimasia.LuaEngine.Graphics.Texture.Port.Internal
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-asset ==0.1.0.0,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-lua-engine:texture
 
 -- The adapter's lifecycle contracts over an injected owner and completion boundary, registered with the
 -- group `test.vulkan-headless`. They need no device, display or GLFW session: the backend runs over a
@@ -88,6 +110,7 @@ test-suite lua-engine-graphics-tests
     main-is: Main.hs
     hs-source-dirs: test test-common
     other-modules:
+        Test.LuaEngine.Graphics.Boundary
         Test.LuaEngine.Graphics.Cancellation
         Test.LuaEngine.Graphics.Composed
         Test.LuaEngine.Graphics.Composition
@@ -128,7 +151,9 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Window.Rig
         Test.LuaEngine.Graphics.Window.Spec
         Test.LuaEngine.Graphics.Windows
+        Test.LuaEngine.Graphics.Work
     build-depends:
+        hetoimasia-lua-engine-graphics:internal,
         base >=4.22 && <4.23,
         array >=0.5 && <0.6,
         bytestring >=0.12 && <0.13,

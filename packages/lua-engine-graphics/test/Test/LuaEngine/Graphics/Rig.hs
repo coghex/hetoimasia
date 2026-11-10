@@ -10,6 +10,9 @@ module Test.LuaEngine.Graphics.Rig
   , withRig
   , withRigUnchecked
   , withBackendOnRaw
+  , withSteppedRig
+  , Schedule (..)
+  , settle
   , bounded
   , leaked
   , openEveryHold
@@ -56,20 +59,21 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Exception (SomeException, finally, throwIO, try)
 import Data.List (findIndex)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Control.Monad (forM_, unless)
+import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64, Word8)
 import Hetoimasia.Asset.Image (TexelFormat (TexelRgba8Srgb))
-import Hetoimasia.LuaEngine.Graphics.Texture.Backend
+import Hetoimasia.LuaEngine.Graphics.Texture.Backend.Internal
 import Hetoimasia.LuaEngine.Texture.Backend
 import System.Environment (lookupEnv)
 import System.Timeout (timeout)
 import Text.Read (readMaybe)
 import Test.HUnit.Lang (assertFailure)
 import Test.LuaEngine.Graphics.Fake
+import Test.LuaEngine.Graphics.Work (pumpObserver)
 import Test.Support.Owned (withOwnedThreadOpening)
 
 -- | A backend over a fake owner, with the pipeline's port it hands out.
@@ -127,7 +131,43 @@ withRigOver fake body = do
 -- fake's owner and manages its holds itself.
 withBackendOnRaw ∷ Fake → (Rig → IO a) → IO a
 withBackendOnRaw fake body =
-  withBackend (fakePort fake) $ \backend → body (Rig fake backend (textureBackend backend))
+  uncurry withBackendObserved (pumpObserver (fakeWork fake)) (fakePort fake) $ \backend → body (Rig fake backend (textureBackend backend))
+
+-- | A rig with no thread of the pump's or of the owner's: the example advances both, one step at a time, with 'settle', so what it
+-- measures has no concurrency in it (#679). The fake has the leak check of 'withRig' and no bound: nothing waits unless the
+-- example leaves work no step can finish, which the scope's drain then waits for, as it would for the pump.
+withSteppedRig ∷ FakeConfig → (Rig → IO a) → IO a
+withSteppedRig cfg body = do
+  fake ← newFake cfg
+  value ←
+    uncurry withBackendUnpumped (pumpObserver (fakeWork fake)) (fakePort fake) (\backend → body (Rig fake backend (textureBackend backend)))
+      `finally` openEveryHold fake
+  problems ← atomically (leaked fake)
+  unless (null problems) (assertFailure ("the example left native work behind: " <> Text.unpack (Text.intercalate "; " problems)))
+  pure value
+
+-- | The order a stepped rig takes its steps in.
+data Schedule
+  = -- | The pump takes one step, then the owner one, and so on until neither has one.
+    Alternating
+  | -- | The pump takes steps until it has none, then the owner one, and so on until neither has one: the pump runs as far ahead of
+    -- the owner as it can.
+    PumpToBlock
+  deriving (Eq, Show, Enum, Bounded)
+
+-- | Take steps, in the order of a schedule, until the pump and the owner both have none: the rig is quiescent.
+settle ∷ Schedule → Rig → IO ()
+settle schedule rig = case schedule of
+  Alternating → do
+    pumped ← pumpOnce (rigBackend rig)
+    owned ← ownerOnce (rigFake rig)
+    when (pumped || owned) (settle schedule rig)
+  PumpToBlock → do
+    pumped ← pumpUntilIdle
+    owned ← ownerOnce (rigFake rig)
+    when (pumped || owned) (settle schedule rig)
+  where
+    pumpUntilIdle = pumpOnce (rigBackend rig) >>= \did → if did then True <$ pumpUntilIdle else pure False
 
 openEveryHold ∷ Fake → IO ()
 openEveryHold fake = latchHolds fake >> forM_ [minBound .. maxBound] (release fake) >> releaseAllTickets fake >> setVersionHolders fake 0
