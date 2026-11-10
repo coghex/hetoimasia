@@ -564,6 +564,22 @@ case plan of
   Refused why   -> classifyPlan why           -- busy, invalid, disk, integrity, replan, too large
 ```
 
+**The caller protocol is a requirement on every consumer** (the storage backend of #663 and the owner of #665
+among them). A plan reads through the window the caller gives it, and the window is the only state the caller
+carries from one call to the next, so the retry for a window that outgrew its bounds is the caller's, through
+the window: when a plan answers `Refused (Capacity (WindowExceeded _ | WindowBytesExceeded _ | ProbesExceeded _))`
+the larger unit of work did not fit. The caller builds a fresh window for the same version, `reduceWork old fresh`
+(the work the plan may take on, `windowWork`, halves: the pages one maintenance transaction frees, the writes of
+one discovery batch; never below one), and plans again. A unit of one page or one write needs a bounded window,
+so the retry ends in at most six steps with the work done or the typed result for a window that cannot hold even
+that; a caller that retries the same window or restarts at the full work gets the same answer for ever (the
+failure round 12 found). Every other capacity result either is handled inside the call (`TxnPagesExceeded`,
+`TxnRamExceeded`, `ListTooLarge`, `OverlayExceeded`, `BookkeepingExceeded`: discovery halves its writes and
+maintenance its chunk) or waits for a reader's release and maintenance (`DiskFull`, `RetirementBacklog`: the
+`BlockedByReader` result names the reader), or is the typed refusal of a store beyond its format (`TreeTooTall`).
+`Hetoimasia.Terrain.Runtime.Store` documents the same loop beside `Pending`; the suites drive it as a caller
+does (`fillRetry`).
+
 ### The page format
 
 A page is exactly **4,096 bytes** and immutable once written. Header fields are
