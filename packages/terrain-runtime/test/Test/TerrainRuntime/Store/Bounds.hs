@@ -275,6 +275,27 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         mPagesWritten (plMeasure b) `shouldSatisfy` (<= 5)
         mUpdates (plMeasure b) `shouldSatisfy` (<= mUpdates (plMeasure a))
       other → expectationFailure (show other)
+  it "a discovery batch is bounded by the work of its window, and the retry halves that work down to one write" $ do
+    -- the caller's bounded retry (a fresh window with half the work, 'reduceWork') reaches discovery through the window:
+    -- a plan through a window of work k plans at most k writes, so each retry plans a smaller batch than the last
+    let run0 = newRun smallSpec twoOpenings 64
+        scene = runEnv run0
+    r1 ← must (foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA)
+    let h1 = runH r1
+        batchAt wk = do
+          (q, _, _) ← must (fillFrom h1 (limitWork wk (storeWindow (hStore h1))) (planDiscovery scene (hStore h1)))
+          case q of
+            Planned pl → pure (mUpdates (plMeasure pl))
+            other → expectationFailure ("a batch was expected: " <> take 200 (show other)) >> fail "batch"
+    -- the window of a retry: 64, then 32, ... never below one
+    let ladder = takeWhile (>= 1) (iterate (\k → windowWork (reduceWork (limitWork k (storeWindow (hStore h1))) (storeWindow (hStore h1)))) 64)
+    take 3 ladder `shouldBe` [64, 32, 16]
+    windowWork (reduceWork (limitWork 1 (storeWindow (hStore h1))) (storeWindow (hStore h1))) `shouldBe` 1
+    sizes ← mapM batchAt [64, 8, 4, 2]
+    putStrLn ("DISCOVERY batch updates at work 64, 8, 4, 2: " <> show sizes)
+    -- each smaller work plans a smaller batch than the full one, down to the least
+    (sizes !! 3 < sizes !! 0) `shouldBe` True
+    and (zipWith (>=) sizes (drop 1 sizes)) `shouldBe` True
   it "fits the supported minimum removal at the format's worst-case height, in the smallest and default allowances" $ do
     forM_ [smallSpec, defaultStoreSpec, specOf (64 * 1024 * 1024) (Just (40 * 1024 * 1024))] $ \spec' → do
       cfg ← must (either (Left . show) Right (mkStoreConfig spec'))

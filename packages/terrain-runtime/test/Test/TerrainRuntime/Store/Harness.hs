@@ -21,6 +21,7 @@ module Test.TerrainRuntime.Store.Harness
   , fillPlan
   , fillWith
   , fillRetry
+  , fillFrom
   , deltaFor
   , Outcome (..)
   , commitDelta
