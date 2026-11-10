@@ -68,6 +68,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , maxSpillPages
   , maxReclaimPages
   , workOneWindowPages
+  , looseGrowthUnit
+  , looseGrowthOrdinary
   , workOneProbeBytes
   , removalWindowPages
   , maxRetireInternals
@@ -253,6 +255,28 @@ maxSpillPages = 8
 -- | The most pages one reclamation transaction frees.
 maxReclaimPages ∷ Int
 maxReclaimPages = 64
+
+-- | The most a maintenance transaction of ONE page adds to the loose list, net of the pages it takes from it, once the
+-- list is at or below 'looseSoftCap' (above it the transaction is a spill that only inserts into the allocator tree
+-- and strictly lowers the list). Replaced bookkeeping pages return to the list and the pages written are taken from
+-- it, so the list grows only by the pages a deletion merges away or a root it collapses, and by the list page of the
+-- entry it finishes: a deletion in a tree of @h@ levels merges at most one node on each level above the leaf and
+-- collapses the root once, so at most @h@ pages. The unit of one unindexes one page (@hr@), removes or updates its
+-- entry (@hr@), frees the entry's list page (1) and edits the allocator tree: it coalesces the one page it frees with
+-- its neighbours (two deletions and an insertion, at most @2 * hf@) and, when the loose list cannot supply it,
+-- consumes the lowest extents, whose deletions empty at most 3 leaves (at most 72 pages of extents of one page, 56 to
+-- a leaf) and merge one node on each level above (@hf@).
+looseGrowthUnit ∷ Int → Int → Int
+looseGrowthUnit hr hf = 2 * hr + 1 + 2 * hf + 3 + hf
+
+-- | The most an ORDINARY plan (a standalone removal included) adds to the loose list net of what it takes: none while
+-- the list holds at least the pages the plan claims, because the bookkeeping edit of an ordinary plan has no
+-- deletion (it indexes the pages it replaces and consumes no extent when the loose list supplies it), so it replaces
+-- no more pages than it writes; below that the plan consumes at most 'maxClaimPages' pages of extents, whose
+-- deletions empty at most @maxClaimPages / 56 + 1@ leaves and merge one node on each level above, @hf@. The list
+-- then holds the unused part of the supply and what it replaced, at most 'maxClaimPages' plus this.
+looseGrowthOrdinary ∷ Int → Int
+looseGrowthOrdinary hf = maxClaimPages `div` 56 + 1 + hf
 
 -- | The pages a maintenance transaction of ONE page holds in its window AT ONCE, from the heights of the
 -- retirement tree (@hr@), the allocator tree (@hf@) and the record trees (@hrec@) and the readers pinned at

@@ -334,6 +334,43 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     case q of
       Planned _ → pure ()
       other → expectationFailure ("the removal did not plan after the readers released, bound " <> show lim0 <> ": " <> take 300 (show other))
+  it "with no retirement entry left and the loose list at exactly its cap: a removal plans, and maintenance still drains the list to its soft cap" $ do
+    let run0 = newRun smallSpec sealedStack 64
+    r1 ← must (removeCell run0 (tileAt 1 1 3))
+    r2 ← must (removeCell r1 (tileAt 1 1 4))
+    -- every entry reclaimed: nothing is left to reclaim
+    (hClean, _) ← must (reclaimAll (runH r2))
+    (rRetiredPages (storeRoots (hStore hClean))) `shouldBe` 0
+    let roots = storeRoots (hStore hClean)
+        extra = looseCap - length (rLoose roots)
+        fresh = [PageNo (rHw roots + fromIntegral i) | i ← [0 .. extra - 1]]
+        hFull = hClean {hStore = modifyRoots (\r → r {rHw = rHw r + fromIntegral extra, rLoose = rLoose r ++ fresh}) (hStore hClean)}
+    length (rLoose (storeRoots (hStore hFull))) `shouldBe` looseCap
+    must (checkH hFull)
+    -- the atomic removal fits: an ordinary plan takes loose pages first and replaces no more pages than it writes
+    (p, _, _, _) ← must (fillCounting hFull (storeWindow (hStore hFull)) (\w → planRemoval (runEnv r2) (hStore hFull) w (tileAt 2 2 3)))
+    case p of
+      Planned pl → do
+        h1 ← must (commitPlan hFull pl)
+        must (checkH h1)
+        (length (rLoose (storeRoots (hStore h1))) <= looseCap) `shouldBe` True
+      other → expectationFailure ("a removal at a full loose list was not planned: " <> take 200 (show other))
+    -- and maintenance has work with nothing to reclaim: it spills, each transaction lowering the list, until the soft cap
+    let spillAll h n
+          | n > (200 ∷ Int) = Left "the drain did not end"
+          | otherwise = do
+              (m, _, _) ← fillWith h (planMaintenance (hStore h))
+              let l = length (rLoose (storeRoots (hStore h)))
+              case m of
+                Planned pl → do
+                  h' ← commitPlan h pl
+                  if mFreed (plMeasure pl) == 0 && length (rLoose (storeRoots (hStore h'))) < l then spillAll h' (n + 1) else Left ("a spill did not lower the list: " <> show (l, length (rLoose (storeRoots (hStore h')))))
+                NoWork → Right (h, n)
+                other → Left ("maintenance with nothing to reclaim answered " <> take 200 (show other))
+    (hDone, spills) ← must (spillAll hFull 0)
+    spills `shouldBe` (looseCap - looseSoftCap) `div` maxSpillPages
+    length (rLoose (storeRoots (hStore hDone))) `shouldBe` looseSoftCap
+    must (checkH hDone)
   it "fits the supported minimum removal at the format's worst-case height, in the smallest and default allowances" $ do
     forM_ [smallSpec, defaultStoreSpec, specOf (64 * 1024 * 1024) (Just (40 * 1024 * 1024))] $ \spec' → do
       cfg ← must (either (Left . show) Right (mkStoreConfig spec'))

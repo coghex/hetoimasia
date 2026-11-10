@@ -107,7 +107,7 @@ import qualified Data.ByteString as BS
 import Control.Monad (foldM)
 import Data.Int (Int64)
 import Data.List (nub, sort)
-import Data.Maybe (isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word16, Word32, Word64)
@@ -1016,7 +1016,12 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       version' ← maybe (refuse (Invalid VersionArithmetic)) pure (bumpWord (rVersion roots))
       let retireRoot = fmap Disk (rRetire roots)
       (firstEntry, e0) ← phase (newEdit overlayBudgetBookkeeping win) (ceilKey TreeRetire False retireRoot BS.empty)
-      case firstEntry of
+      -- a loose list past its soft cap is drained FIRST, whatever else is outstanding (an entry a reader holds, no entry at
+      -- all): the transaction only inserts into the allocator tree, so it never answers that the loose list is full and
+      -- it always lowers it
+      if length (rLoose roots) > looseSoftCap
+        then Planned <$> tryChunk Nothing version' (newEdit overlayBudgetBookkeeping win) 0
+        else case firstEntry of
         Nothing → pure NoWork
         -- the retired-page index sorts after every entry: no entry key first means none left
         Just (k, _) | BS.length k /= 8 → pure NoWork
@@ -1057,7 +1062,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
         unproven
       unreachable bounds fp cfg roots pins RetiredPageLive FactRetirable win pages edit0
     attempt _ _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
-    attempt e ret prefix remaining version' edit (c : cs) = case tryChunk e ret prefix remaining version' edit c of
+    attempt e ret prefix remaining version' edit (c : cs) = case tryChunk (Just (e, ret, prefix, remaining)) version' edit c of
       Right plan → Right (Planned plan)
       Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret prefix remaining version' edit cs
       Left o → Left o
@@ -1075,12 +1080,18 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       phase edit1 (deleteKey TreeRetire root (retiredKey pg))
     tooBig = shrinkable
     chunkSizes n = let top = min n (min maxReclaimPages (windowWork win)) in takeWhile (>= 1) (iterate (`div` 2) top)
-    tryChunk e ret prefix remaining version' edit c = do
-      let freed = take c remaining
-          m = bdReserve bounds + 4 * c
+    -- One maintenance transaction: the first @c@ pages of an entry's list freed, or (no entry) only the loose pages
+    -- handed to the allocator tree. The latter strictly lowers the loose list: it only inserts into the allocator tree,
+    -- its pages come from the loose list itself, and a transaction without deletes replaces no more pages than it
+    -- writes.
+    tryChunk mEntry version' edit c = do
+      let (e, ret, prefix, remaining) = fromMaybe (0, Retire (PageNo 0) 0 0, [], []) mEntry
+          hasEntry = isJust mEntry
+          freed = take c remaining
+          m = if hasEntry then bdReserve bounds + 4 * c else bdReserveMax bounds
           lp = retList ret
           done' = fromIntegral (retDone ret) + c
-          finished = done' == fromIntegral (retCount ret)
+          finished = hasEntry && done' == fromIntegral (retCount ret)
       (mtake, bkEdit0) ← phase edit (takeSupply cfg roots m)
       tk ← maybe (refuse (Capacity (DiskFull (fromIntegral m) (freePool cfg roots + fromIntegral (length (rLoose roots))) 0))) pure mtake
       let claim = fromIntegral m - fromIntegral (tkLoose tk) ∷ Word64
@@ -1131,11 +1142,14 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
       -- no longer indexed under the entry, which unindexing refuses
       bkEditI ← proving bounds fp win (FactGone e) (goneFromIndex e retireRoot) (drop (length prefix - maxReclaimPages) prefix) bkEditI0
       (retireRoot1, bkEdit3) ←
-        if finished
-          then phase bkEditI (deleteKey TreeRetire retireRootI (be64 e))
+        if not hasEntry
+          then pure (retireRootI, bkEditI)
           else
-            let (k', v') = encodeRetire e (ret {retDone = fromIntegral done' ∷ Word16})
-             in phase bkEditI (insertKey TreeRetire retireRootI k' v')
+            if finished
+              then phase bkEditI (deleteKey TreeRetire retireRootI (be64 e))
+              else
+                let (k', v') = encodeRetire e (ret {retDone = fromIntegral done' ∷ Word16})
+                 in phase bkEditI (insertKey TreeRetire retireRootI k' v')
       -- counted before any page is numbered: more than the supply holds is a shrinkable capacity result
       -- (a smaller chunk frees fewer pages), never a failed numbering
       let bkNeed = freshCount bkEdit3 [retireRoot1, freeRoot2]

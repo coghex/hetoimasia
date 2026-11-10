@@ -175,7 +175,7 @@ dispersed firstKeys k =
       [] → Nothing
 
 spec ∷ Spec
-spec = specBoundary >> specFragmented >> specFinal >> specBound >> specForged >> specAtOnce >> specFingerprint >> specSparse
+spec = specBoundary >> specFragmented >> specFinal >> specBound >> specForged >> specAtOnce >> specFingerprint >> specSparse >> specLoose
 
 specBoundary ∷ Spec
 specBoundary = describe "the round-11 boundary at the real reserve: 64 dispersed link updates need more bookkeeping than 68" $ do
@@ -354,6 +354,12 @@ specAtOnce = describe "round 13: the window a unit of work holds at once, under 
           , workOneWindowPages hr hf hrec pins * windowPageBytes + workOneProbeBytes hr hf > maxWindowBytes
           ]
     bad `shouldBe` []
+    -- the loose list: a unit of one adds at most 'looseGrowthUnit' net once the list is at the soft cap or below (above it the
+    -- transaction is a spill, which lowers it), an ordinary plan or a removal none while it holds what the plan claims and at
+    -- most the claim and 'looseGrowthOrdinary' below that: neither can reach the cap
+    [(hr, hf) | hr ← [1 .. maxLevel + 1], hf ← [1 .. maxLevel + 1], looseSoftCap + looseGrowthUnit hr hf > looseCap] `shouldBe` []
+    [hf | hf ← [1 .. maxLevel + 1], maxClaimPages + looseGrowthOrdinary hf > looseCap] `shouldBe` []
+    putStrLn ("ATONCE loose list: soft " <> show looseSoftCap <> " + unit of one at (8,8) " <> show (looseGrowthUnit 8 8) <> " <= cap " <> show looseCap <> "; ordinary " <> show (maxClaimPages + looseGrowthOrdinary 8))
     -- and the standalone removal, which cannot shrink, for every record and allocator height and pin count, with the
     -- retirement tree at the minimum fill the store enforces and the backlog bound it checks (at most 17 internal pages)
     let badRemoval = [(hf, hrec, pins) | hf ← [1 .. maxLevel + 1], hrec ← [1 .. maxLevel + 1], pins ← [0 .. maxReaders], removalWindowPages maxRetireInternals hf hrec pins * windowPageBytes + 188 * probeBytes > maxWindowBytes]
@@ -475,3 +481,44 @@ specSparse = describe "round 13: a sparse retirement tree fails closed as corrup
         Refused (Integrity (BadPage (UnderFull _) _)) → pure ()
         Planned _ → pure () -- the oldest entry's pages may not lie in the forged page
         other → expectationFailure ("maintenance through an under-full " <> what <> " was not refused as corruption: " <> take 200 (show other))
+
+-- | The same store with its loose list padded to exactly @n@ pages of the unwritten space past the used space: a valid
+-- store (the pages are dead and counted), the state of one that has accumulated them.
+paddedLoose ∷ Int → H → H
+paddedLoose n h =
+  let roots = storeRoots (hStore h)
+      extra = n - length (rLoose roots)
+      fresh = [PageNo (rHw roots + fromIntegral i) | i ← [0 .. extra - 1]]
+   in h {hStore = modifyRoots (\r → r {rHw = rHw r + fromIntegral extra, rLoose = rLoose r ++ fresh}) (hStore h)}
+
+-- | A loose list at exactly its cap, and the units that cannot shrink: a maintenance transaction of one page finishing an entry
+-- whose deletions merge nodes, which must never answer that the list is full on a valid store.
+specLoose ∷ Spec
+specLoose = describe "round 14: a loose list at exactly its cap" $
+  it "drains by spilling first, then finishes an entry whose deletes merge nodes, every call Planned or NoWork" $ do
+    let (h0, _, _) = finalChunk 269
+        h1 = paddedLoose looseCap h0
+    must (checkH h1)
+    length (rLoose (storeRoots (hStore h1))) `shouldBe` looseCap
+    let go h n
+          | n > (3000 ∷ Int) = Left "the drain did not end"
+          | otherwise = do
+              (res, _, _, _) ← fillRetryCounting h (planMaintenance (hStore h))
+              let looseBefore = length (rLoose (storeRoots (hStore h)))
+              case res of
+                Planned pl → do
+                  h' ← commitPlan h pl
+                  let looseAfter = length (rLoose (storeRoots (hStore h')))
+                  -- above the soft cap the transaction is a spill: it frees nothing and strictly lowers the list
+                  if looseBefore > looseSoftCap
+                    then
+                      if mFreed (plMeasure pl) == 0 && looseAfter < looseBefore then go h' (n + 1) else Left ("a spill above the soft cap did not lower the list: " <> show (looseBefore, looseAfter, mFreed (plMeasure pl)))
+                    else
+                      if looseAfter > looseCap then Left "the list outgrew its cap" else go h' (n + 1)
+                NoWork → Right (h, n)
+                other → Left ("maintenance neither did work nor found nothing left: " <> take 200 (show other))
+    (drained, passes) ← must (go h1 0)
+    putStrLn ("LOOSE at the cap: " <> show passes <> " transactions to drain; loose list " <> show (length (rLoose (storeRoots (hStore drained)))))
+    rRetiredPages (storeRoots (hStore drained)) `shouldBe` 0
+    (length (rLoose (storeRoots (hStore drained))) <= looseSoftCap) `shouldBe` True
+    must (checkH drained)
