@@ -21,7 +21,7 @@ all 11 amendment children, TRA-13–TRA-23, are now filed as [#655], [#656],
 [#657], [#658], [#659], [#660], [#661], [#662], [#663], [#665] and [#666].
 No unprocessed new children remain. The assigned #645–#648 and #659
 P-16/P-17 revision packets are now applied; the processing cursor below
-records their sign-offs and the baseline coordination still to confirm.
+records their sign-offs and the completed baseline coordination notices.
 Any further tracker draft requires separate sign-off. Design sign-off itself
 authorizes no tracker mutation, implementation or PR-hold release.
 
@@ -398,22 +398,51 @@ The owner-present macOS checkpoint remains supervised: the solver asks the
 manager before it. F8 deletion requirement 2 is unchanged. The manager owns
 re-approval; this record proves neither implementation nor final acceptance.
 
+**P-16 baseline coordination TRA-3 posted 2026-11-10 UTC:** [#639] carries
+the [coordination notice](https://github.com/coghex/hetoimasia/issues/639#issuecomment-6757816987),
+marker `terrain-baseline-coordination:639-v1`. Verified `het-manager`
+sign-off `qjaf8b8qq2tmc8zvw94fp53rai` approves batch v2 (reply to
+`j7x9vef5xid4zfj7f2nd9iq4c2`). Exact live comment SHA-256:
+`a09153de95b120747d1e86a4d2948a0cc795dd1b6b156ea981b6a2f95036d3ea`. The comment and unchanged approved
+issue body, closed state and metadata were verified; this records ownership
+and merged facts, adds no requirement and claims no further implementation.
+
+**P-16 baseline coordination TRA-4 posted 2026-11-10 UTC:** [#640] carries
+the [coordination notice](https://github.com/coghex/hetoimasia/issues/640#issuecomment-6757820503),
+marker `terrain-baseline-coordination:640-v1`. Verified `het-manager`
+sign-off `qjaf8b8qq2tmc8zvw94fp53rai` approves batch v2 (reply to
+`j7x9vef5xid4zfj7f2nd9iq4c2`). Exact live comment SHA-256:
+`ec59af5f23810e3da1c52cc4c4288b0fb2dc0a3daaef011e6a02abea1deb7b70`. The comment and unchanged approved
+issue body, closed state and metadata were verified; this records ownership
+and merged facts, adds no requirement and claims no further implementation.
+
+**P-16 baseline coordination TRA-5 posted 2026-11-10 UTC:** [#641] carries
+the [coordination notice](https://github.com/coghex/hetoimasia/issues/641#issuecomment-6757822539),
+marker `terrain-baseline-coordination:641-v1`. Verified `het-manager`
+sign-off `qjaf8b8qq2tmc8zvw94fp53rai` approves batch v2 (reply to
+`j7x9vef5xid4zfj7f2nd9iq4c2`). Exact live comment SHA-256:
+`1c18d02d7f5ba754d8b0eca0a43a20cda2c09e8220984d79c2f268ef108ee0ce`. The comment and unchanged approved
+issue body, closed state and metadata were verified; this records ownership
+and merged facts, adds no requirement and claims no further implementation.
+
 **Amendment processing cursor:** new-child filing is complete. #645/#646
 revision v2, #647 revision v2, #648 revision v1 and #659's atlas amendment are
-posted. The manager's
-`request-user-het-terrain-20261106-1838-apply648-prompt.txt` directs a stop:
-**do not start another artifact until asked**. The substantive P-16/P-17
-revision packets assigned here are applied; readiness reviews, implementation,
-proof gates and final acceptance remain separate.
+posted. The manager subsequently authorized the P-16 baseline coordination
+batch for #639/#640/#641; all three signed comments are posted and verified
+as recorded above. The assigned P-16/P-17 tracker revisions and baseline
+coordination are complete. Readiness reviews, implementation, proof gates
+and final acceptance remain separate; **do not start another artifact until
+asked**.
 
-P-16 also lists baseline coordination for #639/PR #653 (links to the new
-model/store owners), #640 (TRA-22/[#665]) and #641 (TRA-23/[#666]). The
-read-only closeout check found no dedicated coordination notice in those
-issues' current bodies/trusted timelines; #640's review explicitly leaves its
-link for a separately signed-off revision. These rows are reported to the
-manager for confirmation, not started or silently marked complete. PR #654
-already records #644's baseline disposition and TRA-17 handoff. No other
-artifact is changed by this entry.
+P-16's baseline coordination now links #639/PR #653 to TRA-18–TRA-22's
+model/store owners, #640/PR #664 to TRA-22/[#665], and #641/PR #676 to
+TRA-23/[#666]. The #640 notice also records PR #676's public service
+additions with their exact authorization dates (UTC); the #641 notice
+records its adapter-mediated name arbitration and the single-transaction
+design as an existing follow-up, without creating a new requirement.
+PR #654 already records #644's baseline disposition and TRA-17 handoff.
+Approved issue bodies and closed states remain unchanged. No implementation
+or final arena qualification is claimed by this coordination closeout.
 
 ## Epic contract
 
