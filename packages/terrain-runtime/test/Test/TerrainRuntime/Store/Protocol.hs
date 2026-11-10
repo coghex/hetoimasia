@@ -11,7 +11,8 @@ module Test.TerrainRuntime.Store.Protocol (spec) where
 
 import Control.Monad (foldM, forM, forM_)
 import qualified Data.ByteString as BS
-import Hetoimasia.Terrain.Discovery (pendingObligations, worstEdgeWrites)
+import Hetoimasia.Terrain.Coordinate (TileCoord)
+import Hetoimasia.Terrain.Discovery (Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites, worstEditReads)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
@@ -27,13 +28,13 @@ must ∷ Either String a → IO a
 must = either (\e → expectationFailure e >> fail e) pure
 
 -- | What the caller did to get a plan through.
-data Counts = Counts {cReductions ∷ !Int, cCheckpoints ∷ !Int, cPages ∷ !Int, cMaintenance ∷ !Int}
+data Counts = Counts {cReductions ∷ !Int, cCheckpoints ∷ !Int, cPages ∷ !Int, cMaintenance ∷ !Int, cReadPeak ∷ !Int, cFacts ∷ !Int}
 
 noCounts ∷ Counts
-noCounts = Counts 0 0 0 0
+noCounts = Counts 0 0 0 0 0 0
 
 addCounts ∷ Counts → Counts → Counts
-addCounts (Counts a b c d) (Counts a' b' c' d') = Counts (a + a') (b + b') (c + c') (d + d')
+addCounts (Counts a b c d e f) (Counts a' b' c' d' e' f') = Counts (a + a') (b + b') (c + c') (d + d') (max e e') (max f f')
 
 windowResult ∷ CapacityWhy → Bool
 windowResult c = case c of
@@ -48,10 +49,20 @@ windowResult c = case c of
 -- given work limit. Returns the store (maintenance may have committed), the outcome ('Planned', 'NoWork' or 'BlockedByReader')
 -- and what the caller did.
 drive ∷ H → Int → (H → Window → Planned) → Either String (H, Planned, Counts)
-drive h0 limit planner = loop h0 (limitWork limit (storeWindow (hStore h0))) noCounts (0 ∷ Int)
+drive h0 limit = driveFrom h0 (limitWork limit (storeWindow (hStore h0)))
+
+-- | The most steps (pages fetched and checkpoints) a plan through the protocol may take: every checkpoint carries at least one new
+-- read fact, a removal reads at most 'worstEditReads' records (+1 for the end of its read phase) and a window fetches at most
+-- 'maxWindowPages' pages between two checkpoints.
+maxProtocolSteps ∷ Int
+maxProtocolSteps = (worstEditReads + 1) * (maxWindowPages + 1) + 1000
+
+-- | 'drive' from a given window (one that may carry facts).
+driveFrom ∷ H → Window → (H → Window → Planned) → Either String (H, Planned, Counts)
+driveFrom h0 w0 planner = loop h0 w0 noCounts (0 ∷ Int)
   where
     loop h w c n
-      | n > 6000 = Left "the protocol did not settle in 6,000 steps"
+      | n > maxProtocolSteps = Left ("the protocol did not settle in " <> show maxProtocolSteps <> " steps")
       | otherwise = case planner h w of
           Pending p → case diskRead (hDisk h) p of
             Nothing → Left ("pending page not on disk: " <> show p)
@@ -59,7 +70,7 @@ drive h0 limit planner = loop h0 (limitWork limit (storeWindow (hStore h0))) noC
               Left e → Left ("page " <> show p <> " refused: " <> show e)
               Right w' → loop h w' c {cPages = cPages c + 1} (n + 1)
           PendingProbes ps → loop h (foldl (\w' p → windowProbe (cfgUsablePages (hCfg h)) p (maybe BS.empty id (diskRead (hDisk h) p)) w') w ps) c {cPages = cPages c + 1} (n + 1)
-          Checkpoint fs → loop h (windowCheckpoint fs w) c {cCheckpoints = cCheckpoints c + 1} (n + 1)
+          Checkpoint fs → let w' = windowCheckpoint fs w in loop h w' c {cCheckpoints = cCheckpoints c + 1, cReadPeak = max (cReadPeak c) (windowSize w), cFacts = max (cFacts c) (windowReadFactCount w')} (n + 1)
           Refused (Capacity why)
             | windowResult why →
                 if windowWork w <= 1
@@ -91,6 +102,10 @@ maintenanceTight h = tightBounds (workOneWindowPages (heightOf h TreeRetire) (he
 -- | The same for a standalone removal.
 removalTight ∷ H → Bounds
 removalTight h = tightBounds (removalWindowPages (retireInternalsOf h) (heightOf h TreeFree) (recordHeight h) 0)
+
+-- | The same plan with no read-phase checkpoint at all: a window as large as any plan can fill and no residue rule.
+unboundedReads ∷ Bounds
+unboundedReads = standardBounds {bdWindowPages = 1000000, bdWindowBytes = maxBound `div` 2, bdReadResidue = maxBound}
 
 tightBounds ∷ Int → Bounds
 tightBounds lim = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
@@ -133,7 +148,10 @@ maintenanceUntil done boundsOf limit = go 0 noCounts
             other → Left ("maintenance answered " <> take 200 (show other))
 
 spec ∷ Spec
-spec = describe "the facade's caller protocol, followed exactly, for every starting work limit" $ do
+spec = readPhaseSpec >> protocolSpec
+
+protocolSpec ∷ Spec
+protocolSpec = describe "the facade's caller protocol, followed exactly, for every starting work limit" $ do
   let limits = [1 .. 64 ∷ Int]
       withScene = do
         let run0 = newRun smallSpec twoOpenings 64
@@ -258,3 +276,230 @@ spec = describe "the facade's caller protocol, followed exactly, for every start
       entryDone b `shouldBe` True
       pure (lim, na, nb)
     putStrLn ("PROTOCOL fragmented entry: transactions (standard, tight) per starting limit " <> show rows)
+
+-- ---------------------------------------------------------------------------
+-- The read phase
+
+-- | A store whose links tree is deep (the fillers) and holds two union-find chains of @hops@ links, one under each of the runs
+-- [1,2) and [3,4) of the column (2,2): every link of a chain is a node of a distinct leaf. Removing the cell between the runs
+-- joins them, and joining reads both chains one record at a time, each a lookup through the whole links tree.
+chainStore ∷ Int → Int → Either String (H, Env, TileCoord)
+chainStore hops fillers = do
+  let run0 = newRun smallSpec sealedStack 64
+      spacing = max 1 (fillers `div` (2 * hops + 2))
+      node tag i = RunNode (columnAt (toInteger (10 + (2 * i + tag) * spacing)) 101) 0
+      colRun lo = RunNode (columnAt 2 2) lo
+      chain tag start = [(linkKey (if i == 0 then start else node tag i), if i == hops then rootRec 1 False else childRec (node tag (i + 1))) | i ← [0 .. hops]]
+      runs = [(runKey 2 2 1, runRec 2), (runKey 2 2 3, runRec 4)]
+      star = [(linkKey (RunNode (columnAt (toInteger x) 100) 0), if x == 0 then rootRec 1 False else childRec (RunNode (columnAt 0 100) 0)) | x ← [0 .. fillers - 1]]
+      writes = [(k, Just v) | (k, v) ← runs ++ chain 0 (colRun 1) ++ chain 1 (colRun 3) ++ star]
+      chunks [] = []
+      chunks xs = let (a, b) = splitAt 60 xs in a : chunks b
+  h ← foldM (\h ws → do
+               (h', out) ← commitDelta h Ordinary (deltaFor (hStore h) False False 1 ws)
+               case out of
+                 Committed _ → Right h'
+                 other → Left ("the chain store was not built: " <> show other)) (runH run0) (chunks writes)
+  Right (h, runEnv run0, tileAt 2 2 2)
+
+-- | The tightest bounds a removal and a discovery unit promise, at the heights of the store's own trees.
+removalPromise ∷ H → Int
+removalPromise h = removalWindowPages (retireInternalsOf h) (heightOf h TreeFree) (recordHeight h) 0
+
+discoveryPromise ∷ H → Int
+discoveryPromise h = discoveryUnitWindowPages (retireInternalsOf h) (heightOf h TreeFree) (recordHeight h) 0
+
+cOf ∷ Driven → Counts
+cOf = runCounts
+
+-- | What one plan through the protocol did, and the plan: the outcome, the pages of the window it ended in, the largest window
+-- a checkpoint was taken from (the read phase's peak), and the facts it carried.
+data Driven = Driven {runPlan ∷ Plan, runCounts ∷ Counts}
+
+runThrough ∷ H → Int → (H → Window → Planned) → Either String Driven
+runThrough h limit planner = do
+  (_, p, c) ← drive h limit planner
+  case p of
+    Planned plan → Right (Driven plan c)
+    other → Left ("not planned: " <> take 200 (show other))
+
+-- | The smallest window bound (in pages) a plan succeeds under through the protocol, by search, and the evidence that it is the
+-- smallest: the plan succeeds at it and fails one page below it.
+minimalBound ∷ H → (Bounds → H → Window → Planned) → Int → Either String Int
+minimalBound h planner hi = go 1 hi
+  where
+    ok b = either (const False) (const True) (runThrough h 64 (planner (tightBounds b)))
+    go lo up
+      | not (ok up) = Left ("no success even at " <> show up <> " pages")
+      | lo >= up = if up > 1 && ok (up - 1) then Left "not minimal" else Right up
+      | otherwise = let mid = (lo + up) `div` 2 in if ok mid then go lo mid else go (mid + 1) up
+
+samePlan ∷ Plan → Plan → Bool
+samePlan a b = plPages a == plPages b && plNext a == plNext b && plEffects a == plEffects b
+
+
+-- | A store after the removal of an opening, whose obligations are inspected through long chains: every union-find root the first
+-- inspection reads is replaced by the head of a chain of @hops@ links, each in a leaf of its own, ending in the same root record.
+chainedDiscovery ∷ Int → Int → Either String (H, Env)
+chainedDiscovery hops fillers = do
+  let run0 = newRun smallSpec twoOpenings 64
+  r1 ← foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA
+  let env = runEnv r1
+      (_, ReadSet rs _) = stepDiscoveryTraced env (retainedHeader (runRef r1)) (retainedProvider (runRef r1)) (allowanceOf (envLimits env))
+      -- the nodes it read as a root (a stored one, or the implicit one of a node with no record): each becomes the head of a chain
+      -- ending in the root it had
+      targets = [(node, root) | (KeyLink node, v) ← rs, Just root ← [case v of Just (RecRoot r) → Just r; Nothing → Just (Root 1 False); _ → Nothing]]
+      n = max 1 (length targets)
+      spacing = max 1 (fillers `div` (n * (hops + 1) + 2))
+      cn i k = RunNode (columnAt (toInteger (10 + (k * n + i) * spacing)) 102) 0
+      chainFor (i, (node, root)) = (KeyLink node, RecChild (cn i 1)) : [(KeyLink (cn i k), RecChild (cn i (k + 1))) | k ← [1 .. hops - 1]] ++ [(KeyLink (cn i hops), RecRoot root)]
+      star = [(KeyLink (RunNode (columnAt (toInteger x) 100) 0), if x == 0 then rootRec 1 False else childRec (RunNode (columnAt 0 100) 0)) | x ← [0 .. fillers - 1]]
+      writes = [(k, Just v) | (k, v) ← concatMap chainFor (zip [0 ..] targets) ++ star]
+      chunks [] = []
+      chunks xs = let (a, b) = splitAt 60 xs in a : chunks b
+  if null targets then Left "the first inspection read no union-find root" else Right ()
+  h ← foldM (\hh ws → do
+               (h', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) False False 1 ws)
+               case out of
+                 Committed _ → Right h'
+                 other → Left ("the chained store was not built: " <> show other)) (runH r1) (chunks writes)
+  Right (h, env)
+
+-- | Every record of a store, for comparing two stores that were drained through different batches.
+recordsOfStore ∷ H → Either String [(RecordKey, Record)]
+recordsOfStore = storeRecords
+
+-- | Discovery drained through the protocol, every batch committed: the store, the batches and what the caller did in all.
+drainThrough ∷ H → Int → (H → Window → Planned) → Either String (H, Int, Counts)
+drainThrough h0 limit planner = go h0 (0 ∷ Int) noCounts
+  where
+    go h n c
+      | n > 400 = Left "discovery did not drain"
+      | otherwise = do
+          (h1, p, c') ← drive h limit planner
+          case p of
+            NoWork → Right (h1, n, addCounts c c')
+            Planned plan → do
+              h2 ← commitPlan h1 plan
+              go h2 (n + 1) (addCounts c c')
+            other → Left ("discovery answered " <> take 200 (show other))
+
+readPhaseSpec ∷ Spec
+readPhaseSpec = describe "the read phase: records are facts, a window never holds more than the plan's bounds, the edit starts from what it needs" $ do
+  it "the bounds hold one whole read, fit the window and its bytes, and the residue is derived from them: at every height 1..8 and 0..16 pinned versions" $ do
+    let hs = [1 .. maxLevel + 1]
+        grid = [(hf, hrec, pins) | hf ← hs, hrec ← hs, pins ← [0 .. maxReaders]]
+        bad p = [g | g@(hf, hrec, pins) ← grid, p hf hrec pins]
+        oneRead hrec = readPathPages hrec
+    -- every promised bound holds one whole logical-record read (or a retry could never make progress)
+    bad (\hf hrec pins → removalWindowPages maxRetireInternals hf hrec pins < oneRead hrec || discoveryUnitWindowPages maxRetireInternals hf hrec pins < oneRead hrec) `shouldBe` []
+    -- every promised bound fits the window's pages and bytes (the removal's proofs hold up to 'removalWorstProbes' probes)
+    bad (\hf hrec pins → removalWindowPages maxRetireInternals hf hrec pins > maxWindowPages || removalWindowPages maxRetireInternals hf hrec pins * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` []
+    bad (\hf hrec pins → discoveryUnitWindowPages maxRetireInternals hf hrec pins * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` []
+    -- the residue is what the worst removal leaves free in the byte limit, and no more
+    readResiduePages `shouldBe` 6
+    ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders) * windowPageBytes + removalWorstProbes * probeBytes <= maxWindowBytes) `shouldBe` True
+    ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders + 1) * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` True
+    -- the facts of the worst removal and of a discovery unit are RAM the feasibility proofs count, and they fit
+    (worstEditReads * recordFactBytes <= maxReadFactBytes, worstEdgeReads * recordFactBytes <= maxReadFactBytes) `shouldBe` (True, True)
+    putStrLn ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (worstEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)
+  it "removes the cell between two runs whose chains are 12 and 64 links long at EXACTLY the promised bound, and plans what the standard bounds plan" $ do
+    forM_ [12, 64] $ \hops → do
+      (h, env, tile) ← must (chainStore hops 8192)
+      let promise = removalPromise h
+          planner bounds hh w = planRemovalWith bounds env (hStore hh) w tile
+      std ← must (runThrough h 64 (planner standardBounds))
+      tight ← must (runThrough h 64 (planner (tightBounds promise)))
+      free ← must (runThrough h 64 (planner unboundedReads))
+      -- the same plan with checkpoints (at the tightest bound, at the standard bounds) and with none at all
+      (samePlan (runPlan std) (runPlan tight), samePlan (runPlan free) (runPlan tight), cCheckpoints (cOf free)) `shouldBe` (True, True, 0)
+      -- the window the plan ends in holds no more than the promise, and the read phase peaked at exactly the bound it ran under
+      (mWindowPages (plMeasure (runPlan tight)) <= promise) `shouldBe` True
+      (cReadPeak (cOf tight) <= promise) `shouldBe` True
+      putStrLn ("READPHASE removal " <> show hops <> " hops: heights (records " <> show (recordHeight h) <> ", free " <> show (heightOf h TreeFree) <> "), promised " <> show promise <> ", read peak (tight " <> show (cReadPeak (cOf tight)) <> ", standard " <> show (cReadPeak (cOf std)) <> "), edit window " <> show (mWindowPages (plMeasure (runPlan tight))) <> ", checkpoints (tight " <> show (cCheckpoints (cOf tight)) <> ", standard " <> show (cCheckpoints (cOf std)) <> "), facts " <> show (cFacts (cOf tight)))
+      -- the continuation was used: the reads do not fit the bound without it
+      (cCheckpoints (cOf tight) > 0) `shouldBe` True
+      -- how much of the promise the plan needs: the smallest bound it succeeds under, and one page less fails (the formula is an
+      -- upper bound over every shape of tree and read; the edit phase of this fixture is far from it, the read phase is at it)
+      bmin ← must (minimalBound h planner promise)
+      putStrLn ("READPHASE removal " <> show hops <> " hops: smallest bound the plan succeeds under " <> show bmin <> " of the promised " <> show promise)
+      (bmin <= promise, bmin >= readPathPages (recordHeight h)) `shouldBe` (True, True)
+  it "a checkpoint is never taken with no new fact: a window that cannot hold one read is the typed window result, never a loop" $ do
+    (h, env, tile) ← must (chainStore 12 8192)
+    -- a bound of two pages cannot hold the three pages of one read of the links tree
+    let tiny = tightBounds 2
+        loop w n
+          | n > (4000 ∷ Int) = expectationFailure "the plan did not settle" >> pure Nothing
+          | otherwise = case planRemovalWith tiny env (hStore h) w tile of
+              Pending p → case diskRead (hDisk h) p >>= \bs → either (const Nothing) Just (windowInsert (cfgUsablePages (hCfg h)) p bs w) of
+                Just w' → loop w' (n + 1)
+                Nothing → expectationFailure "page" >> pure Nothing
+              Checkpoint fs → loop (windowCheckpoint fs w) (n + 1)
+              Refused (Capacity c) → pure (Just c)
+              other → expectationFailure (take 200 (show other)) >> pure Nothing
+    r ← loop (storeWindow (hStore h)) 0
+    r `shouldSatisfy` (\c → case c of Just (WindowExceeded _) → True; Just (WindowBytesExceeded _) → True; _ → False)
+  it "discovers through chains of 40 links at EXACTLY the promised bound of a unit, and drains to the same records as the standard bounds" $ do
+    (h, env) ← must (chainedDiscovery 40 8192)
+    let promise = discoveryPromise h
+        planner bounds hh w = planDiscoveryWith bounds env (hStore hh) w
+    -- the unit (limit 3): the same plan at the tight bound as at the standard bounds
+    std ← must (runThrough h 3 (planner standardBounds))
+    free ← must (runThrough h 3 (planner unboundedReads))
+    tight ← must (runThrough h 3 (planner (tightBounds promise)))
+    -- with the checkpoint of the end of the read phase (standard bounds) and with none: the same plan. (A tight window may complete
+    -- fewer inspections of a batch, since a batch is what the pages the window holds complete; its plan is compared by what it
+    -- drains to, below)
+    (samePlan (runPlan std) (runPlan free), cCheckpoints (cOf free)) `shouldBe` (True, 0)
+    -- and a batch of up to 64 updates: with the end-of-read checkpoint and with none, the same plan
+    std64 ← must (runThrough h 64 (planner standardBounds))
+    free64 ← must (runThrough h 64 (planner unboundedReads))
+    samePlan (runPlan std64) (runPlan free64) `shouldBe` True
+    (mWindowPages (plMeasure (runPlan tight)) <= promise, cReadPeak (cOf tight) <= promise, cCheckpoints (cOf tight) > 0) `shouldBe` (True, True, True)
+    bminD ← must (minimalBound h planner promise)
+    putStrLn ("READPHASE discovery unit: smallest bound the plan succeeds under " <> show bminD <> " of the promised " <> show promise)
+    (bminD <= promise, bminD >= readPathPages (recordHeight h)) `shouldBe` (True, True)
+    -- a 64-update batch: the batch is whatever the pages the window holds complete, so only the end state is the same: drained
+    -- through tight and through standard bounds, the stores hold the same records
+    (hStd, nStd, cStd) ← must (drainThrough h 64 (planner standardBounds))
+    (hTight, nTight, cTight) ← must (drainThrough h 64 (planner (tightBounds promise)))
+    recStd ← must (recordsOfStore hStd)
+    recTight ← must (recordsOfStore hTight)
+    recTight `shouldBe` recStd
+    pendingObligations (storeHeader (hStore hStd)) `shouldBe` 0
+    pendingObligations (storeHeader (hStore hTight)) `shouldBe` 0
+    putStrLn ("READPHASE discovery 40 links: promised " <> show promise <> ", unit: read peak " <> show (cReadPeak (cOf tight)) <> ", edit window " <> show (mWindowPages (plMeasure (runPlan tight))) <> ", checkpoints " <> show (cCheckpoints (cOf tight)) <> ", facts " <> show (cFacts (cOf tight)) <> "; drained: standard " <> show nStd <> " batches / " <> show (cCheckpoints cStd) <> " checkpoints, tight " <> show nTight <> " batches / " <> show (cCheckpoints cTight) <> " checkpoints")
+  it "counts the read facts a plan holds in its RAM, and the feasibility proofs count the most a removal and a discovery unit read" $ do
+    (h, env, tile) ← must (chainStore 64 8192)
+    pl ← must (runThrough h 64 (\hh w → planRemovalWith (tightBounds (removalPromise h)) env (hStore hh) w tile))
+    -- the plan was made through windows that carried facts: its continuation charge holds them
+    (ramContinuation (mRam (plMeasure (runPlan pl))) >= cFacts (cOf pl) * recordFactBytes) `shouldBe` True
+    -- the supported minimum removal and the smallest unit of discovery, with the facts of their most reads, fit the RAM bound
+    (minimumRemovalRam <= txnRamLimit, minimumDiscoveryUnitRam <= txnRamLimit) `shouldBe` (True, True)
+    putStrLn ("READPHASE RAM: facts held " <> show (cFacts (cOf pl)) <> " x " <> show recordFactBytes <> " B; minimum removal " <> show minimumRemovalRam <> " B, discovery unit " <> show minimumDiscoveryUnitRam <> " B of " <> show txnRamLimit)
+  it "facts are for one state only: facts a plan took are ignored by a plan at another version, which plans what a clean window plans" $ do
+    (h, env, tile) ← must (chainStore 12 8192)
+    let planner bounds hh w = planRemovalWith bounds env (hStore hh) w tile
+        firstCheckpoint w n
+          | n > (4000 ∷ Int) = expectationFailure "no checkpoint" >> fail "cp"
+          | otherwise = case planner standardBounds h w of
+              Pending p → case diskRead (hDisk h) p >>= \bs → either (const Nothing) Just (windowInsert (cfgUsablePages (hCfg h)) p bs w) of
+                Just w' → firstCheckpoint w' (n + 1)
+                Nothing → expectationFailure "page" >> fail "page"
+              Checkpoint fs → pure fs
+              other → expectationFailure ("no checkpoint: " <> take 200 (show other)) >> fail "cp"
+    facts ← firstCheckpoint (storeWindow (hStore h)) 0
+    -- the committed state changes under the facts: the end of the first chain gets another root record
+    let endOfChain = linkKey (RunNode (columnAt (toInteger (10 + (2 * 12 + 0) * max 1 (8192 `div` (2 * 12 + 2)) ∷ Int)) 101) 0)
+    (h2, out) ← must (commitDelta h Ordinary (deltaFor (hStore h) False False 1 [(endOfChain, Just (rootRec 5 True))]))
+    case out of
+      Committed _ → pure ()
+      other → expectationFailure ("the change was not committed: " <> show other)
+    old ← must (runThrough h 64 (planner standardBounds))
+    clean ← must (runThrough h2 64 (planner standardBounds))
+    (_, stale, _) ← must (driveFrom h2 (windowCheckpoint facts (storeWindow (hStore h2))) (planner standardBounds))
+    -- the change matters (the plans differ), and the stale facts did not carry the old state into the new plan
+    samePlan (runPlan old) (runPlan clean) `shouldBe` False
+    case stale of
+      Planned pl → samePlan pl (runPlan clean) `shouldBe` True
+      other → expectationFailure ("the stale-facts window did not plan: " <> take 200 (show other))

@@ -23,7 +23,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Pa
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
 import Hetoimasia.Terrain.Residency (ArenaId (..))
@@ -427,7 +427,7 @@ specFingerprint = describe "round 13: the facts a window carries are trusted onl
     let (h0, firstKeys, _) = fragmented
         roots = storeRoots (hStore h0)
         fp = fingerprintOf (hIdent h0) roots []
-        facts = Facts fp [FactUnreachable (PageNo 9), FactGone 3 (PageNo 11)]
+        facts = Facts fp [FactUnreachable (PageNo 9), FactGone 3 (PageNo 11)] noReadFacts
         w1 = windowCheckpoint facts (storeWindow (hStore h0))
     windowFactCount w1 `shouldBe` 2
     windowKnows (FactUnreachable (PageNo 9)) (windowFactsFor fp w1) `shouldBe` True
@@ -445,7 +445,7 @@ specFingerprint = describe "round 13: the facts a window carries are trusted onl
     (fpAfter /= fp) `shouldBe` True
     windowFactCount (windowFactsFor fpAfter w1) `shouldBe` 0
     -- facts proven against another state replace the ones a window carries, never merge with them
-    let other = Facts fpAfter [FactUnreachable (PageNo 20)]
+    let other = Facts fpAfter [FactUnreachable (PageNo 20)] noReadFacts
     windowFactCount (windowCheckpoint other w1) `shouldBe` 1
 
 -- | A sparse retirement tree is corruption, not a window result: a non-root page of the retirement tree below a quarter

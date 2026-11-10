@@ -76,6 +76,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Plan
   , IntegrityWhy (..)
   , shrinkable
   , fingerprintOf
+  , windowFull
+  , providerFacts
 
     -- * Planning
   , Bounds (..)
@@ -362,13 +364,16 @@ data Bounds = Bounds
   -- ^ the bookkeeping pages a candidate plan first asks for ('bookkeepingReserve' in production)
   , bdReserveMax ∷ !Int
   -- ^ the most it may ask for after counting ('maxBookkeepingPages' in production)
+  , bdReadResidue ∷ !Int
+  -- ^ the read pages a window may still hold when a read phase ends and the edit begins ('readResiduePages' in production): more
+  -- are handed on as facts through a checkpoint. The suite raises it to run the same plan with no read-phase checkpoint.
   }
   deriving stock (Eq, Show)
 
 -- | 256 pages (1 MiB of new encoded pages), 4 MiB of RAM, 512 window pages and 1.25 MiB
 -- of window bytes.
 standardBounds ∷ Bounds
-standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages
+standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages readResiduePages
 
 -- ---------------------------------------------------------------------------
 -- The planning monad
@@ -610,7 +615,7 @@ proving bounds fp win mk prove pages edit0 = go edit0 pages
           Left o → Left o
     checkpoint edit = case editFacts edit of
       [] → Left (OutRefuse (Capacity (if windowSize win + 1 > bdWindowPages bounds then WindowExceeded (windowSize win) else WindowBytesExceeded (windowBytes win))))
-      fs → Left (OutCheckpoint (Facts fp fs))
+      fs → Left (OutCheckpoint (Facts fp fs noReadFacts))
 
 -- | The one proof of ownership every page a plan is about to overwrite passes, against
 -- every owner there is: the committed trees and every pinned reader's tree and the
@@ -801,7 +806,7 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
                     }
                 windowN = windowSize win
                 steps = editSteps edit1 + editSteps bkEdit3
-                ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m
+                ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m (windowReadFactBytes win)
             if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
             let measure =
                   Measure
@@ -848,7 +853,7 @@ headerOnly _ ident roots cls cand next version' edit writes = do
   let base = dlBase cand
       expected = hAuthority next
       next' = roots {rVersion = version', rHeader = next}
-      ram = ramFor 0 (windowBytes win0) 0 0 (length writes) 0 0
+      ram = ramFor 0 (windowBytes win0) 0 0 (length writes) 0 0 (windowReadFactBytes win0)
       win0 = editWindow edit
       measure =
         Measure 0 0 0 0 0 0 0 0 0 (editSteps edit) 0 ram (dlUpdates cand) (length writes) 0
@@ -979,8 +984,8 @@ applyWrites edit roots0 = go roots0 edit
             _ → (rr, rl, root')
       go roots' e' rest
 
-ramFor ∷ Int → Int → Int → Int → Int → Int → Int → RamCharge
-ramFor windowN windowB overlayB written writes replaced supplyN =
+ramFor ∷ Int → Int → Int → Int → Int → Int → Int → Int → RamCharge
+ramFor windowN windowB overlayB written writes replaced supplyN factsB =
   RamCharge
     { ramIoBuffers = written * pageSize
     , ramDecodedCopies = windowB + overlayB
@@ -988,7 +993,7 @@ ramFor windowN windowB overlayB written writes replaced supplyN =
     , ramScratch = replaced * 16 + supplyN * 8 + 4096 + (2 * hotNodes + 1) * hotNodeBytes
     , ramPagePins = windowN * 16
     , ramRootControl = rootRecordBytes + activeRecordBytes + headerBytes
-    , ramContinuation = 1024 + windowN * 8
+    , ramContinuation = 1024 + windowN * 8 + factsB
     }
 
 -- ---------------------------------------------------------------------------
@@ -1199,7 +1204,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
               , rRootCrcs = rootCrcsAfter roots encoded [(TreeRuns, rRuns roots), (TreeLinks, rLinks roots), (TreeTodo, rTodo roots), (TreeFree, free'), (TreeRetire, retire')]
               }
           windowN = windowSize win
-          ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes bkEdit4) written 0 (length replBk + c) m
+          ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes bkEdit4) written 0 (length replBk + c) m (windowReadFactBytes win)
       if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
       let measure =
             Measure
@@ -1292,6 +1297,25 @@ providerFor win rootFor =
         Right Nothing → Absent
         Left _ → Unavailable (KeyRun col z)
     }
+
+-- | The provider a plan's READ phase answers from: what the window carries as read facts first (the records the committed roots
+-- answered an earlier run of this plan, kept through a checkpoint after the pages were dropped), then the pages. The caller
+-- gives it a window whose facts were checked against the plan's fingerprint ('windowFactsFor'); a fact is never consulted for
+-- another state.
+providerFacts ∷ Window → (TreeId → Maybe PageNo) → Provider
+providerFacts win rootFor =
+  Provider
+    { fetchRecord = \key → case windowReadRecord key win of
+        Just (Just r) → Found r
+        Just Nothing → Absent
+        Nothing → fetchRecord paged key
+    , fetchFloorRun = \col z → case windowReadFloor (col, z) win of
+        Just (Just run) → Found run
+        Just Nothing → Absent
+        Nothing → fetchFloorRun paged col z
+    }
+  where
+    paged = providerFor win rootFor
 
 -- | Why a record is unavailable: the page to fetch, or an integrity failure. A removed
 -- run may have been asked for by key or by a floor lookup (the run at or below a

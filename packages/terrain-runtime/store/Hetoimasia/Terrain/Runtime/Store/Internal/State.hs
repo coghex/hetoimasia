@@ -73,6 +73,10 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , workOneProbeBytes
   , removalWindowPages
   , editWindowPages
+  , readResiduePages
+  , readPathPages
+  , maxReadFactBytes
+  , removalWorstProbes
   , discoveryUnitWindowPages
   , maintenanceUnitPages
   , discoveryUnitWrites
@@ -320,7 +324,35 @@ workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2 + maxSpillPages) * probeBytes
 -- each retired page and an entry for each list) at least 46 to a leaf and 47 children to an internal page, that is
 -- 712 leaves, 16 internal pages and a root; the allocator tree's edit, @3 * hf@; and ONE proof as above.
 removalWindowPages ∷ Int → Int → Int → Int → Int
-removalWindowPages = editWindowPages worstEditWrites
+removalWindowPages ri hf hrec pins = editWindowPages worstEditWrites ri hf hrec pins + readResiduePages
+
+-- | The most page probes the proof phase of a standalone removal holds at once ('workOneProbeBytes' counts them for maintenance).
+removalWorstProbes ∷ Int
+removalWorstProbes = 188
+
+-- | The read pages a plan may still hold when its READ phase ends and its edit phase begins. A read phase (the logical-record
+-- reads of a removal's staging or of a discovery step) holds the pages of what it read until it ends, up to its window bound;
+-- before the edit it either holds no more than this or hands what it read on as facts through a checkpoint and starts the edit
+-- from an empty window. It is DERIVED, not chosen: the whole pages the worst removal ('editWindowPages' at the tallest trees,
+-- the most retirement internals and every reader pinned) leaves free in the window's byte limit beside its probes, so a window
+-- that holds the edit phase and this residue stays inside 'maxWindowBytes'. The bound a removal or a discovery unit promises is
+-- the edit phase's bound plus this.
+readResiduePages ∷ Int
+readResiduePages =
+  (maxWindowBytes - editWindowPages worstEditWrites maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders * windowPageBytes - removalWorstProbes * probeBytes)
+    `div` windowPageBytes
+
+-- | The pages the most pages one logical-record read holds: a lookup is one root-to-leaf path, a floor lookup that crosses into
+-- the previous leaf is two. Every window bound a read phase runs under must hold one whole read, or a retry could never make
+-- progress.
+readPathPages ∷ Int → Int
+readPathPages hrec = 2 * hrec
+
+-- | The RAM the read facts of one plan may hold (as a retained continuation of its RAM charge): a read set past it is the typed,
+-- shrinkable 'TxnRamExceeded' of a discovery batch (the work halves). A standalone removal reads at most 'worstEditReads' records
+-- and a discovery unit at most 'worstEdgeReads', each 'recordFactBytes' (30 KB and 20 KB): neither can reach it.
+maxReadFactBytes ∷ Int
+maxReadFactBytes = 1024 * 1024
 
 -- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'worstEditWrites').
 editWindowPages ∷ Int → Int → Int → Int → Int → Int
@@ -330,7 +362,7 @@ editWindowPages writes retireInternals hf hrec pins =
 -- | The pages the SMALLEST unit of a discovery batch holds at once: one connection inspection, at most 'discoveryUnitWrites'
 -- (3) record writes, an edit like a removal's but of fewer writes, so never more than 'removalWindowPages'.
 discoveryUnitWindowPages ∷ Int → Int → Int → Int → Int
-discoveryUnitWindowPages = editWindowPages discoveryUnitWrites
+discoveryUnitWindowPages ri hf hrec pins = editWindowPages discoveryUnitWrites ri hf hrec pins + readResiduePages
 
 -- | The ATOMIC unit of each planner that reads the window's work limit ('windowWorkAtLeast'): the least work the planner can
 -- do. A work limit counts units of the planner's own work (the pages a maintenance transaction frees, the record writes of

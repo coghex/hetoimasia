@@ -174,7 +174,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         windowOf m = foldl (\w n → either (error . show) id (windowInsert total (PageNo n) (either (error . show) id (encodePage ident0 (leaf n))) w)) (uncheckedWindow ident0 0) [1 .. m]
         d = deltaFor (hStore (newH smallSpec ident0)) True False 1 [(runKey 0 0 1, Just (runRec 3))]
         run m = planDelta cfg ident0 roots (windowOf m) Ordinary d
-        tight = planDeltaWith (Bounds maxTxnPages txnRamLimit 5 maxWindowBytes bookkeepingReserve maxBookkeepingPages) cfg ident0 roots
+        tight = planDeltaWith (Bounds maxTxnPages txnRamLimit 5 maxWindowBytes bookkeepingReserve maxBookkeepingPages readResiduePages) cfg ident0 roots
     windowBytes (windowOf 310) `shouldBe` 310 * windowPageBytes
     windowBytes (windowOf 310) `shouldSatisfy` (<= maxWindowBytes)
     windowBytes (windowOf 311) `shouldSatisfy` (> maxWindowBytes)
@@ -266,7 +266,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         scene = runEnv run0
     r1 ← must (foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA)
     let h1 = runH r1
-        tight = Bounds 5 txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages
+        tight = Bounds 5 txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages readResiduePages
     (full, _, _) ← must (fillWith h1 (planDiscovery scene (hStore h1)))
     (small, _, _) ← must (fillWith h1 (planDiscoveryWith tight scene (hStore h1)))
     case (full, small) of

@@ -58,6 +58,13 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , factBytes
   , windowCheckpoint
   , windowFactsFor
+  , noReadFacts
+  , windowReadFacts
+  , windowReadRecord
+  , windowReadFloor
+  , windowReadFactCount
+  , windowReadFactBytes
+  , recordFactBytes
   , windowKnows
   , windowFactCount
   , limitWork
@@ -133,7 +140,10 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Int (Int64)
 import Data.Word (Word32, Word64)
+import Hetoimasia.Terrain.Cell (Column)
+import Hetoimasia.Terrain.Discovery (ReadSet (..), Record, RecordKey)
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
@@ -189,12 +199,17 @@ data Window = Window
   , wWork ∷ !Int
   -- ^ The most units of work a plan through this window may take on (the pages one maintenance
   -- transaction frees, the writes of one discovery batch): the caller's bounded retry, see 'limitWork'.
+  , wReadRecords ∷ !(Map RecordKey (Maybe Record))
+  -- ^ The records the committed roots answered an earlier run of THIS plan, carried through a 'windowCheckpoint' like the
+  -- proofs (see 'Facts'): trusted only for the fingerprint they were read against.
+  , wReadFloors ∷ !(Map (Column, Int64) (Maybe (Int64, Int64)))
+  -- ^ The floor-run answers of the same reads.
   }
   deriving stock (Eq, Show)
 
 -- | An empty window for a store and a version.
 emptyWindow ∷ StoreIdentity → Word64 → Window
-emptyWindow ident v = Window ident v Map.empty Map.empty maxBound False Map.empty Nothing Set.empty maxBound
+emptyWindow ident v = Window ident v Map.empty Map.empty maxBound False Map.empty Nothing Set.empty maxBound Map.empty Map.empty
 
 -- | The window of a version whose used page space is the first @n@ pages: a
 -- reference to a page at or past @n@ is refused, never read.
@@ -266,8 +281,17 @@ data Fingerprint = Fingerprint !StoreIdentity !Word64 ![(PageNo, Word32)] ![(Wor
 -- | The facts a plan established before its window filled up, with what they were proven against. OPAQUE
 -- outside the store's own modules: a caller receives it in 'Hetoimasia.Terrain.Runtime.Store.Internal.Plan.Checkpoint'
 -- and gives it to 'windowCheckpoint', and has no way to make or change one.
-data Facts = Facts !Fingerprint ![Fact]
+data Facts = Facts !Fingerprint ![Fact] !ReadSet
   deriving stock (Eq, Show)
+
+-- | No read facts: what a proof checkpoint carries (it made proofs, not reads).
+noReadFacts ∷ ReadSet
+noReadFacts = ReadSet [] []
+
+-- | The accounted bytes of one remembered record fact: its key, its value and the entry around them. A fact is held in the
+-- plan's RAM (as a retained continuation), never in the window's page bytes.
+recordFactBytes ∷ Int
+recordFactBytes = maxKeyBytes + maxValueBytes + 24
 
 -- | The accounted bytes of one remembered fact.
 factBytes ∷ Int
@@ -277,13 +301,23 @@ factBytes = 24
 -- version, trust, work and used space, holding none of the pages or probes of the old one and the facts the
 -- plan established (added to those it already had when they were proven against the same state).
 windowCheckpoint ∷ Facts → Window → Window
-windowCheckpoint (Facts fp fs) w =
-  let kept = if wFacts w == Just fp then wProven w else Set.empty
-   in w {wPages = Map.empty, wProbes = Map.empty, wFacts = Just fp, wProven = Set.union kept (Set.fromList fs)}
+windowCheckpoint (Facts fp fs (ReadSet rs fl)) w =
+  let same = wFacts w == Just fp
+      kept = if same then wProven w else Set.empty
+      keptR = if same then wReadRecords w else Map.empty
+      keptF = if same then wReadFloors w else Map.empty
+   in w
+        { wPages = Map.empty
+        , wProbes = Map.empty
+        , wFacts = Just fp
+        , wProven = Set.union kept (Set.fromList fs)
+        , wReadRecords = Map.union (Map.fromList rs) keptR
+        , wReadFloors = Map.union (Map.fromList fl) keptF
+        }
 
 -- | The window, with the facts it carries kept only if they were proven against this state.
 windowFactsFor ∷ Fingerprint → Window → Window
-windowFactsFor fp w = if wFacts w == Just fp then w else w {wFacts = Nothing, wProven = Set.empty}
+windowFactsFor fp w = if wFacts w == Just fp then w else w {wFacts = Nothing, wProven = Set.empty, wReadRecords = Map.empty, wReadFloors = Map.empty}
 
 -- | Whether the window carries a fact (after 'windowFactsFor').
 windowKnows ∷ Fact → Window → Bool
@@ -292,6 +326,26 @@ windowKnows f w = Set.member f (wProven w)
 -- | The facts a window carries.
 windowFactCount ∷ Window → Int
 windowFactCount = Set.size . wProven
+
+-- | The records the window carries as read facts (after 'windowFactsFor').
+windowReadFacts ∷ Window → ReadSet
+windowReadFacts w = ReadSet (Map.toAscList (wReadRecords w)) (Map.toAscList (wReadFloors w))
+
+-- | What the committed roots answered for a key, if the window carries it ('Nothing': not known; @Just Nothing@: absent).
+windowReadRecord ∷ RecordKey → Window → Maybe (Maybe Record)
+windowReadRecord k w = Map.lookup k (wReadRecords w)
+
+-- | The same for a floor-run query.
+windowReadFloor ∷ (Column, Int64) → Window → Maybe (Maybe (Int64, Int64))
+windowReadFloor q w = Map.lookup q (wReadFloors w)
+
+-- | How many record and floor facts the window carries.
+windowReadFactCount ∷ Window → Int
+windowReadFactCount w = Map.size (wReadRecords w) + Map.size (wReadFloors w)
+
+-- | The RAM the read facts of the window hold.
+windowReadFactBytes ∷ Window → Int
+windowReadFactBytes w = windowReadFactCount w * recordFactBytes
 
 -- | The version the window was filled for.
 windowVersion ∷ Window → Word64

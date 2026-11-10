@@ -148,13 +148,14 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , minimumRemovalFeasible
   , minimumRemovalPages
   , minimumRemovalRam
+  , minimumDiscoveryUnitRam
   ) where
 
 import Data.ByteString (ByteString)
 import Data.List (nub)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
@@ -167,6 +168,7 @@ import Hetoimasia.Terrain.Discovery
   , Env
   , Header (..)
   , Provider
+  , ReadSet (..)
   , Record
   , RecordKey (..)
   , Refusal
@@ -176,8 +178,11 @@ import Hetoimasia.Terrain.Discovery
   , allowanceOf
   , candidateReport
   , envLimits
-  , stageRemoval
-  , stepDiscovery
+  , stageRemovalTraced
+  , stepDiscoveryTraced
+  , worstEdgeReads
+  , worstEdgeWrites
+  , worstEditReads
   , worstEditWrites
   )
 import Data.Int (Int64)
@@ -446,36 +451,88 @@ planRemoval ∷ Env → Store → Window → TileCoord → Planned
 planRemoval = planRemovalWith standardBounds
 
 -- | 'planRemoval' under given bounds.
+--
+-- A removal reads logical records (union-find chains, floor runs) before it can say what it writes, and every page of every read
+-- stays in the caller's window until staging ends. Its READ phase is therefore bounded like the rest: the records it has read
+-- are facts ('Checkpoint'), the provider answers from them first, and the phase ends in one of three ways: staging needs a
+-- page and the window cannot take it (a 'Checkpoint' of what was read; the caller continues through a fresh window and staging
+-- replays from the facts), staging completes holding more than 'readResiduePages' read pages (the same checkpoint, so the
+-- edit phase starts from an empty window), or staging completes. A checkpoint that would carry no new fact is the typed
+-- window result, never a loop. The record facts of a plan are for the retries of THAT plan.
 planRemovalWith ∷ Bounds → Env → Store → Window → TileCoord → Planned
-planRemovalWith bounds env s win tile = withWindow s win $ \prov →
-  case stageRemoval env (rHeader (sRoots s)) prov (editAllowance env) tile of
-    Left refusal → Refused (refusalOf refusal)
-    Right NoChange → NoWork
-    Right (EditSuspended key) → suspended s win key
-    Right (Discovery.Staged cand) → planEditWith bounds s win cand
+planRemovalWith bounds env s win0 tile = withWindow s win0 $ \_ →
+  let (fp, win, prov) = readPhase s win0
+   in case stageRemovalTraced env (rHeader (sRoots s)) prov (editAllowance env) tile of
+        (Left refusal, _) → Refused (refusalOf refusal)
+        (Right NoChange, _) → NoWork
+        (Right (EditSuspended key), rs) → suspendedReads bounds s fp win rs key
+        (Right (Discovery.Staged cand), rs) → settleReads bounds fp win rs (planEditWith bounds s win cand)
+
+-- | The window as the read phase of a plan sees it (its read facts kept only for this very state), its fingerprint, and the
+-- provider over it: the facts first, then the pages.
+readPhase ∷ Store → Window → (Fingerprint, Window, Provider)
+readPhase s win0 =
+  let fp = fingerprintOf (sIdent s) (sRoots s) (pinnedRoots s)
+      win = windowFactsFor fp win0
+   in (fp, win, providerFacts (below s win) (committedRoot s))
+
+-- | How many of the records a read phase resolved the window does not carry as facts yet.
+newReadFacts ∷ Window → ReadSet → Int
+newReadFacts win (ReadSet rs fl) =
+  length [() | (k, _) ← rs, isNothing (windowReadRecord k win)] + length [() | (q, _) ← fl, isNothing (windowReadFloor q win)]
+
+-- | A read phase's checkpoint: every record it resolved, as facts the next window carries. With no new fact it is the typed window
+-- result (the window cannot hold one read, so no retry helps); with more facts than the plan's RAM may hold it is the shrinkable
+-- 'TxnRamExceeded' (a discovery batch halves its work; a removal reads too few for it to happen).
+checkpointReads ∷ Bounds → Fingerprint → Window → ReadSet → Planned
+checkpointReads bounds fp win rs
+  | fresh == 0 = Refused (Capacity (if windowSize win + 1 > bdWindowPages bounds then WindowExceeded (windowSize win) else WindowBytesExceeded (windowBytes win)))
+  | (windowReadFactCount win + fresh) * recordFactBytes > maxReadFactBytes = Refused (Capacity (TxnRamExceeded ((windowReadFactCount win + fresh) * recordFactBytes)))
+  | otherwise = Checkpoint (Facts fp [] rs)
+  where
+    fresh = newReadFacts win rs
+
+-- | A read phase that needs a page: the page when the window can take it, else a checkpoint of what was read.
+suspendedReads ∷ Bounds → Store → Fingerprint → Window → ReadSet → RecordKey → Planned
+suspendedReads bounds s fp win rs key = case missingAt s win key of
+  Right (Right (Just p))
+    | windowFull bounds win → checkpointReads bounds fp win rs
+    | otherwise → Pending p
+  Right (Right Nothing) → Refused (Integrity CorruptCounters)
+  Right (Left why) → Refused (Integrity why)
+  Left _ → Refused (Stale ForeignWindow)
+
+-- | The end of a read phase: more read pages than the residue a promised bound leaves for the edit hand what was read on as facts,
+-- so the edit starts from an empty window; otherwise the edit goes on.
+settleReads ∷ Bounds → Fingerprint → Window → ReadSet → Planned → Planned
+settleReads bounds fp win rs next
+  | windowSize win > bdReadResidue bounds && newReadFacts win rs > 0 = checkpointReads bounds fp win rs
+  | otherwise = next
 
 -- | Plan one discovery batch: as many structural updates as #661's limits and this
 -- plan's page and RAM bounds allow (at most 64), the continuation staying in the
 -- obligation records. When a batch does not fit the transaction bounds it is
 -- planned again with fewer writes, so a bound that is tighter than 64 updates
--- stops the batch earlier.
+-- stops the batch earlier. Its read phase is the removal's ('planRemovalWith').
 planDiscovery ∷ Env → Store → Window → Planned
 planDiscovery = planDiscoveryWith standardBounds
 
 -- | 'planDiscovery' under given bounds.
 planDiscoveryWith ∷ Bounds → Env → Store → Window → Planned
-planDiscoveryWith bounds env s win = withWindow s win $ \prov → go prov (min (allowWrites full) (windowWorkAtLeast discoveryUnitWrites win)) (8 ∷ Int)
+planDiscoveryWith bounds env s win0 = withWindow s win0 $ \_ →
+  let (fp, win, prov) = readPhase s win0
+   in go fp win prov (min (allowWrites full) (windowWorkAtLeast discoveryUnitWrites win0)) (8 ∷ Int)
   where
     full = allowanceOf (envLimits env)
-    go prov writes tries =
-      case stepDiscovery env (rHeader (sRoots s)) prov full {allowWrites = writes} of
-        Left refusal → Refused (refusalOf refusal)
-        Right Idle → NoWork
-        Right (Stalled key) → suspended s win key
-        Right (Progress cand _) → case planDeltaPinned bounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s) win Ordinary (deltaOf cand) of
+    go fp win prov writes tries =
+      case stepDiscoveryTraced env (rHeader (sRoots s)) prov full {allowWrites = writes} of
+        (Left refusal, _) → Refused (refusalOf refusal)
+        (Right Idle, _) → NoWork
+        (Right (Stalled key), rs) → suspendedReads bounds s fp win rs key
+        (Right (Progress cand _), rs) → case settleReads bounds fp win rs (planDeltaPinned bounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s) win Ordinary (deltaOf cand)) of
           Refused why
             | tries > 0 && tooBig why && reportWrites (candidateReport cand) > discoveryUnitWrites →
-                go prov (max discoveryUnitWrites (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
+                go fp win prov (max discoveryUnitWrites (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
           other → other
     tooBig = shrinkable
 
@@ -489,13 +546,6 @@ withWindow s win f = case windowRefusal (sIdent s) (rVersion (sRoots s)) win of
   Just WindowOfAnotherStore → Refused (Stale ForeignWindow)
   Just (WindowOfAnotherVersion a b) → Refused (Stale (StaleWindow a b))
   Nothing → f (providerFor (below s win) (committedRoot s))
-
-suspended ∷ Store → Window → RecordKey → Planned
-suspended s win key = case missingAt s win key of
-  Right (Right (Just p)) → Pending p
-  Right (Right Nothing) → Refused (Integrity CorruptCounters)
-  Right (Left why) → Refused (Integrity why)
-  Left _ → Refused (Stale ForeignWindow)
 
 refusalOf ∷ Refusal → PlanRefusal
 refusalOf = refusalToPlan
@@ -953,13 +1003,24 @@ minimumRemovalPages = worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bo
 -- | The most RAM the minimum explicit removal reserves: a full window, its pages and
 -- the control records.
 minimumRemovalRam ∷ Int
-minimumRemovalRam =
-  minimumRemovalPages * pageSize
+minimumRemovalRam = removalRamWith worstEditWrites worstEditReads minimumRemovalPages
+
+-- | The RAM the smallest unit of discovery (one connection inspection: 'worstEdgeWrites' writes, 'worstEdgeReads' reads) reserves,
+-- by the same account: a full window, its pages, the control records and the read facts it retains.
+minimumDiscoveryUnitRam ∷ Int
+minimumDiscoveryUnitRam = removalRamWith worstEdgeWrites worstEdgeReads (worstEdgeWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve)
+
+-- | The RAM an edit of the given writes and reads reserves in the worst state: the pages it writes, a full window, the ownership
+-- proofs, the overlay, the control records and, as a retained continuation, the 'recordFactBytes' of every record it reads.
+removalRamWith ∷ Int → Int → Int → Int
+removalRamWith writes nReads pages =
+  pages * pageSize
     + maxWindowBytes
     + worstOwnershipBytes
     + overlayWorstBytes
     + (2 * hotNodes + 1) * hotNodeBytes
-    + worstEditWrites * maxEntryBytes
+    + writes * maxEntryBytes
+    + nReads * recordFactBytes
     + maxWindowPages * 16
     + rootRecordBytes
     + activeRecordBytes
@@ -976,6 +1037,7 @@ minimumRemovalFeasible ∷ StoreConfig → Either Counterexample ()
 minimumRemovalFeasible cfg
   | minimumRemovalPages > maxTxnPages = Left (Counterexample "pages written by the minimum removal" (toInteger minimumRemovalPages) (toInteger maxTxnPages))
   | minimumRemovalRam > txnRamLimit = Left (Counterexample "RAM reserved by the minimum removal" (toInteger minimumRemovalRam) (toInteger txnRamLimit))
+  | minimumDiscoveryUnitRam > txnRamLimit = Left (Counterexample "RAM reserved by the smallest unit of discovery" (toInteger minimumDiscoveryUnitRam) (toInteger txnRamLimit))
   | need > have = Left (Counterexample "allowance pages for the minimum removal beside the protected reserve" need have)
   | otherwise = Right ()
   where

@@ -17,10 +17,22 @@
 --   'PendingProbes' pages -> fetch each page, 'addProbe' it to the window (it may not be a page
 --                       at all), plan again: the plan must first prove no owner claims it
 --   'Checkpoint' facts -> the window filled while the plan was proving that the pages it will
---                       overwrite are owned by nobody but the allocator: build a fresh window of the
---                       same version with 'windowCheckpoint' facts (it keeps what was proven and the
---                       work limit, and drops the pages and probes) and plan again. A consumer MUST
---                       handle it; the 'Facts' are opaque and only the planner makes them
+--                       overwrite are owned by nobody but the allocator, or while a removal or a
+--                       discovery step was READING the records it decides from (union-find chains,
+--                       floor runs: one lookup each, and every page of every lookup stays in the
+--                       window until the plan ends): build a fresh window of the same version with
+--                       'windowCheckpoint' facts (it keeps what was proven, the records that were
+--                       read and the work limit, and drops the pages and probes) and plan again; the
+--                       plan answers the records it read from the facts. A consumer MUST handle it;
+--                       the 'Facts' are opaque and only the planner makes them, and they are for the
+--                       retries of ONE plan (a window of another version drops them). A read phase
+--                       ends in a checkpoint when the window cannot take the page it needs, and once
+--                       more when it ends holding more than the residue the promised bound leaves for
+--                       the edit, so the edit starts from an empty window; a checkpoint that would
+--                       carry no new fact is the typed window result, never a loop. Facts past the
+--                       plan's RAM for them are the shrinkable 'TxnRamExceeded' (a discovery batch
+--                       halves its work; a removal reads too few records to reach it, and a caller
+--                       that meets it anyway starts a fresh window, which carries none)
 --   'Planned' p      -> 'admit' p store, write 'planPages', report each outcome with
 --                       'dispatchWrite' and 'completeWrite', then 'publish' (or 'abortTransaction')
 --   'NoWork'         -> nothing to append

@@ -198,6 +198,7 @@ spec = describe "Discovery" $ do
   boundarySpecs
   controlSpecs
   evidenceSpecs
+  readSetSpecs
 
 -- ---------------------------------------------------------------------------
 
@@ -1280,3 +1281,110 @@ boundarySpecs = describe "bounded boundary queries" $ do
       `shouldBe` Left (LimitBelowProgress FieldScratchBytes (toInteger (boundaryQueryScratch 1024) - 1) (toInteger (boundaryQueryScratch 1024)))
     mkDiscoveryLimits baseSpec {specBoundaryFaces = 5} `shouldBe` Left (LimitBelowProgress FieldBoundaryFaces 5 6)
     mkDiscoveryLimits baseSpec {specBoundaryFaces = 65537} `shouldBe` Left (LimitUnrepresentable FieldBoundaryFaces 65537 65536)
+
+-- ---------------------------------------------------------------------------
+-- The read set
+
+-- | A provider that answers only from a read set (nothing else is available): the page-resident store keeps a read set when it
+-- drops the pages it fetched, and answers the replayed operation from it.
+factsProvider ∷ ReadSet → Provider
+factsProvider (ReadSet rs fl) =
+  Provider
+    { fetchRecord = \k → maybe (Unavailable k) (maybe Absent Found) (lookup k rs)
+    , fetchFloorRun = \c z → case lookup (c, z) fl of
+        Just (Just run) → Found run
+        Just Nothing → Absent
+        Nothing → Unavailable (KeyRun c z)
+    }
+
+readSetSpecs ∷ Spec
+readSetSpecs = describe "the read set: what the provider answered, never what the operation staged" $ do
+  let rig0 = newRig (limitsWith 64) twoOpenings
+      (queued, _) = runTrace rig0 [Edit c | c ← openingA]
+      -- every state of a drain, from the first batch to the last
+      states = go (queued ∷ Rig) (0 ∷ Int)
+        where
+          go rig n
+            | n > 60 = [rig]
+            | otherwise = case stepDiscovery (rigEnv rig) (retainedHeader (rigRetained rig)) (rigProvider rig) fullAllowance of
+                Right (Progress _ _) → rig : go (fst (batchRig fullAllowance rig)) (n + 1)
+                _ → [rig]
+      answeredBy p (k, v) = case fetchRecord p k of
+        Found r → v == Just r
+        Absent → v == Nothing
+        Unavailable _ → False
+      answeredFloorBy p ((c, z), v) = case fetchFloorRun p c z of
+        Found run → v == Just run
+        Absent → v == Nothing
+        Unavailable _ → False
+  it "the traced entry points answer exactly what the untraced ones answer: over every state of a drain and over removals" $ do
+    length states `shouldSatisfy` (> 1)
+    forM_ states $ \rig → do
+      let header = retainedHeader (rigRetained rig)
+          provider = rigProvider rig
+      fst (stepDiscoveryTraced (rigEnv rig) header provider fullAllowance) `shouldBe` stepDiscovery (rigEnv rig) header provider fullAllowance
+    forM_ [mustTile 9 0 5, mustTile 1 0 5, mustTile 5 3 5, mustTile 3 0 4] $ \tile → do
+      let header = retainedHeader (rigRetained rig0)
+          provider = rigProvider rig0
+      fst (stageRemovalTraced (rigEnv rig0) header provider fullAllowance tile) `shouldBe` stageRemoval (rigEnv rig0) header provider fullAllowance tile
+  it "every record and floor answer of a read set is what the provider answered, for a batch, a stalled step and a removal" $ do
+    forM_ states $ \rig → do
+      let provider = rigProvider rig
+          (_, ReadSet rs fl) = stepDiscoveryTraced (rigEnv rig) (retainedHeader (rigRetained rig)) provider fullAllowance
+      filter (not . answeredBy provider) rs `shouldBe` []
+      filter (not . answeredFloorBy provider) fl `shouldBe` []
+    let (_, ReadSet rrs rfl) = stageRemovalTraced (rigEnv rig0) (retainedHeader (rigRetained rig0)) (rigProvider rig0) fullAllowance (mustTile 9 0 5)
+    rrs `shouldSatisfy` (not . null)
+    filter (not . answeredBy (rigProvider rig0)) rrs `shouldBe` []
+    filter (not . answeredFloorBy (rigProvider rig0)) rfl `shouldBe` []
+  it "a staged write never enters a read set: a record an inspection read and then wrote is in the set with its COMMITTED value" $ do
+    -- the round-17 condition: a later inspection of the same batch reads the staged value from the overlay, not from the provider
+    let crossings =
+          [ (k, committed, staged)
+          | rig ← states
+          , (Right (Progress c _), ReadSet rs _) ← [stepDiscoveryTraced (rigEnv rig) (retainedHeader (rigRetained rig)) (rigProvider rig) fullAllowance]
+          , (k, committed) ← rs
+          , Just staged ← [lookup k (candidateWrites c)]
+          , staged /= committed
+          ]
+    -- the scenario does read, then write, then (in a later inspection) read again: the example is not vacuous
+    crossings `shouldSatisfy` (not . null)
+    -- and the set holds the committed value in every one of them
+    forM_ states $ \rig →
+      case stepDiscoveryTraced (rigEnv rig) (retainedHeader (rigRetained rig)) (rigProvider rig) fullAllowance of
+        (Right (Progress _ _), ReadSet rs _) → filter (not . answeredBy (rigProvider rig)) rs `shouldBe` []
+        _ → pure ()
+  it "a suspended operation's read set replays it: the same suspension, no new fact, until every record is available" $ do
+    -- a removal and a discovery step through a provider that withholds the records it has not been told about
+    let loopRemoval window n
+          | n > (400 ∷ Int) = expectationFailure "the removal never completed" >> pure 0
+          | otherwise = do
+              let p = windowProvider window (rigProvider rig0)
+                  (res, rs) = stageRemovalTraced (rigEnv rig0) (retainedHeader (rigRetained rig0)) p fullAllowance (mustTile 9 0 5)
+              case res of
+                Right (EditSuspended k) → do
+                  -- replayed from its own read set alone, it suspends on the same record and reads nothing new
+                  let (res2, rs2) = stageRemovalTraced (rigEnv rig0) (retainedHeader (rigRetained rig0)) (factsProvider rs) fullAllowance (mustTile 9 0 5)
+                  -- (a floor query a provider cannot answer is labelled by that provider: only that it still suspends is compared)
+                  res2 `shouldSatisfy` (\r → case r of Right (EditSuspended _) → True; _ → False)
+                  rs2 `shouldBe` rs
+                  (+ 1) <$> loopRemoval (k : window) (n + 1)
+                Right (Staged _) → pure n
+                other → expectationFailure ("unexpected " <> show other) >> pure n
+    steps ← loopRemoval [] 0
+    steps `shouldSatisfy` (> 0)
+    let loopStep window n
+          | n > (400 ∷ Int) = expectationFailure "the step never progressed" >> pure 0
+          | otherwise = do
+              let p = windowProvider window (rigProvider queued)
+                  (res, rs) = stepDiscoveryTraced (rigEnv queued) (retainedHeader (rigRetained queued)) p fullAllowance
+              case res of
+                Right (Stalled k) → do
+                  let (res2, rs2) = stepDiscoveryTraced (rigEnv queued) (retainedHeader (rigRetained queued)) (factsProvider rs) fullAllowance
+                  res2 `shouldSatisfy` (\r → case r of Right (Stalled _) → True; _ → False)
+                  rs2 `shouldBe` rs
+                  (+ 1) <$> loopStep (k : window) (n + 1)
+                Right (Progress _ _) → pure n
+                other → expectationFailure ("unexpected " <> show other) >> pure n
+    stalls ← loopStep [] 0
+    stalls `shouldSatisfy` (> 0)

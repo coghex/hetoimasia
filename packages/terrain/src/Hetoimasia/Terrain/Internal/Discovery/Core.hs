@@ -51,9 +51,12 @@ module Hetoimasia.Terrain.Internal.Discovery.Core
     -- * Staging
   , StageOutcome (..)
   , stageRemoval
+  , stageRemovalTraced
   , Halt (..)
   , Step (..)
   , stepDiscovery
+  , stepDiscoveryTraced
+  , ReadSet (..)
 
     -- * Retained state
   , Retained
@@ -240,7 +243,24 @@ data Stop
 -- provider had been asked for and the peak accounted scratch. Both are read from
 -- the one charging function ('charge'), so a rejected or suspended attempt shows
 -- exactly what it had been charged.
-data Failure = Failure !Stop !Int !Int
+data Failure = Failure !Stop !Int !Int !ReadSet
+
+-- | What the provider ANSWERED an operation, from the records it was asked for: the records and the floor-run answers, exactly as
+-- the provider gave them and never a value the operation staged (a staged write lives in the overlay, a different map). A caller
+-- that keeps the provider's answers between runs of the same operation (the page-resident store, when it must drop the pages it
+-- fetched) can answer a later run from them: the operation reads the same records in the same order and gets the same values.
+data ReadSet = ReadSet
+  { readRecords ∷ ![(RecordKey, Maybe Record)]
+  , readFloors ∷ ![((Column, Int64), Maybe (Int64, Int64))]
+  }
+  deriving stock (Eq, Show)
+
+-- | The answers an operation's state has read from the provider.
+readSetOf ∷ S → ReadSet
+readSetOf s = ReadSet (Map.toAscList (sCache s)) (Map.toAscList (sFloor s))
+
+noReads ∷ ReadSet
+noReads = ReadSet [] []
 
 -- | The resources one operation may use, each already the smaller of the
 -- validated limit and the caller's allowance.
@@ -348,7 +368,7 @@ stopWith ∷ Stop → M a
 stopWith x = M (\_ _ s → Left (failure x s))
 
 failure ∷ Stop → S → Failure
-failure x s = Failure x (sReads s) (sPeak s)
+failure x s = Failure x (sReads s) (sPeak s) (readSetOf s)
 
 corrupt ∷ Integrity → M a
 corrupt = stopWith . StopCorrupt
@@ -721,14 +741,19 @@ data StageOutcome
 -- the same candidate. Every read and every staged write is checked against the
 -- limits and the allowance before it is made.
 stageRemoval ∷ Env → Header → Provider → Allowance → TileCoord → Either Refusal StageOutcome
-stageRemoval env hdr prov allow tile@(TileCoord ax ay az) =
+stageRemoval env hdr prov allow tile = fst (stageRemovalTraced env hdr prov allow tile)
+
+-- | 'stageRemoval' and the records the provider answered it, whatever the outcome (a suspension included: the records it
+-- resolved before the one it waits for). The outcome is exactly 'stageRemoval''s.
+stageRemovalTraced ∷ Env → Header → Provider → Allowance → TileCoord → (Either Refusal StageOutcome, ReadSet)
+stageRemovalTraced env hdr prov allow tile@(TileCoord ax ay az) =
   case runM editM env prov (emptyS caps) of
-    Left (Failure (StopCapacity cap) _ _) → Left (uncurry (CapacityBlocked cap) (editFigures cap))
-    Left (Failure (StopMissing k) _ _) → Right (EditSuspended k)
-    Left (Failure (StopCorrupt i) _ _) → Left (Corrupt i)
-    Left (Failure StopOverflow _ _) → Left AuthorityOverflow
-    Right (Nothing, _) → Right NoChange
-    Right (Just (flips, joins), s) → finish s flips joins
+    Left (Failure (StopCapacity cap) _ _ rs) → (Left (uncurry (CapacityBlocked cap) (editFigures cap)), rs)
+    Left (Failure (StopMissing k) _ _ rs) → (Right (EditSuspended k), rs)
+    Left (Failure (StopCorrupt i) _ _ rs) → (Left (Corrupt i), rs)
+    Left (Failure StopOverflow _ _ rs) → (Left AuthorityOverflow, rs)
+    Right (Nothing, s) → (Right NoChange, readSetOf s)
+    Right (Just (flips, joins), s) → (finish s flips joins, readSetOf s)
   where
     limits = envLimitsField env
     caps = capsOf limits allow hdr
@@ -864,21 +889,27 @@ data Acc = Acc
 -- capacity is refused with the resource. Every connection is inspected exactly
 -- once; the obligation record carries the progress.
 stepDiscovery ∷ Env → Header → Provider → Allowance → Either Refusal Step
-stepDiscovery env hdr0 prov allow
-  | pendingObligations hdr0 == 0 = Right Idle
+stepDiscovery env hdr prov allow = fst (stepDiscoveryTraced env hdr prov allow)
+
+-- | 'stepDiscovery' and the records the provider answered it. For 'Progress', the records of the inspections the batch
+-- completed (what its candidate was computed from); for 'Stalled', those the first inspection resolved before the one it waits
+-- for; empty otherwise. The outcome is exactly 'stepDiscovery''s.
+stepDiscoveryTraced ∷ Env → Header → Provider → Allowance → (Either Refusal Step, ReadSet)
+stepDiscoveryTraced env hdr0 prov allow
+  | pendingObligations hdr0 == 0 = (Right Idle, noReads)
   | otherwise = loop (Acc (emptyS caps) hdr0 0 0 0 [] 0 0)
   where
     limits = envLimitsField env
     caps = capsOf limits allow hdr0
     batch = limitBatchUpdates limits
     loop acc
-      | accUpdates acc >= batch = conclude acc HaltBatchFull
-      | pendingObligations (accHeader acc) == 0 = conclude acc HaltDrained
+      | accUpdates acc >= batch = conclude acc HaltBatchFull noReads
+      | pendingObligations (accHeader acc) == 0 = conclude acc HaltDrained noReads
       | otherwise = case runM (inspectHead (accHeader acc)) env prov (accS acc) of
-          Left (Failure (StopMissing k) n peak) → conclude (attempt n peak acc) (HaltSuspended k)
-          Left (Failure (StopCapacity cap) n peak) → conclude (attempt n peak acc) (HaltCapacity cap)
-          Left (Failure (StopCorrupt i) _ _) → Left (Corrupt i)
-          Left (Failure StopOverflow _ _) → Left AuthorityOverflow
+          Left (Failure (StopMissing k) n peak rs) → conclude (attempt n peak acc) (HaltSuspended k) rs
+          Left (Failure (StopCapacity cap) n peak _) → conclude (attempt n peak acc) (HaltCapacity cap) noReads
+          Left (Failure (StopCorrupt i) _ _ _) → (Left (Corrupt i), noReads)
+          Left (Failure StopOverflow _ _ _) → (Left AuthorityOverflow, noReads)
           Right ((nextHeader, retired, result), s') →
             loop
               acc
@@ -892,12 +923,12 @@ stepDiscovery env hdr0 prov allow
                 , accPeak = max (accPeak acc) (sPeak s')
                 }
     attempt n peak acc = acc {accAttempted = max n (accAttempted acc), accPeak = max peak (accPeak acc)}
-    conclude acc halt
+    conclude acc halt failed
       | accUpdates acc == 0 = case halt of
-          HaltSuspended k → Right (Stalled k)
-          HaltCapacity cap → Left (uncurry (CapacityBlocked cap) (capacityFigures False limits caps cap))
-          _ → Right Idle
-      | otherwise = build acc halt
+          HaltSuspended k → (Right (Stalled k), failed)
+          HaltCapacity cap → (Left (uncurry (CapacityBlocked cap) (capacityFigures False limits caps cap)), noReads)
+          _ → (Right Idle, noReads)
+      | otherwise = (build acc halt, readSetOf (accS acc))
     build acc halt = do
       let s = accS acc
           (writes, grown) = settleWrites s
@@ -1066,11 +1097,11 @@ retainedFromRecords h entries = do
 runQuery ∷ Env → Provider → M a → Observed a
 runQuery env prov m = case runM m env prov (emptyS caps) of
   Right (a, s) → Observed (Right a) (sReads s)
-  Left (Failure (StopMissing k) n _) → Observed (Left (MissingRecord k)) n
-  Left (Failure (StopCorrupt i) n _) → Observed (Left (Inconsistent i)) n
-  Left (Failure (StopCapacity CapacityReads) n _) → Observed (Left (ReadLimit (capReads caps))) n
-  Left (Failure (StopCapacity cap) n _) → Observed (Left (QueryCapacity cap)) n
-  Left (Failure StopOverflow n _) → Observed (Left (Inconsistent BadAccounting)) n
+  Left (Failure (StopMissing k) n _ _) → Observed (Left (MissingRecord k)) n
+  Left (Failure (StopCorrupt i) n _ _) → Observed (Left (Inconsistent i)) n
+  Left (Failure (StopCapacity CapacityReads) n _ _) → Observed (Left (ReadLimit (capReads caps))) n
+  Left (Failure (StopCapacity cap) n _ _) → Observed (Left (QueryCapacity cap)) n
+  Left (Failure StopOverflow n _ _) → Observed (Left (Inconsistent BadAccounting)) n
   where
     limits = envLimitsField env
     caps =
