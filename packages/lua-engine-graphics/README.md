@@ -55,7 +55,7 @@ withTextureGraphics ∷ SceneSession → TextureGraphicsConfiguration → Vulkan
 
 | State | Owner | Writers | Readers | Thread | Lifetime / disposal |
 | --- | --- | --- | --- | --- | --- |
-| Backend state (`State`: jobs, textures, the active textures (those the pump may have a step for: every texture except the idle offered and live ones), bootstrap, failure) | one `Backend` | the pipeline's decode worker (add a job), any thread that cancels or releases (one transaction each), the owner-thread actions (track what they made), the pump | any thread | STM | `withBackend`; empty at exit |
+| Backend state (`State`: jobs, textures, the active textures (those the pump may have a step for: every texture except the idle offered and live ones and those queued for the release lane), bootstrap, failure) | one `Backend` | the pipeline's decode worker (add a job), any thread that cancels or releases (one transaction each), the owner-thread actions (track what they made), the pump | any thread | STM | `withBackend`; empty at exit |
 | The pump | the backend's worker group | — | — | one thread | started by `withBackend`; stopped after the drain |
 | Renderer, registry, table | the session | the bootstrap action; later scene adapters | any (registry reads) | owner thread (constructions) | the session's managed resources |
 | A native image | its job, then the table | the owner action that made it (records it in the job) | the pump | owner thread | destroyed by the owner once nothing holds it |
@@ -71,23 +71,26 @@ progress. Sink calls are single transactions and never enter Lua.
 
 ### What a pump step costs
 
-A step examines *candidates* in a fixed order — the jobs in flight, the **active** textures, then the table's
-bootstrap — and takes the first that has something to do. A texture the backend has delivered and nobody has released
-(`TexLive`, and the two offer stages before it) has nothing the pump could do for it until a release is asked, so it is
-not a candidate. The transaction that asks moves it out of those stages and adds it to the active map in the same step:
-the lease's release (`releaseTexture`), the close (`closeAndDrain`), the owner's end (`ownerEnded`) and the offer's answer
-(`deliver`). Nothing else writes those stages, and a texture leaves the texture map and the active map together, when it
-is forgotten.
+A step examines *candidates* in a fixed order by id — the jobs in flight, the **active** textures, the lowest texture waiting
+for the release lane, then the table's bootstrap — and takes the first that has something to do. A texture the backend has
+delivered and nobody has released (`TexLive`, and the two offer stages before it) has nothing the pump could do for it until a
+release is asked, so it is not a candidate. The transaction that asks moves it out of those stages and into the map its new stage
+belongs to in the same step: the lease's release (`releaseTexture`), the close (`closeAndDrain`), the owner's end (`ownerEnded`) and
+the offer's answer (`deliver`). A texture whose release was asked waits in `TexReleaseRequested` for the release lane, which refuses
+every one alike within a transaction (full, or not started), so those waiting live in a queue of their own and the pump looks at the
+lowest of them: one the lane refuses says the later ones would be refused, and the next is looked at once the lowest is submitted.
+The pump's own write that submits it moves it to the active textures. Nothing else writes those stages, and a texture leaves every
+map together, when it is forgotten.
 
-So the cost of one step is the jobs in flight plus the textures being released, held or retired, and never the textures
-retained; a wake that finds nothing re-examines only those. The work for a scenario is linear in the textures it creates
-and releases: measured on the fake owner at one-pixel textures, a pump evaluation examines at most two jobs and two active
-textures at any size, and the committed evaluations examine about ten jobs and six active textures for each texture created
-and released, the same at 250 and at 1,000 textures. `withBackendObserved` takes the observers an example counts by
-(`Examined` as an evaluation begins and for each candidate, and a hook after each committed evaluation), and the
-`does work linear in the textures an instance retains and releases` example of `lua-engine-graphics-tests` bounds the
-largest work of one evaluation and the work of the committed ones, never the attempts a scheduler restarts. `readBackend` is
-an observer, not part of the pump: it reads every texture's stage once per call.
+So the cost of one step is the jobs in flight plus the textures being released, held or retired and the one waiting for the lane,
+and never the textures retained or those queued behind the lowest; a wake that finds nothing re-examines only those. The work for a
+scenario is linear in the textures it creates and releases, a mass release included: measured on the fake owner, a pump evaluation
+examines at most two jobs and two active textures in the one-pixel scenario at any size, and at most 33 textures in a release of 250
+to 2,000 with the lane full (a lane of 16, the ones the owner has to answer, and the lowest waiting), where it examined every texture
+waiting before. `withBackendObserved` takes the observers an example counts by (`Examined` as an evaluation begins and for each
+candidate, and a hook after each committed evaluation), and the `does work linear in …` examples of `lua-engine-graphics-tests` bound
+the largest work of one evaluation and the work of the committed ones, never the attempts a scheduler restarts. `readBackend` is an
+observer, not part of the pump: it reads every texture's stage once per call.
 
 ## The readiness predicate
 
