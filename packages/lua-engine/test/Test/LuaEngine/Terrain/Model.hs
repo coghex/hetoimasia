@@ -99,6 +99,9 @@ spec = describe "Terrain lifecycle model" $
           withFvm world runtime (presentationOver rig) $ \pv →
             withFvm world runtime (gameplayOver rig) $ \gv → do
               serial ← newIORef (0 ∷ Int)
+              tally ← newIORef ([] ∷ [Text])
+              gSpawnRef ← newIORef (Nothing ∷ Maybe Spawned)
+              clientBaseline ← newIORef (-1 ∷ Integer)
               p ← Side <$> newIORef False <*> newIORef 0
               g ← Side <$> newIORef False <*> newIORef 0
               let advance = tickBy control gv 1 >> advanceClock world 2000000000
@@ -107,12 +110,14 @@ spec = describe "Terrain lifecycle model" $
                   -- Queue a command for a label, and wait for the instance's answer to it.
                   command label text = do
                     n ← atomicModifyIORef'' serial
+                    modifyIORef' tally (Text.takeWhile (/= ' ') text :)
                     sendCommand rig label (Text.pack (show n) <> " " <> text)
                     let wanted = "ack\t" <> Text.pack (show n) <> "\t"
                     pumpUntil world (advance >> any (Text.isPrefixOf wanted) <$> outLines world)
                     printed ← outLines world
                     pure (maybe "" (Text.drop (Text.length wanted)) (find (Text.isPrefixOf wanted) printed))
                   sideOf label = if label == "p" then p else g
+                  tallyNote kind = modifyIORef' tally (kind :)
                   census = length . censusRequests <$> atomically (inspectCensusSTM (rgService rig))
                   accounted = (+) <$> readIORef (sdReads p) <*> readIORef (sdReads g)
                   -- The service holds no more than the reads that can still be taken.
@@ -122,8 +127,10 @@ spec = describe "Terrain lifecycle model" $
                     bound ← accounted
                     slots ← limitHeld (rgService rig) "command slots"
                     leases ← limitHeld (rgService rig) "leases"
+                    clients ← limitHeld (rgService rig) "clients"
+                    clientsAtStart ← readIORef clientBaseline
                     handles ← (\a b → length (filter id [a, b])) <$> readIORef (sdHandle p) <*> readIORef (sdHandle g)
-                    (what, held <= bound, slots <= toInteger bound, leases <= toInteger handles, (held, bound, slots, leases, handles)) `shouldSatisfy` (\(_, a, b, c, _) → a && b && c)
+                    (what, held <= bound, slots <= toInteger bound, leases <= toInteger handles, (clientsAtStart < 0 || clients == clientsAtStart), (held, bound, slots, leases, handles, clients)) `shouldSatisfy` (\(_, a, b, c, d, _) → a && b && c && d)
                   -- One operation on a side.
                   operation label choice = do
                     let side = sideOf label
@@ -136,7 +143,13 @@ spec = describe "Terrain lifecycle model" $
                       1 | started > 0 → do
                             outcome ← command label "take"
                             when (Text.isPrefixOf "take " outcome && outcome /= "take pending" && outcome /= "take none") (modifyIORef' (sdReads side) (subtract 1))
-                      2 | started > 0 → void (command label "cancel")
+                      2 | handle → do
+                        -- a cancel needs a read to cancel: start one when there is none
+                        when (started == 0) $ do
+                          outcome ← command label "read"
+                          when (outcome == "read ok") (modifyIORef' (sdReads side) (+ 1))
+                        now ← readIORef (sdReads side)
+                        when (now > 0) (void (command label "cancel"))
                       3 → void (command label "idle")
                       5 | handle && label == "p" → do
                         -- only when nothing else is pending anywhere: the wait is for every request the service holds to be settled
@@ -146,11 +159,32 @@ spec = describe "Terrain lifecycle model" $
                         void (advanceRequestEpoch (scheduledEndpoint (fvOwner (if label == "p" then pv else gv))))
                         void (command label "forget")
                         writeIORef (sdReads side) 0
+                      6 | label == "g" && handle → do
+                        -- the gameplay instance ends and is replaced: everything it held goes with it, and the new instance attaches again
+                        Just old ← readIORef gSpawnRef
+                        stopSpawned old
+                        pumpUntil world (advance >> ((== Just Instance.Stopped) <$> phaseOf old))
+                        forgetInstance (fvFacade gv) (spId old)
+                        writeIORef (sdHandle g) False
+                        writeIORef (sdReads g) 0
+                        tallyNote "endinstance"
+                        -- the gameplay instance's two clients (its owner's and its attach's) went with it, and only those
+                        baseline ← readIORef clientBaseline
+                        writeIORef clientBaseline (baseline - 2)
+                        check "g after its instance ended"
+                        writeIORef clientBaseline baseline
+                        fresh ← spawn world gv "modules-test" "lua/g.lua"
+                        writeIORef gSpawnRef (Just fresh)
+                        opened ← length . filter (== "opened\tg\tsuccess") <$> outLines world
+                        void (command "g" "attach")
+                        pumpUntil world (advance >> ((> opened) . length . filter (== "opened\tg\tsuccess") <$> outLines world))
+                        writeIORef (sdHandle g) True
                       _ → void (command label "idle")
                     check (label <> " op " <> Text.pack (show choice))
               -- p opens the arena and g attaches to it
               pSpawn ← spawn world pv "modules-test" "lua/p.lua"
-              gSpawn ← spawn world gv "modules-test" "lua/g.lua"
+              gSpawn0 ← spawn world gv "modules-test" "lua/g.lua"
+              writeIORef gSpawnRef (Just gSpawn0)
               -- (on odd seeds g attaches while the open is still pending: the answer is not_found, the service's lease for that attach is
               -- let go at once, and g attaches again once the arena is published)
               void (command "p" "open")
@@ -165,6 +199,8 @@ spec = describe "Terrain lifecycle model" $
                 void (command "g" "attach")
                 pumpUntil world (advance >> elem "opened\tg\tsuccess" <$> outLines world)
                 writeIORef (sdHandle g) True
+              -- the instances' clients are what they are while the instances live: nothing a sequence does adds or ends one
+              limitHeld (rgService rig) "clients" >>= writeIORef clientBaseline
               -- a bounded random sequence of operations over both VMs
               seedRef ← newIORef seed
               -- (the first eight operations cover every kind once, in an order the seed shifts; the rest are drawn)
@@ -176,6 +212,18 @@ spec = describe "Terrain lifecycle model" $
                 let kind = if step < 8 then (step + seed) `mod` 8 else (b `shiftR` 8) `mod` 8
                     label = if kind == 5 || (a `shiftR` 8) `mod` 2 == 0 then "p" else "g"
                 operation label kind
+              -- the other VM can always make progress: with every outstanding read taken, each VM starts and takes a fresh one
+              forM_ (["p", "g"] ∷ [Text]) $ \label → do
+                started ← readIORef (sdReads (sideOf label))
+                replicateM_ (started + 1) (command label "take" >> settleAll)
+                writeIORef (sdReads (sideOf label)) 0
+              forM_ (["g", "p"] ∷ [Text]) $ \label → do
+                outcome ← command label "read"
+                (label, outcome) `shouldBe` (label, "read ok")
+                void (command label "take")
+                settleAll
+                void (command label "take")
+              settleAll
               -- every handle taken or discarded, released and ended: nothing is left charged
               forM_ ["p", "g"] $ \label → do
                 started ← readIORef (sdReads (sideOf label))
@@ -188,6 +236,7 @@ spec = describe "Terrain lifecycle model" $
               (held, ()) `shouldBe` (0, ())
               forM_ ["command slots", "leases", "arenas"] $ \name → (name, ) <$> limitHeld (rgService rig) name >>= \(n, v) → (n, v) `shouldBe` (n, 0)
               stopSpawned pSpawn
+              Just gSpawn ← readIORef gSpawnRef
               stopSpawned gSpawn
               pumpUntil world (advance >> ((== Just Instance.Stopped) <$> phaseOf pSpawn))
               pumpUntil world (advance >> ((== Just Instance.Stopped) <$> phaseOf gSpawn))
@@ -196,6 +245,8 @@ spec = describe "Terrain lifecycle model" $
               forgetInstance (fvFacade pv) (spId pSpawn)
               forgetInstance (fvFacade gv) (spId gSpawn)
               limitHeld (rgService rig) "clients" `shouldReturn` 0
+              sent ← readIORef tally
+              putStrLn ("model seed " <> show seed <> ": " <> show (length sent) <> " commands, " <> show [(k, length (filter (== k) sent)) | k ← ["read", "readtake", "take", "cancel", "forget", "idle", "attach", "open", "release", "endinstance"]])
   where
     atomicModifyIORef'' ref = do
       n ← readIORef ref
