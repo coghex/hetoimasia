@@ -417,3 +417,56 @@ The round-17 repairs (the read-phase continuation, the root collapse, the owners
 **The honest notes.** (1) Because the worst case is built by the same function, a component can only be under-counted through the arguments of the builder; the control that restores a stale second copy is the one that stands for the reviewer's defect. (2) The scratch component of the worst case has slack no fixture reaches (573 list pages x 16 B and 256 supply pages x 8 B): removing the supply term left every real plan under it, so that mutation was NOT caught and is not claimed as a control. (3) Two fixtures changed because of the enforced premise: `wide` commits 190 records a plan, not 200 (a plan of more is outside what the admission is sized for), and the 256-page boundary search (`findExact256`) runs with the writes allowance of `bdWorst` lifted, because on the shallow 12,000-run history a plan reaches 256 pages only with more than 192 writes; it measures the PAGE bound, which the RAM gate would otherwise pre-empt. (4) The terrain-runtime suite (497 examples) took 997.0 s of wall time locally (lab measurement, not a CI receipt).
 
 Gates at `9cb02522`: `terrain-runtime` 497/0, `terrain` 905/0, `terrain-render-2d` 558/0, `workflow-tests` 965/0, `cabal build all`, `cabal check` for both packages, the catalog check, `owned_starts` check and ratchet: all green.
+
+## Round 19 (head `6e82f907`, Codex): CHANGES_REQUESTED, two findings, both valid
+
+The round-18 repairs (one builder, one gate, the enforced 192-write premise, dominance) were confirmed. Both findings are about numbers the model asserts without having measured or constructed them.
+
+**Finding 1, class: an accounted-bytes constant that was reasoned from field widths, not measured against what the structure retains.** The reviewer measured that a probe, a proof fact, the root set at its loose cap and a typed record fact each retain several times what they are charged (a typed read fact 576 bytes against the 152 charged). Measured here with the forced live heap, before any change: probe 615 B against 320; proof fact in a set 64 against 24; a root set at the loose cap about 41 KB against 512; a typed record write 234 against 130; a parsed node 29,304 against 28,000. Every constant that says how many bytes something retains was then listed, measured and set from the measurement.
+
+**Every accounted-bytes constant, what it was, what was measured and what it is** (the table is printed by the suite's `Memory` examples; one example per row asserts `measured <= accounted`).
+
+| Constant | Was | Measured | Is |
+| --- | --- | --- | --- |
+| `windowPageOverhead` (a validated page in a window beyond its buffer) | 128 | 169 | 192 (page 4,288) |
+| `probeBytes` | 320 (key as a pinned, copied `ByteString`: 615 measured) | 168 (key as a compact byte array) | 256 |
+| `recordFactBytes` (a read fact) | 152, the decoded values (576 measured by the reviewer) | 224 packed | 256: key 64 + value 64 + `readFactOverheadBytes` 128; a window holds the encoded key and value |
+| `factBytes` (a proof fact) | 24 | 64 | 80 |
+| `pageListCellBytes` (replaced and supply lists) | 16 and 8 a page | 40 | 48 |
+| `rootRecordBytes` | 512 | 41,107 at the loose cap | 512 + 1,024 cells = 49,664 |
+| `activeRecordBytes` | 512 | 64 a page state | 512 + `maxTxnPages` x 80 |
+| `readerRecordBytes` | 256 | 369 | 512 |
+| `writeRetainedBytes` (a typed write; `ramKeys`) | 130 (`maxEntryBytes`) | 272 | 320 |
+| `hotNodeBytes` | 28,000 | 25,284 (225 entries) | 32,768 |
+| `overlayNodeBytes` | payload + 160 | payload + 262 | payload + 320 |
+| window bytes | page buffers | | plus `maxProofFacts` proof facts at `factBytes` |
+
+The terms with no store heap behind them are LEDGER terms and stated as such in the table: `ramPagePins`, the continuation base, the 4,096-byte scratch, the descriptor records of the admission.
+
+**What changed in the representation to make the measured cost honest.** The read facts are held PACKED (`Map ShortByteString ShortByteString`: the encoded key and value as the pages hold them, decoded on use), charged from what is held plus a measured per-entry overhead, so what is charged is what is held; a probe's key is a compact byte array. An absent answer is the empty value, so the suite pins that a present record never encodes to an empty value over every `Record` constructor at its edges and through the window (`Codec`).
+
+**Consequences, stated plainly** (the README's "Memory is measured, not reasoned" has them with the table). (1) A window holds 305 pages at `maxWindowBytes` (310 before). (2) `readResiduePages` is 4 (6), the promised removal bound 294 (296), the discovery unit 230 (232). (3) The component-wise worst total with no read facts is 4,405,424 B, ABOVE `txnRamLimit`: the round-18 statement that it fits "by construction" is withdrawn. It is an account bound; `chargeFor` is the gate; the extremes are planned and fit: minimum removal 4,118,128 B and discovery unit 3,821,680 B of 4,194,304 (headroom 76 KiB and 372 KiB). The component-wise worst including the read facts is 5,454,000 B (round 18: 5,181,264). The smallest accepted accounts are now control 1,134,208 B (1 arena, 1 reader; 1,166,464 at 4 x 16), protected staging 1,714,224 and cache 2,744,320 (11,388,928), and the defaults (8 MiB, 4 MiB, 48 MiB) hold them. The tests that asserted 310 pages and "below 4 MiB by construction" were rewritten to say this.
+
+**Finding 2, class: a key format whose kinds share a namespace, or two key lengths in one tree.** The retirement tree held two kinds of key, an entry's 8-byte version and a retired page's `0xFF` and number (9 bytes), told apart by the first byte of the 9-byte key being `0xFF`. A version whose high byte is `0xFF` (from `0xff00000000000000`) then looked like a retired page, so a replaced run became a retired page that maintenance answered `NoWork` for. The reviewer's repro is an example (`Keys`).
+
+**The same class, constructed.** The earlier statement that only the links tree has two key lengths was FALSE: the retirement tree had two (8 and 9). That was also a hole in the deletion argument (a deletion can split a node when a parent can sit within a separator difference of full): at the old format a retirement parent of 18 entries and 167 page children fills 4,052 of 4,052 bytes and a deletion splits it (the manager's candidate in the review of `6e82f907`; built and run at the old format by the `Rebalance` example below: the shape of 18 version and 167 page children, 4,052 of 4,052 bytes, one split on the deletion). Closed by construction: every retirement-tree key is now 9 bytes, tagged by kind (entry `0x00` and the big-endian version, retired page `0xFF` and the page number), so one key length per tree except links (52 and 25), and the kinds never share a first byte. `maxRetireInternals` is derived from the key and value sizes (45 entries a leaf, 47 children, 729 leaves: 16 internal pages and the root, 17).
+
+**Every place that built, compared or decoded a retirement key, and what it does now.**
+
+| Place | Now |
+| --- | --- |
+| `Records.hs` `versionKey`, `retiredKey`, `isRetireEntryKey` | the one definition of each kind's key and of the test that tells them apart |
+| `encodeRetire` / `decodeRetire` | the key is `versionKey`; a decode requires `isRetireEntryKey` and reads the version at offset 1 |
+| `decodeRetiredPage`, `validateEntry` | tag-checked; dispatch on the first byte |
+| `Page.hs` `validateSeparator TreeRetire` | accepts only a 9-byte key whose tag is `0x00` or `0xFF` |
+| `Plan.hs` lookups and `deleteKey TreeRetire` | go through `versionKey`; the no-entry conclusion requires `not (isRetireEntryKey k)` |
+| `State.hs` `maxRetireInternals` | derived from `retireKeyBytes`, `retireEntryValueBytes`, `minNodeBytes`, `maxRetiredPages` |
+| tests `Codec`, `Reference`, `Readers`, `FuzzTrees`, `Ownership`, `History`, `Rebalance` | the independent walkers and fixtures read tagged keys; the tripwire for the deletion argument now covers every tree, both kinds of the retirement tree included: the `Rebalance` example computes the key lengths from the encoders; at the old format (a difference of one byte between the two kinds) it finds the window of parent sizes and builds the shape above, at the current format (difference zero) it asserts that no parent size is in the window |
+
+**Tests.** `Keys` (new): the key table printed from the encoders; the two kinds disjoint and each ordered by its number over the full range of the version and the page number; the reviewer's repro; histories that start at each edge of the version counter, checked by the independent checker and a full read. `Memory` (new): the table above, one regression per row, and the read facts at their ceiling (4,096 of them retain 950,600 of 1,048,576 B). `Codec`: a present record never encodes to an empty value.
+
+**Controls** (applied locally, restored with `git checkout`, never committed). Every accounted constant lowered at once (each to the figure it was reasoned at): 10 of the 11 row examples fail, and the fact-ceiling example fails; the eleventh row, the overlay, has its own control (payload + 160): it fails by itself. Untagged 8-byte version keys, and the entry tag set equal to the page tag: see the honest notes.
+
+**The honest notes.** (1) The two key-format controls do not fail a `Keys` example: the suite ABORTS in `History`'s setup (the store it builds through `runIO` refuses the key it is no longer allowed to write) before any example prints, with a non-zero exit; a `Keys`-specific failure line was not obtained for them. (2) The overlay row first measured 43 B against 4,210 accounted: it held the references the builder returned, not the edit that keeps the pages. It now keeps the edit alive and forces its packed payload, and takes out the last eight parsed pages (the hot set, charged separately): 262 B around a 4,050-byte payload, so the constant went from 160 to 320. (3) The first measurement of the parsed node (29,304) was taken with the input pages unforced; with the inputs forced before the first reading it is 25,284, and the constant (32,768) holds either. (4) The measured figures are for this GHC and this runtime on this machine; a constant is held with margin above its measurement, and a change of runtime is exactly what the per-row examples would catch. (5) The probe and fact figures are upper bounds for the window bounds; no fixture holds every probe at the longest key.
+
+Gates at `59a90b7d`: `terrain-runtime` 517/0, `terrain` 905/0, `terrain-render-2d` 558/0, `workflow-tests` 965/0, `cabal build all`, `cabal check` for both packages, the catalog check, `owned_starts` check and ratchet: all green.
