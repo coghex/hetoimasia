@@ -786,7 +786,12 @@ accounted at 28,000 bytes each; the encoded output is 4 KiB a written page. The 
 header is charged at its fixed 128-byte record size: its byte total counts the retained
 *history*, which lives in pages, and is not transaction memory, so a history of any size
 plans like an empty one. A plan whose window or new pages would hold more is refused
-(`WindowBytesExceeded`, `OverlayExceeded`) with nothing changed. A plan numbers and encodes its new
+(`WindowBytesExceeded`, `OverlayExceeded`) with nothing changed. Every kind of plan (a candidate, a header-only
+candidate whose writes are all no-ops, a reclamation) takes its charge from ONE function, `chargeFor`, which refuses it
+(`TxnRamExceeded`, with the plan's total: the figure may be under the limit when a component is past its own worst case)
+when its total is past 4 MiB or any component is past the worst case the admission is sized for; that worst case holds at most
+three record writes for each of the 64 updates of a batch (192, #661's default), so a candidate with more is the shrinkable
+`TxnRamExceeded`. A plan numbers and encodes its new
 pages one at a time and forces each output buffer and page number before the next page is
 built, so no parsed page outlives the plan (a dense 180-leaf plan's measured live heap is
 checked against what it reports).
@@ -966,6 +971,15 @@ or deletes history by itself, and an integrity or I/O pause is not cleared by a 
 allowance.
 
 ### Edit-bank admission
+
+**The worst case is the charge builder, not a copy of it.** The accounts are sized from `worstTransactionCharge`, which is
+`ramFor`, the builder a real plan is charged by, applied to worst-case arguments (`worstChargeWith`, with the read facts at
+`maxReadFactBytes`); the minimum removal and the smallest unit of discovery are the same function at their own arguments. A
+term the charge gains is therefore in every worst case, and the suite checks, for every plan it commits, that each component
+and each account's credit is at most the worst case's. The smallest control account `mkEditBankConfig` accepts is 1,064,320
+bytes for one arena and one reader (1,080,448 at four arenas of 16 readers), protected staging 1,565,392 and cache 2,688,000
+(11,203,584); the defaults (8 MiB, 4 MiB, 48 MiB) hold them. The component-wise worst total, 5,181,264 bytes, is a bound for the
+accounts and not for one plan, which `chargeFor` still holds to 4 MiB.
 
 `Hetoimasia.Terrain.Runtime.Store.Admission` divides the 64 MiB edit bank into 48 MiB
 caches, 8 MiB staging (4 MiB protected for a foreground mutation) and 8 MiB control,
