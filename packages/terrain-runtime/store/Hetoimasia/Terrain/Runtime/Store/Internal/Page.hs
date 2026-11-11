@@ -53,6 +53,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Page
   , innerEntryBytes
   , innerKeyBytes
   , innerEntryTail
+  , overlayOverheadBytes
+  , overlayNodeBytes
+  , maxPackedPayloadBytes
   , encodePage
   , decodePage
   , bodyOfValid
@@ -111,6 +114,22 @@ entryBytes (k, v) = 2 + BS.length k + BS.length v
 -- and the encoder and decoder of the page are held to it by the codec suite.
 innerKeyBytes ∷ ByteString → Int
 innerKeyBytes k = 1 + BS.length k + innerEntryTail
+
+-- | What holds a new page packed beyond its payload: the two map entries (the page and its size), the packed record and the byte
+-- string's header. MEASURED (the suite's @Memory@ regression, forced live heap, the edit kept alive): 262 bytes around a 4,050-byte
+-- payload, held to 320; the 160 reasoned before counted the header only.
+overlayOverheadBytes ∷ Int
+overlayOverheadBytes = 320
+
+-- | The accounted bytes of one overlay page: its packed entries and what holds them.
+overlayNodeBytes ∷ Int → Int
+overlayNodeBytes payload = payload + overlayOverheadBytes
+
+-- | The most bytes a new page occupies packed. A leaf packs to its page payload; an internal page packs each entry one byte larger
+-- (the tag of the reference it is packed with), so at the shortest key ('minKeyBytes') it packs up to
+-- @pagePayloadBytes / (1 + minKeyBytes + innerEntryTail)@ bytes more (192).
+maxPackedPayloadBytes ∷ Int
+maxPackedPayloadBytes = pagePayloadBytes + pagePayloadBytes `div` (1 + minKeyBytes + innerEntryTail)
 
 -- | What follows the key in an internal entry: the child's page number and checksum.
 innerEntryTail ∷ Int

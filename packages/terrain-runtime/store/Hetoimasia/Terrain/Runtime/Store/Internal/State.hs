@@ -55,13 +55,15 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , maxWindowProbes
   , maxRetiredPages
   , worstOwnershipBytes
-  , overlayWorstBytes
+  , overlayPageWorstBytes
+  , overlayWorstFor
   , overlayBudgetRecord
   , overlayBudgetBookkeeping
   , txnRamLimit
   , maxReaders
   , readerRecordBytes
   , pageListCellBytes
+  , pageSetElemBytes
   , pageStateEntryBytes
   , writeRetainedBytes
   , maxProofFacts
@@ -119,6 +121,7 @@ import Data.Word (Word32, Word64)
 import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), worstEdgeWrites, worstEditWrites)
 import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (maxPackedPayloadBytes, overlayNodeBytes)
 
 mib ∷ Word64
 mib = 1024 * 1024
@@ -211,21 +214,26 @@ maxRetiredPages = 16384
 worstOwnershipBytes ∷ Int
 worstOwnershipBytes = maxWindowProbes * probeBytes
 
+-- | The most accounted bytes of one new page at its worst: the largest packed payload ('maxPackedPayloadBytes') and what holds it
+-- ('overlayNodeBytes'). Every overlay figure below is this one, never a restated number.
+overlayPageWorstBytes ∷ Int
+overlayPageWorstBytes = overlayNodeBytes maxPackedPayloadBytes
+
 -- | The most accounted bytes of new (overlay) pages the record trees of one plan may
--- hold while it works: the 256 pages it may write at their packed size and a margin.
+-- hold while it works: the 256 pages it may write at their worst packed size and a margin of five pages.
 -- An overlay page is held packed, its entries as one byte string.
 overlayBudgetRecord ∷ Int
-overlayBudgetRecord = 1100000
+overlayBudgetRecord = (maxTxnPages + 5) * overlayPageWorstBytes
 
--- | The most accounted bytes the new pages a plan keeps can hold at once: its 256
--- written pages at their packed size. The working budgets above are looser bounds on
--- the work in progress; this is what a plan's reservation holds.
-overlayWorstBytes ∷ Int
-overlayWorstBytes = maxTxnPages * (pagePayloadBytes + 160)
+-- | The most accounted bytes the new pages of a plan that writes the given number of pages can hold at once: those pages at their
+-- worst packed size. The working budgets are looser bounds on the work in progress; this is what a plan's reservation holds (a new
+-- page is a written page, so a plan that writes fewer pages holds fewer).
+overlayWorstFor ∷ Int → Int
+overlayWorstFor written = written * overlayPageWorstBytes
 
--- | The same for the allocator and retirement trees of one plan.
+-- | The same for the allocator and retirement trees of one plan: the bookkeeping reserve and a margin of three pages.
 overlayBudgetBookkeeping ∷ Int
-overlayBudgetBookkeeping = 300000
+overlayBudgetBookkeeping = (bookkeepingReserve + 3) * overlayPageWorstBytes
 
 -- | The RAM one transaction may reserve: 4 MiB.
 txnRamLimit ∷ Int
@@ -245,6 +253,11 @@ readerRecordBytes = 512
 pageListCellBytes ∷ Int
 pageListCellBytes = 48
 
+-- | What one element of a SET of page numbers retains (the replaced pages of an edit are a set): a map node, the boxed number and
+-- the pointers. MEASURED: 56 bytes, held to 64.
+pageSetElemBytes ∷ Int
+pageSetElemBytes = 64
+
 -- | The accounted bytes of the committed root record: its fixed fields (measured at most 123 bytes with the five tree checksums,
 -- held to 512) and the loose list at its cap, a list of page numbers ('pageListCellBytes' each). A root set is retained whole
 -- by the store and, as the next root set, by the plan that builds it.
@@ -260,11 +273,14 @@ pageStateEntryBytes = 80
 activeRecordBytes ∷ Int
 activeRecordBytes = 512 + maxTxnPages * pageStateEntryBytes
 
--- | What one typed record write retains while a plan holds it: the key and the value as Haskell values (a source node key and a
--- source node child are the largest). MEASURED at 234 bytes, held to 320; the 130 bytes of an encoded entry were the figure
--- reasoned before.
+-- | What one typed record write retains while a plan holds it: the candidate's list, the map the planner builds to put the writes
+-- in key order and its canonical list, all alive at once, each holding the key and the record as Haskell values. The largest
+-- valid pairing is a source-node key and a source-node child with ALL THREE optional coordinates populated in each (a key of
+-- 21 words and a child of the same); the suite measures every pairing a plan accepts. MEASURED: 560 bytes at the largest (272 with
+-- no optional coordinate, the figure a fixture without them gave), held to 640. The 130 bytes of an encoded entry were the figure
+-- reasoned first.
 writeRetainedBytes ∷ Int
-writeRetainedBytes = 320
+writeRetainedBytes = 640
 
 -- | The most proof facts a plan's window carries: four for each page it may overwrite and one for each page a reclamation chunk consumes.
 maxProofFacts ∷ Int

@@ -15,6 +15,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Format
   , pagePayloadBytes
   , formatVersion
   , maxKeyBytes
+  , minKeyBytes
   , worstUpdatePages
   , windowPageOverhead
   , retireKeyBytes
@@ -102,6 +103,12 @@ retireEntryValueBytes = 12
 -- to 192. The ONE definition: 'Hetoimasia.Terrain.Runtime.Store.Internal.State.windowPageBytes' and the window's byte count both use it.
 windowPageOverhead ∷ Int
 windowPageOverhead = 192
+
+-- | The shortest encoded key any tree holds: the 8-byte sequence of the todo tree and start of a free extent. Held by the suite's key
+-- table (the minimum of the lengths it prints), because the densest internal page, and so the largest packed overlay page,
+-- follows from it.
+minKeyBytes ∷ Int
+minKeyBytes = 8
 
 -- | The longest encoded key a page holds. The longest real key is 52 bytes (a
 -- source component node); the bound leaves room and is checked on decode.

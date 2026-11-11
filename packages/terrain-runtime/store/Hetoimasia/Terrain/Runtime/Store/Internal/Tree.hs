@@ -98,6 +98,13 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , editWindow
   , editFreshBytes
   , overlayNodeBytes
+  , windowPayloadBytes
+  , packParsedNode
+  , packedBytes
+  , parsedNode
+  , parsedNodeWeight
+  , storedPayload
+  , Stored
   , hotNodes
   , hotNodeBytes
   , Ref (.., Disk)
@@ -504,12 +511,6 @@ hotNodeBytes = 32768
 
 -- | A new page held packed: its entries as one byte string.
 data Stored = Stored !TreeId !Int !Bool !Int !ByteString
-
--- | The accounted bytes of one overlay page: its packed entries and what holds them (two map entries, the packed record and the byte
--- string's header). MEASURED (the suite's @Memory@ regression, forced live heap, the edit kept alive): 262 bytes around a 4,050-byte
--- payload, held to 320; the 160 reasoned before counted the header only.
-overlayNodeBytes ∷ Int → Int
-overlayNodeBytes payload = payload + 320
 
 packNode ∷ Node → Stored
 packNode (Node t l body) = case body of
@@ -1392,6 +1393,31 @@ treeHeight _ Nothing = pure 0
 treeHeight tree (Just r) = (\n → nLevel n + 1) <$> load tree Nothing r
 
 -- | The plan state, for the suite.
+-- | Test exposure: a page parsed as a plan holds it in its hot set (for the suite's forced-memory regression of 'hotNodeBytes').
+parsedNode ∷ Page → Either PageError Node
+parsedNode pg@(Page t _ p _) = nodeOfPage t p pg
+
+-- | Test exposure: forces every key, value, page number and checksum of a parsed node, and answers how many entries it has.
+parsedNodeWeight ∷ Node → Int
+parsedNodeWeight (Node _ _ b) = case b of
+  NLeaf es → length es + sum [BS.length k + BS.length v | (k, v) ← es]
+  NInner es → length es + sum [BS.length k + refWeight r | (k, r) ← es]
+  where
+    refWeight (DiskRef (PageNo p) mc) = fromIntegral p + maybe 0 fromIntegral mc
+    refWeight (Fresh i) = i
+
+-- | Test exposure: the bytes of the page buffers a window holds (forces every one), for the suite's forced-memory regression.
+windowPayloadBytes ∷ Window → Int
+windowPayloadBytes w = sum [BS.length (vpBytes v) | v ← Map.elems (wPages w)]
+
+-- | Test exposure: a parsed node packed as an edit packs it (at a level that varies with the number, so no two packings are shared).
+packParsedNode ∷ Int → Node → Stored
+packParsedNode i (Node t _ b) = packNode (Node t (i `mod` 7 + 1) b)
+
+-- | Test exposure: the packed payload of a stored node (forces it).
+storedPayload ∷ Stored → Int
+storedPayload (Stored _ _ _ n pl) = n + BS.length pl
+
 -- | Test exposure: the bytes of the packed new pages an edit holds (forces every one), for the suite's forced-memory regression of
 -- 'overlayNodeBytes'.
 editPackedPayload ∷ Edit → Int

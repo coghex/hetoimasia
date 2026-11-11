@@ -997,7 +997,7 @@ applyWrites edit roots0 = go roots0 edit
 -- sum, so a term the charge gains is in every one of them by construction.
 worstChargeWith ∷ Int → Int → Int → RamCharge
 worstChargeWith written writes factsB =
-  ramFor maxWindowPages (maxWindowBytes + worstOwnershipBytes + maxProofFacts * factBytes) overlayWorstBytes written writes (maxListPages + bookkeepingReserve) maxClaimPages factsB
+  ramFor maxWindowPages (maxWindowBytes + worstOwnershipBytes + maxProofFacts * factBytes) (overlayWorstFor written) written writes (maxListPages + bookkeepingReserve) maxClaimPages factsB
 
 -- | The worst charge a plan may carry, the one the admission sizes its accounts from ('Hetoimasia.Terrain.Runtime.Store.Admission'):
 -- at the format's bounds, with up to three record writes for each of the 64 updates of a batch and the read facts at their ceiling.
@@ -1037,7 +1037,7 @@ ramFor windowN windowB overlayB written writes replaced supplyN factsB =
     { ramIoBuffers = written * pageSize
     , ramDecodedCopies = windowB + overlayB
     , ramKeys = writes * writeRetainedBytes
-    , ramScratch = replaced * pageListCellBytes + supplyN * pageListCellBytes + 4096 + (2 * hotNodes + 1) * hotNodeBytes
+    , ramScratch = replaced * pageSetElemBytes + supplyN * pageListCellBytes + 4096 + (2 * hotNodes + 1) * hotNodeBytes
     , ramPagePins = windowN * 16
     , ramRootControl = rootRecordBytes + activeRecordBytes + headerBytes
     , ramContinuation = 1024 + windowN * 8 + factsB

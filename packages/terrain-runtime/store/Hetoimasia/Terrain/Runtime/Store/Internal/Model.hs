@@ -64,6 +64,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , pinnedRoots
   , pinsOf
   , committedRoot
+  , PageState (..)
 
     -- * Usage
   , Usage (..)
