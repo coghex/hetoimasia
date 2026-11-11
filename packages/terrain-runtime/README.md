@@ -575,8 +575,8 @@ less than its **atomic unit**: a limit below it means the unit (`windowWorkAtLea
 once: `maintenanceUnitPages`, one page, and `discoveryUnitWrites`, the three writes of one connection inspection,
 which is #661's `worstEdgeWrites`). A standalone removal is one atomic edit and reads no work limit: a window it
 outgrows is a hard capacity result, bounded by `removalWindowPages`. The unit needs a bounded window (the discovery
-unit holds at most `discoveryUnitWindowPages`, 226 pages at the deepest trees and 16 pinned versions, inside the
-removal's 290 and the limit of 310), so the retry ends in at most six steps with the work done, and never in
+unit holds at most `discoveryUnitWindowPages`, 232 pages at the deepest trees and 16 pinned versions, inside the
+removal's 296 and the limit of 310: the edit phase's formula plus the 6 pages of read residue below), so the retry ends in at most six steps with the work done, and never in
 `Invalid`, `Integrity` or `Stale`: a driver that follows this protocol exactly succeeds from every starting limit
 from 1 to 64 (`Test.TerrainRuntime.Store.Protocol`; the table of the refusals `classifyPlan` maps to `FailInvalid`,
 none of which a valid store reaches, is in the evidence); a caller that retries the same window or restarts at the full work gets the same answer for ever (the
@@ -614,11 +614,32 @@ that state, so a reader acquired in between or a commit costs a proof again and 
 made. A checkpoint always carries a new fact (a window that cannot hold the plan's edit and ONE proof is the typed
 `WindowExceeded`), so a transaction takes at most as many checkpoints as the pages it writes plus the 64 it
 verifies. What a window holds at once is the edit and one proof, `workOneWindowPages` for a unit of one page and
-`removalWindowPages` for a standalone removal, which cannot shrink; both rest on `maxLevel` and `maxReaders`
+`removalWindowPages` for a standalone removal, which cannot shrink (the edit phase's formula plus `readResiduePages`,
+below); both rest on `maxLevel` and `maxReaders`
 alone, and both are asserted against `maxWindowBytes / windowPageBytes` (310 pages) for every height 1 to 8 and
 every number of pinned readers (the removal's retirement-tree term, at most 17 internal pages, rests on two
 checks the store makes: a non-root page below a quarter of a payload is refused when a plan descends to it
 (`UnderFull`), and a root set retiring more than `maxRetiredPages` pages is refused at every plan).
+
+**The read phase of a removal and of a discovery step is a checkpoint phase too.** A removal reads logical records
+(union-find chains, floor runs, up to `worstEditReads`, 197) before it can say what it writes, and a discovery step up
+to `worstEdgeReads` (132) an inspection; every page of every read stays in the caller's window until the plan ends,
+which no formula over the write paths can bound. The records a plan has read are therefore facts it carries through
+`Checkpoint`, exactly as it carries its proofs: the provider answers from them first. A read phase ends in a
+`Checkpoint` of everything read so far when it needs a page the window cannot take (the proof phase's rule, under the
+plan's own bounds), and once more when it ends holding more than `readResiduePages` (6) read pages, so that the edit
+starts from an empty window; a checkpoint with no new fact is the typed window result. The window holds at once the
+phase's own pages: the read phase at most the bound it runs under (every promised bound holds one whole read, at most
+`2 * height` pages), the edit phase the edit formula plus the residue. `readResiduePages` is derived from the byte
+limit (the worst removal, `removalWindowPages`, 296 pages at the deepest trees and 16 pinned versions, leaves room for
+6 more whole pages beside its `removalWorstProbes` probes); the probe figures are counted from the pages written
+(`minimumRemovalPages`, 188; the discovery unit's `discoveryUnitPagesWritten`, 120). The facts are RAM, in the plan's
+charge as a retained continuation (152 bytes a fact, at most 29,944 B for a removal and 20,064 B for a unit, under
+`maxReadFactBytes`; past it the shrinkable `TxnRamExceeded`), and the feasibility proofs count them. They are for the
+retries of ONE plan, and a window of another version drops them. The cost of the rule is one more checkpoint (and one
+replay of staging from the facts) when a read phase held more than the residue. The read-only queries (`queryCell`,
+`queryObligation`, ...) are not plans and make no at-once claim: #661 bounds each by its own read limits, and the
+window a query reads through is the caller's.
 
 ### The page format
 

@@ -685,6 +685,18 @@ own classes but joins no known class, so it reveals nothing. A later opening fro
 known space joins the whole modified class and discovers it. A removal of a known
 solid beside an unknown void discovers it only through actual new connectivity.
 
+### The read set of an operation
+
+`stageRemovalTraced` and `stepDiscoveryTraced` are `stageRemoval` and `stepDiscovery` that also return a `ReadSet`: the
+records and the floor-run answers the provider gave the operation, in key order, exactly as the provider gave them. They
+are **additive**: the two original functions are `fst` of them and their results are unchanged (checked on every state
+of a drain and on removals). A read set holds only #661's own logical types and never a value the operation staged (a
+staged write lives in the overlay, which the set does not read). For a suspended operation it holds the records
+resolved before the one it waits for; for a `Progress` step, those of the inspections the batch completed; for a
+`Stalled` step, those its first inspection resolved. It exists for a host that must drop the records it fetched between
+two runs of the same operation (the page-resident store keeps them as facts when it drops pages, and answers the replay
+from them): the replay reads the same records in the same order and gets the same values.
+
 ### Discovery batches
 
 `stepDiscovery` inspects the connections of the oldest unfinished obligation, one
