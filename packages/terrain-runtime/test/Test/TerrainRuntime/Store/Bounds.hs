@@ -170,7 +170,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     n `shouldSatisfy` (> 256)
     ramTotal (mRam (plMeasure p)) `shouldSatisfy` (<= txnRamLimit)
     mWindowPages (plMeasure p) `shouldSatisfy` (<= maxWindowPages)
-  it "bounds the window by its accounted bytes (310 pages accepted, 311 refused) and by its page count" $ do
+  it "bounds the window by its accounted bytes (305 pages accepted, 306 refused) and by its page count" $ do
     let cfg = either (error . show) id (mkStoreConfig smallSpec)
         roots = storeRoots (hStore (newH smallSpec ident0))
         total = cfgUsablePages cfg
@@ -179,13 +179,17 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         d = deltaFor (hStore (newH smallSpec ident0)) True False 1 [(runKey 0 0 1, Just (runRec 3))]
         run m = planDelta cfg ident0 roots (windowOf m) Ordinary d
         tight = planDeltaWith (Bounds maxTxnPages txnRamLimit 5 maxWindowBytes bookkeepingReserve maxBookkeepingPages worstPlanCharge readResiduePages) cfg ident0 roots
-    windowBytes (windowOf 310) `shouldBe` 310 * windowPageBytes
-    windowBytes (windowOf 310) `shouldSatisfy` (<= maxWindowBytes)
-    windowBytes (windowOf 311) `shouldSatisfy` (> maxWindowBytes)
-    case run 310 of
+    -- the most whole pages the byte limit holds at the MEASURED page cost (4,288 bytes a page)
+    let fitting = maxWindowBytes `div` windowPageBytes
+        fitN = fromIntegral fitting
+    fitting `shouldBe` 305
+    windowBytes (windowOf fitN) `shouldBe` fitting * windowPageBytes
+    windowBytes (windowOf fitN) `shouldSatisfy` (<= maxWindowBytes)
+    windowBytes (windowOf (fitN + 1)) `shouldSatisfy` (> maxWindowBytes)
+    case run fitN of
       Planned p → ramTotal (mRam (plMeasure p)) `shouldSatisfy` (<= txnRamLimit)
       other → expectationFailure (show other)
-    run 311 `shouldBe` Refused (Capacity (WindowBytesExceeded (311 * windowPageBytes)))
+    run (fitN + 1) `shouldBe` Refused (Capacity (WindowBytesExceeded ((fitting + 1) * windowPageBytes)))
     case tight (windowOf 5) Ordinary d of
       Planned _ → pure ()
       other → expectationFailure (show other)
@@ -268,11 +272,16 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     forM_ [96, 97 ∷ Int] $ \n → case plan n of
       Right (Planned p) → must (chargeDominated p)
       other → expectationFailure (show n <> " no-op writes were not planned: " <> take 200 (show other))
-  it "bounds a plan's RAM below 4 MiB by construction, component by component" $ do
-    -- the worst charge is the one builder a real plan is charged by, at worst-case arguments; with no read facts it fits the bound
+  it "bounds a plan's RAM below 4 MiB by ONE gate, component by component (the sum of the worst components is an account bound)" $ do
+    -- the worst charge is the one builder a real plan is charged by, at worst-case arguments. At the MEASURED costs every component's
+    -- worst held at once, with no read facts, is more than 4 MiB (the window at its byte limit, 256 written pages and the largest edit
+    -- cannot all be one plan): the sum bounds the ACCOUNTS, and 'chargeFor' refuses (TxnRamExceeded) a plan whose own total is past the
+    -- limit. The promised extremes are each planned and fit: the exact 256-page plan, the minimum removal and the discovery unit.
     let w = worstChargeWith maxTxnPages (3 * maxBatchUpdates) 0
-    ramTotal w `shouldSatisfy` (< txnRamLimit)
-    ramTotal w `shouldSatisfy` (> 3 * 1024 * 1024)
+        comps = [ramIoBuffers w, ramDecodedCopies w, ramKeys w, ramScratch w, ramPagePins w, ramRootControl w, ramContinuation w]
+    all (< txnRamLimit) comps `shouldBe` True
+    ramTotal w `shouldSatisfy` (> txnRamLimit)
+    (minimumRemovalRam, minimumDiscoveryUnitRam) `shouldSatisfy` (\(a, b) → a <= txnRamLimit && b <= txnRamLimit)
     ramIoBuffers w `shouldBe` 1024 * 1024
   it "refuses one past the 64-update batch and a tighter bound stops a batch earlier" $ do
     let cfg = either (error . show) id (mkStoreConfig smallSpec)

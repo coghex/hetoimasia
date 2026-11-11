@@ -92,8 +92,9 @@ spec = describe "TRA-20 evidence" $ do
           <> " minimumRemovalPages=" <> show minimumRemovalPages <> " minimumRemovalRam=" <> show minimumRemovalRam)
     mPagesWritten m `shouldBe` 256
     -- the component-wise worst holds the read facts at their ceiling ('maxReadFactBytes'): the sum of the worst of every component is a
-    -- bound for the ACCOUNTS (it exceeds the plan limit by design); a plan's own total is checked against 'txnRamLimit' by the planner
-    ramTotal (worstChargeWith maxTxnPages (3 * maxBatchUpdates) 0) `shouldSatisfy` (< txnRamLimit)
+    -- bound for the ACCOUNTS (at the measured costs it exceeds the plan limit by design); a plan's own total is checked against
+    -- 'txnRamLimit' by the planner's one gate
+    ramTotal (worstChargeWith maxTxnPages (3 * maxBatchUpdates) 0) `shouldSatisfy` (> txnRamLimit)
     ramContinuation w - ramContinuation (worstChargeWith maxTxnPages (3 * maxBatchUpdates) 0) `shouldBe` maxReadFactBytes
   it "two openings with a pending continuation, replayed through pages" $ do
     let run0 = newRun smallSpec twoOpenings 1

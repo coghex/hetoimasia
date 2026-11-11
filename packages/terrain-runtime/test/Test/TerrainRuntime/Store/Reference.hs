@@ -294,10 +294,10 @@ ownership arena source store rd = Ownership live retired free loose violations h
     trees = [TreeRuns, TreeLinks, TreeTodo, TreeFree, TreeRetire]
     walks = [(t, walkTree arena source rd (treeRoot t)) | t ← trees]
     walkOf t = maybe (TreeWalk [] [] 0 []) id (lookup t walks)
-    retireEntries = [(getBe64' k 0, getBe64' v 0, getLe16' v 8, getLe16' v 10) | (k, v) ← twLeaves (walkOf TreeRetire), BS.length k == 8, BS.length v == 12]
+    retireEntries = [(getBe64' k 1, getBe64' v 0, getLe16' v 8, getLe16' v 10) | (k, v) ← twLeaves (walkOf TreeRetire), BS.length k == 9, BS.index k 0 == 0, BS.length v == 12]
     listPages = [lp | (_, lp, _, _) ← retireEntries]
     -- the retirement tree also indexes every retired page by number under its entry's version
-    indexed = sortOn id [(getBe64' k 1, getBe64' v 0) | (k, v) ← twLeaves (walkOf TreeRetire), BS.length k == 9, BS.length v == 8]
+    indexed = sortOn id [(getBe64' k 1, getBe64' v 0) | (k, v) ← twLeaves (walkOf TreeRetire), BS.length k == 9, BS.index k 0 == 0xFF, BS.length v == 8]
     expectedIndex = sortOn id [(p, ver) | (ver, lp, _, _) ← retireEntries, Just (Right ps) ← [lookup lp listWalk], p ← ps]
     listWalk = [(lp, parseList ver lp c d) | (ver, lp, c, d) ← retireEntries]
     parseList ver lp c d = case rd (PageNo lp) of

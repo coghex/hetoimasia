@@ -76,6 +76,10 @@ setBytes i new bs = BS.concat [BS.take i bs, new, BS.drop (i + BS.length new) bs
 total ∷ Word64
 total = 16128
 
+-- | The key of a retirement entry: its namespace tag and the version.
+vkey ∷ Word64 → ByteString
+vkey n = BS.cons 0 (be64' n)
+
 decode ∷ ByteString → Either PageError Page
 decode = decodePage ident0 total (PageNo 0)
 
@@ -250,13 +254,13 @@ spec = describe "the private page codec against independent bytes" $ do
       dec (leaf 3 [(be64' maxBound, be64' 2)]) `shouldBe` Left MalformedValue
       dec (leaf 3 [(be64' 10, be64' 5), (be64' 15, be64' 1)]) `shouldBe` Left KeyOrder
       dec (leaf 3 [(be64' 10, be64' 7), (be64' 15, be64' 1)]) `shouldBe` Left KeyOrder
-      -- retirement entries
-      dec (leaf 4 [(be64' 3, BS.concat [be64' 9, le16' 4, le16' 1])]) `shouldBe` Right (Page TreeRetire 0 (PageNo 0) (Leaf [(be64' 3, BS.concat [be64' 9, le16' 4, le16' 1])]))
-      dec (leaf 4 [(be64' 0, BS.concat [be64' 9, le16' 4, le16' 1])]) `shouldBe` Left MalformedValue
-      dec (leaf 4 [(be64' 3, BS.concat [be64' 9, le16' 0, le16' 0])]) `shouldBe` Left MalformedValue
-      dec (leaf 4 [(be64' 3, BS.concat [be64' 9, le16' 4, le16' 4])]) `shouldBe` Left MalformedValue
-      dec (leaf 4 [(be64' 3, BS.concat [be64' 9, le16' 507, le16' 0])]) `shouldBe` Left MalformedValue
-      dec (leaf 4 [(be64' 3, BS.concat [be64' total, le16' 4, le16' 0])]) `shouldBe` Left MalformedValue
+      -- retirement entries (keys: the tag 0x00 and the version)
+      dec (leaf 4 [(vkey 3, BS.concat [be64' 9, le16' 4, le16' 1])]) `shouldBe` Right (Page TreeRetire 0 (PageNo 0) (Leaf [(vkey 3, BS.concat [be64' 9, le16' 4, le16' 1])]))
+      dec (leaf 4 [(vkey 0, BS.concat [be64' 9, le16' 4, le16' 1])]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(vkey 3, BS.concat [be64' 9, le16' 0, le16' 0])]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(vkey 3, BS.concat [be64' 9, le16' 4, le16' 4])]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(vkey 3, BS.concat [be64' 9, le16' 507, le16' 0])]) `shouldBe` Left MalformedValue
+      dec (leaf 4 [(vkey 3, BS.concat [be64' total, le16' 4, le16' 0])]) `shouldBe` Left MalformedValue
     it "refuses an entry whose declared lengths run past the payload, in a leaf and in an internal page" $ do
       let dec = decodePage ident0 total (PageNo 0)
       -- a leaf entry claiming a 60-byte value with one byte left; an internal entry claiming a 24-byte key and no child
@@ -267,7 +271,7 @@ spec = describe "the private page codec against independent bytes" $ do
           dec = decodePage ident0 total (PageNo 0)
           marked p = BS.cons 0xFF (be64' p)
           ver = be64' 7
-          entry = (be64' 3, BS.concat [be64' 9, le16' 4, le16' 1])
+          entry = (vkey 3, BS.concat [be64' 9, le16' 4, le16' 1])
       -- an index entry after a version entry is a well-formed leaf
       either (const False) (const True) (dec (leaf 4 [entry, (marked 5, ver)])) `shouldBe` True
       dec (leaf 4 [(BS.cons 0xFE (be64' 5), ver)]) `shouldBe` Left MalformedValue
@@ -305,13 +309,14 @@ spec = describe "the private page codec against independent bytes" $ do
             , ("links: a tag that is neither", 1, BS.pack [7, 0, 0])
             , ("todo: not eight bytes", 2, BS.replicate 3 1)
             , ("free: not eight bytes", 3, BS.replicate 7 1)
-            , ("retire: nine bytes without the marker", 4, BS.replicate 9 1)
+            , ("retire: nine bytes with a tag that is neither", 4, BS.replicate 9 1)
+            , ("retire: eight bytes (the key an entry had before it was tagged)", 4, be64' 3)
             ]
       forM_ badSeparators $ \(what, t, k) → (what, dec (innerOf t 1 [(k, 5)])) `shouldBe` (what, Left MalformedKey)
       -- and the separators of each tree's own keys are accepted
       either (const False) (const True) (dec (innerOf 0 1 [(encodeKey (runKey 0 0 5), 5)])) `shouldBe` True
       either (const False) (const True) (dec (innerOf 3 1 [(be64' 5, 5)])) `shouldBe` True
-      either (const False) (const True) (dec (innerOf 4 1 [(be64' 3, 5), (BS.cons 0xFF (be64' 5), 6)])) `shouldBe` True
+      either (const False) (const True) (dec (innerOf 4 1 [(vkey 3, 5), (BS.cons 0xFF (be64' 5), 6)])) `shouldBe` True
       either (const False) (const True) (dec (list [3, 4, 9])) `shouldBe` True
       dec (list [4, 3]) `shouldBe` Left KeyOrder
       dec (list [3, 3]) `shouldBe` Left KeyOrder

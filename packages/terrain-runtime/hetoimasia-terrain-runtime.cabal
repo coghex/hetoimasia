@@ -132,6 +132,8 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Store.FuzzTrees
         Test.TerrainRuntime.Store.Harness
         Test.TerrainRuntime.Store.History
+        Test.TerrainRuntime.Store.Keys
+        Test.TerrainRuntime.Store.Memory
         Test.TerrainRuntime.Store.Protocol
         Test.TerrainRuntime.Store.Rebalance
         Test.TerrainRuntime.Store.Large

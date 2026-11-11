@@ -59,12 +59,12 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , windowCheckpoint
   , windowFactsFor
   , noReadFacts
-  , windowReadFacts
   , windowReadRecord
   , windowReadFloor
   , windowReadFactCount
   , windowReadFactBytes
   , recordFactBytes
+  , readFactOverheadBytes
   , windowKnows
   , windowFactCount
   , limitWork
@@ -133,6 +133,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   ) where
 
 import Data.ByteString (ByteString)
+import Data.ByteString.Short (ShortByteString, fromShort, toShort)
+import qualified Data.ByteString.Short as SBS
 import qualified Data.ByteString as BS
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
@@ -143,11 +145,11 @@ import qualified Data.Set as Set
 import Data.Int (Int64)
 import Data.Word (Word32, Word64)
 import Hetoimasia.Terrain.Cell (Column)
-import Hetoimasia.Terrain.Discovery (ReadSet (..), Record, RecordKey)
+import Hetoimasia.Terrain.Discovery (ReadSet (..), Record, RecordKey (..))
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
-import Hetoimasia.Terrain.Runtime.Store.Internal.Records (getLe32)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64, decodeValue, encodeKey, encodeValue, getBe64, getLe32)
 
 -- ---------------------------------------------------------------------------
 -- Window
@@ -168,7 +170,7 @@ data VPage = VPage
 -- a few bytes, never the 4 KiB buffer.
 data Probe
   = ProbeNone
-  | ProbeTree !TreeId !Int !ByteString
+  | ProbeTree !TreeId !Int !ShortByteString
   | ProbeList !Word64
   deriving stock (Eq, Show)
 
@@ -199,10 +201,10 @@ data Window = Window
   , wWork ∷ !Int
   -- ^ The most units of work a plan through this window may take on (the pages one maintenance
   -- transaction frees, the writes of one discovery batch): the caller's bounded retry, see 'limitWork'.
-  , wReadRecords ∷ !(Map RecordKey (Maybe Record))
+  , wReadRecords ∷ !(Map ShortByteString ShortByteString)
   -- ^ The records the committed roots answered an earlier run of THIS plan, carried through a 'windowCheckpoint' like the
   -- proofs (see 'Facts'): trusted only for the fingerprint they were read against.
-  , wReadFloors ∷ !(Map (Column, Int64) (Maybe (Int64, Int64)))
+  , wReadFloors ∷ !(Map ShortByteString ShortByteString)
   -- ^ The floor-run answers of the same reads.
   }
   deriving stock (Eq, Show)
@@ -291,11 +293,16 @@ noReadFacts = ReadSet [] []
 -- | The accounted bytes of one remembered record fact: its key, its value and the entry around them. A fact is held in the
 -- plan's RAM (as a retained continuation), never in the window's page bytes.
 recordFactBytes ∷ Int
-recordFactBytes = maxKeyBytes + maxValueBytes + 24
+recordFactBytes = maxKeyBytes + maxValueBytes + readFactOverheadBytes
+
+-- | What one packed fact costs beyond its key and value bytes: a map node and two byte-array headers with their padding. MEASURED
+-- (forced live heap, the suite's @Memory@ regression): at most 100 bytes; held to 128.
+readFactOverheadBytes ∷ Int
+readFactOverheadBytes = 128
 
 -- | The accounted bytes of one remembered fact.
 factBytes ∷ Int
-factBytes = 24
+factBytes = 80
 
 -- | The window of a retry after a plan filled its window while proving: a fresh window for the same store,
 -- version, trust, work and used space, holding none of the pages or probes of the old one and the facts the
@@ -311,8 +318,8 @@ windowCheckpoint (Facts fp fs (ReadSet rs fl)) w =
         , wProbes = Map.empty
         , wFacts = Just fp
         , wProven = Set.union kept (Set.fromList fs)
-        , wReadRecords = Map.union (Map.fromList rs) keptR
-        , wReadFloors = Map.union (Map.fromList fl) keptF
+        , wReadRecords = Map.union (Map.fromList [(packKey k, maybe SBS.empty (toShort . encodeValue) v) | (k, v) ← rs]) keptR
+        , wReadFloors = Map.union (Map.fromList [(packKey (KeyRun c z), maybe SBS.empty packRun v) | ((c, z), v) ← fl]) keptF
         }
 
 -- | The window, with the facts it carries kept only if they were proven against this state.
@@ -327,25 +334,45 @@ windowKnows f w = Set.member f (wProven w)
 windowFactCount ∷ Window → Int
 windowFactCount = Set.size . wProven
 
--- | The records the window carries as read facts (after 'windowFactsFor').
-windowReadFacts ∷ Window → ReadSet
-windowReadFacts w = ReadSet (Map.toAscList (wReadRecords w)) (Map.toAscList (wReadFloors w))
-
 -- | What the committed roots answered for a key, if the window carries it ('Nothing': not known; @Just Nothing@: absent).
 windowReadRecord ∷ RecordKey → Window → Maybe (Maybe Record)
-windowReadRecord k w = Map.lookup k (wReadRecords w)
+windowReadRecord k w = case Map.lookup (packKey k) (wReadRecords w) of
+  Nothing → Nothing
+  Just v
+    | SBS.null v → Just Nothing
+    | otherwise → case decodeValue k (fromShort v) of
+        Nothing → Nothing
+        Just r → Just (Just r)
 
 -- | The same for a floor-run query.
 windowReadFloor ∷ (Column, Int64) → Window → Maybe (Maybe (Int64, Int64))
-windowReadFloor q w = Map.lookup q (wReadFloors w)
+windowReadFloor (c, z) w = case Map.lookup (packKey (KeyRun c z)) (wReadFloors w) of
+  Nothing → Nothing
+  Just v
+    | SBS.null v → Just Nothing
+    | SBS.length v == 16 → Just (Just (unpackRun v))
+    | otherwise → Nothing
 
 -- | How many record and floor facts the window carries.
 windowReadFactCount ∷ Window → Int
 windowReadFactCount w = Map.size (wReadRecords w) + Map.size (wReadFloors w)
 
--- | The RAM the read facts of the window hold.
+-- | The RAM the read facts of the window hold: the bytes of every packed key and value plus the entry around them
+-- ('readFactOverheadBytes'), counted from what is held.
 windowReadFactBytes ∷ Window → Int
-windowReadFactBytes w = windowReadFactCount w * recordFactBytes
+windowReadFactBytes w = sum [SBS.length k + SBS.length v + readFactOverheadBytes | m ← [wReadRecords w, wReadFloors w], (k, v) ← Map.toList m]
+
+-- | A read fact is held PACKED, as the bytes the pages hold: its key and value as two compact, unpinned byte arrays in a map, never
+-- as the decoded Haskell values (a source node key and child are hundreds of bytes of constructors and thunks). A floor query is
+-- keyed as a run key and holds the run's two ends.
+packKey ∷ RecordKey → ShortByteString
+packKey = toShort . encodeKey
+
+packRun ∷ (Int64, Int64) → ShortByteString
+packRun (lo, hi) = toShort (BS.append (be64 (fromIntegral lo)) (be64 (fromIntegral hi)))
+
+unpackRun ∷ ShortByteString → (Int64, Int64)
+unpackRun v = let b = fromShort v in (fromIntegral (getBe64 b 0), fromIntegral (getBe64 b 8))
 
 -- | The version the window was filled for.
 windowVersion ∷ Window → Word64
@@ -359,10 +386,6 @@ windowIdentity = wIdent
 -- and headers around it ('windowPageOverhead').
 windowBytes ∷ Window → Int
 windowBytes w = Map.size (wPages w) * (pageSize + windowPageOverhead)
-
--- | The accounted overhead of one page in a window beyond its buffer.
-windowPageOverhead ∷ Int
-windowPageOverhead = 128
 
 -- | The accounted bytes of the probes a window holds, 'probeBytes' each.
 windowProbeBytes ∷ Window → Int
@@ -388,13 +411,13 @@ windowProbe total no bytes w = w {wProbes = Map.insert no (detach probe) (wProbe
     probe = case decodePage (wIdent w) total no bytes of
       Left _ → ProbeNone
       Right page → probeOfPage page
-    detach (ProbeTree t l k) = let k' = BS.copy k in BS.length k' `seq` ProbeTree t l k'
+    detach (ProbeTree t l k) = ProbeTree t l k
     detach other = other
 
 probeOfPage ∷ Page → Probe
 probeOfPage (Page tree level _ body) = case body of
-  Leaf ((k, _) : _) → ProbeTree tree level k
-  Inner ((k, _) : _) → ProbeTree tree level k
+  Leaf ((k, _) : _) → ProbeTree tree level (toShort k)
+  Inner ((k, _) : _) → ProbeTree tree level (toShort k)
   List v _ → ProbeList v
   _ → ProbeNone
 
@@ -471,7 +494,7 @@ hotNodes = 8
 -- list, a cons cell, a pair and two string headers per entry (119 entries at most for a
 -- record page and 225 for the smallest bookkeeping entry), rounded up.
 hotNodeBytes ∷ Int
-hotNodeBytes = 28000
+hotNodeBytes = 32768
 
 -- | A new page held packed: its entries as one byte string.
 data Stored = Stored !TreeId !Int !Bool !Int !ByteString

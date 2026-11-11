@@ -16,6 +16,11 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Format
   , formatVersion
   , maxKeyBytes
   , worstUpdatePages
+  , windowPageOverhead
+  , retireKeyBytes
+  , retireEntryTag
+  , retirePageTag
+  , retireEntryValueBytes
   , maxValueBytes
   , maxEntryBytes
   , maxLevel
@@ -73,6 +78,31 @@ formatVersion = 1
 worstUpdatePages ∷ Int → Int
 worstUpdatePages height = 2 * height + 1
 
+-- | Every key of the retirement tree is this long: a one-byte NAMESPACE TAG and a big-endian 64-bit number. An entry (the pages a
+-- version replaced) is @0x00 ++ version@ and a retired-page index record is @0xFF ++ page@, so the two kinds are disjoint by
+-- construction and each orders by its number across the whole range of its field (a version up to 'maxBound' included), and a repack
+-- can never put a longer key where a shorter one was (one key length: the separators of a parent are all the same size).
+retireKeyBytes ∷ Int
+retireKeyBytes = 9
+
+-- | The tag of an entry key (a version): below every page key.
+retireEntryTag ∷ Word8
+retireEntryTag = 0x00
+
+-- | The tag of a retired-page index key: above every entry key.
+retirePageTag ∷ Word8
+retirePageTag = 0xFF
+
+-- | The value of a retirement entry: its list page (8), count (2) and done (2).
+retireEntryValueBytes ∷ Int
+retireEntryValueBytes = 12
+
+-- | What a validated page held in a window costs beyond its 4 KiB buffer: the map entry, the boxed page number, the page record and the
+-- buffer's own header. MEASURED (the suite's @Memory@ regression, forced live heap): 4,265 bytes a page, so 169 of overhead, held
+-- to 192. The ONE definition: 'Hetoimasia.Terrain.Runtime.Store.Internal.State.windowPageBytes' and the window's byte count both use it.
+windowPageOverhead ∷ Int
+windowPageOverhead = 192
+
 -- | The longest encoded key a page holds. The longest real key is 52 bytes (a
 -- source component node); the bound leaves room and is checked on decode.
 maxKeyBytes ∷ Int
@@ -104,10 +134,11 @@ maxEntryBytes = 2 + maxKeyBytes + maxValueBytes
 maxLevel ∷ Int
 maxLevel = 7
 
--- | The accounted bytes of one page probe a window keeps: its map entry, tag, level and
--- the key it keeps, copied out of the page buffer (at most 'maxKeyBytes').
+-- | The accounted bytes of one page probe a window keeps: its map entry, tag, level and the key it keeps, copied out of the page buffer
+-- (at most 'maxKeyBytes') as a compact byte array. MEASURED (the suite's @Memory@ regression): 168 bytes at the longest key a page
+-- holds (52), held to 256 for the 64-byte bound. The same copy as a pinned @ByteString@ measured 615.
 probeBytes ∷ Int
-probeBytes = 256 + maxKeyBytes
+probeBytes = 256
 
 -- | The most page numbers one retirement list page holds.
 maxListPages ∷ Int

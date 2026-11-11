@@ -115,6 +115,7 @@ retireIndex h =
   [ (getBe64' k 1, getBe64' v 0)
   | (k, v) ← twLeaves (walkTree a (siSource (hIdent h)) (diskRead (hDisk h)) ((\(PageNo p) → p) <$> rRetire (storeRoots (hStore h))))
   , BS.length k == 9
+  , BS.index k 0 == 0xFF
   ]
   where
     ArenaId a = siArena (hIdent h)
@@ -125,7 +126,7 @@ retireLists h = mapM one entries
   where
     ArenaId a = siArena (hIdent h)
     walk = walkTree a (siSource (hIdent h)) (diskRead (hDisk h)) ((\(PageNo p) → p) <$> rRetire (storeRoots (hStore h)))
-    entries = [(getBe64' k 0, getBe64' v 0, getLe16' v 10) | (k, v) ← twLeaves walk, BS.length k == 8]
+    entries = [(getBe64' k 1, getBe64' v 0, getLe16' v 10) | (k, v) ← twLeaves walk, BS.length k == 9, BS.index k 0 == 0]
     one (ver, lp, done) = case diskRead (hDisk h) (PageNo lp) >>= either (const Nothing) Just . parsePage a (siSource (hIdent h)) of
       Just pg | RefList _ ps ← rpBody pg → Right (ver, drop (fromIntegral done) ps)
       _ → Left "a retirement list is not readable"

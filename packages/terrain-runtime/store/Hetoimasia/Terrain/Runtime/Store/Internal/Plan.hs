@@ -108,6 +108,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Plan
   ) where
 
 import Data.ByteString (ByteString)
+import Data.ByteString.Short (fromShort)
 import qualified Data.ByteString as BS
 import Control.Monad (foldM)
 import Data.Int (Int64)
@@ -582,14 +583,14 @@ unreachable bounds fp cfg roots pins why mk win pages edit0 =
       Nothing → Left (OutProbes [pg])
       Just ProbeNone → Right edit
       Just (ProbeList v) → do
-        (mv, edit') ← phase edit (lookupKey TreeRetire (fmap Disk (rRetire roots)) (be64 v))
-        case mv >>= decodeRetire total (be64 v) of
+        (mv, edit') ← phase edit (lookupKey TreeRetire (fmap Disk (rRetire roots)) (versionKey v))
+        case mv >>= decodeRetire total (versionKey v) of
           Just (_, ret) | retList ret == pg → refuse (Integrity (why pg))
           _ → Right edit'
       Just (ProbeTree tree level key) →
         let rootsOf = nub (rootOf roots tree : [pinRootFor tree p | p ← pins, isRecordTree tree])
          in foldM (\e r → do
-                      (found, e') ← phase e (livePageAt tree (fmap Disk r) key level)
+                      (found, e') ← phase e (livePageAt tree (fmap Disk r) (fromShort key) level)
                       if found == Just pg then refuse (Integrity (why pg)) else Right e') edit rootsOf
 
 -- | What a window must hold to take one more page: it would outgrow its page or byte bound.
@@ -996,7 +997,7 @@ applyWrites edit roots0 = go roots0 edit
 -- sum, so a term the charge gains is in every one of them by construction.
 worstChargeWith ∷ Int → Int → Int → RamCharge
 worstChargeWith written writes factsB =
-  ramFor maxWindowPages (maxWindowBytes + worstOwnershipBytes) overlayWorstBytes written writes (maxListPages + bookkeepingReserve) maxClaimPages factsB
+  ramFor maxWindowPages (maxWindowBytes + worstOwnershipBytes + maxProofFacts * factBytes) overlayWorstBytes written writes (maxListPages + bookkeepingReserve) maxClaimPages factsB
 
 -- | The worst charge a plan may carry, the one the admission sizes its accounts from ('Hetoimasia.Terrain.Runtime.Store.Admission'):
 -- at the format's bounds, with up to three record writes for each of the 64 updates of a batch and the read facts at their ceiling.
@@ -1035,8 +1036,8 @@ ramFor windowN windowB overlayB written writes replaced supplyN factsB =
   RamCharge
     { ramIoBuffers = written * pageSize
     , ramDecodedCopies = windowB + overlayB
-    , ramKeys = writes * maxEntryBytes
-    , ramScratch = replaced * 16 + supplyN * 8 + 4096 + (2 * hotNodes + 1) * hotNodeBytes
+    , ramKeys = writes * writeRetainedBytes
+    , ramScratch = replaced * pageListCellBytes + supplyN * pageListCellBytes + 4096 + (2 * hotNodes + 1) * hotNodeBytes
     , ramPagePins = windowN * 16
     , ramRootControl = rootRecordBytes + activeRecordBytes + headerBytes
     , ramContinuation = 1024 + windowN * 8 + factsB
@@ -1085,8 +1086,8 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
         then Planned <$> tryChunk Nothing version' (newEdit overlayBudgetBookkeeping win) 0
         else case firstEntry of
         Nothing → pure NoWork
-        -- the retired-page index sorts after every entry: no entry key first means none left
-        Just (k, _) | BS.length k /= 8 → pure NoWork
+        -- the retired-page index sorts after every entry (its tag is above the entries'): no entry key first means none left
+        Just (k, _) | not (isRetireEntryKey k) → pure NoWork
         Just (k, v) → do
           (e, ret) ← maybe (refuse (Integrity MalformedRetirement)) pure (decodeRetire total k v)
           case oldest of
@@ -1208,7 +1209,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
           then pure (retireRootI, bkEditI)
           else
             if finished
-              then phase bkEditI (deleteKey TreeRetire retireRootI (be64 e))
+              then phase bkEditI (deleteKey TreeRetire retireRootI (versionKey e))
               else
                 let (k', v') = encodeRetire e (ret {retDone = fromIntegral done' ∷ Word16})
                  in phase bkEditI (insertKey TreeRetire retireRootI k' v')

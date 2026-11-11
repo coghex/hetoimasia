@@ -22,7 +22,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), bodyBytes, encodePage, innerKeyBytes)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
-import Hetoimasia.Terrain.Runtime.Store.Internal.Records (encodeKey, encodeValue)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Test.Hspec
@@ -282,6 +282,45 @@ specAdversarial = describe "adversarial histories over both key kinds, at two an
     must (checkH h3)
     heightOf h3 TreeLinks `shouldBe` 1
     Map.size ref3 `shouldBe` length kept
+  it "the retirement tree holds keys of two lengths today: a repack can put a page key where a version separator was, and the parent splits on a delete; with one key length it cannot" $ do
+    -- an entry's key (a version) and a retired-page index record's key, from the encoders; a version sorts before every page
+    let versionKeyOf v = fst (encodeRetire v (Retire (PageNo 1) 1 0))
+        pageKeyOf p = retiredKey (PageNo p)
+        versionLen = BS.length (versionKeyOf 1)
+        pageLen = BS.length (pageKeyOf 0)
+        diff = pageLen - versionLen
+        entryV v = (versionKeyOf v, BS.replicate 12 1)
+        entryP p = (pageKeyOf p, BS.replicate 8 2)
+        sepBytes len = 1 + len + 12
+        -- a version leaf at the minimum fill, a page leaf above it; the BOUNDARY leaf holds the last version keys and then page keys
+        versionLeaf l = PLeaf [entryV (fromIntegral l * 1000 + i) | i ← [1 .. 50]]
+        -- 47 entries of 22 bytes are the minimum fill (1,034 of a quarter payload, 1,013); one deletion leaves 1,012
+        underV = PLeaf [entryV (900000 + i) | i ← [1 .. 47]]
+        boundary = PLeaf ([entryV (950000 + i) | i ← [1 .. 10]] ++ [entryP i | i ← [0 .. 199]])
+        pageLeaf l = PLeaf [entryP (1000 + fromIntegral l * 100 + i) | i ← [0 .. 54]]
+        window = [(a, b) | a ← [3 .. 60 ∷ Int], b ← [1 .. 220 ∷ Int], let t = a * sepBytes versionLen + b * sepBytes pageLen, t <= pagePayloadBytes, t + diff > pagePayloadBytes]
+    if diff <= 0
+      then do
+        -- one key length: no parent can sit within a separator difference of full (the difference is zero), so a repack never grows one
+        window `shouldBe` []
+        diff `shouldBe` 0
+      else do
+        (a, b) ← case window of
+          (w : _) → pure w
+          [] → expectationFailure "no count of version and page children puts the parent in the window" >> fail "window"
+        let shape = PInner ([versionLeaf l | l ← [1 .. a - 2]] ++ [underV, boundary] ++ [pageLeaf l | l ← [1 .. b]])
+            victim = versionKeyOf 900001
+        ((viol0, bytes0), _) ← runTree (do r ← buildProbe TreeRetire shape; v ← shapeViolations TreeRetire (Just r); pure (v, a * sepBytes versionLen + b * sepBytes pageLen))
+        viol0 `shouldBe` []
+        ((root, viol, splits), _) ← runTree $ do
+          r0 ← buildProbe TreeRetire shape
+          root ← deleteKey TreeRetire (Just r0) victim
+          viol ← shapeViolations TreeRetire root
+          e ← getEditProbe
+          pure (root, viol, editDeleteSplits e)
+        putStrLn ("RETIRE two key lengths: version key " <> show versionLen <> " B, page key " <> show pageLen <> " B; parent of " <> show a <> " version and " <> show b <> " page children = " <> show bytes0 <> " of " <> show pagePayloadBytes <> " B; delete splits: " <> show splits)
+        viol `shouldBe` []
+        (root /= Nothing, splits) `shouldBe` (True, 1)
   it "the exit every write shares: an over-full node is split into two legal halves, a fitting one rewritten, an emptied one dropped" $ do
     -- a repack of the children can replace a separator by a longer key, so a parent within a few bytes of full may exceed a page
     -- when a deletion rewrites it: the exit insertion and deletion share splits it

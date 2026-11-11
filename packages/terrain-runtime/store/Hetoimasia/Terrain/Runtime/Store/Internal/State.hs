@@ -61,6 +61,10 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , txnRamLimit
   , maxReaders
   , readerRecordBytes
+  , pageListCellBytes
+  , pageStateEntryBytes
+  , writeRetainedBytes
+  , maxProofFacts
   , rootRecordBytes
   , activeRecordBytes
   , looseCap
@@ -180,7 +184,7 @@ maxWindowPages = 512
 -- | The accounted bytes of one validated page in a window: its 4 KiB buffer and the
 -- map entry and headers around it.
 windowPageBytes ∷ Int
-windowPageBytes = pageSize + 128
+windowPageBytes = pageSize + windowPageOverhead
 
 -- | The most accounted bytes a plan's window may hold: 1.25 MiB (about 310 pages). The
 -- window keeps validated page buffers, not decoded entry lists, so this is the memory
@@ -231,17 +235,40 @@ txnRamLimit = 4 * 1024 * 1024
 maxReaders ∷ Int
 maxReaders = 16
 
--- | The accounted bytes of one reader pin record.
+-- | The accounted bytes of one reader pin record: the pinned roots, their checksum list and the used space. MEASURED at 369 bytes, held to 512
+-- (the 256 reasoned before counted the fields, not the list cells and boxes).
 readerRecordBytes ∷ Int
-readerRecordBytes = 256
+readerRecordBytes = 512
 
--- | The accounted bytes of the committed root record.
+-- | What one cell of a list of page numbers retains: the cons cell and the boxed number. MEASURED (the suite's @Memory@ regression
+-- forces a list and reads the live heap: 40 bytes, held to 48), not reasoned from the 8 bytes of the number.
+pageListCellBytes ∷ Int
+pageListCellBytes = 48
+
+-- | The accounted bytes of the committed root record: its fixed fields (measured at most 123 bytes with the five tree checksums,
+-- held to 512) and the loose list at its cap, a list of page numbers ('pageListCellBytes' each). A root set is retained whole
+-- by the store and, as the next root set, by the plan that builds it.
 rootRecordBytes ∷ Int
-rootRecordBytes = 512
+rootRecordBytes = 512 + looseCap * pageListCellBytes
 
--- | The accounted bytes of the active transaction's control record.
+-- | What one entry of the active transaction's map of page states retains: a map node and the boxed page number (measured).
+pageStateEntryBytes ∷ Int
+pageStateEntryBytes = 80
+
+-- | The accounted bytes of the active transaction's control record: its map of the states of the pages it writes, at most
+-- 'maxTxnPages' (the plan it holds and its next root set are charged elsewhere: the pages as I/O buffers, the roots as the root record).
 activeRecordBytes ∷ Int
-activeRecordBytes = 512
+activeRecordBytes = 512 + maxTxnPages * pageStateEntryBytes
+
+-- | What one typed record write retains while a plan holds it: the key and the value as Haskell values (a source node key and a
+-- source node child are the largest). MEASURED at 234 bytes, held to 320; the 130 bytes of an encoded entry were the figure
+-- reasoned before.
+writeRetainedBytes ∷ Int
+writeRetainedBytes = 320
+
+-- | The most proof facts a plan's window carries: four for each page it may overwrite and one for each page a reclamation chunk consumes.
+maxProofFacts ∷ Int
+maxProofFacts = 4 * maxTxnPages + maxReclaimPages
 
 -- | The most loose pages the root set holds: a plan reserves at most
 -- 'maxClaimPages' and a commit replaces at most as many bookkeeping pages.
@@ -309,10 +336,21 @@ workOneWindowPages ∷ Int → Int → Int → Int → Int
 workOneWindowPages hr hf hrec pins =
   (hr + 1) + 2 * hr + 3 * hf + maxSpillPages * hf + max ((1 + pins) * hrec) (max hr hf)
 
--- | The most internal pages a retirement tree can have: at most @2 * maxRetiredPages@ records (an index record for
--- each retired page and an entry for each list), at least 46 to a leaf and 47 to an internal page.
+-- | The most internal pages a retirement tree can have, DERIVED from the key and entry sizes and the minimum fill the store
+-- enforces: at most @2 * maxRetiredPages@ records (an index record for each retired page and an entry for each list); a leaf
+-- holds at least a quarter payload of its largest entry (@2 + 'retireKeyBytes' + 'retireEntryValueBytes'@, 23 bytes: 45 entries) and an
+-- internal page of its entries (@1 + 'retireKeyBytes' + 12@, 22 bytes: 47 children), and each level above the leaves has at most
+-- the ceiling of the level below over 47 pages, the last being the root: 729 leaves, 16 internal pages and a root.
 maxRetireInternals ∷ Int
-maxRetireInternals = 17
+maxRetireInternals = levels (ceilDiv leaves minChildren)
+  where
+    ceilDiv a b = (a + b - 1) `div` b
+    minLeafEntries = ceilDiv minNodeBytes (2 + retireKeyBytes + retireEntryValueBytes)
+    minChildren = ceilDiv minNodeBytes (1 + retireKeyBytes + 12)
+    leaves = ceilDiv (2 * maxRetiredPages) minLeafEntries
+    levels n
+      | n <= 1 = 1
+      | otherwise = n + levels (ceilDiv n minChildren)
 
 -- | The accounted bytes of the probes of a transaction of one page.
 workOneProbeBytes ∷ Int → Int → Int

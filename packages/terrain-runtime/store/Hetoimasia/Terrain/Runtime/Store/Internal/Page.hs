@@ -326,7 +326,7 @@ unpackBody isLeaf count0 payload0
 validateSeparator ∷ TreeId → ByteString → Either PageError ()
 validateSeparator tree k = case tree of
   TreeFree → ok (BS.length k == 8)
-  TreeRetire → ok (BS.length k == 8 || (BS.length k == 9 && BS.index k 0 == 0xFF))
+  TreeRetire → ok (BS.length k == retireKeyBytes && (BS.index k 0 == retireEntryTag || BS.index k 0 == retirePageTag))
   _ → ok (decodeKey tree k /= Nothing)
   where
     ok b = if b then Right () else Left MalformedKey

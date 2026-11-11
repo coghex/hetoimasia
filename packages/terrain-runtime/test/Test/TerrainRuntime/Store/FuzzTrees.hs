@@ -199,8 +199,10 @@ spec = describe "a re-sealed byte of a live page, in each of the five trees" $ d
     putStrLn ("FUZZTREES pages " <> show sizes)
     forM_' sizes $ \(t, k) → (t, k) `shouldSatisfy` ((>= 4) . snd)
     let retireKeys = map fst (fst (referenceOf h TreeRetire))
-    length [() | k ← retireKeys, BS.length k == 9] `shouldSatisfy` (> 50)
-    length [() | k ← retireKeys, BS.length k == 8] `shouldSatisfy` (> 1)
+    length [() | k ← retireKeys, BS.index k 0 == 0xFF] `shouldSatisfy` (> 50)
+    length [() | k ← retireKeys, BS.index k 0 == 0] `shouldSatisfy` (> 1)
+    -- one key length in the tree
+    (all ((== 9) . BS.length) retireKeys) `shouldBe` True
     must (checkH h)
   it "refuses a pointer that names a stale valid page of the same tree and level, where it used to answer from the stale page" $ do
     let total = cfgUsablePages (hCfg h)

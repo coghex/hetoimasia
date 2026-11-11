@@ -35,7 +35,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
-import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64, isRetireEntryKey, versionKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (windowInsert)
 import Test.Hspec
@@ -144,7 +144,7 @@ livePages h = Set.fromList (concatMap (twPages . walkOf) [TreeRuns, TreeLinks, T
 retiredPagesOf ∷ H → IO [(Word64, [Word64])]
 retiredPagesOf h = do
   let walk = walkTree (arenaOf h) (sourceOf h) (diskRead (hDisk h)) ((\(PageNo p) → p) <$> rRetire (storeRoots (hStore h)))
-  entries ← pure [(getBe64' k 0, getBe64' v 0) | (k, v) ← twLeaves walk, BS.length k == 8]
+  entries ← pure [(getBe64' k 1, getBe64' v 0) | (k, v) ← twLeaves walk, BS.length k == 9, BS.index k 0 == 0]
   forM entries $ \(ver, lp) → do
     pg ← parsed h (PageNo lp)
     case rpBody pg of
@@ -213,8 +213,8 @@ retireLeafFor h key = do
 -- the entry (the entries sort before the index of retired pages).
 firstRetire ∷ H → IO (PageNo, [(ByteString, ByteString)], (ByteString, ByteString))
 firstRetire h = do
-  (leaf, es) ← retireLeafFor h (be64 0)
-  case [x | x@(k, _) ← es, BS.length k == 8] of
+  (leaf, es) ← retireLeafFor h (versionKey 0)
+  case [x | x@(k, _) ← es, isRetireEntryKey k] of
     (x : _) → pure (leaf, es, x)
     [] → expectationFailure "a retirement entry expected" >> fail "retire"
 
@@ -410,12 +410,12 @@ spec = describe "page ownership against forged records with valid checksums" $ d
       (hA, _) ← must (reclaimAll (h0 {hStore = s1}))
       (h2, ref2, _) ← must (foldM (\s _ → churn s 30) (hA, ref0, g0) [1 .. 4 ∷ Int])
       (leaf, es, (k0, v0)) ← firstRetire h2
-      let (lp, cnt, e) = (getBe64' v0 0, getLe16' v0 8, getBe64' k0 0)
+      let (lp, cnt, e) = (getBe64' v0 0, getLe16' v0 8, getBe64' k0 1)
       -- the oldest entry still waiting is newer than the reader's version (the reclamation that ran first only
       -- consumed entries it could, and its own commits changed no record page)
       e `shouldSatisfy` (> pinned)
       -- the entry now claims the version the reader pins: nothing newer holds its pages
-      let lowerEntry = [(if k == k0 then be64 pinned else k, x) | (k, x) ← es]
+      let lowerEntry = [(if k == k0 then versionKey pinned else k, x) | (k, x) ← es]
       h3 ← forge h2 leaf (Page TreeRetire 0 leaf (Leaf lowerEntry))
       -- the list still carries the true version: the entry and the list contradict each other
       (stampMismatch, _, _) ← must (fillWith h3 (planMaintenance (hStore h3)))
@@ -439,7 +439,7 @@ spec = describe "page ownership against forged records with valid checksums" $ d
         Refused (Integrity (RetiredIndexMismatch (PageNo q))) → ps `shouldSatisfy` (q `elem`)
         other → expectationFailure ("a lowered version contradicting the retired-page index was not refused: " <> take 300 (show other))
       -- the index forged to agree as well: only the reader's tree can say
-      let lowerIndex = [(k, if BS.length k == 9 && getBe64' x 0 == e then be64 pinned else x) | (k, x) ← lowerEntry]
+      let lowerIndex = [(k, if BS.length k == 9 && BS.index k 0 == 0xFF && getBe64' x 0 == e then be64 pinned else x) | (k, x) ← lowerEntry]
       h5 ← forge h4 leaf (Page TreeRetire 0 leaf (Leaf lowerIndex))
       (agreed, _, _) ← must (fillWith h5 (planMaintenance (hStore h5)))
       case agreed of
@@ -490,7 +490,7 @@ spec = describe "page ownership against forged records with valid checksums" $ d
     it "refuses a retirement list that names a page the retired-page index holds under another entry" $ do
       (h, _, _) ← fixture
       (_, _, (k0, v0)) ← firstRetire h
-      let (lp, cnt, e) = (getBe64' v0 0, getLe16' v0 8, getBe64' k0 0)
+      let (lp, cnt, e) = (getBe64' v0 0, getLe16' v0 8, getBe64' k0 1)
       lpage ← parsed h (PageNo lp)
       ps ← case rpBody lpage of
         RefList _ xs → pure xs
@@ -559,7 +559,7 @@ spec = describe "page ownership against forged records with valid checksums" $ d
     it "refuses a retirement list that names a bookkeeping page or a page past the used space" $ do
       (h, _, _) ← fixture
       (_, _, (k0, v0)) ← firstRetire h
-      let (lp, cnt, e) = (getBe64' v0 0, getLe16' v0 8, getBe64' k0 0)
+      let (lp, cnt, e) = (getBe64' v0 0, getLe16' v0 8, getBe64' k0 1)
       lpage ← parsed h (PageNo lp)
       ps ← case rpBody lpage of
         RefList _ xs → pure xs
@@ -578,9 +578,9 @@ spec = describe "page ownership against forged records with valid checksums" $ d
     it "refuses a retirement entry whose list page lies past the used space, is not a list, or does not hold the pages it counts" $ do
       (h, _, _) ← fixture
       (leaf, entries, (k0, v0)) ← firstRetire h
-      let (e, lp, cnt, done) = (getBe64' k0 0, getBe64' v0 0, getLe16' v0 8, getLe16' v0 10)
+      let (e, lp, cnt, done) = (getBe64' k0 1, getBe64' v0 0, getLe16' v0 8, getLe16' v0 10)
       let entryValue list c d = BS.concat [be64 list, le16' c, le16' d]
-          retarget v = forge h leaf (Page TreeRetire 0 leaf (Leaf [(k, if k == be64 e then v else x) | (k, x) ← entries]))
+          retarget v = forge h leaf (Page TreeRetire 0 leaf (Leaf [(k, if k == versionKey e then v else x) | (k, x) ← entries]))
           hw = rHw (storeRoots (hStore h))
       runsRoot ← maybe (expectationFailure "runs root" >> fail "runs") pure (rRuns (storeRoots (hStore h)))
       forM_

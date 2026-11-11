@@ -18,7 +18,8 @@
 --             val  tile(24) done(1)                      25   -- done in 1 .. 6
 -- TreeFree    key  start page(8)                          8
 --             val  length(8)                              8   -- at least 1
--- TreeRetire  key  version(8)                             8   -- the version that replaced the pages
+-- TreeRetire  key  0x00 version(8)                         9   -- an entry: the version that replaced the pages
+--                  0xFF page(8)                            9   -- a retired-page index record (the value is its entry's version)
 --             val  list page(8) count(2) done(2)         12   -- 1 <= count <= 505, done < count
 -- @
 --
@@ -42,6 +43,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Records
   , decodeRetire
   , Retire (..)
   , retiredKey
+  , versionKey
+  , isRetireEntryKey
   , decodeRetiredPage
   , be64
   , getBe64
@@ -246,12 +249,12 @@ data Retire = Retire
   deriving stock (Eq, Show)
 
 encodeRetire ∷ Word64 → Retire → (ByteString, ByteString)
-encodeRetire version (Retire (PageNo p) c d) = (be64 version, BS.concat [be64 p, le16 c, le16 d])
+encodeRetire version (Retire (PageNo p) c d) = (versionKey version, BS.concat [be64 p, le16 c, le16 d])
 
 decodeRetire ∷ Word64 → ByteString → ByteString → Maybe (Word64, Retire)
 decodeRetire total k v
-  | BS.length k == 8 && BS.length v == 12
-  , let version = getBe64 k 0
+  | isRetireEntryKey k && BS.length v == retireEntryValueBytes
+  , let version = getBe64 k 1
   , version >= 1
   , let p = getBe64 v 0
   , p < total
@@ -267,12 +270,21 @@ decodeRetire _ _ _ = Nothing
 -- version of the entry that owns the page. A page is looked up here to learn, in one
 -- bounded descent, whether a retirement obligation still owns it.
 retiredKey ∷ PageNo → ByteString
-retiredKey (PageNo p) = BS.cons 0xFF (be64 p)
+retiredKey (PageNo p) = BS.cons retirePageTag (be64 p)
+
+-- | The key of a retirement entry: its namespace tag and the version it records. The ONE encoder: every lookup, insertion and
+-- deletion of an entry builds its key here.
+versionKey ∷ Word64 → ByteString
+versionKey v = BS.cons retireEntryTag (be64 v)
+
+-- | Whether a key of the retirement tree is an entry's (and not a retired page's).
+isRetireEntryKey ∷ ByteString → Bool
+isRetireEntryKey k = BS.length k == retireKeyBytes && BS.index k 0 == retireEntryTag
 
 -- | A retired-page record: the page and the version of its entry.
 decodeRetiredPage ∷ Word64 → ByteString → ByteString → Maybe (Word64, Word64)
 decodeRetiredPage total k v
-  | BS.length k == 9 && BS.index k 0 == 0xFF && BS.length v == 8
+  | BS.length k == retireKeyBytes && BS.index k 0 == retirePageTag && BS.length v == 8
   , let p = getBe64 k 1
   , p < total
   , let version = getBe64 v 0
@@ -289,7 +301,7 @@ validateEntry ∷ TreeId → Word64 → ByteString → ByteString → Either Pag
 validateEntry tree total k v = case tree of
   TreeFree → maybe (Left MalformedValue) (const (Right ())) (decodeFree total k v)
   TreeRetire
-    | BS.length k == 9 → maybe (Left MalformedValue) (const (Right ())) (decodeRetiredPage total k v)
+    | BS.length k == retireKeyBytes && BS.index k 0 == retirePageTag → maybe (Left MalformedValue) (const (Right ())) (decodeRetiredPage total k v)
     | otherwise → maybe (Left MalformedValue) (const (Right ())) (decodeRetire total k v)
   _ → do
     key ← maybe (Left MalformedKey) Right (decodeKey tree k)
