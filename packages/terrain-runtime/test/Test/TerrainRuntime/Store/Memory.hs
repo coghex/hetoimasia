@@ -75,7 +75,12 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
     mHot ← retainedPer 300 [(fromIntegral i, densePage (fromIntegral i)) | i ← ints 300] (BS.length . snd) (\bufs → pure [either (error . show) id (decodePage ident0 total (PageNo pno) bs) | (pno, bs) ← bufs]) (\ps → evaluate (sum [length es | Page _ _ _ (Leaf es) ← ps]))
     mState ← retainedPer 25600 (ints 25600) id (\is → pure (Map.fromList [(PageNo (fromIntegral i * 7919), ()) | i ← is])) (\m → evaluate (Map.size m))
     -- an overlay page: a new page held packed, its full payload and the entry around it, as an edit keeps it
-    mOverlay ← retainedPer 400 (ints 400) id (\is → pure (either (error . show) fst (runM (mapM (\i → buildProbe TreeFree (PLeaf [(be64 (fromIntegral (i * 1000 + 2 * j)), be64 1) | j ← [1 .. 225 ∷ Int]])) is) (newEdit maxBound (emptyWindow ident0 0))))) (\refs → evaluate (length refs))
+    mOverlayRaw ← retainedPer 4000 (ints 4000) id (\is → pure (either (error . show) snd (runM (mapM (\i → buildProbe TreeFree (PLeaf [(be64 (fromIntegral (i * 1000 + 2 * j)), be64 1) | j ← [1 .. 225 ∷ Int]])) is) (newEdit maxBound (emptyWindow ident0 0))))) (\e → evaluate (editPackedPayload e))
+    -- the edit also keeps its last 'hotNodes' new pages PARSED: those are the hot set, charged in the scratch at 'hotNodeBytes', so the
+    -- measurement takes them out at their own measured size and leaves the packed pages
+    paySize ← evaluate (editPackedPayload (either (error . show) snd (runM (mapM (\i → buildProbe TreeFree (PLeaf [(be64 (fromIntegral (i * 1000 + 2 * j)), be64 1) | j ← [1 .. 225 ∷ Int]])) [1 .. 28 ∷ Int]) (newEdit maxBound (emptyWindow ident0 0)))))
+    putStrLn ("MEMORY overlay packed payload of the fixture: " <> show (paySize `div` 20) <> " B a page (28 pages, 8 held parsed)")
+    let mOverlay = mOverlayRaw - fromIntegral hotNodes * mHot / 4000
     pure
       [ Row "window page (buffer + map entry)" (pageSize + windowPageOverhead) mPage
       , Row "probe (map entry + key)" probeBytes mProbe

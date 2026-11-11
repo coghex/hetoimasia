@@ -130,6 +130,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , editDeleteSplits
   , treeHeight
   , getEditProbe
+  , editPackedPayload
   ) where
 
 import Data.ByteString (ByteString)
@@ -499,9 +500,11 @@ hotNodeBytes = 32768
 -- | A new page held packed: its entries as one byte string.
 data Stored = Stored !TreeId !Int !Bool !Int !ByteString
 
--- | The accounted bytes of one overlay page: its packed entries and a header.
+-- | The accounted bytes of one overlay page: its packed entries and what holds them (two map entries, the packed record and the byte
+-- string's header). MEASURED (the suite's @Memory@ regression, forced live heap, the edit kept alive): 262 bytes around a 4,050-byte
+-- payload, held to 320; the 160 reasoned before counted the header only.
 overlayNodeBytes ∷ Int → Int
-overlayNodeBytes payload = payload + 160
+overlayNodeBytes payload = payload + 320
 
 packNode ∷ Node → Stored
 packNode (Node t l body) = case body of
@@ -1384,5 +1387,10 @@ treeHeight _ Nothing = pure 0
 treeHeight tree (Just r) = (\n → nLevel n + 1) <$> load tree Nothing r
 
 -- | The plan state, for the suite.
+-- | Test exposure: the bytes of the packed new pages an edit holds (forces every one), for the suite's forced-memory regression of
+-- 'overlayNodeBytes'.
+editPackedPayload ∷ Edit → Int
+editPackedPayload e = sum [BS.length pl | Stored _ _ _ _ pl ← IntMap.elems (eFresh e)]
+
 getEditProbe ∷ M Edit
 getEditProbe = getEdit
