@@ -174,8 +174,11 @@ spec = describe "Terrain storage qualification on this platform" $ do
     dir <- fixture
     withEnvIn dir defaultProbe $ \env -> do
       before' <- availableOf dir
+      names0 <- listDirectory dir
       b <- openBacking env ident (hCfg h64)
-      listDirectory dir `shouldReturn` []
+      -- the name is gone as soon as the file exists: the directory lists what it listed before (a fresh
+      -- ext4 volume has its own lost+found)
+      listDirectory dir `shouldReturn` names0
       held <- availableOf dir
       record "unlink.reserved.bytes" (show (before' - held))
       -- a borrower is using the file: the close waits for it, and the data is still readable
