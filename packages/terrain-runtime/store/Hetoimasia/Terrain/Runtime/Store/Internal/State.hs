@@ -86,6 +86,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , typedReadBytes
   , readPhaseFixedBytes
   , maxTypedReads
+  , readPhaseStagedWriteBytes
+  , readPhaseProofFactBytes
   , removalWorstProbes
   , minimumRemovalPages
   , discoveryUnitPagesWritten
@@ -122,10 +124,11 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   ) where
 
 import Data.Word (Word32, Word64)
-import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), headerBytes, worstEdgeWrites, worstEditWrites)
+import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), headerBytes, maxBatchUpdates, worstEdgeWrites, worstEditWrites)
 import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (maxPackedPayloadBytes, overlayNodeBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (factBytes)
 
 mib ∷ Word64
 mib = 1024 * 1024
@@ -451,13 +454,29 @@ typedReadBytes = 576
 readPhaseFixedBytes ∷ Int
 readPhaseFixedBytes = rootRecordBytes + activeRecordBytes + headerBytes + 4096
 
--- | The most reads a plan lets #661 make: those whose TYPED read set fits beside a full window (its page bytes and its ownership
--- probes), the packed facts at their ceiling and the fixed records within a plan's RAM. #661 holds the typed set while it reads, and
+-- | The writes #661's staging has accumulated while it reads: up to three record writes for each of the 64 updates of a batch (the
+-- 192-write premise of the worst charge), each at 'writeRetainedBytes', which counts three copies of the write and so is
+-- conservative for the one copy staging holds.
+readPhaseStagedWriteBytes ∷ Int
+readPhaseStagedWriteBytes = 3 * maxBatchUpdates * writeRetainedBytes
+
+-- | The proof facts the window carries when a read phase is REPLAYED after a proof checkpoint: up to 'maxProofFacts', each
+-- 'factBytes'.
+readPhaseProofFactBytes ∷ Int
+readPhaseProofFactBytes = maxProofFacts * factBytes
+
+-- | The most reads a plan lets #661 make: those whose TYPED read set fits, within a plan's RAM, beside everything else alive while
+-- it reads: a full window (its page bytes and its ownership probes), the packed read facts at their ceiling, the proof facts a
+-- replayed read phase carries, the writes staging has accumulated and the fixed records. #661 holds the typed set while it reads, and
 -- checks its read allowance only as it reads, so the allowance is what bounds that memory. A discovery batch that would read more ENDS
 -- EARLY as progress with the inspections it completed; a removal reads at most 'worstEditReads' and a unit of discovery
 -- 'worstEdgeReads', both far below it (a property of the suite), so it is never a refusal.
+--
+-- The scratch figure of #661's own limits ('Hetoimasia.Terrain.Discovery.worstEdgeScratch' and its kin) is an accounting limit of
+-- that package, a bound it checks its own work against, and NOT a structure counted here: what this derivation counts is what is
+-- alive, term by term.
 maxTypedReads ∷ Int
-maxTypedReads = (txnRamLimit - maxWindowBytes - worstOwnershipBytes - maxReadFactBytes - readPhaseFixedBytes) `div` typedReadBytes
+maxTypedReads = (txnRamLimit - maxWindowBytes - worstOwnershipBytes - maxReadFactBytes - readPhaseProofFactBytes - readPhaseStagedWriteBytes - readPhaseFixedBytes) `div` typedReadBytes
 
 -- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'worstEditWrites').
 editWindowPages ∷ Int → Int → Int → Int → Int → Int
