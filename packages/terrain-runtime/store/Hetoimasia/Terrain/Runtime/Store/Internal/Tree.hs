@@ -53,6 +53,14 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , Fact (..)
   , Fingerprint (..)
   , Facts (..)
+  , PackedReads (..)
+  , packReads
+  , factsOf
+  , packedReadsBytes
+  , packedReadsFresh
+  , packedFactBytes
+  , fingerprintBytes
+  , factsRetainedBytes
   , recordFact
   , editFacts
   , factBytes
@@ -291,12 +299,56 @@ data Fingerprint = Fingerprint !StoreIdentity !Word64 ![(PageNo, Word32)] ![(Wor
 -- | The facts a plan established before its window filled up, with what they were proven against. OPAQUE
 -- outside the store's own modules: a caller receives it in 'Hetoimasia.Terrain.Runtime.Store.Internal.Plan.Checkpoint'
 -- and gives it to 'windowCheckpoint', and has no way to make or change one.
-data Facts = Facts !Fingerprint ![Fact] !ReadSet
+--
+-- The read facts are carried PACKED, in the form the window holds them (see 'PackedReads'): they are packed when the facts are
+-- CREATED ('factsOf'), so nothing typed leaves the planner and what the caller holds is what 'factsRetainedBytes' accounts.
+data Facts = Facts !Fingerprint ![Fact] !PackedReads
+  deriving stock (Eq, Show)
+
+-- | The record and floor facts a plan read, as the bytes the pages hold: two maps from the encoded key to the encoded value (the
+-- EMPTY value for an absent answer; a floor answer is its 16 bytes). The form a window holds them in.
+data PackedReads = PackedReads !(Map ShortByteString ShortByteString) !(Map ShortByteString ShortByteString)
   deriving stock (Eq, Show)
 
 -- | No read facts: what a proof checkpoint carries (it made proofs, not reads).
-noReadFacts ∷ ReadSet
-noReadFacts = ReadSet [] []
+noReadFacts ∷ PackedReads
+noReadFacts = PackedReads Map.empty Map.empty
+
+-- | Pack what a plan read: the ONLY place the typed records of a read set are turned into facts.
+packReads ∷ ReadSet → PackedReads
+packReads (ReadSet rs fl) =
+  PackedReads
+    (Map.fromList [(packKey k, maybe SBS.empty (toShort . encodeValue) v) | (k, v) ← rs])
+    (Map.fromList [(packKey (KeyRun c z), maybe SBS.empty packRun v) | ((c, z), v) ← fl])
+
+-- | Facts made from what a plan established and read: the reads are packed here, at creation.
+factsOf ∷ Fingerprint → [Fact] → ReadSet → Facts
+factsOf fp fs rs = Facts fp fs (packReads rs)
+
+-- | The accounted bytes of one packed read fact: its key and value bytes and the entry around them ('readFactOverheadBytes').
+packedFactBytes ∷ ShortByteString → ShortByteString → Int
+packedFactBytes k v = SBS.length k + SBS.length v + readFactOverheadBytes
+
+-- | The accounted bytes of packed reads, counted from what is held.
+packedReadsBytes ∷ PackedReads → Int
+packedReadsBytes (PackedReads rs fl) = sum [packedFactBytes k v | m ← [rs, fl], (k, v) ← Map.toList m]
+
+-- | How many of the packed reads the window does not carry yet, and their accounted bytes.
+packedReadsFresh ∷ PackedReads → Window → (Int, Int)
+packedReadsFresh (PackedReads rs fl) w =
+  let new = [packedFactBytes k v | (k, v) ← Map.toList rs, not (Map.member k (wReadRecords w))] <> [packedFactBytes k v | (k, v) ← Map.toList fl, not (Map.member k (wReadFloors w))]
+   in (length new, sum new)
+
+-- | What the accounted fingerprint of a facts value is: the store identity, the version, five root checksums and up to
+-- 'maxReaders' pinned versions of three roots each. MEASURED (the suite's @Memory@ regression): 7,285 bytes at the worst; held to 8,192.
+fingerprintBytes ∷ Int
+fingerprintBytes = 8192
+
+-- | The RAM a facts value holds (what the caller keeps between a 'Checkpoint' and 'windowCheckpoint'): the fingerprint, every proof
+-- fact and every packed read fact, counted from what is held. The ceiling on the reads a plan carries ('maxReadFactBytes') is
+-- checked against this form.
+factsRetainedBytes ∷ Facts → Int
+factsRetainedBytes (Facts _ fs pr) = fingerprintBytes + length fs * factBytes + packedReadsBytes pr
 
 -- | The accounted bytes of one remembered record fact: its key, its value and the entry around them. A fact is held in the
 -- plan's RAM (as a retained continuation), never in the window's page bytes.
@@ -316,7 +368,7 @@ factBytes = 80
 -- version, trust, work and used space, holding none of the pages or probes of the old one and the facts the
 -- plan established (added to those it already had when they were proven against the same state).
 windowCheckpoint ∷ Facts → Window → Window
-windowCheckpoint (Facts fp fs (ReadSet rs fl)) w =
+windowCheckpoint (Facts fp fs (PackedReads rs fl)) w =
   let same = wFacts w == Just fp
       kept = if same then wProven w else Set.empty
       keptR = if same then wReadRecords w else Map.empty
@@ -326,8 +378,8 @@ windowCheckpoint (Facts fp fs (ReadSet rs fl)) w =
         , wProbes = Map.empty
         , wFacts = Just fp
         , wProven = Set.union kept (Set.fromList fs)
-        , wReadRecords = Map.union (Map.fromList [(packKey k, maybe SBS.empty (toShort . encodeValue) v) | (k, v) ← rs]) keptR
-        , wReadFloors = Map.union (Map.fromList [(packKey (KeyRun c z), maybe SBS.empty packRun v) | ((c, z), v) ← fl]) keptF
+        , wReadRecords = Map.union rs keptR
+        , wReadFloors = Map.union fl keptF
         }
 
 -- | The window, with the facts it carries kept only if they were proven against this state.

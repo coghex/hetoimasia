@@ -530,8 +530,8 @@ spec = describe "the private page codec against independent bytes" $ do
     it "returns a present and an absent answer through the window as they went in (records, and the 16-byte floor answer)" $ do
       let recKey = KeyLink (srcNode 1 1 1)
           floors = [((col, 0), Just (minBound, maxBound)), ((col, 1), Just (0, 0)), ((col, 2), Nothing)]
-          w = windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Just r) | r ← [childRec (srcNode 2 2 2)]] [])) (emptyWindow ident0 1)
-          wAbsent = windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Nothing)] floors)) (emptyWindow ident0 1)
+          w = windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Just r) | r ← [childRec (srcNode 2 2 2)]] [])) (emptyWindow ident0 1)
+          wAbsent = windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Nothing)] floors)) (emptyWindow ident0 1)
       windowReadRecord recKey w `shouldBe` Just (Just (childRec (srcNode 2 2 2)))
       windowReadRecord recKey wAbsent `shouldBe` Just Nothing
       windowReadRecord (KeyLink (srcNode 9 9 9)) w `shouldBe` Nothing

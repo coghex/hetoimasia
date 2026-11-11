@@ -82,6 +82,10 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , readResiduePages
   , readPathPages
   , maxReadFactBytes
+  , writtenPageBytes
+  , typedReadBytes
+  , readPhaseFixedBytes
+  , maxTypedReads
   , removalWorstProbes
   , minimumRemovalPages
   , discoveryUnitPagesWritten
@@ -118,7 +122,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   ) where
 
 import Data.Word (Word32, Word64)
-import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), worstEdgeWrites, worstEditWrites)
+import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), headerBytes, worstEdgeWrites, worstEditWrites)
 import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (maxPackedPayloadBytes, overlayNodeBytes)
@@ -430,6 +434,30 @@ readPathPages hrec = 2 * hrec
 -- and a discovery unit at most 'worstEdgeReads', each 'recordFactBytes' (30 KB and 20 KB): neither can reach it.
 maxReadFactBytes ∷ Int
 maxReadFactBytes = 1024 * 1024
+
+-- | What one page a plan WRITES retains in its list of pages: the cons cell, the tuple, the boxed page number and the byte string
+-- (its header, the pinned buffer's header and the padding) around the 4,096 bytes. MEASURED (the suite's @Memory@ regression, every
+-- kind of written page): 4,236 bytes; held to 4,288. The staging account is sized from 256 of them.
+writtenPageBytes ∷ Int
+writtenPageBytes = 4288
+
+-- | What one typed read of a discovery or removal retains while the read phase runs: the record read (a key and a record as Haskell
+-- values, the largest a source-node key and a source-node child with all three optional coordinates populated), the map the core
+-- keeps it in and the ascending list it is handed over as, alive together. MEASURED (the suite's @Memory@ regression); held with margin.
+typedReadBytes ∷ Int
+typedReadBytes = 576
+
+-- | The fixed RAM beside the typed reads, the window and the facts of a read phase: the control records and the scratch floor.
+readPhaseFixedBytes ∷ Int
+readPhaseFixedBytes = rootRecordBytes + activeRecordBytes + headerBytes + 4096
+
+-- | The most reads a plan lets #661 make: those whose TYPED read set fits beside a full window (its page bytes and its ownership
+-- probes), the packed facts at their ceiling and the fixed records within a plan's RAM. #661 holds the typed set while it reads, and
+-- checks its read allowance only as it reads, so the allowance is what bounds that memory. A discovery batch that would read more ENDS
+-- EARLY as progress with the inspections it completed; a removal reads at most 'worstEditReads' and a unit of discovery
+-- 'worstEdgeReads', both far below it (a property of the suite), so it is never a refusal.
+maxTypedReads ∷ Int
+maxTypedReads = (txnRamLimit - maxWindowBytes - worstOwnershipBytes - maxReadFactBytes - readPhaseFixedBytes) `div` typedReadBytes
 
 -- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'worstEditWrites').
 editWindowPages ∷ Int → Int → Int → Int → Int → Int

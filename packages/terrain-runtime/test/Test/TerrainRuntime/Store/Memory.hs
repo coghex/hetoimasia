@@ -26,15 +26,18 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Ord (comparing)
 import qualified Data.Set as Set
+import Data.Int (Int64)
 import Data.Word (Word64)
 import GHC.Stats (RTSStats (..), GCDetails (..), getRTSStats)
 import Hetoimasia.Terrain.Connectivity (Axis (..), ComponentKey, keyParameters, mkComponentKey)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger)
-import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), Todo (..), headerBytes)
+import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), Todo (..), headerBytes, worstEdgeReads, worstEditReads)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
+import Hetoimasia.Terrain.Runtime.Store.Admission (worstTransactionCharge)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (PageState (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (RamCharge (..), worstChargeWith)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
@@ -188,16 +191,17 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
     -- answer (16 bytes), an absent answer (empty); and the bound itself: a 64-byte key with a 64-byte value, which no valid record reaches
     mFact ← sequence $
       [ do
-          v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [] (ReadSet [(kf i, Just (rf i)) | i ← is] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
-          pure (Variant nm v Nothing)
+          v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(kf i, Just (rf i)) | i ← is] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
+          -- each variant against ITS OWN charge: its key and value lengths and the fixed entry overhead
+          pure (Variant nm v (Just (BS.length (encodeKey (kf 1)) + BS.length (encodeValue (rf 1)) + readFactOverheadBytes)))
       | (nm, kf, rf) ← validPairs
       ]
         <> [ do
-               v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [] (ReadSet [] [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2))), if odd i then Just (fromInteger (big i), fromInteger (big (i + 1))) else Nothing) | i ← is])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
-               pure (Variant "floor answer (16 bytes) or absent" v Nothing)
+               v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [] [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2))), if odd i then Just (fromInteger (big i), fromInteger (big (i + 1))) else Nothing) | i ← is])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
+               pure (Variant "floor answer (16 bytes) or absent" v (Just (BS.length (encodeKey (runKey 1 1 1)) + 16 + readFactOverheadBytes)))
            , do
                v ← retainedPer nFacts (ints nFacts) id (\is → pure (Map.fromList [(toShort (BS.append (be64 (fromIntegral i)) (BS.pack [fromIntegral (i + j) | j ← [1 .. maxKeyBytes - 8]])), toShort (BS.pack [fromIntegral (i + j + 3) | j ← [1 .. maxValueBytes]])) | i ← is])) (\m → evaluate (Map.size m))
-               pure (Variant "the bound: a 64-byte key with a 64-byte value (not reachable by a valid record)" v Nothing)
+               pure (Variant "the bound: a 64-byte key with a 64-byte value (not reachable by a valid record)" v (Just (maxKeyBytes + maxValueBytes + readFactOverheadBytes)))
            ]
     -- PROOF FACT: a member of the window's set of proofs; every constructor, the largest carries a version and a page
     mProof ← sequence
@@ -277,6 +281,42 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       | (tree, nm, sup) ← [t | t@(tr, _, _) ← treeSupplies, tr `elem` [TreeFree, TreeRetire, TreeRuns]]
       , inner ← [False, True]
       ]
+    -- WRITTEN PAGE: the plan's list of encoded pages, each a page number and a pinned 4,096-byte buffer; every kind of page it writes
+    mWritten ← sequence
+      [ do
+          v ← retainedPer 3000 (ints 3000) id (\is → pure [(PageNo (fromIntegral i), mk i) | i ← is]) (\ps → evaluate (sum [BS.length b | (_, b) ← ps]))
+          pure (Variant nm v Nothing)
+      | (nm, mk) ←
+          [ ("tree page, leaf (runs, densest)", \i → either (error . show) id (encodePage ident0 (Page TreeRuns 0 (PageNo (fromIntegral i)) (denseBodyOf TreeRuns False (take 400 runsSupply)))))
+          , ("tree page, internal (free, densest)", \i → either (error . show) id (encodePage ident0 (Page TreeFree 1 (PageNo (fromIntegral i)) (denseBodyOf TreeFree True (take 400 freeSupply)))))
+          , ("retirement list page at its cap", \i → either (error . show) id (encodePage ident0 (Page TreeRetire 0 (PageNo (fromIntegral i)) (List (fromIntegral i) [PageNo (fromIntegral (i * 600 + j)) | j ← [1 .. maxListPages]]))))
+          ]
+      ]
+    -- FACTS VALUE: what the caller holds between a Checkpoint and windowCheckpoint. The read facts are packed AT CREATION, so nothing typed
+    -- is in it; the proof facts are a LIST there (not the window's Set); the fingerprint holds the roots and the pinned versions
+    mFacts ← sequence
+      [ do
+          v ← retainedPer nFacts (ints nFacts) id (\is → pure (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(KeyLink (SrcNode (compKey 3 i)), Just (RecChild (SrcNode (compKey 3 (i + 7))))) | i ← is] []))) (\fx → evaluate (factsRetainedBytes fx))
+          pure (Variant "N packed read facts, the largest kind (a source key and a source child)" v (Just (BS.length (encodeKey (KeyLink (SrcNode (compKey 3 1)))) + BS.length (encodeValue (RecChild (SrcNode (compKey 3 8)))) + readFactOverheadBytes)))
+      , do
+          v ← retainedPer 20000 (ints 20000) id (\is → pure (factsOf (Fingerprint ident0 1 [] []) [FactGone (fromInteger (big i)) (PageNo (fromInteger (big (i + 1)))) | i ← is] (ReadSet [] []))) (\fx → evaluate (factsRetainedBytes fx))
+          pure (Variant "N proof facts, a list (the largest constructor)" v (Just factBytes))
+      , do
+          v ← retainedPer 200 (ints 200) id (\is → pure [Fingerprint ident0 (fromInteger (big i)) [(PageNo (fromInteger (big (i + k))), fromInteger (big (i + k))) | k ← [1 .. 5]] [(fromInteger (big (i + 10 * q)), [(PageNo (fromInteger (big (i + q + k))), fromInteger (big (i + q + k))) | k ← [1 .. 3]]) | q ← [1 .. maxReaders]] | i ← is]) (\fs → evaluate (sum [fromIntegral ver + length rs + sum [length ps | (_, ps) ← pins] | Fingerprint _ ver rs pins ← fs]))
+          pure (Variant "one fingerprint at its worst: 5 root checksums and 16 pinned versions of 3 roots" v (Just fingerprintBytes))
+      ]
+    -- TYPED READ IN FLIGHT: what #661 holds while a read phase runs: the record read (as Haskell values), the map it keeps it in and the
+    -- ascending list it is handed over as, all alive together
+    mTypedRead ← sequence $
+      [ do
+          v ← retainedPer 3000 (ints 3000) id (\is → pure (typedReadsOf kf rf is)) (\(m, l) → evaluate (sum (map recordWeight l) + Map.size m))
+          pure (Variant nm v Nothing)
+      | (nm, kf, rf) ← validPairs
+      ]
+        <> [ do
+               v ← retainedPer 3000 (ints 3000) id (\is → pure (let m = Map.fromList [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2)) ∷ Int64), if odd i then Just (fromInteger (big i) ∷ Int64, fromInteger (big (i + 1)) ∷ Int64) else Nothing) | i ← is] in (m, Map.toAscList m))) (\(m, l) → evaluate (Map.size m + length l))
+               pure (Variant "floor query (a column and a level) with its answer" v Nothing)
+           ]
     -- DISCOVERY HEADER: the always-resident control record (an authority and three counters), every field at its largest
     mHeader ← retainedPer 1000 (ints 1000) id (\is → pure [headerOf i | i ← is]) (\hs → evaluate (sum [fromIntegral (hHead h) + fromIntegral (hTail h) + hBytes h | h ← hs]))
     pure
@@ -292,6 +332,9 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       , Row "parsed node in the hot set (with its list cell, tuple and page number)" "the densest valid page of any tree: the free tree's 8 + 8 byte extents give 225 entries; the table prints every tree and kind" Nothing hotNodeBytes mHot
       , Row "page-state map entry of the active transaction" "every state is nullary: one cost" Nothing pageStateEntryBytes mState
       , Row "overlay page (packed payload + what holds it)" "a leaf packs to its page payload; an internal page packs each entry one byte larger, so the shortest separator gives the most entries" Nothing overlayPageWorstBytes mOverlay
+      , Row "written page (the plan's list entry: cons, tuple, page number, pinned buffer)" "a 4,096-byte pinned buffer whatever the page says; tree leaf, internal and list page measured" Nothing writtenPageBytes mWritten
+      , Row "a Facts value (the caller's continuation: fingerprint, proof facts as a list, packed read facts)" "N packed reads at the largest kind, N proof facts of the largest constructor, the worst fingerprint (16 pinned versions of 3 roots)" Nothing (packedFactBytes (toShort (BS.replicate 52 0)) (toShort (BS.replicate 53 0))) mFacts
+      , Row "typed read in flight (record + map entry + list cell, #661's read set during a read phase)" "a source-node key and a source-node child with all three optional coordinates populated, held in the core's map and in the list it is handed over as" (Just "source-node key, 3 parameters with child, source node, 3 parameters") typedReadBytes mTypedRead
       , Row "discovery header record" "an authority and three counters, all at their largest" Nothing headerBytes [Variant "header" mHeader Nothing]
       ]
   it "TABLE: every accounted constant, its largest valid instance and why, every variant measured against the accounted figure" $ do
@@ -333,13 +376,44 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
     -- and it is checked against what the measured variants really pack to, not against its own definition
     let packed = [b | r ← rows, take 12 (rowName r) == "overlay page", v ← rowVariants r, Just b ← [varBudget v]]
     (length packed > 0, all (<= overlayPageWorstBytes) packed) `shouldBe` (True, True)
+  it "a plan's I/O charge is the MEASURED written page for every page it writes (not the 4,096 bytes of the buffer)" $ do
+    case [r | r ← rows, take 12 (rowName r) == "written page"] of
+      [r] → do
+        let m = ceiling (varMeasured (rowMax r)) ∷ Int
+        (ramIoBuffers (worstChargeWith maxTxnPages 0 0) >= maxTxnPages * m, ramIoBuffers (worstChargeWith maxTxnPages 0 0) `div` maxTxnPages) `shouldBe` (True, writtenPageBytes)
+        -- and the budget a plan's pages are charged from is the same one the admission's accounts are sized from
+        ramIoBuffers worstTransactionCharge `shouldBe` maxTxnPages * writtenPageBytes
+      other → expectationFailure ("expected one written-page row, found " <> show (length other))
+  it "the read phase in flight fits: the typed reads at the cap, a full window, the packed facts at their ceiling and the fixed records are within a plan's RAM, at the MEASURED typed read" $ do
+    case [r | r ← rows, take 13 (rowName r) == "typed read in"] of
+      [r] → do
+        let m = ceiling (varMeasured (rowMax r)) ∷ Int
+            peak n = n * m + maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + readPhaseFixedBytes
+        -- a removal reads at most worstEditReads, a unit of discovery worstEdgeReads, a batch the cap; each fits
+        forM_ [worstEdgeReads, worstEditReads, maxTypedReads] $ \n → (n, peak n <= txnRamLimit) `shouldBe` (n, True)
+        -- and the cap is above what a removal or one inspection can read, so it is never what refuses them
+        (maxTypedReads >= worstEditReads, maxTypedReads >= worstEdgeReads) `shouldBe` (True, True)
+        -- the cap is the largest the ACCOUNTED typed read allows: one more read at the accounted figure would not fit
+        let fixed = maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + readPhaseFixedBytes
+        (maxTypedReads * typedReadBytes + fixed <= txnRamLimit, (maxTypedReads + 1) * typedReadBytes + fixed > txnRamLimit) `shouldBe` (True, True)
+      other → expectationFailure ("expected one typed-read row, found " <> show (length other))
+  it "a Facts value of N read facts and N proof facts retains no more than factsRetainedBytes says (measured on one value, accounted on another)" $ do
+    let fingerprintOf salt = Fingerprint ident0 (fromInteger (big salt)) [(PageNo (fromInteger (big (salt + k))), fromInteger (big (salt + k))) | k ← [1 .. 5]] [(fromInteger (big (salt + 10 * q)), [(PageNo (fromInteger (big (salt + q + k))), fromInteger (big (salt + q + k))) | k ← [1 .. 3]]) | q ← [1 .. maxReaders]]
+        mkFacts salt = factsOf (fingerprintOf salt) [FactGone (fromInteger (big (i + salt))) (PageNo (fromInteger (big (i + salt + 1)))) | i ← [1 .. maxProofFacts]] (ReadSet [(KeyLink (SrcNode (compKey 3 (i + salt))), Just (RecChild (SrcNode (compKey 3 (i + salt + 7))))) | i ← ints nFacts] [])
+    measured ← retainedPer 1 [()] (const 0) (\_ → pure (mkFacts 1)) (\fx → evaluate (factsRetainedBytes fx))
+    let accounted = factsRetainedBytes (mkFacts 100000)
+    putStrLn ("MEMORY a Facts value of " <> show nFacts <> " read facts and " <> show maxProofFacts <> " proof facts: retains " <> show (round measured ∷ Int) <> " B, accounted " <> show accounted <> " B")
+    (measured <= fromIntegral accounted, accounted <= maxReadFactBytes + maxProofFacts * factBytes + fingerprintBytes) `shouldBe` (True, True)
   it "the read facts at their ceiling retain no more than the ceiling: N of them, near maxReadFactBytes, in total" $ do
-    mTotal ← retainedPer 1 [()] (const 0) (\_ → pure (windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [] (ReadSet [(KeyLink (SrcNode (compKey 3 i)), Just (RecChild (SrcNode (compKey 3 (i + 7))))) | i ← ints nFacts] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
+    mTotal ← retainedPer 1 [()] (const 0) (\_ → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(KeyLink (SrcNode (compKey 3 i)), Just (RecChild (SrcNode (compKey 3 (i + 7))))) | i ← ints nFacts] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
     putStrLn ("MEMORY read facts at the ceiling: " <> show nFacts <> " facts retain " <> show (round mTotal ∷ Int) <> " B of " <> show maxReadFactBytes)
     (mTotal <= fromIntegral maxReadFactBytes) `shouldBe` True
     unless (nFacts > 0) (expectationFailure "no facts")
   where
     ints n = [1 .. n] ∷ [Int]
+    typedReadsOf kf rf is =
+      let m = Map.fromList [(kf i, Just (rf i)) | i ← is]
+       in (m, Map.toAscList m)
     writesOf kf rf is =
       let ws = [(kf i, Just (rf i)) | i ← is]
           m = Map.fromList ws

@@ -463,7 +463,7 @@ planRemoval = planRemovalWith standardBounds
 planRemovalWith ∷ Bounds → Env → Store → Window → TileCoord → Planned
 planRemovalWith bounds env s win0 tile = withWindow s win0 $ \_ →
   let (fp, win, prov) = readPhase s win0
-   in case stageRemovalTraced env (rHeader (sRoots s)) prov (editAllowance env) tile of
+   in case stageRemovalTraced env (rHeader (sRoots s)) prov (readCapped bounds (editAllowance env)) tile of
         (Left refusal, _) → Refused (refusalOf refusal)
         (Right NoChange, _) → NoWork
         (Right (EditSuspended key), rs) → suspendedReads bounds s fp win rs key
@@ -488,10 +488,12 @@ newReadFacts win (ReadSet rs fl) =
 checkpointReads ∷ Bounds → Fingerprint → Window → ReadSet → Planned
 checkpointReads bounds fp win rs
   | fresh == 0 = Refused (Capacity (if windowSize win + 1 > bdWindowPages bounds then WindowExceeded (windowSize win) else WindowBytesExceeded (windowBytes win)))
-  | (windowReadFactCount win + fresh) * recordFactBytes > maxReadFactBytes = Refused (Capacity (TxnRamExceeded ((windowReadFactCount win + fresh) * recordFactBytes)))
-  | otherwise = Checkpoint (Facts fp [] rs)
+  | windowReadFactBytes win + freshBytes > maxReadFactBytes = Refused (Capacity (TxnRamExceeded (windowReadFactBytes win + freshBytes)))
+  | otherwise = Checkpoint (Facts fp [] packed)
   where
-    fresh = newReadFacts win rs
+    -- packed HERE, at creation: nothing typed leaves the planner, and the ceiling counts the bytes the facts hold
+    packed = packReads rs
+    (fresh, freshBytes) = packedReadsFresh packed win
 
 -- | A read phase that needs a page: the page when the window can take it, else a checkpoint of what was read.
 suspendedReads ∷ Bounds → Store → Fingerprint → Window → ReadSet → RecordKey → Planned
@@ -526,7 +528,7 @@ planDiscoveryWith bounds env s win0 = withWindow s win0 $ \_ →
   where
     full = allowanceOf (envLimits env)
     go fp win prov writes tries =
-      case stepDiscoveryTraced env (rHeader (sRoots s)) prov full {allowWrites = writes} of
+      case stepDiscoveryTraced env (rHeader (sRoots s)) prov (readCapped bounds full) {allowWrites = writes} of
         (Left refusal, _) → Refused (refusalOf refusal)
         (Right Idle, _) → NoWork
         (Right (Stalled key), rs) → suspendedReads bounds s fp win rs key
@@ -539,6 +541,11 @@ planDiscoveryWith bounds env s win0 = withWindow s win0 $ \_ →
 
 editAllowance ∷ Env → Allowance
 editAllowance = allowanceOf . envLimits
+
+-- | The allowance of a read phase under the plan's bounds: it never reads more records than the bounds' read cap, because #661 holds
+-- them typed while it reads ('maxTypedReads'). A discovery batch that reaches the cap ends early as progress.
+readCapped ∷ Bounds → Allowance → Allowance
+readCapped bounds a = a {allowReads = min (allowReads a) (bdMaxReads bounds)}
 
 -- | Run a planner over the committed provider, refusing a window of another store or
 -- version before anything is read.

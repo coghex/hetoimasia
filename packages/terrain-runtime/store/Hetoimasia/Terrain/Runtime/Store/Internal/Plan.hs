@@ -371,6 +371,9 @@ data Bounds = Bounds
   , bdWorst ∷ !RamCharge
   -- ^ the worst charge a plan may carry ('worstPlanCharge' in production): a plan charged more in any component is refused. The suite
   -- lifts it to measure the page bound with more record writes than the admission is sized for.
+  , bdMaxReads ∷ !Int
+  -- ^ the most records a read phase may read ('maxTypedReads' in production): #661 holds them typed while it reads, so this is what
+  -- bounds that memory. A discovery batch that would read more ends early as progress.
   , bdReadResidue ∷ !Int
   -- ^ the read pages a window may still hold when a read phase ends and the edit begins ('readResiduePages' in production): more
   -- are handed on as facts through a checkpoint. The suite raises it to run the same plan with no read-phase checkpoint.
@@ -380,7 +383,7 @@ data Bounds = Bounds
 -- | 256 pages (1 MiB of new encoded pages), 4 MiB of RAM, 512 window pages and 1.25 MiB
 -- of window bytes.
 standardBounds ∷ Bounds
-standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages worstPlanCharge readResiduePages
+standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages worstPlanCharge maxTypedReads readResiduePages
 
 -- ---------------------------------------------------------------------------
 -- The planning monad
@@ -1034,7 +1037,7 @@ chargeFor bounds windowN windowB overlayB written writes replaced supplyN factsB
 ramFor ∷ Int → Int → Int → Int → Int → Int → Int → Int → RamCharge
 ramFor windowN windowB overlayB written writes replaced supplyN factsB =
   RamCharge
-    { ramIoBuffers = written * pageSize
+    { ramIoBuffers = written * writtenPageBytes
     , ramDecodedCopies = windowB + overlayB
     , ramKeys = writes * writeRetainedBytes
     , ramScratch = replaced * pageSetElemBytes + supplyN * pageListCellBytes + 4096 + (2 * hotNodes + 1) * hotNodeBytes

@@ -12,7 +12,7 @@ module Test.TerrainRuntime.Store.Protocol (spec) where
 import Control.Monad (foldM, forM, forM_)
 import qualified Data.ByteString as BS
 import Hetoimasia.Terrain.Coordinate (TileCoord)
-import Hetoimasia.Terrain.Discovery (Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites, worstEditReads, worstEditWrites)
+import Hetoimasia.Terrain.Discovery (Allowance (..), Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, maxBatchUpdates, Step (..), candidateReport, reportWrites, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites, worstEditReads, worstEditWrites)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
@@ -433,6 +433,70 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
       -- the proof phase holds no more probes than the pages the removal writes, which 'removalWorstProbes' is derived from
       (cProbePeak (cOf tight) <= removalWorstProbes, cProbePeak (cOf std) <= removalWorstProbes) `shouldBe` (True, True)
       putStrLn ("READPHASE removal " <> show hops <> " hops: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show removalWorstProbes)
+  it "caps the reads of a read phase at what its typed set can hold, and the cap is never a refusal: a removal and a unit fit, a batch ends early" $ do
+    -- the derived cap is above everything one removal or one inspection can read (so neither can be refused for it) and below what a
+    -- default batch may ask for (so it is the cap that ends a long batch, not the allowance of #661)
+    (maxTypedReads >= worstEditReads, maxTypedReads >= worstEdgeReads, maxTypedReads < maxBatchUpdates * worstEdgeReads) `shouldBe` (True, True, True)
+    -- a removal at EXACTLY its worst read count plans what the standard bounds plan
+    (h, env, tile) ← must (chainStore 64 8192)
+    let planner bounds hh w = planRemovalWith bounds env (hStore hh) w tile
+    std ← must (runThrough h 64 (planner standardBounds))
+    capped ← must (runThrough h 64 (planner (standardBounds {bdMaxReads = worstEditReads})))
+    samePlan (runPlan std) (runPlan capped) `shouldBe` True
+    -- a discovery over chains of 40 links (an inspection reads up to 132 records) with the cap at ONE inspection's worst read count and
+    -- above it: every batch is planned (never a refusal), a lower cap ends a batch earlier with fewer updates, and every cap drains to
+    -- the same records as the standard bounds
+    (hd, envd) ← must (chainedDiscovery 40 8192)
+    let caps = [worstEdgeReads, 2 * worstEdgeReads, 4 * worstEdgeReads, maxTypedReads]
+        batchPlanner cap hh w = planDiscoveryWith (standardBounds {bdMaxReads = cap}) envd (hStore hh) w
+    updates ← forM caps $ \cap → do
+      d ← must (runThrough hd 64 (batchPlanner cap))
+      pure (mUpdates (plMeasure (runPlan d)))
+    stdBatch ← must (runThrough hd 64 (\hh w → planDiscoveryWith standardBounds envd (hStore hh) w))
+    (hStd, nStd, _) ← must (drainThrough hd 64 (\hh w → planDiscoveryWith standardBounds envd (hStore hh) w))
+    recStd ← must (recordsOfStore hStd)
+    drained ← forM caps $ \cap → do
+      (hc, n, _) ← must (drainThrough hd 64 (batchPlanner cap))
+      rc ← must (recordsOfStore hc)
+      pure (n, rc == recStd, pendingObligations (storeHeader (hStore hc)))
+    putStrLn ("READPHASE read cap " <> show maxTypedReads <> " (removal needs at most " <> show worstEditReads <> ", an inspection " <> show worstEdgeReads <> "); updates in the first batch at caps " <> show caps <> " = " <> show updates <> " (standard bounds " <> show (mUpdates (plMeasure (runPlan stdBatch))) <> "); batches to drain " <> show (map (\(n, _, _) → n) drained) <> " (standard " <> show nStd <> ")")
+    -- the cap at one inspection ends the batch after fewer updates than a cap that holds more; every cap drains to the same records
+    -- (the fixture's batches read few records, so the caps above do not bite: every cap plans the same batch, which is the point of a
+    -- cap that is never a refusal. The cut itself is shown at #661's step below.)
+    (all (>= 1) updates, and (zipWith (<=) updates (drop 1 updates))) `shouldBe` (True, True)
+    all (\(_, same, left) → same && left == 0) drained `shouldBe` True
+  it "a read allowance below what a batch needs ends the batch early as progress with the inspections it completed, never as a refusal" $ do
+    -- both openings removed: several obligations, several inspections in one batch
+    let run0 = newRun smallSpec twoOpenings 64
+    r1 ← must (foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 (openingA ++ openingB))
+    let env = runEnv r1
+        hdr = retainedHeader (runRef r1)
+        prov = retainedProvider (runRef r1)
+        full = allowanceOf (envLimits env)
+        readsOf (_, ReadSet rs fl) = length rs + length fl
+        updatesOf (Right (Progress cand _), _) = reportWrites (candidateReport cand)
+        updatesOf _ = -1
+        stepWith a = stepDiscoveryTraced env hdr prov a
+        oneUnit = stepWith full {allowWrites = worstEdgeWrites}
+        whole = stepWith full
+        cappedAtUnit = stepWith full {allowReads = readsOf oneUnit}
+    putStrLn ("READPHASE early end: one inspection reads " <> show (readsOf oneUnit) <> " and writes " <> show (updatesOf oneUnit) <> "; the whole batch reads " <> show (readsOf whole) <> " and writes " <> show (updatesOf whole) <> "; with the allowance at one inspection's reads: " <> show (readsOf cappedAtUnit) <> " reads, " <> show (updatesOf cappedAtUnit) <> " writes")
+    -- the whole batch needs more reads than one inspection (so the cap bites), and capped at one inspection's reads it is PROGRESS with
+    -- exactly the inspection that fits, within the allowance
+    (readsOf whole > readsOf oneUnit, updatesOf whole > updatesOf oneUnit) `shouldBe` (True, True)
+    (updatesOf cappedAtUnit, readsOf cappedAtUnit <= readsOf oneUnit) `shouldBe` (updatesOf oneUnit, True)
+    -- and the PLANNER passes the cap on: a batch planned under a read cap of one inspection is progress with fewer updates than the
+    -- standard bounds plan, and a removal under a cap below what it reads is refused (the production cap is never that low)
+    let h1 = runH r1
+    (pFull, _, _) ← must (fillWith h1 (planDiscoveryWith standardBounds env (hStore h1)))
+    (pCap, _, _) ← must (fillWith h1 (planDiscoveryWith (standardBounds {bdMaxReads = readsOf oneUnit}) env (hStore h1)))
+    case (pFull, pCap) of
+      (Planned a, Planned b) → (mUpdates (plMeasure b) < mUpdates (plMeasure a), mUpdates (plMeasure b) >= 1) `shouldBe` (True, True)
+      other → expectationFailure ("expected two planned batches: " <> take 200 (show other))
+    (hr, envr, tile) ← must (chainStore 64 8192)
+    case runThrough hr 64 (\hh w → planRemovalWith (standardBounds {bdMaxReads = 1}) envr (hStore hh) w tile) of
+      Left _ → pure ()
+      Right _ → expectationFailure "a removal under a read cap of 1 should be refused"
   it "a checkpoint is never taken with no new fact: a window that cannot hold one read is the typed window result, never a loop" $ do
     (h, env, tile) ← must (chainStore 12 8192)
     -- a bound of two pages cannot hold the three pages of one read of the links tree
