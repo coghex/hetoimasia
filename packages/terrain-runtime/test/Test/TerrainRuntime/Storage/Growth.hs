@@ -48,6 +48,11 @@ allocatedOf env = do
 grow ∷ Env → Backing → Word64 → Word64 → IO Outcome
 grow env b from to = submitGrowth (envSvc env) b from to >>= outcomeOf env
 
+-- | The file occupies what it did before the growth, to one block: a filesystem may keep one block of its
+-- own bookkeeping accounted after a release (ext4 kept one extent block in the Linux repeats; APFS none).
+backTo ∷ Word64 → Word64 → Bool
+backTo held a = a <= held + 4096
+
 -- | What the service holds reserved on the volume, in bytes.
 reservedTotal ∷ Env → IO Word64
 reservedTotal env = sum . svReserved <$> atomically (serviceView (envSvc env))
@@ -112,7 +117,7 @@ spec = describe "Storage backend: growth" $ do
             notes `shouldBe` []
           other → expectationFailure (name <> ": " <> show other)
         -- whatever was obtained was released: the file occupies what it did, nothing is pending
-        allocatedOf env >>= (`shouldBe` held0)
+        allocatedOf env >>= (`shouldSatisfy` backTo held0)
         v ← view env b
         (name, bvCommittedBytes v, bvLengthBytes v, bvPendingReservation v) `shouldBe` (name, 64 * mib, 64 * mib, Nothing)
         readOk env b h0 5
@@ -127,7 +132,7 @@ spec = describe "Storage backend: growth" $ do
       cancelTicket (envSvc env) t >>= (`shouldBe` CancelRequested)
       openGate g
       awaitOutcome env t >>= (`shouldBe` Cancelled [])
-      allocatedOf env >>= (`shouldBe` held0)
+      allocatedOf env >>= (`shouldSatisfy` backTo held0)
       (bvLengthBytes <$> view env b) >>= (`shouldBe` 64 * mib)
 
   it "keeps a pending reservation, charged, when its release fails, and blocks growth until it is released" $
@@ -171,7 +176,7 @@ spec = describe "Storage backend: growth" $ do
       pg ← case o of GrowthPrepared pg _ → pure pg; other → fail (show other)
       t ← submitAbandon (envSvc env) b pg >>= either (fail . show) pure
       awaitOutcome env t >>= (`shouldBe` Released)
-      allocatedOf env >>= (`shouldBe` held0)
+      allocatedOf env >>= (`shouldSatisfy` backTo held0)
       v ← view env b
       (bvGrowthPrepared v, bvLengthBytes v) `shouldBe` (False, 64 * mib)
   where
