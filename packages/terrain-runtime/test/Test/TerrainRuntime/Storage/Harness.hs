@@ -24,6 +24,9 @@ module Test.TerrainRuntime.Storage.Harness
 
     -- * The seam
   , Probe (..)
+  , newProbe
+  , seamFor
+  , quiet
   , Gate (..)
   , Act (..)
   , newGate
@@ -129,6 +132,8 @@ data Act
     FilesystemIs !BC.ByteString
   | -- | Make the call and report the descriptor as not close-on-exec.
     NotCloexec
+  | -- | Raise an exception in the worker (a defect, not a storage result).
+    Throw
 
 data Rule = Rule
   { rMatch ∷ NativeOp → Bool
@@ -289,6 +294,7 @@ seamFor p = Seam wrapped before after
             case a of
               Just (FailWith e) → pure (Left e)
               Just ZeroBytes → pure (Right 0)
+              Just Throw → ioError (userError "injected defect")
               Just (ShortTo k) → nativePread real fd ptr (min k n) off
               _ → nativePread real fd ptr n off
         , nativePwrite = \fd ptr n off → do
