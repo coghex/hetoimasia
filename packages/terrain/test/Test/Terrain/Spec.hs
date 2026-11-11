@@ -19,6 +19,7 @@ import qualified Test.Terrain.ResidencyProperty as ResidencyProperty
 import qualified Test.Terrain.Segment as Segment
 import qualified Test.Terrain.Shape as Shape
 import qualified Test.Terrain.Source as Source
+import qualified Test.Terrain.StorageCompat as StorageCompat
 
 spec ∷ Spec
 spec = describe "Terrain" $ do
@@ -39,3 +40,4 @@ spec = describe "Terrain" $ do
   ResidencyProperty.spec
   Growth.spec
   Opacity.spec
+  StorageCompat.spec

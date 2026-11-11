@@ -10,8 +10,12 @@ description:
     settlement in one arbitration with cancellation and the parent session's
     admission, immutable borrowed snapshots, offload and reload from the
     immutable source plus canonical retained removals, and an orderly close. It
-    depends on the pure terrain package and the foundation and runtime services;
-    it has no Lua, window, renderer, GPU, native or game dependency.
+    also holds the pure model of the temporary store (TRA-20): the private page
+    codec, copy-on-write indexes, allocator and retirement work, staged
+    transaction planning, pinned readers, the allowance and the edit bank's
+    admission, with no file, thread or clock. It depends on the pure terrain
+    package and the foundation and runtime services; it has no Lua, window,
+    renderer, GPU, native or game dependency.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -37,6 +41,8 @@ library
     exposed-modules:
         Hetoimasia.Terrain.Runtime
         Hetoimasia.Terrain.Runtime.Settlement
+        Hetoimasia.Terrain.Runtime.Store
+        Hetoimasia.Terrain.Runtime.Store.Admission
         Hetoimasia.Terrain.Runtime.Supervised
     -- The state, the transactions and the owner behind the public interface; a
     -- client cannot import them.
@@ -48,11 +54,41 @@ library
         Hetoimasia.Terrain.Runtime.Internal.Types
     build-depends:
         base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
         stm >=2.5.3 && <2.6,
         text >=2.1 && <2.2,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-runtime:store
+
+-- The temporary store's pure model (TRA-20): the page codec and CRC32C, the
+-- copy-on-write indexes, the allocator and retirement work, transaction planning,
+-- readers, reclamation and the allowance. Being private it is visible to no client;
+-- the public facade `Hetoimasia.Terrain.Runtime.Store` and `...Store.Admission`
+-- re-export the narrow interface, and this package's own suite reaches the
+-- implementation through it to check the codec, the trees and the allocator
+-- against independent references. It performs no I/O, starts no thread and has no
+-- STM, Lua, window, GPU or game dependency.
+library store
+    import: language
+    visibility: private
+    hs-source-dirs: store
+    exposed-modules:
+        Hetoimasia.Terrain.Runtime.Store.Internal.Crc32c
+        Hetoimasia.Terrain.Runtime.Store.Internal.Format
+        Hetoimasia.Terrain.Runtime.Store.Internal.Model
+        Hetoimasia.Terrain.Runtime.Store.Internal.Page
+        Hetoimasia.Terrain.Runtime.Store.Internal.Plan
+        Hetoimasia.Terrain.Runtime.Store.Internal.Records
+        Hetoimasia.Terrain.Runtime.Store.Internal.State
+        Hetoimasia.Terrain.Runtime.Store.Internal.Tree
+    build-depends:
+        array >=0.5 && <0.6,
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
         hetoimasia-terrain ==0.1.0.0
 
 -- This package's own contracts, registered as the CPU validation group
@@ -64,7 +100,9 @@ test-suite terrain-runtime-tests
     type: exitcode-stdio-1.0
     main-is: Main.hs
     hs-source-dirs: test
-    ghc-options: -threaded -rtsopts
+    -- The allocation observations read the runtime's counters, which exist only
+    -- when the program is started with -T.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     other-modules:
         Test.TerrainRuntime.Basic
         Test.TerrainRuntime.Budgets
@@ -82,8 +120,35 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Revalidation
         Test.TerrainRuntime.Usage
         Test.TerrainRuntime.Spec
+        Test.TerrainRuntime.Store.AdmissionSpec
+        Test.TerrainRuntime.Store.Allowance
+        Test.TerrainRuntime.Store.Boundary
+        Test.TerrainRuntime.Store.Bounds
+        Test.TerrainRuntime.Store.Codec
+        Test.TerrainRuntime.Store.Cycles
+        Test.TerrainRuntime.Store.Evidence
+        Test.TerrainRuntime.Store.Faults
+        Test.TerrainRuntime.Store.Fuzz
+        Test.TerrainRuntime.Store.FuzzTrees
+        Test.TerrainRuntime.Store.Harness
+        Test.TerrainRuntime.Store.History
+        Test.TerrainRuntime.Store.Keys
+        Test.TerrainRuntime.Store.Memory
+        Test.TerrainRuntime.Store.Protocol
+        Test.TerrainRuntime.Store.Rebalance
+        Test.TerrainRuntime.Store.Large
+        Test.TerrainRuntime.Store.Scattered
+        Test.TerrainRuntime.Store.Identity
+        Test.TerrainRuntime.Store.Ownership
+        Test.TerrainRuntime.Store.Readers
+        Test.TerrainRuntime.Store.Reference
+        Test.TerrainRuntime.Store.Replay
+        Test.TerrainRuntime.Store.Scenes
+        Test.TerrainRuntime.Store.Trees
+        Test.TerrainRuntime.Store.Workload
     build-depends:
         base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
@@ -94,4 +159,5 @@ test-suite terrain-runtime-tests
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-terrain ==0.1.0.0,
         hetoimasia-terrain-runtime ==0.1.0.0,
+        hetoimasia-terrain-runtime:store,
         hetoimasia-test-support ==0.1.0.0

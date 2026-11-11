@@ -1,0 +1,698 @@
+-- | The store's configuration, its limits and the committed root set.
+--
+-- = Page states
+--
+-- Every page below the high-water mark @hw@ is in exactly one state, and the
+-- counters of 'Roots' say how many pages are in each:
+--
+-- * __live__: reachable from the committed roots (a record, allocator or
+--   retirement tree page, or a retirement list page);
+-- * __retired__: replaced by a commit and listed in a retirement entry, kept until
+--   every reader that could still read it has released;
+-- * __free__: a free extent of the allocator tree, ready to be taken;
+-- * __loose__: an owner-private bookkeeping page (an allocator or retirement page
+--   a commit replaced, or a page a plan reserved and did not use) kept in the root
+--   set for the next plan to take first.
+--
+-- Pages at or above @hw@ and below the usable page count are the untouched tail:
+-- free, and taken by raising @hw@, which needs no allocator record. A page is in
+-- the committed root's state only after its transaction published; pages a pending
+-- transaction has claimed are /staged/ and counted separately.
+--
+-- Used pages are @hw - free@ plus the staged claim; free capacity is the rest of
+-- the usable pages. Free reserved extents are never used bytes, retired pages are a
+-- subset of the used pages (pending reclaim is not extra free capacity), and a page
+-- reached by several roots is one page.
+--
+-- = Why loose pages are safe to reuse
+--
+-- A reader pins the record trees only; the allocator and retirement trees are the
+-- owner's, read only while planning against the committed roots. A bookkeeping page
+-- a commit replaced is unreachable from the new committed roots and from every
+-- reader, and the single mutating transaction that could still hold it has just
+-- published, so the next plan may take it at once. Record-tree pages a commit
+-- replaced are never loose: they go to a retirement entry and wait for the readers.
+--
+-- State, ownership and lifetime: values. The terrain owner holds the one current
+-- 'Roots' and replaces it only when a published plan says so.
+module Hetoimasia.Terrain.Runtime.Store.Internal.State
+  ( -- * Limits
+    mib
+  , gib
+  , defaultAllowanceBytes
+  , minAllowanceBytes
+  , allowanceUnitBytes
+  , protectedReserveBytes
+  , reservePages
+  , defaultOffsetLimit
+  , bookkeepingReserve
+  , maxBookkeepingPages
+  , bookkeepingSlack
+  , maxClaimPages
+  , maxWindowPages
+  , windowPageBytes
+  , maxWindowBytes
+  , maxWindowProbes
+  , maxRetiredPages
+  , worstOwnershipBytes
+  , overlayPageWorstBytes
+  , overlayWorstFor
+  , overlayBudgetRecord
+  , overlayBudgetBookkeeping
+  , txnRamLimit
+  , maxReaders
+  , readerRecordBytes
+  , pageListCellBytes
+  , pageSetElemBytes
+  , pageStateEntryBytes
+  , writeRetainedBytes
+  , maxProofFacts
+  , rootRecordBytes
+  , activeRecordBytes
+  , looseCap
+  , looseSoftCap
+  , maxSpillPages
+  , maxReclaimPages
+  , workOneWindowPages
+  , looseGrowthUnit
+  , looseGrowthOrdinary
+  , workOneProbeBytes
+  , removalWindowPages
+  , editWindowPages
+  , readResiduePages
+  , readPathPages
+  , maxReadFactBytes
+  , writtenPageBytes
+  , typedReadBytes
+  , readPhaseFixedBytes
+  , maxTypedReads
+  , readPhaseStagedWriteBytes
+  , readPhaseProofFactBytes
+  , removalWorstProbes
+  , minimumRemovalPages
+  , discoveryUnitPagesWritten
+  , discoveryUnitWorstProbes
+  , discoveryUnitWindowPages
+  , maintenanceUnitPages
+  , discoveryUnitWrites
+  , maxRetireInternals
+
+    -- * Configuration
+  , StoreSpec (..)
+  , StoreConfig
+  , ConfigError (..)
+  , mkStoreConfig
+  , defaultStoreSpec
+  , cfgAllowanceBytes
+  , cfgOverheadBytes
+  , cfgOffsetLimit
+  , cfgUsablePages
+  , cfgTotalPages
+  , OffsetError (..)
+  , pageFileOffset
+  , rangeFileEnd
+  , growConfig
+  , validateSize
+
+    -- * Roots
+  , Roots (..)
+  , rootOf
+  , rootTrust
+  , pinTrust
+  , emptyRoots
+  , Pins (..)
+  ) where
+
+import Data.Word (Word32, Word64)
+import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), headerBytes, maxBatchUpdates, worstEdgeWrites, worstEditWrites)
+import Hetoimasia.Terrain.Residency (ArenaId, Revision (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (maxPackedPayloadBytes, overlayNodeBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (factBytes)
+
+mib ∷ Word64
+mib = 1024 * 1024
+
+gib ∷ Word64
+gib = 1024 * mib
+
+-- | The default per-arena storage allowance: 1 GiB.
+defaultAllowanceBytes ∷ Word64
+defaultAllowanceBytes = gib
+
+-- | The smallest allowance: 64 MiB.
+minAllowanceBytes ∷ Word64
+minAllowanceBytes = 64 * mib
+
+-- | An allowance is a whole number of these: 1 MiB.
+allowanceUnitBytes ∷ Word64
+allowanceUnitBytes = mib
+
+-- | The bytes of the allowance protected for allocator and reclamation progress:
+-- 8 MiB. Ordinary new history cannot spend them.
+protectedReserveBytes ∷ Word64
+protectedReserveBytes = 8 * mib
+
+reservePages ∷ Word64
+reservePages = protectedReserveBytes `div` pageSizeW
+
+-- | The largest signed 64-bit file offset: the default native limit.
+defaultOffsetLimit ∷ Word64
+defaultOffsetLimit = 2 ^ (63 ∷ Int) - 1
+
+-- | The pages a plan reserves for its allocator and retirement trees: four updates
+-- at the worst cost of one, @2 * (maxLevel + 1) + 1@. Pages it does not use become
+-- loose.
+bookkeepingReserve ∷ Int
+bookkeepingReserve = 4 * worstUpdatePages (maxLevel + 1)
+
+-- | The most bookkeeping pages one candidate plan may take: every page a plan writes counts against the
+-- 'maxTxnPages' of a transaction, so the record pages, the list page and the bookkeeping together stay
+-- within them (a plan that needs more is the shrinkable 'TxnPagesExceeded'), and the pages it claims stay
+-- within 'maxClaimPages'. The bookkeeping a plan needs is not bounded by the reserve alone: every replaced
+-- record page is also indexed in the retirement tree, one root-to-leaf path each. The plan counts the pages
+-- its bookkeeping edit really needs before it numbers any and, when the reserve is short, takes that many
+-- (and 'bookkeepingSlack' more) instead.
+maxBookkeepingPages ∷ Int
+maxBookkeepingPages = maxTxnPages
+
+-- | The pages taken beyond the count the first attempt needed: the larger supply takes more free
+-- extents, which the allocator tree's own edit may need a page or two more for.
+bookkeepingSlack ∷ Int
+bookkeepingSlack = 8
+
+-- | The most pages one plan takes from the allocator: every page it may write
+-- ('maxTxnPages') and the bookkeeping reserve.
+maxClaimPages ∷ Int
+maxClaimPages = maxTxnPages + bookkeepingReserve
+
+-- | The most validated pages a plan's continuation may hold (a structural bound; the
+-- byte bound, 'maxWindowBytes', is the tighter one for dense pages).
+maxWindowPages ∷ Int
+maxWindowPages = 512
+
+-- | The accounted bytes of one validated page in a window: its 4 KiB buffer and the
+-- map entry and headers around it.
+windowPageBytes ∷ Int
+windowPageBytes = pageSize + windowPageOverhead
+
+-- | The most accounted bytes a plan's window may hold: 1.25 MiB (about 310 pages). The
+-- window keeps validated page buffers, not decoded entry lists, so this is the memory
+-- it really holds; a plan that needs more is refused with a typed result.
+maxWindowBytes ∷ Int
+maxWindowBytes = 1310720
+
+-- | The most page probes a plan's window may hold: every page it writes below the used
+-- space is probed once ('maxTxnPages'), and a reclamation chunk probes the pages it
+-- frees beside the bookkeeping pages it writes.
+maxWindowProbes ∷ Int
+maxWindowProbes = 512
+
+-- | The most retired pages that may be outstanding when an ordinary plan adds more. Every
+-- retired page is indexed in the retirement tree by its number, so a plan can prove in one
+-- descent that a page it overwrites is not still owned by an entry; the index is bounded by
+-- bounding the backlog (a reader's pin holds it). A plan that would add past it is refused
+-- with a typed result until a reader releases and maintenance has reclaimed. Maintenance
+-- never adds to it.
+maxRetiredPages ∷ Int
+maxRetiredPages = 16384
+
+-- | The most accounted bytes of the ownership proof: the probes a window keeps.
+worstOwnershipBytes ∷ Int
+worstOwnershipBytes = maxWindowProbes * probeBytes
+
+-- | The most accounted bytes of one new page at its worst: the largest packed payload ('maxPackedPayloadBytes') and what holds it
+-- ('overlayNodeBytes'). Every overlay figure below is this one, never a restated number.
+overlayPageWorstBytes ∷ Int
+overlayPageWorstBytes = overlayNodeBytes maxPackedPayloadBytes
+
+-- | The most accounted bytes of new (overlay) pages the record trees of one plan may
+-- hold while it works: the 256 pages it may write at their worst packed size and a margin of five pages.
+-- An overlay page is held packed, its entries as one byte string.
+overlayBudgetRecord ∷ Int
+overlayBudgetRecord = (maxTxnPages + 5) * overlayPageWorstBytes
+
+-- | The most accounted bytes the new pages of a plan that writes the given number of pages can hold at once: those pages at their
+-- worst packed size. The working budgets are looser bounds on the work in progress; this is what a plan's reservation holds (a new
+-- page is a written page, so a plan that writes fewer pages holds fewer).
+overlayWorstFor ∷ Int → Int
+overlayWorstFor written = written * overlayPageWorstBytes
+
+-- | The same for the allocator and retirement trees of one plan: the bookkeeping reserve and a margin of three pages.
+overlayBudgetBookkeeping ∷ Int
+overlayBudgetBookkeeping = (bookkeepingReserve + 3) * overlayPageWorstBytes
+
+-- | The RAM one transaction may reserve: 4 MiB.
+txnRamLimit ∷ Int
+txnRamLimit = 4 * 1024 * 1024
+
+-- | The readers one store may have pinned at once.
+maxReaders ∷ Int
+maxReaders = 16
+
+-- | The accounted bytes of one reader pin record: the pinned roots, their checksum list and the used space. MEASURED at 369 bytes, held to 512
+-- (the 256 reasoned before counted the fields, not the list cells and boxes).
+readerRecordBytes ∷ Int
+readerRecordBytes = 512
+
+-- | What one cell of a list of page numbers retains: the cons cell and the boxed number. MEASURED (the suite's @Memory@ regression
+-- forces a list and reads the live heap: 40 bytes, held to 48), not reasoned from the 8 bytes of the number.
+pageListCellBytes ∷ Int
+pageListCellBytes = 48
+
+-- | What one element of a SET of page numbers retains (the replaced pages of an edit are a set): a map node, the boxed number and
+-- the pointers. MEASURED: 56 bytes, held to 64.
+pageSetElemBytes ∷ Int
+pageSetElemBytes = 64
+
+-- | The accounted bytes of the committed root record: its fixed fields (measured at most 123 bytes with the five tree checksums,
+-- held to 512) and the loose list at its cap, a list of page numbers ('pageListCellBytes' each). A root set is retained whole
+-- by the store and, as the next root set, by the plan that builds it.
+rootRecordBytes ∷ Int
+rootRecordBytes = 512 + looseCap * pageListCellBytes
+
+-- | What one entry of the active transaction's map of page states retains: a map node and the boxed page number (measured).
+pageStateEntryBytes ∷ Int
+pageStateEntryBytes = 80
+
+-- | The accounted bytes of the active transaction's control record: its map of the states of the pages it writes, at most
+-- 'maxTxnPages' (the plan it holds and its next root set are charged elsewhere: the pages as I/O buffers, the roots as the root record).
+activeRecordBytes ∷ Int
+activeRecordBytes = 512 + maxTxnPages * pageStateEntryBytes
+
+-- | What one typed record write retains while a plan holds it: the candidate's list, the map the planner builds to put the writes
+-- in key order and its canonical list, all alive at once, each holding the key and the record as Haskell values. The largest
+-- valid pairing is a source-node key and a source-node child with ALL THREE optional coordinates populated in each (a key of
+-- 21 words and a child of the same); the suite measures every pairing a plan accepts. MEASURED: 560 bytes at the largest (272 with
+-- no optional coordinate, the figure a fixture without them gave), held to 640. The 130 bytes of an encoded entry were the figure
+-- reasoned first.
+writeRetainedBytes ∷ Int
+writeRetainedBytes = 640
+
+-- | The most proof facts a plan's window carries: four for each page it may overwrite and one for each page a reclamation chunk consumes.
+maxProofFacts ∷ Int
+maxProofFacts = 4 * maxTxnPages + maxReclaimPages
+
+-- | The most loose pages the root set holds: a plan reserves at most
+-- 'maxClaimPages' and a commit replaces at most as many bookkeeping pages.
+looseCap ∷ Int
+looseCap = 1024
+
+-- | The length past which a maintenance transaction hands the excess of the loose list to the allocator
+-- tree as free extents. Maintenance returns more pages to the loose list than it takes (every entry it
+-- finishes releases its list page, every merge of tree nodes replaces more pages than it writes), so a long
+-- drain of small entries would otherwise outgrow 'looseCap'; an ordinary plan takes at least what it adds.
+-- The list stays within this and the few pages one transaction adds.
+looseSoftCap ∷ Int
+looseSoftCap = 512
+
+-- | The most loose pages one maintenance transaction hands to the allocator tree. Each is a free extent of its own
+-- (loose pages are not adjacent), so it costs a path of the allocator tree in the transaction's edit, which a window
+-- holds at once; and each is a page a plan puts in the allocator's hands, so it gets the same proofs as a page the
+-- plan writes ('workOneWindowPages' counts both).
+maxSpillPages ∷ Int
+maxSpillPages = 8
+
+-- | The most pages one reclamation transaction frees.
+maxReclaimPages ∷ Int
+maxReclaimPages = 64
+
+-- | The most a maintenance transaction of ONE page adds to the loose list, net of the pages it takes from it, once the
+-- list is at or below 'looseSoftCap' (above it the transaction is a spill that only inserts into the allocator tree
+-- and strictly lowers the list). Replaced bookkeeping pages return to the list and the pages written are taken from
+-- it, so the list grows only by the pages a deletion merges away or a root it collapses, and by the list page of the
+-- entry it finishes: a deletion in a tree of @h@ levels merges at most one node on each level above the leaf and
+-- collapses the root once, so at most @h@ pages. The unit of one unindexes one page (@hr@), removes or updates its
+-- entry (@hr@), frees the entry's list page (1) and edits the allocator tree: it coalesces the one page it frees with
+-- its neighbours (two deletions and an insertion, at most @2 * hf@) and, when the loose list cannot supply it,
+-- consumes the lowest extents, whose deletions empty at most 3 leaves (at most 72 pages of extents of one page, 56 to
+-- a leaf) and merge one node on each level above (@hf@).
+looseGrowthUnit ∷ Int → Int → Int
+looseGrowthUnit hr hf = 2 * hr + 1 + 2 * hf + 3 + hf
+
+-- | The most an ORDINARY plan (a standalone removal included) adds to the loose list net of what it takes: none while
+-- the list holds at least the pages the plan claims, because the bookkeeping edit of an ordinary plan has no
+-- deletion (it indexes the pages it replaces and consumes no extent when the loose list supplies it), so it replaces
+-- no more pages than it writes; below that the plan consumes at most 'maxClaimPages' pages of extents, whose
+-- deletions empty at most @maxClaimPages / 56 + 1@ leaves and merge one node on each level above, @hf@. The list
+-- then holds the unused part of the supply and what it replaced, at most 'maxClaimPages' plus this.
+looseGrowthOrdinary ∷ Int → Int
+looseGrowthOrdinary hf = maxClaimPages `div` 56 + 1 + hf
+
+-- | The pages a maintenance transaction of ONE page holds in its window AT ONCE, from the heights of the
+-- retirement tree (@hr@), the allocator tree (@hf@) and the record trees (@hrec@) and the readers pinned at
+-- distinct versions (@pins@). It rests on 'maxLevel' (every height is at most @maxLevel + 1@) and
+-- 'maxReaders' alone: a tree the load path accepts need not be at minimum fill. The window holds what the
+-- transaction edits and ONE proof; every proof beyond it is a fact the plan carries through a checkpoint, so no
+-- proof is ever held with another:
+--
+-- * the oldest entry and its list: @hr + 1@;
+-- * the unindexing of the page and the update or removal of the entry: @2 * hr@;
+-- * the allocator tree's own edit: @3 * hf@, and the free extents of the loose pages it spills ('maxSpillPages'), one
+--   path each: @maxSpillPages * hf@;
+-- * the largest proof: that the page is unreachable, a path in the committed tree and in each pinned one,
+--   @(1 + pins) * hrec@; that the retired-page index does not own it or has dropped it, @hr@; that the free
+--   extents do not contain it, @hf@.
+--
+-- The probes it holds are at most @3 * hr + 3 * hf + 2 + maxSpillPages@ ('workOneProbeBytes').
+workOneWindowPages ∷ Int → Int → Int → Int → Int
+workOneWindowPages hr hf hrec pins =
+  (hr + 1) + 2 * hr + 3 * hf + maxSpillPages * hf + max ((1 + pins) * hrec) (max hr hf)
+
+-- | The most internal pages a retirement tree can have, DERIVED from the key and entry sizes and the minimum fill the store
+-- enforces: at most @2 * maxRetiredPages@ records (an index record for each retired page and an entry for each list); a leaf
+-- holds at least a quarter payload of its largest entry (@2 + 'retireKeyBytes' + 'retireEntryValueBytes'@, 23 bytes: 45 entries) and an
+-- internal page of its entries (@1 + 'retireKeyBytes' + 12@, 22 bytes: 47 children), and each level above the leaves has at most
+-- the ceiling of the level below over 47 pages, the last being the root: 729 leaves, 16 internal pages and a root.
+maxRetireInternals ∷ Int
+maxRetireInternals = levels (ceilDiv leaves minChildren)
+  where
+    ceilDiv a b = (a + b - 1) `div` b
+    minLeafEntries = ceilDiv minNodeBytes (2 + retireKeyBytes + retireEntryValueBytes)
+    minChildren = ceilDiv minNodeBytes (1 + retireKeyBytes + 12)
+    leaves = ceilDiv (2 * maxRetiredPages) minLeafEntries
+    levels n
+      | n <= 1 = 1
+      | otherwise = n + levels (ceilDiv n minChildren)
+
+-- | The accounted bytes of the probes of a transaction of one page.
+workOneProbeBytes ∷ Int → Int → Int
+workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2 + maxSpillPages) * probeBytes
+
+-- | The pages a standalone explicit removal holds at once. It cannot shrink (it is atomic): its edit is held
+-- whole. At most 'worstEditWrites' writes (7) each read a path of @hrec@ pages and replace at most as many;
+-- each replaced page is indexed in the retirement tree, which reads one leaf for each (at most 7 * hrec + 1) and
+-- the internal pages above them, at most @retireInternals@, which is 'maxRetireInternals': the store refuses a
+-- non-root page below a quarter of a payload when it descends to it ('UnderFull') and a root set that retires more
+-- than 'maxRetiredPages' pages, so a retirement tree holds at most twice that many records (an index record for
+-- each retired page and an entry for each list) at least 46 to a leaf and 47 children to an internal page, that is
+-- 712 leaves, 16 internal pages and a root; the allocator tree's edit, @3 * hf@; and ONE proof as above.
+removalWindowPages ∷ Int → Int → Int → Int → Int
+removalWindowPages ri hf hrec pins = editWindowPages worstEditWrites ri hf hrec pins + readResiduePages
+
+-- | The most pages the supported minimum explicit removal writes at the format bounds: its worst-case record writes
+-- ('worstEditWrites') each at the worst cost of an update on the tallest tree, one retirement list page and the bookkeeping
+-- reserve. The ONE definition: the feasibility proof of "Model" and the probes below name it.
+minimumRemovalPages ∷ Int
+minimumRemovalPages = worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve
+
+-- | The most page probes the proof phase of a standalone removal holds at once ('workOneProbeBytes' counts them for maintenance).
+-- The proof phase classifies, once, each page the plan is about to write below the used space (a page taken from the loose list or
+-- from a free extent: 'maxWindowProbes' is that count for a plan of 'maxTxnPages'), so a plan holds no more probes than it writes
+-- pages, and the worst removal writes 'minimumRemovalPages' (188). The window the proofs run in carries them in its bytes.
+removalWorstProbes ∷ Int
+removalWorstProbes = minimumRemovalPages
+
+-- | The pages the smallest unit of discovery (one connection inspection, at most 'discoveryUnitWrites' record writes) writes at the
+-- format bounds, counted like 'minimumRemovalPages': 120.
+discoveryUnitPagesWritten ∷ Int
+discoveryUnitPagesWritten = discoveryUnitWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve
+
+-- | The most probes the proof phase of a discovery unit holds at once: no more than the pages it writes, by the argument of
+-- 'removalWorstProbes' (and below the removal's, which the residue of 'readResiduePages' is derived from, so that figure is an upper
+-- bound for the unit's window as well).
+discoveryUnitWorstProbes ∷ Int
+discoveryUnitWorstProbes = discoveryUnitPagesWritten
+
+-- | The read pages a plan may still hold when its READ phase ends and its edit phase begins. A read phase (the logical-record
+-- reads of a removal's staging or of a discovery step) holds the pages of what it read until it ends, up to its window bound;
+-- before the edit it either holds no more than this or hands what it read on as facts through a checkpoint and starts the edit
+-- from an empty window. It is DERIVED, not chosen: the whole pages the worst removal ('editWindowPages' at the tallest trees,
+-- the most retirement internals and every reader pinned) leaves free in the window's byte limit beside its probes, so a window
+-- that holds the edit phase and this residue stays inside 'maxWindowBytes'. The bound a removal or a discovery unit promises is
+-- the edit phase's bound plus this.
+readResiduePages ∷ Int
+readResiduePages =
+  (maxWindowBytes - editWindowPages worstEditWrites maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders * windowPageBytes - removalWorstProbes * probeBytes)
+    `div` windowPageBytes
+
+-- | The pages the most pages one logical-record read holds: a lookup is one root-to-leaf path, a floor lookup that crosses into
+-- the previous leaf is two. Every window bound a read phase runs under must hold one whole read, or a retry could never make
+-- progress.
+readPathPages ∷ Int → Int
+readPathPages hrec = 2 * hrec
+
+-- | The RAM the read facts of one plan may hold (as a retained continuation of its RAM charge): a read set past it is the typed,
+-- shrinkable 'TxnRamExceeded' of a discovery batch (the work halves). A standalone removal reads at most 'worstEditReads' records
+-- and a discovery unit at most 'worstEdgeReads', each 'recordFactBytes' (30 KB and 20 KB): neither can reach it.
+maxReadFactBytes ∷ Int
+maxReadFactBytes = 1024 * 1024
+
+-- | What one page a plan WRITES retains in its list of pages: the cons cell, the tuple, the boxed page number and the byte string
+-- (its header, the pinned buffer's header and the padding) around the 4,096 bytes. MEASURED (the suite's @Memory@ regression, every
+-- kind of written page): 4,236 bytes; held to 4,288. The staging account is sized from 256 of them.
+writtenPageBytes ∷ Int
+writtenPageBytes = 4288
+
+-- | What one typed read of a discovery or removal retains while the read phase runs: the record read (a key and a record as Haskell
+-- values, the largest a source-node key and a source-node child with all three optional coordinates populated), the map the core
+-- keeps it in and the ascending list it is handed over as, alive together. MEASURED (the suite's @Memory@ regression); held with margin.
+typedReadBytes ∷ Int
+typedReadBytes = 576
+
+-- | The fixed RAM beside the typed reads, the window and the facts of a read phase: the control records and the scratch floor.
+readPhaseFixedBytes ∷ Int
+readPhaseFixedBytes = rootRecordBytes + activeRecordBytes + headerBytes + 4096
+
+-- | The writes #661's staging has accumulated while it reads: up to three record writes for each of the 64 updates of a batch (the
+-- 192-write premise of the worst charge), each at 'writeRetainedBytes', which counts three copies of the write and so is
+-- conservative for the one copy staging holds.
+readPhaseStagedWriteBytes ∷ Int
+readPhaseStagedWriteBytes = 3 * maxBatchUpdates * writeRetainedBytes
+
+-- | The proof facts the window carries when a read phase is REPLAYED after a proof checkpoint: up to 'maxProofFacts', each
+-- 'factBytes'.
+readPhaseProofFactBytes ∷ Int
+readPhaseProofFactBytes = maxProofFacts * factBytes
+
+-- | The most reads a plan lets #661 make: those whose TYPED read set fits, within a plan's RAM, beside everything else alive while
+-- it reads: a full window (its page bytes and its ownership probes), the packed read facts at their ceiling, the proof facts a
+-- replayed read phase carries, the writes staging has accumulated and the fixed records. #661 holds the typed set while it reads, and
+-- checks its read allowance only as it reads, so the allowance is what bounds that memory. A discovery batch that would read more ENDS
+-- EARLY as progress with the inspections it completed; a removal reads at most 'worstEditReads' and a unit of discovery
+-- 'worstEdgeReads', both far below it (a property of the suite), so it is never a refusal.
+--
+-- The scratch figure of #661's own limits ('Hetoimasia.Terrain.Discovery.worstEdgeScratch' and its kin) is an accounting limit of
+-- that package, a bound it checks its own work against, and NOT a structure counted here: what this derivation counts is what is
+-- alive, term by term.
+maxTypedReads ∷ Int
+maxTypedReads = (txnRamLimit - maxWindowBytes - worstOwnershipBytes - maxReadFactBytes - readPhaseProofFactBytes - readPhaseStagedWriteBytes - readPhaseFixedBytes) `div` typedReadBytes
+
+-- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'worstEditWrites').
+editWindowPages ∷ Int → Int → Int → Int → Int → Int
+editWindowPages writes retireInternals hf hrec pins =
+  writes * hrec + (writes * hrec + 1) + retireInternals + 3 * hf + max ((1 + pins) * hrec) hf
+
+-- | The pages the SMALLEST unit of a discovery batch holds at once: one connection inspection, at most 'discoveryUnitWrites'
+-- (3) record writes, an edit like a removal's but of fewer writes, so never more than 'removalWindowPages'.
+discoveryUnitWindowPages ∷ Int → Int → Int → Int → Int
+discoveryUnitWindowPages ri hf hrec pins = editWindowPages discoveryUnitWrites ri hf hrec pins + readResiduePages
+
+-- | The ATOMIC unit of each planner that reads the window's work limit ('windowWorkAtLeast'): the least work the planner can
+-- do. A work limit counts units of the planner's own work (the pages a maintenance transaction frees, the record writes of
+-- a discovery batch) and never asks for less than this: a limit below it means this. The standalone removal reads no work
+-- limit: it is one atomic edit and cannot shrink.
+--
+-- The pages one maintenance transaction frees.
+maintenanceUnitPages ∷ Int
+maintenanceUnitPages = 1
+
+-- | The record writes of one connection inspection, the smallest batch discovery can stage: #661's own constant, the
+-- figure its planner refuses a smaller allowance with ('CapacityWrites').
+discoveryUnitWrites ∷ Int
+discoveryUnitWrites = worstEdgeWrites
+
+-- ---------------------------------------------------------------------------
+-- Configuration
+
+-- | An unvalidated configuration, every figure an 'Integer' so that an
+-- unrepresentable one is refused by name and never wrapped.
+data StoreSpec = StoreSpec
+  { specAllowanceBytes ∷ !Integer
+  -- ^ The per-arena allowance in bytes.
+  , specOverheadBytes ∷ !(Maybe Integer)
+  -- ^ Conservative format and reservation overhead inside the allowance. A later
+  -- backend supplies its own figure; 'Nothing' takes the default: 1/256 of the
+  -- allowance, at least 1 MiB, rounded up to a page.
+  , specOffsetLimit ∷ !Integer
+  -- ^ The largest file offset the platform's signed offset type holds.
+  }
+  deriving stock (Eq, Show)
+
+-- | A specification with the default allowance and the signed 64-bit offset limit.
+defaultStoreSpec ∷ StoreSpec
+defaultStoreSpec = StoreSpec (toInteger defaultAllowanceBytes) Nothing (toInteger defaultOffsetLimit)
+
+-- | A validated configuration. The constructor is private.
+data StoreConfig = StoreConfig
+  { cfgAllowance ∷ !Word64
+  , cfgOverhead ∷ !Word64
+  , cfgLimit ∷ !Word64
+  }
+  deriving stock (Eq, Show)
+
+cfgAllowanceBytes ∷ StoreConfig → Word64
+cfgAllowanceBytes = cfgAllowance
+
+cfgOverheadBytes ∷ StoreConfig → Word64
+cfgOverheadBytes = cfgOverhead
+
+cfgOffsetLimit ∷ StoreConfig → Word64
+cfgOffsetLimit = cfgLimit
+
+-- | The pages the allowance holds beyond its overhead: the page space the store
+-- numbers.
+cfgUsablePages ∷ StoreConfig → Word64
+cfgUsablePages c = (cfgAllowance c - cfgOverhead c) `div` pageSizeW
+
+-- | The bound of every page reference: the usable pages.
+cfgTotalPages ∷ StoreConfig → Word64
+cfgTotalPages = cfgUsablePages
+
+-- | Why a configuration was refused. A bad configuration is never a capacity
+-- outcome of an operation.
+data ConfigError
+  = AllowanceBelowMinimum !Integer
+  | AllowanceNotAligned !Integer
+  | AllowanceBeyondOffsetLimit !Integer !Integer
+  | OffsetLimitInvalid !Integer
+  | OverheadInvalid !Integer
+  | -- | The allowance minus its overhead leaves too little for the protected
+    -- reserve and one transaction.
+    NoRoomForReserve !Integer !Integer
+  deriving stock (Eq, Show)
+
+-- | Validate a specification. The allowance is at least 64 MiB, a multiple of
+-- 1 MiB and within the offset limit; the overhead is non-negative and leaves room
+-- for the protected reserve and a maximal transaction, so that a configuration that
+-- is accepted can always make the supported minimum edit.
+mkStoreConfig ∷ StoreSpec → Either ConfigError StoreConfig
+mkStoreConfig spec = do
+  let bytes = specAllowanceBytes spec
+      limit = specOffsetLimit spec
+  if limit < 1 || limit > toInteger defaultOffsetLimit then Left (OffsetLimitInvalid limit) else Right ()
+  if bytes < toInteger minAllowanceBytes then Left (AllowanceBelowMinimum bytes) else Right ()
+  if bytes `mod` toInteger allowanceUnitBytes /= 0 then Left (AllowanceNotAligned bytes) else Right ()
+  if bytes > limit then Left (AllowanceBeyondOffsetLimit bytes limit) else Right ()
+  let overhead = maybe (defaultOverhead bytes) id (specOverheadBytes spec)
+  if overhead < 0 || overhead >= bytes then Left (OverheadInvalid overhead) else Right ()
+  let usable = (bytes - overhead) `div` toInteger pageSizeW
+      need = toInteger reservePages + toInteger maxClaimPages + 1
+  if usable < need then Left (NoRoomForReserve usable need) else Right ()
+  Right (StoreConfig (fromInteger bytes) (fromInteger overhead) (fromInteger limit))
+
+defaultOverhead ∷ Integer → Integer
+defaultOverhead bytes = ((max (toInteger mib) (bytes `div` 256) + 4095) `div` 4096) * 4096
+
+-- | Why a page or range could not be placed in the file.
+data OffsetError
+  = PageBeyondAllowance !PageNo
+  | OffsetOverflow
+  deriving stock (Eq, Show)
+
+-- | The file offset of a page, checked: the page lies inside the usable pages and
+-- its end is inside the allowance and the native offset limit, with no wrapping.
+pageFileOffset ∷ StoreConfig → PageNo → Either OffsetError Word64
+pageFileOffset c p@(PageNo n)
+  | n >= cfgUsablePages c = Left (PageBeyondAllowance p)
+  | otherwise = do
+      let off = toInteger n * toInteger pageSizeW
+          end = off + toInteger pageSizeW
+      if end > toInteger (cfgAllowance c) || end > toInteger (cfgLimit c) then Left OffsetOverflow else Right (fromInteger off)
+
+-- | The end offset of a byte range starting at a page, checked against the page
+-- space, the allowance and the offset limit: @offset + length@ never wraps.
+rangeFileEnd ∷ StoreConfig → PageNo → Word64 → Either OffsetError Word64
+rangeFileEnd c p len = do
+  off ← pageFileOffset c p
+  let end = toInteger off + toInteger len
+      pageSpace = toInteger (cfgUsablePages c) * toInteger pageSizeW
+  if end > pageSpace || end > toInteger (cfgAllowance c) || end > toInteger (cfgLimit c) then Left OffsetOverflow else Right (fromInteger end)
+
+-- | Whether a size is a legal allowance on its own: at least the minimum, a multiple
+-- of the unit and inside the native offset limit. The overhead and the reserve room
+-- are properties of a whole configuration, not of a size.
+validateSize ∷ StoreConfig → Integer → Either ConfigError ()
+validateSize c bytes = do
+  let limit = toInteger (cfgLimit c)
+  if bytes < toInteger minAllowanceBytes then Left (AllowanceBelowMinimum bytes) else Right ()
+  if bytes `mod` toInteger allowanceUnitBytes /= 0 then Left (AllowanceNotAligned bytes) else Right ()
+  if bytes > limit then Left (AllowanceBeyondOffsetLimit bytes limit) else Right ()
+
+-- | The configuration with a larger allowance, the overhead unchanged, validated
+-- as a new configuration would be.
+growConfig ∷ StoreConfig → Integer → Either ConfigError StoreConfig
+growConfig c bytes = mkStoreConfig (StoreSpec bytes (Just (toInteger (cfgOverhead c))) (toInteger (cfgLimit c)))
+
+-- ---------------------------------------------------------------------------
+-- Roots
+
+-- | The committed immutable root set: one version of every tree, the discovery
+-- control header and the page counters. A plan is made against exactly one 'Roots'
+-- and publishes the next; nothing here changes in place.
+data Roots = Roots
+  { rVersion ∷ !Word64
+  , rRuns ∷ !(Maybe PageNo)
+  , rLinks ∷ !(Maybe PageNo)
+  , rTodo ∷ !(Maybe PageNo)
+  , rFree ∷ !(Maybe PageNo)
+  , rRetire ∷ !(Maybe PageNo)
+  , rHeader ∷ !Header
+  , rHw ∷ !Word64
+  , rFreePages ∷ !Word64
+  , rLivePages ∷ !Word64
+  , rRetiredPages ∷ !Word64
+  , rLoose ∷ [PageNo]
+  , rRootCrcs ∷ [(TreeId, Word32)]
+  -- ^ The checksum each tree's root page must carry, as published with the root: the anchor of the
+  -- checksum chain (an internal entry records its child's, the root record records the roots'). A tree
+  -- with no entry here is read unchecked (a root set made by hand).
+  }
+  deriving stock (Eq, Show)
+
+-- | The root page of a tree.
+rootOf ∷ Roots → TreeId → Maybe PageNo
+rootOf r TreeRuns = rRuns r
+rootOf r TreeLinks = rLinks r
+rootOf r TreeTodo = rTodo r
+rootOf r TreeFree = rFree r
+rootOf r TreeRetire = rRetire r
+
+-- | What a window must hold for a root set: the checksum each root page carries, by page number.
+rootTrust ∷ Roots → [(PageNo, Word32)]
+rootTrust r = [(p, c) | (t, c) ← rRootCrcs r, Just p ← [rootOf r t]]
+
+-- | The same for the record roots a reader pins.
+pinTrust ∷ Pins → [(PageNo, Word32)]
+pinTrust p = [(pg, c) | (t, c) ← pinCrcs p, Just pg ← [case t of TreeRuns → pinRuns p; TreeLinks → pinLinks p; TreeTodo → pinTodo p; _ → Nothing]]
+
+-- | The roots of a fresh arena incarnation: no page, no record, revisions zero.
+emptyRoots ∷ ArenaId → Roots
+emptyRoots arena =
+  Roots
+    { rVersion = 0
+    , rRuns = Nothing
+    , rLinks = Nothing
+    , rTodo = Nothing
+    , rFree = Nothing
+    , rRetire = Nothing
+    , rHeader = Header (Authority arena (Revision 0) (Revision 0) (Revision 0)) 0 0 0
+    , rHw = 0
+    , rFreePages = 0
+    , rLivePages = 0
+    , rRetiredPages = 0
+    , rLoose = []
+    , rRootCrcs = []
+    }
+
+-- | The record trees' roots a reader pins, with the version they belong to.
+data Pins = Pins
+  { pinVersion ∷ !Word64
+  , pinRuns ∷ !(Maybe PageNo)
+  , pinLinks ∷ !(Maybe PageNo)
+  , pinTodo ∷ !(Maybe PageNo)
+  , pinCrcs ∷ [(TreeId, Word32)]
+  , pinHw ∷ !Word64
+  -- ^ The used page space of the pinned version: no pinned tree reaches a page at or past it.
+  }
+  deriving stock (Eq, Show)

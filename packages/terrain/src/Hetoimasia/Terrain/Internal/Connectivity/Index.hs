@@ -44,6 +44,7 @@ module Hetoimasia.Terrain.Internal.Connectivity.Index
   , ComponentKey
   , keyOrigin
   , keyParameters
+  , mkComponentKey
   , VoidLookup (..)
   , PortalRelation (..)
   , BoundaryFace (..)
@@ -170,6 +171,21 @@ keyOrigin (ComponentKey origin _ _ _) = origin
 -- component from its siblings of the same class, with their values.
 keyParameters ∷ ComponentKey → [(Axis, AxisCoord)]
 keyParameters (ComponentKey _ x y z) = [(axis, v) | (axis, Just v) ← [(AxisX, x), (AxisY, y), (AxisZ, z)]]
+
+-- | Rebuild a key from its origin and its parameters, the exact inverse of
+-- 'keyOrigin' and 'keyParameters': the parameter axes must be strictly ascending
+-- (X before Y before Z, each at most once), as 'keyParameters' lists them, and any
+-- other list is refused. It is for the temporary store's codec (TRA-20) to decode a
+-- record it wrote; a key it rebuilds names a component only if the compiled source
+-- has one, which the discovery model checks (@UnknownComponent@) and this function
+-- does not.
+mkComponentKey ∷ TileCoord → [(Axis, AxisCoord)] → Maybe ComponentKey
+mkComponentKey origin params
+  | ascending (map fst params) = Just (ComponentKey origin (pick AxisX) (pick AxisY) (pick AxisZ))
+  | otherwise = Nothing
+  where
+    pick axis = lookup axis params
+    ascending axes = and (zipWith (<) axes (drop 1 axes))
 
 -- | The answer to a component lookup for one void of one cell.
 data VoidLookup

@@ -236,9 +236,12 @@ module Hetoimasia.Terrain.Discovery
   , Report (..)
   , StageOutcome (..)
   , stageRemoval
+  , stageRemovalTraced
   , Halt (..)
   , Step (..)
   , stepDiscovery
+  , stepDiscoveryTraced
+  , ReadSet (..)
 
     -- * Retained state
   , Retained
