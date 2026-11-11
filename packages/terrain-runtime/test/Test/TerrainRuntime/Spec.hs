@@ -13,6 +13,7 @@ import qualified Test.TerrainRuntime.Opacity as Opacity
 import qualified Test.TerrainRuntime.Oracle as Oracle
 import qualified Test.TerrainRuntime.Races as Races
 import qualified Test.TerrainRuntime.Revalidation as Revalidation
+import qualified Test.TerrainRuntime.Storage.Open as StorageOpen
 import qualified Test.TerrainRuntime.Store.AdmissionSpec as StoreAdmission
 import qualified Test.TerrainRuntime.Store.Allowance as StoreAllowance
 import qualified Test.TerrainRuntime.Store.Boundary as StoreBoundary
@@ -74,3 +75,4 @@ spec = do
   StoreAdmission.spec
   StoreBounds.spec
   StoreBoundary.spec
+  StorageOpen.spec

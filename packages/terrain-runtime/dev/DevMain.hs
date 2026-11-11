@@ -1,0 +1,7 @@
+module Main (main) where
+
+import qualified Test.TerrainRuntime.Storage.Open as StorageOpen
+import Test.Hspec (hspec)
+
+main ∷ IO ()
+main = hspec StorageOpen.spec
