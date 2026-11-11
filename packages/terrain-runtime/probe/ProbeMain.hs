@@ -254,7 +254,14 @@ availableOf dir = do
 -- | Run an action with the rest of the volume's free space consumed by a file of the probe's own (reserved
 -- natively until the platform refuses), and give the space back when it ends. Hands over the bytes taken.
 withFiller :: FilePath -> (Word64 -> IO a) -> IO a
-withFiller dir = \act -> bracket acquire (\(_, fd) -> () <$ closeFile productionSeam fd) (act . fst)
+withFiller dir = \act -> do
+  free0 <- availableOf dir
+  r <- bracket acquire (\(_, fd) -> () <$ closeFile productionSeam fd) (act . fst)
+  -- a filesystem may give the blocks of a closed, unlinked file back lazily (APFS did, within about a
+  -- second): observe, bounded, until the volume reports the space again, and record how long it took
+  polls <- pollRecoveredCount dir free0
+  record "filler.reclaim.observations" (show polls)
+  pure r
   where
     acquire = do
       made <- createPrivate productionSeam (BC.pack dir) 4242
@@ -275,6 +282,13 @@ withFiller dir = \act -> bracket acquire (\(_, fd) -> () <$ closeFile production
 
 -- | The free space once the volume has reclaimed a closed file: observed by bounded polling of the platform's
 -- own report (a filesystem may free the blocks of a closed, unlinked file lazily), at most 600 observations.
+pollRecoveredCount :: FilePath -> Word64 -> IO Int
+pollRecoveredCount dir target = go (0 :: Int)
+  where
+    go n = do
+      a <- availableOf dir
+      if a + 4 * mib >= target || n >= 600 then pure n else go (n + 1)
+
 pollRecovered :: FilePath -> Word64 -> IO Word64
 pollRecovered dir target = go (0 :: Int)
   where
