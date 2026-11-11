@@ -8,10 +8,8 @@ settlement, immutable borrowed snapshots, offload and reload from the immutable
 source plus canonical retained removals, and an orderly close.
 
 It depends on `hetoimasia-terrain`, `hetoimasia-foundation` and
-`hetoimasia-runtime`. It has no Lua, GLFW, graphics or game dependency. Its one native
-dependency is the storage backend's small C shim (see
-[the storage backend](#the-storage-backend-tra-21)); the baseline service above uses
-none. It has no global registry and no universal environment: everything it borrows is
+`hetoimasia-runtime`. It has no Lua, GLFW, graphics, native or game dependency,
+no global registry and no universal environment: everything it borrows is
 injected through `Ports` (the parent session's admission, a supervision
 capability, a logger and a diagnostics seam). The Lua request endpoint is TRA-5;
 this package supplies a Lua-independent settlement seam it can attach to.
@@ -549,9 +547,7 @@ until the terrain owner adopts the store (TRA-22); nothing here is wired into it
 | --- | --- |
 | `Hetoimasia.Terrain.Runtime.Store` | the narrow public interface: configuration, windows, `Store`, planning, the transaction, readers, growth, feasibility |
 | `Hetoimasia.Terrain.Runtime.Store.Admission` | the edit bank's division and its all-or-nothing, backed-only-eviction credits; every cache entry is charged at least a page (`minCacheEntryBytes`) and every grant at least 128 bytes in each account it draws on (`minGrantBytes`), so no number of tiny credits holds records the ledger does not show |
-| private library `store` (`store/`) | the codec, trees, allocator, planner, state machine and, since TRA-21, the edit bank's admission (`Store.Internal.Admission`, moved here unchanged so the storage backend can charge it without a dependency cycle; the public `Store.Admission` re-exports it); visible to no client; this package's suite reaches it to check them against independent references |
-| `Hetoimasia.Terrain.Runtime.Storage` | the storage backend's narrow public interface (TRA-21): the service, opaque handles, jobs, outcomes and typed failures |
-| private library `storage` (`storage/`) | the backend's native shim, file layer, volume qualification and service; visible to no client; this package's suite reaches it to drive the production adapter through a seam |
+| private library `store` (`store/`) | the codec, trees, allocator, planner and state machine; visible to no client; this package's suite reaches it to check them against independent references |
 
 A client, such as the later storage backend, holds a `Store` value, plans through a
 `Window` (a bounded set of validated page buffers for one store and one version), writes the pages a `Plan`
@@ -1110,148 +1106,12 @@ are unchanged until TRA-22 (checked in `terrain-tests`).
 
 ### What later slices supply
 
-TRA-21 (supplied; see [the storage backend](#the-storage-backend-tra-21)): the temporary
-file, its descriptor lifecycle, real preallocation and free-space checks, the I/O workers,
-short-write loops and filesystem overhead qualification.
+TRA-21: the temporary file, its descriptor lifecycle, real preallocation and free-space
+checks, the I/O workers, short-write loops and filesystem overhead qualification.
 TRA-22: opening, the live owner's root publication, write-backed request settlement,
 discovery scheduling, pause and retry orchestration and close and reset. TRA-23: the
 Lua facade and status. No result of this model is proof of physical preallocation,
 durable writes, live settlement or crash recovery.
-
-## The storage backend (TRA-21)
-
-`Hetoimasia.Terrain.Runtime.Storage` performs the effects the pure store above describes: one
-private, reserved, unlinked temporary file per arena incarnation, bounded asynchronous page I/O on
-two workers, and checked growth. It **publishes nothing**. No outcome changes a root, a revision or
-a request's result: the terrain owner (TRA-22) holds the one current `Store`, hands the backend the
-pages a transaction staged (`stageWrite`), reports each page's outcome to the model
-(`writeOutcomes`) and alone decides publication or abort. A claim that the writes were durable,
-that a crash is recoverable or that a live terrain publication works is not made here: a successful
-write is the operating system accepting it, never an `fsync`.
-
-```haskell
-withStorage config admission group logger $ \svc → do      -- two workers start in the caller's group
-  Right t ← submitOpen svc ExplicitWork (OpenSpec dir identity (storeConfig store))
-  atomically (awaitTicket svc t)
-  Just (Opened backing reservation) ← withOutcome svc t pure   -- reserved, proven, unlinked: only now ready
-  Right w ← pure (stageWrite store txn)                        -- the active transaction's staged pages
-  Right t2 ← submitWrite svc backing w                         -- at most 256 pages, 1 MiB
-  ...
-  closeBacking svc backing                                     -- drain, then close the descriptor once
-```
-
-The storage location is an explicit input (`osDirectory`): the backend uses no implicit current
-directory and has no default; TRA-22 or application assembly chooses and documents the production
-default. Space and support are asked of the opened descriptor (`fstat`, `fstatfs`), never of a path.
-
-### State, owner, thread and lifetime
-
-All service state is one record behind one `TVar`, with the shared edit-bank `Admission` the
-caller injects: a submission, a dispatch, a completion, a cancellation and a close are each one
-transaction on them, so no credit is taken twice or released twice.
-
-| State | Owner and writers | Readers | Thread | Bound | Release |
-| --- | --- | --- | --- | --- | --- |
-| The descriptor of a backing | The backing entry, from the open job's success to `closeBacking`; only a worker touches it | The two workers | Workers | One per arena (four) | Closed once, by `closeBacking`, after its jobs and borrowers have retired; a failed close is reported, never retried |
-| The file | The backing; unlinked at creation, so it lives until the last close | Borrowers | Any | The allowance (64 MiB to the configured size, 1 GiB by default) | Reclaimed by the filesystem after the last close |
-| A job record (queued, running or finished) | `submit*` creates and charges it; the workers complete it; `withOutcome`, `discardTicket` or the close retires it | The submitter | Callers, workers | 8 queued, 2 running, 32 records in all | Credits released at retirement |
-| A read's transfer buffer and result | Charged at dispatch (staging for the buffer, the cache for the result copy); the service owns the bytes until retired | `withOutcome`'s body | Worker, caller | One page to 1 MiB per running read | Staging at the end of the transfer; the cache at retirement |
-| A write's pages | The transaction (already accounted); the job only references them | The worker | Worker | 256 pages, 1 MiB | With the transaction |
-| The volume's reservation coordination | The service; one holder at a time per volume | Workers | Workers | One per volume | Released on every exit of a reservation |
-| A prepared growth and a pending reservation | The backing entry | The owner | Worker, owner | One each | Committed or abandoned by the owner; the pending record until a retry or the close |
-
-**Handles are opaque.** A `Backing` names no descriptor: the service resolves it, so a closed,
-foreign or reused handle is refused before any I/O, and a descriptor number reused by a later file
-is unreachable through an old handle. A `Ticket` names one job of one service; a late, duplicated
-or cancelled outcome cannot target a replacement arena. The constructors are hidden and the suite
-compiles a client outside the package to show it.
-
-**Cancellation is an ownership protocol.** A cancel before dispatch withdraws the job at once. A
-cancel of a running job releases nothing: the job stops at its next safe point (before the next
-page), and its buffer, record and descriptor use stay charged and held until the native call has
-returned. A cancel after completion changes nothing. Closing waits, with no deadline, no detach and
-no timeout, for the running calls and the borrowers of that backing, in the caller's protected
-boundary and not in an uninterruptibly masked release; an interruption delivered while it waits is
-remembered and delivered afterwards. The close itself is one bounded, uninterruptible native call.
-
-### Foreign calls
-
-Every call is `safe`: a call may block in the kernel as long as the filesystem takes, and a `safe`
-call releases its capability so the terrain owner and the other worker keep running. None is
-`unsafe` (an unsafe call holds its capability for the whole call, and even an `fstat` on a network
-filesystem is not guaranteed to be quick) and none is `interruptible` (an asynchronous exception
-never interrupts a call in progress, and a descriptor is never closed under one). This needs the
-threaded runtime; the service refuses to start without it (`NotThreaded`).
-
-### The reservation, and what is proved
-
-`reserveRange` obtains a real native reservation and then proves it: (1) the filesystem the
-descriptor is on is on the qualified list (`apfs`, `ext4`; anything else, tmpfs, ramfs, network and
-copy-on-write configurations included, is `storage_unsupported` even if the native call would
-succeed); (2) the free space the unprivileged process sees leaves at least 256 MiB after the
-request (`f_bavail`, never root-reserved blocks), the check and the allocation being one step under
-the volume's coordination so two arenas cannot spend the same observed headroom; (3) the native
-allocation, `F_PREALLOCATE` with `F_ALLOCATEALL` on macOS and `fallocate` mode 0 on Linux (never
-`posix_fallocate`, never a write loop), whose own count of allocated bytes must equal the request;
-(4) the checked file length; (5) the filesystem's own report of allocated bytes covers the whole
-length, so a sparse file of the right length fails. The physical overhead (allocated beyond the
-length) is reported to the model in `Reservation` and must not exceed the overhead the store
-configuration charges; a larger one refuses the open.
-
-| Platform | Filesystem | Reservation | Rewrite inside the reservation, volume exhausted | Release |
-| --- | --- | --- | --- | --- |
-| macOS 26 (arm64) | APFS, 3 GiB disk image | exact (overhead 0) at 64 MiB, 256 MiB, 1 GiB | no new allocation | Preallocation beyond the end of the file is released only by raising the length and shortening it; the last close reclaimed the space within the first observation |
-| Linux (aarch64) | ext4, 3 GiB loop image | see [the evidence](../../docs/evidence/terrain/tra21/README.md) | see the evidence | see the evidence |
-
-The qualification is a probe, not a claim of universal support; the table is what was run, and the
-records, the commands and the run identifiers are in the evidence.
-
-### Failures
-
-Expected failures are values (`StorageFailure`, `failureCode`): `storage_unsupported`,
-`reservation_failed`, `storage_io` (a transfer or setup error with its operation, page, file offset
-and bytes moved) and `storage_integrity` (a page that decoded with a failure, or a file that ended
-inside an expected page: never absent history, empty terrain or regenerated source), and the
-refusals made before any work (`invalid_request`, `busy`, a closed or foreign handle). A defect
-(an exception that is not a storage result) is `host_failure`: it is recorded, completes its job as
-a host failure, stops the service and ends the worker, which supervision sees.
-
-A transfer advances the checked offset and the buffer by what was moved; an interrupted call is
-retried without repeating moved bytes, at most 64 times in a row; a write that makes no progress is
-`storage_io` and is not retried; a read that reaches the end of the file inside a page is
-`storage_integrity`. Nothing is retried automatically after a failure, and a successful scratch
-write or a larger allowance does not clear an integrity failure.
-
-### Scheduling and accounting
-
-Explicit work precedes camera prefetch; maintenance (accepted work and reclamation) is served after
-at most three explicit jobs while it waits, camera after at most seven jobs of the other classes.
-There is one mutating job (a transaction's write or a growth step) in the session at a time; reads
-proceed beside it. Every job is charged `jobRecordBytes` (2,048, measured by the suite against the
-live heap of the largest queued read and open) of the control account from submission to
-retirement, all or nothing; a read's transfer buffer and result are charged when it is
-dispatched, so a full queue holds no buffer; camera reads cannot take the protected 4 MiB of
-staging. A refusal creates nothing. The 8 MiB protected allocator allowance of the model stays
-inside the allowance; the backend neither enlarges it nor bypasses the model.
-
-### Growth
-
-`submitGrowth` executes a growth the model proposed, against the committed allowance: the base must
-be the committed allowance, the target larger, no growth prepared and no earlier extra reservation
-unreleased. It reserves the extra range under the same proof, and answers a `PreparedGrowth` that
-is **not spendable**: a request naming the larger allowance is refused until the owner commits the
-model's growth and then `commitBackingGrowth`. A failure or cancellation first releases what was
-obtained (raising the length and shortening it, which frees preallocation on both targets); if that
-release fails the extra stays as a bounded **pending reservation**, charged on the volume, blocking
-another growth, until `submitReleasePending` succeeds or the close releases it with the file. Old
-contents and the old allowance are authoritative throughout.
-
-### Tests
-
-`terrain-runtime-tests` (`Test.TerrainRuntime.Storage.*`) owns the deterministic safety cases (see
-[the suites](../../docs/test_suites.md)); `terrain-storage-probe` is the optional local real-platform
-qualification, which fills a disposable volume the scripts under `tools/terrain-storage/` make and
-refuses to run anywhere else.
 
 ## Consumers
 
