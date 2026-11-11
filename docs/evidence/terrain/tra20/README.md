@@ -15,7 +15,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-terrain-render-2d:terrain
 $(cabal list-bin --project-file cabal.project.cpu hetoimasia-terrain-runtime:terrain-runtime-tests) --match "TRA-20 evidence"
 ```
 
-Results: `terrain-runtime-tests` 379 examples, 0 failures; `terrain-tests` 901/0; `terrain-render-2d-tests` 649/0.
+Results at `59a90b7d` (the Measurements block below is the printer's output at that head; earlier rounds' sections quote the output of their own heads): `terrain-runtime-tests` 517 examples, 0 failures; `terrain-tests` 905/0; `terrain-render-2d-tests` 558/0; `workflow-tests` 965/0.
 
 ## Fixtures, seeds and references
 
@@ -27,35 +27,35 @@ Results: `terrain-runtime-tests` 379 examples, 0 failures; `terrain-tests` 901/0
 ## Measurements (evidence printer output)
 
 ```text
-EVIDENCE trees seed=11 steps=400 records=1587 commits=400 totalPageWrites=5038 maxPagesPerTransaction=23 maxRam=737187 maxWindowPages=23 maxReadSteps=140 maxClaim=71
-EVIDENCE trees seed=11 heights=[(TreeRuns,2),(TreeLinks,2),(TreeTodo,2),(TreeFree,0),(TreeRetire,2)] live=431 retired=3999 free=0 loose=68 highWater=4498 violations=0
-EVIDENCE trees seed=29 steps=400 records=1581 commits=400 totalPageWrites=4986 maxPagesPerTransaction=25 maxRam=755783 maxWindowPages=24 maxReadSteps=142 maxClaim=70
-EVIDENCE trees seed=29 heights=[(TreeRuns,2),(TreeLinks,2),(TreeTodo,2),(TreeFree,0),(TreeRetire,2)] live=429 retired=3947 free=0 loose=68 highWater=4444 violations=0
-EVIDENCE trees seed=47 steps=400 records=1621 commits=400 totalPageWrites=5134 maxPagesPerTransaction=24 maxRam=749594 maxWindowPages=25 maxReadSteps=136 maxClaim=70
-EVIDENCE trees seed=47 heights=[(TreeRuns,2),(TreeLinks,2),(TreeTodo,2),(TreeFree,0),(TreeRetire,2)] live=432 retired=4090 free=0 loose=68 highWater=4590 violations=0
+EVIDENCE trees seed=11 steps=400 records=1587 commits=400 totalPageWrites=5614 maxPagesPerTransaction=25 maxRam=958403 maxWindowPages=32 maxReadSteps=561 maxClaim=71
+EVIDENCE trees seed=11 heights=[(TreeRuns,2),(TreeLinks,2),(TreeTodo,2),(TreeFree,0),(TreeRetire,2)] live=468 retired=3999 free=0 loose=68 highWater=4535 violations=0
+EVIDENCE trees seed=29 steps=400 records=1581 commits=400 totalPageWrites=5557 maxPagesPerTransaction=27 maxRam=972810 maxWindowPages=31 maxReadSteps=627 maxClaim=70
+EVIDENCE trees seed=29 heights=[(TreeRuns,2),(TreeLinks,2),(TreeTodo,2),(TreeFree,0),(TreeRetire,2)] live=466 retired=3947 free=0 loose=67 highWater=4480 violations=0
+EVIDENCE trees seed=47 steps=400 records=1621 commits=400 totalPageWrites=5694 maxPagesPerTransaction=26 maxRam=975357 maxWindowPages=35 maxReadSteps=586 maxClaim=70
+EVIDENCE trees seed=47 heights=[(TreeRuns,2),(TreeLinks,2),(TreeTodo,2),(TreeFree,0),(TreeRetire,2)] live=470 retired=4090 free=0 loose=68 highWater=4628 violations=0
 EVIDENCE growAndShrink seed=5 runsTreeHeightAtPeak=3 rootAfterDeletingEverything=empty
-EVIDENCE bounds history=20000runs exactPlan pages=256 bytes=1048576 recordPages=254 listPages=1 bookkeepingPages=1 replacedRecordPages=254 replacedBookkeepingPages=1 slack=67 claimed=255 windowPages=255 readSteps=1490 ramTotal=3213404
+EVIDENCE bounds history=20000runs exactPlan pages=256 bytes=1048576 recordPages=249 listPages=1 bookkeepingPages=6 replacedRecordPages=249 replacedBookkeepingPages=4 slack=62 claimed=250 windowPages=253 readSteps=5792 ramTotal=3495669
 EVIDENCE bounds onePastPages=257 refused=TxnPagesExceeded
-EVIDENCE bounds worstTransactionRam io=1048576 decoded=2388992 keys=24960 scratch=491872 pagePins=8192 rootControl=1152 continuation=5120 total=3968864 limit=4194304
-EVIDENCE bounds format maxLevel=7 worstUpdatePagesAtMaxHeight=17 bookkeepingReserve=68 maxClaimPages=324 minimumRemovalPages=188 minimumRemovalRam=3654510
+EVIDENCE bounds worstTransactionRam io=1048576 decoded=2607104 keys=61440 scratch=604208 pagePins=8192 rootControl=70784 continuation=1053696 total=5454000 limit=4194304
+EVIDENCE bounds format maxLevel=7 worstUpdatePagesAtMaxHeight=17 bookkeepingReserve=68 maxClaimPages=324 minimumRemovalPages=188 minimumRemovalRam=4118128
 EVIDENCE replay twoOpenings batch=1 pendingAfterFirstBatch=3 drainBatches=35 plans=42 maxStructuralUpdates=1 maxPagesPerTransaction=4 pendingAtEnd=0
-EVIDENCE fault fixture pages=12 prefixes=13 oldRootIntactInEvery=True rollbackWrites=0 usageRestored=True
+EVIDENCE fault fixture pages=14 prefixes=15 oldRootIntactInEvery=True rollbackWrites=0 usageRestored=True
 EVIDENCE readers pinnedVersions=[40,65] retiredBytesWhileHeld=4599808 oldestPin=Just 40
 EVIDENCE readers reclaimedBeforeThePin transactions=39 retiredBytesStillHeld=3600384
 EVIDENCE readers reclaimOutcomeWhileHeld=BlockedByReader entry=41 pin=40
-EVIDENCE readers afterLastRelease reclaimTransactions=65 retiredBytes=0 maxPagesPerTransaction=20 totalPagesFreed=1123
-EVIDENCE exhaustion tight=64MiB allowance, 48MiB overhead commits=124 refusal=Capacity (DiskFull 324 2359 2048)
-EVIDENCE exhaustion at refusal allowance=67108864 used=57446400 live=602112 staged=0 retired(pending reclaim)=6234112 loose=278528 free=9662464 protected=8388608 available=1273856 readers=0 pinnedVersions=0
-EVIDENCE exhaustion after 123 reclaim transactions allowance=67108864 used=51236864 live=98304 staged=0 retired(pending reclaim)=0 loose=806912 free=15872000 protected=8388608 available=7483392 readers=0 pinnedVersions=0
-EVIDENCE exhaustion maxPagesPerTransaction=21 totalPagesFreed=1522
-EVIDENCE cycles CycleReport {crSeed = 101, crCommits = 186, crAborts = 52, crFailedWrites = 24, crReads = 57, crReclaims = 36, crMaxReaders = 6, crMaxPages = 18, crMaxWindow = 17, crMaxRam = 671959, crMaxSteps = 136, crPagesWritten = 2402, crHighWater = 1402, crRecords = 893}
-EVIDENCE cycles CycleReport {crSeed = 202, crCommits = 177, crAborts = 50, crFailedWrites = 22, crReads = 51, crReclaims = 37, crMaxReaders = 6, crMaxPages = 19, crMaxWindow = 19, crMaxRam = 684291, crMaxSteps = 114, crPagesWritten = 2378, crHighWater = 1424, crRecords = 914}
-EVIDENCE cycles CycleReport {crSeed = 303, crCommits = 194, crAborts = 49, crFailedWrites = 28, crReads = 24, crReclaims = 42, crMaxReaders = 5, crMaxPages = 19, crMaxWindow = 18, crMaxRam = 682100, crMaxSteps = 110, crPagesWritten = 2546, crHighWater = 1465, crRecords = 921}
-EVIDENCE allocation a one-record edit plan history500runs=451328B history20000runs=983728B ratio=2.179629892229155
-EVIDENCE allocation a pinned point read history500runs=136848B history20000runs=229824B ratio=1.6794107330761137
+EVIDENCE readers afterLastRelease reclaimTransactions=65 retiredBytes=0 maxPagesPerTransaction=22 totalPagesFreed=1123
+EVIDENCE exhaustion tight=64MiB allowance, 48MiB overhead commits=123 refusal=Capacity (DiskFull 324 2362 2048)
+EVIDENCE exhaustion at refusal allowance=67108864 used=57434112 live=659456 staged=0 retired(pending reclaim)=6164480 loose=278528 free=9674752 protected=8388608 available=1286144 readers=0 pinnedVersions=0
+EVIDENCE exhaustion after 122 reclaim transactions allowance=67108864 used=51331072 live=98304 staged=0 retired(pending reclaim)=0 loose=901120 free=15777792 protected=8388608 available=7389184 readers=0 pinnedVersions=0
+EVIDENCE exhaustion maxPagesPerTransaction=23 totalPagesFreed=1505
+EVIDENCE cycles CycleReport {crSeed = 101, crCommits = 186, crAborts = 52, crFailedWrites = 24, crReads = 57, crReclaims = 36, crMaxReaders = 6, crMaxPages = 20, crMaxWindow = 75, crMaxRam = 1050640, crMaxSteps = 539, crPagesWritten = 2894, crHighWater = 1428, crRecords = 893}
+EVIDENCE cycles CycleReport {crSeed = 202, crCommits = 177, crAborts = 50, crFailedWrites = 22, crReads = 51, crReclaims = 37, crMaxReaders = 6, crMaxPages = 22, crMaxWindow = 101, crMaxRam = 1202524, crMaxSteps = 731, crPagesWritten = 2827, crHighWater = 1451, crRecords = 914}
+EVIDENCE cycles CycleReport {crSeed = 303, crCommits = 194, crAborts = 49, crFailedWrites = 28, crReads = 24, crReclaims = 42, crMaxReaders = 5, crMaxPages = 22, crMaxWindow = 33, crMaxRam = 927545, crMaxSteps = 537, crPagesWritten = 3064, crHighWater = 1491, crRecords = 921}
+EVIDENCE allocation a one-record edit plan history500runs=813576B history20000runs=4990808B ratio=6.134409077947235
+EVIDENCE allocation a pinned point read history500runs=154160B history20000runs=279368B ratio=1.8121951219512196
 EVIDENCE allocation a usage and control report history500runs=1232B history20000runs=1232B ratio=1.0
-EVIDENCE allocation a reclamation step over an equal retirement list history500runs=472328B history20000runs=466496B ratio=0.9876526481597534
-EVIDENCE allocation control: a map of every record key history500runs=35304B history20000runs=1361640B ratio=38.569000679809655
+EVIDENCE allocation a reclamation step over an equal retirement list history500runs=2412856B history20000runs=2406960B ratio=0.9975564227620711
+EVIDENCE allocation control: a map of every record key history500runs=40288B history20000runs=1361640B ratio=33.797656870532165
 ```
 
 Reading the lines: `maxPagesPerTransaction` is the most encoded pages one plan wrote, metadata included (the bound is 256, 1 MiB); `maxRam` is the largest RAM a plan reserved, by component (the bound is 4 MiB; `worstTransactionRam` is the worst case at the format's bounds); `maxWindowPages` the most validated page buffers a plan held (the window is bounded to 1,310,720 accounted bytes, about 310 pages, at 4,224 bytes a page); `maxReadSteps` the most node visits a plan made; `maxClaim` the most pages taken from the allocator; `exactPlan` the plan that wrote exactly 256 pages and `onePastPages` the page count one more write needs (refused as `TxnPagesExceeded`); `maxStructuralUpdates` the most structural updates a discovery batch performed (bound 64); `used/live/staged/retired/loose/free/protected/available` the usage identities of `usage` (`used + free = allowance`; retired pages, the pending reclaim, are a subset of used); `allocation ... ratio` the bytes one forced computation allocated at a history forty times larger over a small one (the `control` row, a map of every record key, shows the measurement would notice a history-sized structure: its ratio is about 40).
