@@ -180,6 +180,28 @@ spec = describe "Storage backend: queue, workers and lifetime" $ do
       discardTicket (envSvc env) rd
       openFds (envProbe env) >>= (`shouldBe` [])
 
+  it "closes a backing whose queue is full: the queued jobs are withdrawn, the running calls finish and nothing leaks" $
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      g ← addGate (envProbe env) isRead
+      running ← forM [100, 101] (\n → readJob env b ExplicitWork n 1 >>= ok)
+      awaitReached g 2
+      queued ← forM [102 .. 109] (\n → readJob env b ExplicitWork n 1 >>= ok)
+      closed ← newEmptyMVar
+      withOwnedThread (closeBacking (envSvc env) b >>= putMVar closed) $ \_ wait → do
+        -- the queued jobs settle at once; the close waits for the two calls held in flight
+        bounded (atomically (serviceView (envSvc env) >>= \v → check (svQueued v == 0)))
+        tryReadMVar closed >>= (`shouldSatisfy` isNothing)
+        openGate g
+        wait
+      readMVar closed >>= (`shouldSatisfy` crClosed)
+      -- every record was retired by the close: nothing is left to take
+      forM_ (running <> queued) (\t → withOutcome (envSvc env) t pure >>= (`shouldSatisfy` isNothing))
+      (svRecords <$> view env) `shouldReturn` 0
+      evs ← events (envProbe env)
+      -- the queued reads never reached a native call
+      length [() | OpReadAt _ _ ← evs] `shouldBe` 2
+
   it "waits for a borrower, such as a reader pin, before closing" $
     withEnv (\env → do
       b ← openBacking env ident (hCfg h0)
