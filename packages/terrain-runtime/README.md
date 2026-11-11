@@ -608,7 +608,7 @@ pinned state, and the proofs are the only part of a plan whose window grows with
 heights. A plan whose window would outgrow its bound while proving answers `Checkpoint facts` instead: build a
 fresh window of the same version with `windowCheckpoint facts old` (it drops the pages and probes, keeps the
 facts, the work limit and the trust) and plan again; the plan does not repeat a proof it carries a fact for. The
-`Facts` are opaque (no constructor reaches a client) and carry the state they were proven against (the store, the
+`Facts` are opaque (no constructor reaches a client; the read facts in them are packed when they are created, never typed) and carry the state they were proven against (the store, the
 version, the committed roots and the pinned roots with their versions): a window trusts them only for exactly
 that state, so a reader acquired in between or a commit costs a proof again and never skips one it should have
 made. A checkpoint always carries a new fact (a window that cannot hold the plan's edit and ONE proof is the typed
@@ -804,7 +804,7 @@ validated 4 KiB buffer of each page it read (a small header more, at most 1.25 M
 parses entries from a buffer only while a node is visited; the new pages a plan builds
 are held **packed** (their entries as one byte string, about 4.2 KiB each, 256 pages at
 most when it ends) except for the last eight per tree edit, which stay parsed and are
-accounted at 32,768 bytes each (25,284 measured for a 225-entry node); the encoded output is 4 KiB a written page. The discovery
+accounted at 32,768 bytes each (26,212 measured at the largest); the pages it writes are charged at what its page list retains, 4,288 bytes a page (4,245 measured). The discovery
 header is charged at its fixed 128-byte record size: its byte total counts the retained
 *history*, which lives in pages, and is not transaction memory, so a history of any size
 plans like an empty one. A plan whose window or new pages would hold more is refused
@@ -975,7 +975,7 @@ that claim is reserved before any work, so a refusal (`DiskFull`) precedes any c
 and leaves the prior contents and every discovery obligation intact. The owner maps it
 to `storage_full` and the pause. `minimumRemovalFeasible` shows the supported minimum
 removal (7 record writes at the tallest height, a list page and the bookkeeping
-reserve: 188 pages, 4,118,128 bytes of RAM at the measured costs, 3.93 MiB) fits any accepted configuration in an empty
+reserve: 188 pages, 3,945,392 bytes of RAM at the measured costs, 3.76 MiB) fits any accepted configuration in an empty
 workspace; if a configuration could not hold it, the counterexample is returned for a
 design decision and no budget is relaxed.
 
@@ -994,39 +994,76 @@ allowance.
 
 ### Memory is measured, not reasoned
 
-Every constant that says how many bytes a thing retains is checked by the suite's `Memory` examples against the live heap: build
-the largest valid instance inside the measured step from plain numbers (so nothing is allocated before the first reading), force it
-all the way down, hold it, take two major collections and read `gcdetails_live_bytes` before and after, and divide. One example
-per row asserts `measured <= accounted`, so a constant lowered below what is retained fails by itself.
+Every constant that says how many bytes something retains is checked by the suite's `Memory` examples against the live heap, on
+the LARGEST valid instance of what it stands for. "Largest valid instance" is a claim about a type, so it is checked, not
+assumed: a row measures every variant of its type (each constructor; each optional field populated and not; each list at its
+cap; numbers near 2^62, so no small `Int` box is shared), asserts that every variant is within its accounted figure, and asserts
+that the variant the row names as the largest is the largest measured. No field is an unbounded integer: every coordinate, level
+and counter is 64 bits and range-checked by the codec (`axisFromInteger`), so none is a bignum.
 
-| Constant | What it stands for | Measured B | Accounted B |
-| --- | --- | --- | --- |
-| `windowPageBytes` | a validated page in a window (buffer, map entry, number, record) | 4,265 | 4,288 (4,096 + `windowPageOverhead` 192) |
-| `probeBytes` | a probe: map entry, tag, level, key as a compact byte array | 168 | 256 |
-| `recordFactBytes` | a packed read fact at its ceiling (key 64 + value 64 + `readFactOverheadBytes` 128) | 224 | 256 |
-| `factBytes` | a proof fact in a set | 64 | 80 |
-| `pageListCellBytes` | one cell of a list of page numbers | 40 | 48 |
-| `rootRecordBytes` | a root set at the loose cap (512 fixed + 1,024 cells) | 41,107 | 49,664 |
-| `readerRecordBytes` | a reader pin record | 369 | 512 |
-| `writeRetainedBytes` | a typed record write, key and value as values | 272 | 320 |
-| `hotNodeBytes` | a parsed dense node in the hot set (225 entries) | 25,284 | 32,768 |
-| `pageStateEntryBytes` | a page-state map entry of the active transaction | 64 | 80 |
-| `overlayNodeBytes` | a new page held packed (4,050-byte payload + `320`) | 4,312 | 4,370 |
+The method: build the structure inside the measured step from plain numbers (so nothing is allocated before the first reading),
+force it all the way down, hold it, take two major collections and read `gcdetails_live_bytes` before and after, and divide. The
+inputs are kept alive to the end, so a buffer that is copied into the structure is counted and not netted out against its own
+dying input (the first form of the measurement read a window page as 33 bytes for that reason). A margin is accounted over every
+maximum; the thin ones are named in the table.
 
-The read facts at their ceiling (4,096 of them) retain 950,600 of `maxReadFactBytes` (1,048,576). The terms of the charge with no
-heap structure behind them are LEDGER terms, named as such and not measured: `ramPagePins` (16 a window page), the continuation's
-base (1,024 + 8 a window page), the 4,096-byte scratch, and the descriptor records of the admission.
+| Constant | Largest valid instance, and why | Variants measured | Measured B | Accounted B | Margin |
+| --- | --- | --- | --- | --- | --- |
+| `windowPageBytes` | a 4,096-byte validated buffer whatever the page says | leaf and internal page of every tree | 4,265 | 4,288 | **23 B (thin)** |
+| `probeBytes` | the links tree's 52-byte first key (the longest a valid page holds); the bound a page could carry, 64, is measured too | keys of 8, 24, 25, 52, 64 bytes, a retirement list, nothing | 176 (168 at 52) | 256 | 80 B |
+| `recordFactBytes` | the longest valid key (52) with the longest valid value (53); encoded, so the typed form's optional coordinates do not matter | 32 valid key and record pairings, a floor answer, an absent answer, the 64 + 64 bound; **each against its OWN charge** (its key length, its value length and 128) | 224 at the largest pairing (own charge 233); 240 at the bound | 256 | 16 B at the bound |
+| `factBytes` | the constructor with the most fields | all five `Fact` constructors | 64 (`FactGone`) | 80 | 16 B |
+| `pageListCellBytes` | a cons cell and a boxed number | list of page numbers | 40 | 48 | 8 B |
+| `pageSetElemBytes` | a set node, the boxed number and the pointers | set of page numbers (the replaced pages of an edit) | 56 | 64 | 8 B |
+| `rootRecordBytes` | every root present, the header at its largest, five checksums, the loose list at its cap of 1,024 distinct pages | with and without roots, with and without the loose list | 41,746 | 49,664 (512 + 1,024 cells) | 7,918 B |
+| `readerRecordBytes` | all three pinned roots and three checksums | with and without | 481 | 512 | 31 B |
+| `writeRetainedBytes` | a source-node key and a source-node child, each with ALL THREE optional coordinates populated, held three times at once (the candidate's list, the planner's map, its canonical list) | every one of the 32 pairings of a key kind and a record kind the planner accepts | 560 (272 with no optional coordinate) | 640 | 80 B |
+| `hotNodeBytes` | the densest valid page of any tree: the free tree's 8 + 8 byte extents give 225 entries (a leaf, 25,300 B); the largest is a free or todo INTERNAL page of 192 entries (8-byte separators, boxed references) | the densest leaf and internal page of every tree and kind | 26,212 | 32,768 | 6,556 B |
+| `pageStateEntryBytes` | every state is nullary: one cost | the four states | 64 | 80 | 16 B |
+| `overlayNodeBytes` | a leaf packs to its page payload; an internal page packs each entry one byte larger (the tag of its reference), so the shortest separator (`minKeyBytes`, 8) gives the most entries: 4,232 bytes packed | leaf and internal page of the free, retirement and runs trees | 4,478 (for its own 4,552) | payload + 320; the worst 4,564 | **74 B (2%)** |
+| `writtenPageBytes` | a plan's page list holds a cons cell, a tuple, a page number and a pinned buffer around each 4,096 bytes | tree leaf, tree internal, retirement list at its cap | 4,245 | 4,288 | **43 B (thin)** |
+| a `Facts` value | N packed read facts at the largest kind, N proof facts of the largest constructor (a LIST there, not the window's set), the worst fingerprint | reads 224 B each (own charge 233); proof facts 48 B each (80); one fingerprint with 5 root checksums and 16 pinned versions of 3 roots 7,285 B (`fingerprintBytes` 8,192) | a Facts of 4,096 reads and 1,088 proof facts: 1,011,808 | 1,049,600 (`factsRetainedBytes`) | 37,792 B |
+| `typedReadBytes` | the same source key and child, as #661's core holds a read: the record, its map entry and the ascending list it is handed over as | the 32 pairings and a floor query (212) | 512 | 576 | 64 B |
+| `headerBytes` | an authority and three counters, all at their largest | one | 105 | 128 | 23 B |
 
-A read fact is held packed, and an ABSENT answer (no such record, no such run) is the EMPTY value, so a PRESENT record must never
-encode to nothing. The suite pins it over every `Record` constructor at its edges, shows the empty value decodes under no key, and
-checks that present and absent answers (records and the 16-byte floor answer) come back through the window as they went in.
+The read facts at their ceiling (4,096 of the largest kind) retain 946,336 of `maxReadFactBytes` (1,048,576). The terms of the charge
+with no heap structure behind them are LEDGER terms, named as such and not measured: `ramPagePins` (16 a window page), the
+continuation's base (1,024 + 8 a window page), the 4,096-byte scratch, and the descriptor records of the admission.
 
-**Consequences of the measured costs, stated plainly.** (1) A window holds **305 pages** at `maxWindowBytes` (it was 310 at the
-reasoned page cost). (2) `readResiduePages` is **4** (it was 6): the promised removal bound is **294** pages (296) and a discovery
-unit's **230** (232). (3) The sum of every component's worst case, with no read facts, is **4,405,424** bytes, above the 4 MiB
-limit: it is an account bound and no longer "below 4 MiB by construction". The one gate is `chargeFor`, which refuses (`TxnRamExceeded`)
-a plan whose own total is past the limit; the promised extremes are each planned and fit: the minimum removal needs
-**4,118,128** bytes and a discovery unit **3,821,680** of 4,194,304 (76 KiB and 372 KiB of headroom).
+**What the audit found beyond the finding that opened the round.** (1) The replaced pages of an edit are a SET, 56 bytes an
+element, not the 40-byte list cell the charge used for them: `pageSetElemBytes`. (2) `overlayWorstBytes` still carried a literal
+`+ 160` after the overlay overhead became 320, and the overlay budgets (1,100,000 and 300,000 bytes) were fixed numbers that a dense
+256-page plan exceeds: such a plan could have been refused for a promise it keeps. Every overlay figure is now one definition,
+`overlayPageWorstBytes = overlayNodeBytes maxPackedPayloadBytes` (a worst packed page of 4,244 bytes, the internal page's tag byte
+included, and the key table asserts `minKeyBytes`); the budgets and the worst charge are derived from it. (3) The measurement kept
+the inputs alive (above).
+
+**The design change: the overlay worst scales with the pages written.** `worstChargeWith` charges the overlay at `overlayWorstFor
+written = written x overlayPageWorstBytes` instead of a constant for 256 pages. It is sound because every overlay page is a written
+page (a new page is written), so a plan that writes fewer pages holds fewer overlay pages; it is why the minimum removal got smaller
+although the write charge rose.
+
+**What a plan holds that the first measured table did not count** (the manager's read of the table against the charge). (1) The
+pages it writes: `ramIoBuffers` charges `writtenPageBytes` (4,288) a written page, not the 4,096 of the buffer. (2) `Facts`
+cross the API PACKED: a `Facts` holds the read facts in the form a window holds them, packed when the facts are created
+(`factsOf`), so nothing typed leaves the planner; `factsRetainedBytes` counts what the caller keeps between a `Checkpoint` and
+`windowCheckpoint` (the fingerprint, the proof facts as a list, the packed reads) and the ceiling on the reads a plan carries is
+checked against those bytes. The type is the control: `Facts` has no typed field. (3) The read phase IN FLIGHT: #661 holds the typed
+read set while it reads (`typedReadBytes` 576, measured 512). It checks its read allowance only as it reads, so the allowance is
+what bounds that memory: `maxTypedReads` is derived to fill a plan's 4 MiB exactly from its seven terms, the typed reads, a full
+window (1,310,720), the ownership probes (131,072), the packed facts at their ceiling (1,048,576), the proof facts a replayed read
+phase carries (87,040), the writes staging has accumulated (122,880: 192 at `writeRetainedBytes`) and the fixed records (74,880):
+**2,463 reads**. Both planners pass it as the read allowance (`bdMaxReads`), so a discovery batch that would read more ENDS EARLY as
+progress with the inspections it completed. It is never a refusal: the cap is above what a removal reads (`worstEditReads`, 197) and
+what one inspection reads (`worstEdgeReads`, 132), as a property of the suite. #661's own scratch figure (`worstEdgeScratch` and its
+kin) is an accounting limit of that package, a bound it checks its own work against, and not a structure counted here.
+
+**Consequences, stated plainly.** (1) A window holds **305 pages** at `maxWindowBytes`. (2) `readResiduePages` is **4**: the promised
+removal bound is **294** pages and a discovery unit's **230**. (3) The sum of every component's worst case is an ACCOUNT bound:
+**5,663,872** bytes with the read facts at their ceiling (io 1,097,728, decoded 2,697,216, keys 122,880, scratch 613,376, pins 8,192,
+root and control 70,784, continuation 1,053,696) and 4,615,296 without them, above the 4 MiB limit. The one gate is `chargeFor`, which
+refuses (`TxnRamExceeded`) a plan whose own total is past the limit. The promised extremes are each planned and fit: the minimum
+removal needs **3,945,392** bytes and a discovery unit **3,324,256** of 4,194,304 (249 KB of headroom for the removal).
 
 ### Edit-bank admission
 
@@ -1035,8 +1072,8 @@ a plan whose own total is past the limit; the promised extremes are each planned
 `maxReadFactBytes`); the minimum removal and the smallest unit of discovery are the same function at their own arguments. A
 term the charge gains is therefore in every worst case, and the suite checks, for every plan it commits, that each component
 and each account's credit is at most the worst case's. The smallest control account `mkEditBankConfig` accepts is 1,134,208
-bytes for one arena and one reader (1,166,464 at four arenas of 16 readers), protected staging 1,714,224 and cache 2,744,320
-(11,388,928); the defaults (8 MiB, 4 MiB, 48 MiB) hold them. The component-wise worst total, 5,454,000 bytes (4,405,424 without
+bytes for one arena and one reader (1,166,464 at four arenas of 16 readers), protected staging 1,833,984 and cache 2,834,432
+(11,479,040); the defaults (8 MiB, 4 MiB, 48 MiB) hold them. The component-wise worst total, 5,663,872 bytes (4,615,296 without
 read facts), is above 4 MiB: it is a bound for the accounts and not for one plan, which `chargeFor` holds to 4 MiB (see
 *Memory is measured* above).
 
