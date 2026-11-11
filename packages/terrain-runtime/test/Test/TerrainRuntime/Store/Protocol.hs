@@ -12,7 +12,7 @@ module Test.TerrainRuntime.Store.Protocol (spec) where
 import Control.Monad (foldM, forM, forM_)
 import qualified Data.ByteString as BS
 import Hetoimasia.Terrain.Coordinate (TileCoord)
-import Hetoimasia.Terrain.Discovery (Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites, worstEditReads)
+import Hetoimasia.Terrain.Discovery (Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites, worstEditReads, worstEditWrites)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
@@ -28,13 +28,13 @@ must ∷ Either String a → IO a
 must = either (\e → expectationFailure e >> fail e) pure
 
 -- | What the caller did to get a plan through.
-data Counts = Counts {cReductions ∷ !Int, cCheckpoints ∷ !Int, cPages ∷ !Int, cMaintenance ∷ !Int, cReadPeak ∷ !Int, cFacts ∷ !Int}
+data Counts = Counts {cReductions ∷ !Int, cCheckpoints ∷ !Int, cPages ∷ !Int, cMaintenance ∷ !Int, cReadPeak ∷ !Int, cFacts ∷ !Int, cProbePeak ∷ !Int}
 
 noCounts ∷ Counts
-noCounts = Counts 0 0 0 0 0 0
+noCounts = Counts 0 0 0 0 0 0 0
 
 addCounts ∷ Counts → Counts → Counts
-addCounts (Counts a b c d e f) (Counts a' b' c' d' e' f') = Counts (a + a') (b + b') (c + c') (d + d') (max e e') (max f f')
+addCounts (Counts a b c d e f g) (Counts a' b' c' d' e' f' g') = Counts (a + a') (b + b') (c + c') (d + d') (max e e') (max f f') (max g g')
 
 windowResult ∷ CapacityWhy → Bool
 windowResult c = case c of
@@ -61,9 +61,9 @@ maxProtocolSteps = (worstEditReads + 1) * (maxWindowPages + 1) + 1000
 driveFrom ∷ H → Window → (H → Window → Planned) → Either String (H, Planned, Counts)
 driveFrom h0 w0 planner = loop h0 w0 noCounts (0 ∷ Int)
   where
-    loop h w c n
+    loop h w c0 n
       | n > maxProtocolSteps = Left ("the protocol did not settle in " <> show maxProtocolSteps <> " steps")
-      | otherwise = case planner h w of
+      | otherwise = let c = c0 {cProbePeak = max (cProbePeak c0) (windowProbeCount w)} in case planner h w of
           Pending p → case diskRead (hDisk h) p of
             Nothing → Left ("pending page not on disk: " <> show p)
             Just bs → case windowInsert (cfgUsablePages (hCfg h)) p bs w of
@@ -173,7 +173,7 @@ protocolSpec = describe "the facade's caller protocol, followed exactly, for eve
           , hrec ← hs
           , pins ← [0 .. maxReaders]
           , discoveryUnitWindowPages maxRetireInternals hf hrec pins > removalWindowPages maxRetireInternals hf hrec pins
-              || discoveryUnitWindowPages maxRetireInternals hf hrec pins * windowPageBytes + 188 * probeBytes > maxWindowBytes
+              || discoveryUnitWindowPages maxRetireInternals hf hrec pins * windowPageBytes + discoveryUnitWorstProbes * probeBytes > maxWindowBytes
           ]
     bad `shouldBe` []
     putStrLn ("PROTOCOL bounds: unit of discovery (3 writes) at (8,8,16) = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> " pages, removal (7 writes) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", limit " <> show (maxWindowBytes `div` windowPageBytes))
@@ -398,6 +398,9 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     bad (\hf hrec pins → discoveryUnitWindowPages maxRetireInternals hf hrec pins * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` []
     -- the residue is what the worst removal leaves free in the byte limit, and no more
     readResiduePages `shouldBe` 6
+    -- the probe figures are counted from the pages written, in one place
+    (removalWorstProbes, discoveryUnitWorstProbes) `shouldBe` (worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve, discoveryUnitWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve)
+    (removalWorstProbes, discoveryUnitWorstProbes, minimumRemovalPages) `shouldBe` (188, 120, 188)
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders) * windowPageBytes + removalWorstProbes * probeBytes <= maxWindowBytes) `shouldBe` True
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders + 1) * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` True
     -- the facts of the worst removal and of a discovery unit are RAM the feasibility proofs count, and they fit
@@ -424,6 +427,9 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
       bmin ← must (minimalBound h planner promise)
       putStrLn ("READPHASE removal " <> show hops <> " hops: smallest bound the plan succeeds under " <> show bmin <> " of the promised " <> show promise)
       (bmin <= promise, bmin >= readPathPages (recordHeight h)) `shouldBe` (True, True)
+      -- the proof phase holds no more probes than the pages the removal writes, which 'removalWorstProbes' is derived from
+      (cProbePeak (cOf tight) <= removalWorstProbes, cProbePeak (cOf std) <= removalWorstProbes) `shouldBe` (True, True)
+      putStrLn ("READPHASE removal " <> show hops <> " hops: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show removalWorstProbes)
   it "a checkpoint is never taken with no new fact: a window that cannot hold one read is the typed window result, never a loop" $ do
     (h, env, tile) ← must (chainStore 12 8192)
     -- a bound of two pages cannot hold the three pages of one read of the links tree
@@ -459,6 +465,8 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     bminD ← must (minimalBound h planner promise)
     putStrLn ("READPHASE discovery unit: smallest bound the plan succeeds under " <> show bminD <> " of the promised " <> show promise)
     (bminD <= promise, bminD >= readPathPages (recordHeight h)) `shouldBe` (True, True)
+    (cProbePeak (cOf tight) <= discoveryUnitWorstProbes, cProbePeak (cOf std) <= discoveryUnitWorstProbes) `shouldBe` (True, True)
+    putStrLn ("READPHASE discovery unit: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show discoveryUnitWorstProbes)
     -- a 64-update batch: the batch is whatever the pages the window holds complete, so only the end state is the same: drained
     -- through tight and through standard bounds, the stores hold the same records
     (hStd, nStd, cStd) ← must (drainThrough h 64 (planner standardBounds))

@@ -15,6 +15,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Format
   , pagePayloadBytes
   , formatVersion
   , maxKeyBytes
+  , worstUpdatePages
   , maxValueBytes
   , maxEntryBytes
   , maxLevel
@@ -65,6 +66,12 @@ pagePayloadBytes = pageChecksumOffset - pageHeaderBytes
 -- | The only format version this implementation reads or writes.
 formatVersion ∷ Word16
 formatVersion = 1
+
+-- | The most new pages one update of a tree of the given height writes: a copy of the path, a split at every level and a new
+-- root. The ONE definition: the bookkeeping reserve, the pages the worst removal and the smallest unit of discovery write, and
+-- the probes of their proof phases are all counted from it.
+worstUpdatePages ∷ Int → Int
+worstUpdatePages height = 2 * height + 1
 
 -- | The longest encoded key a page holds. The longest real key is 52 bytes (a
 -- source component node); the bound leaves room and is checked on decode.

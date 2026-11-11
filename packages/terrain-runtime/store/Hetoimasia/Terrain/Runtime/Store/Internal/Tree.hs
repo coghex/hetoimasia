@@ -1278,11 +1278,6 @@ assignPages encode e roots supply0 = do
         go acc [] = Right acc
         go acc (y : ys) = f acc y >>= \acc' → go acc' ys
 
--- | The most new pages one update of a tree of the given height writes: a copy of
--- the path, a split at every level and a new root.
-worstUpdatePages ∷ Int → Int
-worstUpdatePages height = 2 * height + 1
-
 -- ---------------------------------------------------------------------------
 -- Exposed for the suite: building a tree of a given shape, checking a tree's shape, and the exits' answers
 

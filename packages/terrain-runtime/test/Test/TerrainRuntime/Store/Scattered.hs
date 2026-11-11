@@ -362,7 +362,7 @@ specAtOnce = describe "round 13: the window a unit of work holds at once, under 
     putStrLn ("ATONCE loose list: soft " <> show looseSoftCap <> " + unit of one at (8,8) " <> show (looseGrowthUnit 8 8) <> " <= cap " <> show looseCap <> "; ordinary " <> show (maxClaimPages + looseGrowthOrdinary 8))
     -- and the standalone removal, which cannot shrink, for every record and allocator height and pin count, with the
     -- retirement tree at the minimum fill the store enforces and the backlog bound it checks (at most 17 internal pages)
-    let badRemoval = [(hf, hrec, pins) | hf ← [1 .. maxLevel + 1], hrec ← [1 .. maxLevel + 1], pins ← [0 .. maxReaders], removalWindowPages maxRetireInternals hf hrec pins * windowPageBytes + 188 * probeBytes > maxWindowBytes]
+    let badRemoval = [(hf, hrec, pins) | hf ← [1 .. maxLevel + 1], hrec ← [1 .. maxLevel + 1], pins ← [0 .. maxReaders], removalWindowPages maxRetireInternals hf hrec pins * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes]
     badRemoval `shouldBe` []
     putStrLn ("ATONCE bounds: unit of one at (8,8,8,16) = " <> show (workOneWindowPages 8 8 8 16) <> " pages, removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> " pages, limit " <> show (maxWindowBytes `div` windowPageBytes))
   it "makes progress at work one with a window of exactly the at-once bound, with 1 to 16 distinct pinned versions, on a store with no tail, and again after the readers release" $ do

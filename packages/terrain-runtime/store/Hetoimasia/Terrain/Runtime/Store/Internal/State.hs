@@ -77,6 +77,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , readPathPages
   , maxReadFactBytes
   , removalWorstProbes
+  , minimumRemovalPages
+  , discoveryUnitPagesWritten
+  , discoveryUnitWorstProbes
   , discoveryUnitWindowPages
   , maintenanceUnitPages
   , discoveryUnitWrites
@@ -147,7 +150,7 @@ defaultOffsetLimit = 2 ^ (63 ∷ Int) - 1
 -- at the worst cost of one, @2 * (maxLevel + 1) + 1@. Pages it does not use become
 -- loose.
 bookkeepingReserve ∷ Int
-bookkeepingReserve = 4 * (2 * (maxLevel + 1) + 1)
+bookkeepingReserve = 4 * worstUpdatePages (maxLevel + 1)
 
 -- | The most bookkeeping pages one candidate plan may take: every page a plan writes counts against the
 -- 'maxTxnPages' of a transaction, so the record pages, the list page and the bookkeeping together stay
@@ -326,9 +329,29 @@ workOneProbeBytes hr hf = (3 * hr + 3 * hf + 2 + maxSpillPages) * probeBytes
 removalWindowPages ∷ Int → Int → Int → Int → Int
 removalWindowPages ri hf hrec pins = editWindowPages worstEditWrites ri hf hrec pins + readResiduePages
 
+-- | The most pages the supported minimum explicit removal writes at the format bounds: its worst-case record writes
+-- ('worstEditWrites') each at the worst cost of an update on the tallest tree, one retirement list page and the bookkeeping
+-- reserve. The ONE definition: the feasibility proof of "Model" and the probes below name it.
+minimumRemovalPages ∷ Int
+minimumRemovalPages = worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve
+
 -- | The most page probes the proof phase of a standalone removal holds at once ('workOneProbeBytes' counts them for maintenance).
+-- The proof phase classifies, once, each page the plan is about to write below the used space (a page taken from the loose list or
+-- from a free extent: 'maxWindowProbes' is that count for a plan of 'maxTxnPages'), so a plan holds no more probes than it writes
+-- pages, and the worst removal writes 'minimumRemovalPages' (188). The window the proofs run in carries them in its bytes.
 removalWorstProbes ∷ Int
-removalWorstProbes = 188
+removalWorstProbes = minimumRemovalPages
+
+-- | The pages the smallest unit of discovery (one connection inspection, at most 'discoveryUnitWrites' record writes) writes at the
+-- format bounds, counted like 'minimumRemovalPages': 120.
+discoveryUnitPagesWritten ∷ Int
+discoveryUnitPagesWritten = discoveryUnitWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve
+
+-- | The most probes the proof phase of a discovery unit holds at once: no more than the pages it writes, by the argument of
+-- 'removalWorstProbes' (and below the removal's, which the residue of 'readResiduePages' is derived from, so that figure is an upper
+-- bound for the unit's window as well).
+discoveryUnitWorstProbes ∷ Int
+discoveryUnitWorstProbes = discoveryUnitPagesWritten
 
 -- | The read pages a plan may still hold when its READ phase ends and its edit phase begins. A read phase (the logical-record
 -- reads of a removal's staging or of a discovery step) holds the pages of what it read until it ends, up to its window bound;

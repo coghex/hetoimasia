@@ -994,12 +994,6 @@ data Counterexample = Counterexample
   }
   deriving stock (Eq, Show)
 
--- | The most pages the supported minimum explicit removal writes at the format
--- bounds: its worst-case record writes each at the worst cost of an update on the
--- tallest tree, one retirement list page and the bookkeeping reserve.
-minimumRemovalPages ∷ Int
-minimumRemovalPages = worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve
-
 -- | The most RAM the minimum explicit removal reserves: a full window, its pages and
 -- the control records.
 minimumRemovalRam ∷ Int
@@ -1008,7 +1002,7 @@ minimumRemovalRam = removalRamWith worstEditWrites worstEditReads minimumRemoval
 -- | The RAM the smallest unit of discovery (one connection inspection: 'worstEdgeWrites' writes, 'worstEdgeReads' reads) reserves,
 -- by the same account: a full window, its pages, the control records and the read facts it retains.
 minimumDiscoveryUnitRam ∷ Int
-minimumDiscoveryUnitRam = removalRamWith worstEdgeWrites worstEdgeReads (worstEdgeWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve)
+minimumDiscoveryUnitRam = removalRamWith worstEdgeWrites worstEdgeReads discoveryUnitPagesWritten
 
 -- | The RAM an edit of the given writes and reads reserves in the worst state: the pages it writes, a full window, the ownership
 -- proofs, the overlay, the control records and, as a retained continuation, the 'recordFactBytes' of every record it reads.

@@ -320,7 +320,10 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         bounds = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
         env = runEnv r2
         tile = tileAt 2 2 3
-    (p, _, _, cps) ← must (fillCounting hP (storeWindow (hStore hP)) (\w → planRemovalWith bounds env (hStore hP) w tile))
+    (p, wEnd, _, cps) ← must (fillCounting hP (storeWindow (hStore hP)) (\w → planRemovalWith bounds env (hStore hP) w tile))
+    -- the proof phase of the removal on a store with no tail holds no more probes than the pages it writes (what 'removalWorstProbes' is)
+    (windowProbeCount wEnd <= removalWorstProbes) `shouldBe` True
+    putStrLn ("REMOVAL at once: probes held " <> show (windowProbeCount wEnd) <> " of " <> show removalWorstProbes)
     case p of
       Planned pl → do
         (mWindowPages (plMeasure pl) <= lim) `shouldBe` True
