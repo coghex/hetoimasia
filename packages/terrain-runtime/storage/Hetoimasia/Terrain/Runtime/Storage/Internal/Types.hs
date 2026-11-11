@@ -24,6 +24,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Types
   , maxRunningJobs
   , maxJobRecords
   , maxInterrupts
+  , maxDirectoryBytes
 
     -- * Failures
   , StorageFailure (..)
@@ -82,6 +83,11 @@ maxJobRecords = 32
 -- storm of interruptions is a bounded failure, never a spin.
 maxInterrupts ∷ Int
 maxInterrupts = 64
+
+-- | The longest directory path a backing may be opened in. A job record holds it, so
+-- it is part of the record's measured size.
+maxDirectoryBytes ∷ Int
+maxDirectoryBytes = 512
 
 -- | The reported free-space headroom that must remain on the file's volume after
 -- the proposed reservation, growth included: 256 MiB.

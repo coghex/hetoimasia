@@ -179,7 +179,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State
 -- against the live heap of the largest valid job (every work kind, every field
 -- at its largest) and asserts is within this figure.
 jobRecordBytes ∷ Word64
-jobRecordBytes = A.descriptorRecordBytes + 1536
+jobRecordBytes = 2048
 
 -- | Maintenance is served after at most this many explicit jobs while it waits.
 fairMaintenance ∷ Int
@@ -652,7 +652,11 @@ admitJob svc mb ident cls work = do
           pure (Right (Ticket (svId svc) jid))
 
 submitOpen ∷ StorageService → WorkClass → OpenSpec → IO (Either StorageFailure Ticket)
-submitOpen svc cls spec = atomically (admitJob svc Nothing (osIdentity spec) cls (WOpen spec))
+submitOpen svc cls spec
+  | BS.null dir || BS.length dir > maxDirectoryBytes || BS.elem 0 dir = pure (Left (InvalidRequest DirectoryInvalid))
+  | otherwise = atomically (admitJob svc Nothing (osIdentity spec) cls (WOpen spec))
+  where
+    dir = osDirectory spec
 
 -- | Queue a read of @count@ contiguous pages (1 to 256) from @start@. The range
 -- is validated against the request's configuration before anything is queued.
