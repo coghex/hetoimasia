@@ -178,6 +178,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Store.Trees
         Test.TerrainRuntime.Store.Workload
         Test.TerrainRuntime.Storage.Harness
+        Test.TerrainRuntime.Storage.Io
         Test.TerrainRuntime.Storage.Open
     build-depends:
         base >=4.22 && <4.23,
@@ -207,6 +208,7 @@ test-suite storage-dev
     ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
     other-modules:
         Test.TerrainRuntime.Storage.Harness
+        Test.TerrainRuntime.Storage.Io
         Test.TerrainRuntime.Storage.Open
         Test.TerrainRuntime.Store.Harness
         Test.TerrainRuntime.Store.Reference

@@ -32,6 +32,7 @@ module Test.TerrainRuntime.Storage.Harness
   , addRule
   , addRuleAfter
   , addGate
+  , addGateAfter
   , events
   , countEvents
   , clearEvents
@@ -141,7 +142,7 @@ data Rule = Rule
 data Probe = Probe
   { pLog ∷ !(TVar [NativeOp])
   , pRules ∷ !(TVar [Rule])
-  , pGates ∷ !(TVar [(NativeOp → Bool, Gate)])
+  , pGates ∷ !(TVar [(NativeOp → Bool, Gate, TVar Int)])
   , pCreated ∷ !(TVar [Int])
   , pOpen ∷ !(TVar (Set.Set Int))
   , pHandles ∷ !(TVar [Fd])
@@ -163,9 +164,14 @@ addRuleAfter p skip n match act = do
 
 -- | Hold every matching call until the gate opens.
 addGate ∷ Probe → (NativeOp → Bool) → IO Gate
-addGate p match = do
+addGate p = addGateAfter p 0
+
+-- | 'addGate' after the first @skip@ matching calls have passed.
+addGateAfter ∷ Probe → Int → (NativeOp → Bool) → IO Gate
+addGateAfter p skip match = do
   g ← newGate
-  atomically (modifyTVar' (pGates p) ((match, g) :))
+  sk ← newTVarIO skip
+  atomically (modifyTVar' (pGates p) ((match, g, sk) :))
   pure g
 
 -- | How many native operations so far satisfy a predicate (readable inside a
@@ -219,9 +225,11 @@ seamFor p = Seam wrapped before after
     before op = do
       atomically (modifyTVar' (pLog p) (op :))
       gates ← readTVarIO (pGates p)
-      forM_ [g | (m, g) ← gates, m op] $ \g → do
-        atomically (modifyTVar' (gReached g) (+ 1))
-        atomically (readTVar (gOpen g) >>= check)
+      forM_ [(g, sk) | (m, g, sk) ← gates, m op] $ \(g, sk) → do
+        skipped ← atomically (readTVar sk >>= \n → if n > 0 then writeTVar sk (n - 1) >> pure True else pure False)
+        unless skipped $ do
+          atomically (modifyTVar' (gReached g) (+ 1))
+          atomically (readTVar (gOpen g) >>= check)
     after _ = pure ()
     wrapped =
       real
