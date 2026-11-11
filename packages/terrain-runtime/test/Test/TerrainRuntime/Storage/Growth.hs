@@ -103,7 +103,7 @@ spec = describe "Storage backend: growth" $ do
     forM_ stages $ \(name, setup, expected) →
       withEnv $ \env → do
         b ← openBacking env ident (hCfg h0)
-        before ← allocatedOf env
+        held0 ← allocatedOf env
         setup (envProbe env)
         o ← grow env b (64 * mib) (128 * mib)
         case o of
@@ -112,7 +112,7 @@ spec = describe "Storage backend: growth" $ do
             notes `shouldBe` []
           other → expectationFailure (name <> ": " <> show other)
         -- whatever was obtained was released: the file occupies what it did, nothing is pending
-        allocatedOf env >>= (`shouldBe` before)
+        allocatedOf env >>= (`shouldBe` held0)
         v ← view env b
         (name, bvCommittedBytes v, bvLengthBytes v, bvPendingReservation v) `shouldBe` (name, 64 * mib, 64 * mib, Nothing)
         readOk env b h0 5
@@ -120,21 +120,21 @@ spec = describe "Storage backend: growth" $ do
   it "releases the extra space when the growth is cancelled after it was obtained" $
     withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
-      before ← allocatedOf env
-      g ← addGateAfter (envProbe env) 1 isReserve
+      held0 ← allocatedOf env
+      g ← addGate (envProbe env) isReserve
       t ← submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= either (fail . show) pure
       awaitReached g 1
       cancelTicket (envSvc env) t >>= (`shouldBe` CancelRequested)
       openGate g
       awaitOutcome env t >>= (`shouldBe` Cancelled [])
-      allocatedOf env >>= (`shouldBe` before)
+      allocatedOf env >>= (`shouldBe` held0)
       (bvLengthBytes <$> view env b) >>= (`shouldBe` 64 * mib)
 
   it "keeps a pending reservation, charged, when its release fails, and blocks growth until it is released" $
     withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
       -- the growth fails after the allocation (the overhead is beyond the model's), and the one release attempt fails
-      addRuleAfter (envProbe env) 2 1 (== OpStatFile) (OverAllocated (10 * mib))
+      addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (10 * mib))
       addRule (envProbe env) 1 (isSetLength (64 * mib)) (FailWith (er C.eIO))
       o ← grow env b (64 * mib) (128 * mib)
       case o of
@@ -157,7 +157,7 @@ spec = describe "Storage backend: growth" $ do
   it "releases a pending reservation with the file when the backing closes" $
     withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
-      addRuleAfter (envProbe env) 2 1 (== OpStatFile) (OverAllocated (10 * mib))
+      addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (10 * mib))
       addRule (envProbe env) 1 (isSetLength (64 * mib)) (FailWith (er C.eIO))
       _ ← grow env b (64 * mib) (128 * mib)
       rep ← closeBacking (envSvc env) b
@@ -166,12 +166,12 @@ spec = describe "Storage backend: growth" $ do
   it "gives back a prepared growth that will not be committed" $
     withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
-      before ← allocatedOf env
+      held0 ← allocatedOf env
       o ← grow env b (64 * mib) (128 * mib)
       pg ← case o of GrowthPrepared pg _ → pure pg; other → fail (show other)
       t ← submitAbandon (envSvc env) b pg >>= either (fail . show) pure
       awaitOutcome env t >>= (`shouldBe` Released)
-      allocatedOf env >>= (`shouldBe` before)
+      allocatedOf env >>= (`shouldBe` held0)
       v ← view env b
       (bvGrowthPrepared v, bvLengthBytes v) `shouldBe` (False, 64 * mib)
   where
@@ -179,5 +179,5 @@ spec = describe "Storage backend: growth" $ do
       [ ("headroom", \p → addRule p 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + 255 * mib)), \f → case f of ReservationFailed (InsufficientHeadroom {}) → True; _ → False)
       , ("allocation refused", \p → addRule p 1 isReserve (FailWith (er C.eNOSPC)), \f → case f of ReservationFailed (AllocationRefused _) → True; _ → False)
       , ("length established after allocation", \p → addRule p 1 (isSetLength (128 * mib)) (FailWith (er C.eIO)), \f → case f of ReservationFailed (LengthFailed _) → True; _ → False)
-      , ("rounded allocation beyond the model", \p → addRuleAfter p 2 1 (== OpStatFile) (OverAllocated (10 * mib)), \f → case f of ReservationFailed (OverheadExceedsModel _ _) → True; _ → False)
+      , ("rounded allocation beyond the model", \p → addRuleAfter p 1 1 (== OpStatFile) (OverAllocated (10 * mib)), \f → case f of ReservationFailed (OverheadExceedsModel _ _) → True; _ → False)
       ]
