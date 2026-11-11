@@ -366,6 +366,11 @@ windowReadFactBytes w = sum [SBS.length k + SBS.length v + readFactOverheadBytes
 -- | A read fact is held PACKED, as the bytes the pages hold: its key and value as two compact, unpinned byte arrays in a map, never
 -- as the decoded Haskell values (a source node key and child are hundreds of bytes of constructors and thunks). A floor query is
 -- keyed as a run key and holds the run's two ends.
+--
+-- An ABSENT answer (no such record, no such run) is held as the EMPTY value, so it is load-bearing that a PRESENT one never is: every
+-- 'encodeValue' case is at least one byte (a run's 8, a root's 10, a child's tag, a todo's tile and counter) and a floor answer is
+-- always its 16 bytes. The suite pins this over every 'Record' constructor at its edges and through the window itself
+-- (@Codec@: \"a present record never encodes to an empty value\").
 packKey ∷ RecordKey → ShortByteString
 packKey = toShort . encodeKey
 

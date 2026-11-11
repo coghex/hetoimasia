@@ -20,7 +20,7 @@ import Control.Exception (evaluate)
 import Data.Int (Int64)
 import System.Timeout (timeout)
 import Data.Word (Word64, Word8)
-import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), Record (..), RecordKey (..))
+import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Connectivity (Axis (..), mkComponentKey)
 import Hetoimasia.Terrain.Coordinate (axisFromInteger)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
@@ -512,6 +512,31 @@ spec = describe "the private page codec against independent bytes" $ do
       case runM (deleteKey TreeRuns (Just (Disk (PageNo 3))) (runKeyBytes 1000)) (newEdit 1000000 w) of
         Left (Bad KeyOrder (PageNo 2)) → pure ()
         other → expectationFailure ("a malformed sibling was merged: " <> either show (const "a plan was produced") other)
+  describe "a present record never encodes to an empty value (an absent read fact IS the empty packed value)" $ do
+    -- A window holds a read fact packed: the encoded key and value, and an ABSENT answer (no such record, no such run) as the EMPTY
+    -- value. That is only sound while no present record encodes to nothing, so this is pinned over every Record constructor at its
+    -- edges, and through the window itself: present and absent answers come back as they went in, whatever their bytes.
+    let col = columnAt 3 (-4)
+        nodes = [srcNode 0 0 0, srcNode 1 (-1) 5, srcNode 300 (-300) 70000, RunNode col minBound, RunNode col 0, RunNode col maxBound]
+        records =
+          [RecRun v | v ← [minBound, -1, 0, 1, maxBound]]
+            <> [rootRec n k | n ← [0, 1, maxBound], k ← [False, True]]
+            <> [RecChild n | n ← nodes]
+            <> [todoRec x y z d | (x, y, z) ← [(0, 0, 0), (-5, 7, 300)], d ← [0, 1, 255]]
+        keys = [runKey 0 0 1, runKey 3 (-4) 0] <> map KeyLink nodes <> [KeyTodo 0, KeyTodo maxBound]
+    it "encodes every constructor, at its edges, to at least one byte, and the empty value decodes under no key" $ do
+      forM_ records $ \r → (r, BS.null (encodeValue r)) `shouldBe` (r, False)
+      forM_ keys $ \k → decodeValue k BS.empty `shouldBe` Nothing
+    it "returns a present and an absent answer through the window as they went in (records, and the 16-byte floor answer)" $ do
+      let recKey = KeyLink (srcNode 1 1 1)
+          floors = [((col, 0), Just (minBound, maxBound)), ((col, 1), Just (0, 0)), ((col, 2), Nothing)]
+          w = windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Just r) | r ← [childRec (srcNode 2 2 2)]] [])) (emptyWindow ident0 1)
+          wAbsent = windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Nothing)] floors)) (emptyWindow ident0 1)
+      windowReadRecord recKey w `shouldBe` Just (Just (childRec (srcNode 2 2 2)))
+      windowReadRecord recKey wAbsent `shouldBe` Just Nothing
+      windowReadRecord (KeyLink (srcNode 9 9 9)) w `shouldBe` Nothing
+      forM_ floors $ \(q, a) → windowReadFloor q wAbsent `shouldBe` Just a
+      windowReadFloor (col, 3) wAbsent `shouldBe` Nothing
   describe "revision and version arithmetic" $ do
     it "refuses a revision or version that would wrap, and a delta that names another authority" $ do
       let cfg = either (error . show) id (mkStoreConfig smallSpec)
