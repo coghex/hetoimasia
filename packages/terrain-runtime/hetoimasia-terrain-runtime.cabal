@@ -203,6 +203,40 @@ test-suite terrain-runtime-tests
         hetoimasia-terrain-runtime:store,
         hetoimasia-test-support ==0.1.0.0
 
+-- The real-platform qualification of the storage backend (TRA-21, requirement 9): the
+-- production native backend on a bounded, disposable volume of the platform it runs on,
+-- named by a pointer file the setup scripts under tools/terrain-storage/ write. It is an
+-- explicit local probe (validation group `test.terrain-storage-qualification`, optional,
+-- category probe, no CI route): it fills a capped volume, so it is never selected by an
+-- affected path or a routine suite command, and it refuses to run anywhere else.
+test-suite terrain-storage-probe
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: ProbeMain.hs
+    hs-source-dirs: probe, test
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-T"
+    other-modules:
+        Test.TerrainRuntime.Storage.Harness
+        Test.TerrainRuntime.Store.Harness
+        Test.TerrainRuntime.Store.Reference
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        hspec >=2.11 && <3,
+        stm >=2.5.3 && <2.6,
+        temporary >=1.3 && <1.4,
+        text >=2.1 && <2.2,
+        unix >=2.8 && <2.9,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-terrain ==0.1.0.0,
+        hetoimasia-terrain-runtime ==0.1.0.0,
+        hetoimasia-terrain-runtime:storage,
+        hetoimasia-terrain-runtime:store,
+        hetoimasia-test-support ==0.1.0.0
+
 -- DEV-ONLY (never committed): a fast loop for the storage examples.
 test-suite storage-dev
     import: language

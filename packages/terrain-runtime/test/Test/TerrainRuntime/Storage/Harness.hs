@@ -15,6 +15,7 @@ module Test.TerrainRuntime.Storage.Harness
     Env (..)
   , withEnv
   , withEnvWith
+  , withEnvIn
   , EnvOptions (..)
   , defaultOptions
   , testConfigFor
@@ -328,10 +329,12 @@ data EnvOptions = EnvOptions
   { eoQualified ∷ !(Maybe [BC.ByteString])
   -- ^ The qualified list; 'Nothing' qualifies the filesystem the examples run on.
   , eoHeadroom ∷ !Word64
+  , eoUnbounded ∷ !Bool
+  -- ^ Whether the body runs without the routine suite's bound (a probe's heavy steps).
   }
 
 defaultOptions ∷ EnvOptions
-defaultOptions = EnvOptions Nothing minHeadroomBytes
+defaultOptions = EnvOptions Nothing minHeadroomBytes False
 
 quiet ∷ Logger
 quiet = mkLogger defaultLogFilter (callbackSink (\_ → pure ()))
@@ -361,8 +364,12 @@ withEnv ∷ (Env → IO a) → IO a
 withEnv = withEnvWith defaultOptions
 
 withEnvWith ∷ EnvOptions → (Env → IO a) → IO a
-withEnvWith opts body =
-  withSystemTempDirectory "hetoimasia-terrain-storage" $ \dir → do
+withEnvWith opts body = withSystemTempDirectory "hetoimasia-terrain-storage" $ \dir → withEnvIn dir opts body
+
+-- | An environment whose files are made in a given directory (the probe's disposable
+-- volume), with the same checks at its end.
+withEnvIn ∷ FilePath → EnvOptions → (Env → IO a) → IO a
+withEnvIn dir opts body = do
     cfg ← testConfigFor dir opts
     probe ← newProbe
     bank ← either (\e → fail (show e)) pure (A.mkEditBankConfig A.defaultEditBankSpec)
@@ -370,7 +377,7 @@ withEnvWith opts body =
     result ← newIORef Nothing
     withWorkerGroup $ \group →
       withStorageService (StoragePorts admission group quiet (seamFor probe) cfg) $ \svc →
-        bounded (body (Env svc admission probe dir cfg)) >>= writeIORef result . Just
+        (if eoUnbounded opts then id else bounded) (body (Env svc admission probe dir cfg)) >>= writeIORef result . Just
     leaked ← A.ledgers <$> readTVarIO admission
     unless (ledgerZero leaked) (expectationFailure ("the service leaked accounting: " <> show leaked))
     maybe (fail "the example produced no result") pure =<< readIORef result
