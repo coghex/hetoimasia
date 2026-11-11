@@ -18,6 +18,7 @@
 module Main (main) where
 
 import Control.Concurrent.STM (atomically)
+import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, bracket, try)
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as BS
@@ -281,20 +282,20 @@ withFiller dir = \act -> do
       pure (taken, crFd c)
 
 -- | The free space once the volume has reclaimed a closed file: observed by bounded polling of the platform's
--- own report (a filesystem may free the blocks of a closed, unlinked file lazily), at most 600 observations.
+-- own report (a filesystem may free the blocks of a closed, unlinked file lazily), at most 200 observations, 50 ms apart.
 pollRecoveredCount :: FilePath -> Word64 -> IO Int
 pollRecoveredCount dir target = go (0 :: Int)
   where
     go n = do
       a <- availableOf dir
-      if a + 4 * mib >= target || n >= 600 then pure n else go (n + 1)
+      if a + 4 * mib >= target || n >= 200 then pure n else threadDelay 50000 >> go (n + 1)
 
 pollRecovered :: FilePath -> Word64 -> IO Word64
 pollRecovered dir target = go (0 :: Int)
   where
     go n = do
       a <- availableOf dir
-      if a + 4 * mib >= target || n >= 600 then pure a else go (n + 1)
+      if a + 4 * mib >= target || n >= 200 then pure a else threadDelay 50000 >> go (n + 1)
 
 main :: IO ()
 main = hspec spec
