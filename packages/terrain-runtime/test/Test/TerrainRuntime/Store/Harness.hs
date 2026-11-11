@@ -75,6 +75,7 @@ import Hetoimasia.Terrain.Discovery
   , Todo (..)
   )
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
+import Hetoimasia.Terrain.Runtime.Store.Admission (Credit (..), transactionCredits, worstTransactionCharge)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
@@ -198,8 +199,28 @@ data Outcome
   deriving stock (Eq, Show)
 
 -- | Admit, write every page and publish: the whole happy path.
+-- | The dominance property of the RAM charge, checked for EVERY plan the suite commits: a plan is charged no more than the worst case the
+-- admission funds, component by component and account by account (the accounts 'mkEditBankConfig' sizes from that worst case), so a
+-- term the charge gains that a worst case forgot fails here, wherever the first plan with that term commits.
+chargeDominated ∷ Plan → Either String ()
+chargeDominated plan
+  | null overComponent && null overCredit = Right ()
+  | otherwise = Left ("a plan is charged more RAM than the worst case: components " <> show overComponent <> ", credits " <> show overCredit)
+  where
+    r = mRam (plMeasure plan)
+    w = worstTransactionCharge
+    components ∷ RamCharge → [(String, Int)]
+    components c = [("io", ramIoBuffers c), ("decoded", ramDecodedCopies c), ("keys", ramKeys c), ("scratch", ramScratch c), ("pagePins", ramPagePins c), ("rootControl", ramRootControl c), ("continuation", ramContinuation c)]
+    overComponent = [(n, a, b) | ((n, a), (_, b)) ← zip (components r) (components w), a > b]
+    amount cr = case cr of
+      StagingCredit n → n
+      ControlCredit n → n
+      CacheCredit _ n _ _ → n
+    overCredit = [(a, b) | (a, b) ← zip (map amount (transactionCredits (ArenaId 1) r)) (map amount (transactionCredits (ArenaId 1) w)), a > b]
+
 commitPlan ∷ H → Plan → Either String H
 commitPlan h plan = do
+  chargeDominated plan
   (tid, s1) ← either (Left . ("admit: " <>) . show) Right (admit plan (hStore h))
   let go (s, d) (p, bs) = do
         let (r1, sa) = dispatchWrite tid p s

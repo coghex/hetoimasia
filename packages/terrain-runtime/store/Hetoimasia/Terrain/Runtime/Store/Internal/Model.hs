@@ -1007,21 +1007,7 @@ minimumDiscoveryUnitRam = removalRamWith worstEdgeWrites worstEdgeReads discover
 -- | The RAM an edit of the given writes and reads reserves in the worst state: the pages it writes, a full window, the ownership
 -- proofs, the overlay, the control records and, as a retained continuation, the 'recordFactBytes' of every record it reads.
 removalRamWith ∷ Int → Int → Int → Int
-removalRamWith writes nReads pages =
-  pages * pageSize
-    + maxWindowBytes
-    + worstOwnershipBytes
-    + overlayWorstBytes
-    + (2 * hotNodes + 1) * hotNodeBytes
-    + writes * maxEntryBytes
-    + nReads * recordFactBytes
-    + maxWindowPages * 16
-    + rootRecordBytes
-    + activeRecordBytes
-    + 1024
-    + maxWindowPages * 8
-    + 4096
-    + 128
+removalRamWith writes nReads pages = ramTotal (worstChargeWith pages writes (nReads * recordFactBytes))
 
 -- | Whether the supported minimum explicit removal fits a configuration in an empty
 -- workspace: its pages within the transaction bound, its RAM within the

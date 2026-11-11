@@ -11,7 +11,7 @@ module Test.TerrainRuntime.Store.Evidence (spec) where
 
 import Control.Monad (forM_)
 import qualified Data.Map.Strict as Map
-import Hetoimasia.Terrain.Discovery (Record, RecordKey, pendingObligations)
+import Hetoimasia.Terrain.Discovery (maxBatchUpdates, Record, RecordKey, pendingObligations)
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Admission (worstTransactionCharge)
@@ -91,7 +91,10 @@ spec = describe "TRA-20 evidence" $ do
           <> " bookkeepingReserve=" <> show bookkeepingReserve <> " maxClaimPages=" <> show maxClaimPages
           <> " minimumRemovalPages=" <> show minimumRemovalPages <> " minimumRemovalRam=" <> show minimumRemovalRam)
     mPagesWritten m `shouldBe` 256
-    ramTotal w `shouldSatisfy` (< txnRamLimit)
+    -- the component-wise worst holds the read facts at their ceiling ('maxReadFactBytes'): the sum of the worst of every component is a
+    -- bound for the ACCOUNTS (it exceeds the plan limit by design); a plan's own total is checked against 'txnRamLimit' by the planner
+    ramTotal (worstChargeWith maxTxnPages (3 * maxBatchUpdates) 0) `shouldSatisfy` (< txnRamLimit)
+    ramContinuation w - ramContinuation (worstChargeWith maxTxnPages (3 * maxBatchUpdates) 0) `shouldBe` maxReadFactBytes
   it "two openings with a pending continuation, replayed through pages" $ do
     let run0 = newRun smallSpec twoOpenings 1
     r1 ← must (foldM' (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA)

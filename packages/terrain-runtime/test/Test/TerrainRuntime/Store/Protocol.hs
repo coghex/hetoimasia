@@ -18,6 +18,8 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
+import Hetoimasia.Terrain.Residency (ArenaId (..))
+import Hetoimasia.Terrain.Runtime.Store.Admission (Class (..), EditBankSpec (..), defaultEditBankSpec, mkEditBankConfig, newAdmission, reserve, transactionCredits)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Reference
@@ -511,3 +513,40 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     case stale of
       Planned pl → samePlan pl (runPlan clean) `shouldBe` True
       other → expectationFailure ("the stale-facts window did not plan: " <> take 200 (show other))
+  it "funds the ACTUAL credits of a removal, of a discovery unit and of a 64-update batch against the tightest configuration mkEditBankConfig accepts" $ do
+    (h, env, tile) ← must (chainStore 64 8192)
+    removal ← must (runThrough h 64 (\hh w → planRemovalWith standardBounds env (hStore hh) w tile))
+    (hd, envd) ← must (chainedDiscovery 40 8192)
+    unit ← must (runThrough hd 3 (\hh w → planDiscoveryWith standardBounds envd (hStore hh) w))
+    batch ← must (runThrough hd 64 (\hh w → planDiscoveryWith standardBounds envd (hStore hh) w))
+    let plans = [("removal", runPlan removal), ("discovery unit", runPlan unit), ("64-update batch", runPlan batch)]
+        accepted sp = either (const False) (const True) (mkEditBankConfig sp)
+        smallest ok = go 1 (2 ^ (30 ∷ Int))
+          where
+            go lo hi
+              | lo >= hi = hi
+              | ok mid = go lo mid
+              | otherwise = go (mid + 1) hi
+              where
+                mid = (lo + hi) `div` 2
+        tightest arenas readers = do
+          let base = defaultEditBankSpec {ebsArenas = arenas, ebsReadersPerArena = readers, ebsEditBank = 2 ^ (36 ∷ Int)}
+              control = smallest (\c → accepted base {ebsControl = c})
+              staging = smallest (\p → accepted base {ebsStaging = p, ebsProtectedStaging = p})
+              cache = smallest (\c → accepted base {ebsCache = c})
+              tightSpec = base {ebsControl = control, ebsStaging = staging, ebsProtectedStaging = staging, ebsCache = cache, ebsEditBank = control + staging + cache}
+          -- tight: each account one byte lower is refused
+          accepted tightSpec `shouldBe` True
+          [accepted tightSpec {ebsControl = control - 1, ebsEditBank = ebsEditBank tightSpec - 1}, accepted tightSpec {ebsStaging = staging - 1, ebsProtectedStaging = staging - 1, ebsEditBank = ebsEditBank tightSpec - 1}, accepted tightSpec {ebsCache = cache - 1, ebsEditBank = ebsEditBank tightSpec - 1}] `shouldBe` [False, False, False]
+          cfg ← either (\e → expectationFailure (show e) >> fail "config") pure (mkEditBankConfig tightSpec)
+          -- every actual plan is funded from fresh accounts: never refused as a credit no account could ever hold
+          forM_ plans $ \(name, plan) →
+            case reserve Foreground (transactionCredits (ArenaId 1) (mRam (plMeasure plan))) (newAdmission cfg) of
+              Right _ → pure ()
+              Left why → expectationFailure (name <> " was not funded by the tightest accepted configuration (" <> show arenas <> " arenas, " <> show readers <> " readers): " <> show why)
+          pure (control, staging, cache)
+    (c1, s1, ch1) ← tightest 1 1
+    (c2, s2, ch2) ← tightest 4 (toInteger maxReaders)
+    -- the default configuration holds the control account the worst case needs
+    (c2 <= ebsControl defaultEditBankSpec, c1 <= c2) `shouldBe` (True, True)
+    putStrLn ("READPHASE funding: tightest accepted (control, protected staging, cache) at 1x1 = " <> show (c1, s1, ch1) <> ", at 4x" <> show maxReaders <> " = " <> show (c2, s2, ch2) <> "; default control " <> show (ebsControl defaultEditBankSpec) <> "; credits of the actual plans " <> show [(n, transactionCredits (ArenaId 1) (mRam (plMeasure p))) | (n, p) ← plans])

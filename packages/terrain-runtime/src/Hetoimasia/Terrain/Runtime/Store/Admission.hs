@@ -111,13 +111,10 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.List (sortOn)
 import Data.Word (Word32, Word64)
-import Hetoimasia.Terrain.Discovery (maxBatchUpdates)
 import Hetoimasia.Terrain.Residency (ArenaId)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (AdmitRefusal (..), Condition)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (hotNodeBytes, hotNodes)
 
 -- ---------------------------------------------------------------------------
 -- Configuration
@@ -192,16 +189,7 @@ readerPinnedCacheBytes = 32 * fromIntegral windowPageBytes
 
 -- | The most RAM one transaction can reserve at the format's bounds, by component.
 worstTransactionCharge ∷ RamCharge
-worstTransactionCharge =
-  RamCharge
-    { ramIoBuffers = maxTxnPages * pageSize
-    , ramDecodedCopies = maxWindowBytes + worstOwnershipBytes + overlayWorstBytes
-    , ramKeys = 3 * maxBatchUpdates * maxEntryBytes
-    , ramScratch = (maxListPages + bookkeepingReserve) * 16 + maxClaimPages * 8 + 4096 + (2 * hotNodes + 1) * hotNodeBytes
-    , ramPagePins = maxWindowPages * 16
-    , ramRootControl = rootRecordBytes + activeRecordBytes + 128
-    , ramContinuation = 1024 + maxWindowPages * 8
-    }
+worstTransactionCharge = worstPlanCharge
 
 -- | Validate a division. A configuration is refused when a worst-case foreground
 -- transaction could not be funded: its staging must fit the protected share, its

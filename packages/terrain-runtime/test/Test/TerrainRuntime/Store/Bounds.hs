@@ -40,7 +40,8 @@ must = either (\e → expectationFailure e >> fail e) pure
 wide ∷ Int → Either String (H, [RecordKey])
 wide n = do
   let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. n - 1]]
-      chunk = 200
+      -- at most the records a plan is sized for (3 per update of a 64-update batch, 'worstPlanCharge')
+      chunk = 3 * maxBatchUpdates - 2
       go h [] = Right h
       go h ks = do
         let (a, b) = splitAt chunk ks
@@ -80,7 +81,10 @@ findExact256 h keys = case [r | off ← [0, 7, 13, 29, 41, 53, 3, 19, 31, 47], R
   (r : _) → Right r
   [] → Left "no exact 256-page plan with a refused successor"
   where
-    planPages off k = fillPlan h (deltaFor (hStore h) True False 1 (spread keys 60 off k)) Ordinary
+    -- the page bound is measured with the record-writes allowance lifted: on this shallow history a plan reaches 256 pages only with more
+    -- writes than the admission is sized for (3 per update of a batch), which the planner would refuse first
+    relaxed = standardBounds {bdWorst = worstChargeWith maxTxnPages (maxTxnPages * 100) maxReadFactBytes}
+    planPages off k = (\(p, _, _) → p) <$> fillWith h (\w → planDeltaPinned relaxed (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) w Ordinary (deltaFor (hStore h) True False 1 (spread keys 60 off k)))
     pagesFor off k = case planPages off k of
       Right (Planned p) → Right (mPagesWritten (plMeasure p), Just p)
       Right (Refused (Capacity (TxnPagesExceeded n))) → Right (n, Nothing)
@@ -174,7 +178,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         windowOf m = foldl (\w n → either (error . show) id (windowInsert total (PageNo n) (either (error . show) id (encodePage ident0 (leaf n))) w)) (uncheckedWindow ident0 0) [1 .. m]
         d = deltaFor (hStore (newH smallSpec ident0)) True False 1 [(runKey 0 0 1, Just (runRec 3))]
         run m = planDelta cfg ident0 roots (windowOf m) Ordinary d
-        tight = planDeltaWith (Bounds maxTxnPages txnRamLimit 5 maxWindowBytes bookkeepingReserve maxBookkeepingPages readResiduePages) cfg ident0 roots
+        tight = planDeltaWith (Bounds maxTxnPages txnRamLimit 5 maxWindowBytes bookkeepingReserve maxBookkeepingPages worstPlanCharge readResiduePages) cfg ident0 roots
     windowBytes (windowOf 310) `shouldBe` 310 * windowPageBytes
     windowBytes (windowOf 310) `shouldSatisfy` (<= maxWindowBytes)
     windowBytes (windowOf 311) `shouldSatisfy` (> maxWindowBytes)
@@ -246,7 +250,8 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     -- ... and the plan alone retains its output pages and little else: no parsed page survives it
     (if held <= output + output `div` 4 + fromIntegral (windowBytes win) then pure () else expectationFailure ("held " <> show held <> " but the output is " <> show output))
   it "bounds a plan's RAM below 4 MiB by construction, component by component" $ do
-    let w = RamCharge (maxTxnPages * pageSize) (maxWindowPages * windowPageBytes + worstOwnershipBytes) (3 * maxBatchUpdates * maxEntryBytes) ((maxListPages + bookkeepingReserve) * 16 + maxClaimPages * 8 + 4096) (maxWindowPages * 16) (rootRecordBytes + activeRecordBytes + 128) (1024 + maxWindowPages * 8)
+    -- the worst charge is the one builder a real plan is charged by, at worst-case arguments; with no read facts it fits the bound
+    let w = worstChargeWith maxTxnPages (3 * maxBatchUpdates) 0
     ramTotal w `shouldSatisfy` (< txnRamLimit)
     ramTotal w `shouldSatisfy` (> 3 * 1024 * 1024)
     ramIoBuffers w `shouldBe` 1024 * 1024
@@ -266,7 +271,7 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
         scene = runEnv run0
     r1 ← must (foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA)
     let h1 = runH r1
-        tight = Bounds 5 txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages readResiduePages
+        tight = Bounds 5 txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages worstPlanCharge readResiduePages
     (full, _, _) ← must (fillWith h1 (planDiscovery scene (hStore h1)))
     (small, _, _) ← must (fillWith h1 (planDiscoveryWith tight scene (hStore h1)))
     case (full, small) of

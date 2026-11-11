@@ -78,6 +78,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Plan
   , fingerprintOf
   , windowFull
   , providerFacts
+  , worstChargeWith
+  , worstPlanCharge
+  , chargeWithin
 
     -- * Planning
   , Bounds (..)
@@ -364,6 +367,9 @@ data Bounds = Bounds
   -- ^ the bookkeeping pages a candidate plan first asks for ('bookkeepingReserve' in production)
   , bdReserveMax ∷ !Int
   -- ^ the most it may ask for after counting ('maxBookkeepingPages' in production)
+  , bdWorst ∷ !RamCharge
+  -- ^ the worst charge a plan may carry ('worstPlanCharge' in production): a plan charged more in any component is refused. The suite
+  -- lifts it to measure the page bound with more record writes than the admission is sized for.
   , bdReadResidue ∷ !Int
   -- ^ the read pages a window may still hold when a read phase ends and the edit begins ('readResiduePages' in production): more
   -- are handed on as facts through a checkpoint. The suite raises it to run the same plan with no read-phase checkpoint.
@@ -373,7 +379,7 @@ data Bounds = Bounds
 -- | 256 pages (1 MiB of new encoded pages), 4 MiB of RAM, 512 window pages and 1.25 MiB
 -- of window bytes.
 standardBounds ∷ Bounds
-standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages readResiduePages
+standardBounds = Bounds maxTxnPages txnRamLimit maxWindowPages maxWindowBytes bookkeepingReserve maxBookkeepingPages worstPlanCharge readResiduePages
 
 -- ---------------------------------------------------------------------------
 -- The planning monad
@@ -807,7 +813,7 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
                 windowN = windowSize win
                 steps = editSteps edit1 + editSteps bkEdit3
                 ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m (windowReadFactBytes win)
-            if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
+            if ramTotal ram > bdRamBytes bounds || not (chargeWithin bounds ram) then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
             let measure =
                   Measure
                     { mPagesWritten = written
@@ -983,6 +989,35 @@ applyWrites edit roots0 = go roots0 edit
             TreeLinks → (rr, root', rt)
             _ → (rr, rl, root')
       go roots' e' rest
+
+-- | A plan's RAM charge at its worst, by the SAME builder that charges a real plan ('ramFor') applied to worst-case arguments: the
+-- window at its page and byte limits with every probe it may hold, the overlay at its worst, the supply and the lists at theirs,
+-- and the given pages written, record writes and read facts (bytes). Every worst case the suite and the admission state (the
+-- worst transaction, the minimum removal, the smallest unit of discovery) is this function at its own arguments, never a parallel
+-- sum, so a term the charge gains is in every one of them by construction.
+worstChargeWith ∷ Int → Int → Int → RamCharge
+worstChargeWith written writes factsB =
+  ramFor maxWindowPages (maxWindowBytes + worstOwnershipBytes) overlayWorstBytes written writes (maxListPages + bookkeepingReserve) maxClaimPages factsB
+
+-- | The worst charge a plan may carry, the one the admission sizes its accounts from ('Hetoimasia.Terrain.Runtime.Store.Admission'):
+-- at the format's bounds, with up to three record writes for each of the 64 updates of a batch and the read facts at their ceiling.
+worstPlanCharge ∷ RamCharge
+worstPlanCharge = worstChargeWith maxTxnPages (3 * maxBatchUpdates) maxReadFactBytes
+
+-- | Whether a charge is within the bounds' worst case in every component. A plan charged more than this is refused ('TxnRamExceeded'):
+-- the admission funds exactly what it was sized for, so a plan the configuration could never hold is a typed refusal of the plan,
+-- never a credit no account can hold.
+chargeWithin ∷ Bounds → RamCharge → Bool
+chargeWithin bounds r =
+  ramIoBuffers r <= ramIoBuffers w
+    && ramDecodedCopies r <= ramDecodedCopies w
+    && ramKeys r <= ramKeys w
+    && ramScratch r <= ramScratch w
+    && ramPagePins r <= ramPagePins w
+    && ramRootControl r <= ramRootControl w
+    && ramContinuation r <= ramContinuation w
+  where
+    w = bdWorst bounds
 
 ramFor ∷ Int → Int → Int → Int → Int → Int → Int → Int → RamCharge
 ramFor windowN windowB overlayB written writes replaced supplyN factsB =
@@ -1205,7 +1240,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
               }
           windowN = windowSize win
           ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes bkEdit4) written 0 (length replBk + c) m (windowReadFactBytes win)
-      if ramTotal ram > bdRamBytes bounds then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
+      if ramTotal ram > bdRamBytes bounds || not (chargeWithin bounds ram) then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
       let measure =
             Measure
               { mPagesWritten = written
