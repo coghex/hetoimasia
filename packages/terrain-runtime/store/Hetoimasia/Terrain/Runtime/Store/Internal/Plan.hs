@@ -738,7 +738,7 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
     then
       if next == hdr
         then pure Nothing
-        else Just <$> headerOnly cfg ident roots cls cand next version' edit1 writes
+        else Just <$> headerOnly bounds cfg ident roots cls cand next version' edit1 writes
     else
       let attempt rsv = do
             let m = d + (if needRetire then 1 else 0) + rsv
@@ -812,8 +812,7 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
                     }
                 windowN = windowSize win
                 steps = editSteps edit1 + editSteps bkEdit3
-                ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m (windowReadFactBytes win)
-            if ramTotal ram > bdRamBytes bounds || not (chargeWithin bounds ram) then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
+            ram ← chargeFor bounds windowN (windowBytes win + windowProbeBytes win) (editFreshBytes edit1 + editFreshBytes bkEdit3) written (length writes) (listN + length replBk) m (windowReadFactBytes win)
             let measure =
                   Measure
                     { mPagesWritten = written
@@ -854,14 +853,14 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settle $ do
         Just _ → refuse (Integrity (DoubleFree pg))
         Nothing → phase edit1 (insertKey TreeRetire root (retiredKey pg) (be64 ver))
 
-headerOnly ∷ StoreConfig → StoreIdentity → Roots → TxClass → Delta → Header → Word64 → Edit → [(RecordKey, Maybe Record)] → P Plan
-headerOnly _ ident roots cls cand next version' edit writes = do
+headerOnly ∷ Bounds → StoreConfig → StoreIdentity → Roots → TxClass → Delta → Header → Word64 → Edit → [(RecordKey, Maybe Record)] → P Plan
+headerOnly bounds _ ident roots cls cand next version' edit writes = do
   let base = dlBase cand
       expected = hAuthority next
       next' = roots {rVersion = version', rHeader = next}
-      ram = ramFor 0 (windowBytes win0) 0 0 (length writes) 0 0 (windowReadFactBytes win0)
       win0 = editWindow edit
-      measure =
+  ram ← chargeFor bounds 0 (windowBytes win0) 0 0 (length writes) 0 0 (windowReadFactBytes win0)
+  let measure =
         Measure 0 0 0 0 0 0 0 0 0 (editSteps edit) 0 ram (dlUpdates cand) (length writes) 0
   pure (finishPlan ident cls KindCandidate base next' cand [] measure expected version')
 
@@ -1018,6 +1017,18 @@ chargeWithin bounds r =
     && ramContinuation r <= ramContinuation w
   where
     w = bdWorst bounds
+
+-- | The ONE way a plan gets its RAM charge: made by 'ramFor' and held to the bounds, whatever kind of plan it is (a candidate, a
+-- header-only candidate whose writes are all no-ops, a reclamation). It is refused ('TxnRamExceeded', the plan's total) when the total
+-- is past 'bdRamBytes' or any component is past 'bdWorst': the figure is the plan's total and may be under the limit when the
+-- offending component is one the worst case bounds more tightly. Every site that builds a 'Measure' takes its charge from here, so
+-- a new kind of plan cannot reach the admission unchecked.
+chargeFor ∷ Bounds → Int → Int → Int → Int → Int → Int → Int → Int → P RamCharge
+chargeFor bounds windowN windowB overlayB written writes replaced supplyN factsB
+  | ramTotal ram > bdRamBytes bounds || not (chargeWithin bounds ram) = refuse (Capacity (TxnRamExceeded (ramTotal ram)))
+  | otherwise = pure ram
+  where
+    ram = ramFor windowN windowB overlayB written writes replaced supplyN factsB
 
 ramFor ∷ Int → Int → Int → Int → Int → Int → Int → Int → RamCharge
 ramFor windowN windowB overlayB written writes replaced supplyN factsB =
@@ -1239,8 +1250,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
               , rRootCrcs = rootCrcsAfter roots encoded [(TreeRuns, rRuns roots), (TreeLinks, rLinks roots), (TreeTodo, rTodo roots), (TreeFree, free'), (TreeRetire, retire')]
               }
           windowN = windowSize win
-          ram = ramFor windowN (windowBytes win + windowProbeBytes win) (editFreshBytes bkEdit4) written 0 (length replBk + c) m (windowReadFactBytes win)
-      if ramTotal ram > bdRamBytes bounds || not (chargeWithin bounds ram) then refuse (Capacity (TxnRamExceeded (ramTotal ram))) else pure ()
+      ram ← chargeFor bounds windowN (windowBytes win + windowProbeBytes win) (editFreshBytes bkEdit4) written 0 (length replBk + c) m (windowReadFactBytes win)
       let measure =
             Measure
               { mPagesWritten = written

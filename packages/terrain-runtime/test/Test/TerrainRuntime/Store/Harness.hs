@@ -19,6 +19,7 @@ module Test.TerrainRuntime.Store.Harness
 
     -- * Planning
   , fillPlan
+  , chargeDominated
   , fillWith
   , fillRetry
   , fillRetryCounting

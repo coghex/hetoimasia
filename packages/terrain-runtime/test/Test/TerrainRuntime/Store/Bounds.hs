@@ -249,6 +249,25 @@ spec = describe "transaction bounds, exactly and one past, and work independent 
     (if held <= reported then pure () else expectationFailure ("held " <> show held <> " reported " <> show reported))
     -- ... and the plan alone retains its output pages and little else: no parsed page survives it
     (if held <= output + output `div` 4 + fromIntegral (windowBytes win) then pure () else expectationFailure ("held " <> show held <> " but the output is " <> show output))
+  it "holds EVERY kind of plan to the worst-case charge: a header-only candidate of no-op writes plans at 192 writes and is refused, typed and shrinkable, at 193" $ do
+    (h, keys) ← must (wide 400)
+    -- every write sets the value a record already has, so the plan changes the header and nothing else (no page is written)
+    let noOps n = deltaFor (hStore h) True False 1 [(k, Just (runRec 20)) | k ← take n keys]
+        plan n = fillPlan h (noOps n) Ordinary
+        most = 3 * maxBatchUpdates
+    case plan most of
+      Right (Planned p) → do
+        mPagesWritten (plMeasure p) `shouldBe` 0
+        must (chargeDominated p)
+      other → expectationFailure ("192 no-op writes were not planned: " <> take 200 (show other))
+    -- one more is outside the worst case: the typed, shrinkable refusal (it was handed to the admission unchecked)
+    case plan (most + 1) of
+      Right (Refused why@(Capacity (TxnRamExceeded _))) → shrinkable why `shouldBe` True
+      other → expectationFailure ("193 no-op writes were not refused as TxnRamExceeded: " <> take 200 (show other))
+    -- a caller shrinks the candidate: both halves plan, and each is charged within the worst case
+    forM_ [96, 97 ∷ Int] $ \n → case plan n of
+      Right (Planned p) → must (chargeDominated p)
+      other → expectationFailure (show n <> " no-op writes were not planned: " <> take 200 (show other))
   it "bounds a plan's RAM below 4 MiB by construction, component by component" $ do
     -- the worst charge is the one builder a real plan is charged by, at worst-case arguments; with no read facts it fits the bound
     let w = worstChargeWith maxTxnPages (3 * maxBatchUpdates) 0
