@@ -442,6 +442,10 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
       let k = 24 ∷ Int
       heapBefore ← live
       ts ← forM [1 .. k] (const produce)
+      -- the second reading is taken with the workers IDLE (blocked in their wait): a worker that has committed its
+      -- job's outcome is still inside its frame for a moment, holding the work it ran, and one reading taken then
+      -- counts that job's pages (a race of the test, seen once in 26 repeats: +1 MiB over 24 jobs)
+      workersIdle env
       heapAfter ← live
       let perJobBytes = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
           modelled = recordModel + report
@@ -522,6 +526,7 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       let k = 24 ∷ Int
       heapBefore ← live
       ts ← forM [1 .. k] produce
+      workersIdle env
       heapAfter ← live
       let perJobBytes = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
       putStrLn ("memory retention | finished untaken open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " held at once | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
@@ -576,3 +581,8 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       perProfile `shouldSatisfy` (<= 1024)
       _ ← unlinkFile productionSeam (BC.pack dir) (crName c)
       void (closeFile productionSeam (crFd c))
+
+-- | Wait until both workers are blocked in their wait for work (observed, no timer): nothing of a finished job is held by a
+-- worker's frame any more.
+workersIdle ∷ Env → IO ()
+workersIdle env = workerThreads (envProbe env) >>= mapM_ awaitBlockedInStm
