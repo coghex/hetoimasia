@@ -101,6 +101,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , JobSnap (..)
   , JobKind (..)
   , BackingSnap (..)
+  , HeldSnap (..)
   , SlotTag (..)
   , snapshotOf
   , drainWaitsMessage
@@ -117,6 +118,8 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , forceOutcome
   , scrubWork
   , Entry (..)
+  , payloadOf
+  , budgetOf
   , Job (..)
   , JobPhase (..)
   , Work (..)
@@ -549,7 +552,14 @@ data Entry = Entry
   , eIdent ∷ !StoreIdentity
   , eVolume ∷ !Word64
   , eCap ∷ !Word64
+  -- ^ The committed allowance: the cap the model and the caller speak of. The file never occupies more than this.
   , eLength ∷ !Word64
+  -- ^ The allowance RESERVED for this backing (the committed one, or the prepared one while a growth is prepared), in
+  -- the same units as 'eCap'. It is the backing's contribution to the volume's figure: never less than what the file
+  -- physically occupies. The file's own length is 'payloadOf' this.
+  , eAllocated ∷ !Word64
+  -- ^ The bytes the filesystem reported the file occupies after the last step that changed it. THE INVARIANT: this
+  -- never exceeds 'eLength' plus a pending extra (the volume contribution), so the physical allocation fits the allowance.
   , eOverheadModel ∷ !Word64
   , eGrowth ∷ !GrowthSlot
   , ePending ∷ !(Maybe Word64)
@@ -582,6 +592,12 @@ data St = St
   -- 'CrReporting', CARRYING THE GRANT, until the close has nothing left to do with the service (its diagnostics are
   -- done); another transaction releases the grant and deletes it. The drain joins the records, so the service cannot end, and its logger cannot be used after its scope, while a
   -- close is in its diagnostics, and nothing is ever added to a drained service.
+  , stHeld ∷ !(Map Word64 Held)
+  -- ^ THE HELD CLOSES. A close that failed on a platform where a failed close is not established to have released the
+  -- descriptor ('CloseNotEstablished') is made once and never retried, and the backing's reservation STAYS COUNTED here, as
+  -- possibly still held, with the control grant that paid for the backing's record, until the service ends (the seal releases
+  -- them). Owner: the close core (inserts, once per backing); the seal (clears). Readers: the snapshot, the checker.
+  -- Bounded by the control account like every record. Lifetime: the service.
   , stEvidence ∷ ![Kept]
   -- ^ Cleanup failures that nobody received (an outcome disposed of undelivered, a close nobody waited for), kept
   -- (at most 'maxKept') for the scope that ends the service.
@@ -598,7 +614,7 @@ data St = St
 -- live: a reporting record keeps the control grant of the backing it was (its measured size is under that charge),
 -- released by the transaction that deletes it, so the number of records a held logger can accumulate is bounded by the
 -- control account like every other record.
-data ClosingRec = CrNative !Entry | CrReporting !A.Grant
+data ClosingRec = CrNative !Entry | CrReporting !(Maybe A.Grant)
 
 -- | A failure of a cleanup nobody received, with what it was.
 -- | What the service keeps of a failure nobody received, with its identity: a cleanup note, or the failure of a backing's
@@ -607,6 +623,10 @@ data KeptFailure = KeptNote !CleanupNote | KeptClose !Word64 !CloseFailure
 
 -- | How a close failed, fully evaluated when kept (a lazy value would retain what it was made from).
 data CloseFailure = CloseErrno !Errno | CloseRaised !Text
+
+-- | A close whose reservation stays counted: the volume it is counted on, the bytes (the backing's contribution at the
+-- close: its allowance and any pending extra), and the grant that is charged for the record.
+data Held = Held {hVolume ∷ !Word64, hBytes ∷ !Word64, hGrant ∷ !A.Grant}
 
 data Kept = Kept !Text !KeptFailure !A.Grant
 
@@ -677,7 +697,7 @@ data StorageCleanupFailure
 instance Exception StorageCleanupFailure
 
 emptySt ∷ St
-emptySt = St Running 1 1 Map.empty Map.empty Map.empty Nothing 0 (Fair 0 0) Set.empty Map.empty Nothing Map.empty [] 0 0 Nothing
+emptySt = St Running 1 1 Map.empty Map.empty Map.empty Nothing 0 (Fair 0 0) Set.empty Map.empty Nothing Map.empty Map.empty [] 0 0 Nothing
 
 -- | Run a body with the service. The two workers are started in the group the
 -- caller owns; the body runs; then, in the protected boundary and whatever ended
@@ -770,7 +790,10 @@ drainService svc workers = do
     s ← readTVar (svState svc)
     check (Map.null (stClosingRecs s))
     forM_ (stEvidence s) (\(Kept _ _ g) → releaseGrant svc g)
-    modifyTVar' (svState svc) (\t → t {stEvidence = [], stPhase = Sealed})
+    -- the held closes end with the service: their charge is released and their reservation is no longer counted
+    forM_ (Map.elems (stHeld s)) (\h → releaseGrant svc (hGrant h))
+    modifyTVar' (svState svc) (\t → t { stEvidence = [], stPhase = Sealed, stHeld = Map.empty
+                                       , stReserved = foldl (\m h → subReserved (hVolume h) (hBytes h) m) (stReserved t) (Map.elems (stHeld s)) })
     pure (stEvidence s, stEvidenceDropped s)
   let (undelivered, dropped) = fromMaybe ([], 0) sealed
   evidence ← sequence ([(,) label <$> keptEvidenceOf k | Kept label k _ ← undelivered]
@@ -1135,6 +1158,21 @@ growthSizeError e to
 -- volume's reserved figure is the sum of these over its backings, and a close gives back exactly this.
 backingContribution ∷ Entry → Word64
 backingContribution e = eLength e + fromMaybe 0 (ePending e)
+
+-- | THE PAYLOAD RULE, in one place (round 7). An arena's file holds the model's usable pages and nothing else:
+-- @payload = usable pages x page@, with @usable pages = (allowance - overhead) / page@, which is the model's own
+-- @cfgUsablePages@ (the same expression, on the same page grid; a test asserts the two agree). The platform's own overhead
+-- (an extent block, a rounding) must fit in what the allowance leaves, 'budgetOf': allocated bytes <= the allowance, always.
+-- No page the model can produce lies beyond the payload: the model hands out page @n@ only when @n < usable pages@
+-- (@pageFileOffset@), so its end is @(n + 1) * page <= usable pages * page = payload@. A write below the payload never
+-- extends the file; a page in the tail between the payload and the allowance is refused before any native call.
+payloadOf ∷ Word64 → Word64 → Word64
+payloadOf allowance overhead = ((allowance - overhead) `div` pageW) * pageW
+  where pageW = fromIntegral pageSize
+
+-- | What an allowance leaves for the platform's own overhead: the allowance less its payload.
+budgetOf ∷ Word64 → Word64 → Word64
+budgetOf allowance overhead = allowance - payloadOf allowance overhead
 
 setSlot ∷ StorageService → Word64 → GrowthSlot → STM ()
 setSlot svc bid slot = modifyTVar' (svState svc) (\s → s {stBackings = Map.adjust (\x → x {eGrowth = slot}) bid (stBackings s)})
@@ -1700,16 +1738,18 @@ execOpen svc jid spec = do
                 then Cancelled <$> unwind owned c False
                 else withVolume svc (nsDevice st) (reserveAndRegister c owned st)
     reserveAndRegister c owned st = do
-      r ← reserveRange seam (svConfig svc) (cancelled svc jid) (crFd c) 0 allowance
+      -- the PAYLOAD is asked of the platform, never the whole allowance: the overhead must fit in what is left of it
+      r ← reserveRange seam (svConfig svc) (cancelled svc jid) (crFd c) 0 (payloadOf allowance (cfgOverheadBytes cfg)) allowance
       case r of
         Left (StoppedCancelled _) → Cancelled <$> unwind owned c False
         Left (StoppedFailure f _) → do
           notes ← unwind owned c False
           pure (Failed f notes)
         Right rv
-          | rvOverhead rv > cfgOverheadBytes cfg → do
+          | rvAllocated rv > allowance → do
+              -- the physical allocation does not fit the allowance: the overhead exceeded what the allowance leaves for it
               notes ← unwind owned c False
-              pure (Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (cfgOverheadBytes cfg))) notes)
+              pure (Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (budgetOf allowance (cfgOverheadBytes cfg)))) notes)
           | otherwise → do
               registered ← atomically (register c st rv)
               case registered of
@@ -1737,12 +1777,12 @@ execOpen svc jid spec = do
                 Right grant → do
                   let bid = stNextBacking s
                       ident = osIdentity spec
-                      entry = Entry (crFd c) ident (nsDevice st) allowance (rvLength rv) (cfgOverheadBytes cfg) GIdle Nothing EOpen 0 (cfgOffsetLimit cfg) grant
+                      entry = Entry (crFd c) ident (nsDevice st) allowance allowance (rvAllocated rv) (cfgOverheadBytes cfg) GIdle Nothing EOpen 0 (cfgOffsetLimit cfg) grant
                       prof = rvProfile rv
                   writeTVar (svState svc) s
                     { stNextBacking = bid + 1
                     , stBackings = Map.insert bid entry (stBackings s)
-                    , stReserved = Map.insertWith (+) (nsDevice st) (rvLength rv) (stReserved s)
+                    , stReserved = Map.insertWith (+) (nsDevice st) allowance (stReserved s)
                     }
                   pure (Right (Backing (svId svc) bid ident, Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (nsDevice st)))
 
@@ -1760,7 +1800,8 @@ execGrow svc jid j from to = do
     Just _ | from == to → pure GrowthNoChange
     Nothing → pure (Failed BackingClosed [])
     Just (bid, e) → withVolume svc (eVolume e) $ do
-      r ← tryWithContext (reserveRange seam (svConfig svc) (cancelled svc jid) (eFd e) from (to - from))
+      -- the extra PAYLOAD: the allowances shifted by the budget (the file is shorter than the allowance by it)
+      r ← tryWithContext (reserveRange seam (svConfig svc) (cancelled svc jid) (eFd e) (payloadOf from (eOverheadModel e)) (payloadOf to (eOverheadModel e) - payloadOf from (eOverheadModel e)) (to - from))
       case r of
         Left ewc → do
           notes ← giveBack bid e True
@@ -1770,8 +1811,9 @@ execGrow svc jid j from to = do
         Right (Left (StoppedCancelled acquired)) → Cancelled <$> giveBack bid e acquired
         Right (Left (StoppedFailure f acquired)) → (\notes → Failed f notes) <$> giveBack bid e acquired
         Right (Right rv)
-          | rvOverhead rv > eOverheadModel e →
-              (\notes → Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (eOverheadModel e))) notes) <$> giveBack bid e True
+          | rvAllocated rv > to →
+              -- the physical allocation does not fit the NEW allowance
+              (\notes → Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (budgetOf to (eOverheadModel e)))) notes) <$> giveBack bid e True
           | otherwise → do
               let p = PreparedGrowth (svId svc) jid bid from to (rvAllocated rv)
               published ← atomically $ do
@@ -1780,7 +1822,7 @@ execGrow svc jid j from to = do
                 case Map.lookup bid (stBackings s) of
                   Just x | not cancelRequested, GRunning ← eGrowth x → do
                     writeTVar (svState svc) s
-                      { stBackings = Map.insert bid x {eGrowth = GPrepared p, eLength = to} (stBackings s)
+                      { stBackings = Map.insert bid x {eGrowth = GPrepared p, eLength = to, eAllocated = rvAllocated rv} (stBackings s)
                       , stReserved = Map.insertWith (+) (eVolume e) (to - from) (stReserved s)
                       }
                     pure True
@@ -1798,9 +1840,11 @@ execGrow svc jid j from to = do
       | not acquired = atomically (setSlot svc bid GIdle) >> pure []
       | otherwise = do
           -- an exception from the release is a release that failed: the extra is then kept as pending
-          released ← tryWithContext (releaseExtra seam (eFd e) from to) ∷ IO (Either (ExceptionWithContext SomeException) (Either Errno ()))
+          released ← tryWithContext (releaseExtra seam (eFd e) (payloadOf from (eOverheadModel e)) (payloadOf to (eOverheadModel e))) ∷ IO (Either (ExceptionWithContext SomeException) (Either Errno ()))
           case either (const (Left (Errno (-1)))) id released of
-            Right () → atomically (setSlot svc bid GIdle) >> pure []
+            Right () → do
+              allocated ← allocatedAfter svc e from
+              atomically (setSlot svc bid GIdle >> modifyTVar' (svState svc) (\s → s {stBackings = Map.adjust (\x → x {eAllocated = allocated}) bid (stBackings s)})) >> pure []
             Left err → do
               atomically $ modifyTVar' (svState svc) $ \s →
                 s { stBackings = Map.adjust (\x → x {ePending = let n = to - from in n `seq` Just n, eGrowth = GIdle}) bid (stBackings s)
@@ -1816,15 +1860,16 @@ execRelease svc j from to = do
   case me of
     Nothing → pure (Failed BackingClosed [])
     Just (bid, e) → withVolume svc (eVolume e) $ do
-      released ← tryWithContext (releaseExtra (svSeam svc) (eFd e) from to) ∷ IO (Either (ExceptionWithContext SomeException) (Either Errno ()))
+      released ← tryWithContext (releaseExtra (svSeam svc) (eFd e) (payloadOf from (eOverheadModel e)) (payloadOf to (eOverheadModel e))) ∷ IO (Either (ExceptionWithContext SomeException) (Either Errno ()))
       case released of
         Left ewc → do
           -- an exception: what the release did is unknown, so the extra stays accounted as pending
           atomically (pendAgain bid)
           rethrowIO ewc
         Right (Right ()) → do
+          allocated ← allocatedAfter svc e from
           atomically $ modifyTVar' (svState svc) $ \s →
-            s { stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Nothing, eLength = from}) bid (stBackings s)
+            s { stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Nothing, eLength = from, eAllocated = allocated}) bid (stBackings s)
               , stReserved = subReserved (eVolume e) (to - from) (stReserved s)
               }
           pure Released
@@ -1874,6 +1919,9 @@ data CloseReport = CloseReport
   -- released it with the file.
   , crCloseException ∷ !(Maybe Text)
   -- ^ An exception the one close raised (the call was made once and is not repeated).
+  , crReservationHeld ∷ !Bool
+  -- ^ The close failed on a platform where a failed close is not established to have released the descriptor: the
+  -- backing's reservation stays counted, in a charged record, until the service ends.
   }
   deriving stock (Eq, Show)
 
@@ -1883,7 +1931,7 @@ data CloseReport = CloseReport
 -- caller's protected boundary, not in an uninterruptibly masked release; the
 -- close itself is a bounded call, made uninterruptibly.
 noClose ∷ CloseReport
-noClose = CloseReport False Nothing Nothing Nothing
+noClose = CloseReport False Nothing Nothing Nothing False
 
 closeBacking ∷ StorageService → Backing → IO CloseReport
 closeBacking svc b = case resolveBacking svc b of
@@ -1938,15 +1986,16 @@ closeBackingCore svc bid = mask_ $ do
                 Left (ExceptionWithContext _ ex) → (Nothing, Just (T.pack (show ex)))
               -- the typed failure of the close: the backing's id and the errno, or the (bounded) text of the exception
               failing = [KeptClose bid (CloseErrno en) | Just en ← [err]] <> [KeptClose bid (CloseRaised (T.copy (T.take maxHostFailureChars t))) | Just t ← [thrown]]
-          atomically (finishClosing svc bid e ("close of backing " <> T.pack (show bid)) failing)
+          let held = (isJust err || isJust thrown) && nativeCloseFact (seamNative (svSeam svc)) == CloseNotEstablished
+          atomically (finishClosing svc bid e held ("close of backing " <> T.pack (show bid) <> (if held then " (reservation held: a failed close is not established to release)" else "")) failing)
           -- the diagnostics, each remembered and not obeyed: the report is still made and the caller (the drain,
           -- which goes on to close the other backings) delivers a cancellation afterwards
-          l1 ← maybe (pure Nothing) (\(Errno n) → quietly (logWarning (svLogger svc) component "Backing close failed" [("errno", T.pack (show n))])) err
-          l2 ← maybe (pure Nothing) (\t → quietly (logWarning (svLogger svc) component "Backing close raised" [("exception", t)])) thrown
+          l1 ← maybe (pure Nothing) (\(Errno n) → quietly (logWarning (svLogger svc) component "Backing close failed" [("errno", T.pack (show n)), ("reservation", if held then "held" else "released")])) err
+          l2 ← maybe (pure Nothing) (\t → quietly (logWarning (svLogger svc) component "Backing close raised" [("exception", t), ("reservation", if held then "held" else "released")])) thrown
           l3 ← quietly (logInfo (svLogger svc) component "Backing closed" [("backing", T.pack (show bid))])
           -- nothing is left to do with the service: the record ends
           atomically (endClosing svc bid)
-          pure (firstLate [late, l1, l2, l3], CloseReport True err (ePending e) thrown)
+          pure (firstLate [late, l1, l2, l3], CloseReport True err (ePending e) thrown held)
         _ → pure (late, noClose)
   where
     claim b = do
@@ -1973,12 +2022,20 @@ closeBackingCore svc bid = mask_ $ do
 -- the volume's reserved figure, a failing close is KEPT as evidence and the record becomes 'CrReporting', still
 -- carrying the control grant (a record is charged for as long as it lives: the diagnostics may be held by a logger
 -- for as long as that logger likes).
-finishClosing ∷ StorageService → Word64 → Entry → Text → [KeptFailure] → STM ()
-finishClosing svc bid e label failing = do
+--
+-- A HELD close (a failure on a platform where it is not established to have released the descriptor) subtracts nothing: the
+-- contribution stays on the volume's figure, and the grant moves to the held record ('stHeld'), which lives to the
+-- service's end; the reporting record then carries no grant of its own.
+finishClosing ∷ StorageService → Word64 → Entry → Bool → Text → [KeptFailure] → STM ()
+finishClosing svc bid e held label failing = do
   modifyTVar' (svState svc) $ \t →
-    t { stReserved = subReserved (eVolume e) (backingContribution e) (stReserved t)
-      , stClosingRecs = Map.insert bid (CrReporting (eGrant e)) (stClosingRecs t)
-      }
+    if held
+      then t { stHeld = Map.insert bid (Held (eVolume e) (backingContribution e) (eGrant e)) (stHeld t)
+             , stClosingRecs = Map.insert bid (CrReporting Nothing) (stClosingRecs t)
+             }
+      else t { stReserved = subReserved (eVolume e) (backingContribution e) (stReserved t)
+             , stClosingRecs = Map.insert bid (CrReporting (Just (eGrant e))) (stClosingRecs t)
+             }
   keepEvidence svc label failing
 
 -- | The close has nothing left to do with the service: the record's charge is released and the record ends, in ONE
@@ -1987,9 +2044,22 @@ endClosing ∷ StorageService → Word64 → STM ()
 endClosing svc bid = do
   s ← readTVar (svState svc)
   case Map.lookup bid (stClosingRecs s) of
-    Just (CrReporting g) → releaseGrant svc g
+    Just (CrReporting (Just g)) → releaseGrant svc g
     _ → pure ()
   modifyTVar' (svState svc) (\t → t {stClosingRecs = Map.delete bid (stClosingRecs t)})
+
+-- | Whether a closing record carries a control grant of its own.
+carriesGrant ∷ ClosingRec → Bool
+carriesGrant (CrNative _) = True
+carriesGrant (CrReporting g) = isJust g
+
+-- | What the file occupies after a release, by a fresh report of the platform (read straight from the adapter, not
+-- through the seam's hooks: it is bookkeeping, not a step of the work); when it cannot be read, the allowance the backing
+-- is now reserved for (an upper bound: the invariant holds either way).
+allocatedAfter ∷ StorageService → Entry → Word64 → IO Word64
+allocatedAfter svc e bound = do
+  r ← tryWithContext (nativeStat (seamNative (svSeam svc)) (eFd e)) ∷ IO (Either (ExceptionWithContext SomeException) (Either Errno NativeStat))
+  pure (case r of Right (Right st) → nsAllocated st; _ → bound)
 
 -- | A volume's figure less @n@. A volume nothing is reserved on holds no place in the service: its node leaves the
 -- map at zero, so a node never outlives the charge of the last record that paid for it.
@@ -2082,11 +2152,16 @@ data JobSnap = JobSnap
   deriving stock (Eq, Show)
 
 -- | One tracked backing.
+data HeldSnap = HeldSnap {hsId ∷ !Word64, hsVolume ∷ !Word64, hsBytes ∷ !Word64}
+  deriving stock (Eq, Show)
+
 data BackingSnap = BackingSnap
   { bsId ∷ !Word64
   , bsSlot ∷ !SlotTag
   , bsPending ∷ !(Maybe Word64)
   , bsLength ∷ !Word64
+  , bsAllocated ∷ !Word64
+  -- ^ What the file physically occupies (the last report): never more than 'bsLength' plus a pending extra.
   , bsVolume ∷ !Word64
   , bsBorrows ∷ !Int
   , bsClosing ∷ !Bool
@@ -2098,7 +2173,12 @@ data Snapshot = Snapshot
   { snJobs ∷ ![JobSnap]
   , snBackings ∷ ![BackingSnap]
   , snClosing ∷ !Int
+  , snClosingCharged ∷ !Int
+  -- ^ How many closing records carry a control grant (every one but a held close's reporting record: its grant is the held record's).
   , snClosingRecs ∷ ![BackingSnap]
+  , snHeld ∷ ![HeldSnap]
+  -- ^ The held closes: a backing whose close failed where a failed close is not established to have released the
+  -- descriptor, its volume and the bytes still counted on it.
   -- ^ The closing records, each with what it still pays for.
   , snWorkers ∷ !Int
   , snAdmissionOpen ∷ !Bool
@@ -2137,12 +2217,14 @@ snapshotOf svc = do
           , jsDelivered = jDelivered j
           }
       slotTag g = case g of GIdle → SlotIdle; GRunning → SlotRunning; GPrepared _ → SlotPrepared; GReleasing _ → SlotReleasing
-      backingSnap (bid, e) = BackingSnap bid (slotTag (eGrowth e)) (ePending e) (eLength e) (eVolume e) (eBorrows e) (ePhase e /= EOpen)
+      backingSnap (bid, e) = BackingSnap bid (slotTag (eGrowth e)) (ePending e) (eLength e) (eAllocated e) (eVolume e) (eBorrows e) (ePhase e /= EOpen)
   pure Snapshot
     { snJobs = map jobSnap (Map.toList (stJobs s))
     , snBackings = map backingSnap (Map.toList (stBackings s))
     , snClosing = Map.size (stClosingRecs s)
+    , snClosingCharged = length [() | r ← Map.elems (stClosingRecs s), carriesGrant r]
     , snClosingRecs = [backingSnap (bid, e) | (bid, CrNative e) ← Map.toList (stClosingRecs s)]
+    , snHeld = [HeldSnap bid (hVolume h) (hBytes h) | (bid, h) ← Map.toList (stHeld s)]
     , snWorkers = stWorkers s
     , snAdmissionOpen = stPhase s == Running
     , snStopReason = stStopReason s

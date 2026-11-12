@@ -80,14 +80,20 @@ reportedCoversPhysical :: Env -> IO ()
 reportedCoversPhysical env = do
   held <- sum . svReserved <$> view env
   phys <- allocatedOf env
-  hasPending <- atomically (snapshotOf (envSvc env)) >>= \sn -> pure (any (isJust . bsPending) (snBackings sn))
-  (held, phys, hasPending) `shouldSatisfy` \(h, p, pend) -> p <= h + 4096 && (h <= p + 4096 || pend)
+  sn <- atomically (snapshotOf (envSvc env))
+  let hasPending = any (isJust . bsPending) (snBackings sn)
+      nBacking = fromIntegral (length (snBackings sn) + snClosing sn) :: Word64
+  -- THE LEDGER NEVER UNDER-COUNTS (it counts the allowance, and the file occupies at most that); it may exceed what the
+  -- files occupy by the overhead budget each backing leaves unused, and by a pending extra
+  (held, phys, hasPending) `shouldSatisfy` \(h, p, pend) -> p <= h && (h <= p + nBacking * budgetBytes (hCfg h0) + 4096 || pend)
 
 reportedMatchesPhysical :: Env -> IO ()
 reportedMatchesPhysical env = do
   held <- sum . svReserved <$> view env
   phys <- allocatedOf env
-  (held, phys) `shouldSatisfy` \(h, p) -> p <= h + 4096 && h <= p + 4096
+  sn <- atomically (snapshotOf (envSvc env))
+  let nBacking = fromIntegral (length (snBackings sn) + snClosing sn) :: Word64
+  (held, phys) `shouldSatisfy` \(h, p) -> p <= h && h <= p + nBacking * budgetBytes (hCfg h0) + 4096
 
 -- | The per-volume reserved figures: every one back at zero once every backing is closed.
 volumeLedgerClear :: Env -> IO ()
@@ -276,7 +282,7 @@ growthClass = describe "(B) the growth state machine" $ do
     withEnv $ \env -> do
       b <- openBacking env ident (hCfg h0)
       p <- prepared env b
-      g <- addGate (envProbe env) (== OpSetFileLength (64 * mib))
+      g <- addGate (envProbe env) (== OpSetFileLength (payloadBytes (hCfg h0)))
       t <- submitAbandon (envSvc env) b p >>= either (fail . show) pure
       awaitReached g 1
       -- the release is running: the token commits nothing, a second abandon, a growth and a release are refused
@@ -319,7 +325,7 @@ growthClass = describe "(B) the growth state machine" $ do
     gatePoints :: [(String, Probe -> IO Gate)]
     gatePoints =
       [ ("before the allocation", \p -> addGate p isReserve)
-      , ("before the length", \p -> addGate p (== OpSetFileLength (128 * mib)))
+      , ("before the length", \p -> addGate p (== OpSetFileLength (payloadBytes (hCfg h0) + 64 * mib)))
       , ("before the final verification", \p -> addGateAfter p 1 isStat)
       ]
 
@@ -363,9 +369,9 @@ matrix =
   , (SGrow, "reserve", isReserve, 0, none)
   , (SGrow, "set length", isLen, 0, none)
   , (SGrow, "stat (verify)", isStat, 1, none)
-  , (SGrow, "set length (rollback after a failure)", (== OpSetFileLength (64 * mib)), 0, \p -> addRuleAfter p 1 1 isStat (OverAllocated (10 * mib)))
+  , (SGrow, "set length (rollback after a failure)", (== OpSetFileLength (payloadBytes (hCfg h0))), 0, \p -> addRuleAfter p 1 1 isStat (OverAllocated (10 * mib)))
   , (SRelease, "stat", isStat, 0, none)
-  , (SRelease, "set length", (== OpSetFileLength (64 * mib)), 0, none)
+  , (SRelease, "set length", (== OpSetFileLength (payloadBytes (hCfg h0))), 0, none)
   , (SRead, "pread", isRd, 0, none)
   , (SWrite, "pwrite", isWr, 0, none)
   , (SClose, "close", (== OpCloseFile), 0, none)
@@ -617,7 +623,7 @@ chargeClass = describe "(D) every charge is released on every path" $ do
       b <- openBacking env ident (hCfg h0)
       -- a growth that never published fails to release its extra: it stays pending, charged on the volume
       addRuleAfter (envProbe env) 1 1 isStat (OverAllocated (10 * mib))
-      addRule (envProbe env) 1 (== OpSetFileLength (64 * mib)) (FailWith eio)
+      addRule (envProbe env) 1 (== OpSetFileLength (payloadBytes (hCfg h0))) (FailWith eio)
       _ <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= either (fail . show) pure >>= awaitOutcome env
       (sum . svReserved <$> view env) >>= (`shouldBe` 128 * mib)
       _ <- closeBacking (envSvc env) b

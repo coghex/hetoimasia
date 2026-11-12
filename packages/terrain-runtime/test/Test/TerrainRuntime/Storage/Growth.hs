@@ -76,9 +76,13 @@ spec = describe "Storage backend: growth" $ do
       o ← grow env b (gpFrom p) (gpTo p)
       case o of
         GrowthPrepared pg rs → do
-          rsAllocated rs `shouldSatisfy` (>= 128 * mib)
-          rsOverhead rs `shouldBe` rsAllocated rs - 128 * mib
-          allocatedOf env >>= (`shouldSatisfy` (>= 128 * mib))
+          -- the extra PAYLOAD was reserved (the file holds the new allowance's usable pages), and the whole file occupies
+          -- no more than the new allowance
+          rsAllocated rs `shouldSatisfy` (>= payloadBytes (hCfg big))
+          rsAllocated rs `shouldSatisfy` (<= 128 * mib)
+          rsLength rs `shouldBe` payloadBytes (hCfg big)
+          rsOverhead rs `shouldBe` rsAllocated rs - payloadBytes (hCfg big)
+          allocatedOf env >>= (`shouldSatisfy` (>= payloadBytes (hCfg big)))
           v ← view env b
           (bvCommittedBytes v, bvGrowthPrepared v) `shouldBe` (64 * mib, True)
           -- a prepared growth is not capacity: a request for the larger allowance is refused
@@ -142,7 +146,7 @@ spec = describe "Storage backend: growth" $ do
       b ← openBacking env ident (hCfg h0)
       -- the growth fails after the allocation (the overhead is beyond the model's), and the one release attempt fails
       addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (10 * mib))
-      addRule (envProbe env) 1 (isSetLength (64 * mib)) (FailWith (er C.eIO))
+      addRule (envProbe env) 1 (isSetLength (payloadBytes (hCfg h0))) (FailWith (er C.eIO))
       o ← grow env b (64 * mib) (128 * mib)
       case o of
         Failed (ReservationFailed (OverheadExceedsModel _ _)) notes → notes `shouldBe` [CleanupNote IoSetLength (er C.eIO)]
@@ -165,7 +169,7 @@ spec = describe "Storage backend: growth" $ do
     withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
       addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (10 * mib))
-      addRule (envProbe env) 1 (isSetLength (64 * mib)) (FailWith (er C.eIO))
+      addRule (envProbe env) 1 (isSetLength (payloadBytes (hCfg h0))) (FailWith (er C.eIO))
       _ ← grow env b (64 * mib) (128 * mib)
       rep ← closeBacking (envSvc env) b
       (crClosed rep, crPendingReservation rep) `shouldBe` (True, Just (64 * mib))
@@ -176,10 +180,12 @@ spec = describe "Storage backend: growth" $ do
     withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
       held0 ← allocatedOf env
+      -- the headroom is kept after the extra ALLOWANCE (64 MiB); the platform occupies the budget plus 4,096 bytes beyond it
+      let over = budgetBytes (hCfg big) + 4096
       addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + minHeadroomBytes))
-      addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated 4096)
+      addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated over)
       o ← grow env b (64 * mib) (128 * mib)
-      o `shouldSatisfy` \x → case x of Failed (ReservationFailed (InsufficientHeadroom avail got room)) _ → avail == 64 * mib + minHeadroomBytes && got == 64 * mib + 4096 && room == minHeadroomBytes; _ → False
+      o `shouldSatisfy` \x → case x of Failed (ReservationFailed (InsufficientHeadroom avail got room)) _ → avail == 64 * mib + minHeadroomBytes && got == payloadBytes (hCfg big) - payloadBytes (hCfg h0) + over && room == minHeadroomBytes; _ → False
       rulesConsumed (envProbe env) >>= (`shouldBe` True)
       -- given back: the slot is idle, nothing prepared or pending, the file is the size it was
       v ← view env b
@@ -187,13 +193,47 @@ spec = describe "Storage backend: growth" $ do
       allocatedOf env >>= (`shouldSatisfy` backTo held0)
       reservedTotal env >>= (`shouldBe` (64 * mib))
 
-  it "admits the same growth when the overhead is available too" $
+  it "admits a growth that leaves exactly the headroom after the extra allowance, and refuses one byte less" $ do
     withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
-      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + minHeadroomBytes + 4096))
-      addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated 4096)
+      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + minHeadroomBytes))
       o ← grow env b (64 * mib) (128 * mib)
-      o `shouldSatisfy` \x → case x of GrowthPrepared _ rv → rsOverhead rv >= 4096; _ → False
+      o `shouldSatisfy` \x → case x of GrowthPrepared {} → True; _ → False
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + minHeadroomBytes - 1))
+      o ← grow env b (64 * mib) (128 * mib)
+      o `shouldSatisfy` \x → case x of Failed (ReservationFailed (InsufficientHeadroom _ got _)) _ → got == 64 * mib; _ → False
+
+  -- THE PHYSICAL INVARIANT AT ITS BOUNDARY, for growth (round 7): after a growth the file occupies at most the NEW
+  -- allowance. A seam whose allocation is exactly the new allowance is admitted; one byte more is refused and the extra
+  -- is given back (nothing prepared, nothing pending, the file as it was).
+  it "admits a growth whose physical allocation is exactly the new allowance, and refuses one byte more, giving it back" $ do
+    -- the real overhead the platform adds to this growth, measured without an injection
+    real ← withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      o ← grow env b (64 * mib) (128 * mib)
+      case o of
+        GrowthPrepared _ rv → pure (rsAllocated rv)
+        other → fail ("the baseline growth was not prepared: " <> show other)
+    let exact = 128 * mib - real
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated exact)
+      o ← grow env b (64 * mib) (128 * mib)
+      case o of
+        GrowthPrepared _ rv → rsAllocated rv `shouldBe` 128 * mib
+        other → expectationFailure ("an allocation of exactly the new allowance must be admitted: " <> show other)
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      held0 ← allocatedOf env
+      addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (exact + 1))
+      o ← grow env b (64 * mib) (128 * mib)
+      o `shouldSatisfy` \x → case x of Failed (ReservationFailed (OverheadExceedsModel {})) [] → True; _ → False
+      rulesConsumed (envProbe env) >>= (`shouldBe` True)
+      v ← view env b
+      (bvGrowthPrepared v, bvPendingReservation v, bvLengthBytes v) `shouldBe` (False, Nothing, 64 * mib)
+      allocatedOf env >>= (`shouldSatisfy` backTo held0)
 
   it "gives back a prepared growth that will not be committed" $
     withEnv $ \env → do
@@ -210,6 +250,6 @@ spec = describe "Storage backend: growth" $ do
     stages =
       [ ("headroom", \p → addRule p 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + 255 * mib)), \f → case f of ReservationFailed (InsufficientHeadroom {}) → True; _ → False)
       , ("allocation refused", \p → addRule p 1 isReserve (FailWith (er C.eNOSPC)), \f → case f of ReservationFailed (AllocationRefused _) → True; _ → False)
-      , ("length established after allocation", \p → addRule p 1 (isSetLength (128 * mib)) (FailWith (er C.eIO)), \f → case f of ReservationFailed (LengthFailed _) → True; _ → False)
+      , ("length established after allocation", \p → addRule p 1 (isSetLength (payloadBytes (hCfg big))) (FailWith (er C.eIO)), \f → case f of ReservationFailed (LengthFailed _) → True; _ → False)
       , ("rounded allocation beyond the model", \p → addRuleAfter p 1 1 (== OpStatFile) (OverAllocated (10 * mib)), \f → case f of ReservationFailed (OverheadExceedsModel _ _) → True; _ → False)
       ]

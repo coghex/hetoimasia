@@ -242,14 +242,14 @@ closingRow env kind n = do
   fd ← (\fds → case fds of f : _ → f; [] → error "no descriptor") <$> fdHandles (envProbe env)
   u ← newUnique
   let (grants, adm) = reserveN n backingRecordBytes
-      entryFor g i = Entry fd ident (fromIntegral i) (1024 * mib') (1024 * mib') mib' (GReleasing (Just (PreparedGrowth u (fromIntegral i) (fromIntegral i) (64 * mib') (128 * mib') (fromIntegral i)))) (Just (fromIntegral i)) EOpen 0 (1024 * mib') g
+      entryFor g i = Entry fd ident (fromIntegral i) (1024 * mib') (1024 * mib') (1024 * mib') mib' (GReleasing (Just (PreparedGrowth u (fromIntegral i) (fromIntegral i) (64 * mib') (128 * mib') (fromIntegral i)))) (Just (fromIntegral i)) EOpen 0 (1024 * mib') g
       ledger = Map.fromList [(fromIntegral i, fromIntegral i * 3) | i ← [1 .. n]] ∷ Map.Map Word64 Word64
       keyed ∷ (A.Grant → Int → v) → Map.Map Word64 v
       keyed f = Map.fromList [(fromIntegral i ∷ Word64, f g i) | (i, g) ← zip [1 .. n] grants]
   heldAdded n $ case kind of
     HeldBacking → holdLive (keyed entryFor, ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (eLength e) | e ← Map.elems m])
     HeldNative → holdLive (keyed (\g i → CrNative (entryFor g i)), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative e → fromIntegral (eLength e); CrReporting _ → 0 | c ← Map.elems m])
-    HeldReporting → holdLive (keyed (\g _ → CrReporting g), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative _ → 0; CrReporting _ → 1 | c ← Map.elems m])
+    HeldReporting → holdLive (keyed (\g _ → CrReporting (Just g)), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative _ → 0; CrReporting _ → 1 | c ← Map.elems m])
 
 -- ---------------------------------------------------------------------------
 -- The rows

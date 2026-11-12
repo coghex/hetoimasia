@@ -15,7 +15,7 @@ import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeAsyncException (..), SomeException, fromException, throwIO, toException, tryWithContext)
 import Control.Monad (forM_, void, when)
 import qualified Data.ByteString.Char8 as BC
-import Data.List (intercalate)
+import Data.List (intercalate, isInfixOf)
 import Data.Maybe (isJust, isNothing)
 import System.Directory (listDirectory)
 import qualified Data.Map.Strict as Map
@@ -30,7 +30,7 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (pageFileOffset)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes, pageFileOffset)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
@@ -61,10 +61,10 @@ invariantProblems sn ledger fds = concat
     | b <- snBackings sn, any ((== Just (bsId b)) . jsPrepared) (snJobs sn), bsSlot b /= SlotPrepared ]
   , [ "descriptors open " <> show (length fds) <> " outside [" <> show nBack <> ", " <> show (nBack + snClosing sn + runningOpens) <> "]"
     | length fds < nBack || length fds > nBack + snClosing sn + runningOpens ]
-  , [ "volume " <> show v <> " reserved " <> show r <> " but backings and closing records contribute " <> show (contribution v)
+  , [ "volume " <> show v <> " reserved " <> show r <> " but backings, closing records and held closes contribute " <> show (contribution v)
     | (v, r) <- Map.toList (snReserved sn), r /= contribution v ]
   , [ "volume " <> show v <> " has backings contributing " <> show c <> " but no reserved figure"
-    | v <- map bsVolume (snBackings sn <> snClosingRecs sn), c <- [contribution v], c /= 0, Map.notMember v (snReserved sn) ]
+    | v <- map bsVolume (snBackings sn <> snClosingRecs sn) <> map hsVolume (snHeld sn), c <- [contribution v], c /= 0, Map.notMember v (snReserved sn) ]
   -- THE CLASS (round 5): no container of the service outlives its bound or its charge. The control equation below
   -- covers the jobs, the backings, EVERY closing record and the kept failures; these cover the rest.
   , [ "volume " <> show v <> " keeps a node at zero: a volume nothing is reserved on holds no place in the service"
@@ -72,6 +72,12 @@ invariantProblems sn ledger fds = concat
   , [ show (length (snJobs sn)) <> " job records exceed the bound " <> show maxJobRecords | length (snJobs sn) > maxJobRecords ]
   , [ show (snQueued sn) <> " queued jobs exceed the bound " <> show maxQueuedJobs | snQueued sn > maxQueuedJobs ]
   , [ show (snBusyVolumes sn) <> " volumes are held for a reservation by " <> show (snWorkers sn) <> " workers" | snBusyVolumes sn > snWorkers sn ]
+  -- THE PHYSICAL INVARIANT (round 7): what a file occupies never exceeds the allowance it is reserved for (plus a pending
+  -- extra still held), and a volume's reserved figure is never less than what its files occupy
+  , [ "backing " <> show (bsId b) <> " occupies " <> show (bsAllocated b) <> " but is reserved for " <> show (bsLength b) <> " plus " <> show (maybe 0 id (bsPending b))
+    | b <- snBackings sn <> snClosingRecs sn, bsAllocated b > bsLength b + maybe 0 id (bsPending b) ]
+  , [ "volume " <> show v <> " is reserved " <> show r <> " but its files occupy " <> show phys
+    | (v, r) <- Map.toList (snReserved sn), let phys = sum [bsAllocated b | b <- snBackings sn <> snClosingRecs sn, bsVolume b == v], r < phys ]
   , [ "admission is open but " <> show (snWorkers sn) <> " workers are alive"
     | snAdmissionOpen sn, snWorkers sn /= 2 ]
   -- a running job is a worker's: more running jobs than workers alive (and so any running job with no worker) is a
@@ -101,10 +107,12 @@ invariantProblems sn ledger fds = concat
     isRelease k = k == KAbandon || k == KReleasePending
     runningOpens = length [() | j <- snJobs sn, jsKind j == KOpen, jsPhase j == 1]
     -- a closing record still pays for everything its backing paid for, until its native close has returned
-    contribution v = sum [bsLength b + maybe 0 id (bsPending b) | b <- snBackings sn <> snClosingRecs sn, bsVolume b == v]
+    -- and a HELD close keeps counting what its backing contributed until the service ends
+    contribution v = sum [bsLength b + maybe 0 id (bsPending b) | b <- snBackings sn <> snClosingRecs sn, bsVolume b == v] + sum [hsBytes h | h <- snHeld sn, hsVolume h == v]
     -- EVERY closing record pays, whether its native close has returned or not: a reporting record keeps the grant of the
     -- backing it was until the transaction that deletes it
-    controlNeed = sum (map jsCharge (snJobs sn)) + fromIntegral (nBack + snClosing sn) * backingRecordBytes + fromIntegral (snEvidence sn) * keptEntryBytes
+    -- (a held close's reporting record carries none: its grant is the held record's, charged to the service's end)
+    controlNeed = sum (map jsCharge (snJobs sn)) + fromIntegral (nBack + snClosingCharged sn + length (snHeld sn)) * backingRecordBytes + fromIntegral (snEvidence sn) * keptEntryBytes
     stagingNeed = sum [transferBufferBytes n | j <- snJobs sn, jsPhase j == 1, KRead n <- [jsKind j]]
     cacheNeed = sum [fromIntegral n * resultPageBytes | j <- snJobs sn, KRead n <- [jsKind j], jsPhase j == 1 || jsHoldsResult j]
     nPhase p = length [() | j <- snJobs sn, jsPhase j == p]
@@ -421,6 +429,66 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
       sealed <- atomically (snapshotOf svc)
       (snClosing sealed, snEvidence sealed) `shouldBe` (0, 0)
       openFds (envProbe env) >>= (`shouldBe` [])
+
+  -- ---- round 7 (B): A FAILED CLOSE ASSUMES NOTHING THE PLATFORM HAS NOT ESTABLISHED. The platform-fact table
+  -- ('closeFactOf') has two values; each is driven through the seam, with an error return and with a raised close.
+  -- Established (Linux): the failed close released the descriptor, so the reservation is released with it. Not
+  -- established (macOS): the close is made once and never retried, the backing's reservation STAYS COUNTED in a charged
+  -- record of its own until the service ends, and the failure is a labelled cleanup failure either way.
+  forM_ [(f, i) | f <- [CloseReleasesOnFailure, CloseNotEstablished], i <- [("an error return (EIO)", FailWith eio, True), ("a raised close", Throw, False)]] $ \(fact, (injName, inj, isErr)) ->
+    it ("treats a failed close under " <> show fact <> " as the table says: " <> injName <> ", the volume's figure, the charge and the held record asserted") $ do
+      r <- tryWithContext (withEnvWith defaultOptions {eoCloseFact = fact} $ \env -> do
+        let svc = envSvc env
+            allowance = cfgAllowanceBytes (hCfg h0)
+            holds = fact == CloseNotEstablished
+            closeCalls = length . filter (== OpCloseFile) <$> events (envProbe env)
+            controlNow = A.lgControlReserved . A.ledgers <$> readTVarIO (envAdmission env)
+        b <- openBacking env ident (hCfg h0)
+        sn0 <- atomically (snapshotOf svc)
+        (bid0, vol) <- case snBackings sn0 of [x] -> pure (bsId x, bsVolume x); xs -> fail ("expected one backing, got " <> show (length xs))
+        snReserved sn0 `shouldBe` Map.fromList [(vol, allowance)]
+        controlNow `shouldReturn` backingRecordBytes
+        addRule (envProbe env) 1 (== OpCloseFile) inj
+        rep <- closeBacking svc b
+        (crClosed rep, crReservationHeld rep) `shouldBe` (True, holds)
+        (isJust (crCloseError rep), isJust (crCloseException rep)) `shouldBe` (isErr, not isErr)
+        sn <- atomically (snapshotOf svc)
+        (length (snBackings sn), snClosing sn, snEvidence sn) `shouldBe` (0, 0, 1)
+        if holds
+          then do
+            -- the reservation is STILL COUNTED, in a record of its own, charged beside the evidence
+            snHeld sn `shouldBe` [HeldSnap bid0 vol allowance]
+            snReserved sn `shouldBe` Map.fromList [(vol, allowance)]
+            controlNow `shouldReturn` (backingRecordBytes + keptEntryBytes)
+          else do
+            snHeld sn `shouldBe` []
+            snReserved sn `shouldBe` Map.empty
+            controlNow `shouldReturn` keptEntryBytes
+        checkInvariants env
+        -- made once, never retried: a second close finds nothing, and no second native close is made
+        (crClosed <$> closeBacking svc b) >>= (`shouldBe` False)
+        closeCalls `shouldReturn` 1
+        -- a successful close is the same on both: another backing opens beside the held reservation and closes cleanly
+        b2 <- openBacking env ident2 (hCfg h0)
+        sn2 <- atomically (snapshotOf svc)
+        snReserved sn2 `shouldBe` Map.fromList [(vol, if holds then 2 * allowance else allowance)]
+        checkInvariants env
+        rep2 <- closeBacking svc b2
+        (crClosed rep2, crCloseError rep2, crCloseException rep2, crReservationHeld rep2) `shouldBe` (True, Nothing, Nothing, False)
+        sn3 <- atomically (snapshotOf svc)
+        snReserved sn3 `shouldBe` (if holds then Map.fromList [(vol, allowance)] else Map.empty)
+        length (snHeld sn3) `shouldBe` (if holds then 1 else 0)
+        checkInvariants env
+        openFds (envProbe env) >>= (`shouldBe` [])
+        pure ()) :: IO (Either (ExceptionWithContext SomeException) ())
+      -- the failure is a labelled cleanup failure of the service's end on both; the held reservation is released with it
+      -- (the harness checks every ledger is back at zero after the end)
+      case r of
+        Left (ExceptionWithContext ctx _) -> do
+          let shown = unwords (map displayCleanupFailure (cleanupFailuresInContext ctx))
+          length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
+          ("reservation held" `isInfixOf` shown) `shouldBe` (fact == CloseNotEstablished)
+        Right () -> expectationFailure "the failing close was kept as evidence and must end the scope with the failure, but it ended normally"
 
   it "charges a closing record for as long as it lives: a logger held on the close's diagnostics cannot make the service accumulate records, and repeated open, take and close meets pressure" $ do
     gate <- newTVarIO False
@@ -749,7 +817,7 @@ setupCell env kind phase ev = do
     _ -> pure Nothing
   when (kind == KindReleasePending) $ do
     addRuleAfter probe 1 1 (== OpStatFile) (OverAllocated (10 * mib))
-    addRule probe 1 (== OpSetFileLength (64 * mib)) (FailWith eio)
+    addRule probe 1 (== OpSetFileLength (payloadBytes (hCfg h0))) (FailWith eio)
     void (submitGrowth svc b (64 * mib) (128 * mib) >>= either (fail . show) pure >>= awaitOutcome env)
   holders <- if phase == PhQueued
     then do
@@ -766,9 +834,9 @@ setupCell env kind phase ev = do
     else pure Nothing
   when (ev == EvCleanupException) $ case kind of
     KindOpen -> addRule probe 1 (\op -> case op of OpReserveRange _ _ -> True; _ -> False) (FailWith (Errno 28)) >> addRule probe 1 (== OpCloseFile) Throw
-    KindGrow -> addRuleAfter probe 1 1 (== OpStatFile) (OverAllocated (10 * mib)) >> addRule probe 1 (== OpSetFileLength (64 * mib)) Throw
-    KindAbandon -> addRule probe 1 (== OpSetFileLength (64 * mib)) Throw
-    KindReleasePending -> addRule probe 1 (== OpSetFileLength (64 * mib)) Throw
+    KindGrow -> addRuleAfter probe 1 1 (== OpStatFile) (OverAllocated (10 * mib)) >> addRule probe 1 (== OpSetFileLength (payloadBytes (hCfg h0))) Throw
+    KindAbandon -> addRule probe 1 (== OpSetFileLength (payloadBytes (hCfg h0))) Throw
+    KindReleasePending -> addRule probe 1 (== OpSetFileLength (payloadBytes (hCfg h0))) Throw
     _ -> pure ()
   submitted <- submitKind env b token kind
   t <- either (\f -> fail ("submit refused: " <> show f)) pure submitted
@@ -984,8 +1052,8 @@ heldOp k = case k of
   KindRead -> isRd 200
   KindWrite -> \op -> case op of OpWriteAt _ _ -> True; _ -> False
   KindGrow -> \op -> case op of OpReserveRange _ _ -> True; _ -> False
-  KindAbandon -> (== OpSetFileLength (64 * mib))
-  KindReleasePending -> (== OpSetFileLength (64 * mib))
+  KindAbandon -> (== OpSetFileLength (payloadBytes (hCfg h0)))
+  KindReleasePending -> (== OpSetFileLength (payloadBytes (hCfg h0)))
 
 submitKind :: Env -> Backing -> Maybe PreparedGrowth -> Kind -> IO (Either StorageFailure Ticket)
 submitKind env b token kind = case kind of
@@ -1171,11 +1239,11 @@ chargeEvidence k = case k of
     b <- openBacking env ident (hCfg h0)
     -- a growth whose rollback release fails leaves the extra pending and charged
     addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (10 * mib))
-    addRule (envProbe env) 1 (== OpSetFileLength (64 * mib)) (FailWith eio)
+    addRule (envProbe env) 1 (== OpSetFileLength (payloadBytes (hCfg h0))) (FailWith eio)
     void (submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= either (fail . show) pure >>= awaitOutcome env)
     reservedOf env `shouldReturn` (128 * mib)
     -- the retry's set-length is held: DURING it the extra is still counted
-    g <- addGate (envProbe env) (== OpSetFileLength (64 * mib))
+    g <- addGate (envProbe env) (== OpSetFileLength (payloadBytes (hCfg h0)))
     t <- submitReleasePending (envSvc env) b >>= either (fail . show) pure
     awaitReached g 1
     reservedOf env `shouldReturn` (128 * mib)
@@ -1187,7 +1255,7 @@ chargeEvidence k = case k of
     b <- openBacking env ident (hCfg h0)
     p <- prepared env b
     reservedOf env `shouldReturn` (128 * mib)
-    g <- addGate (envProbe env) (== OpSetFileLength (64 * mib))
+    g <- addGate (envProbe env) (== OpSetFileLength (payloadBytes (hCfg h0)))
     t <- submitAbandon (envSvc env) b p >>= either (fail . show) pure
     awaitReached g 1
     -- DURING the release's set-length the prepared extra is still counted

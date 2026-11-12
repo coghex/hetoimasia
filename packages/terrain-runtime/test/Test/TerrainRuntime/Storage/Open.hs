@@ -12,12 +12,15 @@ module Test.TerrainRuntime.Storage.Open (spec) where
 import Control.Concurrent.STM (atomically, check)
 import Control.Monad (forM_)
 import Data.Bits ((.&.))
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import qualified Foreign.C.Error as C
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), pageSize)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes, cfgOverheadBytes, cfgTotalPages)
 import System.Directory (listDirectory)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.Process (proc)
@@ -49,15 +52,18 @@ spec = describe "Storage backend: opening a backing" $ do
           nsMode st .&. 0o777 `shouldBe` 0o600
           nsLinks st `shouldBe` 0
           cx `shouldBe` True
-          nsSize st `shouldBe` cfgAllowanceBytes cfg
-          nsAllocated st `shouldSatisfy` (>= cfgAllowanceBytes cfg)
+          -- THE PAYLOAD RULE: the file holds the model's usable pages (the allowance less its overhead budget), and
+          -- what it physically occupies never exceeds the allowance
+          nsSize st `shouldBe` payloadBytes cfg
+          nsAllocated st `shouldSatisfy` (>= payloadBytes cfg)
+          nsAllocated st `shouldSatisfy` (<= cfgAllowanceBytes cfg)
           rsAllocated rs `shouldBe` nsAllocated st
-          rsOverhead rs `shouldBe` nsAllocated st - cfgAllowanceBytes cfg
+          rsOverhead rs `shouldBe` nsAllocated st - payloadBytes cfg
           listDirectory (envDir env) `shouldReturn` []
           evs ← events (envProbe env)
           -- the name is gone, and the allocation was made, before the outcome exists
           let at op = length (takeWhile (/= op) evs)
-          at OpUnlinkFile `shouldSatisfy` (< at (OpReserveRange 0 (cfgAllowanceBytes cfg)))
+          at OpUnlinkFile `shouldSatisfy` (< at (OpReserveRange 0 (payloadBytes cfg)))
         other → expectationFailure ("not opened: " <> show other)
 
   it "keeps the descriptor out of a child process: the child cannot use its number, and can use an inherited one" $
@@ -106,7 +112,7 @@ spec = describe "Storage backend: opening a backing" $ do
       addRule (envProbe env) 1 (isReserve) Lie
       o ← openBackingAt env (envDir env) ident (hCfg cfg64)
       o `shouldBeFailure` \f → case f of
-        ReservationFailed (CoverageShort got want) → got < want && want == cfgAllowanceBytes (hCfg cfg64)
+        ReservationFailed (CoverageShort got want) → got < want && want == payloadBytes (hCfg cfg64)
         _ → False
 
   -- A CHECK USES WHAT WAS OBTAINED, NOT WHAT WAS ASKED: exactly the length and the headroom are available, so the
@@ -114,11 +120,14 @@ spec = describe "Storage backend: opening a backing" $ do
   -- ext4), which takes some of the required headroom. The reservation is refused and unwound.
   it "refuses an open whose obtained bytes, overhead included, leave less than the headroom" $
     withEnv $ \env → do
+      -- the headroom is kept after the ALLOWANCE; the platform then occupies 4,096 bytes beyond it (the budget plus 4,096), so
+      -- the bytes obtained take some of the required headroom
       let allowance = cfgAllowanceBytes (hCfg cfg64)
+          over = budgetBytes (hCfg cfg64) + 4096
       addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (allowance + minHeadroomBytes))
-      addRuleAfter (envProbe env) 2 1 (== OpStatFile) (OverAllocated 4096)
+      addRuleAfter (envProbe env) 2 1 (== OpStatFile) (OverAllocated over)
       o ← openBackingAt env (envDir env) ident (hCfg cfg64)
-      o `shouldBeFailure` \f → case f of ReservationFailed (InsufficientHeadroom avail got room) → avail == allowance + minHeadroomBytes && got == allowance + 4096 && room == minHeadroomBytes; _ → False
+      o `shouldBeFailure` \f → case f of ReservationFailed (InsufficientHeadroom avail got room) → avail == allowance + minHeadroomBytes && got == payloadBytes (hCfg cfg64) + over && room == minHeadroomBytes; _ → False
       rulesConsumed (envProbe env) >>= (`shouldBe` True)
       -- unwound: no descriptor, no name, no record, nothing reserved
       openFds (envProbe env) >>= (`shouldBe` [])
@@ -126,19 +135,80 @@ spec = describe "Storage backend: opening a backing" $ do
       left `shouldBe` []
       (svBackings <$> atomically (serviceView (envSvc env))) `shouldReturn` 0
 
-  it "admits the same open when the overhead is available too" $
+  it "admits an open that leaves exactly the headroom after the allowance" $ do
     withEnv $ \env → do
       let allowance = cfgAllowanceBytes (hCfg cfg64)
-      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (allowance + minHeadroomBytes + 4096))
-      addRuleAfter (envProbe env) 2 1 (== OpStatFile) (OverAllocated 4096)
+      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (allowance + minHeadroomBytes))
       o ← openBackingAt env (envDir env) ident (hCfg cfg64)
       case o of
-        Opened _ rv → rsOverhead rv `shouldBe` 4096
+        Opened _ rv → rsAllocated rv `shouldSatisfy` (<= allowance)
         other → expectationFailure ("expected the open to be admitted, got " <> show other)
+      -- one byte less is refused before any native allocation
+    withEnv $ \env → do
+      let allowance = cfgAllowanceBytes (hCfg cfg64)
+      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (allowance + minHeadroomBytes - 1))
+      o ← openBackingAt env (envDir env) ident (hCfg cfg64)
+      o `shouldBeFailure` \f → case f of ReservationFailed (InsufficientHeadroom avail got room) → avail == allowance + minHeadroomBytes - 1 && got == allowance && room == minHeadroomBytes; _ → False
+      evs ← events (envProbe env)
+      length [() | OpReserveRange _ _ ← evs] `shouldBe` 0
+
+  -- THE PAYLOAD RULE IS THE MODEL'S OWN FIGURE: the file's length is usable pages x page for every configuration the suite
+  -- builds, and a page in the tail between the payload and the allowance (below the allowance, at or beyond the usable
+  -- pages) is refused before any native call, leaving the file's length and allocation unchanged.
+  it "asks the platform for exactly the model's usable pages, and refuses a page in the tail between the payload and the allowance" $
+    withEnv $ \env → do
+      let cfg = hCfg cfg64
+      forM_ [cfg64, newStoreH smallSpec] $ \h →
+        payloadOf (cfgAllowanceBytes (hCfg h)) (cfgOverheadBytes (hCfg h)) `shouldBe` payloadBytes (hCfg h)
+      o ← openBackingAt env (envDir env) ident cfg
+      b ← case o of Opened b _ → pure b; other → fail (show other)
+      [fd] ← fdHandles (envProbe env)
+      st0 ← either (fail . show) pure =<< nativeStat posixNative fd
+      nsSize st0 `shouldBe` payloadBytes cfg
+      let tailPage = PageNo (cfgTotalPages cfg)
+      readPages env b cfg (cfgTotalPages cfg) 1 ReadProbe >>= (`shouldSatisfy` either (\f → case f of InvalidRequest (PageOutsideFile p _) → p == tailPage; _ → False) (const False))
+      let plan = either error id (planFor cfg64 1)
+      (tid, s1) ← either (fail . show) pure (admit plan (hStore cfg64))
+      sw ← either (fail . show) pure (stageWrite s1 tid)
+      t ← submitWrite (envSvc env) b sw {swPages = [(tailPage, BS.replicate pageSize 7)]}
+      t `shouldSatisfy` either (\f → case f of InvalidRequest (PageOutsideFile p _) → p == tailPage; _ → False) (const False)
+      st1 ← either (fail . show) pure =<< nativeStat posixNative fd
+      (nsSize st1, nsAllocated st1) `shouldBe` (nsSize st0, nsAllocated st0)
+      evs ← events (envProbe env)
+      length [() | OpWriteAt {} ← evs] `shouldBe` 0
+
+  -- THE PHYSICAL INVARIANT AT ITS BOUNDARY (round 7): the platform's own overhead must fit in what the allowance leaves
+  -- for it, so that the file never occupies more than the allowance. A seam that over-allocates by EXACTLY that budget
+  -- is admitted with allocated == allowance; one byte more is refused and unwound.
+  it "admits an open whose physical allocation is exactly the allowance, and refuses one byte more, unwinding it" $ do
+    let cfg = hCfg cfg64
+    -- the real overhead the platform adds, measured without an injection
+    real ← withEnv $ \env → do
+      o0 ← openBackingAt env (envDir env) ident cfg
+      case o0 of
+        Opened _ rv → pure (rsOverhead rv)
+        other → fail ("the baseline open failed: " <> show other)
+    let exact = budgetBytes cfg - real
+    withEnv $ \env → do
+      addRuleAfter (envProbe env) 2 1 (== OpStatFile) (OverAllocated exact)
+      o ← openBackingAt env (envDir env) ident cfg
+      case o of
+        Opened _ rv → do
+          rsAllocated rv `shouldBe` cfgAllowanceBytes cfg
+          rsLength rv `shouldBe` payloadBytes cfg
+        other → expectationFailure ("an allocation of exactly the allowance must be admitted: " <> show other)
+    withEnv $ \env → do
+      addRuleAfter (envProbe env) 2 1 (== OpStatFile) (OverAllocated (exact + 1))
+      o ← openBackingAt env (envDir env) ident cfg
+      o `shouldBeFailure` \f → case f of ReservationFailed (OverheadExceedsModel got room) → got == budgetBytes cfg + 1 && room == budgetBytes cfg; _ → False
+      rulesConsumed (envProbe env) >>= (`shouldBe` True)
+      openFds (envProbe env) >>= (`shouldBe` [])
+      listDirectory (envDir env) >>= (`shouldBe` [])
+      (svBackings <$> atomically (serviceView (envSvc env))) `shouldReturn` 0
 
   it "serializes reservations on one volume, so two arenas cannot spend the same observed headroom" $
     withEnv $ \env → do
-      let allowance = cfgAllowanceBytes (hCfg cfg64)
+      let allowance = payloadBytes (hCfg cfg64)
       -- a baseline with room for exactly one reservation beside the headroom
       addRule (envProbe env) (-1) (== OpStatFilesystem) (FreeAfterOwn (minHeadroomBytes + allowance + 32 * 1024 * 1024))
       gate ← addGate (envProbe env) isReserve
@@ -163,7 +233,7 @@ spec = describe "Storage backend: opening a backing" $ do
       , ("descriptor leaks through exec", \p → addRule p 1 (== OpCloexecFlag) NotCloexec, \f → case f of StorageIo (IoFailure IoCloexec IoStateWrong _ _ _ _) → True; _ → False)
       , ("filesystem query fails", \p → addRule p 1 (== OpStatFilesystem) (FailWith (Errno 5)), \f → case f of StorageIo (IoFailure IoStatFs _ _ _ _ _) → True; _ → False)
       , ("filesystem not qualified", \p → addRule p 1 (== OpStatFilesystem) (FilesystemIs "tmpfs"), \f → case f of StorageUnsupported (FilesystemNotQualified "tmpfs") → True; _ → False)
-      , ("headroom", \p → addRule p 1 (== OpStatFilesystem) (FreeBytesAre (64 * 1024 * 1024 + 255 * 1024 * 1024)), \f → case f of ReservationFailed (InsufficientHeadroom {}) → True; _ → False)
+      , ("headroom", \p → addRule p 1 (== OpStatFilesystem) (FreeBytesAre (payloadBytes (hCfg cfg64) + 255 * 1024 * 1024)), \f → case f of ReservationFailed (InsufficientHeadroom {}) → True; _ → False)
       , ("native allocation unsupported", \p → addRule p 1 isReserve' (FailWith (er C.eNOTSUP)), \f → case f of StorageUnsupported (NativeUnsupported StepAllocate _) → True; _ → False)
       , ("native allocation refused", \p → addRule p 1 isReserve' (FailWith (er C.eNOSPC)), \f → case f of ReservationFailed (AllocationRefused _) → True; _ → False)
       , ("length cannot be established", \p → addRule p 1 isLength (FailWith (er C.eIO)), \f → case f of ReservationFailed (LengthFailed _) → True; _ → False)

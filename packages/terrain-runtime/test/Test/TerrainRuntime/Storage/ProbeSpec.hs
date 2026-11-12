@@ -175,7 +175,7 @@ probeCases =
           [fd] <- fdHandles (envProbe env)
           pattern' fd (cfgAllowanceBytes cfg) 4
           addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (10 * mib))
-          addRule (envProbe env) 1 (== OpSetFileLength (64 * mib)) (FailWith (Errno (fromIntegral (let C.Errno c = C.eIO in c))))
+          addRule (envProbe env) 1 (== OpSetFileLength (payloadBytes (hCfg h64))) (FailWith (Errno (fromIntegral (let C.Errno c = C.eIO in c))))
           o <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
           o `shouldBeFailure` \f -> case f of ReservationFailed (OverheadExceedsModel _ _) -> True; _ -> False
           v <- atomically (backingView (envSvc env) b)

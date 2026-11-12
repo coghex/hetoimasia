@@ -22,11 +22,14 @@ module Test.TerrainRuntime.Storage.Harness
   , fsNameOf
   , ident
   , ident2
+  , payloadBytes
+  , budgetBytes
 
     -- * The seam
   , Probe (..)
   , newProbe
   , seamFor
+  , withCloseFact
   , quiet
   , Gate (..)
   , Act (..)
@@ -95,7 +98,8 @@ import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), StoreIdentity)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan (..), Planned (..), TxClass (..))
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, StoreSpec)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (pageSize)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, StoreSpec, cfgAllowanceBytes, cfgTotalPages)
 import System.IO.Temp (withSystemTempDirectory)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
 import Test.Hspec (expectationFailure, shouldSatisfy)
@@ -266,6 +270,10 @@ takeRuleFrom ref op = atomically $ do
         | otherwise = go rest
   go rules
 
+-- | The same seam under another platform fact about a failed close.
+withCloseFact ∷ CloseFact → Seam → Seam
+withCloseFact f sm = sm {seamNative = (seamNative sm) {nativeCloseFact = f}}
+
 -- | The seam: production natives, perturbed by the probe's rules and gates.
 seamFor ∷ Probe → Seam
 seamFor p = Seam wrapped before after
@@ -300,7 +308,10 @@ seamFor p = Seam wrapped before after
           atomically (readTVar (gOpen g) >>= check)
     wrapped =
       real
-        { nativeCreate = \dir name → do
+        { -- THE HOST'S OWN FACT IS NOT THE EXAMPLES': every example runs against a fixed close fact (a failed close has
+          -- released the descriptor) unless it asks for the other, so no result depends on the platform it runs on
+          nativeCloseFact = CloseReleasesOnFailure
+        , nativeCreate = \dir name → do
             a ← takeRule p OpCreateFile
             case a of
               Just (FailWith e) → pure (Left e)
@@ -403,10 +414,12 @@ data EnvOptions = EnvOptions
   , eoHeadroom ∷ !Word64
   , eoUnbounded ∷ !Bool
   -- ^ Whether the body runs without the routine suite's bound (a probe's heavy steps).
+  , eoCloseFact ∷ !CloseFact
+  -- ^ The platform fact about a failed close the service runs under (the table's two values).
   }
 
 defaultOptions ∷ EnvOptions
-defaultOptions = EnvOptions Nothing minHeadroomBytes False
+defaultOptions = EnvOptions Nothing minHeadroomBytes False CloseReleasesOnFailure
 
 quiet ∷ Logger
 quiet = mkLogger defaultLogFilter (callbackSink (\_ → pure ()))
@@ -450,7 +463,7 @@ withEnvIn dir opts body = do
     -- the service's end is attempted whatever the body did, and the ledger check below runs even when the service's
     -- own end reports a cleanup failure; that failure, with its context, is rethrown after it
     ended ← tryWithContext $ withWorkerGroup $ \group →
-      withStorageService (StoragePorts admission group quiet (seamFor probe) cfg) $ \svc →
+      withStorageService (StoragePorts admission group quiet (withCloseFact (eoCloseFact opts) (seamFor probe)) cfg) $ \svc →
         ((if eoUnbounded opts then id else bounded) (body (Env svc admission probe dir cfg)) `finally` openAllGates probe) >>= writeIORef result . Just
     leaked ← A.ledgers <$> readTVarIO admission
     unless (ledgerZero leaked) (expectationFailure ("the service leaked accounting: " <> show leaked))
@@ -610,3 +623,11 @@ awaitBlockedOnThrowTo tid = bounded loop
         ThreadDied → expectationFailure "the sender died"
         _ → yield >> loop
 
+-- | The file length the service asks of the platform for a configuration: the model's usable pages and nothing else (the
+-- allowance less the model's overhead, on the page grid).
+payloadBytes ∷ StoreConfig → Word64
+payloadBytes cfg = cfgTotalPages cfg * fromIntegral pageSize
+
+-- | What the allowance leaves for the platform's own overhead: the physical allocation must fit it.
+budgetBytes ∷ StoreConfig → Word64
+budgetBytes cfg = cfgAllowanceBytes cfg - payloadBytes cfg

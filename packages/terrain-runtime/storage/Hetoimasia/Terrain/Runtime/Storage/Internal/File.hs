@@ -157,21 +157,23 @@ data Stopped = StoppedFailure !StorageFailure !Bool | StoppedCancelled !Bool
 -- coordination for the whole call, so no other reservation spends the headroom
 -- observed here. The cancellation test is read between steps; a stop leaves
 -- whatever the native steps obtained for the caller to release.
-reserveRange ∷ Seam → StorageConfig → IO Bool → Fd → Word64 → Word64 → IO (Either Stopped Reserved)
-reserveRange seam cfg cancelled fd off len = do
+reserveRange ∷ Seam → StorageConfig → IO Bool → Fd → Word64 → Word64 → Word64 → IO (Either Stopped Reserved)
+reserveRange seam cfg cancelled fd off len keep = do
   prof ← profileOf seam fd
   case prof of
     Left (op, e) → pure (Left (StoppedFailure (StorageIo (ioFailure op e Nothing)) False))
     Right p
       | not (qualifies (scQualified cfg) p) → pure (stopFail (StorageUnsupported (FilesystemNotQualified (vpFilesystem p))))
       | otherwise → case headroomLeft p of
-          Nothing → pure (stopFail (ReservationFailed (InsufficientHeadroom (vpAvailableBytes p) len (scHeadroomBytes cfg))))
+          Nothing → pure (stopFail (ReservationFailed (InsufficientHeadroom (vpAvailableBytes p) keep (scHeadroomBytes cfg))))
           Just () → afterCheck p
   where
     end = off + len
     stopFail f = Left (StoppedFailure f False)
     stopAfter f = Left (StoppedFailure f True)
-    headroomLeft p = case availableAfter p len of
+    -- the headroom is kept after the ALLOWANCE the request is for (@keep@, never less than @len@): the file can occupy up
+    -- to that much, so the headroom holds however the platform's overhead falls
+    headroomLeft p = case availableAfter p (max keep len) of
       Just left | left >= scHeadroomBytes cfg → Just ()
       _ → Nothing
     afterCheck p = do

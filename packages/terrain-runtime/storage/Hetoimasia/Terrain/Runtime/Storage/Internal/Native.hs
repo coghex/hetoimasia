@@ -38,6 +38,8 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Native
   , NativeStat (..)
   , NativeFs (..)
   , Native (..)
+  , CloseFact (..)
+  , closeFactOf
   , NativeOp (..)
   , Seam (..)
   , posixNative
@@ -53,6 +55,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Word (Word64, Word8)
+import System.Info (os)
 import Foreign.C.String (CString, peekCString)
 import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
@@ -107,7 +110,46 @@ data Native = Native
   , nativePread ∷ Fd → Ptr Word8 → Int → Word64 → IO (Either Errno Int)
   , nativePwrite ∷ Fd → Ptr Word8 → Int → Word64 → IO (Either Errno Int)
   , nativeClose ∷ Fd → IO (Either Errno ())
+  , nativeCloseFact ∷ !CloseFact
+  -- ^ What this platform has ESTABLISHED about a close that fails (see 'closeFactOf').
   }
+
+-- | THE PLATFORM-FACT TABLE FOR A FAILED @close(2)@. The backend assumes nothing a platform has not established: a
+-- failed close is made once and never retried on every platform, and what the service then does with the backing's
+-- reservation depends on this table, one row per supported platform, with the ground each row stands on.
+--
+-- +----------+---------------------------+------------------------------------------------------------------------------+
+-- | Platform | Fact                      | Ground                                                                       |
+-- +==========+===========================+==============================================================================+
+-- | Linux    | 'CloseReleasesOnFailure'  | ESTABLISHED BY ITS DOCUMENTATION (close(2), NOTES): "Retrying the close()    |
+-- |          |                           | after a failure return is the wrong thing to do, since this may cause a      |
+-- |          |                           | reused file descriptor from another thread to be closed. This can occur      |
+-- |          |                           | because the Linux kernel always releases the file descriptor early in the    |
+-- |          |                           | close operation, freeing it for reuse; the steps that may return an error,   |
+-- |          |                           | such as flushing data to the filesystem or device, occur only later in the   |
+-- |          |                           | close operation." A failed close has released the descriptor.                |
+-- +----------+---------------------------+------------------------------------------------------------------------------+
+-- | macOS    | 'CloseNotEstablished'     | NOT ESTABLISHED. close(2) on macOS documents no such guarantee. Its open-    |
+-- |          |                           | source kernel (XNU) is cited to release the descriptor before it calls the   |
+-- |          |                           | file's close operation, but that is a reading of source, not a documented    |
+-- |          |                           | contract and not demonstrated (a failing close cannot be induced on APFS     |
+-- |          |                           | inside the approved fixtures); NO CLAIM RESTS ON IT. Observed only: a        |
+-- |          |                           | SUCCESSFUL close releases the descriptor (a second close answers EBADF).     |
+-- +----------+---------------------------+------------------------------------------------------------------------------+
+-- | any other| 'CloseNotEstablished'     | nothing is established.                                                      |
+-- +----------+---------------------------+------------------------------------------------------------------------------+
+--
+-- What the service does with the row: where a failed close is established to have released the descriptor, the
+-- backing's reservation is released with it (the space is free). Where it is NOT established, the close is never
+-- retried and the backing's reservation STAYS COUNTED, as possibly still held, in a charged record of its own until the
+-- service ends; the failure is reported as a labelled cleanup failure either way. A SUCCESSFUL close is the same on both.
+data CloseFact = CloseReleasesOnFailure | CloseNotEstablished
+  deriving stock (Eq, Show)
+
+-- | The table, by the platform's name (@System.Info.os@). Anything the table does not name is not established.
+closeFactOf ∷ String → CloseFact
+closeFactOf "linux" = CloseReleasesOnFailure
+closeFactOf _ = CloseNotEstablished
 
 -- | The operations a hook can see. The payload names where the operation acts,
 -- so a test can hold or fail one specific transfer.
@@ -254,6 +296,7 @@ posixNative =
     , nativePread = \(Fd fd) buf n off → transferred <$> c_pread fd buf (fromIntegral n) off
     , nativePwrite = \(Fd fd) buf n off → transferred <$> c_pwrite fd buf (fromIntegral n) off
     , nativeClose = \(Fd fd) → (\r → status r ()) <$> c_close fd
+    , nativeCloseFact = closeFactOf os
     }
 
 -- | A descriptor-free rendering of an errno for diagnostics.
