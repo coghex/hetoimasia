@@ -65,7 +65,7 @@ module Test.TerrainRuntime.Storage.Harness
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (finally)
+import Control.Exception (ExceptionWithContext, SomeException, finally, rethrowIO, tryWithContext)
 import Control.Monad (forM_, unless)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -392,11 +392,16 @@ withEnvIn dir opts body = do
     bank ← either (\e → fail (show e)) pure (A.mkEditBankConfig A.defaultEditBankSpec)
     admission ← newTVarIO (A.newAdmission bank)
     result ← newIORef Nothing
-    withWorkerGroup $ \group →
+    -- the service's end is attempted whatever the body did, and the ledger check below runs even when the service's
+    -- own end reports a cleanup failure; that failure, with its context, is rethrown after it
+    ended ← tryWithContext $ withWorkerGroup $ \group →
       withStorageService (StoragePorts admission group quiet (seamFor probe) cfg) $ \svc →
         ((if eoUnbounded opts then id else bounded) (body (Env svc admission probe dir cfg)) `finally` openAllGates probe) >>= writeIORef result . Just
     leaked ← A.ledgers <$> readTVarIO admission
     unless (ledgerZero leaked) (expectationFailure ("the service leaked accounting: " <> show leaked))
+    case ended of
+      Left (ewc ∷ ExceptionWithContext SomeException) → rethrowIO ewc
+      Right _ → pure ()
     maybe (fail "the example produced no result") pure =<< readIORef result
 
 -- | Open every gate of the probe, so a worker held by a failed example can finish and the service can

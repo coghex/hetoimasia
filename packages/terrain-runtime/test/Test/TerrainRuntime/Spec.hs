@@ -16,6 +16,7 @@ import qualified Test.TerrainRuntime.Revalidation as Revalidation
 import qualified Test.TerrainRuntime.Storage.Classes as StorageClasses
 import qualified Test.TerrainRuntime.Storage.Growth as StorageGrowth
 import qualified Test.TerrainRuntime.Storage.Io as StorageIo
+import qualified Test.TerrainRuntime.Storage.Lifecycle as StorageLifecycle
 import qualified Test.TerrainRuntime.Storage.Lifetime as StorageLifetime
 import qualified Test.TerrainRuntime.Storage.Memory as StorageMemory
 import qualified Test.TerrainRuntime.Storage.Opacity as StorageOpacity
@@ -88,4 +89,5 @@ spec = do
   StorageMemory.spec
   StorageMemory.spec2
   StorageClasses.spec
+  StorageLifecycle.spec
   StorageOpacity.spec
