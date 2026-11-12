@@ -27,10 +27,10 @@
 -- The standalone rows rebuild what the service holds per element, with the same constructors it uses: the job table
 -- node, the queue's element and the admission's own entry for the grant (a job), the backing map's node and the volume
 -- ledger's node (an entry and a closing record), the list cell and the grant (a kept failure).
-module Test.TerrainRuntime.Storage.Memory (spec, spec2, spec3, floorSpec, noiseFloor, signalMultiple) where
+module Test.TerrainRuntime.Storage.Memory (spec, spec2, spec3, floorSpec, rulesSpec, noiseFloor, signalMultiple) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (evaluate)
+import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM, forM_, replicateM, void)
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
@@ -112,6 +112,19 @@ floorSpec = describe "Storage backend: the live-heap reading's noise floor" $
       putStrLn ("memory floor | around a list built, forced and dropped | amplitude " <> show (round lst ∷ Integer))
       putStrLn ("memory floor | around an open and close (observation: it leaves garbage a later collection frees) | min " <> show (round (minimum oc) ∷ Integer) <> " max " <> show (round (maximum oc) ∷ Integer))
       putStrLn ("memory floor | the floor every asserted row must beat " <> show (round signalMultiple ∷ Integer) <> " times | " <> show (round theFloor ∷ Integer))
+
+-- | The rule that no row passes vacuously, shown on values: a measurement of zero or below, and a signal below
+-- 'signalMultiple' times the floor, each FAIL the row.
+rulesSpec ∷ Spec
+rulesSpec = describe "Storage backend: a memory row cannot pass without measuring something" $ do
+  let fails act = (try act ∷ IO (Either SomeException ())) >>= \r → either (const (pure ())) (const (expectationFailure "the row passed")) r
+      big = ceiling (signalMultiple * theFloor) ∷ Int
+  it "fails a row that measured zero, or less than zero (a clamp or a least-of-N would have passed it)" $ do
+    fails (checkSignal "measured nothing" big 0)
+    fails (checkSignal "measured less than nothing" big (-2184))
+  it "fails a row whose signal is below the floor times the multiple, and passes one above it" $ do
+    fails (checkSignal "signal too small" 10 1)
+    checkSignal "signal far above" big 1.5
 
 -- | The live heap that a build adds, per instance: read before, build (forced; it hands back an action that touches
 -- what it built), read after, then the action run so the build stayed live across the second reading.

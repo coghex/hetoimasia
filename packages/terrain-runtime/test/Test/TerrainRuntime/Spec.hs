@@ -86,6 +86,8 @@ spec = do
   StorageIo.spec
   StorageLifetime.spec
   StorageGrowth.spec
+  StorageMemory.floorSpec
+  StorageMemory.rulesSpec
   StorageMemory.spec
   StorageMemory.spec2
   StorageMemory.spec3
