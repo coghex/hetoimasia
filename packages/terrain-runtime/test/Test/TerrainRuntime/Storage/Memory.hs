@@ -32,6 +32,8 @@ import System.Mem (performMajorGC)
 import Test.Hspec
 import Test.TerrainRuntime.Storage.Harness
 import Test.TerrainRuntime.Storage.Lifecycle (withControlledService, Ctl (..))
+import qualified Data.Map.Strict as Map
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Data.Unique (newUnique)
 import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThreadOpening)
@@ -113,13 +115,21 @@ spec2 = describe "Storage backend: every other accounted figure is measured" $ d
       _ <- awaitOutcome env t
       pure ()
 
-  it "charges a backing's record at least the live heap it adds, with a growth prepared and a reservation pending" $
+  it "charges a backing's record at least the live heap it adds (the service-level cross-check)" $
     withEnv $ \env -> do
       -- one open first, so the figures are the records' and not one-time initialisation
       warm <- openBacking env (identOf 9 99) (hCfg h0)
-      -- Fifteen independent samples (each opens a backing and closes it), the LEAST taken: what the live heap shows is
-      -- the structure plus noise (a pinned block kept alive by one live object, the timing of a collection), and noise
-      -- only ever ADDS, so the least sample is the best estimate of the structure itself.
+      -- Fifteen independent samples (each opens a backing and closes it), the LEAST taken. WHY THE LEAST IS SOUND: a
+      -- reading of the live heap is the structure plus noise (a pinned block kept alive by one live object, the
+      -- timing of a collection), and that noise only ever ADDS, so the least of independent samples is the best
+      -- estimate. The negative figure seen once (-2512) came from the earlier version of this row, which SUBTRACTED
+      -- two readings taken across a state change that frees as much as it allocates (a growth job's record and
+      -- outcome were retired between them): such a difference is not a measurement of any structure. These samples
+      -- do not do that: each is one quiescent reading, one open (the structure appears, its job record is already
+      -- retired by the harness's take), one reading; nothing the baseline held is freed by the open (the baseline was
+      -- collected twice and a warm-up open has forced the lazily evaluated parts). The residual cases (a thunk whose
+      -- evaluation shrinks what it was) are caught by the guard below, which fails a cross-check that is not at least
+      -- the standalone entry's size. The BOUND is the standalone row below; this row is its cross-check.
       samples <- forM [1 .. 15 :: Int] $ \k -> do
         heapBefore <- live
         b <- openBacking env (identOf (fromIntegral k) (fromIntegral (100 + k))) (hCfg h0)
@@ -127,14 +137,46 @@ spec2 = describe "Storage backend: every other accounted figure is measured" $ d
         _ <- closeBacking (envSvc env) b
         pure (fromIntegral heapOpen - fromIntegral heapBefore ∷ Double)
       _ <- closeBacking (envSvc env) warm
-      -- the largest variant of the entry adds, by its structure and not by a measurement: a pending reservation is a
-      -- 'Just' of a boxed word (32 bytes) and a prepared growth's slot is a six-field record (64 bytes)
       let opened = minimum samples
-          variants = 128 ∷ Double
-      putStrLn ("measured bytes per open backing: " <> show opened <> ", the largest variant of its entry adding " <> show variants <> " by structure (accounted " <> show backingRecordBytes <> " for both)")
-      (opened + variants) `shouldSatisfy` (<= fromIntegral backingRecordBytes)
+      standaloneEntry <- entryCost env
+      putStrLn ("measured bytes per open backing (cross-check): " <> show opened <> " (accounted " <> show backingRecordBytes <> "; the standalone largest entry with its map places: " <> show standaloneEntry <> ")")
+      opened `shouldSatisfy` (<= fromIntegral backingRecordBytes)
+      -- the guard: a service that holds a backing holds at least its entry
+      opened `shouldSatisfy` (>= standaloneEntry)
+
+  it "charges a backing's record at least its largest entry, measured as a value, with the service's own places for it" $
+    withEnv $ \env -> do
+      standaloneEntry <- entryCost env
+      row "backing entry, largest variant (GReleasing (Just prepared), a pending reservation), standalone, with its backing-map node and its volume-ledger node" backingRecordBytes standaloneEntry
   where
     bounded' = bounded
+    -- THE LARGEST VARIANT OF THE ENTRY, as a value. Every field is a word or a boxed word except the growth slot:
+    -- 'GIdle' and 'GRunning' are shared nullary constructors, 'GPrepared' holds one six-field 'PreparedGrowth', and
+    -- 'GReleasing' holds a 'Maybe' of one, so GReleasing (Just prepared) is the largest (the slot box, the Just
+    -- box and the PreparedGrowth). A pending reservation is present (a Just of a boxed word), the entry is open,
+    -- and its grant is a real control grant. What backingRecordBytes pays for is this entry plus its node in the
+    -- service's backing map (and the closing-record map it moves to, never both) plus its volume's node in the
+    -- reserved-figure map, so both maps are measured with it, 200 entries at a time, per entry.
+    entryCost env = do
+      fd <- (\fds -> case fds of f : _ -> f; [] -> error "no descriptor") <$> fdHandles (envProbe env)
+      _ <- openBacking env ident (hCfg h0)
+      fd' <- (\fds -> case fds of f : _ -> f; [] -> fd) <$> fdHandles (envProbe env)
+      u <- newUnique
+      bank <- either (fail . show) pure (A.mkEditBankConfig A.defaultEditBankSpec)
+      let n = 200 :: Int
+          grants = go (A.newAdmission bank) (replicate n ())
+          go _ [] = []
+          go a (_ : rest) = case A.reserve A.Foreground [A.ControlCredit backingRecordBytes] a of
+            Right (g, a') -> g : go a' rest
+            Left _ -> error "no control credit for the standalone entries"
+          entry i g = Entry fd' ident (fromIntegral i) (1024 * mib') (1024 * mib') mib' (GReleasing (Just (PreparedGrowth u (fromIntegral i) (fromIntegral i) (64 * mib') (128 * mib') (fromIntegral i)))) (Just (fromIntegral i)) EOpen (fromIntegral i) (maxBound - fromIntegral i) g
+      heapBefore <- live
+      let backings = Map.fromList [(fromIntegral i ∷ Word64, entry i g) | (i, g) <- zip [1 .. n] grants]
+          ledger = Map.fromList [(fromIntegral i, fromIntegral i * 3) | i <- [1 .. n]] :: Map.Map Word64 Word64
+      _ <- evaluate (sum [fromIntegral (eBorrows e) + eCap e | e <- Map.elems backings] + sum (Map.elems ledger))
+      heapAfter <- live
+      _ <- evaluate (Map.size backings + Map.size ledger)
+      pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral n ∷ Double)
 
 -- ---------------------------------------------------------------------------
 -- Every retained structure, charged and measured at its LARGEST instance

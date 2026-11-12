@@ -114,6 +114,9 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , maxKept
   , keepEvidence
   , keptEntryBytes
+  , Entry (..)
+  , GrowthSlot (..)
+  , EntryPhase (..)
   , StagedWrite (..)
   , Kept (..)
   , EvidenceDropped (..)
