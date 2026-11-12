@@ -407,11 +407,11 @@ data Job = Job
   , jDiscard ∷ !Bool
   -- ^ The holder discarded the ticket while the job ran: it is retired when it finishes.
   , jDelivered ∷ !Bool
+  -- ^ A callback of 'withOutcome' returned normally with the outcome: the caller owns what it carries. A delivery
+  -- has three ends: delivered (this mark), failed (the callback raised: nobody owns it) and undelivered.
   , jCharge ∷ !Word64
   -- ^ The control charge this record paid at admission ('jobCharge' of its work then): kept as a number, so that a
   -- finished job's work can be dropped to its shape and the snapshot still reads what the record paid.
-  -- ^ A callback of 'withOutcome' returned normally with the outcome: the caller owns what it carries. A delivery
-  -- has three ends: delivered (this mark), failed (the callback raised: nobody owns it) and undelivered.
   }
 
 -- ---------------------------------------------------------------------------
