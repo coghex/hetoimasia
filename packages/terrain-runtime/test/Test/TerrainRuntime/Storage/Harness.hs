@@ -249,6 +249,7 @@ seamFor p = Seam wrapped before after
             a ← takeRule p OpCreateFile
             case a of
               Just (FailWith e) → pure (Left e)
+              Just Throw → ioError (userError "injected exception")
               _ → do
                 r ← nativeCreate real dir name
                 case r of
@@ -259,20 +260,24 @@ seamFor p = Seam wrapped before after
             a ← takeRule p OpUnlinkFile
             case a of
               Just (FailWith e) → pure (Left e)
+              Just Throw → ioError (userError "injected exception")
               _ → nativeUnlink real d n
         , nativeCloexec = \fd → do
             r ← nativeCloexec real fd
             a ← takeRule p OpCloexecFlag
-            pure $ case (a, r) of
-              (Just NotCloexec, Right _) → Right False
-              _ → r
+            case (a, r) of
+              (Just NotCloexec, Right _) → pure (Right False)
+              (Just Throw, _) → ioError (userError "injected exception")
+              (Just (FailWith e), _) → pure (Left e)
+              _ → pure r
         , nativeStat = \fd → do
             r ← nativeStat real fd
             a ← takeRule p OpStatFile
-            pure $ case (a, r) of
-              (Just (OverAllocated n), Right s) → Right s {nsAllocated = nsAllocated s + n}
-              (Just (FailWith e), _) → Left e
-              _ → r
+            case (a, r) of
+              (Just (OverAllocated n), Right s) → pure (Right s {nsAllocated = nsAllocated s + n})
+              (Just (FailWith e), _) → pure (Left e)
+              (Just Throw, _) → ioError (userError "injected exception")
+              _ → pure r
         , nativeStatFs = \fd → do
             r ← nativeStatFs real fd
             a ← takeRule p OpStatFilesystem
@@ -284,17 +289,20 @@ seamFor p = Seam wrapped before after
                 pure (Right f {nfAvailableBytes = n - min n (sum sizes)})
               (Just (FilesystemIs n), Right f) → pure (Right f {nfTypeName = n})
               (Just (FailWith e), _) → pure (Left e)
+              (Just Throw, _) → ioError (userError "injected exception")
               _ → pure r
         , nativeReserve = \fd off len → do
             a ← takeRule p (OpReserveRange off len)
             case a of
               Just (FailWith e) → pure (Left e)
+              Just Throw → ioError (userError "injected exception")
               Just Lie → pure (Right len)
               _ → nativeReserve real fd off len
         , nativeSetLength = \fd len → do
             a ← takeRule p (OpSetFileLength len)
             case a of
               Just (FailWith e) → pure (Left e)
+              Just Throw → ioError (userError "injected exception")
               _ → nativeSetLength real fd len
         , nativePread = \fd ptr n off → do
             a ← takeRule p (OpReadAt off n)
@@ -309,6 +317,7 @@ seamFor p = Seam wrapped before after
             case a of
               Just (FailWith e) → pure (Left e)
               Just ZeroBytes → pure (Right 0)
+              Just Throw → ioError (userError "injected exception")
               Just (ShortTo k) → nativePwrite real fd ptr (min k n) off
               _ → nativePwrite real fd ptr n off
         , nativeClose = \fd → do
@@ -317,6 +326,8 @@ seamFor p = Seam wrapped before after
             a ← takeRule p OpCloseFile
             case a of
               Just (FailWith e) → pure (Left e)
+              -- the call was made and then the exception is raised, as a failing close does
+              Just Throw → ioError (userError "injected exception")
               _ → pure r
         }
 

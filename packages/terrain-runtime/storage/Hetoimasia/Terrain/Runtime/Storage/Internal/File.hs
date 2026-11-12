@@ -146,8 +146,11 @@ data Reserved = Reserved
   }
   deriving stock (Eq, Show)
 
--- | Why a step did not finish: a failure, or a cancellation seen between steps.
-data Stopped = StoppedFailure !StorageFailure | StoppedCancelled
+-- | Why a step did not finish: a failure, or a cancellation seen between steps. The flag says
+-- whether the native allocation had been attempted when it stopped, so the caller knows whether
+-- anything may have been acquired (every stop after the allocation call may hold space, even a
+-- failure of the final query: only a stop before it obtained nothing).
+data Stopped = StoppedFailure !StorageFailure !Bool | StoppedCancelled !Bool
   deriving stock (Eq, Show)
 
 -- | Reserve @[off, off + len)@ and prove it. The caller holds the volume's
@@ -158,7 +161,7 @@ reserveRange ∷ Seam → StorageConfig → IO Bool → Fd → Word64 → Word64
 reserveRange seam cfg cancelled fd off len = do
   prof ← profileOf seam fd
   case prof of
-    Left (op, e) → pure (Left (StoppedFailure (StorageIo (ioFailure op e Nothing))))
+    Left (op, e) → pure (Left (StoppedFailure (StorageIo (ioFailure op e Nothing)) False))
     Right p
       | not (qualifies (scQualified cfg) p) → pure (stopFail (StorageUnsupported (FilesystemNotQualified (vpFilesystem p))))
       | otherwise → case headroomLeft p of
@@ -166,39 +169,40 @@ reserveRange seam cfg cancelled fd off len = do
           Just () → afterCheck p
   where
     end = off + len
-    stopFail = Left . StoppedFailure
+    stopFail f = Left (StoppedFailure f False)
+    stopAfter f = Left (StoppedFailure f True)
     headroomLeft p = case availableAfter p len of
       Just left | left >= scHeadroomBytes cfg → Just ()
       _ → Nothing
     afterCheck p = do
       stopped0 ← cancelled
       if stopped0
-        then pure (Left StoppedCancelled)
+        then pure (Left (StoppedCancelled False))
         else do
           r ← around seam (OpReserveRange off len) (nativeReserve (seamNative seam) fd off len)
           case r of
             Left e
-              | unsupportedErrno e → pure (stopFail (StorageUnsupported (NativeUnsupported StepAllocate e)))
-              | otherwise → pure (stopFail (ReservationFailed (AllocationRefused e)))
+              | unsupportedErrno e → pure (stopAfter (StorageUnsupported (NativeUnsupported StepAllocate e)))
+              | otherwise → pure (stopAfter (ReservationFailed (AllocationRefused e)))
             Right reported
-              | reported /= len → pure (stopFail (ReservationFailed (AllocationShort reported len)))
+              | reported /= len → pure (stopAfter (ReservationFailed (AllocationShort reported len)))
               | otherwise → establish p
     establish p = do
       stopped1 ← cancelled
       if stopped1
-        then pure (Left StoppedCancelled)
+        then pure (Left (StoppedCancelled True))
         else do
           l ← around seam (OpSetFileLength end) (nativeSetLength (seamNative seam) fd end)
           case l of
-            Left e → pure (stopFail (ReservationFailed (LengthFailed e)))
+            Left e → pure (stopAfter (ReservationFailed (LengthFailed e)))
             Right () → verify p
     verify p = do
       st ← around seam OpStatFile (nativeStat (seamNative seam) fd)
       pure $ case st of
-        Left e → stopFail (StorageIo (ioFailure IoStat e Nothing))
+        Left e → stopAfter (StorageIo (ioFailure IoStat e Nothing))
         Right s
-          | nsSize s /= end → stopFail (ReservationFailed (LengthMismatch (nsSize s) end))
-          | nsAllocated s < end → stopFail (ReservationFailed (CoverageShort (nsAllocated s) end))
+          | nsSize s /= end → stopAfter (ReservationFailed (LengthMismatch (nsSize s) end))
+          | nsAllocated s < end → stopAfter (ReservationFailed (CoverageShort (nsAllocated s) end))
           | otherwise → Right (Reserved (nsAllocated s) (nsSize s) (nsAllocated s - end) p)
 
 -- | Give back the reservation of @[from, to)@: make sure the file is at least

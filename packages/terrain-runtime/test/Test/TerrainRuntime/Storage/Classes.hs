@@ -1,0 +1,446 @@
+-- | The four classes of defect round 1 of review found, each as a class and not as its instances.
+--
+-- (A) The probe's fixture: every example reaches a filler or a reservation only through a verified 'Fixture'.
+-- (B) The growth state machine: every gate point of a growth against every event injected there, and every event
+--     in the prepared and releasing states, each outcome one the state table (Service, 'GrowthSlot') allows, with the
+--     reported reservation always equal to the file's physical allocation afterwards.
+-- (C) Every native resource has an owner at every instant, exceptions included: for each native call at each stage
+--     it occurs in, a typed failure, a thrown exception and a cancellation, then the process's open descriptors are
+--     back to the baseline, no backing is tracked without a descriptor or the reverse, and the allocation matches.
+-- (D) Every charge is released on every path: reviewer reproductions as direct examples and random sequences of
+--     submit, cancel, discard, take, close and shutdown with the shared admission back to its starting figures.
+module Test.TerrainRuntime.Storage.Classes (spec) where
+
+import Control.Concurrent (throwTo)
+import Control.Concurrent.MVar
+import Control.Concurrent.STM
+import Control.Exception (AsyncException (UserInterrupt), try, SomeException)
+import Control.Monad (forM, forM_, unless, void, when)
+import qualified Data.ByteString.Char8 as BC
+import Data.IORef
+import Data.Word (Word64)
+import qualified Foreign.C.Error as C
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
+import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), StoreIdentity (..))
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
+import System.Directory (doesDirectoryExist, listDirectory)
+import System.FilePath ((</>))
+import System.IO (hFlush, stdout)
+import System.IO.Temp (withSystemTempDirectory)
+import Test.Hspec
+import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
+import Test.TerrainRuntime.Storage.Fixture
+import Test.TerrainRuntime.Storage.Harness
+import Test.TerrainRuntime.Storage.ProbeSpec (probeCases)
+import Test.TerrainRuntime.Store.Harness (H (..), smallSpec)
+
+mib :: Word64
+mib = 1024 * 1024
+
+h0 :: H
+h0 = newStoreH smallSpec
+
+eio :: Errno
+eio = let C.Errno c = C.eIO in Errno (fromIntegral c)
+
+openFdCount :: IO Int
+openFdCount = do
+  proc' <- doesDirectoryExist "/proc/self/fd"
+  length <$> listDirectory (if proc' then "/proc/self/fd" else "/dev/fd")
+
+view :: Env -> IO ServiceView
+view env = atomically (serviceView (envSvc env))
+
+backing' :: Env -> Backing -> IO BackingView
+backing' env b = atomically (backingView (envSvc env) b) >>= maybe (fail "no backing") pure
+
+allocatedOf :: Env -> IO Word64
+allocatedOf env = do
+  fds <- fdHandles (envProbe env)
+  case fds of
+    fd : _ -> either (fail . show) (pure . nsAllocated) =<< nativeStat posixNative fd
+    [] -> fail "no descriptor"
+
+-- | The reservation the service reports (held on the volume) equals the file's physical allocation, to the
+-- filesystem's accounting of one block.
+reportedMatchesPhysical :: Env -> IO ()
+reportedMatchesPhysical env = do
+  held <- sum . svReserved <$> view env
+  phys <- allocatedOf env
+  (held, phys) `shouldSatisfy` \(h, p) -> p <= h + 4096 && h <= p + 4096
+
+isReserve, isStat :: NativeOp -> Bool
+isReserve op = case op of OpReserveRange _ _ -> True; _ -> False
+isStat op = op == OpStatFile
+
+-- ---------------------------------------------------------------------------
+
+spec :: Spec
+spec = describe "Storage backend: the classes round 1 of review found" $ do
+  fixtureClass
+  growthClass
+  sweepClass
+  chargeClass
+
+-- ---------------------------------------------------------------------------
+-- (A) the probe's fixture
+
+fixtureClass :: Spec
+fixtureClass = describe "(A) the probe fixture" $
+  it "refuses a fixture over the cap, a missing one and (where it is the same volume) the ordinary drive, and every probe case fails at the acquisition with nothing allocated" $
+    withSystemTempDirectory "hetoimasia-terrain-fixture" $ \dir -> do
+      over <- acquireFixture (Policy mib False) dir
+      missing <- acquireFixture defaultPolicy (dir </> "absent")
+      fine <- acquireFixture (Policy maxBound False) dir
+      over `shouldSatisfy` isOver
+      missing `shouldSatisfy` \r -> case r of Left (MissingDirectory _) -> True; _ -> False
+      fine `shouldSatisfy` either (const False) (const True)
+      -- each of the probe's cases, handed the refusal, fails before it does anything
+      forM_ [over, missing] $ \refused ->
+        forM_ probeCases $ \(name, run) -> do
+          r <- try (run (pure refused))
+          (name, either (\e -> const True (e :: SomeException)) (const False) r) `shouldBe` (name, True)
+      -- nothing was created or reserved on the way
+      listDirectory dir `shouldReturn` []
+  where
+    isOver r = case r of Left (OverCap _ _) -> True; _ -> False
+
+-- ---------------------------------------------------------------------------
+-- (B) the growth state machine
+
+data GrowthEvent = EvNone | EvCancel | EvCommit | EvAbandon | EvSecondGrowth | EvReleasePending
+  deriving stock (Eq, Show, Enum, Bounded)
+
+growthClass :: Spec
+growthClass = describe "(B) the growth state machine" $ do
+  it "allows only the outcomes of the state table at every gate point of a growth, for every event injected there" $
+    forM_ gatePoints $ \(gname, gate) ->
+      forM_ [minBound .. maxBound] $ \ev ->
+        withEnv $ \env -> do
+          b <- openBacking env ident (hCfg h0)
+          -- a token of an earlier, abandoned preparation of this very growth: stale at every gate point
+          old <- preparedOn env b
+          submitAbandon (envSvc env) b old >>= either (fail . show) pure >>= awaitOutcome env >>= (`shouldBe` Released)
+          g <- gate (envProbe env)
+          t <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= either (fail . show) pure
+          awaitReached g 1
+          refusal <- case ev of
+            EvNone -> pure Nothing
+            EvCancel -> cancelTicket (envSvc env) t >>= \c -> pure (if c == CancelRequested then Nothing else Just (show c))
+            EvCommit -> commitBackingGrowth (envSvc env) b old >>= \r ->
+              pure (case r of Left (InvalidRequest NoPreparedGrowth) -> Nothing; other -> Just (show other))
+            EvAbandon -> submitAbandon (envSvc env) b old >>= \r ->
+              pure (case r of Left (InvalidRequest NoPreparedGrowth) -> Nothing; other -> Just (show (fmap (const ()) other)))
+            EvSecondGrowth -> submitGrowth (envSvc env) b (64 * mib) (96 * mib) >>= \r ->
+              pure (case r of Left (BusyNow GrowthActive) -> Nothing; other -> Just (show (fmap (const ()) other)))
+            EvReleasePending -> submitReleasePending (envSvc env) b >>= \r ->
+              pure (case r of Left (InvalidRequest NoPreparedGrowth) -> Nothing; other -> Just (show (fmap (const ()) other)))
+          (gname, show ev, refusal) `shouldBe` (gname, show ev, Nothing)
+          openGate g
+          o <- awaitOutcome env t
+          case (ev, o) of
+            (EvCancel, Cancelled _) -> do
+              reportedMatchesPhysical env
+              (bvGrowthPrepared <$> backing' env b) >>= (`shouldBe` False)
+              allocatedOf env >>= (`shouldSatisfy` (<= 64 * mib + 4096))
+            (EvCancel, other) -> expectationFailure (gname <> ": cancel produced " <> show other)
+            (_, GrowthPrepared _ _) -> do
+              reportedMatchesPhysical env
+              (bvGrowthPrepared <$> backing' env b) >>= (`shouldBe` True)
+            (_, other) -> expectationFailure (show (gname, ev, other))
+
+  it "revokes the commit authority in the step that accepts an abandon, and refuses every event while the release runs" $
+    withEnv $ \env -> do
+      b <- openBacking env ident (hCfg h0)
+      p <- prepared env b
+      g <- addGate (envProbe env) (== OpSetFileLength (64 * mib))
+      t <- submitAbandon (envSvc env) b p >>= either (fail . show) pure
+      awaitReached g 1
+      -- the release is running: the token commits nothing, a second abandon, a growth and a release are refused
+      commitBackingGrowth (envSvc env) b p >>= (`shouldBe` Left (InvalidRequest NoPreparedGrowth))
+      submitAbandon (envSvc env) b p >>= (`shouldBe` Left (InvalidRequest NoPreparedGrowth)) . fmap (const ())
+      submitGrowth (envSvc env) b (64 * mib) (96 * mib) >>= (`shouldBe` Left (BusyNow GrowthActive)) . fmap (const ())
+      submitReleasePending (envSvc env) b >>= (`shouldBe` Left (InvalidRequest NoPreparedGrowth)) . fmap (const ())
+      openGate g
+      awaitOutcome env t >>= (`shouldBe` Released)
+      reportedMatchesPhysical env
+      (bvCommittedBytes <$> backing' env b) >>= (`shouldBe` 64 * mib)
+      -- the same growth prepared again is a new preparation: the abandoned token is refused and the new one commits
+      p2 <- prepared env b
+      p2 `shouldSatisfy` (/= p)
+      commitBackingGrowth (envSvc env) b p >>= (`shouldBe` Left (InvalidRequest NoPreparedGrowth))
+      submitAbandon (envSvc env) b p >>= (`shouldBe` Left (InvalidRequest NoPreparedGrowth)) . fmap (const ())
+      commitBackingGrowth (envSvc env) b p2 >>= (`shouldBe` Right ())
+      commitBackingGrowth (envSvc env) b p2 >>= (`shouldBe` Left (InvalidRequest NoPreparedGrowth))
+      (bvCommittedBytes <$> backing' env b) >>= (`shouldBe` 128 * mib)
+
+  it "refuses a token of another service and sizes off the grid or past the limit before any native work" $ do
+    foreignToken <- withEnv $ \env -> do
+      b <- openBacking env ident (hCfg h0)
+      prepared env b
+    withEnv $ \env -> do
+      b <- openBacking env ident (hCfg h0)
+      _ <- prepared env b
+      commitBackingGrowth (envSvc env) b foreignToken >>= (`shouldBe` Left ForeignHandle)
+      submitAbandon (envSvc env) b foreignToken >>= (`shouldBe` Left (InvalidRequest NoPreparedGrowth)) . fmap (const ())
+    withEnv $ \env -> do
+      b <- openBacking env ident (hCfg h0)
+      before' <- length <$> events (envProbe env)
+      -- 4 KiB past the committed size is off the 1 MiB grid; past the offset limit is refused too
+      submitGrowth (envSvc env) b (64 * mib) (64 * mib + 4096) >>= (`shouldSatisfy` isInvalid) . fmap (const ())
+      submitGrowth (envSvc env) b (64 * mib) maxBound >>= (`shouldSatisfy` isInvalid) . fmap (const ())
+      length <$> events (envProbe env) >>= (`shouldBe` before')
+  where
+    isInvalid r = case r of Left (InvalidRequest (AllowanceInvalid _)) -> True; _ -> False
+    gatePoints :: [(String, Probe -> IO Gate)]
+    gatePoints =
+      [ ("before the allocation", \p -> addGate p isReserve)
+      , ("before the length", \p -> addGate p (== OpSetFileLength (128 * mib)))
+      , ("before the final verification", \p -> addGateAfter p 1 isStat)
+      ]
+
+prepared :: Env -> Backing -> IO PreparedGrowth
+prepared env b = preparedOn env b
+
+preparedOn :: Env -> Backing -> IO PreparedGrowth
+preparedOn env b = do
+  o <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
+  case o of
+    GrowthPrepared p _ -> pure p
+    other -> fail ("not prepared: " <> show other)
+
+-- ---------------------------------------------------------------------------
+-- (C) every native resource has an owner at every instant
+
+data Injection = Typed | Thrown | Cancelled'
+  deriving stock (Eq, Show, Enum, Bounded)
+
+data Stage = SOpen | SGrow | SRelease | SRead | SWrite | SClose
+  deriving stock (Eq, Show)
+
+-- | (stage, native call, the occurrence of it the injection lands on, rules installed first)
+matrix :: [(Stage, String, NativeOp -> Bool, Int, Probe -> IO ())]
+matrix =
+  [ (SOpen, "create", (== OpCreateFile), 0, none)
+  , (SOpen, "unlink", (== OpUnlinkFile), 0, none)
+  , (SOpen, "cloexec", (== OpCloexecFlag), 0, none)
+  , (SOpen, "stat (verify private)", isStat, 0, none)
+  , (SOpen, "stat (profile)", isStat, 1, none)
+  , (SOpen, "statfs", (== OpStatFilesystem), 0, none)
+  , (SOpen, "reserve", isReserve, 0, none)
+  , (SOpen, "set length", isLen, 0, none)
+  , (SOpen, "stat (verify reservation)", isStat, 2, none)
+  , (SOpen, "close (cleanup after a failure)", (== OpCloseFile), 0, \p -> addRule p 1 isReserve (FailWith (Errno 28)))
+  , (SGrow, "stat (profile)", isStat, 0, none)
+  , (SGrow, "statfs", (== OpStatFilesystem), 0, none)
+  , (SGrow, "reserve", isReserve, 0, none)
+  , (SGrow, "set length", isLen, 0, none)
+  , (SGrow, "stat (verify)", isStat, 1, none)
+  , (SGrow, "set length (rollback after a failure)", (== OpSetFileLength (64 * mib)), 0, \p -> addRuleAfter p 1 1 isStat (OverAllocated (10 * mib)))
+  , (SRelease, "stat", isStat, 0, none)
+  , (SRelease, "set length", (== OpSetFileLength (64 * mib)), 0, none)
+  , (SRead, "pread", isRd, 0, none)
+  , (SWrite, "pwrite", isWr, 0, none)
+  , (SClose, "close", (== OpCloseFile), 0, none)
+  ]
+  where
+    none _ = pure ()
+    isLen op = case op of OpSetFileLength _ -> True; _ -> False
+    isRd op = case op of OpReadAt _ _ -> True; _ -> False
+    isWr op = case op of OpWriteAt _ _ -> True; _ -> False
+
+sweepClass :: Spec
+sweepClass = describe "(C) every native resource has an owner at every instant" $
+  it "keeps descriptors, tracking and allocation consistent for each native call at each stage under a typed failure, an exception and a cancellation" $ do
+    cases <- forM matrix $ \(stage, name, match, occurrence, prelude) ->
+      forM [minBound .. maxBound] $ \inj -> do
+        baseline <- openFdCount
+        putStrLn ("  sweep case: " <> show stage <> " / " <> name <> " / " <> show inj) >> hFlush stdout
+        withEnv $ \env -> runCase env stage match occurrence prelude inj
+        fdsAfter <- openFdCount
+        ((show stage, name, show inj), fdsAfter) `shouldBe` ((show stage, name, show inj), baseline)
+        pure ()
+    length (concat cases) `shouldBe` length matrix * length [minBound .. maxBound :: Injection]
+    putStrLn ("sweep: " <> show (length matrix) <> " native calls at their stages x 3 injections = " <> show (length (concat cases)) <> " cases")
+  where
+    runCase :: Env -> Stage -> (NativeOp -> Bool) -> Int -> (Probe -> IO ()) -> Injection -> IO ()
+    runCase env stage match occurrence prelude inj
+      | stage == SClose = closeScenario env inj
+      | otherwise = do
+          let probe = envProbe env
+          act <- case stage of
+            SOpen -> pure (submitOpen (envSvc env) ExplicitWork (OpenSpec (BC.pack (envDir env)) ident (hCfg h0)))
+            SGrow -> do
+              b <- openBacking env ident (hCfg h0)
+              pure (submitGrowth (envSvc env) b (64 * mib) (128 * mib))
+            SRelease -> do
+              b <- openBacking env ident (hCfg h0)
+              p <- preparedOn env b
+              pure (submitAbandon (envSvc env) b p)
+            SRead -> do
+              b <- openBacking env ident (hCfg h0)
+              pure (submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo 5) 1 ReadProbe)
+            SWrite -> do
+              b <- openBacking env ident (hCfg h0)
+              let plan = either error id (planFor h0 1)
+              (tid, s1) <- either (fail . show) pure (admit plan (hStore h0))
+              sw <- either (fail . show) pure (stageWrite s1 tid)
+              pure (submitWrite (envSvc env) b sw)
+            SClose -> fail "unreachable"
+          prelude probe
+          gate <- if inj == Cancelled' then Just <$> addGateAfter probe occurrence match else pure Nothing
+          case inj of
+            Typed -> addRuleAfter probe occurrence 1 match (FailWith eio)
+            Thrown -> addRuleAfter probe occurrence 1 match Throw
+            Cancelled' -> pure ()
+          t <- act >>= either (fail . ("submit refused: " <>) . show) pure
+          forM_ gate $ \g -> do
+            awaitReached g 1
+            void (cancelTicket (envSvc env) t)
+            openGate g
+          o <- awaitOutcome env t
+          show o `shouldSatisfy` (not . null)
+          v <- view env
+          fds <- openFds probe
+          length fds `shouldBe` svBackings v
+          when (stage `elem` [SGrow, SRelease]) (reportedMatchesPhysical env)
+
+-- | Closing a backing under each injection: a typed close error, an exception raised by the close and an
+-- interruption of the closing thread while it waits at the call.
+closeScenario :: Env -> Injection -> IO ()
+closeScenario env inj = do
+  b <- openBacking env ident (hCfg h0)
+  let probe = envProbe env
+  case inj of
+    Typed -> do
+      addRule probe 1 (== OpCloseFile) (FailWith eio)
+      rep <- closeBacking (envSvc env) b
+      (crClosed rep, crCloseError rep) `shouldBe` (True, Just eio)
+    Thrown -> do
+      addRule probe 1 (== OpCloseFile) Throw
+      rep <- closeBacking (envSvc env) b
+      (crClosed rep, crCloseException rep == Nothing) `shouldBe` (True, False)
+    Cancelled' -> do
+      -- the closing thread is interrupted while it waits for a held call: the interruption is remembered, the close
+      -- still happens, and the interruption is delivered after it
+      g <- addGate probe (\op -> case op of OpReadAt _ _ -> True; _ -> False)
+      _ <- submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo 5) 1 ReadProbe >>= either (fail . show) pure
+      awaitReached g 1
+      done <- newEmptyMVar
+      withOwnedThread (try (closeBacking (envSvc env) b) >>= putMVar done) $ \tid wait -> do
+        bounded (atomically (backingView (envSvc env) b >>= \v -> check (maybe False bvClosing v)))
+        throwTo tid UserInterrupt
+        openGate g
+        wait
+      r <- readMVar done
+      (either (\e -> const True (e :: SomeException)) (const False) r) `shouldBe` True
+  openFds probe >>= (`shouldBe` [])
+  (svBackings <$> view env) >>= (`shouldBe` 0)
+
+-- ---------------------------------------------------------------------------
+-- (D) every charge is released on every path
+
+chargeClass :: Spec
+chargeClass = describe "(D) every charge is released on every path" $ do
+  it "retires a ticket discarded while its job runs, when the job finishes" $
+    withEnv $ \env -> do
+      b <- openBacking env ident (hCfg h0)
+      g <- addGate (envProbe env) (\op -> case op of OpReadAt _ _ -> True; _ -> False)
+      t <- submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo 5) 1 ReadProbe >>= either (fail . show) pure
+      awaitReached g 1
+      discardTicket (envSvc env) t
+      openGate g
+      bounded (atomically (serviceView (envSvc env) >>= \v -> check (svRecords v == 0)))
+      l <- A.ledgers <$> readTVarIO (envAdmission env)
+      -- only the backing's own record is still charged
+      (A.lgControlReserved l, A.lgCacheBacked l, A.lgStagingForeground l) `shouldBe` (backingRecordBytes, 0, 0)
+
+  it "retires an opened backing's outcome nobody took when the service shuts down, and closes the backing" $ do
+    baseline <- openFdCount
+    withEnv $ \env -> do
+      t <- submitOpen (envSvc env) ExplicitWork (OpenSpec (BC.pack (envDir env)) ident (hCfg h0)) >>= either (fail . show) pure
+      bounded (atomically (awaitTicket (envSvc env) t))
+    -- the environment's own check found the admission at zero; the descriptor is closed too
+    openFdCount >>= (`shouldBe` baseline)
+
+  it "never drops an eviction: a read that would need the owner's cache copies waits until the owner releases them" $
+    withEnv $ \env -> do
+      b <- openBacking env ident (hCfg h0)
+      -- the owner caches a backed, unpinned copy that fills the cache account
+      (grant, entry) <- atomically $ do
+        a <- readTVar (envAdmission env)
+        (gr, a') <- either (const (error "owner cache")) pure (A.reserve A.Foreground [A.CacheCredit (siArena ident) (48 * mib - 2048) A.Backed False] a)
+        writeTVar (envAdmission env) a'
+        pure (gr, firstEntry gr)
+      t <- submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo 5) 1 ReadProbe >>= either (fail . show) pure
+      -- nothing evicted it: the copy is still charged and the read has not been dispatched
+      l <- A.ledgers <$> readTVarIO (envAdmission env)
+      A.lgCacheBacked l `shouldSatisfy` (>= 48 * mib - 2048)
+      v <- view env
+      (svQueued v, svRunning v) `shouldBe` (1, 0)
+      -- the owner releases its copy; the read goes
+      atomically (modifyTVar' (envAdmission env) (\a -> either (const a) id (A.dropEntry entry a)))
+      atomically (modifyTVar' (envAdmission env) (A.release grant))
+      awaitOutcome env t >>= (`shouldSatisfy` \o -> case o of Pages _ -> True; _ -> False)
+
+  it "returns the shared admission to exactly its starting figures after random sequences of submit, cancel, discard, take, close and shutdown" $ do
+    counts <- forM [1 .. 40 :: Int] $ \seed -> do
+      done <- newIORef (0 :: Int)
+      withEnv $ \env -> randomSequence env seed done
+      readIORef done
+    -- every sequence ran its steps, and each environment's end asserted the admission back at zero
+    sum counts `shouldBe` 40 * 36
+    putStrLn ("random sequences: 40 seeds, " <> show (sum counts) <> " operations")
+
+-- | A deterministic pseudo-random sequence of operations against one environment.
+randomSequence :: Env -> Int -> IORef Int -> IO ()
+randomSequence env seed done = do
+  gate <- addGate (envProbe env) (\op -> case op of OpReadAt _ _ -> True; _ -> False)
+  gen <- newIORef (fromIntegral seed * 2654435761 + 12345 :: Word64)
+  tickets <- newIORef ([] :: [Ticket])
+  backings <- newIORef ([] :: [Backing])
+  let next :: Int -> IO Int
+      next n = atomicModifyIORef' gen $ \g -> let g' = g * 6364136223846793005 + 1442695040888963407 in (g', fromIntegral ((g' `div` 65536) `mod` fromIntegral n))
+      pick :: [x] -> IO (Maybe x)
+      pick xs = if null xs then pure Nothing else (\i -> Just (xs !! i)) <$> next (length xs)
+  b0 <- openBacking env ident (hCfg h0)
+  writeIORef backings [b0]
+  forM_ [1 .. 36 :: Int] $ \step -> do
+    op <- next (8 :: Int)
+    case op of
+      0 -> submitSome next tickets backings ExplicitWork
+      1 -> submitSome next tickets backings CameraWork
+      2 -> submitSome next tickets backings MaintenanceWork
+      3 -> readIORef tickets >>= pick >>= mapM_ (\t -> void (cancelTicket (envSvc env) t))
+      4 -> readIORef tickets >>= pick >>= mapM_ (\t -> discardTicket (envSvc env) t)
+      5 -> readIORef tickets >>= pick >>= mapM_ (\t -> void (withOutcome (envSvc env) t pure))
+      6 -> do
+        -- nothing may wait on a held read: the gate opens before a close or an open waits for the workers
+        openGate gate
+        bs <- readIORef backings
+        when (length bs > 1) $ pick bs >>= mapM_ (\b -> closeBacking (envSvc env) b >> modifyIORef' backings (filter (/= b)))
+        when (length bs <= 1 && step > 0) $ do
+          r <- submitOpen (envSvc env) ExplicitWork (OpenSpec (BC.pack (envDir env)) ident2 (hCfg h0))
+          forM_ r $ \t -> do
+            bounded (atomically (awaitTicket (envSvc env) t))
+            withOutcome (envSvc env) t (\o -> case o of Opened b _ -> modifyIORef' backings (b :); _ -> pure ()) >>= void . pure
+      _ -> when (step > 18) (openGate gate)
+    modifyIORef' done (+ 1)
+  openGate gate
+  where
+    submitSome next tickets backings cls = do
+      bs <- readIORef backings
+      unless (null bs) $ do
+        i <- next (length bs)
+        page <- next 200
+        r <- submitRead (envSvc env) (bs !! i) cls (hCfg h0) (PageNo (fromIntegral page)) 1 ReadProbe
+        forM_ r $ \t -> modifyIORef' tickets (t :)
+
+firstEntry :: A.Grant -> A.EntryId
+firstEntry g = case A.grantEntries g of
+  e : _ -> e
+  [] -> error "a grant with no cache entry"

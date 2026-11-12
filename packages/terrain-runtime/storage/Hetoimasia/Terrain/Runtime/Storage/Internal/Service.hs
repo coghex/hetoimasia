@@ -115,21 +115,23 @@ import Control.Exception
   , ExceptionWithContext (..)
   , SomeAsyncException
   , SomeException
-  , asyncExceptionFromException
+  , fromException
   , bracket_
   , mask
+  , mask_
   , rethrowIO
   , throwIO
   , try
   , tryWithContext
   , uninterruptibleMask_
   )
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Foldable (toList)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust)
@@ -166,10 +168,14 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), StoreIdent
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (TxnId, WriteOutcome (..), activePages, storeConfig, storeIdentity, Store)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (decodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-  ( StoreConfig
+  ( ConfigError (..)
+  , StoreConfig
   , cfgAllowanceBytes
+  , allowanceUnitBytes
+  , cfgOffsetLimit
   , cfgOverheadBytes
   , cfgTotalPages
+  , minAllowanceBytes
   , pageFileOffset
   )
 
@@ -246,12 +252,20 @@ instance Show Ticket where
 -- spendable: only the owner's 'commitBackingGrowth', after the model committed,
 -- makes the capacity usable.
 data PreparedGrowth = PreparedGrowth
-  { pgBacking ∷ !Word64
+  { pgService ∷ !Unique
+  -- ^ The service that prepared it: a token of another service is refused.
+  , pgAttempt ∷ !Word64
+  -- ^ A fresh identity for this preparation (the job that made it): a token of an
+  -- earlier, abandoned or committed preparation of the same growth is refused.
+  , pgBacking ∷ !Word64
   , pgFrom ∷ !Word64
   , pgTo ∷ !Word64
   , pgAllocated ∷ !Word64
   }
-  deriving stock (Eq, Show)
+  deriving stock (Eq)
+
+instance Show PreparedGrowth where
+  show p = "PreparedGrowth#" <> show (pgAttempt p) <> " backing " <> show (pgBacking p) <> " " <> show (pgFrom p) <> "->" <> show (pgTo p)
 
 preparedFrom, preparedTo, preparedAllocated ∷ PreparedGrowth → Word64
 preparedFrom = pgFrom
@@ -340,6 +354,8 @@ data Job = Job
   , jControl ∷ !A.Grant
   , jDispatch ∷ !(Maybe A.Grant)
   , jBorrowed ∷ !Int
+  , jDiscard ∷ !Bool
+  -- ^ The holder discarded the ticket while the job ran: it is retired when it finishes.
   }
 
 -- ---------------------------------------------------------------------------
@@ -407,7 +423,27 @@ instance Show Outcome where
 data Phase = Running | Closing | Stopped
   deriving stock (Eq, Show)
 
-data GrowthSlot = GIdle | GPrepared !PreparedGrowth
+-- | The growth state of a backing. Every event is one transaction on it:
+--
+-- +----------------------------+------------------------------------------------------------+
+-- | state                      | events                                                     |
+-- +============================+============================================================+
+-- | 'GIdle'                    | submit growth: 'GRunning' (admission); submit release of a |
+-- |                            | pending reservation: 'GReleasing' 'Nothing'; commit and   |
+-- |                            | abandon: refused                                           |
+-- | 'GRunning'                 | prepare publishes (cancellation arbitrated in the same     |
+-- |                            | step): 'GPrepared', or the extra is released and 'GIdle'   |
+-- |                            | (a failed release leaves a charged pending record);        |
+-- |                            | commit, abandon, a second growth: refused                  |
+-- | 'GPrepared' p              | commit p (the token must be this service's and this        |
+-- |                            | attempt's): 'GIdle' and the cap rises; abandon p:          |
+-- |                            | 'GReleasing' (commit authority revoked in the same step);  |
+-- |                            | a second growth: refused; close: released with the file    |
+-- | 'GReleasing'               | the release finishes: 'GIdle' (or 'GIdle' with the extra  |
+-- |                            | pending when the release failed); commit, a second         |
+-- |                            | release, a growth: refused                                 |
+-- +----------------------------+------------------------------------------------------------+
+data GrowthSlot = GIdle | GRunning | GPrepared !PreparedGrowth | GReleasing !(Maybe PreparedGrowth)
 
 data EntryPhase = EOpen | EClosing
   deriving stock (Eq)
@@ -423,6 +459,7 @@ data Entry = Entry
   , ePending ∷ !(Maybe Word64)
   , ePhase ∷ !EntryPhase
   , eBorrows ∷ !Int
+  , eOffsetLimit ∷ !Word64
   , eGrant ∷ !A.Grant
   -- ^ The control charge of this record, released at the close.
   }
@@ -482,6 +519,8 @@ instance Exception StartFailure
 data StorageCleanupFailure
   = -- | The one close of a backing's descriptor failed.
     BackingCloseFailed !Text !Errno
+  | -- | The one close raised an exception.
+    BackingCloseRaised !Text !Text
   deriving stock (Show)
 
 instance Exception StorageCleanupFailure
@@ -546,13 +585,21 @@ workerDef svc n =
 drainService ∷ StorageService → [Worker ()] → IO (Maybe (ExceptionWithContext SomeException), [(Text, ExceptionWithContext SomeException)])
 drainService svc workers = do
   (late0, _) ← protectedly (atomically (closeAdmission svc))
-  entries ← atomically (Map.keys . stBackings <$> readTVar (svState svc))
-  closed ← forM entries $ \bid → closeBackingCore svc bid
+  -- the workers first: a running job (an open included) finishes, so every backing is registered and no call is in flight
   (late1, _) ← protectedly (atomically (mapM_ requestStop workers))
   (late2, _) ← protectedly (atomically (mapM_ awaitCompletion workers))
+  entries ← atomically (Map.keys . stBackings <$> readTVar (svState svc))
+  closed ← forM entries $ \bid → closeBackingCore svc bid
+  -- every record still in the table (an outcome nobody took, an opened backing nobody named) is retired once its
+  -- borrowers have finished
+  (late3, _) ← protectedly . atomically $ do
+    s ← readTVar (svState svc)
+    check (null [() | j ← Map.elems (stJobs s), jBorrowed j > 0])
+    forM_ (Map.keys (stJobs s)) (retireJob svc)
   atomically (modifyTVar' (svState svc) (\s → s {stPhase = Stopped}))
-  evidence ← sequence [(,) "backing close" <$> evidenceOf (BackingCloseFailed (T.pack (show bid)) e) | (bid, (_, report)) ← zip entries closed, Just e ← [crCloseError report]]
-  pure (firstJust ([late0, late1, late2] <> map fst closed), evidence)
+  evidence ← sequence ([(,) "backing close" <$> evidenceOf (BackingCloseFailed (T.pack (show bid)) e) | (bid, (_, report)) ← zip entries closed, Just e ← [crCloseError report]]
+    <> [(,) "backing close" <$> evidenceOf (BackingCloseRaised (T.pack (show bid)) t) | (bid, (_, report)) ← zip entries closed, Just t ← [crCloseException report]])
+  pure (firstJust ([late0, late1, late2, late3] <> map fst closed), evidence)
   where
     firstJust xs = case [e | Just e ← xs] of
       (e : _) → Just e
@@ -575,7 +622,7 @@ protectedly act = loop Nothing
       r ← tryWithContext act
       case r of
         Right x → pure (remembered, Just x)
-        Left ewc@(ExceptionWithContext _ e) → case asyncExceptionFromException e ∷ Maybe SomeAsyncException of
+        Left ewc@(ExceptionWithContext _ e) → case fromException e ∷ Maybe SomeAsyncException of
           Just _ → loop (Just (fromMaybe ewc remembered))
           Nothing → rethrowIO ewc
 
@@ -594,7 +641,7 @@ withdrawWhere svc p = do
   let queued = [(jid, j) | (jid, j) ← Map.toList (stJobs s), isQueued (jPhase j), p j]
   forM_ queued $ \(jid, _) → do
     dequeue svc jid
-    finishJob svc jid (Cancelled [])
+    void (finishJob svc jid (Cancelled []))
     retireJob svc jid
   -- running jobs of the predicate stop at their next safe point
   forM_ [jid | (jid, j) ← Map.toList (stJobs s), isRunning (jPhase j), p j] $ \jid →
@@ -671,7 +718,7 @@ admitJob svc mb ident cls work = do
         Left r → pure (Left (mapRefusal r))
         Right grant → do
           let jid = stNextJob s
-              job = Job (fmap (\(Backing _ bid _) → bid) mb) ident cls work JQueued False grant Nothing 0
+              job = Job (fmap (\(Backing _ bid _) → bid) mb) ident cls work JQueued False grant Nothing 0 False
           writeTVar (svState svc) s
             { stNextJob = jid + 1
             , stJobs = Map.insert jid job (stJobs s)
@@ -752,8 +799,9 @@ growthBlocks ∷ StorageService → Backing → STM (Maybe StorageFailure)
 growthBlocks svc (Backing _ bid _) = do
   s ← readTVar (svState svc)
   pure $ case Map.lookup bid (stBackings s) of
-    Just e | GPrepared _ ← eGrowth e → Just (BusyNow GrowthActive)
-    _ → Nothing
+    Just e | GIdle ← eGrowth e → Nothing
+    Just _ → Just (BusyNow GrowthActive)
+    Nothing → Nothing
 
 -- | Queue the execution of a growth to a larger allowance. The size rules were
 -- decided by the model (@proposeGrowth@); the backend re-checks what it owns: the
@@ -770,21 +818,41 @@ submitGrowth svc b from to
         Nothing → pure (Left BackingClosed)
         Just e
           | from /= eCap e → pure (Left (InvalidRequest (GrowthStaleBase from (eCap e))))
+          | Just bad ← growthSizeError e to → pure (Left (InvalidRequest bad))
           -- an equal size is an idempotent no-op: it needs no reservation, so nothing blocks it
           | from == to → admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WGrow (GrowSpec from to))
           | Just p ← ePending e → pure (Left (ReservationFailed (PendingReservationBlocks p)))
-          | GPrepared _ ← eGrowth e → pure (Left (BusyNow GrowthActive))
-          | otherwise → admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WGrow (GrowSpec from to))
+          | GIdle ← eGrowth e → do
+              t ← admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WGrow (GrowSpec from to))
+              -- the slot moves in the transaction that admits the job, never after it
+              when (either (const False) (const True) t) (setSlot svc bid GRunning)
+              pure t
+          | otherwise → pure (Left (BusyNow GrowthActive))
 
--- | Queue the release of a prepared growth that will not be committed.
+-- | The size rules at this boundary, the model's own (@proposeGrowth@) re-applied to the number
+-- this backend is about to reserve: the minimum, the 1 MiB grid and the native offset limit.
+growthSizeError ∷ Entry → Word64 → Maybe InvalidWhy
+growthSizeError e to
+  | to < minAllowanceBytes = Just (AllowanceInvalid (AllowanceBelowMinimum (toInteger to)))
+  | to `mod` allowanceUnitBytes /= 0 = Just (AllowanceInvalid (AllowanceNotAligned (toInteger to)))
+  | to > eOffsetLimit e = Just (AllowanceInvalid (AllowanceBeyondOffsetLimit (toInteger to) (toInteger (eOffsetLimit e))))
+  | otherwise = Nothing
+
+setSlot ∷ StorageService → Word64 → GrowthSlot → STM ()
+setSlot svc bid slot = modifyTVar' (svState svc) (\s → s {stBackings = Map.adjust (\x → x {eGrowth = slot}) bid (stBackings s)})
+
+-- | Queue the release of a prepared growth that will not be committed. Accepting it revokes the
+-- commit authority in the same transaction.
 submitAbandon ∷ StorageService → Backing → PreparedGrowth → IO (Either StorageFailure Ticket)
 submitAbandon svc b p = atomically $ do
   s ← readTVar (svState svc)
-  let Backing _ bid _ = b
+  let Backing u bid _ = b
   case Map.lookup bid (stBackings s) of
+    _ | u /= svId svc → pure (Left ForeignHandle)
     Just e
       | GPrepared q ← eGrowth e, q == p → do
           t ← admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WRelease (pgFrom p) (pgTo p))
+          when (either (const False) (const True) t) (setSlot svc bid (GReleasing (Just p)))
           pure t
       | otherwise → pure (Left (InvalidRequest NoPreparedGrowth))
     Nothing → pure (Left BackingClosed)
@@ -794,20 +862,26 @@ submitAbandon svc b p = atomically $ do
 submitReleasePending ∷ StorageService → Backing → IO (Either StorageFailure Ticket)
 submitReleasePending svc b = atomically $ do
   s ← readTVar (svState svc)
-  let Backing _ bid _ = b
+  let Backing u bid _ = b
   case Map.lookup bid (stBackings s) of
+    _ | u /= svId svc → pure (Left ForeignHandle)
     Just e
-      | Just extra ← ePending e → admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WRelease (eCap e) (eCap e + extra))
+      | Just extra ← ePending e, GIdle ← eGrowth e → do
+          t ← admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WRelease (eCap e) (eCap e + extra))
+          when (either (const False) (const True) t) (setSlot svc bid (GReleasing Nothing))
+          pure t
+      | Just _ ← ePending e → pure (Left (BusyNow GrowthActive))
       | otherwise → pure (Left (InvalidRequest NoPreparedGrowth))
     Nothing → pure (Left BackingClosed)
 
 -- | The owner's commit of a prepared growth, after the model committed its own:
--- only now is the larger allowance spendable by this backing.
+-- only now is the larger allowance spendable by this backend. The token must be the one this
+-- service's current preparation made.
 commitBackingGrowth ∷ StorageService → Backing → PreparedGrowth → IO (Either StorageFailure ())
 commitBackingGrowth svc (Backing u bid _) p = atomically $ do
   s ← readTVar (svState svc)
   case Map.lookup bid (stBackings s) of
-    _ | u /= svId svc → pure (Left ForeignHandle)
+    _ | u /= svId svc || pgService p /= svId svc → pure (Left ForeignHandle)
     Nothing → pure (Left BackingClosed)
     Just e
       | ePhase e /= EOpen → pure (Left BackingClosed)
@@ -893,11 +967,12 @@ discardTicket svc t = do
         JDone _ → pure Nothing
         JQueued → do
           dequeue svc jid
-          finishJob svc jid (Cancelled [])
+          void (finishJob svc jid (Cancelled []))
           retireJob svc jid
           pure Nothing
         JRunning → do
-          modifyTVar' (svState svc) (\st → st {stJobs = Map.adjust (\x → x {jCancel = True}) jid (stJobs st)})
+          -- the holder gives the outcome up: the job stops at its next safe point and is retired when it ends
+          modifyTVar' (svState svc) (\st → st {stJobs = Map.adjust (\x → x {jCancel = True, jDiscard = True}) jid (stJobs st)})
           pure Nothing
   forM_ opened (void' . closeBackingId svc)
   where
@@ -923,7 +998,7 @@ cancelTicket svc t = atomically $ do
     Just (jid, j) → case jPhase j of
       JQueued → do
         dequeue svc jid
-        finishJob svc jid (Cancelled [])
+        void (finishJob svc jid (Cancelled []))
         pure CancelledBeforeDispatch
       JRunning → do
         modifyTVar' (svState svc) (\st → st {stJobs = Map.adjust (\x → x {jCancel = True}) jid (stJobs st)})
@@ -932,11 +1007,11 @@ cancelTicket svc t = atomically $ do
 
 -- | Record a job's outcome: its resources of the running phase end here (the
 -- transfer's staging, the mutation slot), its result stays until retired.
-finishJob ∷ StorageService → Word64 → Outcome → STM ()
+finishJob ∷ StorageService → Word64 → Outcome → STM (Maybe Word64)
 finishJob svc jid outcome = do
   s ← readTVar (svState svc)
   case Map.lookup jid (stJobs s) of
-    Nothing → pure ()
+    Nothing → pure Nothing
     Just j → do
       forM_ (jDispatch j) $ \g → if holdsResult outcome then releaseStaging svc g else releaseGrant svc g
       let j' = j {jPhase = JDone outcome, jDispatch = if holdsResult outcome then jDispatch j else Nothing}
@@ -945,6 +1020,13 @@ finishJob svc jid outcome = do
         , stRunning = if isRunningPhase (jPhase j) then stRunning s - 1 else stRunning s
         , stMutation = if stMutation s == Just jid then Nothing else stMutation s
         }
+      -- a ticket discarded while the job ran: nobody will take the outcome, so it is retired here, and
+      -- a backing it opened (which nobody can name) is for the worker to close
+      if jDiscard j
+        then do
+          retireJob svc jid
+          pure (case outcome of Opened (Backing _ bid _) _ → Just bid; _ → Nothing)
+        else pure Nothing
   where
     isRunningPhase JRunning = True
     isRunningPhase _ = False
@@ -998,8 +1080,10 @@ dispatchNext svc = do
         Just j → case dispatchCredits j of
           Nothing → Just (c, jid, Nothing, a)
           Just (cls, credits) → case A.reserve cls credits a of
-            Right (g, a') → Just (c, jid, Just g, a')
-            Left _ → try' rest
+            -- the service never evicts what another consumer caches: a dispatch that would need that waits
+            -- until the owner has released (dropped) enough, and the reservation made for it is discarded
+            Right (g, a') | null (A.grantEvicted g) → Just (c, jid, Just g, a')
+            _ → try' rest
   case try' candidates of
     Nothing → retry
     Just (c, jid, grant, a') → do
@@ -1038,12 +1122,14 @@ runJob svc jid = do
     Just j → do
       r ← try (execute svc jid j)
       case r of
-        Right outcome → atomically (finishJob svc jid outcome)
+        Right outcome → do
+          toClose ← atomically (finishJob svc jid outcome)
+          forM_ toClose (void . closeBackingId svc)
         Left (e ∷ SomeException) → do
           let why = T.pack (show e)
           logError (svLogger svc) component "Storage worker defect" [("defect", why)]
           atomically $ do
-            finishJob svc jid (Failed (HostFailure why) [])
+            void (finishJob svc jid (Failed (HostFailure why) []))
             modifyTVar' (svState svc) (\s → s {stDefect = Just why, stPhase = Stopped})
             closeAdmission svc
           throwIO e
@@ -1140,6 +1226,18 @@ withVolume svc dev act =
       writeTVar (svState svc) s {stBusyVolumes = Set.insert dev (stBusyVolumes s)}
     release = modifyTVar' (svState svc) (\s → s {stBusyVolumes = Set.delete dev (stBusyVolumes s)})
 
+-- | A cleanup step of an open that failed while an exception unwound it.
+data OpenCleanupFailed = OpenCleanupFailed !IoOp !Errno
+  deriving stock (Show)
+
+instance Exception OpenCleanupFailed
+
+data OpenStop = OpenCancelled | OpenFailed !StorageFailure
+
+-- | Open a backing. From the moment the file exists until the backing table owns the descriptor
+-- (the one transaction that registers it), THIS function owns it, on every exit: a typed failure
+-- unwinds explicitly, and an exception (from any native step, the seam included) closes it too,
+-- keeping the cleanup failures beside the primary exception.
 execOpen ∷ StorageService → Word64 → OpenSpec → IO Outcome
 execOpen svc jid spec = do
   stop0 ← cancelled svc jid
@@ -1148,15 +1246,30 @@ execOpen svc jid spec = do
     created ← createPrivate seam (osDirectory spec) unique
     case created of
       Left f → pure (Failed (StorageIo f) [])
-      Right c → afterCreate c
+      Right c → do
+        owned ← newIORef (0 ∷ Int)
+        r ← tryWithContext (afterCreate c owned)
+        case r of
+          Right o → pure o
+          Left ewc → do
+            state ← readIORef owned
+            -- an exception: the descriptor is closed here unless the table already owns it; the name is
+            -- unlinked again if it still exists (a second unlink finding none is not a failure)
+            -- 0: still ours; 1: the table owns it; 2: its close was already attempted (never repeated)
+            notes ← if state /= 0 then pure [] else unwind owned c True
+            evidence ← sequence [(,) "open cleanup" <$> evidenceOf (OpenCleanupFailed op e) | CleanupNote op e ← notes, e /= Errno 2]
+            final ← composeCleanup (Just ewc) evidence
+            rethrowIO (fromMaybe ewc final)
   where
     seam = svSeam svc
     cfg = osConfig spec
     allowance = cfgAllowanceBytes cfg
     -- every failure after the file exists closes the descriptor (which releases
     -- everything it obtained) and keeps what the cleanup could not do
-    unwind c named = do
+    unwind owned c named = do
       notes1 ← if named then retryUnlink c else pure []
+      -- recorded BEFORE the close is attempted, so an exception from it can never lead to a second close
+      writeIORef owned 2
       notes2 ← closeNote c
       pure (notes1 <> notes2)
     retryUnlink c = do
@@ -1165,66 +1278,78 @@ execOpen svc jid spec = do
     closeNote c = do
       r ← uninterruptibleMask_ (closeFile seam (crFd c))
       pure [CleanupNote IoClose e | Left e ← [r]]
-    afterCreate c = do
+    afterCreate c owned = do
       un ← unlinkFile seam (osDirectory spec) (crName c)
       case un of
         Left e → do
-          notes ← unwind c True
+          notes ← unwind owned c True
           pure (Failed (StorageIo (IoFailure IoUnlink (IoErrno e) Nothing Nothing 0 0)) notes)
         Right () → do
           v ← verifyPrivate seam (crFd c)
           case v of
             Left f → do
-              notes ← unwind c False
+              notes ← unwind owned c False
               pure (Failed (StorageIo f) notes)
             Right st → do
               stop ← cancelled svc jid
               if stop
-                then Cancelled <$> unwind c False
-                else withVolume svc (nsDevice st) (reserveAndRegister c st)
-    reserveAndRegister c st = do
+                then Cancelled <$> unwind owned c False
+                else withVolume svc (nsDevice st) (reserveAndRegister c owned st)
+    reserveAndRegister c owned st = do
       r ← reserveRange seam (svConfig svc) (cancelled svc jid) (crFd c) 0 allowance
       case r of
-        Left StoppedCancelled → Cancelled <$> unwind c False
-        Left (StoppedFailure f) → do
-          notes ← unwind c False
+        Left (StoppedCancelled _) → Cancelled <$> unwind owned c False
+        Left (StoppedFailure f _) → do
+          notes ← unwind owned c False
           pure (Failed f notes)
         Right rv
           | rvOverhead rv > cfgOverheadBytes cfg → do
-              notes ← unwind c False
+              notes ← unwind owned c False
               pure (Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (cfgOverheadBytes cfg))) notes)
           | otherwise → do
               registered ← atomically (register c st rv)
               case registered of
-                Left f → do
-                  notes ← unwind c False
+                Left OpenCancelled → Cancelled <$> unwind owned c False
+                Left (OpenFailed f) → do
+                  notes ← unwind owned c False
                   pure (Failed f notes)
                 Right (b, reservation) → do
+                  -- the table owns the descriptor from the transaction above
+                  writeIORef owned 1
                   logInfo (svLogger svc) component "Backing opened" [("backing", T.pack (show b)), ("allocated", T.pack (show (rvAllocated rv)))]
                   pure (Opened b reservation)
+    -- cancellation is arbitrated in the transaction that publishes the backing
     register c st rv = do
       s ← readTVar (svState svc)
+      let cancelRequested = maybe False jCancel (Map.lookup jid (stJobs s))
       if stPhase s /= Running
-        then pure (Left ServiceStopped)
-        else do
-          charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit backingRecordBytes] a)
-          case charged of
-            Left r → pure (Left (mapRefusal r))
-            Right grant → do
-              let bid = stNextBacking s
-                  ident = osIdentity spec
-                  entry = Entry (crFd c) ident (nsDevice st) allowance (rvLength rv) (cfgOverheadBytes cfg) GIdle Nothing EOpen 0 grant
-                  prof = rvProfile rv
-              writeTVar (svState svc) s
-                { stNextBacking = bid + 1
-                , stBackings = Map.insert bid entry (stBackings s)
-                , stReserved = Map.insertWith (+) (nsDevice st) (rvLength rv) (stReserved s)
-                }
-              pure (Right (Backing (svId svc) bid ident, Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (nsDevice st)))
+        then pure (Left (OpenFailed ServiceStopped))
+        else
+          if cancelRequested
+            then pure (Left OpenCancelled)
+            else do
+              charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit backingRecordBytes] a)
+              case charged of
+                Left r → pure (Left (OpenFailed (mapRefusal r)))
+                Right grant → do
+                  let bid = stNextBacking s
+                      ident = osIdentity spec
+                      entry = Entry (crFd c) ident (nsDevice st) allowance (rvLength rv) (cfgOverheadBytes cfg) GIdle Nothing EOpen 0 (cfgOffsetLimit cfg) grant
+                      prof = rvProfile rv
+                  writeTVar (svState svc) s
+                    { stNextBacking = bid + 1
+                    , stBackings = Map.insert bid entry (stBackings s)
+                    , stReserved = Map.insertWith (+) (nsDevice st) (rvLength rv) (stReserved s)
+                    }
+                  pure (Right (Backing (svId svc) bid ident, Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (nsDevice st)))
 
 -- ---------------------------------------------------------------------------
 -- Growth
 
+-- | Execute a growth: reserve and prove the extra range, then publish it as prepared in ONE transaction that
+-- also arbitrates cancellation. Whatever may have been acquired (every stop after the native allocation was
+-- attempted, a failed final query included, and an exception from any step) is released before the slot
+-- returns to idle, or left as a charged pending reservation when that release fails.
 execGrow ∷ StorageService → Word64 → Job → Word64 → Word64 → IO Outcome
 execGrow svc jid j from to = do
   me ← atomically (entryOf svc (jBacking j))
@@ -1232,62 +1357,80 @@ execGrow svc jid j from to = do
     Just _ | from == to → pure GrowthNoChange
     Nothing → pure (Failed BackingClosed [])
     Just (bid, e) → withVolume svc (eVolume e) $ do
-      r ← reserveRange seam (svConfig svc) (cancelled svc jid) (eFd e) from (to - from)
+      r ← tryWithContext (reserveRange seam (svConfig svc) (cancelled svc jid) (eFd e) from (to - from))
       case r of
-        Left StoppedCancelled → rollback bid e (Cancelled)
-        Left (StoppedFailure f)
-          | obtainedNothing f → pure (Failed f [])
-          | otherwise → rollback bid e (\notes → Failed f notes)
-        Right rv
-          | rvOverhead rv > eOverheadModel e → rollback bid e (\notes → Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (eOverheadModel e))) notes)
+        Left ewc → do
+          notes ← giveBack bid e True
+          evidence ← sequence [(,) "growth release" <$> evidenceOf (OpenCleanupFailed op err) | CleanupNote op err ← notes]
+          final ← composeCleanup (Just ewc) evidence
+          rethrowIO (fromMaybe ewc final)
+        Right (Left (StoppedCancelled acquired)) → Cancelled <$> giveBack bid e acquired
+        Right (Left (StoppedFailure f acquired)) → (\notes → Failed f notes) <$> giveBack bid e acquired
+        Right (Right rv)
+          | rvOverhead rv > eOverheadModel e →
+              (\notes → Failed (ReservationFailed (OverheadExceedsModel (rvOverhead rv) (eOverheadModel e))) notes) <$> giveBack bid e True
           | otherwise → do
-              let p = PreparedGrowth bid from to (rvAllocated rv)
-              atomically $ modifyTVar' (svState svc) $ \s →
-                s { stBackings = Map.adjust (\x → x {eGrowth = GPrepared p, eLength = to}) bid (stBackings s)
-                  , stReserved = Map.insertWith (+) (eVolume e) (to - from) (stReserved s)
-                  }
-              let prof = rvProfile rv
-              pure (GrowthPrepared p (Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (eVolume e)))
+              let p = PreparedGrowth (svId svc) jid bid from to (rvAllocated rv)
+              published ← atomically $ do
+                s ← readTVar (svState svc)
+                let cancelRequested = maybe False jCancel (Map.lookup jid (stJobs s))
+                case Map.lookup bid (stBackings s) of
+                  Just x | not cancelRequested, GRunning ← eGrowth x → do
+                    writeTVar (svState svc) s
+                      { stBackings = Map.insert bid x {eGrowth = GPrepared p, eLength = to} (stBackings s)
+                      , stReserved = Map.insertWith (+) (eVolume e) (to - from) (stReserved s)
+                      }
+                    pure True
+                  _ → pure False
+              if published
+                then do
+                  let prof = rvProfile rv
+                  pure (GrowthPrepared p (Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (eVolume e)))
+                else Cancelled <$> giveBack bid e True
   where
     seam = svSeam svc
-    -- a failure before the native allocation was attempted obtained nothing
-    obtainedNothing f = case f of
-      StorageUnsupported (FilesystemNotQualified _) → True
-      ReservationFailed (InsufficientHeadroom {}) → True
-      StorageIo (IoFailure op _ _ _ _ _) → op == IoStat || op == IoStatFs
-      _ → False
-    -- give the extra back; a release that fails leaves a bounded pending record
+    -- give the extra back and return the slot to idle; a release that fails leaves a bounded pending record
     -- that stays charged until an explicit retry or the close
-    rollback bid e finish = do
-      released ← releaseExtra seam (eFd e) from to
-      case released of
-        Right () → pure (finish [])
-        Left err → do
-          atomically $ modifyTVar' (svState svc) $ \s →
-            s { stBackings = Map.adjust (\x → x {ePending = Just (to - from)}) bid (stBackings s)
-              , stReserved = Map.insertWith (+) (eVolume e) (to - from) (stReserved s)
-              }
-          pure (finish [CleanupNote IoSetLength err])
+    giveBack bid e acquired
+      | not acquired = atomically (setSlot svc bid GIdle) >> pure []
+      | otherwise = do
+          -- an exception from the release is a release that failed: the extra is then kept as pending
+          released ← try (releaseExtra seam (eFd e) from to)
+          case either (\(_ ∷ SomeException) → Left (Errno 0)) id released of
+            Right () → atomically (setSlot svc bid GIdle) >> pure []
+            Left err → do
+              atomically $ modifyTVar' (svState svc) $ \s →
+                s { stBackings = Map.adjust (\x → x {ePending = Just (to - from), eGrowth = GIdle}) bid (stBackings s)
+                  , stReserved = Map.insertWith (+) (eVolume e) (to - from) (stReserved s)
+                  }
+              pure [CleanupNote IoSetLength err]
 
--- | Release an abandoned growth's or a pending extra reservation.
+-- | Release an abandoned growth's or a pending extra reservation. The slot is 'GReleasing' from the
+-- transaction that admitted the job; it is idle again when this ends, however it ends.
 execRelease ∷ StorageService → Job → Word64 → Word64 → IO Outcome
 execRelease svc j from to = do
   me ← atomically (entryOf svc (jBacking j))
   case me of
     Nothing → pure (Failed BackingClosed [])
     Just (bid, e) → withVolume svc (eVolume e) $ do
-      released ← releaseExtra (svSeam svc) (eFd e) from to
+      released ← tryWithContext (releaseExtra (svSeam svc) (eFd e) from to) ∷ IO (Either (ExceptionWithContext SomeException) (Either Errno ()))
       case released of
-        Right () → do
+        Left ewc → do
+          -- an exception: what the release did is unknown, so the extra stays accounted as pending
+          atomically (pendAgain bid)
+          rethrowIO ewc
+        Right (Right ()) → do
           atomically $ modifyTVar' (svState svc) $ \s →
             s { stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Nothing, eLength = from}) bid (stBackings s)
               , stReserved = Map.adjust (\n → n - min n (to - from)) (eVolume e) (stReserved s)
               }
           pure Released
-        Left err → do
-          atomically $ modifyTVar' (svState svc) $ \s →
-            s {stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Just (to - from)}) bid (stBackings s)}
+        Right (Left err) → do
+          atomically (pendAgain bid)
           pure (Failed (StorageIo (IoFailure IoSetLength (IoErrno err) Nothing Nothing 0 0)) [CleanupNote IoSetLength err])
+  where
+    pendAgain bid = modifyTVar' (svState svc) $ \s →
+      s {stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Just (to - from)}) bid (stBackings s)}
 
 -- ---------------------------------------------------------------------------
 -- Scoped use and closing
@@ -1323,6 +1466,8 @@ data CloseReport = CloseReport
   , crPendingReservation ∷ !(Maybe Word64)
   -- ^ An extra reservation still pending when the file closed; closing it
   -- released it with the file.
+  , crCloseException ∷ !(Maybe Text)
+  -- ^ An exception the one close raised (the call was made once and is not repeated).
   }
   deriving stock (Eq, Show)
 
@@ -1331,9 +1476,12 @@ data CloseReport = CloseReport
 -- borrower to retire, then close the descriptor, once. The wait is in the
 -- caller's protected boundary, not in an uninterruptibly masked release; the
 -- close itself is a bounded call, made uninterruptibly.
+noClose ∷ CloseReport
+noClose = CloseReport False Nothing Nothing Nothing
+
 closeBacking ∷ StorageService → Backing → IO CloseReport
 closeBacking svc (Backing u bid _)
-  | u /= svId svc = pure (CloseReport False Nothing Nothing)
+  | u /= svId svc = pure (noClose)
   | otherwise = closeBackingId svc bid
 
 closeBackingId ∷ StorageService → Word64 → IO CloseReport
@@ -1345,7 +1493,7 @@ closeBackingId svc bid = do
 -- | The close, returning an interruption it remembered instead of obeying, for
 -- the caller to deliver once the descriptor is closed.
 closeBackingCore ∷ StorageService → Word64 → IO (Maybe (ExceptionWithContext SomeException), CloseReport)
-closeBackingCore svc bid = do
+closeBackingCore svc bid = mask_ $ do
   started ← atomically $ do
     s ← readTVar (svState svc)
     case Map.lookup bid (stBackings s) of
@@ -1355,46 +1503,40 @@ closeBackingCore svc bid = do
         withdrawWhere svc ((== Just bid) . jBacking)
         pure True
   if not started
-    then pure (Nothing, CloseReport False Nothing Nothing)
+    then pure (Nothing, noClose)
     else do
-      -- the wait is repeated until it completes: an interruption is remembered and
-      -- delivered after the close, never obeyed here
-      (late, _) ← protectedly (atomically (drained svc bid))
-      -- retire what finished and nobody holds
-      claimed ← atomically $ do
-        s ← readTVar (svState svc)
-        let mine = [jid | (jid, j) ← Map.toList (stJobs s), jBacking j == Just bid]
-        forM_ mine (retireJob svc)
-        s' ← readTVar (svState svc)
-        case Map.lookup bid (stBackings s') of
-          Nothing → pure Nothing
-          Just e → do
-            releaseGrant svc (eGrant e)
-            modifyTVar' (svState svc) $ \t →
-              t { stBackings = Map.delete bid (stBackings t)
-                , stReserved = Map.adjust (\n → n - min n (eLength e)) (eVolume e) (stReserved t)
-                }
-            pure (Just e)
+      -- the drain check and the claim of the descriptor are ONE transaction: nothing (a job, a borrower, an
+      -- outcome taken for a body) can begin between the two, and the wait for it is in the caller's boundary,
+      -- every interruption remembered and delivered after the close. The whole hand-off to the native close is
+      -- masked, so no exception can fall between the entry leaving the table and the close being made.
+      (late, claimed) ← protectedly (atomically (claim bid))
       case claimed of
-        Nothing → pure (late, CloseReport False Nothing Nothing)
-        Just e → do
-          r ← uninterruptibleMask_ (closeFile (svSeam svc) (eFd e))
-          let err = either Just (const Nothing) r
+        Just (Just e) → do
+          r ← try (uninterruptibleMask_ (closeFile (svSeam svc) (eFd e)))
+          let (err, thrown) = case r of
+                Right (Left en) → (Just en, Nothing)
+                Right (Right ()) → (Nothing, Nothing)
+                Left (ex ∷ SomeException) → (Nothing, Just (T.pack (show ex)))
           forM_ err $ \(Errno n) → logWarning (svLogger svc) component "Backing close failed" [("errno", T.pack (show n))]
+          forM_ thrown $ \t → logWarning (svLogger svc) component "Backing close raised" [("exception", t)]
           logInfo (svLogger svc) component "Backing closed" [("backing", T.pack (show bid))]
-          pure (late, CloseReport True err (ePending e))
-
--- | The backing is drained: no job of it is queued or running and nothing
--- borrows it.
-drained ∷ StorageService → Word64 → STM ()
-drained svc bid = do
-  s ← readTVar (svState svc)
-  case Map.lookup bid (stBackings s) of
-    Nothing → pure ()
-    Just e → do
-      let active = [() | j ← Map.elems (stJobs s), jBacking j == Just bid, activePhase (jPhase j) || jBorrowed j > 0]
-      check (null active && eBorrows e == 0)
+          pure (late, CloseReport True err (ePending e) thrown)
+        _ → pure (late, noClose)
   where
+    claim b = do
+      s ← readTVar (svState svc)
+      case Map.lookup b (stBackings s) of
+        Nothing → pure Nothing
+        Just e → do
+          let active = [() | j ← Map.elems (stJobs s), jBacking j == Just b, activePhase (jPhase j) || jBorrowed j > 0]
+          check (null active && eBorrows e == 0)
+          forM_ [jid | (jid, j) ← Map.toList (stJobs s), jBacking j == Just b] (retireJob svc)
+          releaseGrant svc (eGrant e)
+          modifyTVar' (svState svc) $ \t →
+            t { stBackings = Map.delete b (stBackings t)
+              , stReserved = Map.adjust (\n → n - min n (eLength e)) (eVolume e) (stReserved t)
+              }
+          pure (Just e)
     activePhase JQueued = True
     activePhase JRunning = True
     activePhase (JDone _) = False
@@ -1417,7 +1559,7 @@ backingView ∷ StorageService → Backing → STM (Maybe BackingView)
 backingView svc (Backing _ bid _) = do
   s ← readTVar (svState svc)
   pure $ flip fmap (Map.lookup bid (stBackings s)) $ \e →
-    BackingView (eCap e) (eLength e) (ePending e) (case eGrowth e of GPrepared _ → True; GIdle → False) (eBorrows e) (ePhase e /= EOpen)
+    BackingView (eCap e) (eLength e) (ePending e) (case eGrowth e of GIdle → False; _ → True) (eBorrows e) (ePhase e /= EOpen)
 
 -- | What the service reports of itself: the counts the contract bounds.
 data ServiceView = ServiceView

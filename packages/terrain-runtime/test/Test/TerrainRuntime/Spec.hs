@@ -13,6 +13,7 @@ import qualified Test.TerrainRuntime.Opacity as Opacity
 import qualified Test.TerrainRuntime.Oracle as Oracle
 import qualified Test.TerrainRuntime.Races as Races
 import qualified Test.TerrainRuntime.Revalidation as Revalidation
+import qualified Test.TerrainRuntime.Storage.Classes as StorageClasses
 import qualified Test.TerrainRuntime.Storage.Growth as StorageGrowth
 import qualified Test.TerrainRuntime.Storage.Io as StorageIo
 import qualified Test.TerrainRuntime.Storage.Lifetime as StorageLifetime
@@ -86,4 +87,5 @@ spec = do
   StorageGrowth.spec
   StorageMemory.spec
   StorageMemory.spec2
+  StorageClasses.spec
   StorageOpacity.spec
