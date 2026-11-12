@@ -377,7 +377,11 @@ chargeClass = describe "(D) every charge is released on every path" $ do
         writeTVar (envAdmission env) a'
         pure (gr, firstEntry gr)
       t <- submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo 5) 1 ReadProbe >>= either (fail . show) pure
-      -- nothing evicted it: the copy is still charged and the read has not been dispatched
+      -- a job that needs no credit, queued after it, is dispatched in a scheduling pass that offered the read first
+      -- (explicit before maintenance) and refused it: when that job has finished the read was certainly considered
+      noop <- submitGrowth (envSvc env) b (64 * mib) (64 * mib) >>= either (fail . show) pure
+      awaitOutcome env noop >>= (`shouldBe` GrowthNoChange)
+      -- nothing evicted the owner's copy: it is still charged and the read has not been dispatched
       l <- A.ledgers <$> readTVarIO (envAdmission env)
       A.lgCacheBacked l `shouldSatisfy` (>= 48 * mib - 2048)
       v <- view env
