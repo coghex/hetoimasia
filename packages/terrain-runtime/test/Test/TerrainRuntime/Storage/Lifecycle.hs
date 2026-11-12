@@ -117,7 +117,7 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
   it "keeps every invariant for every kind of work, in every phase, under every event, as each cell declares" $ do
     forM_ allCells $ \(k, ph, ev) -> case declared k ph ev of
       (NotApplicable, _) -> pure ()
-      (applic, _) -> (if ev == EvCleanupException then expectCleanupEvidence else id) (runCell k ph ev applic)
+      (applic, _) -> if ev == EvCleanupException then runCleanupCell k ph else runCell k ph ev applic
     let (e, r, n) = tally
     e + r + n `shouldBe` length allCells
     mapM_ putStrLn matrixTable
@@ -351,34 +351,35 @@ allCells = [(k, ph, ev) | k <- [minBound .. maxBound], ph <- [minBound .. maxBou
 declared :: Kind -> Phase -> Event -> (Applic, String)
 declared kind phase ev = case ev of
   EvCancel -> case phase of
-    PhQueued -> (Effect, "the job is withdrawn (CancelledBeforeDispatch) and what its admission installed is reversed")
-    PhRunning -> (Effect, "stop requested at the next safe point (CancelRequested); the held call finishes first")
+    PhQueued -> (Effect, "the job is withdrawn at once (CancelledBeforeDispatch; nothing queued, observed) and what its admission installed is reversed")
+    PhRunning -> (Effect, "stop requested (CancelRequested); the job keeps running until its held call returns (observed)")
     _ -> (Refusal, "CancelTooLate: the outcome stands")
   EvDiscard -> case phase of
-    PhQueued -> (Effect, "withdrawn and retired; the admission is reversed")
-    PhRunning -> (Effect, "marked: stopped at its next safe point and disposed of when it ends")
+    PhQueued -> (Effect, "withdrawn at once and retired (nothing queued, observed); the admission is reversed")
+    PhRunning -> (Effect, "marked: it keeps running until its held call returns (observed), then is disposed of")
     PhDone -> (Effect, "disposed of at once (an opened backing is closed, a prepared growth becomes a pending reservation)")
     PhBorrowed -> (Refusal, "nothing: the borrower holds the outcome and retires it")
   EvTake -> case phase of
     PhQueued -> (Refusal, "no outcome yet: answers Nothing")
     PhRunning -> (Refusal, "no outcome yet: answers Nothing")
     PhDone -> (Effect, "borrowed and retired; a second take answers Nothing")
-    PhBorrowed -> (Effect, "a second borrower of the same outcome")
+    PhBorrowed -> (Effect, "a second borrower of the same outcome (two borrows, observed)")
   EvClose -> case (kind, phase) of
     (KindOpen, PhBorrowed) -> (Effect, "closes the backing the open job created: waits for the borrower (observed blocked), then closes")
     (KindOpen, PhDone) -> (NotApplicable, "the created backing's handle is inside the untaken outcome: its discard and the shutdown cell close it")
     (KindOpen, _) -> (NotApplicable, "the backing does not exist yet")
-    (_, PhQueued) -> (Effect, "the queued job is withdrawn; the close waits for the running work")
-    (_, PhRunning) -> (Effect, "waits for the held call")
-    (_, PhDone) -> (Effect, "retires the untaken outcome")
+    (_, PhQueued) -> (Effect, "the queued job is withdrawn at once (nothing queued, observed); the close waits (observed blocked) for the running work, then closes")
+    (_, PhRunning) -> (Effect, "the close waits (observed blocked) for the held call, then closes")
+    (_, PhDone) -> (Effect, "retires the untaken outcome and closes")
     (_, PhBorrowed) -> (Effect, "waits for the borrower (observed blocked), then closes")
   EvShutdown -> case phase of
-    PhQueued -> (Effect, "shutdown with the workers busy: the queued job is withdrawn, the drain waits (observed blocked) for the held calls")
-    PhRunning -> (Effect, "shutdown with the job held at its native call: the drain waits (observed blocked)")
-    PhDone -> (Effect, "shutdown with the outcome untaken: disposed of, backings closed, evidence kept")
-    PhBorrowed -> (Effect, "shutdown while a borrower holds the outcome: the drain waits (observed blocked) for it")
+    PhQueued -> (Effect, "the queued job is withdrawn at once (observed mid-drain: nothing queued, the two busy workers still held); the drain waits (observed blocked) for them")
+    PhRunning -> (Effect, "the drain waits (observed blocked) for the held call; the job is still running mid-drain, not detached")
+    PhDone -> (Effect, "the untaken outcome is disposed of and every backing closed: nothing is left")
+    PhBorrowed -> (Effect, "the drain waits (observed blocked) for the borrower; the job is still borrowed mid-drain")
   EvCleanupException
-    | kind `elem` [KindOpen, KindGrow, KindAbandon, KindReleasePending] -> (Effect, "an exception in the kind's cleanup step: the cleanup failures are kept as labelled evidence")
+    | kind `elem` [KindOpen, KindGrow] -> (Effect, "an exception in the cleanup step (injected, observed to fire): a taken outcome carries the cleanup note; an untaken one ends the service with the labelled cleanup failure (a normal end is a failure)")
+    | kind `elem` [KindAbandon, KindReleasePending] -> (Effect, "the release raises (injected, observed to fire): a defect: the job finishes as HostFailure, the defect is recorded, the extra stays accounted as a pending reservation")
     | otherwise -> (NotApplicable, "the kind has no cleanup step to fail")
 
 tally :: (Int, Int, Int)
@@ -438,17 +439,6 @@ withControlledService body =
 
 -- ---------------------------------------------------------------------------
 -- One cell
-
--- | A cell that injects an exception into a cleanup step may end with the service's own end reporting that failure (an
--- outcome nobody took carries it): that is the evidence being kept, and it must carry labelled cleanup failures. Any
--- other exception is a failure.
-expectCleanupEvidence :: IO () -> IO ()
-expectCleanupEvidence cell = do
-  r <- tryWithContext cell :: IO (Either (ExceptionWithContext SomeException) ())
-  case r of
-    Right () -> pure ()
-    Left (ExceptionWithContext ctx e) ->
-      (show e, length (cleanupFailuresInContext ctx)) `shouldSatisfy` \(_, n) -> n >= 1
 
 -- | What a cell works on.
 data Cell = Cell
@@ -518,10 +508,12 @@ runCell kind phase ev applic
             EvCancel -> cancelTicket svc t >>= (`shouldBe` expectedCancel)
             EvDiscard -> discardTicket svc t
             EvTake -> do
-              r <- withOutcome svc t pure
+              r <- withOutcome svc t (\_ -> atomically (snapshotOf svc))
               isJust r `shouldBe` (applic == Effect)
+              -- a take inside a borrow is a second borrower
+              when (phase == PhBorrowed) (forM_ r (\sn -> maximum (map jsBorrowed (snJobs sn)) `shouldBe` 2))
               when (phase == PhDone) (withOutcome svc t pure >>= (`shouldSatisfy` isNothing))
-            EvClose -> closeAndRelease env b (cHolders cell) (cHeld cell)
+            EvClose -> closeAndRelease env b phase (cHolders cell) (cHeld cell)
             _ -> pure ()
       case (phase, ev) of
         -- a close while an outcome is borrowed waits for the borrower: it runs on a thread of its own, started from
@@ -542,16 +534,23 @@ runCell kind phase ev applic
             got `shouldSatisfy` isJust
             releaseAll
             waitClose
-        -- a discard of a borrowed outcome is refused: the job is still there, held
-        (PhBorrowed, EvDiscard) ->
+        -- a cancel or a discard of a borrowed outcome is refused: the job is still there, held
+        (PhBorrowed, e) | e `elem` [EvCancel, EvDiscard] ->
           void . withOutcome svc t $ \_ -> do
             checkInvariants env
-            discardTicket svc t
+            event
             sn <- atomically (snapshotOf svc)
             any (\j -> jsPhase j == 2 && jsBorrowed j >= 1) (snJobs sn) `shouldBe` True
             checkInvariants env
         (PhBorrowed, _) -> void (withOutcome svc t (\_ -> checkInvariants env >> event))
-        _ -> event
+        _ -> do
+          event
+          -- the state the declaration promises while the work is still held: a cancel or a discard of a queued job has
+          -- withdrawn it at once (nothing queued), and one of a running job has not stopped the held call
+          when (ev `elem` [EvCancel, EvDiscard] && phase `elem` [PhQueued, PhRunning]) $ do
+            sn <- atomically (snapshotOf svc)
+            if phase == PhQueued then snQueued sn `shouldBe` 0 else snRunning sn `shouldBe` 1
+            checkInvariants env
       -- everything is let go, the work settles, and the invariants hold
       releaseAll
       settle env
@@ -562,7 +561,7 @@ runCell kind phase ev applic
         (EvCancel, PhRunning) -> withOutcome svc t pure >>= (`shouldSatisfy` isJust)
         (EvCancel, PhDone) -> withOutcome svc t pure >>= (`shouldSatisfy` \r -> case r of Just (Cancelled _) -> False; Just _ -> True; Nothing -> False)
         (EvDiscard, p) | p /= PhBorrowed -> withOutcome svc t pure >>= (`shouldSatisfy` isNothing)
-        (EvClose, p) | kind /= KindOpen, p /= PhBorrowed -> do
+        (EvClose, _) | kind /= KindOpen -> do
           backingView svc b `atomicallyThen` (`shouldSatisfy` isNothing)
           withOutcome svc t pure >>= (`shouldSatisfy` isNothing)
         _ -> pure ()
@@ -602,6 +601,9 @@ runShutdownCell kind phase = withControlledService $ \env ctl -> do
         bounded (atomically (snapshotOf svc >>= \sn -> check (any ((>= 1) . jsBorrowed) (snJobs sn))))
         ctlBegin ctl
         awaitBlockedInStm (ctlThread ctl)
+        -- mid-drain: the borrowed job is still there, held
+        sn <- atomically (snapshotOf svc)
+        any (\j -> jsPhase j == 2 && jsBorrowed j >= 1) (snJobs sn) `shouldBe` True
         checkInvariants env
         putMVar release ()
         waitBorrower
@@ -609,6 +611,15 @@ runShutdownCell kind phase = withControlledService $ \env ctl -> do
     _ -> do
       ctlBegin ctl
       awaitBlockedInStm (ctlThread ctl)
+      -- mid-drain, with the work still held at its gates: a queued job has been withdrawn already (nothing queued, the
+      -- two busy workers still running, the job's own outcome absent or cancelled); a running job is still running
+      sn <- atomically (snapshotOf svc)
+      case phase of
+        PhQueued -> do
+          snQueued sn `shouldBe` 0
+          snRunning sn `shouldBe` 2
+          withOutcome svc (cT cell) pure >>= (`shouldSatisfy` \r -> case r of Nothing -> True; Just (Cancelled _) -> True; _ -> False)
+        _ -> snRunning sn `shouldBe` 1
       checkInvariants env
       releaseAll
   r <- ctlResult ctl
@@ -619,6 +630,44 @@ runShutdownCell kind phase = withControlledService $ \env ctl -> do
   checkInvariants env
   _ <- pure kind
   pure ()
+
+-- | A cleanup-exception cell: the injected rules must have FIRED, and the evidence must be where the declaration says. For
+-- an open or a growth, a taken (borrowed) outcome carries the cleanup note and the service ends normally, an untaken one
+-- ends the service with the labelled cleanup failure (a normal end is a failure). For a release the exception is a
+-- defect: the job finishes as a host failure, the defect is recorded, the extra stays accounted as pending.
+runCleanupCell :: Kind -> Phase -> IO ()
+runCleanupCell kind phase = withControlledService $ \env ctl -> do
+  cell <- setupCell env kind phase EvCleanupException
+  let svc = envSvc env
+      t = cT cell
+  forM_ (cHolders cell) (openGate . fst)
+  forM_ (cHeld cell) openGate
+  bounded (atomically (awaitTicket svc t))
+  rulesConsumed (envProbe env) >>= (`shouldBe` True)
+  checkInvariants env
+  let finish = ctlBegin ctl >> ctlResult ctl
+  if kind `elem` [KindOpen, KindGrow]
+    then
+      if phase == PhBorrowed
+        then do
+          withOutcome svc t pure >>= (`shouldSatisfy` \r -> case r of Just (Failed _ notes) -> not (null notes); _ -> False)
+          finish >>= either (\(ExceptionWithContext _ e) -> expectationFailure ("a taken outcome left evidence at the end: " <> show (e :: SomeException))) pure
+        else do
+          r <- finish
+          case r of
+            Left (ExceptionWithContext ctx _) -> length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
+            Right () -> expectationFailure "the cleanup failure of an untaken outcome was lost: the service ended normally"
+    else do
+      view' <- atomically (serviceView svc)
+      svDefect view' `shouldSatisfy` isJust
+      sn <- atomically (snapshotOf svc)
+      any (isJust . bsPending) (snBackings sn) `shouldBe` True
+      when (phase == PhBorrowed) (withOutcome svc t pure >>= (`shouldSatisfy` \r -> case r of Just (Failed (HostFailure _) _) -> True; _ -> False))
+      finish >>= either (\(ExceptionWithContext _ e) -> expectationFailure ("the service ended with " <> show (e :: SomeException))) pure
+  openFds (envProbe env) >>= (`shouldBe` [])
+  end <- atomically (snapshotOf svc)
+  (null (snJobs end), null (snBackings end), snClosing end) `shouldBe` (True, True, 0)
+  checkInvariants env
 
 heldOp :: Kind -> NativeOp -> Bool
 heldOp k = case k of
@@ -646,10 +695,17 @@ submitKind env b token kind = case kind of
 
 -- | Close a backing while the work is in whatever phase: in a thread of its own, since it may wait for held work, which
 -- is then let go.
-closeAndRelease :: Env -> Backing -> [(Gate, Ticket)] -> Maybe Gate -> IO ()
-closeAndRelease env b holders held =
-  withOwnedThread (void (closeBacking (envSvc env) b)) $ \_ waitClose -> do
+closeAndRelease :: Env -> Backing -> Phase -> [(Gate, Ticket)] -> Maybe Gate -> IO ()
+closeAndRelease env b phase holders held =
+  withOwnedThread (void (closeBacking (envSvc env) b)) $ \closer waitClose -> do
     bounded (atomically (backingView (envSvc env) b >>= \v -> check (maybe True bvClosing v)))
+    -- with work held the close is OBSERVED waiting for it, and a queued job has been withdrawn at once
+    when (phase `elem` [PhQueued, PhRunning]) $ do
+      awaitBlockedInStm closer
+      sn <- atomically (snapshotOf (envSvc env))
+      when (phase == PhQueued) (snQueued sn `shouldBe` 0)
+      snRunning sn `shouldSatisfy` (>= 1)
+      checkInvariants env
     forM_ holders (openGate . fst)
     forM_ held openGate
     waitClose

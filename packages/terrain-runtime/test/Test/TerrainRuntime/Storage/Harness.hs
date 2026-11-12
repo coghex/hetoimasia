@@ -35,6 +35,7 @@ module Test.TerrainRuntime.Storage.Harness
   , awaitReached
   , awaitBlockedInStm
   , openAllGates
+  , rulesConsumed
   , addRule
   , addRuleAfter
   , addGate
@@ -524,3 +525,11 @@ awaitBlockedInStm tid = bounded loop
         ThreadFinished → expectationFailure "the thread finished: it did not wait"
         ThreadDied → expectationFailure "the thread died: it did not wait"
         _ → yield >> loop
+
+-- | Every rule the probe was given has been used up (a rule of unlimited use never is): an injected fault that never fired
+-- is not a fault that was handled.
+rulesConsumed ∷ Probe → IO Bool
+rulesConsumed p = do
+  rules ← readTVarIO (pRules p)
+  lefts ← mapM (readTVarIO . rUses) rules
+  pure (all (== 0) lefts)
