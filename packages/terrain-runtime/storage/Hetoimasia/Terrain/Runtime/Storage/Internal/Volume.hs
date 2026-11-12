@@ -53,7 +53,11 @@ profileOf seam fd = do
         Left e → pure (Left (IoStatFs, e))
         Right f → do
           name ← if BC.null (nfTypeName f) then linuxFilesystemName (nsDevice s) else pure (nfTypeName f)
-          pure (Right (VolumeProfile (nsDevice s) name (nfBlockSize f) (nfTotalBytes f) (nfAvailableBytes f) (nfTypeNumber f) (nsAllocated s)))
+          -- the name is the profile's OWN copy: on Linux it is a view into the whole mount table, and a profile is
+          -- retained (in the reservation an opened backing reports, in a refusal) long after that table is gone
+          -- built here, completely: the profile that is returned is a value, not a thunk holding the name it was made from
+          let profile = VolumeProfile (nsDevice s) (BC.copy name) (nfBlockSize f) (nfTotalBytes f) (nfAvailableBytes f) (nfTypeNumber f) (nsAllocated s)
+          profile `seq` pure (Right profile)
 
 -- | Whether the profile's filesystem is on the qualified list.
 qualifies ∷ [ByteString] → VolumeProfile → Bool

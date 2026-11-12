@@ -305,7 +305,8 @@ growthClass = describe "(B) the growth state machine" $ do
       b <- openBacking env ident (hCfg h0)
       _ <- prepared env b
       commitBackingGrowth (envSvc env) b foreignToken >>= (`shouldBe` Left ForeignHandle)
-      submitAbandon (envSvc env) b foreignToken >>= (`shouldBe` Left (InvalidRequest NoPreparedGrowth)) . fmap (const ())
+      -- the token's service is checked through the same resolver as the handle's: a foreign token is a foreign handle
+      submitAbandon (envSvc env) b foreignToken >>= (`shouldBe` Left ForeignHandle) . fmap (const ())
     withEnv $ \env -> do
       b <- openBacking env ident (hCfg h0)
       before' <- length <$> events (envProbe env)

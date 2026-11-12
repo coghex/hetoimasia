@@ -27,7 +27,7 @@
 -- The standalone rows rebuild what the service holds per element, with the same constructors it uses: the job table
 -- node, the queue's element and the admission's own entry for the grant (a job), the backing map's node and the volume
 -- ledger's node (an entry and a closing record), the list cell and the grant (a kept failure).
-module Test.TerrainRuntime.Storage.Memory (spec, spec2, spec3, floorSpec, rulesSpec, noiseFloor, signalMultiple) where
+module Test.TerrainRuntime.Storage.Memory (spec, spec2, spec3, spec4, floorSpec, rulesSpec, noiseFloor, signalMultiple) where
 
 import Control.Concurrent.STM (atomically)
 import Control.Exception (SomeException, evaluate, try)
@@ -41,7 +41,10 @@ import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import qualified Data.List
 import Data.Word (Word64)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate, unlinkFile)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
+import Hetoimasia.Terrain.Runtime.Storage.Internal.Volume (profileOf, vpFilesystem)
+import System.IO.Temp (withSystemTempDirectory)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..))
@@ -495,3 +498,68 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
     jobCharge' n = jobRecordBytes + fromIntegral n * writeEntryBytes + writeFailureBytes
     -- the service's end reports the kept failures: this example measures them and ignores that report
     withControlledService' body = withControlledService (\env ctl → body env >> ctlBegin ctl >> void (ctlResult ctl))
+
+-- ---------------------------------------------------------------------------
+-- What the service retains is ITS OWN (round 6): a ByteString is a view
+
+-- | A short path that is a VIEW into a fresh two-megabyte buffer of its own: a service that keeps the view keeps the
+-- buffer. The path names a directory that does not exist, so an open of it fails at once.
+sliceOf ∷ Int → BS.ByteString
+sliceOf k = BS.take 48 (BC.pack ('/' : "no-such-dir-" <> show k <> "/" <> replicate (2 * 1024 * 1024) (toEnum (97 + k `mod` 20))))
+
+-- | The whole of the retention rows of round 6. Each asserts a per-job retention within the record's charge: with the
+-- copy undone the service retains megabytes a job (the control fails it by two orders of magnitude, far above the floor).
+spec4 ∷ Spec
+spec4 = describe "Storage backend: what the service retains of what it is handed is its own" $ do
+  it "a directory that is a short slice of a large buffer costs the copy and not the buffer: K finished, untaken opens held at once" $
+    withEnv $ \env → do
+      let produce k = do
+            t ← submitOpen (envSvc env) ExplicitWork (OpenSpec (sliceOf k) ident (hCfg h0)) >>= either (fail . show) pure
+            bounded (atomically (awaitTicket (envSvc env) t))
+            pure t
+      warm ← produce 0
+      _ ← awaitOutcome env warm
+      let k = 24 ∷ Int
+      heapBefore ← live
+      ts ← forM [1 .. k] produce
+      heapAfter ← live
+      let perJobBytes = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
+      putStrLn ("memory retention | finished untaken open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " held at once | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
+      perJobBytes `shouldSatisfy` (<= fromIntegral jobRecordBytes)
+      forM_ ts (awaitOutcome env)
+
+  it "a directory that is a short slice of a large buffer costs the copy and not the buffer: K queued opens" $
+    withEnv $ \env → do
+      g ← addGate (envProbe env) (== OpCreateFile)
+      held ← forM [1, 2 ∷ Int] (\i → submitOpen (envSvc env) ExplicitWork (OpenSpec (sliceOf (100 + i)) ident (hCfg h0)) >>= either (fail . show) pure)
+      awaitReached g 2
+      heapBefore ← live
+      let k = 8 ∷ Int
+      ts ← forM [1 .. k] (\i → submitOpen (envSvc env) ExplicitWork (OpenSpec (sliceOf (200 + i)) ident (hCfg h0)) >>= either (fail . show) pure)
+      heapAfter ← live
+      let perJobBytes = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
+      putStrLn ("memory retention | queued open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " queued | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
+      perJobBytes `shouldSatisfy` (<= fromIntegral jobRecordBytes)
+      openGate g
+      forM_ (held <> ts) (awaitOutcome env)
+
+  it "a filesystem name that is a short slice of a large buffer (a mount table's text) costs the copy: K profiles held at once" $
+    withSystemTempDirectory "hetoimasia-terrain-profile" $ \dir → do
+      made ← createPrivate productionSeam (BC.pack dir) 1 (const (pure ()))
+      c ← either (fail . show) pure made
+      -- the native adapter reports the type name as a view into a fresh two-megabyte buffer, as the mount table's lines are
+      let viewOf k = BS.take 4 (BC.pack (replicate (2 * 1024 * 1024) (toEnum (97 + k `mod` 20))))
+          native k = posixNative {nativeStatFs = \fd → fmap (\f → f {nfTypeName = viewOf k}) <$> nativeStatFs posixNative fd}
+          profile k = profileOf productionSeam {seamNative = native k} (crFd c) >>= either (\e → fail (show e)) pure
+      _ ← profile 0
+      let k = 24 ∷ Int
+      heapBefore ← live
+      ps ← forM [1 .. k] profile
+      heapAfter ← live
+      let perProfile = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
+      putStrLn ("memory retention | volume profile, a 4-byte filesystem name viewed from a 2 MiB buffer, per profile, " <> show k <> " held | " <> show (round perProfile ∷ Integer))
+      _ ← evaluate (sum (map (BS.length . vpFilesystem) ps))
+      -- the copy of four bytes and the profile's own words: a few hundred bytes, never the buffer
+      perProfile `shouldSatisfy` (<= 1024)
+      _ ← unlinkFile productionSeam (BC.pack dir) (crName c)
+      void (closeFile productionSeam (crFd c))

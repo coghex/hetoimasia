@@ -298,6 +298,42 @@ instance Eq Ticket where
 instance Show Ticket where
   show (Ticket _ n) = "Ticket#" <> show n
 
+-- ---------------------------------------------------------------------------
+-- THE RESOLVERS. A handle names something in ONE service: its service identity first, then its id. These are the only
+-- places a handle's fields are read for a handle a CALLER supplied: every public function that takes a handle goes
+-- through one of them, so a handle of another service (every service numbers its backings and jobs from 1), or of one that
+-- has ended, can never read or change an unrelated record. (`backingIdentity` and the `Eq` and `Show` instances read
+-- nothing of a service.)
+
+-- | What a backing handle names to THIS service.
+data BackingRef = ForeignBacking | OwnBacking !Word64 !StoreIdentity
+
+resolveBacking ∷ StorageService → Backing → BackingRef
+resolveBacking svc (Backing u bid ident)
+  | u /= svId svc = ForeignBacking
+  | otherwise = OwnBacking bid ident
+
+-- | The entry a backing handle names in this state, with its id and identity, or why it names none: a handle of
+-- another service is 'ForeignHandle', one of this service whose backing is gone is 'BackingClosed'.
+lookBacking ∷ StorageService → Backing → St → Either StorageFailure (Word64, StoreIdentity, Entry)
+lookBacking svc b s = case resolveBacking svc b of
+  ForeignBacking → Left ForeignHandle
+  OwnBacking bid ident → maybe (Left BackingClosed) (\e → Right (bid, ident, e)) (Map.lookup bid (stBackings s))
+
+-- | The id of a backing handle THIS SERVICE MADE (an outcome it produced), never of one a caller supplied.
+madeBacking ∷ Backing → Word64
+madeBacking (Backing _ bid _) = bid
+
+-- | The job id a ticket names to this service, or nothing when it is another service's.
+resolveTicket ∷ StorageService → Ticket → Maybe Word64
+resolveTicket svc (Ticket u jid)
+  | u /= svId svc = Nothing
+  | otherwise = Just jid
+
+-- | Whether a growth token was made by this service.
+ownsPrepared ∷ StorageService → PreparedGrowth → Bool
+ownsPrepared svc p = pgService p == svId svc
+
 -- | A growth whose extra reservation was obtained and proven but which is not
 -- spendable: only the owner's 'commitBackingGrowth', after the model committed,
 -- makes the capacity usable.
@@ -857,7 +893,7 @@ disposeUndelivered svc jid = do
     Just j | JDone o ← jPhase j, jBorrowed j == 0 → do
       retireJob svc jid
       case o of
-        Opened (Backing _ bid _) _ → pure (Just bid)
+        Opened b _ → pure (Just (madeBacking b))
         GrowthPrepared p _ → do
           -- the token that could commit or abandon it was never delivered: the preparation becomes an explicit
           -- pending reservation (length and extra unchanged in the volume's figure), recoverable by a release
@@ -949,34 +985,33 @@ mapRefusal r = case r of
 -- | The common admission of a job, all or nothing: the phase, the backing it
 -- names, the record count, the queue, the mutation slot and the record's charge
 -- are checked in this one transaction and nothing changes on a refusal.
-admitJob ∷ StorageService → Maybe Backing → StoreIdentity → WorkClass → Work → STM (Either StorageFailure Ticket)
-admitJob svc mb ident cls work = do
+admitJob ∷ StorageService → Either StoreIdentity Backing → WorkClass → Work → STM (Either StorageFailure Ticket)
+admitJob svc target cls work = do
   s ← readTVar (svState svc)
   let queued = sum (map Seq.length (Map.elems (stQueue s)))
       checks = do
         when (stPhase s /= Running) (Left ServiceStopped)
-        _ ← case mb of
-          Nothing → Right ()
-          Just (Backing u bid bident)
-            | u /= svId svc → Left ForeignHandle
-            | otherwise → case Map.lookup bid (stBackings s) of
-                Nothing → Left BackingClosed
-                Just e
-                  | ePhase e /= EOpen → Left BackingClosed
-                  | eIdent e /= bident || bident /= ident → Left (InvalidRequest IdentityMismatch)
-                  | otherwise → Right ()
+        -- an open names no backing; any other job names one, through the resolver
+        owner ← case target of
+          Left ident → Right (Nothing, ident)
+          Right b → do
+            (bid, bident, e) ← lookBacking svc b s
+            when (ePhase e /= EOpen) (Left BackingClosed)
+            when (eIdent e /= bident) (Left (InvalidRequest IdentityMismatch))
+            Right (Just bid, bident)
         when (Map.size (stJobs s) >= maxJobRecords) (Left (BusyNow RecordsFull))
         when (queued >= maxQueuedJobs) (Left (BusyNow QueueFull))
         when (workMutates work && isJust (stMutation s)) (Left (BusyNow MutationActive))
+        Right owner
   case checks of
     Left f → pure (Left f)
-    Right () → do
+    Right (owned, ident) → do
       charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit (jobCharge work)] a)
       case charged of
         Left r → pure (Left (mapRefusal r))
         Right grant → do
           let jid = stNextJob s
-              job = Job (case mb of Nothing → Nothing; Just (Backing _ bid _) → bid `seq` Just bid) ident cls work JQueued False grant Nothing 0 False False (jobCharge work)
+              job = Job (case owned of Nothing → Nothing; Just n → n `seq` Just n) ident cls work JQueued False grant Nothing 0 False False (jobCharge work)
           writeTVar (svState svc) s
             { stNextJob = jid + 1
             , stJobs = Map.insert jid job (stJobs s)
@@ -988,7 +1023,10 @@ admitJob svc mb ident cls work = do
 submitOpen ∷ StorageService → WorkClass → OpenSpec → IO (Either StorageFailure Ticket)
 submitOpen svc cls spec
   | BS.null dir || BS.length dir > maxDirectoryBytes || BS.elem 0 dir = pure (Left (InvalidRequest DirectoryInvalid))
-  | otherwise = atomically (admitJob svc Nothing (osIdentity spec) cls (WOpen spec))
+  -- THE SERVICE RETAINS ITS OWN COPY: a 'ByteString' is a view, and a four-byte directory cut from a 16 MiB buffer keeps the
+  -- whole buffer alive for as long as the job record exists (queued, running, finished and untaken), at the price of one
+  -- record. The validated directory is copied (and so bounded by 'maxDirectoryBytes') before anything stores it.
+  | otherwise = let own = spec {osDirectory = BS.copy dir} in own `seq` atomically (admitJob svc (Left (osIdentity own)) cls (WOpen own))
   where
     dir = osDirectory spec
 
@@ -1004,14 +1042,15 @@ submitRead svc b cls cfg start@(PageNo n) count mode
       refused ← capRefusal svc b cfg
       case refused of
         Just f → pure (Left f)
-        Nothing → admitJob svc (Just b) (backingIdentity b) cls (WRead (ReadSpec cfg start count mode))
+        Nothing → admitJob svc (Right b) cls (WRead (ReadSpec cfg start count mode))
   where
     lastPage = PageNo (n + fromIntegral count - 1)
 
 -- | Queue a transaction's staged pages. Writes are explicit work.
 submitWrite ∷ StorageService → Backing → StagedWrite → IO (Either StorageFailure Ticket)
 submitWrite svc b w
-  | swIdentity w /= backingIdentity b = pure (Left (InvalidRequest IdentityMismatch))
+  | ForeignBacking ← resolveBacking svc b = pure (Left ForeignHandle)
+  | OwnBacking _ bident ← resolveBacking svc b, swIdentity w /= bident = pure (Left (InvalidRequest IdentityMismatch))
   | length (swPages w) > maxIoPages = pure (Left (InvalidRequest (TooManyPages (length (swPages w)))))
   | otherwise = case firstBad of
       Just f → pure (Left f)
@@ -1021,7 +1060,7 @@ submitWrite svc b w
         case (refused, grown) of
           (Just f, _) → pure (Left f)
           (_, Just f) → pure (Left f)
-          _ → admitJob svc (Just b) (backingIdentity b) ExplicitWork (WWrite w)
+          _ → admitJob svc (Right b) ExplicitWork (WWrite w)
   where
     firstBad = foldr pick Nothing (checkPages (swConfig w) (swPages w))
     pick x acc = maybe acc Just x
@@ -1043,23 +1082,21 @@ checkPages cfg ps = go Set.empty ps
 -- | A request may not name an allowance the backing has not reserved and
 -- committed: a prepared growth is not capacity.
 capRefusal ∷ StorageService → Backing → StoreConfig → STM (Maybe StorageFailure)
-capRefusal svc (Backing u bid _) cfg
-  | u /= svId svc = pure (Just ForeignHandle)
-  | otherwise = do
-      s ← readTVar (svState svc)
-      pure $ case Map.lookup bid (stBackings s) of
-        Nothing → Just BackingClosed
-        Just e
-          | cfgAllowanceBytes cfg > eCap e → Just (InvalidRequest (BeyondCommittedCap (cfgAllowanceBytes cfg) (eCap e)))
-          | otherwise → Nothing
+capRefusal svc b cfg = do
+  s ← readTVar (svState svc)
+  pure $ case lookBacking svc b s of
+    Left f → Just f
+    Right (_, _, e)
+      | cfgAllowanceBytes cfg > eCap e → Just (InvalidRequest (BeyondCommittedCap (cfgAllowanceBytes cfg) (eCap e)))
+      | otherwise → Nothing
 
 growthBlocks ∷ StorageService → Backing → STM (Maybe StorageFailure)
-growthBlocks svc (Backing _ bid _) = do
+growthBlocks svc b = do
   s ← readTVar (svState svc)
-  pure $ case Map.lookup bid (stBackings s) of
-    Just e | GIdle ← eGrowth e → Nothing
-    Just _ → Just (BusyNow GrowthActive)
-    Nothing → Nothing
+  pure $ case lookBacking svc b s of
+    Right (_, _, e) | GIdle ← eGrowth e → Nothing
+    Right _ → Just (BusyNow GrowthActive)
+    Left _ → Nothing
 
 -- | Queue the execution of a growth to a larger allowance. The size rules were
 -- decided by the model (@proposeGrowth@); the backend re-checks what it owns: the
@@ -1070,18 +1107,16 @@ submitGrowth svc b from to
   | to < from = pure (Left (InvalidRequest (GrowthNotIncreasing from to)))
   | otherwise = atomically $ do
       s ← readTVar (svState svc)
-      let Backing u bid _ = b
-      case Map.lookup bid (stBackings s) of
-        _ | u /= svId svc → pure (Left ForeignHandle)
-        Nothing → pure (Left BackingClosed)
-        Just e
+      case lookBacking svc b s of
+        Left f → pure (Left f)
+        Right (bid, _, e)
           | from /= eCap e → pure (Left (InvalidRequest (GrowthStaleBase from (eCap e))))
           | Just bad ← growthSizeError e to → pure (Left (InvalidRequest bad))
           -- an equal size is an idempotent no-op: it needs no reservation, so nothing blocks it
-          | from == to → admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WGrow (GrowSpec from to))
+          | from == to → admitJob svc (Right b) MaintenanceWork (WGrow (GrowSpec from to))
           | Just p ← ePending e → pure (Left (ReservationFailed (PendingReservationBlocks p)))
           | GIdle ← eGrowth e → do
-              t ← admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WGrow (GrowSpec from to))
+              t ← admitJob svc (Right b) MaintenanceWork (WGrow (GrowSpec from to))
               -- the slot moves in the transaction that admits the job, never after it
               when (either (const False) (const True) t) (setSlot svc bid GRunning)
               pure t
@@ -1109,44 +1144,41 @@ setSlot svc bid slot = modifyTVar' (svState svc) (\s → s {stBackings = Map.adj
 submitAbandon ∷ StorageService → Backing → PreparedGrowth → IO (Either StorageFailure Ticket)
 submitAbandon svc b p = atomically $ do
   s ← readTVar (svState svc)
-  let Backing u bid _ = b
-  case Map.lookup bid (stBackings s) of
-    _ | u /= svId svc → pure (Left ForeignHandle)
-    Just e
+  case lookBacking svc b s of
+    Left f → pure (Left f)
+    Right _ | not (ownsPrepared svc p) → pure (Left ForeignHandle)
+    Right (bid, _, e)
       | GPrepared q ← eGrowth e, q == p → do
-          t ← admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WRelease (pgFrom p) (pgTo p) (Just p))
+          t ← admitJob svc (Right b) MaintenanceWork (WRelease (pgFrom p) (pgTo p) (Just p))
           when (either (const False) (const True) t) (setSlot svc bid (GReleasing (Just p)))
           pure t
       | otherwise → pure (Left (InvalidRequest NoPreparedGrowth))
-    Nothing → pure (Left BackingClosed)
 
 -- | Queue another attempt to release an extra reservation a failed release left
 -- pending.
 submitReleasePending ∷ StorageService → Backing → IO (Either StorageFailure Ticket)
 submitReleasePending svc b = atomically $ do
   s ← readTVar (svState svc)
-  let Backing u bid _ = b
-  case Map.lookup bid (stBackings s) of
-    _ | u /= svId svc → pure (Left ForeignHandle)
-    Just e
+  case lookBacking svc b s of
+    Left f → pure (Left f)
+    Right (bid, _, e)
       | Just extra ← ePending e, GIdle ← eGrowth e → do
-          t ← admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WRelease (eCap e) (eCap e + extra) Nothing)
+          t ← admitJob svc (Right b) MaintenanceWork (WRelease (eCap e) (eCap e + extra) Nothing)
           when (either (const False) (const True) t) (setSlot svc bid (GReleasing Nothing))
           pure t
       | Just _ ← ePending e → pure (Left (BusyNow GrowthActive))
       | otherwise → pure (Left (InvalidRequest NoPreparedGrowth))
-    Nothing → pure (Left BackingClosed)
 
 -- | The owner's commit of a prepared growth, after the model committed its own:
 -- only now is the larger allowance spendable by this backend. The token must be the one this
 -- service's current preparation made.
 commitBackingGrowth ∷ StorageService → Backing → PreparedGrowth → IO (Either StorageFailure ())
-commitBackingGrowth svc (Backing u bid _) p = atomically $ do
+commitBackingGrowth svc b p = atomically $ do
   s ← readTVar (svState svc)
-  case Map.lookup bid (stBackings s) of
-    _ | u /= svId svc || pgService p /= svId svc → pure (Left ForeignHandle)
-    Nothing → pure (Left BackingClosed)
-    Just e
+  case lookBacking svc b s of
+    Left f → pure (Left f)
+    Right _ | not (ownsPrepared svc p) → pure (Left ForeignHandle)
+    Right (bid, _, e)
       | ePhase e /= EOpen → pure (Left BackingClosed)
       | GPrepared q ← eGrowth e, q == p → do
           writeTVar (svState svc) s {stBackings = Map.insert bid e {eCap = pgTo p, eGrowth = GIdle} (stBackings s)}
@@ -1157,9 +1189,9 @@ commitBackingGrowth svc (Backing u bid _) p = atomically $ do
 -- Tickets
 
 lookupTicket ∷ StorageService → Ticket → St → Maybe (Word64, Job)
-lookupTicket svc (Ticket u jid) s
-  | u /= svId svc = Nothing
-  | otherwise = (,) jid <$> Map.lookup jid (stJobs s)
+lookupTicket svc t s = do
+  jid ← resolveTicket svc t
+  (,) jid <$> Map.lookup jid (stJobs s)
 
 -- | Wait until the job has finished (an outcome exists). A ticket that names no
 -- job (already taken, discarded or foreign) is finished.
@@ -1299,7 +1331,7 @@ finishJob svc jid outcome0 = do
     Nothing → pure Nothing
     Just j → do
       forM_ (jDispatch j) $ \g → if holdsResult outcome then releaseStaging svc g else releaseGrant svc g
-      let linked = case outcome of Opened (Backing _ bid _) _ → Just bid; _ → jBacking j
+      let linked = case outcome of Opened b _ → Just (madeBacking b); _ → jBacking j
           j' = j {jPhase = JDone outcome, jDispatch = if holdsResult outcome then jDispatch j else Nothing, jBacking = linked, jWork = scrubWork (jWork j)}
       writeTVar (svState svc) s
         { stJobs = Map.insert jid j' (stJobs s)
@@ -1812,18 +1844,18 @@ execRelease svc j from to = do
 -- borrower. The owner holds one for each live reader pin. A closed backing
 -- refuses.
 withUse ∷ ∀ a. StorageService → Backing → IO a → IO (Either StorageFailure a)
-withUse svc (Backing u bid _) act = mask $ \restore → do
+withUse svc b act = mask $ \restore → do
   entered ← atomically $ do
     s ← readTVar (svState svc)
-    case Map.lookup bid (stBackings s) of
-      _ | u /= svId svc → pure (Left ForeignHandle)
-      Just e | ePhase e == EOpen → do
+    case lookBacking svc b s of
+      Right (bid, _, e) | ePhase e == EOpen → do
         writeTVar (svState svc) s {stBackings = Map.insert bid e {eBorrows = eBorrows e + 1} (stBackings s)}
-        pure (Right ())
-      _ → pure (Left BackingClosed)
+        pure (Right bid)
+      Right _ → pure (Left BackingClosed)
+      Left f → pure (Left f)
   case entered of
     Left f → pure (Left f)
-    Right () → do
+    Right bid → do
       -- the borrow was committed above and is released below, both masked: nothing is committed in this region
       r ← tryWithContext (restore act)
       atomically (modifyTVar' (svState svc) (\s → s {stBackings = Map.adjust (\e → e {eBorrows = eBorrows e - 1}) bid (stBackings s)}))
@@ -1854,9 +1886,9 @@ noClose ∷ CloseReport
 noClose = CloseReport False Nothing Nothing Nothing
 
 closeBacking ∷ StorageService → Backing → IO CloseReport
-closeBacking svc (Backing u bid _)
-  | u /= svId svc = pure (noClose)
-  | otherwise = closeBackingId svc bid
+closeBacking svc b = case resolveBacking svc b of
+  ForeignBacking → pure noClose
+  OwnBacking bid _ → closeBackingId svc bid
 
 -- | Close a backing for a caller that receives the report. A failing close is ALWAYS kept by the service (below), so
 -- the report is a copy: a cancellation remembered by the close is delivered after it, and nothing is lost behind it.
@@ -1979,9 +2011,10 @@ data BackingView = BackingView
   deriving stock (Eq, Show)
 
 backingView ∷ StorageService → Backing → STM (Maybe BackingView)
-backingView svc (Backing _ bid _) = do
+backingView svc b = do
   s ← readTVar (svState svc)
-  pure $ flip fmap (Map.lookup bid (stBackings s)) $ \e →
+  -- through the resolver: a handle of another service (or of one that ended) names nothing here
+  pure $ flip fmap (either (const Nothing) (\(_, _, e) → Just e) (lookBacking svc b s)) $ \e →
     BackingView (eCap e) (eLength e) (ePending e) (case eGrowth e of GIdle → False; _ → True) (eBorrows e) (ePhase e /= EOpen)
 
 -- | What the service reports of itself: the counts the contract bounds.
