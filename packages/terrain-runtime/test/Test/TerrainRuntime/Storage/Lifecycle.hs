@@ -27,7 +27,6 @@ import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (pageFileOffset)
-import System.IO (hFlush, stdout)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -228,7 +227,6 @@ expectCleanupEvidence ev cell
 -- | Run one cell; answers whether the event had an effect to check (some cells are no-ops by construction).
 runCell :: Kind -> Phase -> Event -> IO Bool
 runCell kind phase ev = do
-  putStrLn ("  cell: " <> show kind <> " / " <> show phase <> " / " <> show ev) >> hFlush stdout
   withEnv $ \env -> do
     let probe = envProbe env
         svc = envSvc env
