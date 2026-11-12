@@ -440,6 +440,9 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
       warm ← produce
       _ ← awaitOutcome env warm
       let k = 24 ∷ Int
+      -- BOTH readings are taken with the workers idle: the warm-up job's worker may still be inside its frame, holding the
+      -- pages it wrote, and a first reading taken then would count what the second no longer does (a negative figure)
+      workersIdle env
       heapBefore ← live
       ts ← forM [1 .. k] (const produce)
       -- the second reading is taken with the workers IDLE (blocked in their wait): a worker that has committed its
@@ -524,6 +527,7 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       warm ← produce 0
       _ ← awaitOutcome env warm
       let k = 24 ∷ Int
+      workersIdle env
       heapBefore ← live
       ts ← forM [1 .. k] produce
       workersIdle env
