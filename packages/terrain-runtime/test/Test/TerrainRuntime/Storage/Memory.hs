@@ -12,31 +12,48 @@
 -- bound allows in validated mode, a write of the most pages a transaction stages
 -- (its pages are the transaction's own, already accounted, and shared, so they add
 -- nothing here), and an open (which carries a path and a configuration).
-module Test.TerrainRuntime.Storage.Memory (spec, spec2, spec3) where
+-- | What the service retains, against what it is charged.
+--
+-- THE MEASUREMENT (rewritten in round 5, after the CI runner showed the live-heap difference is noisy in BOTH directions
+-- by several KiB, so that "noise only adds" is false and small rows could pass vacuously): the live heap a major
+-- collection leaves is read twice, and the difference of two readings carries a FLOOR, the amplitude it shows when
+-- nothing that matters happened between them ('noiseFloor', measured in the process). Every ASSERTED row therefore
+-- has a SIGNAL far above that floor: either K instances held at once and divided (K raised until the total added is at
+-- least 'signalMultiple' times the floor), or a standalone value built that many at a time, or a structure whose size
+-- already is that large (a transfer buffer). A measured value of zero or below FAILS the row (it measured nothing); there
+-- is no least-of-N and no clamp. A row that cannot reach that signal in the service itself is printed as an observation
+-- and its bound is carried by a standalone row.
+--
+-- The standalone rows rebuild what the service holds per element, with the same constructors it uses: the job table
+-- node, the queue's element and the admission's own entry for the grant (a job), the backing map's node and the volume
+-- ledger's node (an entry and a closing record), the list cell and the grant (a kept failure).
+module Test.TerrainRuntime.Storage.Memory (spec, spec2, spec3, floorSpec, noiseFloor, signalMultiple) where
 
 import Control.Concurrent.STM (atomically)
 import Control.Exception (evaluate)
-import Control.Monad (forM, forM_, void)
+import Control.Monad (forM, forM_, replicateM, void)
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
 import qualified Data.ByteString.Char8 as BC
+import Data.IORef (newIORef, readIORef)
 import Data.Word (Word64)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..))
+import System.IO.Unsafe (unsafePerformIO)
 import System.Mem (performMajorGC)
 import Test.Hspec
 import Test.TerrainRuntime.Storage.Harness
 import Test.TerrainRuntime.Storage.Lifecycle (withControlledService, Ctl (..))
 import qualified Data.Map.Strict as Map
+import qualified Data.Sequence as Seq
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Data.Unique (newUnique)
 import Test.Support.Bounded (bounded)
-import Test.Support.Owned (withOwnedThreadOpening)
 import Test.TerrainRuntime.Store.Harness (H (..), identOf, smallSpec)
 
 h0 ∷ H
@@ -45,8 +62,230 @@ h0 = newStoreH smallSpec
 live ∷ IO Word64
 live = performMajorGC >> performMajorGC >> (gcdetails_live_bytes . gc <$> getRTSStats)
 
--- | The live heap that queuing @n@ jobs adds, per job, with both workers held so the
--- jobs stay queued and no transfer buffer is allocated; and the tickets, to retire.
+mib' ∷ Word64
+mib' = 1024 * 1024
+
+-- ---------------------------------------------------------------------------
+-- THE NOISE FLOOR: what a reading of the live heap does when nothing that matters has happened
+
+-- | How many times the floor a row's signal must be.
+signalMultiple ∷ Double
+signalMultiple = 50
+
+-- | The amplitudes (largest absolute difference of two readings, over 100 samples after a discarded warm-up) of two
+-- readings with NOTHING between them, and of two readings around a change that leaves nothing behind (a list built,
+-- forced and dropped).
+noiseFloor ∷ IO (Double, Double)
+noiseFloor = do
+  let aaOnce = do a ← live; b ← live; pure (fromIntegral b - fromIntegral a ∷ Double)
+      listOnce = do
+        a ← live
+        xs ← evaluate (map (* 2) [1 .. 5000 ∷ Int])
+        _ ← evaluate (length xs)
+        c ← live
+        pure (fromIntegral c - fromIntegral a ∷ Double)
+      amp xs = maximum (map abs xs)
+  -- the first samples of each series are a warm-up (the collector's own state settling) and are discarded
+  _ ← replicateM 5 aaOnce
+  aa ← replicateM 100 aaOnce
+  _ ← replicateM 5 listOnce
+  lst ← replicateM 100 listOnce
+  pure (amp aa, amp lst)
+
+-- | The floor every row is held against, measured once in the process.
+theFloor ∷ Double
+theFloor = unsafePerformIO (uncurry max <$> noiseFloor)
+{-# NOINLINE theFloor #-}
+
+floorSpec ∷ Spec
+floorSpec = describe "Storage backend: the live-heap reading's noise floor" $
+  it "is measured, with nothing between two readings and around a change that leaves nothing" $
+    withEnv $ \env → do
+      (aa, lst) ← noiseFloor
+      oc ← replicateM 100 $ do
+        a ← live
+        b ← openBacking env ident (hCfg h0)
+        _ ← closeBacking (envSvc env) b
+        c ← live
+        pure (fromIntegral c - fromIntegral a ∷ Double)
+      putStrLn ("memory floor | two readings, nothing between | amplitude " <> show (round aa ∷ Integer))
+      putStrLn ("memory floor | around a list built, forced and dropped | amplitude " <> show (round lst ∷ Integer))
+      putStrLn ("memory floor | around an open and close (observation: it leaves garbage a later collection frees) | min " <> show (round (minimum oc) ∷ Integer) <> " max " <> show (round (maximum oc) ∷ Integer))
+      putStrLn ("memory floor | the floor every asserted row must beat " <> show (round signalMultiple ∷ Integer) <> " times | " <> show (round theFloor ∷ Integer))
+
+-- | The live heap that a build adds, per instance: read before, build (forced; it hands back an action that touches
+-- what it built), read after, then the action run so the build stayed live across the second reading.
+heldAdded ∷ Int → IO (IO Int) → IO Double
+heldAdded n build = do
+  heapBefore ← live
+  touch ← build
+  heapAfter ← live
+  _ ← touch
+  pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral n)
+
+-- | Hold a built value LIVE (in a cell the caller's action reads) and force it. A thunk that has been evaluated drops
+-- what it was built from, so a closure over the structures would not keep them alive across the second reading; a cell
+-- does.
+holdLive ∷ a → (a → Int) → IO (IO Int)
+holdLive x size = do
+  ref ← newIORef x
+  _ ← evaluate (size x)
+  pure (readIORef ref >>= \y → evaluate (size y))
+
+-- | A row's signal must be far above the floor and its value above zero (zero or below measured nothing).
+checkSignal ∷ String → Int → Double → Expectation
+checkSignal name n m = do
+  let signal = m * fromIntegral n
+      need = signalMultiple * theFloor
+  putStrLn ("memory signal | " <> name <> " | instances " <> show n <> " | signal " <> show (round signal ∷ Integer) <> " | floor " <> show (round theFloor ∷ Integer))
+  m `shouldSatisfy` (> 0)
+  signal `shouldSatisfy` (>= need)
+
+-- | A standalone row: instances raised until the total added is at least 'signalMultiple' times the floor.
+sound ∷ String → Int → (Int → IO Double) → IO Double
+sound name n0 at = go n0 (0 ∷ Int)
+  where
+    need = signalMultiple * theFloor
+    go n tries = do
+      m ← at n
+      if m * fromIntegral n >= need || tries >= 4
+        then checkSignal name n m >> pure m
+        else go (min 60000 (max (n * 2) (ceiling (need / max m 1) * 2))) (tries + 1)
+
+-- | One row of the table: what is retained, the charge that pays for it, the measured bytes, asserted within it.
+row ∷ String → Word64 → Double → Expectation
+row name charge measured = do
+  putStrLn ("memory row | " <> name <> " | measured " <> show (round measured ∷ Integer) <> " | charged " <> show charge)
+  measured `shouldSatisfy` (<= fromIntegral charge)
+
+-- ---------------------------------------------------------------------------
+-- Standalone builders: what the service holds per element, with the constructors it uses
+
+-- | An admission with room for the standalone rows' many grants (the default control account holds 2,048 records).
+bigBank ∷ A.EditBankConfig
+bigBank = either (error . show) id (A.mkEditBankConfig A.defaultEditBankSpec {A.ebsControl = fromIntegral (256 * mib'), A.ebsEditBank = fromIntegral (1024 * mib')})
+
+-- | @n@ control grants of @bytes@ each, in one admission (the admission's own entries per grant are part of the cost).
+reserveN ∷ Int → Word64 → ([A.Grant], A.Admission)
+reserveN n bytes = go (A.newAdmission bigBank) n []
+  where
+    go a 0 acc = (reverse acc, a)
+    go a k acc = case A.reserve A.Foreground [A.ControlCredit bytes] a of
+      Right (g, a') → go a' (k - 1 ∷ Int) (g : acc)
+      Left _ → error "the control account of the standalone rows is too small"
+
+-- | @n@ queued jobs of a work, as the service holds them: the job table node, the queue's element and the grant's
+-- entry in the admission.
+jobRow ∷ (Int → Work) → Int → IO Double
+jobRow mk n = heldAdded n $ do
+  let (grants, adm) = reserveN n (jobCharge (mk 1))
+      jobs = Map.fromList [(fromIntegral i ∷ Word64, Job Nothing ident ExplicitWork (mk i) JQueued False g Nothing 0 False False) | (i, g) ← zip [1 .. n] grants]
+      queue = Map.singleton ExplicitWork (Seq.fromList (map fromIntegral [1 .. n]) ∷ Seq.Seq Word64)
+  holdLive (jobs, queue, adm) (\(j, q, a) → Map.size j + sum (map Seq.length (Map.elems q)) + fromIntegral (A.lgControlReserved (A.ledgers a)))
+
+readWork ∷ Int → Work
+readWork i = WRead (ReadSpec (hCfg h0) (PageNo (fromIntegral (1000 + i * 300))) 256 ReadValidated)
+
+-- | An open with a path as long as a path may be, of its own.
+openWork ∷ Int → Work
+openWork i = WOpen (OpenSpec (BC.pack ('/' : replicate (maxDirectoryBytes - 1) (toEnum (100 + (i `mod` 100))))) ident (hCfg h0))
+
+-- | The most results a running write holds (the 255 before the page it is held at), each instance its own.
+resultsOf ∷ Int → [(PageNo, PageResult)]
+resultsOf k = [(PageNo (fromIntegral (k * 1000 + i)), Wrote) | i ← [0 .. fromIntegral maxIoPages - 2 ∷ Int]]
+
+-- | A staged write of the most pages a transaction may stage, each its own page.
+bigWrite ∷ IO StagedWrite
+bigWrite = do
+  let plan = either error id (planFor h0 1)
+  (tid, s1) ← either (fail . show) pure (admit plan (hStore h0))
+  sw ← either (fail . show) pure (stageWrite s1 tid)
+  let pages = [(PageNo (100 + i), BS.replicate pageSize (fromIntegral i)) | i ← [0 .. fromIntegral maxIoPages - 1]]
+  -- the pages are the transaction's own: built and forced here, so what the service adds is not counted with them
+  _ ← evaluate (sum (map (BS.length . snd) pages))
+  pure sw {swPages = pages}
+
+-- | What a table of @n@ backing-sized records holds: a backing entry at its largest variant (the growth slot is the only
+-- varying field: 'GReleasing' holds a 'Maybe' of the six-field 'PreparedGrowth', a pending reservation is present, the
+-- entry is open and its grant is a real control grant), in the backing map; or the same entry MOVED into a closing
+-- record whose native close has not returned; or a REPORTING closing record, which keeps nothing but the grant. Each
+-- instance with its volume's node in the reserved-figure ledger (one per instance: conservative, the service shares
+-- a volume's node) and the admission's entry for its grant.
+data Held = HeldBacking | HeldNative | HeldReporting
+
+closingRow ∷ Env → Held → Int → IO Double
+closingRow env kind n = do
+  fd ← (\fds → case fds of f : _ → f; [] → error "no descriptor") <$> fdHandles (envProbe env)
+  u ← newUnique
+  let (grants, adm) = reserveN n backingRecordBytes
+      entryFor g i = Entry fd ident (fromIntegral i) (1024 * mib') (1024 * mib') mib' (GReleasing (Just (PreparedGrowth u (fromIntegral i) (fromIntegral i) (64 * mib') (128 * mib') (fromIntegral i)))) (Just (fromIntegral i)) EOpen 0 (1024 * mib') g
+      ledger = Map.fromList [(fromIntegral i, fromIntegral i * 3) | i ← [1 .. n]] ∷ Map.Map Word64 Word64
+      keyed ∷ (A.Grant → Int → v) → Map.Map Word64 v
+      keyed f = Map.fromList [(fromIntegral i ∷ Word64, f g i) | (i, g) ← zip [1 .. n] grants]
+  heldAdded n $ case kind of
+    HeldBacking → holdLive (keyed entryFor, ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [fromIntegral (eLength e) | e ← Map.elems m])
+    HeldNative → holdLive (keyed (\g i → CrNative (entryFor g i)), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative e → fromIntegral (eLength e); CrReporting _ → 0 | c ← Map.elems m])
+    HeldReporting → holdLive (keyed (\g _ → CrReporting g), ledger, adm) (\(m, l, a) → Map.size m + Map.size l + fromIntegral (A.lgControlReserved (A.ledgers a)) + sum [case c of CrNative _ → 0; CrReporting _ → 1 | c ← Map.elems m])
+
+-- ---------------------------------------------------------------------------
+-- The rows
+
+-- | The live heap one retained outcome adds, per instance, over @n@ distinct instances held live.
+outcomeRow ∷ (Int → Outcome) → Int → IO Double
+outcomeRow mk n = heldAdded n $
+  holdLive (map mk [1 .. n]) (\xs → sum [case o of Failed (HostFailure t) ns → T.length t + length ns; Cancelled ns → length ns; Written w → length (wrPages w); _ → 0 | o ← xs] + length xs)
+
+-- | The retained failure at its largest: the longest text a defect keeps (of four-byte characters, the worst case of
+-- the UTF-8 encoding) and the most notes a failure carries (each cleanup step yields at most two).
+failedLargest ∷ Int → Outcome
+failedLargest i = Failed (HostFailure (T.replicate maxHostFailureChars (T.singleton (toEnum (0x10000 + (i `mod` 1000)))))) [CleanupNote IoClose (Errno (fromIntegral (i + k))) | k ← [1 .. 4]]
+
+cancelledLargest ∷ Int → Outcome
+cancelledLargest i = Cancelled [CleanupNote IoUnlink (Errno (fromIntegral (i + k))) | k ← [1 .. 4]]
+
+-- | The queued, running and finished write at its largest, @n@ at a time.
+writeReportOf ∷ StagedWrite → Bool → Int → Outcome
+writeReportOf sw failing i = Written (WriteReport (swTxn sw) ((if failing then [(PageNo (fromIntegral i), WriteFailedAt (StorageIo (IoFailure IoWrite (IoErrno (Errno 5)) (Just (PageNo (fromIntegral i))) (Just (fromIntegral i * 4096)) 17 4096)))] else [(PageNo (fromIntegral i), Wrote)]) <> [(PageNo (fromIntegral (i + k)), if failing then NotAttempted else Wrote) | k ← [1 .. maxIoPages - 1]]))
+
+-- | The kept failure at its largest (a close that RAISED with the longest text), with its list cell and the admission's
+-- entry for its grant, @n@ at a time.
+keptRow ∷ Int → IO Double
+keptRow n = heldAdded n $ do
+  let (grants, adm) = reserveN n keptEntryBytes
+      ks = [Kept (T.pack ("close of backing " <> show i)) (KeptClose (fromIntegral i) (CloseRaised (T.copy (T.replicate maxHostFailureChars (T.singleton (toEnum (0x10000 + (i `mod` 1000)))))))) g | (i, g) ← zip [1 .. n] grants]
+  holdLive (ks, adm) (\(l, a) → length l + sum [T.length t | Kept _ (KeptClose _ (CloseRaised t)) _ ← l] + fromIntegral (A.lgControlReserved (A.ledgers a)))
+
+spec ∷ Spec
+spec = describe "Storage backend: the accounted job record is measured" $ do
+  it "is at least the live heap the largest queued read adds to the system" $ do
+    perRead ← sound "queued read record" 200 (jobRow readWork)
+    row "queued read record (standalone: job node, queue element, grant entry)" jobRecordBytes perRead
+    -- the service itself, eight held: an OBSERVATION (its signal is below the floor), not an assertion
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      g ← addGate (envProbe env) (\op → case op of OpReadAt _ _ → True; _ → False)
+      held ← forM [1, 2] (\i → submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo i) 1 ReadProbe >>= either (fail . show) pure)
+      awaitReached g 2
+      (readCost, ts) ← perJob 8 (\i → submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo (fromIntegral (1000 + i * 300))) 256 ReadValidated)
+      putStrLn ("memory observation | eight queued reads in the service, per record | " <> show (round readCost ∷ Integer) <> " | not asserted: signal below the floor")
+      openGate g
+      forM_ (held <> ts) (awaitOutcome env)
+
+  it "is at least the live heap the largest queued open adds to the system" $ do
+    perOpen ← sound "queued open record" 200 (jobRow openWork)
+    row "queued open record (standalone, a 512-byte path of its own)" jobRecordBytes perOpen
+    withEnv $ \env → do
+      g ← addGate (envProbe env) (== OpCreateFile)
+      let spec' i = OpenSpec (BC.pack ('/' : replicate (maxDirectoryBytes - 1) (toEnum (100 + i)))) ident (hCfg h0)
+      held ← forM [1, 2 ∷ Int] (\i → submitOpen (envSvc env) ExplicitWork (spec' i) >>= either (fail . show) pure)
+      awaitReached g 2
+      (opens, ts) ← perJob 8 (\i → submitOpen (envSvc env) ExplicitWork (spec' (i + 2)))
+      putStrLn ("memory observation | eight queued opens in the service, per record | " <> show (round opens ∷ Integer) <> " | not asserted: signal below the floor")
+      openGate g
+      forM_ (held <> ts) (awaitOutcome env)
+
+-- | The live heap that queuing @n@ jobs adds, per job, with both workers held so the jobs stay queued and no transfer
+-- buffer is allocated; and the tickets, to retire. Used for OBSERVATIONS: eight records are a signal below the floor.
 perJob ∷ Int → (Int → IO (Either StorageFailure Ticket)) → IO (Double, [Ticket])
 perJob n submit = do
   heapBefore ← live
@@ -54,276 +293,116 @@ perJob n submit = do
   heapAfter ← live
   pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral n, ts)
 
-spec ∷ Spec
-spec = describe "Storage backend: the accounted job record is measured" $ do
-  it "is at least the live heap the largest queued read adds to the system" $
-    withEnv $ \env → do
-      b ← openBacking env ident (hCfg h0)
-      g ← addGate (envProbe env) (\op → case op of OpReadAt _ _ → True; _ → False)
-      held ← forM [1, 2] (\i → submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo i) 1 ReadProbe >>= either (fail . show) pure)
-      awaitReached g 2
-      (readCost, ts) ← perJob 8 (\i → submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo (fromIntegral (1000 + i * 300))) 256 ReadValidated)
-      putStrLn ("measured bytes per queued read record: " <> show readCost <> " (accounted " <> show jobRecordBytes <> ")")
-      readCost `shouldSatisfy` (<= fromIntegral jobRecordBytes)
-      openGate g
-      forM_ (held <> ts) (awaitOutcome env)
-
-  it "is at least the live heap the largest queued open adds to the system" $
-    withEnv $ \env → do
-      g ← addGate (envProbe env) (== OpCreateFile)
-      -- a directory that does not exist, as long as a path may be and a path of each job's own:
-      -- the opens fail once released
-      let spec' i = OpenSpec (BC.pack ('/' : replicate (maxDirectoryBytes - 1) (toEnum (100 + i)))) ident (hCfg h0)
-      held ← forM [1, 2 ∷ Int] (\i → submitOpen (envSvc env) ExplicitWork (spec' i) >>= either (fail . show) pure)
-      awaitReached g 2
-      (opens, ts) ← perJob 8 (\i → submitOpen (envSvc env) ExplicitWork (spec' (i + 2)))
-      putStrLn ("measured bytes per queued open record: " <> show opens <> " (accounted " <> show jobRecordBytes <> ")")
-      opens `shouldSatisfy` (<= fromIntegral jobRecordBytes)
-      openGate g
-      forM_ (held <> ts) (awaitOutcome env)
-
--- | The rest of what the service holds, each charged at what it holds and measured the same way: the
--- transfer buffer of a held read, the result of a finished read nobody has taken, and a backing's record.
+-- | The rest of what the service holds. The transfer buffer and the result are structures of about a megabyte: their
+-- signal is already far above the floor, and the rows assert it.
 spec2 ∷ Spec
 spec2 = describe "Storage backend: every other accounted figure is measured" $ do
   it "charges a held transfer buffer at least the live heap it adds" $
-    withEnv $ \env -> do
-      b <- openBacking env ident (hCfg h0)
-      g <- addGate (envProbe env) (\op -> case op of OpReadAt _ _ -> True; _ -> False)
-      heapBefore <- live
-      ts <- forM [1, 2 ∷ Int] (\i -> submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo (fromIntegral (i * 1000))) 256 ReadProbe >>= either (fail . show) pure)
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      g ← addGate (envProbe env) (\op → case op of OpReadAt _ _ → True; _ → False)
+      heapBefore ← live
+      ts ← forM [1, 2 ∷ Int] (\i → submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo (fromIntegral (i * 1000))) 256 ReadProbe >>= either (fail . show) pure)
       awaitReached g 2
-      heapAfter <- live
+      heapAfter ← live
       let perRead = (fromIntegral heapAfter - fromIntegral heapBefore) / 2 ∷ Double
-          accounted = fromIntegral (transferBufferBytes 256 + jobRecordBytes)
-      putStrLn ("measured bytes per held 256-page read (buffer and record): " <> show perRead <> " (accounted " <> show accounted <> ")")
-      perRead `shouldSatisfy` (<= accounted)
+      checkSignal "held transfer buffer" 2 perRead
+      row "held 256-page read (buffer and record)" (transferBufferBytes 256 + jobRecordBytes) perRead
       openGate g
       forM_ ts (awaitOutcome env)
 
   it "charges a finished, untaken result at least the live heap it holds" $
-    withEnv $ \env -> do
-      b <- openBacking env ident (hCfg h0)
-      heapBefore <- live
-      t <- submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo 1000) 256 ReadProbe >>= either (fail . show) pure
-      bounded' (atomically (awaitTicket (envSvc env) t))
-      heapAfter <- live
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      heapBefore ← live
+      t ← submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo 1000) 256 ReadProbe >>= either (fail . show) pure
+      bounded (atomically (awaitTicket (envSvc env) t))
+      heapAfter ← live
       let held = fromIntegral heapAfter - fromIntegral heapBefore ∷ Double
-          accounted = fromIntegral (256 * resultPageBytes + jobRecordBytes)
-      putStrLn ("measured bytes of a held 256-page result (and its record): " <> show held <> " (accounted " <> show accounted <> ")")
-      held `shouldSatisfy` (<= accounted)
-      _ <- awaitOutcome env t
+      checkSignal "finished 256-page result" 1 held
+      row "finished, untaken 256-page result (and its record)" (256 * resultPageBytes + jobRecordBytes) held
+      _ ← awaitOutcome env t
       pure ()
-
-  it "charges a backing's record at least the live heap it adds (the service-level cross-check)" $
-    withEnv $ \env -> do
-      -- one open first, so the figures are the records' and not one-time initialisation
-      warm <- openBacking env (identOf 9 99) (hCfg h0)
-      -- Fifteen independent samples (each opens a backing and closes it), the LEAST taken. WHY THE LEAST IS SOUND: a
-      -- reading of the live heap is the structure plus noise (a pinned block kept alive by one live object, the
-      -- timing of a collection), and that noise only ever ADDS, so the least of independent samples is the best
-      -- estimate. The negative figure seen once (-2512) came from the earlier version of this row, which SUBTRACTED
-      -- two readings taken across a state change that frees as much as it allocates (a growth job's record and
-      -- outcome were retired between them): such a difference is not a measurement of any structure. These samples
-      -- do not do that: each is one quiescent reading, one open (the structure appears, its job record is already
-      -- retired by the harness's take), one reading; nothing the baseline held is freed by the open (the baseline was
-      -- collected twice and a warm-up open has forced the lazily evaluated parts). The residual cases (a thunk whose
-      -- evaluation shrinks what it was) are caught by the guard below, which fails a cross-check that is not at least
-      -- the standalone entry's size. The BOUND is the standalone row below; this row is its cross-check.
-      samples <- forM [1 .. 15 :: Int] $ \k -> do
-        heapBefore <- live
-        b <- openBacking env (identOf (fromIntegral k) (fromIntegral (100 + k))) (hCfg h0)
-        heapOpen <- live
-        _ <- closeBacking (envSvc env) b
-        pure (fromIntegral heapOpen - fromIntegral heapBefore ∷ Double)
-      _ <- closeBacking (envSvc env) warm
-      let opened = minimum samples
-      standaloneEntry <- entryCost env
-      putStrLn ("measured bytes per open backing (cross-check): " <> show opened <> " (accounted " <> show backingRecordBytes <> "; the standalone largest entry with its map places: " <> show standaloneEntry <> ")")
-      opened `shouldSatisfy` (<= fromIntegral backingRecordBytes)
-      -- the guard: a service that holds a backing holds at least its entry
-      opened `shouldSatisfy` (>= standaloneEntry)
 
   it "charges a backing's record at least its largest entry, measured as a value, with the service's own places for it" $
-    withEnv $ \env -> do
-      standaloneEntry <- entryCost env
-      row "backing entry, largest variant (GReleasing (Just prepared), a pending reservation), standalone, with its backing-map node and its volume-ledger node" backingRecordBytes standaloneEntry
-  where
-    bounded' = bounded
-    -- THE LARGEST VARIANT OF THE ENTRY, as a value. Every field is a word or a boxed word except the growth slot:
-    -- 'GIdle' and 'GRunning' are shared nullary constructors, 'GPrepared' holds one six-field 'PreparedGrowth', and
-    -- 'GReleasing' holds a 'Maybe' of one, so GReleasing (Just prepared) is the largest (the slot box, the Just
-    -- box and the PreparedGrowth). A pending reservation is present (a Just of a boxed word), the entry is open,
-    -- and its grant is a real control grant. What backingRecordBytes pays for is this entry plus its node in the
-    -- service's backing map (and the closing-record map it moves to, never both) plus its volume's node in the
-    -- reserved-figure map, so both maps are measured with it, 200 entries at a time, per entry.
-    entryCost env = do
-      fd <- (\fds -> case fds of f : _ -> f; [] -> error "no descriptor") <$> fdHandles (envProbe env)
-      _ <- openBacking env ident (hCfg h0)
-      fd' <- (\fds -> case fds of f : _ -> f; [] -> fd) <$> fdHandles (envProbe env)
-      u <- newUnique
-      bank <- either (fail . show) pure (A.mkEditBankConfig A.defaultEditBankSpec)
-      let n = 200 :: Int
-          grants = go (A.newAdmission bank) (replicate n ())
-          go _ [] = []
-          go a (_ : rest) = case A.reserve A.Foreground [A.ControlCredit backingRecordBytes] a of
-            Right (g, a') -> g : go a' rest
-            Left _ -> error "no control credit for the standalone entries"
-          entry i g = Entry fd' ident (fromIntegral i) (1024 * mib') (1024 * mib') mib' (GReleasing (Just (PreparedGrowth u (fromIntegral i) (fromIntegral i) (64 * mib') (128 * mib') (fromIntegral i)))) (Just (fromIntegral i)) EOpen (fromIntegral i) (maxBound - fromIntegral i) g
-      heapBefore <- live
-      let backings = Map.fromList [(fromIntegral i ∷ Word64, entry i g) | (i, g) <- zip [1 .. n] grants]
-          ledger = Map.fromList [(fromIntegral i, fromIntegral i * 3) | i <- [1 .. n]] :: Map.Map Word64 Word64
-      _ <- evaluate (sum [fromIntegral (eBorrows e) + eCap e | e <- Map.elems backings] + sum (Map.elems ledger))
-      heapAfter <- live
-      _ <- evaluate (Map.size backings + Map.size ledger)
-      pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral n ∷ Double)
+    withEnv $ \env → do
+      _ ← openBacking env ident (hCfg h0)
+      standalone ← sound "backing entry" 200 (closingRow env HeldBacking)
+      row "backing entry, largest variant (GReleasing (Just prepared), a pending reservation), standalone, with its backing-map node, its volume-ledger node and its grant's entry" backingRecordBytes standalone
+      -- the service itself: an OBSERVATION (the signal of one backing is below the floor), not an assertion
+      warm ← openBacking env (identOf 9 99) (hCfg h0)
+      samples ← forM [1 .. 15 ∷ Int] $ \k → do
+        heapBefore ← live
+        b ← openBacking env (identOf (fromIntegral k) (fromIntegral (100 + k))) (hCfg h0)
+        heapOpen ← live
+        _ ← closeBacking (envSvc env) b
+        pure (fromIntegral heapOpen - fromIntegral heapBefore ∷ Double)
+      _ ← closeBacking (envSvc env) warm
+      putStrLn ("memory observation | an open backing in the service, fifteen samples | min " <> show (round (minimum samples) ∷ Integer) <> " max " <> show (round (maximum samples) ∷ Integer) <> " | not asserted: the signal of one backing is below the floor")
 
--- ---------------------------------------------------------------------------
--- Every retained structure, charged and measured at its LARGEST instance
-
-mib' :: Word64
-mib' = 1024 * 1024
-
--- | A staged write of the most pages a transaction may stage, each its own page.
-bigWrite :: IO StagedWrite
-bigWrite = do
-  let plan = either error id (planFor h0 1)
-  (tid, s1) <- either (fail . show) pure (admit plan (hStore h0))
-  sw <- either (fail . show) pure (stageWrite s1 tid)
-  let pages = [(PageNo (100 + i), BS.replicate pageSize (fromIntegral i)) | i <- [0 .. fromIntegral maxIoPages - 1]]
-  -- the pages are the transaction's own: built and forced here, so what the service adds is not counted with them
-  _ <- evaluate (sum (map (BS.length . snd) pages))
-  pure sw {swPages = pages}
-
--- | The live heap a thing adds, held live while it is counted.
-heapAdded :: IO a -> IO (a, Double)
-heapAdded act = do
-  heapBefore <- live
-  r <- act
-  heapAfter <- live
-  pure (r, fromIntegral heapAfter - fromIntegral heapBefore)
-
--- | One row of the table: what is retained, the charge that pays for it, the measured bytes, asserted within it.
-row :: String -> Word64 -> Double -> Expectation
-row name charge measured = do
-  putStrLn ("memory row | " <> name <> " | measured " <> show (round measured :: Integer) <> " | charged " <> show charge)
-  measured `shouldSatisfy` (<= fromIntegral charge)
-
--- | The retained failure at its largest: the longest text a defect keeps (of four-byte characters, the worst case of
--- the UTF-8 encoding) and the most notes a failure carries (each cleanup step yields at most two).
-failedLargest :: Int -> Outcome
-failedLargest i = Failed (HostFailure (T.replicate maxHostFailureChars (T.singleton (toEnum (0x10000 + i))))) [CleanupNote IoClose (Errno (fromIntegral (i + k))) | k <- [1 .. 4]]
-
-cancelledLargest :: Int -> Outcome
-cancelledLargest i = Cancelled [CleanupNote IoUnlink (Errno (fromIntegral (i + k))) | k <- [1 .. 4]]
-
--- | The live heap one retained outcome adds, per instance, over 200 distinct instances held live.
-standalone :: (Int -> Outcome) -> IO (Double, ())
-standalone mk = do
-  let n = 200 :: Int
-  heapBefore <- live
-  let xs = map mk [1 .. n]
-  _ <- evaluate (sum [case o of Failed (HostFailure t) ns -> T.length t + length ns; Cancelled ns -> length ns; Written w -> length (wrPages w); _ -> 0 | o <- xs])
-  heapAfter <- live
-  _ <- evaluate (length xs)
-  pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral n, ())
-
-spec3 :: Spec
+spec3 ∷ Spec
 spec3 = describe "Storage backend: every retained structure is charged and measured at its largest" $ do
-  it "a queued write of the most pages, charged the record and its report's bounded metadata at admission" $
-    withEnv $ \env -> do
-      b <- openBacking env ident (hCfg h0)
-      sw <- bigWrite
-      g <- addGate (envProbe env) (\op -> case op of OpReadAt _ _ -> True; _ -> False)
-      held <- forM [1, 2] (\i -> submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo i) 1 ReadProbe >>= either (fail . show) pure)
-      awaitReached g 2
-      (t, cost) <- heapAdded (submitWrite (envSvc env) b sw >>= either (fail . show) pure)
-      row "queued write, 256 pages" (jobCharge' (length (swPages sw))) cost
-      openGate g
-      forM_ (t : held) (awaitOutcome env)
+  it "a queued write of the most pages, charged the record and its report's bounded metadata at admission" $ do
+    sw ← bigWrite
+    perWrite ← sound "queued write" 200 (jobRow (const (WWrite sw)))
+    row "queued write, 256 pages (standalone: the pages are the transaction's own and shared)" (jobCharge' (length (swPages sw))) perWrite
 
-  it "a running write holding the most results, at the largest" $
-    withEnv $ \env -> do
-      b <- openBacking env ident (hCfg h0)
-      sw <- bigWrite
-      -- held at the last page: the 255 results before it are what the worker holds
-      g <- addGateAfter (envProbe env) (fromIntegral maxIoPages - 1) (\op -> case op of OpWriteAt _ _ -> True; _ -> False)
-      (t, cost) <- heapAdded $ do
-        t <- submitWrite (envSvc env) b sw >>= either (fail . show) pure
-        awaitReached g 1
-        pure t
-      row "running write, 255 results held" (jobCharge' (length (swPages sw))) cost
-      openGate g
-      _ <- awaitOutcome env t
-      pure ()
+  it "a running write holding the most results, at the largest" $ do
+    sw ← bigWrite
+    -- the job's record plus the 255 results the worker holds at the last page, each instance its own
+    let measure n = heldAdded n $ do
+          let (grants, adm) = reserveN n (jobCharge (WWrite sw))
+              jobs = Map.fromList [(fromIntegral i ∷ Word64, Job Nothing ident ExplicitWork (WWrite sw) JQueued False g Nothing 0 False False) | (i, g) ← zip [1 .. n] grants]
+              results = [resultsOf k | k ← [1 .. n]]
+          holdLive (jobs, results, adm) (\(j, rs, a) → Map.size j + sum (map length rs) + fromIntegral (A.lgControlReserved (A.ledgers a)))
+    perRunning ← sound "running write" 20 measure
+    row "running write, 255 results held (standalone: its record and the results)" (jobCharge' (length (swPages sw))) perRunning
 
   it "a finished write report with the most pages, and with its one failure, at the largest" $ do
-    sw <- bigWrite
-    let report i failing = Written (WriteReport (swTxn sw) ((if failing then [(PageNo (fromIntegral i), WriteFailedAt (StorageIo (IoFailure IoWrite (IoErrno (Errno 5)) (Just (PageNo (fromIntegral i))) (Just (fromIntegral i * 4096)) 17 4096)))] else [(PageNo (fromIntegral i), Wrote)]) <> [(PageNo (fromIntegral (i + k)), if failing then NotAttempted else Wrote) | k <- [1 .. maxIoPages - 1]]))
-    (full, _) <- standalone (\i -> report i False)
-    (failing, _) <- standalone (\i -> report i True)
+    sw ← bigWrite
+    full ← sound "finished write report, written" 20 (outcomeRow (writeReportOf sw False))
+    failing ← sound "finished write report, first page failed" 20 (outcomeRow (writeReportOf sw True))
     row "finished write report, 256 pages written" (fromIntegral maxIoPages * writeEntryBytes + writeFailureBytes) full
     row "finished write report, first page failed, 255 not attempted" (fromIntegral maxIoPages * writeEntryBytes + writeFailureBytes) failing
 
-  it "every other retained outcome, each added to the largest queued record and within the record's charge" $
-    withEnv $ \env -> do
-      -- the largest record a job holds: an open with a path as long as a path may be, measured queued
-      g <- addGate (envProbe env) (== OpCreateFile)
-      let spec' i = OpenSpec (BC.pack ('/' : replicate (maxDirectoryBytes - 1) (toEnum (100 + i)))) ident (hCfg h0)
-      held <- forM [1, 2 :: Int] (\i -> submitOpen (envSvc env) ExplicitWork (spec' i) >>= either (fail . show) pure)
-      awaitReached g 2
-      (record, ts) <- perJob 8 (\i -> submitOpen (envSvc env) ExplicitWork (spec' (i + 2)))
-      u <- newUnique
-      let backing i = Backing u (fromIntegral i) ident
-          reservation i = Reservation (fromIntegral i) 4096 0 (BC.pack "ext4") 4096 (fromIntegral i)
-          prepared' i = PreparedGrowth u (fromIntegral i) 1 (64 * mib') (128 * mib') (fromIntegral i)
-      -- an Opened outcome, its backing's own record being charged separately (the row of the backing's record)
-      (opened, _) <- standalone (\i -> Opened (backing i) (reservation i))
-      (grown, _) <- standalone (\i -> GrowthPrepared (prepared' i) (reservation i))
-      (plain, _) <- standalone (\i -> if even i then Released else GrowthNoChange)
-      row "largest open record plus a retained Opened" jobRecordBytes (record + opened)
-      row "largest open record plus a retained GrowthPrepared" jobRecordBytes (record + grown)
-      row "largest open record plus a retained Released or GrowthNoChange" jobRecordBytes (record + plain)
-      openGate g
-      forM_ (held <> ts) (awaitOutcome env)
+  it "every other retained outcome, each added to the largest queued record and within the record's charge" $ do
+    u ← newUnique
+    record ← sound "largest queued open record" 200 (jobRow openWork)
+    let backing i = Backing u (fromIntegral i) ident
+        reservation i = Reservation (fromIntegral i) 4096 0 (BC.pack "ext4") 4096 (fromIntegral i)
+        prepared' i = PreparedGrowth u (fromIntegral i) 1 (64 * mib') (128 * mib') (fromIntegral i)
+    opened ← sound "retained Opened" 200 (outcomeRow (\i → Opened (backing i) (reservation i)))
+    grown ← sound "retained GrowthPrepared" 200 (outcomeRow (\i → GrowthPrepared (prepared' i) (reservation i)))
+    plain ← sound "retained Released or GrowthNoChange" 200 (outcomeRow (\i → if even i then Released else GrowthNoChange))
+    row "largest open record plus a retained Opened" jobRecordBytes (record + opened)
+    row "largest open record plus a retained GrowthPrepared" jobRecordBytes (record + grown)
+    row "largest open record plus a retained Released or GrowthNoChange" jobRecordBytes (record + plain)
 
-  it "a retained failure and a retained cancellation at their largest, added to the largest queued record" $
-    withEnv $ \env -> do
-      -- the largest record a job holds: an open with a path as long as a path may be (measured as in the first
-      -- example), to which the largest retained outcome is added
-      g <- addGate (envProbe env) (== OpCreateFile)
-      let spec' i = OpenSpec (BC.pack ('/' : replicate (maxDirectoryBytes - 1) (toEnum (100 + i)))) ident (hCfg h0)
-      held <- forM [1, 2 :: Int] (\i -> submitOpen (envSvc env) ExplicitWork (spec' i) >>= either (fail . show) pure)
-      awaitReached g 2
-      (opens, ts) <- perJob 8 (\i -> submitOpen (envSvc env) ExplicitWork (spec' (i + 2)))
-      (failed, _) <- standalone failedLargest
-      (cancelled, _) <- standalone cancelledLargest
-      row "largest open record plus a retained Failed (a defect text of 256 four-byte characters, 4 notes)" jobRecordBytes (opens + failed)
-      row "largest open record plus a retained Cancelled (4 notes)" jobRecordBytes (opens + cancelled)
-      openGate g
-      forM_ (held <> ts) (awaitOutcome env)
+  it "a retained failure and a retained cancellation at their largest, added to the largest queued record" $ do
+    record ← sound "largest queued open record" 200 (jobRow openWork)
+    failed ← sound "retained Failed" 200 (outcomeRow failedLargest)
+    cancelled ← sound "retained Cancelled" 200 (outcomeRow cancelledLargest)
+    row "largest open record plus a retained Failed (a defect text of 256 four-byte characters, 4 notes)" jobRecordBytes (record + failed)
+    row "largest open record plus a retained Cancelled (4 notes)" jobRecordBytes (record + cancelled)
 
-  it "a kept failure, and a closing record that is moved and not copied" $
-    withControlledService' $ \env -> do
-      -- the evidence list is full: 64 kept failures, each charged
-      -- the largest kept failure: a close that RAISED, with the longest exception text kept (of four-byte characters)
-      (_, kept) <- heapAdded (atomically (keepEvidence (envSvc env) "measure" [KeptClose (fromIntegral i) (CloseRaised (T.copy (T.replicate maxHostFailureChars (T.singleton (toEnum (0x10000 + i)))))) | i <- [1 .. maxKept]]))
-      -- the list really is full: every one was kept (none was refused for its charge)
-      snKept <- snEvidence <$> atomically (snapshotOf (envSvc env))
+  it "a kept failure at its largest, with its list cell and its grant's entry" $ do
+    kept ← sound "kept failure" 200 keptRow
+    row "kept failure, a close that raised with the longest text (standalone, per entry)" keptEntryBytes kept
+    -- the service's list really does hold the most it may: 64 are kept and none was refused for its charge
+    withControlledService' $ \env → do
+      atomically (keepEvidence (envSvc env) "measure" [KeptClose (fromIntegral i) (CloseRaised (T.copy (T.replicate maxHostFailureChars (T.singleton (toEnum (0x10000 + i)))))) | i ← [1 .. maxKept]])
+      snKept ← snEvidence <$> atomically (snapshotOf (envSvc env))
       snKept `shouldBe` maxKept
-      row "kept failure, a close that raised with the longest text (per entry, the list full)" keptEntryBytes (kept / fromIntegral maxKept)
-      -- the claim moves a backing's entry into its closing record whole: held at the native close the heap holds one
-      -- entry, not two
-      b <- openBacking env ident (hCfg h0)
-      g <- addGate (envProbe env) (== OpCloseFile)
-      heapBefore <- live
-      withOwnedThreadOpening (openGate g) (void (closeBacking (envSvc env) b)) $ \_ waitClose -> do
-        awaitReached g 1
-        heapAfter <- live
-        row "closing record (the entry moved, per backing)" backingRecordBytes (max 0 (fromIntegral heapAfter - fromIntegral heapBefore))
-        openGate g
-        waitClose
+
+  it "a closing record, the entry moved and not copied (native close pending), and a reporting record (the grant only)" $
+    withEnv $ \env → do
+      _ ← openBacking env ident (hCfg h0)
+      native ← sound "closing record, native close pending" 200 (closingRow env HeldNative)
+      reporting ← sound "closing record, reporting" 200 (closingRow env HeldReporting)
+      row "closing record, native close pending (the entry moved, per backing)" backingRecordBytes native
+      -- what a reporting record retains: its map node and the one grant it carries until the transaction that deletes it
+      row "closing record, reporting (the carried grant, per record)" backingRecordBytes reporting
   where
     jobCharge' n = jobRecordBytes + fromIntegral n * writeEntryBytes + writeFailureBytes
     -- the service's end reports the kept failures: this example measures them and ignores that report
-    withControlledService' body = withControlledService (\env ctl -> body env >> ctlBegin ctl >> void (ctlResult ctl))
+    withControlledService' body = withControlledService (\env ctl → body env >> ctlBegin ctl >> void (ctlResult ctl))

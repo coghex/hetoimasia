@@ -115,6 +115,10 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , keepEvidence
   , keptEntryBytes
   , Entry (..)
+  , Job (..)
+  , JobPhase (..)
+  , Work (..)
+  , ReadSpec (..)
   , GrowthSlot (..)
   , EntryPhase (..)
   , StagedWrite (..)
@@ -531,10 +535,10 @@ data St = St
   , stDefect ∷ !(Maybe Text)
   , stClosingRecs ∷ !(Map Word64 ClosingRec)
   -- ^ THE CLOSING RECORD. A backing claimed for close MOVES here whole (its grant, its volume contribution, its
-  -- descriptor) and nothing it pays for is released until its native close has returned; ONE transaction then releases
-  -- the grant, subtracts the reservation and KEEPS a failing close as evidence, and the record stays, 'CrReporting',
-  -- until the close has nothing left to do with the service (its diagnostics are done); another transaction deletes
-  -- it. The drain joins the records, so the service cannot end, and its logger cannot be used after its scope, while a
+  -- descriptor) and nothing it pays for is released until its native close has returned; ONE transaction then
+  -- subtracts the reservation (the space is free) and KEEPS a failing close as evidence, and the record stays,
+  -- 'CrReporting', CARRYING THE GRANT, until the close has nothing left to do with the service (its diagnostics are
+  -- done); another transaction releases the grant and deletes it. The drain joins the records, so the service cannot end, and its logger cannot be used after its scope, while a
   -- close is in its diagnostics, and nothing is ever added to a drained service.
   , stEvidence ∷ ![Kept]
   -- ^ Cleanup failures that nobody received (an outcome disposed of undelivered, a close nobody waited for), kept
@@ -547,9 +551,12 @@ data St = St
   -- ^ Why the service was stopped by something other than its own drain (the first reason wins).
   }
 
--- | A backing being closed: still paying (the native close has not returned) or reporting (it has, the charges are
--- released, the diagnostics are pending).
-data ClosingRec = CrNative !Entry | CrReporting
+-- | A backing being closed: still holding everything (the native close has not returned) or reporting (it has: the
+-- file is gone and the volume's figure is reduced, the diagnostics are pending). BOTH are charged for as long as they
+-- live: a reporting record keeps the control grant of the backing it was (its measured size is under that charge),
+-- released by the transaction that deletes it, so the number of records a held logger can accumulate is bounded by the
+-- control account like every other record.
+data ClosingRec = CrNative !Entry | CrReporting !A.Grant
 
 -- | A failure of a cleanup nobody received, with what it was.
 -- | What the service keeps of a failure nobody received, with its identity: a cleanup note, or the failure of a backing's
@@ -564,7 +571,7 @@ data Kept = Kept !Text !KeptFailure !A.Grant
 -- | The accounted bytes of one kept failure (its label, its note, its place in the list and its grant), charged to
 -- the control account from the moment it is kept until the service's end. Measured by the suite (Memory).
 keptEntryBytes ∷ Word64
-keptEntryBytes = 1536
+keptEntryBytes = 2048
 
 -- | A mutator reached a sealed (drained) service: nothing may commit to it any more, and the one that cannot be
 -- refused is a defect.
@@ -1738,7 +1745,7 @@ execRelease svc j from to = do
         Right (Right ()) → do
           atomically $ modifyTVar' (svState svc) $ \s →
             s { stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Nothing, eLength = from}) bid (stBackings s)
-              , stReserved = Map.adjust (\n → n - min n (to - from)) (eVolume e) (stReserved s)
+              , stReserved = subReserved (eVolume e) (to - from) (stReserved s)
               }
           pure Released
         Right (Left err) → do
@@ -1882,21 +1889,32 @@ closeBackingCore svc bid = mask_ $ do
     activePhase JRunning = True
     activePhase (JDone _) = False
 
--- | The native close has returned, so what the backing paid for is gone: in ONE transaction its control grant is
--- released, its contribution leaves the volume's reserved figure, a failing close is KEPT as evidence and the record
--- becomes 'CrReporting' (it stays until the diagnostics are done).
+-- | The native close has returned, so what the file held is gone: in ONE transaction the backing's contribution leaves
+-- the volume's reserved figure, a failing close is KEPT as evidence and the record becomes 'CrReporting', still
+-- carrying the control grant (a record is charged for as long as it lives: the diagnostics may be held by a logger
+-- for as long as that logger likes).
 finishClosing ∷ StorageService → Word64 → Entry → Text → [KeptFailure] → STM ()
 finishClosing svc bid e label failing = do
-  releaseGrant svc (eGrant e)
   modifyTVar' (svState svc) $ \t →
-    t { stReserved = Map.adjust (\n → n - min n (backingContribution e)) (eVolume e) (stReserved t)
-      , stClosingRecs = Map.insert bid CrReporting (stClosingRecs t)
+    t { stReserved = subReserved (eVolume e) (backingContribution e) (stReserved t)
+      , stClosingRecs = Map.insert bid (CrReporting (eGrant e)) (stClosingRecs t)
       }
   keepEvidence svc label failing
 
--- | The close has nothing left to do with the service: the record ends.
+-- | The close has nothing left to do with the service: the record's charge is released and the record ends, in ONE
+-- transaction.
 endClosing ∷ StorageService → Word64 → STM ()
-endClosing svc bid = modifyTVar' (svState svc) (\t → t {stClosingRecs = Map.delete bid (stClosingRecs t)})
+endClosing svc bid = do
+  s ← readTVar (svState svc)
+  case Map.lookup bid (stClosingRecs s) of
+    Just (CrReporting g) → releaseGrant svc g
+    _ → pure ()
+  modifyTVar' (svState svc) (\t → t {stClosingRecs = Map.delete bid (stClosingRecs t)})
+
+-- | A volume's figure less @n@. A volume nothing is reserved on holds no place in the service: its node leaves the
+-- map at zero, so a node never outlives the charge of the last record that paid for it.
+subReserved ∷ Word64 → Word64 → Map Word64 Word64 → Map Word64 Word64
+subReserved dev n = Map.update (\v → let r = v - min v n in if r == 0 then Nothing else Just r) dev
 
 -- ---------------------------------------------------------------------------
 -- Inspection
@@ -2010,6 +2028,8 @@ data Snapshot = Snapshot
   , snQueued ∷ !Int
   , snRunning ∷ !Int
   , snMutation ∷ !(Maybe Word64)
+  , snBusyVolumes ∷ !Int
+  -- ^ The volumes a worker holds for a reservation right now (at most one per worker).
   }
   deriving stock (Show)
 
@@ -2051,4 +2071,5 @@ snapshotOf svc = do
     , snQueued = sum (map Seq.length (Map.elems (stQueue s)))
     , snRunning = stRunning s
     , snMutation = stMutation s
+    , snBusyVolumes = Set.size (stBusyVolumes s)
     }
