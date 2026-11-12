@@ -111,9 +111,36 @@ cabal test hetoimasia-tests --test-show-details=direct
   seeded update/abort/publish/read/reclaim cycles, forced-result allocation, a
   separately compiled client of the public store interface, and the evidence printer
   (`--match "TRA-20 evidence"`). The store's implementation is a private library of the
-  package, reached by the suite alone. It is the CPU group `test.terrain-runtime`,
-  mandatory and outside the floor, on the `haskell-engine` worker with a reusable
-  receipt. See [the package's contract](../packages/terrain-runtime/README.md).
+  package, reached by the suite alone. The storage backend (TRA-21,
+  `Test.TerrainRuntime.Storage.*`) is in the same suite and owns the deterministic safety
+  cases of the reserved backing files and the two I/O workers, against real files on the
+  filesystem the suite runs on through the production service and the production native
+  adapter (a recording seam observes the native calls and holds or faults one; nothing
+  substitutes a backend): `Open` (private creation, the unlink before readiness, every
+  setup and reservation stage failing with complete cleanup, the sparse control, serialized
+  reservations), `Io` (exact offsets after short, interrupted, zero-progress and truncated
+  transfers, integrity failures, the refusals before any I/O, every failed or cancelled
+  staged-write prefix with the old pages intact), `Lifetime` (the queue, the workers,
+  scheduling and the protected staging, cancellation, close behind a held call and a
+  borrower, descriptor reuse, two arenas, the primary and cleanup failures), `Growth`,
+  `Memory` (the accounted job record measured against the live heap) and `Opacity` (a
+  separately compiled client). A new deterministic storage case belongs there; capacity,
+  latency and filesystem experiments belong to the probe below, never to this suite. It is
+  the CPU group `test.terrain-runtime`, mandatory and outside the floor, on the
+  `haskell-engine` worker with a reusable receipt. See
+  [the package's contract](../packages/terrain-runtime/README.md).
+- `terrain-storage-probe` (`packages/terrain-runtime/probe/`, TRA-21) owns the real-platform
+  qualification of that backend: the production native backend on a capped, disposable
+  volume, macOS/APFS on Darwin and ext4 on Linux, with the minimum, a middle and the default
+  allowance reserved and proven, every page written and read back, a rewrite with the volume
+  exhausted, growth under exhaustion, a failed release retained and retried, the unlinked
+  file's borrowers and the reclamation after the last close, the refused unqualified
+  filesystem and the sparse negative control. It is the optional probe group
+  `test.terrain-storage-qualification` (`category: probe`, no CI worker route, never selected
+  by an affected path or a routine suite command); it fills a volume, so it refuses to run
+  except against the fixture `tools/terrain-storage/` makes. Run it through the lab,
+  `quruntul --repo . test --target terrain-storage-probe --ref HEAD`, in the candidate
+  checkout of each platform; see [the evidence](evidence/terrain/tra21/README.md).
 
 - Tests belong to the package whose contract they assert. `foundation-tests`
   (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
