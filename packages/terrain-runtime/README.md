@@ -1159,8 +1159,8 @@ transaction on them, so no credit is taken twice or released twice.
 | A write's pages | The transaction (already accounted); the job only references them | The worker | Worker | 256 pages, 1 MiB | With the transaction |
 | The volume's reservation coordination | The service; one holder at a time per volume | Workers | Workers | One per volume | Released on every exit of a reservation |
 | A prepared growth and a pending reservation | The backing entry | The owner | Worker, owner | One each | Committed or abandoned by the owner; the pending record until a retry or the close; a preparation nobody received becomes a pending reservation |
-| A closing record | The service, from the claim of a backing to its native close | Shutdown (joins it) | Closing caller | One per backing being closed | Deleted, with its grant and volume reservation released, in one transaction after the native close returned |
-| A kept failure (a cleanup nobody received) | The service's evidence | The scope that ends the service | Any | At most 64, charged `keptEntryBytes` each; more are counted | Composed into the scope's failure at the end, its charge released |
+| A closing record | The service, from the claim of a backing until its close has ended: the native close and then its diagnostics | Shutdown (joins it, and the seal waits for it) | Closing caller | One per backing being closed | Pays every charge until the native close has returned; one transaction then releases the grant and the volume reservation and keeps a failing close; the record then only holds the service open (`CrReporting`) through the diagnostics and is deleted in a second transaction |
+| A kept failure (a cleanup nobody received, or a close that failed) | The service's evidence | The scope that ends the service | Any | At most 64, charged `keptEntryBytes` (1,536) each, a cleanup note or the typed failure of a close (the backing, and the errno or the bounded text of the exception); more are counted | Composed into the scope's failure at the end (a close as `BackingCloseFailed` or `BackingCloseRaised`), its charge released in the seal transaction |
 
 **Handles are opaque.** A `Backing` names no descriptor: the service resolves it, so a closed,
 foreign or reused handle is refused before any I/O, and a descriptor number reused by a later file
@@ -1217,13 +1217,32 @@ required bytes) and given back, for an open and for a growth.
 | The volume's reserved figure | | | the length plus a pending extra; overhead is not in it, the model charged it |
 | A release | the range [from, to) | the freed extent (overhead included) | the request: the figure never held the overhead |
 
-| Platform | Filesystem | Reservation | Rewrite inside the reservation, volume exhausted | Release |
+| Platform | Filesystem | Reservation | Rewrite inside the reservation, volume exhausted (measured, below) | Release |
 | --- | --- | --- | --- | --- |
-| macOS 26 (arm64) | APFS, 3 GiB disk image | exact (overhead 0) at 64 MiB, 256 MiB, 1 GiB | no new allocation | Preallocation beyond the end of the file is released only by raising the length and shortening it; the last close reclaimed the space within the first observation |
-| Linux 6.8 (aarch64) | ext4, 3 GiB loop image | exact at 64 MiB and 256 MiB; 4,096 bytes over at 1 GiB (an extent block, inside the model overhead) | no new allocation | one block of ext4 bookkeeping stays accounted after a release; the space returned at the last close |
+| macOS 26 (arm64) | APFS, 3 GiB disk image | exact (overhead 0) at 64 MiB, 256 MiB, 1 GiB | the backing's allocated bytes 67,108,864 before and after, 0 bytes of the volume's space consumed | Preallocation beyond the end of the file is released only by raising the length and shortening it; the last close reclaimed the space within the first observation |
+| Linux 6.8 (aarch64) | ext4, 3 GiB loop image | exact at 64 MiB and 256 MiB; 4,096 bytes over at 1 GiB (an extent block, inside the model overhead) | the same: 67,108,864 before and after, 0 consumed | one block of ext4 bookkeeping stays accounted after a release; the space returned at the last close |
 
 The qualification is a probe, not a claim of universal support; the table is what was run, and the
 records, the commands and the run identifiers are in the evidence.
+
+**The probe measures each claim it makes; it does not assume one.** "The volume is exhausted" is the platform's own
+statement, not an inference from the fill: the filler (`fillWith`) reserves in halving chunks until the platform answers
+its out-of-space result for one block, and **only** that result ends it (`ENOSPC`, errno 28, on both hosts: macOS
+`F_PREALLOCATE` with `F_ALLOCATEALL` and Linux `fallocate`; `EIO`, `EINVAL`, `EDQUOT`, an unsupported allocation and a
+length that cannot be established all FAIL the example); then ONE more reservation of a single block is asked through
+the same adapter and must be refused with that result (`exhaustionVerdict`); the volume's residue is read through the
+probe's meter (`fstatfs` on a descriptor opened before anything was allocated), recorded
+(`exhausted.available.bytes`) and asserted below 64 MiB, which is the bound the refused growth (a 64 MiB request) relies
+on and **not** a proof about a rewrite. The two claims are then measured on their own: "the rewrite needs no NEW
+allocation" is the backing's allocated bytes (`fstat`) not growing across the rewrite and still covering the allowance,
+and the volume's available bytes not going down by more than the probe's 4 MiB tolerance (`rewriteVerdict`: a decrease
+that still covers the allowance passes, because a filesystem may give a metadata block back); "growth is refused under
+exhaustion" is the refusal plus the file's length and allocated bytes unchanged (`growthVerdict`). **Observed and not
+explained:** after the fill APFS reports 33,681,408 bytes (32.12 MiB) available that a native all-or-none allocation of
+one block is refused for (ext4 reports 0); a first version of the probe asserted less than 4 MiB, an invented bound, and
+failed on APFS before reaching the service (run `bb26a88a`, in the evidence). No claim rests on the cause. The pure
+verdict functions and the routine controls that feed them values are in the suite (the probe's filler class), and the
+probe examples themselves run only on a real fixture.
 
 ### Failures
 
@@ -1234,6 +1253,12 @@ inside an expected page: never absent history, empty terrain or regenerated sour
 refusals made before any work (`invalid_request`, `busy`, a closed or foreign handle). A defect
 (an exception that is not a storage result) is `host_failure`: it is recorded, completes its job as
 a host failure, stops the service and ends the worker, which supervision sees.
+
+A native allocation the platform answers as unsupported is `storage_unsupported` with the step that was refused
+(`NativeUnsupported StepAllocate errno`: the allocation is the only step with an unsupported form, so `ReservationOp` has
+that one member; an error from the length or a release is a reservation or I/O failure, never "unsupported"), and the
+refusal to start on a runtime that is not threaded is `StartFailure`'s `NotThreaded`. No constructor of these types is
+unused.
 
 A transfer advances the checked offset and the buffer by what was moved; an interrupted call is
 retried without repeating moved bytes, at most 64 times in a row; a write that makes no progress is
@@ -1255,14 +1280,19 @@ measured against the live heap (`Test.TerrainRuntime.Storage.Memory`), never rea
 
 | Held thing | Charged to, and when | Figure | Measured row (200-repeat minimum to maximum, `Memory.hs`) |
 | --- | --- | --- | --- |
-| A job record (queued, running or finished), per ticket | control, from submission to retirement (`admitJob`, `jobCharge`) | `jobRecordBytes` 4,096 | largest queued read 576 to 1,058; largest queued open, a 512-byte path of its own, 1,101 to 1,585; the largest of those plus the largest retained outcome (a `Failed` of 256 four-byte characters and 4 notes) 2,388 to 2,413 |
-| A write's report | control, at admission, with the record: `writeEntryBytes` 112 a staged page and `writeFailureBytes` 512 for the one failure | 29,184 + 4,096 at 256 pages: 33,280 | the report of 256 pages, standalone, 20,541; with its first page failed, 20,709; a running write holding 255 results 28,768 to 28,800 |
-| A read's transfer buffer while it runs | staging (camera work the unprotected share only), at dispatch (`dispatchNext`) | `transferBufferBytes n` | two held 256-page reads, per read with its record: 1,065,336 (constant) of 1,089,536 |
+| A job record (queued, running or finished), per ticket | control, from submission to retirement (`admitJob`, `jobCharge`) | `jobRecordBytes` 4,096 | largest queued read 576 to 1,058; largest queued open, a 512-byte path of its own, 1,101 to 1,585; the largest of those plus the largest retained outcome (a `Failed` of 256 four-byte characters and 4 notes) 2,388 to 2,416 |
+| A write's report | control, at admission, with the record: `writeEntryBytes` 112 a staged page and `writeFailureBytes` 512 for the one failure | 29,184 + 4,096 at 256 pages: 33,280 | the report of 256 pages, standalone, 20,541; with its first page failed, 20,709; a running write holding 255 results 28,824 to 28,904 |
+| A read's transfer buffer while it runs | staging (camera work the unprotected share only), at dispatch (`dispatchNext`) | `transferBufferBytes n` | two held 256-page reads, per read with its record: 1,065,392 (constant) of 1,089,536 |
 | A read's result until it is taken or discarded | cache, pinned, at dispatch | `resultPageBytes` 4,864 a page | a finished, untaken 256-page result with its record: 1,096,392 to 1,128,272 of 1,249,280 |
-| A backing's record (per arena) | control, from the open's success to the end of its native close (`register`, `finishClosing`), all or nothing | `backingRecordBytes` 4,096 | the largest entry variant as a value, with its backing-map and volume-ledger nodes: 324 to 329; the service-level cross-check (the least of 15 open and close samples) 1,984 to 2,296; the closing record, the same entry moved and not copied: 1,696 |
-| Every other retained outcome | inside the job record | `jobRecordBytes` | the largest record plus a retained `Opened` 1,176 to 1,242, `GrowthPrepared` 1,200 to 1,281, `Released` or `GrowthNoChange` 1,064 to 1,130, `Cancelled` with 4 notes 1,324 to 1,349 |
-| A kept failure (a cleanup nobody received) | control, while kept | `keptEntryBytes` 320 | per entry with the list full, 196 to 245 |
+| A backing's record (per arena) | control, from the open's success to the end of its native close (`register`, `finishClosing`), all or nothing | `backingRecordBytes` 4,096 | the largest entry variant as a value, with its backing-map and volume-ledger nodes: 324 to 329; the service-level cross-check (the least of 15 open and close samples) 1,984 to 2,280; the closing record, the same entry moved and not copied: 1,744 to 2,272 |
+| Every other retained outcome | inside the job record | `jobRecordBytes` | the largest record plus a retained `Opened` 1,180 to 1,242, `GrowthPrepared` 1,204 to 1,266, `Released` or `GrowthNoChange` 1,068 to 1,130, `Cancelled` with 4 notes 1,324 to 1,352 |
+| A kept failure (a cleanup nobody received, or a close that failed) | control, while kept | `keptEntryBytes` 1,536 | per entry with the list full (64 asserted kept), the largest instance: a close that RAISED with a 256-character text of four-byte characters, 188 to 1,326 |
 | A write's pages | nothing: the transaction's own, already accounted in its reservation, referenced and never copied | n/a | n/a |
+
+A kept failure was first charged 320 on a measurement of 196 to 245; the strictness work of round 4 found that a lazy kept entry,
+the stop reason and the defect text each retained the exception text they were sliced from (the measurement grew with the
+length of that text when the text was lengthened), so they are now evaluated copies (`T.copy`, forced when kept), and
+the row is measured at its largest instance and charged 1,536 (largest measured 1,326, 0.86 of the charge).
 
 Every row was run 200 times in one process: all passed. What varies is the live heap a reading shows (a pinned object keeps its whole block live, a collection's timing); the retained-outcome rows are measured as standalone values so they do not move, the held buffer is deterministic, the rows that spread keep a margin of at least 10 percent of their charge, and the one row whose samples are independent opens takes the least of 15 (noise only adds) with a guard that it is at least the standalone entry.
 
@@ -1311,7 +1341,7 @@ another growth, until `submitReleasePending` succeeds or the close releases it w
 
 ### Ownership at every instant, exceptions included
 
-A typed failure is not the only way out. Rounds 2 and 3 of review found one class under fourteen findings:
+A typed failure is not the only way out. Rounds 2, 3 and 4 of review found one class under eighteen findings:
 *an exit, a release or a failure taken between a state change and the bookkeeping that completes it*. Each
 exit of a thing the service holds now has **one mechanism that owns it**, and every table below enumerates
 every member of its class (the ones generated from code are marked, and the suite fails to compile when a
@@ -1356,8 +1386,8 @@ cleanup failure of that step and never an exit that skips the next:
 | `execOpen` unwind | unlink retry; the one close of the descriptor (recorded as attempted before it is made) | a cleanup note of the step (errno -1); the close is never repeated |
 | `giveBack` (a growth that did not publish) | the release of the extra range | a release that failed: the extra stays pending and charged |
 | `execRelease` | the release | the same; the exception propagates with its context after the pending record is made |
-| `closeBackingCore` | the claim (the entry moves into the closing record); the one native close; `finishClosing` (one transaction); three diagnostics | recorded as the close's exception, never retried; `finishClosing` precedes the diagnostics |
-| `drainService` | closing admission; stopping the workers; joining them; closing every backing; joining the closing records; disposing of every record; composing the evidence | each wait is in the protected boundary; a cancellation is remembered (first wins) and delivered after the drain |
+| `closeBackingCore` | the claim (the entry moves into the closing record, `CrNative`); the one native close; `finishClosing` (ONE transaction: release the grant, subtract the volume reservation, KEEP a failing close, mark the record `CrReporting`); three diagnostics; `endClosing` (ONE transaction deleting the record) | the close's exception is recorded, never retried, and kept like any failure; `finishClosing` precedes the diagnostics, and the record outlives them |
+| `drainService` | closing admission; stopping the workers; joining them; closing every backing; joining the closing records (and saying so before it waits); disposing of every record; the SEAL (one transaction: every closing record has ended, the kept failures are read and their charges released, the phase becomes `Sealed`); composing the evidence | each wait is in the protected boundary; a cancellation is remembered (first wins) and delivered after the drain |
 | start sequence | stop every started worker; join every started worker | a cancellation of either is remembered; the primary failure propagates |
 
 **5. Every catch keeps its context.** The complete list of sites that catch an exception:
@@ -1375,29 +1405,30 @@ cleanup failure of that step and never an exit that skips the next:
 | `execGrow` | the extra range is rolled back or left pending, then rethrown composed with the cleanup failures |
 | `giveBack`, `execRelease` | a release that raised is a release that failed: kept as a pending reservation; `giveBack` keeps a cleanup note (errno -1) and not the exception itself |
 | `closeBackingCore` (native close) | recorded as the close's exception in the report; never retried |
-| `closeBackingId`, `closeUnwaited` | a remembered cancellation is delivered after the failing report was kept |
+| `closeBackingId`, `closeUnwaited` | a remembered cancellation is delivered after the record has ended; the failing close was already kept inside `closeBackingCore`, so neither keeps anything itself |
 | `Volume.linuxFilesystemName` | a failed read of the mount table is an unnamed filesystem, which is never qualified: a deliberate conversion to a typed result, not a rethrow |
 
-**6. No failure without a keeper** (`keepEvidence`, the one keeper). Every `CloseReport` and cleanup note has
-exactly one keeper: the caller that receives it, or the service's evidence, which holds at most 64 failures,
-charges each `keptEntryBytes`, **counts** one that does not fit (or whose charge is refused) and reports the
-count at the end as one more labelled failure. Every site that closes a backing, and every discarded result
+**6. No failure without a keeper** (`keepEvidence`, the one keeper). Every cleanup note and every failed close has
+exactly one keeper, and a failed close's is **always the service**: `closeBackingCore` keeps it inside the transaction
+that releases the close's charges (`finishClosing`), whoever asked for the close. The `CloseReport` a caller receives
+is a **copy**: receiving it does not discharge the failure, and a failed close always ends the service's scope with its
+labelled typed failure (`BackingCloseFailed backing errno`, or `BackingCloseRaised backing text` for a close that raised,
+the text bounded by `maxHostFailureChars`). The service's evidence holds at most 64 failures, charges each `keptEntryBytes`,
+**counts** one that does not fit (or whose charge is refused) and reports the count at the end as one more labelled
+failure; every kept entry is evaluated when it is kept. Every site that closes a backing, and every discarded result
 that can carry a failure:
 
 | Call site | What it can carry | Keeper |
 | --- | --- | --- |
-| `closeBacking` (public) through `closeBackingId` | the `CloseReport` | the caller; if a cancellation is delivered instead, the evidence ("close whose report was not delivered") |
-| `discardTicket` of a finished `Opened` through `closeUnwaited` | the close's report | the evidence ("unattended close"); a remembered cancellation is rethrown after |
-| `runJob` after `finishJob` (a discarded running `Opened`) through `closeUnwaited` | the close's report | the evidence; a remembered cancellation reaches the worker's one exit |
-| `withOutcome`, failed delivery of an `Opened` through `closeUnwaited` | the close's report | the evidence; the callback's own exception is the one propagated |
-| `drainService` closing every backing | each `CloseReport` | the scope's failure ("backing close") |
+| `closeBackingCore`, for every close: `closeBacking` (public, through `closeBackingId`), `discardTicket` of a finished `Opened`, `runJob` after `finishJob`, a failed delivery of an `Opened`, and the drain | the failing close, typed (`KeptClose`) | the service, inside the core: `finishClosing` keeps it in the same transaction that releases the close's charges and marks the record; the caller's `CloseReport` is a copy |
 | `disposeUndelivered` of `Failed` or `Cancelled` | cleanup notes | `keepEvidence` |
 | `withdrawQueued`, `finishJob` of `Cancelled []` | nothing (no notes) | none needed |
-| `runJob` defect, `finishJob` of `Failed HostFailure` | the defect's bounded text | the outcome, `stDefect` and the rethrown exception |
+| `runJob` defect, `finishJob` of `Failed HostFailure` | the defect's bounded text (a copy) | the outcome, `stDefect` and the rethrown exception |
 | `startWorkers` abort, `protectedly` waits | a remembered cancellation | subsumed by the primary failure that is rethrown |
 | `drainService` waits | a remembered cancellation | the late value delivered after the drain |
 | `closeBackingCore`'s claim, `disposeUndelivered` | the `Opened` of the backing being closed | the close itself (no second close) |
 | `quietly` | a log's cancellation | folded into the caller's remembered one |
+| `keepEvidence` on a sealed service | (nothing may be kept after the seal) | a defect: `SealedMutation` is thrown, nothing is kept or charged |
 
 **7. A delivery has three ends.** *Delivered*: a `withOutcome` callback returned normally, the caller owns what
 the outcome carries (a token, an opened backing), the record is retired. *Failed*: the callback raised or was
@@ -1457,7 +1488,10 @@ discipline, each with its proof:
 | The close is a bounded call made uninterruptibly | `uninterruptibleMask_` around the one native call, the hand-off masked | the sweep's close row with a cancellation injected while the closing thread waits for a held call |
 | The wait is outside any masked release, interruptions remembered | `protectedly` in the caller's boundary | "joins a close another caller claimed" (the drain observed blocked, no timer); "still waits for a close in flight when a cancellation reaches the log of that wait" |
 | The primary failure and the labelled cleanup failures are composed | `composeCleanup`, `cleanupFailuresInContext` | Lifetime "keeps the primary failure and the cleanup failure of a close, and a defect stops the service"; "attempts the descriptor's close even when the unlink cleanup throws (twice)"; the cleanup-exception cells |
-| Nothing is dropped | the one keeper, counted drops | the three keeper examples (a discarded open whose close fails; a close with a cancellation instead of its report; 64 kept and the rest counted) |
+| Nothing is dropped | the one keeper, counted drops | the keeper examples (a discarded open whose close fails; a close with a cancellation instead of its report; 64 kept and the rest counted; a close that RAISED keeps its typed identity) |
+| A failed close always ends the scope with its typed failure | `finishClosing` keeps it inside the core; the report is a copy | Lifetime "never closes twice" and the sweep's close rows end with the labelled failure; the discard and `closeBacking` examples with a cancellation pending during a held failing close; "keeps a close that RAISED as its own typed failure" |
+| The service cannot end, nor its logger be used, while a close is in its diagnostics | the closing record lives through them (`CrReporting`); the drain and the seal join it | "keeps a close tracked through its post-native diagnostics" (the diagnostic held, the drain observed waiting by its own log, then released) |
+| Nothing commits to a service after its scope ended | the seal transaction and `SealedMutation` | the sealed-service example over every public mutator (the table in item 14) |
 
 **11. A real failure of `close` cannot be induced, and the policy that follows.** On the two qualified
 filesystems a `close` of a regular file does not fail in practice (no network or delayed-write filesystem is
@@ -1469,6 +1503,106 @@ unqualified native path); the macOS `close(2)` behaviour was not qualified here 
 **The policy is the same on both and does not depend on what they document: the close is made once, a failure
 or an exception from it is kept and reported, and it is never retried** (nor is an `EINTR`: the close is a
 bounded call made uninterruptibly).
+
+**12. An effect is owned before its after-hook runs** (`around`, `Owns`; round 4, finding 1). A native effect runs
+through ONE function, `around seam op owns act`: the before-hook, the effect, **the recorder of what the effect
+obtained**, and only then the after-hook. `Owns a = NothingAcquired | Acquires (a → IO ())` makes every site say what
+it acquires. For an `Acquires` site the effect and its recorder run together under `mask_` **inside `around`**: a
+`safe` foreign call is not interruptible, so the mask delays nothing, and `around` does not depend on its caller
+being masked (the worker is, by `workerLoop`; the probe and the fixture call `createPrivate` unmasked); the hooks stay
+outside the mask, where a cancellation can reach a blocked one. The mask is structure, not an example: the window it
+closes is between two instructions, with no seam and no gate to hook (stated in the evidence's honest list). Every
+`around` site, with what it acquired or released and who owns it when the after-hook raises:
+
+| Site, native op | What the call acquired or released | Who owns it if the after-hook raises | Example |
+| --- | --- | --- | --- |
+| `createPrivate`, `OpCreateFile` | a descriptor and a name (**acquired**) | the recorder, run before the hook: `execOpen`'s reference to the created file; its handler unwinds (one close, the unlink retried) whatever the hook did | the sweep, open/create after the effect (thrown, asynchronous); "a worker blocked in the after-hook of a create, cancelled while blocked, leaves no descriptor and no name" |
+| `unlinkFile`, `OpUnlinkFile` | releases the name | a lost `Right ()` is an exception; the unwind retries the unlink (ENOENT on the retry is success) | the sweep, open/unlink, after the effect |
+| `verifyPrivate`, `OpCloexecFlag`, `OpStatFile` | nothing | n/a: the open unwinds as for any failure | the sweep, open/cloexec and stat (verify private) |
+| `reserveRange`, `OpReserveRange` | allocated space (the extra range) | the descriptor's file: an open closes its descriptor, a growth's `giveBack` rolls the extra back on any exception | the sweep, open/reserve and grow/reserve, after the effect |
+| `reserveRange`, `OpSetFileLength` (establish) | the length | the same | the sweep, set length rows |
+| `reserveRange`, `OpStatFile` (verify) | nothing | n/a | the sweep, stat rows |
+| `releaseExtra`, `OpStatFile` and `OpSetFileLength` (up, down) | frees space | a lost result is a release that FAILED: the extra stays a pending reservation, accounted (never less than physical) | the sweep, grow/set length (rollback) and release rows: "reported covers physical, and a larger figure is a pending reservation" |
+| `readFully`, `OpReadAt` | bytes in the transfer buffer | nothing to release; the job fails as a defect (`runJob`) and the service stops | the sweep, read |
+| `writeFully`, `OpWriteAt` | bytes in the file (nothing to release) | the same | the sweep, write |
+| `closeFile`, `OpCloseFile` | releases the descriptor | recorded as RAISED, never repeated; `closeBackingCore` keeps it (item 13); one native close is asserted | the sweep, close and the cleanup-close rows, after the effect |
+| `Volume.profileOf`, `OpStatFile`, `OpStatFilesystem` | nothing | n/a | the sweep, stat (profile) and statfs |
+| `Service`: `OpWorkerStart`, `OpWorkerStop`, `OpVolumeWait` | before-hooks only (`seamBefore`; no after-hook) | nothing is acquired before them | the startup rows; "still waits for a close in flight" |
+
+The ownership sweep has an **after dimension**: each of its 21 native calls at its stage is injected five ways (a typed
+failure, a thrown exception, a cancellation, and, **after the effect has happened**, a thrown exception and an
+asynchronous-typed one) = **105 cases**, each ending with the descriptors and names gone, the tracked backings equal to
+the open descriptors, both ledgers and the volume figure right, the invariants holding, and (for a close) exactly one
+native close made. The sweep found one real state: after a rollback's set-length happened and its after-hook raised,
+the result is lost, so the service keeps the extra as a pending reservation although the file is already freed: an
+**over-count, never an under-count**, recoverable by an explicit release (the sweep asserts the figure covers what is
+physical, and that a larger one is a pending reservation).
+
+**13. The close core owns everything until it returns** (`closeBackingCore`; round 4, finding 2). In order, masked
+end to end: the claim moves the entry whole into `stClosingRecs` as `CrNative` (every charge stays paid); the **one**
+native close (uninterruptible, its hooks inside); ONE transaction, `finishClosing`, releases the grant, subtracts the
+volume reservation, **keeps a failing close in the evidence** and marks the record `CrReporting` (it no longer pays);
+the diagnostics, through `quietly`; ONE transaction, `endClosing`, deletes the record; return. Shutdown joins the records
+in its explicit wait and again in the seal, so the service cannot end, and its logger cannot be used after its scope,
+while a close is in its diagnostics. The keeping is inside the core (item 6): a failed close always ends the service's
+scope with its typed failure, whoever asked, and the `CloseReport` a caller receives is a copy. `discardTicket` is masked
+end to end too (it was the one public function that was not).
+
+**14. The service seals** (`Phase = Running | Closing | Stopped | Sealed`; round 4, finding 4(iii)). The last
+transaction of the drain waits for every closing record to end, reads the kept failures, releases their charges, clears
+them and sets `Sealed`; `closeAdmission` keeps a sealed service sealed (it could have downgraded it). After it nothing
+can commit to the service or charge it: every public mutator, on a drained service whose handle escaped, is asserted
+(table generated from the example's own rows) to refuse or find nothing, to leave the snapshot unchanged (compared whole)
+and the admission ledger at zero:
+
+| Function | On a sealed service |
+| --- | --- |
+| `submitOpen` | refused: ServiceStopped |
+| `submitRead` | refused: BackingClosed (the backing is gone) |
+| `submitWrite` | refused: BackingClosed |
+| `submitGrowth` | refused: BackingClosed |
+| `submitAbandon` | refused: BackingClosed |
+| `submitReleasePending` | refused: BackingClosed |
+| `commitBackingGrowth` | refused: BackingClosed |
+| `withUse` | refused: BackingClosed, the action never runs |
+| `withOutcome` | answers Nothing: the ticket names nothing, the callback never runs |
+| `discardTicket` | finds nothing: no effect |
+| `cancelTicket` | answers CancelUnknown |
+| `closeBacking` | finds no backing: nothing closed, no native call |
+| `keepEvidence` | a defect: SealedMutation is thrown, nothing is kept or charged |
+
+The borrow releases of `withOutcome` and `withUse` and `finishDelivery` cannot run after the drain (it waits for
+borrowers), so the entry points above are the complete set.
+
+**15. Public functions: masking, and every effect-then-record pair** (round 4, finding 4(i)):
+
+| Function | Masked? | Effect-then-record pairs | Unmasked point between them |
+| --- | --- | --- | --- |
+| `withStorageService` | workers started under `mask`, body unmasked, the drain masked | workers started then counted in `startWorkers`'s own handler | none |
+| `submitOpen`, `submitRead`, `submitWrite`, `submitGrowth`, `submitAbandon`, `submitReleasePending`, `commitBackingGrowth`, `cancelTicket` | one STM transaction each | none (the effect is the record) | none |
+| `awaitTicket`, `pollTicket`, `backingView`, `serviceView`, `snapshotOf` | STM reads | none | none |
+| `withOutcome` | `mask`: the borrow committed in one transaction, the body unmasked, release and `finishDelivery` in one transaction, the disposal's close masked | the borrow, then the release | none unmasked between an effect and its record |
+| `withUse` | the same | the same | none |
+| `discardTicket` | **`mask_` end to end (it was unmasked between the transaction that retires the record and the close of the backing nobody can name: found in round 4)** | the retiring transaction, then the close | none |
+| `closeBacking` | `closeBackingCore` is `mask_` end to end; the late cancellation is rethrown only after the record ended | the claim, the close, the keeping, the record's end | none |
+
+**16. Every log call** (round 4, finding 4(ii)): seven sites, all through `quietly`, none able to be an exit.
+
+| Log | Thread | What makes shutdown wait for it |
+| --- | --- | --- |
+| "Drain waits for closes in flight" | the drain's own | it is the drain |
+| "Backing close failed", "Backing close raised", "Backing closed" | the closing caller (a caller, a worker or the drain) | the closing record stays `CrReporting` until `endClosing`; the drain and the seal join it |
+| "Backing opened", "Storage worker defect", "Open cleanup step raised" | worker threads | the drain joins the workers |
+
+No log runs on a caller's thread outside a tracked record.
+
+**17. Hooks that can block, not only raise** (round 4, finding 4(iv)): a before-hook gate was covered (a cancellation
+delivered while blocked: the effect has not happened). An after-hook gate: "a worker blocked in the after-hook of a
+create, cancelled while blocked" (observed blocked after the create succeeded, `throwTo`, then no descriptor, no name,
+the job finished as a failure, the service stopped, the invariants hold). The close's hooks run inside its
+`uninterruptibleMask_` by design: a blocked hook holds the bounded close and a cancellation is **pending until it
+returns**; the examples hold exactly that (a failing native close held, a cancellation pending, the close returning its
+error, the cancellation delivered after, the failure kept and the record gone).
 
 Smaller rules that hold the same class:
 
@@ -1562,10 +1696,6 @@ run anywhere else. The storage examples hold the class of defect, not the instan
 | CleanupException | Open, Grow | effect | an exception in the cleanup step (injected, observed to fire): a taken outcome carries the cleanup note; an untaken one ends the service with the labelled cleanup failure (a normal end is a failure) |
 | CleanupException | Abandon, ReleasePending | effect | the release raises (injected, observed to fire): a defect: the job finishes as HostFailure, the defect is recorded, the extra stays accounted as a pending reservation |
 | CleanupException | the other kinds | not applicable | the kind has no cleanup step to fail |
-| CleanupException | Queued | refusal | no outcome yet: the callback never runs |
-| CleanupException | Running | refusal | no outcome yet: the callback never runs |
-| CleanupException | Done | effect | the take's callback " <> how <> ": the outcome nobody received is disposed of by the one disposal (an opened backing is closed with its report kept, a prepared growth becomes a recoverable pending reservation, the record is retired) |
-| CleanupException | Borrowed | effect | a nested take's callback " <> how <> " while another borrower holds the outcome: nothing is disposed of; the borrower's delivery stands (an opened backing stays open, the growth token stays valid) |
 | TakeRaises | Queued | refusal | no outcome yet: the callback never runs |
 | TakeRaises | Running | refusal | no outcome yet: the callback never runs |
 | TakeRaises | Done | effect | the take's callback raises: the outcome nobody received is disposed of by the one disposal (an opened backing is closed with its report kept, a prepared growth becomes a recoverable pending reservation, the record is retired) |
@@ -1586,8 +1716,8 @@ run anywhere else. The storage examples hold the class of defect, not the instan
   outcome carries the cleanup note and an untaken one ends the service with the labelled cleanup failure (a
   normal end is a failure); for a release the exception is a defect (host failure, defect recorded, the extra
   stays accounted as pending).
-* **The sweep** (`Classes`): 21 native calls at their stages by 3 injections (a typed failure, a thrown
-  exception, a cancellation) = 63 cases, each ending with the descriptors back to the baseline, the tracked
+* **The sweep** (`Classes`): 21 native calls at their stages by 5 injections (a typed failure, a thrown
+  exception, a cancellation, and after the effect a thrown and an asynchronous-typed exception) = 105 cases, each ending with the descriptors back to the baseline, the tracked
   backings equal to the open descriptors, the reported reservation equal to the physical allocation, the
   invariants holding, every backing closed and every volume's figure zero:
 
@@ -1616,13 +1746,23 @@ run anywhere else. The storage examples hold the class of defect, not the instan
 | close | close | 1st matching call | - |
 
   The startup rows follow: the first start refused, the second start failing, and a cancellation during the first
-  start, during the second start and during the abort's join.
+  start, during the second start and during the abort's join. The table of what each call acquired and who owns it
+  when its after-hook raises is item 12.
 * **The exit points, the charge table, the keepers and the headroom boundary** (`Lifecycle`, `Open`, `Growth`):
   the tables above, each with its examples: three exit rows with the service kept running; one example per charge
   kind with the native call held; a discarded open whose close fails, a close that receives a cancellation instead
-  of its report, and 64 kept failures plus a counted drop; open and growth with exactly the length and the headroom
+  of its report (each with the failing close held and a cancellation pending), a close that raised and keeps its typed
+  identity, a close held in its diagnostics while the drain waits, and 64 kept failures plus a counted drop; open and growth with exactly the length and the headroom
   available and a seam that over-allocates 4,096 bytes (refused and unwound), and with the overhead available
   (admitted).
+* **The probe's own checks** (`Classes`, "the probe's filler"): the filler ends only on out-of-space (six other
+  errnos and a failing length each end it as a failure); a filler refused at once on a volume with plenty free fails
+  with `ResidueTooLarge` before the action runs; a platform that would still grant one more block fails the
+  precondition (`OneMoreBlockGranted`); a filler failing for another reason cannot yield a passing example and leaves no
+  descriptor held; the pure verdicts are fed values (`exhaustionVerdict`, `rewriteVerdict`, `growthVerdict`: the
+  observed 33,681,408-byte residue passes, new allocation fails, lost coverage fails, a consumed residue fails, a
+  decrease that still covers passes, a refused growth that changed the file fails). Not routine-testable, and stated:
+  that the probe examples call the verdicts at the right points (they run only on a real fixture).
 * **The memory rows** (`Memory`): every retained structure at its largest, measured by forced live heap, each
   asserted measured <= charged, run 200 times in one process (the table under Scheduling and accounting).
 * **The property** (`Classes`): 40 seeds by 36 operations over submit, cancel, discard, take, close and shutdown,
