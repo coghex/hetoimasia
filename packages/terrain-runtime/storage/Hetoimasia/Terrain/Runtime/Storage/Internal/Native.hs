@@ -124,6 +124,8 @@ data NativeOp
     OpVolumeWait !Word64
   | -- | A worker is starting (not a native call: the point where a start can fail).
     OpWorkerStart !Int
+  | -- | A worker is ending (its scope's release: the point a join can be held).
+    OpWorkerStop !Int
   deriving stock (Eq, Show)
 
 -- | An adapter and its hooks. The hooks run on the thread performing the

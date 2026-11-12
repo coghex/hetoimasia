@@ -16,12 +16,15 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (AsyncException (UserInterrupt), try, SomeException)
 import Control.Monad (forM, forM_, unless, void, when)
+import qualified Data.Map.Strict as Map
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Word (Word64)
 import qualified Foreign.C.Error as C
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
+import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.Worker (GroupReport (..), closeWorkerGroup, withWorkerGroup)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), StoreIdentity (..))
@@ -73,6 +76,10 @@ reportedMatchesPhysical env = do
   phys <- allocatedOf env
   (held, phys) `shouldSatisfy` \(h, p) -> p <= h + 4096 && h <= p + 4096
 
+-- | The per-volume reserved figures: every one back at zero once every backing is closed.
+volumeLedgerClear :: Env -> IO ()
+volumeLedgerClear env = (Map.elems . svReserved <$> view env) >>= (`shouldSatisfy` all (== 0))
+
 isReserve, isStat :: NativeOp -> Bool
 isReserve op = case op of OpReserveRange _ _ -> True; _ -> False
 isStat op = op == OpStatFile
@@ -84,6 +91,7 @@ spec = describe "Storage backend: the classes round 1 of review found" $ do
   fixtureClass
   growthClass
   sweepClass
+  startupClass
   chargeClass
 
 -- ---------------------------------------------------------------------------
@@ -272,20 +280,25 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
       | stage == SClose = closeScenario env inj
       | otherwise = do
           let probe = envProbe env
+          openedRef <- newIORef []
           act <- case stage of
             SOpen -> pure (submitOpen (envSvc env) ExplicitWork (OpenSpec (BC.pack (envDir env)) ident (hCfg h0)))
             SGrow -> do
               b <- openBacking env ident (hCfg h0)
+              modifyIORef' openedRef (b :)
               pure (submitGrowth (envSvc env) b (64 * mib) (128 * mib))
             SRelease -> do
               b <- openBacking env ident (hCfg h0)
+              modifyIORef' openedRef (b :)
               p <- preparedOn env b
               pure (submitAbandon (envSvc env) b p)
             SRead -> do
               b <- openBacking env ident (hCfg h0)
+              modifyIORef' openedRef (b :)
               pure (submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo 5) 1 ReadProbe)
             SWrite -> do
               b <- openBacking env ident (hCfg h0)
+              modifyIORef' openedRef (b :)
               let plan = either error id (planFor h0 1)
               (tid, s1) <- either (fail . show) pure (admit plan (hStore h0))
               sw <- either (fail . show) pure (stageWrite s1 tid)
@@ -303,11 +316,16 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
             void (cancelTicket (envSvc env) t)
             openGate g
           o <- awaitOutcome env t
+          opened <- readIORef openedRef
           show o `shouldSatisfy` (not . null)
           v <- view env
           fds <- openFds probe
           length fds `shouldBe` svBackings v
           when (stage `elem` [SGrow, SRelease]) (reportedMatchesPhysical env)
+          -- close whatever the case left open: the volume's reserved figures are back to their start
+          forM_ [b | Opened b _ <- [o]] (closeBacking (envSvc env))
+          forM_ opened (closeBacking (envSvc env))
+          volumeLedgerClear env
 
 -- | Closing a backing under each injection: a typed close error, an exception raised by the close and an
 -- interruption of the closing thread while it waits at the call.
@@ -340,6 +358,54 @@ closeScenario env inj = do
       (either (\e -> const True (e :: SomeException)) (const False) r) `shouldBe` True
   openFds probe >>= (`shouldBe` [])
   (svBackings <$> view env) >>= (`shouldBe` 0)
+  volumeLedgerClear env
+
+-- ---------------------------------------------------------------------------
+-- (C) startup: every started worker has an owner at every instant
+
+startupClass :: Spec
+startupClass = describe "(C) worker startup" $
+  it "stops and joins every started worker, and keeps the primary failure, whether a start fails, is cancelled, or the abort's join is" $ do
+    results <- forM startupCases $ \(name, setup) -> do
+      withWorkerGroup $ \group -> do
+        probe <- newProbe
+        gates <- setup probe
+        bank <- either (fail . show) pure (A.mkEditBankConfig A.defaultEditBankSpec)
+        admission <- newTVarIO (A.newAdmission bank)
+        cfg <- either (fail . show) pure (mkStorageConfig defaultQualified minHeadroomBytes)
+        done <- newEmptyMVar
+        let quietLogger = mkLogger defaultLogFilter (callbackSink (\_ -> pure ()))
+            start = try (withStorageService (StoragePorts admission group quietLogger (seamFor probe) cfg) (\_ -> pure ())) >>= putMVar done
+        withOwnedThread start $ \tid wait -> do
+          -- a cancellation lands where the case holds the start (or the abort's join), then the hold is released
+          forM_ gates $ \(g, cancelHere) -> do
+            awaitReached g 1
+            when cancelHere (throwTo tid UserInterrupt)
+            openGate g
+          wait
+        r <- readMVar done
+        report <- closeWorkerGroup group
+        -- no worker thread is left live: none was still running when the group closed
+        (name, length (reportDrained report)) `shouldBe` (name, 0)
+        pure (name, either (\e -> show (e :: SomeException)) (const "started") r)
+    -- a typed or thrown failure keeps its own error; a cancellation delivered during the start propagates
+    forM_ results $ \(name, shown) -> (name, shown) `shouldSatisfy` \(_, t) -> t /= "started"
+    forM_ [r | r@(n, _) <- results, n `elem` ["the second start fails", "the first start is refused", "the abort's join is cancelled"]] $ \(n, t) ->
+      (n, t) `shouldSatisfy` \(_, x) -> "WorkerNotStarted" `isIn` x
+  where
+    isIn needle hay = any (\i -> take (length needle) (drop i hay) == needle) [0 .. length hay]
+    startupCases :: [(String, Probe -> IO [(Gate, Bool)])]
+    startupCases =
+      [ ("the first start is refused", \p -> addRule p 1 (== OpWorkerStart 2) Throw >> pure [])
+      , ("the second start fails", \p -> addRule p 1 (== OpWorkerStart 1) Throw >> pure [])
+      , ("the first start is cancelled", \p -> (\g -> [(g, True)]) <$> addGate p (== OpWorkerStart 2))
+      , ("the second start is cancelled", \p -> (\g -> [(g, True)]) <$> addGate p (== OpWorkerStart 1))
+      , -- worker one is held as it stops (the abort's join waits for it) and the caller is cancelled there
+        ("the abort's join is cancelled", \p -> do
+            addRule p 1 (== OpWorkerStart 1) Throw
+            g <- addGate p (== OpWorkerStop 2)
+            pure [(g, True)])
+      ]
 
 -- ---------------------------------------------------------------------------
 -- (D) every charge is released on every path
@@ -381,6 +447,8 @@ chargeClass = describe "(D) every charge is released on every path" $ do
       -- (explicit before maintenance) and refused it: when that job has finished the read was certainly considered
       noop <- submitGrowth (envSvc env) b (64 * mib) (64 * mib) >>= either (fail . show) pure
       awaitOutcome env noop >>= (`shouldBe` GrowthNoChange)
+      -- the owner can SEE it must release cache: the view counts the queued jobs refused for want of an eviction
+      (svWaitingForCache <$> view env) >>= (`shouldBe` 1)
       -- nothing evicted the owner's copy: it is still charged and the read has not been dispatched
       l <- A.ledgers <$> readTVarIO (envAdmission env)
       A.lgCacheBacked l `shouldSatisfy` (>= 48 * mib - 2048)
@@ -390,6 +458,37 @@ chargeClass = describe "(D) every charge is released on every path" $ do
       atomically (modifyTVar' (envAdmission env) (\a -> either (const a) id (A.dropEntry entry a)))
       atomically (modifyTVar' (envAdmission env) (A.release grant))
       awaitOutcome env t >>= (`shouldSatisfy` \o -> case o of Pages _ -> True; _ -> False)
+      (svWaitingForCache <$> view env) >>= (`shouldBe` 0)
+
+  it "takes no new borrower of a closing backing, so a caller cannot hold the close open" $
+    withEnv $ \env -> do
+      b <- openBacking env ident (hCfg h0)
+      done <- readJob' env b 5
+      bounded (atomically (awaitTicket (envSvc env) done))
+      g <- addGate (envProbe env) (\op -> case op of OpReadAt _ _ -> True; _ -> False)
+      held <- readJob' env b 6
+      awaitReached g 1
+      closed <- newEmptyMVar
+      withOwnedThread (closeBacking (envSvc env) b >>= putMVar closed) $ \_ wait -> do
+        bounded (atomically (backingView (envSvc env) b >>= \v -> check (maybe False bvClosing v)))
+        -- a finished outcome of the closing backing is refused, so nobody can keep borrowing while the close waits
+        withOutcome (envSvc env) done pure >>= (`shouldSatisfy` isNothing')
+        openGate g
+        wait
+      readMVar closed >>= (`shouldSatisfy` crClosed)
+      _ <- pure held
+      volumeLedgerClear env
+
+  it "gives back exactly what a backing held of its volume after a failed give-back and a close" $
+    withEnv $ \env -> do
+      b <- openBacking env ident (hCfg h0)
+      -- a growth that never published fails to release its extra: it stays pending, charged on the volume
+      addRuleAfter (envProbe env) 1 1 isStat (OverAllocated (10 * mib))
+      addRule (envProbe env) 1 (== OpSetFileLength (64 * mib)) (FailWith eio)
+      _ <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= either (fail . show) pure >>= awaitOutcome env
+      (sum . svReserved <$> view env) >>= (`shouldBe` 128 * mib)
+      _ <- closeBacking (envSvc env) b
+      volumeLedgerClear env
 
   it "returns the shared admission to exactly its starting figures after random sequences of submit, cancel, discard, take, close and shutdown" $ do
     counts <- forM [1 .. 40 :: Int] $ \seed -> do
@@ -435,6 +534,9 @@ randomSequence env seed done = do
       _ -> when (step > 18) (openGate gate)
     modifyIORef' done (+ 1)
   openGate gate
+  -- every backing closed: the volume's reserved figures are back to their start, as the admission is at the end
+  readIORef backings >>= mapM_ (closeBacking (envSvc env))
+  volumeLedgerClear env
   where
     submitSome next tickets backings cls = do
       bs <- readIORef backings
@@ -448,3 +550,10 @@ firstEntry :: A.Grant -> A.EntryId
 firstEntry g = case A.grantEntries g of
   e : _ -> e
   [] -> error "a grant with no cache entry"
+
+readJob' :: Env -> Backing -> Word64 -> IO Ticket
+readJob' env b n = submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo n) 1 ReadProbe >>= either (fail . show) pure
+
+isNothing' :: Maybe a -> Bool
+isNothing' Nothing = True
+isNothing' _ = False

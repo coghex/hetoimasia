@@ -131,7 +131,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Foldable (toList)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust)
@@ -557,26 +557,33 @@ withStorageService ports body = do
 -- | Start the two workers, each acknowledged before the next. A worker that
 -- cannot start stops the ones already started before the failure propagates.
 startWorkers ∷ StorageService → WorkerGroup → IO [Worker ()]
-startWorkers svc group = go (2 ∷ Int) []
+startWorkers svc group = do
+  started ← newIORef []
+  r ← tryWithContext (go started (2 ∷ Int)) ∷ IO (Either (ExceptionWithContext SomeException) [Worker ()])
+  case r of
+    Right ws → pure ws
+    Left ewc → do
+      -- every exit of the start sequence, a typed failure, an exception or a cancellation (the cancellation of the
+      -- abort's own join included), stops and joins every worker that was started, in the protected wait the drain
+      -- uses: no worker is left without an owner, and the primary failure is the one that propagates
+      ws ← readIORef started
+      _ ← protectedly (atomically (modifyTVar' (svState svc) (\s → s {stPhase = Stopped}) >> mapM_ requestStop ws))
+      _ ← protectedly (atomically (mapM_ awaitCompletion ws))
+      rethrowIO ewc
   where
-    go 0 acc = pure (reverse acc)
-    go n acc = do
+    go started 0 = reverse <$> readIORef started
+    go started n = do
       r ← startWorker group (workerDef svc n)
       case r of
-        Started w → go (n - 1) (w : acc)
-        StartupFailed _ _ → abort acc "storage worker startup failed"
-        StartRejected _ → abort acc "storage worker group is closed"
-    abort acc why = do
-      atomically (modifyTVar' (svState svc) (\s → s {stPhase = Stopped}))
-      atomically (mapM_ requestStop acc)
-      atomically (mapM_ awaitCompletion acc)
-      throwIO (WorkerNotStarted why)
+        Started w → modifyIORef' started (w :) >> go started (n - 1)
+        StartupFailed _ _ → throwIO (WorkerNotStarted "storage worker startup failed")
+        StartRejected _ → throwIO (WorkerNotStarted "storage worker group is closed")
 
 workerDef ∷ StorageService → Int → WorkerDefinition ()
 workerDef svc n =
   workerDefinition
     (T.pack ("terrain-storage-io-" <> show n))
-    (\_ → allocResource (seamBefore (svSeam svc) (OpWorkerStart n)) (\_ → pure ()))
+    (\_ → allocResource (seamBefore (svSeam svc) (OpWorkerStart n)) (\_ → seamBefore (svSeam svc) (OpWorkerStop n)))
     (\token () → workerLoop svc token)
 
 -- | Close admission, withdraw what is queued, close every backing and stop the
@@ -838,6 +845,11 @@ growthSizeError e to
   | to > eOffsetLimit e = Just (AllowanceInvalid (AllowanceBeyondOffsetLimit (toInteger to) (toInteger (eOffsetLimit e))))
   | otherwise = Nothing
 
+-- | What a backing holds of its volume: the length of its file and any extra reservation still pending. The
+-- volume's reserved figure is the sum of these over its backings, and a close gives back exactly this.
+backingContribution ∷ Entry → Word64
+backingContribution e = eLength e + fromMaybe 0 (ePending e)
+
 setSlot ∷ StorageService → Word64 → GrowthSlot → STM ()
 setSlot svc bid slot = modifyTVar' (svState svc) (\s → s {stBackings = Map.adjust (\x → x {eGrowth = slot}) bid (stBackings s)})
 
@@ -922,7 +934,7 @@ withOutcome svc t body = mask $ \restore → do
   taken ← atomically $ do
     s ← readTVar (svState svc)
     case lookupTicket svc t s of
-      Just (jid, j) | JDone o ← jPhase j → do
+      Just (jid, j) | JDone o ← jPhase j, not (closingBacking s (jBacking j)) → do
         modifyTVar' (svState svc) $ \st →
           st
             { stJobs = Map.adjust (\x → x {jBorrowed = jBorrowed x + 1}) jid (stJobs st)
@@ -946,6 +958,11 @@ withOutcome svc t body = mask $ \restore → do
         Left (e ∷ SomeException) → throwIO e
   where
     backingOfJob st jid = Map.lookup jid (stJobs st) >>= jBacking
+    -- a backing that is closing takes no new borrower: its records are retired by the close, and a caller taking outcomes
+    -- must not be able to hold the close open
+    closingBacking s mb = case mb >>= \bid → Map.lookup bid (stBackings s) of
+      Just e → ePhase e /= EOpen
+      Nothing → False
 
 adjustBorrow ∷ Maybe Word64 → Int → Map Word64 Entry → Map Word64 Entry
 adjustBorrow Nothing _ m = m
@@ -1430,7 +1447,9 @@ execRelease svc j from to = do
           pure (Failed (StorageIo (IoFailure IoSetLength (IoErrno err) Nothing Nothing 0 0)) [CleanupNote IoSetLength err])
   where
     pendAgain bid = modifyTVar' (svState svc) $ \s →
-      s {stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Just (to - from)}) bid (stBackings s)}
+      -- the extra is now the pending record's: the length is the committed size again, so a backing's
+      -- contribution to the volume's reserved figure is always its length plus its pending extra
+      s {stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Just (to - from), eLength = from}) bid (stBackings s)}
 
 -- ---------------------------------------------------------------------------
 -- Scoped use and closing
@@ -1534,7 +1553,7 @@ closeBackingCore svc bid = mask_ $ do
           releaseGrant svc (eGrant e)
           modifyTVar' (svState svc) $ \t →
             t { stBackings = Map.delete b (stBackings t)
-              , stReserved = Map.adjust (\n → n - min n (eLength e)) (eVolume e) (stReserved t)
+              , stReserved = Map.adjust (\n → n - min n (backingContribution e)) (eVolume e) (stReserved t)
               }
           pure (Just e)
     activePhase JQueued = True
@@ -1570,12 +1589,23 @@ data ServiceView = ServiceView
   , svMutating ∷ !Bool
   , svReserved ∷ !(Map Word64 Word64)
   , svDefect ∷ !(Maybe Text)
+  , svWaitingForCache ∷ !Int
+  -- ^ Queued jobs the service refuses to dispatch because it would have to evict a copy another consumer
+  -- caches: the owner must drop (release) backed, unpinned copies before they can run. The signal is this count.
   }
   deriving stock (Eq, Show)
 
 serviceView ∷ StorageService → STM ServiceView
 serviceView svc = do
   s ← readTVar (svState svc)
+  a ← readTVar (svAdmission svc)
+  let needsEviction j = case dispatchCredits j of
+        Just (cls, credits) → case A.reserve cls credits a of
+          Right (g, _) → not (null (A.grantEvicted g))
+          Left _ → False
+        Nothing → False
+      queuedIds = concatMap toList (Map.elems (stQueue s))
+      waiting = length [() | jid ← queuedIds, Just j ← [Map.lookup jid (stJobs s)], needsEviction j]
   pure ServiceView
     { svQueued = sum (map Seq.length (Map.elems (stQueue s)))
     , svRunning = stRunning s
@@ -1584,4 +1614,5 @@ serviceView svc = do
     , svMutating = isJust (stMutation s)
     , svReserved = stReserved s
     , svDefect = stDefect s
+    , svWaitingForCache = waiting
     }
