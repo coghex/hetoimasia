@@ -31,13 +31,14 @@ module Test.TerrainRuntime.Storage.Memory (spec, spec2, spec3, floorSpec, rulesS
 
 import Control.Concurrent.STM (atomically)
 import Control.Exception (SomeException, evaluate, try)
-import Control.Monad (forM, forM_, replicateM, void)
+import Control.Monad (forM, forM_, replicateM, void, when)
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
 import qualified Data.ByteString.Char8 as BC
-import Data.IORef (newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import qualified Data.List
 import Data.Word (Word64)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
@@ -192,7 +193,7 @@ reserveN n bytes = go (A.newAdmission bigBank) n []
 jobRow ∷ (Int → Work) → Int → IO Double
 jobRow mk n = heldAdded n $ do
   let (grants, adm) = reserveN n (jobCharge (mk 1))
-      jobs = Map.fromList [(fromIntegral i ∷ Word64, Job Nothing ident ExplicitWork (mk i) JQueued False g Nothing 0 False False) | (i, g) ← zip [1 .. n] grants]
+      jobs = Map.fromList [(fromIntegral i ∷ Word64, Job Nothing ident ExplicitWork (mk i) JQueued False g Nothing 0 False False (jobCharge (mk 1))) | (i, g) ← zip [1 .. n] grants]
       queue = Map.singleton ExplicitWork (Seq.fromList (map fromIntegral [1 .. n]) ∷ Seq.Seq Word64)
   holdLive (jobs, queue, adm) (\(j, q, a) → Map.size j + sum (map Seq.length (Map.elems q)) + fromIntegral (A.lgControlReserved (A.ledgers a)))
 
@@ -207,16 +208,23 @@ openWork i = WOpen (OpenSpec (BC.pack ('/' : replicate (maxDirectoryBytes - 1) (
 resultsOf ∷ Int → [(PageNo, PageResult)]
 resultsOf k = [(PageNo (fromIntegral (k * 1000 + i)), Wrote) | i ← [0 .. fromIntegral maxIoPages - 2 ∷ Int]]
 
--- | A staged write of the most pages a transaction may stage, each its own page.
-bigWrite ∷ IO StagedWrite
-bigWrite = do
+-- | A staged write of the most pages a transaction may stage, each its own page and each of its own BYTES. The seed
+-- makes every call a distinct value: without it GHC floats the page list out as one shared constant, every write would
+-- share the same pages, and a service that kept them alive would not be seen to (the page numbers depend on the seed
+-- through a division that is zero for any seed below a million, which the compiler cannot fold).
+bigWriteAt ∷ Int → IO StagedWrite
+bigWriteAt k = do
   let plan = either error id (planFor h0 1)
   (tid, s1) ← either (fail . show) pure (admit plan (hStore h0))
   sw ← either (fail . show) pure (stageWrite s1 tid)
-  let pages = [(PageNo (100 + i), BS.replicate pageSize (fromIntegral i)) | i ← [0 .. fromIntegral maxIoPages - 1]]
+  let zero = fromIntegral (k `div` 1000000) ∷ Word64
+      pages = [(PageNo (100 + i + zero), BS.replicate pageSize (fromIntegral (fromIntegral i + k))) | i ← [0 .. fromIntegral maxIoPages - 1]]
   -- the pages are the transaction's own: built and forced here, so what the service adds is not counted with them
-  _ ← evaluate (sum (map (BS.length . snd) pages))
+  _ ← evaluate (sum (map (BS.length . snd) pages) + sum [fromIntegral p | (PageNo p, _) ← pages])
   pure sw {swPages = pages}
+
+bigWrite ∷ IO StagedWrite
+bigWrite = bigWriteAt 0
 
 -- | What a table of @n@ backing-sized records holds: a backing entry at its largest variant (the growth slot is the only
 -- varying field: 'GReleasing' holds a 'Maybe' of the six-field 'PreparedGrowth', a pending reservation is present, the
@@ -246,7 +254,9 @@ closingRow env kind n = do
 -- | The live heap one retained outcome adds, per instance, over @n@ distinct instances held live.
 outcomeRow ∷ (Int → Outcome) → Int → IO Double
 outcomeRow mk n = heldAdded n $
-  holdLive (map mk [1 .. n]) (\xs → sum [case o of Failed (HostFailure t) ns → T.length t + length ns; Cancelled ns → length ns; Written w → length (wrPages w); _ → 0 | o ← xs] + length xs)
+  -- every instance walked completely ('forceOutcome', the walk the service applies before it retains an outcome): a
+  -- standalone model must hold the evaluated value the service holds, not a lazier one
+  holdLive (map (forceOutcome . mk) [1 .. n]) (\xs → sum [case o of Failed (HostFailure t) ns → T.length t + length ns; Cancelled ns → length ns; Written w → length (wrPages w); _ → 0 | o ← xs] + length xs)
 
 -- | The retained failure at its largest: the longest text a defect keeps (of four-byte characters, the worst case of
 -- the UTF-8 encoding) and the most notes a failure carries (each cleanup step yields at most two).
@@ -365,7 +375,7 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
     -- the job's record plus the 255 results the worker holds at the last page, each instance its own
     let measure n = heldAdded n $ do
           let (grants, adm) = reserveN n (jobCharge (WWrite sw))
-              jobs = Map.fromList [(fromIntegral i ∷ Word64, Job Nothing ident ExplicitWork (WWrite sw) JQueued False g Nothing 0 False False) | (i, g) ← zip [1 .. n] grants]
+              jobs = Map.fromList [(fromIntegral i ∷ Word64, Job Nothing ident ExplicitWork (WWrite sw) JQueued False g Nothing 0 False False (jobCharge (WWrite sw))) | (i, g) ← zip [1 .. n] grants]
               results = [resultsOf k | k ← [1 .. n]]
           holdLive (jobs, results, adm) (\(j, rs, a) → Map.size j + sum (map length rs) + fromIntegral (A.lgControlReserved (A.ledgers a)))
     perRunning ← sound "running write" 20 measure
@@ -406,6 +416,72 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
       atomically (keepEvidence (envSvc env) "measure" [KeptClose (fromIntegral i) (CloseRaised (T.copy (T.replicate maxHostFailureChars (T.singleton (toEnum (0x10000 + i)))))) | i ← [1 .. maxKept]])
       snKept ← snEvidence <$> atomically (snapshotOf (envSvc env))
       snKept `shouldBe` maxKept
+
+  it "validates the model against the service: finished write reports held UNTAKEN at once, produced by real jobs, within a tolerance of the standalone rows" $ do
+    swModel ← bigWrite
+    recordModel ← sound "write job record (model)" 200 (jobRow (const (WWrite swModel)))
+    reportOk ← sound "write report, all written (model)" 20 (outcomeRow (writeReportOf swModel False))
+    reportFirstFailed ← sound "write report, first page failed (model)" 20 (outcomeRow (writeReportOf swModel True))
+    forM_ [("all written", False, reportOk), ("first page failed, 255 not attempted", True, reportFirstFailed)] $ \(label, failing, report) → withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      -- one write first, taken, so the service's one-time state is not counted
+      counter ← newIORef (1 ∷ Int)
+      let produce = do
+            when failing (addRule (envProbe env) 1 (\op → case op of OpWriteAt _ _ → True; _ → False) (FailWith (Errno 5)))
+            sw ← bigWriteAt =<< atomicModifyIORef' counter (\n → (n + 1, n))
+            t ← submitWrite (envSvc env) b sw >>= either (fail . show) pure
+            bounded (atomically (awaitTicket (envSvc env) t))
+            -- the harness's own log of native calls (256 entries a write) is the TEST's memory, not the service's: cleared
+            clearEvents (envProbe env)
+            pure t
+      warm ← produce
+      _ ← awaitOutcome env warm
+      let k = 24 ∷ Int
+      heapBefore ← live
+      ts ← forM [1 .. k] (const produce)
+      heapAfter ← live
+      let perJobBytes = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
+          modelled = recordModel + report
+      checkSignal ("service: " <> label) k perJobBytes
+      row ("service, finished untaken write report (" <> label <> "), per job, " <> show k <> " held at once, the test's own pages dropped") (jobCharge' maxIoPages) perJobBytes
+      putStrLn ("memory model | write report (" <> label <> ") | service " <> show (round perJobBytes ∷ Integer) <> " | standalone record + report " <> show (round modelled ∷ Integer))
+      -- the model must not drift from the service: within 15 percent either way
+      perJobBytes `shouldSatisfy` (<= modelled * 1.15)
+      perJobBytes `shouldSatisfy` (>= modelled * 0.85)
+      forM_ ts (awaitOutcome env)
+
+  it "observes what a running write holds beyond the model: its results (the model) and the worker (a constant of the service)" $
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      sw ← bigWrite
+      let heldAtPage n = do
+            g ← addGateAfter (envProbe env) n (\op → case op of OpWriteAt _ _ → True; _ → False)
+            heapBefore ← live
+            t ← submitWrite (envSvc env) b sw >>= either (fail . show) pure
+            awaitReached g 1
+            heapAfter ← live
+            openGate g
+            _ ← awaitOutcome env t
+            pure (fromIntegral heapAfter - fromIntegral heapBefore ∷ Double)
+      -- warm the path once, so the first reading is not the first use
+      _ ← heldAtPage 0
+      -- the SAME state, read twenty times: the spread of its readings is the noise a worker's presence adds to the
+      -- difference of two readings, and it is larger than the model's whole figure for the results
+      atLast ← replicateM 20 (heldAtPage (fromIntegral maxIoPages - 1))
+      atFirst ← replicateM 20 (heldAtPage 0)
+      let sorted xs = Data.List.sort xs
+          med xs = sorted xs !! (length xs `div` 2)
+      putStrLn ("memory observation | running write held at its first page (the record and the worker, no results), 20 readings | min " <> show (round (minimum atFirst) ∷ Integer) <> " median " <> show (round (med atFirst) ∷ Integer) <> " max " <> show (round (maximum atFirst) ∷ Integer))
+      putStrLn ("memory observation | running write held at its last page (the record, the worker and 255 results), 20 readings | min " <> show (round (minimum atLast) ∷ Integer) <> " median " <> show (round (med atLast) ∷ Integer) <> " max " <> show (round (maximum atLast) ∷ Integer))
+      -- WHAT THE WORKER HOLDS THAT THE MODEL DOES NOT: the harness's own log of native calls (the probe records every one:
+      -- 255 writes by the last page). Its per-entry cost is measured as a standalone value and taken off the difference.
+      perLogEntry ← sound "the probe's log entry (a native write)" 200 (\n → heldAdded n (holdLive [OpWriteAt (fromIntegral i * 4096) 4096 | i ← [1 .. n]] length))
+      let resultsByDifference = maximum atLast - maximum atFirst
+          logShare = perLogEntry * fromIntegral (maxIoPages - 1)
+      putStrLn ("memory observation | the 255 results by difference " <> show (round resultsByDifference ∷ Integer) <> " | less the probe's own log of the 255 native writes " <> show (round logShare ∷ Integer) <> " | leaves " <> show (round (resultsByDifference - logShare) ∷ Integer) <> " | the standalone model of the results " <> show (round (fromIntegral (length (resultsOf 1)) * (64 ∷ Double)) ∷ Integer))
+      putStrLn ("memory observation | the model of the 255 results (standalone, signal above the floor) | " <> show (round (fromIntegral (length (resultsOf 1)) * (64 ∷ Double)) ∷ Integer) <> " | the spread of the in-service readings of one state is " <> show (round (maximum atLast - minimum atLast) ∷ Integer) <> ": not a measurement of the results")
+      -- an OBSERVATION: nothing here is asserted (the readings of one state step by about one 32 KiB stack chunk from one
+      -- repeat to the next: see the distribution in the repeat runs)
 
   it "a closing record, the entry moved and not copied (native close pending), and a reporting record (the grant only)" $
     withEnv $ \env → do

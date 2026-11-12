@@ -114,6 +114,8 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , maxKept
   , keepEvidence
   , keptEntryBytes
+  , forceOutcome
+  , scrubWork
   , Entry (..)
   , Job (..)
   , JobPhase (..)
@@ -144,6 +146,7 @@ import Control.Exception
   , SomeException
   , fromException
   , bracket_
+  , evaluate
   , mask
   , mask_
   , rethrowIO
@@ -404,6 +407,9 @@ data Job = Job
   , jDiscard ∷ !Bool
   -- ^ The holder discarded the ticket while the job ran: it is retired when it finishes.
   , jDelivered ∷ !Bool
+  , jCharge ∷ !Word64
+  -- ^ The control charge this record paid at admission ('jobCharge' of its work then): kept as a number, so that a
+  -- finished job's work can be dropped to its shape and the snapshot still reads what the record paid.
   -- ^ A callback of 'withOutcome' returned normally with the outcome: the caller owns what it carries. A delivery
   -- has three ends: delivered (this mark), failed (the callback raised: nobody owns it) and undelivered.
   }
@@ -856,7 +862,7 @@ disposeUndelivered svc jid = do
           -- the token that could commit or abandon it was never delivered: the preparation becomes an explicit
           -- pending reservation (length and extra unchanged in the volume's figure), recoverable by a release
           forM_ (Map.lookup (pgBacking p) (stBackings s)) $ \e → case eGrowth e of
-            GPrepared q | q == p → setEntry (pgBacking p) (\x → x {eGrowth = GIdle, ePending = Just (pgTo p - pgFrom p), eLength = pgFrom p})
+            GPrepared q | q == p → setEntry (pgBacking p) (\x → x {eGrowth = GIdle, ePending = let n = pgTo p - pgFrom p in n `seq` Just n, eLength = pgFrom p})
             GIdle → pure ()
             GRunning → pure ()
             GPrepared _ → pure ()
@@ -890,7 +896,7 @@ keepEvidence svc label notes = do
         case charged of
           Left _ → dropOne
           -- evaluated when kept (a lazy entry would hold what it was made from, not what it is)
-          Right g → let k = Kept label n g in k `seq` modifyTVar' (svState svc) (\t → t {stEvidence = stEvidence t <> [k]})
+          Right g → let k = Kept label n g in k `seq` modifyTVar' (svState svc) (\t → t {stEvidence = forceSpine (stEvidence t <> [k])})
     dropOne = modifyTVar' (svState svc) (\t → t {stEvidenceDropped = stEvidenceDropped t + 1})
 
 -- | THE ONE STOP of the service for every way a worker can end other than the cooperative stop its token carries
@@ -970,7 +976,7 @@ admitJob svc mb ident cls work = do
         Left r → pure (Left (mapRefusal r))
         Right grant → do
           let jid = stNextJob s
-              job = Job (fmap (\(Backing _ bid _) → bid) mb) ident cls work JQueued False grant Nothing 0 False False
+              job = Job (case mb of Nothing → Nothing; Just (Backing _ bid _) → bid `seq` Just bid) ident cls work JQueued False grant Nothing 0 False False (jobCharge work)
           writeTVar (svState svc) s
             { stNextJob = jid + 1
             , stJobs = Map.insert jid job (stJobs s)
@@ -1283,14 +1289,18 @@ cancelTicket svc t = atomically $ do
 -- | Record a job's outcome: its resources of the running phase end here (the
 -- transfer's staging, the mutation slot), its result stays until retired.
 finishJob ∷ StorageService → Word64 → Outcome → STM (Maybe Word64)
-finishJob svc jid outcome = do
+finishJob svc jid outcome0 = do
+  -- THE SERVICE RETAINS ONLY EVALUATED VALUES: an outcome is stored after a total walk of it (below), so a thunk built
+  -- from what the job held (a lazily appended tail holding the staged pages' bytes, for one) is gone before the record
+  -- is
+  let outcome = forceOutcome outcome0
   s ← readTVar (svState svc)
   case Map.lookup jid (stJobs s) of
     Nothing → pure Nothing
     Just j → do
       forM_ (jDispatch j) $ \g → if holdsResult outcome then releaseStaging svc g else releaseGrant svc g
       let linked = case outcome of Opened (Backing _ bid _) _ → Just bid; _ → jBacking j
-          j' = j {jPhase = JDone outcome, jDispatch = if holdsResult outcome then jDispatch j else Nothing, jBacking = linked}
+          j' = j {jPhase = JDone outcome, jDispatch = if holdsResult outcome then jDispatch j else Nothing, jBacking = linked, jWork = scrubWork (jWork j)}
       writeTVar (svState svc) s
         { stJobs = Map.insert jid j' (stJobs s)
         , stRunning = if isRunningPhase (jPhase j) then stRunning s - 1 else stRunning s
@@ -1303,6 +1313,42 @@ finishJob svc jid outcome = do
     isRunningPhase JRunning = True
     isRunningPhase _ = False
     holdsResult o = case o of Pages _ → True; _ → False
+
+-- | A finished job keeps what it needs to be inspected, never the bytes the owner staged for it: the pages of a write are
+-- the transaction's own, released by the owner when it has reported its outcomes, and a record that outlived that (an
+-- outcome nobody has taken yet) must not keep them alive, nor a list that names them (256 cells and pairs are 12 KB a
+-- job). The record keeps its shape (a write) and the charge it paid ('jCharge').
+scrubWork ∷ Work → Work
+scrubWork w = case w of
+  WWrite sw → WWrite sw {swPages = []}
+  _ → w
+
+-- | The list with its whole spine evaluated (its elements are the caller's).
+forceSpine ∷ [a] → [a]
+forceSpine xs = foldr (\_ k → k) () xs `seq` xs
+
+-- | An outcome, walked completely before it is retained. Which fields could hold a thunk, and what forces them: the
+-- lists (the pages of a write's report, a read's pages, the cleanup notes) are walked to the end and each element
+-- forced; a page result that is a failure is forced through its derived 'Show' (the failure types are strict records
+-- whose only lazy places are the contents of a 'Maybe' and a 'String', which 'show' reaches); the other constructors'
+-- fields are all strict scalars, byte strings and records of them.
+forceOutcome ∷ Outcome → Outcome
+forceOutcome o = walk o `seq` o
+  where
+    walk x = case x of
+      Opened b r → b `seq` r `seq` ()
+      Pages ps → foldr (\(p, b) k → p `seq` b `seq` k) () ps
+      Written w → wrTxn w `seq` foldr (\(p, r) k → p `seq` result r `seq` k) () (wrPages w)
+      GrowthPrepared p r → p `seq` r `seq` ()
+      GrowthNoChange → ()
+      Released → ()
+      Failed f ns → failure f `seq` notes ns
+      Cancelled ns → notes ns
+    result r = case r of
+      WriteFailedAt f → failure f
+      _ → r `seq` ()
+    failure f = length (show f) `seq` ()
+    notes = foldr (\n k → n `seq` k) ()
 
 -- | Retire a finished job: its record's charge and its result's bytes are
 -- released and it leaves the table. A job still borrowed or not finished stays.
@@ -1500,7 +1546,9 @@ execWrite svc jid j w = do
     Nothing → pure (Written (WriteReport (swTxn w) [(p, WriteFailedAt BackingClosed) | (p, _) ← swPages w]))
     Just (_, e) → do
       results ← go e (swPages w) []
-      pure (Written (WriteReport (swTxn w) results))
+      -- built completely: the report holds results and never the pages it was made from
+      evaluated ← evaluate (forceSpine results)
+      pure (Written (WriteReport (swTxn w) evaluated))
   where
     go _ [] acc = pure (reverse acc)
     go e ((p, bytes) : rest) acc = do
@@ -1723,7 +1771,7 @@ execGrow svc jid j from to = do
             Right () → atomically (setSlot svc bid GIdle) >> pure []
             Left err → do
               atomically $ modifyTVar' (svState svc) $ \s →
-                s { stBackings = Map.adjust (\x → x {ePending = Just (to - from), eGrowth = GIdle}) bid (stBackings s)
+                s { stBackings = Map.adjust (\x → x {ePending = let n = to - from in n `seq` Just n, eGrowth = GIdle}) bid (stBackings s)
                   , stReserved = Map.insertWith (+) (eVolume e) (to - from) (stReserved s)
                   }
               pure [CleanupNote IoSetLength err]
@@ -1755,7 +1803,7 @@ execRelease svc j from to = do
     pendAgain bid = modifyTVar' (svState svc) $ \s →
       -- the extra is now the pending record's: the length is the committed size again, so a backing's
       -- contribution to the volume's reserved figure is always its length plus its pending extra
-      s {stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = Just (to - from), eLength = from}) bid (stBackings s)}
+      s {stBackings = Map.adjust (\x → x {eGrowth = GIdle, ePending = let n = to - from in n `seq` Just n, eLength = from}) bid (stBackings s)}
 
 -- ---------------------------------------------------------------------------
 -- Scoped use and closing
@@ -2052,7 +2100,7 @@ snapshotOf svc = do
           , jsBorrowed = jBorrowed j
           , jsPrepared = case jPhase j of JDone (GrowthPrepared p _) → Just (pgBacking p); _ → Nothing
           , jsHoldsResult = case jPhase j of JDone (Pages _) → True; _ → False
-          , jsCharge = jobCharge (jWork j)
+          , jsCharge = jCharge j
           , jsDelivered = jDelivered j
           }
       slotTag g = case g of GIdle → SlotIdle; GRunning → SlotRunning; GPrepared _ → SlotPrepared; GReleasing _ → SlotReleasing
