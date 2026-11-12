@@ -222,7 +222,7 @@ resultPageBytes = 4608
 -- builds as it runs and keeps in its finished outcome until retired. Charged at ADMISSION for every staged page
 -- (nothing is allocated at result time without a charge); measured by the suite (Memory) at the largest report.
 writeEntryBytes ∷ Word64
-writeEntryBytes = 96
+writeEntryBytes = 112
 
 -- | The accounted bytes of the one failure a write report may carry (the first failed page's record; every page
 -- after it is only marked not attempted).
