@@ -42,6 +42,7 @@ module Test.TerrainRuntime.Storage.Harness
   , addAfterRuleAfter
   , addAfterGate
   , withEnvEndingWithKeptFailure
+  , withEnvEndingWithKeptFailureWith
   , workerThreads
   , openAllGates
   , rulesConsumed
@@ -78,8 +79,8 @@ module Test.TerrainRuntime.Storage.Harness
 
 import Control.Concurrent (ThreadId, myThreadId, yield)
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeAsyncException (..), SomeException, finally, rethrowIO, throwIO, tryWithContext)
-import Control.Monad (forM_, unless)
+import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeAsyncException (..), SomeException, finally, rethrowIO, throwIO, try, tryWithContext)
+import Control.Monad (forM_, unless, void)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -101,7 +102,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan (..), Planned (..), 
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, StoreSpec, cfgAllowanceBytes, cfgTotalPages)
 import System.IO.Temp (withSystemTempDirectory)
-import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure)
 import Test.Hspec (expectationFailure, shouldSatisfy)
 import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Store.Harness (H (..), deltaFor, fillPlan, identOf, ident0, newH, runKey, runRec)
@@ -604,11 +605,24 @@ workerThreads p = readTVarIO (pWorkers p)
 -- | An example whose body makes a native close FAIL: the service always keeps a failing close as labelled evidence, so its
 -- scope ends with that failure (the report the caller received is a copy); a normal end is a failure of the example.
 withEnvEndingWithKeptFailure ∷ ∀ a. (Env → IO a) → IO ()
-withEnvEndingWithKeptFailure body = do
-  r ← tryWithContext (withEnv body) ∷ IO (Either (ExceptionWithContext SomeException) a)
+withEnvEndingWithKeptFailure body = void (withEnvEndingWithKeptFailureWith defaultOptions body)
+
+-- | The same under chosen options, answering the kept failures as the scope's end shows them. THE BODY'S OWN FAILURE IS NOT
+-- MASKED: an expectation that fails inside the body is rethrown as it is, after the scope has ended (the scope's end also
+-- carries the kept failure, and an exception with a cleanup failure attached must never pass for the expected end).
+withEnvEndingWithKeptFailureWith ∷ ∀ a. EnvOptions → (Env → IO a) → IO String
+withEnvEndingWithKeptFailureWith opts body = do
+  inner ← newIORef (Nothing ∷ Maybe (Either SomeException ()))
+  r ← tryWithContext (withEnvWith opts (\env → try (body env) >>= writeIORef inner . Just . void)) ∷ IO (Either (ExceptionWithContext SomeException) ())
+  readIORef inner >>= \x → case x of
+    Just (Left (e ∷ SomeException)) → throwIO e
+    Just (Right ()) → pure ()
+    Nothing → expectationFailure "the example's body never ran"
   case r of
-    Left (ExceptionWithContext ctx _) → length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
-    Right _ → expectationFailure "a failing close was kept by the service and must end its scope with the failure, but the scope ended normally"
+    Left (ExceptionWithContext ctx _) → do
+      length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
+      pure (unwords (map displayCleanupFailure (cleanupFailuresInContext ctx)))
+    Right _ → expectationFailure "a failing close was kept by the service and must end its scope with the failure, but the scope ended normally" >> pure ""
 
 -- | Wait, with no timer, until a thread is blocked delivering an exception (@throwTo@ to a target that cannot take it
 -- yet: it is in an uninterruptible region). The cancellation is then PENDING against the target.

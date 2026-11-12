@@ -437,7 +437,7 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
   -- record of its own until the service ends, and the failure is a labelled cleanup failure either way.
   forM_ [(f, i) | f <- [CloseReleasesOnFailure, CloseNotEstablished], i <- [("an error return (EIO)", FailWith eio, True), ("a raised close", Throw, False)]] $ \(fact, (injName, inj, isErr)) ->
     it ("treats a failed close under " <> show fact <> " as the table says: " <> injName <> ", the volume's figure, the charge and the held record asserted") $ do
-      r <- tryWithContext (withEnvWith defaultOptions {eoCloseFact = fact} $ \env -> do
+      shown <- withEnvEndingWithKeptFailureWith defaultOptions {eoCloseFact = fact} $ \env -> do
         let svc = envSvc env
             allowance = cfgAllowanceBytes (hCfg h0)
             holds = fact == CloseNotEstablished
@@ -480,15 +480,9 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
         length (snHeld sn3) `shouldBe` (if holds then 1 else 0)
         checkInvariants env
         openFds (envProbe env) >>= (`shouldBe` [])
-        pure ()) :: IO (Either (ExceptionWithContext SomeException) ())
       -- the failure is a labelled cleanup failure of the service's end on both; the held reservation is released with it
       -- (the harness checks every ledger is back at zero after the end)
-      case r of
-        Left (ExceptionWithContext ctx _) -> do
-          let shown = unwords (map displayCleanupFailure (cleanupFailuresInContext ctx))
-          length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
-          ("reservation held" `isInfixOf` shown) `shouldBe` (fact == CloseNotEstablished)
-        Right () -> expectationFailure "the failing close was kept as evidence and must end the scope with the failure, but it ended normally"
+      ("reservation held" `isInfixOf` shown) `shouldBe` (fact == CloseNotEstablished)
 
   it "charges a closing record for as long as it lives: a logger held on the close's diagnostics cannot make the service accumulate records, and repeated open, take and close meets pressure" $ do
     gate <- newTVarIO False
