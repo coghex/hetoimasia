@@ -72,7 +72,7 @@ mib' = 1024 * 1024
 signalMultiple ∷ Double
 signalMultiple = 50
 
--- | The amplitudes (largest absolute difference of two readings, over 100 samples after a discarded warm-up) of two
+-- | The amplitudes (largest absolute difference of two readings, over 300 samples after a discarded warm-up) of two
 -- readings with NOTHING between them, and of two readings around a change that leaves nothing behind (a list built,
 -- forced and dropped).
 noiseFloor ∷ IO (Double, Double)
@@ -87,9 +87,9 @@ noiseFloor = do
       amp xs = maximum (map abs xs)
   -- the first samples of each series are a warm-up (the collector's own state settling) and are discarded
   _ ← replicateM 5 aaOnce
-  aa ← replicateM 100 aaOnce
+  aa ← replicateM 300 aaOnce
   _ ← replicateM 5 listOnce
-  lst ← replicateM 100 listOnce
+  lst ← replicateM 300 listOnce
   pure (amp aa, amp lst)
 
 -- | The floor every row is held against, measured once in the process.
