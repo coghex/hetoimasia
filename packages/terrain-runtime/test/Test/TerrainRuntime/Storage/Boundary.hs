@@ -51,7 +51,7 @@ data Row = Row
 boundaryTable ∷ [Row]
 boundaryTable =
   [ Row "withStorage" "config (validated when made), the shared admission, a worker group, a logger; the threaded runtime is checked" "nothing of the arguments beyond the handles it was given (the group and the logger are the caller's)" "the body's result; a service whose scope ends with the body" "workers started masked, the body unmasked, the drain masked" "n/a (starts); a refusal to start is `StartFailure`"
-  , Row "mkStorageConfig" "the qualified list and the headroom (at least `minHeadroomBytes`)" "its own copy of the list" "a typed `StorageConfigError` or a config" "pure" "n/a"
+  , Row "mkStorageConfig" "the qualified list and the headroom (at least `minHeadroomBytes`)" "its own EVALUATED copy of every name (a name cut from a large buffer keeps that buffer alive otherwise)" "a typed `StorageConfigError` or a config" "pure" "n/a"
   , Row "backingIdentity" "a backing handle" "nothing" "the store identity the handle was made for (two scalars); reads nothing of any service" "pure" "the same for any service: a handle carries its identity"
   , Row "preparedFrom" "a growth token" "nothing" "a scalar" "pure" "n/a"
   , Row "preparedTo" "a growth token" "nothing" "a scalar" "pure" "n/a"

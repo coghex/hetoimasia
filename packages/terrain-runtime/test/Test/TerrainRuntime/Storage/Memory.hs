@@ -543,6 +543,19 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       openGate g
       forM_ (held <> ts) (awaitOutcome env)
 
+  it "a qualified-filesystem name that is a short slice of a large buffer costs the copy: K configurations held at once" $ do
+    let viewOf k = BS.take 4 (BC.pack (replicate (2 * 1024 * 1024) (toEnum (97 + k `mod` 20))))
+        config k = either (error . show) id (mkStorageConfig [viewOf k, viewOf (k + 1)] minHeadroomBytes)
+    _ ← evaluate (length (scQualified (config 0)))
+    let k = 24 ∷ Int
+    heapBefore ← live
+    cs ← forM [1 .. k] (\i → evaluate (config (100 + i)))
+    heapAfter ← live
+    let perConfig = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
+    putStrLn ("memory retention | storage configuration, two 4-byte names viewed from 2 MiB buffers, per configuration, " <> show k <> " held | " <> show (round perConfig ∷ Integer))
+    _ ← evaluate (sum (map (length . scQualified) cs))
+    perConfig `shouldSatisfy` (<= 1024)
+
   it "a filesystem name that is a short slice of a large buffer (a mount table's text) costs the copy: K profiles held at once" $
     withSystemTempDirectory "hetoimasia-terrain-profile" $ \dir → do
       made ← createPrivate productionSeam (BC.pack dir) 1 (const (pure ()))

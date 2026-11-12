@@ -178,6 +178,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Store.Trees
         Test.TerrainRuntime.Store.Workload
         Test.TerrainRuntime.Storage.Boundary
+        Test.TerrainRuntime.Storage.Boundary
         Test.TerrainRuntime.Storage.Classes
         Test.TerrainRuntime.Storage.Fixture
         Test.TerrainRuntime.Storage.Harness

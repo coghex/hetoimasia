@@ -45,6 +45,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Types
   ) where
 
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (BusyWhy, InvalidCredit)
@@ -126,7 +127,10 @@ data StorageConfigError
 mkStorageConfig ∷ [ByteString] → Word64 → Either StorageConfigError StorageConfig
 mkStorageConfig qualified headroom
   | headroom < minHeadroomBytes = Left (HeadroomBelowMinimum headroom)
-  | otherwise = Right (StorageConfig qualified headroom)
+  -- the configuration keeps its OWN, evaluated copy of the list for the life of the service: a name cut from a large
+  -- buffer (a configuration file's text) would otherwise keep that buffer alive, and a lazily built list would keep
+  -- whatever it was built from
+  | otherwise = let own = map BS.copy qualified in foldr seq () own `seq` Right (StorageConfig own headroom)
 
 -- | Who asks. Explicit work (a user's edit or read) precedes camera prefetch;
 -- maintenance is accepted work and reclamation, which must make progress under a
