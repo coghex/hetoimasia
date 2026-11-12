@@ -34,6 +34,7 @@ module Test.TerrainRuntime.Storage.Harness
   , openGate
   , awaitReached
   , awaitBlockedInStm
+  , workerThreads
   , openAllGates
   , rulesConsumed
   , addRule
@@ -67,7 +68,7 @@ module Test.TerrainRuntime.Storage.Harness
   , shouldBeFailure
   ) where
 
-import Control.Concurrent (ThreadId, yield)
+import Control.Concurrent (ThreadId, myThreadId, yield)
 import Control.Concurrent.STM
 import Control.Exception (ExceptionWithContext, SomeException, finally, rethrowIO, tryWithContext)
 import Control.Monad (forM_, unless)
@@ -158,10 +159,12 @@ data Probe = Probe
   , pCreated ∷ !(TVar [Int])
   , pOpen ∷ !(TVar (Set.Set Int))
   , pHandles ∷ !(TVar [Fd])
+  , pWorkers ∷ !(TVar [ThreadId])
+  -- ^ The threads the service's workers run on, noted as each starts (the seam's start hook runs on it).
   }
 
 newProbe ∷ IO Probe
-newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO []
+newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO []
 
 -- | Apply a rule to the next @n@ matching calls (negative: all of them).
 addRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
@@ -237,7 +240,7 @@ seamFor p = Seam wrapped before after
     before op = do
       atomically (modifyTVar' (pLog p) (op :))
       case op of
-        OpWorkerStart _ → takeRule p op >>= \r → case r of
+        OpWorkerStart _ → myThreadId >>= \tid → atomically (modifyTVar' (pWorkers p) (tid :)) >> takeRule p op >>= \r → case r of
           Just Throw → ioError (userError "injected worker start failure")
           _ → pure ()
         _ → pure ()
@@ -533,3 +536,8 @@ rulesConsumed p = do
   rules ← readTVarIO (pRules p)
   lefts ← mapM (readTVarIO . rUses) rules
   pure (all (== 0) lefts)
+
+-- | The threads the service's workers run on.
+workerThreads ∷ Probe → IO [ThreadId]
+workerThreads p = readTVarIO (pWorkers p)
+

@@ -109,6 +109,33 @@ spec = describe "Storage backend: opening a backing" $ do
         ReservationFailed (CoverageShort got want) → got < want && want == cfgAllowanceBytes (hCfg cfg64)
         _ → False
 
+  -- A CHECK USES WHAT WAS OBTAINED, NOT WHAT WAS ASKED: exactly the length and the headroom are available, so the
+  -- precheck passes; the file then occupies 4,096 bytes more than asked (the native overhead, an extent block on
+  -- ext4), which takes some of the required headroom. The reservation is refused and unwound.
+  it "refuses an open whose obtained bytes, overhead included, leave less than the headroom" $
+    withEnv $ \env → do
+      let allowance = cfgAllowanceBytes (hCfg cfg64)
+      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (allowance + minHeadroomBytes))
+      addRuleAfter (envProbe env) 2 1 (== OpStatFile) (OverAllocated 4096)
+      o ← openBackingAt env (envDir env) ident (hCfg cfg64)
+      o `shouldBeFailure` \f → case f of ReservationFailed (InsufficientHeadroom avail got room) → avail == allowance + minHeadroomBytes && got == allowance + 4096 && room == minHeadroomBytes; _ → False
+      rulesConsumed (envProbe env) >>= (`shouldBe` True)
+      -- unwound: no descriptor, no name, no record, nothing reserved
+      openFds (envProbe env) >>= (`shouldBe` [])
+      left ← listDirectory (envDir env)
+      left `shouldBe` []
+      (svBackings <$> atomically (serviceView (envSvc env))) `shouldReturn` 0
+
+  it "admits the same open when the overhead is available too" $
+    withEnv $ \env → do
+      let allowance = cfgAllowanceBytes (hCfg cfg64)
+      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (allowance + minHeadroomBytes + 4096))
+      addRuleAfter (envProbe env) 2 1 (== OpStatFile) (OverAllocated 4096)
+      o ← openBackingAt env (envDir env) ident (hCfg cfg64)
+      case o of
+        Opened _ rv → rsOverhead rv `shouldBe` 4096
+        other → expectationFailure ("expected the open to be admitted, got " <> show other)
+
   it "serializes reservations on one volume, so two arenas cannot spend the same observed headroom" $
     withEnv $ \env → do
       let allowance = cfgAllowanceBytes (hCfg cfg64)

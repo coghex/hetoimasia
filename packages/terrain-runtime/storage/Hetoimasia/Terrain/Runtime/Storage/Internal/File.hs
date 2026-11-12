@@ -203,7 +203,16 @@ reserveRange seam cfg cancelled fd off len = do
         Right s
           | nsSize s /= end → stopAfter (ReservationFailed (LengthMismatch (nsSize s) end))
           | nsAllocated s < end → stopAfter (ReservationFailed (CoverageShort (nsAllocated s) end))
+          -- A CHECK USES WHAT WAS OBTAINED, NOT WHAT WAS ASKED: the precheck subtracted only the length, but the
+          -- allocation may occupy more (the native overhead: an extent block on ext4). Under the same volume
+          -- coordination, the headroom is verified again with the bytes the file ACTUALLY gained, and the
+          -- reservation is refused (the caller gives it back) when the headroom is no longer left.
+          | not (headroomLeftAfter p (obtained p s)) → stopAfter (ReservationFailed (InsufficientHeadroom (vpAvailableBytes p) (obtained p s) (scHeadroomBytes cfg)))
           | otherwise → Right (Reserved (nsAllocated s) (nsSize s) (nsAllocated s - end) p)
+    obtained p s = nsAllocated s - min (nsAllocated s) (vpFileAllocatedBytes p)
+    headroomLeftAfter p got = case availableAfter p got of
+      Just left → left >= scHeadroomBytes cfg
+      Nothing → False
 
 -- | Give back the reservation of @[from, to)@: make sure the file is at least
 -- @to@ long, then set it to @from@. Truncating a file to the length it already

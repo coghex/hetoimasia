@@ -170,6 +170,31 @@ spec = describe "Storage backend: growth" $ do
       rep ← closeBacking (envSvc env) b
       (crClosed rep, crPendingReservation rep) `shouldBe` (True, Just (64 * mib))
 
+  -- A CHECK USES WHAT WAS OBTAINED, NOT WHAT WAS ASKED (growth): exactly the extra range and the headroom are
+  -- available, the native allocation occupies 4,096 bytes more, and the growth is refused and given back.
+  it "refuses a growth whose obtained bytes, overhead included, leave less than the headroom, and gives it back" $
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      held0 ← allocatedOf env
+      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + minHeadroomBytes))
+      addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated 4096)
+      o ← grow env b (64 * mib) (128 * mib)
+      o `shouldSatisfy` \x → case x of Failed (ReservationFailed (InsufficientHeadroom avail got room)) _ → avail == 64 * mib + minHeadroomBytes && got == 64 * mib + 4096 && room == minHeadroomBytes; _ → False
+      rulesConsumed (envProbe env) >>= (`shouldBe` True)
+      -- given back: the slot is idle, nothing prepared or pending, the file is the size it was
+      v ← view env b
+      (bvGrowthPrepared v, bvPendingReservation v, bvLengthBytes v) `shouldBe` (False, Nothing, 64 * mib)
+      allocatedOf env >>= (`shouldSatisfy` backTo held0)
+      reservedTotal env >>= (`shouldBe` (64 * mib))
+
+  it "admits the same growth when the overhead is available too" $
+    withEnv $ \env → do
+      b ← openBacking env ident (hCfg h0)
+      addRule (envProbe env) 1 (== OpStatFilesystem) (FreeBytesAre (64 * mib + minHeadroomBytes + 4096))
+      addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated 4096)
+      o ← grow env b (64 * mib) (128 * mib)
+      o `shouldSatisfy` \x → case x of GrowthPrepared _ rv → rsOverhead rv >= 4096; _ → False
+
   it "gives back a prepared growth that will not be committed" $
     withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)

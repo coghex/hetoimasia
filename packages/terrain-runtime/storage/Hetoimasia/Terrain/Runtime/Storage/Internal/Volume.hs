@@ -35,6 +35,9 @@ data VolumeProfile = VolumeProfile
   , vpAvailableBytes ∷ !Word64
   -- ^ Bytes available to the unprivileged process.
   , vpTypeNumber ∷ !Word64
+  , vpFileAllocatedBytes ∷ !Word64
+  -- ^ What the descriptor's file occupied when it was observed: the base a reservation adds to, so what a
+  -- reservation OBTAINED (overhead included) is the difference, never only what was asked.
   }
   deriving stock (Eq, Show)
 
@@ -50,7 +53,7 @@ profileOf seam fd = do
         Left e → pure (Left (IoStatFs, e))
         Right f → do
           name ← if BC.null (nfTypeName f) then linuxFilesystemName (nsDevice s) else pure (nfTypeName f)
-          pure (Right (VolumeProfile (nsDevice s) name (nfBlockSize f) (nfTotalBytes f) (nfAvailableBytes f) (nfTypeNumber f)))
+          pure (Right (VolumeProfile (nsDevice s) name (nfBlockSize f) (nfTotalBytes f) (nfAvailableBytes f) (nfTypeNumber f) (nsAllocated s)))
 
 around ∷ Seam → NativeOp → IO a → IO a
 around seam op act = seamBefore seam op *> act <* seamAfter seam op

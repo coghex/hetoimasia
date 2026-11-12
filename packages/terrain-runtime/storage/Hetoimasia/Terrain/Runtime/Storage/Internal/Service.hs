@@ -53,10 +53,10 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , serviceSeam
 
     -- * Handles
-  , Backing
+  , Backing (..)
   , backingIdentity
   , Ticket
-  , PreparedGrowth
+  , PreparedGrowth (..)
   , preparedFrom
   , preparedTo
   , preparedAllocated
@@ -64,7 +64,6 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
     -- * Jobs
   , OpenSpec (..)
   , ReadMode (..)
-  , StagedWrite
   , WriteRefusal (..)
   , stageWrite
   , stagedPages
@@ -108,6 +107,16 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , ServiceView (..)
   , serviceView
   , jobRecordBytes
+  , writeEntryBytes
+  , writeFailureBytes
+  , jobCharge
+  , maxHostFailureChars
+  , maxKept
+  , keepEvidence
+  , keptEntryBytes
+  , StagedWrite (..)
+  , Kept (..)
+  , EvidenceDropped (..)
   , transferBufferBytes
   , resultPageBytes
   , backingRecordBytes
@@ -194,7 +203,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State
 -- against the live heap of the largest valid job (every work kind, every field
 -- at its largest) and asserts is within this figure.
 jobRecordBytes ∷ Word64
-jobRecordBytes = 2048
+jobRecordBytes = 4096
 
 -- | The accounted bytes of a read's transfer buffer of @n@ pages: the pages, the
 -- runtime's own accounting of a large object (a descriptor for every 4 KiB block it
@@ -208,6 +217,27 @@ transferBufferBytes n = fromIntegral (n * pageSize) + fromIntegral (n * pageSize
 -- outcome carries). Measured by the suite against the live heap of a held result.
 resultPageBytes ∷ Word64
 resultPageBytes = 4608
+
+-- | The accounted bytes of one entry of a write's report (a page number and its result, in a list), which a write
+-- builds as it runs and keeps in its finished outcome until retired. Charged at ADMISSION for every staged page
+-- (nothing is allocated at result time without a charge); measured by the suite (Memory) at the largest report.
+writeEntryBytes ∷ Word64
+writeEntryBytes = 96
+
+-- | The accounted bytes of the one failure a write report may carry (the first failed page's record; every page
+-- after it is only marked not attempted).
+writeFailureBytes ∷ Word64
+writeFailureBytes = 512
+
+-- | What a job is charged to the control account from submission to retirement: the record, and for a write the
+-- bounded metadata of the report it will build (one entry per staged page and at most one failure).
+jobCharge ∷ Work → Word64
+jobCharge w = jobRecordBytes + case w of
+  WWrite sw → fromIntegral (length (swPages sw)) * writeEntryBytes + writeFailureBytes
+  WOpen _ → 0
+  WRead _ → 0
+  WGrow _ → 0
+  WRelease _ _ _ → 0
 
 -- | The accounted bytes of one open backing's record (its entry, its growth and
 -- pending-reservation slots at their largest, its place in the volume's ledger),
@@ -362,6 +392,9 @@ data Job = Job
   , jBorrowed ∷ !Int
   , jDiscard ∷ !Bool
   -- ^ The holder discarded the ticket while the job ran: it is retired when it finishes.
+  , jDelivered ∷ !Bool
+  -- ^ A callback of 'withOutcome' returned normally with the outcome: the caller owns what it carries. A delivery
+  -- has three ends: delivered (this mark), failed (the callback raised: nobody owns it) and undelivered.
   }
 
 -- ---------------------------------------------------------------------------
@@ -485,11 +518,38 @@ data St = St
   , stBusyVolumes ∷ !(Set Word64)
   , stReserved ∷ !(Map Word64 Word64)
   , stDefect ∷ !(Maybe Text)
-  , stClosing ∷ !Int
-  -- ^ Backings claimed for close whose native close has not yet returned: still tracked, joined by the drain.
-  , stEvidence ∷ ![CleanupNote]
-  -- ^ Cleanup failures of outcomes disposed of undelivered, kept (at most 64) for the scope that ends the service.
+  , stClosingRecs ∷ !(Map Word64 Entry)
+  -- ^ THE CLOSING RECORD. A backing claimed for close MOVES here whole (its grant, its volume contribution, its
+  -- descriptor) and nothing it pays for is released until its native close has returned; one transaction after
+  -- that releases the grant, subtracts the reservation and deletes the record. The drain joins the records.
+  , stEvidence ∷ ![Kept]
+  -- ^ Cleanup failures that nobody received (an outcome disposed of undelivered, a close nobody waited for), kept
+  -- (at most 'maxKept') for the scope that ends the service.
+  , stEvidenceDropped ∷ !Int
+  -- ^ How many were dropped because the evidence was full: counted, and reported at the end, never silent.
+  , stWorkers ∷ !Int
+  -- ^ Workers alive (started and not yet ended): admission is open only while both are.
+  , stStopReason ∷ !(Maybe Text)
+  -- ^ Why the service was stopped by something other than its own drain (the first reason wins).
   }
+
+-- | A failure of a cleanup nobody received, with what it was.
+data Kept = Kept !Text !CleanupNote !A.Grant
+
+-- | The accounted bytes of one kept failure (its label, its note, its place in the list and its grant), charged to
+-- the control account from the moment it is kept until the service's end. Measured by the suite (Memory).
+keptEntryBytes ∷ Word64
+keptEntryBytes = 256
+
+-- | The most failures the service keeps for its end.
+maxKept ∷ Int
+maxKept = 64
+
+-- | The failures dropped for want of room at the end of the service.
+newtype EvidenceDropped = EvidenceDropped Int
+  deriving stock (Show)
+
+instance Exception EvidenceDropped
 
 -- | The service.
 data StorageService = StorageService
@@ -536,7 +596,7 @@ data StorageCleanupFailure
 instance Exception StorageCleanupFailure
 
 emptySt ∷ St
-emptySt = St Running 1 1 Map.empty Map.empty Map.empty Nothing 0 (Fair 0 0) Set.empty Map.empty Nothing 0 []
+emptySt = St Running 1 1 Map.empty Map.empty Map.empty Nothing 0 (Fair 0 0) Set.empty Map.empty Nothing Map.empty [] 0 0 Nothing
 
 -- | Run a body with the service. The two workers are started in the group the
 -- caller owns; the body runs; then, in the protected boundary and whatever ended
@@ -593,7 +653,7 @@ workerDef ∷ StorageService → Int → WorkerDefinition ()
 workerDef svc n =
   workerDefinition
     (T.pack ("terrain-storage-io-" <> show n))
-    (\_ → allocResource (seamBefore (svSeam svc) (OpWorkerStart n)) (\_ → seamBefore (svSeam svc) (OpWorkerStop n)))
+    (\_ → allocResource (seamBefore (svSeam svc) (OpWorkerStart n) >> atomically (modifyTVar' (svState svc) (\s → s {stWorkers = stWorkers s + 1}))) (\_ → atomically (modifyTVar' (svState svc) (\s → s {stWorkers = stWorkers s - 1})) >> seamBefore (svSeam svc) (OpWorkerStop n)))
     (\token () → workerLoop svc token)
 
 -- | Close admission, withdraw what is queued, close every backing and stop the
@@ -609,11 +669,11 @@ drainService svc workers = do
   closed ← forM entries $ \bid → closeBackingCore svc bid
   -- a close another caller claimed is still tracked until its native call has returned: the drain joins it, and
   -- says so before it waits (the one observation of the wait that needs no timing)
-  inFlight ← atomically (stClosing <$> readTVar (svState svc))
+  inFlight ← atomically (Map.size . stClosingRecs <$> readTVar (svState svc))
   late5 ← if inFlight > 0
     then quietly (logInfo (svLogger svc) component drainWaitsMessage [("closing", T.pack (show inFlight))])
     else pure Nothing
-  (late4, _) ← protectedly (atomically (readTVar (svState svc) >>= \s → check (stClosing s == 0)))
+  (late4, _) ← protectedly (atomically (readTVar (svState svc) >>= \s → check (Map.null (stClosingRecs s))))
   -- every record still in the table (an outcome nobody took, an opened backing nobody named) is disposed of once its
   -- borrowers have finished, and the cleanup failures such outcomes carry are kept as evidence
   (late3, _) ← protectedly . atomically $ do
@@ -621,10 +681,13 @@ drainService svc workers = do
     check (null [() | j ← Map.elems (stJobs s), jBorrowed j > 0])
     forM_ (Map.keys (stJobs s)) (disposeUndelivered svc)
   atomically (modifyTVar' (svState svc) (\s → s {stPhase = Stopped}))
-  undelivered ← atomically (stEvidence <$> readTVar (svState svc))
-  evidence ← sequence ([(,) "undelivered outcome cleanup" <$> evidenceOf (OpenCleanupFailed op e) | CleanupNote op e ← undelivered]
+  (undelivered, dropped) ← atomically ((\s → (stEvidence s, stEvidenceDropped s)) <$> readTVar (svState svc))
+  evidence ← sequence ([(,) label <$> evidenceOf (OpenCleanupFailed op e) | Kept label (CleanupNote op e) _ ← undelivered]
+    <> [(,) "evidence dropped for want of room" <$> evidenceOf (EvidenceDropped dropped) | dropped > 0]
     <> [(,) "backing close" <$> evidenceOf (BackingCloseFailed (T.pack (show bid)) e) | (bid, (_, report)) ← zip entries closed, Just e ← [crCloseError report]]
     <> [(,) "backing close" <$> evidenceOf (BackingCloseRaised (T.pack (show bid)) t) | (bid, (_, report)) ← zip entries closed, Just t ← [crCloseException report]])
+  -- the kept failures are composed: what they were charged is released with them
+  atomically (forM_ undelivered (\(Kept _ _ g) → releaseGrant svc g) >> modifyTVar' (svState svc) (\t → t {stEvidence = []}))
   pure (firstLate ([late0, late1, late2, late3, late4, late5] <> map fst closed), evidence)
 
 -- | The message the drain logs when it waits for closes another caller claimed.
@@ -745,8 +808,8 @@ disposeUndelivered svc jid = do
             GPrepared _ → pure ()
             GReleasing _ → pure ()
           pure Nothing
-        Failed _ notes → keep notes >> pure Nothing
-        Cancelled notes → keep notes >> pure Nothing
+        Failed _ notes → keepEvidence svc "undelivered outcome cleanup" notes >> pure Nothing
+        Cancelled notes → keepEvidence svc "undelivered outcome cleanup" notes >> pure Nothing
         Pages _ → pure Nothing
         Written _ → pure Nothing
         GrowthNoChange → pure Nothing
@@ -754,7 +817,32 @@ disposeUndelivered svc jid = do
     _ → pure Nothing
   where
     setEntry bid f = modifyTVar' (svState svc) (\t → t {stBackings = Map.adjust f bid (stBackings t)})
-    keep notes = modifyTVar' (svState svc) (\t → t {stEvidence = take 64 (stEvidence t <> notes)})
+
+-- | THE ONE KEEPER OF A FAILURE NOBODY RECEIVED: the failure goes into the service's evidence, which ends the
+-- service's scope as labelled cleanup failures. At most 'maxKept' are kept; one that does not fit is COUNTED, and
+-- the count is reported at the end (never dropped silently).
+keepEvidence ∷ StorageService → Text → [CleanupNote] → STM ()
+keepEvidence svc label = mapM_ keepOne
+  where
+    -- every kept failure is CHARGED ('keptEntryBytes', control) while it is kept; one that does not fit, or whose
+    -- charge is refused, is counted
+    keepOne n = do
+      s ← readTVar (svState svc)
+      if length (stEvidence s) >= maxKept then dropOne else do
+        charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit keptEntryBytes] a)
+        case charged of
+          Left _ → dropOne
+          Right g → modifyTVar' (svState svc) (\t → t {stEvidence = stEvidence t <> [Kept label n g]})
+    dropOne = modifyTVar' (svState svc) (\t → t {stEvidenceDropped = stEvidenceDropped t + 1})
+
+-- | THE ONE STOP of the service for every way a worker can end other than the cooperative stop its token carries
+-- (a defect, a cancellation delivered at any point of its loop, a remembered cancellation delivered after a job):
+-- admission closes, queued work settles as cancelled, running work is asked to stop, and the reason is recorded
+-- (the first one wins). A worker that is gone while admission is open would accept tickets nobody runs.
+stopService ∷ StorageService → Text → STM ()
+stopService svc why = do
+  modifyTVar' (svState svc) (\s → s {stStopReason = case stStopReason s of Nothing → Just why; r → r})
+  closeAdmission svc
 
 dequeue ∷ StorageService → Word64 → STM ()
 dequeue svc jid = modifyTVar' (svState svc) (\s → s {stQueue = Map.map (Seq.filter (/= jid)) (stQueue s)})
@@ -817,12 +905,12 @@ admitJob svc mb ident cls work = do
   case checks of
     Left f → pure (Left f)
     Right () → do
-      charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit jobRecordBytes] a)
+      charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit (jobCharge work)] a)
       case charged of
         Left r → pure (Left (mapRefusal r))
         Right grant → do
           let jid = stNextJob s
-              job = Job (fmap (\(Backing _ bid _) → bid) mb) ident cls work JQueued False grant Nothing 0 False
+              job = Job (fmap (\(Backing _ bid _) → bid) mb) ident cls work JQueued False grant Nothing 0 False False
           writeTVar (svState svc) s
             { stNextJob = jid + 1
             , stJobs = Map.insert jid job (stJobs s)
@@ -1043,16 +1131,23 @@ withOutcome svc t body = mask $ \restore → do
     Nothing → pure Nothing
     Just (jid, o) → do
       r ← tryWithContext (restore (body o))
-      atomically $ do
+      -- A DELIVERY HAS THREE ENDS. Delivered: the callback returned, the caller owns what the outcome carries (a
+      -- token, an opened backing) and the record is retired. Failed: the callback raised or was cancelled and no
+      -- borrower received it: nobody owns it, and it goes through the ONE disposal. Undelivered is the discard.
+      toClose ← atomically $ do
         modifyTVar' (svState svc) $ \st →
           st
-            { stJobs = Map.adjust (\x → x {jBorrowed = jBorrowed x - 1}) jid (stJobs st)
+            { stJobs = Map.adjust (\x → x {jBorrowed = jBorrowed x - 1, jDelivered = jDelivered x || either (const False) (const True) r}) jid (stJobs st)
             , stBackings = adjustBorrow (backingOfJob st jid) (-1) (stBackings st)
             }
-        retireJob svc jid
+        finishDelivery svc jid
       case r ∷ Either (ExceptionWithContext SomeException) a of
         Right x → pure (Just x)
-        Left e → rethrowIO e
+        Left e → do
+          -- an opened backing nobody can name is closed with its failure kept; the callback's own exception is the
+          -- one propagated (a cancellation that reached that close's diagnostics is subsumed by it)
+          forM_ toClose (closeUnwaited svc)
+          rethrowIO e
   where
     backingOfJob st jid = Map.lookup jid (stJobs st) >>= jBacking
     -- a backing that is closing takes no new borrower: its records are retired by the close, and a caller taking outcomes
@@ -1060,6 +1155,16 @@ withOutcome svc t body = mask $ \restore → do
     closingBacking s mb = case mb >>= \bid → Map.lookup bid (stBackings s) of
       Just e → ePhase e /= EOpen
       Nothing → False
+
+-- | The end of a borrow: once nobody borrows, a delivered outcome is retired (its owner took it) and an outcome no
+-- borrower received goes through the one disposal.
+finishDelivery ∷ StorageService → Word64 → STM (Maybe Word64)
+finishDelivery svc jid = do
+  s ← readTVar (svState svc)
+  case Map.lookup jid (stJobs s) of
+    Just j | JDone _ ← jPhase j, jBorrowed j == 0 →
+      if jDelivered j then retireJob svc jid >> pure Nothing else disposeUndelivered svc jid
+    _ → pure Nothing
 
 adjustBorrow ∷ Maybe Word64 → Int → Map Word64 Entry → Map Word64 Entry
 adjustBorrow Nothing _ m = m
@@ -1082,7 +1187,7 @@ discardTicket svc t = do
           -- the holder gives the outcome up: the job stops at its next safe point and is disposed of when it ends
           modifyTVar' (svState svc) (\st → st {stJobs = Map.adjust (\x → x {jCancel = True, jDiscard = True}) jid (stJobs st)})
           pure Nothing
-  forM_ toClose (void . closeBackingId svc)
+  forM_ toClose (\b → closeUnwaited svc b >>= mapM_ rethrowIO)
 
 data CancelResult
   = -- | A queued job was withdrawn and settled as cancelled.
@@ -1203,8 +1308,18 @@ dispatchNext svc = do
         }
       pure jid
 
+-- | The worker. The cooperative stop its token carries is the ONLY normal way out; every other way out (an exception
+-- out of the dispatch wait, a cancellation or a defect out of a job, a remembered cancellation delivered after a job
+-- that had finished) runs the one 'stopService' first and then propagates: admission never stays open over a worker
+-- that is gone.
 workerLoop ∷ StorageService → StopToken → IO ()
-workerLoop svc token = mask $ \restore → loop restore
+workerLoop svc token = mask $ \restore → do
+  r ← tryWithContext (loop restore) ∷ IO (Either (ExceptionWithContext SomeException) ())
+  case r of
+    Right () → pure ()
+    Left ewc@(ExceptionWithContext _ e) → do
+      atomically (stopService svc ("a storage worker ended: " <> T.take 256 (T.pack (show e))))
+      rethrowIO ewc
   where
     loop restore = do
       next ← restore (atomically ((Just <$> dispatchNext svc) `orElse` (awaitStopRequest token >> pure Nothing)))
@@ -1226,13 +1341,14 @@ runJob svc jid = do
       case r ∷ Either (ExceptionWithContext SomeException) Outcome of
         Right outcome → do
           toClose ← atomically (finishJob svc jid outcome)
-          forM_ toClose (void . closeBackingId svc)
+          -- a close nobody waits for: its failure has a keeper, its cancellation is remembered
+          lateClose ← maybe (pure Nothing) (closeUnwaited svc) toClose
           -- the job is finished; only now the diagnostic. A cancellation that arrives at the log is delivered
-          -- after it: the worker ends with it, as a cancellation of a worker does
-          late ← case outcome of
+          -- after it, with the close's: the worker ends with it (the one stop of 'workerLoop' runs)
+          lateLog ← case outcome of
             Opened b rv → quietly (logInfo (svLogger svc) component "Backing opened" [("backing", T.pack (show b)), ("allocated", T.pack (show (rsAllocated rv)))])
             _ → pure Nothing
-          forM_ late rethrowIO
+          forM_ (firstLate [lateClose, lateLog]) rethrowIO
         Left ewc@(ExceptionWithContext ctx e) → do
           -- the defect keeps its context (the cleanup failures of every scope it crossed) all the way to the
           -- worker's completion, and the job's outcome names them
@@ -1241,12 +1357,17 @@ runJob svc jid = do
           -- the bookkeeping first (the job finishes, its record and charge are released, the service stops), the
           -- diagnostic after it: nothing a log does can leave the job running. A cancellation that arrives at the
           -- log is dropped with the entry, because the worker ends with the defect either way
+          -- (the outcome's text is bounded: what is retained is charged and measured at its largest)
           atomically $ do
-            void (finishJob svc jid (Failed (HostFailure why) []))
-            modifyTVar' (svState svc) (\s → s {stDefect = Just why, stPhase = Stopped})
-            closeAdmission svc
+            void (finishJob svc jid (Failed (HostFailure (T.take maxHostFailureChars why)) []))
+            modifyTVar' (svState svc) (\s → s {stDefect = Just (T.take maxHostFailureChars why)})
+            stopService svc (T.take 256 why)
           _ ← quietly (logError (svLogger svc) component "Storage worker defect" [("defect", why)])
           rethrowIO ewc
+
+-- | The most characters of a defect's text a job's outcome and the service's record retain.
+maxHostFailureChars ∷ Int
+maxHostFailureChars = 256
 
 cancelled ∷ StorageService → Word64 → IO Bool
 cancelled svc jid = atomically (maybe False jCancel . Map.lookup jid . stJobs <$> readTVar (svState svc))
@@ -1610,11 +1731,30 @@ closeBacking svc (Backing u bid _)
   | u /= svId svc = pure (noClose)
   | otherwise = closeBackingId svc bid
 
+-- | Close a backing for a caller that RECEIVES the report. A cancellation remembered by the close is delivered after
+-- it; when it is, the caller never gets the report, so a failing report is kept in the service's evidence first.
 closeBackingId ∷ StorageService → Word64 → IO CloseReport
 closeBackingId svc bid = do
   (late, report) ← closeBackingCore svc bid
-  forM_ late rethrowIO
+  forM_ late $ \e → do
+    keepCloseFailure svc "close whose report was not delivered" report
+    rethrowIO e
   pure report
+
+-- | A close NOBODY WAITS FOR (a discarded opened backing, one a failed delivery left, one a worker closes): its
+-- failing report has no receiver, so the service keeps it. Answers the cancellation the close remembered, for the
+-- caller to deliver once its own bookkeeping is done.
+closeUnwaited ∷ StorageService → Word64 → IO (Maybe (ExceptionWithContext SomeException))
+closeUnwaited svc bid = do
+  (late, report) ← closeBackingCore svc bid
+  keepCloseFailure svc "unattended close" report
+  pure late
+
+keepCloseFailure ∷ StorageService → Text → CloseReport → IO ()
+keepCloseFailure svc label report = case (crCloseError report, crCloseException report) of
+  (Just e, _) → atomically (keepEvidence svc label [CleanupNote IoClose e])
+  (_, Just _) → atomically (keepEvidence svc label [CleanupNote IoClose (Errno (-1))])
+  _ → pure ()
 
 -- | The close, returning an interruption it remembered instead of obeying, for
 -- the caller to deliver once the descriptor is closed.
@@ -1643,9 +1783,10 @@ closeBackingCore svc bid = mask_ $ do
                 Right (Left en) → (Just en, Nothing)
                 Right (Right ()) → (Nothing, Nothing)
                 Left (ExceptionWithContext _ ex) → (Nothing, Just (T.pack (show ex)))
-          -- the closing record ends the moment the native close has returned (the bookkeeping was final in the
-          -- claim), before anything that could fail: a logger that raises must never leave the drain waiting
-          atomically (modifyTVar' (svState svc) (\t → t {stClosing = stClosing t - 1}))
+          -- the closing record ends the moment the native close has returned, in ONE transaction that releases what
+          -- the backing paid for (the grant, the volume's reservation) and deletes it, before anything that could
+          -- fail: a logger that raises must never leave the drain waiting
+          atomically (finishClosing svc bid e)
           -- a cancellation that arrives at a log is remembered, not obeyed: the report is still made and the
           -- caller (the drain, which goes on to close the other backings) delivers it afterwards
           l1 ← maybe (pure Nothing) (\(Errno n) → quietly (logWarning (svLogger svc) component "Backing close failed" [("errno", T.pack (show n))])) err
@@ -1663,16 +1804,27 @@ closeBackingCore svc bid = mask_ $ do
           check (null active && eBorrows e == 0)
           -- the records of this backing's jobs are disposed of here (an open outcome's backing is this one: no second close)
           forM_ [jid | (jid, j) ← Map.toList (stJobs s), jBacking j == Just b] (disposeUndelivered svc)
-          releaseGrant svc (eGrant e)
+          -- the entry MOVES into the closing record whole: nothing it pays for is released here, because the
+          -- descriptor, the file's allocation and the entry are all still live until the native close returns
           modifyTVar' (svState svc) $ \t →
             t { stBackings = Map.delete b (stBackings t)
-              , stReserved = Map.adjust (\n → n - min n (backingContribution e)) (eVolume e) (stReserved t)
-              , stClosing = stClosing t + 1
+              , stClosingRecs = Map.insert b e (stClosingRecs t)
               }
           pure (Just e)
     activePhase JQueued = True
     activePhase JRunning = True
     activePhase (JDone _) = False
+
+-- | The end of a closing record: the native close has returned, so what the backing paid for is gone, and in ONE
+-- transaction its control grant is released, its contribution leaves the volume's reserved figure and the record
+-- is deleted.
+finishClosing ∷ StorageService → Word64 → Entry → STM ()
+finishClosing svc bid e = do
+  releaseGrant svc (eGrant e)
+  modifyTVar' (svState svc) $ \t →
+    t { stReserved = Map.adjust (\n → n - min n (backingContribution e)) (eVolume e) (stReserved t)
+      , stClosingRecs = Map.delete bid (stClosingRecs t)
+      }
 
 -- ---------------------------------------------------------------------------
 -- Inspection
@@ -1752,6 +1904,9 @@ data JobSnap = JobSnap
   -- ^ A finished growth's untaken preparation: the backing it prepared.
   , jsHoldsResult ∷ !Bool
   -- ^ A finished read that still holds its bytes.
+  , jsCharge ∷ !Word64
+  -- ^ What the job's record is charged to the control account ('jobCharge').
+  , jsDelivered ∷ !Bool
   }
   deriving stock (Eq, Show)
 
@@ -1772,6 +1927,13 @@ data Snapshot = Snapshot
   { snJobs ∷ ![JobSnap]
   , snBackings ∷ ![BackingSnap]
   , snClosing ∷ !Int
+  , snClosingRecs ∷ ![BackingSnap]
+  -- ^ The closing records, each with what it still pays for.
+  , snWorkers ∷ !Int
+  , snAdmissionOpen ∷ !Bool
+  , snStopReason ∷ !(Maybe Text)
+  , snEvidence ∷ !Int
+  , snEvidenceDropped ∷ !Int
   , snReserved ∷ !(Map Word64 Word64)
   , snQueued ∷ !Int
   , snRunning ∷ !Int
@@ -1798,13 +1960,21 @@ snapshotOf svc = do
           , jsBorrowed = jBorrowed j
           , jsPrepared = case jPhase j of JDone (GrowthPrepared p _) → Just (pgBacking p); _ → Nothing
           , jsHoldsResult = case jPhase j of JDone (Pages _) → True; _ → False
+          , jsCharge = jobCharge (jWork j)
+          , jsDelivered = jDelivered j
           }
       slotTag g = case g of GIdle → SlotIdle; GRunning → SlotRunning; GPrepared _ → SlotPrepared; GReleasing _ → SlotReleasing
       backingSnap (bid, e) = BackingSnap bid (slotTag (eGrowth e)) (ePending e) (eLength e) (eVolume e) (eBorrows e) (ePhase e /= EOpen)
   pure Snapshot
     { snJobs = map jobSnap (Map.toList (stJobs s))
     , snBackings = map backingSnap (Map.toList (stBackings s))
-    , snClosing = stClosing s
+    , snClosing = Map.size (stClosingRecs s)
+    , snClosingRecs = map backingSnap (Map.toList (stClosingRecs s))
+    , snWorkers = stWorkers s
+    , snAdmissionOpen = stPhase s == Running
+    , snStopReason = stStopReason s
+    , snEvidence = length (stEvidence s)
+    , snEvidenceDropped = stEvidenceDropped s
     , snReserved = stReserved s
     , snQueued = sum (map Seq.length (Map.elems (stQueue s)))
     , snRunning = stRunning s
