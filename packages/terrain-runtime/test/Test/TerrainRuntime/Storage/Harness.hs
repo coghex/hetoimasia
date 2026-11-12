@@ -34,6 +34,7 @@ module Test.TerrainRuntime.Storage.Harness
   , openGate
   , awaitReached
   , awaitBlockedInStm
+  , openAllGates
   , addRule
   , addRuleAfter
   , addGate
