@@ -116,7 +116,6 @@ module Hetoimasia.Terrain.Runtime.Storage
   , jobRecordBytes
   , writeEntryBytes
   , writeFailureBytes
-  , jobCharge
   , transferBufferBytes
   , resultPageBytes
   , backingRecordBytes

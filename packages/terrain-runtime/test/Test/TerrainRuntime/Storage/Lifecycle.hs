@@ -65,6 +65,10 @@ invariantProblems sn ledger fds = concat
     | v <- map bsVolume (snBackings sn <> snClosingRecs sn), c <- [contribution v], c /= 0, Map.notMember v (snReserved sn) ]
   , [ "admission is open but " <> show (snWorkers sn) <> " workers are alive"
     | snAdmissionOpen sn, snWorkers sn /= 2 ]
+  -- a running job is a worker's: more running jobs than workers alive (and so any running job with no worker) is a
+  -- job nobody will ever finish
+  , [ show (snRunning sn) <> " jobs are running but " <> show (snWorkers sn) <> " workers are alive"
+    | snRunning sn > snWorkers sn ]
   , [ "evidence holds " <> show (snEvidence sn) <> " failures (at most " <> show maxKept <> ")"
     | snEvidence sn > maxKept ]
   , [ "control charges " <> show (A.lgControlReserved ledger) <> " but live records need " <> show controlNeed

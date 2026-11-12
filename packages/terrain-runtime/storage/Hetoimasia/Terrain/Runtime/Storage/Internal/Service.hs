@@ -216,7 +216,7 @@ transferBufferBytes n = fromIntegral (n * pageSize) + fromIntegral (n * pageSize
 -- caller reads and what holds them (the byte string, the pair and the list cell the
 -- outcome carries). Measured by the suite against the live heap of a held result.
 resultPageBytes ∷ Word64
-resultPageBytes = 4608
+resultPageBytes = 4864
 
 -- | The accounted bytes of one entry of a write's report (a page number and its result, in a list), which a write
 -- builds as it runs and keeps in its finished outcome until retired. Charged at ADMISSION for every staged page
@@ -539,7 +539,7 @@ data Kept = Kept !Text !CleanupNote !A.Grant
 -- | The accounted bytes of one kept failure (its label, its note, its place in the list and its grant), charged to
 -- the control account from the moment it is kept until the service's end. Measured by the suite (Memory).
 keptEntryBytes ∷ Word64
-keptEntryBytes = 256
+keptEntryBytes = 320
 
 -- | The most failures the service keeps for its end.
 maxKept ∷ Int
@@ -613,6 +613,8 @@ withStorageService ports body = do
   let svc = StorageService sid (portSeam ports) (portConfig ports) st (portAdmission ports) (portLogger ports) names
   mask $ \restore → do
     workers ← startWorkers svc (portGroup ports)
+    -- the body is the caller's: the service commits nothing inside this unmasked region (every service transaction
+    -- is made by a service function the body calls, each complete in itself); everything after it is masked
     outcome ← tryWithContext (restore (body svc))
     (late, caught) ← drainService svc workers
     let primary = case outcome of
@@ -1130,6 +1132,9 @@ withOutcome svc t body = mask $ \restore → do
   case taken of
     Nothing → pure Nothing
     Just (jid, o) → do
+      -- the borrow was committed above and is released below, both masked: nothing is committed inside this
+      -- unmasked region, and an exception delivered anywhere in it (after the body returned too) is caught here, so
+      -- the borrow is always released and the delivery counted as failed (the caller sees the exception)
       r ← tryWithContext (restore (body o))
       -- A DELIVERY HAS THREE ENDS. Delivered: the callback returned, the caller owns what the outcome carries (a
       -- token, an opened backing) and the record is retired. Failed: the callback raised or was cancelled and no
@@ -1313,19 +1318,24 @@ dispatchNext svc = do
 -- that had finished) runs the one 'stopService' first and then propagates: admission never stays open over a worker
 -- that is gone.
 workerLoop ∷ StorageService → StopToken → IO ()
-workerLoop svc token = mask $ \restore → do
-  r ← tryWithContext (loop restore) ∷ IO (Either (ExceptionWithContext SomeException) ())
+workerLoop svc token = mask_ $ do
+  r ← tryWithContext loop ∷ IO (Either (ExceptionWithContext SomeException) ())
   case r of
     Right () → pure ()
     Left ewc@(ExceptionWithContext _ e) → do
       atomically (stopService svc ("a storage worker ended: " <> T.take 256 (T.pack (show e))))
       rethrowIO ewc
   where
-    loop restore = do
-      next ← restore (atomically ((Just <$> dispatchNext svc) `orElse` (awaitStopRequest token >> pure Nothing)))
+    -- THE DISPATCH IS MASKED, with no unmasked region around it. Under 'mask', 'atomically' is interruptible exactly
+    -- while it is blocked in a retry (the wait for work or for the stop) and at no other point, so the wait can still
+    -- be cancelled, and a transaction that committed (the job is running, 'stRunning' counted) is always followed by
+    -- 'runJob': an unmasked region around it would let a cancellation land between the commit and the run, leaving a
+    -- job running for ever with no worker, a close waiting on it and the service's end hanging.
+    loop = do
+      next ← atomically ((Just <$> dispatchNext svc) `orElse` (awaitStopRequest token >> pure Nothing))
       case next of
         Nothing → pure ()
-        Just jid → runJob svc jid >> loop restore
+        Just jid → runJob svc jid >> loop
 
 -- | Run one dispatched job and record its outcome. A defect (an exception that is
 -- not an expected storage result) is recorded, completes the job as a host
@@ -1698,6 +1708,7 @@ withUse svc (Backing u bid _) act = mask $ \restore → do
   case entered of
     Left f → pure (Left f)
     Right () → do
+      -- the borrow was committed above and is released below, both masked: nothing is committed in this region
       r ← tryWithContext (restore act)
       atomically (modifyTVar' (svState svc) (\s → s {stBackings = Map.adjust (\e → e {eBorrows = eBorrows e - 1}) bid (stBackings s)}))
       case r ∷ Either (ExceptionWithContext SomeException) a of

@@ -92,6 +92,11 @@ probeCases =
               record ("reserve." <> show (bytes `div` mib) <> "MiB.allocated") (show (rsAllocated rs))
               record ("reserve." <> show (bytes `div` mib) <> "MiB.overhead") (show (rsOverhead rs))
               rsAllocated rs `shouldSatisfy` (>= bytes)
+              -- the allocation GRANULARITY is asserted, not only reported: the allocated bytes are a whole multiple of the
+              -- reported block size
+              record ("reserve." <> show (bytes `div` mib) <> "MiB.blocksize") (show (rsBlockSize rs))
+              rsBlockSize rs `shouldSatisfy` (> 0)
+              (rsAllocated rs `mod` rsBlockSize rs) `shouldBe` 0
             other -> expectationFailure ("not reserved: " <> show other)
     
     )
@@ -130,7 +135,12 @@ probeCases =
             verify fd (cfgAllowanceBytes cfg) 3
           g <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
           case g of
-            GrowthPrepared _ rs -> record "growth.64to128.allocated" (show (rsAllocated rs)) >> record "growth.64to128.overhead" (show (rsOverhead rs))
+            GrowthPrepared _ rs -> do
+              record "growth.64to128.allocated" (show (rsAllocated rs))
+              record "growth.64to128.overhead" (show (rsOverhead rs))
+              -- the granularity of the grown file too: whole blocks of the reported block size
+              rsBlockSize rs `shouldSatisfy` (> 0)
+              (rsAllocated rs `mod` rsBlockSize rs) `shouldBe` 0
             other -> expectationFailure ("not grown: " <> show other)
           verify fd (cfgAllowanceBytes cfg) 3
     
