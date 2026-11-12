@@ -176,15 +176,21 @@ fillerClass = describe "(A) the probe's filler" $ do
     exhaustionVerdict (Left enospc :: Either Errno ()) (64 * mib') `shouldBe` Left (ResidueTooLarge (64 * mib'))
     exhaustionVerdict (Right 4096 :: Either Errno Word64) 0 `shouldBe` Left OneMoreBlockGranted
     exhaustionVerdict (Left ioErr :: Either Errno ()) 0 `shouldBe` Left (OneMoreBlockFailedOther ioErr)
-  it "judges the rewrite by what it did: a changed allocation fails, and so does a consumed residue; an unchanged allocation with the space intact passes" $ do
+  it "judges the rewrite by what it did: new allocation fails, lost coverage fails, and so does a consumed residue; no growth with the space intact passes, a decrease that still covers the allowance too" $ do
     let mib' = 1024 * 1024 :: Word64
-    rewriteVerdict (64 * mib') (64 * mib') (32 * mib') (32 * mib') `shouldBe` Right ()
+    let allowance = 64 * mib'
+    rewriteVerdict allowance (64 * mib') (64 * mib') (32 * mib') (32 * mib') `shouldBe` Right ()
     -- the space coming back (a lazy reclaim) or a small reading difference is not a consumption
-    rewriteVerdict (64 * mib') (64 * mib') (32 * mib') (40 * mib') `shouldBe` Right ()
-    rewriteVerdict (64 * mib') (64 * mib') (32 * mib') (30 * mib') `shouldBe` Right ()
-    -- a rewrite that had to allocate: the backing grew, or the residue was consumed
-    rewriteVerdict (64 * mib') (96 * mib') (32 * mib') (32 * mib') `shouldBe` Left (AllocationChanged (64 * mib') (96 * mib'))
-    rewriteVerdict (64 * mib') (64 * mib') (32 * mib') 0 `shouldBe` Left (SpaceConsumed (fromIntegral (32 * mib')))
+    rewriteVerdict allowance (64 * mib') (64 * mib') (32 * mib') (40 * mib') `shouldBe` Right ()
+    rewriteVerdict allowance (64 * mib') (64 * mib') (32 * mib') (30 * mib') `shouldBe` Right ()
+    -- a decrease that still covers the allowance (a metadata block given back) is not new allocation
+    rewriteVerdict allowance (64 * mib' + 4096) (64 * mib') (32 * mib') (32 * mib') `shouldBe` Right ()
+    -- a rewrite that had to allocate: the backing GREW, or the residue was consumed
+    rewriteVerdict allowance (64 * mib') (96 * mib') (32 * mib') (32 * mib') `shouldBe` Left (AllocationGrew (64 * mib') (96 * mib'))
+    rewriteVerdict allowance (64 * mib') (64 * mib' + 4096) (32 * mib') (32 * mib') `shouldBe` Left (AllocationGrew (64 * mib') (64 * mib' + 4096))
+    rewriteVerdict allowance (64 * mib') (64 * mib') (32 * mib') 0 `shouldBe` Left (SpaceConsumed (fromIntegral (32 * mib')))
+    -- the coverage lost: it fell below the allowance
+    rewriteVerdict allowance (64 * mib') (64 * mib' - 4096) (32 * mib') (32 * mib') `shouldBe` Left (CoverageLost allowance (64 * mib' - 4096))
   it "judges a refused growth by what it left: the length and the allocated bytes of the file are what they were" $ do
     growthVerdict (64, 64) (64, 64) `shouldBe` Right ()
     growthVerdict (64, 64) (128, 64) `shouldBe` Left (GrowthChanged (64, 64) (128, 64))

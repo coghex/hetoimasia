@@ -125,14 +125,14 @@ probeCases =
             -- previously written pages are rewritten across the whole reserved range
             timed "rewrite.exhausted" (pattern' fd size 2)
             verify fd size 2
-            -- THE CLAIM, measured: the rewrite allocated nothing (the backing's allocation is unchanged) and consumed
+            -- THE CLAIM, measured: the rewrite allocated nothing new (the allocation did not grow and still covers the allowance) and consumed
             -- none of the volume's remaining space (a rewrite that had to allocate would have consumed the residue)
             allocAfter <- allocatedOf fd
             availAfter <- availableOf meter
             record "rewrite.backing.allocated.after" (show allocAfter)
             record "rewrite.available.consumed" (show (toInteger availBefore - toInteger availAfter))
-            either (fail . show) pure (rewriteVerdict allocBefore allocAfter availBefore availAfter)
-            record "rewrite.within.reservation" "allocation unchanged, no space consumed"
+            either (fail . show) pure (rewriteVerdict size allocBefore allocAfter availBefore availAfter)
+            record "rewrite.within.reservation" "no new allocation, coverage kept, no space consumed"
     
     )
   , ("refuses to grow when the volume is exhausted, keeping the old data and size, and grows when there is room", \acquire -> do
@@ -339,17 +339,23 @@ exhaustionVerdict oneMore residue = case oneMore of
 
 -- | Why a rewrite is not shown to have needed no new allocation.
 data RewriteBad
-  = -- | The backing's allocated bytes changed across the rewrite.
-    AllocationChanged !Word64 !Word64
+  = -- | The backing's allocated bytes GREW across the rewrite: new allocation.
+    AllocationGrew !Word64 !Word64
+  | -- | The backing's allocated bytes fell below the allowance: the coverage the claim stands on was lost.
+    CoverageLost !Word64 !Word64
   | -- | The volume's available bytes went down by more than the probe's 4 MiB tolerance: the rewrite consumed space.
     SpaceConsumed !Integer
   deriving stock (Eq, Show)
 
--- | THE CLAIM "the rewrite needs no new allocation", measured: the backing's allocation before and after, and the
--- volume's available bytes before and after.
-rewriteVerdict :: Word64 -> Word64 -> Word64 -> Word64 -> Either RewriteBad ()
-rewriteVerdict allocBefore allocAfter availBefore availAfter
-  | allocBefore /= allocAfter = Left (AllocationChanged allocBefore allocAfter)
+-- | THE CLAIM "the rewrite needs no NEW allocation", measured, exactly: the allowance, the backing's allocation before
+-- and after, and the volume's available bytes before and after. It fails when the allocation GREW (new allocation) and
+-- when it fell below the allowance (the coverage was lost); a decrease that still covers the allowance passes (a
+-- filesystem may give a metadata block back: ext4 counts its extent-tree blocks in the file's allocation) and is
+-- visible in the record lines.
+rewriteVerdict :: Word64 -> Word64 -> Word64 -> Word64 -> Word64 -> Either RewriteBad ()
+rewriteVerdict allowance allocBefore allocAfter availBefore availAfter
+  | allocAfter > allocBefore = Left (AllocationGrew allocBefore allocAfter)
+  | allocAfter < allowance = Left (CoverageLost allowance allocAfter)
   | consumed > toInteger (4 * mib) = Left (SpaceConsumed consumed)
   | otherwise = Right ()
   where consumed = toInteger availBefore - toInteger availAfter
