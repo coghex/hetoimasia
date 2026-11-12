@@ -9,13 +9,13 @@
 --   service numbers its backings and jobs from 1), and with a handle of a service that has ENDED: the typed refusal or
 --   'Nothing', nothing effected, and nothing of the other service's state shown (the whole snapshot of the service
 --   that was handed the handle is compared before and after).
-module Test.TerrainRuntime.Storage.Boundary (spec, boundaryTable, Row (..)) where
+module Test.TerrainRuntime.Storage.Boundary (spec, boundaryTable, typeTable, Row (..), TypeRow (..)) where
 
 import Control.Concurrent.STM (atomically)
 import Control.Monad (forM_, unless)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Char (isLower)
+import Data.Char (isLower, isUpper)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (nub, sort)
 import Data.Word (Word64)
@@ -92,6 +92,57 @@ boundaryTable =
   , Row "minHeadroomBytes" "none" "n/a" "a constant (256 MiB)" "pure" "n/a"
   ]
 
+-- | One row for an exported TYPE: who builds a value of it, what is checked when a caller does, and whether a value
+-- retained by the service can alias anything of the caller's.
+data TypeRow = TypeRow
+  { tName ∷ String
+  , tKind ∷ String
+  -- ^ a handle, an input a caller builds, an output the service makes, a failure value, or a service
+  , tBuilt ∷ String
+  -- ^ who builds it
+  , tChecked ∷ String
+  -- ^ what is validated when a caller supplies it
+  , tAliasing ∷ String
+  -- ^ whether a retained value can alias a larger allocation or another service's state, and what makes it the service's own
+  }
+
+-- | Every exported TYPE of the public module, one row each (checked against the export list like the functions).
+typeTable ∷ [TypeRow]
+typeTable =
+  [ TypeRow "StorageService" "a service" "`withStorage`" "n/a" "an abstract handle to the running service; a value is valid only inside its scope"
+  , TypeRow "StartFailure" "a failure value" "the service" "n/a" "scalars"
+  , TypeRow "StorageConfig" "an input a caller builds (abstract)" "`mkStorageConfig`" "the headroom at least `minHeadroomBytes`" "the qualified names are the configuration's OWN evaluated copies (a name cut from a large buffer would keep it alive)"
+  , TypeRow "StorageConfigError" "a failure value" "`mkStorageConfig`" "n/a" "scalars"
+  , TypeRow "Backing" "a handle (abstract)" "the service, in an opened backing's outcome" "service identity, then id, in the one resolver" "two scalars and the store identity; names nothing of another service"
+  , TypeRow "Ticket" "a handle (abstract)" "the service, at each submission" "service identity, then id, in the one resolver" "two scalars"
+  , TypeRow "PreparedGrowth" "a handle (abstract)" "the service, in a growth outcome" "its service identity, in the one place (`ownsPrepared`), and the current preparation" "scalars"
+  , TypeRow "WorkClass" "an input a caller builds" "the caller" "total" "a tag"
+  , TypeRow "OpenSpec" "an input a caller builds" "the caller" "the directory: non-empty, at most `maxDirectoryBytes`, no NUL" "the directory is COPIED at `submitOpen` before anything retains it; the identity and the configuration are scalars"
+  , TypeRow "ReadMode" "an input a caller builds" "the caller" "total" "a tag"
+  , TypeRow "StagedWrite" "an input a caller builds (abstract)" "`stageWrite`" "the identity equals the backing's; at most 256 pages, each one page, in the file, each once" "the page list is the OWNER's, shared while the job is queued or running and dropped when it finishes (documented; the transaction's own reservation pays for it)"
+  , TypeRow "WriteRefusal" "a failure value" "`stageWrite`" "n/a" "scalars"
+  , TypeRow "Outcome" "an output the service makes" "the service" "n/a" "an EVALUATED value (`forceOutcome`): a read's pages are the service's own per-page copies, charged; no view into a caller's or the platform's buffer"
+  , TypeRow "Reservation" "an output the service makes" "the service" "n/a" "scalars and the filesystem name, which is the profile's own copy"
+  , TypeRow "WriteReport" "an output the service makes" "the service" "n/a" "page numbers and results, evaluated; never the pages"
+  , TypeRow "PageResult" "an output the service makes" "the service" "n/a" "a tag or a failure value"
+  , TypeRow "CancelResult" "an output the service makes" "the service" "n/a" "a tag"
+  , TypeRow "CloseReport" "an output the service makes" "the service" "n/a" "a COPY of the close's result (the service keeps its own typed failure)"
+  , TypeRow "BackingView" "an output the service makes" "the service" "n/a" "scalars copied out of the entry"
+  , TypeRow "ServiceView" "an output the service makes" "the service" "n/a" "counts and the volume figures of THIS service; copies"
+  , TypeRow "StorageFailure" "a failure value" "the service" "n/a" "strict scalars; a text is a bounded evaluated copy"
+  , TypeRow "IoOp" "a failure value" "the service" "n/a" "a tag"
+  , TypeRow "IoKind" "a failure value" "the service" "n/a" "a tag and an errno"
+  , TypeRow "IoFailure" "a failure value" "the service" "n/a" "scalars"
+  , TypeRow "IntegrityFailure" "a failure value" "the service" "n/a" "scalars"
+  , TypeRow "UnsupportedWhy" "a failure value" "the service" "n/a" "the refused filesystem's name is the profile's own copy"
+  , TypeRow "ReservationFailure" "a failure value" "the service" "n/a" "scalars"
+  , TypeRow "ReservationOp" "a failure value" "the service" "n/a" "a tag"
+  , TypeRow "InvalidWhy" "a failure value" "the service" "n/a" "scalars"
+  , TypeRow "BusyReason" "a failure value" "the service" "n/a" "scalars"
+  , TypeRow "CleanupNote" "a failure value" "the service" "n/a" "scalars"
+  , TypeRow "Errno" "a failure value" "the platform" "n/a" "a scalar"
+  ]
+
 -- | The functions of the public module that take a handle, each as one case of the sweep.
 data HandleFn
   = FnSubmitRead
@@ -129,7 +180,14 @@ fnName f = case f of
 
 -- | The names the public module exports as functions, read from its source.
 exportedFunctions ∷ IO [String]
-exportedFunctions = do
+exportedFunctions = filter (\t → case t of c : _ → isLower c; [] → False) <$> exportedNames
+
+-- | The names the public module exports as TYPES, read from its source.
+exportedTypes ∷ IO [String]
+exportedTypes = filter (\t → case t of c : _ → isUpper c; [] → False) <$> exportedNames
+
+exportedNames ∷ IO [String]
+exportedNames = do
   let path = "src/Hetoimasia/Terrain/Runtime/Storage.hs"
   there ← doesFileExist path
   unless there (expectationFailure ("the public module's source is not at " <> path <> " (the suite runs in the package directory)"))
@@ -138,7 +196,7 @@ exportedFunctions = do
       body = takeWhile (not . (") where" `isPrefixOfAny`)) (drop 1 (dropWhile (not . ("module Hetoimasia.Terrain.Runtime.Storage" `isPrefixOfAny`)) ls))
       code = [takeWhile (/= '-') l | l ← body, not (null (dropWhile (== ' ') l))]
       tokens = concatMap (words . map (\c → if c `elem` ("(),." :: String) then ' ' else c)) code
-  pure (nub [t | t@(c : _) ← tokens, isLower c, all (`notElem` ("*" :: String)) t])
+  pure (nub [t | t@(c : _) ← tokens, isLower c || isUpper c, all (`notElem` ("*" :: String)) t])
   where
     isPrefixOfAny p l = take (length p) (dropWhile (== ' ') l) == p
 
@@ -148,6 +206,10 @@ spec = describe "Storage backend: the public boundary" $ do
     exported ← exportedFunctions
     let tabled = map rName boundaryTable
     sort exported `shouldBe` sort tabled
+
+  it "has a row in the type table for every type the public module exports, and for nothing else" $ do
+    exported ← exportedTypes
+    sort exported `shouldBe` sort (map tName typeTable)
 
   it "has every function that takes a handle in the sweep" $ do
     exported ← exportedFunctions
