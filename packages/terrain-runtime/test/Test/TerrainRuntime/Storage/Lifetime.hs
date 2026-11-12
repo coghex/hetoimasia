@@ -18,7 +18,7 @@ import Data.Maybe (isJust, isNothing)
 import qualified Foreign.C.Error as C
 import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
-import Hetoimasia.Foundation.Worker (closeWorkerGroup, withWorkerGroup)
+import Hetoimasia.Foundation.Worker (GroupReport (..), closeWorkerGroup, withWorkerGroup)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
@@ -69,8 +69,9 @@ spec = describe "Storage backend: queue, workers and lifetime" $ do
       (svQueued v, svRunning v, svRecords v) `shouldBe` (8, 2, 10)
       l ← ledger env
       -- only the two running transfers hold a buffer: one staging page and one result copy each
-      (A.lgStagingForeground l, A.lgCacheBacked l) `shouldBe` (2 * fromIntegral pageSize, 2 * fromIntegral pageSize)
-      A.lgControlReserved l `shouldBe` 10 * jobRecordBytes
+      (A.lgStagingForeground l, A.lgCacheBacked l) `shouldBe` (2 * transferBufferBytes 1, 2 * resultPageBytes)
+      -- ten job records and the one backing's record
+      A.lgControlReserved l `shouldBe` 10 * jobRecordBytes + backingRecordBytes
       openGate g
       forM_ (first2 <> queued) (awaitOutcome env)
 
@@ -85,15 +86,37 @@ spec = describe "Storage backend: queue, workers and lifetime" $ do
       awaitReached g 1
       -- a second mutating job is refused; a read on the other worker completes
       submitWrite (envSvc env) b sw >>= (`shouldBe` Left (BusyNow MutationActive)) . fmap (const ())
+      -- the second worker completes a real read, on another arena's file too
       rt ← readJob env b ExplicitWork 300 1 >>= ok
       awaitOutcome env rt >>= (`shouldSatisfy` isPages)
-      counter ← newTVarIO (0 ∷ Int)
-      atomically (modifyTVar' counter (+ 1))
-      readTVarIO counter `shouldReturn` 1
+      b2 ← openBacking env ident2 (hCfg h0)
+      readJob env b2 ExplicitWork 301 1 >>= ok >>= awaitOutcome env >>= (`shouldSatisfy` isPages)
+      -- and the owner's thread completes real work of its own: the next transaction planned against the store
+      let next = either error id (planFor h0 2)
+      length (gridPages next) `shouldSatisfy` (> 0)
       (svMutating <$> view env) `shouldReturn` True
       openGate g
       awaitOutcome env t1 >>= (`shouldSatisfy` isWritten)
       (svMutating <$> view env) `shouldReturn` False
+
+  it "stops the worker already started and keeps the primary failure when the second worker cannot start" $
+    withWorkerGroup $ \group → do
+      probe ← newProbe
+      -- workers start in order 2, 1: the start of worker 1 is the second
+      addRule probe 1 (== OpWorkerStart 1) Throw
+      bank ← either (fail . show) pure (A.mkEditBankConfig A.defaultEditBankSpec)
+      admission ← newTVarIO (A.newAdmission bank)
+      cfg ← either (fail . show) pure (mkStorageConfig defaultQualified minHeadroomBytes)
+      r ← tryWithContext (withStorageService (StoragePorts admission group quietLogger (seamFor probe) cfg) (\_ → pure ()))
+      case r of
+        Left (ExceptionWithContext _ e) → show (e ∷ SomeException) `shouldContain` "WorkerNotStarted"
+        Right () → expectationFailure "started although a worker could not"
+      -- the first worker was stopped and joined: none was still live when the group closed
+      report ← closeWorkerGroup group
+      length (reportDrained report) `shouldBe` 0
+      length (reportExitedBeforeClosing report) + length (reportObservedFailures report) `shouldSatisfy` (>= 1)
+      evs ← events probe
+      [n | OpWorkerStart n ← evs] `shouldBe` [2, 1]
 
   it "serves explicit work first, maintenance after a bounded run of it and camera last, with none starved" $
     withEnv $ \env → do

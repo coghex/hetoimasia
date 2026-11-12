@@ -19,6 +19,10 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgAllowanceBytes)
 import System.Directory (listDirectory)
+import System.Exit (ExitCode (ExitFailure, ExitSuccess))
+import System.Process (proc)
+import Test.Support.ExternalClient (clientRunBound)
+import Test.Support.Subprocess (runCaptured)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Storage.Harness
@@ -55,6 +59,17 @@ spec = describe "Storage backend: opening a backing" $ do
           let at op = length (takeWhile (/= op) evs)
           at OpUnlinkFile `shouldSatisfy` (< at (OpReserveRange 0 (cfgAllowanceBytes cfg)))
         other → expectationFailure ("not opened: " <> show other)
+
+  it "keeps the descriptor out of a child process: the child cannot use its number, and can use an inherited one" $
+    withEnv $ \env → do
+      _ ← openBacking env ident (hCfg cfg64)
+      [fd] ← fdHandles (envProbe env)
+      let child n = runCaptured clientRunBound (proc "python3" ["-I", "-c", "import os, sys\ntry:\n os.fstat(" <> show n <> ")\nexcept OSError:\n sys.exit(3)"]) ""
+      (closedStatus, _, _) ← child (fdNumber fd)
+      closedStatus `shouldBe` ExitFailure 3
+      -- the control: a descriptor the child does inherit (its standard input) is visible to the same probe
+      (openStatus, _, _) ← child (0 ∷ Int)
+      openStatus `shouldBe` ExitSuccess
 
   it "refuses at every stage with a typed failure and complete cleanup, leaving no descriptor and no name" $
     forM_ stages $ \(name, setup, expected) →

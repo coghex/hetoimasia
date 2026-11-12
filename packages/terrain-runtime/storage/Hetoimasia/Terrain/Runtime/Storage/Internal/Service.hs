@@ -101,6 +101,9 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , ServiceView (..)
   , serviceView
   , jobRecordBytes
+  , transferBufferBytes
+  , resultPageBytes
+  , backingRecordBytes
   , fairMaintenance
   , fairCamera
   ) where
@@ -180,6 +183,26 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State
 -- at its largest) and asserts is within this figure.
 jobRecordBytes ∷ Word64
 jobRecordBytes = 2048
+
+-- | The accounted bytes of a read's transfer buffer of @n@ pages: the pages, the
+-- runtime's own accounting of a large object (a descriptor for every 4 KiB block it
+-- spans, measured at 1/64 of the object, charged here at 1/32) and one block of
+-- slack. Measured by the suite (Memory) against the live heap of held transfers.
+transferBufferBytes ∷ Int → Word64
+transferBufferBytes n = fromIntegral (n * pageSize) + fromIntegral (n * pageSize) `div` 32 + 4096
+
+-- | The accounted bytes of one page of a held read result: the 4,096 bytes the
+-- caller reads and what holds them (the byte string, the pair and the list cell the
+-- outcome carries). Measured by the suite against the live heap of a held result.
+resultPageBytes ∷ Word64
+resultPageBytes = 4608
+
+-- | The accounted bytes of one open backing's record (its entry, its growth and
+-- pending-reservation slots at their largest, its place in the volume's ledger),
+-- charged to the control account from the open's success to the close. Measured by
+-- the suite.
+backingRecordBytes ∷ Word64
+backingRecordBytes = 4096
 
 -- | Maintenance is served after at most this many explicit jobs while it waits.
 fairMaintenance ∷ Int
@@ -357,6 +380,9 @@ data Outcome
   | Pages ![(PageNo, ByteString)]
   | Written !WriteReport
   | GrowthPrepared !PreparedGrowth !Reservation
+  | -- | The requested allowance is the committed one: an idempotent no-op that
+    -- reserved nothing and changed nothing.
+    GrowthNoChange
   | Released
   | -- | A failure, with the cleanup that also failed beside it.
     Failed !StorageFailure ![CleanupNote]
@@ -370,6 +396,7 @@ instance Show Outcome where
     Pages ps → "Pages " <> show (map fst ps)
     Written w → "Written " <> show w
     GrowthPrepared p r → "GrowthPrepared " <> show p <> " " <> show r
+    GrowthNoChange → "GrowthNoChange"
     Released → "Released"
     Failed f n → "Failed " <> show f <> " " <> show n
     Cancelled n → "Cancelled " <> show n
@@ -396,6 +423,8 @@ data Entry = Entry
   , ePending ∷ !(Maybe Word64)
   , ePhase ∷ !EntryPhase
   , eBorrows ∷ !Int
+  , eGrant ∷ !A.Grant
+  -- ^ The control charge of this record, released at the close.
   }
 
 data Fair = Fair {fMaint ∷ !Int, fCamera ∷ !Int}
@@ -508,7 +537,7 @@ workerDef ∷ StorageService → Int → WorkerDefinition ()
 workerDef svc n =
   workerDefinition
     (T.pack ("terrain-storage-io-" <> show n))
-    (\_ → allocResource (pure ()) (\_ → pure ()))
+    (\_ → allocResource (seamBefore (svSeam svc) (OpWorkerStart n)) (\_ → pure ()))
     (\token () → workerLoop svc token)
 
 -- | Close admission, withdraw what is queued, close every backing and stop the
@@ -732,7 +761,7 @@ growthBlocks svc (Backing _ bid _) = do
 -- no earlier extra reservation is still unreleased.
 submitGrowth ∷ StorageService → Backing → Word64 → Word64 → IO (Either StorageFailure Ticket)
 submitGrowth svc b from to
-  | to <= from = pure (Left (InvalidRequest (GrowthNotIncreasing from to)))
+  | to < from = pure (Left (InvalidRequest (GrowthNotIncreasing from to)))
   | otherwise = atomically $ do
       s ← readTVar (svState svc)
       let Backing u bid _ = b
@@ -741,6 +770,8 @@ submitGrowth svc b from to
         Nothing → pure (Left BackingClosed)
         Just e
           | from /= eCap e → pure (Left (InvalidRequest (GrowthStaleBase from (eCap e))))
+          -- an equal size is an idempotent no-op: it needs no reservation, so nothing blocks it
+          | from == to → admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WGrow (GrowSpec from to))
           | Just p ← ePending e → pure (Left (ReservationFailed (PendingReservationBlocks p)))
           | GPrepared _ ← eGrowth e → pure (Left (BusyNow GrowthActive))
           | otherwise → admitJob svc (Just b) (backingIdentity b) MaintenanceWork (WGrow (GrowSpec from to))
@@ -949,9 +980,8 @@ offerOrder s
 dispatchCredits ∷ Job → Maybe (A.Class, [A.Credit])
 dispatchCredits j = case jWork j of
   WRead (ReadSpec _ _ n _) →
-    let bytes = fromIntegral (n * pageSize)
-        cls = if jClass j == CameraWork then A.Camera else A.Foreground
-     in Just (cls, [A.StagingCredit bytes, A.CacheCredit (siArena (jIdent j)) bytes A.Backed True])
+    let cls = if jClass j == CameraWork then A.Camera else A.Foreground
+     in Just (cls, [A.StagingCredit (transferBufferBytes n), A.CacheCredit (siArena (jIdent j)) (fromIntegral n * resultPageBytes) A.Backed True])
   _ → Nothing
 
 -- | Take the next dispatchable job: the first queued job, in the offered order,
@@ -1177,16 +1207,20 @@ execOpen svc jid spec = do
       if stPhase s /= Running
         then pure (Left ServiceStopped)
         else do
-          let bid = stNextBacking s
-              ident = osIdentity spec
-              entry = Entry (crFd c) ident (nsDevice st) allowance (rvLength rv) (cfgOverheadBytes cfg) GIdle Nothing EOpen 0
-              prof = rvProfile rv
-          writeTVar (svState svc) s
-            { stNextBacking = bid + 1
-            , stBackings = Map.insert bid entry (stBackings s)
-            , stReserved = Map.insertWith (+) (nsDevice st) (rvLength rv) (stReserved s)
-            }
-          pure (Right (Backing (svId svc) bid ident, Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (nsDevice st)))
+          charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit backingRecordBytes] a)
+          case charged of
+            Left r → pure (Left (mapRefusal r))
+            Right grant → do
+              let bid = stNextBacking s
+                  ident = osIdentity spec
+                  entry = Entry (crFd c) ident (nsDevice st) allowance (rvLength rv) (cfgOverheadBytes cfg) GIdle Nothing EOpen 0 grant
+                  prof = rvProfile rv
+              writeTVar (svState svc) s
+                { stNextBacking = bid + 1
+                , stBackings = Map.insert bid entry (stBackings s)
+                , stReserved = Map.insertWith (+) (nsDevice st) (rvLength rv) (stReserved s)
+                }
+              pure (Right (Backing (svId svc) bid ident, Reservation (rvAllocated rv) (rvLength rv) (rvOverhead rv) (vpFilesystem prof) (vpBlockSize prof) (nsDevice st)))
 
 -- ---------------------------------------------------------------------------
 -- Growth
@@ -1195,6 +1229,7 @@ execGrow ∷ StorageService → Word64 → Job → Word64 → Word64 → IO Outc
 execGrow svc jid j from to = do
   me ← atomically (entryOf svc (jBacking j))
   case me of
+    Just _ | from == to → pure GrowthNoChange
     Nothing → pure (Failed BackingClosed [])
     Just (bid, e) → withVolume svc (eVolume e) $ do
       r ← reserveRange seam (svConfig svc) (cancelled svc jid) (eFd e) from (to - from)
@@ -1334,10 +1369,11 @@ closeBackingCore svc bid = do
         case Map.lookup bid (stBackings s') of
           Nothing → pure Nothing
           Just e → do
-            writeTVar (svState svc) s'
-              { stBackings = Map.delete bid (stBackings s')
-              , stReserved = Map.adjust (\n → n - min n (eLength e)) (eVolume e) (stReserved s')
-              }
+            releaseGrant svc (eGrant e)
+            modifyTVar' (svState svc) $ \t →
+              t { stBackings = Map.delete bid (stBackings t)
+                , stReserved = Map.adjust (\n → n - min n (eLength e)) (eVolume e) (stReserved t)
+                }
             pure (Just e)
       case claimed of
         Nothing → pure (late, CloseReport False Nothing Nothing)

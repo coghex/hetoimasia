@@ -114,6 +114,9 @@ module Hetoimasia.Terrain.Runtime.Storage
   , maxIoPages
   , maxJobRecords
   , jobRecordBytes
+  , transferBufferBytes
+  , resultPageBytes
+  , backingRecordBytes
   , ServiceView (..)
   , serviceView
 

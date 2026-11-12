@@ -122,6 +122,8 @@ data NativeOp
   | -- | A worker is about to wait for the coordination of a volume (not a native
     -- call: the point where two reservations on one volume are serialized).
     OpVolumeWait !Word64
+  | -- | A worker is starting (not a native call: the point where a start can fail).
+    OpWorkerStart !Int
   deriving stock (Eq, Show)
 
 -- | An adapter and its hooks. The hooks run on the thread performing the

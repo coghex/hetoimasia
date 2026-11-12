@@ -124,7 +124,8 @@ spec = describe "Storage backend: page I/O" $ do
           map snd rest `shouldSatisfy` all (== NotAttempted)
         other → expectationFailure ("unexpected report " <> show other)
       evs ← events (envProbe env)
-      length [() | OpWriteAt _ _ ← evs] `shouldBe` maxInterrupts + 1
+      -- the contract: at most 64 interruptions in a row, so 65 calls and then the failure (a literal, not the constant)
+      length [() | OpWriteAt _ _ ← evs] `shouldBe` 65
     withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
       let plan = planOf h0 1

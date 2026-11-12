@@ -94,15 +94,17 @@ spec = describe "Storage backend: growth" $ do
           readOk env b big 20000
         other → expectationFailure ("not prepared: " <> show other)
 
-  it "answers an equal size as the model's no-op, refuses a smaller size and a stale base, and checks the bounds before any work" $
+  it "answers an equal size as an idempotent no-op that reserves nothing, refuses a smaller size and a stale base, and checks the bounds before any work" $
     withEnv $ \env → do
       b ← openBacking env ident (hCfg big)
       proposeGrowth (hStore big) (toInteger (128 * mib)) `shouldBe` GrowthNoOp
       proposeGrowth (hStore big) (toInteger (64 * mib)) `shouldBe` GrowthNotIncreased
+      grow env b (128 * mib) (128 * mib) >>= (`shouldBe` GrowthNoChange)
+      (bvGrowthPrepared <$> view env b) >>= (`shouldBe` False)
       grow env b (128 * mib) (64 * mib) >>= (`shouldBeFailure` (== InvalidRequest (GrowthNotIncreasing (128 * mib) (64 * mib))))
       grow env b (96 * mib) (192 * mib) >>= (`shouldBeFailure` (== InvalidRequest (GrowthStaleBase (96 * mib) (128 * mib))))
       evs ← events (envProbe env)
-      length [() | OpReserveRange _ _ ← evs] `shouldBe` 1 -- the open's, and no more
+      length [() | OpReserveRange _ _ ← evs] `shouldBe` 1 -- the open's, and no more: the no-op reserved nothing
 
   it "preserves the old size and contents when headroom, the allocation or the length fails" $
     forM_ stages $ \(name, setup, expected) →

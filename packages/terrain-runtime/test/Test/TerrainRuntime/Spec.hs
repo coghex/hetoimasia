@@ -85,4 +85,5 @@ spec = do
   StorageLifetime.spec
   StorageGrowth.spec
   StorageMemory.spec
+  StorageMemory.spec2
   StorageOpacity.spec

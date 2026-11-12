@@ -65,6 +65,7 @@ module Test.TerrainRuntime.Storage.Harness
   ) where
 
 import Control.Concurrent.STM
+import Control.Exception (finally)
 import Control.Monad (forM_, unless)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -230,6 +231,11 @@ seamFor p = Seam wrapped before after
     real = posixNative
     before op = do
       atomically (modifyTVar' (pLog p) (op :))
+      case op of
+        OpWorkerStart _ → takeRule p op >>= \r → case r of
+          Just Throw → ioError (userError "injected worker start failure")
+          _ → pure ()
+        _ → pure ()
       gates ← readTVarIO (pGates p)
       forM_ [(g, sk) | (m, g, sk) ← gates, m op] $ \(g, sk) → do
         skipped ← atomically (readTVar sk >>= \n → if n > 0 then writeTVar sk (n - 1) >> pure True else pure False)
@@ -377,10 +383,15 @@ withEnvIn dir opts body = do
     result ← newIORef Nothing
     withWorkerGroup $ \group →
       withStorageService (StoragePorts admission group quiet (seamFor probe) cfg) $ \svc →
-        (if eoUnbounded opts then id else bounded) (body (Env svc admission probe dir cfg)) >>= writeIORef result . Just
+        ((if eoUnbounded opts then id else bounded) (body (Env svc admission probe dir cfg)) `finally` openAllGates probe) >>= writeIORef result . Just
     leaked ← A.ledgers <$> readTVarIO admission
     unless (ledgerZero leaked) (expectationFailure ("the service leaked accounting: " <> show leaked))
     maybe (fail "the example produced no result") pure =<< readIORef result
+
+-- | Open every gate of the probe, so a worker held by a failed example can finish and the service can
+-- drain: a failing example is reported as a failure, never as a hang.
+openAllGates ∷ Probe → IO ()
+openAllGates p = readTVarIO (pGates p) >>= mapM_ (\(_, g, _) → openGate g)
 
 -- | Every account returned to zero.
 ledgerZero ∷ A.Ledger → Bool
