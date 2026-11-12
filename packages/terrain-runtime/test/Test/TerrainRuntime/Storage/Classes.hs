@@ -535,7 +535,7 @@ randomSequence env seed done = do
             withOutcome (envSvc env) t (\o -> case o of Opened b _ -> modifyIORef' backings (b :); _ -> pure ()) >>= void . pure
       _ -> when (step > 18) (openGate gate)
     modifyIORef' done (+ 1)
-    when (step `mod` 6 == 0) (checkInvariantsQuiet env)
+    checkInvariants env
   openGate gate
   -- every backing closed: the volume's reserved figures are back to their start, as the admission is at the end
   readIORef backings >>= mapM_ (closeBacking (envSvc env))
@@ -560,8 +560,3 @@ readJob' env b n = submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo n) 1
 isNothing' :: Maybe a -> Bool
 isNothing' Nothing = True
 isNothing' _ = False
-
--- | The invariants at a point where jobs may be queued or held: they must hold at every instant, the descriptor count
--- within its bounds.
-checkInvariantsQuiet :: Env -> IO ()
-checkInvariantsQuiet = checkInvariants

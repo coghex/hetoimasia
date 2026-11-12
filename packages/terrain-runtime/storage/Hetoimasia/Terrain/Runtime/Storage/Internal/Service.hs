@@ -104,6 +104,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , BackingSnap (..)
   , SlotTag (..)
   , snapshotOf
+  , drainWaitsMessage
   , ServiceView (..)
   , serviceView
   , jobRecordBytes
@@ -606,7 +607,10 @@ drainService svc workers = do
   (late2, _) ← protectedly (atomically (mapM_ awaitCompletion workers))
   entries ← atomically (Map.keys . stBackings <$> readTVar (svState svc))
   closed ← forM entries $ \bid → closeBackingCore svc bid
-  -- a close another caller claimed is still tracked until its native call has returned: the drain joins it
+  -- a close another caller claimed is still tracked until its native call has returned: the drain joins it, and
+  -- says so before it waits (the one observation of the wait that needs no timing)
+  inFlight ← atomically (stClosing <$> readTVar (svState svc))
+  when (inFlight > 0) (quietly (logInfo (svLogger svc) component drainWaitsMessage [("closing", T.pack (show inFlight))]))
   (late4, _) ← protectedly (atomically (readTVar (svState svc) >>= \s → check (stClosing s == 0)))
   -- every record still in the table (an outcome nobody took, an opened backing nobody named) is disposed of once its
   -- borrowers have finished, and the cleanup failures such outcomes carry are kept as evidence
@@ -624,6 +628,21 @@ drainService svc workers = do
     firstJust xs = case [e | Just e ← xs] of
       (e : _) → Just e
       [] → Nothing
+
+-- | The message the drain logs when it waits for closes another caller claimed.
+drainWaitsMessage ∷ Text
+drainWaitsMessage = "Drain waits for closes in flight"
+
+-- | A diagnostic that may fail without consequence: a logger that raises (synchronously) is the logger's defect and
+-- must never stop a close, a drain or the bookkeeping around them.
+quietly ∷ IO () → IO ()
+quietly act = do
+  r ← tryWithContext act ∷ IO (Either (ExceptionWithContext SomeException) ())
+  case r of
+    Right () → pure ()
+    Left ewc@(ExceptionWithContext _ e) → case fromException e ∷ Maybe SomeAsyncException of
+      Just _ → rethrowIO ewc
+      Nothing → pure ()
 
 -- | An exception with the context a throw would give it, for cleanup evidence.
 evidenceOf ∷ Exception e ⇒ e → IO (ExceptionWithContext SomeException)
@@ -1206,7 +1225,7 @@ runJob svc jid = do
           -- worker's completion, and the job's outcome names them
           let cleanup = map (T.pack . displayCleanupFailure) (cleanupFailuresInContext ctx)
               why = T.intercalate "; " (T.pack (show e) : map ("cleanup: " <>) cleanup)
-          logError (svLogger svc) component "Storage worker defect" [("defect", why)]
+          quietly (logError (svLogger svc) component "Storage worker defect" [("defect", why)])
           atomically $ do
             void (finishJob svc jid (Failed (HostFailure why) []))
             modifyTVar' (svState svc) (\s → s {stDefect = Just why, stPhase = Stopped})
@@ -1358,7 +1377,7 @@ execOpen svc jid spec = do
       case r of
         Right ns → pure ns
         Left (ExceptionWithContext _ ex) → do
-          logWarning (svLogger svc) component "Open cleanup step raised" [("exception", T.pack (show ex))]
+          quietly (logWarning (svLogger svc) component "Open cleanup step raised" [("exception", T.pack (show ex))])
           pure [CleanupNote op (Errno (-1))]
     retryUnlink c = do
       r ← unlinkFile seam (osDirectory spec) (crName c)
@@ -1404,7 +1423,7 @@ execOpen svc jid spec = do
                 Right (b, reservation) → do
                   -- the table owns the descriptor from the transaction above
                   writeIORef owned 1
-                  logInfo (svLogger svc) component "Backing opened" [("backing", T.pack (show b)), ("allocated", T.pack (show (rvAllocated rv)))]
+                  quietly (logInfo (svLogger svc) component "Backing opened" [("backing", T.pack (show b)), ("allocated", T.pack (show (rvAllocated rv)))])
                   pure (Opened b reservation)
     -- cancellation is arbitrated in the transaction that publishes the backing
     register c st rv = do
@@ -1607,11 +1626,12 @@ closeBackingCore svc bid = mask_ $ do
                 Right (Left en) → (Just en, Nothing)
                 Right (Right ()) → (Nothing, Nothing)
                 Left (ExceptionWithContext _ ex) → (Nothing, Just (T.pack (show ex)))
-          forM_ err $ \(Errno n) → logWarning (svLogger svc) component "Backing close failed" [("errno", T.pack (show n))]
-          forM_ thrown $ \t → logWarning (svLogger svc) component "Backing close raised" [("exception", t)]
-          logInfo (svLogger svc) component "Backing closed" [("backing", T.pack (show bid))]
-          -- the closing record ends only now: the native close has returned and the bookkeeping is final
+          -- the closing record ends the moment the native close has returned (the bookkeeping was final in the
+          -- claim), before anything that could fail: a logger that raises must never leave the drain waiting
           atomically (modifyTVar' (svState svc) (\t → t {stClosing = stClosing t - 1}))
+          forM_ err $ \(Errno n) → quietly (logWarning (svLogger svc) component "Backing close failed" [("errno", T.pack (show n))])
+          forM_ thrown $ \t → quietly (logWarning (svLogger svc) component "Backing close raised" [("exception", t)])
+          quietly (logInfo (svLogger svc) component "Backing closed" [("backing", T.pack (show bid))])
           pure (late, CloseReport True err (ePending e) thrown)
         _ → pure (late, noClose)
   where

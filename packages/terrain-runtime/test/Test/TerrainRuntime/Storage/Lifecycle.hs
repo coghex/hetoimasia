@@ -8,16 +8,18 @@
 -- after every step; a state that breaks one fails the example that reached it.
 module Test.TerrainRuntime.Storage.Lifecycle (spec, checkInvariants, invariantProblems) where
 
+import Control.Concurrent (myThreadId, yield)
 import Control.Concurrent.MVar
+import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeException, throwIO, tryWithContext)
+import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeException, finally, throwIO, tryWithContext)
 import Control.Monad (forM_, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import qualified Foreign.C.Error as C
-import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, entryMessage, mkLogger)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, withResource)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
@@ -28,7 +30,6 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (pageFileOffset)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Timeout (timeout)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
 import Test.Support.Owned (withOwnedThread)
@@ -152,7 +153,9 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
       handoff <- newEmptyMVar
       finish <- newEmptyMVar
       serviceDone <- newEmptyMVar
-      let quietLogger = mkLogger defaultLogFilter (callbackSink (\_ -> pure ()))
+      serviceThread <- newEmptyMVar
+      said <- newTVarIO []
+      let quietLogger = mkLogger defaultLogFilter (callbackSink (\e -> atomically (modifyTVar' said (entryMessage e :))))
           runService group =
             withStorageService (StoragePorts admission group quietLogger (seamFor probe) cfg) $ \svc -> do
               t <- submitOpen svc ExplicitWork (OpenSpec (BC.pack dir) ident (hCfg h0)) >>= either (fail . show) pure
@@ -162,17 +165,48 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
                 Just (Opened b _) -> putMVar handoff (svc, b) >> takeMVar finish
                 other -> fail (show other)
       withWorkerGroup $ \group ->
-        withOwnedThread (runService group >> putMVar serviceDone ()) $ \_ waitService -> do
+        withOwnedThread (myThreadId >>= putMVar serviceThread >> runService group >> putMVar serviceDone ()) $ \_ waitService -> do
           (svc, b) <- takeMVar handoff
           g <- addGate probe (== OpCloseFile)
-          withOwnedThread (void (closeBacking svc b)) $ \_ waitCloser -> do
+          -- a failure must be a failure, never a hang: the gate opens whatever happens
+          (`finally` openGate g) $ withOwnedThread (void (closeBacking svc b)) $ \_ waitCloser -> do
             awaitReached g 1
-            -- the close is claimed and its native call is held: the service body returns, and the drain must wait for it
+            -- the close is claimed and its native call is held: the service body returns, and the drain must wait for
+            -- it. The wait is observed, not timed: the drain says so before it waits (a build whose drain does not
+            -- wait never says it, and the bounded wait fails at once). After that message nothing else the drain does
+            -- can block, so the service thread is then either blocked in the wait (STM) or running on to finish: the
+            -- example polls its status (no sleep) until it is one or the other, and a drain that does not wait
+            -- finishes, which fails here at once instead of passing by luck of timing
+            tid <- readMVar serviceThread
             putMVar finish ()
-            timeout 300000 (readMVar serviceDone) >>= (`shouldSatisfy` (not . isJust))
+            bounded (atomically (readTVar said >>= \ms -> check (drainWaitsMessage `elem` ms)))
+            status <- bounded (let settle = threadStatus tid >>= \st -> case st of
+                                              ThreadRunning -> yield >> settle
+                                              ThreadBlocked BlockedOnMVar -> yield >> settle
+                                              _ -> pure st
+                               in settle)
+            status `shouldBe` ThreadBlocked BlockedOnSTM
+            tryReadMVar serviceDone >>= (`shouldSatisfy` (not . isJust))
             openGate g
             waitCloser
           waitService
+      openFds probe >>= (`shouldBe` [])
+
+  it "completes a close and the service's end when the logger raises on every entry" $
+    withSystemTempDirectory "hetoimasia-terrain-lifecycle-log" $ \dir -> do
+      cfg <- testConfigFor dir defaultOptions
+      probe <- newProbe
+      bank <- either (fail . show) pure (A.mkEditBankConfig A.defaultEditBankSpec)
+      admission <- newTVarIO (A.newAdmission bank)
+      let raisingLogger = mkLogger defaultLogFilter (callbackSink (\_ -> throwIO (ErrorCall "the sink raised")))
+      withWorkerGroup $ \group ->
+        bounded $ withStorageService (StoragePorts admission group raisingLogger (seamFor probe) cfg) $ \svc -> do
+          t <- submitOpen svc ExplicitWork (OpenSpec (BC.pack dir) ident (hCfg h0)) >>= either (fail . show) pure
+          atomically (awaitTicket svc t)
+          o <- withOutcome svc t pure
+          case o of
+            Just (Opened b _) -> closeBacking svc b >>= \r -> crClosed r `shouldBe` True
+            other -> fail (show other)
       openFds probe >>= (`shouldBe` [])
 
   it "keeps a callback's failure and its cleanup failures, with their context, through withOutcome and withUse" $
