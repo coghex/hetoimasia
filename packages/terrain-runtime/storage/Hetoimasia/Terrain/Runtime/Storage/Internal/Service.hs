@@ -610,7 +610,9 @@ drainService svc workers = do
   -- a close another caller claimed is still tracked until its native call has returned: the drain joins it, and
   -- says so before it waits (the one observation of the wait that needs no timing)
   inFlight ← atomically (stClosing <$> readTVar (svState svc))
-  when (inFlight > 0) (quietly (logInfo (svLogger svc) component drainWaitsMessage [("closing", T.pack (show inFlight))]))
+  late5 ← if inFlight > 0
+    then quietly (logInfo (svLogger svc) component drainWaitsMessage [("closing", T.pack (show inFlight))])
+    else pure Nothing
   (late4, _) ← protectedly (atomically (readTVar (svState svc) >>= \s → check (stClosing s == 0)))
   -- every record still in the table (an outcome nobody took, an opened backing nobody named) is disposed of once its
   -- borrowers have finished, and the cleanup failures such outcomes carry are kept as evidence
@@ -623,26 +625,31 @@ drainService svc workers = do
   evidence ← sequence ([(,) "undelivered outcome cleanup" <$> evidenceOf (OpenCleanupFailed op e) | CleanupNote op e ← undelivered]
     <> [(,) "backing close" <$> evidenceOf (BackingCloseFailed (T.pack (show bid)) e) | (bid, (_, report)) ← zip entries closed, Just e ← [crCloseError report]]
     <> [(,) "backing close" <$> evidenceOf (BackingCloseRaised (T.pack (show bid)) t) | (bid, (_, report)) ← zip entries closed, Just t ← [crCloseException report]])
-  pure (firstJust ([late0, late1, late2, late3, late4] <> map fst closed), evidence)
-  where
-    firstJust xs = case [e | Just e ← xs] of
-      (e : _) → Just e
-      [] → Nothing
+  pure (firstLate ([late0, late1, late2, late3, late4, late5] <> map fst closed), evidence)
 
 -- | The message the drain logs when it waits for closes another caller claimed.
 drainWaitsMessage ∷ Text
 drainWaitsMessage = "Drain waits for closes in flight"
 
--- | A diagnostic that may fail without consequence: a logger that raises (synchronously) is the logger's defect and
--- must never stop a close, a drain or the bookkeeping around them.
-quietly ∷ IO () → IO ()
+-- | A diagnostic is never an exit. A logger that raises synchronously is the logger's defect and is dropped. An
+-- asynchronous exception (a cancellation delivered at an interruptible point inside a sink that blocks, which every
+-- masked caller of this reaches) is NOT rethrown here: that would leave the caller between a state change and the
+-- bookkeeping that completes it. It is returned instead, the log entry dropped and not retried, and the caller
+-- remembers it and delivers it once its own bookkeeping is done (first one wins, as 'protectedly' does).
+quietly ∷ IO () → IO (Maybe (ExceptionWithContext SomeException))
 quietly act = do
   r ← tryWithContext act ∷ IO (Either (ExceptionWithContext SomeException) ())
-  case r of
-    Right () → pure ()
+  pure $ case r of
+    Right () → Nothing
     Left ewc@(ExceptionWithContext _ e) → case fromException e ∷ Maybe SomeAsyncException of
-      Just _ → rethrowIO ewc
-      Nothing → pure ()
+      Just _ → Just ewc
+      Nothing → Nothing
+
+-- | The first remembered exception of several.
+firstLate ∷ [Maybe (ExceptionWithContext SomeException)] → Maybe (ExceptionWithContext SomeException)
+firstLate xs = case [e | Just e ← xs] of
+  (e : _) → Just e
+  [] → Nothing
 
 -- | An exception with the context a throw would give it, for cleanup evidence.
 evidenceOf ∷ Exception e ⇒ e → IO (ExceptionWithContext SomeException)
@@ -1220,16 +1227,25 @@ runJob svc jid = do
         Right outcome → do
           toClose ← atomically (finishJob svc jid outcome)
           forM_ toClose (void . closeBackingId svc)
+          -- the job is finished; only now the diagnostic. A cancellation that arrives at the log is delivered
+          -- after it: the worker ends with it, as a cancellation of a worker does
+          late ← case outcome of
+            Opened b rv → quietly (logInfo (svLogger svc) component "Backing opened" [("backing", T.pack (show b)), ("allocated", T.pack (show (rsAllocated rv)))])
+            _ → pure Nothing
+          forM_ late rethrowIO
         Left ewc@(ExceptionWithContext ctx e) → do
           -- the defect keeps its context (the cleanup failures of every scope it crossed) all the way to the
           -- worker's completion, and the job's outcome names them
           let cleanup = map (T.pack . displayCleanupFailure) (cleanupFailuresInContext ctx)
               why = T.intercalate "; " (T.pack (show e) : map ("cleanup: " <>) cleanup)
-          quietly (logError (svLogger svc) component "Storage worker defect" [("defect", why)])
+          -- the bookkeeping first (the job finishes, its record and charge are released, the service stops), the
+          -- diagnostic after it: nothing a log does can leave the job running. A cancellation that arrives at the
+          -- log is dropped with the entry, because the worker ends with the defect either way
           atomically $ do
             void (finishJob svc jid (Failed (HostFailure why) []))
             modifyTVar' (svState svc) (\s → s {stDefect = Just why, stPhase = Stopped})
             closeAdmission svc
+          _ ← quietly (logError (svLogger svc) component "Storage worker defect" [("defect", why)])
           rethrowIO ewc
 
 cancelled ∷ StorageService → Word64 → IO Bool
@@ -1377,8 +1393,10 @@ execOpen svc jid spec = do
       case r of
         Right ns → pure ns
         Left (ExceptionWithContext _ ex) → do
-          quietly (logWarning (svLogger svc) component "Open cleanup step raised" [("exception", T.pack (show ex))])
-          pure [CleanupNote op (Errno (-1))]
+          -- a cancellation that arrives at this log is one more failure of the step: it is kept as a second note
+          -- of it, and the cleanup goes on (the close is still made, once)
+          l ← quietly (logWarning (svLogger svc) component "Open cleanup step raised" [("exception", T.pack (show ex))])
+          pure (CleanupNote op (Errno (-1)) : [CleanupNote op (Errno (-1)) | Just _ ← [l]])
     retryUnlink c = do
       r ← unlinkFile seam (osDirectory spec) (crName c)
       pure [CleanupNote IoUnlink e | Left e ← [r]]
@@ -1423,7 +1441,6 @@ execOpen svc jid spec = do
                 Right (b, reservation) → do
                   -- the table owns the descriptor from the transaction above
                   writeIORef owned 1
-                  quietly (logInfo (svLogger svc) component "Backing opened" [("backing", T.pack (show b)), ("allocated", T.pack (show (rvAllocated rv)))])
                   pure (Opened b reservation)
     -- cancellation is arbitrated in the transaction that publishes the backing
     register c st rv = do
@@ -1629,10 +1646,12 @@ closeBackingCore svc bid = mask_ $ do
           -- the closing record ends the moment the native close has returned (the bookkeeping was final in the
           -- claim), before anything that could fail: a logger that raises must never leave the drain waiting
           atomically (modifyTVar' (svState svc) (\t → t {stClosing = stClosing t - 1}))
-          forM_ err $ \(Errno n) → quietly (logWarning (svLogger svc) component "Backing close failed" [("errno", T.pack (show n))])
-          forM_ thrown $ \t → quietly (logWarning (svLogger svc) component "Backing close raised" [("exception", t)])
-          quietly (logInfo (svLogger svc) component "Backing closed" [("backing", T.pack (show bid))])
-          pure (late, CloseReport True err (ePending e) thrown)
+          -- a cancellation that arrives at a log is remembered, not obeyed: the report is still made and the
+          -- caller (the drain, which goes on to close the other backings) delivers it afterwards
+          l1 ← maybe (pure Nothing) (\(Errno n) → quietly (logWarning (svLogger svc) component "Backing close failed" [("errno", T.pack (show n))])) err
+          l2 ← maybe (pure Nothing) (\t → quietly (logWarning (svLogger svc) component "Backing close raised" [("exception", t)])) thrown
+          l3 ← quietly (logInfo (svLogger svc) component "Backing closed" [("backing", T.pack (show bid))])
+          pure (firstLate [late, l1, l2, l3], CloseReport True err (ePending e) thrown)
         _ → pure (late, noClose)
   where
     claim b = do

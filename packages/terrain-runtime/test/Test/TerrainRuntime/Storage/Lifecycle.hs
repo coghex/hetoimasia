@@ -11,14 +11,14 @@ module Test.TerrainRuntime.Storage.Lifecycle (spec, checkInvariants, invariantPr
 import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeException, throwIO, tryWithContext)
+import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeAsyncException (..), SomeException, fromException, throwIO, tryWithContext)
 import Control.Monad (forM_, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import qualified Foreign.C.Error as C
-import Hetoimasia.Foundation.Log (callbackSink, defaultLogFilter, entryMessage, mkLogger)
+import Hetoimasia.Foundation.Log (LogLevel (..), callbackSink, defaultLogFilter, entryLevel, entryMessage, mkLogger)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, withResource)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
@@ -202,6 +202,101 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
             Just (Opened b _) -> closeBacking svc b >>= \r -> crClosed r `shouldBe` True
             other -> fail (show other)
       openFds probe >>= (`shouldBe` [])
+
+  it "still waits for a close in flight when a cancellation reaches the log of that wait, and delivers it afterwards" $
+    withSystemTempDirectory "hetoimasia-terrain-lifecycle-wait" $ \dir -> do
+      cfg <- testConfigFor dir defaultOptions
+      probe <- newProbe
+      bank <- either (fail . show) pure (A.mkEditBankConfig A.defaultEditBankSpec)
+      admission <- newTVarIO (A.newAdmission bank)
+      handoff <- newEmptyMVar
+      finish <- newEmptyMVar
+      result <- newEmptyMVar
+      serviceThread <- newEmptyMVar
+      said <- newTVarIO []
+      -- only the log of the drain's wait is "cancelled" (and noted first, so the example can observe that it was reached)
+      let waitCancelled = mkLogger defaultLogFilter (callbackSink (\e -> when (entryMessage e == drainWaitsMessage) (atomically (modifyTVar' said (entryMessage e :)) >> throwIO (SomeAsyncException (ErrorCall "the wait log was cancelled")))))
+          runService group = tryWithContext $
+            withStorageService (StoragePorts admission group waitCancelled (seamFor probe) cfg) $ \svc -> do
+              t <- submitOpen svc ExplicitWork (OpenSpec (BC.pack dir) ident (hCfg h0)) >>= either (fail . show) pure
+              bounded (atomically (awaitTicket svc t))
+              o <- withOutcome svc t pure
+              case o of
+                Just (Opened b _) -> putMVar handoff (svc, b) >> takeMVar finish
+                other -> fail (show other)
+      withWorkerGroup $ \group ->
+        withOwnedThread (myThreadId >>= putMVar serviceThread >> runService group >>= putMVar result) $ \_ waitService -> do
+          (svc, b) <- takeMVar handoff
+          g <- addGate probe (== OpCloseFile)
+          withOwnedThreadOpening (openGate g) (void (closeBacking svc b)) $ \_ waitCloser -> do
+            awaitReached g 1
+            putMVar finish ()
+            -- the log was cancelled and the drain still waits for the close: it is observed blocked, not finished
+            tid <- readMVar serviceThread
+            bounded (atomically (readTVar said >>= \ms -> check (drainWaitsMessage `elem` ms)))
+            awaitBlockedInStm tid
+            openGate g
+            waitCloser
+          waitService
+      r <- takeMVar result
+      case r :: Either (ExceptionWithContext SomeException) () of
+        Left (ExceptionWithContext _ e) -> (fromException e :: Maybe SomeAsyncException) `shouldSatisfy` isJust
+        Right () -> expectationFailure "the cancellation that reached the wait's log was lost"
+      openFds probe >>= (`shouldBe` [])
+
+  it "ends the service, closes every backing and delivers only afterwards a cancellation that reached a log" $
+    withSystemTempDirectory "hetoimasia-terrain-lifecycle-async" $ \dir -> do
+      cfg <- testConfigFor dir defaultOptions
+      probe <- newProbe
+      bank <- either (fail . show) pure (A.mkEditBankConfig A.defaultEditBankSpec)
+      admission <- newTVarIO (A.newAdmission bank)
+      seen <- newEmptyMVar
+      -- every entry is "cancelled" in the sink: an exception of the asynchronous type, thrown at a log's own
+      -- interruptible point, deterministic and with no throwTo timing
+      let cancelling = mkLogger defaultLogFilter (callbackSink (\_ -> throwIO (SomeAsyncException (ErrorCall "the sink was cancelled"))))
+      r <- withWorkerGroup $ \group -> tryWithContext $
+        withStorageService (StoragePorts admission group cancelling (seamFor probe) cfg) $ \svc -> do
+          putMVar seen svc
+          ts <- mapM (\i -> submitOpen svc ExplicitWork (OpenSpec (BC.pack dir) i (hCfg h0)) >>= either (fail . show) pure) [ident, ident2]
+          forM_ ts (bounded . atomically . awaitTicket svc)
+          -- both opened (the outcomes are untaken): two descriptors are open when the body ends
+          length <$> openFds probe >>= (`shouldBe` 2)
+      case r :: Either (ExceptionWithContext SomeException) () of
+        Left (ExceptionWithContext _ e) -> (fromException e :: Maybe SomeAsyncException) `shouldSatisfy` isJust
+        Right () -> expectationFailure "the cancellation that reached a log was lost"
+      openFds probe >>= (`shouldBe` [])
+      svc <- readMVar seen
+      checkInvariants (Env svc admission probe dir cfg)
+      leaked <- A.ledgers <$> readTVarIO admission
+      ledgerZero leaked `shouldBe` True
+
+  it "finishes a job that fails as a defect when the log of the defect is cancelled: the ticket wakes and the charge is released" $
+    withSystemTempDirectory "hetoimasia-terrain-lifecycle-defect" $ \dir -> do
+      cfg <- testConfigFor dir defaultOptions
+      probe <- newProbe
+      bank <- either (fail . show) pure (A.mkEditBankConfig A.defaultEditBankSpec)
+      admission <- newTVarIO (A.newAdmission bank)
+      seen <- newEmptyMVar
+      let errorsCancelled = mkLogger defaultLogFilter (callbackSink (\e -> when (entryLevel e == Error) (throwIO (SomeAsyncException (ErrorCall "the defect log was cancelled")))))
+      _ <- (withWorkerGroup $ \group -> tryWithContext $
+        withStorageService (StoragePorts admission group errorsCancelled (seamFor probe) cfg) $ \svc -> do
+          putMVar seen svc
+          t <- submitOpen svc ExplicitWork (OpenSpec (BC.pack dir) ident (hCfg h0)) >>= either (fail . show) pure
+          bounded (atomically (awaitTicket svc t))
+          Just (Opened b _) <- withOutcome svc t pure
+          addRule probe 1 (isRd 100) Throw
+          rt <- submitRead svc b ExplicitWork (hCfg h0) (PageNo 100) 1 ReadProbe >>= either (fail . show) pure
+          -- the job finishes as a host failure even though the log of the defect was cancelled
+          bounded (atomically (awaitTicket svc rt))
+          withOutcome svc rt pure >>= (`shouldSatisfy` \o -> case o of Just (Failed (HostFailure _) _) -> True; _ -> False)
+          sn <- atomically (snapshotOf svc)
+          snRunning sn `shouldBe` 0
+          [j | j <- snJobs sn, jsPhase j == 1] `shouldBe` []) :: IO (Either (ExceptionWithContext SomeException) ())
+      openFds probe >>= (`shouldBe` [])
+      svc <- readMVar seen
+      checkInvariants (Env svc admission probe dir cfg)
+      leaked <- A.ledgers <$> readTVarIO admission
+      ledgerZero leaked `shouldBe` True
 
   it "keeps a callback's failure and its cleanup failures, with their context, through withOutcome and withUse" $
     withEnv $ \env -> do
