@@ -33,6 +33,7 @@ module Test.TerrainRuntime.Storage.Harness
   , newGate
   , openGate
   , awaitReached
+  , awaitBlockedInStm
   , addRule
   , addRuleAfter
   , addGate
@@ -64,6 +65,7 @@ module Test.TerrainRuntime.Storage.Harness
   , shouldBeFailure
   ) where
 
+import Control.Concurrent (ThreadId, yield)
 import Control.Concurrent.STM
 import Control.Exception (ExceptionWithContext, SomeException, finally, rethrowIO, tryWithContext)
 import Control.Monad (forM_, unless)
@@ -73,6 +75,7 @@ import Data.IORef
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import Data.Word (Word64)
+import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
 import Hetoimasia.Foundation.Log (Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate)
@@ -506,3 +509,17 @@ shouldBeFailure ∷ Outcome → (StorageFailure → Bool) → IO ()
 shouldBeFailure o p = case o of
   Failed f _ → unless (p f) (expectationFailure ("an unexpected failure: " <> show f))
   other → expectationFailure ("expected a failure, got " <> show other)
+
+-- | Wait, with no timer, until the thread is blocked in a transaction (which is where a close waits for work still in
+-- flight and where a drain waits for a close). A thread that has finished or died instead fails the example at once:
+-- that is what a close or drain that does not wait looks like, so the negative is observed, not sampled early.
+awaitBlockedInStm ∷ ThreadId → IO ()
+awaitBlockedInStm tid = bounded loop
+  where
+    loop = do
+      st ← threadStatus tid
+      case st of
+        ThreadBlocked BlockedOnSTM → pure ()
+        ThreadFinished → expectationFailure "the thread finished: it did not wait"
+        ThreadDied → expectationFailure "the thread died: it did not wait"
+        _ → yield >> loop

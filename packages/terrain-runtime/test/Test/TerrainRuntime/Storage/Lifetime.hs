@@ -28,7 +28,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..), pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (pageFileOffset)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
-import Test.Support.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.TerrainRuntime.Storage.Harness
 import Test.TerrainRuntime.Store.Harness (H (..), smallSpec)
 
@@ -187,9 +187,11 @@ spec = describe "Storage backend: queue, workers and lifetime" $ do
       rd ← readJob env b ExplicitWork 100 1 >>= ok
       awaitReached g 1
       closed ← newEmptyMVar
-      withOwnedThread (closeBacking (envSvc env) b >>= putMVar closed) $ \_ wait → do
-        -- the close has asked the call to stop and is waiting for it: nothing is closed
+      withOwnedThreadOpening (openGate g) (closeBacking (envSvc env) b >>= putMVar closed) $ \closer wait → do
+        -- the close has asked the call to stop and is waiting for it: observed (blocked in its transaction, not
+        -- finished), not sampled early; nothing is closed
         bounded (atomically (backingView (envSvc env) b >>= \v → check (maybe False bvClosing v)))
+        awaitBlockedInStm closer
         evs ← events (envProbe env)
         length [() | OpCloseFile ← evs] `shouldBe` 0
         tryReadMVar closed >>= (`shouldSatisfy` isNothing)
@@ -211,9 +213,10 @@ spec = describe "Storage backend: queue, workers and lifetime" $ do
       awaitReached g 2
       queued ← forM [102 .. 109] (\n → readJob env b ExplicitWork n 1 >>= ok)
       closed ← newEmptyMVar
-      withOwnedThread (closeBacking (envSvc env) b >>= putMVar closed) $ \_ wait → do
-        -- the queued jobs settle at once; the close waits for the two calls held in flight
+      withOwnedThreadOpening (openGate g) (closeBacking (envSvc env) b >>= putMVar closed) $ \closer wait → do
+        -- the queued jobs settle at once; the close waits for the two calls held in flight (observed, not sampled)
         bounded (atomically (serviceView (envSvc env) >>= \v → check (svQueued v == 0)))
+        awaitBlockedInStm closer
         tryReadMVar closed >>= (`shouldSatisfy` isNothing)
         openGate g
         wait

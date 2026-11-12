@@ -8,11 +8,10 @@
 -- after every step; a state that breaks one fails the example that reached it.
 module Test.TerrainRuntime.Storage.Lifecycle (spec, checkInvariants, invariantProblems) where
 
-import Control.Concurrent (myThreadId, yield)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar
-import GHC.Conc (BlockReason (..), ThreadStatus (..), threadStatus)
 import Control.Concurrent.STM
-import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeException, finally, throwIO, tryWithContext)
+import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeException, throwIO, tryWithContext)
 import Control.Monad (forM_, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.Maybe (isJust)
@@ -32,7 +31,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State (pageFileOffset)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
-import Test.Support.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.TerrainRuntime.Storage.Harness
 import Test.TerrainRuntime.Store.Harness (H (..), smallSpec)
 
@@ -168,8 +167,8 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
         withOwnedThread (myThreadId >>= putMVar serviceThread >> runService group >> putMVar serviceDone ()) $ \_ waitService -> do
           (svc, b) <- takeMVar handoff
           g <- addGate probe (== OpCloseFile)
-          -- a failure must be a failure, never a hang: the gate opens whatever happens
-          (`finally` openGate g) $ withOwnedThread (void (closeBacking svc b)) $ \_ waitCloser -> do
+          -- a failure must be a failure, never a hang: the gate is let go by the thread's own release
+          withOwnedThreadOpening (openGate g) (void (closeBacking svc b)) $ \_ waitCloser -> do
             awaitReached g 1
             -- the close is claimed and its native call is held: the service body returns, and the drain must wait for
             -- it. The wait is observed, not timed: the drain says so before it waits (a build whose drain does not
@@ -180,12 +179,7 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
             tid <- readMVar serviceThread
             putMVar finish ()
             bounded (atomically (readTVar said >>= \ms -> check (drainWaitsMessage `elem` ms)))
-            status <- bounded (let settle = threadStatus tid >>= \st -> case st of
-                                              ThreadRunning -> yield >> settle
-                                              ThreadBlocked BlockedOnMVar -> yield >> settle
-                                              _ -> pure st
-                               in settle)
-            status `shouldBe` ThreadBlocked BlockedOnSTM
+            awaitBlockedInStm tid
             tryReadMVar serviceDone >>= (`shouldSatisfy` (not . isJust))
             openGate g
             waitCloser
