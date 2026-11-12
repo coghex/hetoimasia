@@ -34,6 +34,11 @@ module Test.TerrainRuntime.Storage.Harness
   , openGate
   , awaitReached
   , awaitBlockedInStm
+  , awaitBlockedOnThrowTo
+  , addAfterRule
+  , addAfterRuleAfter
+  , addAfterGate
+  , withEnvEndingWithKeptFailure
   , workerThreads
   , openAllGates
   , rulesConsumed
@@ -70,7 +75,7 @@ module Test.TerrainRuntime.Storage.Harness
 
 import Control.Concurrent (ThreadId, myThreadId, yield)
 import Control.Concurrent.STM
-import Control.Exception (ExceptionWithContext, SomeException, finally, rethrowIO, tryWithContext)
+import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeAsyncException (..), SomeException, finally, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (forM_, unless)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -92,7 +97,8 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan (..), Planned (..), TxClass (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, StoreSpec)
 import System.IO.Temp (withSystemTempDirectory)
-import Test.Hspec (expectationFailure)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
+import Test.Hspec (expectationFailure, shouldSatisfy)
 import Test.Support.Bounded (bounded)
 import Test.TerrainRuntime.Store.Harness (H (..), deltaFor, fillPlan, identOf, ident0, newH, runKey, runRec)
 
@@ -140,6 +146,8 @@ data Act
     FilesystemIs !BC.ByteString
   | -- | Make the call and report the descriptor as not close-on-exec.
     NotCloexec
+  | -- | Raise an exception of the ASYNCHRONOUS type (a cancellation) where the hook or the call runs.
+    ThrowAsync
   | -- | Raise an exception in the worker (a defect, not a storage result).
     Throw
 
@@ -159,12 +167,16 @@ data Probe = Probe
   , pCreated ∷ !(TVar [Int])
   , pOpen ∷ !(TVar (Set.Set Int))
   , pHandles ∷ !(TVar [Fd])
+  , pAfterRules ∷ !(TVar [Rule])
+  -- ^ Rules applied by the seam's AFTER-hook: the effect has already happened when they fire.
+  , pAfterGates ∷ !(TVar [(NativeOp → Bool, Gate, TVar Int)])
+  -- ^ Gates the seam's after-hook blocks at, after the effect.
   , pWorkers ∷ !(TVar [ThreadId])
   -- ^ The threads the service's workers run on, noted as each starts (the seam's start hook runs on it).
   }
 
 newProbe ∷ IO Probe
-newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO []
+newProbe = Probe <$> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO Set.empty <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO [] <*> newTVarIO []
 
 -- | Apply a rule to the next @n@ matching calls (negative: all of them).
 addRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
@@ -176,6 +188,24 @@ addRuleAfter p skip n match act = do
   sk ← newTVarIO skip
   uses ← newTVarIO n
   atomically (modifyTVar' (pRules p) (<> [Rule match act sk uses]))
+
+-- | Apply a rule to the AFTER-hook of the next @n@ matching calls: the native effect has happened, then the hook raises.
+addAfterRule ∷ Probe → Int → (NativeOp → Bool) → Act → IO ()
+addAfterRule p = addAfterRuleAfter p 0
+
+addAfterRuleAfter ∷ Probe → Int → Int → (NativeOp → Bool) → Act → IO ()
+addAfterRuleAfter p skip n match act = do
+  sk ← newTVarIO skip
+  uses ← newTVarIO n
+  atomically (modifyTVar' (pAfterRules p) (<> [Rule match act sk uses]))
+
+-- | Hold every matching call at its AFTER-hook (the effect has happened) until the gate opens.
+addAfterGate ∷ Probe → (NativeOp → Bool) → IO Gate
+addAfterGate p match = do
+  g ← newGate
+  sk ← newTVarIO 0
+  atomically (modifyTVar' (pAfterGates p) ((match, g, sk) :))
+  pure g
 
 -- | Hold every matching call until the gate opens.
 addGate ∷ Probe → (NativeOp → Bool) → IO Gate
@@ -214,8 +244,12 @@ fdsCreated p = reverse <$> readTVarIO (pCreated p)
 
 -- | The first rule that matches the operation and has uses left, consumed.
 takeRule ∷ Probe → NativeOp → IO (Maybe Act)
-takeRule p op = atomically $ do
-  rules ← readTVar (pRules p)
+takeRule p = takeRuleFrom (pRules p)
+
+-- | The same over any rule list (the before side and the after side keep their own).
+takeRuleFrom ∷ TVar [Rule] → NativeOp → IO (Maybe Act)
+takeRuleFrom ref op = atomically $ do
+  rules ← readTVar ref
   let go [] = pure Nothing
       go (r : rest)
         | rMatch r op = do
@@ -250,7 +284,20 @@ seamFor p = Seam wrapped before after
         unless skipped $ do
           atomically (modifyTVar' (gReached g) (+ 1))
           atomically (readTVar (gOpen g) >>= check)
-    after _ = pure ()
+    after op = do
+      -- the AFTER side: the native effect has HAPPENED. Rules raise (synchronously, or of the asynchronous type),
+      -- gates block, and a cancellation is delivered to the blocked thread by the example
+      a ← takeRuleFrom (pAfterRules p) op
+      case a of
+        Just Throw → ioError (userError "injected exception in an after-hook")
+        Just ThrowAsync → throwIO (SomeAsyncException (ErrorCall "a cancellation in an after-hook"))
+        _ → pure ()
+      gates ← readTVarIO (pAfterGates p)
+      forM_ [(g, sk) | (m, g, sk) ← gates, m op] $ \(g, sk) → do
+        skipped ← atomically (readTVar sk >>= \n → if n > 0 then writeTVar sk (n - 1) >> pure True else pure False)
+        unless skipped $ do
+          atomically (modifyTVar' (gReached g) (+ 1))
+          atomically (readTVar (gOpen g) >>= check)
     wrapped =
       real
         { nativeCreate = \dir name → do
@@ -367,7 +414,7 @@ quiet = mkLogger defaultLogFilter (callbackSink (\_ → pure ()))
 -- | The filesystem name of a directory, as the backend itself reads it.
 fsNameOf ∷ FilePath → IO BC.ByteString
 fsNameOf dir = do
-  made ← createPrivate productionSeam (BC.pack dir) 0
+  made ← createPrivate productionSeam (BC.pack dir) 0 (const (pure ()))
   case made of
     Left f → fail ("cannot probe the test filesystem: " <> show f)
     Right c → do
@@ -540,4 +587,26 @@ rulesConsumed p = do
 -- | The threads the service's workers run on.
 workerThreads ∷ Probe → IO [ThreadId]
 workerThreads p = readTVarIO (pWorkers p)
+
+-- | An example whose body makes a native close FAIL: the service always keeps a failing close as labelled evidence, so its
+-- scope ends with that failure (the report the caller received is a copy); a normal end is a failure of the example.
+withEnvEndingWithKeptFailure ∷ ∀ a. (Env → IO a) → IO ()
+withEnvEndingWithKeptFailure body = do
+  r ← tryWithContext (withEnv body) ∷ IO (Either (ExceptionWithContext SomeException) a)
+  case r of
+    Left (ExceptionWithContext ctx _) → length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
+    Right _ → expectationFailure "a failing close was kept by the service and must end its scope with the failure, but the scope ended normally"
+
+-- | Wait, with no timer, until a thread is blocked delivering an exception (@throwTo@ to a target that cannot take it
+-- yet: it is in an uninterruptible region). The cancellation is then PENDING against the target.
+awaitBlockedOnThrowTo ∷ ThreadId → IO ()
+awaitBlockedOnThrowTo tid = bounded loop
+  where
+    loop = do
+      st ← threadStatus tid
+      case st of
+        ThreadBlocked BlockedOnException → pure ()
+        ThreadFinished → expectationFailure "the sender finished: the cancellation was not pending"
+        ThreadDied → expectationFailure "the sender died"
+        _ → yield >> loop
 

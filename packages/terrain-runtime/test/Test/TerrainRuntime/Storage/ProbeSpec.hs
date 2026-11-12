@@ -6,7 +6,7 @@
 -- everything that fills a volume or reserves in it takes the resulting 'Fixture'.
 --
 -- Every record line is printed as @PROBE key=value@ for the evidence write-up.
-module Test.TerrainRuntime.Storage.ProbeSpec (probeCases, ProbeCase) where
+module Test.TerrainRuntime.Storage.ProbeSpec (probeCases, ProbeCase, FillError (..), fillWith, withFillerWith, withMeter) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (atomically)
@@ -15,7 +15,6 @@ import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Unsafe as BSU
-import Data.IORef
 import Data.Word (Word64)
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Ptr (castPtr)
@@ -179,6 +178,8 @@ probeCases =
           listDirectory dir `shouldReturn` names0
           held <- availableOf meter
           record "unlink.reserved.bytes" (show (before' - held))
+          -- the claim "the reservation was real" is measured: the volume lost at least the allowance (less a slack)
+          (before' - held) + 4 * mib `shouldSatisfy` (>= cfgAllowanceBytes (hCfg h64))
           -- a borrower is using the file: the close waits for it, and the data is still readable
           r <- withUse (envSvc env) b (readPages env b (hCfg h64) 7 1 ReadProbe)
           fmap (either (const False) (not . null)) r `shouldBe` Right True
@@ -202,7 +203,7 @@ probeCases =
         when shm $ withEnvIn "/dev/shm" (defaultProbe {eoQualified = Just defaultQualified}) $ \env -> do
           o <- openBackingAt env "/dev/shm" ident (hCfg h64)
           case o of
-            Failed (StorageUnsupported (FilesystemNotQualified n)) _ -> record "unsupported.tmpfs" (BC.unpack n)
+            Failed (StorageUnsupported (FilesystemNotQualified n)) _ -> record "unsupported.tmpfs" (BC.unpack n) >> (n `shouldBe` "tmpfs")
             other -> expectationFailure ("tmpfs was not refused: " <> show other)
           -- the refusal came before any allocation was asked of the platform
           evs <- events (envProbe env)
@@ -256,9 +257,10 @@ withMeter :: Fixture -> (Meter -> IO a) -> IO a
 withMeter fx = bracket make (\(Meter fd) -> () <$ closeFile productionSeam fd)
   where
     make = do
-      made <- createPrivate productionSeam (BC.pack (fixtureDir fx)) 9999
+      made <- createPrivate productionSeam (BC.pack (fixtureDir fx)) 9999 (const (pure ()))
       c <- either (fail . show) pure made
-      _ <- unlinkFile productionSeam (BC.pack (fixtureDir fx)) (crName c)
+      unlinked <- unlinkFile productionSeam (BC.pack (fixtureDir fx)) (crName c)
+      either (\e -> fail ("the meter's name could not be unlinked: " <> show e)) pure unlinked
       pure (Meter (crFd c))
 
 availableOf :: Meter -> IO Word64
@@ -278,33 +280,72 @@ noCreateWhile env act = do
   where
     creates = (\evs -> length [() | OpCreateFile <- evs]) <$> events (envProbe env)
 
--- | Run an action with the rest of the volume's free space consumed by a file of the probe's own (reserved
--- natively until the platform refuses), and give the space back when it ends. Hands over the bytes taken.
+-- | Why the filler stopped for a reason that is not the volume being full: it must never be taken for exhaustion.
+data FillError
+  = -- | The reservation failed with an errno that is not the platform's out-of-space result.
+    FillUnexpected !Errno
+  | -- | The length could not be established after a reservation.
+    FillLength !Errno
+  deriving stock (Eq, Show)
+
+-- | The platform's out-of-space result: @ENOSPC@ on macOS (@F_PREALLOCATE@ with @F_ALLOCATEALL@, measured in the
+-- native experiments: a failed all-or-none allocation answers it and obtains nothing) and on Linux (@fallocate@). Any
+-- other errno is NOT capacity: @EIO@, @EINVAL@, an unsupported allocation and the rest end the fill as a failure.
+isOutOfSpace :: Errno -> Bool
+isOutOfSpace (Errno c) = fromIntegral c == (let C.Errno n = C.eNOSPC in n)
+
+-- | Consume the volume's free space in one file the probe owns, with the native adapter given: reserve in halving
+-- chunks from 64 MiB down to one block, until the platform answers its out-of-space result for a block. Only that
+-- result ends the fill; the length establishment is checked; every other error is a failure, never "exhausted".
+fillWith :: Native -> Fd -> IO (Either FillError Word64)
+fillWith native fd = go (64 * mib) 0
+  where
+    go chunk total = do
+      r <- nativeReserve native fd total chunk
+      case r of
+        Right _ -> do
+          l <- nativeSetLength native fd (total + chunk)
+          case l of
+            Left e -> pure (Left (FillLength e))
+            Right () -> go chunk (total + chunk)
+        Left e
+          | isOutOfSpace e -> if chunk > 4096 then go (chunk `div` 2) total else pure (Right total)
+          | otherwise -> pure (Left (FillUnexpected e))
+
+-- | Run an action with the rest of the volume's free space consumed by a file of the probe's own, and give the space
+-- back when it ends. Hands over the bytes taken. THE PRECONDITION IS PROVEN, not assumed: the fill ends only on the
+-- platform's out-of-space result, and the exhausted state is READ through the meter and asserted before the action
+-- runs: less than 4 MiB available, which is far below any range the actions touch (a rewrite of the 64 MiB allowance
+-- that needed new allocation would be refused after the first 4 MiB, and the refused growth is a 64 MiB request), so
+-- "no new allocation" and "refused under exhaustion" cannot pass with free space left.
 withFiller :: Fixture -> Meter -> (Word64 -> IO a) -> IO a
-withFiller fx meter = \act -> do
+withFiller = withFillerWith posixNative
+
+-- | 'withFiller' over a given native adapter (the routine suite hands it one that fails for reasons that are not capacity).
+withFillerWith :: Native -> Fixture -> Meter -> (Word64 -> IO a) -> IO a
+withFillerWith native fx meter = \act -> do
   free0 <- availableOf meter
-  r <- bracket acquire (\(_, fd) -> () <$ closeFile productionSeam fd) (act . fst)
+  r <- bracket acquire (\(_, fd) -> () <$ closeFile productionSeam fd) (\(taken, _) -> do
+    left <- availableOf meter
+    record "exhausted.available.bytes" (show left)
+    left `shouldSatisfy` (< 4 * mib)
+    act taken)
   -- a filesystem may give the blocks of a closed, unlinked file back lazily (APFS did, within about a
   -- second): observe, bounded, until the volume reports the space again, and record how long it took
   polls <- pollRecoveredCount meter free0
   record "filler.reclaim.observations" (show polls)
+  -- "reclaimed" is measured too: the space is back within the bound, or the example fails
+  now <- availableOf meter
+  (now + 4 * mib) `shouldSatisfy` (>= free0)
   pure r
   where
     acquire = do
-      made <- createPrivate productionSeam (BC.pack (fixtureDir fx)) 4242
+      made <- createPrivate productionSeam (BC.pack (fixtureDir fx)) 4242 (const (pure ()))
       c <- either (fail . show) pure made
-      _ <- unlinkFile productionSeam (BC.pack (fixtureDir fx)) (crName c)
-      total <- newIORef (0 :: Word64)
-      let step chunk = do
-            t <- readIORef total
-            r <- nativeReserve posixNative (crFd c) t chunk
-            case r of
-              Right _ -> nativeSetLength posixNative (crFd c) (t + chunk) >> writeIORef total (t + chunk) >> step chunk
-              Left _
-                | chunk > 4096 -> step (chunk `div` 2)
-                | otherwise -> pure ()
-      step (64 * mib)
-      taken <- readIORef total
+      unlinked <- unlinkFile productionSeam (BC.pack (fixtureDir fx)) (crName c)
+      either (\e -> fail ("the filler's name could not be unlinked: " <> show e)) pure unlinked
+      filled <- fillWith native (crFd c)
+      taken <- either (\e -> fail ("the filler stopped for a reason that is not capacity: " <> show e)) pure filled
       pure (taken, crFd c)
 
 -- | The free space once the volume has reclaimed a closed file: observed by bounded polling of the platform's

@@ -94,11 +94,17 @@ pointerFixture = do
 -- | The volume's total bytes, asked of an opened descriptor on it.
 volumeTotal ∷ FilePath → IO (Either String Word64)
 volumeTotal dir = do
-  made ← createPrivate productionSeam (BC.pack dir) 77
+  made ← createPrivate productionSeam (BC.pack dir) 77 (const (pure ()))
   case made of
     Left f → pure (Left (show f))
     Right c → do
-      _ ← unlinkFile productionSeam (BC.pack dir) (crName c)
+      -- every native result is looked at: a name that could not be removed would leave a file on the fixture, and a
+      -- close that failed leaves a descriptor
+      unlinked ← unlinkFile productionSeam (BC.pack dir) (crName c)
       p ← profileOf productionSeam (crFd c)
-      _ ← closeFile productionSeam (crFd c)
-      pure (either (Left . show) (Right . vpTotalBytes) p)
+      closed ← closeFile productionSeam (crFd c)
+      pure $ case (unlinked, closed, p) of
+        (Left e, _, _) → Left ("the probe's own temp file could not be unlinked: " <> show e)
+        (_, Left e, _) → Left ("the probe's own descriptor could not be closed: " <> show e)
+        (_, _, Left e) → Left (show e)
+        (_, _, Right prof) → Right (vpTotalBytes prof)

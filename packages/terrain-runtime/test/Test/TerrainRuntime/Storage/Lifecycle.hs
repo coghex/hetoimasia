@@ -9,6 +9,7 @@
 module Test.TerrainRuntime.Storage.Lifecycle (spec, checkInvariants, invariantProblems, withControlledService, Ctl (..)) where
 
 import Control.Concurrent (ThreadId, myThreadId, throwTo)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (ErrorCall (..), ExceptionWithContext (..), SomeAsyncException (..), SomeException, fromException, throwIO, toException, tryWithContext)
@@ -16,6 +17,7 @@ import Control.Monad (forM_, void, when)
 import qualified Data.ByteString.Char8 as BC
 import Data.List (intercalate)
 import Data.Maybe (isJust, isNothing)
+import System.Directory (listDirectory)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import qualified Foreign.C.Error as C
@@ -93,7 +95,8 @@ invariantProblems sn ledger fds = concat
     runningOpens = length [() | j <- snJobs sn, jsKind j == KOpen, jsPhase j == 1]
     -- a closing record still pays for everything its backing paid for, until its native close has returned
     contribution v = sum [bsLength b + maybe 0 id (bsPending b) | b <- snBackings sn <> snClosingRecs sn, bsVolume b == v]
-    controlNeed = sum (map jsCharge (snJobs sn)) + fromIntegral (nBack + snClosing sn) * backingRecordBytes + fromIntegral (snEvidence sn) * keptEntryBytes
+    -- only a closing record whose native close has not returned still pays (a reporting one has released its charges)
+    controlNeed = sum (map jsCharge (snJobs sn)) + fromIntegral (nBack + length (snClosingRecs sn)) * backingRecordBytes + fromIntegral (snEvidence sn) * keptEntryBytes
     stagingNeed = sum [transferBufferBytes n | j <- snJobs sn, jsPhase j == 1, KRead n <- [jsKind j]]
     cacheNeed = sum [fromIntegral n * resultPageBytes | j <- snJobs sn, KRead n <- [jsKind j], jsPhase j == 1 || jsHoldsResult j]
     nPhase p = length [() | j <- snJobs sn, jsPhase j == p]
@@ -131,6 +134,7 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
     e + r + n `shouldBe` length allCells
     mapM_ putStrLn matrixTable
     mapM_ putStrLn chargeTable
+    mapM_ putStrLn sealedTable
     putStrLn ("lifecycle matrix: " <> show (length allCells) <> " cells (6 kinds x 4 phases x " <> show (length [minBound .. maxBound :: Event]) <> " events): " <> show e <> " with an effect, " <> show r <> " refusals, " <> show n <> " not applicable (not run)")
 
   it "attempts the descriptor's close even when the unlink cleanup throws (twice), and keeps the evidence" $ do
@@ -343,6 +347,120 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
         -- the kept ones and one more, for the dropped
         Left (ExceptionWithContext ctx _) -> length (cleanupFailuresInContext ctx) `shouldBe` maxKept + 1
         Right () -> expectationFailure "kept failures were not reported"
+
+  -- ---- class B (round 4): the close core owns everything until it returns
+  it "keeps a close tracked through its post-native diagnostics: shutdown waits for it, and the failure it kept is not lost" $ do
+    gate <- newTVarIO False
+    reached <- newTVarIO (0 :: Int)
+    drainSaid <- newTVarIO False
+    -- the log after the native close blocks until the gate opens: the close is held IN ITS DIAGNOSTICS; the drain says
+    -- so (a log of its own) before it waits for the record, so the example observes the wait itself and not an earlier
+    -- transient block of the drain
+    let sink e = do
+          when (entryMessage e == drainWaitsMessage) (atomically (writeTVar drainSaid True))
+          when (entryMessage e == "Backing closed") (atomically (modifyTVar' reached (+ 1)) >> atomically (readTVar gate >>= check))
+        logger = mkLogger defaultLogFilter (callbackSink sink)
+    withControlledServiceWith logger $ \env ctl -> do
+      let svc = envSvc env
+      b <- openBacking env ident (hCfg h0)
+      addRule (envProbe env) 1 (== OpCloseFile) (FailWith eio)
+      withOwnedThreadOpening (atomically (writeTVar gate True)) (void (closeBacking svc b)) $ \_ waitCloser -> do
+        bounded (atomically (readTVar reached >>= \n -> check (n >= 1)))
+        -- the native close returned: what the backing paid for is released and the failure kept, but the record stays
+        sn <- atomically (snapshotOf svc)
+        (snClosing sn, length (snClosingRecs sn), length (snBackings sn), snEvidence sn) `shouldBe` (1, 0, 0, 1)
+        A.lgControlReserved <$> (A.ledgers <$> readTVarIO (envAdmission env)) >>= (`shouldBe` keptEntryBytes)
+        checkInvariants env
+        -- shutdown begins and WAITS for the record (observed blocked, no timer); nothing is added meanwhile
+        ctlBegin ctl
+        bounded (atomically (readTVar drainSaid >>= check))
+        awaitBlockedInStm (ctlThread ctl)
+        sn2 <- atomically (snapshotOf svc)
+        (snClosing sn2, snEvidence sn2, snAdmissionOpen sn2) `shouldBe` (1, 1, False)
+        atomically (writeTVar gate True)
+        waitCloser
+      ctlResult ctl >>= \r -> case r of
+        Left (ExceptionWithContext ctx _) -> length (cleanupFailuresInContext ctx) `shouldBe` 1
+        Right () -> expectationFailure "the kept failure of the close was lost: the service ended normally"
+      sealed <- atomically (snapshotOf svc)
+      (snClosing sealed, snEvidence sealed) `shouldBe` (0, 0)
+      openFds (envProbe env) >>= (`shouldBe` [])
+
+  forM_ [("discardTicket of a finished open", \svc t _ -> discardTicket svc t), ("closeBacking", \svc _ b -> void (closeBacking svc b))] $ \(name, close) ->
+    it ("keeps a failing close whose caller is cancelled while the native close is held (" <> name <> "): the cancellation is pending, delivered after, and the failure is kept") $
+      withControlledService $ \env ctl -> do
+        let svc = envSvc env
+            probe = envProbe env
+        t <- submitOpen svc ExplicitWork (OpenSpec (BC.pack (envDir env)) ident (hCfg h0)) >>= either (fail . show) pure
+        bounded (atomically (awaitTicket svc t))
+        b <- openBacking env ident2 (hCfg h0)
+        g <- addGate probe (== OpCloseFile)
+        addRule probe 1 (== OpCloseFile) (FailWith eio)
+        withOwnedThreadOpening (openGate g) (close svc t b) $ \closer waitClose -> do
+          awaitReached g 1
+          -- a cancellation sent now is PENDING: the native close is uninterruptible, the sender blocks until it can be
+          -- delivered (observed, no timer)
+          withOwnedThread (throwTo closer (SomeAsyncException (ErrorCall "the caller was cancelled"))) $ \sender waitSender -> do
+            awaitBlockedOnThrowTo sender
+            openGate g
+            waitSender
+          waitClose
+        -- the close returned EIO and the caller never received its report: the SERVICE kept it
+        sn <- atomically (snapshotOf svc)
+        (snEvidence sn, snClosing sn) `shouldBe` (1, 0)
+        checkInvariants env
+        ctlBegin ctl
+        ctlResult ctl >>= \r -> case r of
+          Left (ExceptionWithContext ctx _) -> length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
+          Right () -> expectationFailure "a failing close was lost behind a cancellation"
+
+  -- ---- the neighbours (round 4): a drained service accepts nothing, and a blocked hook is cancellable
+  it "seals the service at the end of its drain: every mutator then refuses or finds nothing, and nothing commits" $ do
+    ref <- newIORef Nothing
+    withControlledService $ \env ctl -> do
+      let svc = envSvc env
+      b <- openBacking env ident (hCfg h0)
+      p <- prepared env b
+      t <- submitRead svc b ExplicitWork (hCfg h0) (PageNo 5) 1 ReadProbe >>= either (fail . show) pure
+      bounded (atomically (awaitTicket svc t))
+      sw <- do
+        let plan = either error id (planFor h0 1)
+        (tid, s1) <- either (fail . show) pure (admit plan (hStore h0))
+        either (fail . show) pure (stageWrite s1 tid)
+      writeIORef ref (Just (svc, b, t, p, sw, envAdmission env, envProbe env))
+      ctlBegin ctl
+      ctlResult ctl >>= either (\(ExceptionWithContext _ e) -> expectationFailure ("the service ended with " <> show (e :: SomeException))) pure
+    Just (svc, b, t, p, sw, admission, probe) <- readIORef ref
+    snapBefore <- atomically (snapshotOf svc)
+    sealedPhase <- atomically (snapshotOf svc)
+    snAdmissionOpen sealedPhase `shouldBe` False
+    forM_ (sealedRows svc b t p sw) $ \(_, _, check') -> check'
+    snapAfter <- atomically (snapshotOf svc)
+    show snapAfter `shouldBe` show snapBefore
+    -- every charge is back: the admission is at its start and no descriptor is open
+    ledgerZero . A.ledgers <$> readTVarIO admission >>= (`shouldBe` True)
+    openFds probe >>= (`shouldBe` [])
+
+  it "a worker blocked in the after-hook of a create, cancelled while blocked, leaves no descriptor and no name" $
+    withControlledService $ \env ctl -> do
+      let svc = envSvc env
+          probe = envProbe env
+      g <- addAfterGate probe (== OpCreateFile)
+      t <- submitOpen svc ExplicitWork (OpenSpec (BC.pack (envDir env)) ident (hCfg h0)) >>= either (fail . show) pure
+      -- the native create succeeded and the worker is blocked in the after-hook, holding the descriptor and the name
+      awaitReached g 1
+      length <$> openFds probe >>= (`shouldBe` 1)
+      tids <- workerThreads probe
+      forM_ tids (\tid -> throwTo tid (SomeAsyncException (ErrorCall "the worker was cancelled")))
+      bounded (atomically (awaitTicket svc t))
+      -- owned from the instant the create succeeded: closed, unlinked, the job finished as a failure, the service stopped
+      openFds probe >>= (`shouldBe` [])
+      listDirectory (envDir env) >>= (`shouldBe` [])
+      withOutcome svc t pure >>= (`shouldSatisfy` \o -> case o of Just (Failed (HostFailure _) _) -> True; _ -> False)
+      bounded (atomically (snapshotOf svc >>= \sn -> check (isJust (snStopReason sn))))
+      checkInvariants env
+      ctlBegin ctl
+      ctlResult ctl >>= either (\(ExceptionWithContext _ e) -> expectationFailure ("the service ended with " <> show (e :: SomeException))) pure
 
   it "finishes a job that fails as a defect when the log of the defect is cancelled: the ticket wakes and the charge is released" $
     withSystemTempDirectory "hetoimasia-terrain-lifecycle-defect" $ \dir -> do
@@ -999,3 +1117,38 @@ chargeTable :: [String]
 chargeTable =
   "| Charge | What it pays for | The one release site | Why the thing is gone there |" : "| --- | --- | --- | --- |" :
     [ "| " <> drop 2 (show k) <> " | " <> a <> " | " <> b <> " | " <> c <> " |" | k <- [minBound .. maxBound :: ChargeKind], let (a, b, c) = chargeRow k ]
+
+-- ---------------------------------------------------------------------------
+-- A sealed service: every public mutator, and what it does once the drain has completed
+
+-- | Every public function that could commit state or a charge to the service, and what it does on a sealed one. The
+-- table in the documentation is generated from it; each row is asserted.
+sealedRows :: StorageService -> Backing -> Ticket -> PreparedGrowth -> StagedWrite -> [(String, String, IO ())]
+sealedRows svc b t p sw =
+  [ ("submitOpen", "refused: ServiceStopped", submitOpen svc ExplicitWork (OpenSpec (BC.pack "/nonexistent") ident (hCfg h0)) >>= (`shouldSatisfy` isStopped))
+  , ("submitRead", "refused: BackingClosed (the backing is gone)", submitRead svc b ExplicitWork (hCfg h0) (PageNo 5) 1 ReadProbe >>= (`shouldSatisfy` isClosed))
+  , ("submitWrite", "refused: BackingClosed", submitWrite svc b sw >>= (`shouldSatisfy` isClosed))
+  , ("submitGrowth", "refused: BackingClosed", submitGrowth svc b (64 * mib) (128 * mib) >>= (`shouldSatisfy` isClosed))
+  , ("submitAbandon", "refused: BackingClosed", submitAbandon svc b p >>= (`shouldSatisfy` isClosed))
+  , ("submitReleasePending", "refused: BackingClosed", submitReleasePending svc b >>= (`shouldSatisfy` isClosed))
+  , ("commitBackingGrowth", "refused: BackingClosed", commitBackingGrowth svc b p >>= (`shouldSatisfy` either (== BackingClosed) (const False)))
+  , ("withUse", "refused: BackingClosed, the action never runs", withUse svc b (expectationFailure "the action ran on a sealed service") >>= (`shouldSatisfy` either (== BackingClosed) (const False)))
+  , ("withOutcome", "answers Nothing: the ticket names nothing, the callback never runs", withOutcome svc t (\_ -> expectationFailure "the callback ran on a sealed service") >>= (`shouldSatisfy` isNothing))
+  , ("discardTicket", "finds nothing: no effect", discardTicket svc t)
+  , ("cancelTicket", "answers CancelUnknown", cancelTicket svc t >>= (`shouldBe` CancelUnknown))
+  , ("closeBacking", "finds no backing: nothing closed, no native call", closeBacking svc b >>= (`shouldSatisfy` (not . crClosed)))
+  , ("keepEvidence", "a defect: SealedMutation is thrown, nothing is kept or charged", do
+      r <- tryWithContext (atomically (keepEvidence svc "after the seal" [CleanupNote IoClose eio])) :: IO (Either (ExceptionWithContext SomeException) ())
+      case r of
+        Left (ExceptionWithContext _ e) -> (fromException e :: Maybe SealedMutation) `shouldSatisfy` isJust
+        Right () -> expectationFailure "evidence was kept on a sealed service")
+  ]
+  where
+    isStopped x = case x of Left ServiceStopped -> True; _ -> False
+    isClosed x = case x of Left BackingClosed -> True; _ -> False
+
+-- | The table, generated from 'sealedRows'.
+sealedTable :: [String]
+sealedTable =
+  "| Function | On a sealed service |" : "| --- | --- |" :
+    [ "| `" <> n <> "` | " <> d' <> " |" | (n, d', _) <- sealedRows undefined undefined undefined undefined undefined ]

@@ -43,6 +43,8 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Native
   , posixNative
   , productionSeam
   , seamed
+  , Owns (..)
+  , around
   , errnoText
   ) where
 
@@ -144,6 +146,30 @@ productionSeam = Seam posixNative (\_ → pure ()) (\_ → pure ())
 -- | The same adapter observed by hooks around each operation.
 seamed ∷ Native → (NativeOp → IO ()) → (NativeOp → IO ()) → Seam
 seamed = Seam
+
+-- | What a native effect obtained that an owner must release. The seam is a port: its after-hook can raise or be
+-- cancelled while blocked, and the effect has then already HAPPENED, so the hook must never be able to lose what the
+-- effect obtained.
+data Owns a
+  = -- | The effect obtained nothing an owner must release (a query; a length, an allocation or a transfer, whose
+    -- owner is the descriptor and which the caller gives back or accounts on any exception; a release or a close,
+    -- whose result a lost hook turns into an exception that is recorded and never retried).
+    NothingAcquired
+  | -- | The effect obtained something: the recorder runs FIRST, before the after-hook, so the thing already has
+    -- its owner when the hook runs.
+    Acquires (a → IO ())
+
+-- | THE ONE WAY a native effect runs between its hooks: the before-hook, the effect, the recorder of what it
+-- obtained, and only then the after-hook. Every site says what it acquires.
+around ∷ Seam → NativeOp → Owns a → IO a → IO a
+around seam op owns act = do
+  seamBefore seam op
+  r ← act
+  case owns of
+    NothingAcquired → pure ()
+    Acquires record → record r
+  seamAfter seam op
+  pure r
 
 foreign import ccall safe "hts_create"
   c_create ∷ CString → CString → Ptr CInt → IO CInt

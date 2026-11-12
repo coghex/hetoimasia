@@ -16,6 +16,7 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (AsyncException (UserInterrupt), try, SomeException)
 import Control.Monad (forM, forM_, unless, void, when)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -39,7 +40,8 @@ import Test.Support.Owned (withOwnedThread)
 import Test.TerrainRuntime.Storage.Fixture
 import Test.TerrainRuntime.Storage.Harness
 import Test.TerrainRuntime.Storage.Lifecycle (checkInvariants)
-import Test.TerrainRuntime.Storage.ProbeSpec (probeCases)
+import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate, unlinkFile)
+import Test.TerrainRuntime.Storage.ProbeSpec (FillError (..), fillWith, probeCases, withFillerWith, withMeter)
 import Test.TerrainRuntime.Store.Harness (H (..), smallSpec)
 
 mib :: Word64
@@ -71,6 +73,15 @@ allocatedOf env = do
 
 -- | The reservation the service reports (held on the volume) equals the file's physical allocation, to the
 -- filesystem's accounting of one block.
+-- | The service never reports less than the file physically holds, and when it reports more, the excess is a pending
+-- reservation (accounted, recoverable by an explicit release): the state after an effect whose result was lost.
+reportedCoversPhysical :: Env -> IO ()
+reportedCoversPhysical env = do
+  held <- sum . svReserved <$> view env
+  phys <- allocatedOf env
+  hasPending <- atomically (snapshotOf (envSvc env)) >>= \sn -> pure (any (isJust . bsPending) (snBackings sn))
+  (held, phys, hasPending) `shouldSatisfy` \(h, p, pend) -> p <= h + 4096 && (h <= p + 4096 || pend)
+
 reportedMatchesPhysical :: Env -> IO ()
 reportedMatchesPhysical env = do
   held <- sum . svReserved <$> view env
@@ -90,6 +101,7 @@ isStat op = op == OpStatFile
 spec :: Spec
 spec = describe "Storage backend: the classes round 1 of review found" $ do
   fixtureClass
+  fillerClass
   growthClass
   sweepClass
   startupClass
@@ -97,6 +109,54 @@ spec = describe "Storage backend: the classes round 1 of review found" $ do
 
 -- ---------------------------------------------------------------------------
 -- (A) the probe's fixture
+
+-- | The probe's filler proves its preconditions (round 4): it ends only on the platform's out-of-space result, and the
+-- exhausted state is measured before any action that claims it.
+fillerClass :: Spec
+fillerClass = describe "(A) the probe's filler" $ do
+  it "ends only on the platform's out-of-space result: a reservation that fails for another reason, or a length that cannot be established, is a failure and never exhaustion" $
+    withSystemTempDirectory "hetoimasia-terrain-filler" $ \dir -> do
+      made <- createPrivate productionSeam (BC.pack dir) 1 (const (pure ()))
+      c <- either (fail . show) pure made
+      let errno x = let C.Errno n = x in Errno (fromIntegral n)
+          failsWith e = posixNative {nativeReserve = \_ _ _ -> pure (Left e)}
+      -- reasons that are not capacity: EIO, EINVAL, an unsupported allocation
+      forM_ [C.eIO, C.eINVAL, C.eNOTSUP, C.eOPNOTSUPP, C.eNOSYS, C.eDQUOT] $ \e ->
+        fillWith (failsWith (errno e)) (crFd c) >>= (`shouldBe` Left (FillUnexpected (errno e)))
+      -- a length that cannot be established after a reservation that succeeded
+      fillWith posixNative {nativeReserve = \_ _ n -> pure (Right n), nativeSetLength = \_ _ -> pure (Left (errno C.eIO))} (crFd c)
+        >>= (`shouldBe` Left (FillLength (errno C.eIO)))
+      -- the platform's out-of-space result after three whole chunks ends the fill, and the bytes are what was taken
+      calls <- newIORef (0 :: Int)
+      let capacity = posixNative
+            { nativeReserve = \_ _ n -> do
+                k <- atomicModifyIORef' calls (\i -> (i + 1, i))
+                pure (if k < 3 then Right n else Left (errno C.eNOSPC))
+            , nativeSetLength = \_ _ -> pure (Right ())
+            }
+      fillWith capacity (crFd c) >>= (`shouldBe` Right (3 * 64 * mib))
+      _ <- unlinkFile productionSeam (BC.pack dir) (crName c)
+      _ <- closeFile productionSeam (crFd c)
+      listDirectory dir >>= (`shouldBe` [])
+  it "cannot let an example claim exhaustion that was not measured: a filler that is refused at once, on a volume with plenty free, fails before the action runs" $
+    withSystemTempDirectory "hetoimasia-terrain-filler2" $ \dir -> do
+      fxe <- acquireFixture (Policy maxBound False) dir
+      fx <- either (\e -> fail ("fixture refused: " <> show e)) pure fxe
+      -- the adapter answers out-of-space for the very first reservation: the fill "ends" having taken nothing
+      let immediately = posixNative {nativeReserve = \_ _ _ -> pure (Left (Errno (let C.Errno n = C.eNOSPC in fromIntegral n)))}
+      ran <- newIORef False
+      r <- try (withMeter fx (\m -> withFillerWith immediately fx m (\_ -> writeIORef ran True)))
+      (either (\e -> const True (e :: SomeException)) (const False) r) `shouldBe` True
+      readIORef ran >>= (`shouldBe` False)
+  it "a filler whose reservation fails for a reason unrelated to capacity cannot yield a passing example" $
+    withSystemTempDirectory "hetoimasia-terrain-filler3" $ \dir -> do
+      fxe <- acquireFixture (Policy maxBound False) dir
+      fx <- either (\e -> fail ("fixture refused: " <> show e)) pure fxe
+      let broken = posixNative {nativeReserve = \_ _ _ -> pure (Left (Errno (let C.Errno n = C.eIO in fromIntegral n)))}
+      ran <- newIORef False
+      r <- try (withMeter fx (\m -> withFillerWith broken fx m (\_ -> writeIORef ran True)))
+      (either (\e -> const True (e :: SomeException)) (const False) r) `shouldBe` True
+      readIORef ran >>= (`shouldBe` False)
 
 fixtureClass :: Spec
 fixtureClass = describe "(A) the probe fixture" $
@@ -225,7 +285,10 @@ preparedOn env b = do
 -- ---------------------------------------------------------------------------
 -- (C) every native resource has an owner at every instant
 
-data Injection = Typed | Thrown | Cancelled'
+-- | The ways a native call is made to go wrong. The AFTER dimension (round 4): the native effect has HAPPENED and the
+-- seam's after-hook then raises, or raises an exception of the asynchronous type: nothing the effect obtained may be
+-- lost, whatever the call.
+data Injection = Typed | Thrown | Cancelled' | AfterThrown | AfterAsync
   deriving stock (Eq, Show, Enum, Bounded)
 
 data Stage = SOpen | SGrow | SRelease | SRead | SWrite | SClose
@@ -269,12 +332,13 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
       forM [minBound .. maxBound] $ \inj -> do
         baseline <- openFdCount
         putStrLn ("  sweep case: " <> show stage <> " / " <> name <> " / " <> show inj) >> hFlush stdout
-        withEnv $ \env -> runCase env stage match occurrence prelude inj
+        -- a FAILING native close is kept by the service whoever asked for it: the scope ends with that labelled failure
+        (if stage == SClose && inj `elem` [Typed, Thrown, AfterThrown, AfterAsync] then withEnvEndingWithKeptFailure else withEnv) $ \env -> runCase env stage match occurrence prelude inj
         fdsAfter <- openFdCount
         ((show stage, name, show inj), fdsAfter) `shouldBe` ((show stage, name, show inj), baseline)
         pure ()
     length (concat cases) `shouldBe` length matrix * length [minBound .. maxBound :: Injection]
-    putStrLn ("sweep: " <> show (length matrix) <> " native calls at their stages x 3 injections = " <> show (length (concat cases)) <> " cases")
+    putStrLn ("sweep: " <> show (length matrix) <> " native calls at their stages x " <> show (length [minBound .. maxBound :: Injection]) <> " injections (typed, thrown, cancelled, and after the effect: thrown, async) = " <> show (length (concat cases)) <> " cases")
   where
     runCase :: Env -> Stage -> (NativeOp -> Bool) -> Int -> (Probe -> IO ()) -> Injection -> IO ()
     runCase env stage match occurrence prelude inj
@@ -310,6 +374,8 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
           case inj of
             Typed -> addRuleAfter probe occurrence 1 match (FailWith eio)
             Thrown -> addRuleAfter probe occurrence 1 match Throw
+            AfterThrown -> addAfterRuleAfter probe occurrence 1 match Throw
+            AfterAsync -> addAfterRuleAfter probe occurrence 1 match ThrowAsync
             Cancelled' -> pure ()
           t <- act >>= either (fail . ("submit refused: " <>) . show) pure
           forM_ gate $ \g -> do
@@ -322,7 +388,9 @@ sweepClass = describe "(C) every native resource has an owner at every instant" 
           v <- view env
           fds <- openFds probe
           length fds `shouldBe` svBackings v
-          when (stage `elem` [SGrow, SRelease]) (reportedMatchesPhysical env)
+          -- after an after-hook raised, what the last native step did is UNKNOWN to the caller: the extra may be freed
+          -- while the service still counts it, as a pending reservation a retry releases: never less than physical
+          when (stage `elem` [SGrow, SRelease]) (if inj `elem` [AfterThrown, AfterAsync] then reportedCoversPhysical env else reportedMatchesPhysical env)
           checkInvariants env
           -- close whatever the case left open: the volume's reserved figures are back to their start
           forM_ [b | Opened b _ <- [o]] (closeBacking (envSvc env))
@@ -344,6 +412,10 @@ closeScenario env inj = do
       addRule probe 1 (== OpCloseFile) Throw
       rep <- closeBacking (envSvc env) b
       (crClosed rep, crCloseException rep == Nothing) `shouldBe` (True, False)
+    -- the close HAPPENED and its after-hook raises (synchronously, or of the asynchronous type): the close is recorded
+    -- as having raised and is never repeated
+    AfterThrown -> afterClose b Throw
+    AfterAsync -> afterClose b ThrowAsync
     Cancelled' -> do
       -- the closing thread is interrupted while it waits for a held call: the interruption is remembered, the close
       -- still happens, and the interruption is delivered after it
@@ -361,6 +433,14 @@ closeScenario env inj = do
   openFds probe >>= (`shouldBe` [])
   (svBackings <$> view env) >>= (`shouldBe` 0)
   volumeLedgerClear env
+  where
+    afterClose b act = do
+      addAfterRule (envProbe env) 1 (== OpCloseFile) act
+      rep <- closeBacking (envSvc env) b
+      (crClosed rep, crCloseException rep == Nothing) `shouldBe` (True, False)
+      -- exactly one native close was made: an after-hook that raised never leads to a second
+      evs <- events (envProbe env)
+      length [() | OpCloseFile <- evs] `shouldBe` 1
 
 -- ---------------------------------------------------------------------------
 -- (C) startup: every started worker has an owner at every instant

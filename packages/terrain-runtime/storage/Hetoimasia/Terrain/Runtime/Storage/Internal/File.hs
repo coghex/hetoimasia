@@ -66,10 +66,6 @@ import Hetoimasia.Terrain.Runtime.Storage.Internal.Types
   )
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Volume
 
--- | Run a native operation between its hooks.
-around ∷ Seam → NativeOp → IO a → IO a
-around seam op act = seamBefore seam op *> act <* seamAfter seam op
-
 errnoValue ∷ T.Errno → Int
 errnoValue (T.Errno n) = n
 
@@ -97,12 +93,16 @@ data Created = Created
 -- close-on-exec, never following a link. The name is derived from the caller's
 -- unique number, and an existing name (@EEXIST@) takes the next attempt, at most
 -- eight in all, so a name clash is bounded and never an overwrite.
-createPrivate ∷ Seam → ByteString → Word64 → IO (Either IoFailure Created)
-createPrivate seam dir unique = go (0 ∷ Int)
+--
+-- The descriptor and its name are OWNED THE INSTANT the native create succeeds: @own@ records them before the
+-- seam's after-hook runs, so a hook that raises or is cancelled can never leave a descriptor or a name nobody
+-- tracks (the caller's cleanup reads what @own@ recorded).
+createPrivate ∷ Seam → ByteString → Word64 → (Created → IO ()) → IO (Either IoFailure Created)
+createPrivate seam dir unique own = go (0 ∷ Int)
   where
     go attempt = do
       let name = BC.pack ("hetoimasia-terrain-" <> show unique <> "-" <> show attempt)
-      r ← around seam OpCreateFile (nativeCreate (seamNative seam) dir name)
+      r ← around seam OpCreateFile (Acquires (\res → case res of Right fd → own (Created fd name); Left _ → pure ())) (nativeCreate (seamNative seam) dir name)
       case r of
         Right fd → pure (Right (Created fd name))
         Left e
@@ -111,19 +111,19 @@ createPrivate seam dir unique = go (0 ∷ Int)
 
 -- | Remove the file's name (the descriptor keeps the file).
 unlinkFile ∷ Seam → ByteString → ByteString → IO (Either T.Errno ())
-unlinkFile seam dir name = around seam OpUnlinkFile (nativeUnlink (seamNative seam) dir name)
+unlinkFile seam dir name = around seam OpUnlinkFile NothingAcquired (nativeUnlink (seamNative seam) dir name)
 
 -- | The checks a private file must pass before it is used: close-on-exec is set
 -- on the descriptor, the file has no name left, and only its owner can open it.
 -- A descriptor that could leak through a child's @exec@ is a setup failure.
 verifyPrivate ∷ Seam → Fd → IO (Either IoFailure NativeStat)
 verifyPrivate seam fd = do
-  flag ← around seam OpCloexecFlag (nativeCloexec (seamNative seam) fd)
+  flag ← around seam OpCloexecFlag NothingAcquired (nativeCloexec (seamNative seam) fd)
   case flag of
     Left e → pure (Left (ioFailure IoCloexec e Nothing))
     Right False → pure (Left (IoFailure IoCloexec IoStateWrong Nothing Nothing 0 0))
     Right True → do
-      st ← around seam OpStatFile (nativeStat (seamNative seam) fd)
+      st ← around seam OpStatFile NothingAcquired (nativeStat (seamNative seam) fd)
       pure $ case st of
         Left e → Left (ioFailure IoStat e Nothing)
         Right s
@@ -179,7 +179,7 @@ reserveRange seam cfg cancelled fd off len = do
       if stopped0
         then pure (Left (StoppedCancelled False))
         else do
-          r ← around seam (OpReserveRange off len) (nativeReserve (seamNative seam) fd off len)
+          r ← around seam (OpReserveRange off len) NothingAcquired (nativeReserve (seamNative seam) fd off len)
           case r of
             Left e
               | unsupportedErrno e → pure (stopAfter (StorageUnsupported (NativeUnsupported StepAllocate e)))
@@ -192,12 +192,12 @@ reserveRange seam cfg cancelled fd off len = do
       if stopped1
         then pure (Left (StoppedCancelled True))
         else do
-          l ← around seam (OpSetFileLength end) (nativeSetLength (seamNative seam) fd end)
+          l ← around seam (OpSetFileLength end) NothingAcquired (nativeSetLength (seamNative seam) fd end)
           case l of
             Left e → pure (stopAfter (ReservationFailed (LengthFailed e)))
             Right () → verify p
     verify p = do
-      st ← around seam OpStatFile (nativeStat (seamNative seam) fd)
+      st ← around seam OpStatFile NothingAcquired (nativeStat (seamNative seam) fd)
       pure $ case st of
         Left e → stopAfter (StorageIo (ioFailure IoStat e Nothing))
         Right s
@@ -221,14 +221,14 @@ reserveRange seam cfg cancelled fd off len = do
 -- then inside the file, and shortening it frees them on both targets.
 releaseExtra ∷ Seam → Fd → Word64 → Word64 → IO (Either T.Errno ())
 releaseExtra seam fd from to = do
-  st ← around seam OpStatFile (nativeStat (seamNative seam) fd)
+  st ← around seam OpStatFile NothingAcquired (nativeStat (seamNative seam) fd)
   case st of
     Left e → pure (Left e)
     Right s → do
-      up ← if nsSize s < to then around seam (OpSetFileLength to) (nativeSetLength (seamNative seam) fd to) else pure (Right ())
+      up ← if nsSize s < to then around seam (OpSetFileLength to) NothingAcquired (nativeSetLength (seamNative seam) fd to) else pure (Right ())
       case up of
         Left e → pure (Left e)
-        Right () → around seam (OpSetFileLength from) (nativeSetLength (seamNative seam) fd from)
+        Right () → around seam (OpSetFileLength from) NothingAcquired (nativeSetLength (seamNative seam) fd from)
 
 -- ---------------------------------------------------------------------------
 -- Transfers
@@ -252,7 +252,7 @@ readFully seam buf n off fd = go 0 (0 ∷ Int)
       | otherwise = do
           let want = n - done
               at = off + fromIntegral done
-          r ← around seam (OpReadAt at want) (nativePread (seamNative seam) fd (buf `plusPtr` done) want at)
+          r ← around seam (OpReadAt at want) NothingAcquired (nativePread (seamNative seam) fd (buf `plusPtr` done) want at)
           case r of
             Right 0 → pure (Left (ReadEnded (fromIntegral done) (fromIntegral n)))
             Right got
@@ -273,7 +273,7 @@ writeFully seam buf n off fd = go 0 (0 ∷ Int)
           let want = n - done
               at = off + fromIntegral done
               fail' k = IoFailure IoWrite k Nothing (Just at) (fromIntegral done) (fromIntegral n)
-          r ← around seam (OpWriteAt at want) (nativePwrite (seamNative seam) fd (buf `plusPtr` done) want at)
+          r ← around seam (OpWriteAt at want) NothingAcquired (nativePwrite (seamNative seam) fd (buf `plusPtr` done) want at)
           case r of
             Right 0 → pure (Left (fail' IoZeroProgress))
             Right put
@@ -290,4 +290,4 @@ writeFully seam buf n off fd = go 0 (0 ∷ Int)
 -- repeated: the descriptor may already be released, and a second close could
 -- close another resource that reused its number.
 closeFile ∷ Seam → Fd → IO (Either T.Errno ())
-closeFile seam fd = around seam OpCloseFile (nativeClose (seamNative seam) fd)
+closeFile seam fd = around seam OpCloseFile NothingAcquired (nativeClose (seamNative seam) fd)

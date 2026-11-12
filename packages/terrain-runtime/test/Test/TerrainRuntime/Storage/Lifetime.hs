@@ -247,7 +247,7 @@ spec = describe "Storage backend: queue, workers and lifetime" $ do
       readMVar closed >>= (`shouldSatisfy` crClosed))
 
   it "never closes twice: a failed close is reported once and a descriptor number reused later cannot be reached by an old handle" $
-    withEnv $ \env → do
+    withEnvEndingWithKeptFailure $ \env → do
       a ← openBacking env ident (hCfg h0)
       addRule (envProbe env) 1 (== OpCloseFile) (FailWith (er C.eIO))
       rep ← closeBacking (envSvc env) a
