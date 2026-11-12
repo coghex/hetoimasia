@@ -112,7 +112,7 @@ probeCases =
           timed "write.allowance" (pattern' fd size 1)
           timed "readback.allowance" (verify fd size 1)
           -- the rest of the volume is consumed in a filler file the probe owns, until the platform refuses
-          withFiller fx $ \filler -> do
+          withMeter fx $ \meter -> withFiller fx meter $ \filler -> noCreateWhile env $ do
             record "exhausted.filler.bytes" (show filler)
             -- previously written pages are rewritten across the whole reserved range: it must need no new allocation
             timed "rewrite.exhausted" (pattern' fd size 2)
@@ -128,7 +128,7 @@ probeCases =
           b <- openBacking env ident cfg
           [fd] <- fdHandles (envProbe env)
           pattern' fd (cfgAllowanceBytes cfg) 3
-          withFiller fx $ \_ -> do
+          withMeter fx $ \meter -> withFiller fx meter $ \_ -> noCreateWhile env $ do
             o <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
             o `shouldBeFailure` \f -> case f of ReservationFailed (InsufficientHeadroom {}) -> True; _ -> False
             record "growth.exhausted" "reservation_failed"
@@ -170,20 +170,20 @@ probeCases =
   , ("keeps the file after its name is gone for as long as a borrower holds it, and reclaims the space after the last close", \acquire -> do
         fx <- acquired acquire
         let dir = fixtureDir fx
-        withEnvIn dir defaultProbe $ \env -> do
-          before' <- availableOf dir
+        withMeter fx $ \meter -> withEnvIn dir defaultProbe $ \env -> do
+          before' <- availableOf meter
           names0 <- listDirectory dir
           b <- openBacking env ident (hCfg h64)
           -- the name is gone as soon as the file exists: the directory lists what it listed before (a fresh
           -- ext4 volume has its own lost+found)
           listDirectory dir `shouldReturn` names0
-          held <- availableOf dir
+          held <- availableOf meter
           record "unlink.reserved.bytes" (show (before' - held))
           -- a borrower is using the file: the close waits for it, and the data is still readable
           r <- withUse (envSvc env) b (readPages env b (hCfg h64) 7 1 ReadProbe)
           fmap (either (const False) (not . null)) r `shouldBe` Right True
           _ <- closeBacking (envSvc env) b
-          after' <- pollRecovered dir before'
+          after' <- pollRecovered meter before'
           record "close.reclaimed.bytes" (show (after' - held))
           record "close.reclaimed.complete" (show (after' + 4 * mib >= before'))
           after' + 4 * mib `shouldSatisfy` (>= before')
@@ -244,27 +244,49 @@ forPages size act = go 0
     go off | off >= size = pure ()
            | otherwise = act off >> go (off + fromIntegral pageSize)
 
-availableOf :: FilePath -> IO Word64
-availableOf dir = do
-  made <- createPrivate productionSeam (BC.pack dir) 99
-  case made of
-    Left f -> fail (show f)
-    Right c -> do
-      _ <- unlinkFile productionSeam (BC.pack dir) (crName c)
-      p <- profileOf productionSeam (crFd c)
-      _ <- closeFile productionSeam (crFd c)
-      either (fail . show) (pure . vpAvailableBytes) p
+-- | THE PROBE'S WAY OF READING FREE SPACE: a descriptor the probe opens BEFORE anything is allocated and holds for
+-- the whole example (a private, unlinked, empty file on the fixture volume), read with @fstat@ and @fstatfs@ on the
+-- descriptor. Reading free space never creates anything: while a volume is exhausted, or has not yet been given its
+-- space back (a filesystem may free the blocks of a closed, unlinked file lazily), a create needs space and a name,
+-- so a meter that creates fails exactly when it is needed. There is no function here that measures free space by
+-- creating a file.
+newtype Meter = Meter Fd
+
+withMeter :: Fixture -> (Meter -> IO a) -> IO a
+withMeter fx = bracket make (\(Meter fd) -> () <$ closeFile productionSeam fd)
+  where
+    make = do
+      made <- createPrivate productionSeam (BC.pack (fixtureDir fx)) 9999
+      c <- either (fail . show) pure made
+      _ <- unlinkFile productionSeam (BC.pack (fixtureDir fx)) (crName c)
+      pure (Meter (crFd c))
+
+availableOf :: Meter -> IO Word64
+availableOf (Meter fd) = do
+  p <- profileOf productionSeam fd
+  either (fail . show) (pure . vpAvailableBytes) p
+
+-- | The exhausted phase: nothing in it may create a file or a name. The backend's own calls go through the harness
+-- seam, which logs every native create: the count is the same at the end as at the start.
+noCreateWhile :: Env -> IO a -> IO a
+noCreateWhile env act = do
+  before' <- creates
+  r <- act
+  after' <- creates
+  after' `shouldBe` before'
+  pure r
+  where
+    creates = (\evs -> length [() | OpCreateFile <- evs]) <$> events (envProbe env)
 
 -- | Run an action with the rest of the volume's free space consumed by a file of the probe's own (reserved
 -- natively until the platform refuses), and give the space back when it ends. Hands over the bytes taken.
-withFiller :: Fixture -> (Word64 -> IO a) -> IO a
-withFiller fx = \act -> do
-  let dir = fixtureDir fx
-  free0 <- availableOf dir
+withFiller :: Fixture -> Meter -> (Word64 -> IO a) -> IO a
+withFiller fx meter = \act -> do
+  free0 <- availableOf meter
   r <- bracket acquire (\(_, fd) -> () <$ closeFile productionSeam fd) (act . fst)
   -- a filesystem may give the blocks of a closed, unlinked file back lazily (APFS did, within about a
   -- second): observe, bounded, until the volume reports the space again, and record how long it took
-  polls <- pollRecoveredCount dir free0
+  polls <- pollRecoveredCount meter free0
   record "filler.reclaim.observations" (show polls)
   pure r
   where
@@ -287,17 +309,17 @@ withFiller fx = \act -> do
 
 -- | The free space once the volume has reclaimed a closed file: observed by bounded polling of the platform's
 -- own report (a filesystem may free the blocks of a closed, unlinked file lazily), at most 200 observations, 50 ms apart.
-pollRecoveredCount :: FilePath -> Word64 -> IO Int
-pollRecoveredCount dir target = go (0 :: Int)
+pollRecoveredCount :: Meter -> Word64 -> IO Int
+pollRecoveredCount meter target = go (0 :: Int)
   where
     go n = do
-      a <- availableOf dir
+      a <- availableOf meter
       if a + 4 * mib >= target || n >= 200 then pure n else threadDelay 50000 >> go (n + 1)
 
-pollRecovered :: FilePath -> Word64 -> IO Word64
-pollRecovered dir target = go (0 :: Int)
+pollRecovered :: Meter -> Word64 -> IO Word64
+pollRecovered meter target = go (0 :: Int)
   where
     go n = do
-      a <- availableOf dir
+      a <- availableOf meter
       if a + 4 * mib >= target || n >= 200 then pure a else threadDelay 50000 >> go (n + 1)
 
