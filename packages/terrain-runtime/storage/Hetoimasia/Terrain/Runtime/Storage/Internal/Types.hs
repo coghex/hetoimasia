@@ -18,6 +18,8 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Types
   , mkStorageConfig
   , defaultQualified
   , minHeadroomBytes
+  , maxQualifiedNames
+  , maxQualifiedNameBytes
   , maxIoJobBytes
   , maxIoPages
   , maxQueuedJobs
@@ -120,16 +122,44 @@ data StorageConfig = StorageConfig
 data StorageConfigError
   = -- | A headroom below the approved 256 MiB: a limit never loosens.
     HeadroomBelowMinimum !Word64
+  | -- | More qualified names than 'maxQualifiedNames'.
+    TooManyQualifiedNames
+  | -- | A qualified name with no bytes.
+    QualifiedNameEmpty
+  | -- | A qualified name longer than 'maxQualifiedNameBytes'; its length.
+    QualifiedNameTooLong !Int
+  | -- | A qualified name with a byte that no filesystem type name has (not a printable, non-space ASCII byte).
+    QualifiedNameNotPrintable
   deriving stock (Eq, Show)
+
+-- | The most filesystem names a configuration may qualify. The list is the explicit allowlist the contract requires
+-- and this slice qualifies two (@apfs@, @ext4@); sixteen leaves room for the others a build may add (@xfs@, @btrfs@, the
+-- network and fuse families are refused on purpose) without letting a caller hand the service an unbounded list that
+-- it keeps, uncharged, for its whole life.
+maxQualifiedNames ∷ Int
+maxQualifiedNames = 16
+
+-- | The longest filesystem name a configuration may qualify. macOS reports at most 15 characters (@MFSTYPENAMELEN@ is
+-- 16 with the terminator); a Linux type name is a short registered word, with @fuse.@ and a subtype at most (@fuse.gocryptfs@,
+-- @fuse.vmhgfs-fuse@ are 14 and 16): 32 bytes covers every real one with room, and bounds each retained name.
+maxQualifiedNameBytes ∷ Int
+maxQualifiedNameBytes = 32
 
 -- | Validate a configuration. The headroom may be raised and never lowered, so a
 -- test or an application cannot defeat the guard.
 mkStorageConfig ∷ [ByteString] → Word64 → Either StorageConfigError StorageConfig
 mkStorageConfig qualified headroom
   | headroom < minHeadroomBytes = Left (HeadroomBelowMinimum headroom)
+  -- the list is walked at most one name past the limit (an unbounded or infinite list is refused, not traversed), and
+  -- every name is checked BEFORE anything is copied: a refusal copies nothing
+  | length (take (maxQualifiedNames + 1) qualified) > maxQualifiedNames = Left TooManyQualifiedNames
+  | any BS.null qualified = Left QualifiedNameEmpty
+  | (n : _) ← [BS.length q | q ← qualified, BS.length q > maxQualifiedNameBytes] = Left (QualifiedNameTooLong n)
+  | any (BS.any (\w → w < 0x21 || w > 0x7e)) qualified = Left QualifiedNameNotPrintable
   -- the configuration keeps its OWN, evaluated copy of the list for the life of the service: a name cut from a large
   -- buffer (a configuration file's text) would otherwise keep that buffer alive, and a lazily built list would keep
-  -- whatever it was built from
+  -- whatever it was built from. At most 'maxQualifiedNames' names of at most 'maxQualifiedNameBytes' bytes: a constant
+  -- of the service (like the stop reason), charged to nothing, bounded by these two numbers
   | otherwise = let own = map BS.copy qualified in foldr seq () own `seq` Right (StorageConfig own headroom)
 
 -- | Who asks. Explicit work (a user's edit or read) precedes camera prefetch;

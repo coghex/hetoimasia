@@ -12,6 +12,7 @@
 module Test.TerrainRuntime.Storage.Boundary (spec, boundaryTable, typeTable, Row (..), TypeRow (..)) where
 
 import Control.Concurrent.STM (atomically)
+import Control.Exception (evaluate)
 import Control.Monad (forM_, unless)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -51,7 +52,7 @@ data Row = Row
 boundaryTable ∷ [Row]
 boundaryTable =
   [ Row "withStorage" "config (validated when made), the shared admission, a worker group, a logger; the threaded runtime is checked" "nothing of the arguments beyond the handles it was given (the group and the logger are the caller's)" "the body's result; a service whose scope ends with the body" "workers started masked, the body unmasked, the drain masked" "n/a (starts); a refusal to start is `StartFailure`"
-  , Row "mkStorageConfig" "the qualified list and the headroom (at least `minHeadroomBytes`)" "its own EVALUATED copy of every name (a name cut from a large buffer keeps that buffer alive otherwise)" "a typed `StorageConfigError` or a config" "pure" "n/a"
+  , Row "mkStorageConfig" "the qualified list (at most `maxQualifiedNames` names, each non-empty, at most `maxQualifiedNameBytes` bytes, printable non-space ASCII; the list is walked at most one name past the limit) and the headroom (at least `minHeadroomBytes`)" "its own EVALUATED copy of every name, made only after every check has passed (a refusal copies nothing); a constant of the service, charged to nothing, bounded by the two limits" "a typed `StorageConfigError` (`HeadroomBelowMinimum`, `TooManyQualifiedNames`, `QualifiedNameEmpty`, `QualifiedNameTooLong`, `QualifiedNameNotPrintable`) or a config" "pure" "n/a"
   , Row "backingIdentity" "a backing handle" "nothing" "the store identity the handle was made for (two scalars); reads nothing of any service" "pure" "the same for any service: a handle carries its identity"
   , Row "preparedFrom" "a growth token" "nothing" "a scalar" "pure" "n/a"
   , Row "preparedTo" "a growth token" "nothing" "a scalar" "pure" "n/a"
@@ -90,6 +91,8 @@ boundaryTable =
   , Row "failureCode" "a failure" "nothing" "a stable code" "pure" "n/a"
   , Row "defaultQualified" "none" "n/a" "the qualified list" "pure" "n/a"
   , Row "minHeadroomBytes" "none" "n/a" "a constant (256 MiB)" "pure" "n/a"
+  , Row "maxQualifiedNames" "none" "n/a" "a constant (16)" "pure" "n/a"
+  , Row "maxQualifiedNameBytes" "none" "n/a" "a constant (32)" "pure" "n/a"
   ]
 
 -- | One row for an exported TYPE: who builds a value of it, what is checked when a caller does, and whether a value
@@ -111,8 +114,8 @@ typeTable ∷ [TypeRow]
 typeTable =
   [ TypeRow "StorageService" "a service" "`withStorage`" "n/a" "an abstract handle to the running service; a value is valid only inside its scope"
   , TypeRow "StartFailure" "a failure value" "the service" "n/a" "scalars"
-  , TypeRow "StorageConfig" "an input a caller builds (abstract)" "`mkStorageConfig`" "the headroom at least `minHeadroomBytes`" "the qualified names are the configuration's OWN evaluated copies (a name cut from a large buffer would keep it alive)"
-  , TypeRow "StorageConfigError" "a failure value" "`mkStorageConfig`" "n/a" "scalars"
+  , TypeRow "StorageConfig" "an input a caller builds (abstract)" "`mkStorageConfig`" "the headroom at least `minHeadroomBytes`; at most `maxQualifiedNames` names, each non-empty, at most `maxQualifiedNameBytes` bytes, printable non-space ASCII" "the qualified names are the configuration's OWN evaluated copies, made after every check passed (a name cut from a large buffer would keep it alive); the whole is a constant of the service bounded by the two limits"
+  , TypeRow "StorageConfigError" "a failure value" "`mkStorageConfig`" "n/a" "scalars (the length of a name that is too long)"
   , TypeRow "Backing" "a handle (abstract)" "the service, in an opened backing's outcome" "service identity, then id, in the one resolver" "two scalars and the store identity; names nothing of another service"
   , TypeRow "Ticket" "a handle (abstract)" "the service, at each submission" "service identity, then id, in the one resolver" "two scalars"
   , TypeRow "PreparedGrowth" "a handle (abstract)" "the service, in a growth outcome" "its service identity, in the one place (`ownsPrepared`), and the current preparation" "scalars"
@@ -210,6 +213,30 @@ spec = describe "Storage backend: the public boundary" $ do
   it "has a row in the type table for every type the public module exports, and for nothing else" $ do
     exported ← exportedTypes
     sort exported `shouldBe` sort (map tName typeTable)
+
+  describe "the configuration, the one caller input that is retained for the life of the service" $ do
+    let config names = mkStorageConfig names minHeadroomBytes
+        name n = BC.replicate n 'e'
+    it "accepts the most names of the longest length, and only printable non-space ASCII at either end of the range" $ do
+      config (replicate maxQualifiedNames (name maxQualifiedNameBytes)) `shouldSatisfy` either (const False) (const True)
+      config ["!", "~", "apfs", "fuse.gocryptfs", "ext4"] `shouldSatisfy` either (const False) (const True)
+      config [] `shouldSatisfy` either (const False) (const True)
+    it "refuses one name too many, and an unbounded list without walking it" $ do
+      config (replicate (maxQualifiedNames + 1) "ext4") `shouldBe` Left TooManyQualifiedNames
+      -- an infinite list: the walk stops one name past the limit
+      r ← bounded (evaluate (config (repeat "ext4")))
+      r `shouldBe` Left TooManyQualifiedNames
+    it "refuses an empty name and a name one byte too long, with the length" $ do
+      config ["apfs", ""] `shouldBe` Left QualifiedNameEmpty
+      config [name (maxQualifiedNameBytes + 1)] `shouldBe` Left (QualifiedNameTooLong (maxQualifiedNameBytes + 1))
+      config [name (maxQualifiedNameBytes + 1000)] `shouldBe` Left (QualifiedNameTooLong (maxQualifiedNameBytes + 1000))
+    it "refuses a name with a byte no filesystem type name has: a space, a control byte, NUL, DEL, a byte above ASCII" $
+      forM_ [" ", "a b", "a\nb", "a\0b", "a\x7f", "caf\xc3\xa9", "\t"] $ \bad →
+        config [BC.pack bad] `shouldBe` Left QualifiedNameNotPrintable
+    it "still refuses a headroom below the minimum first, whatever the names are" $
+      mkStorageConfig [] (minHeadroomBytes - 1) `shouldBe` Left (HeadroomBelowMinimum (minHeadroomBytes - 1))
+    it "keeps the names it was given, in order, as its own copies" $
+      fmap scQualified (config ["apfs", "ext4"]) `shouldBe` Right ["apfs", "ext4"]
 
   it "has every function that takes a handle in the sweep" $ do
     exported ← exportedFunctions

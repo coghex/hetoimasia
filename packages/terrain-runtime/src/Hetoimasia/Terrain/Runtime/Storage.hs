@@ -60,6 +60,8 @@ module Hetoimasia.Terrain.Runtime.Storage
   , StorageConfigError (..)
   , defaultQualified
   , minHeadroomBytes
+  , maxQualifiedNames
+  , maxQualifiedNameBytes
 
     -- * Handles
   , Backing
