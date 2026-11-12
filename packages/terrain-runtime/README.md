@@ -1152,15 +1152,15 @@ transaction on them, so no credit is taken twice or released twice.
 
 | State | Owner and writers | Readers | Thread | Bound | Release |
 | --- | --- | --- | --- | --- | --- |
-| The descriptor of a backing | The backing entry, from the open job's success to `closeBacking`; only a worker touches it | The two workers | Workers | One per arena (four) | Closed once, by `closeBacking`, after its jobs and borrowers have retired; the entry MOVES into a closing record that keeps every charge it paid for until the native close has returned (shutdown joins it); a failed close is reported, never retried |
+| The descriptor of a backing | The backing entry, from the open job's success to `closeBacking`; only a worker touches it | The two workers | Workers | One per arena (four) | Closed once, by `closeBacking`, after its jobs and borrowers have retired; the entry MOVES into a closing record that keeps every charge it paid for until the native close has returned, and its control grant until the close's diagnostics are done (shutdown joins it); a failed close is reported, never retried |
 | The file | The backing; unlinked at creation, so it lives until the last close | Borrowers | Any | The allowance (64 MiB to the configured size, 1 GiB by default) | Reclaimed by the filesystem after the last close |
 | A job record (queued, running or finished) | `submit*` creates and charges it; the workers complete it; `withOutcome`, `discardTicket` or the close retires it | The submitter | Callers, workers | 8 queued, 2 running, 32 records in all | Credits released at retirement |
 | A read's transfer buffer and result | Charged at dispatch (staging for the buffer, the cache for the result copy); the service owns the bytes until retired | `withOutcome`'s body | Worker, caller | One page to 1 MiB per running read | Staging at the end of the transfer; the cache at retirement |
 | A write's pages | The transaction (already accounted); the job only references them | The worker | Worker | 256 pages, 1 MiB | With the transaction |
 | The volume's reservation coordination | The service; one holder at a time per volume | Workers | Workers | One per volume | Released on every exit of a reservation |
 | A prepared growth and a pending reservation | The backing entry | The owner | Worker, owner | One each | Committed or abandoned by the owner; the pending record until a retry or the close; a preparation nobody received becomes a pending reservation |
-| A closing record | The service, from the claim of a backing until its close has ended: the native close and then its diagnostics | Shutdown (joins it, and the seal waits for it) | Closing caller | One per backing being closed | Pays every charge until the native close has returned; one transaction then releases the grant and the volume reservation and keeps a failing close; the record then only holds the service open (`CrReporting`) through the diagnostics and is deleted in a second transaction |
-| A kept failure (a cleanup nobody received, or a close that failed) | The service's evidence | The scope that ends the service | Any | At most 64, charged `keptEntryBytes` (1,536) each, a cleanup note or the typed failure of a close (the backing, and the errno or the bounded text of the exception); more are counted | Composed into the scope's failure at the end (a close as `BackingCloseFailed` or `BackingCloseRaised`), its charge released in the seal transaction |
+| A closing record | The service, from the claim of a backing until its close has ended: the native close and then its diagnostics | Shutdown (joins it, and the seal waits for it) | Closing caller | One per backing being closed, bounded by the control account (it keeps the backing's grant: `backingRecordBytes`) | Charged for as long as it lives: once the native close has returned one transaction releases the volume's reservation and keeps a failing close, and the record (`CrReporting`) CARRIES the backing's grant through the diagnostics until the transaction that deletes it releases it |
+| A kept failure (a cleanup nobody received, or a close that failed) | The service's evidence | The scope that ends the service | Any | At most 64, charged `keptEntryBytes` (2,048) each, a cleanup note or the typed failure of a close (the backing, and the errno or the bounded text of the exception); more are counted | Composed into the scope's failure at the end (a close as `BackingCloseFailed` or `BackingCloseRaised`), its charge released in the seal transaction |
 
 **Handles are opaque.** A `Backing` names no descriptor: the service resolves it, so a closed,
 foreign or reused handle is refused before any I/O, and a descriptor number reused by a later file
@@ -1275,26 +1275,61 @@ proceed beside it. Camera reads cannot take the protected 4 MiB of staging. A re
 nothing. The 8 MiB protected allocator allowance of the model stays inside the allowance; the backend
 neither enlarges it nor bypasses the model.
 
-Every thing the service holds is charged at what it holds, through one gate each, and every figure is
-measured against the live heap (`Test.TerrainRuntime.Storage.Memory`), never reasoned from an encoded size:
+Every thing the service holds is charged at what it holds, through one gate each, and every figure is measured against
+the live heap (`Test.TerrainRuntime.Storage.Memory`), never reasoned from an encoded size.
 
-| Held thing | Charged to, and when | Figure | Measured row (200-repeat minimum to maximum, `Memory.hs`) |
-| --- | --- | --- | --- |
-| A job record (queued, running or finished), per ticket | control, from submission to retirement (`admitJob`, `jobCharge`) | `jobRecordBytes` 4,096 | largest queued read 576 to 1,058; largest queued open, a 512-byte path of its own, 1,101 to 1,585; the largest of those plus the largest retained outcome (a `Failed` of 256 four-byte characters and 4 notes) 2,388 to 2,416 |
-| A write's report | control, at admission, with the record: `writeEntryBytes` 112 a staged page and `writeFailureBytes` 512 for the one failure | 29,184 + 4,096 at 256 pages: 33,280 | the report of 256 pages, standalone, 20,541; with its first page failed, 20,709; a running write holding 255 results 28,824 to 28,904 |
-| A read's transfer buffer while it runs | staging (camera work the unprotected share only), at dispatch (`dispatchNext`) | `transferBufferBytes n` | two held 256-page reads, per read with its record: 1,065,392 (constant) of 1,089,536 |
-| A read's result until it is taken or discarded | cache, pinned, at dispatch | `resultPageBytes` 4,864 a page | a finished, untaken 256-page result with its record: 1,096,392 to 1,128,272 of 1,249,280 |
-| A backing's record (per arena) | control, from the open's success to the end of its native close (`register`, `finishClosing`), all or nothing | `backingRecordBytes` 4,096 | the largest entry variant as a value, with its backing-map and volume-ledger nodes: 324 to 329; the service-level cross-check (the least of 15 open and close samples) 1,984 to 2,280; the closing record, the same entry moved and not copied: 1,744 to 2,272 |
-| Every other retained outcome | inside the job record | `jobRecordBytes` | the largest record plus a retained `Opened` 1,180 to 1,242, `GrowthPrepared` 1,204 to 1,266, `Released` or `GrowthNoChange` 1,068 to 1,130, `Cancelled` with 4 notes 1,324 to 1,352 |
-| A kept failure (a cleanup nobody received, or a close that failed) | control, while kept | `keptEntryBytes` 1,536 | per entry with the list full (64 asserted kept), the largest instance: a close that RAISED with a 256-character text of four-byte characters, 188 to 1,326 |
-| A write's pages | nothing: the transaction's own, already accounted in its reservation, referenced and never copied | n/a | n/a |
+**How a row is measured (rewritten in round 5).** The difference of two readings of the live heap (two major
+collections each) is a measurement only above a **noise floor**, which the suite measures in the process: two readings with
+nothing between them, and two around a change that leaves nothing behind (300 samples each after a discarded warm-up);
+1,080 to 1,208 bytes on both hosts (one spike of 8,768 in 60,000 samples on Linux). The first version of these rows
+measured a handful of structures in the service and took the least of fifteen samples ("noise only adds"): on the CI
+runner (Linux) the difference was negative, in one run the least sample was -6,792, a running write measured -2,184 and
+a closing record 0 (a `max 0` clamp), and all of them *passed* as "at most the charge". The rule now:
 
-A kept failure was first charged 320 on a measurement of 196 to 245; the strictness work of round 4 found that a lazy kept entry,
-the stop reason and the defect text each retained the exception text they were sliced from (the measurement grew with the
-length of that text when the text was lengthened), so they are now evaluated copies (`T.copy`, forced when kept), and
-the row is measured at its largest instance and charged 1,536 (largest measured 1,326, 0.86 of the charge).
+* **Every asserted row has a signal at least 50 times the floor** (`checkSignal`, printed as `memory signal | row | instances |
+  signal | floor`): a structure built **standalone, N at a time**, with N raised until the total added reaches the signal (up
+  to 60,000), or a structure that is already large (a transfer buffer, 1 MB; a result, 1.1 MB). The standalone rows rebuild what
+  the service holds per element with the constructors the service uses: the job table node, the queue element and the
+  admission's own entry for the grant (a job); the backing map's node, the volume ledger's node and the grant's entry (an entry,
+  a closing record, **a reporting record**); the list cell and the grant (a kept failure). The built value is held live across
+  the second reading through a cell (an evaluated thunk drops what it was built from: a closure over a structure measured
+  zero, and the rule caught it).
+* **No row passes vacuously**: a measured value of zero or below fails (`max 0` and the least-of-N are gone), and a signal below
+  the multiple fails; both are shown on values (`rulesSpec`).
+* **The service itself is held against the model** where its own bounds give the signal: K = 24 finished, **untaken** write
+  reports held at once, produced by real jobs, the test's own pages and the harness's log of native calls dropped before the
+  second reading; asserted at most the charge and within 15 percent of the standalone row for the same structure, for the
+  all-written and the first-page-failed variants. A service-level reading that cannot reach the signal (eight queued records,
+  one backing, a running write) is **printed as an observation and never asserted**.
 
-Every row was run 200 times in one process: all passed. What varies is the live heap a reading shows (a pinned object keeps its whole block live, a collection's timing); the retained-outcome rows are measured as standalone values so they do not move, the held buffer is deterministic, the rows that spread keep a margin of at least 10 percent of their charge, and the one row whose samples are independent opens takes the least of 15 (noise only adds) with a guard that it is at least the standalone entry.
+| Held thing | Charged to, and when | Figure | Standalone row, 200 repeats, both hosts (minimum to maximum) | In the service, held at once |
+| --- | --- | --- | --- | --- |
+| A job record (queued, running or finished), per ticket | control, from submission to retirement (`admitJob`, `jobCharge`, kept as `jCharge`) | `jobRecordBytes` 4,096 | a queued read 537 to 538; a queued open, a 512-byte path of its own, 1,118 to 1,137; with the largest retained outcome: `Opened` 1,255 to 1,276, `GrowthPrepared` 1,280 to 1,300, `Released` or `GrowthNoChange` 1,142 to 1,163, `Cancelled` with 4 notes 1,353 to 1,373, `Failed` (a 256 four-byte-character text, 4 notes) 2,452 to 2,472 | an observation only |
+| A write's report | control, at admission, with the record: `writeEntryBytes` 112 a staged page and `writeFailureBytes` 512 for the one failure | 29,184 + 4,096 at 256 pages: 33,280 | the report of 256 pages written 16,496 to 16,501; with its first page failed 16,649 to 16,654; a queued write job 322 to 481; a running write (record and 255 results) 16,611 to 16,616 | **24 finished untaken reports: 15,410 to 16,739 a job (all written), 15,684 to 17,786 (first page failed)**, at most 17,136 modelled (ratio 0.91 to 1.04) |
+| A read's transfer buffer while it runs | staging (camera work the unprotected share only), at dispatch (`dispatchNext`) | `transferBufferBytes n` | n/a: 1 MB, above the floor in the service | two held 256-page reads, per read with its record: 1,055,868 to 1,067,300 of 1,089,536 |
+| A read's result until it is taken or discarded | cache, pinned, at dispatch | `resultPageBytes` 4,864 a page | n/a | a finished, untaken 256-page result with its record: 1,077,816 to 1,132,048 of 1,249,280 |
+| A backing's record (per arena) | control, from the open's success to `endClosing` (`register`, then the closing record) | `backingRecordBytes` 4,096 | the entry at its largest variant (`GReleasing (Just prepared)`, a pending reservation) with its backing-map node, its volume-ledger node and its grant's entry 388 to 505 | an observation only (one backing is below the floor) |
+| A closing record | control, the same grant | `backingRecordBytes` 4,096 | native close pending (the entry moved, per backing) 402 to 502; **reporting (the carried grant, per record) 217 to 275** | the pressure example (below) |
+| A kept failure (a cleanup nobody received, or a close that failed) | control, while kept | `keptEntryBytes` 2,048 | the largest instance, a close that RAISED with a 256-character text of four-byte characters, with its list cell and its grant's entry: 1,517 (constant) | 64 asserted kept |
+| A write's pages | nothing while the job is queued or running: the transaction's own, already accounted in its reservation, referenced and never copied; **nothing once the job has finished** (`scrubWork`) | n/a | n/a | the finished-report row above |
+
+Two figures moved or were corrected in round 5. `keptEntryBytes` is **2,048** (it was 320, then 1,536): the largest instance now
+includes the admission's entry for the grant (1,517 where 1,326 left it out), which would have been 1.2 percent under 1,536. The
+write report's standalone row is **16.5 KB, not 20.6 KB**: the old model was itself lazy (a page-number thunk per entry) and
+overstated; the standalone instances now go through the same `forceOutcome` the service applies.
+
+**The old running-write reading, explained.** The first rows read a running write held at its last page at 25 to 29 KB in the
+service where the standalone model says 16.6 KB. The difference of the same job held at its last page and at its first page is
+24,496 bytes; the harness's own log of the 255 native writes (the probe records every call) is 12,361 of them (measured as a
+standalone value), and the rest, 12,135, is the 255 results at 48 bytes each (a cons cell and a pair: while the job runs the
+results share the page number with the owner's staged page; the model's 64 bytes include the page-number box a *retained* report
+owns once the transaction has ended, so it is the right figure for the retained report). **The same state read twenty times is
+stable in 191 of 200 repeats (12,984) and steps by 31.5 to 31.9 KB to 44.5 to 44.9 KB in 9 repeats on macOS and 3 on Linux: one
+32 KiB stack chunk of the worker.** That step is what made the in-service differences negative on the CI runner: a blocked
+worker's stack is present in one reading and not the other. The running-write reading is therefore an observation, and its bound is
+carried by the standalone row and by the finished report against the 33,280 charge. The Linux validation host (the Lima guest) is
+**aarch64**; the CI runner is **x86_64**: the failure of the old rows reproduced on the guest, but the x86_64 figures were not
+measured here.
 
 A read's buffer and its result are two physical copies at the moment of completion, so both are
 charged from dispatch. A job whose dispatch would need an **eviction** is not dispatched: `A.reserve`
@@ -1341,7 +1376,7 @@ another growth, until `submitReleasePending` succeeds or the close releases it w
 
 ### Ownership at every instant, exceptions included
 
-A typed failure is not the only way out. Rounds 2, 3 and 4 of review found one class under eighteen findings:
+A typed failure is not the only way out. Rounds 2, 3, 4 and 5 of review found one class under nineteen findings:
 *an exit, a release or a failure taken between a state change and the bookkeeping that completes it*. Each
 exit of a thing the service holds now has **one mechanism that owns it**, and every table below enumerates
 every member of its class (the ones generated from code are marked, and the suite fails to compile when a
@@ -1363,7 +1398,8 @@ charge; the others own nothing.
 **3. A charge ends when what it pays for is gone.** A backing claimed for close MOVES whole into a closing
 record (`stClosingRecs`): its grant, its volume contribution, its pending reservation and its descriptor, and
 nothing is released by the claim. One transaction after the native close has returned (`finishClosing`)
-releases the grant, subtracts the reservation and deletes the record; the drain joins the records. The same
+subtracts the reservation and keeps a failing close, and the record (reporting) CARRIES the grant until the
+transaction that deletes it (`endClosing`) releases it; the drain joins the records. The same
 question was asked of every other release (below) and none releases before the native call that frees the
 thing has returned. The table is `Lifecycle.chargeRow` (total over `ChargeKind`) and the suite holds each
 native call and asserts both ledgers *during* it:
@@ -1373,7 +1409,7 @@ native call and asserts both ledgers *during* it:
 | JobRecord | the job's record (and a write's report metadata) | retireJob, after the outcome is taken or disposed of | the record is deleted in the same transaction; no native thing is behind it |
 | DispatchStaging | a read's transfer buffer | finishJob, when the job ends | execute has returned: the native read is over and the buffer is released |
 | ResultBytes | a finished read's result copy (cache, pinned) | retireJob | the bytes are dropped with the record when the outcome is taken or discarded |
-| BackingRecord | a backing's entry, descriptor and file | finishClosing, one transaction after the native close has returned | the descriptor is closed: the closing record held the grant until then |
+| BackingRecord | a backing's entry, descriptor and file | endClosing, the one transaction that deletes the closing record, after the native close has returned and the close's diagnostics are done | the descriptor is closed and nothing of the close is left: the closing record, reporting or not, carried the grant until then |
 | VolumeReserved | the file's length and any pending extra on the volume | finishClosing (a close), execRelease (a release) | the native close, or the release's set-length, has returned |
 | PendingReservation | an extra range a failed release left allocated | execRelease on success, finishClosing | the retried release's set-length has returned |
 | GrowthExtra | an abandoned or failed growth's extra range | execRelease and giveBack on success | the set-length that frees it has returned: until then the extra stays counted |
@@ -1386,7 +1422,7 @@ cleanup failure of that step and never an exit that skips the next:
 | `execOpen` unwind | unlink retry; the one close of the descriptor (recorded as attempted before it is made) | a cleanup note of the step (errno -1); the close is never repeated |
 | `giveBack` (a growth that did not publish) | the release of the extra range | a release that failed: the extra stays pending and charged |
 | `execRelease` | the release | the same; the exception propagates with its context after the pending record is made |
-| `closeBackingCore` | the claim (the entry moves into the closing record, `CrNative`); the one native close; `finishClosing` (ONE transaction: release the grant, subtract the volume reservation, KEEP a failing close, mark the record `CrReporting`); three diagnostics; `endClosing` (ONE transaction deleting the record) | the close's exception is recorded, never retried, and kept like any failure; `finishClosing` precedes the diagnostics, and the record outlives them |
+| `closeBackingCore` | the claim (the entry moves into the closing record, `CrNative`); the one native close; `finishClosing` (ONE transaction: subtract the volume reservation, carry the grant on the reporting record, KEEP a failing close, mark the record `CrReporting`); three diagnostics; `endClosing` (ONE transaction deleting the record) | the close's exception is recorded, never retried, and kept like any failure; `finishClosing` precedes the diagnostics, and the record outlives them |
 | `drainService` | closing admission; stopping the workers; joining them; closing every backing; joining the closing records (and saying so before it waits); disposing of every record; the SEAL (one transaction: every closing record has ended, the kept failures are read and their charges released, the phase becomes `Sealed`); composing the evidence | each wait is in the protected boundary; a cancellation is remembered (first wins) and delivered after the drain |
 | start sequence | stop every started worker; join every started worker | a cancellation of either is remembered; the primary failure propagates |
 
@@ -1490,7 +1526,7 @@ discipline, each with its proof:
 | The primary failure and the labelled cleanup failures are composed | `composeCleanup`, `cleanupFailuresInContext` | Lifetime "keeps the primary failure and the cleanup failure of a close, and a defect stops the service"; "attempts the descriptor's close even when the unlink cleanup throws (twice)"; the cleanup-exception cells |
 | Nothing is dropped | the one keeper, counted drops | the keeper examples (a discarded open whose close fails; a close with a cancellation instead of its report; 64 kept and the rest counted; a close that RAISED keeps its typed identity) |
 | A failed close always ends the scope with its typed failure | `finishClosing` keeps it inside the core; the report is a copy | Lifetime "never closes twice" and the sweep's close rows end with the labelled failure; the discard and `closeBacking` examples with a cancellation pending during a held failing close; "keeps a close that RAISED as its own typed failure" |
-| The service cannot end, nor its logger be used, while a close is in its diagnostics | the closing record lives through them (`CrReporting`); the drain and the seal join it | "keeps a close tracked through its post-native diagnostics" (the diagnostic held, the drain observed waiting by its own log, then released) |
+| The service cannot end, nor its logger be used, while a close is in its diagnostics, and the records a held logger can leave are bounded | the closing record lives through them (`CrReporting`) CARRYING the grant; the drain and the seal join it | "keeps a close tracked through its post-native diagnostics" (the diagnostic held, the drain observed waiting by its own log, then released); "charges a closing record for as long as it lives" (repeated open, take and close against a held logger meets pressure) |
 | Nothing commits to a service after its scope ended | the seal transaction and `SealedMutation` | the sealed-service example over every public mutator (the table in item 14) |
 
 **11. A real failure of `close` cannot be induced, and the policy that follows.** On the two qualified
@@ -1538,11 +1574,18 @@ the result is lost, so the service keeps the extra as a pending reservation alth
 **over-count, never an under-count**, recoverable by an explicit release (the sweep asserts the figure covers what is
 physical, and that a larger one is a pending reservation).
 
-**13. The close core owns everything until it returns** (`closeBackingCore`; round 4, finding 2). In order, masked
-end to end: the claim moves the entry whole into `stClosingRecs` as `CrNative` (every charge stays paid); the **one**
-native close (uninterruptible, its hooks inside); ONE transaction, `finishClosing`, releases the grant, subtracts the
-volume reservation, **keeps a failing close in the evidence** and marks the record `CrReporting` (it no longer pays);
-the diagnostics, through `quietly`; ONE transaction, `endClosing`, deletes the record; return. Shutdown joins the records
+**13. The close core owns everything until it returns, and a record is charged for as long as it lives**
+(`closeBackingCore`; round 4 finding 2, reversed in part by round 5). In order, masked end to end: the claim moves the entry
+whole into `stClosingRecs` as `CrNative` (every charge stays paid); the **one** native close (uninterruptible, its hooks
+inside); ONE transaction, `finishClosing`, subtracts the volume reservation (the space is free; the node leaves the ledger at
+zero), **keeps a failing close in the evidence** and marks the record `CrReporting`, **which carries the backing's control
+grant**; the diagnostics, through `quietly`; ONE transaction, `endClosing`, releases that grant and deletes the record;
+return. **Round 4 had released the grant at `finishClosing` ("a reporting record no longer pays"): that was wrong.** With a
+logger held on the log "Backing closed", a caller could open, take and close again and again: each native close freed its
+credits for the next open and left one more uncharged reporting record and blocked close behind, bounded by nothing. The
+records are now bounded by the control account like every other record: a held logger meets pressure (a typed
+`BusyNow (AccountPressure _)` for the next open), asserted by a test that narrows the account to three backing records,
+holds the log, repeats open, take and close until the refusal, and checks the account and the invariants at every step. Shutdown joins the records
 in its explicit wait and again in the seal, so the service cannot end, and its logger cannot be used after its scope,
 while a close is in its diagnostics. The keeping is inside the core (item 6): a failed close always ends the service's
 scope with its typed failure, whoever asked, and the `CloseReport` a caller receives is a copy. `discardTicket` is masked
@@ -1604,6 +1647,72 @@ the job finished as a failure, the service stopped, the invariants hold). The cl
 returns**; the examples hold exactly that (a failing native close held, a cancellation pending, the close returning its
 error, the cancellation delivered after, the failure kept and the record gone).
 
+**18. The service retains only evaluated values** (`forceOutcome`, `scrubWork`, `forceSpine`; round 5). A thunk is a hidden
+reference to what it was built from, and a record that keeps one keeps all of it, uncharged. The round 4 write report was the
+instance: `execWrite` ended a failed or cancelled write with `reverse acc <> [(q, NotAttempted) | (q, _) <- (p, bytes) : rest]`,
+and a strict field forces only the first cell, so the finished job retained a thunk that held `rest`, **the staged pages with
+their bytes** (about 1 MiB a job, measured: 1,034,851 bytes a job with 24 held untaken), for as long as the outcome was untaken
+and after the transaction that owned those buffers had ended. Looking for it found a second retention: the finished job's own
+work (`WWrite sw`) kept the staged pages (1,050,673 bytes a job), and a first scrub that replaced the bytes still kept a 256-cell
+list of pairs (12 KB a job). Now: `finishJob` stores an outcome only after a total walk of it (`forceOutcome`: every list to its
+end and each element, the pages of a read, the report's pages and results, the notes, a failure through its derived `Show`,
+which reaches the `Maybe` contents and `String`s the strict fields do not), `execWrite` builds its report completely, a finished
+job drops its work to its shape (`scrubWork`: no pages, no list; the record keeps what it paid as the number `jCharge`).
+Every other retained record, the fields that could hold a thunk and what forces them:
+
+| Record | Fields that could hold a thunk | What forces them |
+| --- | --- | --- |
+| a job at admission | `jBacking` (it was `Just` of a lazy selection of the id from the `Backing`); the work (the staged pages are the owner's list, shared) | `jBacking` is forced; the owner's list is shared and is dropped at finish |
+| a finished job | the outcome; the work | `forceOutcome`, in the strict `jPhase` that the strict map insert evaluates inside the transaction; `scrubWork` |
+| a backing's entry | `ePending` (`Just (to - from)`, built lazily at three sites: growth commit, abandon, rollback) | forced at each site; every other field is a strict scalar or record, and the growth slot's `PreparedGrowth` is strict |
+| a kept failure | the evidence list's spine (a lazy `<>` chain); the close's text | `forceSpine`; an evaluated copy forced when kept |
+| a closing record | none | `CrNative !Entry`, `CrReporting !Grant` |
+| the stop reason, the defect text | the text | evaluated copies (`T.copy`) forced when stored |
+| the shared admission | not this module's | not changed |
+
+The measurement that found it is a test, not a reading: the standalone model of the report, **validated against real jobs held
+untaken** (the row table above), with two controls: the outcome not walked and the report built lazily makes the first-page-failed
+row read 1,034,851 bytes a job and fail, and a finished write that keeps its pages makes the all-written row read 1,050,673 and fail.
+The validation found three flaws in the test itself, each of which would have hidden the finding: the standalone model was lazy
+(it overstated by 4 KB), `bigWrite` took no argument so the compiler floated its page list out as ONE shared constant (every write
+shared the same pages), and the harness's log of native calls keeps 256 entries a write (the test's memory, not the service's).
+
+**19. Every container the service holds is bounded and charged, and so is every thread it can be asked to hold** (round 5).
+Each container and counter of the service's state, what bounds it, what pays for each element, where the charge is taken and
+released, and the proof (the invariant checker asserts the bound at every checkpoint of the matrix, the sweep, the property, the
+exits and shutdown):
+
+| Container | Bounded by | Charge per element | Taken by | Released by | No element outlives its charge: |
+| --- | --- | --- | --- | --- | --- |
+| jobs | `maxJobRecords` (32) and the control account | `jobCharge` in `jControl` (4,096; a write adds its report metadata) | `admitJob`, with the insertion | `retireJob`, with the deletion | the control equation (the sum of the records' charges) |
+| queue | `maxQueuedJobs` (8); its elements are live jobs' ids | inside the job's record | `admitJob` | `withdrawQueued`, `dispatchNext` | queued <= 8 and equals the queued jobs |
+| backings | the control account | `backingRecordBytes` in `eGrant` | the open's registering transaction | not at the close claim (the entry MOVES); `endClosing` | the control equation |
+| closing records, native | the same account | the same grant | the claim (the move) | `endClosing` | the control equation; the descriptor bounds |
+| closing records, **reporting** | the same account | **the same grant, carried** | `finishClosing` | **`endClosing`, with the deletion** | the control equation; the pressure example |
+| evidence | `maxKept` (64), drops counted | `keptEntryBytes` in the `Kept` | `keepEvidence`, with the insertion | the seal transaction | evidence <= 64; the equation; the sealed example |
+| the volume ledger | one node per volume with a contribution | inside `backingRecordBytes` (a node per backing, conservatively) | the open's registration | `subReserved`: **the node leaves the map at zero** | no node at zero (round 5 found one that stayed after the last close); the reserved-figure equation |
+| busy volumes | one per worker (2) | none: at most the two workers | `withVolume`'s acquire | its bracket | busy <= workers |
+| counters and words (`stNextJob`, `stNextBacking`, `svNames`, `stFair`, `stRunning`, `stWorkers`, `stMutation`, `stEvidenceDropped`) | one machine word each | none | n/a | n/a | not collections |
+| `stDefect`, `stStopReason` | one bounded text each (an evaluated copy), per service | none: a constant of the service | the first reason, the latest defect | the service's end | one value |
+
+The dual: every place a thread of a caller or a worker can be held by something the service does not control (a logger sink, a
+seam hook, a callback body), the record that exists while it is held, and what that record is charged:
+
+| A thread held in | The record while it is held | Charged |
+| --- | --- | --- |
+| a log sink after the native close (a closing caller: `closeBacking`, `discardTicket`, `runJob`'s discarded open, a failed delivery, the drain) | the reporting closing record | `backingRecordBytes`, carried (it was **uncharged** in round 4: the finding) |
+| a seam hook inside the native close | the native closing record | `backingRecordBytes` |
+| the claim, waiting for jobs and borrowers | the entry in the backing map (closing); the waiter is a blocked retry with no record | `backingRecordBytes` |
+| a worker in a seam hook inside a job's native call | the running job | `jobCharge` (and the buffer and result of a read) |
+| a worker in "Backing opened", "Storage worker defect" or "Open cleanup step raised" | the finished job's outcome until it is taken | the job record; the worker is one of two |
+| a caller inside a `withOutcome` or `withUse` body | counters on the job and the entry | their own |
+| an open in a hook before its registration | the running job, and the file owned by `execOpen` (at most one per worker) | `jobCharge` (the backing record is charged at registration, all or nothing) |
+| the drain in a log or a protected wait | none (the phase is closing) | n/a |
+| `startWorkers` in the start hook | the worker counter | n/a (at most 2) |
+| `withVolume`'s wait | the busy-volume set | none |
+
+Round 5 found two members unbounded or outliving their charge: the reporting closing record and the volume ledger's node.
+
 Smaller rules that hold the same class:
 
 * **Open.** From the moment the file exists until the one transaction that registers it, `execOpen` owns the
@@ -1631,7 +1740,8 @@ run anywhere else. The storage examples hold the class of defect, not the instan
   `GrowthPrepared` outcome implies a `GPrepared` slot; the open descriptors lie between the tracked backings and
   the tracked plus the closing plus the running opens; every volume's reserved figure equals the contributions of
   its backings **and closing records**; the control charge equals the jobs' charges plus the backing and closing
-  records plus the kept failures; the staging and cache charges equal exactly the running and held reads'; the
+  records (**reporting ones included**) plus the kept failures; no volume node at zero, at most `maxJobRecords` job records, at
+  most `maxQueuedJobs` queued and no more busy volumes than workers; the staging and cache charges equal exactly the running and held reads'; the
   borrow counts equal the live borrowers; the queue, running and mutation counts equal the table's; admission
   open implies both workers alive; running jobs do not exceed workers alive; the evidence holds at most 64.
 * **The lifecycle matrix** (`Lifecycle`): 6 kinds of work (open, read, write, grow, abandon, release a pending
@@ -1763,8 +1873,12 @@ run anywhere else. The storage examples hold the class of defect, not the instan
   observed 33,681,408-byte residue passes, new allocation fails, lost coverage fails, a consumed residue fails, a
   decrease that still covers passes, a refused growth that changed the file fails). Not routine-testable, and stated:
   that the probe examples call the verdicts at the right points (they run only on a real fixture).
-* **The memory rows** (`Memory`): every retained structure at its largest, measured by forced live heap, each
-  asserted measured <= charged, run 200 times in one process (the table under Scheduling and accounting).
+* **The memory rows** (`Memory`): the noise floor, then every retained structure at its largest measured standalone or amplified
+  with a signal 50 times the floor, no vacuous pass, the finished write reports held untaken against the model, run 200 times
+  in one process on both hosts (the table and the method under Scheduling and accounting).
+* **A reporting record is charged** (`Lifecycle`): the control account narrowed to three backing records, the log "Backing
+  closed" held, repeated open, take and close until a typed `BusyNow (AccountPressure _)`, then released: the records end and the
+  account returns to what the test holds.
 * **The property** (`Classes`): 40 seeds by 36 operations over submit, cancel, discard, take, close and shutdown,
   the invariants checked after every step, the admission exactly zero at the end.
 * **Waits are observed, not timed.** A negative ("the close has not returned") is shown by observing the waiting
