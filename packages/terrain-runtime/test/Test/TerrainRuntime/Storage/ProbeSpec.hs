@@ -6,7 +6,10 @@
 -- everything that fills a volume or reserves in it takes the resulting 'Fixture'.
 --
 -- Every record line is printed as @PROBE key=value@ for the evidence write-up.
-module Test.TerrainRuntime.Storage.ProbeSpec (probeCases, ProbeCase, FillError (..), fillWith, withFillerWith, withMeter) where
+module Test.TerrainRuntime.Storage.ProbeSpec
+  ( probeCases, ProbeCase, FillError (..), fillWith, withFillerWith, withMeter
+  , ExhaustionBad (..), exhaustionVerdict, RewriteBad (..), rewriteVerdict, GrowthBad (..), growthVerdict
+  ) where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (atomically)
@@ -113,10 +116,23 @@ probeCases =
           -- the rest of the volume is consumed in a filler file the probe owns, until the platform refuses
           withMeter fx $ \meter -> withFiller fx meter $ \filler -> noCreateWhile env $ do
             record "exhausted.filler.bytes" (show filler)
-            -- previously written pages are rewritten across the whole reserved range: it must need no new allocation
+            -- THE STATE THE CLAIM IS MADE IN: the backing's own allocation covers the whole allowance (read by fstat
+            -- on its descriptor), recorded
+            allocBefore <- allocatedOf fd
+            record "rewrite.backing.allocated.before" (show allocBefore)
+            allocBefore `shouldSatisfy` (>= size)
+            availBefore <- availableOf meter
+            -- previously written pages are rewritten across the whole reserved range
             timed "rewrite.exhausted" (pattern' fd size 2)
             verify fd size 2
-            record "rewrite.within.reservation" "no new allocation needed"
+            -- THE CLAIM, measured: the rewrite allocated nothing (the backing's allocation is unchanged) and consumed
+            -- none of the volume's remaining space (a rewrite that had to allocate would have consumed the residue)
+            allocAfter <- allocatedOf fd
+            availAfter <- availableOf meter
+            record "rewrite.backing.allocated.after" (show allocAfter)
+            record "rewrite.available.consumed" (show (toInteger availBefore - toInteger availAfter))
+            either (fail . show) pure (rewriteVerdict allocBefore allocAfter availBefore availAfter)
+            record "rewrite.within.reservation" "allocation unchanged, no space consumed"
     
     )
   , ("refuses to grow when the volume is exhausted, keeping the old data and size, and grows when there is room", \acquire -> do
@@ -128,9 +144,15 @@ probeCases =
           [fd] <- fdHandles (envProbe env)
           pattern' fd (cfgAllowanceBytes cfg) 3
           withMeter fx $ \meter -> withFiller fx meter $ \_ -> noCreateWhile env $ do
+            st0 <- statOf fd
             o <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
             o `shouldBeFailure` \f -> case f of ReservationFailed (InsufficientHeadroom {}) -> True; _ -> False
             record "growth.exhausted" "reservation_failed"
+            -- the refusal left the file as it was: its length and its allocation are unchanged
+            st1 <- statOf fd
+            record "growth.exhausted.size.after" (show (nsSize st1))
+            record "growth.exhausted.allocated.after" (show (nsAllocated st1))
+            either (fail . show) pure (growthVerdict (nsSize st0, nsAllocated st0) (nsSize st1, nsAllocated st1))
             verify fd (cfgAllowanceBytes cfg) 3
           g <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
           case g of
@@ -285,6 +307,63 @@ noCreateWhile env act = do
   where
     creates = (\evs -> length [() | OpCreateFile <- evs]) <$> events (envProbe env)
 
+statOf :: Fd -> IO NativeStat
+statOf fd = nativeStat posixNative fd >>= either (\e -> fail ("fstat failed: " <> show e)) pure
+
+allocatedOf :: Fd -> IO Word64
+allocatedOf = fmap nsAllocated . statOf
+
+-- | Why the exhausted state the examples are made in does not hold. Each is a precondition the platform must STATE.
+data ExhaustionBad
+  = -- | One more native reservation of a single block was GRANTED after the fill: the platform would still allocate.
+    OneMoreBlockGranted
+  | -- | That reservation failed, but not with the platform's out-of-space result.
+    OneMoreBlockFailedOther !Errno
+  | -- | The volume reports at least the bound available: the bound the refused growth relies on does not hold.
+    ResidueTooLarge !Word64
+  deriving stock (Eq, Show)
+
+-- | THE EXHAUSTED STATE, as measurements. After the fill (which ended on the out-of-space result): (a) ONE more native
+-- reservation of a single block, through the same adapter, is refused with the out-of-space errno: the platform's own
+-- statement that it will allocate nothing more; (b) the volume's reported residue is below 64 MiB, the weakest bound the
+-- refused growth (a 64 MiB request) relies on. The residue is NOT a proof that a rewrite needs no allocation: macOS
+-- reports about 32 MiB available that a native allocation of one block is refused for (observed in run bb26a88a, not
+-- explained), which is why the claim "the rewrite needs no allocation" is measured after the rewrite, not inferred
+-- from the residue.
+exhaustionVerdict :: Either Errno a -> Word64 -> Either ExhaustionBad ()
+exhaustionVerdict oneMore residue = case oneMore of
+  Right _ -> Left OneMoreBlockGranted
+  Left e | not (isOutOfSpace e) -> Left (OneMoreBlockFailedOther e)
+  Left _ | residue >= 64 * mib -> Left (ResidueTooLarge residue)
+  Left _ -> Right ()
+
+-- | Why a rewrite is not shown to have needed no new allocation.
+data RewriteBad
+  = -- | The backing's allocated bytes changed across the rewrite.
+    AllocationChanged !Word64 !Word64
+  | -- | The volume's available bytes went down by more than the probe's 4 MiB tolerance: the rewrite consumed space.
+    SpaceConsumed !Integer
+  deriving stock (Eq, Show)
+
+-- | THE CLAIM "the rewrite needs no new allocation", measured: the backing's allocation before and after, and the
+-- volume's available bytes before and after.
+rewriteVerdict :: Word64 -> Word64 -> Word64 -> Word64 -> Either RewriteBad ()
+rewriteVerdict allocBefore allocAfter availBefore availAfter
+  | allocBefore /= allocAfter = Left (AllocationChanged allocBefore allocAfter)
+  | consumed > toInteger (4 * mib) = Left (SpaceConsumed consumed)
+  | otherwise = Right ()
+  where consumed = toInteger availBefore - toInteger availAfter
+
+-- | Why a refused growth is not shown to have left the file untouched.
+data GrowthBad = GrowthChanged !(Word64, Word64) !(Word64, Word64)
+  deriving stock (Eq, Show)
+
+-- | After a refused growth the file's (length, allocated bytes) are what they were.
+growthVerdict :: (Word64, Word64) -> (Word64, Word64) -> Either GrowthBad ()
+growthVerdict before' after'
+  | before' == after' = Right ()
+  | otherwise = Left (GrowthChanged before' after')
+
 -- | Why the filler stopped for a reason that is not the volume being full: it must never be taken for exhaustion.
 data FillError
   = -- | The reservation failed with an errno that is not the platform's out-of-space result.
@@ -319,10 +398,10 @@ fillWith native fd = go (64 * mib) 0
 
 -- | Run an action with the rest of the volume's free space consumed by a file of the probe's own, and give the space
 -- back when it ends. Hands over the bytes taken. THE PRECONDITION IS PROVEN, not assumed: the fill ends only on the
--- platform's out-of-space result, and the exhausted state is READ through the meter and asserted before the action
--- runs: less than 4 MiB available, which is far below any range the actions touch (a rewrite of the 64 MiB allowance
--- that needed new allocation would be refused after the first 4 MiB, and the refused growth is a 64 MiB request), so
--- "no new allocation" and "refused under exhaustion" cannot pass with free space left.
+-- platform's out-of-space result; then, BEFORE the action runs, one more block is asked of the platform through the same
+-- adapter and must be refused with that result, and the residue the meter reports is recorded and asserted below 64 MiB
+-- ('exhaustionVerdict'). The residue is the bound the refused growth relies on, not a proof of anything about a
+-- rewrite: that claim is measured after the rewrite ('rewriteVerdict').
 withFiller :: Fixture -> Meter -> (Word64 -> IO a) -> IO a
 withFiller = withFillerWith posixNative
 
@@ -335,9 +414,12 @@ withFillerWith native fx meter = \act -> do
     -- filler's descriptor and so its space, and the examples after this one are not poisoned by it
     filled <- fillWith native fd
     taken <- either (\e -> fail ("the filler stopped for a reason that is not capacity: " <> show e)) pure filled
+    -- the platform's own statement that it will allocate nothing more: ONE more block, through the same adapter
+    oneMore <- nativeReserve native fd taken 4096
     left <- availableOf meter
     record "exhausted.available.bytes" (show left)
-    left `shouldSatisfy` (< 4 * mib)
+    record "exhausted.one.more.block" (either (\e -> "refused " <> show e) (const "GRANTED") oneMore)
+    either (\bad -> fail ("the volume is not shown to be exhausted: " <> show bad)) pure (exhaustionVerdict oneMore left)
     act taken)
   -- a filesystem may give the blocks of a closed, unlinked file back lazily (APFS did, within about a
   -- second): observe, bounded, until the volume reports the space again, and record how long it took

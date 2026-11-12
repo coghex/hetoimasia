@@ -20,6 +20,7 @@ import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
+import Data.List (isInfixOf)
 import Data.Word (Word64)
 import qualified Foreign.C.Error as C
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
@@ -41,7 +42,7 @@ import Test.TerrainRuntime.Storage.Fixture
 import Test.TerrainRuntime.Storage.Harness
 import Test.TerrainRuntime.Storage.Lifecycle (checkInvariants)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate, unlinkFile)
-import Test.TerrainRuntime.Storage.ProbeSpec (FillError (..), fillWith, probeCases, withFillerWith, withMeter)
+import Test.TerrainRuntime.Storage.ProbeSpec (ExhaustionBad (..), FillError (..), GrowthBad (..), RewriteBad (..), exhaustionVerdict, fillWith, growthVerdict, probeCases, rewriteVerdict, withFillerWith, withMeter)
 import Test.TerrainRuntime.Store.Harness (H (..), smallSpec)
 
 mib :: Word64
@@ -146,8 +147,48 @@ fillerClass = describe "(A) the probe's filler" $ do
       let immediately = posixNative {nativeReserve = \_ _ _ -> pure (Left (Errno (let C.Errno n = C.eNOSPC in fromIntegral n)))}
       ran <- newIORef False
       r <- try (withMeter fx (\m -> withFillerWith immediately fx m (\_ -> writeIORef ran True)))
-      (either (\e -> const True (e :: SomeException)) (const False) r) `shouldBe` True
+      -- it fails for THE reason: the residue the meter reports is far above the bound the refused growth relies on
+      either (\e -> show (e :: SomeException)) (const "passed") r `shouldSatisfy` ("ResidueTooLarge" `isInfixOf`)
       readIORef ran >>= (`shouldBe` False)
+  it "a platform that would still allocate one more block after the fill is not exhausted: the precondition fails before the action runs" $
+    withSystemTempDirectory "hetoimasia-terrain-filler4" $ \dir -> do
+      fxe <- acquireFixture (Policy maxBound False) dir
+      fx <- either (\e -> fail ("fixture refused: " <> show e)) pure fxe
+      calls <- newIORef (0 :: Int)
+      -- three whole chunks, the halving down to one block refused (fifteen refusals), then the single block ASKED AFTER
+      -- THE FILL is granted
+      let granting = posixNative
+            { nativeReserve = \_ _ n -> do
+                k <- atomicModifyIORef' calls (\i -> (i + 1, i))
+                pure (if k < 3 || k >= 18 then Right n else Left (Errno (let C.Errno e = C.eNOSPC in fromIntegral e)))
+            , nativeSetLength = \_ _ -> pure (Right ())
+            }
+      ran <- newIORef False
+      r <- try (withMeter fx (\m -> withFillerWith granting fx m (\_ -> writeIORef ran True)))
+      either (\e -> show (e :: SomeException)) (const "passed") r `shouldSatisfy` ("OneMoreBlockGranted" `isInfixOf`)
+      readIORef ran >>= (`shouldBe` False)
+  it "judges the exhausted state by the platform's own statement: one more block must be refused with the out-of-space result, and the residue stays below the bound the refused growth relies on (the 32 MiB APFS reports passes)" $ do
+    let enospc = Errno (let C.Errno n = C.eNOSPC in fromIntegral n)
+        ioErr = Errno (let C.Errno n = C.eIO in fromIntegral n)
+        mib' = 1024 * 1024 :: Word64
+    exhaustionVerdict (Left enospc :: Either Errno ()) 0 `shouldBe` Right ()
+    exhaustionVerdict (Left enospc :: Either Errno ()) 33681408 `shouldBe` Right ()
+    exhaustionVerdict (Left enospc :: Either Errno ()) (64 * mib') `shouldBe` Left (ResidueTooLarge (64 * mib'))
+    exhaustionVerdict (Right 4096 :: Either Errno Word64) 0 `shouldBe` Left OneMoreBlockGranted
+    exhaustionVerdict (Left ioErr :: Either Errno ()) 0 `shouldBe` Left (OneMoreBlockFailedOther ioErr)
+  it "judges the rewrite by what it did: a changed allocation fails, and so does a consumed residue; an unchanged allocation with the space intact passes" $ do
+    let mib' = 1024 * 1024 :: Word64
+    rewriteVerdict (64 * mib') (64 * mib') (32 * mib') (32 * mib') `shouldBe` Right ()
+    -- the space coming back (a lazy reclaim) or a small reading difference is not a consumption
+    rewriteVerdict (64 * mib') (64 * mib') (32 * mib') (40 * mib') `shouldBe` Right ()
+    rewriteVerdict (64 * mib') (64 * mib') (32 * mib') (30 * mib') `shouldBe` Right ()
+    -- a rewrite that had to allocate: the backing grew, or the residue was consumed
+    rewriteVerdict (64 * mib') (96 * mib') (32 * mib') (32 * mib') `shouldBe` Left (AllocationChanged (64 * mib') (96 * mib'))
+    rewriteVerdict (64 * mib') (64 * mib') (32 * mib') 0 `shouldBe` Left (SpaceConsumed (fromIntegral (32 * mib')))
+  it "judges a refused growth by what it left: the length and the allocated bytes of the file are what they were" $ do
+    growthVerdict (64, 64) (64, 64) `shouldBe` Right ()
+    growthVerdict (64, 64) (128, 64) `shouldBe` Left (GrowthChanged (64, 64) (128, 64))
+    growthVerdict (64, 64) (64, 128) `shouldBe` Left (GrowthChanged (64, 64) (64, 128))
   it "a filler whose reservation fails for a reason unrelated to capacity cannot yield a passing example" $
     withSystemTempDirectory "hetoimasia-terrain-filler3" $ \dir -> do
       fxe <- acquireFixture (Policy maxBound False) dir
