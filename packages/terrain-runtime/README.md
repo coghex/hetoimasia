@@ -1152,7 +1152,7 @@ transaction on them, so no credit is taken twice or released twice.
 
 | State | Owner and writers | Readers | Thread | Bound | Release |
 | --- | --- | --- | --- | --- | --- |
-| The descriptor of a backing | The backing entry, from the open job's success to `closeBacking`; only a worker touches it | The two workers | Workers | One per arena (four) | Closed once, by `closeBacking`, after its jobs and borrowers have retired; a failed close is reported, never retried |
+| The descriptor of a backing | The backing entry, from the open job's success to `closeBacking`; only a worker touches it | The two workers | Workers | One per arena (four) | Closed once, by `closeBacking`, after its jobs and borrowers have retired; tracked (a closing record) until the native close has returned, which shutdown joins; a failed close is reported, never retried |
 | The file | The backing; unlinked at creation, so it lives until the last close | Borrowers | Any | The allowance (64 MiB to the configured size, 1 GiB by default) | Reclaimed by the filesystem after the last close |
 | A job record (queued, running or finished) | `submit*` creates and charges it; the workers complete it; `withOutcome`, `discardTicket` or the close retires it | The submitter | Callers, workers | 8 queued, 2 running, 32 records in all | Credits released at retirement |
 | A read's transfer buffer and result | Charged at dispatch (staging for the buffer, the cache for the result copy); the service owns the bytes until retired | `withOutcome`'s body | Worker, caller | One page to 1 MiB per running read | Staging at the end of the transfer; the cache at retirement |
@@ -1278,42 +1278,237 @@ Every event is one transaction on the backing's growth slot; this is the table (
 | `GPrepared p` | refused (busy) | n/a | n/a | the token must match: `GIdle` and the cap rises | to `GReleasing`, in the admission's transaction: the commit authority is gone from then on | n/a | released with the file |
 | `GReleasing` | refused (busy) | n/a | not applicable | refused | refused | `GIdle`; a failed release is `GIdle` with the extra pending and charged | waits for the job |
 
+A queued growth, abandonment or pending release that leaves the queue (a cancel, a discard, the closing of admission, the close of its backing) goes through the one withdrawal, which reverses what its admission installed (`GRunning` back to `GIdle`; `GReleasing (Just p)` back to `GPrepared p` with the token valid; `GReleasing Nothing` back to pending), so a cancelled queued job never leaves the slot stuck. An undelivered `GrowthPrepared` outcome that is discarded becomes a pending reservation `submitReleasePending` recovers.
+
 A release that fails keeps a bounded **pending reservation**, charged on the volume and blocking
 another growth, until `submitReleasePending` succeeds or the close releases it with the file.
 
 ### Ownership at every instant, exceptions included
 
-A typed failure is not the only way out. The rules, each with the examples that hold it:
+A typed failure is not the only way out. Round 2 of review found one class under seven findings: *an exit
+between a state change and the bookkeeping that completes it*. Each exit of a thing the service holds now
+has **one mechanism that owns it**, and the examples below are classes (kind of work by phase by event), not
+the instances the reviewer happened to name.
 
-* **Open.** From the moment the file exists until the one transaction that registers it, `execOpen`
-  owns the descriptor on every exit. A typed failure unwinds explicitly; an exception from any native
-  step (the seam included) closes it too, unlinks again if the name remains, never closes twice (the
-  close attempt is recorded before it is made) and keeps the cleanup failures beside the primary
-  exception. Cancellation is arbitrated in the registering transaction.
-* **Reservation progress is explicit.** `reserveRange` says whether the native allocation was attempted
-  when it stopped. Every stop after it, a failed final query included, rolls the extra back or leaves
-  a charged pending reservation; only a stop before it obtained nothing. An exception from any step
-  of a growth is handled the same way, and the release itself is exception-safe.
-* **Close.** The drain check and the claim of the descriptor are one transaction (nothing can begin
-  between them), the wait is in the caller's boundary with every interruption remembered and delivered
-  after the close, the hand-off to the native close is masked, the close is made once and an exception
-  or an errno from it is recorded and never retried. A closing backing takes no new borrower
-  (`withUse` and `withOutcome` refuse it), so a caller cannot hold a close open.
-* **Discard.** A ticket discarded while its job runs is retired when the job finishes, and a backing
-  it opened is closed by the worker.
-* **Startup.** Every worker started is stopped and joined on every exit of the start sequence, a typed
-  failure, an exception or a cancellation (the abort's own join included), in the same protected wait
-  the drain uses; the primary failure propagates.
-* **Shutdown.** The workers stop and are joined, every backing is closed, and every record still in
-  the table (an outcome nobody took, an opened backing nobody named) is retired once its borrowers have
-  finished; the admission and the volume figures are then exactly as they were.
+**1. One withdrawal for a queued job** (`withdrawQueued`, with `undoAdmission`). A queued job leaves the
+queue by this one transaction whatever sends it away: `cancelTicket`, `discardTicket`, the closing of
+admission at shutdown and the close of its backing all call it. It dequeues, reverses what admission of
+that kind installed, and settles the job as cancelled: a growth gives its slot back (`GRunning` to `GIdle`);
+an abandonment restores `GPrepared` with its token valid (`GReleasing (Just p)` to `GPrepared p`); a pending
+release returns to pending (`GReleasing Nothing` to `GIdle`, the extra still charged); every other kind
+installed nothing. The case is total over the work kinds.
+
+**2. One disposal for an undelivered outcome** (`disposeUndelivered`, total over every `Outcome` constructor,
+no wildcard). It is what discard of a finished job, the end of a discarded running job, the close of the
+backing a job names and the shutdown sweep all call: `Opened` closes the backing it created (no second close:
+the job is linked to it); `GrowthPrepared` becomes an explicit pending reservation (`eLength` the committed
+size, the extra pending and charged, the slot idle) which `submitReleasePending` recovers, the volume figure
+unchanged; `Failed` and `Cancelled` keep their cleanup notes as labelled evidence for the service's scope
+(at most 64); `Pages` releases the cache charge; `Written`, `Released` and `GrowthNoChange` own nothing.
+
+**3. A backing is tracked until its native close has returned** (`stClosing`). The claim of the descriptor
+(one transaction with the drain check) counts a closing record; it is decremented the moment the native
+close returns, before anything that can fail (a log included); `drainService` waits for it, so shutdown can
+never return while another caller's close is in flight. The close stays exactly-once. A finished open job
+is **linked** to the backing it created, so `withOutcome` on an `Opened` outcome borrows that backing and a
+close or shutdown waits for the borrower.
+
+**4. Every cleanup step runs independently**, whatever the step before it did, and an exception from a step
+is a cleanup failure of that step, never an exit that skips the next one:
+
+| Scope | Steps, each attempted whatever the others do | What an exception from a step becomes |
+| --- | --- | --- |
+| `execOpen` unwind | unlink retry; the one close of the descriptor (recorded as attempted before it is made) | a cleanup note of the step (errno -1); the close is never repeated |
+| `giveBack` (a growth that did not publish) | the release of the extra range | a release that failed: the extra stays pending and charged |
+| `execRelease` | the release | the same; the exception propagates with its context after the pending record is made |
+| `closeBackingCore` | the claim; the one native close; the closing record's decrement; three diagnostics | recorded as the close's exception, never retried; the decrement precedes the diagnostics |
+| `drainService` | closing admission; stopping the workers; joining them; closing every backing; waiting for closes in flight; disposing of every record; stamping the service stopped; composing the evidence | each wait is in the protected boundary; a cancellation is remembered (first one wins) and delivered after the drain |
+| start sequence | stop every started worker; join every started worker | a cancellation of either is remembered; the primary failure propagates |
+
+**5. Every catch keeps its context.** Each place the library catches an exception uses `tryWithContext`
+and either rethrows with `rethrowIO` or turns it into a value on purpose; the cleanup failures of every scope
+an exception crossed reach the worker's completion and the job's outcome. The complete list:
+
+| Site | What happens to the exception |
+| --- | --- |
+| `withStorageService` (the body) | composed with the drain's cleanup evidence and rethrown with its context |
+| `startWorkers` | the abort sequence runs, then rethrown with its context; the two fresh throws (`NotThreaded`, `WorkerNotStarted`) have no cause to keep |
+| `quietly` | a diagnostic: a synchronous exception is dropped, an asynchronous one is returned to the caller (see below) |
+| `evidenceOf` | builds an evidence value carrying the context of the failure it describes |
+| `protectedly` | an asynchronous exception is remembered and delivered after the wait; any other is rethrown with its context |
+| `withOutcome`, `withUse` | the borrow is released and the record retired, then rethrown with its context |
+| `runJob` | a defect finishes the job as a host failure (the outcome names the cleanup failures), stops the service, then rethrows with its context |
+| `execOpen`, its steps | an exception closes the descriptor once, unlinks again, and is rethrown composed with the cleanup failures |
+| `execGrow` | the extra range is rolled back or left pending, then rethrown composed with the cleanup failures |
+| `giveBack`, `execRelease` | a release that raised is a release that failed: kept as a pending reservation; `giveBack` keeps a cleanup note (errno -1) and not the exception itself |
+| `closeBackingCore` (native close) | recorded as the close's exception in the report; never retried |
+| `Volume.linuxFilesystemName` | a failed read of the mount table is an unnamed filesystem, which is never qualified: a deliberate conversion to a typed result, not a rethrow |
+
+**A diagnostic is never an exit.** Every log call in the service goes through `quietly`: a logger that
+raises synchronously is dropped. An *asynchronous* exception reaching a log (a cancellation delivered at an
+interruptible point inside a sink that blocks, which every masked caller reaches) is **returned** to the
+caller instead of being rethrown, the entry dropped and not retried: the caller finishes its bookkeeping and
+delivers it after. In `closeBackingCore` it is folded into the remembered cancellation, so the drain goes on
+to close the remaining backings; in the drain it is one more late exception; in `runJob` the defect path does
+its bookkeeping (finish the job, record the defect, stop, close admission) **before** its log, and the
+"Backing opened" log runs after the job finished. Policy, stated as policy and not as a gap: a cancellation
+delivered to a worker inside an open's cleanup step is recorded as one more cleanup failure of that step and
+is not redelivered (the worker ends at the cooperative stop its group has already requested); a cancellation
+at the log of a defect is dropped with the entry because the worker ends with the defect either way; and a
+worker ended by a cancellation at the "Backing opened" log does not stop the service. That last case is not
+reachable through the public API: no caller holds the worker handles, and the group cancels a worker only
+when its owner is failing, after the service has drained.
+
+Smaller rules that hold the same class:
+
+* **Open.** From the moment the file exists until the one transaction that registers it, `execOpen` owns the
+  descriptor on every exit; cancellation is arbitrated in the registering transaction.
+* **Reservation progress is explicit.** `reserveRange` says whether the native allocation was attempted when
+  it stopped; every stop after it rolls the extra back or leaves a charged pending reservation.
+* **Close.** The drain check and the claim are one transaction, the wait is in the caller's boundary, the
+  hand-off to the native close is masked, and a closing backing takes no new borrower.
+* **Discard.** A ticket discarded while its job runs is retired when the job finishes; a discard of a
+  borrowed outcome is refused (the borrower retires it).
+* **Startup and shutdown.** As above: every started worker is stopped and joined on every exit; the admission
+  and the volume figures are exactly as they were once the service has ended.
 
 ### Tests
 
-`terrain-runtime-tests` (`Test.TerrainRuntime.Storage.*`, including the class examples of `Classes`: the growth state machine as a gate-point-by-event matrix, the native-call sweep of 21 rows by three injections with the descriptor, tracking, allocation and both ledgers checked, the startup rows, and a 40-seed random property over submit, cancel, discard, take, close and shutdown) owns the deterministic safety cases (see
+`terrain-runtime-tests` (`Test.TerrainRuntime.Storage.*`) owns the deterministic safety cases (see
 [the suites](../../docs/test_suites.md)); `terrain-storage-probe` is the optional local real-platform
 qualification, which fills a disposable volume the scripts under `tools/terrain-storage/` make and
-refuses to run anywhere else.
+refuses to run anywhere else. The storage examples hold the class of defect, not the instance:
+
+* **The invariants** (`Lifecycle.invariantProblems`, one pure function over the service's snapshot
+  (`snapshotOf`), the admission's ledger and the descriptors the seam sees open), checked after every cell of
+  the matrix, after every case of the sweep and after **every** step of the random property: a growth slot
+  is `GRunning` iff exactly one live growth job exists and `GReleasing` iff exactly one live release job;
+  an untaken `GrowthPrepared` outcome implies a `GPrepared` slot; the open descriptors are between the
+  tracked backings and the tracked plus the closing plus the running opens; every volume's reserved figure
+  equals the contributions of its backings; the control, staging and cache charges equal exactly the live
+  records' and the running and held reads'; the borrow counts equal the live borrowers; and the queue,
+  running and mutation counts equal the table's.
+* **The lifecycle matrix** (`Lifecycle`): 6 kinds of work (open, read, write, grow, abandon, release a
+  pending reservation) by 4 phases (queued behind busy workers, running held at its native call, finished
+  and untaken, finished and borrowed) by 6 events (cancel, discard, take, close its backing, service
+  shutdown, an exception in a cleanup step) = **144 cells: 103 with an effect, 30 refusals, 11 not
+  applicable (not run, not counted)**. `declared` is the one declaration of what each cell is; the cells run
+  from it and this grid is generated from it (E effect, R refusal, - not applicable):
+
+| kind / phase | Cancel | Discard | Take | Close | Shutdown | CleanupException |
+| --- | --- | --- | --- | --- | --- | --- |
+| Open / Queued | E | E | R | - | E | E |
+| Open / Running | E | E | R | - | E | E |
+| Open / Done | R | E | E | - | E | E |
+| Open / Borrowed | R | R | E | E | E | E |
+| Read / Queued | E | E | R | E | E | - |
+| Read / Running | E | E | R | E | E | - |
+| Read / Done | R | E | E | E | E | - |
+| Read / Borrowed | R | R | E | E | E | - |
+| Write / Queued | E | E | R | E | E | - |
+| Write / Running | E | E | R | E | E | - |
+| Write / Done | R | E | E | E | E | - |
+| Write / Borrowed | R | R | E | E | E | - |
+| Grow / Queued | E | E | R | E | E | E |
+| Grow / Running | E | E | R | E | E | E |
+| Grow / Done | R | E | E | E | E | E |
+| Grow / Borrowed | R | R | E | E | E | E |
+| Abandon / Queued | E | E | R | E | E | E |
+| Abandon / Running | E | E | R | E | E | E |
+| Abandon / Done | R | E | E | E | E | E |
+| Abandon / Borrowed | R | R | E | E | E | E |
+| ReleasePending / Queued | E | E | R | E | E | E |
+| ReleasePending / Running | E | E | R | E | E | E |
+| ReleasePending / Done | R | E | E | E | E | E |
+| ReleasePending / Borrowed | R | R | E | E | E | E |
+
+| Event | When | Declared | What it does (and is asserted to do) |
+| --- | --- | --- | --- |
+| Cancel | Queued | effect | the job is withdrawn at once (CancelledBeforeDispatch; nothing queued, observed) and what its admission installed is reversed |
+| Cancel | Running | effect | stop requested (CancelRequested); the job keeps running until its held call returns (observed) |
+| Cancel | Done, Borrowed | refusal | CancelTooLate: the outcome stands |
+| Discard | Queued | effect | withdrawn at once and retired (nothing queued, observed); the admission is reversed |
+| Discard | Running | effect | marked: it keeps running until its held call returns (observed), then is disposed of |
+| Discard | Done | effect | disposed of at once (an opened backing is closed, a prepared growth becomes a pending reservation) |
+| Discard | Borrowed | refusal | nothing: the borrower holds the outcome and retires it |
+| Take | Queued | refusal | no outcome yet: answers Nothing |
+| Take | Running | refusal | no outcome yet: answers Nothing |
+| Take | Done | effect | borrowed and retired; a second take answers Nothing |
+| Take | Borrowed | effect | a second borrower of the same outcome (two borrows, observed) |
+| Close | Open, Borrowed | effect | closes the backing the open job created: waits for the borrower (observed blocked), then closes |
+| Close | Open, Done | not applicable | the created backing's handle is inside the untaken outcome: its discard and the shutdown cell close it |
+| Close | Open, any other phase | not applicable | the backing does not exist yet |
+| Close | other kinds, Queued | effect | the queued job is withdrawn at once (nothing queued, observed); the close waits (observed blocked) for the running work, then closes |
+| Close | other kinds, Running | effect | the close waits (observed blocked) for the held call, then closes |
+| Close | other kinds, Done | effect | retires the untaken outcome and closes |
+| Close | other kinds, Borrowed | effect | waits for the borrower (observed blocked), then closes |
+| Shutdown | Queued | effect | the queued job is withdrawn at once (observed mid-drain: nothing queued, the two busy workers still held); the drain waits (observed blocked) for them |
+| Shutdown | Running | effect | the drain waits (observed blocked) for the held call; the job is still running mid-drain, not detached |
+| Shutdown | Done | effect | the untaken outcome is disposed of and every backing closed: nothing is left |
+| Shutdown | Borrowed | effect | the drain waits (observed blocked) for the borrower; the job is still borrowed mid-drain |
+| CleanupException | Open, Grow | effect | an exception in the cleanup step (injected, observed to fire): a taken outcome carries the cleanup note; an untaken one ends the service with the labelled cleanup failure (a normal end is a failure) |
+| CleanupException | Abandon, ReleasePending | effect | the release raises (injected, observed to fire): a defect: the job finishes as HostFailure, the defect is recorded, the extra stays accounted as a pending reservation |
+| CleanupException | the other kinds | not applicable | the kind has no cleanup step to fail |
+
+  Every cell ends with the invariants holding after the work has settled, and asserts what its declaration
+  says. A refusal asserts the refusal (a cancel of a finished job answers `CancelTooLate` and its outcome
+  stands; a take of an unfinished job answers `Nothing`; a discard of a borrowed outcome leaves the job held).
+  An effect asserts what it did **while the work is still held** (a cancel or a discard of a queued job has
+  withdrawn it at once, nothing queued; one of a running job has not stopped the held call; a close and a
+  shutdown are observed blocked, with `threadStatus` and no timer, waiting for the held work, with the
+  queued job already withdrawn mid-drain, the running job still running and the borrowed job still held) and
+  what it left behind (a cancelled or discarded queued growth, abandonment or pending release can be
+  submitted, committed or released again; a discarded finished growth is recoverable as a pending
+  reservation; a discarded running growth is cancelled with the slot idle; a closed backing is gone and its
+  records retired; a discarded or closed open leaves only the first backing and its one descriptor). A
+  shutdown cell ends the service with the phase held and lets go after; the service must end normally with no
+  descriptor, job or backing left and every ledger zero. A cleanup-exception cell asserts that the injected
+  fault **fired** (the probe's rules are all used up) and where the evidence went: for an open or a growth, a
+  taken outcome carries the cleanup note and the service ends normally, and an untaken one ends the service
+  with the labelled cleanup failure (a normal end is a failure); for a release the exception is a defect: the
+  job finishes as a host failure, the service records the defect, and the extra stays accounted as a pending
+  reservation.
+* **The sweep** (`Classes`): 21 native calls at their stages by 3 injections (a typed failure, a thrown
+  exception, a cancellation) = 63 cases, each ending with the descriptors back to the baseline, the tracked
+  backings equal to the open descriptors, the reported reservation equal to the physical allocation, the
+  invariants holding, every backing closed and every volume's figure zero:
+
+| Stage | Native call | Occurrence | Set up first |
+| --- | --- | --- | --- |
+| open | create | 1st matching call | - |
+| open | unlink | 1st matching call | - |
+| open | cloexec | 1st matching call | - |
+| open | stat (verify private) | 1st matching call | - |
+| open | stat (profile) | 2nd matching call | - |
+| open | statfs | 1st matching call | - |
+| open | reserve | 1st matching call | - |
+| open | set length | 1st matching call | - |
+| open | stat (verify reservation) | 3rd matching call | - |
+| open | close (cleanup after a failure) | 1st matching call | an injected allocation refusal |
+| grow | stat (profile) | 1st matching call | - |
+| grow | statfs | 1st matching call | - |
+| grow | reserve | 1st matching call | - |
+| grow | set length | 1st matching call | - |
+| grow | stat (verify) | 2nd matching call | - |
+| grow | set length (rollback after a failure) | 1st matching call | an injected over-allocation |
+| release | stat | 1st matching call | - |
+| release | set length | 1st matching call | - |
+| read | pread | 1st matching call | - |
+| write | pwrite | 1st matching call | - |
+| close | close | 1st matching call | - |
+
+  The startup rows follow: the first start refused, the second start failing, and a cancellation during the
+  first start, during the second start and during the abort's join.
+* **The growth matrix** (`Classes`): 3 gate points of a growth by 6 events, each outcome one the state table
+  allows.
+* **The property** (`Classes`): 40 seeds by 36 operations over submit, cancel, discard, take, close and
+  shutdown, the invariants checked after every step, the admission exactly zero at the end.
+* **Waits are observed, not timed.** A negative ("the close has not returned") is shown by observing the
+  waiting thread blocked in its transaction (`awaitBlockedInStm`), never by sampling early or by a timeout; a
+  build that does not wait finishes, which fails the example at once. The only timers in the storage examples
+  are the two bounded polls (50 ms, at most 200) in the probe's `ProbeSpec` for APFS's lazy reclamation of
+  freed space, a positive wait for a volume figure. The gates a failing example leaves closed are opened by the
+  owned thread's own release, so a failure is a failure and never a hang.
 
 ## Consumers
 
