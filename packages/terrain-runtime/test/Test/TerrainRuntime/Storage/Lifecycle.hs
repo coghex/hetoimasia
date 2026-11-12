@@ -22,7 +22,7 @@ import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import qualified Foreign.C.Error as C
 import Hetoimasia.Foundation.Log (LogLevel (..), Logger, callbackSink, defaultLogFilter, entryLevel, entryMessage, mkLogger)
-import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, withResource)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
 import Hetoimasia.Foundation.Worker (withWorkerGroup)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service
@@ -312,9 +312,30 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
       snEvidence sn `shouldBe` 1
       ctlBegin ctl
       ctlResult ctl >>= \r -> case r of
-        Left (ExceptionWithContext ctx _) -> length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
+        Left (ExceptionWithContext ctx _) -> do
+          length (cleanupFailuresInContext ctx) `shouldSatisfy` (>= 1)
+          -- the failure keeps its identity: the typed failure of the close, with the backing and the errno
+          let shown = unwords (map displayCleanupFailure (cleanupFailuresInContext ctx))
+          shown `shouldSatisfy` ("BackingCloseFailed" `isIn'`)
+          shown `shouldSatisfy` ("5" `isIn'`)
         Right () -> expectationFailure "the failing close of a discarded open was lost: the service ended normally"
       openFds (envProbe env) >>= (`shouldBe` [])
+
+  it "keeps a close that RAISED as its own typed failure, with the backing and the exception's text, bounded" $
+    withControlledService $ \env ctl -> do
+      let svc = envSvc env
+      b <- openBacking env ident (hCfg h0)
+      addRule (envProbe env) 1 (== OpCloseFile) Throw
+      rep <- closeBacking svc b
+      (crClosed rep, crCloseException rep == Nothing) `shouldBe` (True, False)
+      ctlBegin ctl
+      ctlResult ctl >>= \r -> case r of
+        Left (ExceptionWithContext ctx _) -> do
+          let shown = unwords (map displayCleanupFailure (cleanupFailuresInContext ctx))
+          shown `shouldSatisfy` ("BackingCloseRaised" `isIn'`)
+          shown `shouldSatisfy` ("injected exception" `isIn'`)
+          length shown `shouldSatisfy` (< 2 * maxHostFailureChars + 200)
+        Right () -> expectationFailure "the close that raised was lost: the service ended normally"
 
   it "keeps the failing report of a close whose caller receives a cancellation instead" $ do
     let sink e = when (entryMessage e == "Backing close failed") (throwIO (SomeAsyncException (ErrorCall "the close log was cancelled")))
@@ -338,7 +359,7 @@ spec = describe "Storage backend: the lifecycle matrix" $ do
   it "counts the failures it has no room to keep and reports the count at the end" $
     withControlledService $ \env ctl -> do
       let svc = envSvc env
-      atomically (keepEvidence svc "test" (replicate (maxKept + 6) (CleanupNote IoClose eio)))
+      atomically (keepEvidence svc "test" (replicate (maxKept + 6) (KeptNote (CleanupNote IoClose eio))))
       sn <- atomically (snapshotOf svc)
       (snEvidence sn, snEvidenceDropped sn) `shouldBe` (maxKept, 6)
       checkInvariants env
@@ -1138,7 +1159,7 @@ sealedRows svc b t p sw =
   , ("cancelTicket", "answers CancelUnknown", cancelTicket svc t >>= (`shouldBe` CancelUnknown))
   , ("closeBacking", "finds no backing: nothing closed, no native call", closeBacking svc b >>= (`shouldSatisfy` (not . crClosed)))
   , ("keepEvidence", "a defect: SealedMutation is thrown, nothing is kept or charged", do
-      r <- tryWithContext (atomically (keepEvidence svc "after the seal" [CleanupNote IoClose eio])) :: IO (Either (ExceptionWithContext SomeException) ())
+      r <- tryWithContext (atomically (keepEvidence svc "after the seal" [KeptNote (CleanupNote IoClose eio)])) :: IO (Either (ExceptionWithContext SomeException) ())
       case r of
         Left (ExceptionWithContext _ e) -> (fromException e :: Maybe SealedMutation) `shouldSatisfy` isJust
         Right () -> expectationFailure "evidence was kept on a sealed service")
@@ -1152,3 +1173,8 @@ sealedTable :: [String]
 sealedTable =
   "| Function | On a sealed service |" : "| --- | --- |" :
     [ "| `" <> n <> "` | " <> d' <> " |" | (n, d', _) <- sealedRows undefined undefined undefined undefined undefined ]
+
+-- | Whether a text appears in another.
+isIn' :: String -> String -> Bool
+isIn' needle hay = any (\i -> take (length needle) (drop i hay) == needle) [0 .. length hay]
+

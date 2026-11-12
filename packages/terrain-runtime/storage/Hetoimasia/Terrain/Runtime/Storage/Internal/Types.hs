@@ -193,12 +193,10 @@ data UnsupportedWhy
     FilesystemNotQualified !ByteString
   | -- | The native allocation call itself is unsupported here.
     NativeUnsupported !ReservationOp !Errno
-  | -- | The build has no native allocation for this platform.
-    NoNativeAllocation
   deriving stock (Eq, Show)
 
 -- | The reservation step a failure names.
-data ReservationOp = StepAllocate | StepSetLength | StepVerify | StepRelease
+data ReservationOp = StepAllocate
   deriving stock (Eq, Show)
 
 -- | Why an otherwise supported reservation could not be obtained.
@@ -241,7 +239,6 @@ data InvalidWhy
   | NoPreparedGrowth
   | DirectoryInvalid
   | CreditInvalid !InvalidCredit
-  | ThreadedRuntimeRequired
   deriving stock (Eq, Show)
 
 -- | Temporary pressure: nothing was created, and the same request may succeed

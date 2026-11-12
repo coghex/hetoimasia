@@ -119,6 +119,8 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Service
   , EntryPhase (..)
   , StagedWrite (..)
   , Kept (..)
+  , KeptFailure (..)
+  , CloseFailure (..)
   , EvidenceDropped (..)
   , SealedMutation (..)
   , ClosingRec (..)
@@ -550,12 +552,19 @@ data St = St
 data ClosingRec = CrNative !Entry | CrReporting
 
 -- | A failure of a cleanup nobody received, with what it was.
-data Kept = Kept !Text !CleanupNote !A.Grant
+-- | What the service keeps of a failure nobody received, with its identity: a cleanup note, or the failure of a backing's
+-- close, typed with the backing's id and the errno or the (bounded) text of the exception the close raised.
+data KeptFailure = KeptNote !CleanupNote | KeptClose !Word64 !CloseFailure
+
+-- | How a close failed, fully evaluated when kept (a lazy value would retain what it was made from).
+data CloseFailure = CloseErrno !Errno | CloseRaised !Text
+
+data Kept = Kept !Text !KeptFailure !A.Grant
 
 -- | The accounted bytes of one kept failure (its label, its note, its place in the list and its grant), charged to
 -- the control account from the moment it is kept until the service's end. Measured by the suite (Memory).
 keptEntryBytes ∷ Word64
-keptEntryBytes = 320
+keptEntryBytes = 1536
 
 -- | A mutator reached a sealed (drained) service: nothing may commit to it any more, and the one that cannot be
 -- refused is a defect.
@@ -715,7 +724,7 @@ drainService svc workers = do
     modifyTVar' (svState svc) (\t → t {stEvidence = [], stPhase = Sealed})
     pure (stEvidence s, stEvidenceDropped s)
   let (undelivered, dropped) = fromMaybe ([], 0) sealed
-  evidence ← sequence ([(,) label <$> evidenceOf (OpenCleanupFailed op e) | Kept label (CleanupNote op e) _ ← undelivered]
+  evidence ← sequence ([(,) label <$> keptEvidenceOf k | Kept label k _ ← undelivered]
     <> [(,) "evidence dropped for want of room" <$> evidenceOf (EvidenceDropped dropped) | dropped > 0])
   pure (firstLate ([late0, late1, late2, late3, late4, late5, late6] <> map fst closed), evidence)
 
@@ -742,6 +751,14 @@ firstLate ∷ [Maybe (ExceptionWithContext SomeException)] → Maybe (ExceptionW
 firstLate xs = case [e | Just e ← xs] of
   (e : _) → Just e
   [] → Nothing
+
+-- | The evidence a kept failure becomes at the end of the service, with its own exception type: a close that failed is
+-- 'BackingCloseFailed' (the backing and the errno), one that raised is 'BackingCloseRaised' (the backing and the text).
+keptEvidenceOf ∷ KeptFailure → IO (ExceptionWithContext SomeException)
+keptEvidenceOf k = case k of
+  KeptNote (CleanupNote op e) → evidenceOf (OpenCleanupFailed op e)
+  KeptClose bid (CloseErrno en) → evidenceOf (BackingCloseFailed (T.pack (show bid)) en)
+  KeptClose bid (CloseRaised t) → evidenceOf (BackingCloseRaised (T.pack (show bid)) t)
 
 -- | An exception with the context a throw would give it, for cleanup evidence.
 evidenceOf ∷ Exception e ⇒ e → IO (ExceptionWithContext SomeException)
@@ -838,8 +855,8 @@ disposeUndelivered svc jid = do
             GPrepared _ → pure ()
             GReleasing _ → pure ()
           pure Nothing
-        Failed _ notes → keepEvidence svc "undelivered outcome cleanup" notes >> pure Nothing
-        Cancelled notes → keepEvidence svc "undelivered outcome cleanup" notes >> pure Nothing
+        Failed _ notes → keepEvidence svc "undelivered outcome cleanup" (map KeptNote notes) >> pure Nothing
+        Cancelled notes → keepEvidence svc "undelivered outcome cleanup" (map KeptNote notes) >> pure Nothing
         Pages _ → pure Nothing
         Written _ → pure Nothing
         GrowthNoChange → pure Nothing
@@ -851,7 +868,7 @@ disposeUndelivered svc jid = do
 -- | THE ONE KEEPER OF A FAILURE NOBODY RECEIVED: the failure goes into the service's evidence, which ends the
 -- service's scope as labelled cleanup failures. At most 'maxKept' are kept; one that does not fit is COUNTED, and
 -- the count is reported at the end (never dropped silently).
-keepEvidence ∷ StorageService → Text → [CleanupNote] → STM ()
+keepEvidence ∷ StorageService → Text → [KeptFailure] → STM ()
 keepEvidence svc label notes = do
   sealed ← (== Sealed) . stPhase <$> readTVar (svState svc)
   when sealed (throwSTM (SealedMutation "keepEvidence"))
@@ -865,7 +882,8 @@ keepEvidence svc label notes = do
         charged ← withAdmission svc (\a → A.reserve A.Foreground [A.ControlCredit keptEntryBytes] a)
         case charged of
           Left _ → dropOne
-          Right g → modifyTVar' (svState svc) (\t → t {stEvidence = stEvidence t <> [Kept label n g]})
+          -- evaluated when kept (a lazy entry would hold what it was made from, not what it is)
+          Right g → let k = Kept label n g in k `seq` modifyTVar' (svState svc) (\t → t {stEvidence = stEvidence t <> [k]})
     dropOne = modifyTVar' (svState svc) (\t → t {stEvidenceDropped = stEvidenceDropped t + 1})
 
 -- | THE ONE STOP of the service for every way a worker can end other than the cooperative stop its token carries
@@ -873,8 +891,10 @@ keepEvidence svc label notes = do
 -- admission closes, queued work settles as cancelled, running work is asked to stop, and the reason is recorded
 -- (the first one wins). A worker that is gone while admission is open would accept tickets nobody runs.
 stopService ∷ StorageService → Text → STM ()
-stopService svc why = do
-  modifyTVar' (svState svc) (\s → s {stStopReason = case stStopReason s of Nothing → Just why; r → r})
+stopService svc why0 = do
+  -- a copy, evaluated: a lazy slice would retain the exception text it was cut from
+  let why = T.copy why0
+  why `seq` modifyTVar' (svState svc) (\s → s {stStopReason = case stStopReason s of Nothing → Just why; r → r})
   closeAdmission svc
 
 dequeue ∷ StorageService → Word64 → STM ()
@@ -1401,10 +1421,12 @@ runJob svc jid = do
           -- diagnostic after it: nothing a log does can leave the job running. A cancellation that arrives at the
           -- log is dropped with the entry, because the worker ends with the defect either way
           -- (the outcome's text is bounded: what is retained is charged and measured at its largest)
-          atomically $ do
-            void (finishJob svc jid (Failed (HostFailure (T.take maxHostFailureChars why)) []))
-            modifyTVar' (svState svc) (\s → s {stDefect = Just (T.take maxHostFailureChars why)})
-            stopService svc (T.take 256 why)
+          -- the bounded text is a COPY, evaluated before it is stored: a lazy slice would retain the whole text
+          let bounded = T.copy (T.take maxHostFailureChars why)
+          bounded `seq` atomically (do
+            void (finishJob svc jid (Failed (HostFailure bounded) []))
+            modifyTVar' (svState svc) (\s → s {stDefect = Just bounded})
+            stopService svc (T.take 256 why))
           _ ← quietly (logError (svLogger svc) component "Storage worker defect" [("defect", why)])
           rethrowIO ewc
 
@@ -1827,7 +1849,8 @@ closeBackingCore svc bid = mask_ $ do
                 Right (Left en) → (Just en, Nothing)
                 Right (Right ()) → (Nothing, Nothing)
                 Left (ExceptionWithContext _ ex) → (Nothing, Just (T.pack (show ex)))
-              failing = [CleanupNote IoClose en | Just en ← [err]] <> [CleanupNote IoClose (Errno (-1)) | Just _ ← [thrown]]
+              -- the typed failure of the close: the backing's id and the errno, or the (bounded) text of the exception
+              failing = [KeptClose bid (CloseErrno en) | Just en ← [err]] <> [KeptClose bid (CloseRaised (T.copy (T.take maxHostFailureChars t))) | Just t ← [thrown]]
           atomically (finishClosing svc bid e ("close of backing " <> T.pack (show bid)) failing)
           -- the diagnostics, each remembered and not obeyed: the report is still made and the caller (the drain,
           -- which goes on to close the other backings) delivers a cancellation afterwards
@@ -1862,7 +1885,7 @@ closeBackingCore svc bid = mask_ $ do
 -- | The native close has returned, so what the backing paid for is gone: in ONE transaction its control grant is
 -- released, its contribution leaves the volume's reserved figure, a failing close is KEPT as evidence and the record
 -- becomes 'CrReporting' (it stays until the diagnostics are done).
-finishClosing ∷ StorageService → Word64 → Entry → Text → [CleanupNote] → STM ()
+finishClosing ∷ StorageService → Word64 → Entry → Text → [KeptFailure] → STM ()
 finishClosing svc bid e label failing = do
   releaseGrant svc (eGrant e)
   modifyTVar' (svState svc) $ \t →

@@ -154,9 +154,12 @@ fillerClass = describe "(A) the probe's filler" $ do
       fx <- either (\e -> fail ("fixture refused: " <> show e)) pure fxe
       let broken = posixNative {nativeReserve = \_ _ _ -> pure (Left (Errno (let C.Errno n = C.eIO in fromIntegral n)))}
       ran <- newIORef False
+      before' <- openFdCount
       r <- try (withMeter fx (\m -> withFillerWith broken fx m (\_ -> writeIORef ran True)))
       (either (\e -> const True (e :: SomeException)) (const False) r) `shouldBe` True
       readIORef ran >>= (`shouldBe` False)
+      -- the probe's own descriptors are not left held on its failure path (the filler's and the meter's are closed)
+      openFdCount >>= (`shouldBe` before')
 
 fixtureClass :: Spec
 fixtureClass = describe "(A) the probe fixture" $

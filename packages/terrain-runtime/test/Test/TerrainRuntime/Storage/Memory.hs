@@ -306,8 +306,12 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
   it "a kept failure, and a closing record that is moved and not copied" $
     withControlledService' $ \env -> do
       -- the evidence list is full: 64 kept failures, each charged
-      (_, kept) <- heapAdded (atomically (keepEvidence (envSvc env) "measure" [CleanupNote IoClose (Errno (fromIntegral i)) | i <- [1 .. maxKept]]))
-      row "kept failure (per entry, the list full)" keptEntryBytes (kept / fromIntegral maxKept)
+      -- the largest kept failure: a close that RAISED, with the longest exception text kept (of four-byte characters)
+      (_, kept) <- heapAdded (atomically (keepEvidence (envSvc env) "measure" [KeptClose (fromIntegral i) (CloseRaised (T.copy (T.replicate maxHostFailureChars (T.singleton (toEnum (0x10000 + i)))))) | i <- [1 .. maxKept]]))
+      -- the list really is full: every one was kept (none was refused for its charge)
+      snKept <- snEvidence <$> atomically (snapshotOf (envSvc env))
+      snKept `shouldBe` maxKept
+      row "kept failure, a close that raised with the longest text (per entry, the list full)" keptEntryBytes (kept / fromIntegral maxKept)
       -- the claim moves a backing's entry into its closing record whole: held at the native close the heap holds one
       -- entry, not two
       b <- openBacking env ident (hCfg h0)

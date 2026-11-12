@@ -16,7 +16,7 @@ module Test.TerrainRuntime.Storage.Fixture
   , pointerFixture
   ) where
 
-import Control.Exception (IOException, try)
+import Control.Exception (IOException, onException, try)
 import qualified Data.ByteString.Char8 as BC
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate, unlinkFile)
@@ -100,8 +100,10 @@ volumeTotal dir = do
     Right c → do
       -- every native result is looked at: a name that could not be removed would leave a file on the fixture, and a
       -- close that failed leaves a descriptor
-      unlinked ← unlinkFile productionSeam (BC.pack dir) (crName c)
-      p ← profileOf productionSeam (crFd c)
+      -- an exception between the create and the close closes the descriptor (it is never left held)
+      (unlinked, p) ← (do u ← unlinkFile productionSeam (BC.pack dir) (crName c)
+                          q ← profileOf productionSeam (crFd c)
+                          pure (u, q)) `onException` closeFile productionSeam (crFd c)
       closed ← closeFile productionSeam (crFd c)
       pure $ case (unlinked, closed, p) of
         (Left e, _, _) → Left ("the probe's own temp file could not be unlinked: " <> show e)

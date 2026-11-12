@@ -10,7 +10,7 @@ module Test.TerrainRuntime.Storage.ProbeSpec (probeCases, ProbeCase, FillError (
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (bracket)
+import Control.Exception (bracket, onException)
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -256,12 +256,17 @@ newtype Meter = Meter Fd
 withMeter :: Fixture -> (Meter -> IO a) -> IO a
 withMeter fx = bracket make (\(Meter fd) -> () <$ closeFile productionSeam fd)
   where
+    -- a failure after the create closes what was created (the name that could not be removed is named in the
+    -- failure): the meter's descriptor is never left held on a failure path
     make = do
       made <- createPrivate productionSeam (BC.pack (fixtureDir fx)) 9999 (const (pure ()))
       c <- either (fail . show) pure made
-      unlinked <- unlinkFile productionSeam (BC.pack (fixtureDir fx)) (crName c)
-      either (\e -> fail ("the meter's name could not be unlinked: " <> show e)) pure unlinked
-      pure (Meter (crFd c))
+      unlinked <- unlinkFile productionSeam (BC.pack (fixtureDir fx)) (crName c) `onException` closeFile productionSeam (crFd c)
+      case unlinked of
+        Left e -> do
+          _ <- closeFile productionSeam (crFd c)
+          fail ("the meter's name " <> BC.unpack (crName c) <> " could not be unlinked: " <> show e)
+        Right () -> pure (Meter (crFd c))
 
 availableOf :: Meter -> IO Word64
 availableOf (Meter fd) = do
@@ -325,7 +330,11 @@ withFiller = withFillerWith posixNative
 withFillerWith :: Native -> Fixture -> Meter -> (Word64 -> IO a) -> IO a
 withFillerWith native fx meter = \act -> do
   free0 <- availableOf meter
-  r <- bracket acquire (\(_, fd) -> () <$ closeFile productionSeam fd) (\(taken, _) -> do
+  r <- bracket acquire (\fd -> () <$ closeFile productionSeam fd) (\fd -> do
+    -- the fill is INSIDE the bracket: whatever stops it (a failure that is not capacity, an exception) releases the
+    -- filler's descriptor and so its space, and the examples after this one are not poisoned by it
+    filled <- fillWith native fd
+    taken <- either (\e -> fail ("the filler stopped for a reason that is not capacity: " <> show e)) pure filled
     left <- availableOf meter
     record "exhausted.available.bytes" (show left)
     left `shouldSatisfy` (< 4 * mib)
@@ -342,11 +351,12 @@ withFillerWith native fx meter = \act -> do
     acquire = do
       made <- createPrivate productionSeam (BC.pack (fixtureDir fx)) 4242 (const (pure ()))
       c <- either (fail . show) pure made
-      unlinked <- unlinkFile productionSeam (BC.pack (fixtureDir fx)) (crName c)
-      either (\e -> fail ("the filler's name could not be unlinked: " <> show e)) pure unlinked
-      filled <- fillWith native (crFd c)
-      taken <- either (\e -> fail ("the filler stopped for a reason that is not capacity: " <> show e)) pure filled
-      pure (taken, crFd c)
+      unlinked <- unlinkFile productionSeam (BC.pack (fixtureDir fx)) (crName c) `onException` closeFile productionSeam (crFd c)
+      case unlinked of
+        Left e -> do
+          _ <- closeFile productionSeam (crFd c)
+          fail ("the filler's name " <> BC.unpack (crName c) <> " could not be unlinked: " <> show e)
+        Right () -> pure (crFd c)
 
 -- | The free space once the volume has reclaimed a closed file: observed by bounded polling of the platform's
 -- own report (a filesystem may free the blocks of a closed, unlinked file lazily), at most 200 observations, 50 ms apart.

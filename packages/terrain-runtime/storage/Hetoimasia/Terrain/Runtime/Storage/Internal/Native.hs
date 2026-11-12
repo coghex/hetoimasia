@@ -48,6 +48,7 @@ module Hetoimasia.Terrain.Runtime.Storage.Internal.Native
   , errnoText
   ) where
 
+import Control.Exception (mask_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -160,14 +161,17 @@ data Owns a
     Acquires (a → IO ())
 
 -- | THE ONE WAY a native effect runs between its hooks: the before-hook, the effect, the recorder of what it
--- obtained, and only then the after-hook. Every site says what it acquires.
+-- obtained, and only then the after-hook. Every site says what it acquires. It does NOT rely on its caller being
+-- masked: for an effect that acquires something, the effect and its recorder run together under 'mask_' (a safe
+-- foreign call is not interruptible, so nothing else changes), so there is no unmasked point between the effect and
+-- the record of what it obtained, whoever calls; the hooks stay outside the mask, where a cancellation can reach a
+-- blocked one.
 around ∷ Seam → NativeOp → Owns a → IO a → IO a
 around seam op owns act = do
   seamBefore seam op
-  r ← act
-  case owns of
-    NothingAcquired → pure ()
-    Acquires record → record r
+  r ← case owns of
+    NothingAcquired → act
+    Acquires record → mask_ (act >>= \x → record x >> pure x)
   seamAfter seam op
   pure r
 
