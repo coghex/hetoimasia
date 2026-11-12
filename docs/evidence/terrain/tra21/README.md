@@ -2,7 +2,7 @@
 
 Evidence for [#663](https://github.com/coghex/hetoimasia/issues/663) (own reserved backing files and bounded asynchronous storage I/O). The implementation is in `packages/terrain-runtime` (`storage/`, `probe/`); the contract is its README section "The storage backend (TRA-21)".
 
-**The candidate is P = `574e67c8037721c611740545553d6d84361aa831`** on branch `issue-663-storage-backend`, and the two platform records below were taken AT P, one run on each host, through the lab. P is round 5's code head: `1df2c52e` (the repair of Codex's one finding and the manager's reads: a closing record is charged for as long as it lives, the memory rows measured against a noise floor, the service retains only evaluated values) plus `574e67c8`, which moves two lines of a Haddock comment and nothing else (`git diff 1df2c52e P` is those two lines). The reviewed head is P plus the merge of the docs-only commit that records the runs: `git diff P HEAD` shows only `docs/` and `packages/terrain-runtime/README.md`. Two failed probe runs are kept below with their causes (`05aa74b8` at `61cc3fbb`, `bb26a88a` at `0afcf741`), and so are two failures of the CI job `haskell-engine` (at `aae0ce93` and at `c740e7f9`); the passing runs at earlier revisions are history, not the record.
+**The candidate is P = `8ecd4012c8fa5c9705580b6e172abccd5a60f49f`** on branch `issue-663-storage-backend`, and the two platform records below were taken AT P, one run on each host, through the lab. P is round 6's code head: `016614c9`, `1b210741`, `f91651e3`, `505a4c72`, `c97ba9db` and `8ac841a1` (a handle checked against its service in one place, the service's own copies of what it is handed, the public boundary table and its checks), then `8ecd4012` (the configuration bounded where it is made), on top of round 5's `574e67c8`. The reviewed head is P plus the merge of the docs-only commit that records the runs: `git diff P HEAD` shows only `docs/` and `packages/terrain-runtime/README.md`. Two failed probe runs are kept below with their causes (`05aa74b8` at `61cc3fbb`, `bb26a88a` at `0afcf741`), and so are two failures of the CI job `haskell-engine`; the passing runs at earlier revisions are history, not the record.
 
 ## What is and is not claimed
 
@@ -32,8 +32,10 @@ tools/terrain-storage/{macos,linux}-fixture.sh down <scratch>
 | macOS at `0afcf741` (round 4's repair, before the probe's preconditions were measured), a fresh 3 GiB APFS sparse image | `bb26a88a-bf6f-4bce-9cac-0d53cc36bbde` | **6 passed, 2 FAILED: not the record** (below) |
 | macOS at `9e972f9f` (round 4's candidate: history, the service changed in round 5), macOS 26.7.1 (25G313) arm64, Apple M3 Max, Darwin 25.6.0, Apple clang 21.0.0, GHC 9.14.1, a fresh 3 GiB APFS sparse image (device 16777253, block 4096, total 3,011,469,312 bytes) | `63c7da9e-c78a-4d0e-98c1-f2918793fc7a` | 8 passed (history) |
 | Linux at `9e972f9f` (history), Ubuntu 24.04.4 LTS aarch64, Linux 6.8.0-142-generic, gcc 13.3.0, GHC 9.14.1, cabal 3.18.1.0 (the guest shim), the Lima guest `hetoimasia-linux`, a fresh 3 GiB sparse image, mke2fs 1.47.0, ext4 `rw,relatime` (features `has_journal ext_attr resize_inode dir_index filetype needs_recovery extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum`), device 1792, block 4096, total 3,094,126,592 bytes | `3e0d9521-03aa-40cf-8f58-4557c76eb60f` | 8 passed (history) |
-| **macOS at P `574e67c8`**, macOS 26.7.1 (25G313) arm64, Apple M3 Max, Darwin 25.6.0, GHC 9.14.1, a fresh 3 GiB APFS sparse image (device 16777253, block 4096, total 3,011,469,312 bytes) | `206c2d04-2739-4354-9854-48dd896b30c8` | 8 passed: **the macOS record** |
-| **Linux at P `574e67c8`**, Ubuntu 24.04.4 LTS aarch64, Linux 6.8.0-142-generic, gcc 13.3.0, GHC 9.14.1, cabal 3.18.1.0 (the guest shim), the Lima guest `hetoimasia-linux`, a fresh 3 GiB sparse image, mke2fs 1.47.0, ext4 `rw,relatime` (features `has_journal ext_attr resize_inode dir_index filetype needs_recovery extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum`), device 1792, block 4096, total 3,094,126,592 bytes | `6c561731-487e-4127-abf5-f3e04bf03713` | 8 passed: **the Linux record** |
+| macOS at `574e67c8` (round 5's candidate: history, the service changed in round 6), macOS 26.7.1 (25G313) arm64, Apple M3 Max, Darwin 25.6.0, GHC 9.14.1, a fresh 3 GiB APFS sparse image (device 16777253, block 4096, total 3,011,469,312 bytes) | `206c2d04-2739-4354-9854-48dd896b30c8` | 8 passed (history) |
+| Linux at `574e67c8` (history), Ubuntu 24.04.4 LTS aarch64, Linux 6.8.0-142-generic, gcc 13.3.0, GHC 9.14.1, cabal 3.18.1.0 (the guest shim), the Lima guest `hetoimasia-linux`, a fresh 3 GiB sparse image, mke2fs 1.47.0, ext4 `rw,relatime` (features `has_journal ext_attr resize_inode dir_index filetype needs_recovery extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum`), device 1792, block 4096, total 3,094,126,592 bytes | `6c561731-487e-4127-abf5-f3e04bf03713` | 8 passed (history) |
+| **macOS at P `8ecd4012`**, macOS 26.7.1 (25G313) arm64, Apple M3 Max, Darwin 25.6.0, GHC 9.14.1, a fresh 3 GiB APFS sparse image (device 16777253, block 4096, total 3,011,469,312 bytes) | `9cf87baa-6bab-45a5-94bf-07379f4995e4` | 8 passed: **the macOS record** |
+| **Linux at P `8ecd4012`**, Ubuntu 24.04.4 LTS aarch64, Linux 6.8.0-142-generic, gcc 13.3.0, GHC 9.14.1, cabal 3.18.1.0 (the guest shim), the Lima guest `hetoimasia-linux`, a fresh 3 GiB sparse image, mke2fs 1.47.0, ext4 `rw,relatime` (features `has_journal ext_attr resize_inode dir_index filetype needs_recovery extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum`), device 1792, block 4096, total 3,094,126,592 bytes | `49186fbc-6c90-43fb-aea7-c946a339db01` | 8 passed: **the Linux record** |
 
 Both records were made by `quruntul --repo . test --target terrain-storage-probe --ref HEAD`, one run each, on fixtures made by the scripts under `tools/terrain-storage/` and torn down by exact path (the APFS image detached and deleted, the loop mount unmounted and its image removed, the pointer files removed); the Linux guest was started and stopped for the run (posted each time), with guest `sudo` for the one capped loop mount only. The reports of all of them are attached to the lab's ledger (`quruntul report attach`); the Linux guest was started and stopped for the run and posted each time.
 
@@ -95,8 +97,8 @@ The first macOS run failed in the growth example: the probe released its own fil
 | Unlisted filesystem name | `storage_unsupported` | `storage_unsupported` |
 | `tmpfs` (`/dev/shm`) | not applicable | `storage_unsupported`; the refused filesystem NAME asserted to be `tmpfs` (`unsupported.tmpfs=tmpfs`), zero reserve calls |
 | Sparse-size negative control | `reservation_failed` (`CoverageShort`) | `reservation_failed` (`CoverageShort`) |
-| Latency, reserve 64 MiB / 256 MiB / 1 GiB (seconds, one run, no deadline claimed) | 1.2e-4 / 1.7e-4 / 1.9e-4 | 1.0e-4 / 1.4e-4 / 3.6e-4 |
-| Latency, write then read back the 64 MiB allowance | 0.043 s and 0.019 s | 0.020 s and 0.015 s |
+| Latency, reserve 64 MiB / 256 MiB / 1 GiB (seconds, one run, no deadline claimed) | 1.2e-4 / 1.4e-4 / 1.6e-4 | 9.7e-5 / 1.4e-4 / 3.2e-4 |
+| Latency, write then read back the 64 MiB allowance | 0.038 s and 0.018 s | 0.022 s and 0.017 s |
 
 Model accounting, actual allocation and process RSS are three different figures: the model charges the allowance and its configured overhead; the actual allocation is `st_blocks * 512`, above; RSS was not measured. The worst space peak of a growth is the allocation after it (134,217,728 on both). Growth, release and unlink behaviour found on the way, from the native experiments run before the backend was written (APFS, same image type): preallocation past the end of the file is counted in `st_blocks` and in the volume's free space at once; `ftruncate` to the length the file already has does not release it; raising the length and then shortening it does, which is why a release raises the length first (`releaseExtra`); a failed `F_ALLOCATEALL` leaves nothing allocated and answers `ENOSPC`.
 
@@ -106,9 +108,9 @@ These are the routine examples, in `terrain-runtime-tests` (`Test.TerrainRuntime
 
 ## Routine-suite wall time and repeats
 
-`terrain-runtime-tests` at `1df2c52e` (the last code change; P differs by a comment): 650 examples, 0 failures, finished in 861.0380 seconds on this Mac (the brief's baseline is about 16 minutes); at `d3965cfe` 648 examples in 885.0 s, at `0afcf741` 640 in 873.1 s, at `beb38961` 639 in 854.7 s, at `61cc3fbb` 631 in 830.7 s. The owned-start guard passes 63 of 63 and `cabal check` is clean. The storage dev loop (`storage-dev`, never committed) runs the 100 storage examples in about 10 seconds.
+`terrain-runtime-tests` at `8ecd4012` (P): 664 examples, 0 failures, finished in 907.0132 seconds on this Mac (the brief's baseline is about 16 minutes); **the first run of it at P failed once**, on the noise-floor example ("a bounded test call never returned", the 10-second bounded wait), in a run that took 1,162.5 s, while the machine's load average was 23 to 26 from other work: the example takes seconds at normal load, three single reruns under that load did not finish in 200 s each, and the full suite passed when rerun at load 4 (907.0 s). Earlier: 658 examples in 900.0 s at `505a4c72`, 650 in 861.0 s at `1df2c52e`, 648 in 885.0 s at `d3965cfe`, 640 in 873.1 s at `0afcf741`. The owned-start guard passes 63 of 63 and `cabal check` is clean. The storage dev loop (`storage-dev`, never committed) runs the 114 storage examples in about 15 seconds.
 
-The memory rows were run 200 times in one process on each host at `1df2c52e` (a repeat runner over the floor, the rules and the three Memory specs, never committed): all 200 passed on macOS and in the Lima guest; the table is under "After round 5". Repeats of the earlier storage examples on the platforms are history (macOS 40 and 6 runs, Linux 25, 10 and 5).
+The memory rows were run 200 times in one process on each host at `8ac841a1` (a repeat runner over the floor, the rules and the four Memory specs, never committed; the commits after it change the configuration only): 200 of 200 passed on macOS and in the Lima guest; the table is under "After round 6". Two earlier attempts failed on races of the test, not of the service (below): macOS once in 26 repeats and Linux once in 3, both fixed by waiting for idle workers before the readings.
 
 ## Negative controls
 
@@ -270,7 +272,27 @@ The manager's reads of the repair, and what the repair found with them:
 
 The contract changes a reader should look for, each in the package README: a reporting closing record CARRIES its grant to `endClosing` and the records are bounded by the control account (item 13, which reverses the "reporting no longer pays" of round 4); the service retains only evaluated values (item 18); every container is bounded and charged, and the dual for threads (item 19); the memory section's method and table ("Scheduling and accounting").
 
-### The lifecycle matrix, as run (at `1df2c52e`; unchanged by the comment commit)
+## Round 6 of review, answered
+
+Round 6 (head `22a1a7ac`, Codex) requested changes with TWO findings (both P2, both `Service.hs`); the review reports all 30 earlier blockers addressed. Both are at the **public boundary**, the one place none of the earlier tables had walked (rounds 1 to 5 were about the inside of the service):
+
+| # | Finding | What was wrong | The one owner | Example | Control that bites |
+| --- | --- | --- | --- | --- | --- |
+| 1 (P2) | validate the service identity in `backingView` (`Service.hs:1982`) | the public query discarded the handle's `Unique` and looked up only the id; every service starts its backing ids at 1, so another service's handle, including one whose service had ended, returned an unrelated backing's capacity, pending reservation and lifecycle state | one resolver per handle type (`resolveBacking`, `lookBacking`, `resolveTicket`, `ownsPrepared`) that EVERY function taking a handle goes through; nothing else reads a caller-supplied handle's fields | the handle sweep: 14 functions x a live foreign service and an ended one, against a service whose ids overlap, the whole state of both compared before and after | R6-A1 (`backingView` by the bare id), R6-A2 (the resolver without the identity check) |
+| 2 (P2) | own a bounded copy of the directory before retaining `OpenSpec` (`Service.hs:990-991`) | a `ByteString` is a view: a 4-byte directory cut from a 16 MiB buffer keeps all 16 MiB, and `WOpen` kept the caller's spec in queued and finished jobs for the price of one record | an own copy, forced, at the one place the record is built (`submitOpen`); the same rule by type for every retained field that can alias a larger allocation (the owned-copies table, README item 20) | the retention rows: 24 finished untaken and 8 queued opens whose directory is a 48-byte view of a fresh 2 MiB buffer, per job within the record's charge | R6-B1 (the directory not copied: 2,011,718 bytes a finished job and 2,097,771 a queued one) |
+
+## After round 6
+
+The manager's reads of the repair asked for the class behind both findings, and for a table that is complete:
+
+1. **The handle class, walked.** About nine functions had each pattern-matched the handle themselves, each with its own foreign check in its own order; `growthBlocks` read the bare id; `submitWrite` compared the handle's identity before its service (so a foreign handle got `IdentityMismatch`); a foreign growth token to `submitAbandon` answered `NoPreparedGrowth`. **Public behaviour that changed:** `backingView` of a foreign handle is `Nothing`; a foreign growth token to `submitAbandon` is `ForeignHandle` (one existing example changed); a foreign handle to `submitWrite` is `ForeignHandle` first.
+2. **The retention class, closed by type** (the owned-copies table, README item 20): the directory (the finding); **the filesystem name**, which on Linux is a view into the whole text of `/proc/self/mountinfo` that every `Opened` outcome and every `FilesystemNotQualified` refusal kept (confirmed by the control: 2,097,527 bytes a profile); **the configuration's qualified names**, which `mkStorageConfig` kept as the caller's lazy list of views for the life of the service (found while checking the table's own claim: **my first draft of the table said "its own copy"**; the code kept the caller's list; the row found it, 4,194,589 bytes a configuration with the copy undone); and `profileOf`, which returned the profile as a lazy constructor application that held the name (2,097,655 bytes a profile with the copy in place; it now builds and forces it).
+3. **The boundary table and the type table** (README item 21): every exported function (42 rows) and type (32 rows), generated from data in `Test.TerrainRuntime.Storage.Boundary`, which the suite checks against the **export list read from the module's source** (an export without a row, or a row without an export, fails; so does a handle-taking function missing from the sweep).
+4. **The configuration is the one caller input that had no bound** (the manager's read of the table): every other caller input is bounded (the directory by `maxDirectoryBytes`, a write by `maxIoPages` and the page size, a read by its count), and a configuration holding any number of names of any length for the life of the service, charged to nothing, was not. Now at most `maxQualifiedNames` = 16 names of 1 to `maxQualifiedNameBytes` = 32 bytes of printable non-space ASCII, refused with typed `StorageConfigError` cases (`TooManyQualifiedNames`, `QualifiedNameEmpty`, `QualifiedNameTooLong`, `QualifiedNameNotPrintable`), the list walked at most one name past the limit, every check before any copy. Why those numbers: this slice qualifies two names (`apfs`, `ext4`) and 16 leaves room for a build to add more; macOS reports a type name of at most 15 characters and a Linux type name is a short registered word, `fuse.` and a subtype the longest (`fuse.gocryptfs` 14, `fuse.vmhgfs-fuse` 16), so 32 covers every real one; a type name has no space or control byte and is ASCII. In the container table it is a constant of the service, charged to nothing, at most 16 x 32 = 512 bytes of names. Controls R6-C1 to R6-C3.
+5. **Two races of my own test** (found by the repeats, not by the service): the in-service write-report validation read **62,676** bytes a job on macOS once in 26 repeats (against a charge of 33,280) and **-28,248** on Linux in 3. A worker that has committed a job's outcome is still inside its frame for a moment, holding the work it ran (1 MiB of pages): a reading taken then counts them (positive), and a first reading counts what the second no longer does (negative). Both in-service rows now wait until both workers are blocked in their wait (observed by thread status) before BOTH readings.
+6. **A known sensitivity**: the noise-floor example forces about 1,500 major collections and did not finish inside the 10-second bounded wait when the machine ran at load average 23 to 26 (about 4.5 s for the floor and 9 s in all on the CI runner at `22a1a7ac`, a 20x margin there). No code change; it is stated in the honest list.
+
+### The lifecycle matrix, as run (at `8ecd4012`; unchanged since `0afcf741`)
 
 lifecycle matrix: 192 cells (6 kinds x 4 phases x 8 events): 127 with an effect, 54 refusals, 11 not applicable (not run)
 
@@ -353,33 +375,35 @@ What each declared cell does, and is asserted to do:
 | PendingReservation | an extra range a failed release left allocated | execRelease on success, finishClosing | the retried release's set-length has returned |
 | GrowthExtra | an abandoned or failed growth's extra range | execRelease and giveBack on success | the set-length that frees it has returned: until then the extra stays counted |
 
-### The memory rows (200 repeats in one process on each host at `1df2c52e`: 200 of 200 passed; minimum to maximum, in bytes)
+### The memory rows (200 repeats in one process on each host at `8ac841a1`: 200 of 200 passed; minimum to maximum, in bytes)
 
-The method is the package README's, "Scheduling and accounting": a noise floor measured in the process (1,080 to 1,208 bytes; one spike of 8,768 in 60,000 samples on Linux), every asserted row a signal at least 50 times the floor (the smallest seen: 62,784 bytes on macOS and 55,560 on Linux, 52 and 51 times), no vacuous pass, the service-level rows below that signal printed as observations. macOS is an Apple M3 Max; Linux is Ubuntu 24.04 aarch64 in the Lima guest.
+The method is the package README's, "Scheduling and accounting": a noise floor measured in the process (1,080 to 1,208 bytes; one spike of 8,896 in 60,000 samples on Linux), every asserted row a signal at least 50 times the floor, no vacuous pass, the service-level rows below that signal printed as observations, and the finished write reports held against the model in the service. macOS is an Apple M3 Max; Linux is Ubuntu 24.04 aarch64 in the Lima guest (the CI runner is x86_64).
 
 | row | macOS min-max | Linux min-max | charged |
 | --- | --- | --- | --- |
 | queued read record (standalone: job node, queue element, grant entry) | 537-538 | 537-538 | 4096 |
-| queued open record (standalone, a 512-byte path of its own) | 1118-1137 | 1118-1119 | 4096 |
-| held 256-page read (buffer and record) | 1065396-1067300 | 1055868-1056108 | 1089536 |
-| finished, untaken 256-page result (and its record) | 1096392-1132048 | 1077816-1109696 | 1249280 |
-| backing entry, largest variant (GReleasing (Just prepared), a pending reservation), | 481-505 | 388-486 | 4096 |
+| queued open record (standalone, a 512-byte path of its own) | 1118-1137 | 1119-1119 | 4096 |
+| held 256-page read (buffer and record) | 1065396-1067412 | 1055868-1065852 | 1089536 |
+| finished, untaken 256-page result (and its record) | 1096392-1132272 | 1077816-1109696 | 1249280 |
+| backing entry, largest variant (GReleasing (Just prepared), a pending reservation), | 486-506 | 386-486 | 4096 |
 | queued write, 256 pages (standalone: the pages are the transaction's own and shared) | 322-481 | 322-481 | 33280 |
 | running write, 255 results held (standalone: its record and the results) | 16611-16616 | 16611-16616 | 33280 |
-| finished write report, 256 pages written | 16496-16501 | 16501-16501 | 29184 |
-| finished write report, first page failed, 255 not attempted | 16649-16654 | 16654-16654 | 29184 |
-| largest open record plus a retained Opened | 1273-1276 | 1255-1259 | 4096 |
-| largest open record plus a retained GrowthPrepared | 1298-1300 | 1280-1283 | 4096 |
-| largest open record plus a retained Released or GrowthNoChange | 1160-1163 | 1142-1146 | 4096 |
-| largest open record plus a retained Failed (a defect text of 256 four-byte character | 2452-2472 | 2454-2454 | 4096 |
-| largest open record plus a retained Cancelled (4 notes) | 1353-1373 | 1354-1355 | 4096 |
+| finished write report, 256 pages written | 16496-16501 | 16496-16501 | 29184 |
+| finished write report, first page failed, 255 not attempted | 16649-16654 | 16649-16654 | 29184 |
+| largest open record plus a retained Opened | 1256-1276 | 1255-1258 | 4096 |
+| largest open record plus a retained GrowthPrepared | 1280-1300 | 1280-1282 | 4096 |
+| largest open record plus a retained Released or GrowthNoChange | 1143-1163 | 1142-1145 | 4096 |
+| largest open record plus a retained Failed (a defect text of 256 four-byte character | 2452-2472 | 2452-2454 | 4096 |
+| largest open record plus a retained Cancelled (4 notes) | 1353-1372 | 1352-1355 | 4096 |
 | kept failure, a close that raised with the longest text (standalone, per entry) | 1517-1517 | 1517-1517 | 2048 |
-| service, finished untaken write report (all written), per job, 24 held at once, the | 16184-16184 | 15410-16739 | 33280 |
-| service, finished untaken write report (first page failed, 255 not attempted), per j | 16458-17786 | 15684-17012 | 33280 |
-| closing record, native close pending (the entry moved, per backing) | 497-502 | 402-502 | 4096 |
-| closing record, reporting (the carried grant, per record) | 272-275 | 217-275 | 4096 |
+| service, finished untaken write report (all written), per job, 24 held at once, the | 16900-18396 | 16126-17455 | 33280 |
+| service, finished untaken write report (first page failed, 255 not attempted), per j | 17180-17348 | 16406-16406 | 33280 |
+| closing record, native close pending (the entry moved, per backing) | 496-502 | 402-502 | 4096 |
+| closing record, reporting (the carried grant, per record) | 272-275 | 216-275 | 4096 |
 
-What is NOT a row: eight queued reads and opens in the service (576 and 1,101 a record, the same as the standalone rows within noise), fifteen open and close samples of one backing (an observation: 1,872 to 6,328 on macOS, below the floor's signal), and a running write held at its first and last page (12,984 at the last page in 191 of 200 repeats, stepping by about 32 KiB in 9 repeats on macOS and 3 on Linux).
+The service against its model (200 repeats): all written, the service 16,900 to 18,396 (macOS) and 16,126 to 17,455 (Linux) a job against a standalone 16,491 to 16,984, ratio 0.95 to 1.08; first page failed, 17,180 to 17,348 and 16,406 against 16,643 to 17,136, ratio 0.96 to 1.01; asserted within 15 percent and at most 33,280.
+
+The retention rows (round 6), per instance in the service, asserted within the record's charge (4,096) or 1,024: an open's directory, finished untaken (24 held) 792 to 2,123 (macOS) and 960 to 2,293 (Linux); queued (8) 552 to 1,073 and 1,057 to 1,078; a volume profile's filesystem name (24) 346 to 525 and 345 to 526; a configuration's two names (24) 237 to 433 and 233 to 407. With the copy undone: 2,011,718, 2,097,771, 2,097,527 and 4,194,589 (controls R6-B1 to R6-B3).
 
 ### The ownership sweep: the after dimension, and the exit points
 
@@ -429,7 +453,7 @@ The 105 cases are followed by the startup rows. The three exit points (the diagn
 | `closeBacking` | finds no backing: nothing closed, no native call |
 | `keepEvidence` | a defect: SealedMutation is thrown, nothing is kept or charged |
 
-### The controls of rounds 2 to 5 (each applied once to the committed source, the examples run, then reverted; never committed)
+### The controls of rounds 2 to 6 (each applied once to the committed source, the examples run, then reverted; never committed)
 
 Each was read in its failure output: it fails for the reason named, not by a build error or a hang (except C3, below).
 
@@ -485,22 +509,32 @@ Each was read in its failure output: it fails for the reason named, not by a bui
 | R5-M4 | `jobRecordBytes` below what a record holds (1,024) | the queued-open, retained-outcome and failure rows |
 | R5-S1 | the outcome not walked and the write report built lazily (the old behaviour) | the in-service validation: the first-page-failed row measures **1,034,851** bytes a job and fails |
 | R5-S2 | a finished write keeps its pages | the in-service validation: the all-written row measures **1,050,673** bytes a job and fails |
+| **Round 6** | | |
+| R6-A1 | `backingView` by the bare id (the finding) | the handle sweep, `backingView` |
+| R6-A2 | the resolver without the service-identity check | the handle sweep, the first function (`submitRead`) |
+| R6-B1 | the directory not copied at `submitOpen` | the retention rows (2,011,718 a finished job, 2,097,771 a queued one) |
+| R6-B2 | the filesystem name not copied in `profileOf` | the profile row (2,097,527 a profile) |
+| R6-B3 | the configuration's names kept as views | the configuration row (4,194,589 a configuration) |
+| R6-C1 | no count bound on the qualified names | "refuses one name too many, and an unbounded list without walking it" |
+| R6-C2 | no length bound | "refuses an empty name and a name one byte too long, with the length" |
+| R6-C3 | no byte check | "refuses a name with a byte no filesystem type name has" |
+| R6-T | an export without a row (a function row and a type row removed) | the two table-against-export-list examples |
 
 ## Requirement self-audit of #663 (items 1 to 10 and every sentence of Acceptance)
 
-Status is *met*, *met after round N*, *met by decision*, *limitation* or *not claimed*; every row names its code, example or evidence. Round 4 changed 3e, 7a, 7c, 9b, 9c, A4 and A6; round 5 changed 3b, 3c, 3e, 7a, 9b, 9c, A4 and A5.
+Status is *met*, *met after round N*, *met by decision*, *limitation* or *not claimed*; every row names its code, example or evidence. Round 4 changed 3e, 7a, 7c, 9b, 9c, A4 and A6; round 5 changed 3b, 3c, 3e, 7a, 9b, 9c, A4 and A5; round 6 changed 1c, 2d, 9b and 9c.
 
 | # | Requirement (issue #663 body, its approving comment, Acceptance) | Status | Met by (code / example / evidence) |
 | --- | --- | --- | --- |
 | 1a | One private exclusive file per incarnation; close-on-exec; unlink before readiness; no handle before setup/reservation complete | met | `File.createPrivate` (`O_CREAT\|O_EXCL\|O_NOFOLLOW\|O_CLOEXEC`, 0600), `verifyPrivate`, the open job's registration transaction; Open examples (10 stages; child process) |
 | 1b | Failure unwinds with retained cleanup evidence; the file's own volume (not the cwd) | met | `execOpen` unwind (independent steps), `Volume.profileOf` on the descriptor; sweep rows; cleanup cells |
-| 1c | Opaque scoped authorities tied to the incarnation; descriptor numbers not forgeable | met | `Backing`/`Ticket` (hidden constructors, service `Unique`), Opacity examples (external client) |
+| 1c | Opaque scoped authorities tied to the incarnation; descriptor numbers not forgeable | met after round 6 | `Backing`/`Ticket`/`PreparedGrowth` (hidden constructors, service `Unique`), Opacity examples (external client); the handle checked against its service in ONE place for every function that takes one (the resolvers), and the sweep over a live foreign service and an ended one (round 6); the boundary table |
 | 1d | Owner, users, thread, lifetime, cancellation, release of files/jobs/buffers/records specified | met | README "State, owner, thread and lifetime" table and the charge table |
 | 1e | Unlink retains the file until the last close, tested on both targets | met at P | probe "keeps the file after its name is gone" (APFS, ext4) |
 | 2a | Allowance 1 GiB default, 64 MiB minimum, MiB alignment, offset limit | met | sizes re-validated at the boundary (`growthSizeError`); `StoreConfig` is #662's |
 | 2b | Real reservation: `F_PREALLOCATE`/`F_ALLOCATEALL`, `fallocate`, checked length, allocated coverage; sparse file is not a reservation | met | `File.reserveRange` + `hts_reserve`; sparse control example; probe |
 | 2c | 256 MiB headroom after the proposed reservation, growth included; concurrent reservations coordinated | met after round 3 (finding 6) | precheck + a second check with the bytes actually obtained, under `withVolume`; boundary examples for open and growth with a 4,096-byte overhead |
-| 2d | `storage_unsupported` vs `reservation_failed`; malformed sizes refused before work; qualified list | met | `Types.StorageFailure`, `qualifies`, Open stage table, probe tmpfs and unlisted name |
+| 2d | `storage_unsupported` vs `reservation_failed`; malformed sizes refused before work; qualified list | met after round 6 | `Types.StorageFailure`, `qualifies`, Open stage table, probe tmpfs and unlisted name; the qualified list a configuration holds is bounded (16 names of at most 32 printable bytes) and owned (round 6) |
 | 2e | Physical overhead reported to the model and charged before admission; the 8 MiB reserve stays inside the cap | met | `Reservation` carries the overhead; the open and growth are refused when it exceeds the model's (`OverheadExceedsModel`) |
 | 2f | "verified allocated coverage/granularity" | met for coverage and overhead; granularity is reported (`rsBlockSize`), not separately asserted | `Reservation`, probe records (block size 4,096 on both) |
 | 3a | Exactly two workers, eight queued descriptors, 1 MiB jobs, shared across arenas | met | `startWorkers`, `maxQueuedJobs`, `maxIoJobBytes`; Lifetime "runs two jobs and queues eight" |
@@ -518,8 +552,8 @@ Status is *met*, *met after round N*, *met by decision*, *limitation* or *not cl
 | 7d | Qualify close-error and interrupted-close behaviour on the platforms | limitation, retained and stated: an injected `EIO` and a thrown exception are tested; a real failure or `EINTR` of `close` cannot be induced on the qualified filesystems; the policy (never retry) is in the README, item 11 | evidence README "not claimed" |
 | 8 | Deterministic coverage: production backend and seam, gates, no sleeps; the listed cases | met | the storage examples; the matrix, sweep and property; the only timers are two bounded probe polls |
 | 9a | `terrain-storage-probe`, cataloged optional, `category: probe`, no CI route, Darwin and Linux | met | catalog `test.terrain-storage-qualification` |
-| 9b | Probe qualification on macOS/APFS and a named Linux filesystem (ext4), real evidence, capped fixtures, sparse negative control, rewrite under exhaustion, failed/partial growth | met at P | evidence README, run IDs `206c2d04…` (macOS) and `6c561731…` (Linux) at P; history `63c7da9e…`, `3e0d9521…`, `29a10a9a…`, `17e90cd6…`, `4f3965bc…`, `40d69440…`; failed `05aa74b8…`, `bb26a88a…` |
-| 9c | **"one qualification run on each required host at the candidate revision"** (Acceptance) | **met at P**: one run on each host at the exact candidate `574e67c80377`, macOS `206c2d04-2739-4354-9854-48dd896b30c8` and Linux `6c561731-487e-4127-abf5-f3e04bf03713`, both 8 of 8; two runs that did NOT qualify are kept with their causes (`05aa74b8` at `61cc3fbb`, `bb26a88a` at `0afcf741`), and the earlier passing runs are history | the runs under "Commands and run identifiers" |
+| 9b | Probe qualification on macOS/APFS and a named Linux filesystem (ext4), real evidence, capped fixtures, sparse negative control, rewrite under exhaustion, failed/partial growth | met at P | evidence README, run IDs `9cf87baa…` (macOS) and `49186fbc…` (Linux) at P; history `206c2d04…`, `6c561731…`, `63c7da9e…`, `3e0d9521…`, `29a10a9a…`, `17e90cd6…`, `4f3965bc…`, `40d69440…`; failed `05aa74b8…`, `bb26a88a…` |
+| 9c | **"one qualification run on each required host at the candidate revision"** (Acceptance) | **met at P**: one run on each host at the exact candidate `8ecd4012c8fa5c9705580b6e172abccd5a60f49f`, macOS `9cf87baa-6bab-45a5-94bf-07379f4995e4` and Linux `49186fbc-6c90-43fb-aea7-c946a339db01`, both 8 of 8; two runs that did NOT qualify are kept with their causes (`05aa74b8` at `61cc3fbb`, `bb26a88a` at `0afcf741`), and the earlier passing runs are history | the runs under "Commands and run identifiers" |
 | 10a | README, module contracts, `docs/test_suites.md`, `docs/test_classification.md` (eight to nine), `docs/validation.md` registered-groups row | met | landed docs |
 | 10b | Logging injected with bounded context; expected failures are domain results; defects are host failures | met | `terrain.storage` logger; `HostFailure` |
 | 10c | Evidence under `docs/evidence/terrain/tra21/`: commands, run IDs, identities, fixture caps, allocation/overhead, traces, counts, latency; model vs actual vs RSS distinguished | met, updated at P | evidence README |
@@ -531,7 +565,7 @@ Status is *met*, *met after round N*, *met by decision*, *limitation* or *not cl
 | A6 | "Actual reservation and last-close reclamation demonstrated; unsupported profiles refuse" | met at P | probe records |
 | A7 | "No live terrain publication, Lua settlement or crash-recovery qualification is claimed" | claimed nowhere | evidence README "Not claimed" |
 
-## What is not reached, and what is policy (the honest list, after round 5)
+## What is not reached, and what is policy (the honest list, after round 6)
 
 Not reached by any control or example, with the reason:
 
@@ -543,17 +577,19 @@ Not reached by any control or example, with the reason:
 * **The over-count after a lost release result**: when a rollback's or a release's set-length happened and its after-hook raised, the result is lost, so the service keeps the extra as a pending reservation although the file is already freed. It is an over-count (the safe direction), never an under-count, and an explicit release recovers it.
 * **The in-service memory readings below the floor's signal** (round 5): a running write, one backing, eight queued records. Their differences step by about one 32 KiB stack chunk of the worker (9 of 200 repeats on macOS, 3 on Linux, measured), so they are observations, never assertions; the bounds are carried by the standalone rows, and the finished write reports are held against the model in the service. A failed read or open with notes is **not** validated in the service (K x 1 to 2 KB is below 50 times the floor): its standalone row carries it.
 * **The staged pages a queued or running write references** are the owner's list, shared and never copied; they are the transaction's to account (the owner's reservation) and are dropped from the job when it finishes. If the owner holds a transaction while the job is queued, those pages are the owner's memory, not the service's.
+* **A known sensitivity to heavy machine load** (round 6): the noise-floor example forces about 1,500 major collections, and it did not finish inside the 10-second bounded wait when the machine ran at load average 23 to 26 from other work (it took about 4.5 s for the floor and 9 s in all on the CI runner at `22a1a7ac`, a 20x margin there, and seconds at normal load; the suite then took 1,162 s against 907 s). It is a failure of the bounded wait under load, not of an assertion; no code change; the suite passed when rerun at load 4.
+* **The boundary table's "returns" and "retains" columns are stated, not all executed**: the handle columns are run by the sweep, the retention columns by the retention rows (the directory, the filesystem name, the configuration's names), the export list is checked against the table, and the rest (a query returns scalars or copies, a constant is a constant) is read from the code; an alias of mutable service state cannot exist because the service holds no mutable value a caller can reach.
 * **The Linux figures are from an aarch64 guest; the CI runner is x86_64.** The failure of the old rows reproduced on the guest and the new rows pass 200 of 200 there and on macOS; the x86_64 figures were not measured here (the pull request's CI at the pushed head is the check).
 * **The probe's wiring**: that the probe examples call `rewriteVerdict` and `growthVerdict` at the right points is not routine-testable (they run only on a real fixture); it is a read of the diff and the lab runs. The verdicts themselves, the filler and the exhaustion precondition have routine controls. Control R4-C3 bites by hanging a routine example (a failure mode, not an assertion).
 * **The APFS residue**: after the fill APFS reports 32.12 MiB available that a native allocation of one block is refused for. It is measured and not explained, and no claim rests on the cause.
 * **Interleavings between two transactions** the gates do not reach (the drain-and-claim atomicity is by construction; its mutations are caught through observed waits); an exception from the kernel after a native side effect (modelled for the after-hook of every call, not injected inside the kernel); a real `EINTR` or failure of `close` (the limitation below); whether the owner's logger can be cancelled mid-record on every thread (the three log families are covered).
 * **The matrix** does not combine two events on one job (a cancel racing a close) beyond what the sweep and the property do; a cleanup-exception cell injects one fault, not a cascade (the dedicated examples repeat the unlink fault twice).
-* **The platforms**: one run on one APFS image and one ext4 loop image of 3 GiB each, one macOS release and one Linux kernel; no other filesystem, kernel or macOS release, no durability (`fsync`), crash or power-loss claim, no throughput or latency deadline. The full routine suite ran at `1df2c52e`; P differs by a Haddock comment.
+* **The platforms**: one run on one APFS image and one ext4 loop image of 3 GiB each, one macOS release and one Linux kernel; no other filesystem, kernel or macOS release, no durability (`fsync`), crash or power-loss claim, no throughput or latency deadline. The full routine suite ran at `8ecd4012` (P).
 
 Policy, stated as policy and not as a gap:
 
 * **A failed close always ends the service's scope with its typed failure** (`BackingCloseFailed`, `BackingCloseRaised`), whoever asked for the close; the `CloseReport` a caller receives is a copy (round 4).
-* **A record is charged for as long as it lives** (round 5): a reporting closing record keeps its backing's grant until it is deleted; **the service retains only evaluated values** (round 5).
+* **A record is charged for as long as it lives** (round 5): a reporting closing record keeps its backing's grant until it is deleted; **the service retains only evaluated values** (round 5); **a handle is checked against its service in one place and the service retains its own copies of what it is handed** (round 6); **every caller input is bounded**, the configuration at 16 names of at most 32 printable bytes (round 6).
 * **Reversed in round 3:** a worker that ends at any point, including by a cancellation at the "Backing opened" log, **stops the service** (admission closed, queued work settled, the reason recorded): a `Logger` is a public port.
 * A cancellation delivered to a worker inside an open's cleanup step is recorded as one more cleanup failure of that step and is not redelivered; a cancellation at the log of a defect is dropped with the entry because the worker ends with the defect either way.
 * A release that raises is a defect (host failure, service stopped, the extra kept as a pending reservation), not a cleanup failure with notes; the worker's defect is what supervision sees.

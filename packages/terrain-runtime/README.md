@@ -1166,7 +1166,9 @@ transaction on them, so no credit is taken twice or released twice.
 foreign or reused handle is refused before any I/O, and a descriptor number reused by a later file
 is unreachable through an old handle. A `Ticket` names one job of one service; a late, duplicated
 or cancelled outcome cannot target a replacement arena. The constructors are hidden and the suite
-compiles a client outside the package to show it.
+compiles a client outside the package to show it. **A handle is checked against its service in ONE place**
+(item 20): every service numbers its backings and jobs from 1, so a handle of another service, or of one that has ended,
+names nothing here, in every function that takes one, queries included.
 
 **A worker's exit is one thing.** The cooperative stop its token carries is the only normal way a worker leaves; every other way (a cancellation delivered to its dispatch wait, a defect or cancellation out of a job, a remembered cancellation delivered after a finished job) runs the one `stopService` first: admission closes, queued work settles as cancelled, running work is asked to stop, the reason is recorded, and then the exception propagates. Admission never stays open over a worker that is gone, and running jobs never outnumber the workers alive (both are invariants the suite checks).
 
@@ -1313,6 +1315,27 @@ a closing record 0 (a `max 0` clamp), and all of them *passed* as "at most the c
 | A kept failure (a cleanup nobody received, or a close that failed) | control, while kept | `keptEntryBytes` 2,048 | the largest instance, a close that RAISED with a 256-character text of four-byte characters, with its list cell and its grant's entry: 1,517 (constant) | 64 asserted kept |
 | A write's pages | nothing while the job is queued or running: the transaction's own, already accounted in its reservation, referenced and never copied; **nothing once the job has finished** (`scrubWork`) | n/a | n/a | the finished-report row above |
 
+**What the service retains of what it is handed is its own (round 6).** The same method holds the rows that guard against
+a *view*: a `ByteString` keeps the whole buffer it was cut from. Each is asserted per instance within the record's charge, K at
+once, the test dropping its buffers (every slice is a 48-byte or 4-byte view of a fresh 2 MiB buffer); with the copy undone
+the service retains megabytes an instance:
+
+| Retained field | In the service, K at once | macOS | Linux | With the copy undone (control) |
+| --- | --- | --- | --- | --- |
+| an open's directory, finished and untaken | 24 jobs | 792 to 2,123 a job | 960 to 2,293 | 2,011,718 a job (R6-B1) |
+| an open's directory, queued | 8 jobs | 552 to 1,073 | 1,057 to 1,078 | 2,097,771 (R6-B1) |
+| the filesystem name of a volume profile | 24 profiles | 346 to 525 a profile | 345 to 526 | 2,097,527 (R6-B2) |
+| the qualified names of a configuration (two names) | 24 configurations | 237 to 433 a configuration | 233 to 407 | 4,194,589 (R6-B3) |
+
+The in-service write-report validation takes BOTH readings with the workers idle (blocked in their wait, observed by thread
+status): a worker that has committed a job's outcome is still inside its frame for a moment, holding the work it ran, so a
+reading taken then counts that job's pages (positive: 62,676 a job once in 26 repeats on macOS, against 33,280) or, if it is the
+first reading, counts what the second no longer does (-28,248 a job on Linux in 3 repeats). Both were races of the test, found by
+the repeats, not of the service. **Known sensitivity:** the noise-floor example forces about 1,500 major collections and did not
+finish inside the 10-second bounded wait when the machine ran at load average 23 to 26 from other work (it takes about 4.5 s for the
+floor and 9 s in all on the CI runner at `22a1a7ac`, a 20x margin there, and seconds at normal load); it is a failure of the
+bounded wait under heavy machine load, not of an assertion, and the suite passed when rerun at load 4.
+
 Two figures moved or were corrected in round 5. `keptEntryBytes` is **2,048** (it was 320, then 1,536): the largest instance now
 includes the admission's entry for the grant (1,517 where 1,326 left it out), which would have been 1.2 percent under 1,536. The
 write report's standalone row is **16.5 KB, not 20.6 KB**: the old model was itself lazy (a page-number thunk per entry) and
@@ -1376,7 +1399,7 @@ another growth, until `submitReleasePending` succeeds or the close releases it w
 
 ### Ownership at every instant, exceptions included
 
-A typed failure is not the only way out. Rounds 2, 3, 4 and 5 of review found one class under nineteen findings:
+A typed failure is not the only way out. Rounds 2 to 6 of review found one class under twenty-one findings:
 *an exit, a release or a failure taken between a state change and the bookkeeping that completes it*. Each
 exit of a thing the service holds now has **one mechanism that owns it**, and every table below enumerates
 every member of its class (the ones generated from code are marked, and the suite fails to compile when a
@@ -1662,7 +1685,7 @@ Every other retained record, the fields that could hold a thunk and what forces 
 
 | Record | Fields that could hold a thunk | What forces them |
 | --- | --- | --- |
-| a job at admission | `jBacking` (it was `Just` of a lazy selection of the id from the `Backing`); the work (the staged pages are the owner's list, shared) | `jBacking` is forced; the owner's list is shared and is dropped at finish |
+| a job at admission | `jBacking` (it was `Just` of a lazy selection of the id from the `Backing`); the work (an open's directory is the caller's view; the staged pages are the owner's list, shared) | `jBacking` is forced; the directory is copied at `submitOpen` (item 20); the owner's list is shared and is dropped at finish |
 | a finished job | the outcome; the work | `forceOutcome`, in the strict `jPhase` that the strict map insert evaluates inside the transaction; `scrubWork` |
 | a backing's entry | `ePending` (`Just (to - from)`, built lazily at three sites: growth commit, abandon, rollback) | forced at each site; every other field is a strict scalar or record, and the growth slot's `PreparedGrowth` is strict |
 | a kept failure | the evidence list's spine (a lazy `<>` chain); the close's text | `forceSpine`; an evaluated copy forced when kept |
@@ -1694,6 +1717,7 @@ exits and shutdown):
 | busy volumes | one per worker (2) | none: at most the two workers | `withVolume`'s acquire | its bracket | busy <= workers |
 | counters and words (`stNextJob`, `stNextBacking`, `svNames`, `stFair`, `stRunning`, `stWorkers`, `stMutation`, `stEvidenceDropped`) | one machine word each | none | n/a | n/a | not collections |
 | `stDefect`, `stStopReason` | one bounded text each (an evaluated copy), per service | none: a constant of the service | the first reason, the latest defect | the service's end | one value |
+| the configuration's qualified names (`scQualified`) | `maxQualifiedNames` (16) names of at most `maxQualifiedNameBytes` (32) bytes, checked where it is made (round 6) | none: a constant of the service, at most 16 x 32 = 512 bytes of names | `mkStorageConfig`, after every check passed | the service's end | one value, bounded by the two limits; a refusal copies nothing |
 
 The dual: every place a thread of a caller or a worker can be held by something the service does not control (a logger sink, a
 seam hook, a callback body), the record that exists while it is held, and what that record is charged:
@@ -1712,6 +1736,139 @@ seam hook, a callback body), the record that exists while it is held, and what t
 | `withVolume`'s wait | the busy-volume set | none |
 
 Round 5 found two members unbounded or outliving their charge: the reporting closing record and the volume ledger's node.
+
+**20. A handle is checked against its service in one place, and the service retains its own copies of what it is handed**
+(round 6). The first five rounds were about the inside of the service; round 6's two findings were at its edge.
+
+*Handles.* `backingView` discarded the handle's service identity and looked the bare id up: every service numbers its backings from
+1, so another service's handle, or one from a service that had ended, read an unrelated backing's capacity, pending reservation
+and lifecycle state. The fix is one resolver per handle type and nothing else reads a caller-supplied handle's fields:
+`resolveBacking` (the service identity first, then the id and identity), `lookBacking` (the entry a handle names in a state, or
+`ForeignHandle` or `BackingClosed`), `resolveTicket` (the job id a ticket names *here*, else nothing; `lookupTicket` is built on it)
+and `ownsPrepared` (a growth token is this service's); `madeBacking` reads the id of a handle this service *made*, never one a
+caller supplied. Every function that takes a handle goes through them (about nine had each pattern-matched the handle themselves,
+each with its own foreign check in its own order; `growthBlocks` read the bare id; `submitWrite` compared the handle's identity
+before its service). **Public behaviour that changed:** `backingView` of a foreign handle is `Nothing` (it was an unrelated
+backing's view); a foreign growth token to `submitAbandon` is `ForeignHandle` (it was `NoPreparedGrowth`, like
+`commitBackingGrowth`); a foreign handle to `submitWrite` is `ForeignHandle` even when its store identity also mismatches. The
+sweep (`Test.TerrainRuntime.Storage.Boundary`) runs every function that takes a handle, 14 of them, with a handle of a **live
+foreign service** and with a handle of an **ended service**, against a service whose ids overlap (it holds a backing 1 and a finished
+untaken job 1): the typed refusal or `Nothing`, and the whole snapshot and view of the service that was handed the handle (and of the
+one that made it, while it is live) compared before and after. Controls: R6-A1 (`backingView` by the bare id) and R6-A2 (the resolver
+without the identity check) each fail it.
+
+*Owned copies.* A `ByteString` is a view: a 4-byte directory cut from a 16 MiB buffer keeps all 16 MiB alive, and the service kept the
+caller's `OpenSpec` in queued and finished jobs for the price of one record. It is the third member of "it retains what it was made
+from" (the lazy tail and `jWork`'s pages, item 18, were the others), closed this time by type. Every retained field whose type can
+alias a larger allocation, where it comes from, whether it can be a view, and what makes it the service's own:
+
+| Retained field | Comes from | Can it be a view or share with the caller | What makes it the service's own, or why sharing is the contract |
+| --- | --- | --- | --- |
+| a job's `WOpen` directory | the caller | **yes** (the finding) | an own copy (`BS.copy`) forced at `submitOpen`, the one place the record is built; bounded by `maxDirectoryBytes`, charged inside `jobRecordBytes` |
+| a job's `WOpen` identity and configuration, `WRead`, `WGrow`, `WRelease` | the caller | no: `Word64` scalars | n/a |
+| a job's `WWrite` page list | the owner's transaction | yes, by contract: shared, never copied | the owner's, paid by the transaction's reservation; dropped when the job finishes (`scrubWork`) |
+| an `Opened` outcome's `Reservation` filesystem name; a `FilesystemNotQualified` name | the platform: on Linux a view into the whole text of `/proc/self/mountinfo` (`BC.words` slices), on macOS a copy | **yes** (Linux: one outcome kept the whole mount table) | the profile's own copy, built evaluated in `profileOf` (the result is a value, not a thunk holding the name) |
+| a `Pages` outcome's pages | the service: one `BS.packCStringLen` copy per page | no: each page is its own 4 KiB allocation | charged `resultPageBytes` a page until taken |
+| a `Written` report, an entry, a `Kept`, a closing record, the stop reason, the defect | the service | no: scalars, or bounded evaluated texts (`T.copy`) | item 18 |
+| the configuration's `scQualified` names | the caller (`mkStorageConfig`) | **yes** (found while checking this table: the code kept the caller's lazy list of views for the life of the service, and the first draft of the table claimed a copy) | an own, evaluated copy of every name, **after every check passed** (a refusal copies nothing), at most `maxQualifiedNames` (16) names of 1 to `maxQualifiedNameBytes` (32) bytes of printable non-space ASCII: a macOS type name is at most 15 characters and a Linux one a short registered word (`fuse.` and a subtype the longest: `fuse.gocryptfs`, `fuse.vmhgfs-fuse`); a type name has no space or control byte and is ASCII; the list is walked at most one name past the limit |
+| a `CloseReport`'s exception text | the service (`T.pack` of `show`), returned to the caller | no: not retained by the service, which keeps a bounded copy | n/a |
+
+Typed refusals of a configuration: `HeadroomBelowMinimum` (still first), `TooManyQualifiedNames`, `QualifiedNameEmpty`,
+`QualifiedNameTooLong n`, `QualifiedNameNotPrintable`. Evidence: the retention rows (under "Scheduling and accounting") and the
+configuration examples (each limit accepted, each refusal asserted, an infinite list refused without hanging). Controls: R6-B1
+(directory not copied), R6-B2 (filesystem name not copied), R6-B3 (names as views), R6-C1, R6-C2, R6-C3 (no count bound, no length
+bound, no byte check) each fail their example. The row for the profile found one more thing: `profileOf` returned the profile as a
+lazy constructor application that held the name (2,097,655 bytes a profile with the copy in place); it now builds and forces it.
+
+**21. The public boundary** (round 6). Every export of `Hetoimasia.Terrain.Runtime.Storage`, one row each, as data in
+`Test.TerrainRuntime.Storage.Boundary`; the suite **reads the module's export list from its source** and fails when an export has no
+row or a row has no export, and when a function that takes a handle is not in the sweep (control: removing a row fails both
+checks). The tables below are generated from that data. What validates each argument, what each function retains and how it makes
+that its own, what it returns and whether that aliases anything, whether it is masked or atomic, and its answer on a stopped, a
+sealed and a foreign service; the queries are checked as carefully as the mutators (`backingView`, `serviceView`, `pollTicket`,
+`awaitTicket`, `backingIdentity`, the prepared-growth accessors):
+
+| Export | Arguments and what validates each | Retains, and how it is its own | Returns (aliasing, exposure) | Masked or atomic | Stopped, sealed, foreign |
+| --- | --- | --- | --- | --- | --- |
+| `withStorage` | config (validated when made), the shared admission, a worker group, a logger; the threaded runtime is checked | nothing of the arguments beyond the handles it was given (the group and the logger are the caller's) | the body's result; a service whose scope ends with the body | workers started masked, the body unmasked, the drain masked | n/a (starts); a refusal to start is `StartFailure` |
+| `mkStorageConfig` | the qualified list (at most `maxQualifiedNames` names, each non-empty, at most `maxQualifiedNameBytes` bytes, printable non-space ASCII; the list is walked at most one name past the limit) and the headroom (at least `minHeadroomBytes`) | its own EVALUATED copy of every name, made only after every check has passed (a refusal copies nothing); a constant of the service, charged to nothing, bounded by the two limits | a typed `StorageConfigError` (`HeadroomBelowMinimum`, `TooManyQualifiedNames`, `QualifiedNameEmpty`, `QualifiedNameTooLong`, `QualifiedNameNotPrintable`) or a config | pure | n/a |
+| `backingIdentity` | a backing handle | nothing | the store identity the handle was made for (two scalars); reads nothing of any service | pure | the same for any service: a handle carries its identity |
+| `preparedFrom` | a growth token | nothing | a scalar | pure | n/a |
+| `preparedTo` | a growth token | nothing | a scalar | pure | n/a |
+| `preparedAllocated` | a growth token | nothing | a scalar | pure | n/a |
+| `stageWrite` | a store and its active transaction (the model's) | the transaction's pages, shared (the owner's) | a staged write or a typed `WriteRefusal` | pure | n/a |
+| `stagedPages` | a staged write | nothing | the owner's page list, shared | pure | n/a |
+| `stagedTxn` | a staged write | nothing | a scalar | pure | n/a |
+| `submitOpen` | the directory (non-empty, at most `maxDirectoryBytes`, no NUL), a store identity, a configuration | an OWN COPY of the directory (`BS.copy`, forced) in the queued and the finished job; the identity and the configuration are scalars | a ticket, or a typed refusal; nothing aliasing service state | one transaction | stopped: `ServiceStopped`; sealed: `ServiceStopped`; no handle to be foreign |
+| `submitRead` | a backing handle (service identity, then id, then phase), a configuration (against the committed allowance), a first page and a count (1 to 256, inside the file) | scalars only | a ticket or a typed refusal | one transaction | stopped/sealed: `ServiceStopped` or `BackingClosed`; foreign: `ForeignHandle` |
+| `submitWrite` | a backing handle, a staged write (the identity equals the backing's, at most 256 pages, each exactly one page, inside the file, each named once) | the owner's page list, shared while the job is queued or running and DROPPED when it finishes | a ticket or a typed refusal | one transaction | stopped/sealed: `ServiceStopped` or `BackingClosed`; foreign: `ForeignHandle` |
+| `submitGrowth` | a backing handle, a base (the committed allowance) and a target (larger, 1 MiB grid, minimum, offset limit) | scalars only | a ticket or a typed refusal | one transaction (the slot moves with the admission) | stopped/sealed: `ServiceStopped` or `BackingClosed`; foreign: `ForeignHandle` |
+| `submitAbandon` | a backing handle, a growth token (this service's, the current preparation) | scalars | a ticket or a typed refusal | one transaction | foreign handle or foreign token: `ForeignHandle`; sealed: `BackingClosed` |
+| `submitReleasePending` | a backing handle | scalars | a ticket or a typed refusal | one transaction | foreign: `ForeignHandle`; sealed: `BackingClosed` |
+| `commitBackingGrowth` | a backing handle, a growth token (this service's, the current preparation) | scalars | `()` or a typed refusal | one transaction | foreign handle or foreign token: `ForeignHandle`; sealed: `BackingClosed` |
+| `writeOutcomes` | a write report | nothing | a fresh list of page numbers and outcomes | pure | n/a |
+| `awaitTicket` | a ticket (service identity, then id) | nothing | `()` once the job has finished; a ticket that names no job here (taken, discarded or foreign) is finished at once, which shows nothing of another service | an STM read | stopped/sealed/foreign: returns at once |
+| `pollTicket` | a ticket | nothing | whether the job has finished (a ticket that names nothing here: yes) | an STM read | stopped/sealed/foreign: `True` |
+| `withOutcome` | a ticket, a body | nothing: the body runs over an EVALUATED outcome the service made | the body's result, or `Nothing` (not finished, taken, discarded or foreign); the callback never runs then | borrow committed masked, body unmasked, release masked | foreign: `Nothing`; sealed: `Nothing` |
+| `discardTicket` | a ticket | nothing | unit; no effect on a ticket that names nothing here | masked end to end | foreign: no effect; sealed: no effect |
+| `cancelTicket` | a ticket | nothing | `CancelResult` (foreign or unknown: `CancelUnknown`) | one transaction | foreign/sealed: `CancelUnknown` |
+| `withUse` | a backing handle, an action | nothing | the action's result or a typed refusal; the action never runs on a refusal | borrow committed masked, action unmasked, release masked | foreign: `ForeignHandle`; sealed: `BackingClosed` |
+| `closeBacking` | a backing handle | nothing | a copy of the close's report (a foreign or closed handle: nothing closed, no native call) | masked end to end | foreign/sealed: a report that closed nothing |
+| `backingView` | a backing handle (service identity, then id) | nothing | a COPY of scalars (committed, length, pending, borrows, flags), or `Nothing` for a handle of another service or a closed backing | an STM read | foreign/sealed: `Nothing` |
+| `maxQueuedJobs` | none | n/a | a constant (8) | pure | n/a |
+| `maxRunningJobs` | none | n/a | a constant (2) | pure | n/a |
+| `maxIoJobBytes` | none | n/a | a constant | pure | n/a |
+| `maxIoPages` | none | n/a | a constant (256) | pure | n/a |
+| `maxJobRecords` | none | n/a | a constant (32) | pure | n/a |
+| `jobRecordBytes` | none | n/a | a constant (4,096) | pure | n/a |
+| `writeEntryBytes` | none | n/a | a constant (112) | pure | n/a |
+| `writeFailureBytes` | none | n/a | a constant (512) | pure | n/a |
+| `transferBufferBytes` | a page count | n/a | a number | pure | n/a |
+| `resultPageBytes` | none | n/a | a constant (4,864) | pure | n/a |
+| `backingRecordBytes` | none | n/a | a constant (4,096) | pure | n/a |
+| `serviceView` | none | nothing | a COPY of counts and the volume figures of THIS service; no handle to be foreign | an STM read | stopped/sealed: the counts of that state |
+| `failureCode` | a failure | nothing | a stable code | pure | n/a |
+| `defaultQualified` | none | n/a | the qualified list | pure | n/a |
+| `minHeadroomBytes` | none | n/a | a constant (256 MiB) | pure | n/a |
+| `maxQualifiedNames` | none | n/a | a constant (16) | pure | n/a |
+| `maxQualifiedNameBytes` | none | n/a | a constant (32) | pure | n/a |
+
+The exported types:
+
+| Type | Kind | Built by | Checked when a caller supplies it | Aliasing, and what makes a retained value the service's own |
+| --- | --- | --- | --- | --- |
+| `StorageService` | a service | `withStorage` | n/a | an abstract handle to the running service; a value is valid only inside its scope |
+| `StartFailure` | a failure value | the service | n/a | scalars |
+| `StorageConfig` | an input a caller builds (abstract) | `mkStorageConfig` | the headroom at least `minHeadroomBytes`; at most `maxQualifiedNames` names, each non-empty, at most `maxQualifiedNameBytes` bytes, printable non-space ASCII | the qualified names are the configuration's OWN evaluated copies, made after every check passed (a name cut from a large buffer would keep it alive); the whole is a constant of the service bounded by the two limits |
+| `StorageConfigError` | a failure value | `mkStorageConfig` | n/a | scalars (the length of a name that is too long) |
+| `Backing` | a handle (abstract) | the service, in an opened backing's outcome | service identity, then id, in the one resolver | two scalars and the store identity; names nothing of another service |
+| `Ticket` | a handle (abstract) | the service, at each submission | service identity, then id, in the one resolver | two scalars |
+| `PreparedGrowth` | a handle (abstract) | the service, in a growth outcome | its service identity, in the one place (`ownsPrepared`), and the current preparation | scalars |
+| `WorkClass` | an input a caller builds | the caller | total | a tag |
+| `OpenSpec` | an input a caller builds | the caller | the directory: non-empty, at most `maxDirectoryBytes`, no NUL | the directory is COPIED at `submitOpen` before anything retains it; the identity and the configuration are scalars |
+| `ReadMode` | an input a caller builds | the caller | total | a tag |
+| `StagedWrite` | an input a caller builds (abstract) | `stageWrite` | the identity equals the backing's; at most 256 pages, each one page, in the file, each once | the page list is the OWNER's, shared while the job is queued or running and dropped when it finishes (documented; the transaction's own reservation pays for it) |
+| `WriteRefusal` | a failure value | `stageWrite` | n/a | scalars |
+| `Outcome` | an output the service makes | the service | n/a | an EVALUATED value (`forceOutcome`): a read's pages are the service's own per-page copies, charged; no view into a caller's or the platform's buffer |
+| `Reservation` | an output the service makes | the service | n/a | scalars and the filesystem name, which is the profile's own copy |
+| `WriteReport` | an output the service makes | the service | n/a | page numbers and results, evaluated; never the pages |
+| `PageResult` | an output the service makes | the service | n/a | a tag or a failure value |
+| `CancelResult` | an output the service makes | the service | n/a | a tag |
+| `CloseReport` | an output the service makes | the service | n/a | a COPY of the close's result (the service keeps its own typed failure) |
+| `BackingView` | an output the service makes | the service | n/a | scalars copied out of the entry |
+| `ServiceView` | an output the service makes | the service | n/a | counts and the volume figures of THIS service; copies |
+| `StorageFailure` | a failure value | the service | n/a | strict scalars; a text is a bounded evaluated copy |
+| `IoOp` | a failure value | the service | n/a | a tag |
+| `IoKind` | a failure value | the service | n/a | a tag and an errno |
+| `IoFailure` | a failure value | the service | n/a | scalars |
+| `IntegrityFailure` | a failure value | the service | n/a | scalars |
+| `UnsupportedWhy` | a failure value | the service | n/a | the refused filesystem's name is the profile's own copy |
+| `ReservationFailure` | a failure value | the service | n/a | scalars |
+| `ReservationOp` | a failure value | the service | n/a | a tag |
+| `InvalidWhy` | a failure value | the service | n/a | scalars |
+| `BusyReason` | a failure value | the service | n/a | scalars |
+| `CleanupNote` | a failure value | the service | n/a | scalars |
+| `Errno` | a failure value | the platform | n/a | a scalar |
 
 Smaller rules that hold the same class:
 
@@ -1873,6 +2030,11 @@ run anywhere else. The storage examples hold the class of defect, not the instan
   observed 33,681,408-byte residue passes, new allocation fails, lost coverage fails, a consumed residue fails, a
   decrease that still covers passes, a refused growth that changed the file fails). Not routine-testable, and stated:
   that the probe examples call the verdicts at the right points (they run only on a real fixture).
+* **The public boundary** (`Boundary`, item 21): the export list read from the source and checked against the function table and the
+  type table; the handle sweep (14 functions x a live foreign service and an ended one, whole state compared); the configuration's
+  bounds (each limit accepted, each refusal typed, an infinite list refused).
+* **The retention rows** (`Memory`, `spec4`): a directory, a filesystem name and a configuration's names that are 4-to-48-byte views
+  of fresh 2 MiB buffers cost the copy and not the buffer, K at once, finished-untaken and queued.
 * **The memory rows** (`Memory`): the noise floor, then every retained structure at its largest measured standalone or amplified
   with a signal 50 times the floor, no vacuous pass, the finished write reports held untaken against the model, run 200 times
   in one process on both hosts (the table and the method under Scheduling and accounting).
