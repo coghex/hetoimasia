@@ -64,7 +64,9 @@ These are the routine examples, in `terrain-runtime-tests` (`Test.TerrainRuntime
 
 ## Routine-suite wall time and repeats
 
-`terrain-runtime-tests` (584 examples) took 1,042.8 s on this Mac at the candidate before the last probe-only commits; the storage examples are 48 of them and about 4 s of that. macOS, 40 repeats of the storage examples: 0 failures. Linux aarch64, 25 repeats: 2 failures, both in the growth release assertions (ext4 keeps one block of bookkeeping accounted after a release, where the assertion demanded exact equality); the assertion is now "within one block" and the repeats were rerun at the final head (see the pull request).
+`terrain-runtime-tests` is 585 examples including the 49 storage examples. Wall time on this Mac, run directly: 1,042.8 s at an earlier candidate (584 examples), and 1,114 s at the final head while `workflow-tests` ran beside it; the brief's baseline for the suite is about 16 minutes, and the storage examples account for about 4 s of it (measured in isolation, opacity compilation included). No capacity, latency or filesystem experiment is in the routine suite; those are the probe.
+
+Repeats of the storage examples: macOS, 40 runs at an earlier candidate, 0 failures. Linux aarch64: 25 runs found 2 failures, both in the growth release assertions (ext4 keeps one block of bookkeeping accounted after a release, where the assertion demanded exact equality); the assertion is now "within one block", and 10 runs at the final head, run with `terrain-runtime-tests --match "Storage backend"`, had 0 failures.
 
 ## Negative controls
 

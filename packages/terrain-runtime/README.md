@@ -1201,7 +1201,7 @@ configuration charges; a larger one refuses the open.
 | Platform | Filesystem | Reservation | Rewrite inside the reservation, volume exhausted | Release |
 | --- | --- | --- | --- | --- |
 | macOS 26 (arm64) | APFS, 3 GiB disk image | exact (overhead 0) at 64 MiB, 256 MiB, 1 GiB | no new allocation | Preallocation beyond the end of the file is released only by raising the length and shortening it; the last close reclaimed the space within the first observation |
-| Linux (aarch64) | ext4, 3 GiB loop image | see [the evidence](../../docs/evidence/terrain/tra21/README.md) | see the evidence | see the evidence |
+| Linux 6.8 (aarch64) | ext4, 3 GiB loop image | exact at 64 MiB and 256 MiB; 4,096 bytes over at 1 GiB (an extent block, inside the model overhead) | no new allocation | one block of ext4 bookkeeping stays accounted after a release; the space returned at the last close |
 
 The qualification is a probe, not a claim of universal support; the table is what was run, and the
 records, the commands and the run identifiers are in the evidence.
