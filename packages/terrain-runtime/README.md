@@ -1227,28 +1227,90 @@ write or a larger allowance does not clear an integrity failure.
 Explicit work precedes camera prefetch; maintenance (accepted work and reclamation) is served after
 at most three explicit jobs while it waits, camera after at most seven jobs of the other classes.
 There is one mutating job (a transaction's write or a growth step) in the session at a time; reads
-proceed beside it. Every job is charged `jobRecordBytes` (2,048, measured by the suite against the
-live heap of the largest queued read and open) of the control account from submission to
-retirement, all or nothing; a read's transfer buffer and result are charged when it is
-dispatched, so a full queue holds no buffer; camera reads cannot take the protected 4 MiB of
-staging. A refusal creates nothing. The 8 MiB protected allocator allowance of the model stays
-inside the allowance; the backend neither enlarges it nor bypasses the model.
+proceed beside it. Camera reads cannot take the protected 4 MiB of staging. A refusal creates
+nothing. The 8 MiB protected allocator allowance of the model stays inside the allowance; the backend
+neither enlarges it nor bypasses the model.
+
+Every thing the service holds is charged at what it holds, through one gate each, and every figure is
+measured against the live heap (`Test.TerrainRuntime.Storage.Memory`), never reasoned from an encoded size:
+
+| Held thing | Charged to, and when | Figure | Measured row |
+| --- | --- | --- | --- |
+| A job record (queued, running or finished), per ticket | control, from submission to retirement (`admitJob`) | `jobRecordBytes` 2,048 | largest queued read 1,071; largest queued open, a 512-byte path of its own, 1,578 |
+| A read's transfer buffer while it runs | staging (camera work the unprotected share only), at dispatch (`dispatchNext`) | `transferBufferBytes n`: the pages, 1/32 more for the runtime's large-object block descriptors, one block; 1,087,488 at 256 pages | two held 256-page reads, per read with its record: 1,065,444 |
+| A read's result until it is taken or discarded | cache, pinned, at dispatch | `resultPageBytes` 4,608 a page | a finished, untaken 256-page result with its record: 1,096,616 of 1,181,696 |
+| A backing's record (per arena) | control, from the open's success to the close (`register`, `closeBackingCore`), all or nothing | `backingRecordBytes` 4,096 | per backing 1,155, a pending reservation 376 more |
+| A write's pages | nothing: the transaction's own, already accounted in its reservation, referenced and never copied | n/a | n/a |
+
+A read's buffer and its result are two physical copies at the moment of completion, so both are
+charged from dispatch. A job whose dispatch would need an **eviction** is not dispatched: `A.reserve`
+may choose to evict backed, unpinned copies, and those copies belong to the terrain owner's caches, so
+the service never takes that choice. The job stays queued, and the owner sees it:
+`ServiceView.svWaitingForCache` counts the queued jobs refused for want of an eviction. **The owner
+must drop (release) backed, unpinned cached copies when it is greater than zero**; the job runs the
+next time the dispatch fits, and nothing else is signalled or retried.
+
+The **volume ledger** (`svReserved`, per volume) has one definition: a backing contributes its file's
+length plus any extra reservation still pending (`backingContribution`), the open adds it, a prepared
+growth adds its extra, an abandon or a successful release subtracts the extra, and a close subtracts
+exactly the backing's contribution; once every backing is closed every volume's figure is zero. The
+suite asserts both ledgers, the admission's and the volume's, after every sweep case, every close and
+every random sequence.
 
 ### Growth
 
-`submitGrowth` executes a growth the model proposed, against the committed allowance: the base must
-be the committed allowance, the target larger, no growth prepared and no earlier extra reservation
-unreleased. It reserves the extra range under the same proof, and answers a `PreparedGrowth` that
-is **not spendable**: a request naming the larger allowance is refused until the owner commits the
-model's growth and then `commitBackingGrowth`. A failure or cancellation first releases what was
-obtained (raising the length and shortening it, which frees preallocation on both targets); if that
-release fails the extra stays as a bounded **pending reservation**, charged on the volume, blocking
-another growth, until `submitReleasePending` succeeds or the close releases it with the file. Old
-contents and the old allowance are authoritative throughout.
+`submitGrowth` executes a growth the model proposed, against the committed allowance. Sizes are
+validated here again (the minimum, the 1 MiB grid, the native offset limit) before any native work. An
+**equal size is an idempotent no-op** (`GrowthNoChange`: nothing reserved, nothing changed); a smaller
+size is refused. It reserves the extra range under the same proof and answers a `PreparedGrowth`,
+which carries the service's identity and a fresh identity of this preparation, so a token of another
+service, or of an earlier, abandoned or committed preparation, is refused. A prepared growth is **not
+spendable**: a request naming the larger allowance is refused until the owner commits the model's
+growth and then `commitBackingGrowth`. Old contents and the old allowance are authoritative throughout.
+
+Every event is one transaction on the backing's growth slot; this is the table (the comment on
+`GrowthSlot` in `Service.hs` is its source):
+
+| State | submit growth | prepare finishes | cancel | commit p | abandon p | release finishes / fails | close |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `GIdle` | to `GRunning`, in the admission's transaction | n/a | n/a | refused | refused | n/a | closes |
+| `GRunning` | refused (busy) | one transaction checks cancellation: published as `GPrepared`, or cancelled: the extra is released (a failed release leaves a charged pending record) and the slot is idle | the job stops at its next safe point and the same arbitration decides | refused | refused | n/a | waits for the job |
+| `GPrepared p` | refused (busy) | n/a | n/a | the token must match: `GIdle` and the cap rises | to `GReleasing`, in the admission's transaction: the commit authority is gone from then on | n/a | released with the file |
+| `GReleasing` | refused (busy) | n/a | not applicable | refused | refused | `GIdle`; a failed release is `GIdle` with the extra pending and charged | waits for the job |
+
+A release that fails keeps a bounded **pending reservation**, charged on the volume and blocking
+another growth, until `submitReleasePending` succeeds or the close releases it with the file.
+
+### Ownership at every instant, exceptions included
+
+A typed failure is not the only way out. The rules, each with the examples that hold it:
+
+* **Open.** From the moment the file exists until the one transaction that registers it, `execOpen`
+  owns the descriptor on every exit. A typed failure unwinds explicitly; an exception from any native
+  step (the seam included) closes it too, unlinks again if the name remains, never closes twice (the
+  close attempt is recorded before it is made) and keeps the cleanup failures beside the primary
+  exception. Cancellation is arbitrated in the registering transaction.
+* **Reservation progress is explicit.** `reserveRange` says whether the native allocation was attempted
+  when it stopped. Every stop after it, a failed final query included, rolls the extra back or leaves
+  a charged pending reservation; only a stop before it obtained nothing. An exception from any step
+  of a growth is handled the same way, and the release itself is exception-safe.
+* **Close.** The drain check and the claim of the descriptor are one transaction (nothing can begin
+  between them), the wait is in the caller's boundary with every interruption remembered and delivered
+  after the close, the hand-off to the native close is masked, the close is made once and an exception
+  or an errno from it is recorded and never retried. A closing backing takes no new borrower
+  (`withUse` and `withOutcome` refuse it), so a caller cannot hold a close open.
+* **Discard.** A ticket discarded while its job runs is retired when the job finishes, and a backing
+  it opened is closed by the worker.
+* **Startup.** Every worker started is stopped and joined on every exit of the start sequence, a typed
+  failure, an exception or a cancellation (the abort's own join included), in the same protected wait
+  the drain uses; the primary failure propagates.
+* **Shutdown.** The workers stop and are joined, every backing is closed, and every record still in
+  the table (an outcome nobody took, an opened backing nobody named) is retired once its borrowers have
+  finished; the admission and the volume figures are then exactly as they were.
 
 ### Tests
 
-`terrain-runtime-tests` (`Test.TerrainRuntime.Storage.*`) owns the deterministic safety cases (see
+`terrain-runtime-tests` (`Test.TerrainRuntime.Storage.*`, including the class examples of `Classes`: the growth state machine as a gate-point-by-event matrix, the native-call sweep of 21 rows by three injections with the descriptor, tracking, allocation and both ledgers checked, the startup rows, and a 40-seed random property over submit, cancel, discard, take, close and shutdown) owns the deterministic safety cases (see
 [the suites](../../docs/test_suites.md)); `terrain-storage-probe` is the optional local real-platform
 qualification, which fills a disposable volume the scripts under `tools/terrain-storage/` make and
 refuses to run anywhere else.

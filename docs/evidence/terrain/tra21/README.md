@@ -1,6 +1,6 @@
 # TRA-21 evidence: the storage backend on two real platforms
 
-Evidence for [#663](https://github.com/coghex/hetoimasia/issues/663) (own reserved backing files and bounded asynchronous storage I/O). The implementation is in `packages/terrain-runtime` (`storage/`, `probe/`); the contract is its README section "The storage backend (TRA-21)". Candidate revision of both records: `e2b97419bd276401ab58f2cd588090ff1fd4c177` on branch `issue-663-storage-backend`.
+Evidence for [#663](https://github.com/coghex/hetoimasia/issues/663) (own reserved backing files and bounded asynchronous storage I/O). The implementation is in `packages/terrain-runtime` (`storage/`, `probe/`); the contract is its README section "The storage backend (TRA-21)". Candidate revision of the records: `69cb867061ff9c06715a7c879f42c7a7c042605d` on branch `issue-663-storage-backend` (round 2 of review); the earlier records at `e2b97419` are kept below as history.
 
 ## What is and is not claimed
 
@@ -21,7 +21,11 @@ tools/terrain-storage/{macos,linux}-fixture.sh down <scratch>
 | --- | --- | --- |
 | macOS 26.7.1 (25G313), arm64, Darwin 25.6.0, Apple clang 21.0.0, GHC 9.14.1 | `f02cccc9-095a-4bbb-be60-f707913ed6e5` | 8 passed |
 | macOS, the same fixture, one revision earlier (`50595926`) | `f4179231-939f-4723-b369-8c5a166c83b8` | 7 passed, 1 failed (below); kept as evidence, not as the record |
-| Ubuntu 24.04.4 LTS aarch64, Linux 6.8.0-142-generic, gcc 13.3.0, GHC 9.14.1, cabal 3.18.1.0, in the owner's `hetoimasia-linux` Lima VM (guest-local checkout cloned from the read-only worktree mount) | `b932136e-8b6a-4669-97fa-77363abb7e0e` | 8 passed |
+| Ubuntu 24.04.4 LTS aarch64, Linux 6.8.0-142-generic, gcc 13.3.0, GHC 9.14.1, cabal 3.18.1.0, in the owner's `hetoimasia-linux` Lima VM (guest-local checkout cloned from the read-only worktree mount) | `b932136e-8b6a-4669-97fa-77363abb7e0e` (`e2b97419`) | 8 passed |
+| **Final head** `69cb8670`, macOS (same identity as above) | `4f3965bc-f67a-4275-a0f0-96bc158cbf08` | 8 passed: **the macOS record** |
+| **Final head** `69cb8670`, Linux (same identity as above, a fresh ext4 loop image) | `40d69440-4d8a-42ca-8368-0e4f685e197f` | 8 passed: **the Linux record** |
+
+The two final-head runs were taken after the capacity check moved into the probe's mandatory fixture acquisition (round 1 of review); the probe was run on no machine between that finding and the fix. The numbers in the tables below are the final-head runs' (they equal the earlier runs' except where stated).
 
 The first macOS run failed in the growth example: the probe released its own filler file and grew at once, and APFS had not yet given the closed, unlinked file's blocks back (33,681,408 bytes reported available), so the headroom refusal was correct for what the volume reported. The probe now observes the volume with a bounded, spaced poll before growing (200 observations of 50 ms at most); the rerun saw the space at once (0 observations). The lag is real and nondeterministic; a consumer must not assume space returns at the moment of the close.
 
@@ -64,10 +68,55 @@ These are the routine examples, in `terrain-runtime-tests` (`Test.TerrainRuntime
 
 ## Routine-suite wall time and repeats
 
-`terrain-runtime-tests` is 585 examples including the 49 storage examples. Wall time on this Mac, run directly: 1,042.8 s at an earlier candidate (584 examples), and 1,114 s at the final head while `workflow-tests` ran beside it; the brief's baseline for the suite is about 16 minutes, and the storage examples account for about 4 s of it (measured in isolation, opacity compilation included). No capacity, latency or filesystem experiment is in the routine suite; those are the probe.
+`terrain-runtime-tests` is 602 examples at the final head `69cb8670`, including the storage examples (66 match "Storage backend"; the class examples among them run in about 3 s). Wall time on this Mac, run directly with other load beside it: 858.7 s of examples (1,123 s with its startup) at the final head; 1,042.8 s (584 examples) at an earlier candidate and 1,114 s at `06bc8415`; the brief's baseline for the suite is about 16 minutes. The storage examples are a few seconds of it; no capacity, latency or filesystem experiment is in the routine suite, those are the probe.
 
-Repeats of the storage examples: macOS, 40 runs at an earlier candidate, 0 failures. Linux aarch64: 25 runs found 2 failures, both in the growth release assertions (ext4 keeps one block of bookkeeping accounted after a release, where the assertion demanded exact equality); the assertion is now "within one block", and 10 runs at the final head, run with `terrain-runtime-tests --match "Storage backend"`, had 0 failures.
+Repeats of the storage examples: macOS, 40 runs at an earlier candidate and 6 at the dev loop of the final head, 0 failures. Linux aarch64: an earlier 25 runs found 2 failures, both in the growth release assertions (ext4 keeps one block of bookkeeping accounted after a release, where the assertion demanded exact equality), since changed to "within one block"; then 10 runs at `14f9acf4` and 5 runs at the final head `69cb8670`, run with `terrain-runtime-tests --match "Storage backend"` (66 examples), 0 failures.
 
 ## Negative controls
 
 Each was applied once locally to the committed source, the affected examples run, then reverted, never committed: the coverage check removed (the sparse example fails), the offset not advanced after a short transfer (the short I/O examples fail), a running job's cancellation releasing its resources early (the cancellation example fails), a failed close retried (the "never closes twice" example fails), a prepared growth made spendable (the "not spendable" example fails), the volume coordination removed (the serialization example fails), the fair-progress rule removed (the scheduling example fails), the close not waiting for the drain (the example's thread blocks forever, a failure). Not exercised as a control: the interrupted-call retry cap (the storm example asserts the bound, but the cap itself was not mutated) and the descriptor-leak check on a child `exec`.
+
+## Round 1 of review, answered
+
+Round 1 (head `06bc8415`, Codex) requested changes with eleven findings. Fixed as four classes plus the owner's reads of the sites; the evidence for each is the example named.
+
+| Finding | Class | Fix | Example |
+| --- | --- | --- | --- |
+| Probe capacity checked only in the first example | A | one mandatory acquisition (`Fixture`): exists, owned, distinct device, capacity from an opened descriptor, before any allocation; the constructor is hidden and every filler and reservation takes a `Fixture` | `Classes` (A): every probe case, handed a refused fixture, fails at the acquisition with nothing created |
+| Abandon left commit authority open | B | `GReleasing` is entered in the admission's transaction | "revokes the commit authority in the step that accepts an abandon" |
+| Failed final `fstat` treated as obtaining nothing | C | `reserveRange` reports whether the allocation was attempted; every later stop rolls back or leaves a charged pending | sweep row "stat (verify)" |
+| Exception left the opened descriptor open | C | `execOpen` owns the descriptor until the registering transaction on every exit | sweep rows "create" to "stat (verify reservation)" |
+| Drain and claim were two steps; unmasked close | C | one transaction; masked hand-off; one close | "closes only after a gated native call has returned", sweep "close" rows |
+| Discarded running ticket kept its charges | D | marked and retired when the job finishes | "retires a ticket discarded while its job runs" |
+| Open outcomes not drained at shutdown | D | shutdown retires every record and closes the backings they named | "retires an opened backing's outcome nobody took" |
+| `grantEvicted` dropped | D | dispatch refuses a reservation that would evict; `svWaitingForCache` tells the owner | "never drops an eviction" |
+| Growth sizes unvalidated at the boundary | B | minimum, 1 MiB grid and offset limit re-checked | "refuses a token of another service and sizes off the grid" |
+| `PreparedGrowth` not unique | B | carries the service and a fresh attempt identity | "revokes the commit authority" (stale token), foreign token |
+| Cancellation not arbitrated at publication | B | checked in the transaction that publishes `GPrepared` | gate-point matrix, three gate points by six events |
+
+The owner's reads then found three more, each fixed with a control: the second worker's start failing (or being cancelled) left the first without an owner and the abort's join was interruptible; after a failed give-back of a never-published growth the close left `to - from` in the volume's reserved figure; and `withOutcome` took borrowers of a closing backing. A fourth point was answered in the contract, with the signal `svWaitingForCache`.
+
+### (B) the growth state machine, state by event
+
+The table is in the package README ("Growth"). The suite injects every event at three gate points of a growth (before the allocation, before the length, before the final verification) and in the prepared and releasing states: 3 gate points by 6 events (none, cancel, a stale token's commit, a stale token's abandon, a second growth, a release of a pending reservation), each outcome one the table allows, the reported reservation equal to the file's physical allocation within one filesystem block, plus the abandon-in-flight, stale-token, foreign-token and size examples.
+
+### (C) the sweep matrix
+
+21 rows of (stage, native call, which occurrence) by 3 injections (a typed failure, a thrown exception, a cancellation) = 63 cases, after each of which: the process's open descriptors are back to the baseline (counted from `/dev/fd` or `/proc/self/fd`), the backings the service tracks equal the descriptors open, the reported reservation equals the physical allocation (growth, release), every backing closes and every volume's reserved figure is zero. Rows: open (create, unlink, close-on-exec, the three stats, statfs, reserve, set length, and the cleanup close after a failure), growth (profile stat, statfs, reserve, set length, verification stat, and the rollback's set length after a failure), release (stat, set length), read (pread), write (pwrite), close. The cancellation of the close is an interruption delivered to the closing thread while it waits for a held call. The startup rows: the first start refused, the second start fails, a cancellation during the first start, during the second start, and during the abort's join (held at the worker's end); each leaves no live worker (the group's report) and keeps the primary failure.
+
+### (D) the property
+
+40 seeds by 36 operations = 1,440 operations over three work classes of read, cancel, discard, take, close, open and the gate, then every backing is closed and the service shuts down: the admission is exactly zero (the environment's end checks it) and the volume's figures are zero.
+
+### Controls (each applied once to the committed source, the affected examples run, then reverted; never committed)
+
+All bite: B1 abandon does not revoke commit; B2 publication does not arbitrate cancellation; B3 the token compared without its attempt identity; B4 sizes not validated; C1 an exception in open does not close the descriptor; C2 a failed final query treated as obtaining nothing; C4 the close without its drain check; D1 a running ticket's discard not marked; D2 shutdown does not retire the records; D3 eviction allowed; E1 started workers not stopped or joined on a failed start; E2 a close giving back only the length; E3 a closing backing still takes borrowers; E4 the pressure signal not reported. Earlier controls (round 0) are in the first list above.
+
+### What a control cannot catch (the honest list)
+
+Races between two transactions at interleavings the gates do not reach (the matrix injects at gate points; the drain-and-claim atomicity is by construction, and its mutation is caught through the gated-close example, not through a deterministic interleaving); an exception raised by the kernel after a native side effect (modelled only for `close`, whose call is made and then raises; the others raise before the call); asynchronous exceptions delivered to a worker (workers run masked by design, the cancellation is a request); a real `EINTR` from `close`; that the owner actually drops cache when `svWaitingForCache` is positive (the owner is TRA-22's).
+
+### A bug the sweep found
+
+`protectedly`, the wait the drain and the close use to remember an interruption and deliver it afterwards, recognised asynchronous exceptions with `asyncExceptionFromException` at the wrong type, so an interruption of a closing thread aborted the close and left the descriptor open (and would have aborted a drain). The "cancellation" injection of the close row failed with one descriptor leaked; fixed to `fromException` at `SomeAsyncException`.
+
