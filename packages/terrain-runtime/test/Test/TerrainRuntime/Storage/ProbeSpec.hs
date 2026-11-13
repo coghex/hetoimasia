@@ -70,6 +70,8 @@ probeCases =
         fx <- acquired acquire
         let dir = fixtureDir fx
         record "os" os
+        -- the platform-fact table's row for this platform (a failed close is not established to release on macOS)
+        record "close.fact" (show (closeFactOf os))
         record "arch" arch
         record "compiler" (show compilerVersion)
         record "fixture" dir
@@ -93,7 +95,14 @@ probeCases =
             Opened _ rs -> do
               record ("reserve." <> show (bytes `div` mib) <> "MiB.allocated") (show (rsAllocated rs))
               record ("reserve." <> show (bytes `div` mib) <> "MiB.overhead") (show (rsOverhead rs))
-              rsAllocated rs `shouldSatisfy` (>= bytes)
+              -- THE PAYLOAD RULE on the real platform, from the rule and not from numbers: the file holds the model's usable
+              -- pages, the platform covers all of them, and what it physically occupies fits the allowance (the overhead
+              -- fits what the allowance leaves for it)
+              record ("reserve." <> show (bytes `div` mib) <> "MiB.payload") (show (payloadBytes cfg))
+              record ("reserve." <> show (bytes `div` mib) <> "MiB.allowance") (show bytes)
+              rsLength rs `shouldBe` payloadBytes cfg
+              rsAllocated rs `shouldSatisfy` (>= payloadBytes cfg)
+              rsAllocated rs `shouldSatisfy` (<= bytes)
               -- the allocation GRANULARITY is asserted, not only reported: the allocated bytes are a whole multiple of the
               -- reported block size
               record ("reserve." <> show (bytes `div` mib) <> "MiB.blocksize") (show (rsBlockSize rs))
@@ -107,20 +116,22 @@ probeCases =
         let dir = fixtureDir fx
         withEnvIn dir defaultProbe $ \env -> do
           let cfg = hCfg h64
-              size = cfgAllowanceBytes cfg
+              -- every page the model can address: the payload (a page in the tail up to the allowance is refused, never written)
+              size = payloadBytes cfg
           _ <- openBacking env ident cfg
           [fd] <- fdHandles (envProbe env)
-          -- every page of the allowance, a pattern per page, then the whole range read back
+          -- every page of the payload, a pattern per page, then the whole range read back
           timed "write.allowance" (pattern' fd size 1)
           timed "readback.allowance" (verify fd size 1)
           -- the rest of the volume is consumed in a filler file the probe owns, until the platform refuses
           withMeter fx $ \meter -> withFiller fx meter $ \filler -> noCreateWhile env $ do
             record "exhausted.filler.bytes" (show filler)
-            -- THE STATE THE CLAIM IS MADE IN: the backing's own allocation covers the whole allowance (read by fstat
-            -- on its descriptor), recorded
+            -- THE STATE THE CLAIM IS MADE IN: the backing's own allocation covers the whole payload and fits the allowance
+            -- (read by fstat on its descriptor), recorded
             allocBefore <- allocatedOf fd
             record "rewrite.backing.allocated.before" (show allocBefore)
             allocBefore `shouldSatisfy` (>= size)
+            allocBefore `shouldSatisfy` (<= cfgAllowanceBytes cfg)
             availBefore <- availableOf meter
             -- previously written pages are rewritten across the whole reserved range
             timed "rewrite.exhausted" (pattern' fd size 2)
@@ -131,6 +142,7 @@ probeCases =
             availAfter <- availableOf meter
             record "rewrite.backing.allocated.after" (show allocAfter)
             record "rewrite.available.consumed" (show (toInteger availBefore - toInteger availAfter))
+            allocAfter `shouldSatisfy` (<= cfgAllowanceBytes cfg)
             either (fail . show) pure (rewriteVerdict size allocBefore allocAfter availBefore availAfter)
             record "rewrite.within.reservation" "no new allocation, coverage kept, no space consumed"
     
@@ -142,7 +154,7 @@ probeCases =
           let cfg = hCfg h64
           b <- openBacking env ident cfg
           [fd] <- fdHandles (envProbe env)
-          pattern' fd (cfgAllowanceBytes cfg) 3
+          pattern' fd (payloadBytes cfg) 3
           withMeter fx $ \meter -> withFiller fx meter $ \_ -> noCreateWhile env $ do
             st0 <- statOf fd
             o <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
@@ -153,7 +165,7 @@ probeCases =
             record "growth.exhausted.size.after" (show (nsSize st1))
             record "growth.exhausted.allocated.after" (show (nsAllocated st1))
             either (fail . show) pure (growthVerdict (nsSize st0, nsAllocated st0) (nsSize st1, nsAllocated st1))
-            verify fd (cfgAllowanceBytes cfg) 3
+            verify fd (payloadBytes cfg) 3
           g <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
           case g of
             GrowthPrepared _ rs -> do
@@ -162,8 +174,11 @@ probeCases =
               -- the granularity of the grown file too: whole blocks of the reported block size
               rsBlockSize rs `shouldSatisfy` (> 0)
               (rsAllocated rs `mod` rsBlockSize rs) `shouldBe` 0
+              -- after a growth the file holds the new allowance's usable pages and occupies no more than the new allowance
+              rsLength rs `shouldBe` payloadBytes (hCfg (newStoreH (specOf (toInteger (128 * mib)) Nothing)))
+              rsAllocated rs `shouldSatisfy` (<= 128 * mib)
             other -> expectationFailure ("not grown: " <> show other)
-          verify fd (cfgAllowanceBytes cfg) 3
+          verify fd (payloadBytes cfg) 3
     
     )
   , ("retains a failed release as a pending reservation and frees it on an explicit retry, old data intact", \acquire -> do
@@ -173,7 +188,7 @@ probeCases =
           let cfg = hCfg h64
           b <- openBacking env ident cfg
           [fd] <- fdHandles (envProbe env)
-          pattern' fd (cfgAllowanceBytes cfg) 4
+          pattern' fd (payloadBytes cfg) 4
           addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (10 * mib))
           addRule (envProbe env) 1 (== OpSetFileLength (payloadBytes (hCfg h64))) (FailWith (Errno (fromIntegral (let C.Errno c = C.eIO in c))))
           o <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
@@ -184,8 +199,10 @@ probeCases =
           awaitOutcome env t >>= (`shouldBe` Released)
           st <- either (fail . show) pure =<< nativeStat posixNative fd
           record "release.retry.allocated" (show (nsAllocated st))
-          nsAllocated st `shouldSatisfy` (< 65 * mib)
-          verify fd (cfgAllowanceBytes cfg) 4
+          -- given back: the file is the committed allowance's payload again and occupies no more than the allowance
+          nsAllocated st `shouldSatisfy` (<= cfgAllowanceBytes cfg)
+          nsAllocated st `shouldSatisfy` (>= payloadBytes cfg)
+          verify fd (payloadBytes cfg) 4
     
     )
   , ("keeps the file after its name is gone for as long as a borrower holds it, and reclaims the space after the last close", \acquire -> do
@@ -200,12 +217,19 @@ probeCases =
           listDirectory dir `shouldReturn` names0
           held <- availableOf meter
           record "unlink.reserved.bytes" (show (before' - held))
-          -- the claim "the reservation was real" is measured: the volume lost at least the allowance (less a slack)
-          (before' - held) + 4 * mib `shouldSatisfy` (>= cfgAllowanceBytes (hCfg h64))
+          -- the claim "the reservation was real" is measured: the volume lost at least the payload the platform was asked
+          -- for (less a slack)
+          (before' - held) + 4 * mib `shouldSatisfy` (>= payloadBytes (hCfg h64))
           -- a borrower is using the file: the close waits for it, and the data is still readable
           r <- withUse (envSvc env) b (readPages env b (hCfg h64) 7 1 ReadProbe)
           fmap (either (const False) (not . null)) r `shouldBe` Right True
+          [fdHeld] <- fdHandles (envProbe env)
           _ <- closeBacking (envSvc env) b
+          -- OBSERVED, NOT A QUALIFICATION OF A FAILING CLOSE: a SUCCESSFUL close released the descriptor (a non-destructive
+          -- query of the descriptor number answers EBADF: it names no open file)
+          gone <- nativeCloexec posixNative fdHeld
+          record "close.successful.descriptor.released" (show gone)
+          gone `shouldBe` Left (Errno (fromIntegral (let C.Errno c = C.eBADF in c)))
           after' <- pollRecovered meter before'
           record "close.reclaimed.bytes" (show (after' - held))
           record "close.reclaimed.complete" (show (after' + 4 * mib >= before'))

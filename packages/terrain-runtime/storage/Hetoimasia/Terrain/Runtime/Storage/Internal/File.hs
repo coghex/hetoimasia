@@ -15,8 +15,11 @@
 -- 1. the filesystem the descriptor is on is on the qualified list, else
 --    @storage_unsupported@ (even if the native call would have succeeded);
 -- 2. the free space that the unprivileged process sees on that volume leaves the
---    configured headroom (256 MiB at least) after the request, else
---    @reservation_failed@;
+--    configured headroom (256 MiB at least) after the ALLOWANCE the request is
+--    for (@keep@: the payload asked of the platform is the allowance less the
+--    model's overhead budget, and the file can occupy up to the allowance), else
+--    @reservation_failed@; after the allocation the headroom is checked again
+--    with the bytes the file actually gained;
 -- 3. the native allocation (@F_PREALLOCATE@ with @F_ALLOCATEALL@ on macOS,
 --    @fallocate@ mode 0 on Linux); an unsupported call is @storage_unsupported@, a
 --    refused one @reservation_failed@; the platform's own count of allocated

@@ -1800,7 +1800,8 @@ execGrow svc jid j from to = do
     Just _ | from == to → pure GrowthNoChange
     Nothing → pure (Failed BackingClosed [])
     Just (bid, e) → withVolume svc (eVolume e) $ do
-      -- the extra PAYLOAD: the allowances shifted by the budget (the file is shorter than the allowance by it)
+      -- the extra PAYLOAD, [payload from, payload to) (the file is shorter than the allowance by the budget), with the headroom
+      -- kept after the extra ALLOWANCE (to - from)
       r ← tryWithContext (reserveRange seam (svConfig svc) (cancelled svc jid) (eFd e) (payloadOf from (eOverheadModel e)) (payloadOf to (eOverheadModel e) - payloadOf from (eOverheadModel e)) (to - from))
       case r of
         Left ewc → do
