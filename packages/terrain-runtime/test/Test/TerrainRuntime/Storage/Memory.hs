@@ -37,9 +37,9 @@ import qualified Data.Text as T
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (pageSize)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (admit)
 import qualified Data.ByteString.Char8 as BC
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.List
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.File (Created (..), closeFile, createPrivate, unlinkFile)
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native
@@ -63,8 +63,70 @@ import Test.TerrainRuntime.Store.Harness (H (..), identOf, smallSpec)
 h0 ∷ H
 h0 = newStoreH smallSpec
 
+-- | THE LIVE-HEAP READING (round 10; the CI runner showed a pair of readings with NOTHING between them differing by half a megabyte).
+-- A reading is the live bytes of the LAST collection the runtime reports. Another thread of the process that allocates between our
+-- 'performMajorGC' and our read of the statistics makes a MINOR collection the last one, and a minor collection's live bytes are the young
+-- generation's, not the heap's: the "reading" is then an artifact of a collection that was not ours. So (1) a reading is VALID only when the
+-- last collection reported was a major one (its generation is the oldest), else it is discarded and retaken; (2) a measurement's reading is
+-- SETTLED: valid readings are taken until two consecutive ones agree within 'settleTolerance' (residue of earlier examples, finalizers that
+-- run after a collection and threads still ending are gone by then), bounded; a heap that does not settle FAILS the example with its readings
+-- in the message. 'discardedReadings' counts the artifacts seen (printed, so a runner's behaviour is visible).
 live ∷ IO Word64
-live = performMajorGC >> performMajorGC >> (gcdetails_live_bytes . gc <$> getRTSStats)
+live = liveWith (pure ())
+
+-- | 'live', running a hook after every valid reading (the controls use it to remove a transient after the first reading).
+liveWith ∷ IO () → IO Word64
+liveWith afterReading = settle (0 ∷ Int) []
+  where
+    settle attempts seen
+      | attempts >= maxSettleAttempts = error ("the live heap did not settle: " <> show (reverse seen) <> " after " <> show attempts <> " readings")
+      | otherwise = do
+          r ← validReading
+          afterReading
+          case seen of
+            prev : _ | absDiff prev r <= settleTolerance → pure r
+            _ → settle (attempts + 1) (r : seen)
+    absDiff a b = if a > b then a - b else b - a
+
+-- | One VALID reading: after a major collection whose details are the major collection's.
+validReading ∷ IO Word64
+validReading = go (0 ∷ Int)
+  where
+    go k = do
+      performMajorGC
+      st ← getRTSStats
+      major ← majorGeneration
+      if gcdetails_gen (gc st) >= major
+        then pure (gcdetails_live_bytes (gc st))
+        else do
+          atomicModifyIORef' discardedReadings (\n → (n + 1, ()))
+          if k >= 200 then error "no valid live-heap reading in 200 attempts: another thread keeps the last collection minor" else go (k + 1)
+
+-- | The generation a major collection reports (the oldest), found once: the largest generation seen over several forced major collections.
+majorGeneration ∷ IO Word32
+majorGeneration = readIORef majorGenCell >>= maybe find pure
+  where
+    find = do
+      gens ← replicateM 5 (performMajorGC >> (gcdetails_gen . gc <$> getRTSStats))
+      let g = maximum gens
+      writeIORef majorGenCell (Just g)
+      pure g
+
+majorGenCell ∷ IORef (Maybe Word32)
+majorGenCell = unsafePerformIO (newIORef Nothing)
+{-# NOINLINE majorGenCell #-}
+
+-- | How many readings were discarded as artifacts of a minor collection (see 'live').
+discardedReadings ∷ IORef Int
+discardedReadings = unsafePerformIO (newIORef 0)
+{-# NOINLINE discardedReadings #-}
+
+-- | Two consecutive valid readings within this many bytes are a SETTLED heap.
+settleTolerance ∷ Word64
+settleTolerance = 1024
+
+maxSettleAttempts ∷ Int
+maxSettleAttempts = 60
 
 mib' ∷ Word64
 mib' = 1024 * 1024
@@ -76,56 +138,91 @@ mib' = 1024 * 1024
 signalMultiple ∷ Double
 signalMultiple = 50
 
--- | The amplitudes (largest absolute difference of two readings, over 300 samples after a discarded warm-up) of two
--- readings with NOTHING between them, and of two readings around a change that leaves nothing behind (a list built,
--- forced and dropped).
-noiseFloor ∷ IO (Double, Double)
+-- | THE FLOOR (round 10): the amplitude two SETTLED readings show when nothing that matters happened between them. The statistic is the
+-- MEDIAN OF BATCH MAXIMA: seven batches, each the largest absolute difference over twenty pairs; the floor is the median of the seven.
+-- Why: the old floor was one maximum over 300 pairs, so a single outlier reading set it for the whole process (8,768 where it is 1,208
+-- on a quiet run); the maximum is the right statistic for an amplitude, and the median over batches is what keeps one spike (one
+-- batch) from being the floor. The largest single difference over all batches is returned beside it and printed. Likewise for readings around a
+-- change that leaves nothing behind (a list built, forced and dropped); the floor is the larger of the two.
+noiseFloor ∷ IO (Double, Double, Double)
 noiseFloor = do
-  let aaOnce = do a ← live; b ← live; pure (fromIntegral b - fromIntegral a ∷ Double)
+  let aaOnce = do a ← live; b ← live; pure (abs (fromIntegral b - fromIntegral a ∷ Double))
       listOnce = do
         a ← live
         xs ← evaluate (map (* 2) [1 .. 5000 ∷ Int])
         _ ← evaluate (length xs)
         c ← live
-        pure (fromIntegral c - fromIntegral a ∷ Double)
-      amp xs = maximum (map abs xs)
+        pure (abs (fromIntegral c - fromIntegral a ∷ Double))
+      batches once = replicateM 7 (maximum <$> replicateM 20 once)
+      median xs = Data.List.sort xs !! (length xs `div` 2)
   -- the first samples of each series are a warm-up (the collector's own state settling) and are discarded
   _ ← replicateM 5 aaOnce
-  aa ← replicateM 300 aaOnce
+  aa ← batches aaOnce
   _ ← replicateM 5 listOnce
-  lst ← replicateM 300 listOnce
-  pure (amp aa, amp lst)
+  lst ← batches listOnce
+  pure (max (median aa) (median lst), maximum (aa <> lst), median aa)
 
--- | The floor every row is held against, measured once in the process.
+-- | The floor every row is held against, measured once in the process, at the start of the Memory group ('settleFloor').
 theFloor ∷ Double
-theFloor = unsafePerformIO (uncurry max <$> noiseFloor)
+theFloor = unsafePerformIO ((\(f, _, _) → f) <$> noiseFloor)
 {-# NOINLINE theFloor #-}
 
+-- | Forces the floor before the first example of a describe runs: the first describe of the Memory group to run pays for the measurement.
+settleFloor ∷ SpecWith a → SpecWith a
+settleFloor = beforeAll_ (void (evaluate theFloor))
+
 floorSpec ∷ Spec
-floorSpec = describe "Storage backend: the live-heap reading's noise floor" $
+floorSpec = describe "Storage backend: the live-heap reading's noise floor" $ settleFloor $
   it "is measured, with nothing between two readings and around a change that leaves nothing" $
     withEnv $ \env → do
-      (aa, lst) ← noiseFloor
+      (fl, worst, aaMedian) ← noiseFloor
+      discarded ← readIORef discardedReadings
       oc ← replicateM 100 $ do
         a ← live
         b ← openBacking env ident (hCfg h0)
         _ ← closeBacking (envSvc env) b
         c ← live
         pure (fromIntegral c - fromIntegral a ∷ Double)
-      putStrLn ("memory floor | two readings, nothing between | amplitude " <> show (round aa ∷ Integer))
-      putStrLn ("memory floor | around a list built, forced and dropped | amplitude " <> show (round lst ∷ Integer))
+      putStrLn ("memory floor | two settled readings, nothing between | median of batch maxima " <> show (round aaMedian ∷ Integer))
+      putStrLn ("memory floor | the floor of this measurement (the larger of the two series' medians of batch maxima) " <> show (round fl ∷ Integer) <> " | the LARGEST single difference of any sample " <> show (round worst ∷ Integer) <> " | readings discarded as artifacts of a minor collection " <> show discarded)
       putStrLn ("memory floor | around an open and close (observation: it leaves garbage a later collection frees) | min " <> show (round (minimum oc) ∷ Integer) <> " max " <> show (round (maximum oc) ∷ Integer))
       putStrLn ("memory floor | the floor every asserted row must beat " <> show (round signalMultiple ∷ Integer) <> " times | " <> show (round theFloor ∷ Integer))
 
 -- | The rule that no row passes vacuously, shown on values: a measurement of zero or below, and a signal below
 -- 'signalMultiple' times the floor, each FAIL the row.
 rulesSpec ∷ Spec
-rulesSpec = describe "Storage backend: a memory row cannot pass without measuring something" $ do
+rulesSpec = describe "Storage backend: a memory row cannot pass without measuring something" $ settleFloor $ do
   let fails act = (try act ∷ IO (Either SomeException ())) >>= \r → either (const (pure ())) (const (expectationFailure "the row passed")) r
       big = ceiling (signalMultiple * theFloor) ∷ Int
   it "fails a row that measured zero, or less than zero (a clamp or a least-of-N would have passed it)" $ do
     fails (checkSignal "measured nothing" big 0)
     fails (checkSignal "measured less than nothing" big (-2184))
+  -- THE CONTROLS OF ROUND 10: a transient of the size the CI runner showed (a pair of readings with nothing between them that differed by 497,536 bytes)
+  -- must not change a row's verdict, and a real retention of the same size must (it is not hidden).
+  it "does not let a transient that is live for one collection, of the size the CI runner showed, into a settled reading" $ do
+    let spike = 497536 ∷ Int
+    transient ← newIORef (Nothing ∷ Maybe BS.ByteString)
+    base ← live
+    -- the transient is live at the first valid reading and gone by the second: the readings disagree and the third settles WITHOUT it
+    atomicModifyIORef' transient (\_ → (Just (BS.replicate spike 7), ()))
+    _ ← evaluate =<< (maybe 0 BS.length <$> readIORef transient)
+    r ← liveWith (atomicModifyIORef' transient (\_ → (Nothing, ())))
+    -- a reading that had taken the transient in would be at least `spike` above the base
+    (fromIntegral r - fromIntegral base ∷ Double) `shouldSatisfy` (< 50000)
+  it "takes the median of independent samples: one sample carrying a transient of that size leaves the median alone and is reported UNSTABLE, and a retention in every sample is not hidden" $ do
+    let spikeTotal = 497536 ∷ Double
+        n = 24 ∷ Int
+        calm = 400 ∷ Double
+        spiked = calm + spikeTotal / fromIntegral n
+        (med, spread, allowed) = sampleStats n [calm, spiked, calm]
+    -- the row's VALUE is the median: the transient does not move it ...
+    med `shouldBe` calm
+    -- ... and the disagreement is a loud UNSTABLE failure of the row, never a changed figure
+    spread `shouldSatisfy` (> allowed)
+    -- a real retention (every sample carries it) IS the median and is stable: it is not hidden
+    let (med2, spread2, allowed2) = sampleStats n [spiked, spiked, spiked]
+    med2 `shouldBe` spiked
+    spread2 `shouldSatisfy` (<= allowed2)
   it "fails a row whose signal is below the floor times the multiple, and passes one above it" $ do
     fails (checkSignal "signal too small" 10 1)
     checkSignal "signal far above" big 1.5
@@ -158,13 +255,52 @@ checkSignal name n m = do
   m `shouldSatisfy` (> 0)
   signal `shouldSatisfy` (>= need)
 
+-- | How many independent samples a row takes (odd: the median is one of them).
+sampleCount ∷ Int
+sampleCount = 3
+
+-- | The fraction of a row's signal by which its samples may disagree (largest minus smallest total) before the row is UNSTABLE.
+unstableFraction ∷ Double
+unstableFraction = 0.25
+
+-- | The runtime's stack chunk is 32 KiB: whether a thread's chunk is live at a reading or not moves the live heap by exactly that (seen as a
+-- 31,000 to 32,000 byte step of one sample in a few rows on both hosts, and the reason the old repeats showed "one stack chunk" between
+-- readings of one state). A row's samples may therefore differ by one chunk and a little (the median discards the odd sample); more than
+-- that, or more than 'unstableFraction' of the signal, is UNSTABLE.
+stackChunkQuantum ∷ Double
+stackChunkQuantum = 40000
+
+-- | ONE BAD READING CANNOT DECIDE A ROW (round 10): a discarded warm-up run, then an odd number of independent samples of the per-instance figure (each its own settled
+-- readings and, for an in-service row, its own service); the MEDIAN is the row's value (not a minimum, not a maximum); the samples and their spread
+-- are printed; and a row whose samples disagree by more than 'unstableFraction' of its signal (or of the smallest signal a row may have) fails
+-- loudly as UNSTABLE, never as an over- or under-charge.
+medianOf ∷ String → Int → IO Double → IO Double
+medianOf name n sample = do
+  -- the first run of a row in the process pays costs that are not the row's (a first-use initialization, a first evaluation of a shared
+  -- constant): it is a WARM-UP and is discarded, like the noise floor's first samples; the samples after it are independent
+  _ ← sample
+  xs ← replicateM sampleCount sample
+  let (med, spread, allowed) = sampleStats n xs
+  putStrLn ("memory samples | " <> name <> " | " <> show (map (round ∷ Double → Integer) xs) <> " | spread of the totals " <> show (round spread ∷ Integer) <> " of " <> show (round allowed ∷ Integer) <> " allowed | median " <> show (round med ∷ Integer))
+  when (spread > allowed) $
+    expectationFailure ("UNSTABLE: the samples of " <> name <> " disagree by " <> show (round spread ∷ Integer) <> " bytes in total (more than " <> show (round allowed ∷ Integer) <> "): " <> show xs)
+  pure med
+
+-- | The median of the samples, the spread of their totals and the spread allowed (the pure part of 'medianOf').
+sampleStats ∷ Int → [Double] → (Double, Double, Double)
+sampleStats n xs = (med, spread, allowed)
+  where
+    med = Data.List.sort xs !! (length xs `div` 2)
+    spread = (maximum xs - minimum xs) * fromIntegral n
+    allowed = max stackChunkQuantum (unstableFraction * max (abs med * fromIntegral n) (signalMultiple * theFloor))
+
 -- | A standalone row: instances raised until the total added is at least 'signalMultiple' times the floor.
 sound ∷ String → Int → (Int → IO Double) → IO Double
 sound name n0 at = go n0 (0 ∷ Int)
   where
     need = signalMultiple * theFloor
     go n tries = do
-      m ← at n
+      m ← medianOf name n (at n)
       if m * fromIntegral n >= need || tries >= 4
         then checkSignal name n m >> pure m
         else go (min 60000 (max (n * 2) (ceiling (need / max m 1) * 2))) (tries + 1)
@@ -287,7 +423,7 @@ keptRow n = heldAdded n $ do
   holdLive (ks, adm) (\(l, a) → length l + sum [T.length t | Kept _ (KeptClose _ (CloseRaised t)) _ ← l] + fromIntegral (A.lgControlReserved (A.ledgers a)))
 
 spec ∷ Spec
-spec = describe "Storage backend: the accounted job record is measured" $ do
+spec = describe "Storage backend: the accounted job record is measured" $ settleFloor $ do
   it "is at least the live heap the largest queued read adds to the system" $ do
     perRead ← sound "queued read record" 200 (jobRow readWork)
     row "queued read record (standalone: job node, queue element, grant entry)" jobRecordBytes perRead
@@ -327,33 +463,32 @@ perJob n submit = do
 -- | The rest of what the service holds. The transfer buffer and the result are structures of about a megabyte: their
 -- signal is already far above the floor, and the rows assert it.
 spec2 ∷ Spec
-spec2 = describe "Storage backend: every other accounted figure is measured" $ do
-  it "charges a held transfer buffer at least the live heap it adds" $
-    withEnv $ \env → do
+spec2 = describe "Storage backend: every other accounted figure is measured" $ settleFloor $ do
+  it "charges a held transfer buffer at least the live heap it adds" $ do
+    perRead ← medianOf "held transfer buffer" 2 $ withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
       g ← addGate (envProbe env) (\op → case op of OpReadAt _ _ → True; _ → False)
       heapBefore ← live
       ts ← forM [1, 2 ∷ Int] (\i → submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo (fromIntegral (i * 1000))) 256 ReadProbe >>= either (fail . show) pure)
       awaitReached g 2
       heapAfter ← live
-      let perRead = (fromIntegral heapAfter - fromIntegral heapBefore) / 2 ∷ Double
-      checkSignal "held transfer buffer" 2 perRead
-      row "held 256-page read (buffer and record)" (transferBufferBytes 256 + jobRecordBytes) perRead
       openGate g
       forM_ ts (awaitOutcome env)
+      pure ((fromIntegral heapAfter - fromIntegral heapBefore) / 2 ∷ Double)
+    checkSignal "held transfer buffer" 2 perRead
+    row "held 256-page read (buffer and record)" (transferBufferBytes 256 + jobRecordBytes) perRead
 
-  it "charges a finished, untaken result at least the live heap it holds" $
-    withEnv $ \env → do
+  it "charges a finished, untaken result at least the live heap it holds" $ do
+    held ← medianOf "finished 256-page result" 1 $ withEnv $ \env → do
       b ← openBacking env ident (hCfg h0)
       heapBefore ← live
       t ← submitRead (envSvc env) b ExplicitWork (hCfg h0) (PageNo 1000) 256 ReadProbe >>= either (fail . show) pure
       bounded (atomically (awaitTicket (envSvc env) t))
       heapAfter ← live
-      let held = fromIntegral heapAfter - fromIntegral heapBefore ∷ Double
-      checkSignal "finished 256-page result" 1 held
-      row "finished, untaken 256-page result (and its record)" (256 * resultPageBytes + jobRecordBytes) held
       _ ← awaitOutcome env t
-      pure ()
+      pure (fromIntegral heapAfter - fromIntegral heapBefore ∷ Double)
+    checkSignal "finished 256-page result" 1 held
+    row "finished, untaken 256-page result (and its record)" (256 * resultPageBytes + jobRecordBytes) held
 
   it "charges a backing's record at least its largest entry, measured as a value, with the service's own places for it" $
     withEnv $ \env → do
@@ -372,7 +507,7 @@ spec2 = describe "Storage backend: every other accounted figure is measured" $ d
       putStrLn ("memory observation | an open backing in the service, fifteen samples | min " <> show (round (minimum samples) ∷ Integer) <> " max " <> show (round (maximum samples) ∷ Integer) <> " | not asserted: the signal of one backing is below the floor")
 
 spec3 ∷ Spec
-spec3 = describe "Storage backend: every retained structure is charged and measured at its largest" $ do
+spec3 = describe "Storage backend: every retained structure is charged and measured at its largest" $ settleFloor $ do
   it "a queued write of the most pages, charged the record and its report's bounded metadata at admission" $ do
     sw ← bigWrite
     perWrite ← sound "queued write" 200 (jobRow (const (WWrite sw)))
@@ -430,40 +565,41 @@ spec3 = describe "Storage backend: every retained structure is charged and measu
     recordModel ← sound "write job record (model)" 200 (jobRow (const (WWrite swModel)))
     reportOk ← sound "write report, all written (model)" 20 (outcomeRow (writeReportOf swModel False))
     reportFirstFailed ← sound "write report, first page failed (model)" 20 (outcomeRow (writeReportOf swModel True))
-    forM_ [("all written", False, reportOk), ("first page failed, 255 not attempted", True, reportFirstFailed)] $ \(label, failing, report) → withEnv $ \env → do
-      b ← openBacking env ident (hCfg h0)
-      -- one write first, taken, so the service's one-time state is not counted
-      counter ← newIORef (1 ∷ Int)
-      let produce = do
-            when failing (addRule (envProbe env) 1 (\op → case op of OpWriteAt _ _ → True; _ → False) (FailWith (Errno 5)))
-            sw ← bigWriteAt =<< atomicModifyIORef' counter (\n → (n + 1, n))
-            t ← submitWrite (envSvc env) b sw >>= either (fail . show) pure
-            bounded (atomically (awaitTicket (envSvc env) t))
-            -- the harness's own log of native calls (256 entries a write) is the TEST's memory, not the service's: cleared
-            clearEvents (envProbe env)
-            pure t
-      warm ← produce
-      _ ← awaitOutcome env warm
+    forM_ [("all written", False, reportOk), ("first page failed, 255 not attempted", True, reportFirstFailed)] $ \(label, failing, report) → do
       let k = 24 ∷ Int
-      -- BOTH readings are taken with the workers idle: the warm-up job's worker may still be inside its frame, holding the
-      -- pages it wrote, and a first reading taken then would count what the second no longer does (a negative figure)
-      workersIdle env
-      heapBefore ← live
-      ts ← forM [1 .. k] (const produce)
-      -- the second reading is taken with the workers IDLE (blocked in their wait): a worker that has committed its
-      -- job's outcome is still inside its frame for a moment, holding the work it ran, and one reading taken then
-      -- counts that job's pages (a race of the test, seen once in 26 repeats: +1 MiB over 24 jobs)
-      workersIdle env
-      heapAfter ← live
-      let perJobBytes = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
-          modelled = recordModel + report
+      perJobBytes ← medianOf ("service: " <> label) k $ withEnv $ \env → do
+        b ← openBacking env ident (hCfg h0)
+        -- one write first, taken, so the service's one-time state is not counted
+        counter ← newIORef (1 ∷ Int)
+        let produce = do
+              when failing (addRule (envProbe env) 1 (\op → case op of OpWriteAt _ _ → True; _ → False) (FailWith (Errno 5)))
+              sw ← bigWriteAt =<< atomicModifyIORef' counter (\n → (n + 1, n))
+              t ← submitWrite (envSvc env) b sw >>= either (fail . show) pure
+              bounded (atomically (awaitTicket (envSvc env) t))
+              -- the harness's own log of native calls (256 entries a write) is the TEST's memory, not the service's: cleared
+              clearEvents (envProbe env)
+              pure t
+        warm ← produce
+        _ ← awaitOutcome env warm
+        -- BOTH readings are taken with the workers idle: the warm-up job's worker may still be inside its frame, holding the
+        -- pages it wrote, and a first reading taken then would count what the second no longer does (a negative figure)
+        workersIdle env
+        heapBefore ← live
+        ts ← forM [1 .. k] (const produce)
+        -- the second reading is taken with the workers IDLE (blocked in their wait): a worker that has committed its
+        -- job's outcome is still inside its frame for a moment, holding the work it ran, and one reading taken then
+        -- counts that job's pages (a race of the test, seen once in 26 repeats: +1 MiB over 24 jobs)
+        workersIdle env
+        heapAfter ← live
+        forM_ ts (awaitOutcome env)
+        pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
+      let modelled = recordModel + report
       checkSignal ("service: " <> label) k perJobBytes
       row ("service, finished untaken write report (" <> label <> "), per job, " <> show k <> " held at once, the test's own pages dropped") (jobCharge' maxIoPages) perJobBytes
       putStrLn ("memory model | write report (" <> label <> ") | service " <> show (round perJobBytes ∷ Integer) <> " | standalone record + report " <> show (round modelled ∷ Integer))
       -- the model must not drift from the service: within 15 percent either way
       perJobBytes `shouldSatisfy` (<= modelled * 1.15)
       perJobBytes `shouldSatisfy` (>= modelled * 0.85)
-      forM_ ts (awaitOutcome env)
 
   it "observes what a running write holds beyond the model: its results (the model) and the worker (a constant of the service)" $
     withEnv $ \env → do
@@ -526,52 +662,53 @@ sliceOf k = BS.take 48 (BC.pack ('/' : "no-such-dir-" <> show k <> "/" <> replic
 -- | The whole of the retention rows of round 6. Each asserts a per-job retention within the record's charge: with the
 -- copy undone the service retains megabytes a job (the control fails it by two orders of magnitude, far above the floor).
 spec4 ∷ Spec
-spec4 = describe "Storage backend: what the service retains of what it is handed is its own" $ do
-  it "a directory that is a short slice of a large buffer costs the copy and not the buffer: K finished, untaken opens held at once" $
-    withEnv $ \env → do
-      let produce k = do
-            t ← submitOpen (envSvc env) ExplicitWork (OpenSpec (sliceOf k) ident (hCfg h0)) >>= either (fail . show) pure
+spec4 = describe "Storage backend: what the service retains of what it is handed is its own" $ settleFloor $ do
+  it "a directory that is a short slice of a large buffer costs the copy and not the buffer: K finished, untaken opens held at once" $ do
+    let k = 24 ∷ Int
+    perJobBytes ← medianOf "retention: finished untaken open" k $ withEnv $ \env → do
+      let produce n = do
+            t ← submitOpen (envSvc env) ExplicitWork (OpenSpec (sliceOf n) ident (hCfg h0)) >>= either (fail . show) pure
             bounded (atomically (awaitTicket (envSvc env) t))
             pure t
       warm ← produce 0
       _ ← awaitOutcome env warm
-      let k = 24 ∷ Int
       workersIdle env
       heapBefore ← live
       ts ← forM [1 .. k] produce
       workersIdle env
       heapAfter ← live
-      let perJobBytes = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
-      putStrLn ("memory retention | finished untaken open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " held at once | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
-      perJobBytes `shouldSatisfy` (<= fromIntegral jobRecordBytes)
       forM_ ts (awaitOutcome env)
+      pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
+    putStrLn ("memory retention | finished untaken open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " held at once | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
+    perJobBytes `shouldSatisfy` (<= fromIntegral jobRecordBytes)
 
-  it "a directory that is a short slice of a large buffer costs the copy and not the buffer: K queued opens" $
-    withEnv $ \env → do
+  it "a directory that is a short slice of a large buffer costs the copy and not the buffer: K queued opens" $ do
+    let k = 8 ∷ Int
+    perJobBytes ← medianOf "retention: queued open" k $ withEnv $ \env → do
       g ← addGate (envProbe env) (== OpCreateFile)
       held ← forM [1, 2 ∷ Int] (\i → submitOpen (envSvc env) ExplicitWork (OpenSpec (sliceOf (100 + i)) ident (hCfg h0)) >>= either (fail . show) pure)
       awaitReached g 2
       heapBefore ← live
-      let k = 8 ∷ Int
       ts ← forM [1 .. k] (\i → submitOpen (envSvc env) ExplicitWork (OpenSpec (sliceOf (200 + i)) ident (hCfg h0)) >>= either (fail . show) pure)
       heapAfter ← live
-      let perJobBytes = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
-      putStrLn ("memory retention | queued open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " queued | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
-      perJobBytes `shouldSatisfy` (<= fromIntegral jobRecordBytes)
       openGate g
       forM_ (held <> ts) (awaitOutcome env)
+      pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
+    putStrLn ("memory retention | queued open, a 48-byte slice of a 2 MiB buffer, per job, " <> show k <> " queued | " <> show (round perJobBytes ∷ Integer) <> " | charged " <> show jobRecordBytes)
+    perJobBytes `shouldSatisfy` (<= fromIntegral jobRecordBytes)
 
   it "a qualified-filesystem name that is a short slice of a large buffer costs the copy: K configurations held at once" $ do
     let viewOf k = BS.take 4 (BC.pack (replicate (2 * 1024 * 1024) (toEnum (97 + k `mod` 20))))
         config k = either (error . show) id (mkStorageConfig [viewOf k, viewOf (k + 1)] minHeadroomBytes)
     _ ← evaluate (length (scQualified (config 0)))
     let k = 24 ∷ Int
-    heapBefore ← live
-    cs ← forM [1 .. k] (\i → evaluate (config (100 + i)))
-    heapAfter ← live
-    let perConfig = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
+    perConfig ← medianOf "retention: configuration" k $ do
+      heapBefore ← live
+      cs ← forM [1 .. k] (\i → evaluate (config (100 + i)))
+      heapAfter ← live
+      _ ← evaluate (sum (map (length . scQualified) cs))
+      pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
     putStrLn ("memory retention | storage configuration, two 4-byte names viewed from 2 MiB buffers, per configuration, " <> show k <> " held | " <> show (round perConfig ∷ Integer))
-    _ ← evaluate (sum (map (length . scQualified) cs))
     perConfig `shouldSatisfy` (<= 1024)
 
   it "a filesystem name that is a short slice of a large buffer (a mount table's text) costs the copy: K profiles held at once" $
@@ -584,12 +721,13 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
           profile k = profileOf productionSeam {seamNative = native k} (crFd c) >>= either (\e → fail (show e)) pure
       _ ← profile 0
       let k = 24 ∷ Int
-      heapBefore ← live
-      ps ← forM [1 .. k] profile
-      heapAfter ← live
-      let perProfile = (fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double
+      perProfile ← medianOf "retention: volume profile" k $ do
+        heapBefore ← live
+        ps ← forM [1 .. k] profile
+        heapAfter ← live
+        _ ← evaluate (sum (map (BS.length . vpFilesystem) ps))
+        pure ((fromIntegral heapAfter - fromIntegral heapBefore) / fromIntegral k ∷ Double)
       putStrLn ("memory retention | volume profile, a 4-byte filesystem name viewed from a 2 MiB buffer, per profile, " <> show k <> " held | " <> show (round perProfile ∷ Integer))
-      _ ← evaluate (sum (map (BS.length . vpFilesystem) ps))
       -- the copy of four bytes and the profile's own words: a few hundred bytes, never the buffer
       perProfile `shouldSatisfy` (<= 1024)
       _ ← unlinkFile productionSeam (BC.pack dir) (crName c)
