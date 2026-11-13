@@ -265,6 +265,14 @@ rulesSpec = describe "Storage backend: a memory row cannot pass without measurin
     fails (checkSignal "signal too small" 10 1)
     -- the signal a row needs is never less than a stack chunk, whatever the floor: 30,000 bytes at a floor of 16 FAIL
     fails (checkSignal "signal below one stack chunk" 30000 1)
+    -- a retention row's per-instance figure cannot be under the least a copied ByteString costs: 3 and 0 FAIL (noise, or a copy shared instead of built), the
+    -- figures the real rows measure (hundreds of bytes) and the least itself pass
+    fails (retention "control: noise" 24 3 4096)
+    fails (retention "control: nothing" 24 0 4096)
+    fails (retention "control: below the least" 24 (smallestCopiedByteString - 1) 4096)
+    retention "control: the least" 24 smallestCopiedByteString 4096
+    retention "control: a real figure" 24 363 1024
+    fails (retention "control: over the bound" 24 5000 4096)
     checkSignal "signal far above" big 1.5
 
 -- | The live heap that a build adds, per instance: read before, build (forced; it hands back an action that touches
@@ -337,7 +345,7 @@ neededSignal ∷ Double
 neededSignal = max (signalMultiple * theFloor) stackChunkQuantum
 
 -- | The largest total by which samples of a row may differ and still agree: one stack chunk and a little, or 'unstableFraction' of the signal (the
--- smallest signal a row may have is 'signalMultiple' times the floor).
+-- smallest signal a row may have is 'neededSignal').
 allowedFor ∷ Int → Double → Double
 allowedFor n med = max stackChunkQuantum (unstableFraction * max (abs med * fromIntegral n) (signalMultiple * theFloor))
 
@@ -808,15 +816,23 @@ spec4 = describe "Storage backend: what the service retains of what it is handed
       _ ← unlinkFile productionSeam (BC.pack dir) (crName c)
       void (closeFile productionSeam (crFd c))
 
--- | A RETENTION ROW (round 6, sampled in round 10): K held things add AT LEAST nothing never (a figure of zero or below measured nothing, which a floated
--- constant or a lost reading would give) and at most the bound. Its signal is printed beside the signal a row needs: these rows are bounded by the
--- service's own limits (32 job records; a profile or a configuration built from a 2 MiB buffer each), so their signal is below the needed one; what
--- gives them their power is the control (with the copy undone the service retains megabytes a job, orders of magnitude above the bound), and the
--- samples printed above this line.
+-- | The least a COPIED ByteString can cost, in bytes: the constructor (header, address, contents pointer and length: 4 words, 32 bytes), the
+-- 'PlainPtr' box (header and the array pointer: 2 words, 16 bytes) and the pinned array it points to (a two-word header and one payload word: 24 bytes)
+-- sum to 72 bytes on a 64-bit target; the constant is 64, the sum rounded down to the allocator's 16-byte granule so that a layout that unpacks a
+-- field still clears it. Every retention row retains at least one copied ByteString per instance, so a figure under this is not a retention: it is noise
+-- (the floor over the smallest K of 8 is a few bytes an instance, and half the time noise is above zero), or a copy that was shared instead of built.
+smallestCopiedByteString ∷ Double
+smallestCopiedByteString = 64
+
+-- | A RETENTION ROW (round 6, sampled in round 10): K held things retain at least 'smallestCopiedByteString' each (a smaller figure measured nothing:
+-- a shared constant or a lost reading gives noise, which is above zero half the time) and at most the bound. Its signal is printed beside the signal a
+-- row needs: these rows are bounded by the service's own limits (32 job records; a profile or a configuration built from a 2 MiB buffer each), so their
+-- signal is below the needed one; what gives them their power is the control (with the copy undone the service retains megabytes a job, orders of
+-- magnitude above the bound, and a 40,000-byte disagreement cannot hide megabytes), and the minimum above is what shows they measured at all.
 retention ∷ String → Int → Double → Double → Expectation
 retention name k perInstance bound = do
-  putStrLn ("memory retention signal | " <> name <> " | instances " <> show k <> " | signal " <> show (round (perInstance * fromIntegral k) ∷ Integer) <> " | needed by a sound row " <> show (round neededSignal ∷ Integer) <> " | bound per instance " <> show (round bound ∷ Integer))
-  perInstance `shouldSatisfy` (> 0)
+  putStrLn ("memory retention signal | " <> name <> " | instances " <> show k <> " | signal " <> show (round (perInstance * fromIntegral k) ∷ Integer) <> " | needed by a sound row " <> show (round neededSignal ∷ Integer) <> " | minimum per instance " <> show (round smallestCopiedByteString ∷ Integer) <> " | bound per instance " <> show (round bound ∷ Integer))
+  perInstance `shouldSatisfy` (>= smallestCopiedByteString)
   perInstance `shouldSatisfy` (<= bound)
 
 -- | Wait until both workers are blocked in their wait for work (observed, no timer): nothing of a finished job is held by a
