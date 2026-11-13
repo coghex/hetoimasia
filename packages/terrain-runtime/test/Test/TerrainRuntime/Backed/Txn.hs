@@ -17,22 +17,25 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (mask_)
 import Control.Monad (foldM, forM, forM_)
 import qualified Data.Map.Strict as Map
+import Data.Int (Int64)
 import Data.Maybe (isJust)
 import Hetoimasia.Terrain.Coordinate (TileCoord)
-import Hetoimasia.Terrain.Discovery (Retained, allowanceOf, applyCandidate, envLimits, newRetained, retainedHeader, retainedProvider, retainedRecords, stageRemoval)
+import Hetoimasia.Terrain.Cell (Column)
+import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..), Retained, allowanceOf, applyCandidate, envLimits, newRetained, retainedHeader, retainedProvider, retainedRecords, stageRemoval)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Backed.Backend
 import Hetoimasia.Terrain.Runtime.Backed.Fault
+import Hetoimasia.Terrain.Runtime.Backed.Gather
 import Hetoimasia.Terrain.Runtime.Backed.Txn
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Service (ReadMode (..))
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (Errno (..), WorkClass (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo (..))
-import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), Store, publish, storeConfig, storeRoots, storeVersion)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), Store, acquireReader, publish, storeConfig, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (plPages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (removalPlanner)
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (rHw)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (maxReaders, rHw)
 import Test.Hspec
 import Test.TerrainRuntime.Storage.Harness
   ( Act (..)
@@ -47,7 +50,7 @@ import Test.TerrainRuntime.Storage.Harness
   , readPages
   , withEnv
   )
-import Test.TerrainRuntime.Store.Harness (H (..), checkH, compareRecords, ident0, newH, smallSpec, tileAt)
+import Test.TerrainRuntime.Store.Harness (H (..), checkH, columnAt, compareRecords, ident0, newH, smallSpec, tileAt)
 import Test.TerrainRuntime.Store.Reference (diskWrite, emptyDisk)
 import Test.TerrainRuntime.Store.Scenes (envFor, limitsWith, sealedStack)
 
@@ -94,6 +97,29 @@ plansAgain io store = do
     ReadyToPublish {} → pure ()
     Finished d → expectationFailure ("the next transaction was refused: " <> show d)
     Blocked _ → expectationFailure "settle returned a wait"
+
+-- | Read the runs of columns from the committed version through the backend, as the owner does: every
+-- step masked, one blocking wait between steps. The pin is released on every exit.
+gatherRuns ∷ Io → Int → Store → [Column] → IO (Store, GProgressResult)
+gatherRuns io pin store0 columns = case startGatherWith pin store0 columns of
+  Left refusal → fail ("no reader: " <> show refusal)
+  Right (store1, g0) → do
+    let loop g = do
+          (g', progress) ← mask_ (stepGather io OwnerRunning store1 g)
+          case progress of
+            GBlocked wait → atomically wait >> loop g'
+            GDone runs → pure (g', Right runs)
+            GFailed handling → pure (g', Left handling)
+    (g, result) ← loop g0
+    pure (endGather store1 g, result)
+
+type GProgressResult = Either Handling [(Column, Int64, Int64)]
+
+-- | The reference's runs of the columns, in the order the columns were asked.
+refRuns ∷ Retained → [Column] → [(Column, Int64, Int64)]
+refRuns ref columns = [(c, lo, hi) | c ← columns, (KeyRun c' lo, RecRun hi) ← Map.toAscList (retainedRecordMap ref), c' == c]
+  where
+    retainedRecordMap = Map.fromList . retainedRecords
 
 -- | The reference's records after the same removal: #661's own retained model, applied to the
 -- candidate it stages.
@@ -230,7 +256,61 @@ spec = describe "the owner's transaction runner, through the production storage 
         other → expectationFailure ("expected an abort: " <> show (finishedOf other))
       isJust (runTxnId run) `shouldBe` False
       storeVersion storeAfter `shouldBe` storeVersion store
+  describe "reading the removed runs of columns from a pinned committed version through the backend" $ do
+    it "gathers exactly the reference's runs, ascending, through reads the backend really made, and releases its pin" $
+      withArena $ \env io store0 → do
+        let tiles = [tileAt 2 2 z | z ← [3, 5, 4]] <> [tileAt 3 2 z | z ← [3, 4]]
+            columns = [columnAt 3 2, columnAt 2 2, columnAt 9 9]
+        (store, ref) ← foldM
+          ( \(s, r) tile → do
+              out ← removeAndPublish io s tile
+              r' ← refRemove r tile
+              either (\d → fail ("a removal ended without publishing: " <> show d)) (\s' → pure (s', r')) out
+          )
+          (store0, newRetained (ArenaId 1))
+          tiles
+        readsBefore ← atomically (countEvents (envProbe env) isRead)
+        (released, result) ← gatherRuns io gatherPinLimit store columns
+        readsAfter ← atomically (countEvents (envProbe env) isRead)
+        result `shouldBe` Right (refRuns ref columns)
+        refRuns ref columns `shouldSatisfy` (not . null)
+        -- the pages were really read through the backend
+        (readsAfter - readsBefore) `shouldSatisfy` (> 0)
+        -- the pin is gone: every reader the store allows (16) can still be taken, and no more
+        full ← foldM (\s _ → either (\e → fail ("a pin leaked: " <> show e)) (pure . snd) (acquireReader s)) released [1 .. maxReaders]
+        case acquireReader full of
+          Left _ → pure ()
+          Right _ → expectationFailure "more readers than the store allows were taken"
+    it "reads a runs tree of several pages through a window of exactly the pages it needs, and fails closed below that" $
+      withArena $ \_ io store0 → do
+        let tiles = [tileAt x 2 3 | x ← [0 .. 139]]
+        (store, ref) ← foldM
+          ( \(s, r) tile → do
+              out ← removeAndPublish io s tile
+              r' ← refRemove r tile
+              either (\d → fail ("a removal ended without publishing: " <> show d)) (\s' → pure (s', r')) out
+          )
+          (store0, newRetained (ArenaId 1))
+          tiles
+        let columns = [columnAt x 2 | x ← [0, 70, 139]]
+        (_, wide) ← gatherRuns io gatherPinLimit store columns
+        wide `shouldBe` Right (refRuns ref columns)
+        -- the file holds many pages, and a window of the reader's limit reads a few of them
+        rHw (storeRoots store) `shouldSatisfy` (> 3)
+        -- the smallest window the read succeeds in, by search: below it the read ends as a defect (never a loop and
+        -- never an answer), at it the answer is the reference's, reached by restarting with fewer records
+        outcomes ← forM [1 .. gatherPinLimit] $ \pin → (,) pin . snd <$> gatherRuns io pin store columns
+        let works = [pin | (pin, Right runs) ← outcomes, runs == refRuns ref columns]
+            fails = [pin | (pin, Left (HandleDefect _)) ← outcomes]
+            others = [pin | (pin, r) ← outcomes, pin `notElem` works, pin `notElem` fails, isRight' r]
+        others `shouldBe` []
+        case works of
+          smallest : _ → do
+            smallest `shouldSatisfy` (> 1)
+            fails `shouldBe` [1 .. smallest - 1]
+          [] → expectationFailure "no window up to the reader's limit answered"
   where
+    isRight' = either (const False) (const True)
     isWrite op = case op of OpWriteAt _ _ → True; _ → False
     isRead op = case op of OpReadAt _ _ → True; _ → False
     finishedOf = \case Finished d → Just d; _ → Nothing
