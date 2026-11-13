@@ -4,13 +4,16 @@
 -- worker meets a real failure.
 module Test.TerrainRuntime.Backed.Pause (spec) where
 
-import Control.Concurrent.STM (check, readTVar, retry)
+import Control.Concurrent.STM (atomically, check, readTVar, retry)
 import Control.Exception (finally)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Hetoimasia.Terrain.Coordinate (decomposeTile, mkLocalCoord)
 import Hetoimasia.Terrain.Residency (RegionDemand (..), coverageTile)
 import Hetoimasia.Terrain.Runtime
 import Hetoimasia.Terrain.Runtime.Settlement
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Native (NativeOp (..))
+import Hetoimasia.Terrain.Runtime.Store.Admission (Ledger (..))
+import System.IO (hPutStrLn, stderr)
 import Test.Hspec
 import Test.TerrainRuntime.Fixtures
 import qualified Test.TerrainRuntime.Storage.Harness as H
@@ -70,7 +73,16 @@ spec = describe "A paused arena" $ do
       (refusedAt, refusedHost, againHost, againAt) ← flip finally (H.openGate gate) $ do
         _ ← okOf (setViewDemand svc view lease [RegionDemand far (either (error . show) coverageTile (mkLocalCoord 0 0 0))])
         H.awaitReached gate 1
-        -- buried removals, one region's worth at most, until one is refused storage_full
+        -- buried removals, one region's worth at most, until one is refused storage_full; after each
+        -- commit the edit bank is sampled: retained history grows past what the cache holds, and the
+        -- working set stays within the configured bank
+        peaks ← newIORef (0, 0, 0)
+        let sample = do
+              l ← atomically (inspectEditBankSTM svc)
+              let cache = lgCacheBacked l + lgCacheRamOnly l
+                  staging = lgStagingForeground l + lgStagingCamera l
+              (cache <= lgCacheLimit l, staging <= lgStagingLimit l, lgControlReserved l <= lgControlLimit l) `shouldBe` (True, True, True)
+              modifyIORef' peaks (\(c, st', ct) → (max c cache, max st' staging, max ct (lgControlReserved l)))
         let cells = [(x, y, z) | z ← [-31 .. -1], y ← [0 .. 15], x ← [0 .. 15]]
             go [] n = pure (n, Nothing)
             go ((x, y, z) : rest) n = do
@@ -80,7 +92,7 @@ spec = describe "A paused arena" $ do
               -- the result is taken (its record retired), as a host does
               retire svc request
               case settled of
-                [Succeeded _] → go rest (n + 1)
+                [Succeeded _] → sample >> go rest (n + 1)
                 _ → pure (n, Just ((x, y, z), host, rest))
         (committed, refused) ← go cells (0 ∷ Int)
         (refusedAt, refusedHost, untouched) ← case refused of
@@ -92,6 +104,10 @@ spec = describe "A paused arena" $ do
               other → expectationFailure ("expected storage_full, got " <> show other)
             pure found
           Nothing → expectationFailure ("no removal was refused after " <> show committed) >> fail "unreachable"
+        -- the record for the evidence: how many commits, and the edit bank's peaks among them
+        limits ← atomically (inspectEditBankSTM svc)
+        (peakCache, peakStaging, peakControl) ← readIORef peaks
+        hPutStrLn stderr ("storage_full trace: " <> show committed <> " removals committed; edit bank peaks after a commit (bytes): cache " <> show peakCache <> " of " <> show (lgCacheLimit limits) <> ", staging " <> show peakStaging <> " of " <> show (lgStagingLimit limits) <> ", control " <> show peakControl <> " of " <> show (lgControlLimit limits))
         status ← arenaStatus svc lease >>= expectRight
         statusStorage status `shouldBe` StoragePaused [CondCapacity]
         -- what was committed stays readable; a new removal settles at once with the same fault
