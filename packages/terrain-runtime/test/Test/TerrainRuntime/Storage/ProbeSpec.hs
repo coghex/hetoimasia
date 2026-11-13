@@ -189,14 +189,31 @@ probeCases =
           b <- openBacking env ident cfg
           [fd] <- fdHandles (envProbe env)
           pattern' fd (payloadBytes cfg) 4
-          addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated (10 * mib))
+          -- THE RULE (round 8, finding 2): after a failed rollback the pending charge is what the file was OBSERVED to hold beyond the committed
+          -- reservation. The verification of the growth to the 128 MiB target reports the target's payload plus the injected over-report
+          -- (an allocation above the new allowance, which the fit rule refuses); the committed reservation is the 64 MiB allowance.
+          let target = hCfg (newStoreH (specOf (toInteger (128 * mib)) Nothing))
+              injected = 10 * mib
+              observedAllocation = payloadBytes target + injected
+              committed = cfgAllowanceBytes cfg
+              expectedPending = observedAllocation - committed
+          addRuleAfter (envProbe env) 1 1 (== OpStatFile) (OverAllocated injected)
           addRule (envProbe env) 1 (== OpSetFileLength (payloadBytes (hCfg h64))) (FailWith (Errno (fromIntegral (let C.Errno c = C.eIO in c))))
           o <- submitGrowth (envSvc env) b (64 * mib) (128 * mib) >>= outcomeOf env
           o `shouldBeFailure` \f -> case f of ReservationFailed (OverheadExceedsModel _ _) -> True; _ -> False
           v <- atomically (backingView (envSvc env) b)
-          fmap bvPendingReservation v `shouldBe` Just (Just (64 * mib))
+          fmap bvPendingReservation v `shouldBe` Just (Just expectedPending)
+          record "release.pending.charge" (show expectedPending)
+          -- the volume's figure counts the committed reservation and the whole pending charge: everything that was observed
+          sv <- atomically (serviceView (envSvc env))
+          sum (svReserved sv) `shouldBe` observedAllocation
           t <- submitReleasePending (envSvc env) b >>= either (fail . show) pure
           awaitOutcome env t >>= (`shouldBe` Released)
+          -- after the retry nothing is pending and the figure is the committed reservation again
+          v2 <- atomically (backingView (envSvc env) b)
+          fmap (\x -> (bvPendingReservation x, bvReservedBytes x)) v2 `shouldBe` Just (Nothing, committed)
+          sv2 <- atomically (serviceView (envSvc env))
+          sum (svReserved sv2) `shouldBe` committed
           st <- either (fail . show) pure =<< nativeStat posixNative fd
           record "release.retry.allocated" (show (nsAllocated st))
           -- given back: the file is the committed allowance's payload again and occupies no more than the allowance
