@@ -1288,29 +1288,81 @@ neither enlarges it nor bypasses the model.
 Every thing the service holds is charged at what it holds, through one gate each, and every figure is measured against
 the live heap (`Test.TerrainRuntime.Storage.Memory`), never reasoned from an encoded size.
 
-**How a row is measured (rewritten in round 5).** The difference of two readings of the live heap (two major
-collections each) is a measurement only above a **noise floor**, which the suite measures in the process: two readings with
-nothing between them, and two around a change that leaves nothing behind (300 samples each after a discarded warm-up);
-1,080 to 1,208 bytes on both hosts (one spike of 8,768 in 60,000 samples on Linux). The first version of these rows
-measured a handful of structures in the service and took the least of fifteen samples ("noise only adds"): on the CI
-runner (Linux) the difference was negative, in one run the least sample was -6,792, a running write measured -2,184 and
-a closing record 0 (a `max 0` clamp), and all of them *passed* as "at most the charge". The rule now:
+**How a row is measured (rewritten in round 5, and again in round 10).** The difference of two readings of the live heap
+is a measurement only above a **floor**, which the suite measures in the process. The first version of these rows took the
+least of fifteen samples ("noise only adds"): on the CI runner (Linux) the difference was negative and the rows passed
+vacuously. Round 5 measured a floor (the largest difference of 300 pairs of readings) and required every row's signal to be
+50 times it. **The CI job `haskell-engine` then failed at `2388b285`** (run `43368432676`, 827 examples, 1 failure, seed
+1431804430): the floor of that run was 8,768 bytes, set by ONE pair of readings with nothing between them that differed by 497,536
+bytes, and a row whose signal was 387,032 failed the 50-times rule (it needed 438,400). **The cause of that pair is not known**:
+it did not reproduce off the runner (the same code with the same seed passed on macOS, floor 1,208, and in the aarch64 Linux guest,
+floor 1,080), and a process in which another thread allocates showed only stack-chunk steps of about 33 KB. The measurement was
+therefore rebuilt so that it does not depend on that cause (round 10, `Memory.hs` only; no charge and no service code changed):
 
-* **Every asserted row has a signal at least 50 times the floor** (`checkSignal`, printed as `memory signal | row | instances |
-  signal | floor`): a structure built **standalone, N at a time**, with N raised until the total added reaches the signal (up
-  to 60,000), or a structure that is already large (a transfer buffer, 1 MB; a result, 1.1 MB). The standalone rows rebuild what
-  the service holds per element with the constructors the service uses: the job table node, the queue element and the
+* **A reading is valid, and settled.** A reading is taken after a major collection and is valid only when the last collection the
+  runtime reports was a major one; a reading that is not is discarded and retaken, and the discards are counted and printed (zero on
+  every host so far). It is a guard, not a diagnosis. A measurement's reading is then SETTLED: valid readings are taken until two
+  consecutive ones agree within 1,024 bytes, at most 60 attempts, and a heap that does not settle fails the example with its
+  readings. **What settling excludes, and what it does not:** a transient that lives for ONE collection only (a finalizer that runs after
+  a collection, a thread still ending) cannot be in two consecutive readings, so it is excluded; a change that lasts longer is not
+  excluded, it disturbs ONE sample, and the next layer absorbs it.
+* **A row's value is established by a majority of its samples.** A sample is a per-instance figure with its own settled readings
+  (for a row in the service, its own service). Three samples are taken after a discarded warm-up run (the first run in a process pays
+  costs that are not the row's); the value is ESTABLISHED when a majority of the samples taken (more than half) agree within the row's
+  tolerance (a stack chunk, 40,000 bytes in total, or a quarter of the signal, whichever is larger); if the first three do not
+  agree, samples are taken one at a time up to seven. The value is the MEDIAN OF ALL the samples taken (the upper middle for an even
+  count, the conservative side of "charged at least measured"): it lies in every agreeing majority, so the choice among agreeing
+  groups never biases it low. A row fails as UNSTABLE only when seven samples have no agreeing majority, with every sample in the
+  message. One bad sample never fails a row and never moves its figure; a real retention shows in every sample, the majority agrees on
+  the larger figure, and the row fails as over its charge. How many samples each row needed, and how many agreed, is printed
+  (`memory samples | row | [samples] | needed | agreeing | value`).
+* **The floor is a robust statistic of settled readings**, measured once at the start of the Memory group: seven batches of 20
+  pairs of settled readings with nothing between them and seven with a change that leaves nothing behind; each batch contributes its
+  maximum, each series its median of batches, and the floor is the larger of the two. A contaminated batch is absorbed by the median.
+  The LARGEST single difference of any pair is printed beside the floor, so a runner's behaviour is visible (the old floor was that
+  number).
+* **Every asserted row has a signal of at least `neededSignal`** (printed as `memory signal | row | instances | signal | needed |
+  floor`): the larger of 50 times the floor and 40,000 bytes (one stack chunk, the step a sample may take). One definition, used by
+  `checkSignal` and by the standalone rows, which raise their instances until it is reached. The settled floor is small (16 bytes
+  where readings agree) and the 50-times rule alone would ask for 800 bytes while samples may step by 32,768 and agree within 40,000:
+  a row whose signal is below what its samples may disagree by has not measured its figure. Four standalone rows raised their
+  instances for this (a retained Opened 200 to 588, GrowthPrepared 200 to 500, Released or GrowthNoChange 200 to 3,312, the probe's
+  log entry 200 to 1,662); the other 22 already had a signal of at least 46,432. A signal below it fails (a control on values:
+  30,000 at a floor of 16).
+* **How a standalone row is built** (unchanged since round 5): a structure built **standalone, N at a time**, with N raised until the total added
+  reaches the needed signal (up to 60,000), or a structure that is already large (a transfer buffer, 1 MB; a result, 1.1 MB). The standalone rows
+  rebuild what the service holds per element with the constructors the service uses: the job table node, the queue element and the
   admission's own entry for the grant (a job); the backing map's node, the volume ledger's node and the grant's entry (an entry,
   a closing record, **a reporting record**); the list cell and the grant (a kept failure). The built value is held live across
   the second reading through a cell (an evaluated thunk drops what it was built from: a closure over a structure measured
   zero, and the rule caught it).
 * **No row passes vacuously**: a measured value of zero or below fails (`max 0` and the least-of-N are gone), and a signal below
-  the multiple fails; both are shown on values (`rulesSpec`).
+  `neededSignal` fails; both are shown on values (`rulesSpec`).
+* **The retention rows** (a directory, a filesystem name, the names of a configuration: views of 2 MiB buffers copied, K held at once)
+  are bounded by the service's own limits and have a signal BELOW `neededSignal` (about 21,700, 3,400, 8,700 and 11,400 bytes at K = 24, 8, 24
+  and 24, against 40,000). Their power is not their signal but the control: with the copy undone the service retains megabytes a job,
+  orders of magnitude above the bound, which a 40,000-byte disagreement cannot hide. Each asserts, per instance, at least
+  `smallestCopiedByteString` (64 bytes: the constructor 32, the `PlainPtr` box 16 and the pinned array 24 sum to 72, rounded down to the
+  allocator's granule) and at most its bound; a figure under 64 is noise or a copy shared instead of built, and half the time noise
+  is above zero. The established figures over the 200 repeats, per instance (macOS, then Linux): finished untaken open 915 to 2,246 and 904 to 2,233; queued open 910 to 933 and 916 to 932; configuration 359 to 367 and 362 to 363; volume profile 303 to 481 and 306 to 474.
+* **Controls on values** (`rulesSpec`): `[calm, spike, calm]` establishes calm, in any order; `[spike, spike, spike]` establishes the
+  spike; a single bad sample at any of seven positions never changes the figure; five samples whose sorted totals are
+  `[0, 20K, 30K, 55K, far]` give the median of all (30K), not a lower window's; an even count takes the upper middle; three clusters
+  cycling to the bound fail as UNSTABLE; a transient of 497,536 bytes live for one collection is never in a settled reading (and the
+  control asserts that a valid reading taken while it is held DOES contain it, so it cannot pass without the transient in a reading).
+  The transient is built at run time: a first form built it from a constant that GHC floated into a live constant, which the 200
+  repeats caught at repeat 1.
 * **The service itself is held against the model** where its own bounds give the signal: K = 24 finished, **untaken** write
   reports held at once, produced by real jobs, the test's own pages and the harness's log of native calls dropped before the
   second reading; asserted at most the charge and within 15 percent of the standalone row for the same structure, for the
   all-written and the first-page-failed variants. A service-level reading that cannot reach the signal (eight queued records,
   one backing, a running write) is **printed as an observation and never asserted**.
+
+The 200 repeats of the Memory group at `ef998aa3`, one process on each host: 200 of 200 passed on macOS and 200 of 200 in the
+Linux guest. The floor was 16 bytes on macOS and 16 on Linux; the LARGEST single difference of any floor pair, 712 (macOS) and
+10344 (Linux), is what the old floor would have been. Across 7000 measurements on macOS and 7000 on Linux, the most samples any row needed was
+3 (macOS) and 3 (Linux). The figures in the table below are those of the 200 repeats under the former measurement, which carried the former floor's noise in each reading; the figures at
+`ef998aa3` are in the evidence record, row by row, and differ from them: by under 200 bytes an instance for most rows (mostly lower, a few by single digits higher) and by up to about 1,100 for the two large buffers (a held transfer buffer, a finished result); every one is within its charge.
 
 | Held thing | Charged to, and when | Figure | Standalone row, 200 repeats, both hosts (minimum to maximum) | In the service, held at once |
 | --- | --- | --- | --- | --- |
@@ -1341,10 +1393,9 @@ The in-service write-report validation takes BOTH readings with the workers idle
 status): a worker that has committed a job's outcome is still inside its frame for a moment, holding the work it ran, so a
 reading taken then counts that job's pages (positive: 62,676 a job once in 26 repeats on macOS, against 33,280) or, if it is the
 first reading, counts what the second no longer does (-28,248 a job on Linux in 3 repeats). Both were races of the test, found by
-the repeats, not of the service. **Known sensitivity:** the noise-floor example forces about 1,500 major collections and did not
-finish inside the 10-second bounded wait when the machine ran at load average 23 to 26 from other work (it takes about 4.5 s for the
-floor and 9 s in all on the CI runner at `22a1a7ac`, a 20x margin there, and seconds at normal load); it is a failure of the
-bounded wait under heavy machine load, not of an assertion, and the suite passed when rerun at load 4.
+the repeats, not of the service. **Known sensitivity (round 6, measured under the former floor):** the former noise-floor example forced about 1,500
+major collections and did not finish inside the 10-second bounded wait when the machine ran at load average 23 to 26 from other work; the
+floor is now measured differently (settled readings, bounded at 60 attempts each) and its cost under load has not been re-measured.
 
 Two figures moved or were corrected in round 5. `keptEntryBytes` is **2,048** (it was 320, then 1,536): the largest instance now
 includes the admission's entry for the grant (1,517 where 1,326 left it out), which would have been 1.2 percent under 1,536. The
@@ -2265,8 +2316,8 @@ run anywhere else. The storage examples hold the class of defect, not the instan
   bounds (each limit accepted, each refusal typed, an infinite list refused).
 * **The retention rows** (`Memory`, `spec4`): a directory, a filesystem name and a configuration's names that are 4-to-48-byte views
   of fresh 2 MiB buffers cost the copy and not the buffer, K at once, finished-untaken and queued.
-* **The memory rows** (`Memory`): the noise floor, then every retained structure at its largest measured standalone or amplified
-  with a signal 50 times the floor, no vacuous pass, the finished write reports held untaken against the model, run 200 times
+* **The memory rows** (`Memory`): the floor (settled readings, a median of batches), then every retained structure at its largest measured standalone or amplified
+  with a signal of at least `neededSignal` (50 times the floor and one stack chunk), every row's value established by a majority of its samples, no vacuous pass, the finished write reports held untaken against the model, run 200 times
   in one process on both hosts (the table and the method under Scheduling and accounting).
 * **A reporting record is charged** (`Lifecycle`): the control account narrowed to three backing records, the log "Backing
   closed" held, repeated open, take and close until a typed `BusyNow (AccountPressure _)`, then released: the records end and the
